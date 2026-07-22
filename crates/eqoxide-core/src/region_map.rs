@@ -93,6 +93,58 @@ impl RegionMap {
         ]}
     }
 
+    /// Test-only: SEVERAL independent water AABBs, each with its own surface height — the shape a
+    /// real `.wtr` has wherever two water volumes with DIFFERENT surfaces sit side by side (a
+    /// lidded pocket next to an open shaft; a stepped canal). Neither [`water_slab`] (one global
+    /// z-slab) nor [`box_below`] (one XY box, unbounded below) can express that, and it is exactly
+    /// the situation the swim-capability claims are about: a swimmer moving LATERALLY crosses from
+    /// one surface to another and buoyancy re-reads the surface at its new position (#648/#649).
+    ///
+    /// Each box is `[n0, n1, e0, e1, zbot, ztop]` in server coords (north, east, up). Boxes are
+    /// tested in order and the FIRST containing box wins; everywhere outside every box reads dry.
+    ///
+    /// The tree is a CHAIN (box 1's six planes, falling through to box 2's, …), so a later box's
+    /// subtree is entered from several parents and [`water_region_aabbs`](Self::water_region_aabbs)
+    /// reports it more than once, some of them zero-width slivers. That is the safe direction and
+    /// the same one real `.wtr` BSPs already put that method in: a LOOSE or duplicated AABB costs
+    /// the water-span-grid builder TIME, never correctness, because it confirms every candidate
+    /// column with `is_water`. What is guaranteed here is COVERAGE — every wet point lies inside at
+    /// least one reported AABB — and `is_water`/`surface_z`, which are exact.
+    ///
+    /// Keep query points off the exact face planes — the BSP walk treats a `dist == 0.0` as a
+    /// degenerate node and answers `None` (dry), same as every other constructor here.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn water_boxes(boxes: &[[f32; 6]]) -> RegionMap {
+        let k = boxes.len() as i32;
+        let dry_leaf = 6 * k + 1;
+        let mut nodes: Vec<BspNode> = Vec::with_capacity((6 * k + 1 + k) as usize);
+        for (i, b) in boxes.iter().enumerate() {
+            let i = i as i32;
+            let [n0, n1, e0, e1, zbot, ztop] = *b;
+            let water_leaf = dry_leaf + 1 + i;
+            // Outside ANY plane of this box → try the next box, or dry if this was the last.
+            let out = if i + 1 < k { 6 * (i + 1) + 1 } else { dry_leaf };
+            // leaf_at swaps to (north, east, z), so normal = [north, east, z].
+            let planes: [([f32; 3], f32); 6] = [
+                ([1.0, 0.0, 0.0], -n0),    // north >= n0
+                ([-1.0, 0.0, 0.0], n1),    // north <= n1
+                ([0.0, 1.0, 0.0], -e0),    // east  >= e0
+                ([0.0, -1.0, 0.0], e1),    // east  <= e1
+                ([0.0, 0.0, 1.0], -zbot),  // z     >= zbot
+                ([0.0, 0.0, -1.0], ztop),  // z     <= ztop
+            ];
+            for (p, (normal, split)) in planes.into_iter().enumerate() {
+                let inside = if p < 5 { 6 * i + 2 + p as i32 } else { water_leaf };
+                nodes.push(BspNode { normal, split, special: 0, left: inside, right: out, zone_line_index: 0 });
+            }
+        }
+        nodes.push(BspNode { normal: [0.0; 3], split: 0.0, special: 0, left: 0, right: 0, zone_line_index: 0 }); // dry
+        for _ in boxes {
+            nodes.push(BspNode { normal: [0.0; 3], split: 0.0, special: 1, left: 0, right: 0, zone_line_index: 0 });
+        }
+        RegionMap { nodes }
+    }
+
     /// Test-only: a map where everything below `top_z` is a zone-line region carrying `index`.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn zone_line_below(top_z: f32, index: i32) -> RegionMap {
@@ -478,6 +530,36 @@ mod tests {
             out.extend_from_slice(&zli.to_le_bytes());
         }
         out
+    }
+
+    /// `water_boxes` must give each box its OWN surface, bound each box BELOW as well as above,
+    /// and read dry everywhere outside every box. This is the property the synthetic swim fixtures
+    /// (#659) rest on: a swimmer crossing from one box to the next must see a DIFFERENT surface.
+    #[test]
+    fn water_boxes_gives_each_box_its_own_bounded_surface() {
+        // Two boxes side by side in east, surfaces 16 u apart, both bottomed at -79.5.
+        let m = RegionMap::water_boxes(&[
+            [-30.0, 30.0, -60.0, 0.0, -79.5, -56.0],
+            [-30.0, 30.0, 0.0, 60.0, -79.5, -40.0],
+        ]);
+        assert!(m.is_water(-40.0, 0.0, -70.0) && m.is_water(40.0, 0.0, -70.0));
+        assert_eq!(m.surface_z(-40.0, 0.0, -70.0).map(|z| (z * 100.0).round() / 100.0), Some(-56.0));
+        assert_eq!(m.surface_z(40.0, 0.0, -70.0).map(|z| (z * 100.0).round() / 100.0), Some(-40.0));
+        // Bounded below: a point under the volume is dry even though it is under the surface.
+        assert!(!m.is_water(-40.0, 0.0, -85.0), "must be bounded BELOW, like real .wtr water");
+        // Above each surface, and outside the XY footprint, is dry.
+        assert!(!m.is_water(-40.0, 0.0, -50.0));
+        assert!(!m.is_water(40.0, 0.0, -30.0));
+        assert!(!m.is_water(-40.0, 45.0, -70.0), "outside the north band must be dry");
+        assert!(!m.is_water(-80.0, 0.0, -70.0), "outside the east band must be dry");
+        // COVERAGE (not uniqueness — see the constructor doc): every wet point the water-span grid
+        // builder must find lies inside at least one reported AABB.
+        let aabbs = m.water_region_aabbs((-100.0, 100.0, -100.0, 100.0, -100.0, 0.0));
+        for p in [[-40.0f32, 0.0, -70.0], [40.0, 0.0, -70.0], [-5.0, 25.0, -60.0]] {
+            assert!(aabbs.iter().any(|(e, n, z)| p[0] >= e[0] && p[0] <= e[1]
+                    && p[1] >= n[0] && p[1] <= n[1] && p[2] >= z[0] && p[2] <= z[1]),
+                "wet point {p:?} must be covered by some reported AABB: {aabbs:?}");
+        }
     }
 
     #[test]
