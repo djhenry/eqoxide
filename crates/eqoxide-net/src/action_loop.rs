@@ -28,6 +28,28 @@ const POS_SEND_KEEPALIVE_MS: u128 = 1300;
 /// every movement check. Sending one benign entry every 30s keeps the 70s timer alive (eqoxide#105).
 const MOVEMENT_HISTORY_MS: u128 = 30_000;
 
+/// Convert an actual movement speed (this client's own controller speed, EQ units/second) to the
+/// wire `animation` field of `OP_ClientUpdate`. This field is NOT a moving/idle boolean — EQEmu
+/// computes `base_runspeed = eq_runspeed_float * 40`, with the player special-case
+/// `eq_runspeed_float` 0.7 (running) → 28 and 0.3 (walking) → 12 (`EQEmu/zone/mob.cpp:190-196`,
+/// sent as `spu->animation` at `mob.cpp:1743-1745`). Every other client (native and eqoxide)
+/// decodes `speed = animation / 40` to pick the locomotion clip and feeds it to anti-cheat speed
+/// limiting (`cheat_manager.cpp:291-298`) and endurance drain (`client_mods.cpp:1676`), so sending
+/// a constant `1` (decoding to 0.025 — ~2% of walking pace) is a confident falsehood about our own
+/// motion, not a rendering nicety (#624).
+///
+/// `RUN_SPEED` (44 u/s, `eqoxide_core::physics::RUN_SPEED`) is this client's own controller cap,
+/// which is the player-special-cased `eq_runspeed_float = 0.7`. Scaling is linear, so
+/// `anim = speed_u_per_s * (0.7 * 40 / RUN_SPEED)` reproduces the native constants exactly:
+/// `RUN_SPEED` (44 u/s) → 28, and the native walk speed (`RUN_SPEED * 0.3/0.7 ≈ 18.857 u/s`,
+/// per #623) → 12. Rounds to nearest and clamps to the field's ±512 range (10-bit signed).
+pub(crate) fn speed_to_wire_animation(speed_u_per_s: f32) -> i32 {
+    const EQ_RUNSPEED_FLOAT_AT_RUN: f32 = 0.7; // EQEmu player special-case runspeed (mob.cpp:190-196)
+    const ANIM_SCALE: f32 = 40.0; // EQEmu: base_runspeed = runspeed * 40
+    let anim_f = speed_u_per_s * (EQ_RUNSPEED_FLOAT_AT_RUN * ANIM_SCALE / RUN_SPEED);
+    anim_f.round().clamp(-512.0, 511.0) as i32
+}
+
 /// Build a RoF2 OP_FloatListThing payload: one `UpdateMovementEntry` (packed, 17 bytes) at the given
 /// server position. `type = Collision` (1) is a normal move — it resets the server's movement-history
 /// timer without tripping the TeleportA/ZoneLine special-cases in `ProcessMovementHistory`. Field
@@ -2502,8 +2524,15 @@ impl ActionLoop {
         let dx = x - gs.player_x; // east  delta (server_x)
         let dy = y - gs.player_y; // north delta (server_y)
         let dz = z - gs.player_z;
-        let moving = dx != 0.0 || dy != 0.0 || dz != 0.0;
-        let anim: i32 = if moving { 1 } else { 0 };
+        // Real speed, not a moving/idle flag (#624): the distance just covered divided by the wall
+        // time since we last sent a position update. `self.last_pos_send` is still the PREVIOUS
+        // send's timestamp here — every caller updates it only AFTER this call returns (`stream_position`
+        // and the melee-facing call in `drive_auto_engage_melee`), so this is exactly the interval
+        // `dx/dy/dz` were accumulated over. Floored away from 0 so an accidental same-tick double send
+        // can't divide by (near) zero.
+        let dt_secs = self.last_pos_send.elapsed().as_secs_f32().max(0.001);
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        let anim: i32 = speed_to_wire_animation(dist / dt_secs);
         // Internal heading is CCW (0=north, 90=west). The EQ wire (and server) expects
         // CW (0=north, 90=east). The server decodes the wire heading via EQ12toFloat = wire/4,
         // and EQ headings run 0..512 (= 0..360deg), so wire = EQ_units * 4 = deg_cw * 512/360 * 4
@@ -2872,6 +2901,49 @@ mod tests {
         assert!((gs.player_z - foot).abs() < 1e-4,
             "foot→wire→foot must be the identity through the real handler: sent {foot}, gs.player_z {}",
             gs.player_z);
+    }
+
+    /// #624: the wire `animation` field is `speed * 40` (with EQEmu's player special-case 0.7→28,
+    /// 0.3→12 — `mob.cpp:190-196`), NOT a moving/idle boolean. Broadcasting a constant `1` (=speed
+    /// 0.025, ~2% of walking pace) makes every observer render us walking regardless of our real
+    /// speed, and feeds the server's anti-cheat/endurance models a nonsense value.
+    ///
+    /// MUTATION CHECK: restore `speed_to_wire_animation` to `if speed_u_per_s > 0.0 { 1 } else { 0 }`
+    /// (the pre-fix behavior folded into this helper) → `running_speed_encodes_as_28` and
+    /// `walking_speed_encodes_as_12` both go RED (1 != 28, 1 != 12).
+    #[test]
+    fn stationary_speed_encodes_as_zero() {
+        assert_eq!(speed_to_wire_animation(0.0), 0);
+    }
+
+    #[test]
+    fn running_speed_encodes_as_28() {
+        // RUN_SPEED (44 u/s) IS the player-special-cased eq_runspeed_float 0.7 → animation 28.
+        assert_eq!(speed_to_wire_animation(RUN_SPEED), 28);
+    }
+
+    #[test]
+    fn walking_speed_encodes_as_12() {
+        // Native walk speed per #623: RUN_SPEED * (0.3/0.7) ≈ 18.857 u/s → eq_runspeed_float 0.3 → 12.
+        let walk_speed = RUN_SPEED * (0.3 / 0.7);
+        assert_eq!(speed_to_wire_animation(walk_speed), 12);
+    }
+
+    #[test]
+    fn speed_proportional_between_walk_and_run() {
+        // A snared/buffed speed at HALF the run speed (22 u/s → eq_runspeed_float 0.5*0.7 = 0.35 →
+        // animation 14) must land at its own proportional encoding, not snap to one of the two named
+        // speeds — this is what distinguishes a real computation from a hardcoded walk/run lookup.
+        let mid_speed = RUN_SPEED * 0.5;
+        assert_eq!(speed_to_wire_animation(mid_speed), 14);
+    }
+
+    #[test]
+    fn wire_animation_clamps_to_the_signed_10bit_field_bound() {
+        // Absurdly fast (a teleport/correction, not real controller motion) must clamp to +511, and
+        // a hypothetical negative speed must clamp to -512 — never overflow the field or wrap.
+        assert_eq!(speed_to_wire_animation(100_000.0), 511);
+        assert_eq!(speed_to_wire_animation(-100_000.0), -512);
     }
 
     /// **A GOAL THE CLIENT CHANGED MUST NOT BE REPORTED AS THE GOAL THE AGENT ASKED FOR.**
