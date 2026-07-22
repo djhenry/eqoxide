@@ -17,6 +17,13 @@ use super::protocol::*;
 /// anything beyond this drains on the next wake ~10 ms later. (#153)
 const MAX_DATAGRAMS_PER_POLL: usize = 4096;
 
+/// How many session-layer control datagrams (#641) may sit queued for retry at once. The measured
+/// live bursts are in the low hundreds over a couple of seconds, so this holds a whole burst with
+/// room to spare while still bounding memory if the socket were wedged for a long time. On overflow
+/// the OLDEST entry is dropped — an `OP_ACK` is cumulative, so the newest one supersedes it — and is
+/// counted as a genuine, unretried loss.
+const MAX_PENDING_CONTROL: usize = 1024;
+
 // ── Reliable-send retransmission (#254) ──────────────────────────────────────
 // Mirrors EQEmu's Network resend rules (zone/world main.cpp: base=100ms, factor=1.5, min=300,
 // max=5000) with rolling_ping seeded at 500ms → first resend ≈ 500·1.5 + 100 = 850ms, then doubled
@@ -258,6 +265,12 @@ const SEND_FAIL_WARN_QUIET: std::time::Duration = std::time::Duration::from_secs
 enum SendRetry {
     /// Retained in the resend window; `poll_resend` re-sends this same datagram until it is ACKed.
     Retransmitted,
+    /// Session-layer control (ACK / OutOfOrderAck / keepalive / SessionRequest / SessionDisconnect).
+    /// A transient `WouldBlock` on one of these is queued in `pending_control` and re-sent on the
+    /// next tick rather than dropped (#641) — so it is counted in `send_deferred`, not
+    /// `send_failures`. Any OTHER error is a real loss and counted as such: retrying an `EMSGSIZE`
+    /// forever would just be a lie with a different shape.
+    Deferred,
     /// Not retained. If this send fails, this datagram is gone.
     None,
 }
@@ -380,6 +393,43 @@ struct Sent {
     retries: u32,
 }
 
+/// Send a datagram on an already-`connect()`ed tokio `UdpSocket` via a direct `send(2)`, bypassing
+/// tokio's cached-readiness gate (#641).
+///
+/// This exists for exactly one caller — `EqStream::transmit`'s `WouldBlock` rescue — and it is the
+/// only way to tell tokio's SYNTHETIC `WouldBlock` (readiness bit empty, no syscall attempted) from
+/// a real kernel `EAGAIN`/`ENOBUFS`. `try_send`/`try_io` cannot: both consult the same cache and
+/// short-circuit before reaching the kernel.
+///
+/// The fd is borrowed, never owned: `ManuallyDrop` means the temporary `std::net::UdpSocket` is not
+/// closed when it drops, so tokio keeps sole ownership of the descriptor. The socket is non-blocking
+/// (tokio set it that way) and connected, so `send` is a single non-blocking `send(2)` — it can
+/// never park the net thread.
+#[cfg(unix)]
+fn raw_send_bypassing_readiness_cache(
+    socket: &UdpSocket,
+    datagram: &[u8],
+) -> std::io::Result<usize> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: `socket` outlives this borrow, and `ManuallyDrop` suppresses the `close(2)` that
+    // dropping the reconstructed `std::net::UdpSocket` would otherwise perform — so ownership of
+    // the descriptor stays with `socket` and it is not closed twice.
+    let borrowed =
+        std::mem::ManuallyDrop::new(unsafe { std::net::UdpSocket::from_raw_fd(socket.as_raw_fd()) });
+    borrowed.send(datagram)
+}
+
+/// Non-unix fallback: no fd to borrow, so there is no rescue and a `WouldBlock` is reported as the
+/// failure it is. The client is only built and run on Linux today; this keeps the crate portable
+/// without pretending the rescue happened.
+#[cfg(not(unix))]
+fn raw_send_bypassing_readiness_cache(
+    _socket: &UdpSocket,
+    _datagram: &[u8],
+) -> std::io::Result<usize> {
+    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+}
+
 pub struct EqStream {
     session: SessionInfo,
     socket: UdpSocket,
@@ -391,6 +441,28 @@ pub struct EqStream {
     /// Sent-but-unACKed reliable datagrams, in send order, retransmitted on OP_OutOfOrder / timeout
     /// until the server ACKs their sequence (#254). Cumulative OP_ACK pops from the front.
     sent: VecDeque<Sent>,
+    /// Session-layer control datagrams whose send hit a transient `WouldBlock` and which are waiting
+    /// to be retried on a later tick, in send order (#641).
+    ///
+    /// The reliable stream has had a resend window since #254; the CONTROL path had nothing, so a
+    /// failed ACK was simply dropped — measured live at 44–306 per zone-in on a CPU-starved client,
+    /// every one a 7-byte datagram. Since the server retransmits anything it has not seen
+    /// acknowledged, and gives up at its ~30s `resend_timeout`, dropping ACKs is exactly the wrong
+    /// thing to do under load. ACKs are cheap and idempotent, so the honest response to a transient
+    /// refusal is to try again ~10ms later, which is what `flush_pending_control` does.
+    ///
+    /// Drained FIFO from `poll_recv` (every loop tick, in all four loops that own a stream) and
+    /// again immediately before any new control send, so ordering on the wire is preserved.
+    pending_control: VecDeque<Vec<u8>>,
+    /// TEST-ONLY fault injection (#641): the next N `transmit` calls behave as though the kernel
+    /// refused the datagram with `EAGAIN`, without touching the socket. There is no portable,
+    /// deterministic way to make a real `send(2)` on a connected UDP socket return `EAGAIN` from a
+    /// unit test (loopback drains instantly; `tc`/blackhole routes need root), and the branch this
+    /// forces — "the kernel really said no, so queue it and retry" — is precisely the half of #641
+    /// that the raw-`send(2)` rescue does NOT cover, so it must not go untested.
+    /// `Cell` because `transmit` takes `&self`.
+    #[cfg(test)]
+    force_send_refusals: std::cell::Cell<u32>,
     frags: FragmentBuffer,
     app_tx: mpsc::UnboundedSender<AppPacket>,
     /// Wall-clock time of the last inbound **datagram** of any kind — session-layer ACKs and
@@ -426,6 +498,9 @@ impl EqStream {
             next_recv_seq: 0,
             recv_buf: HashMap::new(),
             sent: VecDeque::new(),
+            pending_control: VecDeque::new(),
+            #[cfg(test)]
+            force_send_refusals: std::cell::Cell::new(0),
             frags: FragmentBuffer::new(),
             net_health,
             app_tx,
@@ -624,6 +699,11 @@ impl EqStream {
     /// contention. Bounded by `MAX_DATAGRAMS_PER_POLL` so a sustained flood can't starve the rest
     /// of the loop in a single wake (the remainder drains on the next wake). (#153)
     pub fn poll_recv(&mut self) -> bool {
+        // #641: retry any control datagram (ACK / OutOfOrderAck / keepalive / session control) that a
+        // transient WouldBlock deferred. Here because every loop that owns a stream calls `poll_recv`
+        // each ~10ms tick — the same property `poll_resend` depends on — so no loop has to remember
+        // to drain the queue itself.
+        self.flush_pending_control();
         let mut buf = vec![0u8; 4096];
         for _ in 0..MAX_DATAGRAMS_PER_POLL {
             match self.socket.try_recv(&mut buf) {
@@ -714,61 +794,183 @@ impl EqStream {
     ///
     /// `retry` records whether THIS EXACT datagram is retained for retransmission (the reliable
     /// window) or is gone for good; see `NetHealth::send_failures_unretried`.
+    ///
+    /// ## The `WouldBlock` rescue (#641)
+    ///
+    /// `try_send` can return `WouldBlock` **without ever issuing the syscall**: tokio gates every
+    /// `try_*` call on a cached readiness bit, and when that bit is empty it returns a SYNTHETIC
+    /// `WouldBlock` immediately (`tokio` `io::registration`/`scheduled_io` — the same mechanism
+    /// #603/#610 measured on the cold pre-loop `SESSION_REQUEST`). The bit is refilled only by
+    /// tokio's io driver, so when the driver is starved of CPU the bit can stay empty across a
+    /// whole `poll_recv` drain — and every ACK that drain wanted to send is dropped on the floor,
+    /// including the ones the kernel would happily have taken.
+    ///
+    /// So on `WouldBlock` we re-attempt the datagram once through `send(2)` on the same fd,
+    /// bypassing the readiness cache. That is BOTH the fix and the discriminator:
+    ///   - the raw send succeeds → the `WouldBlock` was synthetic, the datagram is genuinely on the
+    ///     wire now, and it is counted in `send_wouldblock_rescued` (not in `send_failures`, which
+    ///     means "never reached the wire" and must not be inflated by a send that did);
+    ///   - the raw send fails → the kernel really refused it. It is NOT all synthetic: one measured
+    ///     `qeynos` zone-in split 141 rescued / 107 genuinely refused. The genuinely-refused ones
+    ///     are handled a layer up — `send_raw` queues control datagrams in `pending_control` and
+    ///     re-sends them on the next tick — and anything not deferrable falls through to the
+    ///     unchanged failure accounting.
+    ///
+    /// It is deliberately ONE retry, not a loop: a genuine `EAGAIN` must stay observable rather
+    /// than being spun on inside a non-blocking send path, and the tick retry is the recovery.
     #[must_use = "a send outcome must be handled — discarding it is the #612 agent-honesty bug"]
     fn transmit(&self, datagram: &[u8], retry: SendRetry) -> std::io::Result<()> {
-        match self.socket.try_send(datagram) {
+        #[cfg(test)]
+        let attempt: std::io::Result<usize> = if self.force_send_refusals.get() > 0 {
+            self.force_send_refusals.set(self.force_send_refusals.get() - 1);
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        } else {
+            self.attempt_send(datagram)
+        };
+        #[cfg(not(test))]
+        let attempt = self.attempt_send(datagram);
+        match attempt {
             Ok(_) => Ok(()),
-            Err(e) => {
-                let now = Instant::now();
-                // Rate-limit decision is made from the SAME locked snapshot that updates the
-                // counters, so it costs no extra lock and cannot race itself (#612 review, F5).
-                let (loud, total) = {
-                    let mut h = self.net_health.lock().unwrap();
-                    // First failure of a burst is always loud; after that, at most one WARN per
-                    // `SEND_FAIL_WARN_QUIET`. A sustained outage otherwise produces ~10^3 WARN lines
-                    // in 30s (the 20Hz position firehose plus go-back-N retransmits), which buries
-                    // the very signal it is meant to raise.
-                    let loud = h.last_send_error_at
-                        .is_none_or(|t| now.saturating_duration_since(t) >= SEND_FAIL_WARN_QUIET);
-                    h.send_failures = h.send_failures.saturating_add(1);
-                    if retry == SendRetry::None {
-                        h.send_failures_unretried = h.send_failures_unretried.saturating_add(1);
-                    }
-                    h.last_send_error_kind = Some(e.kind());
-                    h.last_send_error_at = Some(now);
-                    (loud, h.send_failures)
-                };
-                // The log is only the OPERATOR's copy; `NetHealth` is the AGENT's, and it is stamped
-                // unconditionally above. Suppressing a log line therefore never suppresses a fact —
-                // that separation is what makes rate-limiting safe here (#612).
-                if loud {
-                    tracing::warn!(
-                        "NET: send failed ({:?}, {} bytes, retransmitted={:?}) — this datagram did \
-                         NOT reach the wire; {} total since start (#612). Further failures logged at \
-                         debug for the next {}s; see /v1/observe/debug send_failures",
-                        e.kind(), datagram.len(), retry, total, SEND_FAIL_WARN_QUIET.as_secs(),
-                    );
-                } else {
-                    tracing::debug!(
-                        "NET: send failed ({:?}, {} bytes, retransmitted={:?}); {} total (#612)",
-                        e.kind(), datagram.len(), retry, total,
-                    );
-                }
-                Err(e)
-            }
+            Err(e) => self.record_send_failure(datagram, retry, e),
         }
     }
 
+    /// `try_send`, plus the raw-`send(2)` rescue described on `transmit`. Split out so the
+    /// test-only refusal injection above can replace the whole socket interaction, and so `transmit`
+    /// reads as "attempt, then account".
+    fn attempt_send(&self, datagram: &[u8]) -> std::io::Result<usize> {
+        match self.socket.try_send(datagram) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                match raw_send_bypassing_readiness_cache(&self.socket, datagram) {
+                    Ok(n) => {
+                        let mut h = self.net_health.lock().unwrap();
+                        h.send_wouldblock_rescued = h.send_wouldblock_rescued.saturating_add(1);
+                        Ok(n)
+                    }
+                    // The kernel refused it too. Report the KERNEL's error, not tokio's cached-
+                    // readiness stand-in, so `last_send_error` names what actually happened.
+                    Err(real) => Err(real),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Account a send that did not reach the wire, and return the error unchanged.
+    fn record_send_failure(
+        &self,
+        datagram: &[u8],
+        retry: SendRetry,
+        e: std::io::Error,
+    ) -> std::io::Result<()> {
+        let now = Instant::now();
+        // A transient refusal of a DEFERRABLE datagram is not a loss: `send_raw` puts it in
+        // `pending_control` and the next tick re-sends it. Counting it in `send_failures` would
+        // republish the very number #641 exists to drive to zero, and would be false besides.
+        // Anything that is NOT a transient refusal (EMSGSIZE, ENETUNREACH, a dead socket) is a real
+        // loss on every path, deferrable or not — retrying those forever would not deliver them.
+        let deferred = retry == SendRetry::Deferred && e.kind() == std::io::ErrorKind::WouldBlock;
+        // Rate-limit decision is made from the SAME locked snapshot that updates the
+        // counters, so it costs no extra lock and cannot race itself (#612 review, F5).
+        let (loud, total) = {
+            let mut h = self.net_health.lock().unwrap();
+            if deferred {
+                h.send_deferred = h.send_deferred.saturating_add(1);
+                return Err(e);
+            }
+            // First failure of a burst is always loud; after that, at most one WARN per
+            // `SEND_FAIL_WARN_QUIET`. A sustained outage otherwise produces ~10^3 WARN lines
+            // in 30s (the 20Hz position firehose plus go-back-N retransmits), which buries
+            // the very signal it is meant to raise.
+            let loud = h.last_send_error_at
+                .is_none_or(|t| now.saturating_duration_since(t) >= SEND_FAIL_WARN_QUIET);
+            h.send_failures = h.send_failures.saturating_add(1);
+            if retry != SendRetry::Retransmitted {
+                h.send_failures_unretried = h.send_failures_unretried.saturating_add(1);
+            }
+            h.last_send_error_kind = Some(e.kind());
+            h.last_send_error_at = Some(now);
+            (loud, h.send_failures)
+        };
+        // The log is only the OPERATOR's copy; `NetHealth` is the AGENT's, and it is stamped
+        // unconditionally above. Suppressing a log line therefore never suppresses a fact —
+        // that separation is what makes rate-limiting safe here (#612).
+        if loud {
+            tracing::warn!(
+                "NET: send failed ({:?}, {} bytes, retransmitted={:?}) — this datagram did \
+                 NOT reach the wire; {} total since start (#612). Further failures logged at \
+                 debug for the next {}s; see /v1/observe/debug send_failures",
+                e.kind(), datagram.len(), retry, total, SEND_FAIL_WARN_QUIET.as_secs(),
+            );
+        } else {
+            tracing::debug!(
+                "NET: send failed ({:?}, {} bytes, retransmitted={:?}); {} total (#612)",
+                e.kind(), datagram.len(), retry, total,
+            );
+        }
+        Err(e)
+    }
+
+    /// Re-send session-layer control datagrams that a transient `WouldBlock` deferred (#641), oldest
+    /// first, stopping at the first one that is still refused so ordering on the wire is preserved.
+    ///
+    /// Called at the top of `poll_recv` — which every loop that owns a stream calls each ~10ms tick,
+    /// the same discipline `poll_resend` relies on — and again before any new control send.
+    fn flush_pending_control(&mut self) {
+        while let Some(front) = self.pending_control.front() {
+            // A still-refused datagram must stay at the FRONT: popping it and pushing it back would
+            // reorder the queue behind any datagram queued in between.
+            if self.transmit(front, SendRetry::Deferred).is_err() {
+                return;
+            }
+            self.pending_control.pop_front();
+        }
+    }
+
+    /// Queue a control datagram for retry on a later tick (#641).
+    fn defer_control(&mut self, datagram: Vec<u8>) {
+        if self.pending_control.len() >= MAX_PENDING_CONTROL {
+            // Drop the OLDEST, not the newest: `OP_ACK` is cumulative, so a later ACK supersedes an
+            // earlier one, and the freshest control datagram is the one worth keeping. This one IS a
+            // genuine loss — nothing will ever re-send it — so it is counted as such.
+            self.pending_control.pop_front();
+            let mut h = self.net_health.lock().unwrap();
+            h.send_failures = h.send_failures.saturating_add(1);
+            h.send_failures_unretried = h.send_failures_unretried.saturating_add(1);
+            tracing::warn!(
+                "NET: control-send retry queue full ({} datagrams) — dropped the oldest; the \
+                 socket has been refusing sends for an unusually long time (#641)",
+                MAX_PENDING_CONTROL,
+            );
+        }
+        self.pending_control.push_back(datagram);
+    }
+
+    /// Session-layer control (SessionRequest / ACK / OutOfOrderAck / keepalive / disconnect).
+    ///
+    /// None of these is retained by the reliable resend window, and before #641 that meant a failed
+    /// one was simply gone — measured live at 44–306 dropped ACKs per zone-in on a CPU-starved
+    /// client. They are cheap and idempotent, so a TRANSIENT refusal (`WouldBlock`) now queues the
+    /// datagram in `pending_control` for the next tick instead. `Ok(())` therefore means "accepted
+    /// for delivery", which for a deferred datagram is a claim about the next ~10ms, not about this
+    /// instant; `send_deferred` is what makes that visible. Any other error is returned unchanged.
     fn send_raw(&mut self, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
         let mut raw = vec![0x00, opcode];
         raw.extend_from_slice(payload);
         raw = self.append_crc(raw);
-        // Session-layer control (SessionRequest / ACK / OutOfOrderAck / keepalive / disconnect):
-        // none of these datagrams is retained by our resend window, so a failure here is `None`
-        // — the client will not re-send THIS datagram. Some have higher-level recovery (connect()'s
-        // SESSION_REQUEST cadence; the server re-sending a packet whose ACK we lost), which is why
-        // the counter is documented as "this datagram is gone", not "a command was lost".
-        self.transmit(&raw, SendRetry::None)
+        // Drain first so a queued datagram cannot end up on the wire AFTER one built later.
+        self.flush_pending_control();
+        if !self.pending_control.is_empty() {
+            self.defer_control(raw);
+            return Ok(());
+        }
+        match self.transmit(&raw, SendRetry::Deferred) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                self.defer_control(raw);
+                Ok(())
+            }
+            other => other,
+        }
     }
 
     fn append_crc(&self, data: Vec<u8>) -> Vec<u8> {
@@ -1267,6 +1469,20 @@ impl EqStream {
     /// Clearing the window is what makes it safe to call from both: a second call (the eventual
     /// `Drop`, if it ever runs) sees an empty window and does nothing, so no double count.
     pub(crate) fn abandon_outstanding(&mut self) {
+        // #641: control datagrams still queued for retry when the session ends are never sent — the
+        // next stream is a different socket. Same honesty rule as the reliable window below: a
+        // datagram we stop trying to deliver is a loss and must be counted as one.
+        let pending = self.pending_control.len() as u64;
+        if pending > 0 {
+            self.pending_control.clear();
+            if let Ok(mut h) = self.net_health.lock() {
+                h.send_failures = h.send_failures.saturating_add(pending);
+                h.send_failures_unretried = h.send_failures_unretried.saturating_add(pending);
+            }
+            tracing::warn!(
+                "NET: session ended with {} session-control datagram(s) still queued for retry —                  these are NOT sent (#641)", pending,
+            );
+        }
         if self.sent.is_empty() {
             return;
         }
@@ -1311,6 +1527,8 @@ pub(crate) async fn test_stream_with_health(
         next_recv_seq: 0,
         recv_buf: HashMap::new(),
         sent: VecDeque::new(),
+        pending_control: VecDeque::new(),
+        force_send_refusals: std::cell::Cell::new(0),
         frags: FragmentBuffer::new(),
         net_health,
         app_tx: tx,
@@ -1339,6 +1557,8 @@ pub(crate) async fn test_stream_with_peer(
         next_recv_seq: 0,
         recv_buf: HashMap::new(),
         sent: VecDeque::new(),
+        pending_control: VecDeque::new(),
+        force_send_refusals: std::cell::Cell::new(0),
         frags: FragmentBuffer::new(),
         net_health,
         app_tx: tx,
@@ -1369,6 +1589,8 @@ pub(crate) async fn test_stream_with_peer_encoded(
         next_recv_seq: 0,
         recv_buf: HashMap::new(),
         sent: VecDeque::new(),
+        pending_control: VecDeque::new(),
+        force_send_refusals: std::cell::Cell::new(0),
         frags: FragmentBuffer::new(),
         net_health,
         app_tx: tx,
@@ -2032,6 +2254,271 @@ mod tests {
         assert!(age < 60_000, "the age is measured at read time, so it must be small here (got {age})");
     }
 
+    // ── #641: a SYNTHETIC WouldBlock must not silently swallow an ACK ─────────────────────────
+
+    /// #641 — THE test. An ACK that tokio refuses with a synthetic `WouldBlock` must still reach
+    /// the wire.
+    ///
+    /// The bug, measured live: a healthy `qeynos` zone-in accrued a burst of `send_failures`, every
+    /// one a 7-byte session-layer control datagram (an ACK) and every one `WouldBlock`. Those ACKs
+    /// never left the machine, so the server kept retransmitting datagrams it had not seen
+    /// acknowledged. Reproduced on demand by pinning the whole client to a single core
+    /// (`taskset -c 0`): 188 failures on `main`, 0 with this fix.
+    ///
+    /// The mechanism this test pins: tokio gates every `try_*` call on a cached readiness bit and
+    /// returns `WouldBlock` **without attempting the syscall** while that bit is empty. It is empty
+    /// on a socket whose writability no task has ever observed — which is exactly the state
+    /// `test_stream_with_peer` leaves, and which on `#[tokio::test]`'s `current_thread` runtime is
+    /// deterministic (no worker thread exists to race the readiness event; see the long note on
+    /// `connect()`). Live, CPU starvation of the io driver produces the same empty bit mid-session.
+    ///
+    /// **The assertion that matters is the WIRE, not a counter**: the peer socket must actually
+    /// receive the ACK. On `main` (no rescue) nothing arrives and this `recv` times out.
+    ///
+    /// `send_wouldblock_rescued == 1` is asserted too, and it is not decoration — it is the
+    /// FIXTURE CHECK. If a future tokio/runtime change made the readiness bit warm here, `try_send`
+    /// would succeed on its own, the ACK would arrive, and the wire assertion would pass while
+    /// testing nothing. That assertion fails in exactly that case, so the test cannot quietly stop
+    /// exercising the path it exists for.
+    #[tokio::test]
+    async fn a_synthetically_blocked_ack_still_reaches_the_wire() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx, peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+        // DELIBERATELY no `stream.socket.writable().await` here (unlike the #612 tests above, which
+        // want a warm cache so a REAL errno surfaces). Cold cache == synthetic WouldBlock.
+
+        stream.send_ack(0x0007);
+
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_millis(500), peer.recv(&mut buf))
+            .await
+            .expect(
+                "the ACK must be on the wire. A `try_send` WouldBlock that tokio synthesised from \
+                 an empty readiness cache means no syscall was even attempted — dropping the ACK \
+                 there is #641, and the server then retransmits everything it saw unacknowledged",
+            )
+            .unwrap();
+        assert!(n > 0, "an empty datagram is not an ACK");
+
+        let h = *net_health.lock().unwrap();
+        assert_eq!(h.send_wouldblock_rescued, 1,
+            "FIXTURE CHECK: this test is only meaningful if `try_send` actually returned a \
+             synthetic WouldBlock and the direct send(2) retry rescued it. 0 here means the \
+             readiness cache was warm and the wire assertion above proved nothing (#641)");
+        assert_eq!(h.send_failures, 0,
+            "a datagram that DID reach the wire must not be counted as never having reached it — \
+             that would be the #612 honesty bug pointing the other way (#641)");
+        assert_eq!(h.send_failures_unretried, 0);
+        assert!(h.last_send_error_kind.is_none(),
+            "no send failed, so there is no last send error to report (#641)");
+    }
+
+    /// #641 — and it must reach the AGENT, through the real `/v1/observe/debug` body, not just an
+    /// internal struct. Same standard as `send_failure_is_visible_to_the_agent_in_observe_debug`.
+    ///
+    /// This also pins the honesty split that #641's issue text asked for: a rescued datagram is
+    /// reported as rescued, and is absent from `send_failures` / `send_failures_unretried`. An
+    /// agent polling those two fields therefore sees loss, and only loss.
+    #[tokio::test]
+    async fn a_rescued_send_is_reported_as_rescued_and_not_as_a_loss_in_observe_debug() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+        stream.send_ack(0x0007);
+
+        let state = eqoxide_http::testkit::empty_state_with_net_health(net_health.clone());
+        let json = eqoxide_http::testkit::debug_json(state).await;
+        let p = &json["player"];
+        assert_eq!(p["send_wouldblock_rescued"].as_u64(), Some(1),
+            "GET /v1/observe/debug must publish the rescue — a client whose io driver is starved \
+             enough to need it is a fact the agent is entitled to (#641). Body: {json}");
+        assert_eq!(p["send_failures"].as_u64(), Some(0),
+            "a rescued datagram reached the wire; reporting it as a failure would be a lie (#641)");
+        assert_eq!(p["send_failures_unretried"].as_u64(), Some(0));
+        assert!(p["last_send_error"].is_null(),
+            "nothing failed, so there is no last send error (#641). Body: {json}");
+    }
+
+    /// #641, the OTHER half — the half the raw-`send(2)` rescue does NOT cover.
+    ///
+    /// Live measurement refuted "it's all synthetic": one instrumented `qeynos` zone-in recorded
+    /// **141 rescued** (synthetic — the kernel took them on the direct retry) alongside **107 the
+    /// kernel genuinely refused**. Nothing in the rescue helps the second group; those ACKs were
+    /// still going on the floor. So a transiently-refused control datagram is now queued and re-sent
+    /// on the next tick.
+    ///
+    /// The refusal is injected (`force_send_refusals`) because there is no portable, deterministic
+    /// way to make a real `send(2)` on a connected UDP socket return `EAGAIN` from a unit test —
+    /// loopback drains instantly, and `tc`/blackhole routes need root. The injection replaces ONLY
+    /// the socket outcome; everything after it — the classification, the queue, `poll_recv`'s drain,
+    /// the bytes on the wire — is the production path.
+    ///
+    /// Asserted on the WIRE: the peer must receive the ACK on the following tick. On `main` (no
+    /// queue) it is dropped and this `recv` times out.
+    #[tokio::test]
+    async fn an_ack_the_kernel_refuses_is_retried_on_the_next_tick_not_dropped() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx, peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+        stream.socket.writable().await.unwrap(); // warm, so ONLY the injected refusal is in play
+        stream.force_send_refusals.set(1);
+
+        stream.send_ack(0x0011);
+
+        // Nothing on the wire yet — this is the moment `main` loses the ACK forever.
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.recv(&mut buf))
+                .await.is_err(),
+            "the injected refusal must actually have stopped this send; if the ACK is already on \
+             the wire the rest of this test proves nothing (#641 fixture check)",
+        );
+        {
+            let h = *net_health.lock().unwrap();
+            assert_eq!(h.send_deferred, 1,
+                "a transiently-refused control datagram must be recorded as DEFERRED (#641)");
+            assert_eq!((h.send_failures, h.send_failures_unretried), (0, 0),
+                "it is queued, not lost — counting it as a failure would republish the very number \
+                 #641 exists to drive to zero (#641)");
+        }
+
+        // The next tick: `poll_recv` drains the queue, and the ACK reaches the server after all.
+        stream.poll_recv();
+        let n = tokio::time::timeout(std::time::Duration::from_millis(500), peer.recv(&mut buf))
+            .await
+            .expect(
+                "the deferred ACK must go out on the next tick. Dropping it is #641: the server \
+                 retransmits everything it has not seen acknowledged, and gives up at its ~30s \
+                 resend_timeout",
+            )
+            .unwrap();
+        assert!(n > 0);
+        assert!(stream.pending_control.is_empty(), "a delivered datagram must leave the queue");
+        let h = *net_health.lock().unwrap();
+        assert_eq!((h.send_failures, h.send_failures_unretried), (0, 0),
+            "the datagram was delivered; nothing here is a loss (#641)");
+    }
+
+    /// #641 — ordering. The control path is a stream of sequence-bearing datagrams, so a queued one
+    /// must never land on the wire AFTER a datagram built later. Both `send_raw` (which drains
+    /// before every new send) and `flush_pending_control` (which stops at the first still-refused
+    /// entry instead of skipping past it) exist for this.
+    #[tokio::test]
+    async fn deferred_control_datagrams_are_re_sent_in_the_order_they_were_built() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx, peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+        stream.socket.writable().await.unwrap();
+
+        // Three refusals: one per `send_ack` (each drains the queue first, and that drain is itself
+        // a refused send), so all three end up queued instead of trickling out mid-test.
+        stream.force_send_refusals.set(3);
+        stream.send_ack(0x0001);
+        stream.send_ack(0x0002);
+        stream.send_ack(0x0003);
+        assert_eq!(stream.pending_control.len(), 3,
+            "the third must queue BEHIND the first two, not overtake them (#641)");
+
+        stream.poll_recv();
+        assert!(stream.pending_control.is_empty());
+
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let mut buf = [0u8; 64];
+            let n = tokio::time::timeout(std::time::Duration::from_millis(500), peer.recv(&mut buf))
+                .await.expect("all three deferred ACKs must arrive (#641)").unwrap();
+            seen.push(buf[..n].to_vec());
+        }
+        let expect: Vec<Vec<u8>> = [0x0001u16, 0x0002, 0x0003].iter()
+            .map(|seq| {
+                let mut raw = vec![0x00, OP_ACK];
+                raw.extend_from_slice(&stream.encode(&seq.to_be_bytes().to_vec()));
+                stream.append_crc(raw)
+            })
+            .collect();
+        assert_eq!(seen, expect,
+            "deferred control datagrams must reach the wire in the order they were built (#641)");
+    }
+
+    /// #641 — the queue is bounded, and overflow is honest.
+    ///
+    /// A socket refusing sends for long enough to overflow 1024 queued control datagrams is a real
+    /// (if extreme) state, and the datagram dropped there is genuinely lost — so it must land in
+    /// `send_failures`/`send_failures_unretried`, the counters that mean exactly that. The OLDEST is
+    /// dropped because `OP_ACK` is cumulative: the newest supersedes it.
+    #[tokio::test]
+    async fn the_control_retry_queue_is_bounded_and_a_dropped_datagram_is_counted_as_lost() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+
+        for i in 0..MAX_PENDING_CONTROL {
+            stream.defer_control(vec![i as u8]);
+        }
+        assert_eq!(stream.pending_control.len(), MAX_PENDING_CONTROL);
+        assert_eq!(net_health.lock().unwrap().send_failures, 0,
+            "filling the queue to capacity loses nothing (#641)");
+
+        stream.defer_control(vec![0xFF]);
+        assert_eq!(stream.pending_control.len(), MAX_PENDING_CONTROL,
+            "the queue must stay bounded (#641)");
+        assert_eq!(stream.pending_control.front(), Some(&vec![1u8]),
+            "the OLDEST entry is the one dropped — a later ACK supersedes an earlier one (#641)");
+        assert_eq!(stream.pending_control.back(), Some(&vec![0xFFu8]),
+            "the newest entry must be kept (#641)");
+        let h = *net_health.lock().unwrap();
+        assert_eq!((h.send_failures, h.send_failures_unretried), (1, 1),
+            "a datagram dropped on overflow is never sent by anything — it is a loss and must be \
+             counted as one, not hidden in send_deferred (#641)");
+    }
+
+    /// #641 — a session that ends with control datagrams still queued has LOST them: the next
+    /// session is a different socket and its queue starts empty. Same reasoning, and the same
+    /// counter, as `reliable_abandoned`'s (#612 F1) — a datagram we stop trying to deliver must not
+    /// be left sitting in a "will be retried" counter that has quietly stopped being true.
+    #[tokio::test]
+    async fn control_datagrams_still_queued_when_the_session_ends_are_counted_as_lost() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        {
+            let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+            stream.socket.writable().await.unwrap();
+            stream.force_send_refusals.set(3);
+            stream.send_ack(0x0001);
+            stream.send_ack(0x0002);
+            stream.send_ack(0x0003);
+            assert_eq!(stream.pending_control.len(), 3);
+            assert_eq!(net_health.lock().unwrap().send_deferred, 3);
+        } // stream dropped — the session ends here
+
+        let h = *net_health.lock().unwrap();
+        assert_eq!((h.send_failures, h.send_failures_unretried), (3, 3),
+            "queued-but-never-sent control datagrams must be reported as the loss they are once \
+             the session that would have retried them is gone (#641)");
+    }
+
+    /// #641 structural guard, in the same spirit as
+    /// `there_is_exactly_one_socket_send_call_in_the_crate_and_it_records_failures`.
+    ///
+    /// The rescue reconstructs a `std::net::UdpSocket` from a borrowed fd. That is sound in exactly
+    /// one shape — wrapped in `ManuallyDrop`, so the descriptor tokio still owns is not closed by
+    /// the temporary's destructor. A second, unwrapped `from_raw_fd` added anywhere in this crate
+    /// would be a use-after-close waiting to happen, so pin that there is one and that it is
+    /// `ManuallyDrop`-wrapped.
+    #[test]
+    fn the_only_raw_fd_socket_in_the_crate_is_the_manually_dropped_send_rescue() {
+        // Needle split so this test's own source does not match it.
+        let needle = concat!("UdpSocket::from_raw", "_fd(");
+        let code = strip_comments(include_str!("transport.rs"));
+        assert_eq!(code.matches(needle).count(), 1,
+            "exactly one raw-fd socket reconstruction is expected in this crate (#641's send \
+             rescue); a second one is a double-close hazard");
+        let at = code.find(needle).unwrap();
+        let before = &code[..at];
+        assert!(before.ends_with("std::mem::ManuallyDrop::new(unsafe { std::net::"),
+            "the reconstructed socket MUST be wrapped in `ManuallyDrop` so dropping it does not \
+             close the descriptor tokio still owns (#641). Found: {:?}",
+            &before[before.len().saturating_sub(80)..]);
+        let fn_start = before.rfind("\nfn ").expect("must live inside a free function");
+        assert!(before[fn_start..].contains("fn raw_send_bypassing_readiness_cache("),
+            "the raw send must stay confined to the rescue helper (#641)");
+    }
+
     /// #612 companion — the RELIABLE path's deliberate call-site decision, verified rather than
     /// assumed. A failed reliable send is counted, but it is NOT counted as `unretried`, because
     /// `send_tracked` pushes the datagram into the resend window even on failure and `poll_resend`
@@ -2280,8 +2767,16 @@ mod tests {
         let at = code_only.find(needle).unwrap();
         let enclosing = &code_only[..at];
         let fn_start = enclosing.rfind("    fn ").expect("the call must live inside a method");
-        assert!(enclosing[fn_start..].contains("fn transmit("),
-            "the one send call must be inside `fn transmit` (found: {:?})",
+        // `transmit` = "attempt, then account"; `attempt_send` is the attempt half, split out in
+        // #641 so the test-only refusal injection can replace the whole socket interaction. The
+        // funnel property is unchanged as long as `attempt_send` has exactly one caller, which the
+        // count below pins — one definition plus one call site.
+        // Needle split so this test's own source does not match it (same trick as `needle` above).
+        let attempt = concat!("attempt_", "send(");
+        assert!(enclosing[fn_start..].contains(attempt),
+            "the one send call must be inside `fn attempt_send` (found: {:?})",
             &enclosing[fn_start..fn_start + 40.min(enclosing.len() - fn_start)]);
+        assert_eq!(code_only.matches(attempt).count(), 3,
+            "`attempt_send` must have exactly ONE caller (`transmit`) besides its definition —              expected 3 mentions (definition + the two cfg-gated calls in `transmit`); a second              caller would bypass `transmit`'s accounting exactly as a raw `try_send` would (#641)");
     }
 }

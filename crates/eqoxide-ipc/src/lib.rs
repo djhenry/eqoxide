@@ -334,14 +334,44 @@ pub struct NetHealth {
     /// never put on the wire. Since process start; never reset (a zone change does not un-drop a
     /// packet).
     ///
-    /// **`0` is NOT the healthy reading today.** Measured on this branch's release binary (#612
-    /// round-2 review): a fresh, healthy login into `qeynos` read **283** — all `WouldBlock`, all
-    /// 7-byte datagrams (session-layer control via `send_raw`, i.e. ACKs/keepalives, not app
-    /// traffic), all accrued in a burst during zone-in and then flat for the 40s sampled after. A
-    /// second client in a quieter zone read 0, so it is load-dependent, not universal. That is a
-    /// real pre-existing bug — our ACKs failing to reach the wire during a zone-in burst — filed as
-    /// #641; it is not an artifact of this counter, it is the first time anything could see it.
+    /// **`0` IS the expected healthy reading since #641.** History, because the previous text here
+    /// said the opposite and an agent reading it would have learned to ignore this counter: the
+    /// #612 round-2 review measured **283** on a fresh, healthy login into `qeynos` — all
+    /// `WouldBlock`, all 7-byte session-layer control datagrams (ACKs), in a burst during zone-in
+    /// and then flat. #641 established that those were tokio SYNTHETIC `WouldBlock`s — a cached
+    /// readiness bit that the io driver had not refilled, so no syscall was ever attempted — and
+    /// `transmit` now re-attempts such a datagram through `send(2)` directly, counting it in
+    /// `send_wouldblock_rescued` instead. A nonzero value here now means a send the KERNEL refused.
     pub send_failures: u64,
+    /// Datagrams that `try_send` rejected with a SYNTHETIC `WouldBlock` — tokio's cached readiness
+    /// bit was empty, so no syscall was attempted — and that `transmit`'s direct `send(2)` retry
+    /// then put on the wire successfully (#641).
+    ///
+    /// These are **not** failures: the datagram reached the wire, which is why they are counted here
+    /// and not in `send_failures`. They are still worth publishing, because a large or growing value
+    /// is a true statement about the process: tokio's io driver is not being scheduled promptly
+    /// enough to keep the socket's readiness bit warm. Measured driver: CPU starvation — pinning the
+    /// whole client to one core reproduces a burst of hundreds during a `qeynos` zone-in on demand,
+    /// while an unloaded run of the same binary reads 0.
+    ///
+    /// Before #641 every one of these was a datagram silently dropped on the floor — mostly ACKs,
+    /// which the server then had to re-solicit by retransmitting the packets it had not seen
+    /// acknowledged.
+    pub send_wouldblock_rescued: u64,
+    /// Session-layer control datagrams (ACK / OutOfOrderAck / keepalive / SessionRequest /
+    /// SessionDisconnect) whose send was refused transiently (`WouldBlock`, kernel included) and
+    /// which were therefore QUEUED and re-sent on a later net-thread tick rather than dropped
+    /// (#641).
+    ///
+    /// **Not a loss counter.** Each of these datagrams did go out, ~10ms late. It is published
+    /// because the delay is real and the pressure that caused it is real: this is the honest signal
+    /// that the socket is refusing sends under load. Before #641 every one of these was a silently
+    /// dropped ACK, which the server answered by retransmitting everything it had not seen
+    /// acknowledged — the road to a `resend_timeout` session drop.
+    ///
+    /// If a queued datagram is still queued when the session ends, it is never sent; that case
+    /// moves to `send_failures` / `send_failures_unretried` (see `abandon_outstanding`).
+    pub send_deferred: u64,
     /// The subset of `send_failures` for datagrams the client does **not** retransmit itself:
     /// unreliable app packets (the `OP_ClientUpdate` position firehose), session-layer control
     /// (ACK / OutOfOrderAck / keepalive / SessionRequest / SessionDisconnect). The complement
@@ -443,7 +473,8 @@ impl Default for NetHealth {
             last_datagram: now, last_packet: now, last_tick: now,
             last_probe_sent: None, last_probe_reply: None,
             first_unanswered_probe_sent: None,
-            send_failures: 0, send_failures_unretried: 0,
+            send_failures: 0, send_wouldblock_rescued: 0, send_deferred: 0,
+            send_failures_unretried: 0,
             last_send_error_kind: None, last_send_error_at: None,
             reliable_abandoned: 0,
         }

@@ -352,10 +352,20 @@ pub struct Health {
     /// send error was discarded, so a packet that never left the machine looked exactly like one the
     /// server received.
     ///
-    /// **NOT 0 on a healthy client today** — a measured fresh login into `qeynos` read 283, all
-    /// `WouldBlock` on session-layer ACKs during the zone-in burst (#641). See
-    /// [`eqoxide_ipc::NetHealth::send_failures`] for the measurement and the caveat.
+    /// **0 IS the expected healthy reading since #641.** The 283-on-a-healthy-`qeynos`-login this
+    /// doc used to warn about were tokio SYNTHETIC `WouldBlock`s (no syscall attempted); they are
+    /// now retried through `send(2)` and counted in `send_wouldblock_rescued`. A nonzero value here
+    /// means the KERNEL refused a send. See [`eqoxide_ipc::NetHealth::send_failures`].
     pub send_failures:          u64,
+    /// #641: datagrams `try_send` rejected with a synthetic `WouldBlock` that `transmit`'s direct
+    /// `send(2)` retry then put on the wire. **Not failures** — the datagram was sent. A large or
+    /// growing value means tokio's io driver is being starved of CPU (readiness bit left empty).
+    /// See [`eqoxide_ipc::NetHealth::send_wouldblock_rescued`].
+    pub send_wouldblock_rescued: u64,
+    /// #641: session-layer control datagrams a transient refusal deferred to a later tick instead
+    /// of dropping. **Not failures** — they were sent, ~10ms late. A nonzero value means the socket
+    /// is refusing sends under load. See [`eqoxide_ipc::NetHealth::send_deferred`].
+    pub send_deferred: u64,
     /// #612: the subset of `send_failures` that the client does not retransmit itself (unreliable
     /// position updates, ACKs, keepalives, session control). The complement is the reliable stream,
     /// which recovers structurally via the resend window. See [`eqoxide_ipc::NetHealth`] for the
@@ -628,6 +638,8 @@ impl HttpState {
             // thread's `EqStream::transmit` is their sole writer); the AGE is measured here, at read
             // time, like every other duration in this projection (#343).
             send_failures:           h.send_failures,
+            send_wouldblock_rescued: h.send_wouldblock_rescued,
+            send_deferred:           h.send_deferred,
             send_failures_unretried: h.send_failures_unretried,
             last_send_error:         h.last_send_error_kind,
             last_send_error_age_ms:  h.last_send_error_at.map(|t| t.elapsed().as_millis() as u64),
@@ -1009,7 +1021,8 @@ mod health_serde_tests {
         let h = super::Health {
             link_age_ms: 0, last_packet_age_ms: 0, snapshot_age_ms: 0,
             connected: true, world_responsive: true, last_world_response_ms: 0,
-            send_failures: 3, send_failures_unretried: 1,
+            send_failures: 3, send_wouldblock_rescued: 5, send_deferred: 9,
+            send_failures_unretried: 1,
             last_send_error: Some(std::io::ErrorKind::WouldBlock),
             last_send_error_age_ms: Some(42), reliable_abandoned: 7,
         };

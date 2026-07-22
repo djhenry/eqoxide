@@ -610,18 +610,25 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // indistinguishable from one the server received — an agent issuing a command had no way,
         // even in principle, to learn that it had not gone out.
         //   send_failures            — datagrams BUILT but not put on the wire, since process start.
-        //                              NOT 0 on a healthy client today: a measured fresh login into
-        //                              qeynos read 283, all WouldBlock on session-layer ACKs during
-        //                              the zone-in burst (a real pre-existing bug, #641, that this
-        //                              counter made visible for the first time). A quieter zone read
-        //                              0. Read a CLIMBING value, not a nonzero one, as trouble.
+        //                              0 IS the expected healthy reading since #641. The qeynos
+        //                              zone-in burst of 283 this comment used to warn about was
+        //                              tokio returning a SYNTHETIC WouldBlock (cached readiness bit
+        //                              empty → no syscall attempted); those are now retried through
+        //                              send(2) and counted in send_wouldblock_rescued. A nonzero
+        //                              value here now means the KERNEL refused a send.
+        //   send_wouldblock_rescued  — synthetic-WouldBlock datagrams the direct send(2) retry DID
+        //                              put on the wire (#641). NOT failures — nothing was lost. A
+        //                              large/growing value means tokio's io driver is starved of CPU.
+        //   send_deferred            — session-layer control datagrams the KERNEL refused
+        //                              transiently, queued and re-sent on a later ~10ms tick (#641).
+        //                              Also NOT failures: they went out, late. Nonzero means the
+        //                              socket is refusing sends under load.
         //   send_failures_unretried  — the subset with no client-side retransmit of that datagram.
-        //                              TWO very different classes share it, and the measurement above
-        //                              says which one you are actually looking at:
+        //                              TWO very different classes share it:
         //                                * session-layer control (ACK / OutOfOrderAck / keepalive /
-        //                                  SessionRequest / SessionDisconnect) — 7-byte datagrams;
-        //                                  this is what the qeynos zone-in burst was (#641). Lost
-        //                                  ACKs stall the server's ordered window, not our position.
+        //                                  SessionRequest / SessionDisconnect) — 7-byte datagrams.
+        //                                  Lost ACKs stall the server's ordered window, not our
+        //                                  position. (This was the whole of the #641 burst.)
         //                                * unreliable OP_ClientUpdate position updates — only these
         //                                  mean the server's idea of where you are may be stale.
         //                              The size distribution is the discriminator; the counter alone
@@ -647,6 +654,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         //   last_send_error_age_ms   — ms since it, measured at read time. Distinguishes a single
         //                              old blip from an ongoing failure.
         player.insert("send_failures".into(),           serde_json::json!(health.send_failures));
+        player.insert("send_wouldblock_rescued".into(), serde_json::json!(health.send_wouldblock_rescued));
+        player.insert("send_deferred".into(),           serde_json::json!(health.send_deferred));
         player.insert("send_failures_unretried".into(), serde_json::json!(health.send_failures_unretried));
         player.insert("last_send_error".into(),
             serde_json::json!(health.last_send_error.map(|k| format!("{k:?}"))));

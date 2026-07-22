@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note}` exposing which duplicates were collapsed. |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -457,7 +457,9 @@ the client for them to be right (#343).
 | `snapshot_age_ms` | ms since the client's network thread last ticked. |
 | `world_responsive` | **Is the WORLD alive, not just the socket?** `false` only when an active liveness probe went unanswered past its bound while the link kept ACKing — a wedged zone. `true` for a healthy zone, including a legitimately idle one (the probe is answered). `true` before the first probe fires. See below. |
 | `last_world_response_ms` | ms since the world last *proved* it processed something for us — a probe reply or a spontaneous packet, whichever is fresher. The companion to `world_responsive`. |
-| `send_failures` | **Datagrams this client BUILT but could not put on the wire** — `try_send` returned an error. Cumulative since process start. **Not `0` on a healthy client today** — see below. |
+| `send_failures` | **Datagrams this client BUILT but could not put on the wire** — the send was attempted and the KERNEL refused it. Cumulative since process start. **`0` is the expected healthy reading** (since #641 — see below). |
+| `send_wouldblock_rescued` | Datagrams tokio refused with a **synthetic** `WouldBlock` (its cached readiness bit was empty, so no syscall was attempted) that the client then put on the wire with a direct `send(2)` retry. **Not failures — nothing was lost.** A large or growing value means tokio's io driver is being starved of CPU (#641). |
+| `send_deferred` | Session-layer control datagrams (ACKs, keepalives, session setup) whose send the **kernel** refused transiently, which were queued and re-sent on a later ~10ms tick instead of being dropped. **Not failures — they went out, late.** Nonzero means the socket is refusing sends under load (#641). |
 | `send_failures_unretried` | The subset of `send_failures` with no client-side retransmit of that datagram. |
 | `last_send_error` | `ErrorKind` name of the most recent send failure (`"WouldBlock"`, `"Uncategorized"`, …), or `null`. |
 | `last_send_error_age_ms` | ms since that failure, measured at read time, or `null`. Distinguishes an old blip from an ongoing failure. |
@@ -484,14 +486,25 @@ principle, to learn that the command had not gone out.
 
 Every send now funnels through one place that records its own failure, so:
 
-- **`send_failures: 0` is NOT the healthy reading today — measure, don't assume.** A fresh, healthy
-  login into `qeynos` on this build measured **`send_failures: 283`**: all `WouldBlock`, all 7-byte
-  datagrams (session-layer control — ACKs/keepalives, not app traffic), all accrued in a burst during
-  the zone-in and then completely flat for the 40s sampled afterwards. A second client in a quieter
-  zone read `0`. That burst is a **real pre-existing bug** — our ACKs failing to reach the wire
-  during a zone-in storm, tracked as **#641** — which this counter made visible for the first time.
-  Until #641 is fixed: read a **climbing** value as trouble, not a nonzero one, and use
-  `last_send_error_age_ms` to tell "still failing" from "a burst at zone-in".
+- **`send_failures: 0` IS the expected healthy reading, and a nonzero value means the kernel
+  refused a send.** This bullet used to say the opposite, and the reversal is #641. The measurement
+  that prompted it: a fresh, healthy login into `qeynos` read **`send_failures: 283`** — all
+  `WouldBlock`, all 7-byte session-layer control datagrams (ACKs), in a burst during zone-in and then
+  flat. Those ACKs never reached the wire, so the server kept retransmitting datagrams it had not
+  seen acknowledged. **Cause, established by measurement:** tokio gates every `try_*` call on a
+  cached readiness bit and returns a **synthetic** `WouldBlock` *without attempting the syscall*
+  while that bit is empty; the bit is refilled only by tokio's io driver, so when the driver is
+  starved of CPU it can stay empty across a whole receive-drain and every ACK in that drain is
+  dropped. Reproduced on demand by pinning the client to one core. The client now retries such a
+  datagram through `send(2)` directly and counts it in `send_wouldblock_rescued`.
+- **`send_wouldblock_rescued` and `send_deferred` are load signals, not loss signals.** Every
+  datagram either counts DID reach the wire (`send_deferred` ~10ms late). They are disjoint from
+  `send_failures` by construction; do not add them together and call the result loss. Both climb
+  under CPU pressure and are `0` on an unloaded client.
+- **Both mechanisms are real, and the split was measured, not assumed.** One instrumented `qeynos`
+  zone-in on a single-core-pinned client recorded **141 rescued** (tokio synthesised the
+  `WouldBlock`; the kernel accepted the datagram on the direct retry) alongside **107 the kernel
+  genuinely refused** (queued and re-sent on the next tick). The pre-#641 client dropped all 248.
 - **`send_failures_unretried` is the sharper number.** The complement (`send_failures -
   send_failures_unretried`) is the *reliable* stream: a failed reliable datagram is kept verbatim in
   the resend window and retransmitted until the server ACKs it — **for as long as the session
@@ -533,7 +546,8 @@ Every send now funnels through one place that records its own failure, so:
   a complete loss count.** Agent commands travel on the reliable path. `unretried` mixes **two
   classes** that need different diagnoses, and the datagram size is what separates them:
   session-layer control (ACK / OutOfOrderAck / keepalive / session setup — 7-byte datagrams; this is
-  what the measured qeynos burst was, #641) versus unreliable `OP_ClientUpdate` position updates.
+  what the pre-#641 qeynos burst was, and since #641 those no longer land here) versus unreliable
+  `OP_ClientUpdate` position updates.
   **Only the latter means the server's idea of where you are may be stale**; the former stalls the
   server's ordered window instead. The counter alone cannot tell them apart, so do not diagnose a
   subsystem from it on its own. For "did my command get there", the honest reading is the pair
