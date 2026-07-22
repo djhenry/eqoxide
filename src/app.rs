@@ -2647,10 +2647,12 @@ mod tests {
     // in `App::render_frame` is unit-testable — it needs wgpu+winit — so before `select_player_action`
     // was extracted, reverting its walk/run branch to a hardcoded "walking" (the exact reported bug)
     // was mutation-UNDETECTABLE: the whole suite stayed green. These tests call the extracted
-    // function directly, so that exact revert is now caught by `self_player_walks_below_threshold` /
-    // `self_player_runs_above_threshold` failing red. Verified: reverting the `moving` arm in
-    // `select_player_action` to `"walking".to_string()` (unconditionally) fails
-    // `self_player_runs_above_threshold` — see the PR body for the mutation-check transcript.) ---
+    // function directly, so that exact revert is now caught red. Verified: reverting the `moving`
+    // arm in `select_player_action` to `"walking".to_string()` (unconditionally) fails
+    // `self_player_runs_above_threshold` and `self_player_sitting_only_applies_when_not_moving`
+    // (`self_player_walks_below_threshold` asserts `"walking"` and stays green under this specific
+    // mutation — it is the other two tests that catch it) — see the PR body for the mutation-check
+    // transcript.) ---
 
     #[test]
     fn self_player_walks_below_threshold() {
