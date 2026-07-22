@@ -28,6 +28,28 @@ const POS_SEND_KEEPALIVE_MS: u128 = 1300;
 /// every movement check. Sending one benign entry every 30s keeps the 70s timer alive (eqoxide#105).
 const MOVEMENT_HISTORY_MS: u128 = 30_000;
 
+/// Convert an actual movement speed (this client's own controller speed, EQ units/second) to the
+/// wire `animation` field of `OP_ClientUpdate`. This field is NOT a moving/idle boolean — EQEmu
+/// computes `base_runspeed = eq_runspeed_float * 40`, with the player special-case
+/// `eq_runspeed_float` 0.7 (running) → 28 and 0.3 (walking) → 12 (`EQEmu/zone/mob.cpp:190-196`,
+/// sent as `spu->animation` at `mob.cpp:1743-1745`). Every other client (native and eqoxide)
+/// decodes `speed = animation / 40` to pick the locomotion clip and feeds it to anti-cheat speed
+/// limiting (`cheat_manager.cpp:291-298`) and endurance drain (`client_mods.cpp:1676`), so sending
+/// a constant `1` (decoding to 0.025 — ~2% of walking pace) is a confident falsehood about our own
+/// motion, not a rendering nicety (#624).
+///
+/// `RUN_SPEED` (44 u/s, `eqoxide_core::physics::RUN_SPEED`) is this client's own controller cap,
+/// which is the player-special-cased `eq_runspeed_float = 0.7`. Scaling is linear, so
+/// `anim = speed_u_per_s * (0.7 * 40 / RUN_SPEED)` reproduces the native constants exactly:
+/// `RUN_SPEED` (44 u/s) → 28, and the native walk speed (`RUN_SPEED * 0.3/0.7 ≈ 18.857 u/s`,
+/// per #623) → 12. Rounds to nearest and clamps to the field's ±512 range (10-bit signed).
+pub(crate) fn speed_to_wire_animation(speed_u_per_s: f32) -> i32 {
+    const EQ_RUNSPEED_FLOAT_AT_RUN: f32 = 0.7; // EQEmu player special-case runspeed (mob.cpp:190-196)
+    const ANIM_SCALE: f32 = 40.0; // EQEmu: base_runspeed = runspeed * 40
+    let anim_f = speed_u_per_s * (EQ_RUNSPEED_FLOAT_AT_RUN * ANIM_SCALE / RUN_SPEED);
+    anim_f.round().clamp(-512.0, 511.0) as i32
+}
+
 /// Build a RoF2 OP_FloatListThing payload: one `UpdateMovementEntry` (packed, 17 bytes) at the given
 /// server position. `type = Collision` (1) is a normal move — it resets the server's movement-history
 /// timer without tripping the TeleportA/ZoneLine special-cases in `ProcessMovementHistory`. Field
@@ -479,8 +501,27 @@ pub struct ActionLoop {
     /// Last time we sent OP_FloatListThing (movement history) — the anti-MQGhost keepalive (#105).
     last_movement_history_send: Instant,
     /// Last position we streamed, and the last-send timestamp (for the 280 ms / 1300 ms cadence).
+    /// NOTE (#624 review): `last_streamed` is mirrored on EVERY tick (~10ms, see the bottom of
+    /// `stream_position`), not just on an actual send — it exists to detect "did the network
+    /// position move THIS tick" (the `moved` throttle test) and "did something outside this
+    /// function move `gs.player_*`" (the correction test). Neither of those is the right anchor
+    /// for a per-SEND delta/speed calculation, which is why `last_sent_pos` (below) exists
+    /// separately: it is the position as of the last packet actually PUT ON THE WIRE, updated
+    /// in lockstep with `last_pos_send` and nowhere else. A prior version of this fix reused
+    /// `gs.player_x/y/z` (itself mirrored every tick, same problem as `last_streamed`) as the
+    /// "from" position for the speed calc — so at a throttled send ~280ms after the last one, the
+    /// delta only ever covered the most recent ~10ms tick while `last_pos_send.elapsed()` measured
+    /// the full ~280ms, silently flooring every sustained run's reported speed back down near the
+    /// walking constant this issue exists to remove. `last_sent_pos` and `last_pos_send` are always
+    /// updated together so the numerator and denominator of the speed calc share one window.
     last_streamed:    [f32; 3],
     last_pos_send:    Instant,
+    /// Position as of the last packet actually sent by `send_position_update`'s throttled callers
+    /// (`stream_position`'s normal + correction paths) — see the note on `last_streamed` above.
+    /// The melee-facing call in `drive_auto_engage_melee` deliberately does NOT touch this: it
+    /// passes its own `from == to` (an explicit stationary facing update), so it never needs, and
+    /// must never perturb, the cadence baseline the throttled path relies on.
+    last_sent_pos:    [f32; 3],
     streamed_init:    bool,
 }
 
@@ -595,6 +636,7 @@ impl ActionLoop {
             guild_slots,
             last_streamed: [0.0, 0.0, 0.0],
             last_pos_send: Instant::now(),
+            last_sent_pos: [0.0, 0.0, 0.0],
             last_movement_history_send: Instant::now(),
             streamed_init: false,
         }
@@ -2116,7 +2158,14 @@ impl ActionLoop {
                             // In melee range: stop the controller and face the target so swings land
                             // (IsFacingMob). The explicit send keeps the server's facing current.
                             *self.controller.nav_intent.lock().unwrap() = None;
-                            self.send_position_update(stream, gs, gs.player_x, gs.player_y, gs.player_z, hdg);
+                            // `from == to`: this is a stationary facing-only correction (we're
+                            // already stopped, IsFacingMob is all that needs updating), so it must
+                            // always report zero speed/anim regardless of the throttled cadence's
+                            // baseline — and, deliberately, does not touch `last_sent_pos`/
+                            // `last_pos_send` (see their doc comments), since it is an out-of-band
+                            // send outside the normal 280ms/1300ms cadence.
+                            let here = [gs.player_x, gs.player_y, gs.player_z];
+                            self.send_position_update(stream, gs, here, gs.player_x, gs.player_y, gs.player_z, hdg);
                         }
                         self.command.request_cancel_goto(); // cancel any stale walk
                         return true;
@@ -2440,6 +2489,7 @@ impl ActionLoop {
         if !self.streamed_init {
             self.last_streamed = gp;
             self.last_pos_send = Instant::now();
+            self.last_sent_pos = gp;
             self.streamed_init = true;
             return;
         }
@@ -2458,9 +2508,14 @@ impl ActionLoop {
         if cd[0] * cd[0] + cd[1] * cd[1] > CORRECTION_SQ {
             tracing::info!("NAV: server correction → handing controller new pos ({:.1},{:.1},{:.1})", gp[0], gp[1], gp[2]);
             *self.controller.pos_correction.lock().unwrap() = Some(gp);
-            self.send_position_update(stream, gs, gp[0], gp[1], gp[2], gs.player_heading);
+            // `from = gp` (== the sent position): a server correction is a snap-adopt, not motion
+            // WE performed, so it must report zero speed/anim, never a spike from whatever
+            // `last_sent_pos` happened to be before the jump (#624 review — the reviewer confirmed
+            // this path does not spike; keep it that way explicitly rather than by accident).
+            self.send_position_update(stream, gs, gp, gp[0], gp[1], gp[2], gs.player_heading);
             self.last_streamed = gp;
             self.last_pos_send = Instant::now();
+            self.last_sent_pos = gp;
             return;
         }
         // Normal: stream the controller's position at cadence, then mirror into gs for game logic.
@@ -2469,9 +2524,15 @@ impl ActionLoop {
         let d = [pos[0] - self.last_streamed[0], pos[1] - self.last_streamed[1], pos[2] - self.last_streamed[2]];
         let moved = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 0.01;
         if (moved && since >= POS_SEND_MOVING_MS) || since >= POS_SEND_KEEPALIVE_MS {
-            // send_position_update derives deltas from the still-old gs.player_*, so call it first.
-            self.send_position_update(stream, gs, pos[0], pos[1], pos[2], view.heading);
+            // `from = self.last_sent_pos`: the position as of the last packet actually SENT, so the
+            // distance covered here shares the exact same window as `dt_secs` inside
+            // `send_position_update` (`self.last_pos_send.elapsed()`, read before we update it just
+            // below). Using `gs.player_x/y/z` here (the #624-review bug) would instead measure only
+            // the most recent ~10ms tick's movement against the full ~280-1300ms throttle interval,
+            // flooring every sustained run's reported speed back down near the walking constant.
+            self.send_position_update(stream, gs, self.last_sent_pos, pos[0], pos[1], pos[2], view.heading);
             self.last_pos_send = Instant::now();
+            self.last_sent_pos = pos;
         }
         gs.player_x = pos[0];
         gs.player_y = pos[1];
@@ -2496,14 +2557,28 @@ impl ActionLoop {
         &mut self,
         stream:  &mut EqStream,
         gs:      &GameState,
+        from: [f32; 3],
         x: f32, y: f32, z: f32,
         heading: f32,
     ) {
-        let dx = x - gs.player_x; // east  delta (server_x)
-        let dy = y - gs.player_y; // north delta (server_y)
-        let dz = z - gs.player_z;
-        let moving = dx != 0.0 || dy != 0.0 || dz != 0.0;
-        let anim: i32 = if moving { 1 } else { 0 };
+        let dx = x - from[0]; // east  delta (server_x)
+        let dy = y - from[1]; // north delta (server_y)
+        let dz = z - from[2];
+        // Real speed, not a moving/idle flag (#624): the distance just covered divided by the wall
+        // time since we last sent a position update. `from` is the EXPLICIT position as of the last
+        // real send (`self.last_sent_pos` at the throttled call sites in `stream_position`, or the
+        // destination itself — a deliberate zero — at the melee-facing call in
+        // `drive_auto_engage_melee`), not `gs.player_x/y/z` (mirrored every ~10ms tick regardless of
+        // whether a send fires — using that as `from` was the #624-review bug: it measured only the
+        // most recent tick's movement while `dt_secs` below measured the full throttle interval, so
+        // a sustained run's reported speed floored back down near the walking constant this issue
+        // exists to remove). `self.last_pos_send` is still the PREVIOUS send's timestamp here —
+        // every throttled caller updates it only AFTER this call returns — so `from` and `dt_secs`
+        // share exactly the same window. Floored away from 0 so an accidental same-tick double send
+        // can't divide by (near) zero.
+        let dt_secs = self.last_pos_send.elapsed().as_secs_f32().max(0.001);
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        let anim: i32 = speed_to_wire_animation(dist / dt_secs);
         // Internal heading is CCW (0=north, 90=west). The EQ wire (and server) expects
         // CW (0=north, 90=east). The server decodes the wire heading via EQ12toFloat = wire/4,
         // and EQ headings run 0..512 (= 0..360deg), so wire = EQ_units * 4 = deg_cw * 512/360 * 4
@@ -2872,6 +2947,137 @@ mod tests {
         assert!((gs.player_z - foot).abs() < 1e-4,
             "foot→wire→foot must be the identity through the real handler: sent {foot}, gs.player_z {}",
             gs.player_z);
+    }
+
+    /// #624: the wire `animation` field is `speed * 40` (with EQEmu's player special-case 0.7→28,
+    /// 0.3→12 — `mob.cpp:190-196`), NOT a moving/idle boolean. Broadcasting a constant `1` (=speed
+    /// 0.025, ~2% of walking pace) makes every observer render us walking regardless of our real
+    /// speed, and feeds the server's anti-cheat/endurance models a nonsense value.
+    ///
+    /// MUTATION CHECK: restore `speed_to_wire_animation` to `if speed_u_per_s > 0.0 { 1 } else { 0 }`
+    /// (the pre-fix behavior folded into this helper) → `running_speed_encodes_as_28` and
+    /// `walking_speed_encodes_as_12` both go RED (1 != 28, 1 != 12).
+    #[test]
+    fn stationary_speed_encodes_as_zero() {
+        assert_eq!(speed_to_wire_animation(0.0), 0);
+    }
+
+    #[test]
+    fn running_speed_encodes_as_28() {
+        // RUN_SPEED (44 u/s) IS the player-special-cased eq_runspeed_float 0.7 → animation 28.
+        assert_eq!(speed_to_wire_animation(RUN_SPEED), 28);
+    }
+
+    #[test]
+    fn walking_speed_encodes_as_12() {
+        // Native walk speed per #623: RUN_SPEED * (0.3/0.7) ≈ 18.857 u/s → eq_runspeed_float 0.3 → 12.
+        let walk_speed = RUN_SPEED * (0.3 / 0.7);
+        assert_eq!(speed_to_wire_animation(walk_speed), 12);
+    }
+
+    #[test]
+    fn speed_proportional_between_walk_and_run() {
+        // A snared/buffed speed at HALF the run speed (22 u/s → eq_runspeed_float 0.5*0.7 = 0.35 →
+        // animation 14) must land at its own proportional encoding, not snap to one of the two named
+        // speeds — this is what distinguishes a real computation from a hardcoded walk/run lookup.
+        let mid_speed = RUN_SPEED * 0.5;
+        assert_eq!(speed_to_wire_animation(mid_speed), 14);
+    }
+
+    #[test]
+    fn wire_animation_clamps_to_the_signed_10bit_field_bound() {
+        // Absurdly fast (a teleport/correction, not real controller motion) must clamp to +511, and
+        // a hypothetical negative speed must clamp to -512 — never overflow the field or wrap.
+        assert_eq!(speed_to_wire_animation(100_000.0), 511);
+        assert_eq!(speed_to_wire_animation(-100_000.0), -512);
+    }
+
+    /// #624 REVIEW FOLLOW-UP: exercises the REAL send cadence — `stream_position`/
+    /// `send_position_update` via the `POS_SEND_MOVING_MS` (280ms) throttle — not just the pure
+    /// `speed_to_wire_animation` formula. A prior version of this fix computed the right formula but
+    /// fed it a MISMATCHED WINDOW: `gs.player_x/y/z` is mirrored on every ~10ms render tick
+    /// regardless of whether a send fires, so at the moment a throttled send actually goes out, the
+    /// distance measured against it was only the most recent tick's sliver of movement (~10ms
+    /// worth), while `dt_secs` measured the full ~280ms since the last real send — silently flooring
+    /// every sustained run's reported speed back down near the walking constant this issue exists to
+    /// remove. The fix anchors both the distance AND the elapsed time to `last_sent_pos`/
+    /// `last_pos_send`, which are updated ONLY together, at the moment a packet is actually put on
+    /// the wire (see their doc comments on the `ActionLoop` struct).
+    ///
+    /// The HTTP API exposes no `animation`/speed field for any entity (`/v1/observe/entities` is
+    /// position-only), so the only way to check what we actually TOLD the server is to read the raw
+    /// wire bytes — exactly what the reviewer did with temporary `tracing::warn!` instrumentation.
+    /// This test does the same thing permanently, via a real loopback `EqStream` peer socket
+    /// (`test_stream_with_peer`): `send_app_packet_unreliable`'s datagran never enters the tracked
+    /// resend window, so `sent_app_packets()` (which only sees `OP_Packet`-framed reliable sends)
+    /// cannot see it — a real socket is the only way to observe it.
+    ///
+    /// MUTATION CHECK: change the normal-path call in `stream_position` from
+    /// `self.send_position_update(stream, gs, self.last_sent_pos, pos[0], pos[1], pos[2], view.heading)`
+    /// back to using `[gs.player_x, gs.player_y, gs.player_z]` as the `from` position (the windowing
+    /// bug this test was added to catch) → the received `anim` collapses to ~1 (fails the `anim >=
+    /// 20` assertion below), even though every pure-function unit test above still passes untouched.
+    #[tokio::test]
+    async fn sustained_running_over_the_real_throttle_reports_real_speed_not_a_tick_sliver() {
+        let (mut stream, _rx, peer_sock, _addr) =
+            crate::transport::test_stream_with_peer(Default::default()).await;
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+
+        // First tick: the controller hasn't "spawned" yet (`view.initialized == false` by default),
+        // so this is a no-op — it must NOT consume the `!streamed_init` baseline tick below.
+        nav.stream_position(&mut stream, &mut gs);
+        {
+            let mut view = nav.controller.controller_view.lock().unwrap();
+            view.initialized = true;
+            view.pos = [0.0, 0.0, 0.0];
+        }
+        // This tick establishes the streamed baseline (`last_streamed`/`last_pos_send`/
+        // `last_sent_pos` all anchor here) and returns without sending.
+        nav.stream_position(&mut stream, &mut gs);
+
+        // Drive the controller east at exactly RUN_SPEED (44 u/s), ticking every ~10ms — the real
+        // gameplay loop's cadence (`gameplay.rs:704,708`) — for just over one throttle period
+        // (`POS_SEND_MOVING_MS` = 280ms), so exactly one throttled OP_ClientUpdate send fires.
+        const TICK_MS: u64 = 10;
+        let ticks = 320 / TICK_MS;
+        let mut x = 0.0f32;
+        for _ in 0..ticks {
+            tokio::time::sleep(Duration::from_millis(TICK_MS)).await;
+            x += RUN_SPEED * (TICK_MS as f32 / 1000.0);
+            nav.controller.controller_view.lock().unwrap().pos = [x, 0.0, 0.0];
+            nav.stream_position(&mut stream, &mut gs);
+        }
+
+        // Read back whatever actually hit the wire. `test_stream_with_peer`'s `SessionInfo::default()`
+        // (encode_pass1/pass2 = 0, key = 0, crc_bytes = 0) is the identity encode, so a raw datagram
+        // is exactly `[opcode_lo, opcode_hi, payload...]` with no CRC suffix — decode it by hand
+        // rather than reaching for `transport`'s private `decode_raw_app`.
+        let mut buf = [0u8; 512];
+        let anim = loop {
+            let (n, _from) = tokio::time::timeout(
+                Duration::from_millis(500), peer_sock.recv_from(&mut buf),
+            )
+                .await
+                .expect("a throttled OP_ClientUpdate should have been sent within the window")
+                .expect("recv_from should succeed on a live loopback socket");
+            let d = &buf[..n];
+            assert!(d[0] != 0x00, "a raw unreliable app packet must have a non-zero lead byte");
+            let opcode = u16::from_le_bytes([d[0], d[1]]);
+            if opcode == crate::protocol::OP_CLIENT_UPDATE {
+                let payload = &d[2..];
+                assert_eq!(payload.len(), 46, "PlayerPositionUpdateClient_Struct is 46 bytes");
+                let anim_bits = u32::from_le_bytes(payload[34..38].try_into().unwrap());
+                break anim_bits as i32;
+            }
+            // Anything else (e.g. a stray reliable-protocol byte pattern) isn't what we're after —
+            // keep draining until the position update itself shows up or the timeout above fires.
+        };
+
+        assert!(anim >= 20 && anim <= 32,
+            "running at RUN_SPEED (44 u/s) for a full ~280ms throttle window must report an \
+             animation near 28 (running), not the ~1 a per-tick-sliver window (or the old hardcoded \
+             boolean) would produce — got {anim}");
     }
 
     /// **A GOAL THE CLIENT CHANGED MUST NOT BE REPORTED AS THE GOAL THE AGENT ASKED FOR.**
