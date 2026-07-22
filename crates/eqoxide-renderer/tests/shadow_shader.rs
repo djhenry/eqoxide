@@ -45,12 +45,13 @@ fn parse_and_validate(source: &str, label: &str) -> naga::Module {
     module
 }
 
-/// Extracts the `X` in `apply_shadow`'s `return color * mix(X, 1.0, shadow_factor(world_pos));`
-/// via a source-level string search — deliberately not going through naga's AST here, since it's
-/// the literal *source text* that must stay byte-for-byte identical between the two files (a
-/// constant-folded AST comparison would miss e.g. `0.250` vs `0.25` staying "equal" numerically
-/// while the two files visibly disagree on what a maintainer sees/greps for).
-fn extract_shadow_floor(source: &str, label: &str) -> f32 {
+/// Extracts the `X` in `apply_shadow`'s `return color * mix(X, 1.0, shadow_factor(world_pos));` —
+/// the raw, trimmed *source text* of the literal, via a string search — and separately its
+/// parsed `f32` value. The drift check between the two shader files (below) compares the string
+/// form, not the parsed form: `"0.250"` and `"0.25"` parse equal as floats but are not the same
+/// source text, and a maintainer diffing the two files would see them disagree. Comparing the
+/// string keeps that visible-drift case failing loudly instead of silently passing.
+fn extract_shadow_floor_literal<'a>(source: &'a str, label: &str) -> &'a str {
     let fn_start = source
         .find("fn apply_shadow(")
         .unwrap_or_else(|| panic!("{label}: couldn't find `fn apply_shadow(`"));
@@ -63,7 +64,13 @@ fn extract_shadow_floor(source: &str, label: &str) -> f32 {
     let comma_at = after_mix
         .find(',')
         .unwrap_or_else(|| panic!("{label}: couldn't find the `,` after `mix(` in apply_shadow"));
-    let literal = after_mix[..comma_at].trim();
+    after_mix[..comma_at].trim()
+}
+
+/// Parsed `f32` form of [`extract_shadow_floor_literal`], for the range/value checks below where
+/// numeric equality (not source-text equality) is the right comparison.
+fn extract_shadow_floor(source: &str, label: &str) -> f32 {
+    let literal = extract_shadow_floor_literal(source, label);
     literal
         .parse::<f32>()
         .unwrap_or_else(|e| panic!("{label}: `{literal}` (the mix() floor argument) isn't a valid f32 literal: {e}"))
@@ -82,12 +89,14 @@ fn zone_and_zone_instanced_wgsl_parse_and_validate() {
 /// as "huh, that looks a little different," not an error).
 #[test]
 fn ambient_floor_matches_between_zone_and_zone_instanced() {
-    let zone_floor = extract_shadow_floor(ZONE_WGSL, "zone.wgsl");
-    let instanced_floor = extract_shadow_floor(ZONE_INSTANCED_WGSL, "zone_instanced.wgsl");
+    let zone_literal = extract_shadow_floor_literal(ZONE_WGSL, "zone.wgsl");
+    let instanced_literal = extract_shadow_floor_literal(ZONE_INSTANCED_WGSL, "zone_instanced.wgsl");
     assert_eq!(
-        zone_floor, instanced_floor,
-        "zone.wgsl's apply_shadow floor ({zone_floor}) must match zone_instanced.wgsl's ({instanced_floor}) \
-         — terrain and placed objects must shadow to the same darkness. Update both files together."
+        zone_literal, instanced_literal,
+        "zone.wgsl's apply_shadow floor literal ({zone_literal}) must match zone_instanced.wgsl's \
+         ({instanced_literal}) — terrain and placed objects must shadow to the same darkness. \
+         Update both files together (this is a source-text comparison, so e.g. \"0.250\" vs \"0.25\" \
+         also fails even though they're numerically equal)."
     );
 }
 
