@@ -332,7 +332,15 @@ pub struct NetHealth {
     // send cannot fail without being counted.
     /// Cumulative count of outbound datagrams whose `try_send` failed — i.e. that were BUILT but
     /// never put on the wire. Since process start; never reset (a zone change does not un-drop a
-    /// packet). `0` is the healthy value.
+    /// packet).
+    ///
+    /// **`0` is NOT the healthy reading today.** Measured on this branch's release binary (#612
+    /// round-2 review): a fresh, healthy login into `qeynos` read **283** — all `WouldBlock`, all
+    /// 7-byte datagrams (session-layer control via `send_raw`, i.e. ACKs/keepalives, not app
+    /// traffic), all accrued in a burst during zone-in and then flat for the 40s sampled after. A
+    /// second client in a quieter zone read 0, so it is load-dependent, not universal. That is a
+    /// real pre-existing bug — our ACKs failing to reach the wire during a zone-in burst — filed as
+    /// #641; it is not an artifact of this counter, it is the first time anything could see it.
     pub send_failures: u64,
     /// The subset of `send_failures` for datagrams the client does **not** retransmit itself:
     /// unreliable app packets (the `OP_ClientUpdate` position firehose), session-layer control
@@ -370,13 +378,34 @@ pub struct NetHealth {
     ///
     /// Without this counter that loss would be exactly the bug #612 fixed, one level up: a
     /// documented contract telling the agent a class of loss cannot have happened when it can.
-    /// `EqStream`'s `Drop` impl adds its outstanding window here, so the abandonment is counted no
-    /// matter WHICH path ended the session (server drop, zone handoff, world reconnect, shutdown).
+    /// `EqStream`'s `Drop` impl adds its outstanding window here, so every path that TEARS THE
+    /// STREAM DOWN is counted without each one remembering to mirror it. See the COVERAGE note
+    /// below for the paths that do not tear it down — one of them is not covered at all.
     ///
     /// Note this counts abandonment, not necessarily *loss of an unsent packet*: a datagram that
     /// reached the wire and whose ACK simply had not arrived yet when we handed off is also counted.
     /// It is an upper bound on "reliable payload this client stopped trying to deliver", which is
-    /// the honest direction to err in. A clean zone handoff routinely leaves a small number here.
+    /// the honest direction to err in.
+    ///
+    /// **MEASURED (#612 round 2): three consecutive clean zone handoffs (qeynos → qeytoqrg → qeynos
+    /// → freportw) left this at 0, with zero abandonment WARNs** — the resend window was empty at
+    /// every handoff. An earlier version of this doc predicted, from reasoning and explicitly
+    /// unmeasured, that a clean handoff "routinely leaves a small number"; that was WRONG and would
+    /// have trained an agent to ignore the counter's most likely true positive. **Treat any nonzero
+    /// value as signal, not noise.**
+    ///
+    /// **COVERAGE — read this before relying on a 0.** It is written where the abandonment can be
+    /// observed, which is not everywhere a session can end:
+    ///   - **Covered:** zone handoff and world reconnect (both `drop` the old stream), zone-in
+    ///     failure returns, and clean shutdown (which calls `abandon_outstanding` explicitly,
+    ///     because its task parks and is never unwound).
+    ///   - **NOT covered: a server-side session drop** — the ~30s `resend_timeout` case. The client
+    ///     currently never notices one: inbound `OP_SessionDisconnect` is unhandled, `poll_recv`'s
+    ///     "socket closed" return is discarded at every call site, and the gameplay loop has no
+    ///     link-staleness exit, so the stream is never dropped and this stays 0 for exactly those
+    ///     datagrams. Detecting a server-side drop is #642, deliberately out of scope for #612.
+    ///     Until then, `connected: false` (15s of link silence, which precedes the server's 30s
+    ///     drop) is the signal for that case — not this counter.
     pub reliable_abandoned: u64,
 }
 

@@ -740,6 +740,13 @@ async fn perform_clean_shutdown(
     // DELIBERATE (#612): counted + WARNed by `transmit`. This is the last thing we do before the
     // process exits; a failed disconnect only costs the server its linkdead timer.
     let _ = s.send_session_disconnect();
+    // #612 review R1: account the outstanding reliable window HERE rather than relying on `Drop`.
+    // This function borrows the stream and returns; its caller then parks in `loop { sleep }` while
+    // the process exits from the MAIN thread, so this task is never unwound and no destructor ever
+    // runs. That was measured by the round-2 reviewer, not reasoned — the counter genuinely read 0
+    // on this path. `abandon_outstanding` clears the window, so if a `Drop` ever does run later it
+    // sees an empty one and cannot double-count.
+    s.abandon_outstanding();
     tracing::info!("EQ: sent OP_Logout + OP_SessionDisconnect (process exits on the main thread)");
 }
 

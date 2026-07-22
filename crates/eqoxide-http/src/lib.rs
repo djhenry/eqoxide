@@ -348,9 +348,13 @@ pub struct Health {
     /// probe traffic being suppressed, because probe replies legitimately count as proof of life here.
     pub last_world_response_ms: u64,
     /// #612: how many outbound datagrams the client BUILT but could not put on the wire (`try_send`
-    /// returned an error). Cumulative since process start. `0` on a healthy client. Before #612 this
-    /// was unobservable — every send error was discarded, so a packet that never left the machine
-    /// looked exactly like one the server received.
+    /// returned an error). Cumulative since process start. Before #612 this was unobservable — every
+    /// send error was discarded, so a packet that never left the machine looked exactly like one the
+    /// server received.
+    ///
+    /// **NOT 0 on a healthy client today** — a measured fresh login into `qeynos` read 283, all
+    /// `WouldBlock` on session-layer ACKs during the zone-in burst (#641). See
+    /// [`eqoxide_ipc::NetHealth::send_failures`] for the measurement and the caveat.
     pub send_failures:          u64,
     /// #612: the subset of `send_failures` that the client does not retransmit itself (unreliable
     /// position updates, ACKs, keepalives, session control). The complement is the reliable stream,
@@ -366,9 +370,11 @@ pub struct Health {
     /// Lets an agent tell "one WouldBlock at login an hour ago" from "failing right now".
     pub last_send_error_age_ms: Option<u64>,
     /// #612 (review F1): un-ACKed RELIABLE datagrams abandoned when a session ended — the case the
-    /// resend window does NOT cover, because the next session's window starts empty. See
-    /// [`eqoxide_ipc::NetHealth::reliable_abandoned`] for the exact contract (it is an upper bound
-    /// on abandoned reliable payload, not a proven count of lost commands).
+    /// resend window does NOT cover, because the next session's window starts empty. Measured 0
+    /// across three clean zone handoffs, so treat any nonzero value as signal. Does NOT cover a
+    /// server-side `resend_timeout` drop (#642). See
+    /// [`eqoxide_ipc::NetHealth::reliable_abandoned`] for the full contract and coverage list (it is
+    /// an upper bound on abandoned reliable payload, not a proven count of lost commands).
     pub reliable_abandoned:     u64,
 }
 

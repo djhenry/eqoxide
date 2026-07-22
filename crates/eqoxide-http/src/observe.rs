@@ -599,19 +599,35 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // indistinguishable from one the server received — an agent issuing a command had no way,
         // even in principle, to learn that it had not gone out.
         //   send_failures            — datagrams BUILT but not put on the wire, since process start.
-        //                              0 on a healthy client. Nonzero = the client hit WouldBlock /
-        //                              ENOBUFS / EMSGSIZE / a dead socket at least that many times.
-        //   send_failures_unretried  — the subset with no client-side retransmit of that datagram
-        //                              (position updates, ACKs, keepalives, session control). The
-        //                              complement is the reliable stream, which `poll_resend` re-sends
-        //                              verbatim until ACKed — but ONLY while the session lives; see
-        //                              reliable_abandoned. So this is NOT a complete count of lost
-        //                              commands, and must not be read as one.
+        //                              NOT 0 on a healthy client today: a measured fresh login into
+        //                              qeynos read 283, all WouldBlock on session-layer ACKs during
+        //                              the zone-in burst (a real pre-existing bug, #641, that this
+        //                              counter made visible for the first time). A quieter zone read
+        //                              0. Read a CLIMBING value, not a nonzero one, as trouble.
+        //   send_failures_unretried  — the subset with no client-side retransmit of that datagram.
+        //                              TWO very different classes share it, and the measurement above
+        //                              says which one you are actually looking at:
+        //                                * session-layer control (ACK / OutOfOrderAck / keepalive /
+        //                                  SessionRequest / SessionDisconnect) — 7-byte datagrams;
+        //                                  this is what the qeynos zone-in burst was (#641). Lost
+        //                                  ACKs stall the server's ordered window, not our position.
+        //                                * unreliable OP_ClientUpdate position updates — only these
+        //                                  mean the server's idea of where you are may be stale.
+        //                              The size distribution is the discriminator; the counter alone
+        //                              cannot tell them apart, so do not diagnose from it alone.
+        //                              The complement is the reliable stream, which `poll_resend`
+        //                              re-sends verbatim until ACKed — but ONLY while the session
+        //                              lives; see reliable_abandoned. So this is NOT a complete count
+        //                              of lost commands, and must not be read as one.
         //   reliable_abandoned       — un-ACKed reliables left outstanding when a session ENDED
-        //                              (server resend_timeout drop, zone handoff, reconnect,
+        //                              (zone handoff, world reconnect, zone-in failure, clean
         //                              shutdown). The next session's window starts empty, so these
         //                              are not retransmitted. This is the reliable stream's loss
         //                              channel, and the one `send_failures_unretried` cannot see.
+        //                              MEASURED 0 across three clean zone handoffs → any nonzero
+        //                              value is signal, not routine noise.
+        //                              DOES NOT cover a server-side resend_timeout drop: the client
+        //                              never notices one today (#642), so use `connected` for that.
         //   last_send_error          — ErrorKind of the most recent one ("WouldBlock", …), or null.
         //   last_send_error_age_ms   — ms since it, measured at read time. Distinguishes a single
         //                              old blip from an ongoing failure.

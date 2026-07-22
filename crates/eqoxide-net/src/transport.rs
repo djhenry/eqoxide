@@ -1229,16 +1229,47 @@ impl EqStream {
 /// `EqStream::connect` builds a fresh stream whose `sent` window starts EMPTY. Everything still
 /// outstanding at that instant is genuinely gone.
 ///
-/// Doing this in `Drop` rather than at the reconnect call site is deliberate: FOUR different paths
-/// end a session (server drop + reconnect, zone handoff, world reconnect, clean shutdown), and the
-/// #343 review's lesson was that "every loop remembers to mirror it" is exactly the discipline that
-/// fails. Whoever drops the stream owns the accounting, so a future fifth path gets it for free.
+/// Doing this in `Drop` rather than at each teardown call site is deliberate: several paths end a
+/// session (zone handoff, world reconnect, zone-in failure), and the #343 review's lesson was that
+/// "every loop remembers to mirror it" is exactly the discipline that fails. Whoever drops the
+/// stream owns the accounting, so a future path gets it for free.
+///
+/// **`Drop` is not sufficient on its own, and the round-2 review of #636 measured exactly where
+/// (R1). Two session-ending paths do not drop the stream:**
+///   - **Clean shutdown** — `perform_clean_shutdown` borrows the stream and returns, then its caller
+///     parks in `loop { sleep }` while the process exits from the MAIN thread; a parked tokio task
+///     is never unwound, so no destructor runs. That path therefore calls `abandon_outstanding`
+///     EXPLICITLY, and `clean_shutdown_accounts_its_outstanding_window_explicitly_not_via_drop`
+///     pins the call.
+///   - **A server-side session drop (the ~30s `resend_timeout` case) — STILL NOT COVERED.** The
+///     client never notices one: inbound `OP_SessionDisconnect` is unhandled, `poll_recv`'s
+///     closed-socket return is discarded at every call site, and the gameplay loop has no
+///     link-staleness exit, so the stream is never torn down and this counter stays 0 for exactly
+///     those datagrams. That is #642, deliberately out of scope for #612 — do NOT write docs that
+///     imply this case is covered. `connected: false` (15s, before the server's 30s drop) is the
+///     honest signal for it.
 impl Drop for EqStream {
     fn drop(&mut self) {
+        self.abandon_outstanding();
+    }
+}
+
+impl EqStream {
+    /// Account the outstanding resend window as abandoned and CLEAR it (#612 review F1/R1).
+    ///
+    /// Called from `Drop` (covers every path that ends a session by dropping the stream) and
+    /// explicitly from `perform_clean_shutdown`, whose task parks forever after returning so its
+    /// destructors never run — a real gap the round-2 review measured rather than assumed.
+    ///
+    /// Clearing the window is what makes it safe to call from both: a second call (the eventual
+    /// `Drop`, if it ever runs) sees an empty window and does nothing, so no double count.
+    pub(crate) fn abandon_outstanding(&mut self) {
         if self.sent.is_empty() {
             return;
         }
         let abandoned = self.sent.len() as u64;
+        let oldest = self.sent[0].seq;
+        self.sent.clear();
         // `Drop` can run while a panic is unwinding, and a poisoned mutex must not turn a bad
         // situation into a double panic — so this is the one place that tolerates a failed lock.
         if let Ok(mut h) = self.net_health.lock() {
@@ -1248,7 +1279,7 @@ impl Drop for EqStream {
             "NET: session ended with {} un-ACKed reliable datagram(s) still outstanding (oldest \
              seq={}) — the next session's resend window starts empty, so these are NOT retransmitted \
              (#612); see /v1/observe/debug reliable_abandoned",
-            abandoned, self.sent[0].seq,
+            abandoned, oldest,
         );
     }
 }
@@ -1976,9 +2007,12 @@ mod tests {
     /// #612 companion — the RELIABLE path's deliberate call-site decision, verified rather than
     /// assumed. A failed reliable send is counted, but it is NOT counted as `unretried`, because
     /// `send_tracked` pushes the datagram into the resend window even on failure and `poll_resend`
-    /// re-sends it verbatim until the server ACKs it. That is exactly why `send_app_packet` does not
-    /// propagate an error to its ~90 call sites: the packet is delayed, not lost, and reporting
-    /// "failed" would be a lie in the other direction.
+    /// re-sends it verbatim until the server ACKs it — **while the session lives**. That is why
+    /// `send_app_packet` does not propagate an error to its ~90 call sites: within a session the
+    /// packet is delayed, not lost, and reporting "failed" would be a lie in the other direction.
+    /// Across a session end that guarantee stops (round-2 review R5 caught this one docstring still
+    /// stating it unconditionally); `reliable_abandoned` is the counter for that case, and
+    /// `reliables_outstanding_when_a_session_ends_are_counted_as_abandoned` is its test.
     ///
     /// If this invariant ever breaks (a future edit pushing to `sent` only on success), the drop
     /// would become silent again — this test is what stops that.
@@ -2086,8 +2120,11 @@ mod tests {
     /// `send_failures_unretried` reads 0 for all of them. Left unobserved that is the #612 bug one
     /// level up: a contract telling the agent a class of loss cannot have happened when it can.
     ///
-    /// Asserts the accounting happens on DROP, which is what makes it path-independent — server
-    /// drop, zone handoff, world reconnect and clean shutdown all end in a dropped stream.
+    /// Asserts the accounting happens on DROP, which covers every path that tears the stream down
+    /// (zone handoff, world reconnect, zone-in failure). The two paths that do NOT drop it are
+    /// handled separately: clean shutdown calls `abandon_outstanding` explicitly (see
+    /// `clean_shutdown_accounts_its_outstanding_window_explicitly_not_via_drop`), and a server-side
+    /// session drop is not covered at all (#642) because the client never notices one.
     #[tokio::test]
     async fn reliables_outstanding_when_a_session_ends_are_counted_as_abandoned() {
         let net_health: eqoxide_ipc::NetHealthShared = Default::default();
@@ -2102,7 +2139,7 @@ mod tests {
             let h = *net_health.lock().unwrap();
             assert_eq!((h.send_failures, h.reliable_abandoned), (0, 0),
                 "nothing is abandoned while the session is still alive");
-        } // ← the session ends here (this is what a resend_timeout drop / zone handoff does)
+        } // ← the session ends here (this is what a zone handoff / world reconnect does)
 
         let h = *net_health.lock().unwrap();
         assert_eq!(h.reliable_abandoned, 2,
@@ -2117,6 +2154,53 @@ mod tests {
         let json = eqoxide_http::testkit::debug_json(state).await;
         assert_eq!(json["player"]["reliable_abandoned"].as_u64(), Some(2),
             "GET /v1/observe/debug must report abandoned reliables (#612 review F1). Body: {json}");
+    }
+
+    /// #612 review R1 — the clean-shutdown trigger, which `Drop` alone does NOT provide.
+    ///
+    /// `perform_clean_shutdown` borrows the stream and returns; its caller then parks in
+    /// `loop { sleep }` while the process exits from the MAIN thread. A tokio task parked on another
+    /// thread is never unwound, so no destructor runs and the outstanding window was never accounted
+    /// on that path — measured by the round-2 reviewer, not reasoned. Hence the explicit call.
+    ///
+    /// Two halves, because neither alone is enough: the behavior of `abandon_outstanding` (counts
+    /// the window, CLEARS it, and is therefore idempotent under a later `Drop`), and a source-level
+    /// assertion that the shutdown path actually calls it — the same technique as
+    /// `connect_awaits_writable_before_the_first_session_request`, and for the same reason: nothing
+    /// about the code *looks* wrong if the call is deleted, and the parked-task behavior that makes
+    /// it necessary cannot be reproduced in a unit test.
+    #[tokio::test]
+    async fn clean_shutdown_accounts_its_outstanding_window_explicitly_not_via_drop() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        {
+            let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+            stream.socket.writable().await.unwrap();
+            stream.send_app_packet(0x1234, &[0xAA]);
+            stream.send_app_packet(0x1234, &[0xBB]);
+            assert_eq!(stream.sent.len(), 2);
+
+            stream.abandon_outstanding();
+            assert_eq!(net_health.lock().unwrap().reliable_abandoned, 2,
+                "the explicit call must account the window (#612 R1)");
+            assert!(stream.sent.is_empty(),
+                "…and must CLEAR it, which is what makes a later Drop a no-op instead of a \
+                 double count");
+        } // Drop runs here on an already-emptied window.
+        assert_eq!(net_health.lock().unwrap().reliable_abandoned, 2,
+            "the subsequent Drop must NOT double-count (#612 R1)");
+
+        // And the shutdown path must actually call it. `perform_clean_shutdown` lives in gameplay.rs.
+        const GAMEPLAY_RS_SRC: &str = include_str!("gameplay.rs");
+        let at = GAMEPLAY_RS_SRC.find("async fn perform_clean_shutdown(")
+            .expect("gameplay.rs: perform_clean_shutdown not found");
+        // Scan from the fn to the end of the file's next top-level item boundary — the function is
+        // short and ends at the first column-0 `}`.
+        let body_end = GAMEPLAY_RS_SRC[at..].find("\n}\n").expect("unterminated fn") + at;
+        let body = &GAMEPLAY_RS_SRC[at..body_end];
+        assert!(body.contains("abandon_outstanding()"),
+            "perform_clean_shutdown must call `abandon_outstanding()` explicitly (#612 R1): its \
+             task parks forever after returning, so `Drop` never runs and the outstanding reliable \
+             window would go unaccounted on the clean-shutdown path.");
     }
 
     /// #612 structural guard. The fix is only durable if there stays exactly ONE place in this CRATE

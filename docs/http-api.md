@@ -444,7 +444,7 @@ corridor is not threadable" from "the steering planner hasn't caught up." `nav_l
 
 ## Connection health
 
-`GET /v1/observe/debug` carries ten fields that tell you **whether the rest of the payload can be
+`GET /v1/observe/debug` carries eleven fields that tell you **whether the rest of the payload can be
 trusted at all**. Six are about what the SERVER did (below); five are about what the client itself
 failed to send (see [Outbound send failures](#outbound-send-failures)). They are computed when you ask — not cached — so nothing has to be running inside
 the client for them to be right (#343).
@@ -457,11 +457,11 @@ the client for them to be right (#343).
 | `snapshot_age_ms` | ms since the client's network thread last ticked. |
 | `world_responsive` | **Is the WORLD alive, not just the socket?** `false` only when an active liveness probe went unanswered past its bound while the link kept ACKing — a wedged zone. `true` for a healthy zone, including a legitimately idle one (the probe is answered). `true` before the first probe fires. See below. |
 | `last_world_response_ms` | ms since the world last *proved* it processed something for us — a probe reply or a spontaneous packet, whichever is fresher. The companion to `world_responsive`. |
-| `send_failures` | **Datagrams this client BUILT but could not put on the wire** — `try_send` returned an error. Cumulative since process start. `0` on a healthy client. |
+| `send_failures` | **Datagrams this client BUILT but could not put on the wire** — `try_send` returned an error. Cumulative since process start. **Not `0` on a healthy client today** — see below. |
 | `send_failures_unretried` | The subset of `send_failures` with no client-side retransmit of that datagram. |
 | `last_send_error` | `ErrorKind` name of the most recent send failure (`"WouldBlock"`, `"Uncategorized"`, …), or `null`. |
 | `last_send_error_age_ms` | ms since that failure, measured at read time, or `null`. Distinguishes an old blip from an ongoing failure. |
-| `reliable_abandoned` | **Un-ACKed reliable datagrams left outstanding when a session ENDED** — the loss `send_failures_unretried` cannot see. Cumulative. A clean zone handoff routinely leaves a small number here. |
+| `reliable_abandoned` | **Un-ACKed reliable datagrams left outstanding when a session ENDED** — the loss `send_failures_unretried` cannot see. Cumulative. Measured `0` across three clean zone handoffs, so **any nonzero value is signal**. Does not cover a server-side session drop — see below. |
 
 **`last_packet_age_ms` is not a disconnect signal.** An idle EQ session — a character sitting alone
 in a quiet zone — routinely goes **40+ seconds with no application packet** while the link is
@@ -484,8 +484,14 @@ principle, to learn that the command had not gone out.
 
 Every send now funnels through one place that records its own failure, so:
 
-- **`send_failures: 0` is the healthy reading.** Nonzero means the client hit a send error that many
-  times since it started.
+- **`send_failures: 0` is NOT the healthy reading today — measure, don't assume.** A fresh, healthy
+  login into `qeynos` on this build measured **`send_failures: 283`**: all `WouldBlock`, all 7-byte
+  datagrams (session-layer control — ACKs/keepalives, not app traffic), all accrued in a burst during
+  the zone-in and then completely flat for the 40s sampled afterwards. A second client in a quieter
+  zone read `0`. That burst is a **real pre-existing bug** — our ACKs failing to reach the wire
+  during a zone-in storm, tracked as **#641** — which this counter made visible for the first time.
+  Until #641 is fixed: read a **climbing** value as trouble, not a nonzero one, and use
+  `last_send_error_age_ms` to tell "still failing" from "a burst at zone-in".
 - **`send_failures_unretried` is the sharper number.** The complement (`send_failures -
   send_failures_unretried`) is the *reliable* stream: a failed reliable datagram is kept verbatim in
   the resend window and retransmitted until the server ACKs it — **for as long as the session
@@ -493,21 +499,32 @@ Every send now funnels through one place that records its own failure, so:
   `unretried` ones — unreliable position updates, ACKs, keepalives, session control — are not
   re-sent by this client at all.
 - **The reliable stream's guarantee ends when the session does — that is what `reliable_abandoned`
-  is for.** `poll_resend` retries indefinitely, but EQEmu drops the session at its ~30s
-  `resend_timeout`, and the reconnect builds a fresh stream whose resend window starts **empty**.
-  Every reliable datagram still outstanding at that moment is genuinely lost, and
-  `send_failures_unretried` reads `0` for all of them. `reliable_abandoned` counts exactly those.
-  It is an **upper bound** on abandoned reliable payload: a datagram that reached the wire and whose
-  ACK merely had not arrived yet when we handed off is counted too. It rises on any session end —
-  server drop, zone handoff, world reconnect, shutdown — so a small nonzero value after zoning is
-  normal, and a large or rapidly climbing one is not.
+  is for.** `poll_resend` retries indefinitely, but only within one session; when a session ends the
+  next one's resend window starts **empty**, so every reliable datagram still outstanding at that
+  moment is genuinely lost while `send_failures_unretried` reads `0` for all of them.
+  `reliable_abandoned` counts exactly those. It is an **upper bound** on abandoned reliable payload:
+  a datagram that reached the wire and whose ACK merely had not arrived yet is counted too.
+- **`reliable_abandoned` is measured at 0 in normal play, so treat any nonzero value as signal.**
+  Three consecutive clean handoffs (`qeynos → qeytoqrg → qeynos → freportw`) left it at `0` — the
+  resend window was empty at every handoff. (An earlier draft of this page predicted, from reasoning
+  and unmeasured, that clean handoffs "routinely leave a small number"; measurement said otherwise
+  and the claim is withdrawn.)
+- **What `reliable_abandoned` does and does not cover.** It rises on: zone handoff, world reconnect,
+  zone-in failure, and clean shutdown. It does **not** rise on a **server-side session drop** (the
+  ~30s `resend_timeout` case), because the client currently never notices one — inbound
+  `OP_SessionDisconnect` is unhandled, `poll_recv`'s "socket closed" return is discarded, and the
+  gameplay loop has no link-staleness exit, so the stream is never torn down. Detecting that is
+  **#642**, out of scope for #612. For that case use `connected`, which goes `false` after 15s of
+  link silence — *before* the server's 30s drop.
 - **`send_failures_unretried > 0` does not by itself mean a command was lost, and neither number is
-  a complete loss count.** Agent commands travel on the reliable path. What a climbing `unretried`
-  count *does* mean is that the position firehose is dropping updates, i.e. the server's idea of
-  where you are may have stopped tracking yours. For "did my command get there", the honest reading
-  is the pair `connected` + `reliable_abandoned` — and note `connected` goes `false` at 15s of
-  silence, **before** the server's 30s drop, so a session heading for a resend_timeout announces
-  itself as disconnected first rather than looking healthy.
+  a complete loss count.** Agent commands travel on the reliable path. `unretried` mixes **two
+  classes** that need different diagnoses, and the datagram size is what separates them:
+  session-layer control (ACK / OutOfOrderAck / keepalive / session setup — 7-byte datagrams; this is
+  what the measured qeynos burst was, #641) versus unreliable `OP_ClientUpdate` position updates.
+  **Only the latter means the server's idea of where you are may be stale**; the former stalls the
+  server's ordered window instead. The counter alone cannot tell them apart, so do not diagnose a
+  subsystem from it on its own. For "did my command get there", the honest reading is the pair
+  `connected` + `reliable_abandoned`.
 - **Use `last_send_error_age_ms` to tell "one blip at login" from "failing right now."** A count
   alone cannot distinguish them.
 - Reported as `null` / `0`, never omitted, so absence of trouble is stated rather than inferred.
