@@ -43,6 +43,18 @@ const MAX_RESEND_PER_PASS: usize = 300;
 /// instead. This 250ms cadence (was a hard-coded 1s) only makes the SESSION come up promptly when our
 /// first SESSION_REQUEST is dropped; SESSION_REQUEST is idempotent (the server dedupes), so a faster
 /// cadence is harmless at the transport layer.
+///
+/// This value is a LOWER BOUND on the interval actually observed on the wire, not the interval itself
+/// (#603): the retry loop in `connect` only re-evaluates `session_request_due` once per iteration of
+/// its `recv` call, which has a 100ms timeout — so a retry that becomes due partway through a `recv`
+/// wait sits out the remainder of that tick before firing. The bound this quantization implies is
+/// 250-350ms (up to +100ms of jitter per retry); measured effective interval in practice clusters
+/// tighter, around ~300ms (300-308ms across sampled runs), not the full range nor a clean 250ms.
+/// Documented rather than "fixed" (making the wait wake exactly at the due instant instead of polling
+/// every 100ms) because this is a live network path whose regression test
+/// (`connect_does_not_flood_session_request_faster_than_the_cadence`) just had a real flakiness
+/// problem removed (#549) — the added complexity and retest burden of an exact-wake timer isn't worth
+/// it for jitter that only ever makes the retry later, never faster/floodier.
 const SESSION_REQUEST_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Pure cadence predicate for the `connect` retry loop (#549): true once `now` is at least
@@ -398,9 +410,51 @@ impl EqStream {
             app_tx,
         };
 
+        // The very first send on a freshly connect()ed UDP socket can return WouldBlock and be silently
+        // dropped by `send_raw`'s `let _ = try_send(..)`. Cause: tokio caches socket readiness and starts
+        // it EMPTY (`scheduled_io.rs`); a `try_*` call against empty cached readiness returns a SYNTHETIC
+        // WouldBlock without even attempting the syscall (`registration.rs`) until some task observes a
+        // real writable-readiness event first. Neither `bind` nor `connect` above does real I/O, so
+        // nothing has given that a chance to happen yet at this point — UNLESS another OS thread already
+        // did it concurrently, which is exactly what makes this runtime-dependent (#603, verified
+        // empirically, fresh runtime per trial, cold — no test in this crate covers the current_thread
+        // case, since `#[tokio::test]`'s default runtime and this one differ; see below):
+        //   - current_thread (`#[tokio::test]`'s default): DETERMINISTIC — no worker thread exists to
+        //     race the readiness event against this call, so it WouldBlocks 100/100 trials, every time.
+        //   - multi_thread (`Builder::new_multi_thread()`, production's actual shape — `src/main.rs`):
+        //     a RACE — a worker thread parked in `epoll_wait` can independently service the readiness
+        //     event while this call is in flight, so it sometimes already succeeds. Measured WouldBlock
+        //     rate roughly 60-90/100 depending on machine and load (three independent measurements: two
+        //     in the 84-90 range, one at 67, one clustered 63-68; worker-count sensitivity pushed it as
+        //     low as 35/100 at 2 workers in one run) — i.e. in production this send was sometimes already
+        //     reaching the wire, not reliably, but not never either; the earlier claim that this line
+        //     "never" worked and the loop did "100%" of the work was itself an overstated universal,
+        //     corrected here. Don't treat any single number above as precise — the point is that it's a
+        //     RACE, not a constant, and no fixed percentage is true across machines.
+        // Either way the outcome the code wants — the datagram genuinely on the wire — was never
+        // guaranteed, only sometimes true by luck of scheduling. Awaiting `writable()` once removes the
+        // luck: it forces a real readiness event to be observed before the send, converting the
+        // nondeterministic race (a majority-but-not-universal failure rate in production's own runtime
+        // shape, see above) into a deterministic 100/100 success, at negligible cost (measured on
+        // production's multi_thread shape: max 55µs / mean 16µs over 100 cold trials this session;
+        // reviewer independently measured max 484µs / mean 14.5µs in a different environment — both
+        // negligible next to the ~300ms retry cadence below).
+        // The retry loop's own sends don't need this: once readiness has been observed once, tokio keeps
+        // it marked ready for the life of the socket.
+        //
+        // Bounded to 500ms (#603 review, F3): this is the only new unbounded wait on the connect path.
+        // No live hang was found in review (driver shutdown returns an `Err` here, which — like a
+        // WouldBlock — is swallowed below and degrades to the pre-#603 behavior of relying entirely on
+        // the retry loop), but a bound costs one line and turns "degrades on some theoretical future
+        // driver-shutdown path" into "provably can't add more than 500ms to connect() even in that case".
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), stream.socket.writable()).await;
         stream.send_session_request();
 
-        // Wait for SESSION_RESPONSE. Re-send SESSION_REQUEST every 1s in case of UDP loss.
+        // Wait for SESSION_RESPONSE, re-sending SESSION_REQUEST on the `session_request_due` cadence
+        // below in case of UDP loss. NOTE (#603): that cadence is only re-checked once per iteration of
+        // this loop's `recv` (100ms timeout, below), so a retry that becomes due mid-recv waits out the
+        // rest of that tick before firing — see `SESSION_REQUEST_RETRY`'s doc comment for the measured
+        // effective interval this produces.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut last_send = std::time::Instant::now();
         let mut recv_buf = vec![0u8; 4096];
@@ -1091,6 +1145,45 @@ pub(crate) async fn test_stream_with_peer_encoded(
 mod tests {
     use super::*;
 
+    /// #603 review follow-up (F2): the `writable().await` line above `stream.send_session_request()`
+    /// in `connect` is load-bearing — remove it and the pre-loop send goes back to being a
+    /// nondeterministic WouldBlock race (deterministic drop on a current_thread runtime; a majority
+    /// but not universal drop rate even on production's multi_thread runtime — see the doc comment on
+    /// that call site for the range across independent measurements) —
+    /// but nothing about the code *looks* wrong without it, and no timing-based test can safely pin
+    /// this without becoming exactly the runtime/scheduler-coupled flaky-test class #549 already had
+    /// to remove once (virtual time auto-advances past real socket I/O; real-time is contention-flaky
+    /// in the other direction). Source-level assertion instead, mirroring the precedent in
+    /// `crates/eqoxide-renderer/tests/weather_shader.rs` and `fog_shader.rs` (both assert on
+    /// `include_str!`-embedded source): fails loudly, by name, the instant the awaited call is deleted
+    /// or reordered to after the send it's supposed to guard.
+    #[test]
+    fn connect_awaits_writable_before_the_first_session_request() {
+        const TRANSPORT_RS_SRC: &str = include_str!("transport.rs");
+        // Isolate the statement immediately preceding the pre-loop `send_session_request()` call, and
+        // check it awaits `writable()` (bounded by a timeout, #603 F3) rather than matching the whole
+        // statement verbatim — robust to changing the timeout duration or wrapper without weakening
+        // what's actually being pinned: that a writability wait happens right before this specific send.
+        let needle = "stream.send_session_request();";
+        let call_site = TRANSPORT_RS_SRC
+            .find(needle)
+            .unwrap_or_else(|| panic!("transport.rs: couldn't find `{needle}`"));
+        let preceding_statement = TRANSPORT_RS_SRC[..call_site]
+            .rsplit(';')
+            .nth(1)
+            .unwrap_or_else(|| panic!("transport.rs: couldn't find the statement before `{needle}`"));
+        assert!(
+            preceding_statement.contains("stream.socket.writable()")
+                && preceding_statement.contains(".await"),
+            "connect() must await `stream.socket.writable()` immediately before the pre-loop \
+             `stream.send_session_request()` call (#603) — without it, the very first send on a \
+             freshly connect()ed UDP socket is a WouldBlock race that can silently miss the wire \
+             (see the doc comment on that call site for the measured drop rates), quietly pushing all \
+             the real work onto the retry loop instead of the fast-path send this line exists for \
+             (found preceding statement: {preceding_statement:?})"
+        );
+    }
+
     /// #343 (review): `connected` is derived from `net_health.last_datagram`, and the ONLY thing
     /// that stamps it is `poll_recv`. This is what makes the clock correct in all four loops that
     /// own an `EqStream` — including `reconnect_via_world`, whose 90-SECOND deadline would otherwise
@@ -1230,9 +1323,16 @@ mod tests {
     /// contention). The direction matters: scheduler contention can only ever DELAY a send, never
     /// conjure an extra one, so contention can only push this count DOWN, never up — a ceiling cannot
     /// flake from load the way a floor did. At the correct 250ms cadence a 700ms window sees ~3 sends
-    /// (t≈0, 250, 500); a wiring bug firing every ~100ms sees ~7. Do NOT tighten this bound "for
-    /// precision" — the slack between 3 and 7 is what makes it contention-proof; a tighter ceiling
-    /// would reintroduce exactly the flake #549 fixed.
+    /// (nominal t≈0, 250, 500 — measured effective arrivals cluster more like 0, 303, 607 per
+    /// `SESSION_REQUEST_RETRY`'s doc comment, still inside the window); a wiring bug firing every
+    /// ~100ms sees ~7. Do NOT tighten this bound "for precision" — the slack between 3 and 7 is what
+    /// makes it contention-proof; a tighter ceiling would reintroduce exactly the flake #549 fixed.
+    ///
+    /// #603 review follow-up: the pre-loop send now awaits `writable()` before firing, so the nominal
+    /// count is exactly 3 rather than the ~2 it could land on before (when the first send was a
+    /// coin-flip that sometimes silently missed the wire). Detection power only improved —
+    /// a wiring bug that degrades the cadence to ~200ms produced 3 sends in this window before (passing,
+    /// indistinguishable from correct) and produces 4 now (failing).
     #[tokio::test]
     async fn connect_does_not_flood_session_request_faster_than_the_cadence() {
         let net_health: eqoxide_ipc::NetHealthShared = Default::default();
