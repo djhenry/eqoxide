@@ -295,9 +295,9 @@ mod windowed_speed_sample_tests {
 /// even explicitly excludes any clip name containing `"back"` so it can't be mis-picked as a run
 /// clip). Whether that `walk_back` label is itself correct is a separate, pre-existing question:
 /// `eqoxide_asset_server::convert::anim_label` (src/convert/mod.rs:1176) currently maps WLD code
-/// `L07` to `"walk_back"`, but `eq_kb/animation-codes.md` (cross-checked against literal strings
-/// pulled from `eqgame.exe`, `L07: CLIMB`) says `L07` is CLIMB, not a walk-backward loop, and lists
-/// no confirmed retail code for backward walking at all. Regardless of which side of that dispute is
+/// `L07` to `"walk_back"`, but `eq_kb/animation-codes.md` (private knowledge base; see that repo
+/// for sourcing) says `L07` is CLIMB, not a walk-backward loop, and lists no confirmed retail code
+/// for backward walking at all. Regardless of which side of that dispute is
 /// right, wiring a "backward" action through `clip_for_action` is out of scope for this fix (#623's
 /// confirmed bug and required Fix A/B/C is walk-vs-run only) — noted here rather than silently
 /// ignored, and left for whoever resolves the L07 labeling question.
