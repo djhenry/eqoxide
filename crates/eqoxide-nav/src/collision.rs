@@ -1817,7 +1817,9 @@ impl Collision {
     /// whether ANY floor sequence from `az` to `bz` fits the controller's envelope on every
     /// sub-segment:
     ///
-    ///     local_rise ≤ seg_run · MAX_WALK_GRADE + step_up
+    /// ```text
+    /// local_rise ≤ seg_run · MAX_WALK_GRADE + step_up
+    /// ```
     ///
     /// — a slope it can walk plus one discrete step it can climb. Two deliberate permissive
     /// choices, both anti-over-tightening (rejecting a genuinely walkable slope would turn a wedge
