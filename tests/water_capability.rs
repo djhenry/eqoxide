@@ -78,6 +78,20 @@ fn swim_plane(col: &Collision, p: [f32; 3]) -> f32 {
 ///
 /// Any future cap on water-edge rise must keep this green. A gate keyed on the source column's
 /// surface cannot: `haul_out_up` is 2.0.
+///
+/// # ⚠️ This test is ENTANGLED with #649 — expect it to flip when that lands
+///
+/// Its green currently *depends on* the very defect #649 tracks. The route from these start depths
+/// passes through the water-blind depenetration push-out, which drops the swimmer to a lower
+/// passage on the way (the same `nearest_floor(up = STEP_UP + GROUND_ORIGIN, down = 200)` that
+/// strands it on the lid from 2 u higher — one mechanism, both directions). Mutating the push-out
+/// out therefore takes this test RED **with a message blaming the withdrawn #648 premise**, which
+/// would be a misleading failure for whoever is fixing #649.
+///
+/// So: if this goes red while you are working on #649, do NOT read it as "a swimmer can no longer
+/// rise" — re-derive the start depths against the fixed controller and re-record them. The
+/// CAPABILITY claim (buoyancy lifts a swimmer to the DESTINATION column's swim plane, unbounded by
+/// the source column's surface) is what must survive; these particular z values are not sacred.
 #[test]
 #[ignore = "asset-gated: needs baked qcat.glb + qcat.wtr at $EQZONES (#357)"]
 fn a_swimmer_rises_to_the_destination_columns_surface_not_its_own() {
@@ -165,8 +179,9 @@ fn qcat_pocket_swim_plane_strands_the_swimmer_on_the_ceiling_lid() {
 
     let end = swim_toward(&col, [pocket_xy[0], pocket_xy[1], plane], shaft, 12.0);
     assert!((end[2] - (-55.9687)).abs() < 0.01,
-        "#649: from the pocket's own swim plane ({plane:.4}) the swimming step-up mounts the \
-         character onto the ceiling lid at −55.9687 (the live #329 wedge coordinate); got {end:?}");
+        "#649: from the pocket's own swim plane ({plane:.4}) the depenetration push-out (NOT the \
+         swimming step-up — see this test's doc comment) places the character on the ceiling lid at \
+         −55.9687, the live #329 wedge coordinate; got {end:?}");
     assert!(!col.in_water(end),
         "#649: and the mounted position is DRY (surface {surface:.5}), which is why buoyancy never \
          recovers it — got in_water=true at {end:?}");
