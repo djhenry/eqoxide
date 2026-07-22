@@ -75,7 +75,8 @@ pub fn accept_color(kind: EdgeKind) -> [f32; 4] {
 pub fn reject_color(reason: RejectReason) -> [f32; 4] {
     match reason {
         RejectReason::StepUp | RejectReason::StepDown => COL_REJECT_STEP,
-        RejectReason::Grade => COL_REJECT_GRADE,
+        // #630 local_rise is a grade-family rejection (the profile's LOCAL grade, not the average).
+        RejectReason::Grade | RejectReason::LocalRise => COL_REJECT_GRADE,
         RejectReason::Clearance => COL_REJECT_CLEAR,
         RejectReason::NoFloor => COL_REJECT_NOFLOOR,
         RejectReason::Water | RejectReason::HaulOutTooHigh => COL_REJECT_WATER,

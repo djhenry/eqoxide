@@ -599,6 +599,11 @@ pub const NAV_PREFERRED_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS * 
 pub const NAV_NEAR_HORIZONTAL: f32 = crate::traversability::PLAYER_BODY.near_horizontal;
 pub const NAV_AGENT_HEIGHT: f32 = crate::traversability::PLAYER_BODY.agent_height;
 
+/// The steepest grade (rise/run) A* accepts on a walk edge — walkable up to ~50°; steeper makes the
+/// controller slide on the face and wedge (#205, eqoxide#212). Was a const local to `astar`; hoisted
+/// to module scope so the #630 profile check (`walk_profile_ok`) shares the same number.
+pub const MAX_WALK_GRADE: f32 = 1.2;
+
 /// A floor this close under a point in water = STANDING (wading), not floating. Shared by the
 /// floating START anchor (#329/#197p2) and the floating GOAL anchor (water-nav design §4d) so the
 /// two ends of a swim plan agree on what "floating" means.
@@ -1795,6 +1800,90 @@ impl Collision {
         zs
     }
 
+    /// #630 — the MAXIMUM-LOCAL-RISE check on a rising walk edge: does the floor PROFILE along the
+    /// hop `a → b` stay within what the controller can actually climb, or does it concentrate the
+    /// rise into a near-vertical face the whole-hop AVERAGE grade hides?
+    ///
+    /// The defect this closes (#617/#309/#329/#482): the walk edge's grade check divides the
+    /// endpoint rise by the whole hop length (8u orthogonal, ~11.3u diagonal), so a flat approach
+    /// ending in a 12.8u vertical face averages to grade 1.13 and passes `MAX_WALK_GRADE = 1.2` —
+    /// the same face is correctly rejected orthogonally (12.8/8 = 1.6). The feet-clearance ray
+    /// doesn't catch it either: that ray interpolates from `az + feet` to `bz + feet`, so on a
+    /// steeply-rising hop it has already gained most of the altitude by the far end and skims over
+    /// a face near the destination. The controller's real capability is `physics::STEP_UP = 2.0` of
+    /// discrete riser plus walking a grade-`MAX_WALK_GRADE` slope — nowhere near a 12.8u face.
+    ///
+    /// So: sample the floor columns at ~`WALK_PROFILE_SPACING` intervals along the hop and ask
+    /// whether ANY floor sequence from `az` to `bz` fits the controller's envelope on every
+    /// sub-segment:
+    ///
+    /// ```text
+    /// local_rise ≤ seg_run · MAX_WALK_GRADE + step_up
+    /// ```
+    ///
+    /// — a slope it can walk plus one discrete step it can climb. Two deliberate permissive
+    /// choices, both anti-over-tightening (rejecting a genuinely walkable slope would turn a wedge
+    /// into a `no_path` — a different regression):
+    ///
+    /// * The envelope is the UNION of the two real capabilities, so a steep stair-stepped profile
+    ///   stays legal.
+    /// * At each probe the check advances to the HIGHEST floor reachable within the envelope
+    ///   (greedy max-altitude — equivalent to the exhaustive search over floor sequences, since a
+    ///   higher `prev_z` never reaches less later). Tracking the floor NEAREST the previous sample
+    ///   instead would follow a ground plane running UNDERNEATH a walkable ramp and falsely reject
+    ///   the ramp. A probe over a void (no floor in the window) is skipped: its run rolls into the
+    ///   next sub-segment, never a free pass.
+    ///
+    /// The check can therefore only reject a hop where NO within-envelope profile exists — strictly
+    /// tighter than main's average-only test, never looser — and a single vertical face taller than
+    /// `spacing · MAX_WALK_GRADE + step_up ≈ 6.8u` cannot hide anywhere along the hop, in ANY
+    /// direction: the fixed probe spacing is what removes the diagonal's extra permissiveness (its
+    /// longer run no longer launders the same face).
+    ///
+    /// **Where the rejection actually happens — read this before editing the loop.** No INTERMEDIATE
+    /// probe ever returns `false`. The envelope is applied to them as the CAP on how far `prev_z` may
+    /// climb at each step (`column_floors` is windowed to `prev_z + allow`), so a probe whose only
+    /// floor sits above the envelope simply finds nothing and leaves `prev_z` where it was — exactly
+    /// like a probe over a void. The single verdict is the FINAL comparison, `bz - prev_z <= allow`:
+    /// a face too tall to be climbed en route shows up as a `prev_z` that never got off the low
+    /// ground, and the hop is refused at its destination. This is deliberate (it is what makes the
+    /// greedy walk equivalent to the exhaustive search over floor sequences); a per-segment
+    /// early-`false` would reject legal profiles whose floors are simply sampled unevenly.
+    ///
+    /// Callers gate on `rise > step_up` — a hop whose endpoint rise the controller can plainly step
+    /// has nothing to launder, and flat terrain pays zero extra queries.
+    pub fn walk_profile_ok(&self, a: [f32; 2], az: f32, b: [f32; 2], bz: f32,
+        probe_down: f32) -> bool {
+        /// Probe spacing (u): half a coarse cell. Bounds the tallest hideable face at
+        /// `spacing · MAX_WALK_GRADE + step_up ≈ 6.8u` while tolerating the local roughness of
+        /// baked zone terrain (rocky slopes, stair runs) that a per-2u check would over-reject.
+        /// On the fine 2u tier a whole hop is under one spacing, so this check adds nothing there
+        /// (the whole-hop grade cap is already tighter) — no fine-tier behaviour change.
+        const WALK_PROFILE_SPACING: f32 = 4.0;
+        let step_up = crate::traversability::PLAYER_BODY.step_up;
+        let run = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        let segs = (run / WALK_PROFILE_SPACING).ceil().max(1.0) as i32;
+        let mut prev_z = az;
+        let mut prev_t = 0.0_f32;
+        for i in 1..=segs {
+            let t = i as f32 / segs as f32;
+            let allow = (t - prev_t) * run * MAX_WALK_GRADE + step_up;
+            if i == segs {
+                // The final sample IS the candidate destination floor — never re-derived, so the
+                // profile check and the edge it guards cannot disagree about where the hop ends.
+                return bz - prev_z <= allow;
+            }
+            // Highest floor reachable within the envelope (column_floors returns high→low, already
+            // bounded to [prev_z - probe_down, prev_z + allow]).
+            let fz = self.column_floors(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t,
+                prev_z, allow, probe_down).into_iter().next();
+            let Some(fz) = fz else { continue }; // void under the probe: fold into the next segment
+            prev_z = fz;
+            prev_t = t;
+        }
+        true
+    }
+
     /// A* over the collision grid: a walkable waypoint path from `start` to `goal` that routes
     /// AROUND walls (a plain collide-and-slide toward the goal only slides along one). Returns
     /// cell-center waypoints `[east, north]` (start-exclusive, goal-inclusive) or None if no geometry / no route.
@@ -2502,11 +2591,14 @@ impl Collision {
         // can no longer scale the boundary-wall lips it used to climb onto the high side of.
         const MAX_STEP_DOWN: f32 = 60.0; // max DROP between adjacent cells (fall/hop down a level)
         // Grade limit (eqoxide#212): STEP_H=20 over an 8u cell is a 250% grade. A discrete vertical
-        // step that tall is already blocked here by the chest-ray path_clear (its riser is a wall),
-        // so the climbs that actually reach A* are smooth RAMPS — and a ramp steeper than the
-        // controller can walk makes it slide on the face and wedge (#205). Reject a climb whose
-        // grade (rise/run) exceeds what's walkable; A* then routes around the steep face.
-        const MAX_WALK_GRADE: f32 = 1.2;  // walkable up to ~50° (rise/run); steeper = slide
+        // step that tall is USUALLY blocked here by the feet-ray path_clear (its riser is a wall) —
+        // but NOT always: the feet ray is interpolated from `cz + feet` to `nf + feet`, so on a
+        // steeply-RISING hop the ray has already gained most of the altitude by the far end and
+        // skims OVER a near-vertical face that sits near the destination (#630, the #617 canal
+        // bank). The climbs that pass both rays are smooth RAMPS or laundered faces — the grade
+        // check below rejects ramps steeper than the controller can walk (it would slide, #205),
+        // and `walk_profile_ok` (#630) rejects the laundered faces the average hides.
+        // (MAX_WALK_GRADE = 1.2 is now a module const, shared with walk_profile_ok.)
         // Jump-edges (eqoxide#190): let A* leap a GENUINE horizontal floor gap a running jump can
         // clear. NAV_RUN_SPEED matches action_loop::RUN_SPEED (the speed the walker drives a jump at);
         // reach is derived from it via movement::running_jump_reach (~22.7u). JUMP_UP_TOL caps how
@@ -2970,6 +3062,22 @@ impl Collision {
                     }
                     let nkey = (nc, nr, qf(nf));
                     if closed.contains(&nkey) { continue; }
+                    // #630: the grade above is an AVERAGE over the whole hop — a near-vertical
+                    // 10–16u face plus a flat approach averages into a "legal" slope (the diagonal's
+                    // ~11.3u run is what launders it: 12.8/11.3 = 1.13 passes where 12.8/8 = 1.6 is
+                    // rejected), and the controller's real 2u step-up cannot climb it (#617's canal
+                    // bank, #309's moat wall). Probe the floor PROFILE along the hop and reject a
+                    // rise concentrated into a face taller than the controller's local envelope.
+                    // Gated on the endpoint rise exceeding the real step-up: anything shallower has
+                    // nothing to launder, so flat terrain pays no extra floor queries.
+                    if rise > crate::traversability::PLAYER_BODY.step_up
+                        && !self.walk_profile_ok([a[0], a[1]], cz, [b[0], b[1]], nf, MAX_STEP_DOWN) {
+                        if let Some(t) = tr.as_deref_mut() {
+                            t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                EdgeVerdict::Rejected { reason: RejectReason::LocalRise });
+                        }
+                        continue;
+                    }
                     // THE WALK-EDGE TEST, through the one authority (#378). Two probe heights from
                     // the shared Body — the CHEST ray (the controller's own contact height, #386)
                     // and a FEET ray just above the walker's real max step-up (a low invisible-

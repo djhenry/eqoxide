@@ -88,6 +88,12 @@ pub enum RejectReason {
     StepDown,
     /// The climb's grade (rise/run) exceeds `MAX_WALK_GRADE` (eqoxide#212).
     Grade,
+    /// The climb's AVERAGE grade passed, but the floor profile along the hop concentrates the
+    /// rise into a local face taller than the controller can actually climb
+    /// (`Collision::walk_profile_ok`, eqoxide#630). The average-over-the-hop grade check alone
+    /// let a near-vertical 10–16u face "launder" itself into a legal slope — the longer diagonal
+    /// run (~11.3u vs 8u) made the same face pass diagonally while failing orthogonally.
+    LocalRise,
     /// The body-clearance test refused the edge (`Traversability::can_traverse_fast`, or a water
     /// family's swept `edge_clear`) — a wall, missing margin, or blocked swim band. The hot loop
     /// only knows the boolean; the finer wall/floor/water distinction lives on the COLD
