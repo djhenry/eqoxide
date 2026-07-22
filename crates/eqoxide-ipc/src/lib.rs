@@ -672,12 +672,26 @@ impl<V> std::ops::Deref for Roster<V> {
 //                  `HashMap::clone`, which yields a `HashMap` that cannot be assigned back.
 //   serde        — no `Deserialize`, so no deserialize-into-place either.
 //
-// With no public constructor and no public mutator there is no expression of type `Roster<V>` an
-// outside crate can name, so `*guard = …` has nothing to assign and `mem::take`/`mem::replace`
-// have nothing to supply. That is the argument for completeness: the surface is CONSTRUCTORS, which
-// is finite and enumerable, rather than call-site shapes, which are not. Two earlier attempts here
-// guessed at shapes (`let mut` in a scanner; then per-entry mutation) and each survived only the
-// shapes someone thought to try.
+// What that list does and does not establish. It establishes exactly one thing: an outside crate
+// cannot CONSTRUCT a `Roster<V>`. So every write that needs a freshly-built value is closed —
+// `*guard = pairs.collect()`, `*guard = Default::default()`, `*guard = kept.clone()`,
+// `mem::take(&mut *guard)`, `mem::replace(&mut *guard, ..)` — because each of them has to name a
+// producer, and there is none.
+//
+// It does NOT establish that no `Roster` value can be named or moved, and an earlier revision of
+// this comment claimed that it did. That was false. `WorldSlots`' fields are `pub`, `publish_entities`
+// is `pub`, and `MutexGuard` supplies `DerefMut` — so an outside crate can legitimately populate a
+// SCRATCH `WorldSlots` and then `mem::swap` one of its maps into a live one, MOVING an existing
+// `Roster` without ever constructing one. That compiles clean in release today (verified, #665) and
+// desyncs `entity_ids` from `entity_positions`, which `combat.rs`'s "is this spawn known?" answers
+// from alone. Closing the producer set was necessary and is not sufficient: the remaining leak is
+// that the CONTAINER hands out mutable access to what it protects. Tracked in #665; deliberately
+// not bolted onto this change.
+//
+// The reason to close CONSTRUCTORS rather than call-site shapes is that producers are finite and
+// enumerable, so "each member is closed" is a claim that can be checked. Two earlier attempts here
+// guessed at shapes instead (`let mut` in a source scanner; then per-entry mutation) and each
+// survived only the shapes someone happened to try.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 impl<V> Roster<V> {
