@@ -1,4 +1,5 @@
-//! Time-of-day server clock + sky-gradient palette (eqoxide#561, Slice 1).
+//! Time-of-day server clock + sky-gradient palette (eqoxide#561 Slice 1; palette/breakpoints
+//! re-derived from native measurements in eqoxide#628).
 //!
 //! Two pure pieces, both unit-tested here so they never need a GPU or a live server:
 //!
@@ -10,10 +11,14 @@
 //!    likewise recomputes from `(now − start)` rather than storing a ticking value.
 //!
 //! 2. [`sky_colors`] — maps the resulting hour-of-day to a 2-stop (zenith, horizon) gradient across
-//!    four phases (dawn / day / dusk / night). The phase breakpoints and the per-phase colors are
-//!    the native outdoor "DefaultClear" day-cycle values; the concrete figures live in the project's
-//!    private technical KB (they are derived from the commercial client's data files and are not
-//!    reproduced verbatim in this public repo beyond what is needed to render a look-alike gradient).
+//!    four phases (dawn / day / dusk / night). #561/#583 shipped this with estimated colors and
+//!    breakpoints, made before any side-by-side comparison against the native client existed. #628
+//!    measured the native client at 11 hours in the same zone/spot/camera and found the estimate
+//!    substantially wrong — night ~5x too bright, no dawn/dusk phases at all, transitions lagging
+//!    1-2h. The palette and breakpoints below are re-derived directly from that measurement table
+//!    (see the per-function derivation comments); the table itself, and the specific numbers below,
+//!    are public (already published in the #628 issue body) — no native client internals beyond
+//!    that aggregate luma/RGB data are reproduced here.
 //!
 //! Honesty (the agent-honesty invariant): the clock reflects real server time or nothing. Until an
 //! `OP_TimeOfDay` has been received the clock is `None`; callers render [`DEFAULT_HOUR`] (a documented
@@ -124,38 +129,77 @@ fn mix(a: SkyColors, b: SkyColors, t: f32) -> SkyColors {
     }
 }
 
-// ── Per-phase palettes (native DefaultClear family; concrete values in the private KB) ───────────
-// Day is a hair off the pre-#561 hardcoded gradient on purpose — that gradient already approximated
-// the native Day phase, so reusing near-identical stops keeps daytime looking unchanged.
+// ── Per-phase palettes (eqoxide#628: re-derived from the native-vs-eqoxide measurement table in ──
+// the issue body, NOT estimates — every number below traces to a specific table entry or an
+// algebraic solve against it; see the derivation notes on each function. The original #561/#583
+// palette was an estimate made before any native comparison existed and measured up to 5x too
+// bright at night with the dawn/dusk phases entirely absent (#628 defects 1 and 2); this palette
+// replaces it. Luma is `Y = 0.299R + 0.587G + 0.114B` on the native 0..255 scale throughout.
+//
+// Only Y (no RGB breakdown) is given in the issue for day/night, since those hours aren't called
+// out as having a distinctive hue — so day/night below keep their previous hue *direction*
+// (already a reasonable native-informed estimate, not contradicted by the issue) and are uniformly
+// brightness-scaled to match the table's measured Y. Dawn and dusk, where the issue calls out a
+// specific hue signature, are matched to the exact (dusk) or algebraically-completed (dawn) native
+// RGB triple and kept FLAT (zenith == horizon): the issue's samples are single fixed-camera points,
+// not a two-stop breakdown, so a non-flat split for those two phases would fabricate an unverified
+// gradient ratio the table cannot support. Restoring a genuine vertical gradient for dawn/dusk (and
+// true celestial-body color) is Slice 2 (sky dome) territory, out of scope here.
 fn day_colors() -> SkyColors {
-    SkyColors { zenith: rgb(90, 131, 178), horizon: rgb(206, 209, 233) }
+    // Native Y at 06/07/13 = 147.8 / 153.7 / 149.0 (mean 150.17). Previous zenith/horizon pair
+    // averaged to Y=167.47; scaled by 150.17/167.47 ≈ 0.8964 (same hue direction, dimmed to match):
+    // zenith (90,131,178)→(81,117,160), horizon (206,209,233)→(185,187,209). Resulting avg
+    // Y=150.02, within 3.7 of every one of the three measured hours.
+    SkyColors { zenith: rgb(81, 117, 160), horizon: rgb(185, 187, 209) }
 }
 fn night_colors() -> SkyColors {
-    // Flat deep blue — native Night map has no vertical gradient.
-    SkyColors { zenith: rgb(4, 17, 42), horizon: rgb(4, 17, 42) }
+    // Native night Y across 00/04/18/19/20/22 = 12.2/12.8/14.8/15.1/12.7/12.3 (mean 13.32). Kept
+    // flat (no vertical gradient) per the pre-existing note that the native Night map has none.
+    // Previous flat color (4,17,42) had the right hue but Y=15.96 (~3-4 too bright vs the mean, and
+    // 5x too bright is what was actually observed live — see the PR body for why the *rendered*
+    // number diverged even further from this constant). Scaled by 13.32/15.96 ≈ 0.8457, same hue:
+    // (4,17,42)→(3,14,36), giving Y=13.22 — within 2.5 of every individual measured hour's Y (worst
+    // case hour 19, native 15.1, diff 1.9).
+    SkyColors { zenith: rgb(3, 14, 36), horizon: rgb(3, 14, 36) }
 }
 fn dawn_colors() -> SkyColors {
-    // Zenith stays near night-blue through dawn; horizon a warm sunrise glow (a 2-stop
-    // simplification of the native alpha-composited dawn map — full fidelity is Slice 2).
-    SkyColors { zenith: rgb(19, 42, 74), horizon: rgb(233, 166, 110) }
+    // Native hour 05 (the pink-dawn sample): Y=69.1, R=86.7 > G=60.0 given directly; B was not
+    // given, so solved from the luma equation: 69.1 = 0.299*86.7 + 0.587*60.0 + 0.114*B →
+    // B ≈ 69.8. That makes the true order R(86.7) > B(69.8) > G(60.0) — a magenta-pink dawn, which
+    // matches "pink" better than a plain warm-orange sunrise would. Rounded to (87, 60, 70), flat
+    // (see module-level derivation note above for why flat): Y=69.21, R>G holds (87>60).
+    SkyColors { zenith: rgb(87, 60, 70), horizon: rgb(87, 60, 70) }
 }
 fn dusk_colors() -> SkyColors {
-    SkyColors { zenith: rgb(27, 44, 74), horizon: rgb(232, 162, 92) }
+    // Native hour 17 (the purple-dusk sample) gives the full triple directly: R=57.2, G=49.6,
+    // B=74.7 (Y=54.7, and 0.299*57.2+0.587*49.6+0.114*74.7 = 54.73, self-consistent). Rounded to
+    // (57, 50, 75), flat (see module-level derivation note above): Y=54.94, order B>R>G holds
+    // (75>57>50) exactly as measured. The previous dusk color (232,162,92 horizon / 27,44,74
+    // zenith) averaged to R>G>B — a warm sunset, the *wrong* hue direction entirely; this is why
+    // #628 could report "no dusk at all" even though a `dusk_colors()` existed.
+    SkyColors { zenith: rgb(57, 50, 75), horizon: rgb(57, 50, 75) }
 }
 
-// ── Phase breakpoints, in fractional hours (native DefaultClear ColorSet Time/Transition track) ──
-// Each phase's transition BEGINS at *_START and reaches full color at *_END; between the end of one
-// transition and the start of the next the flat phase color holds. Night holds from NIGHT_END
-// through to the next day's DAWN_START (the long overnight branch). Concrete source values are in
-// the private technical KB.
-const DAWN_START: f32 = 5.639_64;
-const DAWN_END: f32 = 6.479_35;
-const DAY_START: f32 = 6.719_98;
-const DAY_END: f32 = 7.199_71;
-const DUSK_START: f32 = 16.799_93;
-const DUSK_END: f32 = 17.279_66;
-const NIGHT_START: f32 = 17.759_76;
-const NIGHT_END: f32 = 18.479_74;
+// ── Phase breakpoints, in fractional hours ─────────────────────────────────────────────────────
+// eqoxide#628 defect 3: native transitions ~1-2h earlier than the old breakpoints (native is
+// already well into dawn by 05:00 and back to full night by 18:00; the old breakpoints didn't even
+// start the dawn ramp until 05:38 and didn't finish returning to night until 18:29). Re-derived so
+// hour 5.0 and hour 17.0 (the only hours the issue gives a hue signature for) land inside the FLAT
+// dawn/dusk hold windows (not mid-transition, where the color would be a blend the issue never
+// measured), and hour 6.0 / 18.0 (the next transition boundary) land at or past the transition's
+// end, matching the near-day (147.8) / near-night (14.8) values measured there. No sub-hour native
+// samples exist, so the exact transition widths (currently a symmetric ~0.6-0.7h ramp either side
+// of the anchor hour) are a reasonable interpolation between measured integer hours, not a measured
+// quantity themselves — a denser native sweep (as the issue suggests) would let a future pass pin
+// these tighter.
+const DAWN_START: f32 = 4.2;
+const DAWN_END: f32 = 4.8;
+const DAY_START: f32 = 5.3;
+const DAY_END: f32 = 6.0;
+const DUSK_START: f32 = 16.0;
+const DUSK_END: f32 = 16.7;
+const NIGHT_START: f32 = 17.3;
+const NIGHT_END: f32 = 18.0;
 
 /// Map an hour-of-day (0.0..24.0) to the sky gradient for that moment, interpolating across the
 /// dawn/day/dusk/night transitions.
@@ -311,11 +355,14 @@ mod tests {
 
     #[test]
     fn phase_sequence_is_night_dawn_day_dusk_night_over_the_day() {
-        // Sanity: the four flat holds are the four distinct phases in order.
+        // Sanity: the four flat holds are the four distinct phases in order. Hours 5.0/17.0 are
+        // the exact native-measured dawn/pink and dusk/purple sample hours (eqoxide#628); with the
+        // re-derived breakpoints they now land inside the flat dawn/dusk windows instead of the old
+        // (too-late) breakpoints, which held night through hour 5 and day through hour 17.
         assert_eq!(sky_colors(3.0), night_colors());
-        assert_eq!(sky_colors(6.6), dawn_colors());
+        assert_eq!(sky_colors(5.0), dawn_colors());
         assert_eq!(sky_colors(12.0), day_colors());
-        assert_eq!(sky_colors(17.5), dusk_colors());
+        assert_eq!(sky_colors(17.0), dusk_colors());
         assert_eq!(sky_colors(20.0), night_colors());
         // Day, night, dawn, dusk are all visually distinct.
         assert_ne!(day_colors(), night_colors());
@@ -338,4 +385,105 @@ mod tests {
             assert!((blended.horizon[i] - base.horizon[i] * 0.5).abs() < 1e-4);
         }
     }
+
+    // ── eqoxide#628 regression: match the native measurement table, not just "directionally right" ─
+    // The #561/#583 palette was an estimate; #628 measured the native RoF2 client at 11 hours
+    // (same zone, spot, fixed camera, weather cleared) and found it substantially wrong. These
+    // tests assert the *specific* native numbers from the #628 issue body, with tolerances tight
+    // enough to fail the pre-#628 palette (verified: see the PR body for the exact before/after
+    // numbers run against this same test on unmodified `main`).
+
+    /// `Y = 0.299R + 0.587G + 0.114B` on the native 0..255 scale, matching the issue's luma formula.
+    fn luma_255(c: [f32; 3]) -> f32 {
+        (0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]) * 255.0
+    }
+
+    /// The issue's per-hour number is a single fixed-camera-pixel sample; our model exposes a
+    /// 2-stop gradient. Average the two stops' luma as the closest available proxy — documented
+    /// approximation, not a claim the sample point was literally the midpoint.
+    fn sky_luma_255(c: SkyColors) -> f32 {
+        (luma_255(c.zenith) + luma_255(c.horizon)) / 2.0
+    }
+
+    #[test]
+    fn native_hour_table_matches_measured_luma_eqoxide_628() {
+        // (hour, native Y, tolerance) — every (hour, native Y) pair is copied verbatim from the
+        // table in the eqoxide#628 issue body. Tolerances are derived from the phase colors' own
+        // fit quality (see the derivation comments on day_colors/night_colors/dawn_colors/
+        // dusk_colors above) — e.g. night's flat color is at most 1.9 off any individual sampled
+        // night hour, so 2.5 gives headroom without being vacuous.
+        let cases: &[(f32, f32, f32)] = &[
+            (0.0, 12.2, 2.5),
+            (4.0, 12.8, 2.5),
+            (5.0, 69.1, 2.0),
+            (6.0, 147.8, 5.0),
+            (7.0, 153.7, 5.0),
+            (13.0, 149.0, 5.0),
+            (17.0, 54.7, 2.0),
+            (18.0, 14.8, 2.5),
+            (19.0, 15.1, 2.5),
+            (20.0, 12.7, 2.5),
+            (22.0, 12.3, 2.5),
+        ];
+        for &(hour, native_y, tol) in cases {
+            let y = sky_luma_255(sky_colors(hour));
+            assert!(
+                (y - native_y).abs() <= tol,
+                "hour {hour}: got Y={y:.1}, native Y={native_y} (tol {tol})"
+            );
+        }
+    }
+
+    #[test]
+    fn dawn_and_dusk_hue_ordering_matches_native_eqoxide_628() {
+        // eqoxide#628's two qualitative "signature" facts, asserted on the actual rendered
+        // gradient (not just the raw color constants) so a breakpoint regression that moved hour
+        // 5/17 back into night/day would also fail this: at 05:00 native red exceeds green (pink
+        // dawn); at 17:00 native blue exceeds red exceeds green (purple dusk).
+        //
+        // Dawn asserts the FULL R>B>G chain, not just R>G (PR #637 review, F1): R>G alone lets a
+        // wrong-hue-family mutation through — e.g. a genuinely BLUE dawn `(61,60,136)` still has
+        // R(61)>G(60) by a single 8-bit step, and in fact satisfies dusk's B>R>G signature instead
+        // of dawn's own. R>B>G is what actually distinguishes "pink dawn" from "purple dusk" (both
+        // have R>G in this palette); this was mutation-checked against that exact triple (see the
+        // PR body) and confirmed the un-tightened version passed it while this one fails it.
+        let dawn = sky_colors(5.0);
+        assert!(
+            dawn.horizon[0] > dawn.horizon[2] && dawn.horizon[2] > dawn.horizon[1],
+            "dawn horizon should have R>B>G: {:?}",
+            dawn.horizon
+        );
+        assert!(
+            dawn.zenith[0] > dawn.zenith[2] && dawn.zenith[2] > dawn.zenith[1],
+            "dawn zenith should have R>B>G: {:?}",
+            dawn.zenith
+        );
+
+        let dusk = sky_colors(17.0);
+        assert!(
+            dusk.horizon[2] > dusk.horizon[0] && dusk.horizon[0] > dusk.horizon[1],
+            "dusk horizon should have B>R>G: {:?}",
+            dusk.horizon
+        );
+        assert!(
+            dusk.zenith[2] > dusk.zenith[0] && dusk.zenith[0] > dusk.zenith[1],
+            "dusk zenith should have B>R>G: {:?}",
+            dusk.zenith
+        );
+    }
+
+    // NOTE (PR #637 review, F2): this file previously had
+    // `eleven_sampled_hours_show_more_than_three_distinct_colors_eqoxide_628`, asserting >3
+    // distinct `SkyColors` values across the 11 native-sampled hours (eqoxide#628 defect 2: "only
+    // three distinct sky values across 11 sampled hours"). The independent reviewer confirmed it
+    // is non-discriminating: grafted onto unmodified main, it passes there too, because main's old
+    // (too-late) breakpoints still produce several hours mid-transition-blend, and any two
+    // distinct-but-arbitrary blended floats count as "distinct" regardless of whether a genuine
+    // dawn/dusk phase was ever reached. Raw distinct-color counting can't tell a real 4-phase cycle
+    // apart from a handful of incidental blend artifacts. Deleted rather than patched: the actual
+    // "no dawn/no dusk" defect is already conclusively covered by
+    // `native_hour_table_matches_measured_luma_eqoxide_628` (fails on main's flat night-at-hour-5
+    // and near-day-at-hour-17 values) and `dawn_and_dusk_hue_ordering_matches_native_eqoxide_628`
+    // (fails on main because hours 5/17 never reach the dawn/dusk phase at all), so no coverage is
+    // lost by removing a test that could not detect its own bug.
 }
