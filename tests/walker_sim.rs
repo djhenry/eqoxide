@@ -926,9 +926,6 @@ fn goal_append_blast_radius() {
     use eqoxide::nav::collision::NoRoute;
     const RUN_SPEED: f32 = 44.0;
     const LOOK_AHEAD: f32 = 5.0;
-    const LOCAL_REACH: f32 = 24.0;
-    const LOCAL_BOUND: f32 = 40.0;
-    const LOCAL_CELL: f32 = 2.0;
     const DT: f32 = 1.0 / 100.0;
     const FRAMES_PER_TICK: u32 = 15;
     const GOAL_TIER_TOL: f32 = 8.0;
