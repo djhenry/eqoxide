@@ -392,6 +392,20 @@ pub struct Health {
     /// that is later abandoned (queue overflow, or the session ending) is counted in both.
     /// See [`eqoxide_ipc::NetHealth::send_deferred`].
     pub send_deferred: u64,
+    /// #656: is the io driver's send path starved RIGHT NOW — a `send_wouldblock_rescued`/
+    /// `send_deferred` burst happening currently, as opposed to having happened at some point in
+    /// the past? `send_wouldblock_rescued`/`send_deferred` above are cumulative since process start
+    /// and can only grow, so before this field nothing could tell "starved once, an hour ago" from
+    /// "starved right now" — this is the previously-missing ALERT #656 asked for.
+    ///
+    /// Computed at READ time (#343) from [`eqoxide_ipc::send_starved`], fed the CURRENT streak of
+    /// consecutive pressure events and the age of the most recent one. It is a RATE/recency signal,
+    /// not another lifetime count: it fires once a burst crosses
+    /// [`eqoxide_ipc::SEND_PRESSURE_FIRE_THRESHOLD`] consecutive events, and CLEARS on its own once
+    /// no new pressure event has arrived within [`eqoxide_ipc::SEND_PRESSURE_BURST_GAP_SECS`] —
+    /// regardless of how large the historical streak or the lifetime counters are. See
+    /// [`eqoxide_ipc::send_starved`] for the full fire/clear contract.
+    pub send_starved: bool,
     /// #612: the subset of `send_failures` that the client does not retransmit itself (unreliable
     /// position updates, ACKs, keepalives, session control). The complement is the reliable stream,
     /// which recovers structurally via the resend window. See [`eqoxide_ipc::NetHealth`] for the
@@ -678,6 +692,11 @@ impl HttpState {
         let last_world_response_ms = probe_reply_ago
             .map_or(last_packet_ago, |r| r.min(last_packet_ago))
             .as_millis() as u64;
+        // #656: the io-starvation alert. Measured HERE, at read time (#343's rule for every age in
+        // this payload) — `last_send_pressure_at` is a timestamp, never a pre-computed bool, so the
+        // alert cannot go stale between the net thread's last write and this HTTP read.
+        let send_pressure_ago = h.last_send_pressure_at.map(|t| t.elapsed());
+        let send_starved = eqoxide_ipc::send_starved(h.send_pressure_streak, send_pressure_ago);
         Health {
             link_age_ms:        link_age.as_millis() as u64,
             last_packet_age_ms: last_packet_ago.as_millis() as u64,
@@ -694,6 +713,7 @@ impl HttpState {
             send_failures:           h.send_failures,
             send_wouldblock_rescued: h.send_wouldblock_rescued,
             send_deferred:           h.send_deferred,
+            send_starved,
             send_failures_unretried: h.send_failures_unretried,
             last_send_error:         h.last_send_error_kind,
             last_send_error_age_ms:  h.last_send_error_at.map(|t| t.elapsed().as_millis() as u64),
@@ -1077,6 +1097,7 @@ mod health_serde_tests {
             link_age_ms: 0, last_packet_age_ms: 0, snapshot_age_ms: 0,
             connected: true, world_responsive: true, last_world_response_ms: 0,
             send_failures: 3, send_wouldblock_rescued: 5, send_deferred: 9,
+            send_starved: false,
             send_failures_unretried: 1,
             last_send_error: Some(std::io::ErrorKind::WouldBlock),
             last_send_error_age_ms: Some(42), reliable_abandoned: 7,
@@ -1087,6 +1108,16 @@ mod health_serde_tests {
             "an ErrorKind must serialize as its readable name, not as a struct or an integer");
         assert_eq!(v["send_failures"], serde_json::json!(3));
         assert_eq!(v["reliable_abandoned"], serde_json::json!(7));
+        // #656: the alert field must be PRESENT and boolean, never omitted (an absent JSON key
+        // reads as `null` to a naive caller, not as "healthy") and never a lie in either direction.
+        assert_eq!(v["send_starved"], serde_json::json!(false),
+            "send_starved must serialize as an explicit false when the fixture is not starved (#656)");
+
+        let starved = super::Health { send_starved: true, ..h };
+        let v: serde_json::Value = serde_json::to_value(starved).unwrap();
+        assert_eq!(v["send_starved"], serde_json::json!(true),
+            "send_starved must serialize as an explicit true when the fixture IS starved (#656) — \
+             both the fired and the cleared shape must be honest, not just one of them");
         // #642: SessionDropCause must serialize as its stable snake_case name, not the PascalCase
         // variant a derived Serialize would emit.
         assert_eq!(v["session_drop"], serde_json::json!("server_disconnect"),

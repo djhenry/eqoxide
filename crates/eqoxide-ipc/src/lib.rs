@@ -438,6 +438,29 @@ pub struct NetHealth {
     /// Before #641 every one of these was a silently dropped ACK, which the server answered by
     /// retransmitting everything it had not seen acknowledged — the road to a `resend_timeout` drop.
     pub send_deferred: u64,
+
+    // ── #656: is the io driver starved RIGHT NOW? ──────────────────────────────────────────────
+    //
+    // #641 gave the client `send_wouldblock_rescued`/`send_deferred`, but both are cumulative since
+    // process start — they can only grow, so nothing could ever tell "the driver was starved once,
+    // an hour ago" from "it is starved right now". Nothing consumed them either: no HUD, no WARN,
+    // no documented threshold (#656). These two fields turn the pair into a RATE signal (via
+    // `send_starved`, below) instead of a lifetime count, which is what lets the derived alert
+    // CLEAR on its own once a burst ends.
+    /// When the most recent `send_wouldblock_rescued` OR `send_deferred` event happened. `None`
+    /// until the first one this process has ever seen. Stamped by `record_send_pressure`, which is
+    /// called from both increment sites (the rescue in `EqStream::attempt_send` and the queue in
+    /// `EqStream::defer_control`) — never write these two fields directly from anywhere else, or a
+    /// stale value here would let the derived alert stay wrongly cleared forever, the honesty
+    /// failure this exists to prevent.
+    pub last_send_pressure_at: Option<std::time::Instant>,
+    /// Length of the CURRENT consecutive run of `send_wouldblock_rescued`/`send_deferred` events,
+    /// where "consecutive" means each arrived within [`SEND_PRESSURE_BURST_GAP_SECS`] of the one
+    /// before it. Reset to `1` (not incremented) the first time an event arrives after a longer
+    /// gap — see `record_send_pressure`. This is what filters out the single stray `WouldBlock` on a
+    /// freshly `connect()`ed socket (#603/#610, a documented harmless one-off, not CPU pressure)
+    /// from a genuine sustained refusal run.
+    pub send_pressure_streak: u64,
     /// The subset of `send_failures` for datagrams the client does **not** retransmit itself:
     /// unreliable app packets (the `OP_ClientUpdate` position firehose), session-layer control
     /// (ACK / OutOfOrderAck / keepalive / SessionRequest / SessionDisconnect). The complement
@@ -555,11 +578,32 @@ impl Default for NetHealth {
             last_probe_sent: None, last_probe_reply: None,
             first_unanswered_probe_sent: None,
             send_failures: 0, send_wouldblock_rescued: 0, send_deferred: 0,
+            last_send_pressure_at: None, send_pressure_streak: 0,
             send_failures_unretried: 0,
             last_send_error_kind: None, last_send_error_at: None,
             reliable_abandoned: 0,
             session_drop: None,
         }
+    }
+}
+
+impl NetHealth {
+    /// #656: stamp a `send_wouldblock_rescued`/`send_deferred` event and update the consecutive-
+    /// burst streak that `send_starved` reads. Call this from BOTH increment sites (never bump
+    /// `send_pressure_streak`/`last_send_pressure_at` any other way, or the two would drift from the
+    /// counters they exist to summarize).
+    ///
+    /// A gap since the previous event longer than [`SEND_PRESSURE_BURST_GAP_SECS`] starts a NEW
+    /// streak at `1`, rather than adding to the old one — this is what makes a single stray event
+    /// long ago (e.g. the one documented, harmless `WouldBlock` on a freshly `connect()`ed socket,
+    /// #603/#610) read as `streak == 1`, not as an ever-growing total that could eventually cross the
+    /// fire threshold on its own.
+    pub fn record_send_pressure(&mut self, now: std::time::Instant) {
+        let same_burst = self.last_send_pressure_at
+            .is_some_and(|t| now.saturating_duration_since(t)
+                <= std::time::Duration::from_secs(SEND_PRESSURE_BURST_GAP_SECS));
+        self.send_pressure_streak = if same_burst { self.send_pressure_streak.saturating_add(1) } else { 1 };
+        self.last_send_pressure_at = Some(now);
     }
 }
 
@@ -662,6 +706,56 @@ pub fn world_responsive(
             let answered = probe_reply_ago.is_some_and(|r| r <= sent_ago)
                         || last_packet_ago <= sent_ago;
             answered || sent_ago < timeout
+        }
+    }
+}
+
+/// #656: max gap between successive `send_wouldblock_rescued`/`send_deferred` events for them to
+/// count as the SAME burst (see [`NetHealth::record_send_pressure`]). A gap larger than this ends
+/// the burst — this is what lets [`send_starved`] CLEAR the instant no new pressure event has
+/// arrived within this window, no matter how large the historical streak or the lifetime counters
+/// (`send_wouldblock_rescued`/`send_deferred`) were. Kept short: these events are generated at the
+/// ~10ms net-thread tick cadence during a real burst, so a genuine ongoing burst never lets this
+/// gap open, while a burst that has actually ended clears within a couple of seconds of ending.
+pub const SEND_PRESSURE_BURST_GAP_SECS: u64 = 2;
+
+/// #656: how many consecutive-burst events (within [`SEND_PRESSURE_BURST_GAP_SECS`] of each other)
+/// it takes before [`send_starved`] fires. #603/#610 documented that a single, isolated `WouldBlock`
+/// on a freshly `connect()`ed socket is normal and harmless — NOT evidence of CPU pressure — so a
+/// threshold of `1` would false-alarm on every ordinary session. #641 measured genuinely
+/// CPU-starved zone-ins producing bursts of 100-200; this is set low enough to catch the ONSET of a
+/// real burst rather than wait for it to finish, while still requiring more than one stray event.
+pub const SEND_PRESSURE_FIRE_THRESHOLD: u64 = 5;
+
+/// #656: is the client's outbound send path starved RIGHT NOW — i.e. is a
+/// `send_wouldblock_rescued`/`send_deferred` burst happening currently, as opposed to having
+/// happened at some point in the past? Pure so the fire/clear boundary is unit-testable without a
+/// socket or a live burst; `HttpState::health()` is the sole production caller, feeding it
+/// `NetHealth::send_pressure_streak` and the age of `NetHealth::last_send_pressure_at` measured at
+/// HTTP READ time (never cached — #343's rule for every age in this payload).
+///
+/// This is the previously-missing ALERT #656 asked for. `send_wouldblock_rescued`/`send_deferred`
+/// are cumulative since process start and can only grow, so before this nothing could tell "was
+/// starved once, an hour ago" from "is starved right now" — an agent polling `/v1/observe/debug`
+/// had no way to know whether a climbing `send_deferred` meant anything was currently wrong.
+///
+/// Fires only once BOTH hold:
+///   - the current burst has reached [`SEND_PRESSURE_FIRE_THRESHOLD`] consecutive events (filters
+///     out the single-stray-`WouldBlock`-after-connect case, which is documented normal behavior,
+///     not CPU pressure); AND
+///   - the most recent pressure event is still within [`SEND_PRESSURE_BURST_GAP_SECS`] — so the
+///     alert CLEARS on its own once the burst ends, rather than latching forever. This is exactly
+///     what #656 asked for: a RATE/recency signal derived from the lifetime counters, not another
+///     lifetime counter that only ever grows.
+///
+/// `last_pressure_ago` is `None` before this process has ever recorded a pressure event — correctly
+/// reads as "not starved" (there is nothing to report yet, which is the honest healthy default).
+pub fn send_starved(streak: u64, last_pressure_ago: Option<std::time::Duration>) -> bool {
+    match last_pressure_ago {
+        None => false,
+        Some(ago) => {
+            streak >= SEND_PRESSURE_FIRE_THRESHOLD
+                && ago <= std::time::Duration::from_secs(SEND_PRESSURE_BURST_GAP_SECS)
         }
     }
 }
@@ -1820,6 +1914,110 @@ mod world_responsive_tests {
         // gone (#470) → condemn.
         assert!(!world_responsive(true, None, None, STALE, TIMEOUT, STALE),
             "at/after the passive bound with no probe ever, the prober is dead → zombie (#470)");
+    }
+}
+
+/// #656: the io-driver-starvation alert, tested as a pure function (`send_starved`) plus the
+/// `NetHealth::record_send_pressure` state machine that feeds it. These pin the fire/clear
+/// boundary the issue asked for: a signal that is TRUE while starvation is actually happening and
+/// CLEARS once it stops — never a lifetime count that only grows, and never one that never fires.
+#[cfg(test)]
+mod send_starved_tests {
+    use super::{send_starved, NetHealth, SEND_PRESSURE_BURST_GAP_SECS, SEND_PRESSURE_FIRE_THRESHOLD};
+    use std::time::{Duration, Instant};
+
+    fn s(secs: u64) -> Duration { Duration::from_secs(secs) }
+
+    // ── `send_starved` — the pure fire/clear predicate ──────────────────────────────────────────
+
+    /// Never having seen a pressure event at all must read as healthy — there is nothing to alert
+    /// on. This is the process-start / never-under-pressure default.
+    #[test]
+    fn no_pressure_event_ever_is_not_starved() {
+        assert!(!send_starved(0, None), "no pressure event ever recorded must read as healthy");
+        // Even a nonsensical nonzero streak with no timestamp must not fire — the age is what gates
+        // recency, and there is none to measure.
+        assert!(!send_starved(999, None));
+    }
+
+    /// THE fire case: a burst at/above the threshold, freshly stamped, must fire.
+    #[test]
+    fn a_fresh_burst_at_the_threshold_fires() {
+        assert!(send_starved(SEND_PRESSURE_FIRE_THRESHOLD, Some(s(0))),
+            "a burst that just reached the fire threshold, happening right now, must alert");
+    }
+
+    /// Below the threshold must NOT fire, no matter how fresh — this is the #603/#610 single-stray-
+    /// WouldBlock-after-connect case, which is documented normal behavior, not CPU pressure.
+    #[test]
+    fn below_the_threshold_never_fires_even_when_fresh() {
+        assert!(!send_starved(SEND_PRESSURE_FIRE_THRESHOLD - 1, Some(s(0))),
+            "one event short of the threshold must not alert even at zero age");
+        assert!(!send_starved(1, Some(s(0))),
+            "a single isolated pressure event must never fire — that is the documented harmless case");
+    }
+
+    /// THE clear case, mutation-checked: a burst that once reached the threshold, but whose most
+    /// recent event has aged past the burst-gap window, must have CLEARED — regardless of how large
+    /// the historical streak is. This is the field #656 exists to add: the previous counters
+    /// (`send_wouldblock_rescued`/`send_deferred`) can only grow and could never represent this.
+    #[test]
+    fn a_stale_burst_clears_regardless_of_streak_size() {
+        assert!(!send_starved(200, Some(s(SEND_PRESSURE_BURST_GAP_SECS + 1))),
+            "a burst of 200 events must still read as CLEARED once its most recent event is older \
+             than the burst-gap window — the alert must not latch on a historical peak");
+    }
+
+    /// Boundary: exactly at the burst-gap age still counts as "still going" (closed on the fire
+    /// side); one tick past it has cleared.
+    #[test]
+    fn burst_gap_boundary_is_closed_on_the_firing_side() {
+        assert!(send_starved(SEND_PRESSURE_FIRE_THRESHOLD, Some(s(SEND_PRESSURE_BURST_GAP_SECS))),
+            "age == the burst gap exactly must still count as within the burst");
+        assert!(!send_starved(SEND_PRESSURE_FIRE_THRESHOLD, Some(s(SEND_PRESSURE_BURST_GAP_SECS) + Duration::from_millis(1))),
+            "one instant past the burst gap must have cleared");
+    }
+
+    // ── `NetHealth::record_send_pressure` — the streak state machine ───────────────────────────
+
+    /// A run of events arriving well within the burst gap of each other must accumulate the streak,
+    /// not reset it — this is what lets a genuine ~10ms-cadence burst actually cross the fire
+    /// threshold instead of perpetually reading `streak == 1`.
+    #[test]
+    fn consecutive_events_within_the_gap_accumulate_the_streak() {
+        let mut h = NetHealth::default();
+        let base = Instant::now();
+        for i in 0..SEND_PRESSURE_FIRE_THRESHOLD {
+            h.record_send_pressure(base + Duration::from_millis(10 * i));
+        }
+        assert_eq!(h.send_pressure_streak, SEND_PRESSURE_FIRE_THRESHOLD,
+            "events 10ms apart (well under the multi-second burst gap) must all join one streak");
+        assert_eq!(h.last_send_pressure_at, Some(base + Duration::from_millis(10 * (SEND_PRESSURE_FIRE_THRESHOLD - 1))));
+    }
+
+    /// A gap longer than `SEND_PRESSURE_BURST_GAP_SECS` between two events must start a FRESH streak
+    /// at 1, not add to the old one — mutation check: an unconditional `+= 1` here would let an old,
+    /// long-finished burst's count silently carry forward into a new, unrelated single event and
+    /// falsely cross the fire threshold on its own over enough process lifetime.
+    #[test]
+    fn a_gap_past_the_burst_window_resets_the_streak_to_one() {
+        let mut h = NetHealth::default();
+        let base = Instant::now();
+        for i in 0..3 {
+            h.record_send_pressure(base + Duration::from_millis(10 * i));
+        }
+        assert_eq!(h.send_pressure_streak, 3, "fixture check: the first burst accumulated");
+
+        // The gap must be measured from the LAST recorded event (base + 20ms), not from `base` —
+        // otherwise this fixture doesn't actually exercise a stale gap at all.
+        let last_event = base + Duration::from_millis(20);
+        let after_gap = last_event + Duration::from_secs(SEND_PRESSURE_BURST_GAP_SECS) + Duration::from_millis(1);
+        h.record_send_pressure(after_gap);
+        assert_eq!(h.send_pressure_streak, 1,
+            "an event arriving after the burst gap has elapsed must start a NEW streak, not extend \
+             the old one — otherwise unrelated events far apart in time could sum past the fire \
+             threshold and falsely alert");
+        assert_eq!(h.last_send_pressure_at, Some(after_gap));
     }
 }
 

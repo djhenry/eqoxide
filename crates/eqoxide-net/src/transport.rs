@@ -954,6 +954,10 @@ impl EqStream {
                     Ok(n) => {
                         let mut h = self.net_health.lock().unwrap();
                         h.send_wouldblock_rescued = h.send_wouldblock_rescued.saturating_add(1);
+                        // #656: feed the io-starvation alert's burst/streak tracker. Must be called
+                        // from every increment site (this one and `defer_control`'s), or the alert
+                        // would silently stop seeing part of the signal it is meant to summarize.
+                        h.record_send_pressure(std::time::Instant::now());
                         Ok(n)
                     }
                     // A DOUBLE refusal: the direct `send(2)` is a real syscall, so this one is the
@@ -1075,6 +1079,9 @@ impl EqStream {
                 h.send_failures = h.send_failures.saturating_add(1);
                 h.send_failures_unretried = h.send_failures_unretried.saturating_add(1);
             }
+            // #656: the other increment site for the io-starvation burst/streak tracker — see the
+            // matching call in `attempt_send`'s WouldBlock-rescue branch.
+            h.record_send_pressure(std::time::Instant::now());
         }
         if overflowed {
             tracing::warn!(
@@ -2619,6 +2626,66 @@ mod tests {
         assert_eq!(p["send_failures_unretried"].as_u64(), Some(0));
         assert!(p["last_send_error"].is_null(),
             "nothing failed, so there is no last send error (#641). Body: {json}");
+        // #656: ONE rescued send is exactly the documented harmless single-`WouldBlock`-after-
+        // connect case (#603/#610), not evidence of a starved io driver — it must not alert.
+        assert_eq!(p["send_starved"].as_bool(), Some(false),
+            "a single rescued send must NOT alert send_starved — only a sustained burst does \
+             (#656). Body: {json}");
+    }
+
+    /// #656 — the io-starvation alert reaches the AGENT through the real `/v1/observe/debug` body,
+    /// not just an internal counter, and — the half #656 exists for — it CLEARS on its own once the
+    /// burst ends. `send_wouldblock_rescued`/`send_deferred` are cumulative and can only grow, so
+    /// before this an agent had no honest way to tell "starved right now" from "starved once, long
+    /// ago"; a `send_starved` that only ever turned true (or never turned true at all) would be
+    /// exactly the class of new-observable-that-never-clears the honesty invariant forbids.
+    ///
+    /// Drives a REAL `EqStream` through the #641 WouldBlock-rescue path enough times, back-to-back
+    /// with no `.await` between them (so the cold readiness cache stays cold for every iteration —
+    /// same fixture as `a_synthetically_blocked_ack_still_reaches_the_wire`), to cross
+    /// `SEND_PRESSURE_FIRE_THRESHOLD` — a real burst, not a manufactured field. Then backdates the
+    /// burst's last-event clock past `SEND_PRESSURE_BURST_GAP_SECS`, exactly as an idle net thread
+    /// would age it in real play once the pressure stops, and asserts the SAME endpoint now reads
+    /// clear.
+    #[tokio::test]
+    async fn a_send_pressure_burst_alerts_send_starved_then_clears_once_it_ends() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+        // DELIBERATELY no `stream.socket.writable().await` — cold cache, same as the #641 fixture.
+
+        for i in 0..eqoxide_ipc::SEND_PRESSURE_FIRE_THRESHOLD {
+            stream.send_ack(0x0100 + i as u16);
+        }
+        {
+            let h = *net_health.lock().unwrap();
+            assert!(h.send_wouldblock_rescued >= eqoxide_ipc::SEND_PRESSURE_FIRE_THRESHOLD,
+                "FIXTURE CHECK: this test needs a real burst of synthetically-rescued sends, not a \
+                 warm cache that made them all succeed outright (#656)");
+            assert_eq!(h.send_pressure_streak, eqoxide_ipc::SEND_PRESSURE_FIRE_THRESHOLD,
+                "FIXTURE CHECK: every one of these back-to-back rescues must land in the SAME \
+                 streak (#656)");
+        }
+
+        let state = eqoxide_http::testkit::empty_state_with_net_health(net_health.clone());
+        let json = eqoxide_http::testkit::debug_json(state).await;
+        assert_eq!(json["player"]["send_starved"].as_bool(), Some(true),
+            "a real burst at the fire threshold, still fresh, must alert send_starved (#656). \
+             Body: {json}");
+
+        // The burst has ENDED — simulate the gap window having elapsed, exactly as a real idle
+        // net thread would age this clock once the pressure genuinely stops.
+        {
+            let mut h = net_health.lock().unwrap();
+            h.last_send_pressure_at = Some(
+                std::time::Instant::now()
+                    - std::time::Duration::from_secs(eqoxide_ipc::SEND_PRESSURE_BURST_GAP_SECS + 5),
+            );
+        }
+        let state = eqoxide_http::testkit::empty_state_with_net_health(net_health.clone());
+        let json = eqoxide_http::testkit::debug_json(state).await;
+        assert_eq!(json["player"]["send_starved"].as_bool(), Some(false),
+            "once the burst has aged past the gap window, send_starved MUST clear — a signal that \
+             never clears is worse than the prose it replaced (#656 issue text). Body: {json}");
     }
 
     /// #641, the OTHER half — the half the raw-`send(2)` rescue does NOT cover.
