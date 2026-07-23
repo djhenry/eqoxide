@@ -42,6 +42,13 @@ use eqoxide_core::physics::{RUN_SPEED, WALK_SPEED};
 /// a real corner cut and never on merely hugging a straight wall — the over-tightening #685 must avoid.
 const STEER_LOS_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS;
 
+/// Buffer (beyond the body radius) the committed coarse route is inflated OFF convex wall corners by,
+/// so the walker takes one smooth wider arc with clearance rather than hugging/wiggling the apex
+/// (#685, owner-directed). Modest by design: `radius(1) + buffer(2) = 3u` desired wall clearance, well
+/// under the clearance field's 4u spoke horizon, and bounded per-waypoint by the opposite wall so a
+/// narrow corridor is centred, never widened into the far wall. See `Collision::inflate_route_off_corners`.
+const CORNER_BUFFER: f32 = 2.0;
+
 /// The nav state published while this client has NO collision grid for the current zone — the
 /// terrain assets are still loading, or their load failed (#579). It is NOT `blocked` (there is no
 /// obstacle), NOT `no_path` (no search was ever run) and above all NOT `navigating`: the honest
@@ -504,6 +511,15 @@ impl Walker {
         }));
     }
 
+    /// #685 (owner-directed): inflate a freshly-committed coarse route OFF convex wall corners, so the
+    /// walker steers one smooth wider arc with clearance instead of hugging/wiggling the apex. Uses the
+    /// zone clearance spokes via `Collision::inflate_route_off_corners`; a no-op when no grid is loaded.
+    fn inflate_committed(&self, route: &mut [[f32; 3]]) {
+        if let Some(c) = self.collision.read().unwrap().as_ref() {
+            c.inflate_route_off_corners(route, eqoxide_core::physics::PLAYER_RADIUS, CORNER_BUFFER);
+        }
+    }
+
     /// Apply a finished plan from the worker thread. Returns `true` when the tick must STOP here —
     /// the plan was terminal (no route / gave up) or redirected the goto through a portal.
     pub fn apply_plan(
@@ -558,6 +574,8 @@ impl Walker {
             PlanOutcome::Route(path) => {
                 tracing::info!("NAV: plan #{} → ROUTE to ({:.0},{:.0}) = {} waypoints ({}ms, off the net thread)",
                     reply.gen, goal.0, goal.1, path.len(), reply.plan_ms);
+                let mut path = path;
+                self.inflate_committed(&mut path); // #685: push the route off convex corners (owner)
                 self.path = path;
                 self.path_i = 0;
                 self.stuck_i = 0;
@@ -578,6 +596,8 @@ impl Walker {
                     ({:.0},{:.0}) and re-planning from its end. This is NOT a route to the goal.",
                     reply.gen, limit.as_str(), reply.plan_ms, path.len(), goal.0, goal.1);
                 gs.log_msg("zone", "Planner gave up before finding a full route — walking as far as it can, then re-planning");
+                let mut path = path;
+                self.inflate_committed(&mut path); // #685: push the partial route off convex corners too
                 self.path = path;
                 self.path_i = 0;
                 self.stuck_i = 0;
