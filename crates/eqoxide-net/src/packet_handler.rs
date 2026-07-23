@@ -919,9 +919,15 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         // floor-tier mismatch that wedges nav). Floating entities — boats AND Flying mobs — skip the
         // server's Z-offset (Mob::FixZ early-returns for GetIsBoat + flymode==Flying), so their wire
         // z is already at the reported datum; don't shift them (boats would sink; flying NPCs would
-        // read 3u low — #548). `e.floating` was classified at spawn from flymode/race and persists
-        // here because position updates carry no flymode.
-        e.z = eqoxide_core::coord::wire_z_to_foot(upd.z, e.floating);
+        // read 3u low — #548). We derive the skip from the entity's CURRENT is_boat+flymode (kept
+        // live by the OP_SpawnAppearance type-19 handler, #578), NOT a frozen bool. NB this uses the
+        // POSITION-UPDATE rule, which SUBTRACTS for Levitating(2): a Levitating NPC only sends
+        // position updates while patrolling, and the server bakes GetZOffset into a patrolling
+        // Levitator's z via UpdatePathGround (Mob::FixZ early-returns only for Flying, not Levitating)
+        // — so its update z, unlike its stationary spawn z, carries the offset (#578 residual b).
+        e.z = eqoxide_core::coord::wire_z_to_foot(
+            upd.z,
+            eqoxide_core::coord::position_update_skips_wire_z_offset(e.is_boat, e.flymode));
         e.heading = upd.heading;
         // #643: a position update carries GAIT (a speed code), NOT a pose. It goes in its own
         // typed field; `e.pose` is deliberately left alone here. Before the split these shared
@@ -2281,6 +2287,10 @@ fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
     let param = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
     const ANIMATION: u16 = 14;
     const SITTING:   u32 = 110;
+    // AppearanceType::FlyMode (EQEmu `common/eq_constants.h`) — `param` carries the GravityBehavior
+    // code (Ground=0/Flying=1/Levitating=2/…). Handled for our own spawn (levitate model, #529) and
+    // for remote spawns (wire-Z datum refresh, #578).
+    const FLY_MODE_KIND: u16 = 19;
     if kind == ANIMATION && id == gs.player_id {
         gs.sitting = param == SITTING;
     }
@@ -2305,6 +2315,28 @@ fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
             }
         }
     }
+    // #578: AT_FlyMode (19) about ANOTHER spawn is the server's runtime GravityBehavior broadcast —
+    // the ONLY channel by which a remote NPC/PC's flymode change (a Levitate/Flight buff landing or
+    // fading, a `#set flymode`) reaches us after it spawned. EQEmu broadcasts it to nearby clients
+    // via SendAppearancePacket (`zone/mob.cpp`), the 8-byte SpawnAppearance struct carrying the
+    // GravityBehavior code in `param`. We refresh the entity's cached `flymode` so its wire-Z datum
+    // (Entity::floating / the position-update conversion) and render floor-snap are recomputed from
+    // the CURRENT state — before #578 the classification was frozen at spawn, so a mob that took off
+    // or landed mid-session kept the wrong Z datum and reported a height it wasn't at (agent-honesty).
+    // The already-stored `e.z` is left as-is: it was correctly converted to FOOT under the old datum
+    // and the entity has not physically moved; only how FUTURE wire z is interpreted changes here.
+    if kind == FLY_MODE_KIND && id != gs.player_id {
+        if let Some(e) = gs.world.entities.get_mut(&id) {
+            let old = e.flymode;
+            e.flymode = param as u8;
+            if old != e.flymode {
+                tracing::info!(
+                    "EQ: spawn {} ('{}') FlyMode {} → {} (floating {} → {}) [#578]",
+                    id, e.name, old, e.flymode,
+                    eqoxide_core::coord::skips_wire_z_offset(e.is_boat, old), e.floating());
+            }
+        }
+    }
     // Guild membership reflect (#295): the server pushes our own guild id/rank as SpawnAppearance
     // kinds when membership changes (e.g. a GM `#guild add/remove`), with no client action. Applying
     // them here keeps /observe/debug's guild identity live without any guild-specific opcode. Only
@@ -2325,12 +2357,11 @@ fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
         // The mid-zone cast-ON is NOT observable here — it arrives on the buff channel instead and
         // is decoded by `apply_buff` / `apply_buff_create` via SPA 57 (#586). The two channels are
         // separate fields inside `GameState::levitate`; neither can clobber the other.
-        const FLY_MODE: u16 = 19;
         match kind {
             GUILD_ID   => { gs.player_guild_id = param;
                             tracing::info!("EQ: guild membership changed → guild_id={}", param); }
             GUILD_RANK => { gs.player_guild_rank = param; }
-            FLY_MODE   => { gs.levitate.set_flymode(eqoxide_core::coord::is_levitating_flymode(param as u8));
+            FLY_MODE_KIND => { gs.levitate.set_flymode(eqoxide_core::coord::is_levitating_flymode(param as u8));
                             tracing::info!("EQ: self FlyMode appearance param={} → levitating={}",
                                            param, gs.player_levitating()); }
             _ => {}
@@ -2933,11 +2964,12 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     // (see the else-branch in apply_position_update for the full rationale). Boats AND Flying mobs
     // skip the server Z-offset (Mob::FixZ early-returns for both — GetIsBoat + flymode==Flying), so
     // their wire z is already at the reported datum — leave it (#548: flying NPCs were 3u low because
-    // only boats were excepted). Classified once here and persisted on the Entity, because ongoing
-    // position updates carry no flymode.
-    let floating = eqoxide_core::coord::skips_wire_z_offset(
-        crate::protocol::is_boat_race(info.race), info.flymode);
-    let z_foot = eqoxide_core::coord::wire_z_to_foot(info.z, floating);
+    // only boats were excepted). We store the RAW inputs (is_boat + current flymode) on the Entity;
+    // the floating classification is DERIVED from them (`Entity::floating`) so a later flymode change
+    // (OP_SpawnAppearance type-19) refreshes it instead of it being frozen here (#578).
+    let is_boat = crate::protocol::is_boat_race(info.race);
+    let z_foot = eqoxide_core::coord::wire_z_to_foot(
+        info.z, eqoxide_core::coord::skips_wire_z_offset(is_boat, info.flymode));
     gs.upsert_entity(Entity {
         spawn_id:       info.spawn_id,
         name:           info.name,
@@ -2950,7 +2982,8 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         cur_hp:         if is_corpse { 0 } else { info.cur_hp as i32 },
         max_hp:         100, // RoF2 spawn has no separate max_hp; treat as percent
         race:           eq_race_to_code(info.race).to_string(),
-        floating,
+        is_boat,
+        flymode:        info.flymode,
         heading:        info.heading,
         dead:           is_corpse,
         equipment:      info.equipment,
@@ -3110,7 +3143,7 @@ mod tests {
             x: 0.0, y: 0.0, z: 0.0, hp_pct, cur_hp: 100, max_hp: 100,
             race: String::new(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0, haircolor: 0, pose: Pose::Standing, gait: None, floating: false,
+            face: 0, hairstyle: 0, haircolor: 0, pose: Pose::Standing, gait: None, is_boat: false, flymode: 0,
         }
     }
 
@@ -5232,7 +5265,7 @@ mod tests {
         register_spawn(&mut gs, mk(3, eqoxide_core::coord::FLYMODE_LEVITATING)); // levitating
 
         let ground = gs.world.entities.get(&1).expect("grounded NPC registered");
-        assert!(!ground.floating, "flymode 0 → not floating");
+        assert!(!ground.floating(), "flymode 0 → not floating");
         assert!((ground.z - (100.0 - OFF)).abs() < 1e-3,
             "grounded spawn z must be wire−WIRE_Z_OFFSET (FOOT), got {}", ground.z);
 
@@ -5240,7 +5273,7 @@ mod tests {
         // lowered by the offset. Reverting the fix (subtracting for these) turns these RED.
         for (id, kind) in [(2u32, "flying"), (3u32, "levitating")] {
             let e = gs.world.entities.get(&id).unwrap_or_else(|| panic!("{kind} NPC registered"));
-            assert!(e.floating, "{kind} → floating (skips server Z-offset)");
+            assert!(e.floating(), "{kind} → floating (skips server Z-offset)");
             assert!((e.z - 100.0).abs() < 1e-3,
                 "{kind} spawn z must be the wire z unshifted (#548), got {} (bug would give {})",
                 e.z, 100.0 - OFF);
@@ -5254,6 +5287,91 @@ mod tests {
         assert!((gs.world.entities[&2].z - 120.0).abs() < 0.2,
             "flying position update passes wire z through unshifted (#548), got {}",
             gs.world.entities[&2].z);
+    }
+
+    /// Builds a minimal remote NPC spawn at a given flymode (id, z, flymode) for the #578 tests.
+    #[cfg(test)]
+    fn mk_flymode_spawn(spawn_id: u32, z: f32, flymode: u8) -> crate::protocol::SpawnInfo {
+        crate::protocol::SpawnInfo {
+            spawn_id, name: format!("mob{spawn_id}"), last_name: String::new(),
+            level: 5, npc: 1, gender: 0, race: 54, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0,
+            body_type: 1, cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
+            stand_state: 100, flymode, pet_owner_id: 0, player_state: 64,
+            x: 50.0, y: -60.0, z, heading: 0.0, animation: 100,
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+        }
+    }
+
+    #[test]
+    fn runtime_flymode_change_refreshes_z_datum_578() {
+        // #578 residual (a) (agent-honesty): a remote entity that toggles flymode mid-session via
+        // OP_SpawnAppearance type-19 (FlyMode) must have its wire-Z datum RECOMPUTED — not left frozen
+        // at its spawn-time classification. Before #578, `floating` was a cached bool the type-19
+        // handler didn't touch (it only handled OUR OWN spawn), so a mob that took off kept the
+        // grounded datum and reported a height ~3u off, a falsehood the agent can't detect.
+        use super::{register_spawn, apply_spawn_appearance, apply_position_update};
+        use crate::protocol::{build_spawn_appearance_packet, encode_position_update};
+        use eqoxide_core::coord::{FLYMODE_FLYING, WIRE_Z_OFFSET as OFF};
+
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        register_spawn(&mut gs, mk_flymode_spawn(2, 100.0, 0)); // a grounded NPC
+        assert!(!gs.world.entities[&2].floating(), "starts grounded");
+        assert!((gs.world.entities[&2].z - (100.0 - OFF)).abs() < 1e-3,
+            "grounded spawn z is wire−offset (FOOT)");
+
+        // It TAKES OFF: server broadcasts type-19 FlyMode(Flying) for spawn 2.
+        apply_spawn_appearance(&mut gs, &build_spawn_appearance_packet(2, 19, FLYMODE_FLYING as u32));
+        assert_eq!(gs.world.entities[&2].flymode, FLYMODE_FLYING, "cached flymode refreshed");
+        assert!(gs.world.entities[&2].floating(),
+            "#578(a): floating() flips to true from the CURRENT flymode after take-off");
+
+        // A subsequent position update must now decode at the AIRBORNE datum (unshifted), not the
+        // stale grounded one. This is the load-bearing assertion — reverting the type-19 remote
+        // handler leaves flymode==0, so this stays wire−offset and goes RED.
+        apply_position_update(&mut gs, &encode_position_update(2, 50.0, -60.0, 150.0, 0.0));
+        assert!((gs.world.entities[&2].z - 150.0).abs() < 0.2,
+            "after take-off, the airborne update z passes through unshifted, got {} (stale-datum bug \
+             would give {})", gs.world.entities[&2].z, 150.0 - OFF);
+
+        // And it LANDS again (FlyMode → Ground): the datum must return to grounded (offset subtracted).
+        apply_spawn_appearance(&mut gs, &build_spawn_appearance_packet(2, 19, 0));
+        assert!(!gs.world.entities[&2].floating(), "landing flips floating() back to false");
+        apply_position_update(&mut gs, &encode_position_update(2, 50.0, -60.0, 150.0, 0.0));
+        assert!((gs.world.entities[&2].z - (150.0 - OFF)).abs() < 0.2,
+            "after landing, the grounded update z is shifted wire−offset again, got {}",
+            gs.world.entities[&2].z);
+
+        // A type-19 about ANOTHER spawn id must not touch spawn 2, and our own id is handled by the
+        // self branch (levitate model), never as an entity.
+        register_spawn(&mut gs, mk_flymode_spawn(3, 100.0, 0));
+        apply_spawn_appearance(&mut gs, &build_spawn_appearance_packet(2, 19, FLYMODE_FLYING as u32));
+        assert_eq!(gs.world.entities[&3].flymode, 0, "another spawn's FlyMode must not leak across ids");
+    }
+
+    #[test]
+    fn patrolling_levitating_npc_update_subtracts_offset_578() {
+        // #578 residual (b): EQEmu's Mob::FixZ early-returns only for Flying(1), NOT Levitating(2).
+        // A stationary-hover Levitator's SPAWN z has no offset (correctly skipped, #548), but once it
+        // PATROLS the server bakes GetZOffset into its position via UpdatePathGround — so its update z
+        // carries the offset and must be subtracted, or it renders/reports ~3u too HIGH.
+        use super::{register_spawn, apply_position_update};
+        use crate::protocol::encode_position_update;
+        use eqoxide_core::coord::{FLYMODE_LEVITATING, WIRE_Z_OFFSET as OFF};
+
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk_flymode_spawn(7, 100.0, FLYMODE_LEVITATING));
+        // Spawn (stationary hover): z passes through unshifted — the #548 behavior, preserved.
+        assert!(gs.world.entities[&7].floating(), "levitating → floating for render (hovers)");
+        assert!((gs.world.entities[&7].z - 100.0).abs() < 1e-3,
+            "levitating SPAWN z stays unshifted (stationary hover, no offset)");
+
+        // Now it PATROLS: a position update arrives. Its wire z HAS the offset baked in → subtract it.
+        apply_position_update(&mut gs, &encode_position_update(7, 60.0, -70.0, 150.0, 0.0));
+        assert!((gs.world.entities[&7].z - (150.0 - OFF)).abs() < 0.2,
+            "#578(b): a patrolling Levitator's update z is shifted wire−offset, got {} (the residual \
+             bug — treating it like the spawn hover — would give {})",
+            gs.world.entities[&7].z, 150.0);
     }
 
     #[test]
@@ -6889,7 +7007,7 @@ mod tests {
         // Register an NPC entity with id=42
         gs.world.entities.insert(42, Entity {
             spawn_id: 42, name: "Orc Pawn".into(),
-            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, pose: Pose::Standing, gait: None, floating: false,
+            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, pose: Pose::Standing, gait: None, is_boat: false, flymode: 0,
             level: 5, is_npc: true, gender: 0, race: "ORC".into(),
             cur_hp: 50, max_hp: 100, hp_pct: 50.0,
             dead: false,

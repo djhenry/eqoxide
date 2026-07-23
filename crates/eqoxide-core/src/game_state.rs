@@ -160,15 +160,37 @@ pub struct Entity {
     /// Server-published GAIT (locomotion speed code) from the most recent `OP_ClientUpdate`.
     /// `None` until this entity has sent one — "not reported", not "stationary" (#643).
     pub gait: Option<Gait>,
-    /// True for boat/ship races: they float on the water surface and are exempt from the render
-    /// floor-snap (matching the server's `Mob::FixZ` boat skip) so they don't sink (#194).
-    pub floating: bool,
+    /// True for boat/ship races (`is_boat_race`): their wire z sits at the water surface with no
+    /// server Z-offset (`Mob::FixZ` early-returns for `GetIsBoat`), and they're exempt from the
+    /// render floor-snap so they don't sink (#194). Fixed for the entity's lifetime (race never
+    /// changes) — unlike [`Entity::flymode`].
+    pub is_boat: bool,
+    /// The entity's CURRENT `flymode`/GravityBehavior wire code (Ground=0, Flying=1, Levitating=2,
+    /// …). Seeded at spawn and **refreshed at runtime** by `OP_SpawnAppearance` type-19 (FlyMode) —
+    /// so a mob that takes off or lands mid-session is reflected here, and every flymode-dependent
+    /// decision (the wire-Z datum in [`Entity::floating`], the render floor-snap) is recomputed from
+    /// the current value rather than frozen at spawn (#578). Before #578 this classification was a
+    /// cached `floating: bool` that a later flymode change could not update — a stale, agent-facing
+    /// Z falsehood.
+    pub flymode: u8,
 }
 
 impl Entity {
     #[allow(dead_code)]
     pub fn dist_to(&self, x: f32, y: f32, z: f32) -> f32 {
         ((self.x - x).powi(2) + (self.y - y).powi(2) + (self.z - z).powi(2)).sqrt()
+    }
+
+    /// The spawn/render "skips the server Z-offset & isn't floor-snapped" classification, **derived
+    /// from the entity's CURRENT [`flymode`](Entity::flymode)** rather than stored — so a runtime
+    /// flymode change (`OP_SpawnAppearance` type-19) is honored automatically, with no cached bool to
+    /// go stale (#578). Boats and airborne (Flying/Levitating) mobs hover and carry no server
+    /// Z-offset on their spawn z (#194/#548). NB: this is the SPAWN/RENDER rule (Levitating included);
+    /// the POSITION-UPDATE Z conversion uses the stricter
+    /// [`coord::position_update_skips_wire_z_offset`](crate::coord::position_update_skips_wire_z_offset),
+    /// because a *patrolling* Levitating NPC's update z DOES carry the offset (#578 residual b).
+    pub fn floating(&self) -> bool {
+        crate::coord::skips_wire_z_offset(self.is_boat, self.flymode)
     }
 }
 
@@ -1769,7 +1791,7 @@ pub fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) ->
         dead: false,
         equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
         face: 0, hairstyle: 0, haircolor: 0,
-        pose: Pose::Standing, gait: None, floating: false,
+        pose: Pose::Standing, gait: None, is_boat: false, flymode: 0,
     }
 }
 

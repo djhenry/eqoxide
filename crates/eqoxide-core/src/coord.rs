@@ -46,8 +46,10 @@ pub const WIRE_Z_OFFSET: f32 = 3.125;
 /// both Flying and Levitating NPCs is a stationary hover that never routes through the offset-adding
 /// path at all. So Flying(1) and Levitating(2) wire z is already at the reported datum and must NOT
 /// have `WIRE_Z_OFFSET` subtracted on ingest — otherwise they decode ~3u LOW (#548, an agent-honesty
-/// falsehood). (Residual: a rare *patrolling* Levitating NPC does get the offset baked in mid-route,
-/// so the static rule under-corrects for that case — accepted, per the EQEmu source review.)
+/// falsehood). A rare *patrolling* Levitating NPC DOES get the offset baked in mid-route; the SPAWN
+/// rule here still skips it (stationary-hover assumption), but its position updates are handled by
+/// the stricter [`position_update_skips_wire_z_offset`], which subtracts for a moving Levitator
+/// (#578 residual b — no longer an accepted under-correction).
 pub const FLYMODE_FLYING: u8 = 1;
 /// See [`FLYMODE_FLYING`]. Levitating airborne mobs are excepted from the Z-offset the same way.
 pub const FLYMODE_LEVITATING: u8 = 2;
@@ -70,11 +72,39 @@ pub fn is_levitating_flymode(flymode: u8) -> bool {
 /// True when an entity's wire z is already at the reported datum (no server `GetZOffset` baked in),
 /// so it must be stored as-is on ingest (no `WIRE_Z_OFFSET` shift) and not floor-snapped by the
 /// renderer: boats (`is_boat`, keyed off race — `Mob::FixZ` early-returns for `GetIsBoat`) and
-/// airborne mobs (`flymode` Flying/Levitating — see [`FLYMODE_FLYING`]). This is the
-/// `Entity.floating` classification — computed once at spawn and reused for every later position
-/// update, which carry no flymode of their own.
+/// airborne mobs (`flymode` Flying/Levitating — see [`FLYMODE_FLYING`]). This backs the
+/// `Entity::floating` classification — DERIVED from the entity's CURRENT `flymode` (refreshed at
+/// runtime by `OP_SpawnAppearance` type-19, #578), NOT frozen at spawn. Position updates carry no
+/// flymode of their own, so their Z conversion reads the cached `flymode` via the sibling
+/// [`position_update_skips_wire_z_offset`].
 pub fn skips_wire_z_offset(is_boat: bool, flymode: u8) -> bool {
     is_boat || flymode == FLYMODE_FLYING || flymode == FLYMODE_LEVITATING
+}
+
+/// Whether a **position update's** wire z is already at the reported datum (no server `GetZOffset`
+/// baked in), so it must be stored as-is rather than shifted `−WIRE_Z_OFFSET`. This is the SIBLING
+/// of [`skips_wire_z_offset`] for the ongoing-movement path, and it deliberately differs for
+/// **Levitating(2)**:
+///
+/// `Mob::FixZ`/`GetFixedZ` early-return **only** for `GetIsBoat` and `flymode==Flying(1)` (EQEmu
+/// `zone/waypoints.cpp:788-790,836-842`) — Levitating is NOT excepted. So a Levitating NPC that is
+/// actively **patrolling** is routed through `UpdatePathGround` (`zone/mob_movement_manager.cpp:1090-1099`,
+/// `opts.offset = GetZOffset()`), which bakes `+3.125` into every position it broadcasts, exactly
+/// like a Ground NPC. A *stationary-hover* Levitating NPC never moves, so it sends no position
+/// updates at all — meaning the mere existence of a position update for a Levitating entity is the
+/// movement signal that it went through the offset-adding path. We therefore SKIP the offset for a
+/// Levitating spawn z (via [`skips_wire_z_offset`], the stationary-hover case) but SUBTRACT it on its
+/// position updates (this function, the patrol case) — resolving the #578 residual where a patrolling
+/// Levitator rendered/reported ~3u too high.
+///
+/// Boats and Flying(1) skip on BOTH paths: `Mob::FixZ` early-returns for both, and a Flying NPC
+/// pursuing a target is `PushFlyTo`'d to a raw destination with no offset
+/// (`mob_movement_manager.cpp:1070-1077`). (Accepted residual, per EQEmu source review: a Flying NPC
+/// that patrols with no line-of-sight target instead falls through `UpdatePathGround` and would
+/// carry the offset — rare, and indistinguishable on the wire; we keep Flying an unconditional skip
+/// to match `FixZ`'s literal `== Flying` check.)
+pub fn position_update_skips_wire_z_offset(is_boat: bool, flymode: u8) -> bool {
+    is_boat || flymode == FLYMODE_FLYING
 }
 
 /// Convert an inbound wire z (model-origin datum, `foot + WIRE_Z_OFFSET`) to eqoxide's internal FOOT
@@ -92,4 +122,44 @@ pub fn wire_z_to_foot(wire_z: f32, floating: bool) -> f32 {
 /// at (east, north) = (-sinθ, cosθ), so θ = atan2(-east, north).
 pub fn eq_heading(d_east: f32, d_north: f32) -> f32 {
     (-d_east).atan2(d_north).to_degrees().rem_euclid(360.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #578 residual (b): the SPAWN/render rule and the POSITION-UPDATE rule agree on everything
+    /// EXCEPT Levitating(2). A stationary-hover Levitator's spawn z has no offset (skip), but a
+    /// patrolling Levitator's update z has GetZOffset baked in by UpdatePathGround (subtract). Flying
+    /// and boats skip on both paths; Ground subtracts on both. Pinning the divergence here makes the
+    /// #578 fix a pure-function property: revert `position_update_skips_wire_z_offset` back to
+    /// `skips_wire_z_offset` and the Levitating case flips → RED.
+    #[test]
+    fn position_update_rule_diverges_from_spawn_rule_only_for_levitating() {
+        // Ground: subtract on both.
+        assert!(!skips_wire_z_offset(false, 0));
+        assert!(!position_update_skips_wire_z_offset(false, 0));
+        // Flying: skip on both (Mob::FixZ early-returns for Flying unconditionally).
+        assert!(skips_wire_z_offset(false, FLYMODE_FLYING));
+        assert!(position_update_skips_wire_z_offset(false, FLYMODE_FLYING));
+        // Boat: skip on both (keyed off race, not movement).
+        assert!(skips_wire_z_offset(true, 0));
+        assert!(position_update_skips_wire_z_offset(true, 0));
+        // Levitating: THE divergence — spawn skips (stationary hover), patrol update subtracts.
+        assert!(skips_wire_z_offset(false, FLYMODE_LEVITATING),
+            "a stationary Levitating spawn z carries no offset — skip");
+        assert!(!position_update_skips_wire_z_offset(false, FLYMODE_LEVITATING),
+            "#578(b): a PATROLLING Levitator's update z has GetZOffset baked in — must subtract");
+    }
+
+    /// #578 residual (a) at the datum level: the Z-datum decision is a pure function of the CURRENT
+    /// flymode, so flipping flymode flips the treatment. This is the property that makes a runtime
+    /// change honorable — nothing about the datum is frozen once flymode is known.
+    #[test]
+    fn z_datum_is_a_pure_function_of_current_flymode() {
+        // Ground → subtract; take off (Flying) → skip; land again (Ground) → subtract.
+        assert_eq!(wire_z_to_foot(100.0, skips_wire_z_offset(false, 0)), 100.0 - WIRE_Z_OFFSET);
+        assert_eq!(wire_z_to_foot(100.0, skips_wire_z_offset(false, FLYMODE_FLYING)), 100.0);
+        assert_eq!(wire_z_to_foot(100.0, skips_wire_z_offset(false, 0)), 100.0 - WIRE_Z_OFFSET);
+    }
 }
