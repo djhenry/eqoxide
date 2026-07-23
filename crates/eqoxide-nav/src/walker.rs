@@ -790,14 +790,14 @@ impl Walker {
     /// `wish_dir` (+ facing) — the flags/speed the walker set stay.
     pub fn apply_fast_steering(&mut self, gs: &mut GameState) {
         if !self.local_path.is_empty() && self.nav.goto_target.lock().unwrap().is_some() {
-            // LOS clamp (#685): the fast loop is what the controller actually heads at between plan
-            // gates, so the corner-cut guard must be here too. Hold ONE read guard for the call; the
-            // predicate is clear when no collision grid is loaded (the aim then degrades gracefully).
-            let coll = self.collision.read().unwrap();
-            let los = |a: [f32; 3], b: [f32; 3]|
-                coll.as_ref().map_or(true, |c| c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE));
+            // NO LOS clamp in the ~10ms fast loop (#685, owner): with the coarse route now INFLATED off
+            // convex corners (`inflate_route_off_corners`), the fine path the fast loop pursues no
+            // longer grazes a corner, so a clamp here is redundant — and clamping the carrot every
+            // ~10ms at an apex is exactly the "wiggle through each corner, sloppy and slow" the owner
+            // saw. The route offset removes the CAUSE; the light backstop clamp stays only on the 150ms
+            // coarse tick (`steer_target`), never in this hot loop. So the fast aim is plain pursuit.
             if let Some((wish_dir, heading)) =
-                fast_steer_aim(&self.local_path, &mut self.local_i, [gs.player_x, gs.player_y, gs.player_z], 5.0, los)
+                fast_steer_aim(&self.local_path, &mut self.local_i, [gs.player_x, gs.player_y, gs.player_z], 5.0, |_, _| true)
             {
                 if let Some(intent) = self.nav_intent.lock().unwrap().as_mut() {
                     intent.wish_dir = wish_dir;

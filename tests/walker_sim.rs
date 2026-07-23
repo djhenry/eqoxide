@@ -1150,6 +1150,7 @@ fn corner_buffer_blast_radius() {
 
     let (mut g_pairs, mut g_both, mut g_broken, mut g_gained, mut g_smoothed) = (0usize, 0usize, 0usize, 0usize, 0usize);
     let (mut g_ticks_inf, mut g_ticks_plain) = (0u64, 0u64);
+    let (mut g_moved_wp, mut g_total_wp, mut g_routes_touched) = (0usize, 0usize, 0usize);
     let (mut g_turn_inf, mut g_turn_plain) = (0.0f64, 0.0f64);
     println!("\n=== #685 corner-buffer inflation blast radius (A/B: inflated route vs plain, LOS clamp on both) ===");
     println!("{:<12} {:>6} {:>5} {:>6} {:>6} {:>8} {:>9}", "zone", "pairs", "both", "broken", "gained", "smoothed", "slowdown");
@@ -1181,6 +1182,10 @@ fn corner_buffer_blast_radius() {
             let goal = *coarse.last().unwrap();
             let mut inflated = coarse.clone();
             col.inflate_route_off_corners(&mut inflated, PLAYER_RADIUS, CORNER_BUFFER);
+            let moved = coarse.iter().zip(inflated.iter())
+                .filter(|(a, b)| (a[0] - b[0]).hypot(a[1] - b[1]) > 0.05).count();
+            g_moved_wp += moved; g_total_wp += coarse.len();
+            if moved > 0 { g_routes_touched += 1; }
             let (arr_p, t_p, _wp, turn_p) = run(&col, &coarse, goal);
             let (arr_i, t_i, _wi, turn_i) = run(&col, &inflated, goal);
             if arr_p && !arr_i { z_broken += 1;
@@ -1203,6 +1208,7 @@ fn corner_buffer_blast_radius() {
     let turn_ratio = if g_turn_plain > 0.0 { g_turn_inf / g_turn_plain } else { 1.0 };
     println!("\nTOTAL pairs {g_pairs}  both-complete {g_both}  BROKEN {g_broken}  GAINED {g_gained}  SMOOTHED {g_smoothed}  \
              SLOWDOWN {slowdown:.4}  turning(inflated/plain) {turn_ratio:.3}");
+    println!("INFLATION FIRED: {g_routes_touched} of the sampled routes had >=1 waypoint moved; {g_moved_wp}/{g_total_wp} waypoints offset off a wall.");
     println!("(BROKEN must be 0 — a route the plain coarse route completed that inflation broke is a narrow-corridor \
              over-tightening. SLOWDOWN must be ~1.0. turning<1.0 and SMOOTHED>0 is the anti-wiggle win.)");
     assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
