@@ -49,6 +49,76 @@ fn material_anim(material: &gltf::Material) -> Option<(u32, Vec<String>)> {
     Some((ms, frames))
 }
 
+/// Alpha cutoff (in u8) for EQ MASK / alpha-test materials. The asset server bakes MASK materials
+/// with `alphaCutoff: 0.5`, and the zone shaders discard fragments whose texture alpha falls below
+/// it. 128 ≈ 0.5·255.
+const MASK_ALPHA_CUTOFF_U8: u8 = 128;
+
+/// Recover the transparency of a MASK (alpha-test) foliage texture that was baked without an
+/// alpha key.
+///
+/// EQ masked textures (tree canopies, branches) key out a single background color — classically
+/// palette index 0, which anchors the texture corners. The asset server normally converts that
+/// keyed color to alpha 0 during the bake. A few zone textures shipped a MASK material whose
+/// texture was never keyed (every texel alpha == 255): the alpha test then has nothing to discard,
+/// so the mesh renders as an OPAQUE rectangular block. This was visible on qeytoqrg's `treea.bmp`
+/// / `tree70.bmp` trees, while `bpine.bmp` / `gpine.bmp` (correctly keyed in the same GLB) rendered
+/// as see-through foliage (eqoxide#688).
+///
+/// This restores the intended cutout ON THE CLIENT, generically for any such texture:
+///  * `from_glb` calls it ONLY for textures used by a MASK material, so opaque geometry (walls,
+///    ground) can never be touched.
+///  * It is a NO-OP the moment the texture already has any sub-cutoff texel — a correctly keyed
+///    foliage texture is left byte-for-byte unchanged (so `bpine`/`gpine` are untouched).
+///  * It keys only when the corner (0,0) color is also the single most common color in the image
+///    (the signature of an un-keyed foliage-on-background texture), then zeroes the alpha of every
+///    texel exactly equal to that background color.
+///
+/// Returns the number of texels keyed transparent (0 = left unchanged).
+pub(crate) fn recover_masked_color_key(rgba: &mut [u8], width: u32, height: u32) -> usize {
+    let px = (width as usize) * (height as usize);
+    if px == 0 || rgba.len() < px * 4 {
+        return 0;
+    }
+
+    // Already keyed? Any texel below the mask cutoff means the bake did its job — leave it alone.
+    if rgba.chunks_exact(4).any(|t| t[3] < MASK_ALPHA_CUTOFF_U8) {
+        return 0;
+    }
+
+    // Corner (0,0) color — the classic EQ transparent key (palette index 0 anchors the border).
+    let corner = [rgba[0], rgba[1], rgba[2]];
+
+    // Only key if the corner color is the single most common RGB (a genuine background fill), so a
+    // MASK texture whose corner is an incidental detail color is never punched through.
+    let mut counts: std::collections::HashMap<[u8; 3], usize> = std::collections::HashMap::new();
+    for t in rgba.chunks_exact(4) {
+        *counts.entry([t[0], t[1], t[2]]).or_insert(0) += 1;
+    }
+    let (dominant, dom_count) = counts
+        .iter()
+        .max_by_key(|(_, &c)| c)
+        .map(|(k, &c)| (*k, c))
+        .unwrap_or(([0, 0, 0], 0));
+    if dominant != corner {
+        return 0;
+    }
+    // Guard against a texture with no real background majority (< 5% of texels).
+    if dom_count.saturating_mul(20) < px {
+        return 0;
+    }
+
+    // Zero the alpha of every texel matching the background key color.
+    let mut keyed = 0;
+    for t in rgba.chunks_exact_mut(4) {
+        if [t[0], t[1], t[2]] == corner {
+            t[3] = 0;
+            keyed += 1;
+        }
+    }
+    keyed
+}
+
 /// How a zone primitive is blended, derived from the glTF material's `alphaMode`
 /// (plus the `extras.eqAdditive` flag the asset server emits for EQ additive surfaces).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -214,6 +284,18 @@ impl ZoneAssets {
 
         let document = &gltf_doc.document;
 
+        // Image indices referenced by a MASK (alpha-test) material. Some server-baked GLBs ship a
+        // MASK foliage texture that was never alpha-keyed (every texel opaque) — the alpha test then
+        // discards nothing and the tree renders as an opaque block. `recover_masked_color_key`
+        // repairs those; we gate it to MASK-material textures so opaque geometry is never touched
+        // (eqoxide#688).
+        let masked_image_indices: std::collections::HashSet<usize> = document
+            .materials()
+            .filter(|m| m.alpha_mode() == gltf::material::AlphaMode::Mask)
+            .filter_map(|m| m.pbr_metallic_roughness().base_color_texture())
+            .map(|info| info.texture().source().index())
+            .collect();
+
         // Build texture list: name = the image's name field (lowercased EQ filename like "qcat0001.bmp").
         // Meshes link to textures by image NAME (via tex_index_to_name), not by index.
         let mut textures: Vec<TextureData> = Vec::new();
@@ -226,7 +308,7 @@ impl ZoneAssets {
                     continue;
                 }
             };
-            let rgba = match raw.format {
+            let mut rgba = match raw.format {
                 gltf::image::Format::R8G8B8A8 => raw.pixels.clone(),
                 gltf::image::Format::R8G8B8 => raw.pixels
                     .chunks(3)
@@ -237,6 +319,16 @@ impl ZoneAssets {
                     continue;
                 }
             };
+            // Repair un-keyed MASK foliage textures (see recover_masked_color_key / eqoxide#688).
+            if masked_image_indices.contains(&i) {
+                let keyed = recover_masked_color_key(&mut rgba, raw.width, raw.height);
+                if keyed > 0 {
+                    tracing::info!(
+                        "zone glb: masked texture '{}' had no alpha key — recovered {} transparent texels",
+                        img_name, keyed
+                    );
+                }
+            }
             textures.push(TextureData {
                 name: img_name,
                 width: raw.width,
@@ -537,6 +629,68 @@ mod tests {
         let (p2, _, _, idx2) = compact_primitive(pool.clone(), vec![[0.0,0.0,1.0];5], vec![[0.0,0.0];5], vec![2,2,4]);
         assert_eq!(p2.len(), 2, "the two distinct verts (2,4) → 2 outputs");
         assert_eq!(idx2, vec![0, 0, 1]);
+    }
+
+    // --- eqoxide#688: masked-foliage alpha-key recovery ---
+
+    /// Flatten a per-texel `[R,G,B,A]` list into a row-major RGBA byte buffer.
+    fn rgba_from(texels: &[[u8; 4]]) -> Vec<u8> {
+        texels.iter().flatten().copied().collect()
+    }
+
+    /// The repair case: a MASK foliage texture baked fully opaque (no alpha key) — the dominant
+    /// corner-anchored background is keyed transparent, leaf texels untouched. Reverting the fix
+    /// makes `keyed` 0, so this test is mutation-discriminating.
+    #[test]
+    fn recover_masked_color_key_repairs_unkeyed_foliage() {
+        let bg = [10u8, 20, 30, 255];       // corner + dominant background (12/16 texels)
+        let leaf = [200u8, 100, 50, 255];   // 4 interior leaf texels
+        let mut texels = vec![bg; 16];
+        for i in [5usize, 6, 9, 10] { texels[i] = leaf; }
+        let mut rgba = rgba_from(&texels);
+
+        let keyed = recover_masked_color_key(&mut rgba, 4, 4);
+        assert_eq!(keyed, 12, "all 12 background texels keyed transparent");
+        for (i, t) in rgba.chunks_exact(4).enumerate() {
+            if [5, 6, 9, 10].contains(&i) {
+                assert_eq!(t, &leaf, "leaf texel unchanged (rgb + alpha)");
+            } else {
+                assert_eq!([t[0], t[1], t[2]], [10, 20, 30], "background rgb preserved");
+                assert_eq!(t[3], 0, "background alpha zeroed");
+            }
+        }
+    }
+
+    /// A correctly keyed foliage texture (already has a sub-cutoff texel) must be left
+    /// byte-for-byte unchanged — this is what protects the trees that already render right.
+    #[test]
+    fn recover_masked_color_key_noop_when_already_keyed() {
+        let bg = [65u8, 68, 32, 0];         // already-transparent background
+        let leaf = [40u8, 60, 20, 255];
+        let mut texels = vec![bg; 16];
+        for i in [5usize, 6, 9, 10] { texels[i] = leaf; }
+        let mut rgba = rgba_from(&texels);
+        let before = rgba.clone();
+
+        let keyed = recover_masked_color_key(&mut rgba, 4, 4);
+        assert_eq!(keyed, 0, "already-keyed texture is a no-op");
+        assert_eq!(rgba, before, "already-keyed texture left byte-for-byte unchanged");
+    }
+
+    /// A fully-opaque MASK texture whose corner is an incidental minority color (not the fill) is
+    /// never punched through — guards against keying the wrong color.
+    #[test]
+    fn recover_masked_color_key_noop_when_corner_not_dominant() {
+        let corner = [1u8, 2, 3, 255];      // lone corner texel (1/16)
+        let fill = [90u8, 90, 90, 255];     // the real majority
+        let mut texels = vec![fill; 16];
+        texels[0] = corner;
+        let mut rgba = rgba_from(&texels);
+        let before = rgba.clone();
+
+        let keyed = recover_masked_color_key(&mut rgba, 4, 4);
+        assert_eq!(keyed, 0, "corner color that isn't the background majority is never keyed");
+        assert_eq!(rgba, before);
     }
 }
 
