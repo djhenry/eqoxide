@@ -675,6 +675,23 @@ Every send now funnels through one place that records its own failure, so:
   server's ordered window instead. The counter alone cannot tell them apart, so do not diagnose a
   subsystem from it on its own. For "did my command get there", the honest reading is the pair
   `connected` + `reliable_abandoned`.
+- **A dropped `OP_ClientUpdate` position update is benign-by-supersession, and is deliberately NOT
+  deferred — that is a resolved judgement, not an oversight (#655).** When a position update is
+  counted here (the position class above), the loss self-heals: each `OP_ClientUpdate` carries the
+  full **absolute** x/y/z, and the client re-sends one at most ~280 ms later while moving (a forced
+  ~1300 ms keepalive when idle), so the next update carries the current position and fully corrects
+  the server's view — the server has no memory of the gap. This was verified against the EQEmu RoF2
+  server's position handler: it overwrites the client's authoritative position with each packet's
+  absolute x/y/z **unconditionally**, and the wire `sequence` field is written by this client but
+  never read back server-side. That same fact is why the transient-refusal *deferral* #641 added for
+  control datagrams is **not** extended to position updates: with no sequence or timestamp guard,
+  re-sending a stale position on a later tick — after a fresher one had already gone out — would make
+  the server apply the older absolute position and **rewind** the character. Deferring here would
+  therefore be an agent-honesty regression, not an improvement; dropping and letting the next update
+  supersede is the correct behavior. A sustained (not blip) run of position-class failures still
+  means the server's idea of where you are is lagging your own — read it with `last_send_error_age_ms`
+  and `connected` — but a handful during a CPU-starvation burst is expected to self-heal within one
+  send interval. (Pinned by `an_unreliable_position_refusal_is_dropped_not_deferred_and_self_heals`.)
 - **Use `last_send_error_age_ms` to tell "one blip at login" from "failing right now."** A count
   alone cannot distinguish them.
 - Reported as `null` / `0`, never omitted, so absence of trouble is stated rather than inferred.

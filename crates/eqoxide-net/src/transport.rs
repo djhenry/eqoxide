@@ -2402,6 +2402,93 @@ mod tests {
         assert!(age < 60_000, "the age is measured at read time, so it must be small here (got {age})");
     }
 
+    // ── #655: an unreliable position refusal is DROPPED, not deferred — and self-heals ─────────
+
+    /// #655 — the JUDGEMENT this issue exists to settle, pinned as behavior.
+    ///
+    /// #641 made a transiently-refused *control* datagram (an ACK) defer to the next tick, but
+    /// deliberately did NOT extend that to the unreliable `OP_ClientUpdate` position firehose, on
+    /// the theory that a dropped position self-heals — the next update supersedes it — whereas
+    /// re-sending a STALE one could make the server apply an out-of-date position. #655 asked
+    /// whether that theory holds. It does, and it is not a matter of taste: the EQEmu RoF2 server
+    /// applies the absolute x/y/z of every client `OP_ClientUpdate` UNCONDITIONALLY, with no
+    /// sequence or timestamp guard (verified against the server's position handler — the wire
+    /// `sequence` field at offset 0 is written by this client but never read back server-side). So:
+    ///   - MISSING one update self-heals: the next update carries the current absolute position and
+    ///     fully corrects the server's view — proven here on the wire.
+    ///   - DEFERRING a refused update would be an honesty REGRESSION, not a fix: a stale absolute
+    ///     position re-sent after a fresher one has already gone out would rewind the character
+    ///     server-side, because nothing there rejects the older packet.
+    ///
+    /// This test pins BOTH halves: a refused position update is dropped (counted as an unretried
+    /// loss, never queued) AND the next update supersedes it on the wire with the CURRENT position.
+    /// Adding a deferral queue for the unreliable path — the naive "fix" #655 warns against — turns
+    /// the `pending_control.is_empty()` assertion and the "fresh, not stale, on the wire" assertion
+    /// RED. The refusal is injected (`force_send_refusals`) for the same reason as the #641 tests:
+    /// no portable way to make a real `send(2)` return `EAGAIN` from a unit test.
+    #[tokio::test]
+    async fn an_unreliable_position_refusal_is_dropped_not_deferred_and_self_heals() {
+        const OP: u16 = 0x7dfc; // OP_ClientUpdate (RoF2)
+        // Absolute x_pos lives at PlayerPositionUpdateClient_Struct offset 18; under identity encode
+        // the wire datagram is [op_lo, op_hi, payload..] with no CRC, so it lands at datagram offset
+        // 20. We only need a distinguishable value there to tell "fresh" from "stale" on the wire.
+        let mk = |x: f32| { let mut p = vec![0u8; 46]; p[18..22].copy_from_slice(&x.to_le_bytes()); p };
+        let stale = mk(100.0); // the update the kernel refuses
+        let fresh = mk(250.0); // where we actually are by the next throttled send (~280ms later)
+
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx, peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+        stream.socket.writable().await.unwrap(); // warm cache: ONLY the injected refusal is in play
+
+        // The kernel refuses this position update.
+        stream.force_send_refusals.set(1);
+        let err = stream.send_app_packet_unreliable(OP, &stale)
+            .expect_err("the injected refusal must make this send fail (#655 fixture check)");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        // THE DECISION: it is dropped, not queued. An unreliable position is never deferred —
+        // deferring it would let a stale absolute position reach the server after a fresher one.
+        assert!(stream.pending_control.is_empty(),
+            "an unreliable position update must NOT be queued for deferral (#655): the server \
+             applies absolute position with no sequence guard, so a re-sent stale one would rewind \
+             the character");
+        {
+            let h = *net_health.lock().unwrap();
+            assert_eq!((h.send_failures, h.send_failures_unretried), (1, 1),
+                "the dropped position is counted honestly as an unretried loss (#612) — not hidden \
+                 in send_deferred the way a deferred control datagram would be (#655)");
+            assert_eq!(h.send_deferred, 0, "nothing was deferred (#655)");
+        }
+        // Nothing on the wire from the refused send, and nothing re-sends it later.
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.recv(&mut buf))
+                .await.is_err(),
+            "the refused position must not reach the wire, and must not be re-sent later (#655)",
+        );
+
+        // SELF-HEAL: the very next update carries the CURRENT absolute position and reaches the wire.
+        stream.send_app_packet_unreliable(OP, &fresh).expect("the next position update must go out");
+        let n = tokio::time::timeout(std::time::Duration::from_millis(500), peer.recv(&mut buf))
+            .await.expect("the next position update must reach the server (#655 self-heal)").unwrap();
+        // It is the FRESH position, not a replayed stale one: the server's view converges to where
+        // we actually are. A deferral would instead have put the stale 100.0 on the wire.
+        assert_eq!(n, 48, "wire datagram = [op_lo,op_hi] + 46-byte struct under identity encode");
+        assert_eq!(&buf[0..2], &OP.to_le_bytes(), "opcode on the wire is OP_ClientUpdate");
+        let wire_x = f32::from_le_bytes(buf[20..24].try_into().unwrap());
+        assert_eq!(wire_x, 250.0,
+            "the update on the wire carries the CURRENT position (fresh), proving the drop \
+             self-healed — a deferral would have replayed the stale 100.0 instead (#655)");
+
+        // Exactly one datagram arrived — the dropped one was never replayed behind the fresh one.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.recv(&mut buf))
+                .await.is_err(),
+            "exactly one datagram on the wire — no phantom replay of the dropped update (#655)",
+        );
+        assert!(stream.pending_control.is_empty());
+    }
+
     // ── #641: a SYNTHETIC WouldBlock must not silently swallow an ACK ─────────────────────────
 
     /// #641 — THE test. An ACK that tokio refuses with a synthetic `WouldBlock` must still reach
