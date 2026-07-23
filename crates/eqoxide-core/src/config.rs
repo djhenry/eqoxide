@@ -586,7 +586,7 @@ impl LoginConfig {
                 .unwrap_or("127.0.0.1").to_string(),
             login_port: cfg
                 .get("server").and_then(|s| s.get("login_port")).and_then(|v| v.as_u64())
-                // 5999 = EQEmu loginserver's SoD/RoF2 listener. eqoxide is a RoF2 client, so it
+                // 5999 = EQEmu loginserver's SoD/RoF2 listener. eqoxide is an EQEmu (RoF2) client, so it
                 // speaks the SoD login protocol, not the legacy Titanium listener on 5998 (#404).
                 .unwrap_or(5999) as u16,
             world_port: cfg

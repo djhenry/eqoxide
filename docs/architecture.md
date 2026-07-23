@@ -1,6 +1,6 @@
 # eqoxide — Architecture Overview
 
-A standalone Rust EverQuest Titanium observer/renderer. Connects directly to a local EQEmu
+A standalone Rust EQEmu game client. Connects directly to a local EQEmu
 server (login 127.0.0.1:5999), renders the zone in 3D via wgpu, and exposes a local HTTP API on
 the next free port from 8765 (printed to stdout as `API_PORT=<port>`, so multiple instances can
 run at once — see `http-api.md`) for agent scripting. It can log in either as a **GM observer** (the original use case)
