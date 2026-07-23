@@ -11,6 +11,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use super::protocol::*;
+use eqoxide_ipc::SessionDropCause;
 
 /// Upper bound on datagrams drained (and ACKed) per `poll_recv` call. Generous enough to clear a
 /// zone-in spawn burst in one wake, but bounded so a sustained flood can't monopolize the loop —
@@ -693,10 +694,13 @@ impl EqStream {
         // It does NOT hold across a session end (#612 review F1): when a zone handoff or world
         // reconnect replaces the stream, whatever is still outstanding is abandoned — which
         // `EqStream::drop` counts into `NetHealth::reliable_abandoned`, and clean shutdown accounts
-        // explicitly (see `abandon_outstanding`). A SERVER-side ~30s `resend_timeout` drop is NOT
-        // covered by that counter: the client never notices one today, so the stream is never torn
-        // down and nothing counts it (#642). Do not read `reliable_abandoned == 0` as proof that
-        // case did not happen. (Round-3 review B2 caught this comment claiming the opposite.)
+        // explicitly (see `abandon_outstanding`). Since #642 a SERVER-side drop is ALSO covered WHEN
+        // the client observes it (inbound OP_SessionDisconnect/OP_OutOfSession, or a closed socket →
+        // `session_drop`): the gameplay loop then tears the phase down, dropping the stream. The one
+        // residual gap is a server that drops us and goes TOTALLY silent (no disconnect, no
+        // OutOfSession, no ICMP) — nothing is torn down there and `reliable_abandoned` stays 0, so
+        // `connected: false` (15s silence) remains that case's only signal. Do not read
+        // `reliable_abandoned == 0` as proof no drop happened.
         // What the agent needs is (a) the fact recorded, which `transmit` does in
         // `NetHealth::send_failures` (pollable at /v1/observe/debug), (b) `reliable_abandoned` for
         // the session-ends-under-our-control case, and (c) `connected: false` — which the 15s link
@@ -765,10 +769,37 @@ impl EqStream {
                     self.on_raw_recv(&buf[..n]);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
-                Err(_) => return false,
+                // #642: a non-WouldBlock recv error on a CONNECTED UDP socket is the documented
+                // "socket closed" case — typically `ECONNREFUSED` delivered from an ICMP
+                // port-unreachable, i.e. the server endpoint is gone. Pre-#642 every caller discarded
+                // this `false`, so the loop kept retransmitting into a dead session. Mark it a drop so
+                // the same terminal path fires as for an inbound OP_SessionDisconnect.
+                Err(e) => {
+                    tracing::warn!("NET: recv on the session socket failed ({:?}) — treating as a \
+                                    server-side session drop (#642)", e.kind());
+                    self.mark_session_drop(SessionDropCause::SocketClosed);
+                    return false;
+                }
             }
         }
         true
+    }
+
+    /// Record that the client has POSITIVELY OBSERVED the end of this UDP session (#642): an inbound
+    /// `OP_SessionDisconnect`/`OP_OutOfSession`, or a closed/errored socket recv. Stamps
+    /// `NetHealth::session_drop` (the shared, HTTP-projected signal that forces `connected` false) and
+    /// clears the local `session.connected` handshake flag. Idempotent and cause-stable: once a drop
+    /// is recorded, a later drop signal in the same dead session does NOT overwrite the first cause —
+    /// the first thing we saw is the truest explanation, and this keeps a redundant OutOfSession that
+    /// trails a SessionDisconnect from relabelling it. Cleared only by `handle_session_response` when
+    /// a genuinely new session is established.
+    fn mark_session_drop(&mut self, cause: SessionDropCause) {
+        self.session.connected = false;
+        let mut h = self.net_health.lock().unwrap();
+        if h.session_drop.is_none() {
+            h.session_drop = Some(cause);
+            tracing::warn!("NET: session drop observed ({}) — connection is dead (#642)", cause.as_str());
+        }
     }
 
     /// Retransmit un-ACKed reliable datagrams (#254). Timer-driven **go-back-N**, mirroring EQEmu's
@@ -1325,6 +1356,17 @@ impl EqStream {
                     if dec.len() >= 2 { self.on_out_of_order(u16::from_be_bytes([dec[0], dec[1]])); }
                 }
             }
+            // #642: the server is POSITIVELY telling us this session is over. Before this arm existed
+            // both fell into `_ => {}` and were discarded, so a server-side `resend_timeout` drop left
+            // the client looping on a dead stream while `/v1/observe` still reported it live for up to
+            // CONN_STALE_SECS. Mark it so `connected` is forced false immediately and the gameplay
+            // loop tears the session down honestly (it does NOT auto-reconnect — that is an owner
+            // design question, #642).
+            //   OP_SessionDisconnect — the peer closed the session it agreed to.
+            //   OP_OutOfSession      — the peer got a datagram for a session it no longer knows, i.e.
+            //                          it already dropped us; distinct cause, same terminal meaning.
+            OP_SESSION_DISC => self.mark_session_drop(SessionDropCause::ServerDisconnect),
+            OP_OUT_OF_SESSION => self.mark_session_drop(SessionDropCause::OutOfSession),
             _ => {}
         }
     }
@@ -1369,6 +1411,11 @@ impl EqStream {
             }
         }
         self.session.connected = true;
+        // #642: a fresh session handshake means we have a LIVE session again — re-arm the drop
+        // signal. This is the ONLY clear path, so a zone-handoff reconnect (which drops the old
+        // stream and connects a new one on the shared `net_health`) clears a stale drop, while a real
+        // server-side drop with no reconnect stays reported until the process restarts.
+        self.net_health.lock().unwrap().session_drop = None;
     }
 
     /// A standalone reliable datagram (OP_Packet / OP_Fragment) straight off the wire: its body is
@@ -1558,13 +1605,14 @@ impl EqStream {
 ///     is never unwound, so no destructor runs. That path therefore calls `abandon_outstanding`
 ///     EXPLICITLY, and `clean_shutdown_accounts_its_outstanding_window_explicitly_not_via_drop`
 ///     pins the call.
-///   - **A server-side session drop (the ~30s `resend_timeout` case) — STILL NOT COVERED.** The
-///     client never notices one: inbound `OP_SessionDisconnect` is unhandled, `poll_recv`'s
-///     closed-socket return is discarded at every call site, and the gameplay loop has no
-///     link-staleness exit, so the stream is never torn down and this counter stays 0 for exactly
-///     those datagrams. That is #642, deliberately out of scope for #612 — do NOT write docs that
-///     imply this case is covered. `connected: false` (15s, before the server's 30s drop) is the
-///     honest signal for it.
+///   - **A server-side session drop (the ~30s `resend_timeout` case) — COVERED WHEN OBSERVED since
+///     #642.** The client now notices such a drop the instant the server signals it (inbound
+///     `OP_SessionDisconnect`/`OP_OutOfSession`) or the socket returns closed — `mark_session_drop`
+///     stamps `NetHealth::session_drop`, and the gameplay loop tears the phase down, which DROPS the
+///     stream and runs this destructor. So `reliable_abandoned` finally counts this case. The one
+///     residual hole: a server that drops us and then goes TOTALLY silent (no disconnect, no
+///     OutOfSession, no ICMP) sets no `session_drop`, so the stream is not torn down and this counter
+///     stays 0 there — `connected: false` (15s of silence) remains that sub-case's only signal.
 impl Drop for EqStream {
     fn drop(&mut self) {
         self.abandon_outstanding();
@@ -2714,6 +2762,102 @@ mod tests {
              datagram nobody will ever re-send is exactly the lie #641 is about");
     }
 
+    /// #642 — item 1: an inbound OP_SessionDisconnect off the wire (lead byte 0x00, opcode 0x05) must
+    /// be RECOGNISED as the server ending our session, not fall into `dispatch_transport`'s `_ => {}`
+    /// and vanish. It stamps `NetHealth::session_drop` (the HTTP-projected signal that forces
+    /// `connected` false) and clears the local handshake flag. Fed through `on_raw_recv` so the whole
+    /// wire→dispatch route is exercised, not just the leaf handler. Mutation check: remove the
+    /// `OP_SESSION_DISC` arm and this goes RED (session_drop stays None).
+    #[tokio::test]
+    async fn an_inbound_session_disconnect_marks_the_session_dropped() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx) = test_stream_with_health(0, 0, net_health.clone()).await;
+        stream.session.connected = true; // pretend the handshake had completed and the session was live
+
+        // A datagram the real server sends: 0x00 (protocol) then OP_SessionDisconnect. crc_bytes is 0
+        // on a default test session, so no trailing CRC is needed for on_raw_recv to accept it.
+        stream.on_raw_recv(&[0x00, OP_SESSION_DISC]);
+
+        assert_eq!(net_health.lock().unwrap().session_drop,
+                   Some(SessionDropCause::ServerDisconnect),
+                   "an inbound OP_SessionDisconnect must be recorded as a server-side drop (#642)");
+        assert!(!stream.session.connected,
+                "the local session handshake flag must be cleared on an observed drop (#642)");
+    }
+
+    /// #642 — an inbound OP_OutOfSession (0x1d) is the OTHER way the server says a session is over
+    /// (it got a datagram for a session it no longer knows). Same terminal meaning, distinct cause.
+    #[tokio::test]
+    async fn an_inbound_out_of_session_marks_the_session_dropped() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx) = test_stream_with_health(0, 0, net_health.clone()).await;
+        stream.session.connected = true;
+
+        stream.on_raw_recv(&[0x00, OP_OUT_OF_SESSION]);
+
+        assert_eq!(net_health.lock().unwrap().session_drop,
+                   Some(SessionDropCause::OutOfSession),
+                   "an inbound OP_OutOfSession must be recorded as a server-side drop (#642)");
+        assert!(!stream.session.connected);
+    }
+
+    /// #642 — the drop signal must not be a one-way latch that wedges a healthy reconnect: a genuine
+    /// new session handshake (OP_SessionResponse) CLEARS `session_drop`. This is the re-arm that keeps
+    /// a zone-handoff reconnect (which shares `net_health` across the old and new stream) from
+    /// inheriting the previous session's drop, while a real drop with no reconnect stays reported.
+    #[tokio::test]
+    async fn a_fresh_session_response_clears_a_prior_drop() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx) = test_stream_with_health(0, 0, net_health.clone()).await;
+        // Start from a dropped session.
+        stream.on_raw_recv(&[0x00, OP_SESSION_DISC]);
+        assert!(net_health.lock().unwrap().session_drop.is_some());
+
+        // A well-formed ReliableStreamConnectReply body (>=15 bytes) means a new session is up.
+        let mut dg = vec![0x00, OP_SESSION_RESPONSE];
+        dg.extend_from_slice(&[0u8; 15]);
+        stream.on_raw_recv(&dg);
+
+        assert!(net_health.lock().unwrap().session_drop.is_none(),
+                "a fresh OP_SessionResponse must re-arm the drop signal for the new session (#642)");
+        assert!(stream.session.connected,
+                "a session response marks the local handshake flag live again");
+    }
+
+    /// #642 — item 2: a closed/errored socket recv must record a `SocketClosed` drop rather than
+    /// have its `false` return discarded. `poll_recv`'s `Err(e) =>` arm calls exactly this helper (a
+    /// deterministic unit test rather than an ICMP-port-unreachable one, because tokio's `try_recv`
+    /// gates on read-readiness and does not surface a connected-socket ECONNREFUSED reliably enough
+    /// to assert on — a test that can pass vacuously would be worthless). This pins that the helper
+    /// stamps the shared `session_drop` (forcing `connected` false at the HTTP layer) and clears the
+    /// local handshake flag. Mutation check: make `mark_session_drop` a no-op and this goes RED.
+    #[tokio::test]
+    async fn a_socket_closed_drop_is_stamped_and_clears_connected() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx) = test_stream_with_health(0, 0, net_health.clone()).await;
+        stream.session.connected = true;
+
+        stream.mark_session_drop(SessionDropCause::SocketClosed);
+
+        assert_eq!(net_health.lock().unwrap().session_drop, Some(SessionDropCause::SocketClosed),
+                   "a closed-socket recv must record a SocketClosed drop, not discard the signal (#642)");
+        assert!(!stream.session.connected);
+    }
+
+    /// #642 — the first observed cause wins: a redundant drop signal in the same dead session (e.g. an
+    /// OP_OutOfSession that trails an OP_SessionDisconnect) must NOT relabel the original cause.
+    #[tokio::test]
+    async fn a_second_drop_signal_does_not_overwrite_the_first_cause() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx) = test_stream_with_health(0, 0, net_health.clone()).await;
+
+        stream.mark_session_drop(SessionDropCause::ServerDisconnect);
+        stream.mark_session_drop(SessionDropCause::OutOfSession);
+
+        assert_eq!(net_health.lock().unwrap().session_drop, Some(SessionDropCause::ServerDisconnect),
+                   "the first observed cause is the truest explanation and must not be overwritten (#642)");
+    }
+
     /// #641 review, finding 7 — `ENOBUFS` is as transient as `EAGAIN` on UDP under this pressure
     /// (a momentarily full device/qdisc transmit queue), so it must be deferrable too. It maps to
     /// `ErrorKind::Uncategorized`, which is unstable to match on, so `is_transient` identifies it by
@@ -3120,10 +3264,12 @@ mod tests {
     /// level up: a contract telling the agent a class of loss cannot have happened when it can.
     ///
     /// Asserts the accounting happens on DROP, which covers every path that tears the stream down
-    /// (zone handoff, world reconnect, zone-in failure). The two paths that do NOT drop it are
-    /// handled separately: clean shutdown calls `abandon_outstanding` explicitly (see
-    /// `clean_shutdown_accounts_its_outstanding_window_explicitly_not_via_drop`), and a server-side
-    /// session drop is not covered at all (#642) because the client never notices one.
+    /// (zone handoff, world reconnect, zone-in failure, and — since #642 — an OBSERVED server-side
+    /// drop, which now tears the gameplay phase down and so drops the stream). The one path that does
+    /// NOT drop it is clean shutdown, which calls `abandon_outstanding` explicitly (see
+    /// `clean_shutdown_accounts_its_outstanding_window_explicitly_not_via_drop`). A server drop into
+    /// TOTAL silence (no disconnect/OutOfSession/ICMP) still isn't torn down — `connected: false` is
+    /// that residual sub-case's signal.
     #[tokio::test]
     async fn reliables_outstanding_when_a_session_ends_are_counted_as_abandoned() {
         let net_health: eqoxide_ipc::NetHealthShared = Default::default();

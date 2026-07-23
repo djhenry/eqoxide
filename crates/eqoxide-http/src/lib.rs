@@ -396,10 +396,33 @@ pub struct Health {
     /// resend window does NOT cover, because the next session's window starts empty. Measured 0
     /// across three clean zone handoffs, so treat a nonzero value DURING PLAY as signal (clean
     /// shutdown is the measured exception — 4 and 8 on two live exits, cause not established).
-    /// Does NOT cover a server-side `resend_timeout` drop (#642), which nothing counts. See
+    /// Since #642 it ALSO covers a server-side `resend_timeout` drop WHEN the client observes it
+    /// (OP_SessionDisconnect/OP_OutOfSession or a closed socket → `session_drop` → teardown → stream
+    /// drop); a server drop into total silence still counts nothing there. See
     /// [`eqoxide_ipc::NetHealth::reliable_abandoned`] for the full contract and coverage list (it is
     /// an upper bound on abandoned reliable payload, not a proven count of lost commands).
     pub reliable_abandoned:     u64,
+    /// #642: why the session is over, when the client has POSITIVELY OBSERVED its end (inbound
+    /// `OP_SessionDisconnect`/`OP_OutOfSession`, or a closed socket) — `null` while the session is
+    /// live. Distinct from `connected`, which only goes false after `CONN_STALE_SECS` of SILENCE:
+    /// this is immediate and explicit, and when it is set `connected` is forced `false` (see
+    /// `HttpState::health`), so a server-side drop can never be reported as connected. Serialized as a
+    /// stable snake_case string (`server_disconnect` / `out_of_session` / `socket_closed`).
+    /// See [`eqoxide_ipc::SessionDropCause`].
+    #[serde(serialize_with = "ser_session_drop")]
+    pub session_drop:           Option<eqoxide_ipc::SessionDropCause>,
+}
+
+/// Serializes [`SessionDropCause`](eqoxide_ipc::SessionDropCause) as its stable snake_case name (or
+/// `null`) so `Health::session_drop` reaches the agent as a machine-readable string while `Health`
+/// stays `Copy` (#642).
+fn ser_session_drop<S: serde::Serializer>(
+    c: &Option<eqoxide_ipc::SessionDropCause>, s: S,
+) -> Result<S::Ok, S::Error> {
+    match c {
+        Some(c) => s.serialize_some(c.as_str()),
+        None => s.serialize_none(),
+    }
 }
 
 /// Serializes an `io::ErrorKind` as its `Debug` name so `Health::last_send_error` can stay `Copy`
@@ -626,7 +649,12 @@ impl HttpState {
         // net thread the prober dies too, so no probe is ever outstanding — without this, the "no
         // probe" branch reported a zombie session alive forever. `connected` here is the SAME value
         // published in `Health` below (both derived from `last_datagram` vs CONN_STALE_SECS).
-        let connected = link_age.as_secs() < CONN_STALE_SECS;
+        // #642: a POSITIVELY-OBSERVED server-side drop (OP_SessionDisconnect/OP_OutOfSession or a
+        // closed socket) forces `connected` false IMMEDIATELY, rather than waiting out CONN_STALE_SECS
+        // of link silence. This is the type-level guarantee the honesty invariant asks for: once
+        // `session_drop` is `Some`, there is no derivation of `connected` that reads `true` for the
+        // dead session — the only thing that clears `session_drop` is a fresh OP_SessionResponse.
+        let connected = link_age.as_secs() < CONN_STALE_SECS && h.session_drop.is_none();
         let world_responsive = world_responsive(
             connected, probe_sent_ago, probe_reply_ago, last_packet_ago,
             std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
@@ -657,6 +685,7 @@ impl HttpState {
             last_send_error:         h.last_send_error_kind,
             last_send_error_age_ms:  h.last_send_error_at.map(|t| t.elapsed().as_millis() as u64),
             reliable_abandoned:      h.reliable_abandoned,
+            session_drop:            h.session_drop,
         }
     }
 }
@@ -1038,16 +1067,23 @@ mod health_serde_tests {
             send_failures_unretried: 1,
             last_send_error: Some(std::io::ErrorKind::WouldBlock),
             last_send_error_age_ms: Some(42), reliable_abandoned: 7,
+            session_drop: Some(eqoxide_ipc::SessionDropCause::ServerDisconnect),
         };
         let v: serde_json::Value = serde_json::to_value(h).unwrap();
         assert_eq!(v["last_send_error"], serde_json::json!("WouldBlock"),
             "an ErrorKind must serialize as its readable name, not as a struct or an integer");
         assert_eq!(v["send_failures"], serde_json::json!(3));
         assert_eq!(v["reliable_abandoned"], serde_json::json!(7));
+        // #642: SessionDropCause must serialize as its stable snake_case name, not the PascalCase
+        // variant a derived Serialize would emit.
+        assert_eq!(v["session_drop"], serde_json::json!("server_disconnect"),
+            "a session-drop cause must serialize as its snake_case wire name (#642)");
 
-        let none = super::Health { last_send_error: None, ..h };
+        let none = super::Health { last_send_error: None, session_drop: None, ..h };
         let v: serde_json::Value = serde_json::to_value(none).unwrap();
         assert!(v["last_send_error"].is_null(),
             "absence must serialize as an explicit null, not be omitted (#612)");
+        assert!(v["session_drop"].is_null(),
+            "a live session must serialize session_drop as an explicit null (#642)");
     }
 }

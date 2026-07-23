@@ -814,8 +814,15 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         //                              agent can observe anyway. The CAUSE of that count is not
         //                              established — see NetHealth::reliable_abandoned; do not
         //                              invent one.
-        //                              DOES NOT cover a server-side resend_timeout drop: the client
-        //                              never notices one today (#642), so use `connected` for that.
+        //                              Since #642 this ALSO covers a server-side drop: the client now
+        //                              notices one (OP_SessionDisconnect/OP_OutOfSession or a closed
+        //                              socket → `session_drop`) and tears the gameplay phase down,
+        //                              which drops the stream → abandon_outstanding. See `session_drop`.
+        //   session_drop             — #642: null while live; a snake_case cause string
+        //                              (server_disconnect / out_of_session / socket_closed) once the
+        //                              client has POSITIVELY OBSERVED a server-side drop. When set,
+        //                              `connected` above is already forced false — the immediate,
+        //                              explicit signal, vs `connected`'s CONN_STALE_SECS silence timer.
         //   last_send_error          — ErrorKind of the most recent one ("WouldBlock", …), or null.
         //   last_send_error_age_ms   — ms since it, measured at read time. Distinguishes a single
         //                              old blip from an ongoing failure.
@@ -827,6 +834,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             serde_json::json!(health.last_send_error.map(|k| format!("{k:?}"))));
         player.insert("last_send_error_age_ms".into(),  serde_json::json!(health.last_send_error_age_ms));
         player.insert("reliable_abandoned".into(),      serde_json::json!(health.reliable_abandoned));
+        // #642: the machine-readable cause of a POSITIVELY-OBSERVED server-side session drop, or null
+        // while the session is live. Attached here, not in the literal above, which is at the json!
+        // recursion limit.
+        player.insert("session_drop".into(),
+            serde_json::json!(health.session_drop.map(|c| c.as_str())));
     }
     Json(out)
 }
@@ -1605,6 +1617,51 @@ mod tests {
             "snapshot_age_ms must expose that our own publisher stopped, got {}", p["snapshot_age_ms"]);
         // The stale world is still served (last known good) — but it is now clearly LABELLED stale.
         assert_eq!(p["hp_pct"], serde_json::json!(100.0));
+    }
+
+    /// #642: a POSITIVELY-OBSERVED server-side session drop must flip `connected` to false and expose
+    /// the cause IMMEDIATELY — even while the link clock is fresh (a datagram landed <1s ago), which
+    /// is exactly the up-to-CONN_STALE_SECS window in which the old code reported a dropped session as
+    /// still connected. This is the type-level guarantee: `session_drop.is_some()` forces
+    /// `connected: false`. Mutation check: delete `&& h.session_drop.is_none()` from `health()` and
+    /// this goes RED (connected stays true on a fresh link).
+    #[tokio::test]
+    async fn debug_reports_disconnected_immediately_on_an_observed_session_drop() {
+        let state = empty_state();
+        set_gs(&state, |gs| gs.player_name = "Gmkblr".into());
+        {
+            let mut h = state.net_health.lock().unwrap();
+            // The link is demonstrably alive by the SILENCE metric — a datagram just landed...
+            h.last_datagram = std::time::Instant::now();
+            h.last_tick     = std::time::Instant::now();
+            // ...but the server explicitly ended the session (OP_SessionDisconnect).
+            h.session_drop  = Some(eqoxide_ipc::SessionDropCause::ServerDisconnect);
+        }
+
+        let v = debug_json(state).await;
+        let p = &v["player"];
+        assert_eq!(p["connected"], serde_json::json!(false),
+            "an observed session drop must force connected:false even with a fresh link (#642)");
+        assert_eq!(p["session_drop"], serde_json::json!("server_disconnect"),
+            "the drop cause must be surfaced as a machine-readable string (#642)");
+        // link_age is still small — proving the false verdict came from session_drop, not silence.
+        assert!(p["link_age_ms"].as_u64().unwrap() < 1_000,
+            "the link clock is fresh; connected:false here is driven by session_drop, not staleness");
+    }
+
+    /// The healthy case must not regress: `session_drop` is null on a live session and `connected`
+    /// stays true. Guards the new field against a stuck-observable regression (a signal that never
+    /// clears is worse than the prose it replaced).
+    #[tokio::test]
+    async fn debug_reports_null_session_drop_on_a_live_session() {
+        let state = empty_state();
+        set_gs(&state, |gs| gs.player_name = "Gmkblr".into());
+
+        let v = debug_json(state).await;
+        let p = &v["player"];
+        assert_eq!(p["connected"], serde_json::json!(true));
+        assert!(p["session_drop"].is_null(),
+            "a live session must report session_drop:null, not a stale cause (#642)");
     }
 
     /// The healthy case must not regress: a packet just landed → connected, ages near zero.

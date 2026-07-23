@@ -252,6 +252,44 @@ pub type PosCorrection = Arc<Mutex<Option<[f32; 3]>>>;
 /// (borrowed) or `.load_full()` (owned `Arc<GameState>`).
 pub type GameStateSnapshot = std::sync::Arc<arc_swap::ArcSwap<eqoxide_core::game_state::GameState>>;
 
+/// Why the current UDP session is over, when the client has POSITIVELY OBSERVED its end (#642).
+///
+/// This is distinct from the SILENCE-based `connected`/`last_datagram` signal: those go stale only
+/// after [`CONN_STALE_SECS`] of no datagram, whereas each variant here is an *immediate, explicit*
+/// server-side drop the client saw on the wire. It exists so a dropped session cannot masquerade as
+/// a healthy one for the up-to-15s window before link silence would have caught it — once
+/// `NetHealth::session_drop` is `Some`, `Health::connected` is forced `false` (see the derivation in
+/// `HttpState::health`), so "connected for a session the server already ended" is unrepresentable.
+///
+/// Set by `EqStream` on the drop path; cleared only by a fresh `OP_SessionResponse`
+/// (`handle_session_response`), so a legitimate zone-handoff reconnect re-arms it correctly while a
+/// genuine drop stays reported until a new session is actually established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionDropCause {
+    /// Inbound `OP_SessionDisconnect` (0x05): the server explicitly closed our session.
+    ServerDisconnect,
+    /// Inbound `OP_OutOfSession` (0x1d): the server received a datagram for a session it no longer
+    /// knows — i.e. it has already dropped us and is telling us so.
+    OutOfSession,
+    /// The connected UDP socket's `recv` returned a closed/errored result (e.g. `ECONNREFUSED` from
+    /// an ICMP port-unreachable) — the server endpoint is gone. This is `poll_recv`'s documented
+    /// "socket closed" return, which was previously discarded at every call site.
+    SocketClosed,
+}
+
+impl SessionDropCause {
+    /// Stable, machine-readable snake_case name for the HTTP surface (`/v1/observe/debug` →
+    /// `session_drop`). Kept explicit rather than derived from `Serialize` so the wire string is
+    /// controlled here and cannot drift if the variant is renamed.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionDropCause::ServerDisconnect => "server_disconnect",
+            SessionDropCause::OutOfSession => "out_of_session",
+            SessionDropCause::SocketClosed => "socket_closed",
+        }
+    }
+}
+
 /// The three clocks that answer "can I trust anything else in this payload?", owned and stamped by
 /// the network thread and turned into `Health` **at HTTP read time** (`HttpState::health`), never
 /// cached (#8, #343). They are deliberately separate signals, because they fail independently:
@@ -412,12 +450,15 @@ pub struct NetHealth {
     /// the next stream's window starts EMPTY and those datagrams are genuinely lost while this
     /// counter reads 0 for all of them.
     ///
-    /// **Two different endings, and only one of them is counted anywhere:**
+    /// **Two different endings, and which counter sees them:**
     ///   - A zone handoff / world reconnect / clean shutdown — counted by `reliable_abandoned`.
-    ///   - **A server-side ~30s `resend_timeout` drop — counted by NOTHING.** The client never
-    ///     notices such a drop today (#642), so the stream is never torn down and
-    ///     `reliable_abandoned` does not rise either. `connected: false` (15s of link silence,
-    ///     which precedes the server's 30s drop) is the ONLY honest signal for it.
+    ///   - A server-side drop the client OBSERVES (inbound `OP_SessionDisconnect`/`OP_OutOfSession`,
+    ///     or a closed socket) — since #642 this tears the gameplay phase down, dropping the stream,
+    ///     so `reliable_abandoned` counts it too, and `session_drop` names the cause.
+    ///   - **A server drop into TOTAL silence (no disconnect, no OutOfSession, no ICMP) — counted by
+    ///     NOTHING.** No `session_drop` is set, so the stream is not torn down and `reliable_abandoned`
+    ///     does not rise. `connected: false` (15s of link silence) is the only signal for this
+    ///     residual sub-case.
     ///
     /// This paragraph has now regenerated the wrong way four times across #612's reviews — most
     /// recently right here, under a field whose name does not contain "abandoned", which is exactly
@@ -484,14 +525,26 @@ pub struct NetHealth {
     ///   - **Covered:** zone handoff and world reconnect (both `drop` the old stream), zone-in
     ///     failure returns, and clean shutdown (which calls `abandon_outstanding` explicitly,
     ///     because its task parks and is never unwound).
-    ///   - **NOT covered: a server-side session drop** — the ~30s `resend_timeout` case. The client
-    ///     currently never notices one: inbound `OP_SessionDisconnect` is unhandled, `poll_recv`'s
-    ///     "socket closed" return is discarded at every call site, and the gameplay loop has no
-    ///     link-staleness exit, so the stream is never dropped and this stays 0 for exactly those
-    ///     datagrams. Detecting a server-side drop is #642, deliberately out of scope for #612.
-    ///     Until then, `connected: false` (15s of link silence, which precedes the server's 30s
-    ///     drop) is the signal for that case — not this counter.
+    ///   - **Covered since #642: an OBSERVED server-side session drop** — inbound
+    ///     `OP_SessionDisconnect`/`OP_OutOfSession`, or a closed socket. These now set `session_drop`
+    ///     and the gameplay loop tears the phase down, dropping the stream, so this counter finally
+    ///     rises for the ~30s `resend_timeout` case when the server signals it.
+    ///   - **NOT covered: a server drop into TOTAL silence** — no disconnect, no OutOfSession, no
+    ///     ICMP. Nothing sets `session_drop`, so the stream is not dropped and this stays 0 there.
+    ///     `connected: false` (15s of link silence) remains the signal for that residual sub-case —
+    ///     not this counter.
     pub reliable_abandoned: u64,
+    /// #642: `Some` once the client POSITIVELY OBSERVES that the server ended this session — inbound
+    /// `OP_SessionDisconnect`/`OP_OutOfSession`, or a closed/errored socket recv. Before #642 all
+    /// three signals were discarded (`dispatch_transport`'s `_ => {}`, `poll_recv`'s ignored bool),
+    /// so a server-side session drop left the client looping on a dead stream while `/v1/observe`
+    /// still reported a live session for up to `CONN_STALE_SECS`. This turns that into an immediate,
+    /// explicit terminal state: it FORCES `Health::connected` false (so a dropped socket can never
+    /// read connected) and drives the gameplay loop's honest teardown, which drops the stream and
+    /// finally makes `reliable_abandoned` cover this case. `None` while a session is live; set on the
+    /// drop path and cleared by a fresh `OP_SessionResponse` (`handle_session_response`), so a
+    /// zone-handoff reconnect re-arms it. See [`SessionDropCause`].
+    pub session_drop: Option<SessionDropCause>,
 }
 
 impl Default for NetHealth {
@@ -505,6 +558,7 @@ impl Default for NetHealth {
             send_failures_unretried: 0,
             last_send_error_kind: None, last_send_error_at: None,
             reliable_abandoned: 0,
+            session_drop: None,
         }
     }
 }
