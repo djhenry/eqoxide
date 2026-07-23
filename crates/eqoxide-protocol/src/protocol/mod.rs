@@ -150,6 +150,12 @@ pub const OP_DELETE_SPAWN: u16 = 0x7280;      // RoF2: OP_DeleteSpawn
 pub const OP_CLIENT_UPDATE: u16 = 0x7dfc;     // RoF2: OP_ClientUpdate
 pub const OP_FLOAT_LIST_THING: u16 = 0x46c6;  // RoF2: OP_FloatListThing (movement history; anti-MQGhost)
 pub const OP_SPAWN_APPEARANCE: u16 = 0x0971;  // RoF2: OP_SpawnAppearance
+// Run/walk toggle (#625). Client -> zone, sent once per toggle (no ack packet exists — the server's
+// Handle_OP_SetRunMode just assigns `runmode` and returns, with no broadcast/reply). Verified
+// against the native RoF2 client and the EQEmu server source (generic citation, no local/tool
+// paths): `SetRunMode_Struct` is 4 bytes, `{mode: u8, pad: [u8; 3]}`. Distinct per-patch opcode —
+// Titanium's OP_SetRunMode is a different wire value; this is the RoF2-patched one.
+pub const OP_SET_RUN_MODE: u16 = 0x009f;      // RoF2: OP_SetRunMode
 /// Server → client: a spawn performs a one-shot animation (melee swing, kick, etc.).
 /// Animation_Struct: spawnid(u16) speed(u8) action(u8). action = anim code (1=kick, 2=1HPierce,
 /// 3=2HSlash, 4=2HWeapon, 5=1HWeapon, 7=tailrake/slam, 8=hand-to-hand) → combat clip C0{action}.

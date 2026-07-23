@@ -43,6 +43,8 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/click_door", post(post_door_click))
         .route("/sit", post(post_sit))
         .route("/stand", post(post_stand))
+        .route("/run", post(post_run))
+        .route("/walk", post(post_walk))
         .route("/dialogue", post(post_dialogue))
         .route("/read", post(post_read))
 }
@@ -426,6 +428,23 @@ async fn post_stand(State(s): State<HttpState>) -> (StatusCode, String) {
     (StatusCode::OK, "stand queued".into())
 }
 
+/// POST /v1/interact/run — switch to run mode: sends `OP_SetRunMode` (#625) and speeds the local
+/// nav walker back up to `RUN_SPEED`. See `run_mode` in `/v1/observe/debug` for the last-sent state
+/// (a send-time intent — the opcode has no server ack, same epistemic level as sit/auto_attack).
+async fn post_run(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
+    s.command.request_run_mode(true);
+    (StatusCode::OK, "run queued".into())
+}
+
+/// POST /v1/interact/walk — switch to walk mode: sends `OP_SetRunMode` (#625) and slows the local
+/// nav walker to `WALK_SPEED`.
+async fn post_walk(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
+    s.command.request_run_mode(false);
+    (StatusCode::OK, "walk queued".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::router;
@@ -437,6 +456,28 @@ mod tests {
     fn seed_npc(state: &crate::HttpState, key: &str, id: u32, pos: (f32, f32, f32)) {
         state.world.entity_positions.lock().unwrap().insert_for_test(key.to_string(), pos);
         state.world.entity_ids.lock().unwrap().insert_for_test(key.to_string(), id);
+    }
+
+    // --- run/walk (#625): the toggle queues an intent for action_loop to send OP_SetRunMode ----
+
+    #[tokio::test]
+    async fn run_endpoint_queues_run_mode_true() {
+        let state = empty_state();
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/run").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(command.take_run_mode(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn walk_endpoint_queues_run_mode_false() {
+        let state = empty_state();
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/walk").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(command.take_run_mode(), Some(false));
     }
 
     // --- hail: a malformed name must not silently fall back to "nearest NPC" -------------------

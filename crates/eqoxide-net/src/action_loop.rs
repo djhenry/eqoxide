@@ -1169,6 +1169,7 @@ impl ActionLoop {
         self.drain_cast(stream, gs);
         self.drain_mem_spell(stream, gs);
         self.drain_sit(stream, gs);
+        self.drain_run_mode(stream, gs); // #625 — distinct fn, does not touch any other drain
         self.drain_consider(stream, gs);
         self.drain_merchant(stream, gs);
         self.drain_move_item(stream, gs);
@@ -1846,6 +1847,22 @@ impl ActionLoop {
             stream.send_app_packet(OP_SPAWN_APPEARANCE, &payload);
             gs.sitting = sit;
             tracing::info!("EQ: {}", if sit { "sit" } else { "stand" });
+        }
+    }
+
+    /// Run/walk toggle (#625). Sends `OP_SetRunMode` (0x009f) once per change and mirrors the
+    /// requested state into `gs.run_mode`, which the nav walker (`eqoxide_nav::walker::nav_speed`)
+    /// reads to pick `RUN_SPEED` vs `WALK_SPEED` for `/goto`'s LOCAL controller speed — this opcode
+    /// carries no ack, so `gs.run_mode` is our own send-time intent, not a server confirmation (see
+    /// the field's doc comment). Scoped to nav-driven movement only for this PR; manual WASD/melee
+    /// auto-engage movement still always drives at `RUN_SPEED` (unchanged, out of scope — see the
+    /// PR body). Kept as its own drain fn (not folded into `drain_sit`) so this file's #625 diff
+    /// stays a clean, single-purpose addition alongside any concurrent nav/action_loop work in flight.
+    fn drain_run_mode(&mut self, stream: &mut EqStream, gs: &mut GameState) {
+        if let Some(run) = self.command.take_run_mode() {
+            stream.send_app_packet(OP_SET_RUN_MODE, &build_set_run_mode_packet(run));
+            gs.run_mode = run;
+            tracing::info!("EQ: run mode -> {}", if run { "run" } else { "walk" });
         }
     }
 

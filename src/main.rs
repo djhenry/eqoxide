@@ -292,6 +292,7 @@ fn main() {
         door_click:     Arc::new(Mutex::new(None)),
         doors_shared:   Arc::new(Mutex::new(Vec::new())),
         sit:            Arc::new(Mutex::new(None)),
+        run_mode:       Arc::new(Mutex::new(None)), // #625
         dialogue:       Arc::new(Mutex::new(Vec::new())),
         dialogue_click: Arc::new(Mutex::new(None)),
         // POST /v1/interact/read request slot (#288): the inventory wire slot of a book/note to read.

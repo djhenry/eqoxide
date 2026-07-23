@@ -1162,6 +1162,14 @@ pub struct GameState {
     pub suppress_cast_end: bool,
     /// True when the player is sitting.
     pub sitting: bool,
+    /// Run/walk toggle (#625): `true` = run, `false` = walk. Governs the LOCAL movement speed the
+    /// controller/nav-walker drives at (`eqoxide_core::physics::RUN_SPEED` vs `WALK_SPEED`), and
+    /// mirrors the last `OP_SetRunMode` (0x009f) this client sent — the server itself never echoes
+    /// this flag back (no ack packet exists for it), so this is our own send-time intent, exactly
+    /// like `sitting`/`auto_attack` above track the last posture/attack request we sent, not a
+    /// server confirmation. Defaults to `true` (running) in [`GameState::new`], matching this
+    /// client's behavior before #625: every driver always moved at `RUN_SPEED`.
+    pub run_mode: bool,
     /// When the player's own death was first observed (OP_Death for our spawn), or None
     /// while alive. Used to (a) dedupe the duplicate OP_Death the server sometimes sends
     /// and (b) drive the respawn safety-net that re-requests a bind respawn when the
@@ -1202,6 +1210,11 @@ impl GameState {
     pub fn new() -> Self {
         GameState {
             messages: VecDeque::with_capacity(50),
+            // #625: default to running, matching this client's behavior before the run/walk toggle
+            // existed (every driver always moved at RUN_SPEED). Plain `derive(Default)` would give
+            // `false` (walk) — deliberately overridden here, the same way `messages` overrides its
+            // derived-empty-`VecDeque` default just above.
+            run_mode: true,
             ..Default::default()
         }
     }

@@ -56,6 +56,18 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             cx.acts.command.request_sit(!s.sitting);
         }
 
+        // Run / Walk (#625). Label shows the action the click performs, matching Sit/Stand above.
+        // Sends OP_SetRunMode and slows/speeds the local nav walker to match — see `run_mode` on
+        // GameState/SceneState for the honesty caveat (send-time intent, no server ack).
+        let run_label = if s.run_mode { "Walk" } else { "Run" };
+        if ui.add(btn(run_label)).on_hover_text(if s.run_mode {
+            "Running — click to walk"
+        } else {
+            "Walking — click to run"
+        }).clicked() {
+            cx.acts.command.request_run_mode(!s.run_mode);
+        }
+
         // Target nearest living NPC.
         let target_hover = match &nearest {
             Some((_, n)) => format!("Target {n}"),
