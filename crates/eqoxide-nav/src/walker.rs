@@ -775,7 +775,7 @@ impl Walker {
             // predicate is clear when no collision grid is loaded (the aim then degrades gracefully).
             let coll = self.collision.read().unwrap();
             let los = |a: [f32; 3], b: [f32; 3]|
-                coll.as_ref().map_or(true, |c| c.path_clear(a, b, STEER_LOS_CLEARANCE));
+                coll.as_ref().map_or(true, |c| c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE));
             if let Some((wish_dir, heading)) =
                 fast_steer_aim(&self.local_path, &mut self.local_i, [gs.player_x, gs.player_y, gs.player_z], 5.0, los)
             {
@@ -1077,7 +1077,7 @@ impl Walker {
             // when no grid is loaded. Held for the single synchronous `steer_target` call only.
             let coll = self.collision.read().unwrap();
             let los = |a: [f32; 3], b: [f32; 3]|
-                coll.as_ref().map_or(true, |c| c.path_clear(a, b, STEER_LOS_CLEARANCE));
+                coll.as_ref().map_or(true, |c| c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE));
             let aim = steer_target(&self.path, self.path_i, &self.local_path, &mut self.local_i,
                 [px, py, pz], LOOK_AHEAD, coarse, los);
             drop(coll);

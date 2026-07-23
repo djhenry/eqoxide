@@ -1080,7 +1080,10 @@ fn carrot_los_clamp_blast_radius() {
     const Z_TOL: f32 = 8.0;
     const DT: f32 = 1.0 / 100.0;
     const FRAMES_PER_TICK: u32 = 15;
-    const MAX_TICKS: u32 = 400; // ~60 s of sim per journey — generous headroom over any real route
+    const MAX_TICKS: u32 = 300; // ~45 s of sim per journey — generous headroom over any real route
+    // Per-zone routable-pair budget (each pair is driven TWICE — clamp on and off). Env-overridable
+    // so a quick sweep is cheap; the default is a thorough corpus.
+    let pairs_per_zone: usize = std::env::var("PAIRS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
 
     // Drive the REAL controller along a FIXED coarse route with pure pursuit; `clamp` toggles the LOS
     // guard and is the ONLY variable. Returns (arrived, ticks, distance_walked).
@@ -1104,7 +1107,7 @@ fn carrot_los_clamp_blast_radius() {
                 if t >= 1.0 { path_i += 1; } else { break; }
             }
             let aim = if clamp {
-                carrot_along_los(coarse, path_i, [px, py, pz], LOOK_AHEAD, |a, b| col.path_clear(a, b, r))
+                carrot_along_los(coarse, path_i, [px, py, pz], LOOK_AHEAD, |a, b| col.carrot_los_clear(a, b, r))
             } else {
                 carrot_along(coarse, path_i, [px, py, pz], LOOK_AHEAD)
             }.unwrap_or(goal);
@@ -1146,7 +1149,7 @@ fn carrot_los_clamp_blast_radius() {
         let (mut z_pairs, mut z_both, mut z_reg, mut z_fixed) = (0usize, 0usize, 0usize, 0usize);
         let (mut z_ticks_on, mut z_ticks_off) = (0u64, 0u64);
         let mut tries = 0;
-        while z_pairs < 120 && tries < 8000 {
+        while z_pairs < pairs_per_zone && tries < pairs_per_zone * 70 + 500 {
             tries += 1;
             let e = col.origin[0] + unit(rnd()) * (col.cols as f32 * col.cell_size);
             let n = col.origin[1] + unit(rnd()) * (col.rows as f32 * col.cell_size);

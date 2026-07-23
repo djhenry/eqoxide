@@ -1666,6 +1666,30 @@ impl Collision {
         self.nearest_hit_t(from, target).is_none()
     }
 
+    /// **Line-of-sight test for the pure-pursuit carrot clamp (#685).** May the walker steer STRAIGHT
+    /// from `from` to `to` without the aim chording across a WALL (a convex corner)?
+    ///
+    /// This is a CHEST-HEIGHT centre ray — both foot points raised by the body's `chest` (4.0, the
+    /// controller's own contact-ray height, `traversability::PLAYER_BODY`). Casting at chest is what
+    /// makes the clamp not over-tighten (the dominant risk, #685): a FOOT-height ray skims the ground
+    /// and false-trips on every walkable bump and slope, which over a corpus of hilly zones slowed the
+    /// walker 5-8x and newly FAILED dozens of routes (measured). A chest-height ray rides ABOVE
+    /// walkable ground undulation (a slope/bump is not a corner) while a real WALL — which rises from
+    /// the floor well past chest — still blocks it, exactly as the controller's own chest contact ray
+    /// would. It is the SAME contact height the controller collides at, so the clamp asks precisely the
+    /// controller's question.
+    ///
+    /// A single centre ray (not the `path_clear` feeler fan) is deliberate and also the least-aggressive
+    /// choice: the corner-cut chord crosses the wall with its CENTRELINE, so the centre ray catches it,
+    /// while a ray running ALONGSIDE a wall never intersects it — so merely hugging a corridor wall does
+    /// not clamp. `radius` extends the ray past `to` so a wall just beyond the carrot still counts.
+    ///
+    /// Returns `true` (clear) when no zone geometry is loaded.
+    pub fn carrot_los_clear(&self, from: [f32; 3], to: [f32; 3], radius: f32) -> bool {
+        let chest = crate::traversability::PLAYER_BODY.chest;
+        self.line_clear([from[0], from[1], from[2] + chest], [to[0], to[1], to[2] + chest], radius)
+    }
+
     /// The clearance test A* validates ONE GRID EDGE with, at plan resolution `cell`.
     ///
     /// Sweeps the character's collision volume (`path_clear`) on a FINE grid and casts a centre ray
@@ -5391,18 +5415,18 @@ mod tests {
         let path: Vec<[f32; 3]> = vec![[0.0, 0.0, 1.0], [10.0, 0.0, 1.0], [10.0, 10.0, 1.0]];
         let from = [4.0, 0.0, 1.0];
         let reach = 10.0;
-        let los = |a: [f32; 3], b: [f32; 3]| col.path_clear(a, b, r);
+        let los = |a: [f32; 3], b: [f32; 3]| col.carrot_los_clear(a, b, r);
 
         // The UNCLAMPED carrot cuts the corner: its straight aim crosses the wall (scene reproduces #685).
         let plain = carrot_along(&path, 0, from, reach).unwrap();
-        assert!(!col.path_clear(from, plain, r),
-            "sanity: the unclamped carrot {plain:?} must chord across the corner — path_clear should \
-             reject the straight aim, else this scene does not reproduce #685");
+        assert!(!col.carrot_los_clear(from, plain, r),
+            "sanity: the unclamped carrot {plain:?} must chord across the corner — carrot_los_clear \
+             should reject the straight aim, else this scene does not reproduce #685");
 
-        // The CLAMPED carrot rounds the corner: path_clear ACCEPTS its straight aim.
+        // The CLAMPED carrot rounds the corner: carrot_los_clear ACCEPTS its straight aim.
         let clamped = carrot_along_los(&path, 0, from, reach, los).unwrap();
-        assert!(col.path_clear(from, clamped, r),
-            "the LOS-clamped carrot {clamped:?} must be reachable by the real path_clear sweep — the \
+        assert!(col.carrot_los_clear(from, clamped, r),
+            "the LOS-clamped carrot {clamped:?} must be reachable by the real carrot_los_clear ray — the \
              walker rounds the corner instead of chording into the wall. MUTATION: ignore `los` in \
              carrot_along_los and this goes RED.");
         // Anti-crawl: still leads forward toward the corner, does not retreat behind the walker.
