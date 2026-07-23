@@ -2696,9 +2696,20 @@ impl ActionLoop {
     }
 
     fn perform_cross(&mut self, stream: &mut EqStream, gs: &mut GameState, index: i32, dest_zone: u16, dest_pos: [f32; 3]) -> bool {
-        self.send_zone_change_packet(stream, gs, dest_zone);
         self.last_zone_cross = Instant::now();
         if dest_zone == gs.world.zone_id {
+            // SAME-ZONE translocator (an intra-zone pad — e.g. the qeynos2 guild pads). The zone point
+            // resolves to THIS zone, so it is a pure IN-ZONE teleport, and we must NOT send OP_ZoneChange.
+            //
+            // Sending OP_ZoneChange(zoneID=0) here was the bug: zoneID=0 makes the server resolve the
+            // destination by nearest-XY (`GetClosestZonePointWithoutZone`). A same-zone zone point's DB
+            // trigger is a 0,0,0 placeholder, so a real CROSS-zone trigger wins the nearest-XY race and
+            // the server zones us to the WRONG zone (qeynos2 guild pad → South Qeynos) — on TOP of the
+            // correct local in-zone reposition, i.e. "right location in the zone, then zoned away."
+            // Verified against the native RoF2 client: its guild pads teleport within North Qeynos with
+            // no zone change. An in-zone move needs no OP_ZoneChange — the OP_ClientUpdate position
+            // stream tells the server where we moved (it applies absolute position unconditionally).
+            // Only a genuine CROSS-zone line (the `else` branch) sends the packet and zones.
             self.same_zone_cross_at = Some(Instant::now());
             Self::apply_provisional_crossing(gs, index, dest_pos);
             // STOP the walker (#508). The crossing we were asked to make already happened: the
@@ -2713,6 +2724,10 @@ impl ActionLoop {
             self.command.request_stop();
             true
         } else {
+            // Genuine CROSS-zone line: request the zone change (zoneID=0 → the server resolves the true
+            // destination from our position, correct for a real walk-in crossing, #199) and let the
+            // normal world reconnect / zone-entry handshake run.
+            self.send_zone_change_packet(stream, gs, dest_zone);
             tracing::info!("zone_cross: in zone-line region index={index} → zone_id={dest_zone}");
             gs.log_msg("zone", &format!("Crossing to zone {}", dest_zone));
             false
@@ -3444,9 +3459,11 @@ mod tests {
     /// #368 CORE. A SAME-ZONE crossing must (a) reposition the player to the resolved arrival so it
     /// LEAVES the DRNTP region (no re-fire), and (b) flag the echo so the receive side SKIPS the
     /// world reconnect — that reconnect against a still-live zone is the wedge. A genuine CROSS-ZONE
-    /// crossing must do NEITHER (it repositions on zone-in, and it MUST reconnect). Both send exactly
-    /// one OP_ZONE_CHANGE. Mutation-sensitive: dropping the reposition, the flag-set, or the
-    /// same-zone branch condition each flips an assertion.
+    /// crossing must do NEITHER (it repositions on zone-in, and it MUST reconnect). The same-zone
+    /// cross sends NO OP_ZONE_CHANGE (it is a pure in-zone teleport — zoneID=0 would make the server
+    /// resolve nearest-XY and zone us cross-zone); the cross-zone one sends exactly one.
+    /// Mutation-sensitive: dropping the reposition, the flag-set, the same-zone branch condition, or
+    /// the same-zone packet suppression each flips an assertion.
     #[tokio::test]
     async fn same_zone_cross_repositions_and_skips_reconnect_but_cross_zone_does_not() {
         const HERE: u16 = 2;   // current zone
@@ -3485,8 +3502,13 @@ mod tests {
         assert_eq!(nav.classify_zone_change_echo(1, HERE, HERE), ZoneChangeEcho::SameZoneReposition,
             "a DUPLICATE echo must classify the SAME — the flag is peeked, never consumed (#554)");
         assert!(nav.same_zone_reposition_pending(), "the reposition flag is NOT consumed by classifying");
-        assert!(stream.sent_app_packets().iter().any(|(op, _)| *op == crate::protocol::OP_ZONE_CHANGE),
-            "a same-zone cross still sends OP_ZONE_CHANGE (so the server repositions us)");
+        // REGRESSION PIN (in-zone pad fix): a same-zone translocator must send NO OP_ZONE_CHANGE. The
+        // zoneID=0 packet makes the server resolve nearest-XY and zone us CROSS-zone (qeynos2 guild pad
+        // → South Qeynos) on top of the correct local reposition — the "right location, then zoned away"
+        // bug. It is a pure in-zone teleport. Mutation: restore the unconditional `send_zone_change_packet`
+        // at the top of `perform_cross` and this goes RED.
+        assert!(!stream.sent_app_packets().iter().any(|(op, _)| *op == crate::protocol::OP_ZONE_CHANGE),
+            "a same-zone translocator must NOT send OP_ZONE_CHANGE — it is a local in-zone reposition");
 
         // ── Genuine cross-zone line ─────────────────────────────────────────────────────────────
         let mut nav2 = new_loop();
@@ -3498,6 +3520,11 @@ mod tests {
         nav2.command.request_goto((100.0, 200.0, 5.0));
         let same2 = nav2.perform_cross(&mut stream, &mut gs2, 200, OTHER, [111.0, 222.0, 33.0]);
         assert!(!same2, "dest!=current must be a cross-zone change");
+        // A genuine cross-zone line DOES send OP_ZONE_CHANGE (the other half of the fix: only the
+        // same-zone branch suppresses it). Mutation: drop `send_zone_change_packet` from the else
+        // branch and this goes RED.
+        assert!(stream.sent_app_packets().iter().any(|(op, _)| *op == crate::protocol::OP_ZONE_CHANGE),
+            "a genuine cross-zone crossing must still send OP_ZONE_CHANGE");
         assert_eq!([gs2.player_x, gs2.player_y, gs2.player_z], [7.0, 8.0, 9.0],
             "a cross-zone cross must NOT locally reposition (the destination is in the other zone)");
         assert_eq!(nav2.command.goto_target(), Some((100.0, 200.0, 5.0)),
