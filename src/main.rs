@@ -15,7 +15,7 @@ use winit::event_loop::EventLoop;
 // syntactically valid `--config` still doesn't resolve to a file). Keeping one copy means both
 // error paths can never drift apart.
 const USAGE: &str = "\
-eqoxide — EverQuest (Titanium) client
+eqoxide — EQEmu client
 
 USAGE:
     eqoxide [OPTIONS]

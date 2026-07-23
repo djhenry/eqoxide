@@ -65,7 +65,7 @@ pub const ENCODE_XOR: u8 = 4;
 
 // ── Login server opcodes (SoD-era / RoF2 client — login_opcodes_sod.conf) ───
 // These are login-server-specific opcodes not present in the world/zone opcode table
-// (patch_RoF2.conf lists them all as 0x0000 in zone context). eqoxide is a RoF2 client,
+// (patch_RoF2.conf lists them all as 0x0000 in zone context). eqoxide is an EQEmu (RoF2) client,
 // so it speaks the EQEmu loginserver's SoD-and-later listener (default port 5999) — NOT
 // the legacy Titanium listener (5998). Ground truth: EQEmu loginserver/login_util/
 // login_opcodes_sod.conf and loginserver/client_manager.cpp (CheckSoDOpcodeFile).

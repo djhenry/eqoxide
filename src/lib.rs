@@ -1,4 +1,4 @@
-//! `eqoxide` — a standalone Rust EverQuest (Titanium) observer/renderer.
+//! `eqoxide` — a standalone Rust EQEmu game client (EQEmu servers only; not for official EverQuest servers).
 //!
 //! Connects directly to a local EQEmu server, renders the current zone in 3D (wgpu), and exposes
 //! an HTTP API (port 8765) so an agent can drive the character. It runs either as a GM observer or
