@@ -1952,6 +1952,35 @@ impl Collision {
         true
     }
 
+    /// #639: is a ROUTE'S FINAL HOP — the penultimate waypoint (`from`) onto the exact goal —
+    /// walkable by the SAME predicate every intermediate A* edge passes ([`Self::walk_profile_ok`])?
+    ///
+    /// The goal waypoint is APPENDED to a route: the reconstruction snaps the last waypoint from the
+    /// reached goal-cell centre (or, for a same-cell walk, the start) to the EXACT goal XY. Before
+    /// #639 that appended hop skipped the walk-edge profile check every *other* edge gets, so a route
+    /// could end in a near-vertical final face the controller cannot climb — measured in `permafrost`,
+    /// final hops to grade **6.61** against `MAX_WALK_GRADE = 1.2` — while the planner still reported a
+    /// COMPLETE route. That is the #630 lie reintroduced at exactly the point the agent is most likely
+    /// to believe it has arrived. This restores the invariant: EVERY consecutive waypoint pair in a
+    /// returned route, including the last, satisfies the walk-edge predicate.
+    ///
+    /// Mirrors the intermediate edge's gate EXACTLY (`astar`: `rise > step_up` before the profile
+    /// check): only a RISING hop past the controller's discrete step-up can hide a face, so a flat /
+    /// gentle / downhill final approach is always walkable and pays no probe — the anti-over-tightening
+    /// choice, identical to the one #630 made for intermediate edges. `goal_floor` is the floor the
+    /// walker actually comes to rest on (the reached goal cell's tier), NEVER the caller's raw z: a
+    /// sloppy goal z (0, a map coord) would otherwise inflate the apparent rise and reject a walkable
+    /// goal. Callers exempt SWIM (water/floating) and ZONE-LINE (`goal_region`) goals — walking grade
+    /// governs neither.
+    fn final_hop_walkable(&self, from: [f32; 3], goal_xy: [f32; 2], goal_floor: f32) -> bool {
+        // = astar's local MAX_STEP_DOWN: how far down `walk_profile_ok` may look for the floor
+        // profile. A drop the walker can take; it never affects the CLIMB rejection this guards.
+        const FINAL_HOP_PROBE_DOWN: f32 = 60.0;
+        let step_up = crate::traversability::PLAYER_BODY.step_up;
+        if goal_floor - from[2] <= step_up { return true; } // nothing to launder — same gate as #630
+        self.walk_profile_ok([from[0], from[1]], from[2], goal_xy, goal_floor, FINAL_HOP_PROBE_DOWN)
+    }
+
     /// A* over the collision grid: a walkable waypoint path from `start` to `goal` that routes
     /// AROUND walls (a plain collide-and-slide toward the goal only slides along one). Returns
     /// cell-center waypoints `[east, north]` (start-exclusive, goal-inclusive) or None if no geometry / no route.
@@ -2498,6 +2527,23 @@ impl Collision {
         // Same cell as the goal: a straight walk. Still start the route AT the character (see the
         // `path.insert(0, ...)` note at the end of the search) so pure pursuit steers along it.
         if (sc, sr) == (gc, gr) {
+            // #639: even a same-cell straight walk APPENDS the goal without the walk-edge check every
+            // A* edge passes — a goal on a ledge inside the start's own 8u cell is still an un-walkable
+            // final face. Validate `start → goal` with the same predicate (SWIM and ZONE-LINE goals
+            // exempt: `resolve_goal_floor` anchors a floating goal to the surface and a region point is
+            // an interior volume point, neither governed by walking grade).
+            if ctx.goal_region.is_none() && self.floating_goal_surface(goal).is_none()
+                && self.water_node_goal_z(goal).is_none()
+            {
+                let sf = self.nearest_floor(start[0], start[1], start[2], STEP_UP, MAX_DROP).unwrap_or(start[2]);
+                let gf = self.resolve_goal_floor(goal).unwrap_or(goal[2]);
+                if !self.final_hop_walkable([start[0], start[1], sf], [goal[0], goal[1]], gf) {
+                    tracing::info!("find_path: goal ({:.0},{:.0},{:.1}) is in the start cell but the walk \
+                        onto it exceeds the walk envelope (#639) — no walkable route (goal_not_walkable)",
+                        goal[0], goal[1], goal[2]);
+                    return Search { trace_call, ..Search::no_route(NoRoute::GoalNotWalkable) };
+                }
+            }
             return Search {
                 path: Some((vec![[start[0], start[1], start[2]], [goal[0], goal[1], goal[2]]], true)),
                 trace_call,
@@ -3658,6 +3704,33 @@ impl Collision {
         // Snap the final waypoint to the exact goal only when we actually reached the goal cell; a
         // partial path must end at the reachable cell, not clip toward an unreachable goal.
         if reached_goal {
+            // #639: THE FINAL-HOP WALK-EDGE CHECK. Snapping the last waypoint from the reached
+            // goal-cell centre to the exact goal APPENDS a hop — penultimate → goal — that skipped
+            // the walk-edge predicate every A* edge passes. Validate it with the SAME predicate
+            // (`final_hop_walkable` → `walk_profile_ok`, #630); if the final approach onto the goal
+            // exceeds the controller's walk envelope, there is no walkable route to the EXACT goal
+            // and claiming a complete route would reintroduce the #630 lie at the goal. Fail loudly
+            // as `GoalNotWalkable` (→ nav_reason goal_not_walkable: re-aim, don't retry), exactly as
+            // an intermediate edge that fails the predicate is dropped. Exemptions mirror the checks
+            // above: a SWIM goal (water/floating waypoint z) is governed by the haul-out/buoyancy
+            // logic, not walking grade, and a ZONE-LINE goal (`goal_region`) arrives by region-volume
+            // containment, not a floor tier (same reason it is exempt from the immediate goal-floor
+            // fail earlier in this function).
+            if ctx.goal_region.is_none() && water_goal.is_none() && floating_goal.is_none() {
+                // bz = the RESOLVED goal floor: the tier the walker physically settles on at the
+                // goal XY (the same `goal_floor` A* aimed arrival at, and what `resolve_goal_floor`
+                // reports), never the caller's raw z nor the 8u cell-centre floor. The walker
+                // pure-pursues pen → goal following the real terrain, so this asks the true question:
+                // can it walk that terrain up onto the goal's floor?
+                let pen = if path.len() >= 2 { path[path.len() - 2] }
+                          else { [start[0], start[1], start_floor] };
+                if !self.final_hop_walkable(pen, [goal[0], goal[1]], goal_floor) {
+                    tracing::info!("find_path: reached the goal cell but the FINAL hop onto goal \
+                        ({:.0},{:.0},{:.1}) exceeds the walk envelope (#639) — no walkable route to \
+                        the exact goal (goal_not_walkable)", goal[0], goal[1], goal[2]);
+                    return Search { trace_call, ..Search::no_route(NoRoute::GoalNotWalkable) };
+                }
+            }
             // A FLOATING water goal's final waypoint carries the anchored SURFACE tier, not the
             // caller's raw z — which may be airborne (z=0 over a lower pool surface) or deep
             // below it. Every water waypoint of a route carries the height the character can
@@ -6516,11 +6589,17 @@ mod tests {
     /// **ACCEPTANCE TEST — the residual #329 band, owner-signed-off 2026-07-15 (review Fix D).**
     ///
     /// This is NOT a bug reproduction — it pins INTENDED behaviour. A flat DOWN-facing surface at
-    /// mid-height with OPEN SKY above it (floor@0 + roof@10, nothing on top) IS admitted as walkable
-    /// ground, and A* CAN route onto it. That is the unavoidable cost of facing-blind ground detection:
-    /// this geometry is IDENTICAL to qcat's walkable −42.97 walkway (down-facing, open above, a floor
-    /// below), so no per-surface rule can accept the qcat floor (the #375 fix) while rejecting this —
-    /// the reviewer proved the two are indistinguishable, and the owner accepted the band.
+    /// mid-height with OPEN SKY above it (floor@0 + roof@10, nothing on top) IS admitted as STANDABLE
+    /// ground. That is the unavoidable cost of facing-blind ground detection: this geometry is
+    /// IDENTICAL to qcat's walkable −42.97 walkway (down-facing, open above, a floor below), so no
+    /// per-surface rule can accept the qcat floor (the #375 fix) while rejecting this — the reviewer
+    /// proved the two are indistinguishable, and the owner accepted the band.
+    ///
+    /// UPDATED (#639): the admission is of STANDABILITY (`column_floors` includes the surface), NOT of
+    /// a complete ROUTE onto it. Where the surface floats above the floor with no walkable connection,
+    /// A* no longer returns a route that snaps its final waypoint onto it — that appended final hop was
+    /// a lie (the walker cannot climb the gap). See the assertions below; the reachability-layer
+    /// refusal is exactly the escalation this note's last paragraph names.
     ///
     /// The two #329 cases that ARE still defended (see `close_roof_ceiling_is_rejected_by_headroom` and
     /// `qcat_pocket_nearest_floor_is_never_the_ceiling`):
@@ -6547,14 +6626,25 @@ mod tests {
         assert!(floors.iter().any(|&z| (z - 10.0).abs() < 0.5),
             "ACCEPTED (#375, owner 2026-07-15): an open-topped mid-height down-facing surface IS \
              standable — indistinguishable from qcat's walkable inverted floor. Set: {floors:?}");
-        // And A* can route onto it (a character on the floor can climb to it via the accepted admission).
+        // …but A* does NOT hand back a COMPLETE route CLAIMING to reach it (#639). The surface floats
+        // 10u above the floor with no connecting geometry — a character on the floor cannot walk the
+        // 10u vertical face onto it (STEP_UP = 2). Before #639 the planner reached the goal cell on the
+        // z=0 floor (wrong tier → fallback) and then APPENDED the goal by snapping the final waypoint to
+        // z=10 — a route that says "arrived at z=10" while the walker is stuck at z=0, the exact
+        // agent-honesty lie #639 closes. The goal-append walk-edge check now refuses that final hop
+        // (`goal_not_walkable`). This is precisely the "mitigate at the REACHABILITY layer" escalation
+        // the #375 owner note names (a graph-level walk-edge check, NOT the per-surface classifier rule
+        // proven impossible): the surface stays STANDABLE (the `column_floors` assert above is
+        // unchanged) — it is only no longer reported as WALKABLE-TO across a gap the controller cannot
+        // cross.
         let path = col.find_path([0.0, -20.0, 0.0], [0.0, 20.0, 10.0], eqoxide_core::physics::PLAYER_RADIUS, &[], true);
-        assert!(path.is_some(),
-            "A* routing onto the mid-height surface is the ACCEPTED cost of facing-blindness — NOT a bug. \
-             Do not add a per-surface rule to block it (proven impossible); mitigate at the reachability \
-             layer if it ever bites a real zone.");
+        assert!(path.is_none(),
+            "#639: A* must NOT return a complete route onto a surface floating 10u above the floor with \
+             no walkable connection — that route's appended final hop is a lie (walker stays at z=0). \
+             The surface remains standable (classifier unchanged); only the un-walkable APPROACH is \
+             refused, at the reachability layer, exactly as the #375 owner note anticipated.");
         // Contrast: the far-roof and close-roof cases ARE still rejected — see close_roof_ceiling_* and
-        // qcat_pocket_*. Only THIS open-topped mid-height band is knowingly admitted.
+        // qcat_pocket_*. Only THIS open-topped mid-height band is knowingly admitted (as STANDABLE).
     }
 
     /// **THE `nav_support` HONESTY SIGNAL (D-2, review Fix A).** Admitting a DOWN-facing (inverted-art)

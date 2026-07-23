@@ -892,3 +892,162 @@ use eqoxide_ipc::MoveIntent;
              {route:?}");
     }
 
+
+// ─────────────────────────── #639 goal-append BLAST RADIUS ───────────────────────────
+
+/// **#639 goal-append blast radius over baked zones — REAL `CharacterController` verdict.**
+///
+/// The dominant risk of the goal-append walk-edge check (#639) is OVER-TIGHTENING: a route that used
+/// to return complete now returns `goal_not_walkable`. Some losses are the planner CORRECTLY refusing
+/// a final hop the walker could never execute (honest); a regression would be a REACHABLE goal now
+/// stranded. This distinguishes them WITHOUT a two-build diff:
+///
+/// **LOST is provable single-build.** On `main`, `Unreachable(GoalNotWalkable)` is returned ONLY when
+/// the goal has NO floor anywhere in its column (`collision.rs`, the pre-search immediate fail). The
+/// #639 check is the ONLY code path that returns `GoalNotWalkable` for a goal that HAS a column floor
+/// (A* reached the goal cell, then the appended final hop failed the walk-edge predicate). So a pair
+/// that comes back `GoalNotWalkable` AND whose goal has a column floor is EXACTLY a route #639 newly
+/// refuses — one `main` returned as complete. And #639 only ADDS refusals, so GAINED = 0 by
+/// construction.
+///
+/// For each such LOST pair the REAL controller renders the verdict: drive it (faithful walker) to the
+/// reachable LOW tier under the goal, then push straight at the goal for a further stretch, and report
+/// whether it ever comes to rest at the goal's OWN floor (`arrived_at_goal_tier`). If it cannot, the
+/// #639 refusal was HONEST — the walker physically cannot climb onto the goal. An `arrived_at_goal_tier`
+/// on a LOST pair would be a genuine over-tightening regression.
+///
+/// ```text
+/// ZONE_DIR=~/.local/share/eqoxide/assets/models \
+///   cargo test --release --test walker_sim goal_append_blast_radius -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires baked zone glbs at $ZONE_DIR; the #639 goal-append over-tightening blast radius"]
+fn goal_append_blast_radius() {
+    use eqoxide::nav::collision::NoRoute;
+    const RUN_SPEED: f32 = 44.0;
+    const LOOK_AHEAD: f32 = 5.0;
+    const LOCAL_REACH: f32 = 24.0;
+    const LOCAL_BOUND: f32 = 40.0;
+    const LOCAL_CELL: f32 = 2.0;
+    const DT: f32 = 1.0 / 100.0;
+    const FRAMES_PER_TICK: u32 = 15;
+    const GOAL_TIER_TOL: f32 = 8.0;
+
+    // Faithful walker to `approach` (a routable point), THEN a straight push at `goal` xy. Returns the
+    // controller's final resting position. Drives WALK legs (the #639 losses are all dry land faces).
+    let drive_and_push = |col: &Collision, start: [f32; 3], approach: [f32; 3], goal: [f32; 3]| -> [f32; 3] {
+        let PlanOutcome::Route(coarse) = col.find_path_ex(
+            start, approach, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) else { return start };
+        let mut ctrl = CharacterController::new(start);
+        ctrl.on_ground = true;
+        let mut path_i = 0usize;
+        // Phase 1: follow the coarse route to the low-tier approach (fast pure pursuit, no re-plan —
+        // the approach is known-routable, we only need to GET the walker to the goal's foot).
+        for _ in 0..180 {
+            let (px, py, pz) = (ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]);
+            if (px - approach[0]).hypot(py - approach[1]) < 4.0 { break; }
+            while path_i + 2 < coarse.len() {
+                let (a, b) = (coarse[path_i], coarse[path_i + 1]);
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1] + (pz - a[2]) * ab[2]) / l2 };
+                if t >= 1.0 { path_i += 1; } else { break; }
+            }
+            let carrot = carrot_along(&coarse, path_i, [px, py, pz], LOOK_AHEAD).unwrap_or(approach);
+            let (dx, dy) = (carrot[0] - px, carrot[1] - py);
+            let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+            for _ in 0..FRAMES_PER_TICK {
+                ctrl.step(MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
+                    want_swim: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
+            }
+        }
+        // Phase 2: push STRAIGHT at the goal XY for ~4 s, hopping — the walker's honest best effort to
+        // mount the final face. If it can climb, it reaches the goal's tier here; if not, it wedges.
+        for _ in 0..80 {
+            let (px, py) = (ctrl.pos[0], ctrl.pos[1]);
+            let (dx, dy) = (goal[0] - px, goal[1] - py);
+            let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+            for _ in 0..FRAMES_PER_TICK {
+                ctrl.step(MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
+                    want_swim: false, speed: RUN_SPEED, climb: 0.0, hop: true }, DT, col);
+            }
+        }
+        ctrl.pos
+    };
+
+    let dir = std::env::var("ZONE_DIR")
+        .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+    let zones: Vec<String> = std::env::var("ZONES").ok()
+        .map(|z| z.split(',').map(str::to_string).collect())
+        .unwrap_or_else(|| ["akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka",
+            "felwithea", "highpass", "everfrost", "butcher", "cazicthule", "oasis"]
+            .into_iter().map(str::to_string).collect());
+
+    let mut seed: u64 = 0x639A_11CE;
+    let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
+    let unit = |r: u32| r as f32 / u32::MAX as f32;
+
+    let (mut g_pairs, mut g_routed, mut g_lost, mut g_drove, mut g_over) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    println!("\n=== #639 goal-append blast radius (LOST = goal_not_walkable WITH a column floor) ===");
+    println!("{:<12} {:>6} {:>7} {:>6} {:>7} {:>9}", "zone", "pairs", "routed", "lost", "drove", "over_tight");
+    for zone in &zones {
+        let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
+        let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12} (no glb — skipped)"); continue };
+        let mut col = Collision::build(&za, 32.0);
+        if col.cols == 0 { println!("{zone:<12} (no grid — skipped)"); continue; }
+        col.set_water(RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
+
+        let (mut z_pairs, mut z_routed, mut z_lost, mut z_drove, mut z_over) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut tries = 0;
+        while z_pairs < 120 && tries < 6000 {
+            tries += 1;
+            let e = col.origin[0] + unit(rnd()) * (col.cols as f32 * col.cell_size);
+            let n = col.origin[1] + unit(rnd()) * (col.rows as f32 * col.cell_size);
+            let Some(z) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { continue };
+            let ang = unit(rnd()) * std::f32::consts::TAU;
+            let d = 120.0 + unit(rnd()) * 280.0;
+            let (ge, gn) = (e + d * ang.cos(), n + d * ang.sin());
+            let Some(gz) = col.nearest_floor(ge, gn, z, 400.0, 400.0) else { continue };
+            let s = [e, n, z];
+            let g = [ge, gn, gz];
+            if col.in_water(s) || col.in_water(g) { continue; }
+            z_pairs += 1;
+
+            let outcome = col.find_path_ex(s, g, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker());
+            if matches!(outcome, PlanOutcome::Route(_)) { z_routed += 1; continue; }
+            // LOST iff GoalNotWalkable AND the goal has a floor in its column (main would have routed).
+            let is_gnw = matches!(outcome, PlanOutcome::Unreachable { reason: NoRoute::GoalNotWalkable, .. });
+            if !is_gnw || col.snap_goal_to_column_floor(g).is_none() { continue; }
+            z_lost += 1;
+
+            // Controller verdict on the first few LOST pairs/zone (driving is the costly part).
+            if z_drove < 6 {
+                // Approach = the goal XY at the LOWEST column floor A* CAN route to (main's reached tier).
+                let mut floors = col.column_floors(g[0], g[1], z, 400.0, 400.0);
+                floors.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let approach = floors.iter().map(|&f| [g[0], g[1], f])
+                    .find(|&pt| matches!(col.find_path_ex(s, pt, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()), PlanOutcome::Route(_)));
+                if let Some(app) = approach {
+                    z_drove += 1;
+                    let end = drive_and_push(&col, s, app, g);
+                    let at_goal_xy = (end[0] - g[0]).hypot(end[1] - g[1]) < 4.0;
+                    let at_goal_z = (end[2] - gz).abs() <= GOAL_TIER_TOL;
+                    let arrived_at_goal_tier = at_goal_xy && at_goal_z;
+                    if arrived_at_goal_tier { z_over += 1; }
+                    println!("  LOST {zone} s[{:.0},{:.0},{:.0}] g[{:.0},{:.0},{:.1}] approach_z {:.1} \
+                             end[{:.0},{:.0},{:.1}] arrived_at_goal_tier {}",
+                        s[0], s[1], s[2], g[0], g[1], g[2], app[2], end[0], end[1], end[2], arrived_at_goal_tier as u8);
+                }
+            }
+        }
+        println!("{zone:<12} {z_pairs:>6} {z_routed:>7} {z_lost:>6} {z_drove:>7} {z_over:>9}");
+        g_pairs += z_pairs; g_routed += z_routed; g_lost += z_lost; g_drove += z_drove; g_over += z_over;
+    }
+    println!("\nTOTAL pairs {g_pairs}  routed {g_routed}  LOST(newly-refused) {g_lost}  drove {g_drove}  OVER-TIGHTENED {g_over}");
+    println!("(gained = 0 by construction: #639 only ADDS refusals. OVER-TIGHTENED must be 0 — any LOST \
+             pair where the REAL controller reached the goal's own tier is a regression.)");
+    assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
+    assert_eq!(g_over, 0,
+        "#639 over-tightening: {g_over} LOST pair(s) were reachable by the REAL controller — the goal-\
+         append check refused a goal the walker can actually stand on. Investigate the printed pairs.");
+}
