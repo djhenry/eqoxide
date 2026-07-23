@@ -71,6 +71,7 @@ async fn post_manual(
     OptionalJson(body): OptionalJson<ManualBody>,
 ) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
+    if let Err(e) = require_alive(&s) { return e; } // #644: a corpse cannot be driven manually
     let b = body.unwrap_or_default();
     let dir = [b.east.unwrap_or(0.0), b.north.unwrap_or(0.0)];
     let up = b.up.unwrap_or(0.0).clamp(-1.0, 1.0);
@@ -91,6 +92,7 @@ async fn post_manual(
 /// upward toward the surface (#207), e.g. to lift off a pool floor.
 async fn post_jump(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
+    if let Err(e) = require_alive(&s) { return e; } // #644: a corpse cannot jump
     s.camera.request_manual_move(ManualMove {
         dir: [0.0, 0.0], up: 0.0, jump: true,
         until: std::time::Instant::now() + std::time::Duration::from_millis(400),
@@ -198,6 +200,11 @@ async fn post_goto(
     OptionalJson(body): OptionalJson<MoveBody>,
 ) -> Response {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
+    // #644: a dead character cannot move — reject with an explicit `dead` token BEFORE stamping a
+    // goal, so an agent never reads `200 … navigating` for a goal a corpse can never reach.
+    if let Err((code, msg)) = require_alive(&s) {
+        return json(code, serde_json::json!({ "status": "dead", "message": msg }));
+    }
     let b = body.unwrap_or_default();
     let player_pos = s.player_pos();
 
@@ -280,6 +287,10 @@ async fn post_follow(
     OptionalJson(body): OptionalJson<MoveBody>,
 ) -> Response {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
+    // #644: a corpse cannot follow — same explicit `dead` rejection as /goto.
+    if let Err((code, msg)) = require_alive(&s) {
+        return json(code, serde_json::json!({ "status": "dead", "message": msg }));
+    }
     let b = body.unwrap_or_default();
 
     if b.has_coords() {
@@ -370,6 +381,7 @@ async fn post_zone_cross(
     OptionalJson(body): OptionalJson<ZoneCrossBody>,
 ) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
+    if let Err(e) = require_alive(&s) { return e; } // #644: a corpse cannot cross a zone line
     let b = body.unwrap_or_default();
     apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     let zone_id = b.zone_id.unwrap_or(0);
@@ -871,6 +883,105 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let text = body_text(resp).await;
         assert!(text.contains("not coordinates"), "message: {text}");
+    }
+
+    // ── #644: a DEAD character must not receive `200 … navigating` for a movement it can't do ────
+
+    /// The exact #644 repro: with the character DEAD, `POST /goto` must be REJECTED (409 + machine
+    /// token `dead`) — not accepted with `status: navigating` and a fresh goal_id — and it must NOT
+    /// stamp a nav goal. MUTATION CHECK: remove the `require_alive` guard in `post_goto` and this
+    /// goes RED (200, `status: navigating`, `goto_target` set).
+    #[tokio::test]
+    async fn goto_while_dead_is_rejected_and_queues_nothing() {
+        let state = empty_state();
+        set_gs(&state, |gs| gs.player_dead = true);
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT,
+            "a dead character's /goto must be rejected, not accepted as navigating");
+        let j = body_json(resp).await;
+        assert_eq!(j["status"], "dead", "the caller must get a machine-branchable `dead` token: {j}");
+        assert!(goto_target.lock().unwrap().is_none(),
+            "a dead character's /goto must not stamp a nav goal");
+    }
+
+    /// The rejection uses `is_player_dead()`, so it also fires in the HP-to-0-BEFORE-OP_Death window
+    /// (`cur_hp <= 0` with a known `max_hp`), not just on the `player_dead` flag.
+    #[tokio::test]
+    async fn goto_while_hp_zero_pre_death_is_rejected() {
+        let state = empty_state();
+        set_gs(&state, |gs| { gs.player_dead = false; gs.cur_hp = 0; gs.max_hp = 1284; });
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(goto_target.lock().unwrap().is_none());
+    }
+
+    /// A LIVE character's /goto is unaffected (the guard must not over-fire): cur_hp<=0 with
+    /// max_hp==0 is UNKNOWN HP (fresh spawn), not death, and must still be accepted.
+    #[tokio::test]
+    async fn goto_while_alive_is_still_accepted() {
+        let state = empty_state();
+        set_gs(&state, |gs| { gs.player_dead = false; gs.cur_hp = 0; gs.max_hp = 0; });
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*goto_target.lock().unwrap(), Some((1.0, 2.0, 3.0)));
+    }
+
+    #[tokio::test]
+    async fn follow_while_dead_is_rejected_and_queues_nothing() {
+        let state = empty_state();
+        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat00".into(), 42);
+        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
+        set_gs(&state, |gs| gs.player_dead = true);
+        let goto_entity = state.nav.goto_entity.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/follow")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a rat"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(resp).await["status"], "dead");
+        assert!(goto_entity.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn zone_cross_while_dead_is_rejected_and_queues_nothing() {
+        let state = empty_state();
+        set_gs(&state, |gs| gs.player_dead = true);
+        let zc = state.nav.zone_cross.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/zone_cross").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(body_text(resp).await.contains("dead"));
+        assert!(zc.lock().unwrap().is_none(), "a dead character's zone-cross must not be queued");
+    }
+
+    #[tokio::test]
+    async fn manual_and_jump_while_dead_are_rejected() {
+        for (path, body) in [("/manual", r#"{"east":1.0}"#), ("/jump", "")] {
+            let state = empty_state();
+            set_gs(&state, |gs| gs.player_dead = true);
+            let app = router().with_state(state);
+            let mut rb = Request::post(path);
+            if !body.is_empty() { rb = rb.header("content-type", "application/json"); }
+            let resp = app.oneshot(rb.body(Body::from(body)).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT, "{path} on a corpse must be rejected");
+            assert!(body_text(resp).await.contains("dead"), "{path} must name the `dead` condition");
+        }
     }
 
     // --- manual: a malformed body must be reported honestly, not as "no direction given" -------

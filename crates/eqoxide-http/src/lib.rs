@@ -775,6 +775,38 @@ pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::Sta
     Ok(())
 }
 
+/// #644 (agent-honesty): reject a MOVEMENT command when the character is DEAD, so an agent never
+/// receives a `200 … navigating` for a goal a corpse can never reach.
+///
+/// The bug: after the character dies, `POST /v1/move/{goto,follow,zone_cross}` were still accepted —
+/// a fresh `goal_id`, `status: navigating` — and then the walker's `nav_halt_if_dead` cleared the
+/// route and `nav_state` sat at the ambiguous `idle` forever. The agent (no independent channel to
+/// reality) could not tell *"accepted and running"* from *"you are dead and nothing you ask will
+/// ever happen"*, and would re-issue indefinitely, each time getting a fresh `goal_id` and a 200.
+/// This turns the whole class into an explicit, distinguishable failure — `409 Conflict`, machine
+/// token `dead` — decided BEFORE any goal id is stamped, so a movement acceptance can never report
+/// `navigating` for a corpse in the first place (the honesty invariant's "make the bad state
+/// unrepresentable" tier). The in-flight companion (a goto accepted while alive, then the character
+/// dies mid-route) is handled in the walker: `nav_halt_if_dead` now publishes the terminal
+/// `nav_state: "dead"` instead of `idle`.
+///
+/// Keyed on `GameState::is_player_dead()` — the SAME predicate the nav walker halts on — so it also
+/// fires in the HP-to-0-before-OP_Death window (`cur_hp <= 0` with a known `max_hp`), not just on the
+/// `player_dead` flag. Only movement WRITEs that would report progress are gated by callers; `/stop`
+/// is a cancel (idempotent and honest even on a corpse) and is deliberately NOT gated.
+pub(crate) fn require_alive(s: &HttpState) -> Result<(), (axum::http::StatusCode, String)> {
+    if s.game_state.load().is_player_dead() {
+        return Err((
+            axum::http::StatusCode::CONFLICT,
+            "the character is dead — this movement command was NOT accepted and will not take \
+             effect (a corpse cannot move). Respawn first (POST /v1/lifecycle/respawn), then \
+             reissue. See GET /v1/observe/debug (`dead`)."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_camera_server(
     camera:          eqoxide_ipc::CameraSlots,

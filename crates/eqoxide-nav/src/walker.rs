@@ -41,6 +41,13 @@ use eqoxide_core::physics::RUN_SPEED;
 /// Read `zone_assets` on GET /v1/observe/debug to tell *pending* from *failed*.
 pub const NAV_STATE_ZONE_LOADING: &str = "zone_loading";
 
+/// Terminal `nav_state` published when navigation is halted because the player is DEAD (#644). A
+/// slain character abandons its route (#238); before, that was reported as the ambiguous `idle`
+/// (which also means "ready for work"), so an agent that issued a goto and then polled saw `idle`
+/// and could not tell "arrived / ready" from "you died and went nowhere". `dead` names the
+/// condition honestly and clears back to `idle` on respawn (see `Walker::resolve_goal`).
+pub const NAV_STATE_DEAD: &str = "dead";
+
 /// How many standable spots one pad offer carries in total (the one to try + its `alternates`).
 /// Bounded: a pad's full leaf list is diagnostics, not an offer.
 const OFFERED_SPOTS: usize = 8;
@@ -619,7 +626,11 @@ impl Walker {
         // A corpse must not act on a plan that lands after it died (#238 + #340).
         self.planner.cancel();
         self.awaiting_first_plan = false;
-        self.set_nav_state("idle");
+        // #644: publish an HONEST TERMINAL state, not the ambiguous `idle`. `idle` also means "ready
+        // for work", so an agent that issued a goto (accepted while alive) and then polled after the
+        // character died mid-route saw `idle` and could not distinguish "arrived / ready" from "you
+        // died". `dead` names the condition; it clears back to `idle` on respawn (see `resolve_goal`).
+        self.set_nav_state_because(NAV_STATE_DEAD, Some("player_dead"));
         self.publish_debug(Self::known_pos(gs), None);
         true
     }
@@ -717,6 +728,10 @@ impl Walker {
                 *self.nav_intent.lock().unwrap() = None;
                 if self.nav_state_is("navigating") || self.nav_state_is("navigating_partial")
                     || self.nav_state_is("planning") || self.nav_state_is(NAV_STATE_ZONE_LOADING)
+                    // #644: once the player has RESPAWNED (no longer dead ⇒ this tick reaches
+                    // `resolve_goal`), retire the terminal `dead` back to `idle` so the honest
+                    // death state doesn't linger as a new never-clearing observable.
+                    || self.nav_state_is(NAV_STATE_DEAD)
                 {
                     self.set_nav_state("idle");
                 }
@@ -1657,6 +1672,24 @@ mod tests {
         *nav.goto_target.lock().unwrap() = None;
         assert!(w.resolve_goal(&gs).is_none());
         assert_eq!(nav.nav_state.lock().unwrap().state, "idle");
+    }
+
+    /// #644: the honest terminal `dead` state must NOT become a new never-clearing observable — once
+    /// the character has RESPAWNED (so the tick reaches `resolve_goal` again) and there is no active
+    /// goto, it must retire back to plain `idle`. Mutation check: drop `NAV_STATE_DEAD` from the
+    /// reset list in `resolve_goal` and this goes RED (the state stays stuck at `dead` after respawn).
+    #[test]
+    fn dead_nav_state_clears_to_idle_on_respawn() {
+        let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        let gs = eqoxide_core::game_state::GameState::new(); // alive (cur_hp/max_hp both 0 = unknown, not dead)
+        // Simulate the post-death published state: terminal `dead`, no active goto.
+        w.set_nav_state_because(NAV_STATE_DEAD, Some("player_dead"));
+        *nav.goto_target.lock().unwrap() = None;
+        assert_eq!(nav.nav_state.lock().unwrap().state, "dead");
+        // A respawned (live) player's tick reaches resolve_goal; with no goto it retires `dead`→`idle`.
+        assert!(w.resolve_goal(&gs).is_none());
+        assert_eq!(nav.nav_state.lock().unwrap().state, "idle",
+            "#644: `dead` must clear to `idle` on respawn, not linger forever");
     }
 
     /// **#615 review F1 — the idle snapshot must TRACK reality, never fabricate it.** The live
