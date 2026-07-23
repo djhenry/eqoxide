@@ -536,19 +536,61 @@ pub struct ItemLink {
 ///
 /// ## What is deliberately NOT modelled
 /// Only "does this spell id carry SPA 57". No buff durations, no other SPA behavior, no bonus math.
-/// An unknown spell id (not in the table, or no table loaded) leaves this state **unchanged** — it
-/// is never guessed to be "not levitate". See [`crate::spells::SpellDb::has_effect`].
+/// An unknown spell id (not in the table, or no table loaded) never flips the levitate *belief* —
+/// it is never guessed to be "not levitate". It IS recorded, though (see `unresolved` below), so the
+/// answer can honestly report [`Levitating::Unknown`] instead of a confident `No`. See
+/// [`crate::spells::SpellDb::has_effect`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LevitateState {
     /// Latest reading of the GravityBehavior channel (self-spawn `flymode` / type-19 appearance).
     by_flymode: bool,
     /// Buff slot ids currently known to hold a SPA-57 spell.
     by_buff: std::collections::BTreeSet<u32>,
+    /// Buff slots the server told us about whose spell id we could NOT resolve to a SPA-57 answer
+    /// (absent from the table, or no table loaded). While any such slot stands and no channel
+    /// positively asserts levitate, the honest answer is [`Levitating::Unknown`] — a levitate could
+    /// be hiding in a slot we cannot read (#598). A resolvable update for the slot, a fade, or a
+    /// snapshot that omits/resolves it clears it. Never intersects `by_buff` (a slot is EITHER a
+    /// known levitate OR unresolved, never both).
+    unresolved: std::collections::BTreeSet<u32>,
+}
+
+/// The honest three-valued answer to "is the self-player levitating?", for the API boundary.
+///
+/// [`LevitateState::active`] must stay a `bool` — the controller has to make a concrete hover/fall
+/// decision every frame. But an *observable* reported to a driving agent must never collapse "we
+/// don't know" into a confident `false`: when a buff we were told about references a spell id our
+/// table can't resolve (missing/truncated `spells_us.txt`) and no channel positively asserts
+/// levitate, the truthful answer is neither `Yes` nor `No`. That is the exact silent-wrong-answer
+/// the agent-honesty invariant exists to prevent (#598), so the API answer is three-valued and
+/// `Unknown` is a distinct variant the caller can branch on — serialized as JSON `null`, never
+/// `false` and never omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Levitating {
+    /// A channel positively asserts levitate (flymode 2/5, or a buff we KNOW carries SPA 57).
+    Yes,
+    /// Complete information, and no channel asserts levitate. A trustworthy negative.
+    No,
+    /// We received buff information we could not resolve and have no positive evidence, so we cannot
+    /// honestly answer. Serialized as `null`.
+    Unknown,
 }
 
 impl LevitateState {
-    /// The one answer: is the self-player levitating right now?
+    /// The one answer for the CONTROLLER: is the self-player levitating right now? A `bool` because
+    /// the controller must pick hover-or-fall every frame; `Unknown` is treated as "don't hover on a
+    /// guess" here, which is a safe physics default, NOT an honesty lie (this value is never reported
+    /// to an agent — the API reads [`answer`](Self::answer)).
     pub fn active(&self) -> bool { self.by_flymode || !self.by_buff.is_empty() }
+
+    /// The one answer for the API BOUNDARY: the honest three-valued levitate state (#598). A positive
+    /// from any channel is `Yes`; otherwise an outstanding unresolvable buff makes it `Unknown` (we
+    /// can't rule levitate out); only with complete, levitate-free information is it a confident `No`.
+    pub fn answer(&self) -> Levitating {
+        if self.active() { Levitating::Yes }
+        else if !self.unresolved.is_empty() { Levitating::Unknown }
+        else { Levitating::No }
+    }
 
     /// Mid-zone `OP_SpawnAppearance` type 19 about our own spawn. In practice only ever the CLEAR
     /// (`param=0` on fade) — the 2/5 SET arm is defensive.
@@ -560,42 +602,53 @@ impl LevitateState {
     pub fn resync_on_zone_in(&mut self, levitating: bool) {
         self.by_flymode = levitating;
         self.by_buff.clear();
+        self.unresolved.clear();
     }
 
     /// One buff slot changed. `is_levitate` is the three-valued SPA-57 answer for the spell now in
     /// `slot` (`None` = we have no row for that spell id). `fading` = the server said this buff is
     /// going away.
     ///
-    /// `None` is a NO-OP by design: an unknown spell must never clear a slot we positively know
-    /// holds a levitate (that would report "not levitating" while the character floats).
+    /// `None` never clears a slot we positively know holds a levitate (that would report "not
+    /// levitating" while the character floats). Instead it RECORDS the slot as unresolved, so
+    /// [`answer`](Self::answer) can honestly say `Unknown` rather than a confident `No` (#598).
     pub fn buff_slot_changed(&mut self, slot: u32, is_levitate: Option<bool>, fading: bool) {
         if fading {
             // A fade names the slot being vacated. Removing it is safe whatever the spell was: if
-            // the slot wasn't in the set, this is a no-op.
+            // the slot wasn't in either set, this is a no-op.
             self.by_buff.remove(&slot);
+            self.unresolved.remove(&slot);
             return;
         }
         match is_levitate {
-            Some(true)  => { self.by_buff.insert(slot); }
-            Some(false) => { self.by_buff.remove(&slot); }
-            None        => {}
+            Some(true)  => { self.by_buff.insert(slot); self.unresolved.remove(&slot); }
+            Some(false) => { self.by_buff.remove(&slot); self.unresolved.remove(&slot); }
+            // Unresolvable: keep any known-levitate belief for this slot, but otherwise record that
+            // we cannot read it — the difference between an honest `Unknown` and a confident `No`.
+            None        => { if !self.by_buff.contains(&slot) { self.unresolved.insert(slot); } }
         }
     }
 
     /// A FULL buff-list snapshot (`OP_BuffCreate` with `all_buffs=1`): `(slot, is_levitate)` for
     /// every occupied slot. Slots absent from the snapshot, or holding a spell we KNOW is not
-    /// levitate, drop out. A slot holding an UNKNOWN spell keeps whatever we already believed about
-    /// it — the snapshot is only as complete as our spell table, and we do not pretend otherwise.
+    /// levitate, drop out. A slot holding an UNKNOWN spell keeps a known-levitate belief but is
+    /// otherwise recorded as unresolved — the snapshot is only as complete as our spell table, and we
+    /// report that uncertainty (`Unknown`) rather than pretend the slot isn't levitate (#598).
     pub fn resync_from_snapshot(&mut self, slots: &[(u32, Option<bool>)]) {
         let mut next = std::collections::BTreeSet::new();
+        let mut next_unresolved = std::collections::BTreeSet::new();
         for &(slot, is_levitate) in slots {
             match is_levitate {
                 Some(true)  => { next.insert(slot); }
                 Some(false) => {}
-                None        => { if self.by_buff.contains(&slot) { next.insert(slot); } }
+                None        => {
+                    if self.by_buff.contains(&slot) { next.insert(slot); }
+                    else { next_unresolved.insert(slot); }
+                }
             }
         }
         self.by_buff = next;
+        self.unresolved = next_unresolved;
     }
 
     /// Diagnostics: which channel(s) currently assert levitate. Not wire state — for logs/tests.
@@ -1425,8 +1478,16 @@ impl GameState {
         self.coin_confirmed && self.unverified_buys == 0
     }
 
-    /// Is the self-player levitating (gravity off)? The single read path for [`LevitateState`].
+    /// Is the self-player levitating (gravity off)? The CONTROLLER read path (bool: hover or fall).
+    /// The single read path for [`LevitateState`]. Agent-facing observables must instead use
+    /// [`player_levitating_state`](Self::player_levitating_state), which distinguishes `Unknown`.
     pub fn player_levitating(&self) -> bool { self.levitate.active() }
+
+    /// The honest three-valued levitate state for the API boundary (#598): `Yes`/`No`/`Unknown`.
+    /// `Unknown` when a buff we were told about references a spell id our table can't resolve and no
+    /// channel positively asserts levitate — so the agent never reads a confident `false` we can't
+    /// back up. See [`Levitating`].
+    pub fn player_levitating_state(&self) -> Levitating { self.levitate.answer() }
 
     /// Reconcile the local coin snapshot against the server's authoritative figure, carried by
     /// every OP_PlayerProfile (#361). Two merchant-buy refusal paths — inventory-full and a LORE
@@ -1778,40 +1839,79 @@ mod pose_tests_643 {
 pub(crate) mod tests {
     use super::{Door, GameState, MerchantItem, make_entity};
 
-    /// #586: exhaustive property over every ordering of the two levitate channels' events. The
-    /// invariant that matters for agent-honesty is that `active()` is EXACTLY "some channel
-    /// currently holds evidence" — never a stale `true` after all evidence is withdrawn, never a
-    /// `false` while evidence stands, and never dependent on which channel spoke last.
+    /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
+    /// including the FULL-SNAPSHOT (`resync_from_snapshot`) path that carries the real mid-zone
+    /// cast-on (#586 established it arrives as an `OP_BuffCreate` snapshot with `all_buffs=1`). #586's
+    /// original alphabet omitted snapshots, so the bug-carrying path had only example coverage (#598
+    /// finding 3); it is now first-class here.
+    ///
+    /// Two invariants, both against an independent reference model:
+    /// - `active()` is EXACTLY "some channel currently holds POSITIVE evidence" — never a stale
+    ///   `true` after all evidence is withdrawn, never a `false` while evidence stands, never
+    ///   dependent on which channel spoke last.
+    /// - `answer()` (the agent-facing tri-state) is `Yes` iff `active()`, else `Unknown` iff an
+    ///   unresolvable buff stands, else `No` — so an unknown state can NEVER surface as a confident
+    ///   `No` (#598 finding 1). MUTATION-CHECK: make `answer()` return `No` in place of `Unknown` and
+    ///   this goes RED on the snapshot/unknown-buff orderings.
     #[test]
     fn levitate_state_is_exactly_the_union_of_its_two_channels() {
-        use super::LevitateState;
+        use super::{LevitateState, Levitating};
+        use std::collections::BTreeSet;
         #[derive(Clone, Copy, Debug)]
-        enum Ev { Fly(bool), BuffOn(u32), BuffOff(u32), BuffKnownOther(u32), BuffUnknown(u32), ZoneIn(bool) }
+        enum Ev { Fly(bool), BuffOn(u32), BuffOff(u32), BuffKnownOther(u32), BuffUnknown(u32),
+                  ZoneIn(bool), SnapLev, SnapOther, SnapUnknown }
         let alphabet = [
             Ev::Fly(true), Ev::Fly(false),
             Ev::BuffOn(1), Ev::BuffOff(1), Ev::BuffKnownOther(1), Ev::BuffUnknown(1),
             Ev::BuffOn(2), Ev::BuffOff(2),
             Ev::ZoneIn(true), Ev::ZoneIn(false),
+            Ev::SnapLev, Ev::SnapOther, Ev::SnapUnknown,
         ];
-        // Every sequence of length 3 over the alphabet (1000 orderings), replayed against an
-        // independent reference model.
+        // A snapshot RECOMPUTES both belief sets from scratch over exactly the listed slots.
+        let ref_snapshot = |prev: &BTreeSet<u32>, snap: &[(u32, Option<bool>)]| {
+            let (mut ns, mut nu): (BTreeSet<u32>, BTreeSet<u32>) = Default::default();
+            for &(slot, isl) in snap {
+                match isl {
+                    Some(true)  => { ns.insert(slot); }
+                    Some(false) => {}
+                    None        => { if prev.contains(&slot) { ns.insert(slot); } else { nu.insert(slot); } }
+                }
+            }
+            (ns, nu)
+        };
+        // Every sequence of length 3 over the 13-symbol alphabet (2197 orderings).
         for a in alphabet { for b in alphabet { for c in alphabet {
             let seq = [a, b, c];
             let mut st = LevitateState::default();
             let mut ref_fly = false;
-            let mut ref_slots: std::collections::BTreeSet<u32> = Default::default();
+            let mut ref_slots: BTreeSet<u32> = Default::default();
+            let mut ref_unresolved: BTreeSet<u32> = Default::default();
             for ev in seq {
                 match ev {
                     Ev::Fly(v)   => { st.set_flymode(v); ref_fly = v; }
-                    Ev::ZoneIn(v) => { st.resync_on_zone_in(v); ref_fly = v; ref_slots.clear(); }
-                    Ev::BuffOn(s) => { st.buff_slot_changed(s, Some(true), false); ref_slots.insert(s); }
-                    Ev::BuffKnownOther(s) => { st.buff_slot_changed(s, Some(false), false); ref_slots.remove(&s); }
-                    Ev::BuffOff(s) => { st.buff_slot_changed(s, None, true); ref_slots.remove(&s); }
-                    // The honesty rule: an UNKNOWN spell id changes nothing at all.
-                    Ev::BuffUnknown(_) => { st.buff_slot_changed(1, None, false); }
+                    Ev::ZoneIn(v) => { st.resync_on_zone_in(v); ref_fly = v; ref_slots.clear(); ref_unresolved.clear(); }
+                    Ev::BuffOn(s) => { st.buff_slot_changed(s, Some(true), false); ref_slots.insert(s); ref_unresolved.remove(&s); }
+                    Ev::BuffKnownOther(s) => { st.buff_slot_changed(s, Some(false), false); ref_slots.remove(&s); ref_unresolved.remove(&s); }
+                    Ev::BuffOff(s) => { st.buff_slot_changed(s, None, true); ref_slots.remove(&s); ref_unresolved.remove(&s); }
+                    // An UNKNOWN spell id never flips the levitate belief, but IS recorded so the
+                    // answer can honestly say Unknown (slot 1, matching the wire event modeled).
+                    Ev::BuffUnknown(_) => { st.buff_slot_changed(1, None, false);
+                                            if !ref_slots.contains(&1) { ref_unresolved.insert(1); } }
+                    Ev::SnapLev    => { st.resync_from_snapshot(&[(1, Some(true))]);
+                                        let (ns, nu) = ref_snapshot(&ref_slots, &[(1, Some(true))]); ref_slots = ns; ref_unresolved = nu; }
+                    Ev::SnapOther  => { st.resync_from_snapshot(&[(1, Some(false))]);
+                                        let (ns, nu) = ref_snapshot(&ref_slots, &[(1, Some(false))]); ref_slots = ns; ref_unresolved = nu; }
+                    Ev::SnapUnknown => { st.resync_from_snapshot(&[(1, None)]);
+                                        let (ns, nu) = ref_snapshot(&ref_slots, &[(1, None)]); ref_slots = ns; ref_unresolved = nu; }
                 }
-                assert_eq!(st.active(), ref_fly || !ref_slots.is_empty(),
-                           "levitate mismatch after {seq:?} (fly={ref_fly} slots={ref_slots:?})");
+                let ref_active = ref_fly || !ref_slots.is_empty();
+                assert_eq!(st.active(), ref_active,
+                           "levitate active() mismatch after {seq:?} (fly={ref_fly} slots={ref_slots:?})");
+                let ref_answer = if ref_active { Levitating::Yes }
+                                 else if !ref_unresolved.is_empty() { Levitating::Unknown }
+                                 else { Levitating::No };
+                assert_eq!(st.answer(), ref_answer,
+                           "levitate answer() mismatch after {seq:?} (fly={ref_fly} slots={ref_slots:?} unresolved={ref_unresolved:?})");
             }
         }}}
     }
@@ -1833,6 +1933,48 @@ pub(crate) mod tests {
         // A slot we never believed in, holding an unknown spell, is not invented as levitate.
         st.resync_from_snapshot(&[(9, None)]);
         assert!(!st.active(), "an unknown spell must never be guessed as levitate either");
+    }
+
+    /// #598 finding 1 — the honesty bug this issue exists for: an UNKNOWN levitate state must reach
+    /// the API boundary as an explicit `Unknown`, never a confident `No`. A missing/truncated spell
+    /// table makes every buff unresolvable, so a levitate cast on us mid-zone leaves `active()` false
+    /// while we genuinely cannot rule levitate out. `answer()` must distinguish that from a real
+    /// negative.
+    ///
+    /// MUTATION-CHECK (this test is RED unless the fix stands): make `LevitateState::answer` return
+    /// `Levitating::No` instead of `Levitating::Unknown` (the pre-#598 collapse) → the Unknown
+    /// assertions below fail. On unmodified `origin/main` this test does not exist and does not
+    /// compile (there is no `answer()`/`Levitating`), so its discriminator is this mutation.
+    #[test]
+    fn unresolvable_buff_answers_unknown_not_a_confident_no() {
+        use super::{LevitateState, Levitating};
+        let mut st = LevitateState::default();
+        // Cold start: no evidence, nothing unresolved → a trustworthy negative.
+        assert_eq!(st.answer(), Levitating::No, "fresh state with full information is a real No");
+
+        // A buff arrives whose spell id our table cannot resolve (table missing/truncated). We have
+        // NO positive evidence — but we also cannot say we're not levitating: it could be hiding in
+        // this slot. The honest answer is Unknown, and `active()` (the controller bool) stays false.
+        st.buff_slot_changed(4, None, false);
+        assert!(!st.active(), "an unresolved buff is not positive evidence of levitate");
+        assert_eq!(st.answer(), Levitating::Unknown,
+                   "an unresolvable buff with no positive evidence is UNKNOWN, never a confident No");
+
+        // The same via the real mid-zone cast-on path — a full buff-list snapshot we can't resolve.
+        let mut st2 = LevitateState::default();
+        st2.resync_from_snapshot(&[(4, None)]);
+        assert_eq!(st2.answer(), Levitating::Unknown,
+                   "an unresolvable buff in a SNAPSHOT is UNKNOWN too (the real cast-on path)");
+
+        // Positive evidence dominates: even alongside an unresolved slot, a known levitate is Yes.
+        st.buff_slot_changed(1, Some(true), false);
+        assert_eq!(st.answer(), Levitating::Yes, "a known-SPA-57 buff is a definite Yes");
+
+        // Resolving the slot to a KNOWN non-levitate, and clearing the levitate, returns a real No.
+        st.buff_slot_changed(4, Some(false), false);
+        st.buff_slot_changed(1, None, true);
+        assert_eq!(st.answer(), Levitating::No,
+                   "once every slot is resolved and levitate-free, it is a confident No again");
     }
 
     /// eqoxide#201: the flat bag-slot mapping must round-trip and match the RoF2 numbering

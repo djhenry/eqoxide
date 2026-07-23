@@ -753,11 +753,15 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             serde_json::json!(prov.map(|t| t.elapsed().as_millis() as u64)));
         player.insert("world_responsive".into(),       serde_json::json!(health.world_responsive));
         player.insert("last_world_response_ms".into(), serde_json::json!(health.last_world_response_ms));
-        // #529/#586: Levitate up = gravity off. It changes what movement means (`pos` is a height
-        // the character will NOT fall from, and the controller stops applying gravity), so it must
-        // be readable here — a projection field that never reaches the JSON is the #409 failure
-        // mode all over again. Attached here, not in the literal above, which is at the json!
-        // recursion limit.
+        // #529/#586/#598: Levitate buff up = gravity off. It changes what movement means (`pos` is a
+        // height the character will NOT fall from, and the controller stops applying gravity), so it
+        // must be readable here — a projection field that never reaches the JSON is the #409 failure
+        // mode all over again. THREE-VALUED (`player_levitating` is `Option<bool>`): `true`/`false`/
+        // `null`, where `null` = UNKNOWN (unresolved buff, spell table missing/truncated) — serde
+        // renders `None` as an explicit `null`, never `false` and never an omitted key, so the
+        // agent-honesty contract now holds at the API boundary, not just the type boundary (#598).
+        // NOTE: this is the levitate *buff* state, NOT a general gravity flag (GM `#flymode 1` reads
+        // `false`). Attached here, not in the literal above, which is at the json! recursion limit.
         player.insert("levitating".into(),             serde_json::json!(player_levitating));
         // #612 — OUTBOUND honesty. Everything else in this payload is about what the server told us;
         // these four are about what WE failed to say. Every send error used to be discarded
@@ -1305,6 +1309,43 @@ mod tests {
         let resp = app.oneshot(Request::get("/nav_debug").body(Body::empty()).unwrap()).await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// #598 finding 1, at the API BOUNDARY — the honesty contract must hold in the SERIALIZED body,
+    /// not just in the type. `player.levitating` is three-valued: `true` / `false` / `null`, where
+    /// `null` = UNKNOWN. The assertions below check the exact wire form an agent parses:
+    /// - Unknown serializes as an explicit `null` that IS present in the object — never `false`
+    ///   (the pre-#598 confident-falsehood) and never an OMITTED key (which JSON `["levitating"]`
+    ///   would also read as null — an absent key is itself a lie, so we assert `contains_key`).
+    /// - Yes → `true`, No → `false`.
+    ///
+    /// MUTATION-CHECK: map `Levitating::Unknown => Some(false)` in `PlayerState::from_game_state`
+    /// (the pre-#598 collapse) → the Unknown case here goes RED. Add `skip_serializing_if` to the
+    /// field → the `contains_key` (present-not-omitted) assertion goes RED.
+    #[tokio::test]
+    async fn levitating_is_three_valued_in_the_debug_json_never_a_confident_false() {
+        // UNKNOWN: an unresolvable buff (spell table missing/truncated), no positive evidence.
+        let state = empty_state();
+        set_gs(&state, |gs| gs.levitate.buff_slot_changed(4, None, false));
+        let v = debug_json(state).await;
+        let player = v["player"].as_object().expect("player object");
+        assert!(player.contains_key("levitating"),
+                "the levitating key must be PRESENT for Unknown — an omitted key is a lie too");
+        assert!(player["levitating"].is_null(),
+                "Unknown must serialize as JSON null, got {}", player["levitating"]);
+        assert_ne!(player["levitating"], serde_json::json!(false),
+                   "Unknown must NEVER be the confident-false the invariant forbids");
+
+        // YES: a positive flymode reading.
+        let state = empty_state();
+        set_gs(&state, |gs| gs.levitate.set_flymode(true));
+        let v = debug_json(state).await;
+        assert_eq!(v["player"]["levitating"], serde_json::json!(true), "levitating flymode → true");
+
+        // NO: complete information, no evidence, nothing unresolved → a trustworthy false.
+        let v = debug_json(empty_state()).await;
+        assert_eq!(v["player"]["levitating"], serde_json::json!(false),
+                   "a fully-known non-levitating state → an honest false (not null)");
     }
 
     /// **#608, the no-second-derivation pin for the AGENT consumer.** `/nav_debug` is a structural

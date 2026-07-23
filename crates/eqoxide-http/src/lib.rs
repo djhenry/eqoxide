@@ -183,12 +183,20 @@ pub struct PlayerState {
     pub cur_mana:      i32,
     pub max_mana:      i32,
     pub xp_pct:        f32,
-    /// #529/#586: the character currently has Levitate up (gravity off — it free-floats instead of
-    /// falling, and the controller stops applying gravity). Derived from BOTH server channels: the
-    /// self-spawn `flymode` byte / `OP_SpawnAppearance` type 19, and the buff list cross-referenced
-    /// to SPA 57. Exposed because it changes what movement commands do: an agent that reads
-    /// `pos_up` while levitating is reading a height it will NOT fall from.
-    pub levitating:    bool,
+    /// #529/#586/#598: three-valued Levitate BUFF state. `Some(true)` = levitating (gravity off — it
+    /// free-floats instead of falling, and the controller stops applying gravity); `Some(false)` = a
+    /// trustworthy negative; `None` (serialized JSON `null`) = UNKNOWN — a buff we were told about
+    /// references a spell id our table can't resolve (missing/truncated `spells_us.txt`) and no
+    /// channel positively asserts levitate, so we genuinely cannot say. Never serialize `Unknown` as
+    /// `false`: that is the confident-falsehood the agent-honesty invariant forbids. Derived from BOTH
+    /// server channels: the self-spawn `flymode` byte / `OP_SpawnAppearance` type 19, and the buff
+    /// list cross-referenced to SPA 57. This is the Levitate *buff* state ONLY — it is deliberately
+    /// NOT a general "am I subject to gravity?" reading: GM `#flymode 1` (Flying) genuinely turns
+    /// gravity off yet reports `false`, because #529 scoped this to Levitating(2)/LevitateWhileRunning(5).
+    /// Exposed because it changes what movement commands do: an agent that reads `pos_up` while
+    /// levitating is reading a height it will NOT fall from. No `skip_serializing_if`: the key is
+    /// ALWAYS present so an absent-key can never be misread as "known false".
+    pub levitating:    Option<bool>,
     /// Current target's display name and HP percent (0–100), or None when nothing is targeted.
     pub target_name:   Option<String>,
     pub target_hp_pct: Option<f32>,
@@ -275,7 +283,12 @@ impl PlayerState {
             died_ago_secs: gs.died_at
                                .filter(|t| t.elapsed().as_secs() < DEATH_STICKY_SECS)
                                .map(|t| t.elapsed().as_secs()),
-            levitating: gs.player_levitating(),
+            // #598: three-valued at the API boundary. Unknown → None → JSON `null`, NEVER `false`.
+            levitating: match gs.player_levitating_state() {
+                eqoxide_core::game_state::Levitating::Yes     => Some(true),
+                eqoxide_core::game_state::Levitating::No      => Some(false),
+                eqoxide_core::game_state::Levitating::Unknown => None,
+            },
             mana_pct:   gs.mana_pct,
             cur_mana:   gs.cur_mana,
             max_mana:   gs.max_mana,
