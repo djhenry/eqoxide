@@ -1893,4 +1893,74 @@ mod tests {
         let n = decode_frame_rotation(0, 0, 143, 16383);
         assert!((n.length() - 1.0).abs() < 1e-4 && n.w > 0.99, "normal small rotation: {n:?}");
     }
+
+    /// eqoxide#669: `anim_label` (the EQ animation-code → clip-label mapping) previously had
+    /// ZERO test coverage. Baked clip names are `<code>_<label>` (e.g. "P02A_sit"), and the
+    /// renderer's `clip_for_action` (crates/eqoxide-renderer/src/anim.rs) substring-matches that
+    /// label to resolve agent-requested actions ("sitting"/"crouching"/...) to a clip. A silent
+    /// label swap here mis-bakes every character's passive-pose clip names with no signal
+    /// anywhere else in the suite — the #668 reviewer proved this by flipping P02→"crouch" and
+    /// running the full workspace suite: 0 failures. This test pins the exact label string for
+    /// every code the mapping enumerates, so that same mutation goes RED here.
+    #[test]
+    fn anim_label_pins_eq_code_to_clip_label_mapping() {
+        // Locomotion ("L"-prefixed) codes.
+        assert_eq!(anim_label("L01"), Some("walk"));
+        assert_eq!(anim_label("L02"), Some("run"));
+        assert_eq!(anim_label("L03"), Some("jump_run"));
+        assert_eq!(anim_label("L04"), Some("fall"));
+        assert_eq!(anim_label("L05"), Some("duckwalk"));
+        assert_eq!(anim_label("L06"), Some("swim"));
+        // L07's ground-truth semantics are disputed (kb suggests CLIMB, not walk-back; see
+        // #638/#643, which deferred wiring it for that reason). This test does NOT assert L07
+        // is semantically correct — only that the mapping doesn't silently drift off whatever
+        // value is currently baked, until the owner resolves the dispute.
+        assert_eq!(anim_label("L07"), Some("walk_back"));
+        assert_eq!(anim_label("L08"), Some("swim_idle"));
+        assert_eq!(anim_label("L09"), Some("swim"));
+
+        // Passive ("P"-prefixed) codes — the highest-risk group: P01/P02/P03 are all
+        // plausible-sounding near-static poses that are easy to swap for one another, and #668
+        // showed exactly that swap (P02 sit ↔ P03 crouch) is invisible without a pinning test.
+        assert_eq!(anim_label("P01"), Some("idle_neutral"));
+        assert_eq!(anim_label("P02"), Some("sit"));
+        assert_eq!(anim_label("P03"), Some("crouch"));
+        assert_eq!(anim_label("P06"), Some("kneel"));
+        assert_eq!(anim_label("P07"), Some("swim_idle"));
+
+        // Standing idle fidgets: only O01/O02 map to "idle" (the client's idle cycle selects on
+        // this label). O03 is a low crouched/looting pose and must NOT be labeled "idle" — that
+        // was a real bug class this mapping already guards against.
+        assert_eq!(anim_label("O01"), Some("idle"));
+        assert_eq!(anim_label("O02"), Some("idle"));
+        assert_eq!(anim_label("O03"), Some("looting"));
+        assert_ne!(anim_label("O03"), Some("idle"), "O03 (looting) must never be labeled idle");
+
+        // Prefix-classified groups.
+        assert_eq!(anim_label("C01"), Some("combat"));
+        assert_eq!(anim_label("C99"), Some("combat"), "any C-prefixed code is combat");
+        assert_eq!(anim_label("D05"), Some("death"), "D05 is the specific death code, not generic hit");
+        assert_eq!(anim_label("D01"), Some("hit"), "non-D05 D-prefixed codes are hit reactions");
+        assert_eq!(anim_label("D99"), Some("hit"));
+        assert_eq!(anim_label("S01"), Some("social"));
+        assert_eq!(anim_label("T01"), Some("emote"));
+
+        // Unknown/unmapped codes resolve to None (falls back to the raw code as the clip name;
+        // see the `<code>_<label>` bake site), not a silently-wrong default label.
+        assert_eq!(anim_label("Z99"), None);
+        assert_eq!(anim_label("XYZ"), None);
+    }
+
+    /// Focused regression for the exact mutation the #668 reviewer demonstrated: the sit/crouch
+    /// pair must resolve to DISTINCT labels. If a future edit collapses them to the same string
+    /// (or swaps them), this fails even though the previous test's individual assertions would
+    /// also catch it — kept separate so the failure message names the specific hazard.
+    #[test]
+    fn anim_label_sit_and_crouch_are_distinct() {
+        let sit = anim_label("P02");
+        let crouch = anim_label("P03");
+        assert_eq!(sit, Some("sit"));
+        assert_eq!(crouch, Some("crouch"));
+        assert_ne!(sit, crouch, "P02 (sit) and P03 (crouch) must never share a label");
+    }
 }
