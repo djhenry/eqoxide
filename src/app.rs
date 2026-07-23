@@ -2419,10 +2419,21 @@ fn smooth_entity_motion(
                 if in_water {
                     b.action = if moving { "swimming" } else { "treading" }.to_string();
                 } else if moving {
-                    // Same walk-vs-run rule as the self-player (#623): `m.speed` is already
-                    // units/s (computed above from the server position-update cadence), so we
-                    // can apply the same threshold instead of hardcoding "walking" at every speed.
-                    b.action = eqoxide_core::physics::walk_or_run(m.speed).to_string();
+                    // #651: pick walk vs. run from the WIRE-NATIVE gait — the server's own speed
+                    // code from OP_ClientUpdate — instead of `m.speed`, the position-delta estimate.
+                    // `m.speed` is derived from RoF2's sparse, irregular NPC position cadence and
+                    // systematically under-reports (it never reliably clears WALK_RUN_THRESHOLD), so
+                    // ordinary NPCs never selected the run clip; the gait has no such limitation.
+                    // `gait_to_speed` inverts this client's own outbound encoder back to world u/s,
+                    // so the SAME threshold that gates the self-player (#623) applies here. Gait is
+                    // SIGNED: a backing-up NPC (negative gait) maps to a negative speed and walks,
+                    // never runs. Fall back to `m.speed` only when the entity has sent NO position
+                    // update yet (`gait` is `None`) — exactly the ambiguous window #643 made explicit.
+                    let clip_speed = match b.gait {
+                        Some(g) => eqoxide_core::physics::gait_to_speed(g),
+                        None    => m.speed,
+                    };
+                    b.action = eqoxide_core::physics::walk_or_run(clip_speed).to_string();
                 }
             }
 
@@ -2524,12 +2535,18 @@ mod tests {
 
 
     fn bb(id: u32, pos: [f32; 3]) -> crate::scene::Billboard {
+        bb_gait(id, pos, None)
+    }
+
+    /// Like [`bb`] but with an explicit wire gait, for the #651 walk/run-selection tests.
+    fn bb_gait(id: u32, pos: [f32; 3], gait: Option<i32>) -> crate::scene::Billboard {
         crate::scene::Billboard {
             id, pos,
             level: 1, hp_pct: 100.0, is_target: false, dead: false,
             name: format!("npc{id}"), race: "HUM".into(), action: "idle".into(),
             heading: 0.0, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
             gender: 0, face: 0, hairstyle: 0, haircolor: 0, helm: 0, showhelm: 0, floating: false,
+            gait,
         }
     }
 
@@ -2618,6 +2635,68 @@ mod tests {
         smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], None, t1, 1.0 / 60.0);
         assert_eq!(bbs[0].action, "running",
             "entity moving at ~30u/s (> WALK_RUN_THRESHOLD) must render the run clip");
+    }
+
+    /// #651 — THE fix: walk/run must key on the wire-native `gait`, not the position-delta
+    /// `m.speed`. The fixture is deliberately a DISAGREEMENT: the entity's on-screen glide is slow
+    /// (~10 u/s, a clear "walking" by `m.speed`, and representative of the sub-threshold speeds the
+    /// position estimator produces for ordinary NPCs) while the server-sent gait is a full run
+    /// (28 → 44 u/s). Only a code path that reads `gait` selects "running" here; a path reading
+    /// `m.speed` selects "walking". Asserts the real `b.action` string the renderer resolves.
+    ///
+    /// MUTATION CHECK (performed on this branch): reverting the selection at the call site to
+    /// `walk_or_run(m.speed)` turns this RED ("walking"), while the None-fallback control below
+    /// stays GREEN — proving the assertion discriminates the gait read, not the plumbing.
+    #[test]
+    fn gait_overrides_slow_position_delta_for_run_selection() {
+        let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
+        let t0 = std::time::Instant::now();
+        // Seed at origin (no gait yet needed — first sight only sets the baseline).
+        let mut bbs = vec![bb_gait(7, [0.0, 0.0, 0.0], Some(28))];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], None, t0, 1.0 / 60.0);
+        // ~1s later the server pos moved only 10u east → implied m.speed ~10 u/s (BELOW the 20 u/s
+        // threshold → walk), but the wire gait says full run (28). Gait must win → "running".
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        let mut bbs = vec![bb_gait(7, [10.0, 0.0, 0.0], Some(28))];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], None, t1, 1.0 / 60.0);
+        assert_eq!(bbs[0].action, "running",
+            "gait 28 (full run) must select the run clip even though m.speed ~10 u/s says walk");
+    }
+
+    /// #651 control — the None-fallback (an entity that has sent no position update yet, so `gait`
+    /// is `None`) must still use the `m.speed` estimate. Same slow ~10 u/s glide as the test above
+    /// but `gait: None` → "walking". This is the arm that stays GREEN under the mutation, and it
+    /// pins that we did NOT regress the ambiguous "not reported yet" window #643 made explicit.
+    #[test]
+    fn none_gait_falls_back_to_position_delta() {
+        let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
+        let t0 = std::time::Instant::now();
+        let mut bbs = vec![bb_gait(7, [0.0, 0.0, 0.0], None)];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], None, t0, 1.0 / 60.0);
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        let mut bbs = vec![bb_gait(7, [10.0, 0.0, 0.0], None)];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], None, t1, 1.0 / 60.0);
+        assert_eq!(bbs[0].action, "walking",
+            "with no gait reported, walk/run must fall back to the m.speed estimate (~10 u/s → walk)");
+    }
+
+    /// #651 sign handling — a backing-up NPC carries a NEGATIVE gait and must NEVER select run,
+    /// even when its on-screen glide is fast enough that `m.speed` alone would say "running". The
+    /// fixture disagrees on BOTH axes: fast forward glide (~30 u/s), negative (backward) gait.
+    /// A path that (wrongly) read the gait as unsigned, or fell back to `m.speed`, would run.
+    #[test]
+    fn backing_up_negative_gait_never_runs() {
+        let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
+        let t0 = std::time::Instant::now();
+        let mut bbs = vec![bb_gait(7, [0.0, 0.0, 0.0], Some(-28))];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], None, t0, 1.0 / 60.0);
+        // 30u glide → m.speed ~30 u/s (would "run" by position delta), but gait is a full-speed
+        // BACKWARD run (-28). Signed gait → negative speed → "walking".
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        let mut bbs = vec![bb_gait(7, [30.0, 0.0, 0.0], Some(-28))];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], None, t1, 1.0 / 60.0);
+        assert_eq!(bbs[0].action, "walking",
+            "negative gait (backing up) must walk, never run — even with a fast position delta");
     }
 
     /// #623 companion — the pre-existing submerged override must still win regardless of speed:

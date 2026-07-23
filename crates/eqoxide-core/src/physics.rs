@@ -305,6 +305,76 @@ pub fn walk_or_run(speed_u_per_s: f32) -> &'static str {
     if speed_u_per_s > WALK_RUN_THRESHOLD { "running" } else { "walking" }
 }
 
+/// Convert a signed wire **gait** (the `animation` sub-field of `OP_ClientUpdate`) back into world
+/// units/second, so a remote entity's locomotion clip can be chosen by the SAME
+/// [`WALK_RUN_THRESHOLD`] (world u/s) that gates the self-player (#651). This is the exact inverse of
+/// this client's own outbound encoder `eqoxide_net::action_loop::speed_to_wire_animation`, which maps
+/// `anim = speed_u_per_s * (0.7 * 40 / RUN_SPEED)` — EQEmu computes `base_runspeed = runspeed_float *
+/// 40` with the player special-case run `0.7 → 28` and walk `0.3 → 12` (`EQEmu/zone/mob.cpp:190-196`,
+/// sent as `spu->animation`). So the recovery is `speed = gait * RUN_SPEED / (0.7 * 40)`.
+///
+/// Two properties this preserves, both load-bearing:
+/// - **Correct units.** Naively reading `gait / 40` (as #651's suggested-shape sketch phrased it)
+///   yields EQEmu's speed-*float* (0.7 at run, 0.3 at walk), NOT world u/s — comparing that against
+///   the 20 u/s `WALK_RUN_THRESHOLD` would classify every gait as walking. The full inverse restores
+///   the world-u/s domain the threshold actually lives in: run gait 28 → `RUN_SPEED` (44 u/s), native
+///   walk gait 12 → ~18.857 u/s. (Equivalently, in gait units the threshold is `20 * 28/44 ≈ 12.7`,
+///   i.e. gait ≥ 13 runs; the two named traffic values 12 and 28 straddle it with margin.)
+/// - **Sign.** [`crate::game_state::Gait`] is signed (a backing-up mob carries a negative gait); this
+///   maps that to a negative speed, which [`walk_or_run`] classifies as walking — a mob walking
+///   backwards can never select the run clip. Feeding the raw *unsigned* 10-bit value would read a
+///   backward gait of −12 as 1012 → a spurious run.
+pub fn gait_to_speed(gait: i32) -> f32 {
+    const EQ_RUNSPEED_FLOAT_AT_RUN: f32 = 0.7; // EQEmu player special-case runspeed (mob.cpp:190-196)
+    const ANIM_SCALE: f32 = 40.0; // EQEmu: base_runspeed = runspeed_float * 40
+    gait as f32 * RUN_SPEED / (EQ_RUNSPEED_FLOAT_AT_RUN * ANIM_SCALE)
+}
+
+#[cfg(test)]
+mod gait_to_speed_tests {
+    use super::*;
+
+    /// The two native reference gaits (`EQEmu/zone/mob.cpp:190-196`: walk 0.3→12, run 0.7→28) must
+    /// recover the world speeds the self-player path already uses, and classify accordingly. This
+    /// pins `gait_to_speed` to the SAME anchor values `speed_to_wire_animation` encodes to.
+    #[test]
+    fn native_reference_gaits_recover_walk_and_run_speeds() {
+        // Run gait 28 -> RUN_SPEED (44 u/s) exactly, and selects the run clip.
+        assert!((gait_to_speed(28) - RUN_SPEED).abs() < 1e-3, "gait 28 must recover RUN_SPEED");
+        assert_eq!(walk_or_run(gait_to_speed(28)), "running");
+        // Walk gait 12 -> derived native walk speed (~18.857 u/s), below threshold -> walk clip.
+        let native_walk = RUN_SPEED * (0.3 / 0.7);
+        assert!((gait_to_speed(12) - native_walk).abs() < 1e-3, "gait 12 must recover native walk speed");
+        assert_eq!(walk_or_run(gait_to_speed(12)), "walking");
+    }
+
+    /// The whole point of #651: a gait that clears the threshold selects run even though its
+    /// magnitude in gait units (13) is nowhere near 20 — i.e. the threshold is applied in the
+    /// RIGHT (world-u/s) domain, not naively against the gait code.
+    #[test]
+    fn gait_just_above_threshold_runs() {
+        assert_eq!(walk_or_run(gait_to_speed(13)), "running", "gait 13 (~20.4 u/s) clears threshold");
+        assert_eq!(walk_or_run(gait_to_speed(12)), "walking", "gait 12 (~18.9 u/s) does not");
+    }
+
+    /// A backing-up mob carries a NEGATIVE gait; it must map to a negative speed and never run.
+    #[test]
+    fn negative_gait_is_never_run() {
+        assert!(gait_to_speed(-28) < 0.0, "backward run gait must be a negative speed");
+        assert_eq!(walk_or_run(gait_to_speed(-28)), "walking",
+            "a mob backing up at full speed must WALK, never run");
+        assert_eq!(walk_or_run(gait_to_speed(-12)), "walking");
+    }
+
+    /// Stationary gait 0 -> 0 u/s -> walk classification (the `moving` gate at the call site keeps a
+    /// truly-stopped entity idle; this only asserts 0 never spuriously runs).
+    #[test]
+    fn zero_gait_is_zero_speed() {
+        assert_eq!(gait_to_speed(0), 0.0);
+        assert_eq!(walk_or_run(gait_to_speed(0)), "walking");
+    }
+}
+
 #[cfg(test)]
 mod walk_or_run_tests {
     use super::*;

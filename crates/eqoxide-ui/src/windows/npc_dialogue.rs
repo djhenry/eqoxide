@@ -196,6 +196,7 @@ mod tests {
             helm: 0,
             showhelm: 0,
             floating: false,
+            gait: None,
         }
     }
 
