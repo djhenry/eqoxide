@@ -1087,6 +1087,45 @@ impl Collision {
         self.water.as_ref().and_then(|w| w.zone_line_at(pos[0], pos[1], pos[2]))
     }
 
+    /// The zone-line index a **standing** character occupies at `(east, north, feet_z)`, probing the
+    /// character's vertical body span `[feet_z, feet_z + PLAYER_BODY.height]` rather than the single
+    /// feet point [`zone_line_at`] tests.
+    ///
+    /// A DRNTP trigger volume whose lower face floats just ABOVE the walkable floor is invisible to a
+    /// feet-only probe: the character stands with its feet *below* the volume, yet its body clearly
+    /// occupies it. The qeynos2 Knights-of-Truth waterfall (#266) is exactly this — the trigger's
+    /// lower face sits ≈0.4u over the flat vault floor (feet rest at z≈-14.0; the volume starts
+    /// ≈-13.6), so a character standing on the disclosed footprint is never detected by
+    /// `zone_line_at([x,y,-14.0])` and only a JUMP (which lifts the feet into the volume) crossed.
+    /// Sweeping the capsule span makes the auto-cross fire wherever the body intersects the trigger.
+    ///
+    /// This is the probe the auto-cross MOVER (`eqoxide-net action_loop`) uses, and it AGREES with
+    /// the footprint validator [`Self::teleport_pad_source`] (which validates a floor at feet+1,
+    /// inside the volume): any footprint the validator accepts is detected here, because feet+1 lies
+    /// within this span. Keeping the two aligned is the fix for #266's feet-vs-feet+1 divergence.
+    ///
+    /// **Agent-initiated only, never auto-routed.** This makes a crossing physically fire when the
+    /// agent has *driven* the character onto the disclosed footprint; it does NOT relax the
+    /// [`crate::walker::TRUST_ADVERTISED_SAME_ZONE_CROSSINGS`] `= false` rule, which still forbids the
+    /// walker from *planning* a route through an unverifiable same-zone pad (#543/#660).
+    ///
+    /// Returns the first (lowest) index found scanning feet→head. Point-samples at ≤1u spacing; a
+    /// zone-line slab thinner than the vertical sample step is the only miss, far below any shipped
+    /// DRNTP thickness.
+    pub fn zone_line_at_standing(&self, pos: [f32; 3]) -> Option<i32> {
+        let w = self.water.as_ref()?;
+        const STEP: f32 = 1.0;
+        let feet = pos[2];
+        let head = feet + crate::traversability::PLAYER_BODY.height;
+        // Inclusive feet→head sweep; the explicit final `head` sample guards a step overshoot.
+        let mut z = feet;
+        while z < head {
+            if let Some(idx) = w.zone_line_at(pos[0], pos[1], z) { return Some(idx); }
+            z += STEP;
+        }
+        w.zone_line_at(pos[0], pos[1], head)
+    }
+
     /// Distinct zone-point indices of every zone-line region in this zone — the set of exits. Each
     /// links to an entrance via the `OP_SendZonepoints` `iterator`. Empty when the zone has no
     /// region map (or a v1 map with no indices).
@@ -1241,13 +1280,25 @@ impl Collision {
     /// point is `p` (server coords), or `None` if no floor a character could stand on is inside the
     /// region (a floating / #266 leaf).
     ///
-    /// This mirrors the MOVER's auto-cross condition — `zone_line_at` at the character's STANDING
-    /// height (`action_loop.rs`) — so the planner and mover CANNOT diverge (a divergence would be a
-    /// false `Unreachable`, exactly #403's bug class). It scans the footprint's whole COLUMN for a
-    /// walkable floor (not the tight 2u probe `zone_line_floor_point` uses — that helper serves a
-    /// zone-line GOAL, and its ±2u window can miss the real trigger floor of a footprint whose
-    /// representative point sits low in a tall straddling volume, #403 review C) and keeps the first
-    /// (highest) floor where standing (feet + 1u) is still inside the region.
+    /// This validator accepts a floor `fz` only when **standing on it (feet + 1u) is INSIDE the
+    /// region** (`zone_line_at(p0, p1, fz + 1.0) == index`), then REPORTS the footprint at the floor
+    /// `fz` — the point a character actually stands on — NOT at feet+1. The auto-cross MOVER
+    /// (`eqoxide-net action_loop`) fires via [`Collision::zone_line_at_standing`], which sweeps the
+    /// standing capsule span `[feet, feet + height]`; feet+1 lies within that span, so a footprint
+    /// accepted here is one the mover will fire on when the character stands on it — the two agree.
+    ///
+    /// (History, #266: the mover formerly probed `zone_line_at` at the FEET only. A DRNTP volume
+    /// whose lower face floats just above the floor — the qeynos2 KoT waterfall — is above the feet,
+    /// so validation (feet+1, inside) and the mover (feet, below) DISAGREED: the disclosed footprint
+    /// validated but standing on it never crossed; only a jump did. The capsule-span mover probe
+    /// closed that gap. An earlier version of this comment wrongly claimed the two already mirrored
+    /// each other at "the character's STANDING height" — they did not.)
+    ///
+    /// It scans the footprint's whole COLUMN for a walkable floor (not the tight 2u probe
+    /// `zone_line_floor_point` uses — that helper serves a zone-line GOAL, and its ±2u window can
+    /// miss the real trigger floor of a footprint whose representative point sits low in a tall
+    /// straddling volume, #403 review C) and keeps the first (highest) floor where standing
+    /// (feet + 1u) is still inside the region.
     fn teleport_pad_source(&self, index: i32, p: [f32; 3]) -> Option<[f32; 3]> {
         const STEP_H: f32 = 20.0;
         const REGION_DROP: f32 = 400.0;
@@ -3990,6 +4041,76 @@ mod tests {
         assert!(pads.is_empty(),
             "a floating footprint with no standable trigger floor must create NO edge (its auto-cross \
              would never fire — a Route the walker can't take), got {pads:?}");
+    }
+
+    /// #266 — the qeynos2 Knights-of-Truth waterfall geometry: a DRNTP trigger volume whose lower
+    /// face floats ~0.4u ABOVE the flat vault floor. A resting character stands with its feet at the
+    /// floor, BELOW the volume, so the auto-cross MOVER's old feet-only `zone_line_at([x,y,feet])`
+    /// probe never fired while standing on the disclosed footprint (only a jump, lifting the feet
+    /// into the volume, crossed). The footprint VALIDATOR (`teleport_pad_source`) meanwhile validates
+    /// at feet+1 (inside the volume) yet REPORTS at the floor — so the disclosed footprint validated
+    /// but standing on it did nothing: the feet-vs-feet+1 divergence.
+    ///
+    /// `zone_line_at_standing` sweeps the standing capsule span `[feet, feet+height]`, which INCLUDES
+    /// feet+1, so a character standing exactly on the disclosed footprint now detects the pad.
+    ///
+    /// Mutation check: revert `zone_line_at_standing` to a feet-only probe → the two
+    /// `zone_line_at_standing(...) == Some(IDX)` assertions go RED (they collapse to the feet-only
+    /// `zone_line_at` which returns `None` here). And on unmodified `origin/main` the method does not
+    /// exist; the equivalent main-mover probe is `zone_line_at(footprint)`, which the `NOTE` assertion
+    /// below shows returns `None` — i.e. main's mover misses the disclosed footprint (the #266 bug).
+    #[test]
+    fn standing_on_266_waterfall_footprint_fires_the_crossing() {
+        let quad = |v: Vec<[f32; 3]>| MeshData {
+            positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        // Flat vault floor at up=-14 (MeshData pos = [north, up, east]), spanning the footprint XY.
+        let floor = quad(vec![[0.0, -14.0, -120.0], [80.0, -14.0, -120.0], [80.0, -14.0, 0.0], [0.0, -14.0, 0.0]]);
+        // A vertical wall AWAY from the footprint XY (east=-100) that only extends the zone's z-extent
+        // up to -4 so the region-point precompute's bounds (derived from the mesh AABB) include the
+        // trigger volume's z-slab. It is NOT floor/ceiling under the pad — same device the floating-
+        // footprint test above uses. Without it the region is never sampled and the test is vacuous.
+        let wall = quad(vec![[0.0, -14.0, -100.0], [80.0, -14.0, -100.0], [80.0, -4.0, -100.0], [0.0, -4.0, -100.0]]);
+        let mut col = Collision::build(
+            &ZoneAssets { terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 8.0);
+        const IDX: i32 = 2; // the qeynos2 waterfall's zone-point index
+        // DRNTP trigger volume: north[30,50] × east[-40,-16], z-slab [-13.6, -6.0]. Its LOWER FACE
+        // (-13.6) floats 0.4u above the -14.0 floor, exactly the #266 geometry: feet (-14.0) are
+        // below it; feet+1 (-13.0) and the rest of the standing body (up to -8.0) are inside it.
+        col.set_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_box(30.0, 50.0, -40.0, -16.0, -13.6, -6.0, IDX))));
+
+        const FEET: f32 = -14.0;
+        let xy = [-28.0_f32, 40.0]; // centroid of the footprint box
+
+        // GEOMETRY (documents the divergence; true on main AND branch):
+        // the feet point is below the trigger, feet+1 is inside it.
+        assert_eq!(col.zone_line_at([xy[0], xy[1], FEET]), None,
+            "feet-only probe (what main's mover used) must MISS — feet sit below the trigger's lower face");
+        assert_eq!(col.zone_line_at([xy[0], xy[1], FEET + 1.0]), Some(IDX),
+            "feet+1 (what the validator checks) must be INSIDE the trigger");
+
+        // THE FIX: a standing character's capsule span reaches the trigger, so the crossing fires.
+        assert_eq!(col.zone_line_at_standing([xy[0], xy[1], FEET]), Some(IDX),
+            "zone_line_at_standing must detect the pad a character standing on the footprint occupies");
+
+        // TIE TO THE DISCLOSURE CONTRACT: the footprint the client DISCLOSES (validated + reported by
+        // `teleport_pad_source`, via `teleport_pad_footprints`) sits on the floor — BELOW the trigger —
+        // yet standing there must now fire the mover's probe.
+        let fps = col.teleport_pad_footprints(IDX);
+        assert_eq!(fps.len(), 1, "the standable footprint leaf must resolve to exactly one disclosed point, got {fps:?}");
+        let disclosed = fps[0];
+        assert!((disclosed[2] - FEET).abs() < 0.5,
+            "the disclosed footprint is reported at the floor z (~{FEET}), below the trigger — got {disclosed:?}");
+        // NOTE (the #266 bug on main): the disclosed footprint z is NOT detected by the feet-only
+        // probe main's mover used — this is precisely why standing on it never crossed.
+        assert_eq!(col.zone_line_at(disclosed), None,
+            "main's feet-only mover probe MISSES the disclosed footprint (the #266 bug this fix closes)");
+        // AFTER THE FIX: the capsule-span mover probe fires on the disclosed footprint.
+        assert_eq!(col.zone_line_at_standing(disclosed), Some(IDX),
+            "the standing mover probe must fire the crossing when the agent stands on the disclosed footprint");
     }
 
     /// HONESTY (#403 review A): a same-index footprint baked as SEVERAL horizontally-separated leaves

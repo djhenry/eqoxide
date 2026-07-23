@@ -1468,8 +1468,18 @@ impl ActionLoop {
             // A dead corpse standing in a zone-line region must NOT auto-zone (#238) — this fires purely
             // from physical position, so a character killed right at a boundary would cross while dead.
             if !gs.is_player_dead() && self.last_zone_cross.elapsed().as_millis() > ZONE_CROSS_COOLDOWN_MS {
+                // Probe the STANDING CAPSULE SPAN, not the feet point. A DRNTP trigger volume whose
+                // lower face floats just above the walkable floor (the qeynos2 KoT waterfall, #266:
+                // lower face ≈0.4u over the flat vault floor) sits ABOVE a resting character's feet,
+                // so a feet-only `zone_line_at([x,y,player_z])` never fired while standing on the
+                // disclosed footprint — only a jump crossed. `zone_line_at_standing` sweeps
+                // [feet, feet+height] so the body occupying the trigger fires the crossing, matching
+                // the footprint validator (`teleport_pad_source`, which validates at feet+1). This is
+                // purely the physical auto-cross from the character's real position — it does NOT
+                // auto-route the walker onto the pad (that gate, TRUST_ADVERTISED_SAME_ZONE_CROSSINGS,
+                // stays false); it only makes an agent-driven crossing actually fire (#266).
                 let index = self.collision.read().unwrap().as_ref()
-                    .and_then(|c| c.zone_line_at([gs.player_x, gs.player_y, gs.player_z]));
+                    .and_then(|c| c.zone_line_at_standing([gs.player_x, gs.player_y, gs.player_z]));
                 if let Some(index) = index {
                     // Resolve the region's destination zone + arrival coords. `None` = no advertised
                     // zone point for this index (a data gap) → leave it alone rather than cross blind.
