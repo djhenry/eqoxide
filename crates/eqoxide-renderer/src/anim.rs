@@ -690,4 +690,70 @@ mod tests {
         assert_eq!(skin.idle_clip_for_phase(2), skin.clip_for_action("idle"),
             "no fidgets → always the plain idle clip");
     }
+
+    /// A humanoid skin carrying the REAL passive-pose clip names emitted by the converter and
+    /// present in every shipped playable-race bake (verified by dumping the animation list of
+    /// every `race_*.glb`: all carry `P02A_sit`/`P02B_sit` and `P03A_crouch`). The earlier
+    /// fixtures (`action_skin`, `death_skin`, `humanoid_idle_skin`) deliberately omit the
+    /// passive poses, so no existing test exercised the `"sitting"`/`"crouching"` arms of
+    /// `clip_for_action` against realistic `<code>_<semantic>` names — the exact resolution
+    /// #650 hypothesised (wrongly) was broken. Clip order matches the human-male bake: the
+    /// combat/hit block precedes the passive `P0x` block, so index 0 is NOT a sit clip and a
+    /// silent `unwrap_or(0)` fallback would resolve to the wrong (combat) clip, which this
+    /// fixture is arranged to expose.
+    fn humanoid_pose_skin() -> SkinData {
+        let names = [
+            "C01A_combat", "D05A_death", "L01A_walk", "L01B_walk",
+            "P01A_idle_neutral", "P01B_idle_neutral",
+            "P02A_sit", "P02B_sit", "P03A_crouch", "P03B_crouch", "P05A_kneel",
+        ];
+        let (rest_translations, rest_rotations, rest_scales) = default_rest(3);
+        SkinData {
+            joint_count: 3,
+            parents: vec![None, Some(0), Some(1)],
+            inv_bind: vec![identity_mat(); 3],
+            clips: names.iter().map(|n| AnimClip {
+                name: n.to_string(), duration: 2.0, channels: vec![make_channel(0)],
+            }).collect(),
+            rest_translations, rest_rotations, rest_scales,
+            ground_probes: vec![], joint_names: vec![],
+        }
+    }
+
+    /// #650 regression guard: `"sitting"`/`"crouching"` MUST resolve to the model's real sit/crouch
+    /// clip, not fall through to the walk/idle fallback (or the `unwrap_or(0)` combat clip). #650
+    /// hypothesised the shipped bakes carry no `sit`-named clip so this lookup could never match;
+    /// dumping every `race_*.glb` disproved it (all carry `P02A_sit`), and this pins the resolution
+    /// to those real names. Mutation check: breaking the `"sitting"` arm of `clip_for_action`
+    /// (returning `None`, or deleting the arm so it falls to the `_ =>` walk branch) makes this RED,
+    /// because `"sitting"` would then resolve to the walk clip (index 2) or the `unwrap_or(0)` combat
+    /// clip instead of `P02A_sit` (index 6).
+    #[test]
+    fn sitting_and_crouching_resolve_to_their_pose_clips() {
+        let skin = humanoid_pose_skin();
+        let walk = skin.clip_for_action("walking");
+        let idle = skin.clip_for_action("idle");
+
+        // Names -> indices, to assert against the semantics rather than magic numbers.
+        let idx = |name: &str| skin.clips.iter().position(|c| c.name == name);
+
+        assert_eq!(skin.clip_for_action("sitting"), idx("P02A_sit"),
+            "\"sitting\" must resolve to the P02A_sit clip present in every race bake");
+        assert_eq!(skin.clip_for_action("crouching"), idx("P03A_crouch"),
+            "\"crouching\" must resolve to the P03A_crouch clip");
+
+        // And it must NOT collapse onto the idle/walk fallback — the failure mode #650 described.
+        assert_ne!(skin.clip_for_action("sitting"), walk, "\"sitting\" must not fall back to walk");
+        assert_ne!(skin.clip_for_action("sitting"), idle, "\"sitting\" must not fall back to idle");
+        // A missing/None resolution (bind-pose fallback) is likewise a regression here.
+        assert!(skin.clip_for_action("sitting").is_some(), "sit clip exists → must resolve, not None");
+
+        // The held-pose machinery already classifies these as play-once-then-hold, and a
+        // sit/crouch transition animates (plays its stand->pose transition once).
+        assert!(SkinData::is_held_pose("sitting"));
+        assert!(SkinData::is_held_pose("crouching"));
+        let sit_ci = skin.clip_for_action("sitting").unwrap();
+        assert!(skin.action_animates("sitting", sit_ci),
+            "sitting plays its entry transition (animate=true), the renderer clamps+holds the final seated frame");
+    }
 }
