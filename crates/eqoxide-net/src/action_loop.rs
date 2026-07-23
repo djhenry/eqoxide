@@ -4818,7 +4818,12 @@ mod tests {
             // left over a cleared/rebuilt local_path aims the walker at the wrong segment.
             assert_eq!(nav.walker.local_i, 0, "local_i must reset with local_path on death");
             assert_eq!(nav.walker.path_goal, None);
-            assert_eq!(*nav.nav.nav_state.lock().unwrap(), "idle");
+            // #644: the halted state must be the HONEST TERMINAL `dead`, NOT the ambiguous `idle`
+            // (which also means "ready for work"). An agent that issued a goto and then polled must
+            // be able to tell "you died and went nowhere" from "arrived / ready".
+            let ns = nav.nav.nav_state.lock().unwrap();
+            assert_eq!(ns.state, "dead", "a slain character's nav_state must be the honest `dead`, not `idle`");
+            assert_eq!(ns.reason.as_deref(), Some("player_dead"));
         };
         let new_nav = || {
             let g: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
