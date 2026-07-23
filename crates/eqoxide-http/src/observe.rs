@@ -3,7 +3,7 @@
 use axum::{
     body::Body,
     extract::{Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -77,6 +77,47 @@ fn zone_assets_not_ready(s: &HttpState) -> Option<Response> {
                              \"failed\", which will never become ready).",
         })),
     ).into_response())
+}
+
+/// #646 (split out of #634/#647): the read-time freshness age every `/v1/observe/*` endpoint now
+/// carries, in one form or another. Only `/debug` (`snapshot_age_ms`) and `/nav_debug`
+/// (`published_age_ms`) had ANY such field before this — the other 13 routes served last-known
+/// state with no way for a driving agent to tell it was frozen. #647's review watched this bite
+/// live: with the `eq-net` thread dead, `GET /v1/observe/entities` kept returning `200` with a
+/// frozen map and no marker of any kind.
+///
+/// **This is the SAME clock as `/debug`'s `snapshot_age_ms`, not a second one** — both are
+/// `HttpState::health().snapshot_age_ms`, i.e. `NetHealth::last_tick.elapsed()` measured fresh on
+/// every request (#343: an age is only true at the instant it's read, so nothing here is cached).
+/// `last_tick` is bumped, unconditionally, once per gameplay tick by the SAME `eq-net` thread loop
+/// iteration that publishes `GameState` and drains `ActionLoop::tick` — the single writer of every
+/// world table these endpoints read (`entity_positions`, inventory, chat messages, dialogue
+/// choices, doors, zone points, `GameState`'s spells/skills/book_text) — see
+/// `crates/eqoxide-net/src/gameplay.rs` around `action_loop.tick(..)` immediately followed by
+/// `publish_snapshot(..)`. So a wedged/dead net thread freezes the world tables and stops bumping
+/// this clock in the SAME instant: the age reported here always reflects whether the data next to
+/// it can still change, never merely whether that data happens to have changed recently.
+///
+/// Most endpoints below carry this in-band as a top-level `"snapshot_age_ms"` JSON key — safe,
+/// because none of their existing keys collide with that name. A handful of endpoints predate this
+/// change with a response body that is a bare array/map (no room for a new key without breaking an
+/// existing consumer — `/entities`' default `{name: [x,y,z]}` shape is documented as
+/// backward-compatible for `group_driver.py`'s `ents.items()`), plus `/frame`, whose PNG body can't
+/// carry a field at all: those carry the identical value in this HTTP header instead, so a caller
+/// never has to guess in advance which channel an endpoint uses.
+pub(crate) const SNAPSHOT_AGE_HEADER: &str = "x-snapshot-age-ms";
+
+/// Stamp [`SNAPSHOT_AGE_HEADER`] onto a response whose body cannot safely gain a new top-level JSON
+/// key (a bare array/map, or a non-JSON body like `/frame`'s PNG). `age_ms` must come from
+/// `HttpState::health().snapshot_age_ms` — see the constant's doc for why that (and not some other
+/// clock) is the correct source.
+fn with_snapshot_age(mut resp: Response, age_ms: u64) -> Response {
+    resp.headers_mut().insert(
+        HeaderName::from_static(SNAPSHOT_AGE_HEADER),
+        HeaderValue::from_str(&age_ms.to_string())
+            .expect("a decimal u64 rendered via to_string() is always a valid header value"),
+    );
+    resp
 }
 
 pub(super) fn router() -> Router<HttpState> {
@@ -157,7 +198,9 @@ async fn get_nav_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
 /// `{"text": null}` if none has. Newlines are decoded from RoF2's backtick marker. (#288)
 async fn get_item_text(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let text = s.player().book_text;
-    Json(serde_json::json!({ "text": text }))
+    // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
+    let snapshot_age_ms = s.health().snapshot_age_ms;
+    Json(serde_json::json!({ "text": text, "snapshot_age_ms": snapshot_age_ms }))
 }
 
 /// Query params for GET /v1/observe/packets. All optional; every value arrives as a string and is
@@ -202,8 +245,13 @@ fn parse_op(v: &str) -> Option<u16> {
 /// the opcode histogram + reliable-sequence-gap analysis (the #463 diagnostic) instead of raw
 /// records. `?clear=1` resets the buffer. Controls apply BEFORE the read, so
 /// `?enable=1` on a first call just turns capture on (the buffer is still empty).
-async fn get_packets(Query(q): Query<PacketsQuery>) -> Json<serde_json::Value> {
+async fn get_packets(State(s): State<HttpState>, Query(q): Query<PacketsQuery>) -> Json<serde_json::Value> {
     use eqoxide_telemetry as pkt;
+    // #646: capture itself runs inside the same `eq-net` thread loop as `NetHealth::last_tick` —
+    // see `SNAPSHOT_AGE_HEADER`'s doc. A dead thread stops capturing AND stops bumping this clock
+    // in the same instant, so a large value here means "no new packets are coming", not merely
+    // "none arrived recently".
+    let snapshot_age_ms = s.health().snapshot_age_ms;
 
     if let Some(e) = q.enable.as_deref() {
         pkt::set_enabled(truthy(e));
@@ -234,12 +282,14 @@ async fn get_packets(Query(q): Query<PacketsQuery>) -> Json<serde_json::Value> {
         Json(serde_json::json!({
             "enabled": pkt::enabled(),
             "summary": analysis,
+            "snapshot_age_ms": snapshot_age_ms,
         }))
     } else {
         Json(serde_json::json!({
             "enabled": pkt::enabled(),
             "count": records.len(),
             "packets": records,
+            "snapshot_age_ms": snapshot_age_ms,
         }))
     }
 }
@@ -812,6 +862,9 @@ async fn get_frame(State(s): State<HttpState>, Query(q): Query<FrameQuery>) -> R
 
     // 10s: a debug build's readback + 1024px PNG encode can exceed 2s when the
     // render loop is saturated, which made captures 503 while frames were fine.
+    // #646: a PNG body can't carry an in-band field, so — like `ZONE_ASSETS_STATE_HEADER` above —
+    // freshness rides a response header. See `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
+    let snapshot_age_ms = s.health().snapshot_age_ms;
     match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
         Ok(Ok(png_bytes)) => Response::builder()
             .status(StatusCode::OK)
@@ -820,6 +873,7 @@ async fn get_frame(State(s): State<HttpState>, Query(q): Query<FrameQuery>) -> R
             // Always present, so a caller never has to know whether the gate was bypassed: only
             // `ready` means this frame shows the zone the character is actually in.
             .header(ZONE_ASSETS_STATE_HEADER, state_word)
+            .header(SNAPSHOT_AGE_HEADER, snapshot_age_ms)
             .body(Body::from(png_bytes))
             .unwrap(),
         _ => Response::builder()
@@ -859,10 +913,14 @@ async fn get_who(State(s): State<HttpState>) -> Response {
                 race:    if e.anon { String::new() } else { eqoxide_core::race_class::eq_race_to_code(e.race).to_string() },
                 name: e.name, level: e.level, zone_id: e.zone_id, guild: e.guild, anon: e.anon,
             }).collect();
+            // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this
+            // reuses. Note this only reflects whether the net thread is alive/ticking; the roster
+            // itself is always a fresh request/reply, not a cached snapshot.
+            let snapshot_age_ms = s.health().snapshot_age_ms;
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(serde_json::json!({ "online": online }).to_string()))
+                .body(Body::from(serde_json::json!({ "online": online, "snapshot_age_ms": snapshot_age_ms }).to_string()))
                 .unwrap()
         }
         _ => Response::builder()
@@ -925,6 +983,10 @@ struct EntitiesView {
     /// could not classify into "idle". Nothing agent-visible reported the pose at all, so the
     /// confusion was completely invisible to a driving agent; this field is that missing channel.
     poses: HashMap<String, eqoxide_ipc::EntityPoseView>,
+    /// #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc. Only on the `?labeled=1` shape;
+    /// the default bare map keeps its exact historical shape and carries the same value in the
+    /// `SNAPSHOT_AGE_HEADER` response header instead.
+    snapshot_age_ms: u64,
 }
 
 /// Collapse suspected server-side duplicate spawns (#471) for the read-only /observe/entities view.
@@ -1026,6 +1088,8 @@ async fn get_entities(State(s): State<HttpState>, Query(q): Query<EntitiesQuery>
         };
         (entities, deduped, duplicate_groups, poses)
     };
+    // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc.
+    let snapshot_age_ms = s.health().snapshot_age_ms;
     if labeled {
         let note = (deduped > 0).then(|| format!(
             "{deduped} entry(ies) collapsed as same-name + byte-identical-position duplicates \
@@ -1034,10 +1098,15 @@ async fn get_entities(State(s): State<HttpState>, Query(q): Query<EntitiesQuery>
              A live packet capture is still needed to confirm this is server-sent (two distinct \
              spawn_ids on the wire) rather than a client artifact."
         ));
-        Json(EntitiesView { count: entities.len(), entities, deduped, duplicate_groups, note, poses }).into_response()
+        let resp = Json(EntitiesView {
+            count: entities.len(), entities, deduped, duplicate_groups, note, poses, snapshot_age_ms,
+        }).into_response();
+        with_snapshot_age(resp, snapshot_age_ms)
     } else {
         // Default: the bare, backward-compatible name→pos map — deduped, but same shape as before.
-        Json(entities).into_response()
+        // No room for a new JSON key here without breaking existing consumers (`ents.items()`), so
+        // the freshness age rides the header instead (#646).
+        with_snapshot_age(Json(entities).into_response(), snapshot_age_ms)
     }
 }
 
@@ -1056,6 +1125,8 @@ async fn get_inventory(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // #361: see the /debug field of the same name — false means `currency` may not match the
         // server's real balance right now (a merchant buy in flight, or an unreconciled desync).
         "coin_verified": player.coin_verified,
+        // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
+        "snapshot_age_ms": s.health().snapshot_age_ms,
     }))
 }
 
@@ -1087,7 +1158,9 @@ async fn get_messages(
         Some(k) => all.iter().filter(|m| m.kind == *k).collect(),
         None    => all.iter().collect(),
     };
-    Json(serde_json::json!({ "count": filtered.len(), "messages": filtered }))
+    // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
+    let snapshot_age_ms = s.health().snapshot_age_ms;
+    Json(serde_json::json!({ "count": filtered.len(), "messages": filtered, "snapshot_age_ms": snapshot_age_ms }))
 }
 
 /// GET /v1/observe/dialogue — the current clickable NPC-dialogue choices (saylinks from the most
@@ -1098,7 +1171,9 @@ async fn get_dialogue(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let list: Vec<_> = choices.iter().enumerate()
         .map(|(i, c)| serde_json::json!({ "index": i, "text": c.text }))
         .collect();
-    Json(serde_json::json!({ "count": list.len(), "choices": list }))
+    // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
+    let snapshot_age_ms = s.health().snapshot_age_ms;
+    Json(serde_json::json!({ "count": list.len(), "choices": list, "snapshot_age_ms": snapshot_age_ms }))
 }
 
 /// GET /v1/observe/spells — the 9 memorized gems with names. Empty gem = spell id 0 or 0xFFFFFFFF.
@@ -1112,7 +1187,9 @@ async fn get_spells(State(s): State<HttpState>) -> Json<serde_json::Value> {
             serde_json::json!({ "gem": i, "spell_id": id, "name": name })
         }
     }).collect();
-    Json(serde_json::json!({ "gems": gems }))
+    // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
+    let snapshot_age_ms = s.health().snapshot_age_ms;
+    Json(serde_json::json!({ "gems": gems, "snapshot_age_ms": snapshot_age_ms }))
 }
 
 /// GET /v1/observe/skills — the player's skills with current values (eqoxide#99). `value == 0`
@@ -1124,12 +1201,18 @@ async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
         let value = skills.get(id).copied().unwrap_or(0);
         serde_json::json!({ "id": id, "name": eqoxide_core::skills::skill_name(id as u32), "value": value })
     }).collect();
-    Json(serde_json::json!({ "skills": list }))
+    // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc for the clock this reuses.
+    let snapshot_age_ms = s.health().snapshot_age_ms;
+    Json(serde_json::json!({ "skills": list, "snapshot_age_ms": snapshot_age_ms }))
 }
 
 /// GET /v1/observe/doors — list the current zone's doors (id, name, position, opentype, open state).
-async fn get_doors(State(s): State<HttpState>) -> Json<Vec<DoorView>> {
-    Json(s.interact.doors_shared.lock().unwrap().clone())
+async fn get_doors(State(s): State<HttpState>) -> Response {
+    // #646: bare array body (backward-compatible shape) — freshness rides `SNAPSHOT_AGE_HEADER`
+    // instead of a JSON key. See that const's doc for the clock this reuses.
+    let snapshot_age_ms = s.health().snapshot_age_ms;
+    let doors = s.interact.doors_shared.lock().unwrap().clone();
+    with_snapshot_age(Json(doors).into_response(), snapshot_age_ms)
 }
 
 /// GET /v1/observe/zone_entrances — the zone **entrances** advertised by the server
@@ -1137,8 +1220,12 @@ async fn get_doors(State(s): State<HttpState>) -> Json<Vec<DoorView>> {
 /// heading when you cross into a zone, keyed by destination `zone_id` + `iterator`. This is NOT
 /// where you go to *leave* the current zone — for that, see `/zone_exits`. (Also served at the
 /// deprecated alias `/zone_points`.)
-async fn get_zone_entrances(State(s): State<HttpState>) -> Json<Vec<eqoxide_core::game_state::ZonePoint>> {
-    Json(s.world.zone_points.lock().unwrap().clone())
+async fn get_zone_entrances(State(s): State<HttpState>) -> Response {
+    // #646: bare array body (backward-compatible shape, also served under the deprecated
+    // `/zone_points` alias) — freshness rides `SNAPSHOT_AGE_HEADER` instead of a JSON key.
+    let snapshot_age_ms = s.health().snapshot_age_ms;
+    let points = s.world.zone_points.lock().unwrap().clone();
+    with_snapshot_age(Json(points).into_response(), snapshot_age_ms)
 }
 
 /// GET /v1/observe/zone_exits — the current zone's **exits**: the WLD zone-line regions you navigate
@@ -1155,6 +1242,9 @@ async fn get_zone_entrances(State(s): State<HttpState>) -> Json<Vec<eqoxide_core
 /// honest answer. Poll `/v1/observe/debug` → `zone_assets` until it reads `ready`.
 async fn get_zone_exits(State(s): State<HttpState>) -> Response {
     if let Some(refusal) = zone_assets_not_ready(&s) { return refusal; }
+    // #646: bare array body (backward-compatible shape) — freshness rides `SNAPSHOT_AGE_HEADER`
+    // instead of a JSON key. See that const's doc for the clock this reuses.
+    let snapshot_age_ms = s.health().snapshot_age_ms;
     let player = s.player();
     // `pos_up` is already the FOOT datum (#522), the same datum as the collision geometry
     // (zone-line regions) it's tested against — no conversion needed.
@@ -1180,7 +1270,7 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Response {
             }));
         }
     }
-    Json(serde_json::json!(exits)).into_response()
+    with_snapshot_age(Json(serde_json::json!(exits)).into_response(), snapshot_age_ms)
 }
 
 #[cfg(test)]
@@ -1888,6 +1978,158 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["summary"]["seq_gaps"].as_array().unwrap().len(), 1,
             "a real gap in the underlying stream must still be reported");
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn header_age_ms(resp: &axum::response::Response) -> u64 {
+        resp.headers().get(SNAPSHOT_AGE_HEADER)
+            .unwrap_or_else(|| panic!("{SNAPSHOT_AGE_HEADER} header missing"))
+            .to_str().unwrap().parse().unwrap()
+    }
+
+    /// #646 — the no-freshness-marker bug this issue fixes, pinned against the REAL router body.
+    /// Before this change only `/debug` and `/nav_debug` carried any freshness field at all; every
+    /// route enumerated here served last-known state with no way for a driving agent to tell it was
+    /// frozen (the motivating case: with the net thread dead, `/entities` kept returning `200` with a
+    /// frozen map and no marker of any kind — #634/#647). This test fails on unmodified `origin/main`
+    /// because none of these keys/headers exist there.
+    ///
+    /// JSON-field endpoints get `"snapshot_age_ms"` as a literal top-level key — asserted PRESENT
+    /// (not merely non-panicking: `serde_json` renders a missing key and an explicit `null` the
+    /// same way under naive indexing, so presence is checked explicitly).
+    #[tokio::test]
+    async fn every_previously_age_less_json_endpoint_now_carries_snapshot_age_ms() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+
+        for uri in [
+            "/item_text", "/packets", "/inventory", "/messages", "/dialogue", "/spells",
+            "/skills", "/entities?labeled=1",
+        ] {
+            let resp = get(state.clone(), uri).await;
+            assert_eq!(resp.status(), StatusCode::OK, "GET {uri} must succeed against a healthy state");
+            let v = body_json(resp).await;
+            assert!(v.get("snapshot_age_ms").is_some_and(|x| !x.is_null()),
+                "GET {uri} must carry a PRESENT, non-null snapshot_age_ms key, got body: {v}");
+            assert!(v["snapshot_age_ms"].as_u64().unwrap() < 1_000,
+                "GET {uri} snapshot_age_ms should read near-zero on a freshly-ticked state, got {}",
+                v["snapshot_age_ms"]);
+        }
+    }
+
+    /// #646 — the header-carried half: endpoints whose body is a bare array/map that must keep its
+    /// exact historical shape (no room for a new JSON key without breaking an existing consumer, e.g.
+    /// `/entities`' default map for `group_driver.py`'s `ents.items()`) carry the identical value in
+    /// `X-Snapshot-Age-Ms` instead. Also fails on unmodified `origin/main` — the header did not exist.
+    #[tokio::test]
+    async fn every_previously_age_less_bare_body_endpoint_carries_the_header() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        // `/zone_exits` is gated by the #579 zone-assets check (`zone_assets_not_ready`), which
+        // refuses with 503 whenever the player's zone doesn't match the loaded assets' zone —
+        // `empty_state()`'s player zone defaults to "" (unknown), which the gate always refuses
+        // (`NotUsable::PlayerZoneUnknown`), not just a same-vs-different-zone mismatch. Match it to
+        // `test_ready()`'s `"testfixture"` so this loop exercises the header on a genuinely-served
+        // 200, the same way `zone_asset_gate_tests` does.
+        set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
+
+        for uri in ["/entities", "/doors", "/zone_entrances", "/zone_points", "/zone_exits"] {
+            let resp = get(state.clone(), uri).await;
+            assert_eq!(resp.status(), StatusCode::OK, "GET {uri} must succeed against a healthy state");
+            assert!(header_age_ms(&resp) < 1_000,
+                "GET {uri} X-Snapshot-Age-Ms should read near-zero on a freshly-ticked state");
+        }
+    }
+
+    /// `/who` and `/frame` need a simulated reply from the model layer (the who-roster oneshot / the
+    /// camera frame channel) before they resolve, so they are pinned separately rather than folded
+    /// into the loop above.
+    #[tokio::test]
+    async fn who_carries_snapshot_age_ms() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        let command = state.command.clone();
+        let handle = tokio::spawn({
+            let state = state.clone();
+            async move { get(state, "/who").await }
+        });
+        // Play the model layer's part: drain the request and reply, exactly like
+        // `ActionLoop::drain_who_friends` would once the server's OP_WhoAllResponse lands.
+        let tx = loop {
+            if let Some(tx) = command.take_who_req() { break tx; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        tx.send(vec![]).unwrap();
+        let resp = handle.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert!(v.get("snapshot_age_ms").is_some_and(|x| !x.is_null()),
+            "GET /who must carry a PRESENT, non-null snapshot_age_ms key, got body: {v}");
+        assert!(v["snapshot_age_ms"].as_u64().unwrap() < 1_000);
+    }
+
+    /// `/frame`'s body is a PNG — it cannot carry an in-band field at all, so (like
+    /// `X-Zone-Assets-State` already does) freshness rides `X-Snapshot-Age-Ms` on the response.
+    #[tokio::test]
+    async fn frame_carries_snapshot_age_header() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        // Same #579 gate as above: without a matching zone, `/frame` refuses (503) before it ever
+        // creates the frame-request oneshot, which would otherwise leave this test's poll loop
+        // spinning forever waiting for a `tx` that is never placed — a genuine hang, not a flaky
+        // slow box. Match the player's zone to the fixture's so the request actually reaches the
+        // render-hand-off path this test means to exercise.
+        set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
+        let frame_req = state.camera.frame_req.clone();
+        let handle = tokio::spawn({
+            let state = state.clone();
+            async move { get(state, "/frame").await }
+        });
+        // Play the render thread's part: satisfy the frame-request channel, exactly like the
+        // renderer would once a frame is captured.
+        let tx = loop {
+            if let Some(tx) = frame_req.lock().unwrap().take() { break tx; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        tx.send(vec![0x89, b'P', b'N', b'G']).unwrap();
+        let resp = handle.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(header_age_ms(&resp) < 1_000);
+    }
+
+    /// The age must reflect REALITY: it must keep CLIMBING for a source that has gone stale, driven
+    /// by a read-time `now - last_tick`, never by anything the (in this test, deliberately silent)
+    /// publisher itself updates. Mirrors `last_packet_age_advances_between_reads_with_no_publisher_
+    /// running` above, over one of the newly-added JSON fields instead of the pre-existing `/debug`
+    /// one.
+    #[tokio::test]
+    async fn snapshot_age_ms_climbs_across_reads_of_a_frozen_source() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = ago(5);
+        let first = body_json(get(state.clone(), "/messages").await).await["snapshot_age_ms"].as_u64().unwrap();
+        // Nothing ticks, nothing republishes — just time passing, exactly like a wedged net thread.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = body_json(get(state, "/messages").await).await["snapshot_age_ms"].as_u64().unwrap();
+        assert!(second > first,
+            "snapshot_age_ms froze at {first} across two reads of a stale source — it must be \
+             derived at READ time (#343/#646), not cached or driven by the dead publisher");
+    }
+
+    /// Same climb, over the header channel this time (`/doors`, a bare-array endpoint).
+    #[tokio::test]
+    async fn snapshot_age_header_climbs_across_reads_of_a_frozen_source() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = ago(5);
+        let first = header_age_ms(&get(state.clone(), "/doors").await);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = header_age_ms(&get(state, "/doors").await);
+        assert!(second > first,
+            "X-Snapshot-Age-Ms froze at {first} across two reads of a stale source — it must be \
+             derived at READ time (#343/#646), not cached or driven by the dead publisher");
     }
 }
 
