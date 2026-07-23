@@ -72,6 +72,13 @@ impl CommandState {
         *self.interact.sit.lock().unwrap() = Some(sit);
     }
 
+    /// Run/walk toggle (#625): `Some(true)` = run, `Some(false)` = walk (POST /v1/interact/{run,walk},
+    /// the Actions window's Run/Walk button). The drain sends `OP_SetRunMode` (0x009f) and switches
+    /// the local movement speed to match.
+    pub fn request_run_mode(&self, run: bool) {
+        *self.interact.run_mode.lock().unwrap() = Some(run);
+    }
+
     /// Click one of the current NPC-dialogue saylink choices (POST /v1/interact/dialogue, the
     /// NPC-dialogue window). The drain sends OP_ItemLinkClick.
     pub fn request_dialogue_click(&self, choice: DialogueChoice) {
@@ -125,6 +132,11 @@ impl CommandState {
         self.interact.sit.lock().unwrap().take()
     }
 
+    /// Drain a pending run/walk toggle request (#625).
+    pub fn take_run_mode(&self) -> Option<bool> {
+        self.interact.run_mode.lock().unwrap().take()
+    }
+
     /// Drain a pending dialogue-click request.
     pub fn take_dialogue_click(&self) -> Option<DialogueChoice> {
         self.interact.dialogue_click.lock().unwrap().take()
@@ -171,6 +183,10 @@ mod tests {
         cs.request_sit(true);
         assert_eq!(cs.take_sit(), Some(true));
         assert_eq!(cs.take_sit(), None);
+
+        cs.request_run_mode(false);
+        assert_eq!(cs.take_run_mode(), Some(false));
+        assert_eq!(cs.take_run_mode(), None, "a drained run-mode toggle must not re-fire");
 
         let choice = DialogueChoice { text: "shipment".into(), item_id: 0xFFFFF, ..Default::default() };
         cs.request_dialogue_click(choice.clone());

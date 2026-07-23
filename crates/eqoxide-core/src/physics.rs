@@ -48,6 +48,41 @@ pub const RUN_SPEED: f32 = 44.0;
 /// walk and well below run, giving margin against float noise in the measured speed.
 pub const WALK_RUN_THRESHOLD: f32 = 20.0;
 
+/// Local movement speed (u/s) selected when the run/walk toggle (#625) is set to walk. Derived the
+/// same way #623 derived `WALK_RUN_THRESHOLD`'s reference point: `RUN_SPEED * (0.3/0.7)`, scaling
+/// the player-special-cased native walkspeed float (0.3) against the native runspeed float (0.7)
+/// that `RUN_SPEED` (44 u/s) itself corresponds to (`EQEmu/zone/mob.cpp:190-196`).
+///
+/// This is purely this client's OWN local-controller speed selection. `OP_SetRunMode` (0x009f),
+/// the wire message the toggle also sends, does not itself gate the server's anti-cheat speed
+/// ceiling (verified against the EQEmu zone source: the ceiling is unconditionally the character's
+/// run speed regardless of `runmode` — the flag is consumed elsewhere, by endurance drain and the
+/// fear-speed calc). So walking is enforced by moving the controller slower here, not by the server
+/// refusing a faster speed; see #625's PR body for the full citation trail.
+pub const WALK_SPEED: f32 = RUN_SPEED * (0.3 / 0.7);
+
+#[cfg(test)]
+mod walk_speed_tests {
+    use super::*;
+
+    #[test]
+    fn walk_speed_sits_strictly_below_the_walk_run_threshold() {
+        // The locomotion-clip threshold (#623) must classify a WALK_SPEED move as walking, or the
+        // two constants have drifted apart and #625's toggle would send OP_SetRunMode(false) while
+        // still rendering (and reporting) the run clip.
+        assert!(WALK_SPEED < WALK_RUN_THRESHOLD,
+            "WALK_SPEED {WALK_SPEED} must clear the run clip threshold {WALK_RUN_THRESHOLD}");
+    }
+
+    #[test]
+    fn walk_speed_is_strictly_slower_than_run_speed() {
+        assert!(WALK_SPEED < RUN_SPEED, "a walk toggle that isn't slower than running is a no-op");
+        // Sanity-check the derivation itself: 0.3/0.7 of RUN_SPEED, matching the #623 comment's
+        // ~18.857 u/s figure.
+        assert!((WALK_SPEED - 18.857).abs() < 0.01, "got {WALK_SPEED}");
+    }
+}
+
 /// Minimum real-time window (seconds) a [`windowed_speed_sample`] anchor must span before it is
 /// re-sampled. See that function's doc for why this exists.
 pub const NAV_SPEED_SAMPLE_WINDOW: f32 = 0.15;

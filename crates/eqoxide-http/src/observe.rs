@@ -535,6 +535,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         "ago_secs": c.at.elapsed().as_secs(),
     }));
     let player_levitating = player.levitating;
+    let player_run_mode = player.run_mode;
     let mut out = serde_json::json!({
         "player": {
             "name":       player.name,
@@ -763,6 +764,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // NOTE: this is the levitate *buff* state, NOT a general gravity flag (GM `#flymode 1` reads
         // `false`). Attached here, not in the literal above, which is at the json! recursion limit.
         player.insert("levitating".into(),             serde_json::json!(player_levitating));
+        // #625 — our own last-SENT run/walk toggle intent (`true` = run, `false` = walk).
+        // `OP_SetRunMode` has no server ack, so this is NOT a confirmation of what the server
+        // granted — exactly the same epistemic level as `sitting`/`auto_attack` elsewhere in this
+        // payload. Attached here (not in the literal above, which is at the recursion limit).
+        player.insert("run_mode".into(),               serde_json::json!(player_run_mode));
         // #612 — OUTBOUND honesty. Everything else in this payload is about what the server told us;
         // these four are about what WE failed to say. Every send error used to be discarded
         // (`let _ = self.socket.try_send(..)`), so a datagram that never left the machine was

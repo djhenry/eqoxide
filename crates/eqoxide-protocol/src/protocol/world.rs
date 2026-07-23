@@ -53,6 +53,14 @@ pub fn build_spawn_appearance_packet(spawn_id: u16, kind: u16, parameter: u32) -
     buf
 }
 
+/// `OP_SetRunMode` (0x009f, #625) payload: RoF2 `SetRunMode_Struct` (4 bytes) —
+/// `{mode: u8, pad: [u8; 3]}`. `run` selects run (`mode=1`) vs walk (`mode=0`); the 3 trailing
+/// bytes are unused padding, always zero. Sent client -> zone once per toggle; the server has no
+/// ack for this opcode (`Handle_OP_SetRunMode` just assigns its own `runmode` flag and returns).
+pub fn build_set_run_mode_packet(run: bool) -> [u8; 4] {
+    [if run { 1 } else { 0 }, 0, 0, 0]
+}
+
 /// OP_ClickDoor payload: ClickDoor_Struct (16 bytes). The lite client is an observer —
 /// picklockskill and item_id are 0; the server only uses doorid for lookup and reads
 /// skills/inventory from the Client object. player_id is our own spawn id (u16).
@@ -105,6 +113,20 @@ mod tests {
         assert_eq!(&p[0..2], &77u16.to_le_bytes());
         assert_eq!(&p[2..4], &14u16.to_le_bytes());
         assert_eq!(&p[4..8], &110u32.to_le_bytes());
+    }
+
+    #[test]
+    fn set_run_mode_packet_is_4_byte_rof2_layout() {
+        // RoF2 SetRunMode_Struct: 4 bytes, mode(u8) @0 then 3 zero padding bytes. Any other size
+        // fails the server's DECODE_LENGTH_EXACT (same failure class as #195's EnvDamage bug).
+        let run = build_set_run_mode_packet(true);
+        assert_eq!(run.len(), 4, "SetRunMode_Struct must be exactly 4 bytes");
+        assert_eq!(run[0], 1, "mode@0 = 1 (run)");
+        assert_eq!(&run[1..4], &[0, 0, 0], "3 trailing padding bytes, always zero");
+
+        let walk = build_set_run_mode_packet(false);
+        assert_eq!(walk[0], 0, "mode@0 = 0 (walk)");
+        assert_eq!(&walk[1..4], &[0, 0, 0]);
     }
 
     #[test]

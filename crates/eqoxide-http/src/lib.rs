@@ -230,6 +230,11 @@ pub struct PlayerState {
     pub casting:            Option<CastingView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_cast:          Option<LastCastView>,
+    /// #625: our own last-SENT run/walk toggle intent (`true` = run, `false` = walk) — NOT a
+    /// server confirmation. `OP_SetRunMode` has no ack, so this is exactly as trustworthy as
+    /// `sitting`/`auto_attack`: what we told the server, not what it granted. Defaults `true`
+    /// (matching every driver's pre-#625 behavior of always moving at run speed).
+    pub run_mode:  bool,
 }
 
 impl PlayerState {
@@ -308,6 +313,7 @@ impl PlayerState {
             target_level:    gs.target_id.and_then(|id| gs.world.entities.get(&id)).map(|e| e.level),
             // #336: spawn-scoped, unlike target_con*/target_level above — populated for the LAST
             // consider of any spawn, not gated on that spawn being the current target.
+            run_mode:      gs.run_mode,
             last_consider: gs.last_consider.as_ref().map(|c| LastConsiderView {
                 spawn_id: c.spawn_id,
                 name:     c.name.clone(),

@@ -1390,6 +1390,10 @@ pub type CastAwaitReq = Arc<Mutex<Option<(CastRequest,
 pub type MemSpellReq = Arc<Mutex<Option<(u32, u32, u32, Option<u32>)>>>;
 /// Posture: Some(true)=sit, Some(false)=stand.
 pub type SitReq = Arc<Mutex<Option<bool>>>;
+/// Run/walk toggle (#625): `Some(true)` = run, `Some(false)` = walk. Set by the Actions window's
+/// Run/Walk button and POST /v1/interact/{run,walk}; the drain sends `OP_SetRunMode` (0x009f) and
+/// selects the local movement speed (see `eqoxide_core::physics::WALK_SPEED`).
+pub type RunModeReq = Arc<Mutex<Option<bool>>>;
 /// Standalone consider of a spawn id.
 pub type ConsiderReq = Arc<Mutex<Option<u32>>>;
 
@@ -1492,6 +1496,9 @@ pub struct InteractSlots {
     pub door_click:     DoorClickReq,
     pub doors_shared:   DoorsShared,
     pub sit:            SitReq,
+    /// #625 run/walk toggle. Grouped with `sit` (both are posture/mode toggles the Actions window
+    /// exposes) rather than a new `NavSlots` field, to avoid touching the nav command domain.
+    pub run_mode:       RunModeReq,
     pub dialogue:       DialogueShared,
     pub dialogue_click: DialogueClickReq,
     pub read_book:      ReadBookReq,

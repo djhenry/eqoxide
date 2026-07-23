@@ -121,6 +121,10 @@ pub struct SceneState {
     pub sitting: bool,
     /// True when auto-attack is enabled.
     pub auto_attack: bool,
+    /// #625: our own last-sent run/walk toggle intent (true = run, false = walk) — drives the
+    /// Actions-window button label. `OP_SetRunMode` has no server ack, so this is send-time intent,
+    /// not a server confirmation (same epistemic level as `sitting`/`auto_attack` above).
+    pub run_mode: bool,
     /// The spawn_id of the current target, if any.
     pub target_id: Option<u32>,
     /// `Some(merchant_entity_id)` while a merchant window is open; drives the HUD merchant window.
@@ -408,6 +412,7 @@ impl SceneState {
                 c.started.elapsed().as_millis() < c.cast_ms as u128 + 1500
             }),
             sitting: gs.sitting,
+            run_mode: gs.run_mode,
             auto_attack: gs.auto_attack,
             target_id: gs.target_id,
             merchant_open: gs.merchant_open,

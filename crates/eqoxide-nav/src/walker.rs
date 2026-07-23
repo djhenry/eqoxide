@@ -32,7 +32,7 @@ use crate::steering::*;
 /// as one constant there (both `Walker` and `ActionLoop::drive_auto_engage_melee` need it) rather
 /// than duplicated; `nav::steering` already reaches into it the same way (see its `advance_cursor`
 /// test fixtures).
-use eqoxide_core::physics::RUN_SPEED;
+use eqoxide_core::physics::{RUN_SPEED, WALK_SPEED};
 
 /// The nav state published while this client has NO collision grid for the current zone — the
 /// terrain assets are still loading, or their load failed (#579). It is NOT `blocked` (there is no
@@ -70,6 +70,14 @@ fn spread_spots(sorted: Vec<[f32; 3]>, max: usize, min_sep: f32) -> Vec<[f32; 3]
         }
     }
     out
+}
+
+/// The local controller speed the nav walker drives its `MoveIntent`s at (#625): `RUN_SPEED` while
+/// running (the default, and the only speed the walker used before #625), `WALK_SPEED` once the
+/// player has toggled to walk. Purely a LOCAL speed choice — the wire message this toggle also
+/// sends (`OP_SetRunMode`) does not itself change what the server permits (see `WALK_SPEED`'s doc).
+fn nav_speed(gs: &GameState) -> f32 {
+    if gs.run_mode { RUN_SPEED } else { WALK_SPEED }
 }
 
 /// **The #543 honesty gate.** Whether nav TRUSTS an advertised same-zone crossing enough to
@@ -1163,7 +1171,7 @@ impl Walker {
                 wish_vspeed: 0.0,
                 jump:        false,
                 want_swim:   false,
-                speed:       RUN_SPEED,
+                speed:       nav_speed(gs),
                 climb:       0.0,
                 hop:         false,
             });
@@ -1267,7 +1275,7 @@ impl Walker {
             wish_vspeed,
             jump,
             want_swim:   swim,
-            speed:       RUN_SPEED,
+            speed:       nav_speed(gs),
             climb:       0.0, // nav uses the native step-up now (#239); fences handled by hop
             hop:         self.stuck_ticks >= NAV_HOP_TICKS,
         });
