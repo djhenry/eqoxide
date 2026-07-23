@@ -35,13 +35,25 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 |-------|-------------|
 | `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `position_provisional`/`crossing_pending_ms` — see [Navigation state](#navigation-state) and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. |
-| `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. |
-| `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
-| `GET /v1/observe/messages[?kind=npc]` | Machine-readable message log (oldest→newest). Each line `{kind, text, keywords}`; `kind` ∈ npc/chat/combat/system/exp/loot/trade/zone. This is how you read NPC dialogue. |
-| `GET /v1/observe/spells` | The 9 memorized gems `{gem, spell_id, name}` (empty = null). |
-| `GET /v1/observe/doors` | Current zone's doors `{door_id,name,x,y,z,heading,opentype,is_open}`. |
-| `GET /v1/observe/zone_points` | Zone exit points received from the server. |
+| `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses, snapshot_age_ms}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. The default bare-map shape carries the same freshness value in the `X-Snapshot-Age-Ms` header instead — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646). |
+| `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
+| `GET /v1/observe/messages[?kind=npc]` | Machine-readable message log (oldest→newest). `{count, messages, snapshot_age_ms}`; each line `{kind, text, keywords}`; `kind` ∈ npc/chat/combat/system/exp/loot/trade/zone. This is how you read NPC dialogue. |
+| `GET /v1/observe/dialogue` | Pending NPC dialogue/quest choices `{count, choices:[{index, text}], snapshot_age_ms}`. |
+| `GET /v1/observe/spells` | The 9 memorized gems `{gems:[{gem, spell_id, name}], snapshot_age_ms}` (empty = null). |
+| `GET /v1/observe/skills` | All skills with current trained value `{skills:[{id, name, value}], snapshot_age_ms}`; `value == 0` means untrained. |
+| `GET /v1/observe/doors` | Current zone's doors — a bare array `[{door_id,name,x,y,z,heading,opentype,is_open}]`; freshness rides the `X-Snapshot-Age-Ms` header (no room for a JSON key on a bare array). |
+| `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side — see [Navigation state](#navigation-state) for the distinction from `zone_exits`). Also served at the deprecated alias `GET /v1/observe/zone_points`. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. |
+| `GET /v1/observe/zone_exits` | Current zone's exits (the WLD zone-line regions you navigate toward — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579) for its 503 gating). A bare array; freshness rides the `X-Snapshot-Age-Ms` header. |
+| `GET /v1/observe/item_text` | Text of the most recently read book/note `{text, snapshot_age_ms}` (`text: null` if none read this session). |
+| `GET /v1/observe/packets[?summary=1]` | Packet-telemetry ring dump (#525), default-off capture. `{enabled, count, packets, snapshot_age_ms}`, or with `?summary=1`, `{enabled, summary, snapshot_age_ms}` (opcode histogram + reliable-sequence-gap analysis). |
+| `GET /v1/observe/who` | Server-wide `/who all` roster `{online:[{name, level, class, race, zone_id, guild, anon}], snapshot_age_ms}`. 503 if no response arrives in time. |
 | `GET /v1/observe/nav_debug` | The nav diagnostics snapshot navigation **publishes** (#608) — see [Nav diagnostics](#nav-diagnostics-get-v1observenav_debug--608). |
+
+Every route above that lacked ANY freshness signal before #646 now carries one — either a
+top-level `"snapshot_age_ms"` JSON field or, where the body is a bare array/map/PNG that cannot
+safely gain a new key, the `X-Snapshot-Age-Ms` response header. See
+[Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646) for the full field-vs-header
+breakdown and why.
 
 ---
 
@@ -277,7 +289,10 @@ which a later load on the same code refuted.
 
 Every `200` from `/v1/observe/frame` also carries **`X-Zone-Assets-State:`** with the same word as
 `zone_assets.state`, so a PNG fetched with `?allow_pending=1` cannot be mistaken downstream for one
-of the real zone. Only `ready` means the image shows the zone the character is in.
+of the real zone. Only `ready` means the image shows the zone the character is in. It also carries
+**`X-Snapshot-Age-Ms`** (#646 — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646)):
+a PNG body has no room for an in-band field, so the same freshness clock every other endpoint
+carries rides this header instead.
 
 **Endpoints that are deliberately NOT gated**, because they do not read zone geometry or collision
 and are honest during a load: `/v1/observe/doors` and `/v1/observe/zone_entrances` (both are
@@ -699,6 +714,39 @@ Every send now funnels through one place that records its own failure, so:
 **If `snapshot_age_ms` is large, distrust the whole payload.** It means the client's own network
 thread has stopped publishing, so every other field is a stale snapshot regardless of what
 `connected` says.
+
+### Per-endpoint freshness — `snapshot_age_ms` (#646)
+
+Before #646, only `GET /v1/observe/debug` (`snapshot_age_ms`, above) and `GET /v1/observe/nav_debug`
+(`published_age_ms`) carried any freshness signal. Every other `/v1/observe/*` route served its
+last-known state with no way for a driving agent to tell it was frozen — the motivating case: with
+the `eq-net` thread dead, `GET /v1/observe/entities` kept returning `200` with a frozen entity map
+and no marker of any kind (#634/#647).
+
+**It is the SAME clock as `/debug`'s `snapshot_age_ms`, not a new one**: `HttpState::health()`'s
+`snapshot_age_ms`, i.e. `NetHealth::last_tick.elapsed()` in milliseconds, computed fresh on every
+request (#343 — an age is only true at the instant it's read). `last_tick` is bumped,
+unconditionally, once per gameplay tick by the same `eq-net` thread loop iteration that publishes
+`GameState` and drains `ActionLoop::tick` — the single writer of every world table these endpoints
+read (entities, inventory, chat messages, dialogue choices, doors, zone points, spells, skills,
+book text, the packet-telemetry ring). A wedged or dead net thread therefore freezes the data AND
+stops bumping this clock in the same instant: a large `snapshot_age_ms` always means "this data can
+no longer change", never merely "nothing changed recently".
+
+Two channels carry it, chosen per endpoint by whether the body has room for a new key:
+
+- **A top-level `"snapshot_age_ms"` JSON field**, on every endpoint whose body is already an
+  object: `item_text`, `packets`, `inventory`, `messages`, `dialogue`, `spells`, `skills`, `who`,
+  and `entities` **only** on its `?labeled=1` shape.
+- **The `X-Snapshot-Age-Ms` response header**, carrying the identical value, on endpoints whose
+  body is a bare array/map that must keep its exact historical shape for existing consumers (no
+  room for a new key without breaking them), or a non-JSON body: `entities`' default `{name:
+  [x,y,z]}` map (documented above as backward-compatible for `group_driver.py`), `doors`,
+  `zone_entrances`/`zone_points`, `zone_exits`, and `frame` (a PNG). A caller that always checks
+  the header never has to know in advance which channel a given endpoint uses.
+
+`/debug` and `/nav_debug` are unchanged by #646 — they already had their own freshness fields
+(`snapshot_age_ms` and `published_age_ms` respectively) before this issue.
 
 ### `net_thread_dead` — the frozen world's terminality (#634)
 
