@@ -833,6 +833,13 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         player.insert("send_failures".into(),           serde_json::json!(health.send_failures));
         player.insert("send_wouldblock_rescued".into(), serde_json::json!(health.send_wouldblock_rescued));
         player.insert("send_deferred".into(),           serde_json::json!(health.send_deferred));
+        // #656: the ALERT the two counters above were missing — send_wouldblock_rescued/
+        // send_deferred are cumulative since process start and can only grow, so nothing before
+        // this could tell an agent "starved right now" from "starved once, an hour ago". `true`
+        // only while a real send_wouldblock_rescued/send_deferred burst is ongoing (see
+        // eqoxide_ipc::send_starved for the exact fire/clear rule); CLEARS on its own once the
+        // burst ends, even though send_wouldblock_rescued/send_deferred themselves never go down.
+        player.insert("send_starved".into(),            serde_json::json!(health.send_starved));
         player.insert("send_failures_unretried".into(), serde_json::json!(health.send_failures_unretried));
         player.insert("last_send_error".into(),
             serde_json::json!(health.last_send_error.map(|k| format!("{k:?}"))));
