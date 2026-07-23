@@ -674,12 +674,19 @@ Every send now funnels through one place that records its own failure, so:
   run with none). Leftover reliables from earlier in the session are the obvious hypothesis; nobody
   has traced it.
 - **What `reliable_abandoned` does and does not cover.** It rises on: zone handoff, world reconnect,
-  zone-in failure, and clean shutdown. It does **not** rise on a **server-side session drop** (the
-  ~30s `resend_timeout` case), because the client currently never notices one — inbound
-  `OP_SessionDisconnect` is unhandled, `poll_recv`'s "socket closed" return is discarded, and the
-  gameplay loop has no link-staleness exit, so the stream is never torn down. Detecting that is
-  **#642**, out of scope for #612. For that case use `connected`, which goes `false` after 15s of
-  link silence — *before* the server's 30s drop.
+  zone-in failure, and clean shutdown. Since **#642** it ALSO rises on a **server-side session drop
+  the client OBSERVES** — inbound `OP_SessionDisconnect`/`OP_OutOfSession`, or a closed socket: the
+  client now marks `session_drop` (which forces `connected` false immediately) and the gameplay loop
+  tears the phase down, dropping the stream. The one case it still does **not** cover is a server drop
+  into *total silence* (no disconnect, no OutOfSession, no ICMP): nothing sets `session_drop`, so the
+  stream is not torn down and this stays `0` — for that residual sub-case use `connected`, which goes
+  `false` after 15s of link silence.
+- **`session_drop`** (**#642**) — `null` while the session is live; a machine-readable cause string
+  (`server_disconnect` / `out_of_session` / `socket_closed`) once the client has *positively observed*
+  the server end this session. This is the immediate, explicit companion to `connected`: `connected`
+  only goes `false` after `CONN_STALE_SECS` (15s) of silence, whereas `session_drop` is set the instant
+  the drop is seen on the wire — and when it is set, `connected` is forced `false` regardless of the
+  link clock. Read it to distinguish "the server dropped us" from "the world is merely quiet".
 - **`send_failures_unretried > 0` does not by itself mean a command was lost, and neither number is
   a complete loss count.** Agent commands travel on the reliable path. `unretried` mixes **two
   classes** that need different diagnoses, and the datagram size is what separates them:

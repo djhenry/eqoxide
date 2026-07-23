@@ -180,6 +180,30 @@ pub async fn run_gameplay_phase(
             loop { sleep(Duration::from_millis(200)).await; }
         }
 
+        // ── Server-side session drop (#642) ──────────────────────────────────
+        // The server ended this session out from under us — inbound OP_SessionDisconnect/
+        // OP_OutOfSession, or the socket returned closed (ICMP port-unreachable). `poll_recv` above
+        // stamped `net_health.session_drop`, which has ALREADY forced `connected` false at the HTTP
+        // layer. Do NOT keep looping on a dead stream retransmitting into a session that no longer
+        // exists (the permanent wedge #642 is about). Tear it down honestly and END the phase:
+        // returning drops the `stream` Option → EqStream::Drop → `abandon_outstanding`, so
+        // `reliable_abandoned` finally COVERS a server-side drop (the one hole #636 documented). The
+        // net thread's own #634 machinery then publishes `net_thread_dead`, and `session_drop` keeps
+        // reporting the cause. We do NOT auto-reconnect — that is an owner design question (#642).
+        // Checked AFTER the shutdown branch so a clean /exit (which sends OUR own disconnect) is never
+        // mistaken for a server drop.
+        // NB: copy the cause out and RELEASE the lock before the body — `net_health` is a std Mutex
+        // (not reentrant) and `publish_snapshot` below re-locks it; holding an `if let` guard across
+        // that call self-deadlocks the whole net thread (caught live during self-validation).
+        let session_drop = net_health.lock().unwrap().session_drop;
+        if let Some(cause) = session_drop {
+            tracing::warn!("EQ: server-side session drop ({}) — tearing down the gameplay phase; \
+                            no reconnect (#642)", cause.as_str());
+            gs.log_msg("system", "Disconnected: the server ended this session.");
+            publish_snapshot(&gs, &game_state_snapshot, &net_health);
+            return;
+        }
+
         // ── Camp ─────────────────────────────────────────────────────────────
         // Drain a camp command (from /exit, /camp, the HUD button, or the `/camp` chat keyword)
         // and start/cancel the camp. `OP_Camp` arms EQEmu's ~29s camp timer; we keep the session
