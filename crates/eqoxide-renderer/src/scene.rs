@@ -34,6 +34,11 @@ pub struct Billboard {
     pub showhelm:  u8,
     /// Boat/ship: floats on the water surface, exempt from the render floor-snap (#194).
     pub floating:  bool,
+    /// Server-published locomotion **gait** (signed), the raw `Gait` code from the entity's most
+    /// recent `OP_ClientUpdate`; `None` until the entity has sent a position update ("not reported",
+    /// not "stationary" — #643). Consumed by `smooth_entity_motion` to pick walk vs. run from the
+    /// wire's own speed signal instead of the position-delta estimate (#651).
+    pub gait:      Option<i32>,
 }
 
 /// A door to render this frame. Positions are in client convention [east=x, north=y, up=z].
@@ -233,6 +238,7 @@ impl SceneState {
                 helm:      0,
                 showhelm:  0,
                 floating:  false,
+                gait:      None,
             });
         }
 
@@ -321,6 +327,9 @@ impl SceneState {
                 helm:      e.helm as u32,
                 showhelm:  e.showhelm,
                 floating:  e.floating,
+                // #651: carry the signed wire gait through for walk/run selection. `None` stays
+                // `None` — the ambiguous "no position update yet" window the m.speed fallback covers.
+                gait:      e.gait.map(|g| g.raw()),
             }
         }).collect();
 
