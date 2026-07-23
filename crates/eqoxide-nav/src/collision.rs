@@ -5352,6 +5352,64 @@ mod tests {
         assert!(wide.path_clear(from, to, r), "a slot wider than the character must stay clear");
     }
 
+    /// **#685 (corner-cut) — the LOS-clamped carrot rounds a corner against the REAL `path_clear`.**
+    ///
+    /// The steering module pins the clamp mechanism with an analytic LOS closure
+    /// (`steering::los_clamp_rounds_a_convex_corner_instead_of_cutting_the_chord`); this pins it with
+    /// the ACTUAL production predicate, `Collision::path_clear` — the same volume-sweep the walker
+    /// clamps against live. An L-path bends around a wall panel that juts into the inside of the turn
+    /// (a convex corner). The plain carrot's straight aim is the chord across the corner and
+    /// `path_clear` REJECTS it (it crosses the panel); the LOS-clamped carrot stops at the corner and
+    /// `path_clear` ACCEPTS its aim.
+    ///
+    /// MUTATION-DISCRIMINATING: make `carrot_along_los` ignore its `los` arg and the "clamped aim is
+    /// path_clear" assertion goes RED — the clamped carrot collapses back to the corner-cutting chord.
+    #[test]
+    fn los_clamp_rounds_a_baked_l_corner() {
+        use crate::steering::{carrot_along, carrot_along_los};
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
+        // Floor east[-5,20] north[-5,15] at up=0. (GLB space is [north, up, east].)
+        let floor = MeshData {
+            positions: vec![[-5.0, 0.0, -5.0], [15.0, 0.0, -5.0], [15.0, 0.0, 20.0], [-5.0, 0.0, 20.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        // A wall panel at east=9, north∈[2,6], height 0..8 — the convex obstacle jutting into the
+        // inside of the L-turn. Its near edge (north=2) is kept a full radius clear of leg1 (north=0)
+        // so the STRAIGHT approach to the corner is unobstructed; it blocks ONLY the corner-cutting
+        // chord (which passes ~north 3.3 at east 9). It touches neither path leg.
+        let wall = MeshData {
+            positions: vec![[2.0, 0.0, 9.0], [6.0, 0.0, 9.0], [6.0, 8.0, 9.0], [2.0, 8.0, 9.0]],
+            normals: vec![[-1.0, 0.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets { terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 2.0);
+
+        // L-path: east to the corner (10,0), then north. Feet at z=1 (just above the floor).
+        let path: Vec<[f32; 3]> = vec![[0.0, 0.0, 1.0], [10.0, 0.0, 1.0], [10.0, 10.0, 1.0]];
+        let from = [4.0, 0.0, 1.0];
+        let reach = 10.0;
+        let los = |a: [f32; 3], b: [f32; 3]| col.path_clear(a, b, r);
+
+        // The UNCLAMPED carrot cuts the corner: its straight aim crosses the wall (scene reproduces #685).
+        let plain = carrot_along(&path, 0, from, reach).unwrap();
+        assert!(!col.path_clear(from, plain, r),
+            "sanity: the unclamped carrot {plain:?} must chord across the corner — path_clear should \
+             reject the straight aim, else this scene does not reproduce #685");
+
+        // The CLAMPED carrot rounds the corner: path_clear ACCEPTS its straight aim.
+        let clamped = carrot_along_los(&path, 0, from, reach, los).unwrap();
+        assert!(col.path_clear(from, clamped, r),
+            "the LOS-clamped carrot {clamped:?} must be reachable by the real path_clear sweep — the \
+             walker rounds the corner instead of chording into the wall. MUTATION: ignore `los` in \
+             carrot_along_los and this goes RED.");
+        // Anti-crawl: still leads forward toward the corner, does not retreat behind the walker.
+        assert!((clamped[0] - from[0]).hypot(clamped[1] - from[1]) >= 4.0,
+            "the clamped carrot {clamped:?} must still lead the walker forward toward the corner, not crawl in place");
+    }
+
     /// The planner must not hand the walker a route through a gap its own collision volume cannot
     /// pass. With the slot as the ONLY way through, the honest answer is "no route" — not a route
     /// the character will wedge in. (Run on the FINE 2u tier: that is the tier that can express a

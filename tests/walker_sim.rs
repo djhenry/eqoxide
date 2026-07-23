@@ -12,7 +12,7 @@
 
 use eqoxide::movement::CharacterController;
 use eqoxide::nav::collision::{Collision, LocalOutcome, PlanCtx, PlanOutcome};
-use eqoxide::nav::steering::{carrot_along, fast_steer_aim, swim_vspeed};
+use eqoxide::nav::steering::{carrot_along, carrot_along_los, fast_steer_aim, swim_vspeed};
 use eqoxide::traversability::{Point, Traversability, PLAYER_BODY};
 use eqoxide::assets::{MeshData, RenderMode, ZoneAssets};
 use eqoxide::region_map::RegionMap;
@@ -421,7 +421,9 @@ use eqoxide_ipc::MoveIntent;
                     let from = [ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]];
                     // fast-steer aim on the fine plan if present, else the coarse carrot
                     let steer_aim = if local_path.len() >= 2 {
-                        fast_steer_aim(&local_path, &mut local_i, from, LOOK_AHEAD).map(|(d, _)| d)
+                        // Always-clear LOS keeps this drift baseline byte-for-byte pre-#685; the LOS
+                        // clamp's own blast radius is measured by `carrot_los_clamp_blast_radius`.
+                        fast_steer_aim(&local_path, &mut local_i, from, LOOK_AHEAD, |_, _| true).map(|(d, _)| d)
                     } else { None };
                     aim = steer_aim.unwrap_or_else(|| {
                         let c = carrot_along(&coarse, path_i, from, LOOK_AHEAD)
@@ -1047,4 +1049,142 @@ fn goal_append_blast_radius() {
     assert_eq!(g_over, 0,
         "#639 over-tightening: {g_over} LOST pair(s) were reachable by the REAL controller — the goal-\
          append check refused a goal the walker can actually stand on. Investigate the printed pairs.");
+}
+
+/// **#685 carrot-cut LOS-clamp blast radius over baked zones — REAL `CharacterController` A/B.**
+///
+/// The clamp shortens the pure-pursuit carrot when the straight walker→carrot aim would cross geometry
+/// (a convex corner). Its dominant RISK is OVER-TIGHTENING: shortening on gentle bends would slow the
+/// walker everywhere and could newly fail straight routes. This measures the blast radius by driving
+/// the production `CharacterController` over routable start/goal pairs TWICE per pair — once WITH the
+/// clamp (`path_clear` LOS), once WITHOUT (the pre-#685 plain carrot) — holding EVERYTHING else fixed
+/// (same coarse route, no re-plan), so the ONLY variable is the clamp. It reports:
+///   * REGRESSED — completed WITHOUT the clamp but NOT with it (a route the clamp broke). Must be 0.
+///   * FIXED     — completed WITH the clamp but not without (a corner-cut wedge the clamp cleared).
+///   * SLOWDOWN  — on pairs that complete BOTH ways, ticks-with / ticks-without. Must be ~1.0.
+///
+/// This models COARSE-tier pure pursuit (the tier the clamp guards); the live client also has the fine
+/// tier + re-plan that partially mask corner cuts, so FIXED here over-counts the live benefit — but
+/// REGRESSED and SLOWDOWN, the over-tightening controls, are a valid A/B regardless.
+///
+/// ```text
+/// ZONE_DIR=~/.local/share/eqoxide/assets/models \
+///   cargo test --release --test walker_sim carrot_los_clamp_blast_radius -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires baked zone glbs at $ZONE_DIR; the #685 carrot LOS-clamp over-tightening blast radius"]
+fn carrot_los_clamp_blast_radius() {
+    const RUN_SPEED: f32 = 44.0;
+    const LOOK_AHEAD: f32 = 5.0;
+    const STOP_DIST: f32 = 2.0;
+    const Z_TOL: f32 = 8.0;
+    const DT: f32 = 1.0 / 100.0;
+    const FRAMES_PER_TICK: u32 = 15;
+    const MAX_TICKS: u32 = 400; // ~60 s of sim per journey — generous headroom over any real route
+
+    // Drive the REAL controller along a FIXED coarse route with pure pursuit; `clamp` toggles the LOS
+    // guard and is the ONLY variable. Returns (arrived, ticks, distance_walked).
+    let run = |col: &Collision, coarse: &[[f32; 3]], goal: [f32; 3], clamp: bool| -> (bool, u32, f32) {
+        let r = PLAYER_RADIUS;
+        let mut ctrl = CharacterController::new(coarse[0]);
+        ctrl.on_ground = true;
+        let mut path_i = 0usize;
+        let mut walked = 0.0f32;
+        let mut prev = ctrl.pos;
+        for tick in 0..MAX_TICKS {
+            let (px, py, pz) = (ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]);
+            if (px - goal[0]).hypot(py - goal[1]) < STOP_DIST && (pz - goal[2]).abs() <= Z_TOL {
+                return (true, tick, walked);
+            }
+            while path_i + 2 < coarse.len() {
+                let (a, b) = (coarse[path_i], coarse[path_i + 1]);
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1] + (pz - a[2]) * ab[2]) / l2 };
+                if t >= 1.0 { path_i += 1; } else { break; }
+            }
+            let aim = if clamp {
+                carrot_along_los(coarse, path_i, [px, py, pz], LOOK_AHEAD, |a, b| col.path_clear(a, b, r))
+            } else {
+                carrot_along(coarse, path_i, [px, py, pz], LOOK_AHEAD)
+            }.unwrap_or(goal);
+            let (dx, dy) = (aim[0] - px, aim[1] - py);
+            let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+            for _ in 0..FRAMES_PER_TICK {
+                ctrl.step(MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
+                    want_swim: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
+            }
+            walked += (ctrl.pos[0] - prev[0]).hypot(ctrl.pos[1] - prev[1]);
+            prev = ctrl.pos;
+        }
+        (false, MAX_TICKS, walked)
+    };
+
+    let dir = std::env::var("ZONE_DIR")
+        .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+    let zones: Vec<String> = std::env::var("ZONES").ok()
+        .map(|z| z.split(',').map(str::to_string).collect())
+        .unwrap_or_else(|| ["akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka",
+            "felwithea", "highpass", "everfrost", "butcher", "cazicthule", "oasis"]
+            .into_iter().map(str::to_string).collect());
+
+    let mut seed: u64 = 0x685A_11CE;
+    let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
+    let unit = |r: u32| r as f32 / u32::MAX as f32;
+
+    let (mut g_pairs, mut g_both, mut g_reg, mut g_fixed) = (0usize, 0usize, 0usize, 0usize);
+    let (mut g_ticks_on, mut g_ticks_off) = (0u64, 0u64);
+    println!("\n=== #685 carrot LOS-clamp blast radius (A/B: clamp ON vs OFF, same route) ===");
+    println!("{:<12} {:>6} {:>5} {:>5} {:>6} {:>9}", "zone", "pairs", "both", "fixed", "regr", "slowdown");
+    for zone in &zones {
+        let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
+        let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12} (no glb — skipped)"); continue };
+        let mut col = Collision::build(&za, 32.0);
+        if col.cols == 0 { println!("{zone:<12} (no grid — skipped)"); continue; }
+        col.set_water(RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
+
+        let (mut z_pairs, mut z_both, mut z_reg, mut z_fixed) = (0usize, 0usize, 0usize, 0usize);
+        let (mut z_ticks_on, mut z_ticks_off) = (0u64, 0u64);
+        let mut tries = 0;
+        while z_pairs < 120 && tries < 8000 {
+            tries += 1;
+            let e = col.origin[0] + unit(rnd()) * (col.cols as f32 * col.cell_size);
+            let n = col.origin[1] + unit(rnd()) * (col.rows as f32 * col.cell_size);
+            let Some(z) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { continue };
+            let ang = unit(rnd()) * std::f32::consts::TAU;
+            let d = 120.0 + unit(rnd()) * 280.0;
+            let (ge, gn) = (e + d * ang.cos(), n + d * ang.sin());
+            let Some(gz) = col.nearest_floor(ge, gn, z, 400.0, 400.0) else { continue };
+            let (s, g) = ([e, n, z], [ge, gn, gz]);
+            if col.in_water(s) || col.in_water(g) { continue; } // dry-land corner cuts only
+            let PlanOutcome::Route(coarse) = col.find_path_ex(s, g, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) else { continue };
+            if coarse.len() < 3 { continue; } // a straight 2-point route has no corner to cut
+            z_pairs += 1;
+
+            let goal = *coarse.last().unwrap();
+            let (arr_off, t_off, _d_off) = run(&col, &coarse, goal, false);
+            let (arr_on, t_on, _d_on) = run(&col, &coarse, goal, true);
+            if arr_off && !arr_on { z_reg += 1;
+                println!("  REGRESSED {zone} s[{:.0},{:.0},{:.0}] g[{:.0},{:.0},{:.0}] wp {} (clamp broke a route plain completed)",
+                    s[0], s[1], s[2], g[0], g[1], g[2], coarse.len());
+            }
+            if arr_on && !arr_off { z_fixed += 1; }
+            if arr_on && arr_off { z_both += 1; z_ticks_on += t_on as u64; z_ticks_off += t_off as u64; }
+        }
+        let slow = if z_ticks_off > 0 { z_ticks_on as f64 / z_ticks_off as f64 } else { 1.0 };
+        println!("{zone:<12} {z_pairs:>6} {z_both:>5} {z_fixed:>5} {z_reg:>6} {slow:>9.3}");
+        g_pairs += z_pairs; g_both += z_both; g_reg += z_reg; g_fixed += z_fixed;
+        g_ticks_on += z_ticks_on; g_ticks_off += z_ticks_off;
+    }
+    let slowdown = if g_ticks_off > 0 { g_ticks_on as f64 / g_ticks_off as f64 } else { 1.0 };
+    println!("\nTOTAL pairs {g_pairs}  both-complete {g_both}  FIXED {g_fixed}  REGRESSED {g_reg}  SLOWDOWN {slowdown:.4}");
+    println!("(REGRESSED must be 0 — a route plain-carrot completed that the clamp broke is over-tightening. \
+             SLOWDOWN on both-complete pairs must be ~1.0 — the clamp must not slow straight/gentle routes.)");
+    assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
+    assert_eq!(g_reg, 0,
+        "#685 over-tightening: {g_reg} route(s) the plain carrot completed FAILED with the LOS clamp — \
+         the clamp broke a route it should not have. Investigate the printed pairs.");
+    assert!(slowdown < 1.10,
+        "#685 over-tightening: the LOS clamp slowed both-completing routes by {:.1}% (ticks_on/ticks_off={slowdown:.4}) \
+         — a clear straight shot must keep the full LOOK_AHEAD, so slowdown must be ~1.0.", (slowdown - 1.0) * 100.0);
 }
