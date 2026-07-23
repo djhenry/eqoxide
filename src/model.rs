@@ -431,7 +431,8 @@ mod mock {
                 gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0,
                 pose: eqoxide_core::game_state::Pose::Standing,
                 gait: None,
-                floating: false,
+                is_boat: false,
+                flymode: 0,
             })
         }
 
