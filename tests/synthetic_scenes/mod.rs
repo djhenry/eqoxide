@@ -324,3 +324,54 @@ pub fn flat_run_into_a_walkable_ramp() -> Collision {
     ];
     collision(m, None)
 }
+
+// ─────── scene 5: a flat run, then a final goal ATOP a face (#639) ───────
+
+/// The raised goal patch (the "pillar top"). Deliberately SMALL and OFFSET so it covers **no coarse
+/// 8u cell centre**: the coarse grid's origin is the scene's min corner (east −64, north −48), so
+/// centres fall on east `…, −4, +4, +12, …` and north `…, −8, 0, +8, …`. A patch over
+/// east `[6, 10]` × north `[−4, 4]` sits strictly between the +4 and +12 columns and the 0 row's
+/// neighbours, touching NO centre. A\* can therefore only ever stand at the goal cell on the LOW
+/// ground; the goal ATOP the patch is reached solely by the goal-append snap — the gap #639 closes.
+pub const GOAL_PATCH_E0: f32 = 6.0;
+pub const GOAL_PATCH_E1: f32 = 10.0;
+pub const GOAL_PATCH_N0: f32 = -4.0;
+pub const GOAL_PATCH_N1: f32 = 4.0;
+/// The exact goal: centred on the raised patch, atop the face, at [`HIGH_Z`].
+pub const GOAL_ATOP_FACE: [f32; 3] = [8.0, 0.0, HIGH_Z];
+/// The paired control goal: the SAME XY, but on the low ground UNDER the patch (`LOW_Z`).
+pub const GOAL_BESIDE_FACE: [f32; 3] = [8.0, 0.0, LOW_Z];
+
+/// **SCENE 5 — A FLAT RUN, THEN A FINAL GOAL ATOP A NEAR-VERTICAL FACE (#639).**
+///
+/// Low ground at [`LOW_Z`] across the whole scene, plus a small raised floor patch at [`HIGH_Z`]
+/// (12.8 u up) at the goal — a "pillar top" floating over the low ground with a 12.8 u face on every
+/// side. The patch is small and offset so no coarse 8 u cell CENTRE lands on it (see the
+/// `GOAL_PATCH_*` note); every cell A\* can stand in near the goal is on the low ground.
+///
+/// This isolates the goal-**append** gap, distinct from scene 3's intermediate-edge case. A\* walks
+/// the flat low ground and REACHES the goal cell — its centre is low ground, 12.8 u below the goal's
+/// resolved floor, so it is taken as a wrong-tier fallback (`reached_goal = true`). The route is then
+/// completed by snapping the final waypoint to the exact goal atop the patch — a penultimate → goal
+/// hop of grade ≈ `12.8 / 8` that NO intermediate walk-edge check ever saw. Every hop UP TO the goal
+/// cell is a legal flat walk; ONLY the appended final hop is un-walkable.
+///
+/// # Why there is no bypass
+///
+/// The patch is a floating slab reachable from nowhere: a 12.8 u face on all sides, no ramp, no
+/// stair. The low ground is otherwise open, so the goal CELL is always reachable — the scene cannot
+/// pass its assertion by being globally unroutable (that would be scene 3, not #639). The paired
+/// control is the same goal XY on the low ground ([`GOAL_BESIDE_FACE`]), which must route: same
+/// approach, walkable final tier, so ONLY the tier the goal sits on distinguishes the two.
+pub fn flat_run_into_a_final_goal_face() -> Collision {
+    let (n0, n1) = (-48.0, 48.0);
+    let m = vec![
+        floor(LOW_Z, -64.0, 64.0, n0, n1),                                          // open low ground
+        floor(HIGH_Z, GOAL_PATCH_E0, GOAL_PATCH_E1, GOAL_PATCH_N0, GOAL_PATCH_N1),   // the raised goal patch
+        wall_ew(-64.0, n0, n1, LOW_Z, HIGH_Z + 20.0),
+        wall_ew(64.0, n0, n1, LOW_Z, HIGH_Z + 20.0),
+        wall_ns(n0, -64.0, 64.0, LOW_Z, HIGH_Z + 20.0),
+        wall_ns(n1, -64.0, 64.0, LOW_Z, HIGH_Z + 20.0),
+    ];
+    collision(m, None)
+}
