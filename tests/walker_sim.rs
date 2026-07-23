@@ -12,7 +12,7 @@
 
 use eqoxide::movement::CharacterController;
 use eqoxide::nav::collision::{Collision, LocalOutcome, PlanCtx, PlanOutcome};
-use eqoxide::nav::steering::{carrot_along, fast_steer_aim, swim_vspeed};
+use eqoxide::nav::steering::{carrot_along, carrot_along_los, fast_steer_aim, swim_vspeed};
 use eqoxide::traversability::{Point, Traversability, PLAYER_BODY};
 use eqoxide::assets::{MeshData, RenderMode, ZoneAssets};
 use eqoxide::region_map::RegionMap;
@@ -421,7 +421,9 @@ use eqoxide_ipc::MoveIntent;
                     let from = [ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]];
                     // fast-steer aim on the fine plan if present, else the coarse carrot
                     let steer_aim = if local_path.len() >= 2 {
-                        fast_steer_aim(&local_path, &mut local_i, from, LOOK_AHEAD).map(|(d, _)| d)
+                        // Always-clear LOS keeps this drift baseline byte-for-byte pre-#685; the LOS
+                        // clamp's own blast radius is measured by `carrot_los_clamp_blast_radius`.
+                        fast_steer_aim(&local_path, &mut local_i, from, LOOK_AHEAD, |_, _| true).map(|(d, _)| d)
                     } else { None };
                     aim = steer_aim.unwrap_or_else(|| {
                         let c = carrot_along(&coarse, path_i, from, LOOK_AHEAD)
@@ -1047,4 +1049,173 @@ fn goal_append_blast_radius() {
     assert_eq!(g_over, 0,
         "#639 over-tightening: {g_over} LOST pair(s) were reachable by the REAL controller — the goal-\
          append check refused a goal the walker can actually stand on. Investigate the printed pairs.");
+}
+
+/// **#685 corner-buffer inflation blast radius over baked zones — REAL `CharacterController` A/B.**
+///
+/// The PRIMARY fix (owner-directed) is `Collision::inflate_route_off_corners`: it pushes coarse-route
+/// waypoints OFF convex wall corners by `radius + buffer`, so the walker takes one smooth wider arc
+/// instead of hugging/wiggling the apex. Its dominant RISK is OVER-TIGHTENING a corridor — shoving a
+/// waypoint into the far wall and BREAKING a narrow-but-passable route. This measures the blast radius
+/// by driving the production `CharacterController` over routable start/goal pairs TWICE per pair —
+/// once on the PLAIN coarse route, once on the INFLATED route — with the carrot LOS clamp
+/// (`carrot_los_clear`) ON in BOTH (the shipped config), so the ONLY variable is the inflation. Reports:
+///   * BROKEN   — completed on the plain route but NOT the inflated one (inflation broke a route). Must be 0.
+///   * GAINED   — completed on the inflated route but not the plain one (a corner wedge inflation cleared).
+///   * SMOOTHED — of pairs that complete BOTH ways, how many turn LESS on the inflated route (smoother),
+///                and the mean reduction in total turning (radians) — the anti-wiggle signal.
+///   * SLOWDOWN — ticks-inflated / ticks-plain on both-complete pairs. Must be ~1.0 (no crawl on open ground).
+///
+/// This models COARSE-tier pursuit (the tier the inflation reshapes); the live client also has the fine
+/// tier + re-plan, so GAINED here is a coarse-only proxy — but BROKEN, SLOWDOWN and the narrow-corridor
+/// safety are a valid A/B regardless.
+///
+/// ```text
+/// ZONE_DIR=~/.local/share/eqoxide/assets/models \
+///   cargo test --release --test walker_sim corner_buffer_blast_radius -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires baked zone glbs at $ZONE_DIR; the #685 corner-buffer inflation blast radius"]
+fn corner_buffer_blast_radius() {
+    const RUN_SPEED: f32 = 44.0;
+    const LOOK_AHEAD: f32 = 5.0;
+    const STOP_DIST: f32 = 2.0;
+    const Z_TOL: f32 = 8.0;
+    const DT: f32 = 1.0 / 100.0;
+    const FRAMES_PER_TICK: u32 = 15;
+    const MAX_TICKS: u32 = 300; // ~45 s of sim per journey — generous headroom over any real route
+    const CORNER_BUFFER: f32 = 2.0; // must match walker.rs CORNER_BUFFER
+    let pairs_per_zone: usize = std::env::var("PAIRS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+
+    // Drive the REAL controller along `route` with LOS-clamped pure pursuit (shipped config). Returns
+    // (arrived, ticks, distance_walked, total_turning_radians). `route` is either the plain coarse
+    // route or the inflated one — the A/B variable.
+    let run = |col: &Collision, route: &[[f32; 3]], goal: [f32; 3]| -> (bool, u32, f32, f32) {
+        let r = PLAYER_RADIUS;
+        let mut ctrl = CharacterController::new(route[0]);
+        ctrl.on_ground = true;
+        let mut path_i = 0usize;
+        let (mut walked, mut turning) = (0.0f32, 0.0f32);
+        let mut prev = ctrl.pos;
+        let mut prev_head: Option<f32> = None;
+        for tick in 0..MAX_TICKS {
+            let (px, py, pz) = (ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]);
+            if (px - goal[0]).hypot(py - goal[1]) < STOP_DIST && (pz - goal[2]).abs() <= Z_TOL {
+                return (true, tick, walked, turning);
+            }
+            while path_i + 2 < route.len() {
+                let (a, b) = (route[path_i], route[path_i + 1]);
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1] + (pz - a[2]) * ab[2]) / l2 };
+                if t >= 1.0 { path_i += 1; } else { break; }
+            }
+            let aim = carrot_along_los(route, path_i, [px, py, pz], LOOK_AHEAD, |a, b| col.carrot_los_clear(a, b, r))
+                .unwrap_or(goal);
+            let (dx, dy) = (aim[0] - px, aim[1] - py);
+            let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+            for _ in 0..FRAMES_PER_TICK {
+                ctrl.step(MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
+                    want_swim: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
+            }
+            // Smoothness: accumulate |Δheading| of ACTUAL movement (wiggle shows up as turning).
+            let (mx, my) = (ctrl.pos[0] - prev[0], ctrl.pos[1] - prev[1]);
+            if mx.hypot(my) > 1e-3 {
+                let h = my.atan2(mx);
+                if let Some(ph) = prev_head {
+                    let mut dh = h - ph;
+                    while dh > std::f32::consts::PI { dh -= std::f32::consts::TAU; }
+                    while dh < -std::f32::consts::PI { dh += std::f32::consts::TAU; }
+                    turning += dh.abs();
+                }
+                prev_head = Some(h);
+            }
+            walked += mx.hypot(my);
+            prev = ctrl.pos;
+        }
+        (false, MAX_TICKS, walked, turning)
+    };
+
+    let dir = std::env::var("ZONE_DIR")
+        .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+    let zones: Vec<String> = std::env::var("ZONES").ok()
+        .map(|z| z.split(',').map(str::to_string).collect())
+        .unwrap_or_else(|| ["akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka",
+            "felwithea", "highpass", "everfrost", "butcher", "cazicthule", "oasis"]
+            .into_iter().map(str::to_string).collect());
+
+    let mut seed: u64 = 0x685A_11CE;
+    let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
+    let unit = |r: u32| r as f32 / u32::MAX as f32;
+
+    let (mut g_pairs, mut g_both, mut g_broken, mut g_gained, mut g_smoothed) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut g_ticks_inf, mut g_ticks_plain) = (0u64, 0u64);
+    let (mut g_moved_wp, mut g_total_wp, mut g_routes_touched) = (0usize, 0usize, 0usize);
+    let (mut g_turn_inf, mut g_turn_plain) = (0.0f64, 0.0f64);
+    println!("\n=== #685 corner-buffer inflation blast radius (A/B: inflated route vs plain, LOS clamp on both) ===");
+    println!("{:<12} {:>6} {:>5} {:>6} {:>6} {:>8} {:>9}", "zone", "pairs", "both", "broken", "gained", "smoothed", "slowdown");
+    for zone in &zones {
+        let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
+        let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12} (no glb — skipped)"); continue };
+        let mut col = Collision::build(&za, 32.0);
+        if col.cols == 0 { println!("{zone:<12} (no grid — skipped)"); continue; }
+        col.set_water(RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
+
+        let (mut z_pairs, mut z_both, mut z_broken, mut z_gained, mut z_smoothed) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut z_ti, mut z_tp) = (0u64, 0u64);
+        let mut tries = 0;
+        while z_pairs < pairs_per_zone && tries < pairs_per_zone * 70 + 500 {
+            tries += 1;
+            let e = col.origin[0] + unit(rnd()) * (col.cols as f32 * col.cell_size);
+            let n = col.origin[1] + unit(rnd()) * (col.rows as f32 * col.cell_size);
+            let Some(z) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { continue };
+            let ang = unit(rnd()) * std::f32::consts::TAU;
+            let d = 120.0 + unit(rnd()) * 280.0;
+            let (ge, gn) = (e + d * ang.cos(), n + d * ang.sin());
+            let Some(gz) = col.nearest_floor(ge, gn, z, 400.0, 400.0) else { continue };
+            let (s, g) = ([e, n, z], [ge, gn, gz]);
+            if col.in_water(s) || col.in_water(g) { continue; } // dry-land corners only
+            let PlanOutcome::Route(coarse) = col.find_path_ex(s, g, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) else { continue };
+            if coarse.len() < 3 { continue; } // a straight 2-point route has no corner to inflate
+            z_pairs += 1;
+
+            let goal = *coarse.last().unwrap();
+            let mut inflated = coarse.clone();
+            col.inflate_route_off_corners(&mut inflated, PLAYER_RADIUS, CORNER_BUFFER);
+            let moved = coarse.iter().zip(inflated.iter())
+                .filter(|(a, b)| (a[0] - b[0]).hypot(a[1] - b[1]) > 0.05).count();
+            g_moved_wp += moved; g_total_wp += coarse.len();
+            if moved > 0 { g_routes_touched += 1; }
+            let (arr_p, t_p, _wp, turn_p) = run(&col, &coarse, goal);
+            let (arr_i, t_i, _wi, turn_i) = run(&col, &inflated, goal);
+            if arr_p && !arr_i { z_broken += 1;
+                println!("  BROKEN {zone} s[{:.0},{:.0},{:.0}] g[{:.0},{:.0},{:.0}] wp {} (inflation broke a route plain completed)",
+                    s[0], s[1], s[2], g[0], g[1], g[2], coarse.len());
+            }
+            if arr_i && !arr_p { z_gained += 1; }
+            if arr_i && arr_p {
+                z_both += 1; z_ti += t_i as u64; z_tp += t_p as u64;
+                g_turn_inf += turn_i as f64; g_turn_plain += turn_p as f64;
+                if turn_i < turn_p - 0.05 { z_smoothed += 1; }
+            }
+        }
+        let slow = if z_tp > 0 { z_ti as f64 / z_tp as f64 } else { 1.0 };
+        println!("{zone:<12} {z_pairs:>6} {z_both:>5} {z_broken:>6} {z_gained:>6} {z_smoothed:>8} {slow:>9.3}");
+        g_pairs += z_pairs; g_both += z_both; g_broken += z_broken; g_gained += z_gained; g_smoothed += z_smoothed;
+        g_ticks_inf += z_ti; g_ticks_plain += z_tp;
+    }
+    let slowdown = if g_ticks_plain > 0 { g_ticks_inf as f64 / g_ticks_plain as f64 } else { 1.0 };
+    let turn_ratio = if g_turn_plain > 0.0 { g_turn_inf / g_turn_plain } else { 1.0 };
+    println!("\nTOTAL pairs {g_pairs}  both-complete {g_both}  BROKEN {g_broken}  GAINED {g_gained}  SMOOTHED {g_smoothed}  \
+             SLOWDOWN {slowdown:.4}  turning(inflated/plain) {turn_ratio:.3}");
+    println!("INFLATION FIRED: {g_routes_touched} of the sampled routes had >=1 waypoint moved; {g_moved_wp}/{g_total_wp} waypoints offset off a wall.");
+    println!("(BROKEN must be 0 — a route the plain coarse route completed that inflation broke is a narrow-corridor \
+             over-tightening. SLOWDOWN must be ~1.0. turning<1.0 and SMOOTHED>0 is the anti-wiggle win.)");
+    assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
+    assert_eq!(g_broken, 0,
+        "#685 over-tightening: {g_broken} route(s) the plain coarse route completed FAILED after inflation — \
+         the corner-buffer offset broke a passable route (likely a narrow corridor). Investigate the printed pairs.");
+    assert!(slowdown < 1.10,
+        "#685: inflation slowed both-completing routes by {:.1}% (ticks_inf/ticks_plain={slowdown:.4}) — the \
+         inflated route must not crawl.", (slowdown - 1.0) * 100.0);
 }

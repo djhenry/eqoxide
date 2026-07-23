@@ -2854,7 +2854,10 @@ mod fine_tier_tests {
             let mut local_i = rng.usize_below(local.len() + 3);
             let fallback = [rng.f32_in(-600.0, 600.0), rng.f32_in(-600.0, 600.0), 0.0];
 
-            let aim = steer_target(&coarse, path_i, &local, &mut local_i, from, 5.0, fallback);
+            // Always-clear LOS: this property pins the fine-tier no-stall TOTALITY, which is orthogonal
+            // to the #685 corner clamp — an all-clear predicate keeps steer_target's aim identical to
+            // pre-#685 so the totality claim under all fine-tier shapes is what is under test here.
+            let aim = steer_target(&coarse, path_i, &local, &mut local_i, from, 5.0, fallback, |_, _| true);
 
             // THE PROPERTY: an aim always exists, and it is a real point the walker can be driven at.
             // (`steer_target` returns `[f32;3]`, not `Option` — the no-stall guarantee is in the TYPE.

@@ -34,6 +34,21 @@ use crate::steering::*;
 /// test fixtures).
 use eqoxide_core::physics::{RUN_SPEED, WALK_SPEED};
 
+/// Radius the pure-pursuit carrot's line-of-sight clamp sweeps when deciding whether the straight
+/// walker→carrot aim would cross geometry (#685). It is the character's OWN collision radius, so the
+/// clamp asks exactly the controller's question — "would my body cross a wall going straight there" —
+/// via the same `Collision::path_clear` volume-sweep the controller moves under and A* validates fine
+/// edges with (#358). Kept at `PLAYER_RADIUS` (not padded wider) precisely so the clamp trips ONLY on
+/// a real corner cut and never on merely hugging a straight wall — the over-tightening #685 must avoid.
+const STEER_LOS_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS;
+
+/// Buffer (beyond the body radius) the committed coarse route is inflated OFF convex wall corners by,
+/// so the walker takes one smooth wider arc with clearance rather than hugging/wiggling the apex
+/// (#685, owner-directed). Modest by design: `radius(1) + buffer(2) = 3u` desired wall clearance, well
+/// under the clearance field's 4u spoke horizon, and bounded per-waypoint by the opposite wall so a
+/// narrow corridor is centred, never widened into the far wall. See `Collision::inflate_route_off_corners`.
+const CORNER_BUFFER: f32 = 2.0;
+
 /// The nav state published while this client has NO collision grid for the current zone — the
 /// terrain assets are still loading, or their load failed (#579). It is NOT `blocked` (there is no
 /// obstacle), NOT `no_path` (no search was ever run) and above all NOT `navigating`: the honest
@@ -496,6 +511,15 @@ impl Walker {
         }));
     }
 
+    /// #685 (owner-directed): inflate a freshly-committed coarse route OFF convex wall corners, so the
+    /// walker steers one smooth wider arc with clearance instead of hugging/wiggling the apex. Uses the
+    /// zone clearance spokes via `Collision::inflate_route_off_corners`; a no-op when no grid is loaded.
+    fn inflate_committed(&self, route: &mut [[f32; 3]]) {
+        if let Some(c) = self.collision.read().unwrap().as_ref() {
+            c.inflate_route_off_corners(route, eqoxide_core::physics::PLAYER_RADIUS, CORNER_BUFFER);
+        }
+    }
+
     /// Apply a finished plan from the worker thread. Returns `true` when the tick must STOP here —
     /// the plan was terminal (no route / gave up) or redirected the goto through a portal.
     pub fn apply_plan(
@@ -550,6 +574,8 @@ impl Walker {
             PlanOutcome::Route(path) => {
                 tracing::info!("NAV: plan #{} → ROUTE to ({:.0},{:.0}) = {} waypoints ({}ms, off the net thread)",
                     reply.gen, goal.0, goal.1, path.len(), reply.plan_ms);
+                let mut path = path;
+                self.inflate_committed(&mut path); // #685: push the route off convex corners (owner)
                 self.path = path;
                 self.path_i = 0;
                 self.stuck_i = 0;
@@ -570,6 +596,8 @@ impl Walker {
                     ({:.0},{:.0}) and re-planning from its end. This is NOT a route to the goal.",
                     reply.gen, limit.as_str(), reply.plan_ms, path.len(), goal.0, goal.1);
                 gs.log_msg("zone", "Planner gave up before finding a full route — walking as far as it can, then re-planning");
+                let mut path = path;
+                self.inflate_committed(&mut path); // #685: push the partial route off convex corners too
                 self.path = path;
                 self.path_i = 0;
                 self.stuck_i = 0;
@@ -762,8 +790,14 @@ impl Walker {
     /// `wish_dir` (+ facing) — the flags/speed the walker set stay.
     pub fn apply_fast_steering(&mut self, gs: &mut GameState) {
         if !self.local_path.is_empty() && self.nav.goto_target.lock().unwrap().is_some() {
+            // NO LOS clamp in the ~10ms fast loop (#685, owner): with the coarse route now INFLATED off
+            // convex corners (`inflate_route_off_corners`), the fine path the fast loop pursues no
+            // longer grazes a corner, so a clamp here is redundant — and clamping the carrot every
+            // ~10ms at an apex is exactly the "wiggle through each corner, sloppy and slow" the owner
+            // saw. The route offset removes the CAUSE; the light backstop clamp stays only on the 150ms
+            // coarse tick (`steer_target`), never in this hot loop. So the fast aim is plain pursuit.
             if let Some((wish_dir, heading)) =
-                fast_steer_aim(&self.local_path, &mut self.local_i, [gs.player_x, gs.player_y, gs.player_z], 5.0)
+                fast_steer_aim(&self.local_path, &mut self.local_i, [gs.player_x, gs.player_y, gs.player_z], 5.0, |_, _| true)
             {
                 if let Some(intent) = self.nav_intent.lock().unwrap().as_mut() {
                     intent.wish_dir = wish_dir;
@@ -1058,8 +1092,15 @@ impl Walker {
                 }));
             }
 
+            // LOS clamp (#685): shorten the carrot at a convex corner so the walker rounds it instead
+            // of chording across the wall. Same `path_clear` volume-sweep the controller/A* use; clear
+            // when no grid is loaded. Held for the single synchronous `steer_target` call only.
+            let coll = self.collision.read().unwrap();
+            let los = |a: [f32; 3], b: [f32; 3]|
+                coll.as_ref().map_or(true, |c| c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE));
             let aim = steer_target(&self.path, self.path_i, &self.local_path, &mut self.local_i,
-                [px, py, pz], LOOK_AHEAD, coarse);
+                [px, py, pz], LOOK_AHEAD, coarse, los);
+            drop(coll);
             (aim[0], aim[1], aim[2])
         } else {
             self.clear_local_plan();

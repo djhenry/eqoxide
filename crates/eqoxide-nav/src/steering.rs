@@ -198,6 +198,38 @@ pub fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
 /// into the shaft wall instead of swimming DOWN it. On near-horizontal LAND segments 3D ≡ 2D (the z
 /// contribution vanishes) and the interpolated z equals the segment z, so land steering is unchanged.
 pub fn carrot_along(path: &[[f32; 3]], start_i: usize, from: [f32; 3], reach: f32) -> Option<[f32; 3]> {
+    // The unclamped carrot is exactly the LOS-clamped one with an always-clear predicate — byte for
+    // byte, by construction — so callers with no collision (and every existing test) are unaffected.
+    carrot_along_los(path, start_i, from, reach, |_, _| true)
+}
+
+/// A pure-pursuit carrot, **LINE-OF-SIGHT CLAMPED**: the furthest point up to `reach` arclength along
+/// `path` (from segment `start_i`) whose STRAIGHT segment from `from` stays clear per `los`.
+///
+/// This is [`carrot_along`] with a corner guard, and it exists because the plain carrot **cuts convex
+/// corners** (#685). The plain carrot advances a fixed arclength ahead regardless of geometry, so
+/// where the committed path bends around a convex corner (walking around the outside of a wall) the
+/// straight walker→carrot aim is the **chord across the corner** — it crosses the wall on the inside
+/// of the turn. The walker drives into the wall, makes no forward progress, trips the stall detector,
+/// and wedges (the live qcat L-corner, which the `PROACTIVE_REPLAN_CAP` machinery above only ever
+/// worked *around* via replan cooldowns, never fixed). Here the carrot only advances while
+/// `los(from, candidate)` holds; at a corner it stops at the last clear point, so the walker steers at
+/// the corner and **rounds** it (following the path's own waypoints) instead of cutting through.
+///
+/// `los(a, b)` answers *"can the character travel straight from a to b without crossing geometry"* —
+/// production callers pass `Collision::path_clear` (the SAME volume-sweep the controller moves under
+/// and A* validates fine edges with, #358). It is a closure so this stays pure/testable and so the
+/// no-geometry case (`los` always-true) reduces to the old `carrot_along` exactly.
+///
+/// **Not over-tightening — the dominant risk (#685).** `path_clear` is blind to a wall the segment
+/// runs ALONGSIDE (a ray parallel to a plane never intersects it — `collision.rs`'s documented LIMIT),
+/// so merely hugging a straight corridor wall does NOT trip the clamp; only a segment that actually
+/// CROSSES geometry does, which is exactly the corner cut. A clear straight shot therefore keeps the
+/// full `reach`, and gentle bends whose chord stays in open space are unchanged.
+pub fn carrot_along_los(
+    path: &[[f32; 3]], start_i: usize, from: [f32; 3], reach: f32,
+    los: impl Fn([f32; 3], [f32; 3]) -> bool,
+) -> Option<[f32; 3]> {
     let a = *path.get(start_i)?;
     let b = path.get(start_i + 1).copied().unwrap_or(a);
     let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
@@ -205,22 +237,34 @@ pub fn carrot_along(path: &[[f32; 3]], start_i: usize, from: [f32; 3], reach: f3
     let t = if l2 < 1e-6 { 0.0 }
         else { (((from[0] - a[0]) * ab[0] + (from[1] - a[1]) * ab[1] + (from[2] - a[2]) * ab[2]) / l2).clamp(0.0, 1.0) };
     let mut cur = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+    // The nearest path point is the LOS FLOOR: the walker is essentially on it, so it is always a
+    // valid aim. Seeding `best` here UNCHECKED is what stops the clamp from ever STALLING the walker —
+    // even with everything ahead blocked it aims forward onto the path, never at a point behind itself
+    // (pinned by the never-stall property test with an all-blocking `los`). It also makes the aim
+    // MONOTONE: the clamp can only ever shorten the reach, never retreat behind where we already are.
+    let mut best = cur;
     let (mut rem, mut i) = (reach, start_i);
     loop {
         match path.get(i + 1).copied() {
             Some(bp) => {
                 let d = [bp[0] - cur[0], bp[1] - cur[1], bp[2] - cur[2]];
                 let dl = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                if dl >= rem || i + 2 >= path.len() {
-                    let c = if dl < 1e-6 { cur }
-                        else { let s = (rem / dl).min(1.0); [cur[0] + d[0] * s, cur[1] + d[1] * s, cur[2] + d[2] * s] };
-                    break Some(c);
-                }
+                let last = dl >= rem || i + 2 >= path.len();
+                let cand = if last {
+                    if dl < 1e-6 { cur }
+                    else { let s = (rem / dl).min(1.0); [cur[0] + d[0] * s, cur[1] + d[1] * s, cur[2] + d[2] * s] }
+                } else { bp };
+                // Advance the accepted carrot only while the straight shot to it stays clear. The
+                // instant it would cross geometry (a corner), stop at the last clear point — the walker
+                // aims at the corner and rounds it. `best` may already be the LOS floor `cur`.
+                if los(from, cand) { best = cand; } else { break; }
+                if last { break; }
                 rem -= dl; cur = bp; i += 1;
             }
-            None => break Some(cur),
+            None => break,
         }
     }
+    Some(best)
 }
 
 /// Max commanded vertical swim speed (u/s), kept UNDER the controller's `BUOY_RATE` (30) so a carrot
@@ -284,9 +328,15 @@ pub fn swim_vspeed(carrot_z: f32, player_z: f32, swim_plane: Option<f32>) -> f32
 /// RUN_SPEED the projection onto segment 0 saturates at t=1, and for the rest of the gate the aim
 /// is measured from `local_path[1]`, which is now BEHIND the walker. The look-ahead collapses and
 /// can invert on a bend, which is the drawn-path-vs-actual-movement divergence in #311.
-pub fn fast_steer_aim(path: &[[f32; 3]], local_i: &mut usize, from: [f32; 3], reach: f32) -> Option<([f32; 2], f32)> {
+pub fn fast_steer_aim(
+    path: &[[f32; 3]], local_i: &mut usize, from: [f32; 3], reach: f32,
+    los: impl Fn([f32; 3], [f32; 3]) -> bool,
+) -> Option<([f32; 2], f32)> {
     advance_cursor(path, local_i, from);
-    let aim = carrot_along(path, *local_i, from, reach)?;
+    // LOS-CLAMPED (#685): the fast-steer aim runs every ~10ms and is what the controller actually
+    // heads at between plan gates, so the corner-cut guard MUST be here or the walker still chords
+    // across the corner in the fast loop even after the tick's carrot is clamped.
+    let aim = carrot_along_los(path, *local_i, from, reach, los)?;
     let (dx, dy) = (aim[0] - from[0], aim[1] - from[1]);
     let d = (dx * dx + dy * dy).sqrt();
     (d > 1e-3).then(|| ([dx / d, dy / d], eq_heading(dx, dy)))
@@ -345,9 +395,13 @@ pub fn steer_target(
     local:  &[[f32; 3]], local_i: &mut usize,
     from: [f32; 3], look_ahead: f32,
     fallback: [f32; 3],
+    los: impl Fn([f32; 3], [f32; 3]) -> bool,
 ) -> [f32; 3] {
+    // Both carrots are LOS-CLAMPED (#685): whichever tier we steer along, the straight aim must not
+    // chord across a convex corner. `los` is passed BY REFERENCE to both so one predicate serves both
+    // tiers. With an always-clear `los` (no collision) this is byte-for-byte the old behaviour.
     // The coarse carrot: the aim we ALWAYS have while a route is committed.
-    let coarse_aim = carrot_along(coarse, path_i, from, look_ahead).unwrap_or(fallback);
+    let coarse_aim = carrot_along_los(coarse, path_i, from, look_ahead, &los).unwrap_or(fallback);
     // The fine carrot, when the fine tier has given us a path worth steering along. A 1-waypoint
     // "path" is just the character's own position and steers nowhere.
     if local.len() >= 2 {
@@ -355,7 +409,7 @@ pub fn steer_target(
         // (#382) — so advance the cursor onto the segment it is actually on before measuring the
         // carrot, or the aim is taken from behind it (#311).
         advance_cursor(local, local_i, from);
-        carrot_along(local, *local_i, from, look_ahead).unwrap_or(coarse_aim)
+        carrot_along_los(local, *local_i, from, look_ahead, &los).unwrap_or(coarse_aim)
     } else {
         coarse_aim
     }
@@ -621,7 +675,7 @@ mod tests {
         const DT: f32 = 0.01; // ~10ms fast-steering tick
         let mut min_forward_dot = f32::MAX;
         for _ in 0..15 { // 150ms — exactly one local_path gate, deliberately NOT rebuilt
-            let (wish_dir, _heading) = fast_steer_aim(&local_path, &mut local_i, pos, 5.0)
+            let (wish_dir, _heading) = fast_steer_aim(&local_path, &mut local_i, pos, 5.0, |_, _| true)
                 .expect("a bending path within reach must always produce an aim");
             // Forward tangent of the segment the cursor is currently tracking — wish_dir must
             // never point backward along it.
@@ -681,5 +735,88 @@ mod tests {
         assert_eq!(swim_vspeed(-50.0, -50.0, None), 0.0, "no surface → 0 is a safe hold (buoyancy inert)");
         assert!(swim_vspeed(-40.0, -50.0, None) > 0.0 && swim_vspeed(-60.0, -50.0, None) < 0.0,
             "no surface → still signed toward the carrot");
+    }
+
+    /// Standard sign-of-orientation segment crossing (proper crossings only; collinear touching is
+    /// treated as non-crossing, which is fine for the corner scenes below). Pure 2D, for the analytic
+    /// LOS closures — the Collision-backed pin lives in `collision.rs` (`los_clamp_rounds_a_baked_l_corner`).
+    fn segments_cross(p: [f32; 2], p2: [f32; 2], q: [f32; 2], q2: [f32; 2]) -> bool {
+        let o = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        let (d1, d2) = (o(q, q2, p), o(q, q2, p2));
+        let (d3, d4) = (o(p, p2, q), o(p, p2, q2));
+        ((d1 > 0.0) != (d2 > 0.0)) && ((d3 > 0.0) != (d4 > 0.0))
+    }
+
+    /// **#685: the LOS-clamped carrot ROUNDS a convex corner instead of cutting the chord across it.**
+    ///
+    /// The plain `carrot_along` advances a fixed arclength ahead, so on an L-path its straight
+    /// walker→carrot aim is the CHORD across the corner — which crosses the wall on the inside of the
+    /// turn (a convex obstacle the path wraps). `carrot_along_los` stops the carrot at the last point
+    /// whose straight shot is clear, so the aim lands on the corner and the walker rounds it.
+    ///
+    /// MUTATION-DISCRIMINATING: make `carrot_along_los` ignore `los` (behave like `carrot_along`) and
+    /// the "rounded carrot is LOS-clear" assertion goes RED — the chord across the corner is exactly
+    /// what `los` rejects.
+    #[test]
+    fn los_clamp_rounds_a_convex_corner_instead_of_cutting_the_chord() {
+        // An L-path: east to the corner (10,0), then north. Reach overshoots the corner onto leg 2.
+        let path: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 10.0, 0.0]];
+        let from = [4.0, 0.0, 0.0];
+        let reach = 10.0;
+        // A wall panel on the INSIDE of the turn — the triangle the chord cuts. It touches NEITHER path
+        // leg (leg1 runs y=0, leg2 runs x=10), so it blocks ONLY the chord, never the path itself.
+        let (w0, w1) = ([9.0f32, 1.0], [9.0f32, 5.0]);
+        let los = |a: [f32; 3], b: [f32; 3]| !segments_cross([a[0], a[1]], [b[0], b[1]], w0, w1);
+
+        // The UNCLAMPED carrot cuts the corner: its chord crosses the wall (proves the scene repros).
+        let plain = carrot_along(&path, 0, from, reach).unwrap();
+        assert!(!los(from, plain),
+            "sanity: the unclamped carrot {plain:?} must cut the corner (its chord crosses the wall), \
+             else this scene does not reproduce #685");
+
+        // The CLAMPED carrot rounds the corner: its chord is clear, and it sits at/behind the vertex.
+        let clamped = carrot_along_los(&path, 0, from, reach, los).unwrap();
+        assert!(los(from, clamped),
+            "the LOS-clamped carrot {clamped:?} must be reachable in a STRAIGHT line — it must not cut \
+             the corner. MUTATION: ignore `los` in carrot_along_los and this goes RED.");
+        // Anti-crawl: the clamp shortens toward the corner, it does not retreat behind the walker.
+        let ahead = (clamped[0] - from[0]).hypot(clamped[1] - from[1]);
+        assert!(ahead >= 4.0,
+            "the clamped carrot {clamped:?} must still lead the walker forward toward the corner \
+             (ahead={ahead:.1}u) — the clamp rounds the corner, it must never crawl in place");
+        assert!(clamped[0] <= 10.0 + 1e-3 && clamped[1] <= 1.0 + 1e-3,
+            "the clamped carrot {clamped:?} should rest at/behind the corner vertex (10,0), not up the far leg");
+    }
+
+    /// **No over-tightening on a clear straight shot** (#685 dominant risk). With an always-clear `los`
+    /// (open ground) the clamped carrot is IDENTICAL to the unclamped one across positions and reaches —
+    /// the full LOOK_AHEAD is kept, so straight/gently-curving routes are unchanged and never slow.
+    #[test]
+    fn los_clamp_keeps_full_reach_on_a_clear_path() {
+        let path: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0], [30.0, 0.0, 0.0]];
+        for &from in &[[0.0f32, 0.0, 0.0], [3.0, 0.0, 0.0], [12.0, 0.0, 0.0]] {
+            for &reach in &[5.0f32, 12.0, 24.0] {
+                let plain = carrot_along(&path, 0, from, reach).unwrap();
+                let clamped = carrot_along_los(&path, 0, from, reach, |_, _| true).unwrap();
+                assert_eq!(plain, clamped,
+                    "a clear-LOS clamp must equal the unclamped carrot (from={from:?}, reach={reach}) — \
+                     shortening a clear straight shot is the over-tightening #685 must avoid");
+            }
+        }
+    }
+
+    /// **The LOS clamp can never STALL the walker** (#685 no-stall / over-tightening extreme). Even if
+    /// EVERY forward straight shot is blocked (an adversarial all-false `los`), `carrot_along_los` still
+    /// returns a finite aim — the nearest path point — never `None`/NaN, and `steer_target` stays TOTAL.
+    #[test]
+    fn los_clamp_never_stalls_even_when_everything_is_blocked() {
+        let path: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 10.0, 0.0]];
+        let from = [4.0, 0.0, 0.0];
+        let blocked = |_: [f32; 3], _: [f32; 3]| false;
+        let c = carrot_along_los(&path, 0, from, 10.0, blocked).expect("must still return an aim");
+        assert!(c.iter().all(|v| v.is_finite()), "aim must be finite even with all LOS blocked: {c:?}");
+        let mut li = 0usize;
+        let aim = steer_target(&path, 0, &path, &mut li, from, 5.0, [0.0, 0.0, 0.0], blocked);
+        assert!(aim.iter().all(|v| v.is_finite()), "steer_target must stay total under a blocking los: {aim:?}");
     }
 }

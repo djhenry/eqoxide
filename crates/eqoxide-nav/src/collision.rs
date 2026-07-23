@@ -1666,6 +1666,30 @@ impl Collision {
         self.nearest_hit_t(from, target).is_none()
     }
 
+    /// **Line-of-sight test for the pure-pursuit carrot clamp (#685).** May the walker steer STRAIGHT
+    /// from `from` to `to` without the aim chording across a WALL (a convex corner)?
+    ///
+    /// This is a CHEST-HEIGHT centre ray — both foot points raised by the body's `chest` (4.0, the
+    /// controller's own contact-ray height, `traversability::PLAYER_BODY`). Casting at chest is what
+    /// makes the clamp not over-tighten (the dominant risk, #685): a FOOT-height ray skims the ground
+    /// and false-trips on every walkable bump and slope, which over a corpus of hilly zones slowed the
+    /// walker 5-8x and newly FAILED dozens of routes (measured). A chest-height ray rides ABOVE
+    /// walkable ground undulation (a slope/bump is not a corner) while a real WALL — which rises from
+    /// the floor well past chest — still blocks it, exactly as the controller's own chest contact ray
+    /// would. It is the SAME contact height the controller collides at, so the clamp asks precisely the
+    /// controller's question.
+    ///
+    /// A single centre ray (not the `path_clear` feeler fan) is deliberate and also the least-aggressive
+    /// choice: the corner-cut chord crosses the wall with its CENTRELINE, so the centre ray catches it,
+    /// while a ray running ALONGSIDE a wall never intersects it — so merely hugging a corridor wall does
+    /// not clamp. `radius` extends the ray past `to` so a wall just beyond the carrot still counts.
+    ///
+    /// Returns `true` (clear) when no zone geometry is loaded.
+    pub fn carrot_los_clear(&self, from: [f32; 3], to: [f32; 3], radius: f32) -> bool {
+        let chest = crate::traversability::PLAYER_BODY.chest;
+        self.line_clear([from[0], from[1], from[2] + chest], [to[0], to[1], to[2] + chest], radius)
+    }
+
     /// The clearance test A* validates ONE GRID EDGE with, at plan resolution `cell`.
     ///
     /// Sweeps the character's collision volume (`path_clear`) on a FINE grid and casts a centre ray
@@ -1798,6 +1822,77 @@ impl Collision {
     /// (computed at the key centre, never the query point).
     pub fn wall_clearance(&self, east: f32, north: f32, floor_z: f32) -> f32 {
         self.clearance.wall_at(self, east, north, floor_z)
+    }
+
+    /// **Corner-buffer route inflation (#685, owner-directed).** Push each INTERIOR route waypoint
+    /// AWAY from a nearby convex wall corner so the walker takes ONE smooth wider arc with clearance,
+    /// instead of hugging the apex and wiggling through (the sloppy/slow behaviour of the pure
+    /// carrot-shorten clamp). This is agent-radius inflation done with the zone's clearance spokes —
+    /// the same 16 radial rays `clearance_probe` / the F11 overlay draw.
+    ///
+    /// At each interior waypoint: the nearest wall's direction + distance come from the min spoke. If
+    /// the waypoint sits within `radius + buffer` of that wall, it is offset OUTWARD (away from the
+    /// wall) by the deficit — but **never past the midpoint** toward the OPPOSITE wall: the antipodal
+    /// spoke bounds the push, so a narrow-but-passable corridor is CENTRED, never sealed (the owner's
+    /// "only offset when there's room" discipline). An offset that would break the route (an adjacent
+    /// segment no longer `path_clear`) is reverted, so inflation can only ever improve or no-op a
+    /// waypoint — it cannot invent a wall-crossing the spokes' 4u horizon did not see.
+    ///
+    /// Endpoints (start = live position, goal) are fixed. Removes the CAUSE (route grazing the corner)
+    /// rather than reacting to it; the carrot LOS clamp (`carrot_los_clear`) stays as a light backstop.
+    pub fn inflate_route_off_corners(&self, route: &mut [[f32; 3]], radius: f32, buffer: f32) {
+        if self.cols == 0 || route.len() < 3 { return; }
+        use crate::traversability::PLAYER_BODY;
+        const SPOKES: usize = 16;
+        const CAP: f32 = 4.0; // the ClearanceField's WALL_CAP horizon (spokes saturate here)
+        let want = radius + buffer;
+        // Radial wall clearance at (x,y): distance to nearest solid at the body probe heights, per
+        // spoke. Returns the 16 spoke distances (index k ↔ angle k/16·τ).
+        let spokes_at = |x: f32, y: f32, floor_z: f32| -> [f32; SPOKES] {
+            let mut d = [CAP; SPOKES];
+            for (k, dk) in d.iter_mut().enumerate() {
+                let a = (k as f32) / (SPOKES as f32) * std::f32::consts::TAU;
+                let (dx, dy) = (a.cos(), a.sin());
+                for hz in PLAYER_BODY.planner_probes() {
+                    let from = [x, y, floor_z + hz];
+                    let to = [x + dx * CAP, y + dy * CAP, floor_z + hz];
+                    if let Some(t) = self.nearest_hit_t(from, to) { *dk = dk.min(t * CAP); }
+                }
+            }
+            d
+        };
+        for i in 1..route.len() - 1 {
+            let p = route[i];
+            let floor_z = self.nearest_floor(p[0], p[1], p[2], 3.0, 8.0).unwrap_or(p[2]);
+            let d = spokes_at(p[0], p[1], floor_z);
+            // Nearest wall = the min spoke.
+            let (mut imin, mut dmin) = (0usize, f32::MAX);
+            for (k, &dk) in d.iter().enumerate() { if dk < dmin { dmin = dk; imin = k; } }
+            if dmin >= want { continue; } // already ≥ radius+buffer of any wall → nothing to do (open ground)
+            let a = (imin as f32) / (SPOKES as f32) * std::f32::consts::TAU;
+            let wall_dir = [a.cos(), a.sin()];              // toward the nearest wall
+            let d_opp = d[(imin + SPOKES / 2) % SPOKES];    // room on the far side
+            let deficit = want - dmin;
+            // Room to push out. When the far side is OPEN (its spoke saturated at the horizon) there is
+            // no opposite wall to worry about, so we may take the full deficit — reaching radius+buffer
+            // at the corner. When the far side is a real WALL (spoke < CAP) we never push past the
+            // midpoint between the two walls, so a narrow corridor CENTRES and is never widened into
+            // the far wall.
+            let opp_room = if d_opp >= CAP - 1e-3 { deficit } else { ((d_opp - dmin) * 0.5).max(0.0) };
+            let push = deficit.min(opp_room);
+            if push <= 1e-3 { continue; }
+            let np = [p[0] - wall_dir[0] * push, p[1] - wall_dir[1] * push, p[2]];
+            // Only accept an offset whose adjacent segments do not cross a wall — validated with the
+            // SAME chest-height LOS the walker steers by (`carrot_los_clear`), not the foot-height
+            // swept `path_clear`: a neighbour waypoint may itself legitimately sit within a radius of a
+            // wall (a goal against a wall), and path_clear's radius-extended shoulder would spuriously
+            // reject the reconnecting segment there even though the centreline never crosses. The push
+            // is already bounded away from BOTH walls (near wall + midpoint), so a centreline check is
+            // the right conservatism — it rejects an offset that would chord across a *different* wall.
+            if self.carrot_los_clear(route[i - 1], np, radius) && self.carrot_los_clear(np, route[i + 1], radius) {
+                route[i] = np;
+            }
+        }
     }
 
     /// Graded ground (ledge) clearance at a standing point, from the zone-lifetime clearance
@@ -5350,6 +5445,145 @@ mod tests {
         // A slot the character genuinely fits through stays passable — the fix must not seal doors.
         let wide = slotted_wall(2.0 * r + 1.0);
         assert!(wide.path_clear(from, to, r), "a slot wider than the character must stay clear");
+    }
+
+    /// **#685 (corner-cut) — the LOS-clamped carrot rounds a corner against the REAL `path_clear`.**
+    ///
+    /// The steering module pins the clamp mechanism with an analytic LOS closure
+    /// (`steering::los_clamp_rounds_a_convex_corner_instead_of_cutting_the_chord`); this pins it with
+    /// the ACTUAL production predicate, `Collision::path_clear` — the same volume-sweep the walker
+    /// clamps against live. An L-path bends around a wall panel that juts into the inside of the turn
+    /// (a convex corner). The plain carrot's straight aim is the chord across the corner and
+    /// `path_clear` REJECTS it (it crosses the panel); the LOS-clamped carrot stops at the corner and
+    /// `path_clear` ACCEPTS its aim.
+    ///
+    /// MUTATION-DISCRIMINATING: make `carrot_along_los` ignore its `los` arg and the "clamped aim is
+    /// path_clear" assertion goes RED — the clamped carrot collapses back to the corner-cutting chord.
+    #[test]
+    fn los_clamp_rounds_a_baked_l_corner() {
+        use crate::steering::{carrot_along, carrot_along_los};
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
+        // Floor east[-5,20] north[-5,15] at up=0. (GLB space is [north, up, east].)
+        let floor = MeshData {
+            positions: vec![[-5.0, 0.0, -5.0], [15.0, 0.0, -5.0], [15.0, 0.0, 20.0], [-5.0, 0.0, 20.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        // A wall panel at east=9, north∈[2,6], height 0..8 — the convex obstacle jutting into the
+        // inside of the L-turn. Its near edge (north=2) is kept a full radius clear of leg1 (north=0)
+        // so the STRAIGHT approach to the corner is unobstructed; it blocks ONLY the corner-cutting
+        // chord (which passes ~north 3.3 at east 9). It touches neither path leg.
+        let wall = MeshData {
+            positions: vec![[2.0, 0.0, 9.0], [6.0, 0.0, 9.0], [6.0, 8.0, 9.0], [2.0, 8.0, 9.0]],
+            normals: vec![[-1.0, 0.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets { terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 2.0);
+
+        // L-path: east to the corner (10,0), then north. Feet at z=1 (just above the floor).
+        let path: Vec<[f32; 3]> = vec![[0.0, 0.0, 1.0], [10.0, 0.0, 1.0], [10.0, 10.0, 1.0]];
+        let from = [4.0, 0.0, 1.0];
+        let reach = 10.0;
+        let los = |a: [f32; 3], b: [f32; 3]| col.carrot_los_clear(a, b, r);
+
+        // The UNCLAMPED carrot cuts the corner: its straight aim crosses the wall (scene reproduces #685).
+        let plain = carrot_along(&path, 0, from, reach).unwrap();
+        assert!(!col.carrot_los_clear(from, plain, r),
+            "sanity: the unclamped carrot {plain:?} must chord across the corner — carrot_los_clear \
+             should reject the straight aim, else this scene does not reproduce #685");
+
+        // The CLAMPED carrot rounds the corner: carrot_los_clear ACCEPTS its straight aim.
+        let clamped = carrot_along_los(&path, 0, from, reach, los).unwrap();
+        assert!(col.carrot_los_clear(from, clamped, r),
+            "the LOS-clamped carrot {clamped:?} must be reachable by the real carrot_los_clear ray — the \
+             walker rounds the corner instead of chording into the wall. MUTATION: ignore `los` in \
+             carrot_along_los and this goes RED.");
+        // Anti-crawl: still leads forward toward the corner, does not retreat behind the walker.
+        assert!((clamped[0] - from[0]).hypot(clamped[1] - from[1]) >= 4.0,
+            "the clamped carrot {clamped:?} must still lead the walker forward toward the corner, not crawl in place");
+    }
+
+    /// **#685 (owner-directed corner-buffer offset) — inflate a wall-grazing route waypoint OFF the
+    /// wall by the buffer, with room on the far side.** A route runs 1u (= PLAYER_RADIUS) from a wall;
+    /// `inflate_route_off_corners` must push the interior waypoint out to `radius + buffer` clearance
+    /// (open space beyond), while leaving the fixed endpoints put and keeping the route walkable. This
+    /// is the PRIMARY fix — the walker takes one smooth wider arc instead of hugging the apex.
+    ///
+    /// MUTATION-DISCRIMINATING: make `inflate_route_off_corners` a no-op (or delete the offset) and the
+    /// "waypoint moved to ~radius+buffer" assertion goes RED — the waypoint stays grazing the wall.
+    #[test]
+    fn inflate_route_pushes_a_wall_grazing_waypoint_off_the_wall() {
+        let r = eqoxide_core::physics::PLAYER_RADIUS; // 1.0
+        let buffer = 2.0;
+        // Floor east[-20,20] north[-20,20]; a wall along east=10 (open space to the west).
+        let floor = MeshData {
+            positions: vec![[-20.0, 0.0, -20.0], [20.0, 0.0, -20.0], [20.0, 0.0, 20.0], [-20.0, 0.0, 20.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let wall = MeshData {
+            positions: vec![[-20.0, 0.0, 10.0], [20.0, 0.0, 10.0], [20.0, 8.0, 10.0], [-20.0, 8.0, 10.0]],
+            normals: vec![[-1.0, 0.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets { terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 2.0);
+
+        // Interior waypoint grazes the wall at east=9 (1u = radius from the wall at east=10); the fixed
+        // endpoints sit 2u off the wall (east=8) so the reconnect walkability check below is meaningful.
+        let mut route = vec![[8.0f32, -8.0, 1.0], [9.0, 0.0, 1.0], [8.0, 8.0, 1.0]];
+        // Pre: the middle waypoint grazes the wall (1u away).
+        assert!((10.0 - route[1][0] - r).abs() < 0.3, "sanity: the middle waypoint starts ~radius from the wall");
+
+        col.inflate_route_off_corners(&mut route, r, buffer);
+
+        // Post: the middle waypoint pushed WEST to ~radius+buffer (3u) of clearance; endpoints unchanged.
+        let clearance = 10.0 - route[1][0];
+        assert!(clearance >= r + buffer - 0.4,
+            "inflation must push the wall-grazing waypoint out to ~radius+buffer clearance (got {clearance:.2}u, \
+             waypoint x={:.2}). MUTATION: no-op inflate_route_off_corners and this goes RED (x stays 9).", route[1][0]);
+        assert!(route[1][0] < 8.5, "the middle waypoint must have moved off the wall (x={:.2})", route[1][0]);
+        assert_eq!(route[0], [8.0, -8.0, 1.0], "the fixed start endpoint must not move");
+        assert_eq!(route[2], [8.0, 8.0, 1.0], "the fixed goal endpoint must not move");
+        // And the inflated route stays walkable end to end.
+        assert!(col.path_clear(route[0], route[1], r) && col.path_clear(route[1], route[2], r),
+            "the inflated route must stay walkable (both segments path_clear)");
+    }
+
+    /// **The corner-buffer offset must NOT widen a narrow corridor into the far wall** (#685 discipline).
+    /// In a corridor only `2·(radius+small)` wide, a centred waypoint has a wall close on BOTH sides;
+    /// inflation must CENTRE it (bounded by the midpoint), never shove it into the opposite wall.
+    #[test]
+    fn inflate_route_centres_a_narrow_corridor_never_seals_it() {
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
+        let buffer = 2.0;
+        // A 5u-wide corridor: walls at east=0 and east=5, running along north. Centre is east=2.5.
+        let floor = MeshData {
+            positions: vec![[-20.0, 0.0, -2.0], [20.0, 0.0, -2.0], [20.0, 0.0, 7.0], [-20.0, 0.0, 7.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let wall = |e: f32| MeshData {
+            positions: vec![[-20.0, 0.0, e], [20.0, 0.0, e], [20.0, 8.0, e], [-20.0, 8.0, e]],
+            normals: vec![[1.0, 0.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets { terrain: vec![floor, wall(0.0), wall(5.0)], objects: vec![], textures: vec![] }, 2.0);
+
+        // A waypoint pushed slightly off-centre toward the east wall (east=3.2 → 1.8u from that wall).
+        let mut route = vec![[2.5f32, -8.0, 1.0], [3.2, 0.0, 1.0], [2.5, 8.0, 1.0]];
+        col.inflate_route_off_corners(&mut route, r, buffer);
+        // It must move toward the CENTRE (west, ~2.5), never past it into the west wall (never < ~2.5).
+        assert!(route[1][0] <= 3.2 + 1e-3 && route[1][0] >= 2.4,
+            "narrow-corridor inflation must centre the waypoint (moved to x={:.2}), never shove it past \
+             the midpoint into the opposite wall", route[1][0]);
+        assert!(col.path_clear(route[0], route[1], r) && col.path_clear(route[1], route[2], r),
+            "the corridor route must stay walkable — inflation must never seal a passable corridor");
     }
 
     /// The planner must not hand the walker a route through a gap its own collision volume cannot
