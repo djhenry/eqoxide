@@ -237,6 +237,16 @@ pub type SearchTraceHandle = Arc<Mutex<SearchTrace>>;
 pub struct PlanDebug {
     /// The plan generation (monotonic per session).
     pub gen: u64,
+    /// GOAL IDENTITY (#631, mirrors #349's `nav_goal_id`): the `NavStatus::goal_id` of the
+    /// `/move/{goto,follow,zone_cross}` this plan was computed FOR — captured when the request was
+    /// posted, so it is the command the plan answers, never a later one. This is the fix for gap 1:
+    /// a `PlanDebug` survives route clears (it is the diagnostic OF a failure), so a stale plan from a
+    /// SUPERSEDED goal keeps riding the snapshot after a `/stop` or a fresh goto. Without an identity
+    /// on the plan itself, an agent reading `plan.gen`/`plan.outcome` beside the current
+    /// `NavDebugSnapshot::goal_id` cannot tell the plan belongs to a PREVIOUS command — the plan
+    /// masquerades as this command's outcome. When `PlanDebug::goal_id != NavDebugSnapshot::goal_id`
+    /// the plan is a prior goal's record, not the current one's; equality means it IS this goal's plan.
+    pub goal_id: u64,
     pub start: [f32; 3],
     pub goal: [f32; 3],
     /// `"route" | "unreachable" | "exhausted"` — which `PlanOutcome` variant came back.
@@ -253,6 +263,17 @@ pub struct PlanDebug {
     /// The planner CHANGED the goal z (snapped to a floor / the water surface) — the
     /// `goal_z_snapped` honesty channel.
     pub goal_snapped: bool,
+    /// HORIZONTAL goal re-anchoring disclosure (#631 gap 2). The horizontal (east/north) distance,
+    /// in units, from the goal the caller NAMED to the point the committed route actually ENDS at.
+    /// `goal_snapped` (from #344) only ever covered the VERTICAL case; a route that does not reach
+    /// the requested XY — an `Exhausted` partial that stops at its closest approach — left the agent
+    /// with `goal_snapped: false` and no way to tell its named coordinates were not where the walker
+    /// was headed (the #482 observation: a goto planned to a point 55u horizontally from the ask). A
+    /// COMPLETE route ends exactly at the requested XY, so this is `0.0` for a real route to the goal;
+    /// a nonzero value means "the destination I committed to is this far, horizontally, from the one
+    /// you asked for." Measured from `self.path`, the SAME route the walker steers, so it cannot drift
+    /// from what the character actually does.
+    pub goal_offset: f32,
     pub trace: SearchTrace,
 }
 
@@ -430,6 +451,14 @@ pub struct NavDebugSnapshot {
     /// `/v1/observe/debug`'s `nav_state`/`nav_reason`).
     pub nav_state: String,
     pub nav_reason: Option<String>,
+    /// GOAL IDENTITY (#631 gap 1): the `NavStatus::goal_id` live at publish time — the SAME
+    /// monotonic stamp surfaced as `nav_goal_id` on `/v1/observe/debug` (#349), bumped on every
+    /// accepted `/move/{goto,follow,zone_cross,stop}`. Carried onto the snapshot so the `plan` below
+    /// (which SURVIVES route clears as a failure diagnostic) is always attributable: a `plan` whose
+    /// own `goal_id` differs from THIS one is a superseded command's record, not the current one's.
+    /// Without it, a `plan` from a prior failed goto rode the snapshot unlabelled after a `/stop` or a
+    /// fresh goto and could not be told apart from the current command's outcome (the gap-1 lie).
+    pub goal_id: u64,
     /// Player position when published `[east, north, up]` — **`None` when the position was not
     /// known at publish time** (fresh login before the first server position, a zone reset). Never
     /// a made-up `[0,0,0]`: a confident wrong position put the overlay's player marker 985 units
