@@ -33,7 +33,7 @@ async fn post_open(
     let Some(name) = name else {
         return (StatusCode::BAD_REQUEST, "provide {\"trainer\":\"Name\"}".into());
     };
-    let ids = s.world.entity_ids.lock().unwrap();
+    let ids = s.world.entity_ids();
     let nl = name.to_lowercase();
     let found = ids.iter()
         .find(|(k, _)| clean_entity_name(k).to_lowercase() == nl)

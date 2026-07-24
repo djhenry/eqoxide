@@ -722,7 +722,7 @@ impl Walker {
         if let Some(name) = chase {
             if self.nav.goto_target.lock().unwrap().is_none() {
                 *self.nav.goto_entity.lock().unwrap() = None; // cancelled elsewhere
-            } else if let Some(&pos) = self.world.entity_positions.lock().unwrap().get(&name) {
+            } else if let Some(&pos) = self.world.entity_positions().get(&name) {
                 *self.nav.goto_target.lock().unwrap() = Some(pos); // follow the entity's latest position
             } else {
                 *self.nav.goto_target.lock().unwrap() = None; // entity despawned / left view
