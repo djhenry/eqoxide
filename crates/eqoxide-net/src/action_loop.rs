@@ -596,10 +596,13 @@ impl ActionLoop {
         // The published nav diagnostics view (#608): a `.clone()` of the SAME slot `main.rs` hands
         // to the render + HTTP consumers. The Walker is its only writer.
         nav_debug:       eqoxide_nav::diagnostics::NavDebugView,
+        // The zone terrain+collision LOAD STATE (#579), the SAME shared handle as the HTTP surface's.
+        // The Walker consults it through `zone_assets::usability` for the #600 zone-identity gate.
+        zone_assets:     eqoxide_nav::zone_assets::ZoneAssetStateShared,
     ) -> Self {
         let walker = eqoxide_nav::walker::Walker::new(
             nav.clone(), world.clone(), collision.clone(), controller.nav_intent.clone(),
-            nav_debug,
+            nav_debug, zone_assets,
         );
         ActionLoop {
             nav,
@@ -3367,6 +3370,8 @@ mod tests {
             Default::default(), // collision
             std::path::PathBuf::new(), // maps_dir
             Default::default(), // nav_debug (#608)
+            std::sync::Arc::new(std::sync::Mutex::new(
+                eqoxide_nav::zone_assets::ZoneAssetState::Idle)), // zone_assets (#600)
         )
     }
 

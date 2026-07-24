@@ -201,6 +201,11 @@ pub struct ModelContext {
     /// ActionLoop) writes it; the render overlay and `/v1/observe/nav_debug` read it. Defined in
     /// `eqoxide-nav` (it names nav types, which `eqoxide-ipc` sits below).
     pub nav_debug:       crate::nav::diagnostics::NavDebugView,
+    /// The zone terrain+collision LOAD STATE (#579): the render/app thread owns the writes
+    /// (`begin_zone_load`/`finish_zone_load`); the walker (inside the owner's ActionLoop) READS it
+    /// for the #600 zone-identity gate, and the HTTP surface reads the SAME Arc. Cloned from the one
+    /// handle `main.rs` builds — identity preserved, exactly like `collision`.
+    pub zone_assets:     crate::nav::zone_assets::ZoneAssetStateShared,
     pub maps_dir:        PathBuf,
     pub shutdown:        Arc<AtomicBool>,
     pub camp:            crate::ipc::CampReq,
@@ -266,6 +271,7 @@ impl Model for ServerModel {
             ctx.collision,
             ctx.maps_dir,
             ctx.nav_debug,
+            ctx.zone_assets,
             ctx.shutdown,
             ctx.camp,
             ctx.camp_until,
@@ -550,6 +556,8 @@ mod tests {
             guild_slots:     Default::default(),
             collision:       Default::default(),
             nav_debug:       Default::default(),
+            zone_assets:     Arc::new(std::sync::Mutex::new(
+                crate::nav::zone_assets::ZoneAssetState::Idle)),
             maps_dir:        PathBuf::new(),
             shutdown:        Arc::new(AtomicBool::new(false)),
             camp:            Default::default(),
