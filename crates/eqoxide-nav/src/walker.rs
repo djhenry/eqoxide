@@ -320,6 +320,14 @@ impl Walker {
     pub fn reset_for_zone_change(&mut self) {
         *self.nav.goto_target.lock().unwrap() = None;
         *self.nav.goto_entity.lock().unwrap() = None;
+        // #600 review round 3: a one-shot `/zone_cross` that never resolved (re-queued through an
+        // asset load for a zone we then LEFT — a Failed load, or a server-initiated move mid-load)
+        // must NOT survive into the next zone and fire an unexpected crossing there. The queued id is
+        // in the PREVIOUS zone's advertised-zonepoint space; the world has changed, so clearing it is
+        // the safe/honest choice. A cross genuinely still mid-resolution for the CURRENT zone has
+        // already been turned into a concrete `goto_target` (also cleared here), so nothing legitimate
+        // is lost.
+        *self.nav.zone_cross.lock().unwrap() = None;
         *self.nav_intent.lock().unwrap() = None; // stop driving the controller toward the stale aim
         // The debug snapshot's plan/pads/clearance describe the PREVIOUS zone's geometry — keeping
         // them would present the old zone's trace over the new zone's world (#608 honesty).
@@ -819,9 +827,12 @@ impl Walker {
                 // are not usable and publishes `zone_loading`, re-queueing the one-shot request so it
                 // resolves once they land. Resetting that `zone_loading` back to `idle` here (no goto
                 // goal is set yet) would flip the state to a misleading "ready/idle" every tick while
-                // the load runs. So keep `zone_loading` while a cross is still queued; a `/stop` clears
-                // the request and the next tick retires it honestly. (Only `zone_loading` is guarded —
-                // navigating/planning/dead never coexist with an unresolved queued cross.)
+                // the load runs. So keep `zone_loading` while a cross is still queued. `/stop`
+                // (`CommandState::request_stop`) DOES clear `nav.zone_cross` (round-3 fix), so after a
+                // stop `zone_cross_pending` is false and this branch retires `zone_loading`→`idle` on
+                // the very next tick — the cross is genuinely cancelled, not left to fire post-load.
+                // (Only `zone_loading` is guarded — navigating/planning/dead never coexist with an
+                // unresolved queued cross.)
                 let zone_cross_pending = self.nav.zone_cross.lock().unwrap().is_some();
                 if self.nav_state_is("navigating") || self.nav_state_is("navigating_partial")
                     || self.nav_state_is("planning")
@@ -1995,18 +2006,20 @@ mod tests {
         assert_eq!(nav.nav_state.lock().unwrap().state, "idle");
     }
 
-    /// **#600 (review round 2): a queued `/zone_cross` keeps `zone_loading` from decaying to `idle`
-    /// during the load.** `ActionLoop::drain_zone_cross` refuses to resolve a cross while the zone's
-    /// assets are not usable, publishes `zone_loading`, and RE-QUEUES the one-shot request. With no
-    /// concrete goto goal set yet, `resolve_goal` would (before this guard) reset that `zone_loading`
-    /// to `idle` every tick — so an agent polling mid-load would see a misleading "ready/idle" for a
-    /// cross that has not happened. The queued request must hold `zone_loading` until the assets land.
+    /// **#600 (review round 2): `resolve_goal`'s guard responds to the `nav.zone_cross` slot state.**
+    /// This is a PURE MECHANISM test of `resolve_goal` in isolation — it drives the slot directly
+    /// (`nav.zone_cross`) because `CommandState`/`request_stop` live in a crate ABOVE this one and are
+    /// not reachable here. What actually WRITES that slot in production — `drain_zone_cross` re-queuing
+    /// during a load, and `request_stop`/`reset_for_zone_change` CLEARING it — is exercised through the
+    /// real drivers in the eqoxide-net test `zone_cross_queued_during_load_is_cancellable_by_stop_
+    /// and_never_leaks`. Here we only pin the guard's response: a present slot HOLDS `zone_loading`; an
+    /// absent slot retires it to `idle`.
     ///
     /// Mutation check: drop `&& !zone_cross_pending` from the reset guard in `resolve_goal` → this
-    /// goes RED (the state resets to `idle` with the cross still queued). Complements
-    /// `cancelling_the_goto_while_loading_returns_to_idle`, which pins the NO-cross case still resets.
+    /// goes RED (the state resets to `idle` with the slot still set). Complements
+    /// `cancelling_the_goto_while_loading_returns_to_idle`, which pins the empty-slot case still resets.
     #[test]
-    fn a_queued_zone_cross_holds_zone_loading_and_does_not_reset_to_idle() {
+    fn resolve_goal_holds_zone_loading_while_the_zone_cross_slot_is_set() {
         let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
         let gs = eqoxide_core::game_state::GameState::new();
         // The drain published zone_loading and re-queued the one-shot cross; no goto goal is set.
@@ -2016,13 +2029,29 @@ mod tests {
 
         assert!(w.resolve_goal(&gs).is_none());
         assert_eq!(nav.nav_state.lock().unwrap().state, NAV_STATE_ZONE_LOADING,
-            "#600: zone_loading must persist while a /zone_cross is queued, not flip to a misleading idle");
+            "#600: zone_loading must persist while the zone_cross slot is set, not flip to a misleading idle");
 
-        // Once the cross is cleared (e.g. /stop or it finally resolved), the same tick retires it.
+        // Slot cleared (what the real `request_stop`/`reset_for_zone_change` do): the tick retires it.
         *nav.zone_cross.lock().unwrap() = None;
         assert!(w.resolve_goal(&gs).is_none());
         assert_eq!(nav.nav_state.lock().unwrap().state, "idle",
-            "with no queued cross, zone_loading retires to idle exactly as before");
+            "with the slot cleared, zone_loading retires to idle exactly as before");
+    }
+
+    /// **#600 (review round 3): a never-resolved one-shot `/zone_cross` must NOT leak across a zone
+    /// change.** If a cross was re-queued through an asset load for a zone we then leave (a Failed load,
+    /// or a server-initiated move mid-load), `reset_for_zone_change` must clear `nav.zone_cross` — else
+    /// it survives into the NEXT zone and fires an unexpected crossing there.
+    ///
+    /// Mutation check: delete the `*self.nav.zone_cross.lock().unwrap() = None;` line from
+    /// `reset_for_zone_change` → this goes RED (the stale cross leaks into the new zone).
+    #[test]
+    fn reset_for_zone_change_clears_a_never_resolved_zone_cross() {
+        let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        *nav.zone_cross.lock().unwrap() = Some(30); // queued but never resolved (loaded through a change)
+        w.reset_for_zone_change();
+        assert!(nav.zone_cross.lock().unwrap().is_none(),
+            "#600: a one-shot cross that never resolved must not survive into the next zone");
     }
 
     /// #644: the honest terminal `dead` state must NOT become a new never-clearing observable — once

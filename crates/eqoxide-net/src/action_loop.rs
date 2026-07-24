@@ -3484,6 +3484,108 @@ mod tests {
         }
     }
 
+    /// Build an `ActionLoop` whose `command` facade SHARES the walker's `NavSlots` — exactly as
+    /// `main.rs` wires production (both are `.clone()`s of the one bundle). So a `request_zone_cross`/
+    /// `request_stop` on the returned `CommandState` writes the SAME `nav.zone_cross` slot that
+    /// `drain_zone_cross` drains and `Walker::resolve_goal` reads. (The default `test_action_loop`
+    /// gives `command` its OWN nav, which is fine for slot round-trips but cannot exercise the
+    /// cross-slot coupling this test needs.) Returns the loop + the shared handles the test drives.
+    fn shared_nav_action_loop() -> (
+        ActionLoop, eqoxide_ipc::NavSlots, eqoxide_command::CommandState,
+        eqoxide_nav::collision::SharedCollision, eqoxide_nav::zone_assets::ZoneAssetStateShared,
+    ) {
+        let nav = eqoxide_ipc::NavSlots {
+            nav_state: std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::NavStatus::default())),
+            ..Default::default()
+        };
+        let command = eqoxide_command::CommandState::new(
+            Default::default(), Default::default(), Default::default(), Default::default(),
+            Default::default(), Default::default(), Default::default(), Default::default(),
+            Default::default(), Default::default(), nav.clone(), Default::default(),
+        );
+        let collision: eqoxide_nav::collision::SharedCollision = Default::default();
+        let zone_assets: eqoxide_nav::zone_assets::ZoneAssetStateShared =
+            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_nav::zone_assets::ZoneAssetState::Idle));
+        let al = ActionLoop::new(
+            nav.clone(), Default::default(), Default::default(), Default::default(),
+            command.clone(), Default::default(), Default::default(), Default::default(),
+            Default::default(), Default::default(), Default::default(), Default::default(),
+            collision.clone(), std::path::PathBuf::new(), Default::default(), zone_assets.clone(),
+        );
+        (al, nav, command, collision, zone_assets)
+    }
+
+    /// **#600 review round 3: a `/zone_cross` queued during an asset load is CANCELLABLE by `/stop`,
+    /// and never leaks.** Drives the REAL `request_stop` (not a manual slot null) through the whole
+    /// chain: `drain_zone_cross` re-queues the cross during the load and publishes `zone_loading`;
+    /// `resolve_goal` holds `zone_loading` while it is queued; `request_stop` clears the queued cross;
+    /// `resolve_goal` then retires `zone_loading`→`idle`; and after the assets land the cross does NOT
+    /// fire (no crossing attempt). A no-`/stop` positive control proves the cross WOULD otherwise still
+    /// be live post-load — so `/stop` is genuinely the differentiator.
+    ///
+    /// **Mutation check:** delete `*self.nav.zone_cross.lock().unwrap() = None;` from
+    /// `CommandState::request_stop` → after `/stop` the cross stays queued, so (a) `resolve_goal` keeps
+    /// `zone_loading` instead of retiring to `idle` AND (b) the post-load drain fires the cross — both
+    /// asserted here, so this goes RED.
+    #[tokio::test]
+    async fn zone_cross_queued_during_load_is_cancellable_by_stop_and_never_leaks() {
+        use eqoxide_nav::zone_assets;
+        const WANT: u16 = 30;
+
+        // ── The fix: /stop cancels the queued-during-load cross ───────────────────────────────────
+        let (mut al, nav, command, collision, za) = shared_nav_action_loop();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        *al.world.zone_points.lock().unwrap() = vec![zp_at(7, WANT, [10.0, 10.0, 0.0])];
+        zone_assets::begin_zone_load(&collision, &za, "freporte", "loading…"); // assets loading, collision None
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.world.zone_name = "freporte".into();
+
+        command.request_zone_cross(WANT);
+        al.drain_zone_cross(&mut stream, &mut gs);
+        assert_eq!(nav.nav_state.lock().unwrap().state, "zone_loading", "loading: honest transient state");
+        assert_eq!(*nav.zone_cross.lock().unwrap(), Some(WANT), "the cross was re-queued to resolve post-load");
+
+        // resolve_goal (no concrete goto goal yet) HOLDS zone_loading while the cross is queued.
+        assert!(al.walker.resolve_goal(&gs).is_none());
+        assert_eq!(nav.nav_state.lock().unwrap().state, "zone_loading",
+            "a queued cross holds zone_loading, not a misleading idle");
+
+        // The REAL /stop: it must cancel the queued cross.
+        command.request_stop();
+        assert!(nav.zone_cross.lock().unwrap().is_none(), "/stop must clear the queued cross (#600 rd3)");
+
+        // Now resolve_goal retires zone_loading → idle honestly (the cross is genuinely cancelled).
+        assert!(al.walker.resolve_goal(&gs).is_none());
+        assert_eq!(nav.nav_state.lock().unwrap().state, "idle",
+            "after /stop the cross is gone, so zone_loading retires to idle");
+
+        // Assets land: the cancelled cross must NOT fire. drain finds an empty slot and does nothing.
+        zone_assets::finish_zone_load(&collision, &za,
+            "freporte", Some(zone_assets::ZoneAssetState::test_ready().collision().unwrap().clone()), 1, None);
+        al.drain_zone_cross(&mut stream, &mut gs);
+        assert!(nav.goto_target.lock().unwrap().is_none(),
+            "the cancelled cross must not fire a crossing attempt after the load completes");
+        assert_eq!(nav.nav_state.lock().unwrap().state, "idle", "still idle — no post-/stop crossing");
+
+        // ── Positive control: WITHOUT /stop the cross is still live post-load (so /stop mattered) ──
+        let (mut al2, nav2, command2, collision2, za2) = shared_nav_action_loop();
+        *al2.world.zone_points.lock().unwrap() = vec![zp_at(7, WANT, [10.0, 10.0, 0.0])];
+        zone_assets::begin_zone_load(&collision2, &za2, "freporte", "loading…");
+        let mut gs2 = eqoxide_core::game_state::GameState::new();
+        gs2.world.zone_name = "freporte".into();
+        command2.request_zone_cross(WANT);
+        al2.drain_zone_cross(&mut stream, &mut gs2);
+        assert_eq!(nav2.nav_state.lock().unwrap().state, "zone_loading");
+        // No /stop this time. Assets land; the still-queued cross RESOLVES (flat grid ⇒ no region ⇒ a
+        // truthful no_path — the point is it ATTEMPTED the cross, unlike the cancelled case above).
+        zone_assets::finish_zone_load(&collision2, &za2,
+            "freporte", Some(zone_assets::ZoneAssetState::test_ready().collision().unwrap().clone()), 1, None);
+        al2.drain_zone_cross(&mut stream, &mut gs2);
+        assert_eq!(nav2.nav_state.lock().unwrap().state, "no_path",
+            "without /stop the re-queued cross is still live and resolves after load — /stop is the differentiator");
+        assert!(nav2.zone_cross.lock().unwrap().is_none(), "a usable resolution consumes the cross");
+    }
+
     // ─────────────────────────────────────────────────────────────────────────────────────────
     // A3 Migration 1 (#448): the honest awaited merchant-buy path. These drive a buy through
     // `drain_merchant` (the loop's own `command` slot is shared with the drain, so a real
