@@ -323,8 +323,11 @@ impl SkinData {
     }
 
     /// Resolve a non-idle, non-dead `action` to a concrete clip index, falling back to the model's
-    /// idle/neutral stand when it has no clip for that action — and only to clip 0 as a last resort
-    /// if the model somehow has no idle either.
+    /// idle/neutral stand when it has no clip for that action. Returns `None` — NEVER clip 0 — when
+    /// the model has neither the action clip nor any idle/walk-named clip; the caller must treat
+    /// `None` exactly like the `"dead"`-with-no-death-clip case: `clip_idx = usize::MAX` (bind-pose
+    /// sentinel) + `animate = false`. This mirrors the `"dead"` branch's own `Option`-returning
+    /// `clip_for_action("dead")` call, so both paths are wired the same way at the call sites.
     ///
     /// Why this exists (#692): a transient combat swing sets the action to `C0N` (e.g. `C05`). A
     /// minimal model like the skeleton has no `C`-family combat clip, so `clip_for_action` returns
@@ -334,12 +337,18 @@ impl SkinData {
     /// action simply holds its neutral stand, never death. Generic: helps any model missing an
     /// action clip; a model that HAS the clip resolves it directly and never reaches the fallback.
     ///
+    /// Hardening (reviewer finding on #694): the ORIGINAL fix still bottomed out at `unwrap_or(0)`
+    /// when a model has NEITHER the action clip NOR any idle/walk clip — reproducing the exact #692
+    /// symptom for that (currently unshipped) model shape. Returning `Option` instead of baking in
+    /// `unwrap_or(0)` here lets the caller route the true "nothing to show" case to the bind-pose
+    /// sentinel instead, so clip 0 is NEVER reached by ANY model shape, not just the ones that happen
+    /// to have an idle clip.
+    ///
     /// Do NOT route the `"dead"` action through this — dead has its own `usize::MAX` bind-pose
     /// sentinel path in the renderer and must not be coerced to idle.
-    pub fn clip_for_action_or_idle(&self, action: &str) -> usize {
+    pub fn clip_for_action_or_idle(&self, action: &str) -> Option<usize> {
         self.clip_for_action(action)
             .or_else(|| self.clip_for_action("idle"))
-            .unwrap_or(0)
     }
 
     /// Lively idle "fidget" animations (look around, shift weight, etc.) that the native client
@@ -620,10 +629,48 @@ mod tests {
 
         // The fix: the swing falls back to idle, NOT clip 0 (= death).
         let chosen = skin.clip_for_action_or_idle("C05");
-        assert_eq!(chosen, idle, "missing combat clip must fall back to the idle/neutral stand");
-        assert_ne!(chosen, 0, "must NOT fall back to clip 0 (the death/collapse clip) — #692");
-        assert_eq!(Some(chosen), Some(idle));
-        assert_ne!(Some(chosen), death, "an attacking skeleton must never play its death clip");
+        assert_eq!(chosen, Some(idle), "missing combat clip must fall back to the idle/neutral stand");
+        assert_ne!(chosen, Some(0), "must NOT fall back to clip 0 (the death/collapse clip) — #692");
+        assert_ne!(chosen, death, "an attacking skeleton must never play its death clip");
+    }
+
+    /// Hardening (reviewer finding on #694): when a model has NEITHER the action clip NOR any
+    /// idle/walk-named clip, `clip_for_action_or_idle` must return `None` — never silently land on
+    /// clip 0, which would reproduce the exact #692 "falls apart" symptom for this model shape (no
+    /// shipped asset hits it today, but the PR claims "never arbitrary clip 0", so this must hold
+    /// generically). The caller is responsible for routing `None` to the bind-pose sentinel, exactly
+    /// like the `"dead"`-with-no-death-clip path already does.
+    ///
+    /// Mutation check: reverting the terminal fallback to `.unwrap_or(0)` (i.e. making this fn
+    /// return `usize` again with clip 0 as the last resort) turns this RED, because `Some(0)` would
+    /// come back where `None` is required.
+    #[test]
+    fn combat_swing_with_no_idle_either_falls_back_to_none_not_clip_zero() {
+        // Death at clip 0, ONE other clip that is neither idle- nor walk-named, and NO combat clip.
+        // `clip_for_action("idle")` requires a name containing "idle" or, failing that, "walk" — this
+        // skin has neither, so the idle fallback itself resolves to `None`.
+        let names = ["D05_death", "P02_sit"];
+        let (rest_translations, rest_rotations, rest_scales) = default_rest(3);
+        let skin = SkinData {
+            joint_count: 3,
+            parents: vec![None, Some(0), Some(1)],
+            inv_bind: vec![identity_mat(); 3],
+            clips: names.iter().map(|n| AnimClip {
+                name: n.to_string(), duration: 2.0, channels: vec![make_channel(0)],
+            }).collect(),
+            rest_translations, rest_rotations, rest_scales,
+            ground_probes: vec![], joint_names: vec![],
+        };
+
+        // Preconditions: no combat clip AND no idle/walk clip either.
+        assert_eq!(skin.clip_for_action("C05"), None, "precondition: no C0N combat clip");
+        assert_eq!(skin.clip_for_action("idle"), None,
+            "precondition: no idle- or walk-named clip to fall back to");
+
+        let chosen = skin.clip_for_action_or_idle("C05");
+        assert_eq!(chosen, None,
+            "with neither the action clip nor an idle clip, must return None (bind-pose sentinel), \
+             never fall back to clip 0 (death here)");
     }
 
     /// #692: a model that DOES have the combat clip must still play it — the idle fallback only
@@ -645,7 +692,7 @@ mod tests {
         };
         assert_eq!(skin.clip_for_action("C05"), Some(1),
             "a model with a real C05 combat clip resolves it directly");
-        assert_eq!(skin.clip_for_action_or_idle("C05"), 1,
+        assert_eq!(skin.clip_for_action_or_idle("C05"), Some(1),
             "the idle fallback must NOT override a model that actually has the combat clip");
     }
 
