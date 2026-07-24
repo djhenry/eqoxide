@@ -125,6 +125,20 @@ pub struct CameraSnapshot {
     pub focus:     [f32; 3],
 }
 
+/// Camera azimuth that places the camera behind a player facing `heading_deg`
+/// (EQ convention: 0=north/+Y, CCW). Camera sits opposite the facing direction:
+///   az = heading_rad - π/2
+///
+/// Relocated from `camera_state` (#422): `eqoxide-http`'s `GET /v1/observe/frame` preset resolver
+/// (`observe::resolve_camera_override`) needs this exact formula to turn a preset/yaw override into
+/// an azimuth relative to the character's current heading, but `eqoxide-http` cannot depend on the
+/// `eqoxide` binary crate that owns `camera_state` — moving the (tiny, pure) formula here instead of
+/// duplicating it keeps the two crates' notion of "behind the character" from ever drifting apart.
+/// Re-exported from `camera_state::desired_azimuth` so every existing call site there is unchanged.
+pub fn desired_azimuth(heading_deg: f32) -> f32 {
+    heading_deg.to_radians() - std::f32::consts::FRAC_PI_2
+}
+
 /// Smoothed per-phase timings (milliseconds) for the HUD overlay. All zero until the first profiled
 /// frame. Each field is an exponential moving average so the on-screen numbers are readable rather
 /// than flickering frame-to-frame.
@@ -206,9 +220,37 @@ pub fn enabled() -> bool {
 }
 // ── end relocated definitions ────────────────────────────────────────────────────────────────────
 
+/// A STATELESS per-capture camera override for `GET /v1/observe/frame` (#422): applied ONLY to the
+/// one off-screen render the render loop performs for this request, never written into the live
+/// `camera_state::CameraState` the on-screen view uses — so a capture with an override can never
+/// leave a later, override-less capture looking at a stale angle (the agent-honesty invariant this
+/// crate's module doc references: no new observable that can get "stuck"). Fields mirror
+/// `CameraSnapshot`'s `azimuth`/`elevation`/`radius` (radians / world units, same convention as
+/// `camera_state::compute_eye`) — `eqoxide-http` resolves named presets and the degree-based
+/// `pitch`/`yaw`/`distance` query params down to this triple before handing it across the channel,
+/// so the render side needs no preset/unit knowledge at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraOverride {
+    pub azimuth:   f32,
+    pub elevation: f32,
+    pub radius:    f32,
+}
+
+/// A pending frame capture: the render loop drains this, captures a PNG (optionally from an
+/// off-screen render using `camera_override` instead of the live camera — #422), and sends the
+/// bytes back through `tx`.
+pub struct FrameCaptureRequest {
+    /// `None` (the overwhelmingly common case, and always the case before #422) means: read back
+    /// today's already-rendered on-screen frame, byte-for-byte the pre-#422 behavior. `Some` means:
+    /// render one extra off-screen pass with this camera and read THAT back instead — the on-screen
+    /// frame (and the live camera driving it) is untouched either way.
+    pub camera_override: Option<CameraOverride>,
+    pub tx: oneshot::Sender<Vec<u8>>,
+}
+
 /// A pending frame capture: the render loop drains this, captures a PNG,
 /// and sends the bytes back through the channel.
-pub type FrameReq = Arc<Mutex<Option<oneshot::Sender<Vec<u8>>>>>;
+pub type FrameReq = Arc<Mutex<Option<FrameCaptureRequest>>>;
 
 /// A pending `/who all` request: GET /v1/observe/who registers a oneshot sender here; the nav thread
 /// drains it, sends OP_WhoAllRequest, and fires it with the parsed roster when OP_WhoAllResponse

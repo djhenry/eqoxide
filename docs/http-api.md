@@ -34,7 +34,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | Route | Description |
 |-------|-------------|
 | `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `position_provisional`/`crossing_pending_ms` — see [Navigation state](#navigation-state) and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
-| `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. |
+| `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. Optional `preset`/`pitch`/`yaw`/`distance` params request a one-off diagnostic camera angle for just this capture — see [Camera override for `/frame`](#camera-override-for-observeframe-422). |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses, snapshot_age_ms}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. The default bare-map shape carries the same freshness value in the `X-Snapshot-Age-Ms` header instead — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646). |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
 | `GET /v1/observe/messages[?kind=npc]` | Machine-readable message log (oldest→newest). `{count, messages, snapshot_age_ms}`; each line `{kind, text, keywords}`; `kind` ∈ npc/chat/combat/system/exp/loot/trade/zone. This is how you read NPC dialogue. |
@@ -329,6 +329,43 @@ character is moving through a world the client has not built, so prefer waiting 
 `POST /v1/move/goto` still accepts the goal, but its response carries a non-null
 **`zone_assets_pending`** note while the assets are missing, and `nav_state` reads `zone_loading`
 until they land.
+
+### Camera override for `/observe/frame` (#422)
+
+The live/persistent gameplay camera is often at an unhelpful angle for judging nav or collision
+footing (e.g. staring up at the character's face) — exactly the moment a screenshot is most needed.
+`GET /v1/observe/frame` accepts an **optional, STATELESS, per-request** camera override: it changes
+only the one PNG this request returns and reverts immediately after — the on-screen/live camera
+(and every capture after this one, with no params) is never touched. There is deliberately no
+persistent "debug camera mode" toggle: a sticky flag is a new observable that can get stuck, so a
+later plain capture could silently inherit a stale angle.
+
+Pass **either** a named `preset`, **or** one or more of `pitch`/`yaw`/`distance` — mixing the two
+is a `400`. No override params at all (or `?preset=default`) is byte-for-byte the pre-#422 behavior:
+the already-rendered on-screen frame is read back, unchanged.
+
+| Param | Meaning | Range |
+|---|---|---|
+| `preset` | A named diagnostic angle, relative to wherever the character is **currently facing** (so it stays correctly oriented no matter which way that is). One of `default` (no override), `top_down` (bird's-eye, ~85° pitch), `behind_above` (over-the-shoulder diagnostic view), `front` (facing the character head-on). | — |
+| `pitch` | Elevation above the horizon, degrees. Positive looks down, negative looks up. Omitted → the live camera's current pitch. | `-85.0..=85.0` |
+| `yaw` | Camera heading, degrees, same convention as `heading_ccw` on `/v1/observe/debug` (0 = north, increasing CCW). Unlike the presets, this is **absolute** — a fixed `yaw` always frames the same world direction regardless of the character's facing at capture time, so a scripted diagnostic angle is reproducible. Omitted → the live camera's current yaw. | `-360.0..=360.0` |
+| `distance` | Camera distance from the character, world units. Omitted → the live camera's current distance. | `1.0..=2000.0` |
+
+An invalid request (out-of-range value, non-numeric value, unknown preset, or `preset` combined with
+any of `pitch`/`yaw`/`distance`) is always a `400 {"error": "invalid_camera_override", "message": "…"}`
+— **never** a `200` at a silently-clamped-or-ignored angle.
+
+An overridden capture is a separate, UI-free render pass (the on-screen frame — window chrome, HUD,
+inventory, etc. — is built and presented first, completely unaffected either way): a plain
+`GET /v1/observe/frame` shows exactly what's currently on screen, egui windows included, while any
+`preset`/`pitch`/`yaw`/`distance` capture shows only the 3D world from the requested angle.
+
+```
+GET /v1/observe/frame                              # unchanged: today's on-screen frame
+GET /v1/observe/frame?preset=top_down               # bird's-eye view, wherever the character is facing
+GET /v1/observe/frame?preset=behind_above            # over-the-shoulder diagnostic view
+GET /v1/observe/frame?pitch=30&yaw=90&distance=150   # explicit angle, independent of facing
+```
 
 ### `matched` — which entity a name actually resolved to (#513)
 

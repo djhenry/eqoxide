@@ -870,12 +870,116 @@ struct FrameQuery {
     /// agent acted on exactly that confusion in #560. Pass `?allow_pending=1` when the loading
     /// screen itself is what you want to see.
     allow_pending: Option<String>,
+    /// #422: a named diagnostic camera angle for THIS capture only — see `resolve_camera_override`
+    /// for the full preset table. Mutually exclusive with `pitch`/`yaw`/`distance`.
+    preset: Option<String>,
+    /// #422: explicit pitch override in degrees (elevation above the horizon; positive looks down,
+    /// negative looks up), range -85.0..=85.0. Omitted fields fall back to the live camera's current
+    /// value. Mutually exclusive with `preset`.
+    pitch: Option<String>,
+    /// #422: explicit yaw override in degrees, EQ heading convention (0=north, increasing CCW) — the
+    /// SAME convention as `heading_ccw` on `GET /v1/observe/state`, and applied ABSOLUTELY (not
+    /// relative to the character's current facing, unlike the presets below), so a fixed `yaw` value
+    /// always frames the same world direction regardless of which way the character happens to be
+    /// facing at capture time. Range -360.0..=360.0. Mutually exclusive with `preset`.
+    yaw: Option<String>,
+    /// #422: explicit distance override in world units, range 1.0..=2000.0. Mutually exclusive with
+    /// `preset`.
+    distance: Option<String>,
 }
 
 /// The state word every `/frame` response carries in `X-Zone-Assets-State` (#595 review nit): a PNG
 /// fetched with `?allow_pending=1` is a 200 `image/png` like any other, so without this header a
 /// mid-load (or wrong-zone) capture is indistinguishable downstream from a real one.
 pub(crate) const ZONE_ASSETS_STATE_HEADER: &str = "x-zone-assets-state";
+
+/// #422: pitch/elevation validation bound, degrees. Symmetric, and short of the true ±90° pole by
+/// enough margin (`camera_state::CameraState::apply_orbit_delta`'s own `POLE` guard sits at 89.94°)
+/// that `camera_state::eye_and_look`'s `look_at_rh`-style math — which the override path drives
+/// DIRECTLY, bypassing every clamp `CameraState` normally applies — cannot degenerate into a
+/// parallel eye/up vector and produce a garbage (or NaN) frame.
+const PITCH_DEG_RANGE: std::ops::RangeInclusive<f32> = -85.0..=85.0;
+/// #422: yaw validation bound, degrees. Generous (a full turn either way) since azimuth is periodic
+/// and out-of-range here can only mean a typo, not a geometry hazard.
+const YAW_DEG_RANGE: std::ops::RangeInclusive<f32> = -360.0..=360.0;
+/// #422: distance validation bound, world units. 1.0 floor keeps the eye off the focus point
+/// (degenerate look-at); 2000.0 ceiling is generously past `camera_state::RADIUS_MAX` (500.0) while
+/// still catching an obvious typo (e.g. a stray extra digit).
+const DISTANCE_RANGE: std::ops::RangeInclusive<f32> = 1.0..=2000.0;
+
+/// Resolve `FrameQuery`'s preset/pitch/yaw/distance fields into a `CameraOverride`, or `None` for
+/// "no override" (no params given, or `?preset=default`) — the exact pre-#422 behavior of reading
+/// back the already-rendered on-screen frame. `Err` carries a human-readable reason for a 400,
+/// returned to the caller BEFORE anything is registered on `s.camera.frame_req` (#422: an invalid
+/// request must never produce a capture at all, let alone a silently-wrong-angle one).
+///
+/// Pure — no I/O, no lock — so every case (valid preset, valid numeric, partial numeric, invalid
+/// range, unknown preset, non-numeric, preset+numeric combined, no params) is unit-testable without
+/// a running renderer or HTTP stack.
+fn resolve_camera_override(
+    q: &FrameQuery,
+    heading_deg: f32,
+    live: &CameraSnapshot,
+) -> Result<Option<CameraOverride>, String> {
+    let numeric_given = q.pitch.is_some() || q.yaw.is_some() || q.distance.is_some();
+    if q.preset.is_some() && numeric_given {
+        return Err("preset is mutually exclusive with pitch/yaw/distance — pass one or the other, \
+                     not both".to_string());
+    }
+
+    if let Some(preset) = q.preset.as_deref() {
+        // (pitch_deg, yaw_offset_deg relative to the character's CURRENT heading, distance).
+        return Ok(match preset {
+            "default"      => None,
+            "top_down"     => Some(preset_override(heading_deg,  85.0,   0.0, 200.0)),
+            "behind_above" => Some(preset_override(heading_deg,  45.0,   0.0,  70.0)),
+            "front"        => Some(preset_override(heading_deg,  20.0, 180.0,  70.0)),
+            other => return Err(format!(
+                "unknown preset \"{other}\" — valid presets: default, top_down, behind_above, front"
+            )),
+        });
+    }
+
+    if !numeric_given {
+        return Ok(None);
+    }
+
+    let pitch_deg = q.pitch.as_deref().map(|v| parse_ranged(v, "pitch", PITCH_DEG_RANGE)).transpose()?;
+    let yaw_deg   = q.yaw.as_deref().map(|v| parse_ranged(v, "yaw", YAW_DEG_RANGE)).transpose()?;
+    let distance  = q.distance.as_deref().map(|v| parse_ranged(v, "distance", DISTANCE_RANGE)).transpose()?;
+
+    Ok(Some(CameraOverride {
+        azimuth:   yaw_deg.map(desired_azimuth).unwrap_or(live.azimuth),
+        elevation: pitch_deg.map(f32::to_radians).unwrap_or(live.elevation),
+        radius:    distance.unwrap_or(live.radius),
+    }))
+}
+
+/// A named preset expressed the same way the numeric path is: pitch in degrees, a yaw OFFSET in
+/// degrees added to `desired_azimuth(heading_deg)` (i.e. relative to the character's current
+/// facing — presets are meant to stay correctly oriented no matter which way the character is
+/// facing at capture time, unlike the absolute numeric `yaw` param), and a distance in world units.
+fn preset_override(heading_deg: f32, pitch_deg: f32, yaw_offset_deg: f32, distance: f32) -> CameraOverride {
+    CameraOverride {
+        azimuth:   desired_azimuth(heading_deg) + yaw_offset_deg.to_radians(),
+        elevation: pitch_deg.to_radians(),
+        radius:    distance,
+    }
+}
+
+/// Parse `v` as an `f32` and check it falls within `range`, with a message naming `field` either
+/// way — the 400 body must tell the caller exactly what was wrong, never just "bad request".
+fn parse_ranged(v: &str, field: &str, range: std::ops::RangeInclusive<f32>) -> Result<f32, String> {
+    let parsed: f32 = v.trim().parse().map_err(|_| {
+        format!("{field}=\"{v}\" is not a number")
+    })?;
+    if !range.contains(&parsed) {
+        return Err(format!(
+            "{field}={parsed} is out of range [{}, {}]", range.start(), range.end()
+        ));
+    }
+    Ok(parsed)
+}
 
 async fn get_frame(State(s): State<HttpState>, Query(q): Query<FrameQuery>) -> Response {
     let state_word = {
@@ -886,8 +990,21 @@ async fn get_frame(State(s): State<HttpState>, Query(q): Query<FrameQuery>) -> R
     if !q.allow_pending.as_deref().is_some_and(truthy) {
         if let Some(refusal) = zone_assets_not_ready(&s) { return refusal; }
     }
+
+    // #422: resolved BEFORE touching `frame_req` — an invalid override must 400 outright, never
+    // register a request that would otherwise capture (at best a default, at worst a garbled) frame.
+    let heading_deg = s.player().heading_ccw;
+    let live_camera = s.camera.snapshot.lock().unwrap().clone();
+    let camera_override = match resolve_camera_override(&q, heading_deg, &live_camera) {
+        Ok(ov) => ov,
+        Err(message) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid_camera_override", "message": message })),
+        ).into_response(),
+    };
+
     let (tx, rx) = oneshot::channel::<Vec<u8>>();
-    *s.camera.frame_req.lock().unwrap() = Some(tx);
+    *s.camera.frame_req.lock().unwrap() = Some(FrameCaptureRequest { camera_override, tx });
 
     // 10s: a debug build's readback + 1024px PNG encode can exceed 2s when the
     // render loop is saturated, which made captures 503 while frames were fine.
@@ -2202,14 +2319,170 @@ mod tests {
         });
         // Play the render thread's part: satisfy the frame-request channel, exactly like the
         // renderer would once a frame is captured.
-        let tx = loop {
-            if let Some(tx) = frame_req.lock().unwrap().take() { break tx; }
+        let req = loop {
+            if let Some(req) = frame_req.lock().unwrap().take() { break req; }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };
-        tx.send(vec![0x89, b'P', b'N', b'G']).unwrap();
+        assert_eq!(req.camera_override, None, "no query params were passed — must be the \
+            byte-for-byte pre-#422 on-screen readback path, not an override (#422)");
+        req.tx.send(vec![0x89, b'P', b'N', b'G']).unwrap();
         let resp = handle.await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(header_age_ms(&resp) < 1_000);
+    }
+
+    // ─────────── #422: /frame camera-override resolution (pure, no renderer/HTTP needed) ───────────
+
+    fn some_live_camera() -> CameraSnapshot {
+        // Deliberately NOT all-zero/all-default, so a test that fell back to "whatever's already
+        // there" instead of a genuinely-resolved value is caught rather than accidentally passing.
+        CameraSnapshot {
+            mode: CameraMode::AutoFollow,
+            azimuth: 1.111,
+            elevation: 0.222,
+            radius: 99.0,
+            focus: [0.0, 0.0, 0.0],
+        }
+    }
+
+    #[test]
+    fn no_params_resolve_to_no_override() {
+        let q = FrameQuery::default();
+        assert_eq!(resolve_camera_override(&q, 0.0, &some_live_camera()), Ok(None));
+    }
+
+    #[test]
+    fn preset_default_resolves_to_no_override_same_as_no_params() {
+        let q = FrameQuery { preset: Some("default".into()), ..Default::default() };
+        assert_eq!(resolve_camera_override(&q, 123.0, &some_live_camera()), Ok(None));
+    }
+
+    #[test]
+    fn preset_top_down_looks_nearly_straight_down_at_any_heading() {
+        for heading in [0.0_f32, 90.0, 271.0] {
+            let q = FrameQuery { preset: Some("top_down".into()), ..Default::default() };
+            let ov = resolve_camera_override(&q, heading, &some_live_camera()).unwrap().unwrap();
+            assert!((ov.elevation - 85.0_f32.to_radians()).abs() < 1e-5, "heading={heading}");
+            assert!((ov.radius - 200.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn preset_behind_above_stays_relative_to_current_heading() {
+        // The whole point of a preset (vs. the absolute numeric `yaw`) is that it tracks whichever
+        // way the character is currently facing — pin that the resolved azimuth actually moves with
+        // `heading_deg` rather than landing on some fixed world direction.
+        let q = FrameQuery { preset: Some("behind_above".into()), ..Default::default() };
+        let ov_a = resolve_camera_override(&q, 0.0, &some_live_camera()).unwrap().unwrap();
+        let ov_b = resolve_camera_override(&q, 90.0, &some_live_camera()).unwrap().unwrap();
+        assert!((ov_a.azimuth - ov_b.azimuth).abs() > 1e-3, "azimuth did not move with heading");
+        assert_eq!(ov_a.azimuth, desired_azimuth(0.0));
+        assert_eq!(ov_a.elevation, 45.0_f32.to_radians());
+        assert_eq!(ov_a.radius, 70.0);
+    }
+
+    #[test]
+    fn preset_front_looks_from_the_opposite_side_of_behind_above() {
+        let live = some_live_camera();
+        let behind = resolve_camera_override(
+            &FrameQuery { preset: Some("behind_above".into()), ..Default::default() }, 0.0, &live,
+        ).unwrap().unwrap();
+        let front = resolve_camera_override(
+            &FrameQuery { preset: Some("front".into()), ..Default::default() }, 0.0, &live,
+        ).unwrap().unwrap();
+        let diff = (front.azimuth - behind.azimuth).rem_euclid(std::f32::consts::TAU);
+        assert!((diff - std::f32::consts::PI).abs() < 1e-4, "front should be ~180° from behind_above, diff={diff}");
+    }
+
+    #[test]
+    fn unknown_preset_is_a_400_not_a_silent_fallback() {
+        let q = FrameQuery { preset: Some("orbit-cam".into()), ..Default::default() };
+        let err = resolve_camera_override(&q, 0.0, &some_live_camera()).unwrap_err();
+        assert!(err.contains("orbit-cam"), "error should name the bad value, got: {err}");
+    }
+
+    #[test]
+    fn preset_combined_with_numeric_is_rejected() {
+        let q = FrameQuery {
+            preset: Some("top_down".into()), pitch: Some("10".into()), ..Default::default()
+        };
+        assert!(resolve_camera_override(&q, 0.0, &some_live_camera()).is_err());
+    }
+
+    #[test]
+    fn full_numeric_override_uses_every_given_field() {
+        let q = FrameQuery {
+            pitch: Some("30".into()), yaw: Some("90".into()), distance: Some("150".into()),
+            ..Default::default()
+        };
+        let ov = resolve_camera_override(&q, 0.0, &some_live_camera()).unwrap().unwrap();
+        assert!((ov.elevation - 30.0_f32.to_radians()).abs() < 1e-5);
+        assert_eq!(ov.azimuth, desired_azimuth(90.0));
+        assert_eq!(ov.radius, 150.0);
+    }
+
+    #[test]
+    fn numeric_yaw_is_absolute_not_relative_to_current_heading() {
+        // Unlike the presets, an explicit numeric `yaw` must land on the SAME world direction
+        // regardless of the character's current heading — an agent scripting a fixed diagnostic
+        // angle must get a reproducible frame, not one that silently depends on unobserved state.
+        let q = FrameQuery { yaw: Some("45".into()), ..Default::default() };
+        let ov_a = resolve_camera_override(&q, 0.0, &some_live_camera()).unwrap().unwrap();
+        let ov_b = resolve_camera_override(&q, 200.0, &some_live_camera()).unwrap().unwrap();
+        assert_eq!(ov_a.azimuth, ov_b.azimuth);
+        assert_eq!(ov_a.azimuth, desired_azimuth(45.0));
+    }
+
+    #[test]
+    fn partial_numeric_override_falls_back_to_the_live_camera_for_omitted_fields() {
+        let live = some_live_camera();
+        let q = FrameQuery { pitch: Some("10".into()), ..Default::default() }; // yaw/distance omitted
+        let ov = resolve_camera_override(&q, 0.0, &live).unwrap().unwrap();
+        assert!((ov.elevation - 10.0_f32.to_radians()).abs() < 1e-5);
+        assert_eq!(ov.azimuth, live.azimuth, "omitted yaw must fall back to the LIVE camera, not 0");
+        assert_eq!(ov.radius, live.radius, "omitted distance must fall back to the LIVE camera, not 0");
+    }
+
+    #[test]
+    fn out_of_range_pitch_is_rejected() {
+        for bad in ["86", "-86", "90"] {
+            let q = FrameQuery { pitch: Some(bad.into()), ..Default::default() };
+            assert!(resolve_camera_override(&q, 0.0, &some_live_camera()).is_err(), "pitch={bad}");
+        }
+    }
+
+    #[test]
+    fn boundary_pitch_is_accepted() {
+        for ok in ["85", "-85", "0"] {
+            let q = FrameQuery { pitch: Some(ok.into()), ..Default::default() };
+            assert!(resolve_camera_override(&q, 0.0, &some_live_camera()).is_ok(), "pitch={ok}");
+        }
+    }
+
+    #[test]
+    fn out_of_range_yaw_is_rejected() {
+        let q = FrameQuery { yaw: Some("361".into()), ..Default::default() };
+        assert!(resolve_camera_override(&q, 0.0, &some_live_camera()).is_err());
+    }
+
+    #[test]
+    fn out_of_range_distance_is_rejected() {
+        for bad in ["0.5", "2001"] {
+            let q = FrameQuery { distance: Some(bad.into()), ..Default::default() };
+            assert!(resolve_camera_override(&q, 0.0, &some_live_camera()).is_err(), "distance={bad}");
+        }
+    }
+
+    #[test]
+    fn non_numeric_field_is_a_400_not_a_silent_zero() {
+        for q in [
+            FrameQuery { pitch: Some("north".into()), ..Default::default() },
+            FrameQuery { yaw: Some("NaN-ish".into()), ..Default::default() },
+            FrameQuery { distance: Some("far".into()), ..Default::default() },
+        ] {
+            let err = resolve_camera_override(&q, 0.0, &some_live_camera()).unwrap_err();
+            assert!(err.contains("not a number"), "got: {err}");
+        }
     }
 
     /// The age must reflect REALITY: it must keep CLIMBING for a source that has gone stale, driven
