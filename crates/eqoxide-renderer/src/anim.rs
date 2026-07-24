@@ -322,6 +322,26 @@ impl SkinData {
         }
     }
 
+    /// Resolve a non-idle, non-dead `action` to a concrete clip index, falling back to the model's
+    /// idle/neutral stand when it has no clip for that action — and only to clip 0 as a last resort
+    /// if the model somehow has no idle either.
+    ///
+    /// Why this exists (#692): a transient combat swing sets the action to `C0N` (e.g. `C05`). A
+    /// minimal model like the skeleton has no `C`-family combat clip, so `clip_for_action` returns
+    /// `None`. The old call sites did `clip_for_action(action).unwrap_or(0)`, and clip 0 of the
+    /// skeleton is `D05_death` — so an attacking skeleton "fell apart" (played its collapse) instead
+    /// of just standing. Falling back to the idle clip means a model that cannot play the requested
+    /// action simply holds its neutral stand, never death. Generic: helps any model missing an
+    /// action clip; a model that HAS the clip resolves it directly and never reaches the fallback.
+    ///
+    /// Do NOT route the `"dead"` action through this — dead has its own `usize::MAX` bind-pose
+    /// sentinel path in the renderer and must not be coerced to idle.
+    pub fn clip_for_action_or_idle(&self, action: &str) -> usize {
+        self.clip_for_action(action)
+            .or_else(|| self.clip_for_action("idle"))
+            .unwrap_or(0)
+    }
+
     /// Lively idle "fidget" animations (look around, shift weight, etc.) that the native client
     /// plays periodically over the near-static neutral stand. Excludes the neutral idle, held
     /// poses, and held-item variants. Prefers the full-body "A" variant over the upper-body "B".
@@ -559,6 +579,74 @@ mod tests {
         let skin = death_skin();
         // D05A_death is clip 0; "dead" must find it.
         assert_eq!(skin.clip_for_action("dead"), Some(0), "dead → D05A_death clip (index 0)");
+    }
+
+    /// A skin mirroring the real converted skeleton GLB: clip 0 is the death clip, there is a
+    /// neutral idle, and there is NO C-family combat clip. (#692)
+    fn skeleton_skin() -> SkinData {
+        // Exact clip order of the shipped skeleton.glb: death FIRST (index 0), no combat clip.
+        let names = ["D05_death", "L01_walk", "L02_run", "O01_idle",
+                     "P01_idle_neutral", "P02_sit", "P03_crouch"];
+        let (rest_translations, rest_rotations, rest_scales) = default_rest(3);
+        SkinData {
+            joint_count: 3,
+            parents: vec![None, Some(0), Some(1)],
+            inv_bind: vec![identity_mat(); 3],
+            clips: names.iter().map(|n| AnimClip {
+                name: n.to_string(), duration: 2.0, channels: vec![make_channel(0)],
+            }).collect(),
+            rest_translations, rest_rotations, rest_scales,
+            ground_probes: vec![], joint_names: vec![],
+        }
+    }
+
+    /// #692: a combat swing on a model with no C0N clip must fall back to the IDLE clip — never to
+    /// clip 0, which for the skeleton is the death/collapse clip (the "falls apart on attack" bug).
+    ///
+    /// Mutation check: revert the renderer sites to `clip_for_action(action).unwrap_or(0)` — i.e.
+    /// make `clip_for_action_or_idle` return `unwrap_or(0)` — and this goes RED, because the
+    /// skeleton's clip 0 IS the death clip, so the `!= 0` / `!= death` / `== idle` assertions fail.
+    #[test]
+    fn combat_swing_without_combat_clip_falls_back_to_idle_not_death() {
+        let skin = skeleton_skin();
+
+        // Preconditions: this really is the skeleton-shaped model the bug needs.
+        let death = skin.clip_for_action("dead");
+        assert_eq!(death, Some(0), "precondition: skeleton clip 0 is the death clip");
+        assert_eq!(skin.clip_for_action("C05"), None,
+            "precondition: skeleton has no C0N combat clip, so a swing resolves to None");
+        let idle = skin.clip_for_action("idle").expect("skeleton has a neutral idle");
+        assert_eq!(idle, 4, "idle resolves to P01_idle_neutral (index 4)");
+
+        // The fix: the swing falls back to idle, NOT clip 0 (= death).
+        let chosen = skin.clip_for_action_or_idle("C05");
+        assert_eq!(chosen, idle, "missing combat clip must fall back to the idle/neutral stand");
+        assert_ne!(chosen, 0, "must NOT fall back to clip 0 (the death/collapse clip) — #692");
+        assert_eq!(Some(chosen), Some(idle));
+        assert_ne!(Some(chosen), death, "an attacking skeleton must never play its death clip");
+    }
+
+    /// #692: a model that DOES have the combat clip must still play it — the idle fallback only
+    /// fires when the action clip is absent, so we don't regress models with real combat anims.
+    #[test]
+    fn combat_swing_with_combat_clip_still_plays_it() {
+        // death + combat + idle; the C05B_combat clip is at index 1.
+        let names = ["D05_death", "C05B_combat", "P01_idle_neutral", "L01_walk"];
+        let (rest_translations, rest_rotations, rest_scales) = default_rest(3);
+        let skin = SkinData {
+            joint_count: 3,
+            parents: vec![None, Some(0), Some(1)],
+            inv_bind: vec![identity_mat(); 3],
+            clips: names.iter().map(|n| AnimClip {
+                name: n.to_string(), duration: 2.0, channels: vec![make_channel(0)],
+            }).collect(),
+            rest_translations, rest_rotations, rest_scales,
+            ground_probes: vec![], joint_names: vec![],
+        };
+        assert_eq!(skin.clip_for_action("C05"), Some(1),
+            "a model with a real C05 combat clip resolves it directly");
+        assert_eq!(skin.clip_for_action_or_idle("C05"), 1,
+            "the idle fallback must NOT override a model that actually has the combat clip");
     }
 
     #[test]
