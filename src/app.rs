@@ -1735,7 +1735,7 @@ impl App {
 
         // Submit — associated function avoids reborrowing self.
         let prof_submit = crate::profiling::Stopwatch::start();
-        Self::submit_frame(&self.frame_req, enc, output, renderer);
+        Self::submit_frame(&self.frame_req, enc, output, renderer, &self.scene, self.camera.focus);
         let dur_submit = prof_submit.elapsed();
 
         // Record per-phase timings for the --profile HUD overlay (cheap; only blended when enabled).
@@ -1891,20 +1891,49 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// Submit the command buffer; if a /frame capture is pending, copy the
-    /// texture to a staging buffer first and encode it as PNG.
+    /// Submit the command buffer; if a /frame capture is pending, copy the texture to a staging
+    /// buffer first and encode it as PNG.
+    ///
+    /// A capture carrying a per-request camera override (#422) instead renders an EXTRA off-screen
+    /// pass with that camera and reads THAT back — the on-screen frame (built above with the live
+    /// `CameraState`, unaffected by anything below) is always submitted and presented FIRST,
+    /// unconditionally, exactly as if no capture were pending at all.
+    ///
+    /// That ordering is load-bearing, not cosmetic: `renderer.render_frame` writes the camera
+    /// matrix into a single reused GPU buffer (`camera_uniform`) via `queue.write_buffer`, and every
+    /// draw call in every pass binds that SAME buffer. Two `write_buffer` calls issued before one
+    /// `queue.submit()` both land before that submission's draws execute on the GPU — only the
+    /// LAST write would be visible, so recording the override's camera into the same submission as
+    /// the on-screen frame would silently paint the on-screen frame with the override's angle. By
+    /// submitting the primary frame in its own `queue.submit()` before the override pass even
+    /// starts recording, that write is strictly ordered after the primary submission on the queue's
+    /// timeline, so the primary draws are guaranteed to see only the live camera. The live
+    /// `CameraState` itself is never written either way — this is a render-only, one-shot override.
     fn submit_frame(
         frame_req: &FrameReq,
         encoder:   wgpu::CommandEncoder,
         output:    wgpu::SurfaceTexture,
-        renderer:  &EqRenderer,
+        renderer:  &mut EqRenderer,
+        scene:     &SceneState,
+        focus:     [f32; 3],
     ) {
-        let pending_tx = frame_req.lock().unwrap().take();
-        if let Some(tx) = pending_tx {
-            let w         = renderer.surface_config.width;
-            let h         = renderer.surface_config.height;
-            let row_pitch = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
-                * ((w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+        let pending = frame_req.lock().unwrap().take();
+        let Some(eqoxide_ipc::FrameCaptureRequest { camera_override, tx }) = pending else {
+            renderer.queue.submit(std::iter::once(encoder.finish()));
+            output.present();
+            return;
+        };
+
+        let w         = renderer.surface_config.width;
+        let h         = renderer.surface_config.height;
+        let row_pitch = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
+            * ((w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+        // 1024 keeps window text readable in captures (#162); 512 made the new UI's 12pt labels
+        // illegible. Shared by both the default and override paths below.
+        const MAX_DIM: Option<u32> = Some(1024);
+
+        let Some(ov) = camera_override else {
+            // Unmodified pre-#422 path: read back the already-rendered on-screen frame.
             let staging = renderer.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("frame_staging"), size: (row_pitch * h) as u64,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
@@ -1928,16 +1957,61 @@ impl App {
             slice.map_async(wgpu::MapMode::Read, |_| {});
             renderer.device.poll(wgpu::Maintain::Wait);
             let png = encode_frame_png(
-                &slice.get_mapped_range(), w, h, row_pitch, renderer.surface_config.format,
-                // 1024 keeps window text readable in captures (#162); 512 made
-                // the new UI's 12pt labels illegible.
-                Some(1024),
+                &slice.get_mapped_range(), w, h, row_pitch, renderer.surface_config.format, MAX_DIM,
             );
             let _ = tx.send(png);
-        } else {
-            renderer.queue.submit(std::iter::once(encoder.finish()));
-            output.present();
-        }
+            return;
+        };
+
+        // Submit + present the on-screen frame FIRST, completely unmodified — see doc comment above.
+        renderer.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+
+        // Now, and only now, record + submit a SEPARATE off-screen pass with the override camera.
+        let (eye, look) = crate::camera_state::eye_and_look(ov.azimuth, ov.elevation, ov.radius, focus);
+        let offscreen = renderer.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("frame_capture_override"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: renderer.surface_config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let offscreen_view = offscreen.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut ov_enc = renderer.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("frame_capture_override") },
+        );
+        // dt=0.0: this is a SECOND `render_frame` call within the same real frame — passing the
+        // real dt again would double-advance every entity's animation clock for this tick. 0.0
+        // draws the exact same pose the primary pass just drew, from a different angle.
+        renderer.render_frame(&mut ov_enc, &offscreen_view, scene, eye, look, 0.0);
+
+        let staging = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frame_staging_override"), size: (row_pitch * h) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ov_enc.copy_texture_to_buffer(
+            offscreen.as_image_copy(),
+            wgpu::ImageCopyBuffer {
+                buffer: &staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0, bytes_per_row: Some(row_pitch), rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        renderer.queue.submit(std::iter::once(ov_enc.finish()));
+        renderer.device.poll(wgpu::Maintain::Wait);
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        renderer.device.poll(wgpu::Maintain::Wait);
+        let png = encode_frame_png(
+            &slice.get_mapped_range(), w, h, row_pitch, renderer.surface_config.format, MAX_DIM,
+        );
+        let _ = tx.send(png);
     }
 }
 

@@ -7,7 +7,7 @@
 //! `camera_state`. The BEHAVIOR (`CameraState` and its update/snapshot logic) stays here and `use`s
 //! those types. Re-exported so every existing `crate::camera_state::{CameraMode,CameraCmd,
 //! CameraSnapshot}` path across the tree keeps resolving unchanged.
-pub use eqoxide_ipc::{CameraCmd, CameraMode, CameraSnapshot};
+pub use eqoxide_ipc::{desired_azimuth, CameraCmd, CameraMode, CameraSnapshot};
 
 pub const ELEVATION_MIN: f32 = 0.08727; // 5°
 pub const ELEVATION_MAX: f32 = 1.39626; // 80°
@@ -47,11 +47,15 @@ pub fn compute_eye(azimuth: f32, elevation: f32, radius: f32, focus: [f32; 3]) -
     ]
 }
 
-/// Camera azimuth that places the camera behind a player facing `heading_deg`
-/// (EQ convention: 0=north/+Y, CCW). Camera sits opposite the facing direction:
-///   az = heading_rad - π/2
-pub fn desired_azimuth(heading_deg: f32) -> f32 {
-    heading_deg.to_radians() - std::f32::consts::FRAC_PI_2
+/// `(eye, look_target)` for a spherical camera around `focus` — the same pair [`CameraState::tick`]
+/// returns each frame for the live camera. Extracted as a free function (#422) so a one-off capture
+/// (`GET /v1/observe/frame`'s per-request camera override) can compute the identical eye/look-target
+/// pair for an ARBITRARY (azimuth, elevation, radius) without going through `CameraState` at all —
+/// the override never touches the live camera's fields, only this pure math.
+pub fn eye_and_look(azimuth: f32, elevation: f32, radius: f32, focus: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let eye  = compute_eye(azimuth, elevation, radius, focus);
+    let look = [focus[0], focus[1], focus[2] + LOOK_TARGET_Z];
+    (eye, look)
 }
 
 /// Inverse of [`desired_azimuth`]: the heading (EQ degrees, CCW) a character must face
@@ -99,9 +103,7 @@ impl CameraState {
             self.azimuth = des_az;
         }
 
-        let eye = compute_eye(self.azimuth, self.elevation, self.radius, self.focus);
-        let look = [self.focus[0], self.focus[1], self.focus[2] + LOOK_TARGET_Z];
-        (eye, look)
+        eye_and_look(self.azimuth, self.elevation, self.radius, self.focus)
     }
 
     /// Adjust azimuth and elevation from mouse drag (radians/pixel × pixel-delta).
@@ -203,6 +205,21 @@ mod tests {
         let eye = compute_eye(-PI / 2.0, 0.0, 10.0, focus);
         assert!((eye[0] - 5.0).abs() < 1e-4, "x={}", eye[0]);
         assert!((eye[1] + 10.0).abs() < 1e-4, "y={}", eye[1]);
+    }
+
+    #[test]
+    fn eye_and_look_matches_tick_for_the_same_spherical_params() {
+        // #422: the per-capture override path calls `eye_and_look` directly (bypassing
+        // `CameraState`); pin that it reproduces exactly what `tick()` would have returned for the
+        // same (azimuth, elevation, radius, focus) — the refactor that extracted it must not have
+        // changed the live camera's math.
+        let mut cam = CameraState::new([1.0, 2.0, 3.0], 40.0);
+        cam.apply_orbit_delta(0.3, 0.1);
+        cam.radius = 123.0;
+        let (tick_eye, tick_look) = cam.tick(0.0, [1.0, 2.0, 3.0], 40.0);
+        let (fn_eye, fn_look) = eye_and_look(cam.azimuth, cam.elevation, cam.radius, cam.focus);
+        assert_eq!(tick_eye, fn_eye);
+        assert_eq!(tick_look, fn_look);
     }
 
     #[test]
