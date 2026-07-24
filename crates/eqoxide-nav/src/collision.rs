@@ -1630,6 +1630,36 @@ impl Collision {
         hits.first().map(|&(z, _)| z) // sorted high→low ⇒ first = highest standable at/below origin_z
     }
 
+    /// **THE PHANTOM-DESCENT GUARD (#693).** Can a body actually FALL from `takeoff_z` down to
+    /// `landing_z` in the column at `(east, north)`? A falling body stops at the FIRST solid
+    /// surface below its feet — it cannot pass through an intervening floor. So a descent is real
+    /// only when NO surface (facing-blind: a slab obstructs a fall regardless of its winding) lies
+    /// in the column strictly between the landing and the takeoff's step band.
+    ///
+    /// This is the tier discriminator the qcat/qeynos live wedge was missing: the qeynos streets
+    /// (z≈0) are STACKED directly over the aqueduct level (z≈−28) with no opening at most XY, and
+    /// the descent edge families (controlled fall / water descent / water entry) selected the deep
+    /// tier as a landing while skipping the street the character was standing on — routing the
+    /// walker straight DOWN through solid pavement, which it re-pathed against forever
+    /// (`nav_state: blocked` at ~(−502,−103)). Here that column fails the guard (the street itself
+    /// is an intervening surface), while a genuine lip / hole / open channel / dock edge passes —
+    /// its column holds nothing between takeoff and landing. Geometry-only, water is not an
+    /// obstruction; the takeoff band tops out at `step_up` (a surface higher than that above the
+    /// takeoff is not in the body's fall path — the lateral move is separately guarded by each
+    /// family's own clearance ray).
+    ///
+    /// `LANDING_TOL` excludes the landing surface itself (and its coincident slab-twin triangle —
+    /// same tolerance class as `column_hits`'s `SAME_SURFACE`).
+    pub fn descent_corridor_clear(&self, east: f32, north: f32, takeoff_z: f32, landing_z: f32) -> bool {
+        const LANDING_TOL: f32 = 0.6;
+        let top = takeoff_z + crate::traversability::PLAYER_BODY.step_up;
+        let bottom = landing_z + LANDING_TOL;
+        if bottom >= top { return true; } // no gap in which anything could intervene
+        let mut hits = Vec::new();
+        self.column_hits(east, north, top, 0.0, top - bottom, false, &mut hits);
+        hits.is_empty()
+    }
+
     /// Is the player's cylindrical footprint at `(east, north, foot_z)` clear of geometry?
     /// Samples a horizontal ring of `n` directions at `radius` (and the centre) at chest height,
     /// returning `true` only when none are blocked. Used by the depenetration net (design §3.3).
@@ -2638,6 +2668,20 @@ impl Collision {
                         goal[0], goal[1], goal[2]);
                     return Search { trace_call, ..Search::no_route(NoRoute::GoalNotWalkable) };
                 }
+                // #693: the descent mirror of #639. A goal on a LOWER STACKED tier of the start's
+                // own cell (the aqueduct floor under the street the character stands on) used to
+                // return a straight-down two-point "route" through solid ground — `final_hop_walkable`
+                // passes every descent by design. A drop steeper than the step-down is only real if
+                // the goal's column is open between the tiers; otherwise it is not walkable from here.
+                let body = &crate::traversability::PLAYER_BODY;
+                if gf < sf - body.step_up
+                    && !self.descent_corridor_clear(goal[0], goal[1], sf, gf)
+                {
+                    tracing::info!("find_path: goal ({:.0},{:.0},{:.1}) is a stacked tier {:.1}u beneath \
+                        the start's floor with solid ground in between (#693) — no walkable route \
+                        (goal_not_walkable)", goal[0], goal[1], goal[2], sf - gf);
+                    return Search { trace_call, ..Search::no_route(NoRoute::GoalNotWalkable) };
+                }
             }
             return Search {
                 path: Some((vec![[start[0], start[1], start[2]], [goal[0], goal[1], goal[2]]], true)),
@@ -3397,6 +3441,18 @@ impl Collision {
                                 }
                                 continue;
                             }
+                            // #693: this loop iterates EVERY floor below, including tiers stacked
+                            // beneath solid ground the body cannot fall through. Water is no
+                            // obstruction (you sink through it), solid geometry is: require the
+                            // destination column to be open between the takeoff band and this
+                            // landing, exactly like the controlled fall.
+                            if !self.descent_corridor_clear(b[0], b[1], cz, nf) {
+                                if let Some(t) = tr.as_deref_mut() {
+                                    t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                        EdgeVerdict::Rejected { reason: RejectReason::DescentBlocked });
+                                }
+                                continue;
+                            }
                             let nkey = (nc, nr, qf(nf));
                             if closed.contains(&nkey) { continue; }
                             if let Some(t) = tr.as_deref_mut() {
@@ -3530,8 +3586,20 @@ impl Collision {
                                 t.edge([a[0], a[1], cz], [b[0], b[1], surf],
                                     EdgeVerdict::Rejected { reason: RejectReason::Water });
                             }
-                        }
-                        if (surf - cz).abs() <= STEP_H && !closed.contains(&nkey) {
+                        } else if surf < cz - crate::traversability::PLAYER_BODY.step_up
+                            && !self.descent_corridor_clear(b[0], b[1], cz, surf)
+                        {
+                            // #693: a DOWNWARD entry onto a water surface must not pass through
+                            // solid ground stacked between the shore floor and the water (a flooded
+                            // tunnel under a street). This family deliberately casts no clearance
+                            // ray (a dry ray would snag the pool lip), which also made it blind to
+                            // an entire intervening floor — the corridor guard restores exactly that
+                            // check and nothing else.
+                            if let Some(t) = tr.as_deref_mut() {
+                                t.edge([a[0], a[1], cz], [b[0], b[1], surf],
+                                    EdgeVerdict::Rejected { reason: RejectReason::DescentBlocked });
+                            }
+                        } else if !closed.contains(&nkey) {
                             if let Some(t) = tr.as_deref_mut() {
                                 t.edge([a[0], a[1], cz], [b[0], b[1], surf],
                                     EdgeVerdict::Accepted { kind: EdgeKind::SwimSurface });
@@ -3561,8 +3629,18 @@ impl Collision {
                     if let Some(nf) = self.column_floors(b[0], b[1], cz, 0.0, MAX_FALL)
                         .into_iter().find(|&z| z < cz - STEP_H)
                     {
-                        let nkey = (nc, nr, qf(nf));
-                        if !closed.contains(&nkey) {
+                        // #693: `find` skipped every floor above `nf` in b's column — but a falling
+                        // body CANNOT skip a surface. If anything solid sits between the takeoff
+                        // band and this landing (the qeynos street stacked over the aqueduct), the
+                        // fall is a phantom: reject it, loudly, instead of routing the walker
+                        // straight down through solid ground.
+                        if !self.descent_corridor_clear(b[0], b[1], cz, nf) {
+                            if let Some(t) = tr.as_deref_mut() {
+                                t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                    EdgeVerdict::Rejected { reason: RejectReason::DescentBlocked });
+                            }
+                        } else if !closed.contains(&(nc, nr, qf(nf))) {
+                            let nkey = (nc, nr, qf(nf));
                             if let Some(t) = tr.as_deref_mut() {
                                 t.edge([a[0], a[1], cz], [b[0], b[1], nf],
                                     EdgeVerdict::Accepted { kind: EdgeKind::Fall });
@@ -3606,7 +3684,16 @@ impl Collision {
                                     EdgeVerdict::Rejected { reason: RejectReason::Water });
                             }
                         } else if !closed.contains(&nkey) {
-                            if !self.edge_clear([a[0], a[1], top + 0.5], [b[0], b[1], top + 0.5], radius, cell) {
+                            // #693: a DIVE-in reaches a swim plane BELOW the current floor — which
+                            // must not tunnel through solid ground stacked in between (a flooded
+                            // aqueduct under a street). Same phantom-descent guard as the fall
+                            // families; a wade (plane within a step) has no gap and passes trivially.
+                            if !self.descent_corridor_clear(b[0], b[1], cz, top) {
+                                if let Some(t) = tr.as_deref_mut() {
+                                    t.edge([a[0], a[1], cz], [b[0], b[1], top],
+                                        EdgeVerdict::Rejected { reason: RejectReason::DescentBlocked });
+                                }
+                            } else if !self.edge_clear([a[0], a[1], top + 0.5], [b[0], b[1], top + 0.5], radius, cell) {
                                 if let Some(t) = tr.as_deref_mut() {
                                     t.edge([a[0], a[1], cz], [b[0], b[1], top],
                                         EdgeVerdict::Rejected { reason: RejectReason::Clearance });
@@ -3825,6 +3912,21 @@ impl Collision {
                         the exact goal (goal_not_walkable)", goal[0], goal[1], goal[2]);
                     return Search { trace_call, ..Search::no_route(NoRoute::GoalNotWalkable) };
                 }
+                // #693: the DESCENT mirror. `final_hop_walkable` passes every descent by design
+                // (only rises can hide an unclimbable face) — so a WRONG-TIER `goal_fallback`
+                // arrival (goal cell reached on the tier ABOVE the requested one, e.g. the street
+                // over the aqueduct) used to append a final waypoint that dives through the solid
+                // ground between the tiers. A final drop past the step-down is only walkable if
+                // the goal's column is open between the penultimate tier and the goal floor.
+                let step_up = crate::traversability::PLAYER_BODY.step_up;
+                if goal_floor < pen[2] - step_up
+                    && !self.descent_corridor_clear(goal[0], goal[1], pen[2], goal_floor)
+                {
+                    tracing::info!("find_path: reached the goal cell {:.1}u ABOVE the goal tier with \
+                        solid ground in between (#693) — the requested tier is not reachable by \
+                        descending here (goal_not_walkable)", pen[2] - goal_floor);
+                    return Search { trace_call, ..Search::no_route(NoRoute::GoalNotWalkable) };
+                }
             }
             // A FLOATING water goal's final waypoint carries the anchored SURFACE tier, not the
             // caller's raw z — which may be airborne (z=0 over a lower pool surface) or deep
@@ -3991,6 +4093,160 @@ mod tests {
     /// against an over-restrictive A* regression; asserting the variant fixes both.
     fn plan(col: &Collision, start: [f32; 3], goal: [f32; 3], radius: f32) -> PlanOutcome {
         col.find_path_ex(start, goal, radius, &[], 8.0, None, 0.0, PlanCtx::default())
+    }
+
+    // ──────────────────── #693: the phantom stacked-tier descent (qeynos/qcat) ────────────────────
+
+    /// An up-facing floor plate at height `z` over east [e0,e1] × north [n0,n1].
+    /// (libeq pos = [north, height, east]; winding matches `floor_up`, verified up-facing.)
+    fn plate(z: f32, e0: f32, e1: f32, n0: f32, n1: f32) -> MeshData {
+        MeshData {
+            positions: vec![[n0, z, e0], [n1, z, e0], [n1, z, e1], [n0, z, e1]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 2, 1, 0, 3, 2], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        }
+    }
+
+    /// TWO FULL STACKED FLOORS, no opening anywhere: an upper walkable surface (z=0) directly over
+    /// a lower one (z=-30) — the qeynos street over the qcat aqueduct, distilled. There is NO
+    /// walkable connection between the tiers at any XY.
+    fn stacked_floors() -> Collision {
+        Collision::build(&ZoneAssets {
+            terrain: vec![plate(0.0, -60.0, 60.0, -60.0, 60.0), plate(-30.0, -60.0, 60.0, -60.0, 60.0)],
+            objects: vec![], textures: vec![],
+        }, 32.0)
+    }
+
+    /// **THE #693 REGRESSION — RED ON MAIN.** A goal on a lower floor tier stacked directly BENEATH
+    /// solid ground must NOT be answered with a route that descends through that ground. On main the
+    /// CONTROLLED-FALL edge picked the deep tier as a fall landing while skipping the very floor the
+    /// character stands on (`find(|z| z < cz - STEP_H)` — a falling body cannot skip a surface), so
+    /// the live qeynos→qcat-crossing walk got a route that dove through the street at
+    /// ~(-502,-103) and the walker wedged there re-pathing forever (`nav_state: blocked`). The
+    /// honest answer is `goal_not_walkable`: the goal's tier has no walkable link from anywhere in
+    /// the start's component.
+    ///
+    /// MUTATION: revert the `descent_corridor_clear` guards (fall family + final-hop) → the plan
+    /// returns a Route diving through the upper plate → RED. Verified at authoring time against
+    /// unmodified main.
+    #[test]
+    fn a_stacked_tier_beneath_solid_ground_is_not_a_descent_landing() {
+        let c = stacked_floors();
+        // Multi-cell: approach across the upper tier toward a goal on the sealed lower tier.
+        let out = plan(&c, [-40.0, 0.0, 0.0], [40.0, 0.0, -30.0], eqoxide_core::physics::PLAYER_RADIUS);
+        assert!(out.route().is_none(),
+            "#693: got a route to a sealed stacked tier — it can only descend THROUGH the upper \
+             floor: {:?}", out.route());
+        assert!(matches!(out, PlanOutcome::Unreachable { reason: NoRoute::GoalNotWalkable, .. }),
+            "the honest verdict for a vertically sealed goal tier is goal_not_walkable, got {out:?}");
+    }
+
+    /// **THE #693 SAME-CELL VARIANT — RED ON MAIN.** A goal on the sealed lower tier of the START'S
+    /// OWN cell used to return a straight-down two-point "route" (`final_hop_walkable` passes every
+    /// descent by design) — the walker then walks in place on the street trying to sink through it.
+    #[test]
+    fn a_stacked_tier_beneath_the_start_cell_is_not_a_straight_walk_down() {
+        let c = stacked_floors();
+        let out = plan(&c, [4.0, 0.0, 0.0], [4.5, 0.5, -30.0], eqoxide_core::physics::PLAYER_RADIUS);
+        assert!(out.route().is_none(),
+            "#693 (same-cell): got a straight-down route through the upper floor: {:?}", out.route());
+        assert!(matches!(out, PlanOutcome::Unreachable { reason: NoRoute::GoalNotWalkable, .. }),
+            "same-cell sealed descent must be goal_not_walkable, got {out:?}");
+    }
+
+    /// **THE #693 OVER-TIGHTENING CONTROL.** The same two stacked floors WITH a real 16×16 opening
+    /// in the upper plate: the descent guard must keep the genuine fall-through-the-hole route —
+    /// the exact "descend at the real entrance" behaviour the fix exists to preserve. The route
+    /// must reach the lower tier, and its descent step must land INSIDE the opening (a fall
+    /// corridor is only clear there), not through the solid part of the plate.
+    #[test]
+    fn a_real_opening_in_the_upper_tier_still_descends_through_it() {
+        // Upper plate with a hole over east [8,24] × north [-8,8]; lower plate solid.
+        let c = Collision::build(&ZoneAssets {
+            terrain: vec![
+                plate(0.0, -60.0, 8.0, -60.0, 60.0),   // west of the hole
+                plate(0.0, 24.0, 60.0, -60.0, 60.0),   // east of the hole
+                plate(0.0, 8.0, 24.0, -60.0, -8.0),    // south of the hole
+                plate(0.0, 8.0, 24.0, 8.0, 60.0),      // north of the hole
+                plate(-30.0, -60.0, 60.0, -60.0, 60.0), // the lower tier
+            ],
+            objects: vec![], textures: vec![],
+        }, 32.0);
+        let out = plan(&c, [-40.0, 0.0, 0.0], [40.0, 0.0, -30.0], eqoxide_core::physics::PLAYER_RADIUS);
+        let route = out.route().unwrap_or_else(|| panic!(
+            "#693 over-tightened: a lower tier with a REAL opening must still route (fall through \
+             the hole), got {out:?}"));
+        assert!(route.last().is_some_and(|w| (w[2] - (-30.0)).abs() < 1.0),
+            "route must end on the lower tier: {route:?}");
+        // The drop must happen AT the opening: find the descending step and check its landing.
+        let drop = route.windows(2).find(|w| w[0][2] - w[1][2] > 20.0)
+            .unwrap_or_else(|| panic!("route has no descent step: {route:?}"));
+        let land = drop[1];
+        assert!((4.0..=28.0).contains(&land[0]) && (-12.0..=12.0).contains(&land[1]),
+            "the descent must land inside/at the opening (east 8..24, north -8..8), landed at \
+             ({:.1},{:.1},{:.1}) — a phantom through-the-plate descent", land[0], land[1], land[2]);
+    }
+
+    /// **THE #693 WATER-FAMILY VARIANT — RED ON MAIN.** The same stacked seal, but the lower tier
+    /// is FLOODED (water fills −30..−10 under the upper plate). The WATER-DESCENT and WATER-ENTRY
+    /// families had no corridor/clearance check at all ("you fall into the water and sink"), so
+    /// they tunnelled through the upper floor exactly like the fall family. Water is not an
+    /// obstruction to a descent — but the solid floor above it is.
+    #[test]
+    fn a_flooded_stacked_tier_beneath_solid_ground_is_not_a_descent_landing() {
+        // Vertical wall panels sealing the tunnel's perimeter, so the flooded lower tier has no
+        // genuine way in around the plate edges (without them the fixture's world-wide water lets
+        // A* legitimately swim in from beyond the plates — a REAL route, not the phantom).
+        let wall_e = |e: f32| MeshData {
+            positions: vec![[-60.0, -32.0, e], [60.0, -32.0, e], [60.0, 2.0, e], [-60.0, 2.0, e]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        };
+        let wall_n = |n: f32| MeshData {
+            positions: vec![[n, -32.0, -60.0], [n, -32.0, 60.0], [n, 2.0, 60.0], [n, 2.0, -60.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        };
+        let mut c = Collision::build(&ZoneAssets {
+            terrain: vec![
+                plate(0.0, -60.0, 60.0, -60.0, 60.0), plate(-30.0, -60.0, 60.0, -60.0, 60.0),
+                wall_e(-60.0), wall_e(60.0), wall_n(-60.0), wall_n(60.0),
+            ],
+            objects: vec![], textures: vec![],
+        }, 32.0);
+        // Water bounded to the tunnel interior (−30..−10 between the plates) — NOT world-wide
+        // (`flat_below` water outside the plates would let A* legitimately swim in around the
+        // edge, which is a real route, not the phantom).
+        c.set_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::water_boxes(&[[-59.0, 59.0, -59.0, 59.0, -29.5, -10.0]]))));
+        let out = plan(&c, [-40.0, 0.0, 0.0], [40.0, 0.0, -30.0], eqoxide_core::physics::PLAYER_RADIUS);
+        assert!(out.route().is_none(),
+            "#693 (water): got a route diving through the upper floor into the flooded tier: {:?}",
+            out.route());
+        assert!(matches!(out, PlanOutcome::Unreachable { reason: NoRoute::GoalNotWalkable, .. }),
+            "a flooded sealed tier must be goal_not_walkable, got {out:?}");
+    }
+
+    /// The #693 primitive itself: an intervening slab blocks the descent corridor; an opening (or
+    /// a column holding nothing but the landing) is clear.
+    #[test]
+    fn descent_corridor_sees_the_intervening_slab_and_the_opening() {
+        let c = stacked_floors();
+        assert!(!c.descent_corridor_clear(0.0, 0.0, 0.0, -30.0),
+            "the upper plate lies between takeoff (0) and landing (-30) — corridor must be blocked");
+        // A column with only the landing: clear.
+        let lone = Collision::build(&ZoneAssets {
+            terrain: vec![plate(-30.0, -60.0, 60.0, -60.0, 60.0)],
+            objects: vec![], textures: vec![],
+        }, 32.0);
+        assert!(lone.descent_corridor_clear(0.0, 0.0, 0.0, -30.0),
+            "an open column above the landing must be clear");
+        // A landing at/above the takeoff band (no gap in which anything could intervene): clear.
+        assert!(lone.descent_corridor_clear(0.0, 0.0, -30.0, -30.5));
+        assert!(lone.descent_corridor_clear(0.0, 0.0, -30.0, -28.0));
     }
 
     /// A flooded pit must be exitable by SWIMMING UP: pit floor at z=0, a cliff wall
@@ -6819,6 +7075,115 @@ mod tests {
              terminal wedge. RED on main; GREEN after the shared is_standable predicate (D-2).");
     }
 
+
+    /// **#693 DIAGNOSIS PROBE (temporary): which edge family descends through the qcat street?**
+    /// Live wedge: walker on the street at ~(-502.5, -103.4, z≈0), fine waypoint snapped to a
+    /// stacked lower tier (z≈-25.75) at the same XY. This dumps the wedge column (floors + water),
+    /// then runs a traced coarse plan from the street toward the aqueduct-depth goal and prints
+    /// every accepted NON-WALK edge (fall / water descent / water entry) near the wedge.
+    #[test]
+    #[ignore = "requires the cached qcat glb + .wtr; #693 diagnosis probe"]
+    fn probe_693_qcat_street_phantom_descent() {
+        let dir = std::env::var("ZONE_DIR")
+            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+        let zone = std::env::var("PROBE_ZONE").unwrap_or_else(|_| "qeynos".into());
+        let za = ZoneAssets::from_glb(&std::path::Path::new(&dir).join(format!("{zone}.glb"))).unwrap();
+        let mut col = Collision::build(&za, 32.0);
+        col.set_water(eqoxide_core::region_map::RegionMap::load(
+            &std::path::Path::new(&dir).join("maps/water"), &zone).map(std::sync::Arc::new));
+        println!("zone={zone} water loaded: {}", col.water.is_some());
+        println!("grid: origin={:?} cols={} rows={} cell={} z=[{:.1},{:.1}] extent e=[{:.0},{:.0}] n=[{:.0},{:.0}]",
+            col.origin, col.cols, col.rows, col.cell_size, col.z_min, col.z_max,
+            col.origin[0], col.origin[0] + col.cols as f32 * col.cell_size,
+            col.origin[1], col.origin[1] + col.rows as f32 * col.cell_size);
+
+        // 1) The wedge column and its surroundings: stacked tiers + water?
+        // Try BOTH axis orders — the live report may be in server (y,x) order.
+        for (x, y) in [(-502.5f32, -103.4f32), (-510.0, -103.4), (-495.0, -103.4),
+                       (-502.5, -95.0), (-502.5, -110.0), (-480.0, -103.4), (-520.0, -103.4),
+                       (-103.4, -502.5), (-103.4, -510.0), (-103.4, -495.0),
+                       (-95.0, -502.5), (-110.0, -502.5)] {
+            let floors = col.column_floors(x, y, 0.0, 25.0, 120.0);
+            let surfaces = col.column_surfaces(x, y, 0.0, 25.0, 120.0);
+            let wet: Vec<f32> = (0..30).map(|k| -(k as f32) * 4.0)
+                .filter(|&z| col.in_water([x, y, z])).collect();
+            println!("col ({x:7.1},{y:7.1}): floors={floors:?}");
+            println!("    surfaces={surfaces:?}");
+            println!("    water at z={:?}", wet);
+        }
+
+        // 1b) Where is the aqueduct OPEN (deep floor, no street above) vs STACKED? Maps the real
+        // entrances near the wedge.
+        let mut open = Vec::new();
+        let mut stacked = 0usize;
+        for gc in 0..(col.cols * 4) {
+            for gr in 0..(col.rows * 4) {
+                let x = col.origin[0] + (gc as f32 + 0.5) * col.cell_size / 4.0;
+                let y = col.origin[1] + (gr as f32 + 0.5) * col.cell_size / 4.0;
+                let fs = col.column_floors(x, y, 0.0, 25.0, 120.0);
+                let deep = fs.iter().any(|&z| z < -20.0);
+                let street = fs.iter().any(|&z| z > -8.0);
+                if deep && !street { open.push((x, y)); }
+                if deep && street { stacked += 1; }
+            }
+        }
+        println!("stacked columns: {stacked}; open-deep columns: {}", open.len());
+        for (x, y) in open.iter().filter(|(x, y)| (x + 502.5).hypot(y + 103.4) < 150.0) {
+            println!("  OPEN deep near wedge: ({x:.0},{y:.0}) floors={:?}",
+                col.column_floors(*x, *y, 0.0, 25.0, 120.0));
+        }
+
+        // 2) Traced plan: street start near the wedge, goal at aqueduct depth (the live ask).
+        let start = [-480.0f32, -103.4, 0.0];
+        let goal = [-520.0f32, -103.4, -28.0];
+        let trace: crate::diagnostics::SearchTraceHandle = std::sync::Arc::new(
+            std::sync::Mutex::new(crate::diagnostics::SearchTrace::with_budget(60_000)));
+        let ctx = PlanCtx::worker().ensure_budget().with_trace(trace.clone());
+        let (out, _tier) = crate::planner::plan_path_with_ctx(&col, start, goal, &[], 0.0, ctx);
+        println!("outcome: {:?} route: {:?}", out.reason(), out.route().map(|r| r.len()));
+        if let Some(r) = out.route() {
+            for w in r { println!("  wp ({:7.1},{:7.1},{:7.2})", w[0], w[1], w[2]); }
+        }
+        let tr = trace.lock().unwrap();
+        for (ci, call) in tr.calls.iter().enumerate() {
+            for e in &call.edges {
+                if let crate::diagnostics::EdgeVerdict::Accepted { kind } = e.verdict {
+                    use crate::diagnostics::EdgeKind::*;
+                    if !matches!(kind, Walk) {
+                        let near = (e.from[0] - start[0]).hypot(e.from[1] - start[1]) < 60.0;
+                        if near || (e.from[2] - e.to[2]).abs() > 8.0 {
+                            println!("  call {ci}: {:?} ({:7.1},{:7.1},{:7.2}) -> ({:7.1},{:7.1},{:7.2})",
+                                kind, e.from[0], e.from[1], e.from[2], e.to[0], e.to[1], e.to[2]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    /// #693 live-follow-up probe: the fine local tier at the qeynos canal drop (-582,133)->(-566,136,-14).
+    #[test]
+    #[ignore = "requires the cached qeynos glb; #693 fine-tier canal-drop probe"]
+    fn probe_693_fine_canal_drop() {
+        let dir = std::env::var("ZONE_DIR")
+            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+        let za = ZoneAssets::from_glb(&std::path::Path::new(&dir).join("qeynos.glb")).unwrap();
+        let mut col = Collision::build(&za, 32.0);
+        col.set_water(eqoxide_core::region_map::RegionMap::load(
+            &std::path::Path::new(&dir).join("maps/water"), "qeynos").map(std::sync::Arc::new));
+        // columns across the drop
+        for (x, y) in [(-582.0f32, 133.0f32), (-575.7, 144.4), (-570.0, 140.0), (-566.7, 136.4), (-566.0, 130.0), (-560.0, 130.0)] {
+            println!("col ({x:6.1},{y:6.1}) floors={:?} surfaces={:?}",
+                col.column_floors(x, y, 0.0, 25.0, 60.0), col.column_surfaces(x, y, 0.0, 25.0, 60.0));
+        }
+        let start = [-582.0f32, 133.2, 0.0];
+        for carrot in [[-566.7f32, 136.4, -14.0], [-558.7, 126.9, -14.0], [-550.7, 120.4, -14.0]] {
+            let out = col.find_path_local(start, carrot, 2.0, 40.0, 4.0);
+            println!("find_path_local {:?} -> state={} reason={} steer_len={}",
+                carrot, out.state(), out.reason(), out.steer().len());
+        }
+    }
 
     /// **ACCEPTANCE TEST — the residual #329 band, owner-signed-off 2026-07-15 (review Fix D).**
     ///

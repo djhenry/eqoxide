@@ -101,6 +101,12 @@ pub enum RejectReason {
     Clearance,
     /// A water-family precondition refused the edge (e.g. the span/surface it needs is absent).
     Water,
+    /// A descent edge (controlled fall / water descent / water-entry dive) whose landing lies
+    /// beneath an INTERVENING solid surface in the destination column — a stacked lower floor
+    /// tier under solid ground, not a real drop. A falling body stops at the first surface below
+    /// it, so this landing is unreachable by descending here (`Collision::descent_corridor_clear`,
+    /// #693 — the qeynos-street-over-aqueduct phantom descent).
+    DescentBlocked,
     /// A water exit whose lip is above the swimmer's haul-out reach (#359).
     HaulOutTooHigh,
 }

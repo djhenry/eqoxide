@@ -83,6 +83,9 @@ pub fn reject_color(reason: RejectReason) -> [f32; 4] {
         // #630 local_rise is a grade-family rejection (the profile's LOCAL grade, not the average).
         RejectReason::Grade | RejectReason::LocalRise => COL_REJECT_GRADE,
         RejectReason::Clearance => COL_REJECT_CLEAR,
+        // #693: a phantom stacked-tier descent is a step-family refusal (the landing is real, the
+        // vertical corridor onto it is not) — draw it with the step colors.
+        RejectReason::DescentBlocked => COL_REJECT_STEP,
         RejectReason::NoFloor => COL_REJECT_NOFLOOR,
         RejectReason::Water | RejectReason::HaulOutTooHigh => COL_REJECT_WATER,
     }
