@@ -446,8 +446,13 @@ pub fn encode_player_pass(
 
         match r.character_model_for(&scene.player_race, scene.player_gender) {
             Some(GpuModel::Skinned(model)) => {
+                // #694 hardening: guard with `clip_idx < clips.len()`, matching the NPC pass sites
+                // below (e.g. the death-sentinel check at ~line 907). `!clips.is_empty()` alone does
+                // NOT bound `clip_idx` — the #692/#694 bind-pose sentinel is `usize::MAX`, which is
+                // always `>= clips.len()` for any non-empty clip set and would index out of range.
                 let matrices = match r.anim_states.get(&0) {
-                    Some(state) if !model.skin.clips.is_empty() =>
+                    Some(state) if !model.skin.clips.is_empty()
+                        && state.clip_idx < model.skin.clips.len() =>
                         model.skin.evaluate(state.clip_idx, state.time),
                     _ => model.skin.bind_pose(),
                 };
@@ -555,7 +560,15 @@ pub fn encode_player_pass(
                 // authors IT models in the point-bone frame with an identity attach; the
                 // only extra transform bridges the weapon bake's vertex convention into
                 // the rig frame (see models::held_item_xform); no per-weapon tuning.
-                let (clip_i, t) = r.anim_states.get(&0).map(|s| (s.clip_idx, s.time)).unwrap_or((0, 0.0));
+                // #694 hardening: `joint_world` indexes `clips[clip_idx]` directly and panics if
+                // out of range (same as `evaluate`). The old `unwrap_or((0, 0.0))` here didn't
+                // guard against a valid-but-OOB `clip_idx` (the #692/#694 bind-pose sentinel is
+                // `usize::MAX`) — match the NPC held-item pattern below (~line 976): filter the
+                // anim state by `clip_idx < clips.len()` and use `None` (→ `joint_world_rest`,
+                // the None arm at the `hand` match below) when it's out of range.
+                let clip_time = r.anim_states.get(&0)
+                    .filter(|s| s.clip_idx < model.skin.clips.len())
+                    .map(|s| (s.clip_idx, s.time));
                 let pmat = glam::Mat4::from_cols_array_2d(&crate::camera::entity_model_matrix_heading(
                     scene.player_pos, scene.player_heading, visual_scale, dominant_mesh_scale,
                     [0.0, 0.0], true, 0.0, crate::models::archetype_correction(archetype)));
@@ -582,7 +595,10 @@ pub fn encode_player_pass(
                         .or_else(|| (*bone == "SHIELD_POINT")
                             .then(|| model.skin.attach_joint("L_POINT")).flatten())
                         else { continue };
-                    let hand = glam::Mat4::from_cols_array_2d(&model.skin.joint_world(clip_i, t, joint));
+                    let hand = glam::Mat4::from_cols_array_2d(&match clip_time {
+                        Some((clip_i, t)) => model.skin.joint_world(clip_i, t, joint),
+                        None               => model.skin.joint_world_rest(joint),
+                    });
                     let wmat = (pmat * hand * hx).to_cols_array_2d();
                     r.queue.write_buffer(&r.weapon_uniform_pool[*wslot].0, 0,
                         bytemuck::bytes_of(&EntityUniform { model: wmat, tint: [1.0, 1.0, 1.0, 1.0] }));
@@ -1111,8 +1127,12 @@ pub fn encode_shadow_pass(
         let archetype = race_to_archetype(&scene.player_race);
         match r.character_model_for(&scene.player_race, scene.player_gender) {
             Some(GpuModel::Skinned(model)) => {
+                // #694 hardening: same guard as the NPC shadow-caster branch below (~line 1165) —
+                // `!clips.is_empty()` alone does not bound `clip_idx`, and the #692/#694 bind-pose
+                // sentinel is `usize::MAX`, which would index out of range without this check.
                 let matrices = match r.anim_states.get(&0) {
-                    Some(s) if !model.skin.clips.is_empty() => model.skin.evaluate(s.clip_idx, s.time),
+                    Some(s) if !model.skin.clips.is_empty() && s.clip_idx < model.skin.clips.len() =>
+                        model.skin.evaluate(s.clip_idx, s.time),
                     _ => model.skin.bind_pose(),
                 };
                 write_joints(j_slot, &matrices);

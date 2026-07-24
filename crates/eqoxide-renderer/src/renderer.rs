@@ -1093,8 +1093,26 @@ impl EqRenderer {
                     state.clip_idx = skinned.skin.idle_clip_for_phase(0).unwrap_or(0);
                     state.animate  = skinned.skin.action_animates(action, state.clip_idx);
                 } else {
-                    state.clip_idx = skinned.skin.clip_for_action(action).unwrap_or(0);
-                    state.animate  = skinned.skin.action_animates(action, state.clip_idx);
+                    // #692: when the model has no clip for this action (e.g. a skeleton has no
+                    // C0N combat clip for a swing), fall back to the idle/neutral stand — NEVER to
+                    // arbitrary clip 0, which for a minimal model is the death/collapse clip (so an
+                    // attacking skeleton would "fall apart"). action != "dead" here (that branch is
+                    // handled above with its own bind-pose sentinel).
+                    //
+                    // Hardening (#694 reviewer finding): if the model has NEITHER the action clip
+                    // NOR any idle/walk clip, `clip_for_action_or_idle` returns `None` — route that
+                    // to the SAME `usize::MAX` bind-pose sentinel the `"dead"` branch above uses,
+                    // so clip 0 is never reached by any model shape, not just ones with an idle.
+                    match skinned.skin.clip_for_action_or_idle(action) {
+                        Some(ci) => {
+                            state.clip_idx = ci;
+                            state.animate  = skinned.skin.action_animates(action, ci);
+                        }
+                        None => {
+                            state.clip_idx = usize::MAX; // sentinel: no action or idle clip → bind pose
+                            state.animate  = false;
+                        }
+                    }
                 }
             }
 
@@ -1105,8 +1123,19 @@ impl EqRenderer {
             // Skip re-resolution for dead entities: usize::MAX is the intentional "no death
             // clip" sentinel and must not be overwritten with clip 0.
             if state.clip_idx >= skinned.skin.clips.len() && *action != "dead" {
-                state.clip_idx = skinned.skin.clip_for_action(action).unwrap_or(0);
-                state.animate  = skinned.skin.action_animates(action, state.clip_idx);
+                // #692: same idle fallback as above — a re-resolution that finds no action clip
+                // must land on idle, not clip 0 (death for minimal models). Same #694 hardening:
+                // `None` (no action AND no idle clip either) routes to the bind-pose sentinel.
+                match skinned.skin.clip_for_action_or_idle(action) {
+                    Some(ci) => {
+                        state.clip_idx = ci;
+                        state.animate  = skinned.skin.action_animates(action, ci);
+                    }
+                    None => {
+                        state.clip_idx = usize::MAX; // sentinel: no action or idle clip → bind pose
+                        state.animate  = false;
+                    }
+                }
             }
 
             // Advance animation time. Held poses (dead, sitting, crouching) play their entry
