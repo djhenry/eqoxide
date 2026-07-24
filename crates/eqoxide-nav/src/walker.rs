@@ -814,8 +814,18 @@ impl Walker {
                 self.clear_local_plan();
                 self.awaiting_first_plan = false;
                 *self.nav_intent.lock().unwrap() = None;
+                // #600: a queued `/zone_cross` is a PENDING intent even before it has a concrete goto
+                // goal — `ActionLoop::drain_zone_cross` refuses to resolve it while the zone's assets
+                // are not usable and publishes `zone_loading`, re-queueing the one-shot request so it
+                // resolves once they land. Resetting that `zone_loading` back to `idle` here (no goto
+                // goal is set yet) would flip the state to a misleading "ready/idle" every tick while
+                // the load runs. So keep `zone_loading` while a cross is still queued; a `/stop` clears
+                // the request and the next tick retires it honestly. (Only `zone_loading` is guarded —
+                // navigating/planning/dead never coexist with an unresolved queued cross.)
+                let zone_cross_pending = self.nav.zone_cross.lock().unwrap().is_some();
                 if self.nav_state_is("navigating") || self.nav_state_is("navigating_partial")
-                    || self.nav_state_is("planning") || self.nav_state_is(NAV_STATE_ZONE_LOADING)
+                    || self.nav_state_is("planning")
+                    || (self.nav_state_is(NAV_STATE_ZONE_LOADING) && !zone_cross_pending)
                     // #644: once the player has RESPAWNED (no longer dead ⇒ this tick reaches
                     // `resolve_goal`), retire the terminal `dead` back to `idle` so the honest
                     // death state doesn't linger as a new never-clearing observable.
@@ -1983,6 +1993,36 @@ mod tests {
         *nav.goto_target.lock().unwrap() = None;
         assert!(w.resolve_goal(&gs).is_none());
         assert_eq!(nav.nav_state.lock().unwrap().state, "idle");
+    }
+
+    /// **#600 (review round 2): a queued `/zone_cross` keeps `zone_loading` from decaying to `idle`
+    /// during the load.** `ActionLoop::drain_zone_cross` refuses to resolve a cross while the zone's
+    /// assets are not usable, publishes `zone_loading`, and RE-QUEUES the one-shot request. With no
+    /// concrete goto goal set yet, `resolve_goal` would (before this guard) reset that `zone_loading`
+    /// to `idle` every tick — so an agent polling mid-load would see a misleading "ready/idle" for a
+    /// cross that has not happened. The queued request must hold `zone_loading` until the assets land.
+    ///
+    /// Mutation check: drop `&& !zone_cross_pending` from the reset guard in `resolve_goal` → this
+    /// goes RED (the state resets to `idle` with the cross still queued). Complements
+    /// `cancelling_the_goto_while_loading_returns_to_idle`, which pins the NO-cross case still resets.
+    #[test]
+    fn a_queued_zone_cross_holds_zone_loading_and_does_not_reset_to_idle() {
+        let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        let gs = eqoxide_core::game_state::GameState::new();
+        // The drain published zone_loading and re-queued the one-shot cross; no goto goal is set.
+        w.set_nav_state_because(NAV_STATE_ZONE_LOADING, Some("zone_assets_pending"));
+        *nav.zone_cross.lock().unwrap() = Some(30);
+        assert!(nav.goto_target.lock().unwrap().is_none(), "no concrete goto goal yet — that is the point");
+
+        assert!(w.resolve_goal(&gs).is_none());
+        assert_eq!(nav.nav_state.lock().unwrap().state, NAV_STATE_ZONE_LOADING,
+            "#600: zone_loading must persist while a /zone_cross is queued, not flip to a misleading idle");
+
+        // Once the cross is cleared (e.g. /stop or it finally resolved), the same tick retires it.
+        *nav.zone_cross.lock().unwrap() = None;
+        assert!(w.resolve_goal(&gs).is_none());
+        assert_eq!(nav.nav_state.lock().unwrap().state, "idle",
+            "with no queued cross, zone_loading retires to idle exactly as before");
     }
 
     /// #644: the honest terminal `dead` state must NOT become a new never-clearing observable — once
