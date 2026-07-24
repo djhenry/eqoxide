@@ -1242,25 +1242,42 @@ impl Walker {
         // ROUTE-LEVEL NO-PROGRESS DETECTION (#631 gap 3 — the Crushbone-moat honesty fix).
         //
         // The stall detector below catches a walker whose `path_i` STOPS advancing. It is blind to
-        // one that keeps advancing `path_i` productively-looking while making no headway toward the
-        // GOAL — the moat: the walker followed partial routes in laps around the castle ring for 3+
-        // minutes, `path_i` marching, `navigating` reported the whole time, no terminal state ever.
-        // So track CLOSEST APPROACH: `√(gdist² + gdz²)` to the goal's resolved floor. If it has not
-        // improved by [`NAV_PROGRESS_EPS`] for [`NAV_NO_PROGRESS_WINDOW`], the journey is making no
-        // progress and we stop honestly instead of reporting healthy navigation forever.
+        // one that keeps re-planning PARTIAL routes in laps while making no headway toward the GOAL —
+        // the moat: the walker swam partial routes around the castle ring for 3+ minutes, no terminal
+        // state ever. We terminate honestly when the journey is genuinely getting nowhere.
         //
-        // TUNED HARD AGAINST OVER-FIRING (the dominant risk, #631): (1) 3-D distance, so a spiral
-        // ramp / vertical climb toward a goal directly above keeps improving and is never killed;
-        // (2) a wall-clock window far longer than any legitimate no-progress leg — a necessary detour
-        // that temporarily INCREASES distance survives as long as it resumes closing within the
-        // window (~2.6 km of away-travel at run speed), while a slow-but-steady or long-straight run
-        // keeps improving and resets the clock every tick; (3) FIXED-destination gotos only — a
-        // `/follow` chase, whose goal moves with the leader, is exempt (a fleeing leader is not a
-        // no-progress bug); (4) only while actually walking a committed route (`have_path`).
+        // THE PROGRESS SIGNAL IS TWO-CHANNEL, and the walker is progressing if EITHER fires:
+        //   (a) COMMITTED-ROUTE progress — the walker advanced along a COMPLETE route (`path_i` past
+        //       the max seen on this route, while `nav_state == navigating`). A complete route's end
+        //       IS the goal, so advancing it is guaranteed goal-ward progress *by construction* — it
+        //       cannot be a lap (a lap would be a re-planned PARTIAL, `navigating_partial`, or would
+        //       stop advancing `path_i` and trip `walker_stalled`). This is the fix for the reviewer's
+        //       false-fire: a legitimate long go-around across a barrier (river/wall/moat) whose START
+        //       is the closest straight-line point to the goal makes NO closest-approach improvement
+        //       for most of the trip, yet is plainly getting there — killing it was a confident
+        //       falsehood on a legit route. Straight-line distance to the goal is irrelevant while a
+        //       complete route is being traversed.
+        //   (b) CLOSEST APPROACH — `√(gdist² + gdz²)` to the goal's resolved floor improved by
+        //       [`NAV_PROGRESS_EPS`]. This is the honest signal for PARTIAL navigation (`navigating_
+        //       partial`), where advancing `path_i` can be a lap: a legit partial makes genuine
+        //       goal-ward progress (`PARTIAL_MIN_UNITS`) so its closest approach keeps improving,
+        //       while the moat's laps never close on the goal → no improvement → terminate.
+        //
+        // Only when NEITHER channel has fired for [`NAV_NO_PROGRESS_WINDOW`] do we stop. Further
+        // guards against over-firing: 3-D distance (a spiral/vertical climb toward a goal above
+        // counts as approach); FIXED-destination gotos only (a `/follow` chase's goal moves with the
+        // leader); and only while walking a committed route (`have_path`).
         if have_path && !following {
             let g3d = (gdist * gdist + gdz * gdz).sqrt();
             let now = std::time::Instant::now();
-            if crate::steering::progress_improved(&mut self.nav_best_g3d, g3d, NAV_PROGRESS_EPS) {
+            // (a) advancing a COMPLETE committed route — `path_i` past this route's max-so-far
+            // (`stuck_i`, which the stall block below maintains and which is reset to 0 on every
+            // re-plan, so a fresh route's advancement is always seen). `navigating` (not
+            // `navigating_partial`) means the committed route actually reaches the goal.
+            let advancing_complete_route = self.nav_state_is("navigating") && self.path_i > self.stuck_i;
+            // (b) closest-approach improvement (side-effecting: lowers `nav_best_g3d`).
+            let closer = crate::steering::progress_improved(&mut self.nav_best_g3d, g3d, NAV_PROGRESS_EPS);
+            if advancing_complete_route || closer {
                 self.nav_progress_at = now;
             } else if now.duration_since(self.nav_progress_at) >= NAV_NO_PROGRESS_WINDOW {
                 self.stop_nav(gs, "blocked", "no_progress", &format!(
@@ -2033,31 +2050,82 @@ mod tests {
     /// the moving-but-going-nowhere case the `stuck_ticks` detector (which only watches `path_i`)
     /// misses. Drives the real `drive_walk` tick with the no-progress clock already expired.
     ///
-    /// Mutation check: delete the no-progress block in `drive_walk` and this goes RED (the tick falls
-    /// through to emit a MoveIntent and the state stays whatever it was, never `blocked`).
+    /// Represents the real moat: a re-planned PARTIAL route (`navigating_partial`) whose `path_i` is
+    /// ADVANCING (a lap) but whose closest approach never improves. `path_i` advancement must NOT
+    /// count as progress here — that is the whole reason channel (a) is gated on a COMPLETE route —
+    /// so the walker still terminates honestly (`blocked` / `no_progress`).
+    ///
+    /// Mutation check: delete the no-progress block in `drive_walk` and this goes RED. Also: drop the
+    /// `nav_state_is("navigating")` gate on channel (a) (so a partial's `path_i` advance counts as
+    /// progress) and this ALSO goes RED — the lap would reset the clock and never terminate, exactly
+    /// the moat regression the gate exists to prevent.
     #[test]
-    fn drive_walk_terminates_no_progress_when_closest_approach_never_improves() {
-        let (mut w, nav, _intent, _view) = walker_with(open_plane(200.0));
+    fn drive_walk_terminates_no_progress_on_an_advancing_partial_lap() {
+        let (mut w, nav, _intent, _view) = walker_with(open_plane(600.0));
         let mut gs = eqoxide_core::game_state::GameState::new();
-        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
+        gs.player_x = 10.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
         let goal = (500.0, 0.0, 0.0); // far → ArrivalAction::Drive
         *nav.goto_target.lock().unwrap() = Some(goal);
-        w.set_nav_state("navigating");
-        // A committed route already in hand (so `have_path`, no re-plan: path_goal == goal).
-        w.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0]];
-        w.path_i = 0;
+        // A PARTIAL route (a moat lap), NOT a complete route to the goal.
+        w.set_nav_state("navigating_partial");
+        w.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0], [30.0, 0.0, 0.0]];
+        w.path_i = 1;   // ADVANCING along the lap (path_i 1 > stuck_i 0) — looks like motion...
+        w.stuck_i = 0;
         w.path_goal = Some(goal);
-        // Closest approach was ~10u and last improved a full window ago; this tick's g3d (~500) does
-        // not beat it, so the window has elapsed with no progress.
+        // ...but closest approach has been stuck at ~10u for a full window: the lap never closes.
         w.nav_best_g3d = 10.0;
         w.nav_progress_at = std::time::Instant::now() - (NAV_NO_PROGRESS_WINDOW + std::time::Duration::from_secs(1));
 
         w.drive_walk(&mut gs, goal);
 
-        assert!(w.nav_state_is("blocked"), "no-progress must terminate, not report navigating forever");
+        assert!(w.nav_state_is("blocked"),
+            "an advancing PARTIAL lap that never closes on the goal must still terminate — path_i \
+             advancement on a partial is not goal-ward progress");
         assert_eq!(nav.nav_state.lock().unwrap().reason.as_deref(), Some("no_progress"),
             "#631 gap 3: the terminal reason must be the distinct `no_progress`");
         assert!(nav.goto_target.lock().unwrap().is_none(), "a terminal stop clears the goto");
+    }
+
+    /// **THE REVIEWER'S FALSE-FIRE REPRO (#631 gap 3, changes-requested): a legitimate long go-around
+    /// whose START is the closest straight-line point to the goal must NEVER be killed while the
+    /// walker is advancing its COMPLETE committed route** — even though closest-approach makes no
+    /// improvement for the whole away-leg and the walker is currently far (straight-line) from the
+    /// goal. The prior code used only the all-time-closest signal, so a >60s go-around (start-is-
+    /// closest) terminated `no_progress` mid-journey, ~12s before arrival — a confident falsehood on a
+    /// route that was getting there.
+    ///
+    /// FAILS ON THE PRIOR CODE (only the closest-approach channel → the expired clock + no improvement
+    /// → `blocked`); PASSES AFTER the committed-route channel is added. Mutation check: delete the
+    /// `advancing_complete_route` term and this goes RED (the go-around is killed again).
+    #[test]
+    fn drive_walk_never_terminates_a_complete_route_the_walker_is_advancing_even_when_far_from_goal() {
+        let (mut w, nav, _intent, _view) = walker_with(open_plane(2000.0));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        // The walker is on its go-around, currently FAR (straight-line) from the goal — the peak of
+        // the away-leg — and standing on waypoint 3 of a long COMPLETE route.
+        gs.player_x = 500.0; gs.player_y = 800.0; gs.player_z = 0.0; gs.player_pos_known = true;
+        let goal = (1000.0, 0.0, 0.0);
+        *nav.goto_target.lock().unwrap() = Some(goal);
+        w.set_nav_state("navigating"); // a COMPLETE route (reaches the goal), not a partial
+        w.path = vec![
+            [0.0, 0.0, 0.0], [200.0, 400.0, 0.0], [400.0, 700.0, 0.0], [500.0, 800.0, 0.0],
+            [700.0, 600.0, 0.0], [900.0, 200.0, 0.0], [1000.0, 0.0, 0.0],
+        ];
+        w.path_i = 3;    // advanced along the route...
+        w.stuck_i = 2;   // ...past this route's previous max → advancing_complete_route
+        w.path_goal = Some(goal);
+        // The START was the closest straight-line point: best was set low (~50u) and has NOT improved
+        // since — the away-leg makes closest-approach worse, and the window has fully elapsed.
+        w.nav_best_g3d = 50.0;
+        w.nav_progress_at = std::time::Instant::now() - (NAV_NO_PROGRESS_WINDOW + std::time::Duration::from_secs(30));
+
+        w.drive_walk(&mut gs, goal);
+
+        assert!(!w.nav_state_is("blocked"),
+            "#631 gap 3 (reviewer repro): a COMPLETE route the walker is actively advancing must NEVER \
+             be terminated no_progress, however far the current straight-line distance to the goal — a \
+             complete route's end IS the goal, so advancing it is progress by construction");
+        assert!(nav.goto_target.lock().unwrap().is_some(), "the go-around continues to the goal");
     }
 
     /// **The over-firing guard (the #631 high-risk half): a route still making progress is NEVER

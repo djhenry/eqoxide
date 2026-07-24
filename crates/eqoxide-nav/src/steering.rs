@@ -61,13 +61,17 @@ pub const PORTAL_COOLDOWN_TICKS: u32 = 66;
 /// mistaken for none. 8u over the [`NAV_NO_PROGRESS_WINDOW`] is a ~0.13 u/s closing rate — a walker
 /// that cannot beat that toward its goal is, by any honest reading, not getting there.
 pub const NAV_PROGRESS_EPS: f32 = 8.0;
-/// How long the closest approach to the goal may fail to improve (by [`NAV_PROGRESS_EPS`]) while the
-/// walker is actively following a route before navigation terminates honestly (`blocked` /
-/// `no_progress`). Chosen to sit FAR above any legitimate no-progress leg and FAR below the observed
-/// failure (the moat swam laps for 3+ minutes): 60s tolerates a necessary detour that travels ~2.6 km
-/// AWAY from the goal at run speed before turning back, so a real detour, a slow path, or a long
-/// straight run is never falsely killed — the over-firing this fix must avoid (#631). A lap/eddy that
-/// genuinely cannot close on the goal is caught in 60s instead of never.
+/// How long BOTH progress channels (committed-route advancement of a complete route, AND
+/// closest-approach improvement — see `Walker::drive_walk`) may go quiet before navigation
+/// terminates honestly (`blocked` / `no_progress`). This window governs ONLY the case where the
+/// walker is *not* advancing a complete route (a re-planned partial / lap) AND is not getting any
+/// closer — the moat, which swam laps for 3+ minutes. A legitimate route the walker is traversing
+/// keeps channel (a) firing every tick regardless of how long or how far-from-goal the go-around is,
+/// so the length of a legit route is NOT bounded by this constant (the earlier claim that 60s
+/// "tolerates ~2.6 km of away-travel" was wrong: with a single all-time-closest signal the return
+/// leg kept the clock running, so the real tolerance was total-route < 60s — which is exactly the
+/// false-fire the committed-route channel removes). 60s is simply how long a genuine no-forward-
+/// progress lap may persist before it is called. (#631)
 pub const NAV_NO_PROGRESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Record a closest-approach observation and report whether it was genuine PROGRESS (#631 gap 3).
