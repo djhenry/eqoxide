@@ -109,6 +109,10 @@ pub struct SceneState {
     pub player_equipment_tint: [[u8; 3]; 9],
     /// Player inventory + equipment items (for the inventory UI window).
     pub inventory: Vec<eqoxide_core::game_state::InvItem>,
+    /// True once OP_CharInventory has been applied at least once (including a legitimate 0-item
+    /// inventory) — lets the Inventory window distinguish "received, empty" from "not yet
+    /// received" instead of showing a permanent false "(waiting...)" (eqoxide#695).
+    pub inventory_received: bool,
     /// Equipped weapon held-model ids (IDFile, e.g. "IT10649"), for rendering weapons in hand.
     /// Empty = nothing equipped in that slot. Primary = worn slot 13, secondary = slot 14.
     pub primary_weapon_idfile: String,
@@ -400,6 +404,7 @@ impl SceneState {
             player_equipment: gs.player_equipment,
             player_equipment_tint: gs.player_equipment_tint,
             inventory: gs.inventory.clone(),
+            inventory_received: gs.inventory_received,
             primary_weapon_idfile: gs.inventory.iter().find(|i| i.slot == 13)
                 .map(|i| i.idfile.clone()).unwrap_or_default(),
             secondary_weapon_idfile: gs.inventory.iter().find(|i| i.slot == 14)
@@ -505,6 +510,25 @@ mod tests {
         let scene = SceneState::from_game_state(&sample_state(), &std::collections::HashMap::new());
         assert_eq!(scene.billboards.len(), 1);
         assert!(scene.billboards[0].is_target);
+    }
+
+    /// eqoxide#695: `inventory_received` must survive the GameState -> SceneState conversion the
+    /// real render loop uses every frame — this is the exact wiring the Inventory window's
+    /// "(Empty)" vs "(waiting...)" decision depends on. Covers both a pending (not yet received)
+    /// and a received-but-empty snapshot, since `inventory` is `[]` in both.
+    #[test]
+    fn from_game_state_propagates_inventory_received_flag() {
+        let mut gs = sample_state();
+        gs.inventory.clear();
+        gs.inventory_received = false;
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
+        assert!(scene.inventory.is_empty());
+        assert!(!scene.inventory_received, "must stay false until OP_CharInventory has actually applied");
+
+        gs.inventory_received = true; // as apply_char_inventory sets it, even for a 0-item packet
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
+        assert!(scene.inventory.is_empty());
+        assert!(scene.inventory_received, "a received-but-empty inventory must propagate as received");
     }
 
     #[test]

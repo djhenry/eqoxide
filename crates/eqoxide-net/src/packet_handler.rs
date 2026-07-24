@@ -493,6 +493,10 @@ fn push_item_and_contents(out: &mut Vec<eqoxide_core::game_state::InvItem>, item
 fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
     if p.len() < 4 { return; }
     let item_count = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
+    // The server has now told us the inventory state — set this even for a legitimate 0-item
+    // inventory (eqoxide#695) so the UI can distinguish "received, empty" from "not yet received"
+    // instead of showing a permanent false "(waiting for inventory...)" for an empty-handed char.
+    gs.inventory_received = true;
     if item_count == 0 { return; }
     let mut off = 4usize;
     let mut items = Vec::with_capacity(item_count);
@@ -6651,6 +6655,32 @@ mod tests {
         let payload = 0u32.to_le_bytes().to_vec(); // count = 0
         apply_char_inventory(&mut gs, &payload);
         assert_eq!(gs.inventory.len(), 1, "zero-count packet must not clear inventory");
+    }
+
+    /// eqoxide#695 (agent-honesty): a legitimate 0-item OP_CharInventory must still mark the
+    /// inventory as *received*, or the UI shows a permanent false "(waiting for inventory...)"
+    /// for any character with an empty inventory. This is the mutation-discriminating regression
+    /// test — reverting the `gs.inventory_received = true` line (or moving it back below the
+    /// `item_count == 0` early return) turns this RED while every other test above stays GREEN.
+    #[test]
+    fn apply_char_inventory_zero_count_still_sets_received_flag() {
+        let mut gs = GameState::new();
+        assert!(!gs.inventory_received, "flag must start false before any packet arrives");
+        let payload = 0u32.to_le_bytes().to_vec(); // count = 0, a legitimate empty inventory
+        apply_char_inventory(&mut gs, &payload);
+        assert!(gs.inventory_received, "a 0-item OP_CharInventory is still a real, complete answer from the server");
+        assert!(gs.inventory.is_empty(), "must not fabricate phantom items for the empty case");
+    }
+
+    /// The non-empty path must also set the flag (this held even before the fix, but pin it down
+    /// so the two packet shapes are covered symmetrically).
+    #[test]
+    fn apply_char_inventory_with_items_sets_received_flag() {
+        let mut gs = GameState::new();
+        let payload = build_char_inventory(&[fixture()]);
+        apply_char_inventory(&mut gs, &payload);
+        assert!(gs.inventory_received, "a non-empty OP_CharInventory must also mark inventory as received");
+        assert_eq!(gs.inventory.len(), 1);
     }
 
     #[test]

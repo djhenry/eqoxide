@@ -1114,6 +1114,13 @@ pub struct GameState {
 
     /// Player inventory + equipment (decoded from OP_CharInventory / OP_ItemPacket).
     pub inventory: Vec<InvItem>,
+    /// Set true the first time OP_CharInventory has been applied — **including a legitimate
+    /// 0-item inventory**. Distinguishes "the server sent an inventory and it's empty" from
+    /// "we're still waiting for the server to send one" (eqoxide#695, agent-honesty invariant):
+    /// without this flag, `inventory.is_empty()` alone can't tell a completed-empty load from a
+    /// pending one, and the UI showed a permanent false "(waiting for inventory...)" for any
+    /// character with a genuinely empty inventory.
+    pub inventory_received: bool,
 
     /// Set true when the server sends OP_TradeRequestAck — the trade session now exists, so the
     /// nav thread may move the cursor item into the NPC trade slot and accept. Cleared once the
