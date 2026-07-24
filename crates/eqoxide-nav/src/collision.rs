@@ -7161,6 +7161,30 @@ mod tests {
         }
     }
 
+
+    /// #693 live-follow-up probe: the fine local tier at the qeynos canal drop (-582,133)->(-566,136,-14).
+    #[test]
+    #[ignore = "requires the cached qeynos glb; #693 fine-tier canal-drop probe"]
+    fn probe_693_fine_canal_drop() {
+        let dir = std::env::var("ZONE_DIR")
+            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+        let za = ZoneAssets::from_glb(&std::path::Path::new(&dir).join("qeynos.glb")).unwrap();
+        let mut col = Collision::build(&za, 32.0);
+        col.set_water(eqoxide_core::region_map::RegionMap::load(
+            &std::path::Path::new(&dir).join("maps/water"), "qeynos").map(std::sync::Arc::new));
+        // columns across the drop
+        for (x, y) in [(-582.0f32, 133.0f32), (-575.7, 144.4), (-570.0, 140.0), (-566.7, 136.4), (-566.0, 130.0), (-560.0, 130.0)] {
+            println!("col ({x:6.1},{y:6.1}) floors={:?} surfaces={:?}",
+                col.column_floors(x, y, 0.0, 25.0, 60.0), col.column_surfaces(x, y, 0.0, 25.0, 60.0));
+        }
+        let start = [-582.0f32, 133.2, 0.0];
+        for carrot in [[-566.7f32, 136.4, -14.0], [-558.7, 126.9, -14.0], [-550.7, 120.4, -14.0]] {
+            let out = col.find_path_local(start, carrot, 2.0, 40.0, 4.0);
+            println!("find_path_local {:?} -> state={} reason={} steer_len={}",
+                carrot, out.state(), out.reason(), out.steer().len());
+        }
+    }
+
     /// **ACCEPTANCE TEST — the residual #329 band, owner-signed-off 2026-07-15 (review Fix D).**
     ///
     /// This is NOT a bug reproduction — it pins INTENDED behaviour. A flat DOWN-facing surface at
