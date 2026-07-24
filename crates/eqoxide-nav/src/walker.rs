@@ -188,6 +188,19 @@ pub struct Walker {
     pub nav_repaths:      u32,
     /// Closest straight-line distance to the current goal reached so far.
     pub nav_best_gdist:   f32,
+    /// ROUTE-LEVEL NO-PROGRESS DETECTION (#631 gap 3). `nav_best_g3d` is the closest 3-D approach to
+    /// the current goal (`√(gdist² + gdz²)` to the goal's resolved floor) the walker has EVER made on
+    /// this goal; `nav_progress_at` is when it last IMPROVED beyond [`NAV_PROGRESS_EPS`]. The existing
+    /// stall detector (`stuck_ticks`) only catches a walker that STOPS advancing its `path_i` — it is
+    /// blind to one that keeps moving productively-looking while making no headway toward the goal
+    /// (the #309 Crushbone moat: swimming laps around the ring for 3+ minutes, `path_i` advancing the
+    /// whole time, `navigating` forever, no terminal state). When closest-approach has not improved
+    /// for [`NAV_NO_PROGRESS_WINDOW`] the walker terminates honestly (`blocked` / `no_progress`).
+    /// 3-D (not horizontal) so a spiral ramp or a vertical climb toward a goal above counts as real
+    /// progress and is never falsely killed. Scoped to a FIXED-destination goto (never a `/follow`
+    /// chase, whose goal moves with the leader). `f32::MAX` = no approach measured yet on this goal.
+    pub nav_best_g3d:     f32,
+    pub nav_progress_at:  std::time::Instant,
     /// Downhill back-off (#212): drive the reverse direction for this many ticks before re-pathing.
     pub backoff_ticks:    u32,
     pub backoff_dir:      [f32; 2],
@@ -211,6 +224,12 @@ pub struct Walker {
     pub goal_snapped: bool,
     /// True while a plan is in flight for a goal we have NO route for yet.
     pub awaiting_first_plan: bool,
+    /// The `NavStatus::goal_id` captured when the CURRENT plan was posted (#631 gap 1). Stamped into
+    /// the published `PlanDebug` when the reply lands, so the plan record is attributable to the exact
+    /// command it answers — a plan surviving on the snapshot after a `/stop`/fresh goto is then
+    /// self-identifying (its `goal_id` differs from the snapshot's live one) rather than masquerading
+    /// as the current command's outcome.
+    pub plan_goal_id: u64,
 }
 
 impl Walker {
@@ -244,6 +263,8 @@ impl Walker {
             stuck_i: 0,
             nav_repaths: 0,
             nav_best_gdist: f32::MAX,
+            nav_best_g3d: f32::MAX,
+            nav_progress_at: std::time::Instant::now(),
             backoff_ticks: 0,
             backoff_dir: [0.0, 0.0],
             local_stuck_ticks: 0,
@@ -257,6 +278,7 @@ impl Walker {
             local_planner: crate::planner::LocalPlanner::spawn(),
             goal_snapped: false,
             awaiting_first_plan: false,
+            plan_goal_id: 0,
         }
     }
 
@@ -301,6 +323,8 @@ impl Walker {
         self.nav_repaths = 0;
         self.proactive_replans = 0;
         self.nav_best_gdist = f32::MAX;
+        self.nav_best_g3d = f32::MAX; // #631 gap 3: closest-approach tracking is per-goal + per-zone
+        self.nav_progress_at = std::time::Instant::now();
         self.backoff_ticks = 0;
         self.local_stuck_ticks = 0;
         self.replan_coarse = false;
@@ -367,9 +391,9 @@ impl Walker {
     /// render this and nothing else; there is no second derivation for them to disagree with.
     fn publish_debug(&mut self, player: Option<[f32; 3]>, water: Option<crate::diagnostics::WaterDebug>) {
         self.debug_seq += 1;
-        let (state, reason) = {
+        let (state, reason, goal_id) = {
             let s = self.nav.nav_state.lock().unwrap();
-            (s.state.clone(), s.reason.clone())
+            (s.state.clone(), s.reason.clone(), s.goal_id)
         };
         let goal = self.nav.goto_target.lock().unwrap().map(|(x, y, z)| [x, y, z]);
         let snap = crate::diagnostics::NavDebugSnapshot {
@@ -377,6 +401,7 @@ impl Walker {
             zone_model_loaded: self.collision.read().unwrap().is_some(),
             nav_state: state,
             nav_reason: reason,
+            goal_id,
             player,
             published_at: std::time::Instant::now(),
             goal,
@@ -536,14 +561,26 @@ impl Walker {
         // reason, and the per-edge trace it recorded while searching. Published at the end of this
         // method, once the nav_state it belongs with has been set.
         {
-            let (outcome_str, route_len) = match &reply.outcome {
-                PlanOutcome::Route(p) => ("route", p.len()),
-                PlanOutcome::Unreachable { .. } => ("unreachable", 0),
+            let (outcome_str, route_len, route_end) = match &reply.outcome {
+                PlanOutcome::Route(p) => ("route", p.len(), p.last().copied()),
+                PlanOutcome::Unreachable { .. } => ("unreachable", 0, None),
                 PlanOutcome::Exhausted { progress, .. } =>
-                    ("exhausted", progress.as_ref().map_or(0, |p| p.len())),
+                    ("exhausted", progress.as_ref().map_or(0, |p| p.len()),
+                     progress.as_ref().and_then(|p| p.last().copied())),
             };
+            // #631 gap 2: how far, HORIZONTALLY, the committed route's ENDPOINT lands from the goal
+            // the caller named. 0 for a complete route (it ends exactly at the requested XY), nonzero
+            // for a partial that stops at its closest approach — the honest "your named coords are not
+            // where the walker is headed, and by this much". Measured on the SAME route the walker
+            // steers, so the disclosure cannot drift from the committed path (`goal_snapped` covers
+            // only the vertical case; this is its horizontal companion).
+            let goal_offset = crate::steering::route_goal_offset(route_end, reply.goal);
             self.last_plan = Some(std::sync::Arc::new(crate::diagnostics::PlanDebug {
                 gen: reply.gen,
+                // The goal_id captured when THIS plan was posted (#631 gap 1) — the command it answers,
+                // never a later one. A superseded plan riding the snapshot is then self-identifying:
+                // its goal_id differs from the snapshot's live goal_id.
+                goal_id: self.plan_goal_id,
                 start: reply.start,
                 goal: reply.goal,
                 outcome: outcome_str.to_string(),
@@ -552,6 +589,7 @@ impl Walker {
                 plan_ms: reply.plan_ms as u64,
                 tight: reply.tight,
                 goal_snapped: snapped.is_some(),
+                goal_offset,
                 trace: reply.trace.clone(),
             }));
         }
@@ -980,6 +1018,12 @@ impl Walker {
             self.nav_repaths = 0;
             self.proactive_replans = 0;
             self.nav_best_gdist = f32::MAX;
+            // #631 gap 3: a genuinely NEW destination — restart closest-approach tracking so the
+            // no-progress window measures progress toward THIS goal, not a stale one. (The `f32::MAX`
+            // sentinel self-initialises `nav_progress_at` on the first drive tick, but resetting the
+            // clock here too keeps the window honest across a re-aim.)
+            self.nav_best_g3d = f32::MAX;
+            self.nav_progress_at = std::time::Instant::now();
             self.replan_cooldown = 0;
             self.replan_coarse = false;
             self.goal_snapped = false;
@@ -1009,6 +1053,9 @@ impl Walker {
                         collision: c,
                     });
                     self.path_goal = Some(goal); // the goal the committed/incoming route is FOR
+                    // #631 gap 1: remember WHICH command (goal_id) this plan answers, to stamp onto
+                    // its published PlanDebug when the reply lands.
+                    self.plan_goal_id = self.nav.nav_state.lock().unwrap().goal_id;
                     let post_us = t0.elapsed().as_micros();
                     tracing::info!("NAV: posted plan #{gen} to ({:.0},{:.0}) — {post_us}us on the net thread (was: the whole A*)",
                         goal.0, goal.1);
@@ -1192,6 +1239,59 @@ impl Walker {
             self.proactive_replans = 0;
         }
 
+        // ROUTE-LEVEL NO-PROGRESS DETECTION (#631 gap 3 — the Crushbone-moat honesty fix).
+        //
+        // The stall detector below catches a walker whose `path_i` STOPS advancing. It is blind to
+        // one that keeps re-planning PARTIAL routes in laps while making no headway toward the GOAL —
+        // the moat: the walker swam partial routes around the castle ring for 3+ minutes, no terminal
+        // state ever. We terminate honestly when the journey is genuinely getting nowhere.
+        //
+        // THE PROGRESS SIGNAL IS TWO-CHANNEL, and the walker is progressing if EITHER fires:
+        //   (a) COMMITTED-ROUTE progress — the walker advanced along a COMPLETE route (`path_i` past
+        //       the max seen on this route, while `nav_state == navigating`). A complete route's end
+        //       IS the goal, so advancing it is guaranteed goal-ward progress *by construction* — it
+        //       cannot be a lap (a lap would be a re-planned PARTIAL, `navigating_partial`, or would
+        //       stop advancing `path_i` and trip `walker_stalled`). This is the fix for the reviewer's
+        //       false-fire: a legitimate long go-around across a barrier (river/wall/moat) whose START
+        //       is the closest straight-line point to the goal makes NO closest-approach improvement
+        //       for most of the trip, yet is plainly getting there — killing it was a confident
+        //       falsehood on a legit route. Straight-line distance to the goal is irrelevant while a
+        //       complete route is being traversed.
+        //   (b) CLOSEST APPROACH — `√(gdist² + gdz²)` to the goal's resolved floor improved by
+        //       [`NAV_PROGRESS_EPS`]. This is the honest signal for PARTIAL navigation (`navigating_
+        //       partial`), where advancing `path_i` can be a lap: a legit partial makes genuine
+        //       goal-ward progress (`PARTIAL_MIN_UNITS`) so its closest approach keeps improving,
+        //       while the moat's laps never close on the goal → no improvement → terminate.
+        //
+        // Only when NEITHER channel has fired for [`NAV_NO_PROGRESS_WINDOW`] do we stop. Further
+        // guards against over-firing: 3-D distance (a spiral/vertical climb toward a goal above
+        // counts as approach); FIXED-destination gotos only (a `/follow` chase's goal moves with the
+        // leader); and only while walking a committed route (`have_path`).
+        if have_path && !following {
+            let g3d = (gdist * gdist + gdz * gdz).sqrt();
+            let now = std::time::Instant::now();
+            // (a) advancing a COMPLETE committed route — `path_i` past this route's max-so-far
+            // (`stuck_i`, which the stall block below maintains and which is reset to 0 on every
+            // re-plan, so a fresh route's advancement is always seen). `navigating` (not
+            // `navigating_partial`) means the committed route actually reaches the goal.
+            let advancing_complete_route = self.nav_state_is("navigating") && self.path_i > self.stuck_i;
+            // (b) closest-approach improvement (side-effecting: lowers `nav_best_g3d`).
+            let closer = crate::steering::progress_improved(&mut self.nav_best_g3d, g3d, NAV_PROGRESS_EPS);
+            if advancing_complete_route || closer {
+                self.nav_progress_at = now;
+            } else if now.duration_since(self.nav_progress_at) >= NAV_NO_PROGRESS_WINDOW {
+                self.stop_nav(gs, "blocked", "no_progress", &format!(
+                    "No progress toward ({:.1},{:.1}) for {}s: the walker keeps moving but its closest \
+                     approach to the goal has not improved (held at ~{:.0}u). This is the moving-but-\
+                     going-nowhere case the stall detector misses — a lap/eddy the route cannot escape \
+                     (e.g. swimming a moat ring), not a physical wedge. A coarse route keeps being \
+                     followed, but it does not get closer. Approach from another direction or pick a \
+                     reachable waypoint.",
+                    goal.0, goal.1, NAV_NO_PROGRESS_WINDOW.as_secs(), self.nav_best_g3d));
+                return;
+            }
+        }
+
         // OSCILLATION GUARD (#378 Phase 2 — the live qcat L-corner honesty fix).
         if self.proactive_replans >= PROACTIVE_REPLAN_CAP {
             self.stop_nav(gs, "blocked", "local_no_way_through", &format!(
@@ -1234,6 +1334,7 @@ impl Walker {
                         collision: c,
                     });
                     self.stuck_ticks = 0;
+                    self.plan_goal_id = self.nav.nav_state.lock().unwrap().goal_id; // #631 gap 1
                     tracing::warn!("NAV: backed off downhill — posted re-plan #{gen} (attempt {})", self.nav_repaths);
                 }
             }
@@ -1850,5 +1951,212 @@ mod tests {
             .filter(|e| matches!(e.verdict, EdgeVerdict::Accepted { kind: EdgeKind::Walk }))
             .count();
         assert!(accepted_walks > 0, "an open-plane route must have accepted walk edges in its trace");
+    }
+
+    // ─────────────────────────── #631 gap 1: the plan is attributable ───────────────────────────
+
+    /// **#631 gap 1: a failed goto's diagnostic must never masquerade as the CURRENT command's
+    /// outcome.** A `PlanDebug` survives route clears (it is the diagnostic OF a failure), so after a
+    /// `/stop` (or a fresh goto) the previous goal's plan keeps riding the snapshot. Live-reproduced
+    /// on the current binary: after a failed goto then `/stop`, `nav_debug.plan.gen`/`outcome`
+    /// described the SUPERSEDED goal with no goal_id to tell it apart — the plan read as this
+    /// command's result. The fix stamps the plan with the goal_id it was FOR and the snapshot with the
+    /// LIVE goal_id, so a stale plan is self-identifying (`plan.goal_id != snapshot.goal_id`).
+    ///
+    /// Mutation check: in `apply_plan` stamp `goal_id: 0` (or the live goal_id) instead of
+    /// `self.plan_goal_id`, or in `publish_debug` publish a constant goal_id — either collapses the
+    /// two identities and the `assert_ne!` below goes RED (the exact reproduced masquerade returns).
+    #[test]
+    fn a_superseded_failed_plan_is_attributable_to_its_own_goal_id_not_the_current_command() {
+        use crate::collision::{NoRoute, PlanOutcome};
+        let (mut w, nav, _intent, view) = walker_with(open_plane(200.0));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
+
+        // Goal A, accepted as goal_id 1, posted under that id; the worker returns a DEFINITIVE no.
+        nav.nav_state.lock().unwrap().goal_id = 1;
+        *nav.goto_target.lock().unwrap() = Some((999.0, 999.0, 0.0));
+        w.plan_goal_id = 1;
+        let reply = crate::planner::PlanReply {
+            gen: 5, start: [0.0; 3], goal: [999.0, 999.0, 0.0],
+            outcome: PlanOutcome::Unreachable {
+                reason: NoRoute::SearchClosed, goal_blocked_by: None, frontier_blocked_by: None },
+            plan_ms: 3, goal_snapped: None, tight: false,
+            trace: crate::diagnostics::SearchTrace::default(),
+        };
+        assert!(w.apply_plan(reply, &mut gs, (999.0, 999.0, 0.0)),
+            "a definitive no must stop the tick");
+        assert!(w.nav_state_is("no_path"), "goal A fails honestly under its own id");
+
+        // The agent SUPERSEDES: a fresh command bumps the goal_id (a /stop → idle here). The failure
+        // diagnostic is retained, as designed — but it is now the PREVIOUS goal's.
+        {
+            let mut s = nav.nav_state.lock().unwrap();
+            s.goal_id = 2;
+            s.state = "idle".into();
+        }
+        *nav.goto_target.lock().unwrap() = None;
+        w.publish_debug(Walker::known_pos(&gs), None);
+
+        let snap = view.lock().unwrap().clone().expect("a snapshot must be published");
+        assert_eq!(snap.goal_id, 2, "the snapshot carries the CURRENT command's identity");
+        let plan = snap.plan.as_ref().expect("the failure diagnostic is retained");
+        assert_eq!(plan.goal_id, 1, "the retained plan names the goal it was actually FOR");
+        assert_ne!(plan.goal_id, snap.goal_id,
+            "#631 gap 1: a superseded plan MUST be distinguishable from the current command's outcome \
+             — its goal_id differs from the live one, so `plan.gen`/`plan.outcome` can never be read \
+             as this command's result (the reproduced idle+stale-gen masquerade)");
+    }
+
+    /// **#631 gap 2, wiring: `apply_plan` records the horizontal shortfall on the published plan.**
+    /// A partial route (`Exhausted`) that stops short of the goal must publish a nonzero `goal_offset`
+    /// equal to its committed endpoint's horizontal distance from the requested goal — the honest
+    /// "your named coords are not where I'm headed, by this much", which `goal_snapped: false` alone
+    /// hid. (The pure math is pinned in `steering::route_goal_offset_reports_horizontal_shortfall_only`.)
+    ///
+    /// Mutation check: hard-code `goal_offset: 0.0` in `apply_plan` and the `> 40.0` assertion goes RED.
+    #[test]
+    fn apply_plan_publishes_the_horizontal_goal_offset_for_a_partial() {
+        use crate::collision::{PlanLimit, PlanOutcome};
+        let (mut w, nav, _intent, view) = walker_with(open_plane(400.0));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
+        nav.nav_state.lock().unwrap().goal_id = 1;
+        *nav.goto_target.lock().unwrap() = Some((300.0, 0.0, 0.0));
+        w.plan_goal_id = 1;
+
+        // A partial route whose far end is 55u (horizontally) short of the goal (the #482 shape).
+        let partial = vec![[0.0, 0.0, 0.0], [40.0, -30.0, 0.0], [245.0, 0.0, 0.0]];
+        let reply = crate::planner::PlanReply {
+            gen: 9, start: [0.0; 3], goal: [300.0, 0.0, 0.0],
+            outcome: PlanOutcome::Exhausted { limit: PlanLimit::NodeCap, progress: Some(partial) },
+            plan_ms: 4, goal_snapped: None, tight: false,
+            trace: crate::diagnostics::SearchTrace::default(),
+        };
+        w.apply_plan(reply, &mut gs, (300.0, 0.0, 0.0));
+        w.publish_debug(Walker::known_pos(&gs), None);
+        let snap = view.lock().unwrap().clone().unwrap();
+        let plan = snap.plan.as_ref().expect("the partial plan is published");
+        assert!(!plan.goal_snapped, "no vertical snap here — the old channel says nothing");
+        assert!((plan.goal_offset - 55.0).abs() < 1.0,
+            "#631 gap 2: the ~55u horizontal shortfall to the committed endpoint must be disclosed, \
+             got {}", plan.goal_offset);
+    }
+
+    // ────────────────────────── #631 gap 3: route-level no-progress ──────────────────────────
+
+    /// A walker with a committed route whose closest approach has not improved for the whole window
+    /// TERMINATES honestly (`blocked` / `no_progress`) instead of reporting `navigating` forever —
+    /// the moving-but-going-nowhere case the `stuck_ticks` detector (which only watches `path_i`)
+    /// misses. Drives the real `drive_walk` tick with the no-progress clock already expired.
+    ///
+    /// Represents the real moat: a re-planned PARTIAL route (`navigating_partial`) whose `path_i` is
+    /// ADVANCING (a lap) but whose closest approach never improves. `path_i` advancement must NOT
+    /// count as progress here — that is the whole reason channel (a) is gated on a COMPLETE route —
+    /// so the walker still terminates honestly (`blocked` / `no_progress`).
+    ///
+    /// Mutation check: delete the no-progress block in `drive_walk` and this goes RED. Also: drop the
+    /// `nav_state_is("navigating")` gate on channel (a) (so a partial's `path_i` advance counts as
+    /// progress) and this ALSO goes RED — the lap would reset the clock and never terminate, exactly
+    /// the moat regression the gate exists to prevent.
+    #[test]
+    fn drive_walk_terminates_no_progress_on_an_advancing_partial_lap() {
+        let (mut w, nav, _intent, _view) = walker_with(open_plane(600.0));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.player_x = 10.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
+        let goal = (500.0, 0.0, 0.0); // far → ArrivalAction::Drive
+        *nav.goto_target.lock().unwrap() = Some(goal);
+        // A PARTIAL route (a moat lap), NOT a complete route to the goal.
+        w.set_nav_state("navigating_partial");
+        w.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0], [30.0, 0.0, 0.0]];
+        w.path_i = 1;   // ADVANCING along the lap (path_i 1 > stuck_i 0) — looks like motion...
+        w.stuck_i = 0;
+        w.path_goal = Some(goal);
+        // ...but closest approach has been stuck at ~10u for a full window: the lap never closes.
+        w.nav_best_g3d = 10.0;
+        w.nav_progress_at = std::time::Instant::now() - (NAV_NO_PROGRESS_WINDOW + std::time::Duration::from_secs(1));
+
+        w.drive_walk(&mut gs, goal);
+
+        assert!(w.nav_state_is("blocked"),
+            "an advancing PARTIAL lap that never closes on the goal must still terminate — path_i \
+             advancement on a partial is not goal-ward progress");
+        assert_eq!(nav.nav_state.lock().unwrap().reason.as_deref(), Some("no_progress"),
+            "#631 gap 3: the terminal reason must be the distinct `no_progress`");
+        assert!(nav.goto_target.lock().unwrap().is_none(), "a terminal stop clears the goto");
+    }
+
+    /// **THE REVIEWER'S FALSE-FIRE REPRO (#631 gap 3, changes-requested): a legitimate long go-around
+    /// whose START is the closest straight-line point to the goal must NEVER be killed while the
+    /// walker is advancing its COMPLETE committed route** — even though closest-approach makes no
+    /// improvement for the whole away-leg and the walker is currently far (straight-line) from the
+    /// goal. The prior code used only the all-time-closest signal, so a >60s go-around (start-is-
+    /// closest) terminated `no_progress` mid-journey, ~12s before arrival — a confident falsehood on a
+    /// route that was getting there.
+    ///
+    /// FAILS ON THE PRIOR CODE (only the closest-approach channel → the expired clock + no improvement
+    /// → `blocked`); PASSES AFTER the committed-route channel is added. Mutation check: delete the
+    /// `advancing_complete_route` term and this goes RED (the go-around is killed again).
+    #[test]
+    fn drive_walk_never_terminates_a_complete_route_the_walker_is_advancing_even_when_far_from_goal() {
+        let (mut w, nav, _intent, _view) = walker_with(open_plane(2000.0));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        // The walker is on its go-around, currently FAR (straight-line) from the goal — the peak of
+        // the away-leg — and standing on waypoint 3 of a long COMPLETE route.
+        gs.player_x = 500.0; gs.player_y = 800.0; gs.player_z = 0.0; gs.player_pos_known = true;
+        let goal = (1000.0, 0.0, 0.0);
+        *nav.goto_target.lock().unwrap() = Some(goal);
+        w.set_nav_state("navigating"); // a COMPLETE route (reaches the goal), not a partial
+        w.path = vec![
+            [0.0, 0.0, 0.0], [200.0, 400.0, 0.0], [400.0, 700.0, 0.0], [500.0, 800.0, 0.0],
+            [700.0, 600.0, 0.0], [900.0, 200.0, 0.0], [1000.0, 0.0, 0.0],
+        ];
+        w.path_i = 3;    // advanced along the route...
+        w.stuck_i = 2;   // ...past this route's previous max → advancing_complete_route
+        w.path_goal = Some(goal);
+        // The START was the closest straight-line point: best was set low (~50u) and has NOT improved
+        // since — the away-leg makes closest-approach worse, and the window has fully elapsed.
+        w.nav_best_g3d = 50.0;
+        w.nav_progress_at = std::time::Instant::now() - (NAV_NO_PROGRESS_WINDOW + std::time::Duration::from_secs(30));
+
+        w.drive_walk(&mut gs, goal);
+
+        assert!(!w.nav_state_is("blocked"),
+            "#631 gap 3 (reviewer repro): a COMPLETE route the walker is actively advancing must NEVER \
+             be terminated no_progress, however far the current straight-line distance to the goal — a \
+             complete route's end IS the goal, so advancing it is progress by construction");
+        assert!(nav.goto_target.lock().unwrap().is_some(), "the go-around continues to the goal");
+    }
+
+    /// **The over-firing guard (the #631 high-risk half): a route still making progress is NEVER
+    /// killed — even at the window boundary.** Same expired clock as above, but this tick's closest
+    /// approach IMPROVES on the best, which must reset the clock and let navigation continue.
+    ///
+    /// Mutation check: make `progress_improved` always return `false` (or drop the `if improved`
+    /// branch) and this route gets killed → the assert that it is STILL navigating goes RED. This is
+    /// the test that would catch a no-progress detector that fires on legitimate progress.
+    #[test]
+    fn drive_walk_never_terminates_a_route_that_is_still_getting_closer() {
+        let (mut w, nav, _intent, _view) = walker_with(open_plane(600.0));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
+        let goal = (500.0, 0.0, 0.0);
+        *nav.goto_target.lock().unwrap() = Some(goal);
+        w.set_nav_state("navigating");
+        w.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0]];
+        w.path_i = 0;
+        w.path_goal = Some(goal);
+        // The clock is expired, BUT the best approach so far (600) is worse than this tick's ~500, so
+        // this observation is real progress: the clock resets and no termination may occur.
+        w.nav_best_g3d = 600.0;
+        w.nav_progress_at = std::time::Instant::now() - (NAV_NO_PROGRESS_WINDOW + std::time::Duration::from_secs(1));
+
+        w.drive_walk(&mut gs, goal);
+
+        assert!(!w.nav_state_is("blocked"),
+            "#631 gap 3 (over-firing guard): a route whose closest approach IMPROVED this tick must \
+             NOT be terminated — that would kill legitimate slow/detouring progress");
+        assert!(nav.goto_target.lock().unwrap().is_some(), "navigation continues");
+        assert!(w.nav_best_g3d <= 500.5, "the improved closest approach must be recorded");
     }
 }

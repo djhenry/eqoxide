@@ -454,6 +454,7 @@ is not snapped: it fails as `no_path` / `goal_not_walkable`.)
 | `walker_stalled` | The fine planner *can* thread the route from here, and the walker still didn't move: a genuine collision/steering wedge. `POST /v1/move/manual` (optionally `"jump": true`) may free it; then re-issue the `goto`. |
 | `local_no_way_through` | The **fine 2u planner closed its whole 40u window** without finding a way along the committed route, OR the walker spent its proactive-re-plan budget re-routing the same impasse without progress (the qcat L-corner class). The corridor is not threadable at the character's own collision radius — this is *not* a slide/collision wedge, and nudging will not fix it. A coarse route to the goal may exist, but the walker cannot follow it around this corner. Approach the goal from another direction. (#382, #378) |
 | `fall_would_be_lethal` | The next waypoint is down a drop whose fall damage would likely kill the character. Stopped at the ledge. |
+| `no_progress` | The walker kept moving but its **closest approach to the goal did not improve for 60 s** — a lap/eddy a route follows without ever getting closer (e.g. swimming a moat ring), which the `walker_stalled` detector (it only watches for a walker that *stops*) misses. Not a physical wedge: a coarse route keeps being followed, it just does not close on the goal. Approach from another direction or pick a reachable waypoint. Measured as 3‑D closest approach, so a spiral ramp / vertical climb is never mistaken for no progress, and only fires for a **fixed-destination** goto (never a `/follow` chase). (#631) |
 
 ### `nav_blocked_by` and `nav_tier` — the blockage payload (#378)
 
@@ -922,15 +923,27 @@ Top-level shape (`available: false` + a `note` until the walker first publishes)
   object (same source as `/debug`'s) rides along for the pending/failed/stale detail.
 - **`nav_state` / `nav_reason`** — the walker's published state at publish time (same vocabulary
   as `/debug`).
+- **`goal_id`** — the live `nav_goal_id` (#349) at publish time. It is what makes `plan` below
+  attributable (#631): `plan` **survives route clears** (it is the diagnostic OF a failure), so after
+  a `/stop` or a fresh goto the previous goal's plan keeps riding the snapshot. When
+  **`plan.goal_id != goal_id` the plan describes a SUPERSEDED command**, not the current one — never
+  read `plan.gen`/`plan.outcome` as this command's result unless the two ids match. (Before this, the
+  retained plan carried no identity and a failed goto's record read as the current command's outcome.)
 - **`player`**, **`goal`** — position `[east,north,up]` at publish (**`null` when the position was
   not known** — fresh login before the first server placement, a zone reset; never a fabricated
   `[0,0,0]`); the active `/goto` goal.
 - **`committed_coarse` / `committed_fine`** — the walker's **actual committed** coarse route and
   fine/local steering plan, verbatim (`Walker::path`/`local_path` — the #246 property; never a
   recompute).
-- **`plan`** — the last coarse plan's record, from the planner's own reply: `gen`, `start`,
-  `goal` (the question actually asked), `outcome` (`route`/`unreachable`/`exhausted`), `reason`
-  (the `nav_reason` vocabulary), `route_len`, `plan_ms`, `tight`, `goal_snapped`, and **`trace`**:
+- **`plan`** — the last coarse plan's record, from the planner's own reply: `gen`, **`goal_id`**
+  (the command this plan ANSWERS — compare against the top-level `goal_id` to tell a current plan
+  from a superseded one, #631), `start`, `goal` (the question actually asked), `outcome`
+  (`route`/`unreachable`/`exhausted`), `reason` (the `nav_reason` vocabulary), `route_len`,
+  `plan_ms`, `tight`, `goal_snapped` (the VERTICAL goal change, #344), **`goal_offset`** (the
+  HORIZONTAL companion, #631: the east/north distance in units from the goal you NAMED to where the
+  committed route actually ENDS — `0.0` for a complete route to the goal, nonzero for a partial that
+  stops short; so `goal_snapped: false` can no longer hide that the destination differs horizontally
+  from your coordinates — the #482 "planned 55u away" observation), and **`trace`**:
   - `trace.calls[]` — one entry per A* call (clearance tier × anchor attempt), each with
     `clearance`, `cell`, `char_anchor`, `truncated`, and `edges[]`;
   - each edge: `{from, to, verdict: "accepted", kind}` or `{from, to, verdict: "rejected",

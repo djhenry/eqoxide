@@ -54,6 +54,56 @@ pub const PROACTIVE_REPLAN_CAP: u32 = 8;
 /// this long (~10 s at 150 ms/tick) so a goal that's STILL unreachable after the teleport can't
 /// ping-pong the char back and forth through the portal. One escape attempt, then it walks/stalls.
 pub const PORTAL_COOLDOWN_TICKS: u32 = 66;
+/// ROUTE-LEVEL NO-PROGRESS DETECTION (#631 gap 3). How much the closest 3-D approach to the goal
+/// must improve to count as PROGRESS. Deliberately a whole coarse cell (8u): smaller and ordinary
+/// server-position jitter around a lap would masquerade as forward progress and keep resetting the
+/// window forever (the moat would never terminate); larger and a genuinely slow approach could be
+/// mistaken for none. 8u over the [`NAV_NO_PROGRESS_WINDOW`] is a ~0.13 u/s closing rate — a walker
+/// that cannot beat that toward its goal is, by any honest reading, not getting there.
+pub const NAV_PROGRESS_EPS: f32 = 8.0;
+/// How long BOTH progress channels (committed-route advancement of a complete route, AND
+/// closest-approach improvement — see `Walker::drive_walk`) may go quiet before navigation
+/// terminates honestly (`blocked` / `no_progress`). This window governs ONLY the case where the
+/// walker is *not* advancing a complete route (a re-planned partial / lap) AND is not getting any
+/// closer — the moat, which swam laps for 3+ minutes. A legitimate route the walker is traversing
+/// keeps channel (a) firing every tick regardless of how long or how far-from-goal the go-around is,
+/// so the length of a legit route is NOT bounded by this constant (the earlier claim that 60s
+/// "tolerates ~2.6 km of away-travel" was wrong: with a single all-time-closest signal the return
+/// leg kept the clock running, so the real tolerance was total-route < 60s — which is exactly the
+/// false-fire the committed-route channel removes). 60s is simply how long a genuine no-forward-
+/// progress lap may persist before it is called. (#631)
+pub const NAV_NO_PROGRESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Record a closest-approach observation and report whether it was genuine PROGRESS (#631 gap 3).
+///
+/// `best` is the smallest 3-D distance-to-goal seen so far on this goal (`f32::MAX` before any); a
+/// new observation `d` counts as progress only when it beats `best` by more than `eps`, at which
+/// point `best` is lowered to `d`. The first observation (from `f32::MAX`) always counts, so the
+/// caller's no-progress clock self-initialises on the first drive tick. Pure and total, so the
+/// no-progress policy is unit-testable off the tick against circling / approaching / detouring
+/// trajectories — the exact place an over-firing bug would hide.
+pub fn progress_improved(best: &mut f32, d: f32, eps: f32) -> bool {
+    if d < *best - eps {
+        *best = d;
+        true
+    } else {
+        false
+    }
+}
+
+/// The HORIZONTAL distance from the committed route's ENDPOINT to the goal the caller named
+/// (#631 gap 2). `route_end` is the last waypoint of the committed route (`None` for a definitive
+/// no-route). A COMPLETE route ends exactly at the requested XY, so this is `0.0`; a partial route
+/// that stops at its closest approach returns how far, horizontally, that endpoint falls short —
+/// the honest companion to the vertical-only `goal_snapped`, so `goal_snapped: false` can no longer
+/// hide that the destination differs from the named coordinates. Pure/total for unit testing.
+pub fn route_goal_offset(route_end: Option<[f32; 3]>, goal: [f32; 3]) -> f32 {
+    match route_end {
+        Some(end) => ((end[0] - goal[0]).powi(2) + (end[1] - goal[1]).powi(2)).sqrt(),
+        None => 0.0,
+    }
+}
+
 /// A path segment longer than this (horizontal) is a find_path JUMP-EDGE, not a walk — normal
 /// adjacent nav cells are ≤ 8·√2 ≈ 11.3u apart, jump-edges span ≥ 16u across a real gap. The walker
 /// asks the controller to jump when traversing such a segment. (eqoxide#190)
@@ -818,5 +868,93 @@ mod tests {
         let mut li = 0usize;
         let aim = steer_target(&path, 0, &path, &mut li, from, 5.0, [0.0, 0.0, 0.0], blocked);
         assert!(aim.iter().all(|v| v.is_finite()), "steer_target must stay total under a blocking los: {aim:?}");
+    }
+
+    /// **#631 gap 2: horizontal goal re-anchoring is DISCLOSED, and the vertical case is not it.**
+    ///
+    /// `goal_snapped` (from #344) covers only the VERTICAL snap; a route that does not reach the
+    /// requested XY left `goal_snapped: false` and no way to tell (the #482 observation: a goto
+    /// planned to a point 55u horizontally from the ask). `route_goal_offset` is the horizontal
+    /// companion: 0 for a complete route (it ends exactly at the goal XY — no false positive), the
+    /// horizontal shortfall for a partial that stops at its closest approach.
+    ///
+    /// Mutation-discriminating: hard-code `route_goal_offset` to return `0.0` and the #482-shape and
+    /// on-a-plane-partial assertions go RED — a relocated destination becomes invisible again.
+    #[test]
+    fn route_goal_offset_reports_horizontal_shortfall_only() {
+        // A COMPLETE route ends exactly at the requested XY (collision.rs snaps the final waypoint to
+        // goal.xy): 0 offset, whatever the z — no false positive on a real route to the goal.
+        assert_eq!(route_goal_offset(Some([10.0, 20.0, 5.0]), [10.0, 20.0, -3.0]), 0.0,
+            "a route ending at the goal XY is not re-anchored, regardless of its z");
+        // The #482 shape: committed endpoint 55u (horizontally) from the named goal.
+        let off = route_goal_offset(Some([-607.1, -66.1, -7.0]), [-601.0, -121.0, -8.7]);
+        assert!((off - 55.24).abs() < 0.5, "the ~55u horizontal shortfall must be surfaced: {off}");
+        // A pure Z difference is NOT a horizontal re-anchoring — that is `goal_snapped`'s job, and
+        // double-reporting it here would be a second, confusing signal for the same fact.
+        assert_eq!(route_goal_offset(Some([0.0, 0.0, 100.0]), [0.0, 0.0, 0.0]), 0.0,
+            "a vertical-only difference is goal_snapped's channel, not a horizontal offset");
+        // A DEFINITIVE no-route is not a re-anchoring — there is no committed destination to disclose.
+        assert_eq!(route_goal_offset(None, [1.0, 2.0, 3.0]), 0.0);
+    }
+
+    /// **#631 gap 3: the no-progress property — TERMINATE a lap that never closes on the goal, and
+    /// NEVER a route that is genuinely (even slowly, even via a detour) getting there.**
+    ///
+    /// This is the over-firing-prone half of #631, so it is pinned as a property over trajectories,
+    /// not one example. The policy is exactly the walker's: `progress_improved` records the closest
+    /// 3-D approach; the clock resets whenever it improves by [`NAV_PROGRESS_EPS`]; navigation
+    /// terminates only when it has NOT improved for [`NAV_NO_PROGRESS_WINDOW`].
+    ///
+    /// Mutation-discriminating both ways: widen `NAV_PROGRESS_EPS` to `f32::MAX` (nothing counts as
+    /// progress) and the APPROACH/DETOUR/SLOW cases fire → RED; shrink it to `0.0` (jitter counts as
+    /// progress) and the CIRCLING case never fires → RED.
+    #[test]
+    fn no_progress_terminates_a_lap_but_never_a_route_that_is_getting_there() {
+        use std::time::{Duration, Instant};
+        // Replays (t_secs, closest-3D-dist) through the walker's exact policy; returns the time the
+        // walker would terminate `no_progress`, or None if it never does.
+        let fires_at = |samples: &[(f32, f32)]| -> Option<f32> {
+            let base = Instant::now();
+            let mut best = f32::MAX;
+            let mut improved_at = base;
+            for &(t, d) in samples {
+                let now = base + Duration::from_secs_f32(t);
+                if progress_improved(&mut best, d, NAV_PROGRESS_EPS) {
+                    improved_at = now;
+                } else if now.duration_since(improved_at) >= NAV_NO_PROGRESS_WINDOW {
+                    return Some(t);
+                }
+            }
+            None
+        };
+        let win = NAV_NO_PROGRESS_WINDOW.as_secs_f32();
+
+        // CIRCLING (the moat): constant distance forever. Best is set on the first sample and never
+        // improves, so it MUST terminate — right at the window, not before, not never.
+        let circling: Vec<(f32, f32)> = (0..80).map(|i| (i as f32 * 5.0, 60.0)).collect();
+        let fired = fires_at(&circling).expect("a lap that never closes on the goal MUST terminate");
+        assert!((fired - win).abs() <= 5.0 + 1e-3,
+            "the moat must terminate at ~{win}s (the window), got {fired}s");
+
+        // STEADILY APPROACHING (even SLOWLY): distance falls by >EPS within every window. A very slow
+        // 0.4 u/s crawl (12u per 30s > the 8u EPS) still resets the clock each step — never killed.
+        let slow: Vec<(f32, f32)> = (0..40).map(|i| (i as f32 * 30.0, 500.0 - i as f32 * 12.0)).collect();
+        assert_eq!(fires_at(&slow), None,
+            "a slow-but-steady approach keeps improving closest-approach — it must NEVER be killed");
+
+        // A NECESSARY DETOUR that first goes AWAY (distance rises for ~25s) then closes. Best stays
+        // flat during the away-leg but the clock has NOT yet run out, and the approach then resets it
+        // well within the window — the detour survives. (This is the exact false-positive the issue
+        // warns about: a route that temporarily increases distance must not be killed.)
+        let mut detour: Vec<(f32, f32)> = Vec::new();
+        for i in 0..6 { detour.push((i as f32 * 5.0, 100.0 + i as f32 * 12.0)); } // away 0..25s: 100→160
+        for i in 1..20 { detour.push((25.0 + i as f32 * 5.0, 160.0 - i as f32 * 15.0)); } // back, brisk
+        assert_eq!(fires_at(&detour), None,
+            "a detour that temporarily increases distance then closes must survive — killing it is \
+             the over-firing #631 explicitly forbids");
+
+        // A LONG STRAIGHT RUN: monotone decrease over minutes. Never fires (improves every sample).
+        let straight: Vec<(f32, f32)> = (0..60).map(|i| (i as f32 * 5.0, 3000.0 - i as f32 * 44.0)).collect();
+        assert_eq!(fires_at(&straight), None, "a long straight run keeps closing — never killed");
     }
 }
