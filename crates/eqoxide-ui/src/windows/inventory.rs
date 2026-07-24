@@ -46,6 +46,14 @@ fn sel_id() -> egui::Id {
     egui::Id::new("inv_sel")
 }
 
+/// Label shown under an empty inventory grid. Split into a pure function so the "received vs.
+/// waiting" decision (eqoxide#695) is unit-testable without an `egui::Ui`. `received` is
+/// `GameState::inventory_received` — true once OP_CharInventory has been applied at least once,
+/// including a legitimate 0-item packet.
+fn empty_inventory_label(received: bool) -> &'static str {
+    if received { "(Empty)" } else { "(waiting for inventory from server…)" }
+}
+
 fn selected_slot(ui: &egui::Ui) -> Option<i32> {
     ui.ctx().data_mut(|d| d.get_temp(sel_id()))
 }
@@ -185,7 +193,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     }
 
     if inv.is_empty() {
-        ui.label(egui::RichText::new("(waiting for inventory from server…)").weak().size(11.0));
+        ui.label(egui::RichText::new(empty_inventory_label(cx.scene.inventory_received)).weak().size(11.0));
     }
 
     // Selection hint — makes the two-click move protocol discoverable.
@@ -205,4 +213,19 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     ui.add_space(2.0);
     ui.separator();
     widgets::coin_row(ui, cx.scene.coin);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// eqoxide#695: the empty-inventory label must reflect whether OP_CharInventory has actually
+    /// arrived, not just whether `inv` is empty (which is also true before anything has loaded).
+    /// Mutation check: swapping the `if received {...} else {...}` branches, or hardcoding either
+    /// string, turns one of these two assertions RED.
+    #[test]
+    fn empty_inventory_label_distinguishes_received_from_pending() {
+        assert_eq!(empty_inventory_label(false), "(waiting for inventory from server…)");
+        assert_eq!(empty_inventory_label(true), "(Empty)");
+    }
 }
