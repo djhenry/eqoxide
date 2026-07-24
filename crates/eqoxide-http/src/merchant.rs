@@ -59,7 +59,7 @@ async fn post_trade_open(
     // Resolve the merchant, then DROP the entity map lock before awaiting — never hold a std Mutex
     // across an `.await`.
     let found = {
-        let ids = s.world.entity_ids.lock().unwrap();
+        let ids = s.world.entity_ids();
         let nl = b.merchant.to_lowercase();
         ids.iter()
             .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
@@ -172,7 +172,7 @@ async fn post_buy(
     // Resolve the merchant, then DROP the entity map lock before awaiting — never hold a std Mutex
     // across an `.await`.
     let found = {
-        let ids = s.world.entity_ids.lock().unwrap();
+        let ids = s.world.entity_ids();
         let nl = b.merchant.to_lowercase();
         ids.iter()
             .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
@@ -248,7 +248,7 @@ async fn post_sell(
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\",\"slot\":N,\"quantity\":Q}".into()),
     };
     let qty = b.quantity.unwrap_or(1).max(1);
-    let ids = s.world.entity_ids.lock().unwrap();
+    let ids = s.world.entity_ids();
     let nl = b.merchant.to_lowercase();
     let found = ids.iter()
         .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
@@ -272,7 +272,7 @@ mod tests {
     use crate::testkit::empty_state;
 
     fn seed_merchant(state: &crate::HttpState, key: &str, id: u32) {
-        state.world.entity_ids.lock().unwrap().insert_for_test(key.to_string(), id);
+        state.world.entity_ids_mut().insert_for_test(key.to_string(), id);
     }
 
     /// eqoxide#341: a typo'd key ("quantitiy" instead of "quantity") must 400 — not be silently

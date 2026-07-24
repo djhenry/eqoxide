@@ -207,8 +207,8 @@ pub(crate) fn resolve_in_world(
     name: &str,
     player_pos: Option<(f32, f32, f32)>,
 ) -> Option<NameMatch> {
-    let positions = world.entity_positions.lock().unwrap(); // 1st — canonical order
-    let ids = world.entity_ids.lock().unwrap();             // 2nd
+    let positions = world.entity_positions(); // 1st — canonical order
+    let ids = world.entity_ids();             // 2nd
     resolve_entity(name, &ids, &positions, player_pos)
 }
 
@@ -402,9 +402,9 @@ mod tests {
 
         let world = eqoxide_ipc::WorldSlots::default();
         for i in 0..20u32 {
-            world.entity_positions.lock().unwrap()
+            world.entity_positions_mut()
                 .insert_for_test(format!("a_rat{i:03}"), (i as f32, 0.0, 0.0));
-            world.entity_ids.lock().unwrap().insert_for_test(format!("a_rat{i:03}"), i);
+            world.entity_ids_mut().insert_for_test(format!("a_rat{i:03}"), i);
         }
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -429,8 +429,8 @@ mod tests {
         let (w3, s3) = (world.clone(), stop.clone());
         let observe = std::thread::spawn(move || {
             while !s3.load(Ordering::Relaxed) {
-                let positions = w3.entity_positions.lock().unwrap(); // 1st — canonical order
-                let poses = w3.entity_poses.lock().unwrap();         // 2nd
+                let positions = w3.entity_positions(); // 1st — canonical order
+                let poses = w3.entity_poses();         // 2nd
                 std::hint::black_box((positions.len(), poses.len()));
             }
         });

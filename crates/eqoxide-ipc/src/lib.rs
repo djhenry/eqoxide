@@ -886,14 +886,20 @@ impl<V> std::ops::Deref for Roster<V> {
 // producer, and there is none.
 //
 // It does NOT establish that no `Roster` value can be named or moved, and an earlier revision of
-// this comment claimed that it did. That was false. `WorldSlots`' fields are `pub`, `publish_entities`
-// is `pub`, and `MutexGuard` supplies `DerefMut` — so an outside crate can legitimately populate a
-// SCRATCH `WorldSlots` and then `mem::swap` one of its maps into a live one, MOVING an existing
-// `Roster` without ever constructing one. That compiles clean in release today (verified, #665) and
-// desyncs `entity_ids` from `entity_positions`, which `combat.rs`'s "is this spawn known?" answers
-// from alone. Closing the producer set was necessary and is not sufficient: the remaining leak is
-// that the CONTAINER hands out mutable access to what it protects. Tracked in #665; deliberately
-// not bolted onto this change.
+// this comment claimed that it did. That was false. When `WorldSlots`' fields were `pub`,
+// `publish_entities` was `pub`, and `MutexGuard` supplied `DerefMut`, an outside crate could
+// legitimately populate a SCRATCH `WorldSlots` and then `mem::swap` one of its maps into a live one,
+// MOVING an existing `Roster` without ever constructing one. That compiled clean in release (#665)
+// and desynced `entity_ids` from `entity_positions`, which `combat.rs`'s "is this spawn known?"
+// answers from alone. Closing the producer set was necessary but not sufficient: the remaining leak
+// was that the CONTAINER handed out mutable access to what it protects.
+//
+// #665 closed that at the container: `WorldSlots`' three roster fields are now PRIVATE and its only
+// read path is [`WorldSlots::entity_positions`] / `entity_ids` / `entity_poses`, which return a
+// [`RosterReadGuard`] — a guard with NO `DerefMut`. With no `&mut Roster` reachable from outside the
+// crate, there are no two `&mut Roster`s to `mem::swap`, so the move above is now a COMPILE error
+// (proved by the `compile_fail` doctests on those accessors). Writes still go only through
+// `publish_entities`, still the single publisher.
 //
 // The reason to close CONSTRUCTORS rather than call-site shapes is that producers are finite and
 // enumerable, so "each member is closed" is a claim that can be checked. Two earlier attempts here
@@ -918,6 +924,34 @@ impl<V> Roster<V> {
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn insert_for_test(&mut self, k: String, v: V) -> Option<V> { self.0.insert(k, v) }
 }
+
+/// A **read-only** lock guard over a [`Roster`], returned by [`WorldSlots`]'s roster accessors
+/// (`entity_positions` / `entity_ids` / `entity_poses`).
+///
+/// It `Deref`s to `Roster<V>` (which in turn `Deref`s to `HashMap`), so every read the old public
+/// `Arc<Mutex<Roster<..>>>` fields supported — `get`, `len`, `iter`, `keys`, `values`,
+/// `contains_key`, `&*guard`, deref-coercion to `&HashMap` at a call boundary — works unchanged.
+/// The callers that used to write `world.entity_positions.lock().unwrap()` now write
+/// `world.entity_positions()`; nothing else about a read site changes.
+///
+/// It deliberately does **not** implement `DerefMut`. That is the whole point (#665).
+///
+/// # Why not just return the `MutexGuard`
+///
+/// A `MutexGuard<'_, Roster<V>>` supplies `DerefMut`, i.e. a `&mut Roster`. #652 sealed `Roster`'s
+/// *constructors*, which closed every write that needs a freshly-built value — but two `&mut Roster`s
+/// are all `std::mem::swap` needs to *move* one existing roster in place of another (from a populated
+/// scratch `WorldSlots`), desyncing `entity_ids` from `entity_positions` without ever constructing a
+/// `Roster`. Handing back a guard with no `DerefMut` removes the `&mut Roster` entirely, so there is
+/// nothing to swap. See the compile-fail proofs on [`WorldSlots::entity_positions`].
+pub struct RosterReadGuard<'a, V>(std::sync::MutexGuard<'a, Roster<V>>);
+
+impl<V> std::ops::Deref for RosterReadGuard<'_, V> {
+    type Target = Roster<V>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+// No `DerefMut`, deliberately — a `&mut Roster` reachable from outside this crate is exactly the
+// #665 leak (two of them let `mem::swap` move one map past the single-publisher rule).
 
 /// Live entity name → (x, y, z) map, published by `WorldSlots::publish_entities`.
 pub type EntityPositions = Arc<Mutex<Roster<(f32, f32, f32)>>>;
@@ -1583,11 +1617,16 @@ pub struct NavSlots {
 /// shared world index, not particular to navigation, even though nav is its biggest reader.
 #[derive(Clone)]
 pub struct WorldSlots {
-    pub entity_positions: EntityPositions,
-    pub entity_ids:       EntityIds,
+    // The three roster maps are PRIVATE (#665): a `pub Arc<Mutex<Roster<..>>>` field hands out a
+    // `MutexGuard`, whose `DerefMut` yields a `&mut Roster` that `mem::swap` can move past the
+    // single-publisher rule (`publish_entities`). Reads go through the [`RosterReadGuard`] accessors
+    // below (no `DerefMut`); the only writer is `publish_entities`. #652 sealed the VALUE producers;
+    // this seals the CONTAINER.
+    entity_positions: EntityPositions,
+    entity_ids:       EntityIds,
     /// name → pose/gait (#643). Same keys as `entity_positions`; published by the same
     /// `sync_entities` full-replace so it can never go stale independently of the roster.
-    pub entity_poses:     EntityPoses,
+    entity_poses:     EntityPoses,
     pub zone_points:      ZonePoints,
 }
 
@@ -1672,6 +1711,77 @@ impl WorldSlots {
             });
         }
         positions.len()
+    }
+
+    /// Read-lock the live **positions** roster (name → `(x, y, z)`). Reads only — the returned
+    /// [`RosterReadGuard`] has no `DerefMut`, so it cannot be swapped or otherwise written; writes
+    /// go through [`publish_entities`](Self::publish_entities) alone (#665).
+    ///
+    /// # ⚠️ Lock order
+    ///
+    /// A site holding more than one of these must acquire them in the canonical order
+    /// `entity_positions()` → `entity_ids()` → `entity_poses()` — the same order `publish_entities`
+    /// and `eqoxide_http::name_match`'s ABBA guard use. Taking them any other way is a deadlock.
+    ///
+    /// # The #665 leak is now a compile error
+    ///
+    /// The original witness moved a whole roster with `mem::swap`, which needs two `&mut Roster`.
+    /// The private field can't be reached and this accessor yields no `&mut`, so both forms fail to
+    /// compile:
+    ///
+    /// ```compile_fail
+    /// // Form 1 — the field is private; `.lock()` is unreachable from outside the crate.
+    /// let world = eqoxide_ipc::WorldSlots::default();
+    /// let _g = world.entity_positions.lock().unwrap();
+    /// ```
+    ///
+    /// ```compile_fail
+    /// // Form 2 — the read accessor yields no `&mut Roster`, so there is nothing to `mem::swap`.
+    /// let world = eqoxide_ipc::WorldSlots::default();
+    /// let scratch = eqoxide_ipc::WorldSlots::default();
+    /// std::mem::swap(
+    ///     &mut *world.entity_positions(),
+    ///     &mut *scratch.entity_positions(),
+    /// );
+    /// ```
+    pub fn entity_positions(&self) -> RosterReadGuard<'_, (f32, f32, f32)> {
+        RosterReadGuard(self.entity_positions.lock().unwrap())
+    }
+
+    /// Read-lock the live **ids** roster (name → spawn id). Reads only; see
+    /// [`entity_positions`](Self::entity_positions) for the lock order and the #665 rationale.
+    pub fn entity_ids(&self) -> RosterReadGuard<'_, u32> {
+        RosterReadGuard(self.entity_ids.lock().unwrap())
+    }
+
+    /// Read-lock the live **poses** roster (name → [`EntityPoseView`]). Reads only; see
+    /// [`entity_positions`](Self::entity_positions) for the lock order and the #665 rationale.
+    pub fn entity_poses(&self) -> RosterReadGuard<'_, EntityPoseView> {
+        RosterReadGuard(self.entity_poses.lock().unwrap())
+    }
+
+    /// **Test fixtures only.** Mutable lock on the **positions** roster, so a test can seed a partial
+    /// or deliberately-mismatched roster via [`Roster::insert_for_test`]. Gated to `test` /
+    /// `test-fixtures`, so it is **absent from `cargo build --release`** — the release build keeps no
+    /// mutable path to these maps outside `publish_entities`, which is what makes the #665 leak a
+    /// compile error there rather than a runtime convention.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn entity_positions_mut(&self) -> std::sync::MutexGuard<'_, Roster<(f32, f32, f32)>> {
+        self.entity_positions.lock().unwrap()
+    }
+
+    /// **Test fixtures only.** Mutable lock on the **ids** roster; see
+    /// [`entity_positions_mut`](Self::entity_positions_mut).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn entity_ids_mut(&self) -> std::sync::MutexGuard<'_, Roster<u32>> {
+        self.entity_ids.lock().unwrap()
+    }
+
+    /// **Test fixtures only.** Mutable lock on the **poses** roster; see
+    /// [`entity_positions_mut`](Self::entity_positions_mut).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn entity_poses_mut(&self) -> std::sync::MutexGuard<'_, Roster<EntityPoseView>> {
+        self.entity_poses.lock().unwrap()
     }
 }
 
@@ -2051,9 +2161,9 @@ mod world_roster_tests_643 {
 
         assert_eq!(world.publish_entities(&entities), 2);
 
-        let positions = world.entity_positions.lock().unwrap();
-        let ids       = world.entity_ids.lock().unwrap();
-        let poses     = world.entity_poses.lock().unwrap();
+        let positions = world.entity_positions();
+        let ids       = world.entity_ids();
+        let poses     = world.entity_poses();
 
         fn sorted<V>(m: &std::collections::HashMap<String, V>) -> Vec<String> {
             let mut v: Vec<String> = m.keys().cloned().collect();
@@ -2086,9 +2196,9 @@ mod world_roster_tests_643 {
             [(2u32, make_entity(2, "new_zone_mob", 0.0, 0.0, 0.0, true))].into_iter().collect();
         world.publish_entities(&second);
 
-        assert!(!world.entity_positions.lock().unwrap().contains_key("old_zone_mob"));
-        assert!(!world.entity_ids.lock().unwrap().contains_key("old_zone_mob"));
-        assert!(!world.entity_poses.lock().unwrap().contains_key("old_zone_mob"),
+        assert!(!world.entity_positions().contains_key("old_zone_mob"));
+        assert!(!world.entity_ids().contains_key("old_zone_mob"));
+        assert!(!world.entity_poses().contains_key("old_zone_mob"),
             "a stale pose is worse than a stale position — it is a confident claim about a body \
              state that no longer exists");
     }

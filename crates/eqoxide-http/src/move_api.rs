@@ -169,8 +169,8 @@ fn current_target_match(
 ) -> Result<NameMatch, (StatusCode, String)> {
     let target_id = s.player().target_id;
     let (key, pos) = {
-        let positions = s.world.entity_positions.lock().unwrap(); // 1st — canonical order
-        let ids = s.world.entity_ids.lock().unwrap();             // 2nd
+        let positions = s.world.entity_positions(); // 1st — canonical order
+        let ids = s.world.entity_ids();             // 2nd
         resolve_current_target(target_id, &ids, &positions)?
     };
     Ok(NameMatch {
@@ -626,8 +626,8 @@ mod tests {
     #[tokio::test]
     async fn goto_unknown_key_is_400_not_silently_defaulted() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat00".into(), 42);
-        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids_mut().insert_for_test("a_rat00".into(), 42);
+        state.world.entity_positions_mut().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
         set_gs(&state, |gs| gs.target_id = Some(42));
         let goto_target = state.nav.goto_target.clone();
         let app = router().with_state(state);
@@ -652,8 +652,8 @@ mod tests {
     #[tokio::test]
     async fn goto_by_name_discloses_matched_entity() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat003".into(), 55);
-        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat003".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids_mut().insert_for_test("a_rat003".into(), 55);
+        state.world.entity_positions_mut().insert_for_test("a_rat003".into(), (10.0, 20.0, 3.0));
         let goto_target = state.nav.goto_target.clone();
         let app = router().with_state(state);
         let req = Request::post("/goto")
@@ -676,12 +676,12 @@ mod tests {
     async fn goto_by_name_prefers_exact_over_fuzzy_decoy() {
         let state = empty_state();
         {
-            let mut ids = state.world.entity_ids.lock().unwrap();
+            let mut ids = state.world.entity_ids_mut();
             ids.insert_for_test("a_rat003".into(), 55);
             ids.insert_for_test("dire_a_rat004".into(), 66); // fuzzy: contains "a rat"
         }
         {
-            let mut pos = state.world.entity_positions.lock().unwrap();
+            let mut pos = state.world.entity_positions_mut();
             pos.insert_for_test("a_rat003".into(), (10.0, 20.0, 3.0));
             pos.insert_for_test("dire_a_rat004".into(), (999.0, 999.0, 3.0));
         }
@@ -729,8 +729,8 @@ mod tests {
                 ("a_gnoll004", 104, (2000.0, 0.0, 0.0)),
             ];
             let seed = |state: &crate::HttpState| {
-                let mut pos = state.world.entity_positions.lock().unwrap();
-                let mut ids = state.world.entity_ids.lock().unwrap();
+                let mut pos = state.world.entity_positions_mut();
+                let mut ids = state.world.entity_ids_mut();
                 for (k, id, p) in rows {
                     pos.insert_for_test(k.into(), p);
                     ids.insert_for_test(k.into(), id);
@@ -776,8 +776,8 @@ mod tests {
     #[tokio::test]
     async fn goto_omits_distance_when_player_position_is_unknown() {
         let state = empty_state(); // player_pos_known defaults to false
-        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat003".into(), 55);
-        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat003".into(), (300.0, 400.0, 0.0));
+        state.world.entity_ids_mut().insert_for_test("a_rat003".into(), 55);
+        state.world.entity_positions_mut().insert_for_test("a_rat003".into(), (300.0, 400.0, 0.0));
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/goto")
             .header("content-type", "application/json")
@@ -792,8 +792,8 @@ mod tests {
     #[tokio::test]
     async fn goto_reports_distance_once_player_position_is_known() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat003".into(), 55);
-        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat003".into(), (300.0, 400.0, 0.0));
+        state.world.entity_ids_mut().insert_for_test("a_rat003".into(), 55);
+        state.world.entity_positions_mut().insert_for_test("a_rat003".into(), (300.0, 400.0, 0.0));
         set_gs(&state, |gs| {
             gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
             gs.player_pos_known = true;
@@ -810,8 +810,8 @@ mod tests {
     #[tokio::test]
     async fn goto_by_nonexistent_name_is_404_and_queues_nothing() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat003".into(), 55);
-        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat003".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids_mut().insert_for_test("a_rat003".into(), 55);
+        state.world.entity_positions_mut().insert_for_test("a_rat003".into(), (10.0, 20.0, 3.0));
         let goto_target = state.nav.goto_target.clone();
         let app = router().with_state(state);
         let req = Request::post("/goto")
@@ -825,8 +825,8 @@ mod tests {
     #[tokio::test]
     async fn goto_no_body_falls_back_to_current_target() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat00".into(), 42);
-        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids_mut().insert_for_test("a_rat00".into(), 42);
+        state.world.entity_positions_mut().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
         set_gs(&state, |gs| gs.target_id = Some(42));
         let goto_target = state.nav.goto_target.clone();
         let app = router().with_state(state);
@@ -840,8 +840,8 @@ mod tests {
     #[tokio::test]
     async fn follow_malformed_name_is_400_not_silently_defaulted() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat00".into(), 42);
-        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids_mut().insert_for_test("a_rat00".into(), 42);
+        state.world.entity_positions_mut().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
         // A current target IS set — the old Option<Json<T>> bug would silently chase IT instead of
         // reporting the malformed "name" field.
         set_gs(&state, |gs| gs.target_id = Some(42));
@@ -861,8 +861,8 @@ mod tests {
     #[tokio::test]
     async fn follow_no_body_falls_back_to_current_target() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat00".into(), 42);
-        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids_mut().insert_for_test("a_rat00".into(), 42);
+        state.world.entity_positions_mut().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
         set_gs(&state, |gs| gs.target_id = Some(42));
         let goto_entity = state.nav.goto_entity.clone();
         let app = router().with_state(state);
@@ -944,8 +944,8 @@ mod tests {
     #[tokio::test]
     async fn follow_while_dead_is_rejected_and_queues_nothing() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat00".into(), 42);
-        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids_mut().insert_for_test("a_rat00".into(), 42);
+        state.world.entity_positions_mut().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
         set_gs(&state, |gs| gs.player_dead = true);
         let goto_entity = state.nav.goto_entity.clone();
         let app = router().with_state(state);

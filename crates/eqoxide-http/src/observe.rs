@@ -1104,11 +1104,11 @@ async fn get_entities(State(s): State<HttpState>, Query(q): Query<EntitiesQuery>
     // `entity_positions` → `entity_ids` → `entity_poses` (poses last in both, positions first in
     // both). See the canonical-order note in `name_match.rs`. Do not reverse these.
     let (entities, deduped, duplicate_groups, poses) = {
-        let positions = s.world.entity_positions.lock().unwrap();
+        let positions = s.world.entity_positions();
         let (entities, deduped, duplicate_groups) = dedup_entities(&positions);
         // Only pay for the pose projection on the labeled shape; the bare map does not carry it.
         let poses = if labeled {
-            let all = s.world.entity_poses.lock().unwrap();
+            let all = s.world.entity_poses();
             entities.keys()
                 .filter_map(|n| all.get(n).map(|p| (n.clone(), p.clone())))
                 .collect::<HashMap<_, _>>()
@@ -1954,7 +1954,7 @@ mod tests {
     async fn entities_default_returns_bare_deduped_map_471() {
         let state = empty_state();
         {
-            let mut pos = state.world.entity_positions.lock().unwrap();
+            let mut pos = state.world.entity_positions_mut();
             pos.insert_for_test("Geeda".to_string(),        (100.0, 200.0, 5.0));
             pos.insert_for_test("Geeda00".to_string(),      (100.0, 200.0, 5.0)); // the duplicate
             pos.insert_for_test("Bidl_Frugrin".to_string(), (10.0,  20.0,  3.0));
@@ -1978,7 +1978,7 @@ mod tests {
     async fn entities_labeled_param_returns_rich_shape_471() {
         let state = empty_state();
         {
-            let mut pos = state.world.entity_positions.lock().unwrap();
+            let mut pos = state.world.entity_positions_mut();
             pos.insert_for_test("Geeda".to_string(),   (100.0, 200.0, 5.0));
             pos.insert_for_test("Geeda00".to_string(), (100.0, 200.0, 5.0));
         }

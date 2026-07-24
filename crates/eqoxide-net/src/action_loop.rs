@@ -3335,7 +3335,7 @@ mod tests {
         let nav = test_action_loop(group);
         nav.sync_entities(&gs);
 
-        let poses = nav.world.entity_poses.lock().unwrap();
+        let poses = nav.world.entity_poses();
         assert_eq!(poses["a_sitter"].pose, "sitting");
         assert_eq!(poses["a_sitter"].gait, Some(12));
         assert_eq!(poses["a_backpedaller"].pose, "standing");

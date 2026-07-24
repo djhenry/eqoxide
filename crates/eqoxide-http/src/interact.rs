@@ -142,7 +142,7 @@ async fn post_hail(
 ) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let requested = body.and_then(|b| b.name);
-    let positions = s.world.entity_positions.lock().unwrap();
+    let positions = s.world.entity_positions();
 
     let resolved: Option<String> = if let Some(name) = &requested {
         // Exact (clean) match first, then fuzzy substring.
@@ -171,7 +171,7 @@ async fn post_hail(
             let display_name = clean_entity_name(&key);
             // Resolve the NPC's spawn_id so the nav thread can target it before saying — the
             // server only fires EVENT_SAY on the player's current target (#130).
-            let spawn_id = s.world.entity_ids.lock().unwrap().get(&key).copied();
+            let spawn_id = s.world.entity_ids().get(&key).copied();
             s.command.request_hail(display_name.clone(), spawn_id);
             tracing::info!("hail: queued hail to {:?} (spawn_id={:?})", display_name, spawn_id);
             (StatusCode::OK, format!("hailing {}", display_name))
@@ -249,7 +249,7 @@ async fn post_loot(
     if let Err(e) = require_live_session(&s) { return e; }
     let b = body.unwrap_or_default();
     if let Some(id) = b.id {
-        let ids = s.world.entity_ids.lock().unwrap();
+        let ids = s.world.entity_ids();
         let found = ids.iter().find(|(_, &v)| v == id).map(|(k, _)| k.clone());
         drop(ids);
         return match found {
@@ -260,7 +260,7 @@ async fn post_loot(
         };
     }
     if let Some(name) = &b.name {
-        let ids = s.world.entity_ids.lock().unwrap();
+        let ids = s.world.entity_ids();
         let nl = name.to_lowercase();
         let matches: Vec<(String, u32)> = ids.iter()
             .filter(|(k, _)| is_corpse_key(k)
@@ -277,8 +277,8 @@ async fn post_loot(
     }
     // Nearest corpse to the player (camera focus = player pos).
     let focus = s.camera.snapshot.lock().unwrap().focus;
-    let positions = s.world.entity_positions.lock().unwrap();
-    let ids = s.world.entity_ids.lock().unwrap();
+    let positions = s.world.entity_positions();
+    let ids = s.world.entity_ids();
     let resolved = positions.iter()
         .filter(|(k, _)| is_corpse_key(k))
         .map(|(k, &(x, y, _))| {
@@ -334,7 +334,7 @@ async fn post_give(
     // Resolve the NPC, then DROP the entity map lock before awaiting — never hold a std Mutex across
     // an `.await`.
     let found = {
-        let ids = s.world.entity_ids.lock().unwrap();
+        let ids = s.world.entity_ids();
         let nl = b.npc.to_lowercase();
         ids.iter()
             .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
@@ -454,8 +454,8 @@ mod tests {
     use crate::testkit::empty_state;
 
     fn seed_npc(state: &crate::HttpState, key: &str, id: u32, pos: (f32, f32, f32)) {
-        state.world.entity_positions.lock().unwrap().insert_for_test(key.to_string(), pos);
-        state.world.entity_ids.lock().unwrap().insert_for_test(key.to_string(), id);
+        state.world.entity_positions_mut().insert_for_test(key.to_string(), pos);
+        state.world.entity_ids_mut().insert_for_test(key.to_string(), id);
     }
 
     // --- run/walk (#625): the toggle queues an intent for action_loop to send OP_SetRunMode ----
