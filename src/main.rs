@@ -413,6 +413,7 @@ fn main() {
         let controller_b      = controller.clone();
         let guild_slots_b     = guild_slots.clone();
         let sc  = shared_collision.clone();
+        let za  = zone_assets.clone(); // #600: the walker reads this SAME load-state handle for its gate
         let sd  = shutdown.clone();
         let cp  = lifecycle.camp.clone();
         let cu  = lifecycle.camp_until.clone();
@@ -446,6 +447,7 @@ fn main() {
             guild_slots:     guild_slots_b,
             collision:       sc,
             nav_debug:       nav_debug_view.clone(),
+            zone_assets:     za,
             maps_dir:        md,
             shutdown:        sd,
             camp:            cp,

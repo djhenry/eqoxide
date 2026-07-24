@@ -147,6 +147,16 @@ pub struct Walker {
     nav:       eqoxide_ipc::NavSlots,
     world:     eqoxide_ipc::WorldSlots,
     collision: crate::collision::SharedCollision,
+    /// The zone terrain+collision LOAD STATE (#579), the SAME shared handle `main.rs` hands the
+    /// HTTP surface. The walker consults it through [`crate::zone_assets::usability`] — the ONE
+    /// decision function every consumer goes through (#600) — before routing, so that in the ~1-frame
+    /// window where the net thread has published the new `player.zone` but the render thread has not
+    /// yet started the new load, the walker REFUSES rather than routing on the previous zone's grid
+    /// (`self.collision` still holds it). Gating on `collision.is_none()` alone could not see that
+    /// window: the old grid is present and non-empty, so the walker would have routed on the WRONG
+    /// world (the #560 shape). `usability` returns `None` only for a `Ready` grid whose zone equals
+    /// the player's, so a `None` verdict guarantees `self.collision` is the RIGHT zone's grid.
+    zone_assets: crate::zone_assets::ZoneAssetStateShared,
     /// The ONLY movement channel — see the module doc's "intent-only movement boundary".
     nav_intent: eqoxide_ipc::NavIntent,
     /// The published nav diagnostics snapshot (#608, replacing the old `NavPathView` pair): the
@@ -244,9 +254,13 @@ impl Walker {
         collision:  crate::collision::SharedCollision,
         nav_intent: eqoxide_ipc::NavIntent,
         nav_debug:  crate::diagnostics::NavDebugView,
+        // The #579 load-state handle, SAME Arc as the HTTP surface's (see the field doc). Drives the
+        // #600 zone-identity gate in `drive_walk`; must not be a fresh `Default` or the gate would
+        // reason about a different state than the loader writes.
+        zone_assets: crate::zone_assets::ZoneAssetStateShared,
     ) -> Self {
         Walker {
-            nav, world, collision, nav_intent, nav_debug,
+            nav, world, collision, nav_intent, nav_debug, zone_assets,
             debug_seq: 0,
             last_plan: None,
             last_pads: Vec::new(),
@@ -306,6 +320,14 @@ impl Walker {
     pub fn reset_for_zone_change(&mut self) {
         *self.nav.goto_target.lock().unwrap() = None;
         *self.nav.goto_entity.lock().unwrap() = None;
+        // #600 review round 3: a one-shot `/zone_cross` that never resolved (re-queued through an
+        // asset load for a zone we then LEFT — a Failed load, or a server-initiated move mid-load)
+        // must NOT survive into the next zone and fire an unexpected crossing there. The queued id is
+        // in the PREVIOUS zone's advertised-zonepoint space; the world has changed, so clearing it is
+        // the safe/honest choice. A cross genuinely still mid-resolution for the CURRENT zone has
+        // already been turned into a concrete `goto_target` (also cleared here), so nothing legitimate
+        // is lost.
+        *self.nav.zone_cross.lock().unwrap() = None;
         *self.nav_intent.lock().unwrap() = None; // stop driving the controller toward the stale aim
         // The debug snapshot's plan/pads/clearance describe the PREVIOUS zone's geometry — keeping
         // them would present the old zone's trace over the new zone's world (#608 honesty).
@@ -800,8 +822,21 @@ impl Walker {
                 self.clear_local_plan();
                 self.awaiting_first_plan = false;
                 *self.nav_intent.lock().unwrap() = None;
+                // #600: a queued `/zone_cross` is a PENDING intent even before it has a concrete goto
+                // goal — `ActionLoop::drain_zone_cross` refuses to resolve it while the zone's assets
+                // are not usable and publishes `zone_loading`, re-queueing the one-shot request so it
+                // resolves once they land. Resetting that `zone_loading` back to `idle` here (no goto
+                // goal is set yet) would flip the state to a misleading "ready/idle" every tick while
+                // the load runs. So keep `zone_loading` while a cross is still queued. `/stop`
+                // (`CommandState::request_stop`) DOES clear `nav.zone_cross` (round-3 fix), so after a
+                // stop `zone_cross_pending` is false and this branch retires `zone_loading`→`idle` on
+                // the very next tick — the cross is genuinely cancelled, not left to fire post-load.
+                // (Only `zone_loading` is guarded — navigating/planning/dead never coexist with an
+                // unresolved queued cross.)
+                let zone_cross_pending = self.nav.zone_cross.lock().unwrap().is_some();
                 if self.nav_state_is("navigating") || self.nav_state_is("navigating_partial")
-                    || self.nav_state_is("planning") || self.nav_state_is(NAV_STATE_ZONE_LOADING)
+                    || self.nav_state_is("planning")
+                    || (self.nav_state_is(NAV_STATE_ZONE_LOADING) && !zone_cross_pending)
                     // #644: once the player has RESPAWNED (no longer dead ⇒ this tick reaches
                     // `resolve_goal`), retire the terminal `dead` back to `idle` so the honest
                     // death state doesn't linger as a new never-clearing observable.
@@ -978,7 +1013,7 @@ impl Walker {
     /// `nav_state: "navigating"` and steered in a dead-straight line at the goal, so an agent
     /// observing mid-load saw a confident walkable route through geometry that had not been built
     /// (the "700u unobstructed" of the false #560 report).
-    fn halt_no_world(&mut self, player: Option<[f32; 3]>) {
+    fn halt_no_world(&mut self, player: Option<[f32; 3]>, reason: &str) {
         self.path.clear();
         self.path_i = 0;
         self.path_goal = None;      // force a REAL plan the moment collision appears
@@ -986,7 +1021,11 @@ impl Walker {
         self.planner.cancel();
         self.awaiting_first_plan = false;
         *self.nav_intent.lock().unwrap() = None;
-        self.set_nav_state_because(NAV_STATE_ZONE_LOADING, Some("zone_assets_not_loaded"));
+        // `reason` is the machine-readable WHY from `zone_assets::usability` (#600) — the SAME
+        // vocabulary the HTTP surface publishes: `zone_assets_pending` / `_failed` / `_idle` /
+        // `_stale_for_previous_zone` / `player_zone_unknown`. Each is verifiably the variant the
+        // one decision function returned, not a coarser reworded claim.
+        self.set_nav_state_because(NAV_STATE_ZONE_LOADING, Some(reason));
         // Publish honestly: `zone_model_loaded: false`, no routes — "I have no model of this
         // world", never a route through unloaded geometry (#579). `player` comes from the caller's
         // GameState (None until the server placed us — never a fabricated position, #615 F1).
@@ -994,11 +1033,23 @@ impl Walker {
     }
 
     pub fn drive_walk(&mut self, gs: &mut GameState, goal: (f32, f32, f32)) {
-        // No collision grid → no world model. Never present a straight line through unloaded
-        // geometry as a route (#579). Checked BEFORE any planning/steering so the walker cannot
-        // move the character on a world it does not have.
-        if self.collision.read().unwrap().is_none() {
-            self.halt_no_world(Self::known_pos(gs));
+        // THE ONE DECISION FUNCTION (#600). May nav route on the loaded world at all? This is the
+        // SAME predicate the HTTP surface goes through (`zone_assets::usability`), so the walker is
+        // no longer a consumer that opts out. It supersedes the old `collision.is_none()` check:
+        //   * no grid at all (Idle/Pending/Failed) — as before, refuse (#579), AND
+        //   * a grid that is present but belongs to the zone we just LEFT — the ~1-frame stale
+        //     window after the net thread published the new `player.zone` but before the render
+        //     thread ran `begin_zone_load` (StaleForPreviousZone). The old check could not see this
+        //     (the previous zone's grid is present + non-empty), so the walker would have routed on
+        //     the WRONG world — the #560 shape this fix closes.
+        // A `None` verdict is returned ONLY for a `Ready` grid whose zone == `gs.world.zone_name`
+        // (the SAME string the HTTP `player().zone` reads), so passing this gate guarantees
+        // `self.collision` below is the RIGHT zone's grid. Checked BEFORE any planning/steering.
+        if let Some(why) = {
+            let st = crate::zone_assets::lock_state(&self.zone_assets);
+            crate::zone_assets::usability(&st, &gs.world.zone_name)
+        } {
+            self.halt_no_world(Self::known_pos(gs), why.as_str());
             return;
         }
         if self.replan_cooldown > 0 { self.replan_cooldown -= 1; }
@@ -1066,8 +1117,10 @@ impl Walker {
                     }
                 }
                 // The collision grid vanished between the gate at the top of this fn and here (a
-                // zone change landing mid-tick). Same honest answer, never a bare "navigating".
-                None => { self.halt_no_world(Self::known_pos(gs)); return; }
+                // zone change landing mid-tick: the render thread ran `begin_zone_load`, which
+                // clears the grid AND sets the state to `Pending` for the new zone in one call).
+                // Same honest answer, never a bare "navigating".
+                None => { self.halt_no_world(Self::known_pos(gs), "zone_assets_pending"); return; }
             }
         }
 
@@ -1436,6 +1489,23 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// The canonical zone the walker fixtures live in. Navigating tests set
+    /// `gs.world.zone_name = TEST_ZONE` so the #600 identity gate (`usability`) passes.
+    const TEST_ZONE: &str = "testfixture";
+
+    /// Build a `zone_assets` handle CONSISTENT with the collision handed in — the same coupling
+    /// production keeps (`finish_zone_load` writes both from one verdict): a present grid ⇒
+    /// `Ready(TEST_ZONE)` carrying that very grid; no grid ⇒ `Pending(TEST_ZONE)` (assets still
+    /// loading — the #579 window). So `usability` sees a real state, not a fabricated one.
+    fn zone_assets_for(collision: &crate::collision::SharedCollision)
+        -> crate::zone_assets::ZoneAssetStateShared {
+        let st = match collision.read().unwrap().as_ref() {
+            Some(c) => crate::zone_assets::ZoneAssetState::ready(TEST_ZONE, 1, c.clone()),
+            None    => crate::zone_assets::ZoneAssetState::pending(TEST_ZONE, "loading…"),
+        };
+        Arc::new(std::sync::Mutex::new(st))
+    }
+
     fn walker_with(collision: crate::collision::SharedCollision)
         -> (Walker, eqoxide_ipc::NavSlots, eqoxide_ipc::NavIntent, crate::diagnostics::NavDebugView)
     {
@@ -1443,7 +1513,23 @@ mod tests {
         let world: eqoxide_ipc::WorldSlots = Default::default();
         let intent: eqoxide_ipc::NavIntent = Default::default();
         let view: crate::diagnostics::NavDebugView = Default::default();
-        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone());
+        let za = zone_assets_for(&collision);
+        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone(), za);
+        (w, nav, intent, view)
+    }
+
+    /// As [`walker_with`], but the caller supplies the SHARED `collision` + `zone_assets` handles so a
+    /// test can mutate them mid-run through `begin_zone_load`/`finish_zone_load` (the true two-writer
+    /// coupling). Returns the walker plus the nav/intent handles.
+    fn walker_with_shared(
+        collision: crate::collision::SharedCollision,
+        zone_assets: crate::zone_assets::ZoneAssetStateShared,
+    ) -> (Walker, eqoxide_ipc::NavSlots, eqoxide_ipc::NavIntent, crate::diagnostics::NavDebugView) {
+        let nav: eqoxide_ipc::NavSlots = Default::default();
+        let world: eqoxide_ipc::WorldSlots = Default::default();
+        let intent: eqoxide_ipc::NavIntent = Default::default();
+        let view: crate::diagnostics::NavDebugView = Default::default();
+        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone(), zone_assets);
         (w, nav, intent, view)
     }
 
@@ -1500,7 +1586,8 @@ mod tests {
         let intent: eqoxide_ipc::NavIntent = Default::default();
         let view: crate::diagnostics::NavDebugView = Default::default();
         let col = Arc::new(std::sync::RwLock::new(Some(Arc::new(pad_scene_leaves(two_leaves)))));
-        let w = Walker::new(nav, world.clone(), col, intent, view);
+        let za = zone_assets_for(&col); // pad tests don't drive `drive_walk`; a consistent handle regardless
+        let w = Walker::new(nav, world.clone(), col, intent, view, za);
         *world.zone_points.lock().unwrap() = vec![eqoxide_core::game_state::ZonePoint {
             iterator:  PAD_INDEX as u32,
             server_x:  dest[0], server_y: dest[1], server_z: dest[2],
@@ -1773,10 +1860,13 @@ mod tests {
     /// agent polling in that window read a confident walkable route through geometry that had not
     /// been built: the "700u unobstructed" of the false #560 report.
     ///
-    /// The honest answer is `zone_loading` / `zone_assets_not_loaded`, with NO movement intent and
-    /// NO route overlay — "I have no model of this world", not "the way is clear".
+    /// The honest answer is `zone_loading` / (here) `zone_assets_pending`, with NO movement intent and
+    /// NO route overlay — "I have no model of this world", not "the way is clear". Since #600 the
+    /// walker refuses through the SAME `zone_assets::usability` predicate the HTTP surface uses, so
+    /// the reason is that predicate's own verdict (a still-loading zone ⇒ `zone_assets_pending`).
     #[test]
     fn no_collision_reports_zone_loading_and_never_a_route() {
+        // `walker_with` with no grid ⇒ zone_assets = Pending(TEST_ZONE) (assets still loading).
         let (mut w, nav, intent, view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
         let mut gs = eqoxide_core::game_state::GameState::new();
         gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
@@ -1786,7 +1876,8 @@ mod tests {
         let s = nav.nav_state.lock().unwrap().clone();
         assert_eq!(s.state, NAV_STATE_ZONE_LOADING,
             "with no collision the walker must NOT claim to be navigating — that is the #579 lie");
-        assert_eq!(s.reason.as_deref(), Some("zone_assets_not_loaded"));
+        assert_eq!(s.reason.as_deref(), Some("zone_assets_pending"),
+            "#600: the refusal reason is `usability`'s own verdict — a still-loading zone is pending");
         assert!(intent.lock().unwrap().is_none(),
             "the walker must not drive the controller through a world it has not loaded");
         let snap = view.lock().unwrap().clone().expect("the honest no-world state must be published");
@@ -1795,6 +1886,97 @@ mod tests {
             "no route may be published without collision");
         assert_eq!(snap.nav_state, NAV_STATE_ZONE_LOADING);
         assert!(w.path.is_empty());
+    }
+
+    /// **#600 — THE UNIVERSAL: the walker can NEVER route on a collision grid whose zone is not the
+    /// one the character is in.** The sibling of `zone_assets::no_interleaving_of_the_two_writers_
+    /// yields_a_usable_wrong_zone`, but exercising the CONSUMER (`drive_walk`) rather than the pure
+    /// predicate — because before this fix the walker consulted `collision.is_none()`, not
+    /// `usability`, and so opted out of the guarantee #595 built.
+    ///
+    /// It drives the REAL `drive_walk` across EVERY interleaving of the two independent writers around
+    /// a zone change — the net thread publishing `player.zone` (`apply_net`) and the render thread
+    /// running `begin_zone_load` (`apply_render`) — through SHARED `collision`+`zone_assets` handles
+    /// the loader mutates for real. In the stale window (net published the new zone, render has not
+    /// yet started the load) the grid is STILL PRESENT and non-empty (the exact case
+    /// `collision.is_none()` cannot see), and the walker must REFUSE, naming
+    /// `zone_assets_stale_for_previous_zone` — never commit a route or a movement intent through the
+    /// zone it just left.
+    ///
+    /// **Mutation check (do this to trust the test):** revert the `drive_walk` gate to
+    /// `if self.collision.read().unwrap().is_none()` → in every `net_first` iteration with
+    /// `render_lag >= 1` the walker routes on the previous zone's grid and the `state ==
+    /// NAV_STATE_ZONE_LOADING` assertion in the stale window goes RED. A test that passes both ways
+    /// pins nothing; this one does not.
+    #[test]
+    fn walker_never_routes_on_a_collision_grid_whose_zone_is_not_the_players() {
+        use crate::zone_assets::{begin_zone_load, finish_zone_load, ZoneAssetState, ZoneAssetStateShared};
+        // A real floor grid per zone, as the bare `Arc<Collision>` `finish_zone_load` commits.
+        let grid = || open_plane(600.0).read().unwrap().clone().unwrap();
+        let goal = (400.0, 0.0, 0.0);
+
+        for net_first in [true, false] {
+            for render_lag in 0..4u32 {
+                // SHARED handles: the walker reads them; `begin`/`finish_zone_load` (the render
+                // thread's writes) mutate them — the true two-writer coupling, not a fabricated state.
+                let col: crate::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
+                let za: ZoneAssetStateShared = Arc::new(std::sync::Mutex::new(ZoneAssetState::Idle));
+                finish_zone_load(&col, &za, "freporte", Some(grid()), 9, None); // fully loaded, OLD zone
+                let (mut w, nav, intent, _view) = walker_with_shared(col.clone(), za.clone());
+                let mut gs = eqoxide_core::game_state::GameState::new();
+                gs.world.zone_name = "freporte".into();
+                gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
+                *nav.goto_target.lock().unwrap() = Some(goal);
+
+                // CONTROL: a Ready grid for the player's OWN zone must let nav route (no regression —
+                // the gate must pass normally once the correct zone's collision is loaded).
+                w.drive_walk(&mut gs, goal);
+                assert_ne!(nav.nav_state.lock().unwrap().state, NAV_STATE_ZONE_LOADING,
+                    "control: routing must be PERMITTED for the player's own loaded zone");
+
+                let apply_net = |gs: &mut GameState| gs.world.zone_name = "qeynos".into();
+                let apply_render = |col: &crate::collision::SharedCollision, za: &ZoneAssetStateShared|
+                    begin_zone_load(col, za, "qeynos", "loading…");
+
+                if net_first {
+                    apply_net(&mut gs);
+                    // THE STALE WINDOW. player.zone = qeynos, but `col` still holds freporte's grid
+                    // and `za` is still Ready(freporte). The walker MUST refuse on the wrong world.
+                    for _ in 0..render_lag {
+                        assert!(col.read().unwrap().is_some(),
+                            "precondition: the stale window HAS a present grid — the case collision.is_none() misses");
+                        w.drive_walk(&mut gs, goal);
+                        let s = nav.nav_state.lock().unwrap().clone();
+                        assert_eq!(s.state, NAV_STATE_ZONE_LOADING,
+                            "net-first lag {render_lag}: routed on the PREVIOUS zone's grid in the stale window (#600)");
+                        assert_eq!(s.reason.as_deref(), Some("zone_assets_stale_for_previous_zone"),
+                            "the refusal must name the wrong-world reason, not a generic one");
+                        assert!(w.path.is_empty(), "no route may be committed for a zone we are not in");
+                        assert!(intent.lock().unwrap().is_none(), "no movement intent through the wrong world");
+                    }
+                    apply_render(&col, &za);
+                } else {
+                    apply_render(&col, &za); // render clears the grid + goes Pending BEFORE net flips the zone
+                    for _ in 0..render_lag {
+                        w.drive_walk(&mut gs, goal);
+                        assert_eq!(nav.nav_state.lock().unwrap().state, NAV_STATE_ZONE_LOADING,
+                            "render-first lag {render_lag}: must refuse mid-change");
+                    }
+                    apply_net(&mut gs);
+                }
+
+                // Still loading the new zone (grid None, state Pending): refuse.
+                w.drive_walk(&mut gs, goal);
+                assert_eq!(nav.nav_state.lock().unwrap().state, NAV_STATE_ZONE_LOADING,
+                    "the new zone's grid is not built yet — refuse");
+
+                // The new zone's grid lands and the player IS in it: routing resumes (no regression).
+                finish_zone_load(&col, &za, "qeynos", Some(grid()), 5, None);
+                w.drive_walk(&mut gs, goal);
+                assert_ne!(nav.nav_state.lock().unwrap().state, NAV_STATE_ZONE_LOADING,
+                    "once the correct zone's grid is loaded, in-zone navigation must resume");
+            }
+        }
     }
 
     /// The state must not be terminal-sticky: it is a fact about right now, and the goal is KEPT so
@@ -1822,6 +2004,54 @@ mod tests {
         *nav.goto_target.lock().unwrap() = None;
         assert!(w.resolve_goal(&gs).is_none());
         assert_eq!(nav.nav_state.lock().unwrap().state, "idle");
+    }
+
+    /// **#600 (review round 2): `resolve_goal`'s guard responds to the `nav.zone_cross` slot state.**
+    /// This is a PURE MECHANISM test of `resolve_goal` in isolation — it drives the slot directly
+    /// (`nav.zone_cross`) because `CommandState`/`request_stop` live in a crate ABOVE this one and are
+    /// not reachable here. What actually WRITES that slot in production — `drain_zone_cross` re-queuing
+    /// during a load, and `request_stop`/`reset_for_zone_change` CLEARING it — is exercised through the
+    /// real drivers in the eqoxide-net test `zone_cross_queued_during_load_is_cancellable_by_stop_
+    /// and_never_leaks`. Here we only pin the guard's response: a present slot HOLDS `zone_loading`; an
+    /// absent slot retires it to `idle`.
+    ///
+    /// Mutation check: drop `&& !zone_cross_pending` from the reset guard in `resolve_goal` → this
+    /// goes RED (the state resets to `idle` with the slot still set). Complements
+    /// `cancelling_the_goto_while_loading_returns_to_idle`, which pins the empty-slot case still resets.
+    #[test]
+    fn resolve_goal_holds_zone_loading_while_the_zone_cross_slot_is_set() {
+        let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        let gs = eqoxide_core::game_state::GameState::new();
+        // The drain published zone_loading and re-queued the one-shot cross; no goto goal is set.
+        w.set_nav_state_because(NAV_STATE_ZONE_LOADING, Some("zone_assets_pending"));
+        *nav.zone_cross.lock().unwrap() = Some(30);
+        assert!(nav.goto_target.lock().unwrap().is_none(), "no concrete goto goal yet — that is the point");
+
+        assert!(w.resolve_goal(&gs).is_none());
+        assert_eq!(nav.nav_state.lock().unwrap().state, NAV_STATE_ZONE_LOADING,
+            "#600: zone_loading must persist while the zone_cross slot is set, not flip to a misleading idle");
+
+        // Slot cleared (what the real `request_stop`/`reset_for_zone_change` do): the tick retires it.
+        *nav.zone_cross.lock().unwrap() = None;
+        assert!(w.resolve_goal(&gs).is_none());
+        assert_eq!(nav.nav_state.lock().unwrap().state, "idle",
+            "with the slot cleared, zone_loading retires to idle exactly as before");
+    }
+
+    /// **#600 (review round 3): a never-resolved one-shot `/zone_cross` must NOT leak across a zone
+    /// change.** If a cross was re-queued through an asset load for a zone we then leave (a Failed load,
+    /// or a server-initiated move mid-load), `reset_for_zone_change` must clear `nav.zone_cross` — else
+    /// it survives into the NEXT zone and fires an unexpected crossing there.
+    ///
+    /// Mutation check: delete the `*self.nav.zone_cross.lock().unwrap() = None;` line from
+    /// `reset_for_zone_change` → this goes RED (the stale cross leaks into the new zone).
+    #[test]
+    fn reset_for_zone_change_clears_a_never_resolved_zone_cross() {
+        let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        *nav.zone_cross.lock().unwrap() = Some(30); // queued but never resolved (loaded through a change)
+        w.reset_for_zone_change();
+        assert!(nav.zone_cross.lock().unwrap().is_none(),
+            "#600: a one-shot cross that never resolved must not survive into the next zone");
     }
 
     /// #644: the honest terminal `dead` state must NOT become a new never-clearing observable — once
@@ -1916,6 +2146,7 @@ mod tests {
         use crate::diagnostics::{EdgeKind, EdgeVerdict};
         let (mut w, nav, _intent, view) = walker_with(open_plane(400.0));
         let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.world.zone_name = TEST_ZONE.into(); // #600: match the loaded zone so `usability` permits routing
         gs.player_x = -300.0; gs.player_y = 0.0; gs.player_z = 0.0;
         gs.player_pos_known = true;
         *nav.goto_target.lock().unwrap() = Some((300.0, 0.0, 0.0));
@@ -2063,6 +2294,7 @@ mod tests {
     fn drive_walk_terminates_no_progress_on_an_advancing_partial_lap() {
         let (mut w, nav, _intent, _view) = walker_with(open_plane(600.0));
         let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.world.zone_name = TEST_ZONE.into(); // #600: loaded-zone match
         gs.player_x = 10.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
         let goal = (500.0, 0.0, 0.0); // far → ArrivalAction::Drive
         *nav.goto_target.lock().unwrap() = Some(goal);
@@ -2103,6 +2335,7 @@ mod tests {
         let mut gs = eqoxide_core::game_state::GameState::new();
         // The walker is on its go-around, currently FAR (straight-line) from the goal — the peak of
         // the away-leg — and standing on waypoint 3 of a long COMPLETE route.
+        gs.world.zone_name = TEST_ZONE.into(); // #600: loaded-zone match
         gs.player_x = 500.0; gs.player_y = 800.0; gs.player_z = 0.0; gs.player_pos_known = true;
         let goal = (1000.0, 0.0, 0.0);
         *nav.goto_target.lock().unwrap() = Some(goal);
@@ -2139,6 +2372,7 @@ mod tests {
     fn drive_walk_never_terminates_a_route_that_is_still_getting_closer() {
         let (mut w, nav, _intent, _view) = walker_with(open_plane(600.0));
         let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.world.zone_name = TEST_ZONE.into(); // #600: loaded-zone match
         gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
         let goal = (500.0, 0.0, 0.0);
         *nav.goto_target.lock().unwrap() = Some(goal);

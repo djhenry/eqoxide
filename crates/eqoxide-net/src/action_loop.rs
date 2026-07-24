@@ -488,6 +488,11 @@ pub struct ActionLoop {
     /// workers, which it owns exclusively. See `eqoxide_nav::walker` for the intent-only movement
     /// boundary: `Walker` writes ONLY `controller.nav_intent`, never a position or the controller.
     walker:           eqoxide_nav::walker::Walker,
+    /// The zone terrain+collision LOAD STATE (#579), the SAME shared handle the walker and the HTTP
+    /// surface hold. `drain_zone_cross` consults it through `zone_assets::usability` (#600) so its
+    /// collision-derived refusal is the honest transient `zone_loading` while the assets are not
+    /// usable — never a definitive `no_path` an agent would read as "give up permanently".
+    zone_assets:      eqoxide_nav::zone_assets::ZoneAssetStateShared,
     /// The spawn id the pet was last ordered to attack (avoids re-spamming OP_PetCommands every
     /// tick). Reset when the target changes; see the auto-pet-combat block.
     last_pet_target:  Option<u32>,
@@ -596,10 +601,13 @@ impl ActionLoop {
         // The published nav diagnostics view (#608): a `.clone()` of the SAME slot `main.rs` hands
         // to the render + HTTP consumers. The Walker is its only writer.
         nav_debug:       eqoxide_nav::diagnostics::NavDebugView,
+        // The zone terrain+collision LOAD STATE (#579), the SAME shared handle as the HTTP surface's.
+        // The Walker consults it through `zone_assets::usability` for the #600 zone-identity gate.
+        zone_assets:     eqoxide_nav::zone_assets::ZoneAssetStateShared,
     ) -> Self {
         let walker = eqoxide_nav::walker::Walker::new(
             nav.clone(), world.clone(), collision.clone(), controller.nav_intent.clone(),
-            nav_debug,
+            nav_debug, zone_assets.clone(),
         );
         ActionLoop {
             nav,
@@ -631,6 +639,7 @@ impl ActionLoop {
             last_tick: Instant::now(),
             auto_attack: false,
             walker,
+            zone_assets,
             last_pet_target: None,
             controller,
             guild_slots,
@@ -1388,72 +1397,104 @@ impl ActionLoop {
         // zone-point index (iterator), locate that DRNTP region in the zone BSP, and walk there.
         let cross_req = self.command.take_zone_cross();
         if let Some(want_zone) = cross_req {
-            // want_zone != 0 → resolve it to a zone-point index; want_zone == 0 → any nearest line.
-            let want_index = if want_zone != 0 {
-                match self.world.zone_points.lock().unwrap().iter()
-                    .find(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32)
-                {
-                    Some(idx) => Some(idx),
-                    None => {
-                        tracing::info!("zone_cross: no zone point advertised for zone_id={want_zone}");
-                        gs.log_msg("zone", "No zone line found to cross");
-                        // Make the failure observable instead of a silent no-op (#267): a caller that
-                        // got 200 from POST /zone_cross can poll nav_state and see it didn't happen.
-                        // With a REASON — a terminal state with `nav_reason: null` contradicts the
-                        // contract this PR documents (#377 review, N2).
-                        self.walker.set_nav_state_because("no_path", Some("no_zone_line_to_zone"));
-                        None
-                    }
-                }
-            } else {
-                None // any zone line
+            // #600 — THE ONE DECISION FUNCTION, at the THIRD world-answering consumer. The resolution
+            // below reads the SAME shared collision grid the walker/HTTP read AND publishes an
+            // agent-observable nav_state. While the zone's assets are not usable — still loading
+            // (`collision == None`, ~10s), a failed load, or the previous zone's grid in the ~1-frame
+            // stale window — `located` would be `None` and the old code published `no_path`
+            // ("DEFINITIVE: no route exists, do not retry"). That is a confident falsehood: the cross
+            // may be perfectly reachable once the world finishes loading, and telling the agent to
+            // give up permanently is WORSE than the walker case. Gate it through `usability` first and
+            // answer the honest transient `zone_loading` with the predicate's own verdict (the SAME
+            // vocabulary the HTTP surface and the walker publish). RE-QUEUE the one-shot request so it
+            // resolves for real once the correct zone's assets land — mirroring the `zone_loading`
+            // contract the walker's kept goto already honours. `None` (usable) ⇒ the collision read
+            // below is the right zone's grid, and a genuine `no_path` there is truthful.
+            let not_ready = {
+                let st = eqoxide_nav::zone_assets::lock_state(&self.zone_assets);
+                eqoxide_nav::zone_assets::usability(&st, &gs.world.zone_name)
             };
-            // Only proceed if we actually have a target (want_zone==0 always may; want_zone!=0 needs a match).
-            if want_zone == 0 || want_index.is_some() {
-                // Locate the NEAREST reachable zone-line region for the wanted zone (not the first
-                // zone-point index that matches — a zone with several lines to the same target, or an
-                // in-zone translocator with multiple advertised points, would otherwise pick one with
-                // no nearby region and no-op, #266). want_index==None → any nearest line.
-                let located = self.collision.read().unwrap().as_ref().and_then(|c| {
-                    let pos = [gs.player_x, gs.player_y, gs.player_z];
-                    match (want_zone, want_index) {
-                        (0, _) => c.find_zone_line_near(None, pos),
-                        (_, _) => {
-                            // Every zone-point index advertised for `want_zone`, nearest region wins.
-                            let idxs: Vec<i32> = self.world.zone_points.lock().unwrap().iter()
-                                .filter(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32).collect();
-                            idxs.iter()
-                                .filter_map(|&idx| c.find_zone_line_near(Some(idx), pos))
-                                .min_by(|a, b| {
-                                    let da = (a.1[0]-pos[0]).hypot(a.1[1]-pos[1]);
-                                    let db = (b.1[0]-pos[0]).hypot(b.1[1]-pos[1]);
-                                    da.total_cmp(&db)
-                                })
+            if let Some(why) = not_ready {
+                // Re-queue the one-shot request FIRST so the cross resolves for real once the correct
+                // zone's assets land (mirroring the kept-goto `zone_loading` contract). `request_zone_
+                // cross` stamps a transient `pending` on the SHARED nav_state; publish the honest
+                // `zone_loading` AFTER it so the load-window state is the accurate one, not `pending`'s
+                // ≤150ms promise. The queued request also keeps `resolve_goal` from resetting this
+                // `zone_loading` back to `idle` (see its zone-cross guard) — so the state is STABLE
+                // across the whole load, not a one-tick flash.
+                self.command.request_zone_cross(want_zone);
+                self.walker.set_nav_state_because(
+                    eqoxide_nav::walker::NAV_STATE_ZONE_LOADING, Some(why.as_str()));
+            } else {
+                // want_zone != 0 → resolve it to a zone-point index; want_zone == 0 → any nearest line.
+                let want_index = if want_zone != 0 {
+                    match self.world.zone_points.lock().unwrap().iter()
+                        .find(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32)
+                    {
+                        Some(idx) => Some(idx),
+                        None => {
+                            tracing::info!("zone_cross: no zone point advertised for zone_id={want_zone}");
+                            gs.log_msg("zone", "No zone line found to cross");
+                            // Make the failure observable instead of a silent no-op (#267): a caller that
+                            // got 200 from POST /zone_cross can poll nav_state and see it didn't happen.
+                            // With a REASON — a terminal state with `nav_reason: null` contradicts the
+                            // contract this PR documents (#377 review, N2). Reached only when the zone IS
+                            // usable (gated above), so this is a truthful definitive no, not a load artefact.
+                            self.walker.set_nav_state_because("no_path", Some("no_zone_line_to_zone"));
+                            None
                         }
                     }
-                });
-                match located {
-                    Some((index, [tx, ty, tz])) => {
-                        // Destination zone for logging (resolve the located region's index).
-                        let dest_zone = self.world.zone_points.lock().unwrap().iter()
-                            .find(|zp| zp.iterator as i32 == index).map(|zp| zp.zone_id).unwrap_or(want_zone);
-                        let d2 = (tx - gs.player_x).powi(2) + (ty - gs.player_y).powi(2);
-                        const ZONE_LINE_DIST2: f32 = 15.0 * 15.0;
-                        if d2 <= ZONE_LINE_DIST2 {
-                            // Already standing on the line — the auto-cross below fires this tick.
-                            tracing::info!("zone_cross: already on the zone_id={dest_zone} line (index={index})");
-                        } else {
-                            tracing::info!("zone_cross: walking {:.0}u to the zone_id={dest_zone} line at ({tx:.0},{ty:.0}) (index={index})", d2.sqrt());
-                            gs.log_msg("zone", &format!("Walking to the zone {} line", dest_zone));
-                            self.command.request_goto((tx, ty, tz));
+                } else {
+                    None // any zone line
+                };
+                // Only proceed if we actually have a target (want_zone==0 always may; want_zone!=0 needs a match).
+                if want_zone == 0 || want_index.is_some() {
+                    // Locate the NEAREST reachable zone-line region for the wanted zone (not the first
+                    // zone-point index that matches — a zone with several lines to the same target, or an
+                    // in-zone translocator with multiple advertised points, would otherwise pick one with
+                    // no nearby region and no-op, #266). want_index==None → any nearest line.
+                    let located = self.collision.read().unwrap().as_ref().and_then(|c| {
+                        let pos = [gs.player_x, gs.player_y, gs.player_z];
+                        match (want_zone, want_index) {
+                            (0, _) => c.find_zone_line_near(None, pos),
+                            (_, _) => {
+                                // Every zone-point index advertised for `want_zone`, nearest region wins.
+                                let idxs: Vec<i32> = self.world.zone_points.lock().unwrap().iter()
+                                    .filter(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32).collect();
+                                idxs.iter()
+                                    .filter_map(|&idx| c.find_zone_line_near(Some(idx), pos))
+                                    .min_by(|a, b| {
+                                        let da = (a.1[0]-pos[0]).hypot(a.1[1]-pos[1]);
+                                        let db = (b.1[0]-pos[0]).hypot(b.1[1]-pos[1]);
+                                        da.total_cmp(&db)
+                                    })
+                            }
                         }
-                    }
-                    None => {
-                        tracing::info!("zone_cross: no zone-line region found for zone_id={want_zone}");
-                        gs.log_msg("zone", "No zone line found to cross");
-                        // Advertised in OP_SendZonepoints but no DRNTP region in the loaded map (a .wtr
-                        // gap): report it so the caller isn't left thinking the 200 meant success (#267).
-                        self.walker.set_nav_state_because("no_path", Some("zone_line_not_in_map"));
+                    });
+                    match located {
+                        Some((index, [tx, ty, tz])) => {
+                            // Destination zone for logging (resolve the located region's index).
+                            let dest_zone = self.world.zone_points.lock().unwrap().iter()
+                                .find(|zp| zp.iterator as i32 == index).map(|zp| zp.zone_id).unwrap_or(want_zone);
+                            let d2 = (tx - gs.player_x).powi(2) + (ty - gs.player_y).powi(2);
+                            const ZONE_LINE_DIST2: f32 = 15.0 * 15.0;
+                            if d2 <= ZONE_LINE_DIST2 {
+                                // Already standing on the line — the auto-cross below fires this tick.
+                                tracing::info!("zone_cross: already on the zone_id={dest_zone} line (index={index})");
+                            } else {
+                                tracing::info!("zone_cross: walking {:.0}u to the zone_id={dest_zone} line at ({tx:.0},{ty:.0}) (index={index})", d2.sqrt());
+                                gs.log_msg("zone", &format!("Walking to the zone {} line", dest_zone));
+                                self.command.request_goto((tx, ty, tz));
+                            }
+                        }
+                        None => {
+                            tracing::info!("zone_cross: no zone-line region found for zone_id={want_zone}");
+                            gs.log_msg("zone", "No zone line found to cross");
+                            // Advertised in OP_SendZonepoints but no DRNTP region in the loaded map (a .wtr
+                            // gap): report it so the caller isn't left thinking the 200 meant success (#267).
+                            // Gated above, so the grid IS this zone's — a truthful definitive no.
+                            self.walker.set_nav_state_because("no_path", Some("zone_line_not_in_map"));
+                        }
                     }
                 }
             }
@@ -3367,7 +3408,182 @@ mod tests {
             Default::default(), // collision
             std::path::PathBuf::new(), // maps_dir
             Default::default(), // nav_debug (#608)
+            std::sync::Arc::new(std::sync::Mutex::new(
+                eqoxide_nav::zone_assets::ZoneAssetState::Idle)), // zone_assets (#600)
         )
+    }
+
+    /// **#600 (review round 2): `drain_zone_cross` is the THIRD world-answering consumer, and it must
+    /// route its collision-derived refusal through the ONE decision function too.** It reads the SAME
+    /// shared collision grid and publishes an agent-observable `nav_state`. Before this fix, while the
+    /// zone's assets were not usable (`collision == None` for the whole ~10s load, a failed load, or
+    /// the previous zone's grid in the ~1-frame stale window) it published `no_path`
+    /// ("DEFINITIVE: no route exists, do not retry") — telling an agent to give up permanently on a
+    /// crossing that is reachable the moment the world finishes loading. That is a worse lie than the
+    /// walker case (which never claimed definitiveness).
+    ///
+    /// This drives the REAL `drain_zone_cross` (shared handles, real-driver style) across the not-ready
+    /// states — loading (`Pending`), the stale window (`Ready` for the PREVIOUS zone), and a failed
+    /// load — and asserts each answers the honest transient `zone_loading` (never `no_path`) and
+    /// re-queues the one-shot request. It also pins that once the zone IS usable, a genuine no-region
+    /// result is STILL the truthful `no_path` — the gate suppresses the lie, not legitimate refusals.
+    ///
+    /// **Mutation check:** revert the `drain_zone_cross` gate (delete the `usability` guard, run the
+    /// resolution unconditionally) → every not-ready case publishes `no_path` and the
+    /// `state == "zone_loading"` assertions go RED. A test that passes both ways pins nothing.
+    #[tokio::test]
+    async fn drain_zone_cross_routes_its_refusal_through_usability_never_a_definitive_no_path() {
+        use eqoxide_nav::zone_assets::{self, ZoneAssetState};
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        const WANT: u16 = 30;
+        // A real flat-floor `Ready` grid (no zone-line regions) via the test fixture — used for the
+        // stale and usable cases where a grid must be present.
+        let grid = ZoneAssetState::test_ready().collision().unwrap().clone();
+
+        // (label, player_zone, expect_zone_loading). Collision + zone_assets are set per label below.
+        for &(label, player_zone, want_loading) in &[
+            ("loading",          "freporte", true),  // Pending, collision None — the ~10s load window
+            ("stale",            "qeynos",   true),  // Ready for the PREVIOUS zone (freporte) — ~1-frame window
+            ("failed",           "freporte", true),  // the load failed
+            ("usable_no_region", "freporte", false), // usable ⇒ a genuine, TRUTHFUL no_path is still allowed
+        ] {
+            let mut al = test_action_loop(Default::default());
+            // Advertise a zone line for WANT so, ABSENT the gate, resolution reaches a COLLISION-derived
+            // decision (region lookup) rather than short-circuiting on "no zone point advertised".
+            *al.world.zone_points.lock().unwrap() = vec![zp_at(7, WANT, [10.0, 10.0, 0.0])];
+            match label {
+                "loading" => zone_assets::begin_zone_load(&al.collision, &al.zone_assets, "freporte", "loading…"),
+                "failed"  => zone_assets::finish_zone_load(&al.collision, &al.zone_assets, "freporte", None, 0, Some("boom")),
+                // stale + usable both need a present grid; only the player_zone differs.
+                _ => zone_assets::finish_zone_load(&al.collision, &al.zone_assets, "freporte", Some(grid.clone()), 1, None),
+            }
+
+            let mut gs = eqoxide_core::game_state::GameState::new();
+            gs.world.zone_name = player_zone.into();
+            gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
+
+            al.command.request_zone_cross(WANT);
+            al.drain_zone_cross(&mut stream, &mut gs);
+
+            let s = al.nav.nav_state.lock().unwrap().clone();
+            let requeued = al.command.take_zone_cross().is_some();
+            if want_loading {
+                assert_eq!(s.state, "zone_loading",
+                    "{label}: a zone_cross while assets aren't usable must be the honest transient \
+                     zone_loading, NEVER the definitive no_path (#600)");
+                assert!(requeued,
+                    "{label}: the one-shot request must be re-queued so it resolves once assets land");
+            } else {
+                // Usable + no matching region in the (flat) grid ⇒ a TRUTHFUL definitive no.
+                assert_eq!(s.state, "no_path",
+                    "{label}: once the zone IS usable, a genuine no-region result is a truthful no_path — \
+                     the gate must suppress the load-window LIE, not legitimate refusals");
+                assert_eq!(s.reason.as_deref(), Some("zone_line_not_in_map"));
+                assert!(!requeued, "{label}: a usable, resolved attempt consumes the request");
+            }
+        }
+    }
+
+    /// Build an `ActionLoop` whose `command` facade SHARES the walker's `NavSlots` — exactly as
+    /// `main.rs` wires production (both are `.clone()`s of the one bundle). So a `request_zone_cross`/
+    /// `request_stop` on the returned `CommandState` writes the SAME `nav.zone_cross` slot that
+    /// `drain_zone_cross` drains and `Walker::resolve_goal` reads. (The default `test_action_loop`
+    /// gives `command` its OWN nav, which is fine for slot round-trips but cannot exercise the
+    /// cross-slot coupling this test needs.) Returns the loop + the shared handles the test drives.
+    fn shared_nav_action_loop() -> (
+        ActionLoop, eqoxide_ipc::NavSlots, eqoxide_command::CommandState,
+        eqoxide_nav::collision::SharedCollision, eqoxide_nav::zone_assets::ZoneAssetStateShared,
+    ) {
+        let nav = eqoxide_ipc::NavSlots {
+            nav_state: std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::NavStatus::default())),
+            ..Default::default()
+        };
+        let command = eqoxide_command::CommandState::new(
+            Default::default(), Default::default(), Default::default(), Default::default(),
+            Default::default(), Default::default(), Default::default(), Default::default(),
+            Default::default(), Default::default(), nav.clone(), Default::default(),
+        );
+        let collision: eqoxide_nav::collision::SharedCollision = Default::default();
+        let zone_assets: eqoxide_nav::zone_assets::ZoneAssetStateShared =
+            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_nav::zone_assets::ZoneAssetState::Idle));
+        let al = ActionLoop::new(
+            nav.clone(), Default::default(), Default::default(), Default::default(),
+            command.clone(), Default::default(), Default::default(), Default::default(),
+            Default::default(), Default::default(), Default::default(), Default::default(),
+            collision.clone(), std::path::PathBuf::new(), Default::default(), zone_assets.clone(),
+        );
+        (al, nav, command, collision, zone_assets)
+    }
+
+    /// **#600 review round 3: a `/zone_cross` queued during an asset load is CANCELLABLE by `/stop`,
+    /// and never leaks.** Drives the REAL `request_stop` (not a manual slot null) through the whole
+    /// chain: `drain_zone_cross` re-queues the cross during the load and publishes `zone_loading`;
+    /// `resolve_goal` holds `zone_loading` while it is queued; `request_stop` clears the queued cross;
+    /// `resolve_goal` then retires `zone_loading`→`idle`; and after the assets land the cross does NOT
+    /// fire (no crossing attempt). A no-`/stop` positive control proves the cross WOULD otherwise still
+    /// be live post-load — so `/stop` is genuinely the differentiator.
+    ///
+    /// **Mutation check:** delete `*self.nav.zone_cross.lock().unwrap() = None;` from
+    /// `CommandState::request_stop` → after `/stop` the cross stays queued, so (a) `resolve_goal` keeps
+    /// `zone_loading` instead of retiring to `idle` AND (b) the post-load drain fires the cross — both
+    /// asserted here, so this goes RED.
+    #[tokio::test]
+    async fn zone_cross_queued_during_load_is_cancellable_by_stop_and_never_leaks() {
+        use eqoxide_nav::zone_assets;
+        const WANT: u16 = 30;
+
+        // ── The fix: /stop cancels the queued-during-load cross ───────────────────────────────────
+        let (mut al, nav, command, collision, za) = shared_nav_action_loop();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        *al.world.zone_points.lock().unwrap() = vec![zp_at(7, WANT, [10.0, 10.0, 0.0])];
+        zone_assets::begin_zone_load(&collision, &za, "freporte", "loading…"); // assets loading, collision None
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.world.zone_name = "freporte".into();
+
+        command.request_zone_cross(WANT);
+        al.drain_zone_cross(&mut stream, &mut gs);
+        assert_eq!(nav.nav_state.lock().unwrap().state, "zone_loading", "loading: honest transient state");
+        assert_eq!(*nav.zone_cross.lock().unwrap(), Some(WANT), "the cross was re-queued to resolve post-load");
+
+        // resolve_goal (no concrete goto goal yet) HOLDS zone_loading while the cross is queued.
+        assert!(al.walker.resolve_goal(&gs).is_none());
+        assert_eq!(nav.nav_state.lock().unwrap().state, "zone_loading",
+            "a queued cross holds zone_loading, not a misleading idle");
+
+        // The REAL /stop: it must cancel the queued cross.
+        command.request_stop();
+        assert!(nav.zone_cross.lock().unwrap().is_none(), "/stop must clear the queued cross (#600 rd3)");
+
+        // Now resolve_goal retires zone_loading → idle honestly (the cross is genuinely cancelled).
+        assert!(al.walker.resolve_goal(&gs).is_none());
+        assert_eq!(nav.nav_state.lock().unwrap().state, "idle",
+            "after /stop the cross is gone, so zone_loading retires to idle");
+
+        // Assets land: the cancelled cross must NOT fire. drain finds an empty slot and does nothing.
+        zone_assets::finish_zone_load(&collision, &za,
+            "freporte", Some(zone_assets::ZoneAssetState::test_ready().collision().unwrap().clone()), 1, None);
+        al.drain_zone_cross(&mut stream, &mut gs);
+        assert!(nav.goto_target.lock().unwrap().is_none(),
+            "the cancelled cross must not fire a crossing attempt after the load completes");
+        assert_eq!(nav.nav_state.lock().unwrap().state, "idle", "still idle — no post-/stop crossing");
+
+        // ── Positive control: WITHOUT /stop the cross is still live post-load (so /stop mattered) ──
+        let (mut al2, nav2, command2, collision2, za2) = shared_nav_action_loop();
+        *al2.world.zone_points.lock().unwrap() = vec![zp_at(7, WANT, [10.0, 10.0, 0.0])];
+        zone_assets::begin_zone_load(&collision2, &za2, "freporte", "loading…");
+        let mut gs2 = eqoxide_core::game_state::GameState::new();
+        gs2.world.zone_name = "freporte".into();
+        command2.request_zone_cross(WANT);
+        al2.drain_zone_cross(&mut stream, &mut gs2);
+        assert_eq!(nav2.nav_state.lock().unwrap().state, "zone_loading");
+        // No /stop this time. Assets land; the still-queued cross RESOLVES (flat grid ⇒ no region ⇒ a
+        // truthful no_path — the point is it ATTEMPTED the cross, unlike the cancelled case above).
+        zone_assets::finish_zone_load(&collision2, &za2,
+            "freporte", Some(zone_assets::ZoneAssetState::test_ready().collision().unwrap().clone()), 1, None);
+        al2.drain_zone_cross(&mut stream, &mut gs2);
+        assert_eq!(nav2.nav_state.lock().unwrap().state, "no_path",
+            "without /stop the re-queued cross is still live and resolves after load — /stop is the differentiator");
+        assert!(nav2.zone_cross.lock().unwrap().is_none(), "a usable resolution consumes the cross");
     }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────

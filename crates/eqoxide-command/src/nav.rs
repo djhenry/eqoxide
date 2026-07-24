@@ -64,12 +64,21 @@ impl CommandState {
         self.stamp_new_goal("pending", Some(pos))
     }
 
-    /// Cancel any active goto/follow (POST /v1/move/stop). Clears both slots — idempotent. Returns
-    /// the new `goal_id` (#349): the state resets to `idle` under a fresh identity, so a read right
-    /// after `/stop` can never return the cancelled goal's terminal `arrived`/`no_path`.
+    /// Cancel any active goto/follow (POST /v1/move/stop). Clears the goto/follow slots AND the
+    /// one-shot `zone_cross` slot — idempotent. Returns the new `goal_id` (#349): the state resets to
+    /// `idle` under a fresh identity, so a read right after `/stop` can never return the cancelled
+    /// goal's terminal `arrived`/`no_path`.
+    ///
+    /// **`zone_cross` must be cleared here too (#600 review round 3).** A `/zone_cross` issued while
+    /// the zone's assets are still loading is RE-QUEUED by `drain_zone_cross` (so it resolves once
+    /// they land). If `/stop` did not clear that slot, the cross would be UNCANCELLABLE — `/stop`
+    /// would silently no-op and the client would cross anyway when the load finished (a confident
+    /// ACTION lie: the agent asked to stop, the client crossed regardless), and the `zone_loading`
+    /// state would never retire because `resolve_goal`'s `!zone_cross_pending` guard stayed false.
     pub fn request_stop(&self) -> u64 {
         *self.nav.goto_target.lock().unwrap() = None;
         *self.nav.goto_entity.lock().unwrap() = None;
+        *self.nav.zone_cross.lock().unwrap() = None;
         self.stamp_new_goal("idle", None)
     }
 
@@ -257,5 +266,22 @@ mod tests {
 
         cs.request_zone_cross(42);
         assert_eq!(cs.take_zone_cross(), Some(42));
+    }
+
+    /// **#600 review round 3: `/stop` must CANCEL a queued `/zone_cross`.** A cross issued while the
+    /// zone's assets are still loading is re-queued by `drain_zone_cross` (so it resolves once they
+    /// land); if `request_stop` did not clear `nav.zone_cross`, the cross would be uncancellable and
+    /// fire anyway after the load — a confident ACTION lie (the agent asked to stop, the client
+    /// crossed regardless).
+    ///
+    /// Mutation check: delete the `*self.nav.zone_cross.lock().unwrap() = None;` line from
+    /// `request_stop` → `take_zone_cross()` still returns `Some(30)` here and this goes RED.
+    #[test]
+    fn request_stop_cancels_a_queued_zone_cross() {
+        let cs = CommandState::default();
+        cs.request_zone_cross(30);
+        cs.request_stop();
+        assert_eq!(cs.take_zone_cross(), None,
+            "#600: /stop must clear the queued cross so it cannot fire after the load completes");
     }
 }

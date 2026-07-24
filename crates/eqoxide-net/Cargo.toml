@@ -34,6 +34,10 @@ tracing = "0.1"
 # eqoxide-command, so invisible across the crate boundary otherwise. action_loop's death/zone-clear
 # tests read it.
 eqoxide-command = { path = "../eqoxide-command", features = ["test-fixtures"] }
+# `ZoneAssetState::test_ready()` — a real flat-floor `Ready` (with a genuine collision grid), gated
+# behind `test-fixtures` in eqoxide-nav. The #600 drain_zone_cross honesty test uses it to build the
+# STALE-window case (a grid that is Ready for the PREVIOUS zone) without pulling in eqoxide-assets.
+eqoxide-nav = { path = "../eqoxide-nav", features = ["test-fixtures"] }
 # `game_state::make_entity` — a `#[cfg(test)]` fixture constructor in eqoxide-core, exposed to this
 # crate's test build via `test-fixtures`. packet_handler's loot/target tests seed entities with it.
 eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }

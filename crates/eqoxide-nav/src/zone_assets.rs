@@ -251,13 +251,35 @@ impl NotUsable {
     }
 }
 
-/// **The one decision function.** May the loaded assets be used to answer questions about the world
-/// the character is standing in? `None` = yes; `Some(reason)` = no, and here is the machine-readable
-/// why.
+/// **The one decision function for whether to answer about the world.** May the loaded assets be
+/// used to answer a ROUTE or GEOMETRY question about the world the character is standing in? `None` =
+/// yes; `Some(reason)` = no, and here is the machine-readable why.
 ///
 /// It is pure and takes the player's zone explicitly, so the zone-identity check can never be
 /// forgotten by a caller that only had the state handy — and so the universal claim ("a `ready`
 /// observation is never about a zone you are not in") is a property test, not a live run.
+///
+/// **Which consumers actually go through it (verified by grep, not asserted — #600).** Three, and
+/// they are the three that make a world-answering claim (a route/geometry answer or an
+/// agent-observable `nav_state`) off the shared collision grid:
+///   * the HTTP world-observation endpoints — `/observe/frame`, `/observe/zone_exits`,
+///     `/observe/zone_entrances`, `/observe/debug`'s zone block, etc. — via `zone_assets_not_ready`
+///     (`crates/eqoxide-http/src/observe.rs`), which early-returns a 503 before any collision read;
+///   * the nav path-walker's `drive_walk` gate (`crate::walker`, #600), which refuses to route in the
+///     stale/loading window instead of steering on the previous zone's grid; and
+///   * `ActionLoop::drain_zone_cross` (`crates/eqoxide-net/src/action_loop.rs`, #600 review round 2),
+///     which resolves `/v1/move/zone_cross` off the grid and publishes `nav_state` — it answers the
+///     honest transient `zone_loading` while not usable instead of a definitive `no_path`.
+/// A `None` here therefore guarantees, for ALL THREE, that the collision grid they go on to read is
+/// the current zone's. What does NOT go through it, deliberately (each verified to make no
+/// route/geometry claim about the current zone):
+///   * the two per-zone DIAGNOSTIC COUNTERS `nav_support` and `nav_tight` read `shared_collision`
+///     directly, but publish only cumulative metadata (facing-blind / minimum-clearance query counts
+///     since zone load) and ride the SAME `/observe/debug` response as the honest `zone_assets`
+///     verdict beside them — never a route/geometry answer; and
+///   * the other `action_loop` collision reads (combat line-of-sight, swim probing, the physical
+///     auto-cross that fires from the character's real position) drive PHYSICAL movement/crossing,
+///     server-authoritative — not an observable route/geometry claim an agent reads back.
 pub fn usability(state: &ZoneAssetState, player_zone: &str) -> Option<NotUsable> {
     let loaded = match state {
         ZoneAssetState::Idle       => return Some(NotUsable::Idle),
@@ -496,8 +518,10 @@ mod tests {
     //
     // `docs/http-api.md` claims a `ready` observation is NEVER about a zone you are not in. That is
     // a universal, so per the verification hierarchy it needs a PROPERTY test — a live run is an
-    // existence proof over one trajectory and cannot discharge a "never". These exercise the single
-    // decision function every consumer goes through.
+    // existence proof over one trajectory and cannot discharge a "never". These exercise the
+    // decision function `usability` at the PREDICATE level; the nav walker — the other consumer that
+    // goes through it (#600) — is exercised at the CONSUMER level by
+    // `walker::tests::walker_never_routes_on_a_collision_grid_whose_zone_is_not_the_players`.
 
     /// EXHAUSTIVE over the cross product of every state shape × every player-zone value:
     /// `usability` returns `None` (= may describe the world) **if and only if** the state is `Ready`
