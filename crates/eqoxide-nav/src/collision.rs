@@ -3350,6 +3350,30 @@ impl Collision {
                         }
                         continue;
                     }
+                    // #700: the coarse tier validates the walk edge with a centre RAY (to keep narrow
+                    // corridors routable, `edge_clear`); but a STEEP step-DOWN is a body-WIDTH question,
+                    // and that centre ray OVER-ACCEPTS a lip the swept body cannot descend — the open
+                    // qeynos canal lip, where the ray threads a notch in the lip the shoulders hit, so
+                    // coarse commits to a ~14u drop the fine 2u swept tier and the controller then
+                    // refuse. Re-validate a steep drop with the SWEPT body on the coarse tier so the
+                    // two agree. Gated tightly to keep blast radius near zero: only the COARSE tier
+                    // (the fine tier already sweeps here), only a DROP, and only one STEEPER than
+                    // `MAX_WALK_GRADE` — the grade band the walk edge otherwise skips entirely for a
+                    // descent (the `rise > 0.0` guard above), i.e. exactly the lip/cliff faces a
+                    // walking body cannot stroll down. Gentle ramps/stairs stay on the ray, unchanged.
+                    if cell > SWEPT_EDGE_MAX_CELL && rise < 0.0 {
+                        let run = (((dc * dc + dr * dr) as f32).sqrt()) * cell;
+                        if (cz - nf) / run > MAX_WALK_GRADE
+                            && !trav.can_descend_swept(
+                                crate::traversability::Point::new([a[0], a[1]], cz),
+                                crate::traversability::Point::new([b[0], b[1]], nf)) {
+                            if let Some(t) = tr.as_deref_mut() {
+                                t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                    EdgeVerdict::Rejected { reason: RejectReason::Clearance });
+                            }
+                            continue;
+                        }
+                    }
                     if let Some(t) = tr.as_deref_mut() {
                         t.edge([a[0], a[1], cz], [b[0], b[1], nf],
                             EdgeVerdict::Accepted { kind: EdgeKind::Walk });
@@ -7183,6 +7207,178 @@ mod tests {
             println!("find_path_local {:?} -> state={} reason={} steer_len={}",
                 carrot, out.state(), out.reason(), out.steer().len());
         }
+    }
+
+    /// #700 blast-radius A/B, PLANNER level (fast — no controller). Seeds the SAME pairs as
+    /// `walker_sim::descent_guard_blast_radius` and dumps per-pair `AB <zone> <i> routed maxdrop len`.
+    /// Run on the gate-ON build and a gate-OFF build (revert the swept-drop gate), diff the AB lines:
+    /// a pair that flips routed 1→0 is a route the fix removed; controller-drive only those to prove
+    /// each removed a body-impassable edge (never a false no_path). ZONE_DIR + optional ZONES/PAIRS.
+    #[test]
+    #[ignore = "requires baked zone glbs at $ZONE_DIR; #700 planner-level blast-radius A/B"]
+    fn fix_700_planner_ab_corpus() {
+        let dir = std::env::var("ZONE_DIR")
+            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+        let zones: Vec<String> = std::env::var("ZONES").ok()
+            .map(|z| z.split(',').map(str::to_string).collect())
+            .unwrap_or_else(|| ["qeynos", "qcat", "halas", "akanon", "blackburrow", "qeynos2", "gfaydark",
+                "crushbone", "neriaka", "felwithea", "highpass", "everfrost", "butcher", "cazicthule", "oasis"]
+                .into_iter().map(str::to_string).collect());
+        let pairs_per_zone: usize = std::env::var("PAIRS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+        let mut seed: u64 = 0x693A_11CE;
+        let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
+        let unit = |r: u32| r as f32 / u32::MAX as f32;
+        let (mut g_pairs, mut g_routed, mut g_steep) = (0usize, 0usize, 0usize);
+        for zone in &zones {
+            let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
+            let Ok(za) = ZoneAssets::from_glb(&p) else { println!("AB {zone} (no glb)"); continue };
+            let mut col = Collision::build(&za, 32.0);
+            if col.cols == 0 { continue; }
+            col.set_water(eqoxide_core::region_map::RegionMap::load(
+                &std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
+            let (mut z_pairs, mut tries) = (0usize, 0usize);
+            while z_pairs < pairs_per_zone && tries < pairs_per_zone * 70 + 500 {
+                tries += 1;
+                let e = col.origin[0] + unit(rnd()) * (col.cols as f32 * col.cell_size);
+                let n = col.origin[1] + unit(rnd()) * (col.rows as f32 * col.cell_size);
+                let Some(z) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { continue };
+                let ang = unit(rnd()) * std::f32::consts::TAU;
+                let d = 80.0 + unit(rnd()) * 320.0;
+                let (ge, gn) = (e + d * ang.cos(), n + d * ang.sin());
+                let Some(gz) = col.nearest_floor(ge, gn, z, 400.0, 400.0) else { continue };
+                let (s, g) = ([e, n, z], [ge, gn, gz]);
+                if col.in_water(s) || col.in_water(g) { continue; }
+                z_pairs += 1; g_pairs += 1;
+                match col.find_path_ex(s, g, eqoxide_core::physics::PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) {
+                    PlanOutcome::Route(route) => {
+                        g_routed += 1;
+                        let maxdrop = route.windows(2).map(|w| w[0][2] - w[1][2]).fold(0.0f32, f32::max);
+                        // steep = the route has a drop family the #700 gate can touch
+                        let steep = route.windows(2).any(|w| {
+                            let run = (w[1][0]-w[0][0]).hypot(w[1][1]-w[0][1]).max(0.01);
+                            (w[0][2]-w[1][2]) > 8.0 && (w[0][2]-w[1][2])/run > MAX_WALK_GRADE
+                        });
+                        if steep { g_steep += 1; }
+                        println!("AB {zone} {z_pairs} routed=1 maxdrop={maxdrop:.1} len={} steep={} s[{:.0},{:.0},{:.0}] g[{:.0},{:.0},{:.0}]",
+                            route.len(), steep as u8, s[0],s[1],s[2], g[0],g[1],g[2]);
+                    }
+                    other => println!("AB {zone} {z_pairs} routed=0 reason={} s[{:.0},{:.0},{:.0}] g[{:.0},{:.0},{:.0}]",
+                        other.reason(), s[0],s[1],s[2], g[0],g[1],g[2]),
+                }
+            }
+        }
+        println!("AB_TOTAL pairs={g_pairs} routed={g_routed} steep_drop_routes={g_steep}");
+        assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR");
+    }
+
+    /// A vertical wall segment at constant `east`, spanning north `[n0,n1]` and height `[h0,h1]`.
+    /// (`wall_east` spans the full north range; this leaves an authored gap.)
+    #[cfg(test)]
+    fn wall_east_seg(e: f32, n0: f32, n1: f32, h0: f32, h1: f32) -> MeshData {
+        MeshData {
+            positions: vec![[n0, h0, e], [n1, h0, e], [n1, h1, e], [n0, h1, e]],
+            normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        }
+    }
+
+    /// **#700: the coarse tier must not commit to a steep drop the swept body cannot descend.**
+    ///
+    /// At the qeynos canal lip the COARSE walk-edge test (a centre RAY on the 8u grid — deliberately,
+    /// so it does not reject narrow *corridors*, see [`Collision::edge_clear`]) ACCEPTS a ~14u lip
+    /// step-down that the FINE 2u swept tier — and the real controller — REFUSE: the ray threads a
+    /// notch in the lip the character's shoulders hit. Coarse then commits to a lip descent the fine
+    /// stage cannot realize (`local_no_way_through`). A step-DOWN is a body-WIDTH question, not a
+    /// corridor-selection one, so the fix re-validates a STEEP drop with the swept body on the coarse
+    /// tier too (only drops steeper than `MAX_WALK_GRADE` — the band the walk edge otherwise skips
+    /// for a descent — so gentle ramps/stairs are untouched).
+    ///
+    /// Synthetic repro: a 14u drop crossed by a wall with a body-narrow (3u) centre notch. The narrow
+    /// north strip forces the only crossing cell to sit at the notch, which is ray-clear but
+    /// swept-blocked. Coarse must refuse the drop. **Mutation check: delete the swept-drop gate in
+    /// `astar` and coarse routes it → RED** (verified at authoring). The `_open_` sibling is the
+    /// over-tightening guard.
+    #[test]
+    fn coarse_refuses_a_steep_drop_the_swept_body_cannot_descend() {
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
+        // Narrow north strip [-4,4] so the sole crossing cell centres at north 0 (grid-robust).
+        let col = Collision::build(&ZoneAssets {
+            terrain: vec![
+                slab(0.0, -4.0, 4.0, -40.0, -3.0, true),     // top plateau, z=0 (edge at east -3)
+                slab(-14.0, -4.0, 4.0, 3.0, 40.0, true),     // pit floor 14u below (edge at east 3)
+                wall_east_seg(0.0, 0.8, 40.0, -14.0, 8.0),   // lip wall N half
+                wall_east_seg(0.0, -40.0, -0.8, -14.0, 8.0), // lip wall S half → gap north[-0.8,0.8]
+                                                             // (< body diameter 2.0 → body can't fit)
+            ], objects: vec![], textures: vec![],
+        }, 8.0);
+        // Predicate level: the coarse centre ray threads the notch (the over-accept); the swept body
+        // does not fit the 3u notch.
+        let a = crate::traversability::Point::new([-4.0, 0.0], 0.0);
+        let b = crate::traversability::Point::new([4.0, 0.0], -14.0);
+        let coarse = crate::traversability::Traversability::new(&col, r, 8.0, 0.0, false);
+        assert!(coarse.can_traverse_fast(a, b),
+            "#700 premise: the coarse centre ray threads the body-narrow lip notch (the over-accept)");
+        assert!(!coarse.can_descend_swept(a, b),
+            "#700 premise: the swept body cannot descend the 3u notch — the fine tier's verdict");
+        // Route level: after the fix coarse must NOT hand back a route over the notch.
+        let route = col.find_path([-16.0, 0.0, 0.0], [16.0, 0.0, -14.0], r, &[], false);
+        assert!(route.is_none(),
+            "#700: coarse must refuse a steep drop the swept body cannot descend (the only ray-clear \
+             crossing is the body-narrow notch). Revert the swept-drop gate → a route appears → RED. \
+             got {route:?}");
+    }
+
+    /// **#700 over-tightening guard (the dominant risk — the #693 lesson).** A genuinely OPEN steep
+    /// 14u drop the body CAN descend must STILL route after the swept-drop gate: the gate rejects only
+    /// lips the shoulders hit, never open drops. Same scene as the sibling above but with NO lip wall.
+    #[test]
+    fn coarse_still_routes_a_genuinely_open_steep_drop() {
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
+        let col = Collision::build(&ZoneAssets {
+            terrain: vec![
+                slab(0.0, -4.0, 4.0, -40.0, -3.0, true),
+                slab(-14.0, -4.0, 4.0, 3.0, 40.0, true), // fully open 14u drop, no wall
+            ], objects: vec![], textures: vec![],
+        }, 8.0);
+        let a = crate::traversability::Point::new([-4.0, 0.0], 0.0);
+        let b = crate::traversability::Point::new([4.0, 0.0], -14.0);
+        let coarse = crate::traversability::Traversability::new(&col, r, 8.0, 0.0, false);
+        assert!(coarse.can_descend_swept(a, b),
+            "an OPEN steep drop must pass the swept body test — nothing for the shoulders to hit");
+        let route = col.find_path([-16.0, 0.0, 0.0], [16.0, 0.0, -14.0], r, &[], false);
+        assert!(route.is_some(),
+            "#700 over-tightening guard: a genuinely open 14u drop the body CAN descend must still \
+             route — the swept-drop gate must never reject an open drop");
+    }
+
+    /// #700 LIVE PIN (ignored — needs the cached qeynos glb): at the real canal lip the coarse
+    /// planner must no longer COMMIT to the steep lip step-down that the fine/swept tier refuses.
+    /// Before the fix `find_path` from the lip top returns a short route whose descent is a steep
+    /// (>`MAX_WALK_GRADE`) >8u lip drop; after the fix it routes around the walkable ramp instead.
+    /// Run: `ZONE_DIR=~/.local/share/eqoxide/assets/models cargo test -p eqoxide-nav --lib \
+    /// fix_700_coarse_agrees_with_fine_at_canal_lip -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires the cached qeynos glb; #700 canal-lip coarse/fine agreement pin"]
+    fn fix_700_coarse_agrees_with_fine_at_canal_lip() {
+        let dir = std::env::var("ZONE_DIR")
+            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+        let za = ZoneAssets::from_glb(&std::path::Path::new(&dir).join("qeynos.glb")).unwrap();
+        let mut col = Collision::build(&za, 32.0);
+        col.set_water(eqoxide_core::region_map::RegionMap::load(
+            &std::path::Path::new(&dir).join("maps/water"), "qeynos").map(std::sync::Arc::new));
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
+        // From the lip top just above the covered aqueduct, to the tier below it.
+        let route = col.find_path([-574.0, 140.0, 0.0], [-566.0, 140.0, -14.0], r, &[], false)
+            .expect("the lower tier is reachable via the walkable ramp");
+        let commits_steep_lip = route.windows(2).any(|w| {
+            let run = (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]).max(0.01);
+            let drop = w[0][2] - w[1][2];
+            drop > 8.0 && drop / run > MAX_WALK_GRADE
+        });
+        assert!(!commits_steep_lip,
+            "#700: coarse must not commit to the steep canal-lip step-down the swept/fine tier refuses \
+             — it must route the walkable ramp. Route ({} wp): {route:?}", route.len());
     }
 
     /// **ACCEPTANCE TEST — the residual #329 band, owner-signed-off 2026-07-15 (review Fix D).**

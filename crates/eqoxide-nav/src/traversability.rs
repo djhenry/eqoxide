@@ -490,6 +490,30 @@ impl<'a> Traversability<'a> {
             && self.occupy_margin_ok(b)
     }
 
+    /// The walk-edge clearance test forced to the SWEPT body volume — used to validate a STEEP DROP
+    /// even on the coarse tier, where [`can_traverse_fast`](Self::can_traverse_fast)'s edge test is a
+    /// centre RAY (#700).
+    ///
+    /// The coarse tier casts a centre ray so it does not reject narrow *corridors* (sweeping an 8u
+    /// lattice line rejects corridors, not just unwalkable ones — see [`Collision::edge_clear`]). But a
+    /// step-DOWN is a body-WIDTH question, not a corridor-selection one: at the open qeynos canal lip
+    /// the centre ray threads a notch in the lip the character's shoulders cannot descend, so the
+    /// coarse tier ACCEPTS a ~14u drop the fine 2u swept tier — and the real controller — REFUSE
+    /// (issue #700). Sweeping the drop makes the coarse tier ask the same question the fine tier does,
+    /// so it stops committing to a lip descent the fine stage then cannot realize. Only STEEP drops are
+    /// gated on this (grade beyond `MAX_WALK_GRADE`, which the walk edge otherwise skips entirely for a
+    /// descent) — gentle ramps/stairs keep the corridor-preserving ray and are unchanged.
+    #[inline]
+    pub fn can_descend_swept(&self, a: Point, b: Point) -> bool {
+        let [feet, chest] = self.body.planner_probes();
+        self.col.path_clear(
+            [a.xy[0], a.xy[1], a.floor_z + chest],
+            [b.xy[0], b.xy[1], b.floor_z + chest], self.radius)
+            && self.col.path_clear(
+                [a.xy[0], a.xy[1], a.floor_z + feet],
+                [b.xy[0], b.xy[1], b.floor_z + feet], self.radius)
+    }
+
     // ── COLD: the diagnostic forms. Run on FAILED plans (and in tests), never in the inner loop. ──
     // MUST agree with the fast forms: `fast == diagnostic.is_ok()`, property-tested below. Each
     // re-runs the same component predicates in the same order and names the first refusal.
