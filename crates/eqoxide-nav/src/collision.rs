@@ -1665,15 +1665,36 @@ impl Collision {
     /// returning `true` only when none are blocked. Used by the depenetration net (design §3.3).
     pub fn footprint_clear(&self, east: f32, north: f32, foot_z: f32, radius: f32, n: usize) -> bool {
         if self.cols == 0 { return true; }
-        let chest = foot_z + crate::traversability::PLAYER_BODY.ring;
-        let c = [east, north, chest];
+        // Original semantics preserved exactly: ANY spoke hit within the ring (t in (1e-3, 1.0], per
+        // `nearest_hit_t`) means blocked — a wall AT the radius counts as embedded for the footprint.
+        self.ring_nearest_hit(east, north, foot_z + crate::traversability::PLAYER_BODY.ring, radius, n)
+            .is_none()
+    }
+
+    /// The radial-ring core of [`footprint_clear`], cast at an EXPLICIT world height `ring_z` instead
+    /// of `foot_z + ring`. Casts `n` rays outward from the centre to `radius` and returns the NEAREST
+    /// geometry hit as a fraction [0,1] of the spoke length (`None` = every spoke clear).
+    ///
+    /// Unlike a travel-parallel feeler (`path_clear`'s sweep), a radial spoke fans in EVERY direction,
+    /// so it crosses a wall that lies within `radius` in ANY direction — including one the caller's
+    /// motion runs PARALLEL to (a ray running alongside a wall never intersects it; a spoke pointed at
+    /// it does). That is what lets `path_clear` close the #381 parallel-wall hole by sampling this ring
+    /// along the swept segment. Returning the fraction (not a bool) lets each caller pick its own
+    /// boundary: `footprint_clear` blocks on any hit; `path_clear` blocks only STRICTLY within radius
+    /// (a wall exactly at radius is tangent — touching, not overlapping — matching the feeler sweep's
+    /// parallel-tangent-is-clear convention, so it does not newly reject a body-width slide).
+    fn ring_nearest_hit(&self, east: f32, north: f32, ring_z: f32, radius: f32, n: usize) -> Option<f32> {
+        let c = [east, north, ring_z];
         let n = n.max(1);
+        let mut best: Option<f32> = None;
         for i in 0..n {
             let a = (i as f32) / (n as f32) * std::f32::consts::TAU;
-            let to = [east + a.cos() * radius, north + a.sin() * radius, chest];
-            if self.nearest_hit_t(c, to).is_some() { return false; }
+            let to = [east + a.cos() * radius, north + a.sin() * radius, ring_z];
+            if let Some(t) = self.nearest_hit_t(c, to) {
+                best = Some(best.map_or(t, |b| b.min(t)));
+            }
         }
-        true
+        best
     }
 
     /// Is `from → to` blocked by geometry before ~92% of the way? Used for nameplate
@@ -1804,20 +1825,61 @@ impl Collision {
         // slip — but zone geometry is walls and panels, not needles, and it is the same family of
         // approximation the mover itself uses.
         //
-        // LIMIT (#381): the feelers are offset PERPENDICULAR to travel, so they cannot see a wall the
-        // segment runs ALONGSIDE — a ray parallel to a plane never intersects it. A segment skimming
-        // a wall within the body radius, but never crossing it, still reads clear at every feeler.
-        // This is pre-existing (the single centre ray was blind to it too) and it is the floor this
-        // fix cannot get below: measured end-to-end, fine waypoints whose capsule does not fit drop
-        // 0.657% -> 0.248% across five zones, but do not reach zero (akanon 0.65%, blackburrow
-        // 0.84%). Adding feelers cannot close it — no finite set of parallel rays can. The durable
-        // answer is a baked clearance field (#372/#378), not more rays. Do not "fix" it here.
+        // The travel-parallel feelers alone are BLIND to a wall the segment runs ALONGSIDE — a ray
+        // parallel to a plane never intersects it, so a segment skimming a wall within the body radius
+        // (but never crossing it) reads clear at every feeler (#381; the pre-#376 single centre ray had
+        // the same hole, worse). That was the last residual leak of the crossing-exact sweep. The
+        // parallel case is closed BELOW by ALSO sampling the body footprint ring along the segment.
         const FEELERS: [f32; 5] = [-1.0, -0.5, 0.0, 0.5, 1.0];
-        FEELERS.iter().all(|&f| self.line_clear(
+        let feelers_clear = FEELERS.iter().all(|&f| self.line_clear(
             [from[0] + perp[0] * f, from[1] + perp[1] * f, from[2]],
             [to[0] + perp[0] * f, to[1] + perp[1] * f, to[2]],
             radius,
-        ))
+        ));
+        if !feelers_clear {
+            return false;
+        }
+
+        // #381 — PARALLEL-WALL coverage. The character occupies a disc along the WHOLE segment, not
+        // just a swept rectangle. Sample the body's footprint RING (`footprint_clear`'s radial-spoke
+        // core, reused via `ring_nearest_hit`) at points spaced along the segment: a radial spoke fans in
+        // every direction, so it crosses a wall the segment merely runs parallel to — the case the
+        // feelers structurally cannot see. Cast at the segment's own swept height (`from[2]`/`to[2]`,
+        // interpolated), the SAME chest/feet probe heights the feelers use, and at the SAME `radius`
+        // the planner's endpoint occupancy test (`Traversability::occupy_wall_ok`) already demands, so
+        // this adds no clearance the endpoints don't already require.
+        //
+        // OVER-FIRING guard (the dominant risk): sample only STRICTLY INTERIOR points, never the two
+        // endpoints. Endpoint occupancy is the caller's own responsibility (a goal legitimately placed
+        // within a radius of a wall must stay reachable), and a constant-width corridor whose endpoints
+        // already `footprint_clear` at `radius` has that same clearance at every interior sample — so a
+        // legitimate body-width passage is NOT newly rejected. Only a wall that genuinely comes within
+        // `radius` of the swept centreline BETWEEN the endpoints — a real fit failure — is caught.
+        //
+        // This ADDS rejections only; it can never turn a blocked segment clear, so the crossing case
+        // (exact across 42,160 combos post-#376) is unchanged. Spacing r/2 mirrors the feeler lattice.
+        //
+        // A spoke hit at exactly the ring radius is TANGENT (the disc touches, does not overlap) and is
+        // treated as CLEAR — the same boundary the feeler sweep uses when running parallel to a wall at
+        // exactly `radius`. Only a wall STRICTLY within radius (hit fraction < 1 - eps) blocks, so a
+        // body-width slide along a wall exactly a radius away is not newly rejected.
+        const RING_DIRS: usize = 8;
+        const RING_TANGENT_EPS: f32 = 1e-3;
+        let step = (r * 0.5).max(0.5);
+        let mut s = step;
+        while s < hlen - 1e-3 {
+            let t = s / hlen;
+            let e = from[0] + (to[0] - from[0]) * t;
+            let n = from[1] + (to[1] - from[1]) * t;
+            let z = from[2] + (to[2] - from[2]) * t;
+            if let Some(hit) = self.ring_nearest_hit(e, n, z, r, RING_DIRS) {
+                if hit < 1.0 - RING_TANGENT_EPS {
+                    return false;
+                }
+            }
+            s += step;
+        }
+        true
     }
 
     /// Does the character have `clearance` of walkable GROUND all around `(east, north)` at `z`?
@@ -5953,6 +6015,116 @@ mod tests {
         // diagonal too — the fix must not seal it.
         assert!(col.path_clear([9.0, 3.0, 3.0], [11.0, 3.0, 3.0], 1.0),
             "a slot the character fits through must stay clear");
+    }
+
+    /// A single vertical wall at `north = wall_n`, spanning east 0..20 and up 0..10, plus a floor.
+    /// Travel runs ALONG east (parallel to the wall), so the segment never crosses the wall plane —
+    /// the exact geometry the travel-parallel feelers are structurally blind to (#381).
+    fn parallel_wall(wall_n: f32) -> Collision {
+        // GLB axes -> world: east = p[2], north = p[0], height = p[1].
+        let floor = MeshData {
+            positions: vec![[-5.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 20.0], [-5.0, 0.0, 20.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let wall = MeshData { // vertical plane at north = wall_n, up 0..10, east 0..20
+            positions: vec![[wall_n, 0.0, 0.0], [wall_n, 0.0, 20.0], [wall_n, 10.0, 20.0], [wall_n, 10.0, 0.0]],
+            normals: vec![[-1.0, 0.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        Collision::build(&ZoneAssets { terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 2.0)
+    }
+
+    /// **#381 — the last clearance hole: a wall the segment runs PARALLEL to.** The travel-parallel
+    /// feelers cannot see it (a ray alongside a wall never crosses it), so before this fix `path_clear`
+    /// called a segment skimming a wall within the body radius CLEAR even though the character's body
+    /// overlaps the wall. The fix samples the body footprint RING along the segment — a radial spoke
+    /// fans toward the wall and crosses it.
+    ///
+    /// MUTATION-DISCRIMINATING: delete the `ring_nearest_hit`-along-the-segment loop in `path_clear`
+    /// (the #381 addition) and BOTH `!path_clear` assertions go RED — the feelers alone report clear,
+    /// which this test proves directly via `feelers_report_clear`.
+    #[test]
+    fn path_clear_blocks_a_wall_the_segment_runs_parallel_to() {
+        let r = eqoxide_core::physics::PLAYER_RADIUS; // 1.0
+        // Wall at north = 5; travel runs east at north = 4.5 — 0.5u from the wall, INSIDE the 1.0u body
+        // radius. The character's disc overlaps the wall the whole way, but the segment never crosses it.
+        let col = parallel_wall(5.0);
+        let from: [f32; 3] = [2.0, 4.5, 3.0];
+        let to: [f32; 3] = [18.0, 4.5, 3.0];
+
+        // Mechanism proof: every travel-parallel feeler runs ALONGSIDE the wall and reads clear. This is
+        // exactly why the pre-#381 sweep leaked here — reproduce it directly so a mutation that removes
+        // the ring sampling has a demonstrated blind spot to fall back into.
+        let hlen = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
+        let perp = [-(to[1] - from[1]) / hlen * r, (to[0] - from[0]) / hlen * r];
+        let feelers_report_clear = [-1.0f32, -0.5, 0.0, 0.5, 1.0].iter().all(|&f| col.line_clear(
+            [from[0] + perp[0] * f, from[1] + perp[1] * f, from[2]],
+            [to[0] + perp[0] * f, to[1] + perp[1] * f, to[2]], r));
+        assert!(feelers_report_clear,
+            "sanity: the travel-parallel feelers must ALL read clear here — that is the #381 blind spot \
+             this scene reproduces; if a feeler already caught it, the test proves nothing new");
+
+        // AFTER #381: the footprint ring, sampled along the segment, crosses the parallel wall -> BLOCKED.
+        assert!(!col.path_clear(from, to, r),
+            "path_clear must NOT call a segment clear when a wall lies within the body radius alongside \
+             it (#381 parallel-wall hole). MUTATION: remove the ring-along-segment loop -> this goes RED");
+
+        // A wall a full radius away (north = 4.5 + 1.0 = 5.5, so travel at north 4.5 is tangent) is the
+        // boundary: TANGENT is clear (the disc touches, does not overlap) — the over-firing boundary the
+        // fix deliberately preserves, matching the feeler sweep's parallel-at-exactly-radius convention.
+        let tangent = parallel_wall(5.5);
+        assert!(tangent.path_clear(from, to, r),
+            "a wall EXACTLY a radius away is tangent (touching, not overlapping) and must stay CLEAR — \
+             the fix must not over-fire at the boundary");
+    }
+
+    /// **#381 over-firing guard — a legitimate body-width parallel corridor stays CLEAR.** The dominant
+    /// risk of the ring-sampling fix is that it OVER-rejects a tight-but-passable passage. A corridor
+    /// whose walls sit a full radius clear of the centreline must still `path_clear`.
+    ///
+    /// MUTATION: this whole test stays GREEN when the #381 addition is reverted (the fix does not break
+    /// a legitimate passage) — every assertion here holds with OR without the ring loop. It is NOT
+    /// vacuously always-clear: the perpendicular walk-into-a-wall assertion shows `path_clear` genuinely
+    /// discriminates on this scene (via the pre-existing feeler sweep), independent of the #381 loop. The
+    /// fix-DEPENDENT block (a sub-radius parallel wall) is pinned in the companion test above.
+    #[test]
+    fn path_clear_clears_a_legit_body_width_parallel_corridor() {
+        let r = eqoxide_core::physics::PLAYER_RADIUS; // 1.0
+        // Walls parallel to travel at north = +half and north = -half, character down the middle at
+        // north = 0. `half` comfortably > radius is a passage the character genuinely fits.
+        let corridor = |half: f32| -> Collision {
+            let floor = MeshData {
+                positions: vec![[-half - 2.0, 0.0, 0.0], [half + 2.0, 0.0, 0.0],
+                                [half + 2.0, 0.0, 20.0], [-half - 2.0, 0.0, 20.0]],
+                normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+                indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+                render_mode: RenderMode::Opaque, anim: None,
+            };
+            let wall = |n: f32, nx: f32| MeshData {
+                positions: vec![[n, 0.0, 0.0], [n, 0.0, 20.0], [n, 10.0, 20.0], [n, 10.0, 0.0]],
+                normals: vec![[nx, 0.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+                indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+                render_mode: RenderMode::Opaque, anim: None,
+            };
+            Collision::build(&ZoneAssets {
+                terrain: vec![floor, wall(half, -1.0), wall(-half, 1.0)], objects: vec![], textures: vec![] }, 2.0)
+        };
+        let roomy = corridor(2.0);
+
+        // Slide down the middle (walls +/-2.0 from the centreline, 2.0u > radius): CLEAR — no over-fire.
+        assert!(roomy.path_clear([2.0, 0.0, 3.0], [18.0, 0.0, 3.0], r),
+            "a body-width corridor the character genuinely fits (2.0u clearance each side, r={r}) must \
+             stay CLEAR — the #381 ring sampling must not over-reject a legitimate tight passage");
+
+        // Non-vacuous: walking PERPENDICULAR straight into the north wall (north 0 -> 1.5, within a
+        // radius of the wall at north 2.0) is BLOCKED by the pre-existing feeler sweep — so `path_clear`
+        // demonstrably discriminates on this exact scene, with or without the #381 loop.
+        assert!(!roomy.path_clear([10.0, 0.0, 3.0], [10.0, 1.5, 3.0], r),
+            "walking into the corridor wall must block — proves the CLEAR result above is a real \
+             discrimination, not a vacuously-always-clear test");
     }
 
     /// The swept-edge cell threshold must actually COVER the tier the walker steers along. These two

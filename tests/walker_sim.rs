@@ -1354,3 +1354,130 @@ fn descent_guard_blast_radius() {
     println!("\nTOTAL pairs {g_pairs}  routed {g_routed}  complete {g_complete}  refused {g_refused}  descent_routes {g_descent_routes}");
     assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
 }
+
+/// **#381 parallel-wall clearance blast radius over baked zones — REAL `CharacterController`, cross-
+/// build A/B.** The #381 fix adds a footprint-ring sample ALONG each swept segment inside
+/// `Collision::path_clear`, closing the parallel-wall hole (a wall the segment runs alongside within
+/// the body radius). Its dominant RISK is OVER-FIRING: rejecting a legitimate tight passage (a
+/// body-width corridor, a doorway) the character can actually walk.
+///
+/// This routes at the FINE cell (`LOCAL_CELL` = 2 u), where `edge_clear` IS the swept `path_clear`
+/// this fix changes — so every edge in every route is validated by the modified test. Each route is
+/// then DRIVEN by the production `CharacterController` (the #693/#685 coarse-pursuit proxy), so
+/// "complete" is the controller's verdict, not the planner's. Pairs are kept SHORT (fine-tier scale)
+/// so a 2 u whole-zone search stays bounded.
+///
+/// One build measures one column. Run on unmodified `main` and on the fix branch with identical
+/// seeds (the floor model / sampling is untouched by the fix ⇒ identical pairs) and diff the PAIR
+/// lines. The regression that must be ZERO is `route+complete → refused` (a legitimate walkable route
+/// the fix turned into a false no-path). `route+INCOMPLETE → refused` (a route the controller could
+/// not walk anyway, now honestly refused) is a WIN, not a loss.
+///
+/// ```text
+/// ZONE_DIR=~/.local/share/eqoxide/assets/models \
+///   cargo test --release --test walker_sim parallel_wall_clearance_blast_radius -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires baked zone glbs at $ZONE_DIR; the #381 parallel-wall blast radius"]
+fn parallel_wall_clearance_blast_radius() {
+    const RUN_SPEED: f32 = 44.0;
+    const LOOK_AHEAD: f32 = 5.0;
+    const STOP_DIST: f32 = 2.0;
+    const Z_TOL: f32 = 8.0;
+    const DT: f32 = 1.0 / 100.0;
+    const FRAMES_PER_TICK: u32 = 15;
+    const MAX_TICKS: u32 = 300;
+    const FINE_CELL: f32 = 2.0; // nav::steering::LOCAL_CELL — the tier where path_clear is the edge test
+    let pairs_per_zone: usize = std::env::var("PAIRS").ok().and_then(|s| s.parse().ok()).unwrap_or(80);
+
+    let run = |col: &Collision, route: &[[f32; 3]], goal: [f32; 3]| -> (bool, u32) {
+        let r = PLAYER_RADIUS;
+        let mut ctrl = CharacterController::new(route[0]);
+        ctrl.on_ground = true;
+        let mut path_i = 0usize;
+        for tick in 0..MAX_TICKS {
+            let (px, py, pz) = (ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]);
+            if (px - goal[0]).hypot(py - goal[1]) < STOP_DIST && (pz - goal[2]).abs() <= Z_TOL {
+                return (true, tick);
+            }
+            while path_i + 2 < route.len() {
+                let (a, b) = (route[path_i], route[path_i + 1]);
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1] + (pz - a[2]) * ab[2]) / l2 };
+                if t >= 1.0 { path_i += 1; } else { break; }
+            }
+            let aim = carrot_along_los(route, path_i, [px, py, pz], LOOK_AHEAD, |a, b| col.carrot_los_clear(a, b, r))
+                .unwrap_or(goal);
+            let (dx, dy) = (aim[0] - px, aim[1] - py);
+            let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+            for _ in 0..FRAMES_PER_TICK {
+                ctrl.step(MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
+                    want_swim: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
+            }
+        }
+        (false, MAX_TICKS)
+    };
+
+    let dir = std::env::var("ZONE_DIR")
+        .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+    let zones: Vec<String> = std::env::var("ZONES").ok()
+        .map(|z| z.split(',').map(str::to_string).collect())
+        .unwrap_or_else(|| ["akanon", "blackburrow", "qeynos", "gfaydark", "crushbone", "neriaka",
+            "felwithea", "highpass", "qcat", "oasis"]
+            .into_iter().map(str::to_string).collect());
+
+    let mut seed: u64 = 0x381A_11CE;
+    let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
+    let unit = |r: u32| r as f32 / u32::MAX as f32;
+
+    let (mut g_pairs, mut g_routed, mut g_complete, mut g_refused) = (0usize, 0usize, 0usize, 0usize);
+    println!("\n=== #381 parallel-wall blast radius (one build; diff PAIR lines across builds; route+complete->refused MUST be 0) ===");
+    println!("{:<12} {:>6} {:>7} {:>9} {:>8}", "zone", "pairs", "routed", "complete", "refused");
+    for zone in &zones {
+        let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
+        let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12} (no glb — skipped)"); continue };
+        let mut col = Collision::build(&za, 32.0);
+        if col.cols == 0 { println!("{zone:<12} (no grid — skipped)"); continue; }
+        col.set_water(RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
+
+        let (mut z_pairs, mut z_routed, mut z_complete, mut z_refused) = (0usize, 0usize, 0usize, 0usize);
+        let mut tries = 0;
+        while z_pairs < pairs_per_zone && tries < pairs_per_zone * 70 + 500 {
+            tries += 1;
+            let e = col.origin[0] + unit(rnd()) * (col.cols as f32 * col.cell_size);
+            let n = col.origin[1] + unit(rnd()) * (col.rows as f32 * col.cell_size);
+            let Some(z) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { continue };
+            let ang = unit(rnd()) * std::f32::consts::TAU;
+            let d = 20.0 + unit(rnd()) * 70.0; // SHORT, fine-tier scale, so a 2u search stays bounded
+            let (ge, gn) = (e + d * ang.cos(), n + d * ang.sin());
+            let Some(gz) = col.nearest_floor(ge, gn, z, 60.0, 60.0) else { continue };
+            let (s, g) = ([e, n, z], [ge, gn, gz]);
+            if col.in_water(s) || col.in_water(g) { continue; }
+            z_pairs += 1;
+
+            // Bound the frontier to a LOCAL window (like the fine-tier LocalPlanner's ~40-60u reach,
+            // padded) so a 2u search stays fast and representative of where path_clear actually runs.
+            let outcome = col.find_path_ex(s, g, PLAYER_RADIUS, &[], FINE_CELL, Some(200.0), 0.0, PlanCtx::worker());
+            match outcome {
+                PlanOutcome::Route(route) => {
+                    z_routed += 1;
+                    let goal = *route.last().unwrap();
+                    let (arrived, ticks) = run(&col, &route, goal);
+                    if arrived { z_complete += 1; }
+                    println!("PAIR {zone} {i} s[{:.1},{:.1},{:.1}] g[{:.1},{:.1},{:.1}] route len={} complete={} ticks={}",
+                        s[0], s[1], s[2], g[0], g[1], g[2], route.len(), arrived as u8, ticks, i = z_pairs);
+                }
+                other => {
+                    z_refused += 1;
+                    println!("PAIR {zone} {i} s[{:.1},{:.1},{:.1}] g[{:.1},{:.1},{:.1}] REFUSED {}",
+                        s[0], s[1], s[2], g[0], g[1], g[2], other.reason(), i = z_pairs);
+                }
+            }
+        }
+        println!("{zone:<12} {z_pairs:>6} {z_routed:>7} {z_complete:>9} {z_refused:>8}");
+        g_pairs += z_pairs; g_routed += z_routed; g_complete += z_complete; g_refused += z_refused;
+    }
+    println!("\nTOTAL pairs {g_pairs}  routed {g_routed}  complete {g_complete}  refused {g_refused}");
+    assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
+}
