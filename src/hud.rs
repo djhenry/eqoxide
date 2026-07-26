@@ -155,11 +155,24 @@ pub fn draw_fade(ctx: &egui::Context, alpha: f32) {
 /// `asset_sync::download_rate_bytes_per_sec` (cumulative bytes / elapsed time since the CURRENT
 /// downloading phase began) — never an instantaneous or windowed rate — so it can't be mistaken
 /// for either kind of number.
+///
+/// Invariant (#714): any strictly positive `bytes_per_sec` renders a string that does NOT read as
+/// zero. A naive KB/s-below-1-MB/s split rounds anything under ~512 B/s down to "0 KB/s avg" —
+/// false, since the transfer is genuinely progressing. To hold the invariant at every unit
+/// boundary, each branch's divisor is chosen so `{:.0}`/`{:.1}` can never floor a positive input
+/// to zero within that branch, and the one range that still could (under 1 B/s, i.e. less than one
+/// byte moved per second) gets an explicit "<1 B/s avg" instead of a rounded number.
 pub fn format_download_rate(bytes_per_sec: f64) -> String {
     if bytes_per_sec >= 1_048_576.0 {
         format!("{:.1} MB/s avg", bytes_per_sec / 1_048_576.0)
-    } else {
+    } else if bytes_per_sec >= 1024.0 {
         format!("{:.0} KB/s avg", bytes_per_sec / 1024.0)
+    } else if bytes_per_sec >= 1.0 {
+        format!("{:.0} B/s avg", bytes_per_sec)
+    } else if bytes_per_sec > 0.0 {
+        "<1 B/s avg".to_string()
+    } else {
+        format!("{:.0} B/s avg", bytes_per_sec)
     }
 }
 
@@ -304,6 +317,82 @@ mod tests {
         assert!(low.ends_with("avg"), "must be labeled: {low}");
         let high = format_download_rate(1_048_576.0 * 3.0);
         assert!(high.ends_with("avg"), "must be labeled: {high}");
+    }
+
+    /// Returns true if `s` — a `format_download_rate` output — reads as a zero rate. The only
+    /// legitimate all-zero token this function ever emits is a leading "0" (e.g. "0 B/s avg", for
+    /// a genuinely-zero input); the "<1 B/s avg" branch is deliberately excluded by starting with
+    /// "<", not a digit that parses to 0.
+    fn reads_as_zero(s: &str) -> bool {
+        match s.split_whitespace().next() {
+            Some(tok) => tok.parse::<f64>().map(|v| v == 0.0).unwrap_or(false),
+            None => false,
+        }
+    }
+
+    #[test]
+    fn format_download_rate_never_reads_as_zero_for_a_positive_rate() {
+        // #714: `format_download_rate` must hold this invariant over the WHOLE positive-rate
+        // domain, not just the unit boundaries someone thought to hand-pick — a rate under
+        // ~512 B/s used to floor to "0 KB/s avg" while the transfer was genuinely progressing,
+        // which is exactly the false statement #708 banned, wearing a KB/s costume. Sweep the
+        // domain both deterministically (every representable magnitude decade, including the
+        // sub-1-B/s range that a naive B/s branch would still get wrong) and with randomized
+        // samples inside each decade, so a future unit boundary can't reintroduce the bug
+        // un-caught.
+        let mut rng = rand::thread_rng();
+        use rand::Rng;
+
+        // Deterministic boundary/edge values, including the exact unit thresholds and their
+        // neighbors, plus sub-B/s and huge-rate extremes.
+        let fixed: &[f64] = &[
+            f64::MIN_POSITIVE,
+            1e-300,
+            1e-10,
+            0.001,
+            0.5,
+            0.999,
+            1.0,
+            1.000001,
+            2.0,
+            511.0,
+            512.0,
+            513.0,
+            1023.0,
+            1023.999,
+            1024.0,
+            1024.000001,
+            2000.0,
+            1_048_575.0,
+            1_048_575.999,
+            1_048_576.0,
+            1_048_576.000001,
+            5_000_000.0,
+            1e12,
+            f64::MAX,
+        ];
+        for &v in fixed {
+            let s = format_download_rate(v);
+            assert!(
+                !reads_as_zero(&s),
+                "positive rate {v} formatted as a zero-reading string: {s:?}"
+            );
+        }
+
+        // Randomized sweep across magnitude decades from ~1e-6 to ~1e9 bytes/sec, several samples
+        // per decade, so the property is checked densely rather than only at chosen points.
+        for decade in -6..=9i32 {
+            let lo = 10f64.powi(decade);
+            let hi = 10f64.powi(decade + 1);
+            for _ in 0..50 {
+                let v = rng.gen_range(lo..hi);
+                let s = format_download_rate(v);
+                assert!(
+                    !reads_as_zero(&s),
+                    "positive rate {v} (decade {decade}) formatted as a zero-reading string: {s:?}"
+                );
+            }
+        }
     }
 
     #[test]
