@@ -208,6 +208,13 @@ fn fetch_and_reassemble(
     let missing = missing_chunks(files, cache);
     let total = missing.len();
     let mut bytes = 0u64;
+    // Started right as THIS download phase begins (before any chunk fetch), so `elapsed` on every
+    // tick below is scoped entirely to this phase's own transfer time — never diluted by time spent
+    // verifying or idle in a prior phase, and never carried into the next one (#708). When `missing`
+    // is empty (every chunk already cached) this loop body never runs at all, so `progress` is never
+    // called with `Downloading` — the caller sees no download tick, not a misleading "0 B/s" one
+    // (#708 requirement 2: "nothing to download" must not render like a stall).
+    let start = std::time::Instant::now();
     for (i, hash) in missing.iter().enumerate() {
         let data = t.get_chunk(hash)?;
         // The server is content-addressed: a chunk's bytes must hash to its id.
@@ -217,7 +224,7 @@ fn fetch_and_reassemble(
         }
         cache.cas_put(&data)?;
         bytes += data.len() as u64;
-        progress(SyncProgress { phase: Phase::Downloading, done: i + 1, total, bytes });
+        progress(SyncProgress::Downloading { done: i + 1, total, bytes, elapsed: start.elapsed() });
     }
     for entry in files {
         reassemble(cache, entry)?;
@@ -347,16 +354,37 @@ impl Transport for AssetSync {
     }
 }
 
-pub enum Phase {
+/// A single progress tick from a sync operation (#708). `Downloading` is the ONLY variant that
+/// carries transfer data (`done`/`total`/`bytes`/`elapsed`) — `Verifying` has none. This is not a
+/// style choice: it makes a stale download rate structurally unrepresentable rather than merely
+/// something a caller must remember to clear. There is no long-lived "current rate" field anywhere
+/// that a phase change would need to reset — a caller can only ever read `elapsed`/`bytes` from the
+/// one tick that is actually in `Downloading`, and every other phase's tick has nowhere to keep one.
+///
+/// `elapsed` is measured from the start of the CURRENT downloading phase only (see
+/// `fetch_and_reassemble`), so a rate derived from it is a phase-local session-average — not an
+/// instantaneous or windowed rate (#708 requirement 3) — and cannot be inflated by idle time spent
+/// verifying beforehand.
+pub enum SyncProgress {
     Verifying,
-    Downloading,
+    Downloading { done: usize, total: usize, bytes: u64, elapsed: std::time::Duration },
 }
 
-pub struct SyncProgress {
-    pub phase: Phase,
-    pub done: usize,
-    pub total: usize,
-    pub bytes: u64,
+/// Minimum elapsed time before a `Downloading` tick's `bytes`/`elapsed` are considered stable enough
+/// to divide into a rate. The very first tick of a phase can land well under a millisecond after
+/// `Instant::now()` was captured (a tiny/local chunk, warm caches) — dividing by that would produce
+/// an absurd, noisy spike rather than an honest "not enough data yet" (#708 requirement 4).
+const MIN_RATE_ELAPSED: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Pure function: derives a bytes/sec rate from cumulative bytes transferred and elapsed time, or
+/// `None` if `elapsed` is too small to divide by safely (see `MIN_RATE_ELAPSED`). Deliberately takes
+/// plain `(u64, Duration)` rather than a `SyncProgress` so it's trivial to unit-test every edge
+/// (zero elapsed, near-zero elapsed, zero bytes) without constructing a whole sync pipeline.
+pub fn download_rate_bytes_per_sec(bytes: u64, elapsed: std::time::Duration) -> Option<f64> {
+    if elapsed < MIN_RATE_ELAPSED {
+        return None;
+    }
+    Some(bytes as f64 / elapsed.as_secs_f64())
 }
 
 pub fn sync_set(
@@ -404,7 +432,7 @@ pub fn sync_set(
             if artifacts_intact(cache, &files) {
                 return Ok(()); // content AND local artifacts both unchanged — genuine no-op
             }
-            progress(SyncProgress { phase: Phase::Verifying, done: 0, total: 0, bytes: 0 });
+            progress(SyncProgress::Verifying);
             if let Err(repair_err) = fetch_and_reassemble(t, cache, &files, progress) {
                 // The recorded chunk list can itself be stale even though the digest is not: the
                 // digest (`set_digest`) hashes only `path\0<file-blake3>`, never chunk ids, so a
@@ -445,7 +473,7 @@ fn sync_changed_manifest(
     if recomputed != manifest.digest {
         anyhow::bail!("manifest digest mismatch for {set}: claimed {} got {recomputed}", manifest.digest);
     }
-    progress(SyncProgress { phase: Phase::Verifying, done: 0, total: 0, bytes: 0 });
+    progress(SyncProgress::Verifying);
 
     fetch_and_reassemble(t, cache, &manifest.files, progress)?;
 
@@ -827,7 +855,11 @@ mod sync_tests {
         let cache = CacheDirs::with_root(dir.path());
         let t = fixture();
         let mut last = None;
-        sync_set(&t, "common", &cache, &mut |p| last = Some((p.done, p.total))).unwrap();
+        sync_set(&t, "common", &cache, &mut |p| {
+            if let SyncProgress::Downloading { done, total, .. } = p {
+                last = Some((done, total));
+            }
+        }).unwrap();
         // cold: both chunks fetched, file reassembled
         assert_eq!(*t.chunk_calls.borrow(), 2);
         assert!(cache.models_dir().join("humanoid.glb").exists());
@@ -995,5 +1027,166 @@ mod sync_tests {
         let out = std::fs::read(cache.models_dir().join("humanoid.glb")).unwrap();
         assert_eq!(out, whole, "content is identical post-recovery even though it was re-chunked");
         assert!(cache.cas_has(&blake3_hex(&whole[0..15])), "recovered via the NEW (v2) chunk ids");
+    }
+}
+
+#[cfg(test)]
+mod download_rate_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // ── pure function: download_rate_bytes_per_sec (#708 req 4: guard the near-zero divide) ──
+
+    #[test]
+    fn zero_elapsed_is_guarded_not_divided() {
+        assert_eq!(download_rate_bytes_per_sec(1_048_576, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn near_zero_elapsed_below_threshold_is_guarded() {
+        // Just under MIN_RATE_ELAPSED (100ms) — the very first tick after a phase starts can land
+        // here; dividing would produce a noisy, meaningless spike instead of "not enough data yet".
+        assert_eq!(download_rate_bytes_per_sec(1_048_576, Duration::from_millis(99)), None);
+    }
+
+    #[test]
+    fn elapsed_at_threshold_yields_a_real_rate() {
+        // At/above MIN_RATE_ELAPSED the guard lifts and the function must divide correctly.
+        let rate = download_rate_bytes_per_sec(1_048_576, Duration::from_millis(100)).unwrap();
+        assert!((rate - 10_485_760.0).abs() < 1.0, "expected ~10 MB/s, got {rate}");
+    }
+
+    #[test]
+    fn rate_is_bytes_over_elapsed_seconds() {
+        let rate = download_rate_bytes_per_sec(2_000_000, Duration::from_secs(2)).unwrap();
+        assert!((rate - 1_000_000.0).abs() < 1.0, "expected 1,000,000 B/s, got {rate}");
+    }
+
+    // ── property: an all-cached sync never emits a Downloading tick (#708 req 2) ──────────────
+
+    struct FakeTransport {
+        manifest: Manifest,
+        chunks: std::collections::HashMap<String, Vec<u8>>,
+    }
+    impl Transport for FakeTransport {
+        fn get_manifest(&self, _set: &str, inm: Option<&str>) -> anyhow::Result<ManifestFetch> {
+            if inm == Some(self.manifest.digest.as_str()) {
+                return Ok(ManifestFetch::Unchanged);
+            }
+            Ok(ManifestFetch::Changed(self.manifest.clone()))
+        }
+        fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>> {
+            self.chunks.get(hash).cloned().ok_or_else(|| anyhow::anyhow!("no chunk {hash}"))
+        }
+    }
+
+    fn fixture() -> FakeTransport {
+        let a = vec![1u8; 10];
+        let b = vec![2u8; 20];
+        let (ha, hb) = (blake3_hex(&a), blake3_hex(&b));
+        let mut whole = a.clone();
+        whole.extend_from_slice(&b);
+        let mut chunks = std::collections::HashMap::new();
+        chunks.insert(ha.clone(), a);
+        chunks.insert(hb.clone(), b);
+        let files = vec![FileEntry {
+            path: "humanoid.glb".into(), size: whole.len() as u64,
+            blake3: blake3_hex(&whole), chunks: vec![ha, hb],
+        }];
+        FakeTransport { manifest: Manifest { set: "common".into(), digest: set_digest(&files), files }, chunks }
+    }
+
+    #[test]
+    fn all_chunks_already_cached_never_emits_a_downloading_tick() {
+        // #708 req 2: when nothing is missing, `fetch_and_reassemble`'s download loop has zero
+        // iterations — `progress` must never be called with `Downloading` at all, so a caller has
+        // no bytes/elapsed to turn into a misleading "0 B/s". "Complete" and "stalled" must not be
+        // representationally identical.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path());
+        let t = fixture();
+
+        // Prime the CAS + models dir so every chunk this manifest needs is already on disk.
+        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+
+        // Force a second, unconditional (Changed) sync of the SAME content so `fetch_and_reassemble`
+        // actually runs its download loop over `missing_chunks` — which must come back empty.
+        cache.clear_synced("common");
+        let mut saw_downloading = false;
+        sync_set(&t, "common", &cache, &mut |p| {
+            if matches!(p, SyncProgress::Downloading { .. }) {
+                saw_downloading = true;
+            }
+        }).unwrap();
+        assert!(!saw_downloading, "an all-cached sync must never emit a Downloading progress tick");
+    }
+
+    // ── property: elapsed is scoped to the CURRENT downloading phase, not global (#708 req 1/3) ──
+
+    #[test]
+    fn elapsed_does_not_carry_over_from_a_slow_prior_download() {
+        // If `elapsed` were measured from process start (or any point before this phase began)
+        // instead of from the start of THIS call, a slow first sync would make a fast SECOND sync's
+        // very first tick already look like it had been running for a long time — a stale-rate bug
+        // by another name (the rate would be computed against the wrong clock, not just the wrong
+        // phase). Reproduce with two back-to-back sync_set calls against two different manifests
+        // (so the second one also has real work to do), inserting a real sleep before the first
+        // call begins so any global/leaked clock would show up as inflated elapsed on the second.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path());
+
+        // First manifest/content.
+        let a = vec![1u8; 5];
+        let ha = blake3_hex(&a);
+        let files1 = vec![FileEntry {
+            path: "one.glb".into(), size: a.len() as u64, blake3: blake3_hex(&a), chunks: vec![ha.clone()],
+        }];
+        let mut chunks1 = std::collections::HashMap::new();
+        chunks1.insert(ha, a);
+        let t1 = FakeTransport {
+            manifest: Manifest { set: "s1".into(), digest: set_digest(&files1), files: files1 },
+            chunks: chunks1,
+        };
+
+        std::thread::sleep(Duration::from_millis(150)); // simulate time passing before ANY sync runs
+
+        let mut first_elapsed = Duration::ZERO;
+        sync_set(&t1, "s1", &cache, &mut |p| {
+            if let SyncProgress::Downloading { elapsed, .. } = p {
+                first_elapsed = elapsed;
+            }
+        }).unwrap();
+        assert!(first_elapsed < Duration::from_millis(100),
+            "first sync's own elapsed should be small (just its own download loop), got {first_elapsed:?}");
+
+        // A SECOND sleep, between the two syncs, is the actual discriminator: if `start` were ever
+        // hoisted to something that persists across calls (a `static`/`OnceLock`, a field on some
+        // long-lived context) instead of being captured fresh inside THIS call to
+        // `fetch_and_reassemble`, this sleep would show up added into the second sync's `elapsed`
+        // even though the second sync's own download loop never ran during it.
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Second, independent manifest/content — its phase starts fresh.
+        let b = vec![2u8; 5];
+        let hb = blake3_hex(&b);
+        let files2 = vec![FileEntry {
+            path: "two.glb".into(), size: b.len() as u64, blake3: blake3_hex(&b), chunks: vec![hb.clone()],
+        }];
+        let mut chunks2 = std::collections::HashMap::new();
+        chunks2.insert(hb, b);
+        let t2 = FakeTransport {
+            manifest: Manifest { set: "s2".into(), digest: set_digest(&files2), files: files2 },
+            chunks: chunks2,
+        };
+
+        let mut second_elapsed = Duration::ZERO;
+        sync_set(&t2, "s2", &cache, &mut |p| {
+            if let SyncProgress::Downloading { elapsed, .. } = p {
+                second_elapsed = elapsed;
+            }
+        }).unwrap();
+        assert!(second_elapsed < Duration::from_millis(100),
+            "second sync's elapsed must NOT carry over the 300ms slept before/between syncs — got \
+             {second_elapsed:?}, which would mean the clock is global/shared, not phase-scoped");
     }
 }

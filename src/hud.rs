@@ -150,6 +150,34 @@ pub fn draw_fade(ctx: &egui::Context, alpha: f32) {
         .rect_filled(rect, 0.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, a));
 }
 
+/// Human-readable, EXPLICITLY LABELED download-rate string for the loading screen (#708
+/// requirement 3). "avg" marks this as the phase-average rate produced by
+/// `asset_sync::download_rate_bytes_per_sec` (cumulative bytes / elapsed time since the CURRENT
+/// downloading phase began) — never an instantaneous or windowed rate — so it can't be mistaken
+/// for either kind of number.
+pub fn format_download_rate(bytes_per_sec: f64) -> String {
+    if bytes_per_sec >= 1_048_576.0 {
+        format!("{:.1} MB/s avg", bytes_per_sec / 1_048_576.0)
+    } else {
+        format!("{:.0} KB/s avg", bytes_per_sec / 1024.0)
+    }
+}
+
+/// Splits a `load_status` string into its main phase line and an optional trailing download-speed
+/// line (#708). The caller (`app.rs`) embeds the speed line as a second, `\n`-separated line ONLY
+/// while it is actively constructing a `Downloading`-phase status string; every other phase writes
+/// a plain single-line string. That makes a stale speed line structurally impossible to render here
+/// — there is no separate "current speed" field this function reads, only whatever the status
+/// string itself was built with at the moment of the last phase-appropriate write, so a phase
+/// change (a new single-line string) makes the old speed unrepresentable rather than something this
+/// code must remember to clear.
+fn split_status_line(status: &str) -> (&str, Option<&str>) {
+    match status.split_once('\n') {
+        Some((main, speed)) => (main, Some(speed)),
+        None => (status, None),
+    }
+}
+
 pub fn draw_loading(ctx: &egui::Context, zone: &str, status: &str, progress: Option<f32>) {
     egui::Area::new(egui::Id::new("loading"))
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -160,9 +188,15 @@ pub fn draw_loading(ctx: &egui::Context, zone: &str, status: &str, progress: Opt
                     .color(egui::Color32::WHITE));
                 if !status.is_empty() {
                     ui.add_space(8.0);
-                    ui.label(egui::RichText::new(status)
+                    let (main, speed) = split_status_line(status);
+                    ui.label(egui::RichText::new(main)
                         .size(16.0)
                         .color(egui::Color32::from_gray(200)));
+                    if let Some(speed) = speed {
+                        ui.label(egui::RichText::new(speed)
+                            .size(13.0)
+                            .color(egui::Color32::from_gray(150)));
+                    }
                 }
                 if let Some(frac) = progress {
                     ui.add_space(8.0);
@@ -258,6 +292,37 @@ mod tests {
     use super::*;
     use crate::scene::SceneState;
 
+    // ── #708: loading-screen download-speed line ────────────────────────────────
+
+    #[test]
+    fn format_download_rate_picks_units_and_labels_avg() {
+        // Below 1 MiB/s: KB/s. At/above: MB/s. Both MUST carry "avg" (req 3) so this can never be
+        // mistaken for an instantaneous or windowed rate.
+        assert_eq!(format_download_rate(2048.0), "2 KB/s avg");
+        assert_eq!(format_download_rate(1_572_864.0), "1.5 MB/s avg");
+        let low = format_download_rate(512.0);
+        assert!(low.ends_with("avg"), "must be labeled: {low}");
+        let high = format_download_rate(1_048_576.0 * 3.0);
+        assert!(high.ends_with("avg"), "must be labeled: {high}");
+    }
+
+    #[test]
+    fn split_status_line_has_no_speed_for_a_plain_phase_string() {
+        // Every non-downloading phase writes a plain, single-line status (see app.rs's
+        // `set_status`). Without an embedded '\n' there is nothing to split out — a leftover speed
+        // from a previous downloading phase is unrepresentable here, not merely absent by chance.
+        let (main, speed) = split_status_line("Building collision grid…");
+        assert_eq!(main, "Building collision grid…");
+        assert_eq!(speed, None, "a single-line phase status must never yield a speed line");
+    }
+
+    #[test]
+    fn split_status_line_extracts_an_embedded_speed_line() {
+        let (main, speed) = split_status_line("Downloading zone 3/9 (1.2 MB)…\n1.4 MB/s avg");
+        assert_eq!(main, "Downloading zone 3/9 (1.2 MB)…");
+        assert_eq!(speed, Some("1.4 MB/s avg"));
+    }
+
     /// Overlays must render headlessly without panicking on an empty scene.
     #[test]
     fn overlays_draw_headless() {
@@ -267,6 +332,8 @@ mod tests {
             draw_fps(ctx, 60.0);
             draw_connection_banner(ctx, true);
             draw_loading(ctx, "qeynos", "syncing", Some(0.5));
+            // Must also render a status with an embedded speed line without panicking (#708).
+            draw_loading(ctx, "qeynos", "Downloading zone 3/9 (1.2 MB)…\n1.4 MB/s avg", Some(0.3));
             draw_debug_overlay(ctx, [1.0, 2.0, 3.0], 90.0, "qeynos", 4);
             draw_labels(
                 ctx,
