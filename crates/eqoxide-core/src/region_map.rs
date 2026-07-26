@@ -269,11 +269,18 @@ impl RegionMap {
 
     /// If the point is inside a zone-line (`DRNTP`) region, the zone-point index it carries — the
     /// same value as the `OP_SendZonepoints` `iterator` for that line, used to resolve the
-    /// destination zone. `None` when the point isn't in a zone-line region, or when loaded from a
-    /// v1 map (which carries no index). A zero index (unresolved/short-form region) reads as `None`.
+    /// destination zone. `None` only when the point isn't in a zone-line region at all.
+    ///
+    /// A ZERO index reads as `Some(0)`, NOT `None` (#683): zero means the bake carried no
+    /// resolvable index (a short-form/unresolved region, or a v1 map) — but the region is still a
+    /// real zone line and must still trigger a crossing. Gating recognition on the index locked a
+    /// character into qrg forever (its only exit region is baked `special=3, index=0`), while the
+    /// retail client fires OP_ZoneChange on ANY zone-line region hit and lets the server resolve
+    /// the destination from position. The index is a destination-resolution HINT, never a trigger
+    /// gate.
     pub fn zone_line_at(&self, sx: f32, sy: f32, sz: f32) -> Option<i32> {
         let node = self.leaf_at(sx, sy, sz)?;
-        if node.special == REGION_ZONE_LINE && node.zone_line_index != 0 {
+        if node.special == REGION_ZONE_LINE {
             Some(node.zone_line_index)
         } else {
             None
@@ -282,12 +289,14 @@ impl RegionMap {
 
     /// Distinct zone-point indices of every zone-line (`DRNTP`) region in this map — the set of
     /// exits the current zone has. Each index links to an entrance via the `OP_SendZonepoints`
-    /// `iterator`. Empty for a v1 map (no indices).
+    /// `iterator`. Index 0 (a region baked without a resolvable index, or any v1-map zone line) IS
+    /// included (#683): it is a real exit whose destination only the server can resolve, not a
+    /// non-exit.
     pub fn zone_line_indices(&self) -> Vec<i32> {
         let mut v: Vec<i32> = self
             .nodes
             .iter()
-            .filter(|n| n.left == 0 && n.right == 0 && n.special == REGION_ZONE_LINE && n.zone_line_index != 0)
+            .filter(|n| n.left == 0 && n.right == 0 && n.special == REGION_ZONE_LINE)
             .map(|n| n.zone_line_index)
             .collect();
         v.sort_unstable();
@@ -343,7 +352,9 @@ impl RegionMap {
         if nn <= 0 || depth > 256 { return; }
         let Some(node) = self.nodes.get((nn - 1) as usize) else { return; };
         if node.left == 0 && node.right == 0 {
-            if node.special == REGION_ZONE_LINE && node.zone_line_index != 0 {
+            // Index 0 leaves are included (#683): an index-0 zone line is still an exit, and the
+            // precomputed point is what lets `find_zone_line_near`/the auto-cross reach it.
+            if node.special == REGION_ZONE_LINE {
                 match self.find_interior_point(node.zone_line_index, aabb, obliques) {
                     Some(p) => out.push((node.zone_line_index, p)),
                     None => tracing::warn!(
@@ -607,6 +618,51 @@ mod tests {
         let rm = RegionMap::load(dir.path(), "z").expect("v1 still loads");
         assert!(rm.is_water(10.0, 20.0, -5.0));
         assert_eq!(rm.zone_line_at(10.0, 20.0, -5.0), None); // v1 carries no index
+    }
+
+    /// **#683 (qrg / Surefall Glade total exit lockout): a zone-line leaf baked with index 0 is
+    /// STILL a zone line and MUST be recognized.**
+    ///
+    /// qrg's only exit region is baked correctly as `special == REGION_ZONE_LINE` but carries
+    /// `zone_line_index == 0`. The old `&& zone_line_index != 0` gates made every recognition path
+    /// (`zone_line_at`, `zone_line_indices`, the precompute) silently treat it as "not a zone line
+    /// at all", so the character could never leave the zone — while the retail client fires
+    /// OP_ZoneChange on ANY zone-line region hit and lets the server resolve the destination. The
+    /// index is a HINT for destination resolution, not a trigger gate.
+    ///
+    /// Mutation check: restore `&& node.zone_line_index != 0` in any of `zone_line_at`,
+    /// `zone_line_indices`, or `collect_zone_line_leaves` → the corresponding assertion goes RED.
+    /// On unmodified main all three fail (Some(0)→None, [0]→[], 1 point→0 points).
+    #[test]
+    fn a_zero_index_zone_line_region_is_still_recognized_683() {
+        // The qrg shape, via the fixture: everything below z=0 is a zone line carrying index 0.
+        let rm = RegionMap::zone_line_below(0.0, 0);
+        // 1. Point classification: recognized, with the (unresolvable) index reported as-is.
+        assert_eq!(rm.zone_line_at(1.0, 2.0, -3.0), Some(0),
+            "an index-0 zone-line region must be recognized (Some(0)), not erased (None)");
+        assert_eq!(rm.zone_line_at(1.0, 2.0, 3.0), None, "outside the region stays None");
+        // 2. Exit enumeration: the zone HAS an exit; hiding it made /observe/zone_exits report [].
+        assert_eq!(rm.zone_line_indices(), vec![0],
+            "an index-0 exit must be enumerated — a zone with one is not exit-less");
+        // 3. Precompute: the region gets a representative point, so find_zone_line_near can route
+        //    a character onto it and the standing auto-cross can fire.
+        let pts = rm.zone_line_region_points((-100.0, 100.0, -50.0, 50.0, -30.0, 20.0));
+        assert_eq!(pts.len(), 1, "the index-0 zone-line leaf must yield a precomputed point");
+        let (idx, p) = pts[0];
+        assert_eq!(idx, 0);
+        assert_eq!(rm.zone_line_at(p[0], p[1], p[2]), Some(0), "returned point validates: {p:?}");
+        // 4. End-to-end through the REAL v2 loader (the exact bake shape qrg ships).
+        let blob = wtr_v2(&[
+            ([0.0, 0.0, 1.0], -2.0, 0, 2, 3, 0),
+            ([0.0; 3], 0.0, 0, 0, 0, 0),
+            ([0.0; 3], 0.0, REGION_ZONE_LINE, 0, 0, 0), // special=3, index=0 — the qrg bake
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("z.wtr"), &blob).unwrap();
+        let loaded = RegionMap::load(dir.path(), "z").expect("v2 loads");
+        assert_eq!(loaded.zone_line_at(10.0, 20.0, -5.0), Some(0),
+            "a loaded special=3/index=0 leaf must classify as a zone line");
+        assert_eq!(loaded.zone_line_indices(), vec![0]);
     }
 
     #[test]

@@ -149,6 +149,14 @@ impl ZoneAssetState {
     /// build a zone (`Ready` is deliberately not fabricable without a real grid). Test-only.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn test_ready() -> Self {
+        Self::test_ready_with_water(None)
+    }
+
+    /// [`Self::test_ready`], with an optional region map (`.wtr` BSP) installed on the grid — for
+    /// tests in crates that cannot build a zone but need zone-line-region behaviour (e.g. the #683
+    /// unresolved-index auto-cross in `eqoxide-net`). Test-only.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn test_ready_with_water(water: Option<Arc<eqoxide_core::region_map::RegionMap>>) -> Self {
         use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
         let mesh = MeshData {
             positions: vec![
@@ -159,8 +167,9 @@ impl ZoneAssetState {
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
         };
-        let col = Collision::build(
+        let mut col = Collision::build(
             &ZoneAssets { terrain: vec![mesh], objects: vec![], textures: vec![] }, 32.0);
+        if water.is_some() { col.set_water(water); }
         Self::ready("testfixture", 1, Arc::new(col))
     }
 
