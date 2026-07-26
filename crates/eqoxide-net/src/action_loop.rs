@@ -1510,20 +1510,36 @@ impl ActionLoop {
                                     })
                                     // #683: `want_zone` IS advertised but no located region carries
                                     // any of its indices (qrg: the only exit region is baked with
-                                    // index 0). Fall back to the NEAREST zone line of ANY index —
-                                    // the same lookup `want_zone == 0` uses — and let the standing
-                                    // auto-cross + server echo determine the real destination.
+                                    // index 0). Fall back to the nearest UNRESOLVABLE zone line —
+                                    // one whose index matches no advertised destination — and let
+                                    // the standing auto-cross + server echo determine the real
+                                    // destination. ONLY unresolvable lines are candidates: a region
+                                    // whose index resolves to an advertised zone point is KNOWN to
+                                    // lead to that OTHER zone, and walking onto it would cross the
+                                    // caller somewhere it never asked to go (qeynos: a zone_cross
+                                    // to qeynos2, whose gate lines are baked index 0, must not walk
+                                    // onto the nearer RESOLVABLE catacombs line and cross to qcat).
                                     // Gated exactly like the auto-cross fallback (see
                                     // `classify_unresolved_cross`): never in a zone that advertises
                                     // a same-zone pad, and never before zone points arrive — so
                                     // this can't route a character onto an intra-zone pad (#679).
                                     .or_else(|| {
-                                        let allowed = {
+                                        let (allowed, resolvable): (bool, Vec<i32>) = {
                                             let zps = self.world.zone_points.lock().unwrap();
-                                            classify_unresolved_cross(&zps, gs.world.zone_id)
-                                                == UnresolvedCross::SendServerResolved
+                                            (classify_unresolved_cross(&zps, gs.world.zone_id)
+                                                 == UnresolvedCross::SendServerResolved,
+                                             zps.iter().filter(|zp| zp.zone_id != 0)
+                                                .map(|zp| zp.iterator as i32).collect())
                                         };
-                                        if allowed { c.find_zone_line_near(None, pos) } else { None }
+                                        if !allowed { return None; }
+                                        c.zone_line_indices().into_iter()
+                                            .filter(|idx| !resolvable.contains(idx))
+                                            .filter_map(|idx| c.find_zone_line_near(Some(idx), pos))
+                                            .min_by(|a, b| {
+                                                let da = (a.1[0]-pos[0]).hypot(a.1[1]-pos[1]);
+                                                let db = (b.1[0]-pos[0]).hypot(b.1[1]-pos[1]);
+                                                da.total_cmp(&db)
+                                            })
                                     })
                             }
                         }
@@ -1534,9 +1550,13 @@ impl ActionLoop {
                             // against the advertised list. `None` = an UNADVERTISED index (the #683
                             // fallback): the destination is genuinely unknown until the server
                             // resolves the crossing, so say that — never claim the requested zone,
-                            // which the server may tie-break elsewhere (agent-honesty).
+                            // which the server may tie-break elsewhere (agent-honesty). The
+                            // `zone_id != 0` filter mirrors `resolve_cross_destination`: a zone
+                            // point advertising zone_id 0 is the "server resolves from position"
+                            // SENTINEL (qrg ships one with iterator 0), not a destination — without
+                            // the filter this claimed "walking to the zone_id=0 line" (seen live).
                             let known_dest = self.world.zone_points.lock().unwrap().iter()
-                                .find(|zp| zp.iterator as i32 == index).map(|zp| zp.zone_id);
+                                .find(|zp| zp.iterator as i32 == index && zp.zone_id != 0).map(|zp| zp.zone_id);
                             let dest_label = match known_dest {
                                 Some(z) => format!("zone_id={z}"),
                                 None => "server-resolved-destination".to_string(),
@@ -3976,15 +3996,25 @@ mod tests {
         }
     }
 
-    /// **#683 — the `/v1/move/zone_cross {{zone_id:N}}` walk-to falls back to the nearest zone line
-    /// when the advertised index has no located region.** qrg advertises zone 181/4 but its only
-    /// exit region is baked index 0, so the per-index lookup finds nothing; the old code answered
-    /// the definitive `no_path zone_line_not_in_map` and the agent could never even WALK to the
-    /// exit. The fallback walks to the nearest line of ANY index (same as `zone_id:0`) and reports
-    /// the destination honestly as server-resolved — never as the requested zone. Mutation check:
-    /// drop the `.or_else` fallback in `drain_zone_cross` → goto stays unset, nav_state reads
-    /// `no_path`, RED. On unmodified main this test also fails earlier: the index-0 region is not
-    /// even recognized by the region map.
+    /// **#683 — the `/v1/move/zone_cross {{zone_id:N}}` walk-to falls back to the nearest
+    /// UNRESOLVABLE zone line when the advertised index has no located region.** qrg advertises
+    /// zone 181/4 but its only exit region is baked index 0, so the per-index lookup finds
+    /// nothing; the old code answered the definitive `no_path zone_line_not_in_map` and the agent
+    /// could never even WALK to the exit.
+    ///
+    /// The scene is the qeynos MIXED shape (#672, observed live): a NEARER region that RESOLVES
+    /// to a different advertised zone (the catacombs decoy) plus a FARTHER index-0 region. The
+    /// fallback must pick the index-0 line — a resolvable region is KNOWN to lead to its own
+    /// other zone, and walking onto it would cross the caller somewhere it never asked to go. And
+    /// it must report the destination honestly as server-resolved — never as the requested zone
+    /// (qrg's real triggers are 0,0,0 placeholders the server tie-breaks itself).
+    ///
+    /// Mutation checks: drop the `.or_else` fallback in `drain_zone_cross` → goto stays unset,
+    /// RED; relax the fallback to `find_zone_line_near(None, ..)` (any nearest) → it walks to the
+    /// nearer resolvable decoy, the footprint assertion goes RED; drop the `zone_id != 0`
+    /// sentinel filter from the honest-messaging lookup → the message claims "zone 0" (seen
+    /// live), the destination-resolved-by-server assertion goes RED. On unmodified main this test
+    /// fails earlier still: the index-0 region is not even recognized by the region map.
     #[tokio::test]
     async fn zone_cross_walks_to_an_unadvertised_line_when_the_index_lookup_fails_683() {
         use eqoxide_nav::zone_assets;
@@ -3998,12 +4028,21 @@ mod tests {
             let mut zps = nav.world.zone_points.lock().unwrap();
             zps.push(zp_at(1, 181, [1790.0, 1315.0, -13.0]));
             zps.push(zp_at(2, 4,   [196.7, 5100.9, -1.0]));
+            zps.push(zp_at(33, 45, [50.0, 50.0, 0.0])); // the resolvable decoy's destination
+            // The iterator-0 / zone_id-0 SENTINEL qrg really advertises. It matches the located
+            // region's index (0) but is NOT a destination — the honest-messaging lookup must
+            // filter it (seen live before the filter: "walking to the zone_id=0 line").
+            zps.push(zp_at(0, 0, [0.0, 0.0, 0.0]));
         }
-        // Index-0 exit region on a far corner of the flat test floor (north 60..80 × east 60..80,
-        // z-slab [-1, 5] so the floor-projected point still classifies inside the region), player at
-        // the origin — well beyond the 15u "already on the line" radius, so a walk is requested.
+        // Two zone-line regions on the flat test floor (z-slab [-1, 5] so the floor-projected
+        // point still classifies inside), player at the origin, both beyond the 15u "already on
+        // the line" radius: a NEARER decoy (north/east 20..40, ~42u) whose index 33 RESOLVES to
+        // zone 45, and a FARTHER index-0 region (north/east 60..80, ~99u) resolving to nothing.
         let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
-            eqoxide_core::region_map::RegionMap::zone_line_box(60.0, 80.0, 60.0, 80.0, -1.0, 5.0, 0),
+            eqoxide_core::region_map::RegionMap::zone_line_boxes(&[
+                ([20.0, 40.0, 20.0, 40.0, -1.0, 5.0], 33),
+                ([60.0, 80.0, 60.0, 80.0, -1.0, 5.0], 0),
+            ]),
         ))).collision().unwrap().clone();
         zone_assets::finish_zone_load(&nav.collision, &nav.zone_assets, "qrg", Some(grid), 1, None);
 
@@ -4012,11 +4051,12 @@ mod tests {
         nav.drain_zone_cross(&mut stream, &mut gs);
 
         let goal = nav.command.goto_target()
-            .expect("the fallback must walk toward the nearest zone line, not report no_path (#683)");
+            .expect("the fallback must walk toward the nearest unresolvable zone line, not report no_path (#683)");
         assert!((60.0..=80.0).contains(&goal.0) && (60.0..=80.0).contains(&goal.1),
-            "the walk goal must be inside the index-0 exit region footprint, got {goal:?}");
+            "the walk goal must be inside the INDEX-0 region footprint — never the nearer decoy that \
+             resolves to a different zone (it would cross the caller to a zone it never asked for), got {goal:?}");
         // HONESTY: the client must not claim the walk leads to the REQUESTED zone — the server may
-        // tie-break the crossing elsewhere (qrg's real triggers are 0,0,0 placeholders).
+        // tie-break the crossing elsewhere.
         assert!(gs.messages.iter().any(|m| m.text.contains("destination resolved by server")),
             "the walk must be reported with an explicit server-resolved destination");
         assert!(!gs.messages.iter().any(|m| m.text.contains("Walking to the zone 181")),

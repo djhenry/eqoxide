@@ -145,6 +145,44 @@ impl RegionMap {
         RegionMap { nodes }
     }
 
+    /// Test-only: SEVERAL zone-line (`DRNTP`) boxes, each with its OWN index — the shape a real
+    /// zone with a MIX of resolvable and index-0 lines has (qeynos: a resolvable catacombs line
+    /// next to index-0 gate lines, #683/#672). Each entry is `([n0, n1, e0, e1, zbot, ztop], index)`
+    /// in server coords; boxes are tested in order (first containing box wins), everywhere outside
+    /// every box reads dry. Same chain construction as [`water_boxes`] — see its doc for the
+    /// duplicate-AABB caveat (safe direction; every candidate is `zone_line_at`-validated).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn zone_line_boxes(boxes: &[([f32; 6], i32)]) -> RegionMap {
+        let k = boxes.len() as i32;
+        let dry_leaf = 6 * k + 1;
+        let mut nodes: Vec<BspNode> = Vec::with_capacity((6 * k + 1 + k) as usize);
+        for (i, (b, _)) in boxes.iter().enumerate() {
+            let i = i as i32;
+            let [n0, n1, e0, e1, zbot, ztop] = *b;
+            let zl_leaf = dry_leaf + 1 + i;
+            // Outside ANY plane of this box → try the next box, or dry if this was the last.
+            let out = if i + 1 < k { 6 * (i + 1) + 1 } else { dry_leaf };
+            // leaf_at swaps to (north, east, z), so normal = [north, east, z].
+            let planes: [([f32; 3], f32); 6] = [
+                ([1.0, 0.0, 0.0], -n0),    // north >= n0
+                ([-1.0, 0.0, 0.0], n1),    // north <= n1
+                ([0.0, 1.0, 0.0], -e0),    // east  >= e0
+                ([0.0, -1.0, 0.0], e1),    // east  <= e1
+                ([0.0, 0.0, 1.0], -zbot),  // z     >= zbot
+                ([0.0, 0.0, -1.0], ztop),  // z     <= ztop
+            ];
+            for (p, (normal, split)) in planes.into_iter().enumerate() {
+                let inside = if p < 5 { 6 * i + 2 + p as i32 } else { zl_leaf };
+                nodes.push(BspNode { normal, split, special: 0, left: inside, right: out, zone_line_index: 0 });
+            }
+        }
+        nodes.push(BspNode { normal: [0.0; 3], split: 0.0, special: 0, left: 0, right: 0, zone_line_index: 0 }); // dry
+        for (_, index) in boxes {
+            nodes.push(BspNode { normal: [0.0; 3], split: 0.0, special: REGION_ZONE_LINE, left: 0, right: 0, zone_line_index: *index });
+        }
+        RegionMap { nodes }
+    }
+
     /// Test-only: a map where everything below `top_z` is a zone-line region carrying `index`.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn zone_line_below(top_z: f32, index: i32) -> RegionMap {
