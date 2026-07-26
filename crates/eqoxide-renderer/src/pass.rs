@@ -1222,15 +1222,44 @@ pub fn encode_shadow_pass(
         timestamp_writes: None, occlusion_query_set: None,
     });
 
-    // Placed objects (opaque/masked instanced meshes) cast shadows.
+    // Placed objects (opaque/masked instanced meshes) cast shadows. Opaque stays on the cheap
+    // fragment-less `shadow_instanced` pipeline (no per-pixel cost). Masked routes through
+    // `shadow_instanced_masked` (#707), which alpha-tests the caster's diffuse texture at the same
+    // 0.5 threshold as the color pass — otherwise a foliage/branch quad casts its full bounding
+    // rectangle instead of its cutout silhouette (the tree-shadow-is-square bug).
     use eqoxide_assets::RenderMode;
+    let tex_bg = |idx: Option<usize>| -> &wgpu::BindGroup {
+        match idx {
+            Some(i) if i < r.texture_bind_groups.len() => &r.texture_bind_groups[i],
+            _ => &r.fallback_texture_bg,
+        }
+    };
     let mut inst_bound = false;
     for mesh in &r.gpu_instanced {
-        if !matches!(mesh.render_mode, RenderMode::Opaque | RenderMode::Masked) { continue; }
+        if mesh.render_mode != RenderMode::Opaque { continue; }
         if !inst_bound {
             pass.set_pipeline(&r.pipelines.shadow_instanced);
             pass.set_bind_group(0, &r.light_depth_bg, &[]);
             inst_bound = true;
+        }
+        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+        pass.set_vertex_buffer(1, mesh.instance_buf.slice(..));
+        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.index_count, 0, 0..mesh.instance_count);
+    }
+    let mut inst_masked_bound = false;
+    let mut inst_masked_tex: Option<usize> = None;
+    for mesh in &r.gpu_instanced {
+        if mesh.render_mode != RenderMode::Masked { continue; }
+        if !inst_masked_bound {
+            pass.set_pipeline(&r.pipelines.shadow_instanced_masked);
+            pass.set_bind_group(0, &r.light_depth_bg, &[]);
+            pass.set_bind_group(1, tex_bg(mesh.texture_idx), &[]);
+            inst_masked_tex = mesh.texture_idx;
+            inst_masked_bound = true;
+        } else if mesh.texture_idx != inst_masked_tex {
+            inst_masked_tex = mesh.texture_idx;
+            pass.set_bind_group(1, tex_bg(inst_masked_tex), &[]);
         }
         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
         pass.set_vertex_buffer(1, mesh.instance_buf.slice(..));

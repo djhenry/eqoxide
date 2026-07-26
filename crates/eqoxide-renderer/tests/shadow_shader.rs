@@ -31,10 +31,19 @@
 
 const ZONE_WGSL: &str = include_str!("../src/shaders/zone.wgsl");
 const ZONE_INSTANCED_WGSL: &str = include_str!("../src/shaders/zone_instanced.wgsl");
+const SHADOW_WGSL: &str = include_str!("../src/shaders/shadow.wgsl");
+const SHADOW_MASKED_INSTANCED_WGSL: &str = include_str!("../src/shaders/shadow_masked_instanced.wgsl");
 
 /// The value picked in the eqoxide#614 A/B (see this file's module doc). Both shaders must carry
 /// exactly this literal in their `apply_shadow` function.
 const EXPECTED_AMBIENT_FLOOR: f32 = 0.25;
+
+/// The alpha-test cutout threshold used by every masked-material fragment shader in the renderer
+/// (zone.wgsl's `fs_main`, zone_instanced.wgsl's `fs_main`, and — since eqoxide#707 —
+/// shadow_masked_instanced.wgsl's `fs_instanced_masked`). All three MUST agree: if the shadow pass's
+/// cutout diverges from the color pass's, the shadow silhouette disagrees with the rendered
+/// silhouette, which is the exact bug class #707 fixes.
+const EXPECTED_ALPHA_CUTOUT: f32 = 0.5;
 
 fn parse_and_validate(source: &str, label: &str) -> naga::Module {
     let module = naga::front::wgsl::parse_str(source)
@@ -74,6 +83,29 @@ fn extract_shadow_floor(source: &str, label: &str) -> f32 {
     literal
         .parse::<f32>()
         .unwrap_or_else(|e| panic!("{label}: `{literal}` (the mix() floor argument) isn't a valid f32 literal: {e}"))
+}
+
+/// Extracts the `X` in `if (texel.a < X) { discard; }` — the raw, trimmed source text of the
+/// alpha-test cutout threshold — via a string search (same technique as
+/// `extract_shadow_floor_literal` above, for the same "no #include" reason).
+fn extract_alpha_cutout_literal<'a>(source: &'a str, label: &str) -> &'a str {
+    let marker = "texel.a < ";
+    let at = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("{label}: couldn't find `{marker}` (no alpha-test cutout?)"));
+    let after = &source[at + marker.len()..];
+    let paren_at = after
+        .find(')')
+        .unwrap_or_else(|| panic!("{label}: couldn't find the `)` closing the `texel.a < ...` condition"));
+    after[..paren_at].trim()
+}
+
+/// Parsed `f32` form of [`extract_alpha_cutout_literal`].
+fn extract_alpha_cutout(source: &str, label: &str) -> f32 {
+    let literal = extract_alpha_cutout_literal(source, label);
+    literal
+        .parse::<f32>()
+        .unwrap_or_else(|e| panic!("{label}: `{literal}` (the alpha-cutout threshold) isn't a valid f32 literal: {e}"))
 }
 
 #[test]
@@ -130,6 +162,91 @@ fn ambient_floor_is_a_plausible_darkening_fraction() {
         assert!(
             (0.0..1.0).contains(&floor),
             "{label}: shadow floor {floor} is outside the plausible [0.0, 1.0) darkening range"
+        );
+    }
+}
+
+// ── eqoxide#707: masked-foliage shadow caster ──────────────────────────────────────────────────
+//
+// Tree shadows were square: the sun shadow-map depth pass (shadow.wgsl) had no fragment stage at
+// all, so a `RenderMode::Masked` instanced caster (foliage/branches with a keyed-transparent
+// texture) wrote full depth for every triangle of its quad instead of discarding the transparent
+// texels the color pass (zone_instanced.wgsl/zone.wgsl) discards. The fix adds a fragment stage —
+// `shadow_masked_instanced.wgsl`'s `fs_instanced_masked` — used only for `RenderMode::Masked`
+// instanced casters (pass.rs routes by render_mode; `RenderMode::Opaque` casters keep using the
+// cheap fragment-less `shadow_instanced` pipeline). These tests can't spin up a GPU device (no
+// device in this crate's test harness — see this file's module doc), so they cover what's testable
+// without one: the new shader parses/validates as legal WGSL, declares the expected entry points,
+// and — the thing most likely to silently drift later — its alpha-test cutout threshold agrees with
+// the color pass's.
+
+#[test]
+fn shadow_wgsl_and_shadow_masked_instanced_wgsl_parse_and_validate() {
+    parse_and_validate(SHADOW_WGSL, "shadow.wgsl");
+    let masked_module = parse_and_validate(SHADOW_MASKED_INSTANCED_WGSL, "shadow_masked_instanced.wgsl");
+
+    // Structural guard: the masked pipeline (pipeline.rs) binds these two entry points by name: if
+    // either is renamed/removed here without updating pipeline.rs, pipeline creation panics at
+    // startup — but this test catches the drift at build time instead of at first launch.
+    let entry_names: Vec<&str> = masked_module
+        .entry_points
+        .iter()
+        .map(|ep| ep.name.as_str())
+        .collect();
+    assert!(
+        entry_names.contains(&"vs_instanced_masked"),
+        "shadow_masked_instanced.wgsl: missing `vs_instanced_masked` entry point (found {entry_names:?})"
+    );
+    assert!(
+        entry_names.contains(&"fs_instanced_masked"),
+        "shadow_masked_instanced.wgsl: missing `fs_instanced_masked` entry point (found {entry_names:?})"
+    );
+}
+
+/// The core regression guard for #707: the shadow pass's masked-caster cutout must agree with the
+/// color pass's, in both directions — the color shaders must still have theirs (in case a future
+/// edit strips the discard the shadow fix is supposed to mirror), and the new shadow shader must
+/// have picked up the SAME literal, not an independently-chosen one.
+///
+/// Mutation-checked: reverting the #707 fix (dropping `shadow_masked_instanced.wgsl`, or its
+/// `fs_instanced_masked` not containing an `if (texel.a < ...)` cutout) makes
+/// `extract_alpha_cutout_literal` panic — this test goes RED on unmodified pre-fix `main`, not just
+/// on a wrong-but-present threshold.
+#[test]
+fn shadow_masked_alpha_cutout_matches_color_pass() {
+    let zone_literal = extract_alpha_cutout_literal(ZONE_WGSL, "zone.wgsl");
+    let zone_instanced_literal = extract_alpha_cutout_literal(ZONE_INSTANCED_WGSL, "zone_instanced.wgsl");
+    let shadow_masked_literal =
+        extract_alpha_cutout_literal(SHADOW_MASKED_INSTANCED_WGSL, "shadow_masked_instanced.wgsl");
+
+    assert_eq!(
+        zone_literal, zone_instanced_literal,
+        "zone.wgsl's alpha cutout ({zone_literal}) must match zone_instanced.wgsl's \
+         ({zone_instanced_literal}) — both are color-pass cutouts for the same asset-server-decoded \
+         textures."
+    );
+    assert_eq!(
+        zone_literal, shadow_masked_literal,
+        "zone.wgsl's alpha cutout ({zone_literal}) must match shadow_masked_instanced.wgsl's \
+         ({shadow_masked_literal}) — a divergent shadow-pass threshold would make the shadow \
+         silhouette disagree with the rendered silhouette (eqoxide#707)."
+    );
+}
+
+/// Pins the extracted value, separately from the equality check above (equal-but-wrong — e.g. all
+/// three accidentally retuned to some other number together — would pass the drift test but
+/// silently change every masked material's cutout).
+#[test]
+fn shadow_masked_alpha_cutout_matches_expected_value() {
+    for (source, label) in [
+        (ZONE_WGSL, "zone.wgsl"),
+        (ZONE_INSTANCED_WGSL, "zone_instanced.wgsl"),
+        (SHADOW_MASKED_INSTANCED_WGSL, "shadow_masked_instanced.wgsl"),
+    ] {
+        let cutout = extract_alpha_cutout(source, label);
+        assert_eq!(
+            cutout, EXPECTED_ALPHA_CUTOUT,
+            "{label}: alpha cutout {cutout} drifted from the expected {EXPECTED_ALPHA_CUTOUT}"
         );
     }
 }
