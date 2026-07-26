@@ -2,13 +2,13 @@
 
 use axum::{
     body::Body,
-    extract::{Query, State},
+    extract::{Query, RawQuery, State},
     http::{header, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::oneshot;
 use super::*;
 
@@ -888,6 +888,50 @@ struct FrameQuery {
     distance: Option<String>,
 }
 
+/// The `FrameQuery` field names that must each appear at most once — used by
+/// [`parse_frame_query`]'s duplicate-key check (#701). This is exactly the recognized-field set;
+/// a duplicated *unrecognized* key (e.g. `?foo=1&foo=2`) is unaffected by this change and keeps
+/// its pre-#701 behavior of being silently ignored (`FrameQuery` has no `deny_unknown_fields`,
+/// unlike `MessagesQuery`/`EntitiesQuery`).
+const FRAME_QUERY_FIELDS: [&str; 5] = ["allow_pending", "preset", "pitch", "yaw", "distance"];
+
+/// Parse `GET /frame`'s raw query string into a [`FrameQuery`], by hand rather than via axum's
+/// `Query<FrameQuery>` extractor (#701).
+///
+/// **Why not `Query<FrameQuery>`:** axum's extractor calls `serde_urlencoded::from_str`, whose
+/// derived-`Deserialize` visitor rejects a REPEATED key for a scalar field
+/// (`?pitch=10&pitch=200`) with `serde::de::Error::duplicate_field` — confirmed by reading
+/// `serde_urlencoded-0.7.1/src/de.rs` (it defers to `serde::de::value::MapDeserializer`, whose
+/// `visit_map` call lands in `FrameQuery`'s derived visitor, which tracks a `seen` flag per field
+/// exactly the way `serde_derive` generates for every struct). Axum surfaces that as its own
+/// `QueryRejection` → `FailedToDeserializeQueryString`, which renders as a generic `text/plain`
+/// 400 — NOT the `{"error":"invalid_camera_override","message":"…"}` JSON shape every other
+/// malformed-*value* case on this endpoint returns (see `resolve_camera_override`). An agent
+/// parsing the JSON `error` field would get a non-JSON body for this one input class.
+///
+/// This function detects exactly that one failure mode itself — a duplicated KEY among
+/// [`FRAME_QUERY_FIELDS`] — and turns it into the same JSON shape, then falls through to
+/// `serde_urlencoded::from_str` (byte-for-byte the same deserialization axum's `Query` would have
+/// done) for everything else, so every OTHER malformed-value case (unparseable numbers,
+/// out-of-range numbers, unknown presets, unrecognized keys) is completely unchanged.
+///
+/// Scoped to `/frame` only: no other route's extractor is touched, so no other endpoint's 400/200
+/// boundary can move because of this change.
+fn parse_frame_query(raw: &str) -> Result<FrameQuery, String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    for (key, _value) in form_urlencoded::parse(raw.as_bytes()) {
+        let key: &str = key.as_ref();
+        if FRAME_QUERY_FIELDS.contains(&key) && !seen.insert(key.to_string()) {
+            return Err(format!(
+                "duplicate query parameter \"{key}\" — pass allow_pending/preset/pitch/yaw/\
+                 distance at most once each; got \"{key}\" more than once"
+            ));
+        }
+    }
+    serde_urlencoded::from_str::<FrameQuery>(raw)
+        .map_err(|e| format!("could not parse query string: {e}"))
+}
+
 /// The state word every `/frame` response carries in `X-Zone-Assets-State` (#595 review nit): a PNG
 /// fetched with `?allow_pending=1` is a 200 `image/png` like any other, so without this header a
 /// mid-load (or wrong-zone) capture is indistinguishable downstream from a real one.
@@ -981,7 +1025,20 @@ fn parse_ranged(v: &str, field: &str, range: std::ops::RangeInclusive<f32>) -> R
     Ok(parsed)
 }
 
-async fn get_frame(State(s): State<HttpState>, Query(q): Query<FrameQuery>) -> Response {
+async fn get_frame(State(s): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+    // #701: parsed by hand via `parse_frame_query` (see its doc), NOT axum's `Query<FrameQuery>`
+    // extractor — so a duplicated `?pitch=10&pitch=200` gets the same `invalid_camera_override`
+    // JSON 400 as every other malformed-value case below, instead of axum's generic text/plain
+    // rejection. Done first, same as an extractor would run, so a malformed query string still
+    // short-circuits before the zone-assets-readiness gate just below (unchanged ordering).
+    let q = match parse_frame_query(raw.as_deref().unwrap_or("")) {
+        Ok(q) => q,
+        Err(message) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid_camera_override", "message": message })),
+        ).into_response(),
+    };
+
     let state_word = {
         let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
         eqoxide_nav::zone_assets::usability(&st, &s.player().zone)
@@ -2331,6 +2388,100 @@ mod tests {
         let resp = handle.await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(header_age_ms(&resp) < 1_000);
+    }
+
+    // ─────────── #701: /frame duplicate-query-param must get the JSON error shape ───────────
+
+    /// eqoxide#701: a DUPLICATED recognized param (`?pitch=10&pitch=200`) must fail with the SAME
+    /// `{"error":"invalid_camera_override","message":"…"}` JSON shape as a malformed *value* does
+    /// (see the next test), not axum's generic `Query<FrameQuery>` plain-text rejection. Mutation-
+    /// checked: reverting `get_frame`/`parse_frame_query` back to `Query(q): Query<FrameQuery>`
+    /// makes this test fail on BOTH assertions — status stays 400, but content-type becomes
+    /// `text/plain; charset=utf-8` and the body is `serde_urlencoded`'s raw
+    /// `Failed to deserialize query string: duplicate field \`pitch\`` text, which is not valid JSON
+    /// at all (`serde_json::from_slice` on it errors), so the shape assertions below are a real
+    /// discriminator, not a tautology.
+    #[tokio::test]
+    async fn frame_duplicate_pitch_param_gets_invalid_camera_override_json() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        let resp = get(state, "/frame?pitch=10&pitch=200").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
+        assert_eq!(
+            content_type.as_ref().and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "a duplicated query param must get the JSON error shape, not axum's plain-text \
+             rejection (#701)"
+        );
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "invalid_camera_override");
+        let message = v["message"].as_str().expect("message must be a string");
+        assert!(message.contains("pitch"),
+            "the message must name the actually-duplicated field, got: {message}");
+    }
+
+    /// Same duplicate-key check, but on `yaw` instead of `pitch` — pins that the field name is
+    /// genuinely read off the wire (not a hardcoded "pitch" string that would lie about `yaw`).
+    #[tokio::test]
+    async fn frame_duplicate_yaw_param_names_yaw_not_pitch() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        let resp = get(state, "/frame?yaw=10&yaw=20").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "invalid_camera_override");
+        let message = v["message"].as_str().unwrap();
+        assert!(message.contains("yaw"), "message should name \"yaw\", got: {message}");
+        assert!(!message.contains("\"pitch\""), "message should not blame pitch, got: {message}");
+    }
+
+    /// Control: a malformed *value* (not a duplicated key) must keep getting the exact same JSON
+    /// shape it already had before #701 — this pins that routing the parse through
+    /// `parse_frame_query`/`serde_urlencoded::from_str` by hand didn't change behavior for the case
+    /// #422 already covered.
+    #[tokio::test]
+    async fn frame_malformed_pitch_value_still_gets_invalid_camera_override_json() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        // Unlike the duplicate-KEY tests above, `pitch=999` parses fine structurally — the failure
+        // is a range check inside `resolve_camera_override`, which (per #422) only runs AFTER the
+        // #579 zone-assets gate. Match the zone so this test reaches that code path instead of
+        // getting a 503 from the unrelated gate first.
+        set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
+        let resp = get(state, "/frame?pitch=999").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "invalid_camera_override");
+        assert!(v["message"].as_str().unwrap().contains("pitch"));
+    }
+
+    /// Blast-radius control: a duplicated key that is NOT one of `FRAME_QUERY_FIELDS` is untouched
+    /// by #701 — it keeps behaving exactly like before (silently ignored, 200), since it was never
+    /// part of the failure this issue is about and `FrameQuery` has no `deny_unknown_fields`.
+    #[tokio::test]
+    async fn frame_duplicate_unrecognized_key_is_still_silently_ignored() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
+        let frame_req = state.camera.frame_req.clone();
+        let handle = tokio::spawn({
+            let state = state.clone();
+            async move { get(state, "/frame?foo=1&foo=2").await }
+        });
+        let req = loop {
+            if let Some(req) = frame_req.lock().unwrap().take() { break req; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert_eq!(req.camera_override, None,
+            "an unrecognized duplicated key is not a camera-override field — no override, no 400");
+        req.tx.send(vec![0x89, b'P', b'N', b'G']).unwrap();
+        let resp = handle.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // ─────────── #422: /frame camera-override resolution (pure, no renderer/HTTP needed) ───────────

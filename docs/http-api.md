@@ -351,9 +351,16 @@ the already-rendered on-screen frame is read back, unchanged.
 | `yaw` | Camera heading, degrees, same convention as `heading_ccw` on `/v1/observe/debug` (0 = north, increasing CCW). Unlike the presets, this is **absolute** — a fixed `yaw` always frames the same world direction regardless of the character's facing at capture time, so a scripted diagnostic angle is reproducible. Omitted → the live camera's current yaw. | `-360.0..=360.0` |
 | `distance` | Camera distance from the character, world units. Omitted → the live camera's current distance. | `1.0..=2000.0` |
 
-An invalid request (out-of-range value, non-numeric value, unknown preset, or `preset` combined with
-any of `pitch`/`yaw`/`distance`) is always a `400 {"error": "invalid_camera_override", "message": "…"}`
-— **never** a `200` at a silently-clamped-or-ignored angle.
+An invalid request (out-of-range value, non-numeric value, unknown preset, `preset` combined with
+any of `pitch`/`yaw`/`distance`, **or a duplicated parameter** — e.g. `?pitch=10&pitch=200`) is
+always a `400 {"error": "invalid_camera_override", "message": "…"}` — **never** a `200` at a
+silently-clamped-or-ignored angle, and (since #701) never a non-JSON body either. The duplicate-key
+case is checked by hand (`GET /frame` parses its own query string rather than using axum's generic
+`Query` extractor) specifically so it lands in this same JSON shape instead of axum's own plain-text
+`400` rejection, which is what it returned before #701. This guarantee is scoped to the five
+recognized params (`allow_pending`/`preset`/`pitch`/`yaw`/`distance`): an unrecognized query key —
+duplicated or not — is still silently ignored, same as before #701 (this endpoint has no
+`deny_unknown_fields` check, unlike `/observe/messages` and `/observe/entities`).
 
 An overridden capture is a separate, UI-free render pass (the on-screen frame — window chrome, HUD,
 inventory, etc. — is built and presented first, completely unaffected either way): a plain
