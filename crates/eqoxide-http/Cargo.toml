@@ -37,6 +37,14 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
+# #701: GET /frame parses its own query string by hand (via `RawQuery`) instead of axum's `Query`
+# extractor, so a duplicate `?pitch=10&pitch=200` can be turned into the same `invalid_camera_override`
+# JSON 400 the value-validation path already returns, instead of axum's generic plain-text rejection.
+# Both are already transitive deps (axum's own `Query` extractor uses `serde_urlencoded`, which uses
+# `form_urlencoded`) at exactly these versions — promoting them to direct deps does not change what
+# gets resolved.
+serde_urlencoded = "0.7"
+form_urlencoded = "1"
 arc-swap = "1"
 tracing = "0.1"
 # `tower::ServiceExt::oneshot` drives a `Router` in-process (no bound socket). Used by the handler

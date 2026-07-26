@@ -2,13 +2,13 @@
 
 use axum::{
     body::Body,
-    extract::{Query, State},
+    extract::{Query, RawQuery, State},
     http::{header, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::oneshot;
 use super::*;
 
@@ -888,6 +888,96 @@ struct FrameQuery {
     distance: Option<String>,
 }
 
+/// The `FrameQuery` field names that must each appear at most once — used by
+/// [`parse_frame_query`]'s duplicate-key check (#701). This is exactly the recognized-field set;
+/// a duplicated *unrecognized* key (e.g. `?foo=1&foo=2`) is unaffected by this change and keeps
+/// its pre-#701 behavior of being silently ignored (`FrameQuery` has no `deny_unknown_fields`,
+/// unlike `MessagesQuery`/`EntitiesQuery`).
+///
+/// NOTE this is a mix of two different subsystems (#701 review, B1): `allow_pending` is the #579
+/// zone-assets-readiness bypass flag, not a camera parameter, unlike the other four. It's still
+/// listed here — this array only decides which keys the duplicate-detection loop below applies
+/// to — but [`duplicate_field_error`] gives it a *different error code* than the camera fields so
+/// the JSON response doesn't misclassify which subsystem the caller's mistake was in.
+const FRAME_QUERY_FIELDS: [&str; 5] = ["allow_pending", "preset", "pitch", "yaw", "distance"];
+
+/// Build the `(error_code, message)` pair for a duplicated `key` among [`FRAME_QUERY_FIELDS`]
+/// (#701 review finding B1).
+///
+/// `allow_pending` is the #579 zone-assets-readiness bypass flag, not one of the camera-angle
+/// params (`preset`/`pitch`/`yaw`/`distance`). Before this function existed, duplicating it got
+/// the same `invalid_camera_override` code as duplicating `pitch` — telling an agent its *camera
+/// angle* was invalid on a request that contained no camera params at all, sending it hunting
+/// through pitch/yaw/preset/distance for a problem that isn't there. That's also a narrow
+/// *regression* against pre-#701 behavior, which returned a generic, honestly-unclassified
+/// text error for this case and never claimed to know it was about the camera.
+///
+/// So `allow_pending` gets its own `invalid_query_param` code, distinct from
+/// `invalid_camera_override`, which now means exactly what its name says: one of the four camera
+/// params. This is additive — every existing consumer keying off `invalid_camera_override` for a
+/// camera-field problem keeps seeing exactly that.
+fn duplicate_field_error(key: &str) -> (&'static str, String) {
+    if key == "allow_pending" {
+        (
+            "invalid_query_param",
+            "duplicate query parameter \"allow_pending\" — pass it at most once".to_string(),
+        )
+    } else {
+        (
+            "invalid_camera_override",
+            format!(
+                "duplicate query parameter \"{key}\" — pass preset/pitch/yaw/distance at most \
+                 once each; got \"{key}\" more than once"
+            ),
+        )
+    }
+}
+
+/// Parse `GET /frame`'s raw query string into a [`FrameQuery`], by hand rather than via axum's
+/// `Query<FrameQuery>` extractor (#701).
+///
+/// **Why not `Query<FrameQuery>`:** axum's extractor calls `serde_urlencoded::from_str`, whose
+/// derived-`Deserialize` visitor rejects a REPEATED key for a scalar field
+/// (`?pitch=10&pitch=200`) with `serde::de::Error::duplicate_field` — confirmed by reading
+/// `serde_urlencoded-0.7.1/src/de.rs` (it defers to `serde::de::value::MapDeserializer`, whose
+/// `visit_map` call lands in `FrameQuery`'s derived visitor, which tracks a `seen` flag per field
+/// exactly the way `serde_derive` generates for every struct). Axum surfaces that as its own
+/// `QueryRejection` → `FailedToDeserializeQueryString`, which renders as a generic `text/plain`
+/// 400 — NOT the JSON shape every other malformed-*value* case on this endpoint returns (see
+/// `resolve_camera_override`). An agent parsing the JSON `error` field would get a non-JSON body
+/// for this one input class.
+///
+/// This function detects exactly that one failure mode itself — a duplicated KEY among
+/// [`FRAME_QUERY_FIELDS`] — and turns it into a JSON-shaped error via [`duplicate_field_error`]
+/// (which also picks the *correct* error code — see B1 there), then falls through to
+/// `serde_urlencoded::from_str` (byte-for-byte the same deserialization axum's `Query` would have
+/// done) for everything else, so every OTHER malformed-value case (unparseable numbers,
+/// out-of-range numbers, unknown presets, unrecognized keys) is completely unchanged.
+///
+/// Scoped to `/frame` only: no other route's extractor is touched, so no other endpoint's 400/200
+/// boundary can move because of this change.
+fn parse_frame_query(raw: &str) -> Result<FrameQuery, (&'static str, String)> {
+    // `&'static str`, not `String`: each matched key borrows straight from `FRAME_QUERY_FIELDS`
+    // (a `'static` array), not from the per-iteration `Cow` — no per-key allocation (#701 review
+    // nit).
+    let mut seen: HashSet<&'static str> = HashSet::new();
+    for (key, _value) in form_urlencoded::parse(raw.as_bytes()) {
+        let key: &str = key.as_ref();
+        if let Some(&field) = FRAME_QUERY_FIELDS.iter().find(|&&f| f == key) {
+            if !seen.insert(field) {
+                return Err(duplicate_field_error(field));
+            }
+        }
+    }
+    // Defensive fallback: with every duplicate among the recognized fields already caught above,
+    // and every `FrameQuery` field an `Option<String>` (so almost any input deserializes), this is
+    // not expected to trigger in practice. It isn't guaranteed to be camera-specific either (it
+    // isn't tied to any particular field), so — same honesty reasoning as B1 above — it gets the
+    // field-agnostic `invalid_query_param` code rather than assuming `invalid_camera_override`.
+    serde_urlencoded::from_str::<FrameQuery>(raw)
+        .map_err(|e| ("invalid_query_param", format!("could not parse query string: {e}")))
+}
+
 /// The state word every `/frame` response carries in `X-Zone-Assets-State` (#595 review nit): a PNG
 /// fetched with `?allow_pending=1` is a 200 `image/png` like any other, so without this header a
 /// mid-load (or wrong-zone) capture is indistinguishable downstream from a real one.
@@ -981,7 +1071,23 @@ fn parse_ranged(v: &str, field: &str, range: std::ops::RangeInclusive<f32>) -> R
     Ok(parsed)
 }
 
-async fn get_frame(State(s): State<HttpState>, Query(q): Query<FrameQuery>) -> Response {
+async fn get_frame(State(s): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
+    // #701: parsed by hand via `parse_frame_query` (see its doc), NOT axum's `Query<FrameQuery>`
+    // extractor — so a duplicated `?pitch=10&pitch=200` gets the same `invalid_camera_override`
+    // JSON 400 as every other malformed-value case below, instead of axum's generic text/plain
+    // rejection. Done first, same as an extractor would run, so a malformed query string still
+    // short-circuits before the zone-assets-readiness gate just below (unchanged ordering).
+    let q = match parse_frame_query(raw.as_deref().unwrap_or("")) {
+        Ok(q) => q,
+        // #701 review (B1): the error code comes FROM `parse_frame_query`/`duplicate_field_error`
+        // now, not a hardcoded "invalid_camera_override" — a duplicated `allow_pending` (not a
+        // camera param) must not be mislabeled as a camera-override problem.
+        Err((error, message)) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error, "message": message })),
+        ).into_response(),
+    };
+
     let state_word = {
         let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
         eqoxide_nav::zone_assets::usability(&st, &s.player().zone)
@@ -2335,6 +2441,249 @@ mod tests {
         let resp = handle.await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(header_age_ms(&resp) < 1_000);
+    }
+
+    // ─────────── #701: /frame duplicate-query-param must get the JSON error shape ───────────
+
+    /// eqoxide#701: a DUPLICATED recognized param (`?pitch=10&pitch=200`) must fail with the SAME
+    /// `{"error":"invalid_camera_override","message":"…"}` JSON shape as a malformed *value* does
+    /// (see the next test), not axum's generic `Query<FrameQuery>` plain-text rejection. Mutation-
+    /// checked: reverting `get_frame`/`parse_frame_query` back to `Query(q): Query<FrameQuery>`
+    /// makes this test fail on BOTH assertions — status stays 400, but content-type becomes
+    /// `text/plain; charset=utf-8` and the body is `serde_urlencoded`'s raw
+    /// `Failed to deserialize query string: duplicate field \`pitch\`` text, which is not valid JSON
+    /// at all (`serde_json::from_slice` on it errors), so the shape assertions below are a real
+    /// discriminator, not a tautology.
+    #[tokio::test]
+    async fn frame_duplicate_pitch_param_gets_invalid_camera_override_json() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        let resp = get(state, "/frame?pitch=10&pitch=200").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
+        assert_eq!(
+            content_type.as_ref().and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "a duplicated query param must get the JSON error shape, not axum's plain-text \
+             rejection (#701)"
+        );
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "invalid_camera_override");
+        let message = v["message"].as_str().expect("message must be a string");
+        assert!(message.contains("pitch"),
+            "the message must name the actually-duplicated field, got: {message}");
+    }
+
+    /// Same duplicate-key check, but on `yaw` instead of `pitch` — pins that the field name is
+    /// genuinely read off the wire (not a hardcoded "pitch" string that would lie about `yaw`).
+    #[tokio::test]
+    async fn frame_duplicate_yaw_param_names_yaw_not_pitch() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        let resp = get(state, "/frame?yaw=10&yaw=20").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "invalid_camera_override");
+        let message = v["message"].as_str().unwrap();
+        assert!(message.contains("yaw"), "message should name \"yaw\", got: {message}");
+        assert!(!message.contains("\"pitch\""), "message should not blame pitch, got: {message}");
+    }
+
+    /// Control: a malformed *value* (not a duplicated key) must keep getting the exact same JSON
+    /// shape it already had before #701 — this pins that routing the parse through
+    /// `parse_frame_query`/`serde_urlencoded::from_str` by hand didn't change behavior for the case
+    /// #422 already covered.
+    #[tokio::test]
+    async fn frame_malformed_pitch_value_still_gets_invalid_camera_override_json() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        // Unlike the duplicate-KEY tests above, `pitch=999` parses fine structurally — the failure
+        // is a range check inside `resolve_camera_override`, which (per #422) only runs AFTER the
+        // #579 zone-assets gate. Match the zone so this test reaches that code path instead of
+        // getting a 503 from the unrelated gate first.
+        set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
+        let resp = get(state, "/frame?pitch=999").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "invalid_camera_override");
+        assert!(v["message"].as_str().unwrap().contains("pitch"));
+    }
+
+    /// eqoxide#701 review finding B1: duplicating `allow_pending` (the #579 zone-assets-readiness
+    /// bypass flag, NOT a camera param) must NOT come back as `invalid_camera_override` — that
+    /// would tell the caller its camera angle was invalid on a request with no camera params at
+    /// all. It gets its own `invalid_query_param` code instead, and the message must name
+    /// `allow_pending`, not claim anything about the camera.
+    ///
+    /// Mutation-checked: reverting `duplicate_field_error` to always return
+    /// `"invalid_camera_override"` (i.e. collapsing back to the pre-B1-fix behavior) makes the
+    /// `error` assertion below fail — actual value is `"invalid_camera_override"`, not
+    /// `"invalid_query_param"` — so this is a real discriminator between the two codes, not a
+    /// tautology.
+    #[tokio::test]
+    async fn frame_duplicate_allow_pending_gets_invalid_query_param_not_camera_override() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        let resp = get(state, "/frame?allow_pending=1&allow_pending=0").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let v = body_json(resp).await;
+        assert_eq!(
+            v["error"], "invalid_query_param",
+            "allow_pending is not a camera param — must not be mislabeled invalid_camera_override"
+        );
+        let message = v["message"].as_str().expect("message must be a string");
+        assert!(message.contains("allow_pending"),
+            "message must name allow_pending, got: {message}");
+        assert!(!message.contains("camera"),
+            "message must not falsely characterize this as a camera problem, got: {message}");
+    }
+
+    /// Control: the four actual camera fields (`preset`/`pitch`/`yaw`/`distance`) still get
+    /// `invalid_camera_override` when duplicated — B1's fix only carved out `allow_pending`, it
+    /// didn't change the code for the fields the code name is actually about.
+    #[tokio::test]
+    async fn frame_duplicate_preset_still_gets_invalid_camera_override() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        let resp = get(state, "/frame?preset=front&preset=side").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "invalid_camera_override");
+        assert!(v["message"].as_str().unwrap().contains("preset"));
+    }
+
+    /// Blast-radius control: a duplicated key that is NOT one of `FRAME_QUERY_FIELDS` is untouched
+    /// by #701 — it keeps behaving exactly like before (silently ignored, 200), since it was never
+    /// part of the failure this issue is about and `FrameQuery` has no `deny_unknown_fields`.
+    #[tokio::test]
+    async fn frame_duplicate_unrecognized_key_is_still_silently_ignored() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
+        let frame_req = state.camera.frame_req.clone();
+        let mut handle = tokio::spawn({
+            let state = state.clone();
+            async move { get(state, "/frame?foo=1&foo=2").await }
+        });
+        // Hardened during #701 review round 2: a naive unbounded poll-loop here would hang forever
+        // (rather than fail) under any mutation that makes this input a 400 before ever
+        // registering a frame_req — that exact pattern jammed the shared remote builder for
+        // several minutes during this review round. Racing against `handle` bounds it.
+        let req = tokio::select! {
+            req = async {
+                loop {
+                    if let Some(req) = frame_req.lock().unwrap().take() { return req; }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            } => req,
+            res = &mut handle => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected an unrecognized duplicated key to be silently ignored and reach the \
+                     frame-request hand-off, but the handler returned early with status {} instead",
+                    resp.status()
+                );
+            }
+        };
+        assert_eq!(req.camera_override, None,
+            "an unrecognized duplicated key is not a camera-override field — no override, no 400");
+        req.tx.send(vec![0x89, b'P', b'N', b'G']).unwrap();
+        let resp = handle.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Regression pin for the B1 rework of `parse_frame_query`: a bare `?` (empty query string,
+    /// `RawQuery` yields `Some("")`) must still resolve to "no override" and 200, same as no query
+    /// string at all. `form_urlencoded::parse("".as_bytes())` yields zero pairs, so the
+    /// duplicate-key loop never runs and `serde_urlencoded::from_str("")` deserializes to an
+    /// all-`None` `FrameQuery` — this pins that path stays reachable after B1 touched the function.
+    #[tokio::test]
+    async fn frame_empty_query_string_still_resolves_to_no_override() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
+        let frame_req = state.camera.frame_req.clone();
+        let mut handle = tokio::spawn({
+            let state = state.clone();
+            async move { get(state, "/frame?").await }
+        });
+        // Race the frame_req poll against the handler task itself: if a mutation makes
+        // `parse_frame_query` reject this input, `get_frame` returns EARLY (never registering a
+        // frame_req at all), and the naive poll-loop this was copied from would spin forever
+        // waiting for a frame_req that's never coming — hanging the whole test binary instead of
+        // failing it. Racing against `handle` turns that into a clean, immediate assertion failure.
+        let req = tokio::select! {
+            req = async {
+                loop {
+                    if let Some(req) = frame_req.lock().unwrap().take() { return req; }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            } => req,
+            res = &mut handle => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected an empty `?` to resolve to no override and reach the frame-request \
+                     hand-off, but the handler returned early with status {} instead",
+                    resp.status()
+                );
+            }
+        };
+        assert_eq!(req.camera_override, None, "an empty `?` carries no params — no override");
+        req.tx.send(vec![0x89, b'P', b'N', b'G']).unwrap();
+        let resp = handle.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Regression pin for the B1 rework: a doubled `&` separator (`?pitch=10&&yaw=20`) produces an
+    /// empty-string key/value pair between the two real ones — that empty key isn't in
+    /// `FRAME_QUERY_FIELDS`, so it's ignored by the duplicate-key loop exactly like any other
+    /// unrecognized key, and the two real, non-duplicated fields still resolve to a valid override
+    /// (200), not a 400.
+    #[tokio::test]
+    async fn frame_double_ampersand_separator_still_resolves_normally() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
+        let frame_req = state.camera.frame_req.clone();
+        let mut handle = tokio::spawn({
+            let state = state.clone();
+            async move { get(state, "/frame?pitch=10&&yaw=20").await }
+        });
+        // See the comment in `frame_empty_query_string_still_resolves_to_no_override`: racing
+        // against `handle` turns a mutation that makes this input a 400 into a clean assertion
+        // failure instead of a hang (the naive poll-loop this was copied from would spin forever
+        // if `get_frame` returns early without ever registering a frame_req).
+        let req = tokio::select! {
+            req = async {
+                loop {
+                    if let Some(req) = frame_req.lock().unwrap().take() { return req; }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            } => req,
+            res = &mut handle => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected pitch/yaw (neither missing nor duplicated) to resolve to a valid \
+                     override and reach the frame-request hand-off, but the handler returned \
+                     early with status {} instead — a doubled `&` must not turn this into a 400",
+                    resp.status()
+                );
+            }
+        };
+        assert!(req.camera_override.is_some(),
+            "pitch/yaw are neither missing nor duplicated — a doubled `&` must not turn this into \
+             a 400");
+        req.tx.send(vec![0x89, b'P', b'N', b'G']).unwrap();
+        let resp = handle.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // ─────────── #422: /frame camera-override resolution (pure, no renderer/HTTP needed) ───────────

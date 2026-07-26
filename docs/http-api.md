@@ -351,9 +351,25 @@ the already-rendered on-screen frame is read back, unchanged.
 | `yaw` | Camera heading, degrees, same convention as `heading_ccw` on `/v1/observe/debug` (0 = north, increasing CCW). Unlike the presets, this is **absolute** — a fixed `yaw` always frames the same world direction regardless of the character's facing at capture time, so a scripted diagnostic angle is reproducible. Omitted → the live camera's current yaw. | `-360.0..=360.0` |
 | `distance` | Camera distance from the character, world units. Omitted → the live camera's current distance. | `1.0..=2000.0` |
 
-An invalid request (out-of-range value, non-numeric value, unknown preset, or `preset` combined with
-any of `pitch`/`yaw`/`distance`) is always a `400 {"error": "invalid_camera_override", "message": "…"}`
-— **never** a `200` at a silently-clamped-or-ignored angle.
+**Scoped to the four params in the table above** (this guarantee does not cover `allow_pending` —
+see below): an invalid request against `preset`/`pitch`/`yaw`/`distance` — out-of-range value,
+non-numeric value, unknown preset, `preset` combined with any of `pitch`/`yaw`/`distance`, or one
+of these four **duplicated** (e.g. `?pitch=10&pitch=200`) — is always a
+`400 {"error": "invalid_camera_override", "message": "…"}` that names the offending param — **never**
+a `200` at a silently-clamped-or-ignored angle, and (since #701) never a non-JSON body either. The
+duplicate-key case is checked by hand (`GET /frame` parses its own query string rather than using
+axum's generic `Query` extractor) specifically so it lands in this same JSON shape instead of
+axum's own plain-text `400` rejection, which is what it returned before #701.
+
+**`allow_pending` is not a camera param** (it's the [zone-assets-readiness bypass
+flag](#zone_assets--is-the-world-this-response-describes-actually-loaded-579)), so a duplicated
+`allow_pending` (e.g. `?allow_pending=1&allow_pending=0`) does **not** get `invalid_camera_override`
+— that would misname the subsystem the caller's mistake was actually in. It gets its own
+`400 {"error": "invalid_query_param", "message": "…"}` instead (also JSON, since #701; before #701
+this was axum's plain-text rejection like any other duplicate). An unrecognized query key —
+duplicated or not, on either category of param — is still silently ignored either way, same as
+before #701 (this endpoint has no `deny_unknown_fields` check, unlike `/observe/messages` and
+`/observe/entities`).
 
 An overridden capture is a separate, UI-free render pass (the on-screen frame — window chrome, HUD,
 inventory, etc. — is built and presented first, completely unaffected either way): a plain
