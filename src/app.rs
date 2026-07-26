@@ -1368,6 +1368,12 @@ impl App {
             // The new zone's floor may sit above the zone-point spawn z; settle onto it once
             // collision loads (see the reground block in the vertical-physics section below).
             self.needs_reground = true;
+            // …and drop the controller's last-good recovery ring with the old collision (#712).
+            // Those samples are untagged coordinates from the PREVIOUS zone; if the fall-through
+            // guard or the depenetration fallback restores one here it lands the character at an
+            // arbitrary point in THIS zone — in #712 a point 133u outside steamfont's geometry,
+            // where it wedged permanently and the nav graph reported `start_isolated`.
+            self.controller.forget_recovery_history();
             // `door_frac` is already cleared for this zone change above (#326) — that clear has
             // to run before the door-easing loop reads the map, which is earlier in this same
             // function than this reload block, so it isn't repeated here.
@@ -1538,20 +1544,26 @@ impl App {
                 self.controller.teleport(corr);
             }
 
-            // One-shot reground after a zone change: if the controller spawned below the floor, lift
-            // it onto the nearest floor once the new zone's collision is loaded.
+            // One-shot reground after a zone change: if the controller arrived below the floor, lift
+            // it onto that floor once the new zone's collision is loaded. "Below the floor" is
+            // decided by `zone_in_reground`, which asks UPWARD — it also covers the #712 case of
+            // arriving 1–3u under the surface with a long drop beneath, which the old
+            // "no floor at all below" test read as perfectly settled and which ended in a
+            // free-fall past the zone's underworld.
             if self.needs_reground && !self.loading {
                 if let Some(c) = self.collision.as_deref() {
                     let p = self.controller.pos;
-                    if c.ground_below(p[0], p[1], p[2] + 1.0, 200.0).is_none() {
-                        if let Some(f) = c.nearest_floor(p[0], p[1], p[2], 200.0, 0.0) {
+                    match crate::movement::zone_in_reground(c, p) {
+                        crate::movement::Reground::Lift(f) => {
                             self.controller.teleport([p[0], p[1], f]);
                             self.controller.on_ground = true;
                             self.needs_reground = false;
-                            tracing::info!("zone-in: regrounded controller to floor z={:.1}", f);
+                            tracing::info!(
+                                "zone-in: regrounded controller to floor z={:.2} (arrived at z={:.2})",
+                                f, p[2]);
                         }
-                    } else {
-                        self.needs_reground = false;
+                        crate::movement::Reground::Settled => self.needs_reground = false,
+                        crate::movement::Reground::Wait => {}
                     }
                 }
             }
