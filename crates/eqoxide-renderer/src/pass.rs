@@ -1234,6 +1234,22 @@ pub fn encode_shadow_pass(
             _ => &r.fallback_texture_bg,
         }
     };
+    // Same animated-texture frame selection the color pass uses (see draw_instanced above /
+    // encode_zone_pass's `frame_tex`). Only the masked loop needs this: an animated
+    // RenderMode::Masked caster's shadow must alpha-test against the SAME texel the color pass is
+    // currently sampling, or the two silhouettes disagree on any frame but the first (the shadow
+    // would test a stale/base frame while the visible mesh has already advanced) — the identical
+    // failure class #707 fixes, just triggered by time instead of by a missing discard. Opaque
+    // casters never sample a texture in the shadow pass at all, so they don't need this.
+    let now_ms = anim_now_ms();
+    let frame_tex = |tex: Option<usize>, anim: &Option<(u32, Vec<usize>)>| -> Option<usize> {
+        match anim {
+            Some((ms, frames)) if !frames.is_empty() => {
+                Some(frames[(now_ms / (*ms).max(1) as u64) as usize % frames.len()])
+            }
+            _ => tex,
+        }
+    };
     let mut inst_bound = false;
     for mesh in &r.gpu_instanced {
         if mesh.render_mode != RenderMode::Opaque { continue; }
@@ -1251,14 +1267,15 @@ pub fn encode_shadow_pass(
     let mut inst_masked_tex: Option<usize> = None;
     for mesh in &r.gpu_instanced {
         if mesh.render_mode != RenderMode::Masked { continue; }
+        let etex = frame_tex(mesh.texture_idx, &mesh.anim);
         if !inst_masked_bound {
             pass.set_pipeline(&r.pipelines.shadow_instanced_masked);
             pass.set_bind_group(0, &r.light_depth_bg, &[]);
-            pass.set_bind_group(1, tex_bg(mesh.texture_idx), &[]);
-            inst_masked_tex = mesh.texture_idx;
+            pass.set_bind_group(1, tex_bg(etex), &[]);
+            inst_masked_tex = etex;
             inst_masked_bound = true;
-        } else if mesh.texture_idx != inst_masked_tex {
-            inst_masked_tex = mesh.texture_idx;
+        } else if etex != inst_masked_tex {
+            inst_masked_tex = etex;
             pass.set_bind_group(1, tex_bg(inst_masked_tex), &[]);
         }
         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));

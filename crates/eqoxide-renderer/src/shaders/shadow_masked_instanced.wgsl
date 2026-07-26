@@ -10,10 +10,13 @@
 // another entry point tacked onto that file: shadow.wgsl's `entity: Model` uniform already occupies
 // @group(1)@binding(0) for the static/skinned casters, and WGSL requires every global to have a
 // unique (group, binding) across an ENTIRE parsed module even when a given entry point never
-// touches it — so reusing @group(1) here for a texture would collide with that declaration. A fresh
-// module gets independent group numbering for free, at the cost of duplicating the small
-// vertex-transform already in shadow.wgsl's `vs_instanced` (the same WGSL #include limitation
-// documented in tests/shadow_shader.rs's module doc).
+// touches it — so reusing @group(1) here for a texture would collide with that declaration.
+// @group(3) is free in shadow.wgsl and would have avoided the collision in-file; a fresh module was
+// preferred over that because it means `shadow_instanced_masked`'s pipeline layout carries only the
+// two bind groups it actually uses (shadow_light_bgl, texture_bgl) instead of also having to declare
+// shadow.wgsl's unused entity/joint bind group layouts just to keep the group numbering contiguous.
+// The cost is duplicating the small vertex-transform already in shadow.wgsl's `vs_instanced` (the
+// same WGSL #include limitation documented in tests/shadow_shader.rs's module doc).
 //
 // Applies ONLY to RenderMode::Masked instanced (placed-object) casters — pass.rs routes by
 // render_mode, and RenderMode::Opaque casters keep using the cheap fragment-less `shadow_instanced`
