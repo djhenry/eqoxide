@@ -319,10 +319,13 @@ mod tests {
         assert!(high.ends_with("avg"), "must be labeled: {high}");
     }
 
-    /// Returns true if `s` — a `format_download_rate` output — reads as a zero rate. The only
-    /// legitimate all-zero token this function ever emits is a leading "0" (e.g. "0 B/s avg", for
-    /// a genuinely-zero input); the "<1 B/s avg" branch is deliberately excluded by starting with
-    /// "<", not a digit that parses to 0.
+    /// Returns true if `s` — a `format_download_rate` output — parses as a zero rate: its leading
+    /// whitespace-delimited token parses as `f64` and equals `0.0`. This is a NUMERIC-branch check
+    /// only. It does not, and structurally cannot, constrain non-numeric output: any token that
+    /// fails to parse (including `"<1"`, but also an empty string or garbage) counts as "not zero"
+    /// here. `format_download_rate_never_reads_as_zero_for_a_positive_rate` therefore pins the
+    /// sub-1-B/s branch with a separate exact-string assertion instead of routing it through this
+    /// helper — see that test.
     fn reads_as_zero(s: &str) -> bool {
         match s.split_whitespace().next() {
             Some(tok) => tok.parse::<f64>().map(|v| v == 0.0).unwrap_or(false),
@@ -335,13 +338,36 @@ mod tests {
         // #714: `format_download_rate` must hold this invariant over the WHOLE positive-rate
         // domain, not just the unit boundaries someone thought to hand-pick — a rate under
         // ~512 B/s used to floor to "0 KB/s avg" while the transfer was genuinely progressing,
-        // which is exactly the false statement #708 banned, wearing a KB/s costume. Sweep the
-        // domain both deterministically (every representable magnitude decade, including the
-        // sub-1-B/s range that a naive B/s branch would still get wrong) and with randomized
-        // samples inside each decade, so a future unit boundary can't reintroduce the bug
-        // un-caught.
-        let mut rng = rand::thread_rng();
+        // which is exactly the false statement #708 banned, wearing a KB/s costume.
+        //
+        // Two different checks cover the domain, because one helper can't honestly cover both:
+        //   - For v >= 1.0 (the B/s, KB/s, and MB/s branches all round a real number), `reads_as_zero`
+        //     asserts the leading numeric token isn't literally 0.
+        //   - For 0 < v < 1.0 (the sub-1-B/s branch), the output is the fixed literal "<1 B/s avg",
+        //     not a rounded number, so it's pinned by exact string equality instead. This is
+        //     deliberate: `reads_as_zero` would pass for ANY unparseable string in that branch —
+        //     including an empty one — so it cannot be the thing standing between that branch and a
+        //     regression. Sweep the domain both deterministically (every unit-boundary neighbor plus
+        //     sub-1-B/s and huge-rate extremes) and with a seeded random sweep across magnitude
+        //     decades, so the property is checked densely rather than only at chosen points.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x714);
         use rand::Rng;
+        use rand::SeedableRng;
+
+        let assert_not_a_false_zero = |v: f64| {
+            let s = format_download_rate(v);
+            if v < 1.0 {
+                assert_eq!(
+                    s, "<1 B/s avg",
+                    "sub-1-B/s positive rate {v} must render the fixed '<1 B/s avg' literal, got {s:?}"
+                );
+            } else {
+                assert!(
+                    !reads_as_zero(&s),
+                    "positive rate {v} formatted as a zero-reading string: {s:?}"
+                );
+            }
+        };
 
         // Deterministic boundary/edge values, including the exact unit thresholds and their
         // neighbors, plus sub-B/s and huge-rate extremes.
@@ -372,25 +398,19 @@ mod tests {
             f64::MAX,
         ];
         for &v in fixed {
-            let s = format_download_rate(v);
-            assert!(
-                !reads_as_zero(&s),
-                "positive rate {v} formatted as a zero-reading string: {s:?}"
-            );
+            assert_not_a_false_zero(v);
         }
 
-        // Randomized sweep across magnitude decades from ~1e-6 to ~1e9 bytes/sec, several samples
-        // per decade, so the property is checked densely rather than only at chosen points.
+        // Seeded random sweep across magnitude decades from ~1e-6 to ~1e9 bytes/sec, several
+        // samples per decade. Seeded (not `thread_rng`) so a failure is reproducible from the seed
+        // alone — every swept branch has a provable minimum non-zero/pinned output, so this isn't
+        // guarding against flakiness, only against an unreproducible failure if one ever occurs.
         for decade in -6..=9i32 {
             let lo = 10f64.powi(decade);
             let hi = 10f64.powi(decade + 1);
             for _ in 0..50 {
                 let v = rng.gen_range(lo..hi);
-                let s = format_download_rate(v);
-                assert!(
-                    !reads_as_zero(&s),
-                    "positive rate {v} (decade {decade}) formatted as a zero-reading string: {s:?}"
-                );
+                assert_not_a_false_zero(v);
             }
         }
     }
