@@ -718,10 +718,18 @@ impl App {
                 set_status("Verifying zone assets…");
                 let dl_status = load_status.clone();
                 crate::asset_sync::sync_set(&sync, &format!("zone/{zone_name}"), &cache, &mut |p| {
-                    if matches!(p.phase, crate::asset_sync::Phase::Downloading) {
-                        let mb = p.bytes as f64 / 1_048_576.0;
-                        *dl_status.lock().unwrap() =
-                            format!("Downloading zone {}/{} ({:.1} MB)…", p.done, p.total, mb);
+                    // #708: only `Downloading` carries bytes/elapsed at all — see `SyncProgress`.
+                    // A `Verifying` tick has nowhere a rate could be read from, so this branch is
+                    // the ONLY place a speed line can be constructed, and every other status write
+                    // in this function (`set_status`) is a plain single-line string with none.
+                    if let crate::asset_sync::SyncProgress::Downloading { done, total, bytes, elapsed } = p {
+                        let mb = bytes as f64 / 1_048_576.0;
+                        let mut line = format!("Downloading zone {done}/{total} ({mb:.1} MB)…");
+                        if let Some(bps) = crate::asset_sync::download_rate_bytes_per_sec(bytes, elapsed) {
+                            line.push('\n');
+                            line.push_str(&hud::format_download_rate(bps));
+                        }
+                        *dl_status.lock().unwrap() = line;
                     }
                 })?;
                 // Door/object models for clickable doors come from the asset server's
@@ -1005,16 +1013,22 @@ impl App {
                     let sync = crate::asset_sync::AssetSync::login(&url, &user, &pass)?;
                     *status.lock().unwrap() = "Verifying assets…".to_string();
                     crate::asset_sync::sync_set(&sync, "common", &cache, &mut |p| {
-                        match p.phase {
-                            crate::asset_sync::Phase::Verifying => {
+                        match p {
+                            crate::asset_sync::SyncProgress::Verifying => {
+                                // Plain single-line string: no speed line is representable here
+                                // (#708) — `Verifying` carries no bytes/elapsed to derive one from.
                                 *status.lock().unwrap() = "Verifying assets…".to_string();
                                 *progress.lock().unwrap() = None;
                             }
-                            crate::asset_sync::Phase::Downloading => {
-                                let mb = p.bytes as f64 / 1_048_576.0;
-                                *status.lock().unwrap() =
-                                    format!("Downloading {}/{} ({:.1} MB)…", p.done, p.total, mb);
-                                let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 1.0 };
+                            crate::asset_sync::SyncProgress::Downloading { done, total, bytes, elapsed } => {
+                                let mb = bytes as f64 / 1_048_576.0;
+                                let mut line = format!("Downloading {done}/{total} ({mb:.1} MB)…");
+                                if let Some(bps) = crate::asset_sync::download_rate_bytes_per_sec(bytes, elapsed) {
+                                    line.push('\n');
+                                    line.push_str(&hud::format_download_rate(bps));
+                                }
+                                *status.lock().unwrap() = line;
+                                let frac = if total > 0 { done as f32 / total as f32 } else { 1.0 };
                                 *progress.lock().unwrap() = Some(frac);
                             }
                         }
