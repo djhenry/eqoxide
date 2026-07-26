@@ -1133,6 +1133,14 @@ impl ActionLoop {
             // (This is the zone-boundary sibling of the mid-zone stale-plan bug #246.)
             self.walker.reset_for_zone_change();
 
+            // #683 round 3: the gated-refusal latch is keyed on a REGION INDEX, and region indices
+            // are per-zone namespaces (index 0 is the universal unresolvable index). A server
+            // teleport that lands the character from one gated null region directly onto ANOTHER
+            // zone's gated null region would find the latch already set and silently suppress the
+            // new zone's refusal message — the F1 silent wait, resurrected across a zone boundary.
+            // The latch is only ever about the zone the character is standing in; re-arm it here.
+            self.gated_cross_reported = None;
+
             // #448: reap any awaited merchant buy still parked across the crossing as `Unconfirmed`.
             // The merchant is in the OLD zone, so no echo can ever arrive now; leaving the Sender
             // parked would let a shop echo in the NEW zone mis-correlate it (or strand it until the
@@ -2863,11 +2871,16 @@ impl ActionLoop {
                 // A `tracing::debug!` alone left an agent standing on a `zone_id: null` exit in a
                 // gated zone with zero feedback — "crossing in progress" and "refused" were
                 // indistinguishable (#683 review F1, measured live in qeynos2).
+                // The two stated causes mirror the classify gates EXACTLY (round-3 precision fix):
+                // "no server zone points available" covers every way the list can lack a
+                // server-originated advert — not yet received, all entries dropped client-side
+                // (e.g. the 999999 keep-position sentinel filter), or only synthesized map-label
+                // entries present — not just "not yet received".
                 if self.gated_cross_reported != Some(index) {
                     self.gated_cross_reported = Some(index);
-                    gs.log_msg("zone", "Standing on a zone line with unknown destination — auto-cross is disabled here (zone points not yet received, or this zone has teleport pads)");
+                    gs.log_msg("zone", "Standing on a zone line with unknown destination — auto-cross is disabled here (no server zone points are available for this zone, or this zone has teleport pads)");
                 }
-                tracing::debug!("zone_cross: zone-line region index={index} unresolved and the server-resolved fallback is gated (no server zone points yet, or a same-zone pad is advertised here) — not crossing");
+                tracing::debug!("zone_cross: zone-line region index={index} unresolved and the server-resolved fallback is gated (no server zone points available, or a same-zone pad is advertised here) — not crossing");
             }
         }
     }
@@ -4127,6 +4140,55 @@ mod tests {
             assert_eq!(refusals(&gs), 2,
                 "{label}: leaving and re-entering the region must re-report the refusal");
         }
+    }
+
+    /// **#683 round 3 — the gated-refusal latch must NOT survive a zone change.**
+    ///
+    /// Region indices are per-zone namespaces and index 0 is the universal unresolvable index, so
+    /// a server teleport that lands the character from one gated null region directly onto
+    /// ANOTHER zone's gated null region would find the latch still set for "index 0" and silently
+    /// suppress the NEW zone's refusal message — the F1 silent wait this message exists to
+    /// remove, resurrected across a zone boundary. The observable behaviour under test: after a
+    /// zone change, standing on the new zone's gated line reports the refusal AGAIN.
+    ///
+    /// Mutation check: drop the `gated_cross_reported = None` from `sync_zone_points`' zone-change
+    /// branch → the second-message assertion goes RED.
+    #[tokio::test]
+    async fn the_gated_refusal_latch_resets_on_zone_change_683() {
+        use eqoxide_nav::zone_assets;
+        let refusals = |gs: &GameState| gs.messages.iter()
+            .filter(|m| m.text.contains("auto-cross is disabled here")).count();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+
+        // Zone A: gated (no zone points at all), standing on an index-0 line → one refusal.
+        gs.world.zone_id = 2;
+        gs.world.zone_name = "qeynos2".into();
+        nav.sync_zone_points(&gs);
+        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_below(1000.0, 0),
+        ))).collision().unwrap().clone();
+        zone_assets::finish_zone_load(&nav.collision, &nav.zone_assets, "qeynos2", Some(grid.clone()), 1, None);
+        nav.last_zone_cross = Instant::now() - Duration::from_secs(11);
+        nav.drain_zone_cross(&mut stream, &mut gs);
+        assert_eq!(refusals(&gs), 1, "zone A: the gated stand is reported once");
+
+        // Server teleport (e.g. a GM #zone) to zone B, landing DIRECTLY on another gated index-0
+        // line — the character is never observed off-region in between.
+        gs.begin_zone_in();
+        gs.world.zone_id = 24;
+        gs.world.zone_name = "erudnext".into();
+        nav.sync_zone_points(&gs); // the zone-change tick — must re-arm the latch
+        zone_assets::finish_zone_load(&nav.collision, &nav.zone_assets, "erudnext", Some(grid), 1, None);
+        nav.last_zone_cross = Instant::now() - Duration::from_secs(11);
+        nav.drain_zone_cross(&mut stream, &mut gs);
+
+        assert_eq!(refusals(&gs), 2,
+            "zone B's refusal must be reported — a latch left set across a zone change would leave \
+             the agent in a silent wait in the NEW zone (the exact F1 defect, cross-zone)");
+        assert!(!stream.sent_app_packets().iter().any(|(op, _)| *op == OP_ZONE_CHANGE),
+            "no crossing fires in either gated zone");
     }
 
     /// **#683 — the `/v1/move/zone_cross {{zone_id:N}}` walk-to falls back to the nearest
