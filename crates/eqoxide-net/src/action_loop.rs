@@ -466,6 +466,12 @@ pub struct ActionLoop {
     maps_dir:         std::path::PathBuf,
     current_zone:     String,
     last_zone_cross:  Instant,
+    /// One-shot latch for the gated-refusal message (#683 review F1): the zone-line region index
+    /// whose `UnresolvedCross::Ignore` refusal has already been reported to the message log.
+    /// Cleared when the standing probe finds no region (the character left the line), so re-entry
+    /// reports again. Without this the refusal was a `tracing::debug!` only — an agent standing on
+    /// a `zone_id: null` exit in a gated zone waited forever with zero feedback.
+    gated_cross_reported: Option<i32>,
     /// Set when the auto-cross fires OP_ZoneChange for a SAME-ZONE DRNTP line (an intra-zone
     /// translocator whose zone-point target is the current zone — legitimate retail content, e.g.
     /// the 5 qeynos2 teleport pads). The server answers such a zoneID=0 request with a lightweight
@@ -577,6 +583,58 @@ pub(crate) fn classify_zone_change_echo(
     }
 }
 
+/// Disposition for a standing auto-cross on a zone-line region whose index matches NO advertised
+/// zone point (#683): `SendServerResolved` = send OP_ZoneChange with zoneID=0 and let the server
+/// resolve the destination from our position; `Ignore` = keep the old no-op.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum UnresolvedCross { SendServerResolved, Ignore }
+
+/// Classify an unresolved-index zone-line hit (#683) into its ONE disposition — a pure function,
+/// same shape as [`classify_zone_change_echo`].
+///
+/// The retail client sends OP_ZoneChange(zoneID=0) on ANY zone-line region hit and the server
+/// resolves the destination from position (`Handle_OP_ZoneChange` →
+/// `GetClosestZonePointWithoutZone`, an XY-nearest match over the zone's DB zone points) — no
+/// embedded index required. So "the region's index resolves to no advertised point" must not be a
+/// silent no-op: qrg's ONLY exit region is baked with index 0, and ignoring it was a total
+/// zone-exit lockout.
+///
+/// Two gates keep this from re-opening the #679 same-zone drift (a zoneID=0 packet fired while
+/// standing on an INTRA-zone translocator pad makes the server resolve nearest-XY to a real
+/// cross-zone trigger and zone us away — the "right location, then zoned away" bug):
+/// 1. **At least one SERVER-ORIGINATED advert must be present** — an entry with
+///    `iterator != u32::MAX`. Before OP_SendZonepoints arrives EVERY region index is unresolved —
+///    including the indices of known same-zone pads — so firing in that window could zone a
+///    character standing on a pad. Plain non-emptiness does NOT prove the adverts arrived: the
+///    shared list also carries CLIENT-SYNTHESIZED map-label fallback points, which
+///    `sync_zone_points` marks with `iterator: u32::MAX` (#683 review F2, observed live in
+///    qeynos) — those prove nothing about the server, so they don't count.
+/// 2. **No advertised point may target the CURRENT zone.** A same-zone pad is a DB zone point
+///    targeting its own zone, and the server advertises the zone's DB points — so "some advertised
+///    point targets this zone" ⇒ intra-zone pads exist here, and an unresolved region cannot be
+///    distinguished from a misbaked pad. Refuse in such zones. (A properly-advertised pad never
+///    even gets here — its index resolves, and `perform_cross`'s same-zone branch sends NO packet.)
+///    This gate counts EVERY entry, synthetic ones included — the conservative direction.
+///
+/// **Scope of the guarantee (function level, property-tested):** `SendServerResolved` is returned
+/// ONLY when the list holds a server-originated advert AND no entry targets the current zone —
+/// see `classify_unresolved_cross_property_683`. The remaining SYSTEM premise, which the property
+/// cannot see, is that the list's server-originated entries belong to the CURRENT zone; its two
+/// known violators are closed at the source (`GameState::begin_zone_in` clears the previous
+/// zone's points; `sync_zone_points` rebuilds the shared list on every zone change) but that is a
+/// maintained invariant of those writers, not a structural impossibility here.
+///
+/// qrg advertises only cross-zone points, so its locked exit passes both gates.
+pub(crate) fn classify_unresolved_cross(zone_points: &[ZonePoint], current_zone_id: u16) -> UnresolvedCross {
+    let have_server_adverts = zone_points.iter().any(|zp| zp.iterator != u32::MAX);
+    let same_zone_pad_advertised = zone_points.iter().any(|zp| zp.zone_id == current_zone_id);
+    if have_server_adverts && !same_zone_pad_advertised {
+        UnresolvedCross::SendServerResolved
+    } else {
+        UnresolvedCross::Ignore
+    }
+}
+
 impl ActionLoop {
     /// Takes the M4 domain bundles (see `ipc.rs`) rather than ~59 flat slot params. Each bundle
     /// passed here MUST be a `.clone()` of the SAME bundle `main.rs` also hands to `HttpState` —
@@ -634,6 +692,7 @@ impl ActionLoop {
             maps_dir,
             current_zone: String::new(),
             last_zone_cross: Instant::now(),
+            gated_cross_reported: None,
             same_zone_cross_at: None,
             position_seq: 0,
             last_tick: Instant::now(),
@@ -1074,6 +1133,14 @@ impl ActionLoop {
             // (This is the zone-boundary sibling of the mid-zone stale-plan bug #246.)
             self.walker.reset_for_zone_change();
 
+            // #683 round 3: the gated-refusal latch is keyed on a REGION INDEX, and region indices
+            // are per-zone namespaces (index 0 is the universal unresolvable index). A server
+            // teleport that lands the character from one gated null region directly onto ANOTHER
+            // zone's gated null region would find the latch already set and silently suppress the
+            // new zone's refusal message — the F1 silent wait, resurrected across a zone boundary.
+            // The latch is only ever about the zone the character is standing in; re-arm it here.
+            self.gated_cross_reported = None;
+
             // #448: reap any awaited merchant buy still parked across the crossing as `Unconfirmed`.
             // The merchant is in the OLD zone, so no echo can ever arrive now; leaving the Sender
             // parked would let a shop echo in the NEW zone mis-correlate it (or strand it until the
@@ -1468,22 +1535,70 @@ impl ActionLoop {
                                         let db = (b.1[0]-pos[0]).hypot(b.1[1]-pos[1]);
                                         da.total_cmp(&db)
                                     })
+                                    // #683: `want_zone` IS advertised but no located region carries
+                                    // any of its indices (qrg: the only exit region is baked with
+                                    // index 0). Fall back to the nearest UNRESOLVABLE zone line —
+                                    // one whose index matches no advertised destination — and let
+                                    // the standing auto-cross + server echo determine the real
+                                    // destination. ONLY unresolvable lines are candidates: a region
+                                    // whose index resolves to an advertised zone point is KNOWN to
+                                    // lead to that OTHER zone, and walking onto it would cross the
+                                    // caller somewhere it never asked to go (qeynos: a zone_cross
+                                    // to qeynos2, whose gate lines are baked index 0, must not walk
+                                    // onto the nearer RESOLVABLE catacombs line and cross to qcat).
+                                    // Gated exactly like the auto-cross fallback (see
+                                    // `classify_unresolved_cross`): never in a zone that advertises
+                                    // a same-zone pad, and never before zone points arrive — so
+                                    // this can't route a character onto an intra-zone pad (#679).
+                                    .or_else(|| {
+                                        let (allowed, resolvable): (bool, Vec<i32>) = {
+                                            let zps = self.world.zone_points.lock().unwrap();
+                                            (classify_unresolved_cross(&zps, gs.world.zone_id)
+                                                 == UnresolvedCross::SendServerResolved,
+                                             zps.iter().filter(|zp| zp.zone_id != 0)
+                                                .map(|zp| zp.iterator as i32).collect())
+                                        };
+                                        if !allowed { return None; }
+                                        c.zone_line_indices().into_iter()
+                                            .filter(|idx| !resolvable.contains(idx))
+                                            .filter_map(|idx| c.find_zone_line_near(Some(idx), pos))
+                                            .min_by(|a, b| {
+                                                let da = (a.1[0]-pos[0]).hypot(a.1[1]-pos[1]);
+                                                let db = (b.1[0]-pos[0]).hypot(b.1[1]-pos[1]);
+                                                da.total_cmp(&db)
+                                            })
+                                    })
                             }
                         }
                     });
                     match located {
                         Some((index, [tx, ty, tz])) => {
-                            // Destination zone for logging (resolve the located region's index).
-                            let dest_zone = self.world.zone_points.lock().unwrap().iter()
-                                .find(|zp| zp.iterator as i32 == index).map(|zp| zp.zone_id).unwrap_or(want_zone);
+                            // Destination zone for logging — resolve the located region's index
+                            // against the advertised list. `None` = an UNADVERTISED index (the #683
+                            // fallback): the destination is genuinely unknown until the server
+                            // resolves the crossing, so say that — never claim the requested zone,
+                            // which the server may tie-break elsewhere (agent-honesty). The
+                            // `zone_id != 0` filter mirrors `resolve_cross_destination`: a zone
+                            // point advertising zone_id 0 is the "server resolves from position"
+                            // SENTINEL (qrg ships one with iterator 0), not a destination — without
+                            // the filter this claimed "walking to the zone_id=0 line" (seen live).
+                            let known_dest = self.world.zone_points.lock().unwrap().iter()
+                                .find(|zp| zp.iterator as i32 == index && zp.zone_id != 0).map(|zp| zp.zone_id);
+                            let dest_label = match known_dest {
+                                Some(z) => format!("zone_id={z}"),
+                                None => "server-resolved-destination".to_string(),
+                            };
                             let d2 = (tx - gs.player_x).powi(2) + (ty - gs.player_y).powi(2);
                             const ZONE_LINE_DIST2: f32 = 15.0 * 15.0;
                             if d2 <= ZONE_LINE_DIST2 {
                                 // Already standing on the line — the auto-cross below fires this tick.
-                                tracing::info!("zone_cross: already on the zone_id={dest_zone} line (index={index})");
+                                tracing::info!("zone_cross: already on the {dest_label} line (index={index})");
                             } else {
-                                tracing::info!("zone_cross: walking {:.0}u to the zone_id={dest_zone} line at ({tx:.0},{ty:.0}) (index={index})", d2.sqrt());
-                                gs.log_msg("zone", &format!("Walking to the zone {} line", dest_zone));
+                                tracing::info!("zone_cross: walking {:.0}u to the {dest_label} line at ({tx:.0},{ty:.0}) (index={index})", d2.sqrt());
+                                match known_dest {
+                                    Some(z) => gs.log_msg("zone", &format!("Walking to the zone {} line", z)),
+                                    None => gs.log_msg("zone", "Walking to a zone line (destination resolved by server)"),
+                                }
                                 self.command.request_goto((tx, ty, tz));
                             }
                         }
@@ -1524,15 +1639,18 @@ impl ActionLoop {
                     .and_then(|c| c.zone_line_at_standing([gs.player_x, gs.player_y, gs.player_z]));
                 if let Some(index) = index {
                     // Resolve the region's destination zone + arrival coords. `None` = no advertised
-                    // zone point for this index (a data gap) → leave it alone rather than cross blind.
+                    // zone point for this index (a bake/advertise data gap, #683) → fall back to the
+                    // retail server-resolved crossing, gated by `classify_unresolved_cross`.
                     match self.resolve_cross_destination(index) {
                         Some((dest_zone, dest_pos)) => {
                             self.perform_cross(stream, gs, index, dest_zone, dest_pos);
                         }
-                        None => {
-                            tracing::debug!("zone_cross: zone-line region index={index} has no advertised zone point — ignoring");
-                        }
+                        None => self.cross_unresolved(stream, gs, index),
                     }
+                } else {
+                    // Off every zone-line region — re-arm the one-shot gated-refusal report so the
+                    // NEXT time the character stands on a gated line it is told again (#683 F1).
+                    self.gated_cross_reported = None;
                 }
             }
         }
@@ -2722,6 +2840,51 @@ impl ActionLoop {
         gs.log_msg("zone", "In-zone teleport");
     }
 
+    /// The standing auto-cross hit a zone-line region whose index resolves to NO advertised zone
+    /// point (#683 — qrg's only exit region is baked `index=0`, so its exit was a silent no-op and
+    /// the character could never leave the zone). Send the same OP_ZoneChange(zoneID=0) a genuine
+    /// resolved crossing sends and let the server derive the destination from our position, gated
+    /// by [`classify_unresolved_cross`] — see there for the #679-drift defense and the exact
+    /// scope of its guarantee (what is property-tested vs. what is a maintained writer invariant).
+    ///
+    /// HONESTY: nothing here predicts or reports a destination — the client cannot know where the
+    /// server will place it. The arrival zone comes exclusively from the server's OP_ZoneChange
+    /// echo (`classify_zone_change_echo` → `CrossZoneReconnect` → the normal zone-entry handshake),
+    /// so the agent is told where it actually landed, never a guess.
+    fn cross_unresolved(&mut self, stream: &mut EqStream, gs: &mut GameState, index: i32) {
+        let disposition = {
+            let zps = self.world.zone_points.lock().unwrap();
+            classify_unresolved_cross(&zps, gs.world.zone_id)
+        };
+        match disposition {
+            UnresolvedCross::SendServerResolved => {
+                // Stamp the cooldown exactly like `perform_cross` does: the server round-trip takes
+                // tens of ms and we are still standing in the region the whole time — without this
+                // the fallback would refire every nav tick.
+                self.last_zone_cross = Instant::now();
+                self.send_zone_change_packet(stream, gs, 0);
+                tracing::info!("zone_cross: zone-line region index={index} has no advertised zone point — requesting a server-resolved crossing (zoneID=0)");
+                gs.log_msg("zone", "Crossing zone line (destination resolved by server)");
+            }
+            UnresolvedCross::Ignore => {
+                // Report the refusal ONCE per stand (latch cleared when the probe reads no region).
+                // A `tracing::debug!` alone left an agent standing on a `zone_id: null` exit in a
+                // gated zone with zero feedback — "crossing in progress" and "refused" were
+                // indistinguishable (#683 review F1, measured live in qeynos2).
+                // The two stated causes mirror the classify gates EXACTLY (round-3 precision fix):
+                // "no server zone points available" covers every way the list can lack a
+                // server-originated advert — not yet received, all entries dropped client-side
+                // (e.g. the 999999 keep-position sentinel filter), or only synthesized map-label
+                // entries present — not just "not yet received".
+                if self.gated_cross_reported != Some(index) {
+                    self.gated_cross_reported = Some(index);
+                    gs.log_msg("zone", "Standing on a zone line with unknown destination — auto-cross is disabled here (no server zone points are available for this zone, or this zone has teleport pads)");
+                }
+                tracing::debug!("zone_cross: zone-line region index={index} unresolved and the server-resolved fallback is gated (no server zone points available, or a same-zone pad is advertised here) — not crossing");
+            }
+        }
+    }
+
     fn perform_cross(&mut self, stream: &mut EqStream, gs: &mut GameState, index: i32, dest_zone: u16, dest_pos: [f32; 3]) -> bool {
         self.last_zone_cross = Instant::now();
         if dest_zone == gs.world.zone_id {
@@ -3765,6 +3928,334 @@ mod tests {
             "death/bind respawn echoes the current zone yet must reconnect (no pending flag)");
         // A failed request is ignored regardless of the flag.
         assert_eq!(classify_zone_change_echo(0, CURRENT, CURRENT, true), ZoneChangeEcho::Ignored);
+    }
+
+    /// **#683 — the unresolved-cross gates, at the classification boundary.** The fallback may fire
+    /// ONLY when zone points have arrived AND none of them targets the current zone; both gates
+    /// exist to keep the zoneID=0 packet structurally unreachable from an intra-zone translocator
+    /// pad (the #679 drift). Mutation checks: drop the non-empty gate → the first assertion goes
+    /// RED; drop the same-zone gate → the third goes RED; invert the whole classify → the second.
+    #[test]
+    fn classify_unresolved_cross_fires_only_without_same_zone_pads_683() {
+        const HERE: u16 = 54;
+        // Zone-in window: OP_SendZonepoints not yet received — EVERY index is unresolved then,
+        // including known same-zone pads', so the fallback must stay shut.
+        assert_eq!(classify_unresolved_cross(&[], HERE), UnresolvedCross::Ignore,
+            "no zone points yet → every index is unresolved → firing could zone a char off a pad");
+        // The qrg shape: only CROSS-zone points advertised → the fallback is safe and must fire
+        // (this is the exit-lockout fix itself).
+        let qrg_like = [zp_at(1, 181, [1790.0, 1315.0, -13.0]), zp_at(2, 4, [196.7, 5100.9, -1.0])];
+        assert_eq!(classify_unresolved_cross(&qrg_like, HERE), UnresolvedCross::SendServerResolved,
+            "cross-zone-only advertisements → server-resolved crossing allowed (the #683 fix)");
+        // A same-zone pad advertised: an unresolved region here is indistinguishable from a
+        // misbaked pad, and zoneID=0 on a pad is exactly the #679 wrong-zone drift → refuse.
+        let with_pad = [zp_at(1, 181, [0.0; 3]), zp_at(9, HERE, [111.0, 222.0, 33.0])];
+        assert_eq!(classify_unresolved_cross(&with_pad, HERE), UnresolvedCross::Ignore,
+            "a same-zone pad advertised in this zone → the fallback must refuse (#679 defense)");
+        // CLIENT-SYNTHESIZED map-label entries (`sync_zone_points` marks them iterator=u32::MAX)
+        // prove nothing about OP_SendZonepoints having arrived — a list of ONLY those must stay
+        // shut (#683 review F2: plain non-emptiness was satisfiable with zero server adverts).
+        let synthetic_only = [zp_at(u32::MAX, 2, [10.0, 20.0, 0.0]), zp_at(u32::MAX, 1, [-5.0, -6.0, 0.0])];
+        assert_eq!(classify_unresolved_cross(&synthetic_only, HERE), UnresolvedCross::Ignore,
+            "client-synthesized label points alone must not open the fallback — no server advert has arrived");
+    }
+
+    /// **#683 review F2 — the classify guarantee, discharged as a PROPERTY, not examples.**
+    ///
+    /// Exhaustively enumerates every zone-point list of length 0..=3 over an alphabet of the six
+    /// entry shapes that exist in the wild (server cross-zone advert, server same-zone advert,
+    /// server zone_id-0 sentinel, and the client-synthesized `iterator=u32::MAX` variants of each)
+    /// — 259 lists — and asserts the guarantee as an implication over ALL of them:
+    ///
+    ///   `SendServerResolved`  ⇒  (∃ server-originated entry) ∧ (∄ entry targeting the current zone)
+    ///
+    /// plus the two refusal directions (no server entry ⇒ Ignore; any same-zone entry ⇒ Ignore).
+    /// This is what lets the doc say the zoneID=0 fallback cannot fire from a list that lacks a
+    /// server advert or contains a same-zone pad — for EVERY such list, not the five hand-picked
+    /// ones. (The remaining system premise — that server entries belong to the CURRENT zone — is a
+    /// writer invariant pinned by `begin_zone_in_clears_the_previous_zones_zone_points_683` and
+    /// `sync_zone_points`' clear-on-zone-change; a function-level property cannot see writers.)
+    ///
+    /// Mutation checks: revert gate 1 to plain `!zone_points.is_empty()` → the synthetic-only
+    /// lists violate the implication, RED; drop the same-zone gate → RED; invert either → RED.
+    #[test]
+    fn classify_unresolved_cross_property_683() {
+        const HERE: u16 = 54;
+        const OTHER: u16 = 181;
+        // The six entry shapes. (zone_id 0 = the server's "resolve from position" sentinel.)
+        let shapes: [ZonePoint; 6] = [
+            zp_at(1, OTHER, [1.0, 2.0, 3.0]),        // server advert, cross-zone
+            zp_at(9, HERE, [4.0, 5.0, 6.0]),         // server advert, SAME-zone (a pad)
+            zp_at(0, 0, [0.0, 0.0, 0.0]),            // server sentinel advert
+            zp_at(u32::MAX, OTHER, [7.0, 8.0, 0.0]), // synthetic map label, cross-zone
+            zp_at(u32::MAX, HERE, [9.0, 1.0, 0.0]),  // synthetic map label, same-zone
+            zp_at(u32::MAX, 0, [0.0, 0.0, 0.0]),     // synthetic, sentinel-shaped
+        ];
+        let mut checked = 0u32;
+        // All lists of length 0..=3 over the alphabet (6^0 + 6^1 + 6^2 + 6^3 = 259).
+        let mut all: Vec<Vec<ZonePoint>> = vec![vec![]];
+        let mut frontier: Vec<Vec<ZonePoint>> = vec![vec![]];
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for l in &frontier {
+                for s in &shapes {
+                    let mut l2 = l.clone();
+                    l2.push(s.clone());
+                    next.push(l2);
+                }
+            }
+            all.extend(next.iter().cloned());
+            frontier = next;
+        }
+        assert_eq!(all.len(), 259, "exhaustive enumeration of lengths 0..=3");
+        for list in &all {
+            let got = classify_unresolved_cross(list, HERE);
+            let has_server_entry = list.iter().any(|zp| zp.iterator != u32::MAX);
+            let has_same_zone = list.iter().any(|zp| zp.zone_id == HERE);
+            if got == UnresolvedCross::SendServerResolved {
+                assert!(has_server_entry && !has_same_zone,
+                    "fired without its premises: server_entry={has_server_entry} same_zone={has_same_zone}, list={list:?}");
+            }
+            if !has_server_entry {
+                assert_eq!(got, UnresolvedCross::Ignore,
+                    "no server-originated advert ⇒ the zone-in window may be open ⇒ must refuse: {list:?}");
+            }
+            if has_same_zone {
+                assert_eq!(got, UnresolvedCross::Ignore,
+                    "an entry targets the current zone ⇒ pads may exist here ⇒ must refuse (#679): {list:?}");
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 259);
+    }
+
+    /// **#683 (qrg / Surefall Glade total exit lockout) — end-to-end through `drain_zone_cross`.**
+    ///
+    /// A character stands in a zone-line region baked with index 0 (the qrg bake). The index
+    /// resolves to no advertised zone point, and the old code debug-no-op'd — with qrg's ONLY exit
+    /// region shaped this way, the character could never leave the zone. Retail sends
+    /// OP_ZoneChange(zoneID=0) on any zone-line hit and the server resolves the destination from
+    /// position, so the client must do the same.
+    ///
+    /// Mutation checks: revert `cross_unresolved` to the debug no-op → the "exactly one
+    /// OP_ZONE_CHANGE" assertion goes RED (this is also what unmodified main does, via the
+    /// region_map index gate upstream); drop the `last_zone_cross` stamp → the no-refire assertion
+    /// goes RED; send a nonzero wire zoneID → the zoneID==0 assertion goes RED.
+    #[tokio::test]
+    async fn an_unresolved_zone_line_hit_sends_a_server_resolved_cross_683() {
+        use eqoxide_nav::zone_assets;
+        const QRG: u16 = 54;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+        gs.world.zone_id = QRG;
+        {
+            let mut zps = nav.world.zone_points.lock().unwrap();
+            zps.push(zp_at(1, 181, [1790.0, 1315.0, -13.0])); // → jaggedpine (cross-zone)
+            zps.push(zp_at(2, 4,   [196.7, 5100.9, -1.0]));   // → qeytoqrg  (cross-zone)
+        }
+        // The player (origin) stands inside a zone-line region carrying index 0 — no advertised
+        // point has iterator 0, so `resolve_cross_destination(0)` is None.
+        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_below(1000.0, 0),
+        ))).collision().unwrap().clone();
+        zone_assets::finish_zone_load(&nav.collision, &nav.zone_assets, "qrg", Some(grid), 1, None);
+        nav.last_zone_cross = Instant::now() - Duration::from_secs(11); // past the 10s cooldown
+
+        nav.drain_zone_cross(&mut stream, &mut gs);
+
+        let zc = |s: &EqStream| s.sent_app_packets().into_iter()
+            .filter(|(op, _)| *op == OP_ZONE_CHANGE).collect::<Vec<_>>();
+        let sent = zc(&stream);
+        assert_eq!(sent.len(), 1,
+            "an unresolved zone-line hit must send a server-resolved OP_ZONE_CHANGE, not no-op (#683)");
+        // The wire zoneID is the resolve-from-position sentinel 0 — the client never claims a
+        // destination it cannot know.
+        assert_eq!(u16::from_le_bytes([sent[0].1[64], sent[0].1[65]]), 0,
+            "wire zoneID must be 0 (server resolves from position)");
+        // HONESTY: the client reports the crossing WITHOUT predicting a destination — the arrival
+        // zone comes only from the server echo. No "Crossing to zone N" claim may exist.
+        assert!(gs.messages.iter().any(|m| m.text.contains("destination resolved by server")),
+            "the crossing must be reported with an explicit unknown destination");
+        assert!(!gs.messages.iter().any(|m| m.text.starts_with("Crossing to zone")),
+            "the client must never fabricate a destination for an unresolved crossing");
+        // The cooldown was stamped: still standing in the region while the echo is in flight, an
+        // immediate second drain must NOT refire.
+        nav.drain_zone_cross(&mut stream, &mut gs);
+        assert_eq!(zc(&stream).len(), 1, "the fallback must stamp the cross cooldown — no refire");
+    }
+
+    /// **#683 gates, end-to-end: the fallback must NOT fire while a same-zone pad is advertised,
+    /// before zone points arrive, or when only client-synthesized map-label points are present.**
+    /// Identical setup to the firing test except for the advertised list — so the discriminator is
+    /// the gate, not the plumbing. And the refusal must be OBSERVABLE, exactly once per stand
+    /// (#683 review F1): a `tracing::debug!` alone left an agent standing on a `zone_id: null`
+    /// exit waiting forever with zero feedback, "in progress" indistinguishable from "refused".
+    ///
+    /// Mutation checks: drop either classify gate, or revert gate 1 to plain `!is_empty()` → the
+    /// corresponding case sends a packet, RED; drop the refusal `log_msg` → the message assertion
+    /// goes RED; drop the one-shot latch → the exactly-once assertion goes RED; drop the
+    /// latch re-arm (probe-None clear) → the re-entry assertion goes RED.
+    #[tokio::test]
+    async fn the_unresolved_cross_fallback_stays_shut_and_reports_the_refusal_once_683() {
+        use eqoxide_nav::zone_assets;
+        const HERE: u16 = 2;
+        let refusals = |gs: &GameState| gs.messages.iter()
+            .filter(|m| m.text.contains("auto-cross is disabled here")).count();
+        for (label, points) in [
+            ("same-zone pad advertised", vec![zp_at(1, 181, [0.0; 3]), zp_at(9, HERE, [111.0, 222.0, 33.0])]),
+            ("no zone points yet", vec![]),
+            // Client-synthesized map-label entries only (`sync_zone_points` marks them
+            // iterator=u32::MAX; observed live in qeynos) — non-empty, yet NO server advert has
+            // arrived, so the zone-in window may still be open (#683 review F2).
+            ("only synthetic label points", vec![zp_at(u32::MAX, 181, [10.0, 20.0, 0.0])]),
+        ] {
+            let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+            let mut nav = new_loop();
+            let mut gs = GameState::new();
+            gs.world.zone_id = HERE;
+            nav.world.zone_points.lock().unwrap().extend(points);
+            let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+                eqoxide_core::region_map::RegionMap::zone_line_below(1000.0, 0),
+            ))).collision().unwrap().clone();
+            zone_assets::finish_zone_load(&nav.collision, &nav.zone_assets, "qeynos2", Some(grid), 1, None);
+            nav.last_zone_cross = Instant::now() - Duration::from_secs(11);
+
+            // Two ticks standing on the line: no packet ever, and the refusal reported ONCE.
+            nav.drain_zone_cross(&mut stream, &mut gs);
+            nav.drain_zone_cross(&mut stream, &mut gs);
+
+            assert!(!stream.sent_app_packets().iter().any(|(op, _)| *op == OP_ZONE_CHANGE),
+                "{label}: the unresolved-cross fallback must stay shut (#679 defense)");
+            assert_eq!(refusals(&gs), 1,
+                "{label}: the refusal must be reported to the message log exactly once per stand — \
+                 not zero (silent forever-wait) and not per-tick (spam)");
+
+            // Step off the line (above the region), tick — the latch re-arms — then step back on:
+            // the agent is told again for the NEW stand.
+            gs.player_z = 2000.0;
+            nav.drain_zone_cross(&mut stream, &mut gs);
+            gs.player_z = 0.0;
+            nav.drain_zone_cross(&mut stream, &mut gs);
+            assert_eq!(refusals(&gs), 2,
+                "{label}: leaving and re-entering the region must re-report the refusal");
+        }
+    }
+
+    /// **#683 round 3 — the gated-refusal latch must NOT survive a zone change.**
+    ///
+    /// Region indices are per-zone namespaces and index 0 is the universal unresolvable index, so
+    /// a server teleport that lands the character from one gated null region directly onto
+    /// ANOTHER zone's gated null region would find the latch still set for "index 0" and silently
+    /// suppress the NEW zone's refusal message — the F1 silent wait this message exists to
+    /// remove, resurrected across a zone boundary. The observable behaviour under test: after a
+    /// zone change, standing on the new zone's gated line reports the refusal AGAIN.
+    ///
+    /// Mutation check: drop the `gated_cross_reported = None` from `sync_zone_points`' zone-change
+    /// branch → the second-message assertion goes RED.
+    #[tokio::test]
+    async fn the_gated_refusal_latch_resets_on_zone_change_683() {
+        use eqoxide_nav::zone_assets;
+        let refusals = |gs: &GameState| gs.messages.iter()
+            .filter(|m| m.text.contains("auto-cross is disabled here")).count();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+
+        // Zone A: gated (no zone points at all), standing on an index-0 line → one refusal.
+        gs.world.zone_id = 2;
+        gs.world.zone_name = "qeynos2".into();
+        nav.sync_zone_points(&gs);
+        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_below(1000.0, 0),
+        ))).collision().unwrap().clone();
+        zone_assets::finish_zone_load(&nav.collision, &nav.zone_assets, "qeynos2", Some(grid.clone()), 1, None);
+        nav.last_zone_cross = Instant::now() - Duration::from_secs(11);
+        nav.drain_zone_cross(&mut stream, &mut gs);
+        assert_eq!(refusals(&gs), 1, "zone A: the gated stand is reported once");
+
+        // Server teleport (e.g. a GM #zone) to zone B, landing DIRECTLY on another gated index-0
+        // line — the character is never observed off-region in between.
+        gs.begin_zone_in();
+        gs.world.zone_id = 24;
+        gs.world.zone_name = "erudnext".into();
+        nav.sync_zone_points(&gs); // the zone-change tick — must re-arm the latch
+        zone_assets::finish_zone_load(&nav.collision, &nav.zone_assets, "erudnext", Some(grid), 1, None);
+        nav.last_zone_cross = Instant::now() - Duration::from_secs(11);
+        nav.drain_zone_cross(&mut stream, &mut gs);
+
+        assert_eq!(refusals(&gs), 2,
+            "zone B's refusal must be reported — a latch left set across a zone change would leave \
+             the agent in a silent wait in the NEW zone (the exact F1 defect, cross-zone)");
+        assert!(!stream.sent_app_packets().iter().any(|(op, _)| *op == OP_ZONE_CHANGE),
+            "no crossing fires in either gated zone");
+    }
+
+    /// **#683 — the `/v1/move/zone_cross {{zone_id:N}}` walk-to falls back to the nearest
+    /// UNRESOLVABLE zone line when the advertised index has no located region.** qrg advertises
+    /// zone 181/4 but its only exit region is baked index 0, so the per-index lookup finds
+    /// nothing; the old code answered the definitive `no_path zone_line_not_in_map` and the agent
+    /// could never even WALK to the exit.
+    ///
+    /// The scene is the qeynos MIXED shape (#672, observed live): a NEARER region that RESOLVES
+    /// to a different advertised zone (the catacombs decoy) plus a FARTHER index-0 region. The
+    /// fallback must pick the index-0 line — a resolvable region is KNOWN to lead to its own
+    /// other zone, and walking onto it would cross the caller somewhere it never asked to go. And
+    /// it must report the destination honestly as server-resolved — never as the requested zone
+    /// (qrg's real triggers are 0,0,0 placeholders the server tie-breaks itself).
+    ///
+    /// Mutation checks: drop the `.or_else` fallback in `drain_zone_cross` → goto stays unset,
+    /// RED; relax the fallback to `find_zone_line_near(None, ..)` (any nearest) → it walks to the
+    /// nearer resolvable decoy, the footprint assertion goes RED; drop the `zone_id != 0`
+    /// sentinel filter from the honest-messaging lookup → the message claims "zone 0" (seen
+    /// live), the destination-resolved-by-server assertion goes RED. On unmodified main this test
+    /// fails earlier still: the index-0 region is not even recognized by the region map.
+    #[tokio::test]
+    async fn zone_cross_walks_to_an_unadvertised_line_when_the_index_lookup_fails_683() {
+        use eqoxide_nav::zone_assets;
+        const QRG: u16 = 54;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+        gs.world.zone_id = QRG;
+        gs.world.zone_name = "qrg".into();
+        {
+            let mut zps = nav.world.zone_points.lock().unwrap();
+            zps.push(zp_at(1, 181, [1790.0, 1315.0, -13.0]));
+            zps.push(zp_at(2, 4,   [196.7, 5100.9, -1.0]));
+            zps.push(zp_at(33, 45, [50.0, 50.0, 0.0])); // the resolvable decoy's destination
+            // The iterator-0 / zone_id-0 SENTINEL qrg really advertises. It matches the located
+            // region's index (0) but is NOT a destination — the honest-messaging lookup must
+            // filter it (seen live before the filter: "walking to the zone_id=0 line").
+            zps.push(zp_at(0, 0, [0.0, 0.0, 0.0]));
+        }
+        // Two zone-line regions on the flat test floor (z-slab [-1, 5] so the floor-projected
+        // point still classifies inside), player at the origin, both beyond the 15u "already on
+        // the line" radius: a NEARER decoy (north/east 20..40, ~42u) whose index 33 RESOLVES to
+        // zone 45, and a FARTHER index-0 region (north/east 60..80, ~99u) resolving to nothing.
+        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_boxes(&[
+                ([20.0, 40.0, 20.0, 40.0, -1.0, 5.0], 33),
+                ([60.0, 80.0, 60.0, 80.0, -1.0, 5.0], 0),
+            ]),
+        ))).collision().unwrap().clone();
+        zone_assets::finish_zone_load(&nav.collision, &nav.zone_assets, "qrg", Some(grid), 1, None);
+
+        nav.command.request_zone_cross(181); // the agent asks for a zone whose index has no region
+
+        nav.drain_zone_cross(&mut stream, &mut gs);
+
+        let goal = nav.command.goto_target()
+            .expect("the fallback must walk toward the nearest unresolvable zone line, not report no_path (#683)");
+        assert!((60.0..=80.0).contains(&goal.0) && (60.0..=80.0).contains(&goal.1),
+            "the walk goal must be inside the INDEX-0 region footprint — never the nearer decoy that \
+             resolves to a different zone (it would cross the caller to a zone it never asked for), got {goal:?}");
+        // HONESTY: the client must not claim the walk leads to the REQUESTED zone — the server may
+        // tie-break the crossing elsewhere.
+        assert!(gs.messages.iter().any(|m| m.text.contains("destination resolved by server")),
+            "the walk must be reported with an explicit server-resolved destination");
+        assert!(!gs.messages.iter().any(|m| m.text.contains("Walking to the zone 181")),
+            "the client must never claim the unlocated line leads to the requested zone");
     }
 
     fn new_loop() -> ActionLoop {

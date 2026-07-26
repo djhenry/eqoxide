@@ -477,7 +477,16 @@ pub async fn run_gameplay_phase(
                     // the wrong zone) can no longer happen. `world_reconnect_needed` is set-once
                     // idempotent, so N duplicate cross echoes still reconnect exactly once.
                     match action_loop.classify_zone_change_echo(success, echo_zone_id, gs.world.zone_id) {
-                        ZoneChangeEcho::Ignored => {}
+                        ZoneChangeEcho::Ignored => {
+                            // `success != 1` = the server REFUSED the zone change (its
+                            // `SendZoneCancel` / error path). Silent before #683's review (F3):
+                            // after the new server-resolved fallback the last thing the agent heard
+                            // was "Crossing zone line…", so a denial left it indistinguishable from
+                            // a crossing still in flight. Surface every refusal; the auto-cross
+                            // cooldown bounds how often a standing character can re-trigger this.
+                            gs.log_msg("zone", &format!(
+                                "Server did not approve the zone change (code {success})"));
+                        }
                         ZoneChangeEcho::SameZoneReposition => {
                             tracing::info!("EQ: same-zone in-zone reposition (zone_id={echo_zone_id}) — no world reconnect (#368)");
                         }

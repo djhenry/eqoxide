@@ -1280,6 +1280,14 @@ impl GameState {
         // consider). Clear the whole target (id + name + hp + con) here, not just the entity map (#408).
         self.clear_target();
         self.world.new_zone_applied = false;
+        // #683 review (F2): the previous zone's advertised zone points are meaningless — and
+        // actively dangerous — in the new zone. Left in place they persist through the
+        // OP_NewZone→OP_SendZonepoints window under the NEW zone_id, where they can satisfy the
+        // unresolved-cross gates (`classify_unresolved_cross`) with another zone's data: its
+        // "zone points have arrived" premise would be met by adverts that say nothing about THIS
+        // zone. Cleared here, the list is empty until the new zone's own OP_SendZonepoints lands
+        // (`apply_zone_points` rebuilds it), which is the honest state for that window.
+        self.world.zone_points.clear();
         // A fresh zone-in attempt: clear any prior handshake-failure flag so it reflects only THIS
         // attempt (#335). The flag is re-raised by `run_zone_entry_handshake` only if this one times
         // out. `zone_name` is deliberately NOT cleared here — it stays showing the zone we came from
@@ -1879,7 +1887,7 @@ mod pose_tests_643 {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{Door, GameState, MerchantItem, make_entity};
+    use super::{Door, GameState, MerchantItem, ZonePoint, make_entity};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
     /// including the FULL-SNAPSHOT (`resync_from_snapshot`) path that carries the real mid-zone
@@ -2685,6 +2693,28 @@ pub(crate) mod tests {
         assert_eq!([gs.player_x, gs.player_y, gs.player_z], [111.0, 222.0, 333.0],
             "predicted position is not WorldState — a zone purge must not touch it");
         assert_eq!(gs.player_heading, 44.0, "predicted heading is not WorldState");
+    }
+
+    /// #683 review (F2) — the previous zone's advertised zone points must NOT survive a zone-in.
+    ///
+    /// Left in place they persist through the OP_NewZone→OP_SendZonepoints window under the NEW
+    /// zone_id, where they can satisfy the unresolved-cross gates with ANOTHER zone's adverts —
+    /// the exact stale-window premise the review falsified. The honest state for that window is an
+    /// EMPTY list until the new zone's own OP_SendZonepoints rebuilds it. Mutation check: drop the
+    /// `zone_points.clear()` from `begin_zone_in` → RED.
+    #[test]
+    fn begin_zone_in_clears_the_previous_zones_zone_points_683() {
+        let mut gs = GameState::new();
+        gs.world.zone_points.push(ZonePoint {
+            iterator: 7, zone_id: 181,
+            server_x: 1790.0, server_y: 1315.0, server_z: -13.0, heading: 0.0,
+        });
+
+        gs.begin_zone_in();
+
+        assert!(gs.world.zone_points.is_empty(),
+            "the old zone's adverts are meaningless under the new zone_id — a zone-in must clear \
+             them so the pre-OP_SendZonepoints window reads honestly empty");
     }
 
     /// #543/#660 B2 — the provisional-position marker must NOT survive a zone-in.
