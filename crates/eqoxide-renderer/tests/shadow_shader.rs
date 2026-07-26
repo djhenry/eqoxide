@@ -113,9 +113,16 @@ fn extract_alpha_cutout(source: &str, label: &str) -> f32 {
 /// condition itself. An independent review of eqoxide#718 found that naga parses and validates an
 /// EMPTY `if` block just fine, so a test that only checks the condition text cannot tell "texels
 /// below the cutout are discarded" from "texels below the cutout are compared against and then
-/// nothing happens" — the latter reproduces #707 exactly. This extracts the block body so a test can
-/// assert something is actually done with the comparison.
-fn extract_alpha_cutout_block<'a>(source: &'a str, label: &str) -> &'a str {
+/// nothing happens" — the latter reproduces #707 exactly. This extracts the block body, WITH `//`
+/// line comments stripped from each line first, so a test can assert something is actually *done*
+/// with the comparison rather than merely *mentioned* in a comment.
+///
+/// The comment-stripping is load-bearing, not decoration: the first version of this helper returned
+/// the block's raw text, and a self mutation-check against the reviewer's exact repro (commenting out
+/// `discard;` to `// discard;`, leaving the body otherwise byte-for-byte intact) revealed that
+/// `block.contains("discard")` still matched — the word "discard" is still literally present in the
+/// comment. That mutation-check is exactly what caught this and is why the stripping exists.
+fn extract_alpha_cutout_block<'a>(source: &'a str, label: &str) -> String {
     let marker = "texel.a < ";
     let at = source
         .find(marker)
@@ -127,7 +134,16 @@ fn extract_alpha_cutout_block<'a>(source: &'a str, label: &str) -> &'a str {
     let brace_close = after[brace_open..]
         .find('}')
         .unwrap_or_else(|| panic!("{label}: couldn't find the `}}` closing the `texel.a < ...` block"));
-    after[brace_open + 1..brace_open + brace_close].trim()
+    let raw = &after[brace_open + 1..brace_open + brace_close];
+    raw.lines()
+        .map(|line| match line.find("//") {
+            Some(idx) => &line[..idx],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 /// Extracts the raw source text of the EQ WLD → render axis swizzle
