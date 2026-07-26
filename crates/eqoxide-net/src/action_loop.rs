@@ -3904,6 +3904,7 @@ mod tests {
     /// goes RED; send a nonzero wire zoneID → the zoneID==0 assertion goes RED.
     #[tokio::test]
     async fn an_unresolved_zone_line_hit_sends_a_server_resolved_cross_683() {
+        use eqoxide_nav::zone_assets;
         const QRG: u16 = 54;
         let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut nav = new_loop();
@@ -3951,6 +3952,7 @@ mod tests {
     /// from `classify_unresolved_cross` → the corresponding case goes RED.
     #[tokio::test]
     async fn the_unresolved_cross_fallback_stays_shut_near_pads_and_before_zone_points_683() {
+        use eqoxide_nav::zone_assets;
         const HERE: u16 = 2;
         for (label, points) in [
             ("same-zone pad advertised", vec![zp_at(1, 181, [0.0; 3]), zp_at(9, HERE, [111.0, 222.0, 33.0])]),
@@ -3985,6 +3987,7 @@ mod tests {
     /// even recognized by the region map.
     #[tokio::test]
     async fn zone_cross_walks_to_an_unadvertised_line_when_the_index_lookup_fails_683() {
+        use eqoxide_nav::zone_assets;
         const QRG: u16 = 54;
         let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut nav = new_loop();
