@@ -2393,15 +2393,30 @@ mod tests {
         let state = empty_state();
         state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
         let command = state.command.clone();
-        let handle = tokio::spawn({
+        let mut handle = tokio::spawn({
             let state = state.clone();
             async move { get(state, "/who").await }
         });
         // Play the model layer's part: drain the request and reply, exactly like
         // `ActionLoop::drain_who_friends` would once the server's OP_WhoAllResponse lands.
-        let tx = loop {
-            if let Some(tx) = command.take_who_req() { break tx; }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        //
+        // #717: race the poll against the handler's own JoinHandle — see the identical comment on
+        // `frame_carries_snapshot_age_header` just below. A naive unbounded poll loop here would
+        // hang forever, not fail, if `get_who` ever returned early without registering a who_req.
+        let tx = tokio::select! {
+            tx = async {
+                loop {
+                    if let Some(tx) = command.take_who_req() { return tx; }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            } => tx,
+            res = &mut handle => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected /who to reach the who-request hand-off, but the handler returned \
+                     early with status {} instead", resp.status()
+                );
+            }
         };
         tx.send(vec![]).unwrap();
         let resp = handle.await.unwrap();
@@ -2425,15 +2440,32 @@ mod tests {
         // render-hand-off path this test means to exercise.
         set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
         let frame_req = state.camera.frame_req.clone();
-        let handle = tokio::spawn({
+        let mut handle = tokio::spawn({
             let state = state.clone();
             async move { get(state, "/frame").await }
         });
         // Play the render thread's part: satisfy the frame-request channel, exactly like the
         // renderer would once a frame is captured.
-        let req = loop {
-            if let Some(req) = frame_req.lock().unwrap().take() { break req; }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        //
+        // #717: race the poll against the handler's own JoinHandle (the pattern #710 established
+        // for the sibling `/frame` tests below). A naive unbounded poll loop here would hang
+        // forever — not fail — if a change makes `get_frame` return EARLY, before ever populating
+        // `frame_req`; that exact shape jammed the shared remote builder during #710's mutation
+        // check. Racing against `handle` turns that into a clean, immediate assertion failure.
+        let req = tokio::select! {
+            req = async {
+                loop {
+                    if let Some(req) = frame_req.lock().unwrap().take() { return req; }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            } => req,
+            res = &mut handle => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected /frame to reach the frame-request hand-off, but the handler \
+                     returned early with status {} instead", resp.status()
+                );
+            }
         };
         assert_eq!(req.camera_override, None, "no query params were passed — must be the \
             byte-for-byte pre-#422 on-screen readback path, not an override (#422)");

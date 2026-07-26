@@ -690,14 +690,30 @@ mod tests {
         seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
         let command = state.command.clone();
         let app = router().with_state(state);
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             app.oneshot(Request::post("/give").header("content-type", "application/json")
                 .body(Body::from(r#"{"npc":"Mischief","from":23}"#)).unwrap()).await.unwrap()
         });
         // Wait for the handler to park its Sender, then deliver the confirmed receipt.
-        let (npc_id, from_slot, tx) = loop {
-            if let Some(p) = command.take_give_await() { break p; }
-            tokio::task::yield_now().await;
+        //
+        // #717: race the poll against the handler's own JoinHandle (the pattern #710 established
+        // in observe.rs, also applied to the merchant/buy, /open, and /cast tests). A naive
+        // unbounded poll loop here would hang forever, not fail, if a change made the handler
+        // return early without ever parking `give_await`.
+        let (npc_id, from_slot, tx) = tokio::select! {
+            p = async {
+                loop {
+                    if let Some(p) = command.take_give_await() { return p; }
+                    tokio::task::yield_now().await;
+                }
+            } => p,
+            res = &mut task => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected /give to reach the give-await hand-off, but the handler returned \
+                     early with status {} instead", resp.status()
+                );
+            }
         };
         assert_eq!((npc_id, from_slot), (11, 23));
         tx.send(CommandResult::Resolved(GiveOk { npc_id: 11, item_name: "Bone Chips".into() })).unwrap();
@@ -718,13 +734,25 @@ mod tests {
         seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
         let command = state.command.clone();
         let app = router().with_state(state);
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             app.oneshot(Request::post("/give").header("content-type", "application/json")
                 .body(Body::from(r#"{"npc":"Mischief","from":23}"#)).unwrap()).await.unwrap()
         });
-        let (_n, _s, tx) = loop {
-            if let Some(p) = command.take_give_await() { break p; }
-            tokio::task::yield_now().await;
+        // #717: see the identical comment on `give_confirmed_is_200_with_the_receipt` above.
+        let (_n, _s, tx) = tokio::select! {
+            p = async {
+                loop {
+                    if let Some(p) = command.take_give_await() { return p; }
+                    tokio::task::yield_now().await;
+                }
+            } => p,
+            res = &mut task => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected /give to reach the give-await hand-off, but the handler returned \
+                     early with status {} instead", resp.status()
+                );
+            }
         };
         tx.send(CommandResult::Refused("a give is already in flight; retry".into())).unwrap();
 
@@ -746,14 +774,29 @@ mod tests {
         seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
         let command = state.command.clone();
         let app = router().with_state(state);
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             app.oneshot(Request::post("/give").header("content-type", "application/json")
                 .body(Body::from(r#"{"npc":"Mischief","from":23}"#)).unwrap()).await.unwrap()
         });
         // Take the parked Sender and HOLD it — the server's silence, faithfully modelled.
-        let held = loop {
-            if let Some(p) = command.take_give_await() { break p; }
-            tokio::task::yield_now().await;
+        //
+        // #717: race against the handler's own JoinHandle — see `buy_with_no_server_reply_is_202_
+        // unknown_never_success` in merchant.rs for why a naive loop here is a pure, unrecoverable
+        // spin with `task.await` never reached.
+        let held = tokio::select! {
+            p = async {
+                loop {
+                    if let Some(p) = command.take_give_await() { return p; }
+                    tokio::task::yield_now().await;
+                }
+            } => p,
+            res = &mut task => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected /give to reach the give-await hand-off and park a Sender, but the \
+                     handler returned early with status {} instead", resp.status()
+                );
+            }
         };
 
         let resp = task.await.unwrap(); // 8s timeout elapses in virtual time

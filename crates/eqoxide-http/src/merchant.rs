@@ -332,14 +332,29 @@ mod tests {
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
         let app = router().with_state(state);
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             app.oneshot(Request::post("/buy").header("content-type", "application/json")
                 .body(Body::from(r#"{"merchant":"Beek","slot":3}"#)).unwrap()).await.unwrap()
         });
         // Wait for the handler to park its Sender, then deliver the confirmed receipt.
-        let (mid, slot, tx) = loop {
-            if let Some(p) = command.take_buy_await() { break p; }
-            tokio::task::yield_now().await;
+        //
+        // #717: race the poll against the handler's own JoinHandle (the pattern #710 established
+        // in observe.rs). A naive unbounded poll loop here would hang forever, not fail, if a
+        // change made the handler return early (e.g. a 404) without ever parking `buy_await`.
+        let (mid, slot, tx) = tokio::select! {
+            p = async {
+                loop {
+                    if let Some(p) = command.take_buy_await() { return p; }
+                    tokio::task::yield_now().await;
+                }
+            } => p,
+            res = &mut task => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected /buy to reach the buy-await hand-off, but the handler returned \
+                     early with status {} instead", resp.status()
+                );
+            }
         };
         assert_eq!((mid, slot), (11, 3));
         tx.send(CommandResult::Resolved(BuyOk {
@@ -363,13 +378,26 @@ mod tests {
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
         let app = router().with_state(state);
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             app.oneshot(Request::post("/buy").header("content-type", "application/json")
                 .body(Body::from(r#"{"merchant":"Beek","slot":3}"#)).unwrap()).await.unwrap()
         });
-        let (_m, _s, tx) = loop {
-            if let Some(p) = command.take_buy_await() { break p; }
-            tokio::task::yield_now().await;
+        // #717: see the identical comment on `buy_confirmed_is_200_with_the_receipt` above — race
+        // against the handler's JoinHandle so an early return fails fast instead of hanging.
+        let (_m, _s, tx) = tokio::select! {
+            p = async {
+                loop {
+                    if let Some(p) = command.take_buy_await() { return p; }
+                    tokio::task::yield_now().await;
+                }
+            } => p,
+            res = &mut task => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected /buy to reach the buy-await hand-off, but the handler returned \
+                     early with status {} instead", resp.status()
+                );
+            }
         };
         tx.send(CommandResult::Refused("merchant refused".into())).unwrap();
 
@@ -391,14 +419,29 @@ mod tests {
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
         let app = router().with_state(state);
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             app.oneshot(Request::post("/buy").header("content-type", "application/json")
                 .body(Body::from(r#"{"merchant":"Beek","slot":3}"#)).unwrap()).await.unwrap()
         });
         // Take the parked Sender and HOLD it — the server's silence, faithfully modelled.
-        let held = loop {
-            if let Some(p) = command.take_buy_await() { break p; }
-            tokio::task::yield_now().await;
+        //
+        // #717: race against the handler's own JoinHandle. Without this, an early return (before
+        // `buy_await` is ever parked) would spin this loop forever instead of failing — the
+        // `task.await` a few lines down is never even reached in that case.
+        let held = tokio::select! {
+            p = async {
+                loop {
+                    if let Some(p) = command.take_buy_await() { return p; }
+                    tokio::task::yield_now().await;
+                }
+            } => p,
+            res = &mut task => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected /buy to reach the buy-await hand-off and park a Sender, but the \
+                     handler returned early with status {} instead", resp.status()
+                );
+            }
         };
 
         let resp = task.await.unwrap(); // 4s timeout elapses in virtual time
@@ -439,13 +482,27 @@ mod tests {
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
         let app = router().with_state(state);
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             app.oneshot(Request::post("/open").header("content-type", "application/json")
                 .body(Body::from(r#"{"merchant":"Beek"}"#)).unwrap()).await.unwrap()
         });
-        let (mid, tx) = loop {
-            if let Some(p) = command.take_open_await() { break p; }
-            tokio::task::yield_now().await;
+        // #717: race against the handler's own JoinHandle — see the identical comment on the
+        // `/buy` tests above. A naive unbounded poll loop here would hang forever, not fail, if a
+        // change made the handler return early without ever parking `open_await`.
+        let (mid, tx) = tokio::select! {
+            p = async {
+                loop {
+                    if let Some(p) = command.take_open_await() { return p; }
+                    tokio::task::yield_now().await;
+                }
+            } => p,
+            res = &mut task => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected /open to reach the open-await hand-off, but the handler returned \
+                     early with status {} instead", resp.status()
+                );
+            }
         };
         assert_eq!(mid, 11);
         tx.send(CommandResult::Resolved(OpenOk { merchant_id: 11 })).unwrap();
@@ -466,13 +523,25 @@ mod tests {
         seed_merchant(&state, "Innkeeper_Beek000", 11);
         let command = state.command.clone();
         let app = router().with_state(state);
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             app.oneshot(Request::post("/open").header("content-type", "application/json")
                 .body(Body::from(r#"{"merchant":"Beek"}"#)).unwrap()).await.unwrap()
         });
-        let (_mid, tx) = loop {
-            if let Some(p) = command.take_open_await() { break p; }
-            tokio::task::yield_now().await;
+        // #717: see the identical comment on `open_confirmed_is_200` above.
+        let (_mid, tx) = tokio::select! {
+            p = async {
+                loop {
+                    if let Some(p) = command.take_open_await() { return p; }
+                    tokio::task::yield_now().await;
+                }
+            } => p,
+            res = &mut task => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected /open to reach the open-await hand-off, but the handler returned \
+                     early with status {} instead", resp.status()
+                );
+            }
         };
         tx.send(CommandResult::Refused("merchant refused to open the window".into())).unwrap();
 
@@ -496,14 +565,28 @@ mod tests {
         seed_merchant(&state, "Morty_Prysmith", 291);
         let command = state.command.clone();
         let app = router().with_state(state);
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             app.oneshot(Request::post("/open").header("content-type", "application/json")
                 .body(Body::from(r#"{"merchant":"Morty"}"#)).unwrap()).await.unwrap()
         });
         // Take the parked Sender and HOLD it — the non-merchant's total silence, faithfully modelled.
-        let held = loop {
-            if let Some(p) = command.take_open_await() { break p; }
-            tokio::task::yield_now().await;
+        //
+        // #717: race against the handler's own JoinHandle — see `buy_with_no_server_reply_is_202_
+        // unknown_never_success` above for why a naive loop here is a pure, unrecoverable spin.
+        let held = tokio::select! {
+            p = async {
+                loop {
+                    if let Some(p) = command.take_open_await() { return p; }
+                    tokio::task::yield_now().await;
+                }
+            } => p,
+            res = &mut task => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected /open to reach the open-await hand-off and park a Sender, but the \
+                     handler returned early with status {} instead", resp.status()
+                );
+            }
         };
 
         let resp = task.await.unwrap(); // 4s timeout elapses in virtual time
