@@ -1395,12 +1395,16 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Response {
     // `pos_up` is already the FOOT datum (#522), the same datum as the collision geometry
     // (zone-line regions) it's tested against — no conversion needed.
     let pos = [player.pos_east, player.pos_north, player.pos_up];
-    // index -> destination zone_id, from the advertised entrance list.
+    // index -> destination zone_id, from the advertised entrance list. `zone_id == 0` entries are
+    // the "server resolves from position" SENTINEL, not a destination (the same filter
+    // `resolve_cross_destination` applies) — dropping them makes such an exit report
+    // `"zone_id": null` (destination honestly unknown, #683) instead of a nonexistent "zone 0".
     let dest_of: std::collections::HashMap<i32, u16> = s
         .world.zone_points
         .lock()
         .unwrap()
         .iter()
+        .filter(|zp| zp.zone_id != 0)
         .map(|zp| (zp.iterator as i32, zp.zone_id))
         .collect();
     let mut exits = Vec::new();
