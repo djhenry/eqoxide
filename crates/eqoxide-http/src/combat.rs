@@ -462,15 +462,31 @@ mod tests {
         let command = state.command.clone();
         let app = router().with_state(state);
         let body = format!("{{\"gem\":{gem}}}");
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             app.oneshot(Request::post("/cast").header("content-type", "application/json")
                 .body(Body::from(body)).unwrap()).await.unwrap()
         });
         // The awaited cast must NOT leak into the fire-and-forget slot; it parks `cast_await`.
-        let (req, tx) = loop {
-            assert!(command.take_cast().is_none(), "an awaited cast must not queue the UI fire-and-forget slot");
-            if let Some(p) = command.take_cast_await() { break p; }
-            tokio::task::yield_now().await;
+        //
+        // #717: race the poll against the handler's own JoinHandle (the pattern #710 established
+        // in observe.rs, also applied to the merchant/buy and /open tests). A naive unbounded poll
+        // loop here would hang forever, not fail, if a change made the handler return early
+        // without ever parking `cast_await`.
+        let (req, tx) = tokio::select! {
+            p = async {
+                loop {
+                    assert!(command.take_cast().is_none(), "an awaited cast must not queue the UI fire-and-forget slot");
+                    if let Some(p) = command.take_cast_await() { return p; }
+                    tokio::task::yield_now().await;
+                }
+            } => p,
+            res = &mut task => {
+                let resp = res.expect("handler task panicked");
+                panic!(
+                    "expected /cast to reach the cast-await hand-off, but the handler returned \
+                     early with status {} instead", resp.status()
+                );
+            }
         };
         assert_eq!(req.gem, gem);
         tx.send(outcome).unwrap();
