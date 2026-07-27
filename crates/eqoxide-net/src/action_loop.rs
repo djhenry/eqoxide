@@ -1483,6 +1483,17 @@ impl ActionLoop {
         // against the DB trigger and places us at the correct arrival point. Cooldown prevents
         // re-firing while still inside the region right after a crossing.
         {
+            // #725 review round 3, B3: the resolution's obligation must be SETTLED before this
+            // block. Statically it is — `resolve_zone_cross` takes the ticket by value and has
+            // returned — but the refactor that undoes that (parameter to `&ZoneCrossTicket`, so the
+            // caller's local outlives this block) compiles, and the whole suite passed it. This
+            // makes it fail instead: a ticket still alive here is one the auto-cross could pay off
+            // (`perform_cross`'s same-zone branch publishes) or be stamped over by (the other two
+            // arms publish nothing, so a late drop would write `zone_cross_dropped_unhandled` over a
+            // live crossing).
+            debug_assert_eq!(self.command.zone_cross_outstanding(), 0,
+                "#725 B3: a drained zone_cross ticket is still alive at the standing auto-cross — \
+                 resolve_zone_cross must OWN it so the obligation is settled before this point");
             const ZONE_CROSS_COOLDOWN_MS: u128 = 10000; // 10 seconds
             // A dead corpse standing in a zone-line region must NOT auto-zone (#238) — this fires purely
             // from physical position, so a character killed right at a boundary would cross while dead.
@@ -1551,10 +1562,31 @@ impl ActionLoop {
     ///
     /// **Do not change `ticket` to a reference.** The by-value parameter is the whole guarantee: it
     /// is what makes "settle the ticket after the auto-cross" fail to compile rather than merely be
-    /// discouraged. Measured: as a one-line statement move it is now `E0308`; as a deliberate
-    /// signature change plus a late `drop` it still passes the entire suite, and no test catches it
-    /// (see `a_cross_requested_from_inside_the_region_walks_and_crosses_in_one_tick_725` for why a
-    /// test cannot). This sentence is the only thing standing between that refactor and the bug.
+    /// discouraged. Measured: as a one-line statement move it is now `E0308`.
+    ///
+    /// # AMENDED in review round 3 — the escape hatch is easier to reach than round 2 disclosed
+    ///
+    /// Round 2 disclosed the surviving mutation as *"a deliberate two-part refactor (signature
+    /// changed to `&ZoneCrossTicket`, plus a late `drop`)"*. **That overstated how deliberate it has
+    /// to be, and the round-3 reviewer corrected it in the unhelpful direction: no late `drop()` is
+    /// needed at all.** The caller's binding is a local of `drain_zone_cross`, so it already outlives
+    /// the auto-cross on its own. Two edits suffice, and both read as ordinary "avoid a move" tidying:
+    ///
+    /// ```ignore
+    /// let held = self.command.take_zone_cross();
+    /// if let Some(ref ticket) = held { self.resolve_zone_cross(ticket, gs); }
+    /// ```
+    ///
+    /// Reproduced in round 3: that shape compiles and left the whole suite GREEN (39 / 175 / 372).
+    /// It is now caught — not by a test that can observe the wrong outcome (round 2 was right that
+    /// one cannot be written: it needs a resolution arm that publishes nothing, which is what the
+    /// ticket exists to prevent, and both orderings leave the same final state) but by the
+    /// `debug_assert_eq!` on `CommandState::zone_cross_outstanding()` at the top of the auto-cross
+    /// block in [`Self::drain_zone_cross`]. Measured against exactly the two-edit shape above: RED
+    /// in 6 existing `eqoxide-net` tests; GREEN with no false positives on the unmutated branch.
+    /// That is a dynamic backstop for a static fact, and it is deliberately weaker than the type —
+    /// keep the by-value parameter, which is what makes the accidental case impossible rather than
+    /// merely detected.
     fn resolve_zone_cross(&mut self, ticket: eqoxide_command::ZoneCrossTicket, gs: &mut GameState) {
         let want_zone = ticket.zone_id();
         // #600 — THE ONE DECISION FUNCTION, at the THIRD world-answering consumer. The resolution
@@ -3902,14 +3934,43 @@ mod tests {
     /// fixes today; only a test keeps it fixed, and it has to fail both ways or it only guards the
     /// direction someone happened to think of:
     ///
-    /// * add a new way to reach `idle` and forget the docs → the constant is absent from the row →
-    ///   RED. (This is #725's own defect class: a doc sentence the code quietly falsified.)
+    /// * add a new NAMED REASON for `idle` and forget the docs → the constant is absent from the
+    ///   row → RED.
     /// * list a reason in the docs that nothing publishes → the token matches no constant → RED.
     ///   (Guidance that reads correct and sends an agent to wait for something that never arrives —
     ///   the shape of the B2 finding.)
     ///
     /// The set is the whole point of the row: **`nav_reason: null` on `idle` is only the boot
     /// state**, so every other route to `idle` must be named here and named in the docs.
+    ///
+    /// # AMENDED in review round 3 — this comment claimed a guarantee this test does not give
+    ///
+    /// The first bullet above used to read *"add a new way to reach `idle` and forget the docs …
+    /// (This is #725's own defect class: a doc sentence the code quietly falsified.)"* **That was
+    /// measured false, twice, by the round-3 reviewer, and the correction is kept here rather than
+    /// deleted — a deleted wrong claim is how a wrong claim comes back.**
+    ///
+    /// * Reinstating B1's original defect verbatim (`Walker::reset_for_zone_change` back to
+    ///   `set_nav_state("idle")`) leaves THIS TEST GREEN. Only the separate hand-written
+    ///   `a_zone_change_publishes_idle_with_a_reason_not_a_bare_idle_725` goes red — a per-call-site
+    ///   test, which by definition does not exist for a call site nobody has thought of yet.
+    /// * Adding a brand-new reasonless `idle` on a path with no dedicated assertion —
+    ///   `self.walker.set_nav_state("idle")` in `perform_cross`'s CROSS-ZONE branch, i.e. the
+    ///   `/v1/move/zone_cross` success path, the same crossing B1's original defect lived on — left
+    ///   the entire suite GREEN (39 / 175 / 372), reproduced in round 3 before the fix below.
+    ///
+    /// **The rule, not the example.** `published` is a hand-maintained array of constants, so this
+    /// test binds *docs ↔ constants*. It cannot see any code path that publishes no constant: such
+    /// a path adds nothing to the array, so both directions are vacuously satisfied. That is a
+    /// structural ceiling, not a gap in the assertions — a second, third or hundredth reasonless
+    /// `idle` is equally invisible to it, and so is any future `nav_reason: null` on any other
+    /// state. **What covers that is the `debug_assert!` in `Walker::set_nav_state_because` and
+    /// `CommandState::stamp_new_goal`** — the only two production writers that take a reason
+    /// argument (the third, `ZoneCrossTicket::drop`, always supplies one), so the universal is
+    /// enforced where the value is written rather than where it is documented. Measured in round 3:
+    /// against the reasonless-`idle` mutation those asserts go RED in two existing tests, and
+    /// against the unmutated branch the suite is GREEN with no false positives — the boot state is
+    /// built by `NavStatus::default()`, which routes through neither writer.
     ///
     /// It lives in `eqoxide-net` because that is the crate that can see both halves — `zoned`,
     /// `goal_dropped` and `respawned` are the walker's, `stopped`, `goto_superseded` and
@@ -3977,13 +4038,27 @@ mod tests {
     /// **Mutation check, and the honest limit of it.** Moving the ticket's settlement past the
     /// auto-cross as a one-line statement move — the mutation the previous shape lost — no longer
     /// compiles (`E0308`), because the ticket is owned by `resolve_zone_cross` and is not in scope
-    /// down there. **Measured, and not caught:** doing it as a deliberate two-part refactor
-    /// (signature changed to `&ZoneCrossTicket`, plus a late `drop`) leaves this test and the whole
-    /// `eqoxide-net` suite GREEN. I could not construct one that catches it: it would need a
-    /// resolution arm that publishes nothing, which is exactly what the ticket exists to make
-    /// impossible, and both orderings leave the same FINAL state (the auto-cross's own publish is
-    /// last either way). So the accidental case is prevented by the type and the deliberate case
-    /// rests on this comment and the one on `resolve_zone_cross` — stated rather than implied.
+    /// down there.
+    ///
+    /// # AMENDED in review round 3
+    ///
+    /// This paragraph used to end: *"**Measured, and not caught:** doing it as a deliberate two-part
+    /// refactor (signature changed to `&ZoneCrossTicket`, plus a late `drop`) leaves this test and
+    /// the whole `eqoxide-net` suite GREEN … so the accidental case is prevented by the type and the
+    /// deliberate case rests on this comment."* Two corrections, both measured in round 3:
+    ///
+    /// 1. **It is easier to reach than that said** — the late `drop` is not needed, because the
+    ///    caller's binding is a local of `drain_zone_cross` and already outlives the auto-cross.
+    ///    Two edits, both looking like "avoid a move" tidying. Reproduced: suite GREEN.
+    /// 2. **It is no longer uncaught.** `drain_zone_cross` now `debug_assert_eq!`s that no drained
+    ///    ticket is alive when it reaches the auto-cross block. Against the two-edit shape that is
+    ///    RED in 6 `eqoxide-net` tests including this one; on the unmutated branch it is GREEN.
+    ///
+    /// What round 2 got RIGHT and round 3 confirmed: no test can catch it by observing a wrong
+    /// OUTCOME. That needs a resolution arm that publishes nothing, which is what the ticket exists
+    /// to make impossible, and both orderings leave the same final state. The guard therefore checks
+    /// the ticket's LIFETIME directly rather than its effect — which is also why it stays a backstop
+    /// and not the mechanism: the by-value parameter is what makes the accidental case impossible.
     #[tokio::test]
     async fn a_cross_requested_from_inside_the_region_walks_and_crosses_in_one_tick_725() {
         use eqoxide_nav::zone_assets;

@@ -434,6 +434,16 @@ impl Walker {
     /// Set the walker's state + reason. **Deliberately does NOT touch `local`** — the fine tier's
     /// last word is an independent fact about a different tier (#382).
     pub fn set_nav_state_because(&self, state: &str, reason: Option<&str>) {
+        // #725 review round 3, B1: enforce the `idle` row's universal at the WRITER, not per call
+        // site. `nav_reason: null` on `idle` means exactly one thing — no nav request has been made
+        // since the client started — and the boot state is built directly by `NavStatus::default()`,
+        // which does not route through here. Every other route to `idle` goes through this writer or
+        // `CommandState::stamp_new_goal` (the only other production writer of `state`/`reason`
+        // besides `ZoneCrossTicket::drop`, which always supplies a reason), so asserting here and
+        // there covers the class. The doc-row pin cannot: it binds the documented reason list to a
+        // hand-maintained array of constants, and a reasonless publish adds no constant.
+        debug_assert!(!(state == "idle" && reason.is_none()),
+            "#725 B1: `idle` must name how it got there; `nav_reason: null` is reserved for boot");
         let mut s = self.nav.nav_state.lock().unwrap();
         let reason = reason.map(str::to_string);
         if s.state != state || s.reason != reason {
@@ -2174,6 +2184,36 @@ mod tests {
         assert_eq!(s.reason.as_deref(), Some(NAV_REASON_ZONED),
             "#725 B1: `idle` + `nav_reason: null` is the boot state — a SUCCESSFUL crossing must not \
              be reported with it, or success and 'your request was thrown away' are the same read");
+    }
+
+    /// **#725 review round 3: the writer-level guard itself is pinned.** The test above is a
+    /// PER-CALL-SITE assertion, and the round-3 review measured what that class of test cannot do:
+    /// a brand-new reasonless `idle` on a path nobody wrote an assertion for (`perform_cross`'s
+    /// cross-zone branch, i.e. the `/v1/move/zone_cross` SUCCESS path) left the whole suite green,
+    /// and the docs↔constants pin in `eqoxide-net` cannot see it either — a reasonless publish adds
+    /// no constant to the list it compares. The `debug_assert!` in `set_nav_state_because` is what
+    /// closes that, so it needs its own test: without this, deleting the assert is silent.
+    ///
+    /// Debug-only by construction — `debug_assert!` compiles out under `--release`, so the guard is
+    /// a TEST-TIME instrument, not a runtime one. That is the honest scope of the claim: it fails
+    /// the suite for anyone who adds a reasonless `idle`; it does not police a shipped binary.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "#725 B1")]
+    fn a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725() {
+        let (w, _nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        w.set_nav_state("idle"); // the exact shape of B1's original defect, at the chokepoint
+    }
+
+    /// The other side of it: the guard must be about `idle` SPECIFICALLY, not about a missing reason
+    /// in general. Every in-progress state is legitimately reasonless — `pending` needs no
+    /// explanation, the request itself is the explanation — so an over-broad assert would fire on
+    /// the normal path. Mutation check: widen the guard to `reason.is_none()` and this goes RED.
+    #[test]
+    fn a_reasonless_in_progress_state_is_still_allowed_725() {
+        let (w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        w.set_nav_state("pending");
+        assert_eq!(nav.nav_state.lock().unwrap().reason, None);
     }
 
     /// #644: the honest terminal `dead` state must NOT become a new never-clearing observable — once

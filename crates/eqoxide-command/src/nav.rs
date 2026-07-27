@@ -75,6 +75,9 @@ pub struct ZoneCrossTicket {
     nav_state: eqoxide_ipc::NavStateShared,
     /// `(goal_id, state, reason)` at the instant the request left the slot.
     at_drain:  (u64, String, Option<String>),
+    /// Shared liveness count (#725 review round 3, B3) — bumped by `take_zone_cross`, lowered by
+    /// this ticket's `Drop`. See [`CommandState::zone_cross_outstanding`].
+    outstanding: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ZoneCrossTicket {
@@ -85,6 +88,10 @@ impl ZoneCrossTicket {
 
 impl Drop for ZoneCrossTicket {
     fn drop(&mut self) {
+        // Lower the liveness count FIRST, before anything that could panic: the count must describe
+        // "a ticket is alive", and a `Drop` that unwound past this point would leave it permanently
+        // raised and turn the B3 assertion into a false positive on every later crossing.
+        self.outstanding.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         // Recover a poisoned guard rather than `unwrap()`: this runs in a `Drop`, and panicking
         // while another panic unwinds aborts the process. A poisoned nav_state still holds a
         // readable `NavStatus`, and publishing the honest fallback into it is strictly better than
@@ -134,6 +141,12 @@ impl CommandState {
     /// bearing: on `idle`, `nav_reason: null` means exactly one thing, that no nav request has been
     /// made since the client started.
     fn stamp_new_goal(&self, new_state: &str, reason: Option<&str>, goal: Option<(f32, f32, f32)>) -> u64 {
+        // #725 review round 3, B1 — the same writer-level guard as `Walker::set_nav_state_because`;
+        // see the rationale there. These two plus `ZoneCrossTicket::drop` (which always supplies a
+        // reason) are the only production writers of `state`/`reason`, so between them the `idle`
+        // row's universal is a checked invariant rather than prose.
+        debug_assert!(!(new_state == "idle" && reason.is_none()),
+            "#725 B1: `idle` must name how it got there; `nav_reason: null` is reserved for boot");
         let mut s = self.nav.nav_state.lock().unwrap();
         s.goal_id += 1;
         s.state = new_state.to_string();
@@ -234,7 +247,23 @@ impl CommandState {
             let s = self.nav.nav_state.lock().unwrap();
             (s.goal_id, s.state.clone(), s.reason.clone())
         };
-        Some(ZoneCrossTicket { zone_id, nav_state: self.nav.nav_state.clone(), at_drain })
+        self.zone_cross_outstanding.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(ZoneCrossTicket {
+            zone_id,
+            nav_state: self.nav.nav_state.clone(),
+            at_drain,
+            outstanding: self.zone_cross_outstanding.clone(),
+        })
+    }
+
+    /// How many drained [`ZoneCrossTicket`]s are still alive (#725 review round 3, B3).
+    ///
+    /// `ActionLoop::drain_zone_cross` asserts this is `0` before the standing auto-cross runs. Read
+    /// the field's doc comment on [`CommandState`] for why a dynamic count guards a fact the type
+    /// system already enforces — in short, so that undoing the type-level guarantee fails a test
+    /// rather than only contradicting a comment.
+    pub fn zone_cross_outstanding(&self) -> usize {
+        self.zone_cross_outstanding.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Is a zone-cross request queued? A **peek** — it does not drain, so it cannot incur the
@@ -420,6 +449,32 @@ mod tests {
         }
         assert_ne!(NAV_REASON_STOPPED, NAV_REASON_GOTO_CANCELLED,
             "an explicit /stop and a cancel the caller did not ask for must be distinguishable");
+    }
+
+    /// **#725 review round 3, B3: the liveness count that `drain_zone_cross` asserts on.** The
+    /// assertion there is only as good as this counter, and the counter is the sort of bookkeeping
+    /// that rots silently — a `Drop` that stopped decrementing would make the guard fire on every
+    /// later crossing (loud), but a `take` that stopped incrementing would make it never fire again
+    /// (silent, and exactly the failure mode #725 is about). Both directions are pinned here, and
+    /// `CommandState` being `Clone` is included deliberately: it is cloned per HTTP handler, so a
+    /// clone that did not SHARE the count would read zero while a ticket was alive.
+    #[test]
+    fn a_live_zone_cross_ticket_is_visible_as_outstanding_and_clears_on_drop_725() {
+        let cs = CommandState::default();
+        assert_eq!(cs.zone_cross_outstanding(), 0, "nothing drained yet");
+        cs.request_zone_cross(30);
+        assert_eq!(cs.zone_cross_outstanding(), 0, "queuing is not draining — no obligation yet");
+
+        let clone = cs.clone();
+        {
+            let _t = cs.take_zone_cross().expect("the request was queued");
+            assert_eq!(cs.zone_cross_outstanding(), 1, "a drained ticket is outstanding");
+            assert_eq!(clone.zone_cross_outstanding(), 1,
+                "clones must share the count — `CommandState` is cloned per HTTP handler, and a \
+                 per-clone count would read 0 in the very drain loop that asserts on it");
+        }
+        assert_eq!(cs.zone_cross_outstanding(), 0, "settling the ticket clears the obligation");
+        assert_eq!(clone.zone_cross_outstanding(), 0);
     }
 
     #[test]
