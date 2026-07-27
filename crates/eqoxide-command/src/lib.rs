@@ -110,6 +110,12 @@ mod trainer;
 mod social;
 mod chat;
 mod nav;
+// #725: the drained-zone-cross obligation token + the `nav_reason` its backstop publishes. Public
+// because `ActionLoop::drain_zone_cross` (eqoxide-net) is the drainer and the honesty tests assert
+// on the reason token by name rather than by literal.
+pub use nav::{
+    ZoneCrossTicket, NAV_REASON_GOTO_CANCELLED, NAV_REASON_STOPPED, NAV_REASON_ZONE_CROSS_UNHANDLED,
+};
 mod lifecycle;
 
 /// The typed write-path facade. Holds `.clone()`d handles of the same `ipc` command bundles that
@@ -138,6 +144,19 @@ pub struct CommandState {
     chat:      eqoxide_ipc::ChatSlots,
     nav:       eqoxide_ipc::NavSlots,
     lifecycle: eqoxide_ipc::LifecycleSlots,
+    /// How many [`nav::ZoneCrossTicket`]s are alive right now (#725 review round 3, B3).
+    ///
+    /// NOT a command slot — it is instrumentation. `take_zone_cross` bumps it, the ticket's `Drop`
+    /// lowers it, and `ActionLoop::drain_zone_cross` `debug_assert!`s it is zero before the standing
+    /// auto-cross runs. The property it checks is already guaranteed statically (the ticket is moved
+    /// into `resolve_zone_cross` by value and is out of scope below), so this is a DYNAMIC BACKSTOP
+    /// FOR A STATIC FACT: it exists only to make the refactor that would undo that guarantee —
+    /// changing the parameter to `&ZoneCrossTicket` so the caller's local outlives the auto-cross —
+    /// fail a test instead of only contradicting a comment. Deliberately an `Arc<AtomicUsize>` and
+    /// not a `bool` or an `Arc::strong_count`: `CommandState` is `Clone` and is cloned per HTTP
+    /// handler, so clones must SHARE the count (a strong-count probe would read the clones, not the
+    /// tickets), and a count rather than a flag stays correct if two tickets ever coexist.
+    zone_cross_outstanding: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CommandState {
@@ -161,6 +180,7 @@ impl CommandState {
         CommandState {
             combat, merchant, inventory, interact, quest, group, guild, trainer, social, chat,
             nav, lifecycle,
+            zone_cross_outstanding: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }

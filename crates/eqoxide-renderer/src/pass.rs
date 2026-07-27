@@ -15,6 +15,214 @@ fn anim_now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+// ── Instanced placed-object shadow-draw planning (#721) ─────────────────────────────────────────
+//
+// `encode_shadow_pass` used to inline three decisions in its hot loop, none of them reachable from
+// a test because every path to them runs through a `wgpu::RenderPass` and this crate's test harness
+// has no GPU device (see tests/fog_shader.rs / weather_shader.rs for the established device-free
+// precedent):
+//
+//   1. which of the two instanced shadow pipelines a caster is drawn with, from its `RenderMode`
+//      (#707/#718: routing every caster to the fragment-less pipeline makes tree shadows square),
+//   2. which animated-texture frame the masked pipeline alpha-tests against, and
+//   3. whether the masked sub-pass exists at all.
+//
+// #718's mutation check confirmed the gap directly: reverting (1), and separately reverting (2),
+// each left the whole crate suite green. (1) was re-measured on this branch's merge-base while
+// writing #721 — swapping the two `RenderMode` guards there left all 171 `eqoxide-renderer` tests
+// passing. Those decisions now live in `plan_instanced_shadow_draws`
+// below — a pure function over a device-free view of the casters — and `encode_shadow_pass` is a
+// mechanical executor of the plan it returns. The plan is a lazy iterator, NOT a `Vec`: this runs
+// every frame the shadow map is rebuilt (renderer.rs calls `encode_shadow_pass` unconditionally per
+// frame), and a lazy iterator adds no allocation where the two loops it replaced had none. (Not a
+// claim that one `Vec` would be a measurable cost — `encode_shadow_pass` already allocates twice
+// per call. It was free to avoid, so it is avoided.) tests/shadow_routing.rs asserts zero
+// allocations while draining a plan, with a counting allocator.
+
+/// Which of the two instanced placed-object shadow pipelines draws a caster.
+///
+/// `Opaque` is the fragment-less `shadow_instanced` pipeline: it writes depth for every triangle at
+/// no per-pixel cost, which is correct only for solid geometry. `Masked` is `shadow_instanced_masked`
+/// (#718), which has a fragment stage that discards texels under the alpha cutout so alpha-keyed
+/// foliage casts its cutout silhouette instead of its bounding rectangle (#707).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShadowPipelineKind {
+    Opaque,
+    Masked,
+}
+
+impl ShadowPipelineKind {
+    /// **The #707 routing decision.** `None` means "this render mode casts no instanced shadow at
+    /// all" — `Blend`/`Additive` placed objects are excluded, matching the pre-#721 code, which
+    /// only ever ran its two loops for `RenderMode::Opaque` and `RenderMode::Masked`.
+    pub fn for_render_mode(mode: eqoxide_assets::RenderMode) -> Option<Self> {
+        use eqoxide_assets::RenderMode;
+        match mode {
+            RenderMode::Opaque => Some(Self::Opaque),
+            RenderMode::Masked => Some(Self::Masked),
+            RenderMode::Blend | RenderMode::Additive => None,
+        }
+    }
+}
+
+/// The instanced sub-passes `encode_shadow_pass` issues, **in draw order**. Owning the list here
+/// rather than as two hand-written loops is what makes "the masked sub-pass got deleted" a single
+/// testable edit instead of an invisible one.
+pub const INSTANCED_SHADOW_SUBPASSES: [ShadowPipelineKind; 2] =
+    [ShadowPipelineKind::Opaque, ShadowPipelineKind::Masked];
+
+/// What a planned step needs to do to bind group 1 (the caster's diffuse texture) before it draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowTexBind {
+    /// This sub-pass samples nothing (the opaque shadow pipeline has no fragment stage), so group 1
+    /// is never bound for it.
+    NotSampled,
+    /// Group 1 already holds the right texture from an earlier step in this sub-pass — skip the
+    /// redundant `set_bind_group`.
+    Keep,
+    /// Bind group 1 to this texture index (`None` → the renderer's fallback texture).
+    Set(Option<usize>),
+}
+
+/// One planned instanced placed-object shadow draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstancedShadowStep {
+    /// Index into the caster slice the plan was built from.
+    pub caster: usize,
+    /// Which pipeline draws it.
+    pub pipeline: ShadowPipelineKind,
+    /// True on the first step of each non-empty sub-pass: set the pipeline and bind group 0.
+    pub set_pipeline: bool,
+    /// Group-1 action for this step.
+    pub bind: ShadowTexBind,
+}
+
+/// The device-free slice of a caster the shadow plan actually reads. Implemented for
+/// [`crate::gpu::GpuInstancedMesh`] (whose other fields are `wgpu::Buffer`s, hence unconstructible
+/// in a test) and for plain structs in tests.
+pub trait InstancedShadowCaster {
+    fn render_mode(&self) -> eqoxide_assets::RenderMode;
+    fn texture_idx(&self) -> Option<usize>;
+    fn anim(&self) -> Option<&(u32, Vec<usize>)>;
+}
+
+impl InstancedShadowCaster for crate::gpu::GpuInstancedMesh {
+    fn render_mode(&self) -> eqoxide_assets::RenderMode { self.render_mode }
+    fn texture_idx(&self) -> Option<usize> { self.texture_idx }
+    fn anim(&self) -> Option<&(u32, Vec<usize>)> { self.anim.as_ref() }
+}
+
+/// The texture a mesh should bind at `now_ms`: its current animation frame if animated, else its
+/// static texture. **The single definition** — `encode_zone_pass`'s `frame_tex` closure delegates
+/// here, so the color pass and the masked shadow sub-pass cannot drift apart, and this function's
+/// tests grade both.
+///
+/// The masked shadow sub-pass needs this, not the raw `texture_idx`: an animated `RenderMode::Masked`
+/// caster's shadow must alpha-test against the SAME texel the color pass is sampling, or the two
+/// silhouettes disagree on every frame but the first — the identical failure class as #707, just
+/// triggered by time instead of by a missing discard.
+pub fn animated_frame_texture(
+    tex:    Option<usize>,
+    anim:   Option<&(u32, Vec<usize>)>,
+    now_ms: u64,
+) -> Option<usize> {
+    match anim {
+        Some((ms, frames)) if !frames.is_empty() => {
+            Some(frames[(now_ms / (*ms).max(1) as u64) as usize % frames.len()])
+        }
+        _ => tex,
+    }
+}
+
+/// Plans every instanced placed-object shadow draw for one frame: which sub-passes run, in which
+/// order, which caster is in which, and which texture each masked step must bind.
+///
+/// Returns a **lazy iterator** — no allocation, no `Vec` — because `encode_shadow_pass` runs every
+/// frame. Steps come out in exactly the order `encode_shadow_pass` issues them, so a test can
+/// collect them and grade the full draw sequence without a GPU device.
+pub fn plan_instanced_shadow_draws<C: InstancedShadowCaster>(
+    casters: &[C],
+    now_ms:  u64,
+) -> impl Iterator<Item = InstancedShadowStep> + '_ {
+    INSTANCED_SHADOW_SUBPASSES.into_iter().flat_map(move |pipeline| {
+        casters
+            .iter()
+            .enumerate()
+            .filter(move |(_, c)| {
+                ShadowPipelineKind::for_render_mode(c.render_mode()) == Some(pipeline)
+            })
+            .scan(
+                (false, None::<Option<usize>>),
+                move |(started, current_tex), (caster, c)| {
+                    let bind = match pipeline {
+                        ShadowPipelineKind::Opaque => ShadowTexBind::NotSampled,
+                        ShadowPipelineKind::Masked => {
+                            let tex = animated_frame_texture(c.texture_idx(), c.anim(), now_ms);
+                            if *current_tex == Some(tex) {
+                                ShadowTexBind::Keep
+                            } else {
+                                *current_tex = Some(tex);
+                                ShadowTexBind::Set(tex)
+                            }
+                        }
+                    };
+                    let set_pipeline = !*started;
+                    *started = true;
+                    Some(InstancedShadowStep { caster, pipeline, set_pipeline, bind })
+                },
+            )
+    })
+}
+
+/// The device-bound half of an instanced placed-object shadow draw, expressed entirely in **plan
+/// vocabulary** — [`ShadowPipelineKind`]s and texture *indices*, never `wgpu` handles.
+///
+/// This is what makes [`execute_instanced_shadow_plan`] device-free: `encode_shadow_pass` supplies
+/// an impl that closes over the renderer and the live `wgpu::RenderPass`, and
+/// `tests/shadow_routing_equivalence.rs` supplies one that appends to a `Vec`. Both run the *same*
+/// executor, so a regression in the plan→command translation is a test failure rather than
+/// something only a GPU could notice.
+///
+/// The four methods are deliberately the *only* handles the executor has. In particular
+/// [`Self::bind_texture`] receives an index and nothing else — it has no caster in scope, so the
+/// #718 N2 bug ("bind `mesh.texture_idx` instead of the resolved animation frame") is not
+/// expressible there at all.
+pub trait InstancedShadowSink {
+    /// Start a sub-pass: select the pipeline this kind names.
+    fn set_pipeline(&mut self, kind: ShadowPipelineKind);
+    /// Bind group 0 (the shadow light's view-projection uniform).
+    fn bind_light_depth(&mut self);
+    /// Bind group 1 to the *already-resolved* texture index (`None` → fallback texture).
+    fn bind_texture(&mut self, idx: Option<usize>);
+    /// Issue the draw for `casters[caster]`.
+    fn draw(&mut self, caster: usize);
+}
+
+/// Turns a [`plan_instanced_shadow_draws`] plan into sink calls. **This is the real executor** —
+/// `encode_shadow_pass` calls exactly this function, so the command sequence it emits is graded
+/// device-free in `tests/shadow_routing_equivalence.rs` against a transcription of the pre-#721
+/// loops.
+///
+/// Before #721's review round 2 this loop was inlined into `encode_shadow_pass` and therefore
+/// unobservable: the reviewer reintroduced #718's N2 bug in it (`tex_bg(mesh.texture_idx)` for
+/// `tex_bg(tex)`) and all 14 tests stayed green. Keep it here; do not inline it back.
+pub fn execute_instanced_shadow_plan<C: InstancedShadowCaster, S: InstancedShadowSink>(
+    casters: &[C],
+    now_ms:  u64,
+    sink:    &mut S,
+) {
+    for step in plan_instanced_shadow_draws(casters, now_ms) {
+        if step.set_pipeline {
+            sink.set_pipeline(step.pipeline);
+            sink.bind_light_depth();
+        }
+        if let ShadowTexBind::Set(tex) = step.bind {
+            sink.bind_texture(tex);
+        }
+        sink.draw(step.caster);
+    }
+}
+
 /// Entity draw distance (EQ units, measured from the player). Beyond this an NPC's 3D
 /// model is not drawn — it's a distant speck. Combined with a frustum test, this caps
 /// the per-frame entity work in densely-populated zones (e.g. gfaydark, ~400 spawns).
@@ -23,6 +231,267 @@ pub const ENTITY_DRAW_DIST: f32 = 500.0;
 /// draws (the culled position is the feet; the body extends upward). Shared with the HUD so
 /// nameplates cull on the exact same distance+frustum test as models (#177).
 pub const ENTITY_CULL_MARGIN: f32 = 0.5;
+
+// ── Shadow caster SELECTION (#740) ───────────────────────────────────────────────────────────────
+//
+// `encode_shadow_pass` decides, per frame, which entities make it into the shadow map: the player,
+// then the nearby characters nearest-first, culled to the view frustum and bounded by
+// `SHADOW_CASTER_SLOTS`, each posed either at its current animation clip or at bind pose. Those
+// four decisions were inline in the pass until #740 and therefore unreachable from any test:
+// `encode_shadow_pass` takes `&EqRenderer` + `&mut wgpu::CommandEncoder`, and neither
+// `wgpu::Device` nor `wgpu::Queue` implements `Default` or has any non-adapter constructor
+// (wgpu 22 has no `noop` backend), so an integration test cannot build the arguments at all.
+// The extraction below is the same shape #721 used for the instanced draws: a pure planner over a
+// device-free trait, graded in tests/shadow_caster_selection.rs.
+
+/// The model resolved for a shadow-caster candidate, reduced to what SELECTION reads. The real
+/// `GpuModel` is unconstructible in a test (it owns `wgpu::Buffer`s); selection only ever asks
+/// "skinned or static, and how many clips does the skin have".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowModelKind {
+    Skinned { clip_count: usize },
+    Static,
+    /// No model loaded for this race/gender — the candidate casts nothing and consumes no slot.
+    Absent,
+}
+
+/// How a selected skinned caster is posed for the depth pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShadowPose {
+    /// Evaluate the skin at this clip/time.
+    Clip { idx: usize, time: f32 },
+    /// Fall back to the rest pose. **This is the #692/#694 guard's output**: the bind-pose sentinel
+    /// is `clip_idx = usize::MAX`, and a `clip_idx` carried over from a different model can exceed
+    /// the current skin's clip count, so an unguarded `evaluate` would index out of range.
+    BindPose,
+}
+
+/// What a selected caster draws as. Static casters need no joint palette, so they consume a
+/// `shadow_uniform_pool` slot but not a `shadow_joint_pool` slot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShadowCasterDraw {
+    Skinned { j_slot: usize, pose: ShadowPose },
+    Static,
+}
+
+/// Which candidate a step selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowCasterRef {
+    /// The local player (entity id 0), selected before the nearby loop and never frustum-culled.
+    Player,
+    /// Index into the `nearby` slice the plan was built from — NOT the post-sort position, so the
+    /// caller can index its own unsorted data with it.
+    Nearby(usize),
+}
+
+/// One selected shadow caster, in the order `encode_shadow_pass` writes and draws it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShadowCasterStep {
+    pub caster: ShadowCasterRef,
+    /// `shadow_uniform_pool` index for this caster's model matrix.
+    pub u_slot: usize,
+    pub draw:   ShadowCasterDraw,
+}
+
+/// What the planner **looked at** on its way to a plan, reported by the planner itself.
+///
+/// Nothing in `encode_shadow_pass` reads this. It exists so the coverage corpus in
+/// tests/shadow_caster_selection.rs can *observe* reach instead of re-deriving it, and it is here
+/// rather than behind `#[cfg(test)]` because an integration test links the crate as a dependency
+/// and cannot see `cfg(test)` items.
+///
+/// **Why it exists at all**, since a reader will otherwise reasonably ask why a renderer returns
+/// telemetry it ignores. Two of the corpus's coverage counters need to know which candidates the
+/// loop examined, and the plan alone cannot show that: a culled candidate, an `Absent` one, and a
+/// candidate the loop never reached are all three no-ops, identical in `steps`. #747 shipped two
+/// wrong answers to that before this one — reach computed from the fixture (round 2), then reach
+/// reconstructed from a second copy of the planner's own "stop at the bound" rule (round 3), whose
+/// self-check was a *subsequence* test and so constrained the ordering while placing no constraint
+/// whatsoever on the cut. The round-3 review falsified it by measurement: capping the nearby loop
+/// at 100 examined candidates lost real reach in 85 of 400 scenes and moved **not one counter**.
+/// Reported from inside the loop, the cut has exactly one source and there is nothing to drift.
+///
+/// The same argument covers the two `Absent` arms, which emit no step: an empty match arm is
+/// indistinguishable from a dead one, so a `continue` inserted before it would silently zero that
+/// cell's coverage. Counting inside the arm is what makes the arm observable.
+///
+/// `nearby_examined == nearby_culled + nearby_absent + nearby_static + nearby_skinned` holds by
+/// construction, and the corpus asserts that identity on every scene — so a misplaced or duplicated
+/// increment here reports as a broken counter rather than as quietly wrong coverage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShadowCasterReach {
+    /// Nearby candidates whose loop body ran — i.e. those reached before the slot bound stopped the
+    /// loop. Counted at the top of the body, before the cull.
+    pub nearby_examined: usize,
+    /// …of those, rejected by `entity_in_view`.
+    pub nearby_culled: usize,
+    /// …of those that survived the cull, how many landed in each `ShadowModelKind` arm.
+    /// `nearby_skinned` is counted on entry to the arm, before the (documented-dead) `j_slot`
+    /// guard, so the identity above holds regardless of whether that guard ever fires.
+    pub nearby_absent: usize,
+    pub nearby_static: usize,
+    pub nearby_skinned: usize,
+    /// A player was supplied and took the player path's `Absent` arm — also step-less, and
+    /// otherwise inferable only as "supplied but missing from the plan".
+    pub player_absent: bool,
+}
+
+/// A frame's caster selection: the steps to draw, plus what the planner examined to produce them.
+///
+/// Only `steps` drives rendering; see [`ShadowCasterReach`] for why `reach` is here.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ShadowCasterPlan {
+    pub steps: Vec<ShadowCasterStep>,
+    pub reach: ShadowCasterReach,
+}
+
+/// The device-free slice of a shadow-caster candidate that SELECTION reads. `encode_shadow_pass`
+/// implements it over `(&Billboard, Option<&GpuModel>)`; tests implement it on a plain struct.
+pub trait ShadowCasterCandidate {
+    /// World position — the sort key (distance to the light center) and the frustum-cull input.
+    fn pos(&self) -> [f32; 3];
+    fn model_kind(&self) -> ShadowModelKind;
+    /// This entity's animation state as `(clip_idx, time)`, or `None` if it has none.
+    fn anim_state(&self) -> Option<(usize, f32)>;
+}
+
+/// **The #692/#694 guard.** Picks the pose for a skinned caster: its live clip if that clip index
+/// is actually in range for *this* skin, otherwise the rest pose.
+///
+/// `clip_count != 0` is redundant with `idx < clip_count` (no `usize` is less than 0) and is kept
+/// only because the pass wrote both halves; `redundant_is_empty_half_of_the_guard_is_provably_dead`
+/// in tests/shadow_caster_selection.rs pins that redundancy rather than leaving it as folklore.
+pub fn shadow_pose_for(anim: Option<(usize, f32)>, clip_count: usize) -> ShadowPose {
+    match anim {
+        Some((idx, time)) if clip_count != 0 && idx < clip_count => ShadowPose::Clip { idx, time },
+        _ => ShadowPose::BindPose,
+    }
+}
+
+/// Selects the frame's shadow casters: player first, then the nearby candidates **nearest-first to
+/// `light_center`**, dropping anything outside the entity frustum/distance cull, until
+/// `SHADOW_CASTER_SLOTS` uniform slots are spent.
+///
+/// Returns steps in write/draw order with their pool slots already assigned, so the pass has no
+/// selection decision left to make, alongside a [`ShadowCasterReach`] the pass ignores and the
+/// coverage corpus reads. Allocates: the nearest-first sort needs an owned index order (unlike
+/// [`plan_instanced_shadow_draws`], which is lazy).
+///
+/// `model_kind()` is called only for candidates that survive the cull *within this function*.
+///
+/// **Do not read that as a statement about the pass.** The production call site
+/// ([`encode_shadow_pass`]) resolves every billboard's `GpuModel` eagerly into its `CandidateView`s
+/// *before* calling this, so the pass's order of work does differ from pre-#740 — that is the one
+/// disclosed behaviour-neutral delta (#740 §2). An earlier draft of this comment claimed the order
+/// of work "matches the pre-#740 order"; it does not, and the claim is retracted here rather than
+/// deleted.
+pub fn plan_shadow_casters<C: ShadowCasterCandidate>(
+    player:       Option<&C>,
+    nearby:       &[C],
+    light_center: [f32; 3],
+    player_pos:   [f32; 3],
+    view_proj:    [[f32; 4]; 4],
+) -> ShadowCasterPlan {
+    use crate::renderer::SHADOW_CASTER_SLOTS;
+
+    let mut steps: Vec<ShadowCasterStep> = Vec::new();
+    let mut reach = ShadowCasterReach::default();
+    let mut u_slot = 0usize;
+    let mut j_slot = 0usize;
+
+    // ── Player (id 0): always selected when it has a model; no cull, no bound (it is first). ──
+    if let Some(p) = player {
+        match p.model_kind() {
+            ShadowModelKind::Skinned { clip_count } => {
+                let pose = shadow_pose_for(p.anim_state(), clip_count);
+                steps.push(ShadowCasterStep {
+                    caster: ShadowCasterRef::Player,
+                    u_slot,
+                    draw: ShadowCasterDraw::Skinned { j_slot, pose },
+                });
+                u_slot += 1;
+                j_slot += 1;
+            }
+            ShadowModelKind::Static => {
+                steps.push(ShadowCasterStep {
+                    caster: ShadowCasterRef::Player,
+                    u_slot,
+                    draw: ShadowCasterDraw::Static,
+                });
+                u_slot += 1;
+            }
+            // Counted, not empty: an empty arm cannot be told apart from a dead one. NOTE the
+            // counter is `reach.player_absent`, NOT `u_slot` — an absent player must consume no
+            // slot (`a_player_with_no_model_casts_nothing_and_consumes_no_slot`).
+            ShadowModelKind::Absent => reach.player_absent = true,
+        }
+    }
+
+    // ── Nearby characters, nearest-first to the light center, bounded ────────────────────────
+    let dist2 = |p: [f32; 3]| {
+        (p[0] - light_center[0]).powi(2)
+            + (p[1] - light_center[1]).powi(2)
+            + (p[2] - light_center[2]).powi(2)
+    };
+    let mut order: Vec<usize> = (0..nearby.len()).collect();
+    // Stable, like the pre-#740 `Vec<&Billboard>` sort: equidistant candidates keep spawn order.
+    order.sort_by(|&a, &b| {
+        dist2(nearby[a].pos())
+            .partial_cmp(&dist2(nearby[b].pos()))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for i in order {
+        if u_slot >= SHADOW_CASTER_SLOTS {
+            break;
+        }
+        // The one place the cut is observable. Everything after the `break` above is unexamined,
+        // and nothing in `steps` distinguishes "culled", "absent" and "never looked at".
+        reach.nearby_examined += 1;
+        let c = &nearby[i];
+        if !crate::camera::entity_in_view(
+            c.pos(), player_pos, view_proj, ENTITY_DRAW_DIST, ENTITY_CULL_MARGIN,
+        ) {
+            reach.nearby_culled += 1;
+            continue;
+        }
+        match c.model_kind() {
+            ShadowModelKind::Skinned { clip_count } => {
+                // Counted before the guard below, so `examined == culled + absent + static +
+                // skinned` holds whether or not the guard fires.
+                reach.nearby_skinned += 1;
+                // Unreachable in practice (`j_slot <= u_slot` always, and `u_slot <
+                // SHADOW_CASTER_SLOTS` was just checked), kept because the pre-#740 pass wrote it.
+                // `joint_slots_never_outrun_uniform_slots` pins the invariant that makes it dead.
+                if j_slot >= SHADOW_CASTER_SLOTS {
+                    continue;
+                }
+                let pose = shadow_pose_for(c.anim_state(), clip_count);
+                steps.push(ShadowCasterStep {
+                    caster: ShadowCasterRef::Nearby(i),
+                    u_slot,
+                    draw: ShadowCasterDraw::Skinned { j_slot, pose },
+                });
+                u_slot += 1;
+                j_slot += 1;
+            }
+            ShadowModelKind::Static => {
+                reach.nearby_static += 1;
+                steps.push(ShadowCasterStep {
+                    caster: ShadowCasterRef::Nearby(i),
+                    u_slot,
+                    draw: ShadowCasterDraw::Static,
+                });
+                u_slot += 1;
+            }
+            // Counted, not empty — same reason as the player arm above. NOTE the counter is
+            // `reach.nearby_absent`, NOT `u_slot`: an absent candidate consumes no slot.
+            ShadowModelKind::Absent => reach.nearby_absent += 1,
+        }
+    }
+
+    ShadowCasterPlan { steps, reach }
+}
 
 /// Vestigial: this used to HIDE an armor mesh whose exact material+variant texture was
 /// missing (e.g. the variant-03 main chest torso for an armor material that only ships
@@ -193,13 +662,12 @@ pub fn encode_zone_pass(
     let now_ms = anim_now_ms();
     // The texture a mesh should bind this frame: its current animation frame if animated,
     // else its static texture. The per-loop texture cache naturally rebinds when it advances.
+    // This is the SAME function the masked shadow sub-pass resolves its frame with (#721) — the
+    // color and shadow silhouettes must agree on the texel, or #718's N2 mismatch comes back. It
+    // was a byte-identical copy of `animated_frame_texture` until #721's review round 2; do not
+    // re-inline it.
     let frame_tex = |tex: Option<usize>, anim: &Option<(u32, Vec<usize>)>| -> Option<usize> {
-        match anim {
-            Some((ms, frames)) if !frames.is_empty() => {
-                Some(frames[(now_ms / (*ms).max(1) as u64) as usize % frames.len()])
-            }
-            _ => tex,
-        }
+        animated_frame_texture(tex, anim.as_ref(), now_ms)
     };
 
     // Draw the static terrain meshes whose render_mode is in `modes`, with `pipeline`.
@@ -1096,7 +1564,6 @@ pub fn encode_shadow_pass(
     scene:        &SceneState,
     light_center: [f32; 3],
 ) {
-    use crate::renderer::SHADOW_CASTER_SLOTS;
     use crate::models::{race_to_archetype, character_model_key, archetype_scale, target_height_for,
                         archetype_correction, humanoid_placement};
     use crate::gpu::{EntityUniform, GpuModel};
@@ -1108,8 +1575,6 @@ pub fn encode_shadow_pass(
     let id4 = [[1f32,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]];
 
     let mut casters: Vec<Caster> = Vec::new();
-    let mut u_slot = 0usize; // shadow_uniform_pool index
-    let mut j_slot = 0usize; // shadow_joint_pool index
 
     // Write a padded 128-joint palette to shadow_joint_pool[slot], returning nothing.
     let write_joints = |slot: usize, mats: &[[[f32;4];4]]| {
@@ -1122,88 +1587,132 @@ pub fn encode_shadow_pass(
             bytemuck::bytes_of(&EntityUniform { model: mat, tint: [1.0; 4] }));
     };
 
-    // ── Player (id 0) ───────────────────────────────────────────────────────
-    if !scene.player_race.is_empty() {
-        let archetype = race_to_archetype(&scene.player_race);
-        match r.character_model_for(&scene.player_race, scene.player_gender) {
-            Some(GpuModel::Skinned(model)) => {
-                // #694 hardening: same guard as the NPC shadow-caster branch below (~line 1165) —
-                // `!clips.is_empty()` alone does not bound `clip_idx`, and the #692/#694 bind-pose
-                // sentinel is `usize::MAX`, which would index out of range without this check.
-                let matrices = match r.anim_states.get(&0) {
-                    Some(s) if !model.skin.clips.is_empty() && s.clip_idx < model.skin.clips.len() =>
-                        model.skin.evaluate(s.clip_idx, s.time),
-                    _ => model.skin.bind_pose(),
-                };
-                write_joints(j_slot, &matrices);
-                let target = target_height_for(&scene.player_race, archetype);
-                let p = humanoid_placement(model.true_height, model.feet_offset, target);
-                let mat = crate::camera::entity_model_matrix_heading(
-                    scene.player_pos, scene.player_heading, p.visual_scale, p.mesh_scale,
-                    [0.0, 0.0], true, 0.0, archetype_correction(archetype));
-                write_model(u_slot, mat);
-                casters.push(Caster::Skinned { model, u_slot, j_slot });
-                u_slot += 1; j_slot += 1;
+    // ── SELECTION ───────────────────────────────────────────────────────────
+    //
+    // Which entities cast this frame — nearest-first order, the frustum/distance cull, the
+    // `SHADOW_CASTER_SLOTS` bound, the pool-slot assignment, and the #692/#694 clip guard — is
+    // decided by `plan_shadow_casters` (#740), which is device-free and unit tested in
+    // tests/shadow_caster_selection.rs (with a differential pin against the pre-#740 loops in the
+    // same file). Nothing below this point makes a selection decision: it turns each planned step
+    // into a matrix + buffer write. If you find yourself adding a condition here, it belongs in
+    // the planner.
+    /// A candidate's selection inputs, with its `GpuModel` resolved (a pure `HashMap` get).
+    struct CandidateView<'a> {
+        pos:   [f32; 3],
+        model: Option<&'a GpuModel>,
+        anim:  Option<(usize, f32)>,
+    }
+    impl ShadowCasterCandidate for CandidateView<'_> {
+        fn pos(&self) -> [f32; 3] { self.pos }
+        fn model_kind(&self) -> ShadowModelKind {
+            match self.model {
+                Some(GpuModel::Skinned(m)) =>
+                    ShadowModelKind::Skinned { clip_count: m.skin.clips.len() },
+                Some(GpuModel::Static(_))  => ShadowModelKind::Static,
+                None                       => ShadowModelKind::Absent,
             }
-            Some(GpuModel::Static(model)) => {
-                let arch_scale   = archetype_scale(archetype);
-                let visual_scale = 2.0 * model.y_extent * arch_scale;
-                let mat = crate::camera::entity_model_matrix_heading(
-                    scene.player_pos, scene.player_heading, visual_scale, arch_scale,
-                    [model.x_center, model.z_center], true, model.y_bottom, archetype_correction(archetype));
-                write_model(u_slot, mat);
-                casters.push(Caster::Static { model, u_slot });
-                u_slot += 1;
-            }
-            None => {}
         }
+        fn anim_state(&self) -> Option<(usize, f32)> { self.anim }
     }
 
-    // ── Nearby character casters (nearest-first, bounded) ────────────────────
-    let pp = light_center;
-    let mut order: Vec<&crate::scene::Billboard> = scene.billboards.iter().collect();
-    order.sort_by(|a, b| {
-        let da = (a.pos[0]-pp[0]).powi(2) + (a.pos[1]-pp[1]).powi(2) + (a.pos[2]-pp[2]).powi(2);
-        let db = (b.pos[0]-pp[0]).powi(2) + (b.pos[1]-pp[1]).powi(2) + (b.pos[2]-pp[2]).powi(2);
-        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    let player_view = (!scene.player_race.is_empty()).then(|| CandidateView {
+        pos:   scene.player_pos,
+        model: r.character_model_for(&scene.player_race, scene.player_gender),
+        anim:  r.anim_states.get(&0).map(|s| (s.clip_idx, s.time)),
     });
-    for b in order {
-        if u_slot >= SHADOW_CASTER_SLOTS { break; }
-        if !crate::camera::entity_in_view(b.pos, scene.player_pos, r.last_view_proj,
-                                          ENTITY_DRAW_DIST, ENTITY_CULL_MARGIN) { continue; }
-        let archetype = race_to_archetype(&b.race);
+    // COST NOTE (#740 §2), reasoned from source and not benchmarked: this resolves EVERY billboard,
+    // where the pre-#740 loop resolved only candidates that both survived the cull and were reached
+    // before the 64-slot `break` — so the work goes from at most ~SHADOW_CASTER_SLOTS resolutions
+    // per frame to `billboards.len()`. Each resolution is a `character_model_key` (one or two
+    // `str::to_uppercase()` String allocations), one or two `gpu_character_models` gets, and one
+    // `anim_states` get, plus this `Vec`. The OUTPUT is unchanged — all of it is side-effect-free.
+    //
+    // What would settle it (nobody has done this): a frame-time A/B in a crowded zone with this
+    // eager resolve versus a lazy one, at a known `billboards.len()`. The missing input is how large
+    // `billboards.len()` actually gets in the field, which is exactly the open question in #748 —
+    // until that number exists, any figure here is arithmetic, not a measurement.
+    let nearby: Vec<CandidateView> = scene.billboards.iter().map(|b| {
         let (key, slot) = character_model_key(&b.race, b.gender);
-        match r.model_by_key(key, slot) {
-            Some(GpuModel::Skinned(model)) => {
-                if j_slot >= SHADOW_CASTER_SLOTS { continue; }
-                let matrices = match r.anim_states.get(&b.id) {
-                    Some(s) if !model.skin.clips.is_empty() && s.clip_idx < model.skin.clips.len() =>
-                        model.skin.evaluate(s.clip_idx, s.time),
-                    _ => model.skin.bind_pose(),
-                };
-                write_joints(j_slot, &matrices);
-                let target = target_height_for(&b.race, archetype);
-                let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
-                let dominant_scale = target / height;
-                let visual_scale   = -2.0 * model.feet_offset * dominant_scale;
-                let mat = crate::camera::entity_model_matrix_heading(
-                    b.pos, b.heading, visual_scale, dominant_scale,
-                    [0.0, 0.0], true, 0.0, archetype_correction(archetype));
-                write_model(u_slot, mat);
-                casters.push(Caster::Skinned { model, u_slot, j_slot });
-                u_slot += 1; j_slot += 1;
+        CandidateView {
+            pos:   b.pos,
+            model: r.model_by_key(key, slot),
+            anim:  r.anim_states.get(&b.id).map(|s| (s.clip_idx, s.time)),
+        }
+    }).collect();
+
+    let plan = plan_shadow_casters(
+        player_view.as_ref(), &nearby, light_center, scene.player_pos, r.last_view_proj);
+
+    // `plan.reach` is coverage telemetry for tests/shadow_caster_selection.rs and is deliberately
+    // unread here; see `ShadowCasterReach`.
+    for step in &plan.steps {
+        // Placement differs between the player and a nearby character (the player uses
+        // `humanoid_placement`, nearby characters the feet-offset/dominant-scale form), so the two
+        // arms stay separate — but neither decides *whether* to draw.
+        match step.caster {
+            ShadowCasterRef::Player => {
+                let archetype = race_to_archetype(&scene.player_race);
+                match (player_view.as_ref().and_then(|v| v.model), step.draw) {
+                    (Some(GpuModel::Skinned(model)), ShadowCasterDraw::Skinned { j_slot, pose }) => {
+                        let matrices = match pose {
+                            ShadowPose::Clip { idx, time } => model.skin.evaluate(idx, time),
+                            ShadowPose::BindPose           => model.skin.bind_pose(),
+                        };
+                        write_joints(j_slot, &matrices);
+                        let target = target_height_for(&scene.player_race, archetype);
+                        let p = humanoid_placement(model.true_height, model.feet_offset, target);
+                        let mat = crate::camera::entity_model_matrix_heading(
+                            scene.player_pos, scene.player_heading, p.visual_scale, p.mesh_scale,
+                            [0.0, 0.0], true, 0.0, archetype_correction(archetype));
+                        write_model(step.u_slot, mat);
+                        casters.push(Caster::Skinned { model, u_slot: step.u_slot, j_slot });
+                    }
+                    (Some(GpuModel::Static(model)), ShadowCasterDraw::Static) => {
+                        let arch_scale   = archetype_scale(archetype);
+                        let visual_scale = 2.0 * model.y_extent * arch_scale;
+                        let mat = crate::camera::entity_model_matrix_heading(
+                            scene.player_pos, scene.player_heading, visual_scale, arch_scale,
+                            [model.x_center, model.z_center], true, model.y_bottom,
+                            archetype_correction(archetype));
+                        write_model(step.u_slot, mat);
+                        casters.push(Caster::Static { model, u_slot: step.u_slot });
+                    }
+                    _ => {}
+                }
             }
-            Some(GpuModel::Static(model)) => {
-                let arch_scale   = archetype_scale(archetype);
-                let visual_scale = 2.0 * model.y_extent * arch_scale;
-                let mat = crate::camera::entity_model_matrix_heading(
-                    b.pos, b.heading, visual_scale, arch_scale,
-                    [model.x_center, model.z_center], true, model.y_bottom, archetype_correction(archetype));
-                write_model(u_slot, mat);
-                casters.push(Caster::Static { model, u_slot });
-                u_slot += 1;
+            ShadowCasterRef::Nearby(i) => {
+                let b = &scene.billboards[i];
+                let archetype = race_to_archetype(&b.race);
+                match (nearby[i].model, step.draw) {
+                    (Some(GpuModel::Skinned(model)), ShadowCasterDraw::Skinned { j_slot, pose }) => {
+                        let matrices = match pose {
+                            ShadowPose::Clip { idx, time } => model.skin.evaluate(idx, time),
+                            ShadowPose::BindPose           => model.skin.bind_pose(),
+                        };
+                        write_joints(j_slot, &matrices);
+                        let target = target_height_for(&b.race, archetype);
+                        let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
+                        let dominant_scale = target / height;
+                        let visual_scale   = -2.0 * model.feet_offset * dominant_scale;
+                        let mat = crate::camera::entity_model_matrix_heading(
+                            b.pos, b.heading, visual_scale, dominant_scale,
+                            [0.0, 0.0], true, 0.0, archetype_correction(archetype));
+                        write_model(step.u_slot, mat);
+                        casters.push(Caster::Skinned { model, u_slot: step.u_slot, j_slot });
+                    }
+                    (Some(GpuModel::Static(model)), ShadowCasterDraw::Static) => {
+                        let arch_scale   = archetype_scale(archetype);
+                        let visual_scale = 2.0 * model.y_extent * arch_scale;
+                        let mat = crate::camera::entity_model_matrix_heading(
+                            b.pos, b.heading, visual_scale, arch_scale,
+                            [model.x_center, model.z_center], true, model.y_bottom,
+                            archetype_correction(archetype));
+                        write_model(step.u_slot, mat);
+                        casters.push(Caster::Static { model, u_slot: step.u_slot });
+                    }
+                    _ => {}
+                }
             }
-            None => {}
         }
     }
 
@@ -1227,61 +1736,53 @@ pub fn encode_shadow_pass(
     // `shadow_instanced_masked` (#707), which alpha-tests the caster's diffuse texture at the same
     // 0.5 threshold as the color pass — otherwise a foliage/branch quad casts its full bounding
     // rectangle instead of its cutout silhouette (the tree-shadow-is-square bug).
-    use eqoxide_assets::RenderMode;
-    let tex_bg = |idx: Option<usize>| -> &wgpu::BindGroup {
-        match idx {
-            Some(i) if i < r.texture_bind_groups.len() => &r.texture_bind_groups[i],
-            _ => &r.fallback_texture_bg,
-        }
-    };
-    // Same animated-texture frame selection the color pass uses (see draw_instanced above /
-    // encode_zone_pass's `frame_tex`). Only the masked loop needs this: an animated
-    // RenderMode::Masked caster's shadow must alpha-test against the SAME texel the color pass is
-    // currently sampling, or the two silhouettes disagree on any frame but the first (the shadow
-    // would test a stale/base frame while the visible mesh has already advanced) — the identical
-    // failure class #707 fixes, just triggered by time instead of by a missing discard. Opaque
-    // casters never sample a texture in the shadow pass at all, so they don't need this.
-    let now_ms = anim_now_ms();
-    let frame_tex = |tex: Option<usize>, anim: &Option<(u32, Vec<usize>)>| -> Option<usize> {
-        match anim {
-            Some((ms, frames)) if !frames.is_empty() => {
-                Some(frames[(now_ms / (*ms).max(1) as u64) as usize % frames.len()])
-            }
-            _ => tex,
-        }
-    };
-    let mut inst_bound = false;
-    for mesh in &r.gpu_instanced {
-        if mesh.render_mode != RenderMode::Opaque { continue; }
-        if !inst_bound {
-            pass.set_pipeline(&r.pipelines.shadow_instanced);
-            pass.set_bind_group(0, &r.light_depth_bg, &[]);
-            inst_bound = true;
-        }
-        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-        pass.set_vertex_buffer(1, mesh.instance_buf.slice(..));
-        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..mesh.index_count, 0, 0..mesh.instance_count);
+    //
+    // Everything decided here — sub-pass order, which pipeline each caster goes to, which animated
+    // texture frame the masked sub-pass alpha-tests against, and when a group-1 rebind is actually
+    // needed — comes from `plan_instanced_shadow_draws` (#721), which is device-free and unit
+    // tested in tests/shadow_routing.rs. The plan→command translation is `execute_instanced_shadow_plan`,
+    // which is ALSO device-free and is graded in tests/shadow_routing_equivalence.rs against a
+    // transcription of the pre-#721 loops. All that is left here is `InstancedShadowSink`: four
+    // one-expression bodies that turn plan vocabulary into `wgpu` handles. Nothing in this impl
+    // decides anything — if you find yourself adding a condition to it, it belongs in the planner.
+    struct PassSink<'r, 'p, 'e> {
+        r:    &'r EqRenderer,
+        pass: &'p mut wgpu::RenderPass<'e>,
     }
-    let mut inst_masked_bound = false;
-    let mut inst_masked_tex: Option<usize> = None;
-    for mesh in &r.gpu_instanced {
-        if mesh.render_mode != RenderMode::Masked { continue; }
-        let etex = frame_tex(mesh.texture_idx, &mesh.anim);
-        if !inst_masked_bound {
-            pass.set_pipeline(&r.pipelines.shadow_instanced_masked);
-            pass.set_bind_group(0, &r.light_depth_bg, &[]);
-            pass.set_bind_group(1, tex_bg(etex), &[]);
-            inst_masked_tex = etex;
-            inst_masked_bound = true;
-        } else if etex != inst_masked_tex {
-            inst_masked_tex = etex;
-            pass.set_bind_group(1, tex_bg(inst_masked_tex), &[]);
+    impl InstancedShadowSink for PassSink<'_, '_, '_> {
+        fn set_pipeline(&mut self, kind: ShadowPipelineKind) {
+            let r = self.r;
+            // tests/shadow_routing.rs source-text-pins these two arms.
+            self.pass.set_pipeline(match kind {
+                ShadowPipelineKind::Opaque => &r.pipelines.shadow_instanced,
+                ShadowPipelineKind::Masked => &r.pipelines.shadow_instanced_masked,
+            });
         }
-        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-        pass.set_vertex_buffer(1, mesh.instance_buf.slice(..));
-        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..mesh.index_count, 0, 0..mesh.instance_count);
+        fn bind_light_depth(&mut self) {
+            let r = self.r;
+            self.pass.set_bind_group(0, &r.light_depth_bg, &[]);
+        }
+        fn bind_texture(&mut self, idx: Option<usize>) {
+            let r = self.r;
+            // The out-of-range fallback is the same one `encode_zone_pass`'s `tex_bg` applies.
+            let bg = match idx {
+                Some(i) if i < r.texture_bind_groups.len() => &r.texture_bind_groups[i],
+                _ => &r.fallback_texture_bg,
+            };
+            self.pass.set_bind_group(1, bg, &[]);
+        }
+        fn draw(&mut self, caster: usize) {
+            let mesh = &self.r.gpu_instanced[caster];
+            self.pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+            self.pass.set_vertex_buffer(1, mesh.instance_buf.slice(..));
+            self.pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            self.pass.draw_indexed(0..mesh.index_count, 0, 0..mesh.instance_count);
+        }
+    }
+    let now_ms = anim_now_ms();
+    {
+        let mut sink = PassSink { r, pass: &mut pass };
+        execute_instanced_shadow_plan(&r.gpu_instanced, now_ms, &mut sink);
     }
 
     // Skinned casters.

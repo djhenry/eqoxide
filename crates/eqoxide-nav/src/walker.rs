@@ -64,6 +64,57 @@ pub const NAV_STATE_ZONE_LOADING: &str = "zone_loading";
 /// condition honestly and clears back to `idle` on respawn (see `Walker::resolve_goal`).
 pub const NAV_STATE_DEAD: &str = "dead";
 
+/// The CLOSED set of `nav_state` words that are a finished OUTCOME — an answer an agent may read
+/// after the goal that produced it is gone (#725).
+///
+/// Everything else is an IN-PROGRESS word: it asserts that something is still happening, so it is
+/// only true while a goal is actually in flight. [`Walker::resolve_goal`] therefore retires any
+/// state NOT listed here the moment there is no goto goal and no queued zone-cross left to justify
+/// it — see the argument there for why the rule is stated this way round.
+///
+/// `dead` is deliberately ABSENT: it is terminal *for the goal*, but it must clear on respawn
+/// (#644), which is exactly a retirement. `zone_loading` is absent for the same reason — it is a
+/// promise that a route is still coming.
+pub const TERMINAL_NAV_STATES: [&str; 5] = ["idle", "arrived", "no_path", "search_exhausted", "blocked"];
+
+/// Is `state` a finished outcome (see [`TERMINAL_NAV_STATES`]) rather than a claim that work is
+/// still in flight? An unrecognised word is treated as IN-PROGRESS.
+///
+/// **That is the safe direction for the #725 defect class, and it is NOT safe in the other
+/// direction — state both, because only one of them is obvious.** A future *in-progress* word
+/// nobody adds here retires honestly instead of sticking forever, which is the whole point. But a
+/// future *terminal* word nobody adds here is **retired to `idle`/`goal_dropped` one tick after it
+/// is published**, replacing a true outcome with a false one — #725's defect class running
+/// backwards, and strictly worse than what it replaced (an agent polling for its answer would see
+/// the answer, then see it vanish). So: **adding a genuinely terminal `nav_state` word REQUIRES
+/// adding it to [`TERMINAL_NAV_STATES`] in the same change.** The array is the contract, not a
+/// convenience list, and `docs/http-api.md`'s state table must agree with it.
+pub fn nav_state_is_terminal(state: &str) -> bool { TERMINAL_NAV_STATES.contains(&state) }
+
+/// `nav_reason` on the `idle` a goal is retired to when it vanished without ever producing an
+/// outcome (#725) — the accepted request was dropped, cancelled elsewhere, or its chase target
+/// despawned. Distinguishes "idle because your goal quietly went nowhere" from "idle, ready for
+/// work", which are the same word and were previously indistinguishable.
+pub const NAV_REASON_GOAL_DROPPED: &str = "goal_dropped";
+
+/// `nav_reason` on the `idle` that [`NAV_STATE_DEAD`] retires to once the character is alive again
+/// (#644) — "idle because you respawned", not "idle, nothing happened".
+pub const NAV_REASON_RESPAWNED: &str = "respawned";
+
+/// `nav_reason` on the `idle` that [`Walker::reset_for_zone_change`] publishes when the character
+/// changes zone — **including the SUCCESS path of `/v1/move/zone_cross`** (#725 review, B1).
+///
+/// Without it, a crossing that worked published bare `idle` + `nav_reason: null`, which is
+/// byte-identical to "no request was ever outstanding": the agent that asked to cross, and whose
+/// cross succeeded in about a second, could not tell success from "my request evaporated" — the
+/// same indistinguishability #725 is about, at the other end of the same call. With it, `idle` +
+/// `zoned` (read alongside `player.zone`) is a positive success signal.
+///
+/// It is deliberately about the ZONE CHANGE, not about the crossing request: `reset_for_zone_change`
+/// also runs for GM `#zone`, gate/evac, portal doors and server-initiated moves, and "your
+/// navigation was reset because you changed zone" is true of all of them.
+pub const NAV_REASON_ZONED: &str = "zoned";
+
 /// How many standable spots one pad offer carries in total (the one to try + its `alternates`).
 /// Bounded: a pad's full leaf list is diagnostics, not an offer.
 const OFFERED_SPOTS: usize = 8;
@@ -357,7 +408,10 @@ impl Walker {
         // through a zone it is no longer in.
         self.planner.cancel();
         self.awaiting_first_plan = false;
-        self.set_nav_state("idle");
+        // SAY WHY (#725 review B1). A bare `idle` here is indistinguishable from "nothing was ever
+        // requested" — and this is the line that runs on a SUCCESSFUL `/v1/move/zone_cross`, so the
+        // endpoint's success looked exactly like its failure to a polling agent.
+        self.set_nav_state_because("idle", Some(NAV_REASON_ZONED));
         self.nav.nav_state.lock().unwrap().tier = None; // no route committed → no per-route tier
         // Publish the cleared snapshot so no consumer keeps drawing the previous zone's state.
         // Position: None — the old zone's coordinates would be a confident wrong answer in the
@@ -381,6 +435,16 @@ impl Walker {
     /// Set the walker's state + reason. **Deliberately does NOT touch `local`** — the fine tier's
     /// last word is an independent fact about a different tier (#382).
     pub fn set_nav_state_because(&self, state: &str, reason: Option<&str>) {
+        // #725 review round 3, B1: enforce the `idle` row's universal at the WRITER, not per call
+        // site. `nav_reason: null` on `idle` means exactly one thing — no nav request has been made
+        // since the client started — and the boot state is built directly by `NavStatus::default()`,
+        // which does not route through here. Every other route to `idle` goes through this writer or
+        // `CommandState::stamp_new_goal` (the only other production writer of `state`/`reason`
+        // besides `ZoneCrossTicket::drop`, which always supplies a reason), so asserting here and
+        // there covers the class. The doc-row pin cannot: it binds the documented reason list to a
+        // hand-maintained array of constants, and a reasonless publish adds no constant.
+        debug_assert!(!(state == "idle" && reason.is_none()),
+            "#725 B1: `idle` must name how it got there; `nav_reason: null` is reserved for boot");
         let mut s = self.nav.nav_state.lock().unwrap();
         let reason = reason.map(str::to_string);
         if s.state != state || s.reason != reason {
@@ -957,16 +1021,57 @@ impl Walker {
                 // the very next tick — the cross is genuinely cancelled, not left to fire post-load.
                 // (Only `zone_loading` is guarded — navigating/planning/dead never coexist with an
                 // unresolved queued cross.)
+                //
+                // #725: the retirement rule is INVERTED — retire everything that is not in the
+                // closed [`TERMINAL_NAV_STATES`] set, rather than everything on an opt-in list.
+                //
+                // The old form listed the states to retire (`navigating`, `navigating_partial`,
+                // `planning`, `zone_loading`, `dead`), so any state NOT on the list stuck forever
+                // once its goal vanished. Two did, and both were live agent-visible lies:
+                //
+                //   * `pending` — stamped by `request_zone_cross`, whose one-shot request
+                //     `drain_zone_cross` then DRAINED. With the slot empty and no goto goal, nothing
+                //     could ever retire it: measured `nav_state: "pending"` with `nav_reason: null`
+                //     for 45 s / 48 s / 75 s while `docs/http-api.md` told the agent that meant "your
+                //     goal is genuinely in flight" (#725).
+                //   * `following` — published by the `FollowHold` arm while a chase holds near its
+                //     leader. When that leader despawns, `drive_chase` clears BOTH nav slots, and
+                //     `following` was left standing over a chase with nothing left to chase.
+                //
+                // Listing those two would fix those two. Inverting the rule fixes the CLASS: an
+                // in-progress state invented tomorrow retires by default, and only a deliberate
+                // addition to the terminal set can make a word survive with no goal behind it.
+                // The one thing that legitimately outlives a goto goal: a `/zone_cross` request that
+                // is STILL QUEUED. It has no concrete goal yet by construction — the concrete
+                // zone-line goal only exists after `drain_zone_cross` resolves it — so "no goal ⇒
+                // retire" would be wrong for exactly as long as the request sits in its slot, and
+                // wrong in the OTHER direction: `idle` while a crossing the client fully intends to
+                // perform is queued reads as "your request was dropped", and the character then
+                // crosses anyway. That was #600's `zone_loading` case; writing this test found that
+                // `pending` (what `request_zone_cross` itself stamps) has it too, in the window
+                // between the accept on the HTTP thread and the drain on the net thread. Gate on the
+                // REQUEST, not on the state word — the queued request is the thing that makes an
+                // in-progress state true, and the word it happens to carry is not.
+                //
+                // This cannot resurrect #725: the slot is emptied by the drain, so from that instant
+                // `held_for_cross` is false and the very next tick retires anything non-terminal.
                 let zone_cross_pending = self.nav.zone_cross.lock().unwrap().is_some();
-                if self.nav_state_is("navigating") || self.nav_state_is("navigating_partial")
-                    || self.nav_state_is("planning")
-                    || (self.nav_state_is(NAV_STATE_ZONE_LOADING) && !zone_cross_pending)
+                let current = self.nav.nav_state.lock().unwrap().state.clone();
+                if !zone_cross_pending && !nav_state_is_terminal(&current) {
                     // #644: once the player has RESPAWNED (no longer dead ⇒ this tick reaches
-                    // `resolve_goal`), retire the terminal `dead` back to `idle` so the honest
-                    // death state doesn't linger as a new never-clearing observable.
-                    || self.nav_state_is(NAV_STATE_DEAD)
-                {
-                    self.set_nav_state("idle");
+                    // `resolve_goal`), retire the terminal `dead` back to `idle` so the honest death
+                    // state doesn't linger as a new never-clearing observable — and SAY WHY, so
+                    // "idle because you came back" is distinguishable from "idle, ready for work".
+                    let why = if current == NAV_STATE_DEAD { NAV_REASON_RESPAWNED } else { NAV_REASON_GOAL_DROPPED };
+                    self.set_nav_state_because("idle", Some(why));
+                    // KNOWN GAP, deliberately not fixed here (#725 review, N3 → #732).
+                    // `set_nav_state_because` never clears `s.goal`, so this retirement can leave
+                    // the abandoned goal's coordinates standing beside `idle` — the stale-`nav_goal`
+                    // bug. Retiring MORE states (this change added `pending` and `following` to what
+                    // gets retired here) widens the surface it can appear on, so #732 is a slightly
+                    // bigger fix than it was, not a smaller one. It is out of scope on purpose: the
+                    // clear belongs with #732's decision about which transitions own `goal`, and
+                    // guessing at it here would be a second, unreviewed contract change.
                 }
                 // Publish the cleared/terminal state so the snapshot does not keep saying
                 // "arrived"/"navigating" with a route after the goto ended, and REPUBLISH whenever
@@ -2429,6 +2534,63 @@ mod tests {
             "#600: a one-shot cross that never resolved must not survive into the next zone");
     }
 
+    /// **#725 review, B1: a successful crossing must not look like a dropped one.** This is the line
+    /// that runs when the character actually arrives in the new zone — including on the SUCCESS path
+    /// of `/v1/move/zone_cross`. It published a bare `idle` with `nav_reason: null`, which is
+    /// exactly what an agent sees when nothing was ever requested, so the endpoint's success and its
+    /// failure were indistinguishable on the channel the docs tell agents to poll.
+    ///
+    /// **Mutation check:** change `set_nav_state_because("idle", Some(NAV_REASON_ZONED))` back to
+    /// `set_nav_state("idle")` → RED on the reason assertion. Publish `zoned` from somewhere that is
+    /// not a zone change and the meaning is gone, but nothing here can catch that — which is why the
+    /// constant's doc comment states what the word is *about* (the zone change, not the request).
+    #[test]
+    fn a_zone_change_publishes_idle_with_a_reason_not_a_bare_idle_725() {
+        let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        // Mid-crossing: a cross was queued and a goal was in flight, as on the real success path.
+        *nav.zone_cross.lock().unwrap() = Some(30);
+        *nav.goto_target.lock().unwrap() = Some((10.0, 20.0, 3.0));
+        w.set_nav_state("pending");
+
+        w.reset_for_zone_change();
+
+        let s = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(s.state, "idle", "a zone change ends navigation");
+        assert_eq!(s.reason.as_deref(), Some(NAV_REASON_ZONED),
+            "#725 B1: `idle` + `nav_reason: null` is the boot state — a SUCCESSFUL crossing must not \
+             be reported with it, or success and 'your request was thrown away' are the same read");
+    }
+
+    /// **#725 review round 3: the writer-level guard itself is pinned.** The test above is a
+    /// PER-CALL-SITE assertion, and the round-3 review measured what that class of test cannot do:
+    /// a brand-new reasonless `idle` on a path nobody wrote an assertion for (`perform_cross`'s
+    /// cross-zone branch, i.e. the `/v1/move/zone_cross` SUCCESS path) left the whole suite green,
+    /// and the docs↔constants pin in `eqoxide-net` cannot see it either — a reasonless publish adds
+    /// no constant to the list it compares. The `debug_assert!` in `set_nav_state_because` is what
+    /// closes that, so it needs its own test: without this, deleting the assert is silent.
+    ///
+    /// Debug-only by construction — `debug_assert!` compiles out under `--release`, so the guard is
+    /// a TEST-TIME instrument, not a runtime one. That is the honest scope of the claim: it fails
+    /// the suite for anyone who adds a reasonless `idle`; it does not police a shipped binary.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "#725 B1")]
+    fn a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725() {
+        let (w, _nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        w.set_nav_state("idle"); // the exact shape of B1's original defect, at the chokepoint
+    }
+
+    /// The other side of it: the guard must be about `idle` SPECIFICALLY, not about a missing reason
+    /// in general. Every in-progress state is legitimately reasonless — `pending` needs no
+    /// explanation, the request itself is the explanation — so an over-broad assert would fire on
+    /// the normal path. Mutation check: widen the guard to `reason.is_none()` and this goes RED.
+    #[test]
+    fn a_reasonless_in_progress_state_is_still_allowed_725() {
+        let (w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        w.set_nav_state("pending");
+        assert_eq!(nav.nav_state.lock().unwrap().reason, None);
+    }
+
     /// #644: the honest terminal `dead` state must NOT become a new never-clearing observable — once
     /// the character has RESPAWNED (so the tick reaches `resolve_goal` again) and there is no active
     /// goto, it must retire back to plain `idle`. Mutation check: drop `NAV_STATE_DEAD` from the
@@ -2445,6 +2607,147 @@ mod tests {
         assert!(w.resolve_goal(&gs).is_none());
         assert_eq!(nav.nav_state.lock().unwrap().state, "idle",
             "#644: `dead` must clear to `idle` on respawn, not linger forever");
+        assert_eq!(nav.nav_state.lock().unwrap().reason.as_deref(), Some(NAV_REASON_RESPAWNED),
+            "#725: and it says WHY — 'idle because you came back', not the ambiguous bare idle");
+    }
+
+    // ───────────── #725: no in-progress nav_state may outlive the goal behind it ─────────────
+
+    /// **THE UNIVERSAL CLAIM, argued over the whole input space rather than by run count.**
+    ///
+    /// The claim `resolve_goal` has to support is *"no `nav_state` that asserts work is in flight
+    /// can survive a tick with no goto goal and no queued zone-cross"*. That is a statement about
+    /// every state word, so testing the two that were observed to stick (`pending`, `following`)
+    /// would restate the bug, not the invariant. The input space here is the state vocabulary
+    /// itself: every word `docs/http-api.md` documents, plus words no one has written yet — which
+    /// is the case that matters, because the defect was a state nobody remembered to list.
+    ///
+    /// The exhaustive half is real: `set_nav_state_because` accepts any `&str`, so the space of
+    /// state words is unbounded, and the property is checked against representatives of both
+    /// classes AND against arbitrary unrecognised words, which must retire (fail-safe by default).
+    ///
+    /// **Mutation check:** restore the old opt-in list (`navigating || navigating_partial ||
+    /// planning || (zone_loading && !pending) || dead`) → `pending`, `following` and both unknown
+    /// words stay put and this goes RED four times over. Alternatively add `"pending"` to
+    /// [`TERMINAL_NAV_STATES`] → RED, since a terminal `pending` is precisely the lie.
+    #[test]
+    fn no_in_progress_nav_state_survives_a_tick_with_no_goal_725() {
+        // The documented vocabulary, plus two words the codebase has never published — a future
+        // in-progress state, and a typo'd one. Both must retire: unrecognised ⇒ in-progress.
+        const IN_PROGRESS: [&str; 7] = [
+            "pending", "planning", "navigating", "navigating_partial", "following",
+            "crossing_a_state_invented_next_year", "navigatng",
+        ];
+        for state in IN_PROGRESS {
+            let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+            let gs = eqoxide_core::game_state::GameState::new();
+            w.set_nav_state(state);
+            assert!(nav.goto_target.lock().unwrap().is_none() && nav.zone_cross.lock().unwrap().is_none(),
+                "{state}: the premise is a tick with NOTHING in flight");
+
+            assert!(w.resolve_goal(&gs).is_none());
+
+            let s = nav.nav_state.lock().unwrap();
+            assert_eq!(s.state, "idle",
+                "#725: `{state}` claims work is in flight; with no goal and no queued cross there is \
+                 none, so it must retire — an unlisted word sticking forever is the whole defect");
+            assert_eq!(s.reason.as_deref(), Some(NAV_REASON_GOAL_DROPPED),
+                "{state}: and the retirement must be explained — a bare `idle` cannot be told apart \
+                 from 'ready for work', which is what an agent polling for its goal needs to know");
+        }
+
+        // The other half of the property: a TERMINAL word is an answer about a goal that is already
+        // over, so the same tick must leave it exactly alone — retiring it would destroy the outcome
+        // the agent is polling for (#349's stale-answer bug, pointing the other way).
+        for state in TERMINAL_NAV_STATES {
+            let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+            let gs = eqoxide_core::game_state::GameState::new();
+            w.set_nav_state_because(state, Some("some_prior_reason"));
+
+            assert!(w.resolve_goal(&gs).is_none());
+
+            let s = nav.nav_state.lock().unwrap();
+            assert_eq!((s.state.as_str(), s.reason.as_deref()), (state, Some("some_prior_reason")),
+                "`{state}` is a finished outcome — an idle tick must not overwrite the answer the \
+                 caller is waiting to read");
+        }
+    }
+
+    /// **The #725 primary defect, in the walker's own terms.** `request_zone_cross` stamps
+    /// `pending` and queues a one-shot request; `drain_zone_cross` DRAINS that request. If the drain
+    /// then resolves to nothing, the slot is empty and no goto goal exists, so — before this fix —
+    /// no code path could ever move `pending` again. Live, it read `pending` / `nav_reason: null` /
+    /// `nav_goal: null` for 75 s while the docs said that meant "in flight".
+    ///
+    /// The queued-cross case is the deliberate exception and is pinned here too: while the request
+    /// is STILL in its slot, `pending` is a true statement and must hold. **This half caught a real
+    /// bug in the first draft of the fix**, which held only `zone_loading` while a cross was queued
+    /// (the #600 shape) and therefore retired `pending`→`idle` in the window between the HTTP
+    /// thread's accept and the net thread's drain — reporting "your request was dropped" about a
+    /// crossing the client was about to perform. Hence the guard keys on the QUEUED REQUEST, not on
+    /// the state word.
+    ///
+    /// **Mutation check:** revert `resolve_goal`'s retirement rule to the old opt-in list → the
+    /// post-drain assertion goes RED (`pending` stands forever). Narrow `zone_cross_pending` back to
+    /// `current == NAV_STATE_ZONE_LOADING && zone_cross_pending` → the still-queued assertion goes
+    /// RED (`idle` at the accept). Drop the guard entirely → the same assertion goes RED.
+    #[test]
+    fn pending_retires_once_the_zone_cross_request_has_been_drained_725() {
+        let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        let gs = eqoxide_core::game_state::GameState::new();
+
+        // The accept: `pending` + the one-shot request in its slot (what `request_zone_cross` does).
+        w.set_nav_state("pending");
+        *nav.zone_cross.lock().unwrap() = Some(30);
+        assert!(w.resolve_goal(&gs).is_none());
+        assert_eq!(nav.nav_state.lock().unwrap().state, "pending",
+            "while the request is still queued, `pending` is TRUE — it must not be retired early");
+
+        // The drain: the request leaves the slot. Whatever the drainer decided, `pending` is now a
+        // claim about something that no longer exists anywhere.
+        *nav.zone_cross.lock().unwrap() = None;
+        assert!(w.resolve_goal(&gs).is_none());
+        let s = nav.nav_state.lock().unwrap();
+        assert_eq!(s.state, "idle",
+            "#725: once the request is out of its slot nothing downstream can retire `pending` — \
+             the tick that observes no goal and no queued cross is the last chance to be honest");
+        assert_eq!(s.reason.as_deref(), Some(NAV_REASON_GOAL_DROPPED));
+    }
+
+    /// **The second instance of the same class, found while fixing the first (#725).** `following`
+    /// is published by the `FollowHold` arm while a `/v1/move/follow` chase holds near its leader.
+    /// When that leader despawns, `drive_chase` clears BOTH nav slots — and `following` was not on
+    /// the old retirement list, so it stood forever over a chase with nothing left to chase. An
+    /// agent polling a follow it had issued read `following` indefinitely for an entity that no
+    /// longer exists.
+    ///
+    /// Driven through the REAL `drive_chase` (not a hand-cleared slot), so the despawn path is the
+    /// one production takes.
+    ///
+    /// **Mutation check:** revert `resolve_goal` to the opt-in list → `following` persists and this
+    /// goes RED. (On unmodified `main` it is RED, which is the point: this is a shipped bug, and it
+    /// was found by inverting the rule rather than by observing it.)
+    #[test]
+    fn following_retires_when_the_chased_entity_despawns_725() {
+        let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        let gs = eqoxide_core::game_state::GameState::new();
+
+        // An established chase, holding near its leader.
+        *nav.goto_entity.lock().unwrap() = Some("a_large_rat".to_string());
+        *nav.goto_target.lock().unwrap() = Some((10.0, 10.0, 0.0));
+        w.set_nav_state("following");
+
+        // The leader despawns: it is absent from the (empty) entity roster, so the real `drive_chase`
+        // drops the chase.
+        w.drive_chase();
+        assert!(nav.goto_target.lock().unwrap().is_none() && nav.goto_entity.lock().unwrap().is_none(),
+            "premise: drive_chase abandons a chase whose entity left view");
+
+        assert!(w.resolve_goal(&gs).is_none());
+        let s = nav.nav_state.lock().unwrap();
+        assert_eq!(s.state, "idle",
+            "#725 (second instance): `following` must not outlive the entity being followed");
+        assert_eq!(s.reason.as_deref(), Some(NAV_REASON_GOAL_DROPPED));
     }
 
     /// **#615 review F1 — the idle snapshot must TRACK reality, never fabricate it.** The live
