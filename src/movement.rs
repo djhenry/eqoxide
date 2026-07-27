@@ -69,11 +69,13 @@ const GOOD_SAMPLE_SECS: f32 = 0.5;
 /// the push site below is its only other use, and it reads this constant solely to decide when to
 /// drop the *oldest* entry — which nothing will ever look at. `GOOD_RING_LEN = 1` is therefore
 /// behaviourally identical to `8`, the whole `VecDeque` could be an `Option<[f32; 3]>`, and #724's
-/// M3 mutation (8 → 3, suite green) does not measure a tolerance — it measures that the depth is
-/// unreachable. Do not read this as a tuned value, and do not "tune" it: changing it cannot change
-/// behaviour. It is kept as a ring because a future recovery that *chooses* among candidates is the
-/// obvious next step, and collapsing the type would have to be undone to take it.
-/// (#724 round-2 review, N3 — which measured this and was sharper than the PR's own caveat.)
+/// M3 mutation (8 → 3, suite green) does not measure a tolerance — all it measures is that no test
+/// reaches past the newest sample. What makes the depth *dead* is the read-site enumeration above,
+/// which is a code fact, not a measurement. Do not read this as a tuned value, or "tune" it:
+/// changing it cannot change behaviour. It is kept as a ring because a future recovery that
+/// *chooses* among candidates is the obvious next step, and collapsing the type would have to be
+/// undone to take it.
+/// (#724 round-2 review, N3 — which established this, and was sharper than the PR's own caveat.)
 const GOOD_RING_LEN: usize = 8;
 /// Minimum spacing (seconds) between "the controller is HOLDING the body and cannot resume" log
 /// lines. Such a branch changes nothing, so it re-runs every frame and would otherwise log at frame
@@ -458,11 +460,18 @@ impl CharacterController {
     ///
     /// **The `app.rs` zone-change call is NOT made redundant by the fold, and must not be deleted.**
     /// A zone change must drop the ring whether or not a [`Self::teleport`] happens to accompany it,
-    /// and there is a measured arrival where none does: `eqoxide-net`'s `gameplay.rs` #593 note
-    /// documents a cross-zone arrival landing *within* `CORRECTION_SQ` (12 u, 2-D) of the last
-    /// position we streamed from the OLD zone, in which case the streamer's correction branch is
-    /// skipped entirely and no `teleport` is ever called. `app.rs` also calls this at the moment the
-    /// old zone's collision is dropped — earlier than, and independent of, the arrival reground.
+    /// and there is a known arrival shape where none does: the #593 note in `eqoxide-net`'s
+    /// `action_loop.rs` (`stream_position`) describes a cross-zone arrival landing *within*
+    /// `CORRECTION_SQ` (12 u, 2-D) of the last position we streamed from the OLD zone, in which case
+    /// the streamer's correction branch is skipped entirely and no `teleport` is ever called.
+    /// `app.rs` also calls this at the moment the old zone's collision is dropped — earlier than,
+    /// and independent of, the arrival reground.
+    ///
+    /// *Label, because this PR was reviewed for exactly this:* that #593 gap is **read off the
+    /// branch structure, not measured on the wire** — the note reasons about what `stream_position`
+    /// does when `cd² <= CORRECTION_SQ`, and no run has been captured landing in it. The
+    /// independent reason above (the collision-drop clear happens earlier than any arrival, so it
+    /// cannot be the arrival's job) needs no measurement and is the one to lean on.
     ///
     /// Round-2 review (N4) measured that the call site had no test holding it in place: deleting it
     /// from `app.rs`, together with the #712 test's own direct call and `is_empty` assert, left the
@@ -533,9 +542,15 @@ impl CharacterController {
         // Cost, stated plainly: for as long as it takes the body to become grounded again after a
         // relocation, neither recovery path has anything to restore, so a body that lands somewhere
         // unrecoverable HOLDS rather than rubber-bands. The restore is a wrong answer the client
-        // reports as success, and #712 measured that the wrong answer re-fires every 0.5 s and
-        // wedges permanently, so the hold is the better of the two — but it is NOT free, and the
-        // first draft of this comment said something false about it:
+        // reports as success, and #712's live record is that it "wedged permanently" — so the hold
+        // is the better of the two. (An earlier draft of this sentence said #712 *measured* the
+        // wrong answer "re-firing every 0.5 s". It did not: #712's measured record, quoted verbatim
+        // in `zone_in_reground`'s doc above, is the stale PREVIOUS-zone recovery and the permanent
+        // wedge, with no cadence in it. 0.5 s is `GOOD_SAMPLE_SECS`, this file's ring-BANKING
+        // interval, which I had silently promoted into a re-fire rate for the server. Retracted
+        // here rather than deleted because the audit that caught it — #724 round-2 review's "audit
+        // every Measured label" — is the reason it is gone.) The hold is NOT free, and the first
+        // draft of this comment said something false about that too:
         //
         //   ⚠️ RETRACTED (#724 round-2 review, B1). This comment used to justify the trade with
         //   "holding is a visible failure a further server correction can fix". Both halves were
@@ -2642,11 +2657,13 @@ mod tests {
     /// assertions are now satisfied by the `teleport` two lines below them rather than by the
     /// zone-change clear. The method was pinned; the call was not.
     ///
-    /// It is not redundant. `eqoxide-net`'s `gameplay.rs` #593 note documents a cross-zone arrival
-    /// landing within `CORRECTION_SQ` of the last-streamed OLD-zone position, where the streamer's
-    /// correction branch is skipped and **no `teleport` fires at all** — so on that path this call
-    /// is the only thing that drops the previous zone's coordinates. `app.rs` also runs it at the
-    /// moment the old collision is dropped, earlier than and independent of the arrival reground.
+    /// It is not redundant, for one reason that needs no measurement and one that is only reasoned.
+    /// The solid one: `app.rs` runs this at the moment the old zone's collision is dropped, which is
+    /// earlier than and independent of any arrival, so no arrival-time `teleport` can be doing this
+    /// job. The reasoned one, labelled as such: the #593 note in `eqoxide-net`'s `action_loop.rs`
+    /// (`stream_position`) describes a cross-zone arrival landing within `CORRECTION_SQ` of the
+    /// last-streamed OLD-zone position, where the correction branch is skipped and **no `teleport`
+    /// fires at all** — that is read off the branch structure, not captured on the wire.
     ///
     /// A source scan rather than a behavioural test because `App` owns a window, a GPU and an event
     /// loop; the same `include_str!` technique is used in `eqoxide-net`'s `transport.rs` for exactly
@@ -2665,8 +2682,7 @@ mod tests {
         assert!(block.contains("self.controller.forget_recovery_history();"),
             "#712/#724: the zone-change reload block in app.rs MUST drop the controller's recovery \
              ring — the previous zone's untagged coordinates are what wedged #712, and #724's fold \
-             into `teleport` does NOT cover this path (see #593: a cross-zone arrival within \
-             CORRECTION_SQ of the last-streamed old-zone position fires no correction and therefore \
-             no teleport). Block was:\n{block}");
+             into `teleport` does NOT cover this path: this clear runs when the OLD zone's collision \
+             is dropped, earlier than and independent of any arrival. Block was:\n{block}");
     }
 }
