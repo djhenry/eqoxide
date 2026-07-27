@@ -386,6 +386,14 @@ pub struct App {
     /// constructed once in `main.rs`, not here, and handed in through `App::new`. Serves on
     /// `GET /v1/observe/debug` as `common_assets_failed`.
     common_assets_failed: Arc<Mutex<Option<String>>>,
+    /// The agent-observable asset-sync activity (#715): `None` when no sync is in progress,
+    /// `Some(activity)` naming the set and phase of the one that is. Written ONLY through
+    /// `asset_sync::sync_set_observed`, whose RAII guard clears it on every exit path.
+    ///
+    /// SHARED by `Arc` identity with `HttpState::asset_sync` — constructed once in `main.rs`, not
+    /// here, and handed in through `App::new`, for exactly the reason spelled out on
+    /// `common_assets_failed` above. Serves on `GET /v1/observe/asset_sync`.
+    asset_sync_activity: crate::ipc::AssetSyncShared,
     asset_server_url: String,
     asset_user: String,
     asset_pass: String,
@@ -418,6 +426,9 @@ impl App {
         // forever no matter what this app publishes into its own (unreachable) copy.
         common_assets_failed: Arc<Mutex<Option<String>>>,
         model_sync_dead:      Arc<Mutex<Option<String>>>,
+        // #715: same shared-`Arc`-identity rule as the two above — constructed once in `main.rs`
+        // and handed to BOTH this app (the sole writer) and `HttpState` (the reader).
+        asset_sync_activity:  crate::ipc::AssetSyncShared,
         frame_profile_shared: crate::ipc::FrameProfileShared,
         testzone_mode:   bool,
         nav_debug:       bool,
@@ -510,6 +521,7 @@ impl App {
             models_loaded: false,
             model_sync_dead,
             common_assets_failed,
+            asset_sync_activity,
             asset_server_url, asset_user, asset_pass,
             window_title,
             game_state_snapshot, game_state_view, net_health,
@@ -672,6 +684,8 @@ impl App {
         let pending     = self.pending_load.clone();
         // #579: the loader thread is the LIVE writer of the pending progress line an agent polls.
         let za_state    = self.zone_assets.clone();
+        // #715: the loader thread is also the live writer of the agent-observable sync activity.
+        let sync_obs    = self.asset_sync_activity.clone();
         // Monotonic load id (#595 review F3). The handoff is a SINGLE slot shared by every loader,
         // so an older loader finishing late could overwrite a newer one's already-published result;
         // the newer zone's reply was then gone for good and the state hung on `Pending`. A loader
@@ -717,7 +731,7 @@ impl App {
                 let sync = crate::asset_sync::AssetSync::login(&url, &user, &pass)?;
                 set_status("Verifying zone assets…");
                 let dl_status = load_status.clone();
-                crate::asset_sync::sync_set(&sync, &format!("zone/{zone_name}"), &cache, &mut |p| {
+                crate::asset_sync::sync_set_observed(&sync, &format!("zone/{zone_name}"), &cache, &sync_obs, &mut |p| {
                     // #708: only `Downloading` carries bytes/elapsed at all — see `SyncProgress`.
                     // A `Verifying` tick has nowhere a rate could be read from, so this branch is
                     // the ONLY place a speed line can be constructed, and every other status write
@@ -735,7 +749,11 @@ impl App {
                 // Door/object models for clickable doors come from the asset server's
                 // "zonedoors/<zone>" set (the raw <zone>_obj.s3d) into the cache — never ~/eq_assets.
                 // Best-effort: if it's absent, load_door_models falls back to plain boxes.
-                let _ = crate::asset_sync::sync_set(&sync, &format!("zonedoors/{zone_name}"), &cache, &mut |_| {});
+                // #715: observed too, even though it feeds no HUD line. It runs INSIDE the zone
+                // load, so leaving it unobserved would make the endpoint answer "no sync in
+                // progress" during a stretch of the very load an agent is waiting on.
+                let _ = crate::asset_sync::sync_set_observed(
+                    &sync, &format!("zonedoors/{zone_name}"), &cache, &sync_obs, &mut |_| {});
                 set_status("Reading zone geometry…");
                 assets::ZoneAssets::from_glb(&cache.models_dir().join(format!("{zone_name}.glb")))
             })();
@@ -965,6 +983,7 @@ impl App {
             let user = self.asset_user.clone();
             let pass = self.asset_pass.clone();
             let dead = self.model_sync_dead.clone();
+            let sync_obs = self.asset_sync_activity.clone();   // #715
             std::thread::Builder::new().name("model-sync-worker".into()).spawn(move || {
                 // #616: catch_unwind so a panic anywhere below leaves an honest `dead` reason
                 // instead of just killing the thread with nothing published — see
@@ -981,7 +1000,9 @@ impl App {
                     };
                     while let Ok(key) = model_rx.recv() {
                         let set = format!("charmodel/{key}");
-                        match crate::asset_sync::sync_set(&sync, &set, &wcache, &mut |_| {}) {
+                        // #715: observed like the other two loaders, so "no sync in progress" is
+                        // true of the whole process rather than only of the zone loader.
+                        match crate::asset_sync::sync_set_observed(&sync, &set, &wcache, &sync_obs, &mut |_| {}) {
                             Ok(()) => tracing::debug!("model-sync worker: synced {set}"),
                             Err(e) => tracing::warn!("model-sync worker: sync {set} failed: {e}"),
                         }
@@ -1001,6 +1022,7 @@ impl App {
         let status = self.load_status.clone();
         let progress = self.sync_progress.clone();
         let done = self.sync_done.clone();
+        let sync_obs = self.asset_sync_activity.clone();   // #715
         std::thread::Builder::new().name("common-asset-loader".into()).spawn(move || {
             // #616: catch_unwind so a panic anywhere in the body publishes an honest terminal
             // `Err` into `done` instead of leaving it `None` forever — see
@@ -1012,7 +1034,7 @@ impl App {
                 let result = (|| -> anyhow::Result<()> {
                     let sync = crate::asset_sync::AssetSync::login(&url, &user, &pass)?;
                     *status.lock().unwrap() = "Verifying assets…".to_string();
-                    crate::asset_sync::sync_set(&sync, "common", &cache, &mut |p| {
+                    crate::asset_sync::sync_set_observed(&sync, "common", &cache, &sync_obs, &mut |p| {
                         match p {
                             crate::asset_sync::SyncProgress::Verifying => {
                                 // Plain single-line string: no speed line is representable here

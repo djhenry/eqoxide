@@ -48,6 +48,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | `GET /v1/observe/packets[?summary=1]` | Packet-telemetry ring dump (#525), default-off capture. `{enabled, count, packets, snapshot_age_ms}`, or with `?summary=1`, `{enabled, summary, snapshot_age_ms}` (opcode histogram + reliable-sequence-gap analysis). |
 | `GET /v1/observe/who` | Server-wide `/who all` roster `{online:[{name, level, class, race, zone_id, guild, anon}], snapshot_age_ms}`. 503 if no response arrives in time. |
 | `GET /v1/observe/nav_debug` | The nav diagnostics snapshot navigation **publishes** (#608) — see [Nav diagnostics](#nav-diagnostics-get-v1observenav_debug--608). |
+| `GET /v1/observe/asset_sync` | Every asset sync in flight (#715) — phase, chunks, bytes and download rate while the client downloads a zone's (or the common) asset set. `{"active": false}` when nothing is syncing. See [Asset sync progress](#asset-sync-progress-get-v1observeasset_sync--715). |
 
 Every route above that lacked ANY freshness signal before #646 now carries one — either a
 top-level `"snapshot_age_ms"` JSON field or, where the body is a bare array/map/PNG that cannot
@@ -914,6 +915,219 @@ world hung", read `world_responsive`, not `last_packet_age_ms`.**
 > if future server content adds one, it would silently turn every idle session `world_responsive:
 > false`. If that signal ever misfires on a known-healthy idle zone, check for a global consider hook
 > before trusting it.
+
+---
+
+## Asset sync progress (`GET /v1/observe/asset_sync`) — #715
+
+`zone_assets` (above) tells you whether the world is usable. This tells you whether the load behind
+it is **progressing** — the difference between "still downloading, 3 of 7 chunks at 1.2 MB/s" and
+"wedged". Before #715 that information existed only on the loading-screen HUD, which an agent cannot
+see.
+
+**Idle:**
+
+```jsonc
+{
+  "active": false,
+  "syncs": [],
+  "last_ended": {                // null if no sync has ever run in this process
+    "set": "zone/freportw",
+    "ago_ms": 4210               // measured at read time
+  },
+  "semantics": "…"
+}
+```
+
+**Syncs in flight** — `syncs` lists **every** one, oldest-started first, and the fields of
+`syncs[0]` are mirrored onto the top level as the *primary*:
+
+```jsonc
+{
+  "active": true,
+  "syncs": [
+    {
+      "set": "zone/freportw",    // which set: "zone/<z>", "zonedoors/<z>", "common", "charmodel/<key>"
+      "phase": "downloading",    // "starting" | "verifying" | "downloading"
+      "downloading": {           // present ONLY in the downloading phase
+        "chunks_done": 3,
+        "chunks_total": 7,
+        "bytes": 12451840,       // cumulative bytes this downloading phase
+        "elapsed_secs": 10.4,    // since this downloading phase began — FROZEN at the last tick
+        "rate_bytes_per_sec": 1197292.3
+        // …or, instead of a rate: "rate_unavailable": "phase_too_young" | "sample_too_stale"
+      },
+      "published_age_ms": 120,   // how long ago this sample was published — read this FIRST
+      "running_ms": 10520        // how long the whole call has been running, at read time
+    },
+    { "set": "charmodel/hum", "phase": "starting", "published_age_ms": 4, "running_ms": 4 }
+  ],
+  "last_ended": null,
+
+  // The one aggregate: the largest published_age_ms over EVERY entry above. Absent when idle.
+  "stalest_published_age_ms": 120,
+
+  // …and the same fields as syncs[0], copied verbatim. These describe syncs[0] ALONE:
+  "set": "zone/freportw",
+  "phase": "downloading",
+  "downloading": { /* … */ },
+  "published_age_ms": 120,
+  "running_ms": 10520,
+  "semantics": "…"
+}
+```
+
+### `published_age_ms` — is it progressing, or wedged?
+
+**Every field above except `published_age_ms` and `running_ms` is frozen at the producer's last
+tick, and the producer ticks only when a chunk completes.** A download that hangs mid-chunk — a dead
+socket, an asset server that stopped answering — leaves `chunks_done`, `bytes` and `elapsed_secs`
+sitting at their last values with nothing left to update them. `elapsed_secs` in particular is *not*
+"how long this phase has been running": that is `elapsed_secs + published_age_ms/1000`.
+
+The rate is the one frozen field that is **withheld rather than reported stale** — see
+[Why the rate can be absent](#why-the-rate-can-be-absent) below.
+
+Clearing the entry is not the fix — a wedged sync genuinely *is* still in progress, and reporting
+"no sync running" would be a worse answer than a stale one. What makes the stale answer honest is
+its age. `published_age_ms` is computed **at read time**, so:
+
+- **small, and staying small across polls** → the loader is ticking; the numbers beside it are current.
+- **large and growing** → the sync is **wedged**. The numbers beside it describe the last moment it
+  was alive, not now, and the rate in particular is meaningless.
+
+A chunk can legitimately take a while, so a single large reading is not proof of a stall — a value
+that keeps growing across polls is. Do not treat `chunks_done` as current without checking it.
+
+`running_ms` is the companion number: how long the whole `sync_set` call has been running, also
+measured at read time. Unlike `downloading.elapsed_secs` it keeps **moving** while a sync is wedged,
+and it is the only duration that exists at all in the `starting` phase, where a hung manifest fetch
+has no chunks, no bytes and no elapsed. A large `published_age_ms` says *this sample is old*;
+`running_ms` says *and the call has been going this long*.
+
+### The two distinctions this shape exists to keep
+
+**`active: false` is not "zero progress".** An idle client and a download stuck at 0 of 7 chunks are
+different situations an agent acts on differently, so they are different bodies: idle carries
+`"active": false` and **no** `set`, `phase` or `downloading` key at all, while a stalled download is
+`"active": true` with `downloading.chunks_done: 0`. Branch on `active` — never on a count being zero.
+
+**The phase is modelled, not flattened.** Transfer data lives inside `downloading`, an object that
+exists **only** in that phase. This mirrors the producer, where a rate is structurally
+unrepresentable outside downloading (#708). A flat body with a nullable `rate` would make "not
+downloading" indistinguishable from "downloading, rate not derivable yet"; here they are different
+structures, not two spellings of `null`.
+
+### Why the rate can be absent
+
+`rate_bytes_per_sec` is **omitted** whenever it cannot be stated honestly — never `null`, and
+certainly never `0`, which would read as "the download has stopped". Its absence is unambiguous
+because the enclosing `downloading` object is present, and `rate_unavailable` always names the rule
+that withheld it:
+
+| `rate_unavailable` | Meaning |
+|---|---|
+| `phase_too_young` | The downloading phase is under 100 ms old — the same minimum-elapsed guard the HUD's speed line uses. No honest rate can be divided out of that yet. |
+| `sample_too_stale` | Nothing has ticked for over **2000 ms**. The last rate has stopped being an assertion about *now*. |
+
+The staleness rule exists because this endpoint can be polled minutes after the sample was taken,
+which the HUD never is: it redraws from the tick that produced the number. The scale of the problem,
+from a live zone download on this client: the last completed tick measured 31,294,024 B over
+20.65 s, i.e. 1,515,404 B/s. Without the rule the endpoint keeps asserting that figure for as long
+as the sync is wedged — five minutes in, the phase's actual average is 31,294,024 B / 320.65 s
+≈ 97,600 B/s and the instantaneous rate is zero, a 15× overstatement published with no marker.
+
+**How 2000 ms was chosen.** Inter-tick gaps measured on the same healthy live download: median
+41 ms, p95 185 ms, **max 469 ms**. A second cold-cache run polling this endpoint through a full
+Neriak load (five sets, three of them concurrent, ~1,400 chunks / ~110 MB) saw a worst `published_age_ms`
+of **491 ms** and never once withheld a rate. The threshold is ~4× that worst healthy gap, so a link
+four times slower than the measured one still publishes a rate continuously. The error is deliberately
+asymmetric: withholding a rate costs a caller nothing, because `bytes`, `elapsed_secs` and
+`published_age_ms` are all still there and `bytes / (elapsed_secs + published_age_ms/1000)` is an
+honest **lower bound**; publishing a stale one is a falsehood no caller can detect from the number
+itself.
+
+### Phases
+
+- **`starting`** — the `sync_set` call has begun; its manifest request is in flight and the producer
+  has not reported a phase yet. This phase is published by the client, not by the sync producer, and
+  it exists so the "a sync is running" window covers the whole call: leaving it `active: false`
+  would report "no sync in progress" while one demonstrably was. A set that turns out to be already
+  up to date is only ever seen in this phase.
+- **`verifying`** — the producer's `SyncProgress::Verifying`, emitted once the manifest has been
+  accepted and before any chunk transfer begins. Carries no transfer data.
+- **`downloading`** — fetching chunks. Ticks once per fetched chunk, so `chunks_done`/`chunks_total`
+  count the chunks this sync actually has to transfer, not the set's total file count. A set whose
+  chunks are all already cached emits no downloading tick at all rather than a misleading 0 B/s one
+  (#708). The only phase with transfer data.
+
+### When an entry is REMOVED
+
+Each sync's entry is written by an RAII guard wrapped around it, so the entry disappears when that
+sync **succeeds**, when it **fails**, and when the loader thread **panics** mid-sync (the guard
+removes it on unwind, so there is no "clear at the end of the happy path" to be skipped). No exit
+path can leave a *finished* sync reported as in-flight.
+
+A sync that never exits at all — a hung transfer — is the case a guard cannot address, because it
+has not finished and reporting it as finished would be its own falsehood. That one is covered by
+[`published_age_ms`](#published_age_ms--is-it-progressing-or-wedged) above, not by removal.
+
+`last_ended` names the most recent sync to leave the list, so `active: false` right after a load is
+distinguishable from `active: false` in a process where nothing has ever synced (`last_ended: null`).
+It says **ended, not succeeded**: `Drop` runs identically on the success return, the error return and
+a panic unwind, and genuinely cannot tell them apart. Do not read it as "the set is now cached".
+
+### Overlap, and what `syncs` is for
+
+The client runs several syncs concurrently: the zone's terrain (`zone/<zone>`) and door models
+(`zonedoors/<zone>`) during a zone load, the shared `common` set once the window comes up, and
+`charmodel/<key>` sets on demand as an unseen race model is first needed. A short `charmodel` sync
+routinely begins **and ends inside** a long zone download.
+
+Every one of them gets its **own entry**, owned by its own guard, which can only ever remove its
+own. A finishing sync therefore cannot blank out a different one that is still running — in either
+direction, whether it started earlier or later. That is why `active: false` means *no asset sync is
+running in this process*, subject to the one startup exclusion below.
+
+`syncs` is ordered **oldest-started first**, and the fields of `syncs[0]` are mirrored onto the top
+level as the *primary*, for callers that do not want to iterate to find out whether anything is
+running at all. The mirror is a copy of the same encoded object, so the two can never disagree.
+
+**The primary describes one sync — the one `set` names — and nothing else.** Oldest-started is
+chosen because it is *stable*: it does not change identity when a sibling's age or rate changes, so
+a caller polling `set` sees the same sync from poll to poll. It is deliberately **not** chosen as
+"the sync that matters", because the client cannot know which sync the caller is waiting on, and a
+guess dressed as an answer is exactly the failure this endpoint exists to avoid. To follow a
+particular set, find it **by name** in `syncs`.
+
+> ⚠️ **Correction (#726 review, round 2).** This section previously read: *"`syncs[0]` — the
+> long-running one an agent is waiting on, and the one whose wedge matters — is mirrored onto the
+> top level so a caller that only wants 'is the load I am waiting on alive?' need not iterate."*
+> That is retracted. Two claims in it are false. (1) `syncs[0]` is not always the long zone
+> download: a `charmodel/<key>` sync queued during the *previous* zone can still be in flight when
+> the next `zone/<zone>` opens, and is then the older of the two. (2) A healthy primary does **not**
+> mean the process is healthy — a sibling can be wedged for minutes behind it. No field value was
+> ever wrong; the guidance was, and it shipped inside the response's own `semantics` string.
+
+**`stalest_published_age_ms` — the one-field wedge check.** The largest `published_age_ms` over
+**every** live sync. Because it is a maximum, it is large and growing whenever *any* sync is wedged,
+whatever `syncs[0]` is doing, so it is the field to poll when the question is "is this process stuck"
+rather than "how is set X doing". It is taken from the ages already encoded in `syncs` — never
+re-measured — so it always equals one of them exactly. It is **absent, not zero**, when nothing is
+running: a maximum over no samples is not a measurement, and `0` would read as "everything is
+perfectly fresh". Read `active` to tell idle from fresh.
+
+**Startup exclusion.** The `gamedata` and `gameequip` sets are synced during early startup, **before
+this HTTP server binds its port**. They are recorded in the registry like any other sync, but
+nothing can poll the endpoint until after they finish, so they are effectively invisible. On a cold
+cache that window was measured at **349 s** (launch to port bind, empty asset cache, one run) — a
+caller waiting for the API port to open should expect a multi-minute wait on first run, and cannot
+distinguish it from a hung launch through this endpoint. It is not a hole in `active`: by the time
+anything can reach this endpoint, they are done, and `last_ended` names the later of the two.
+
+**Not covered by the guarded window:** the asset server `login()` that precedes each zone sync sits
+*outside* it, so a hung or slow login reads as `active: false` rather than as a `starting` sync. The
+guarded window begins at `sync_set`. Tracked as #731.
 
 ---
 
