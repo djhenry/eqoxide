@@ -88,8 +88,8 @@ pub fn apply(ctx: &egui::Context) {
     let widget = |bg: Color32, stroke_c: Color32, fg: Color32| WidgetVisuals {
         bg_fill: bg,
         weak_bg_fill: bg,
-        bg_stroke: Stroke::new(1.0, stroke_c),
-        fg_stroke: Stroke::new(1.0, fg),
+        bg_stroke: Stroke::new(1.0_f32, stroke_c),
+        fg_stroke: Stroke::new(1.0_f32, fg),
         rounding,
         expansion: 0.0,
     };
@@ -98,7 +98,7 @@ pub fn apply(ctx: &egui::Context) {
     visuals.override_text_color = Some(TEXT);
     visuals.window_fill = BG_WINDOW;
     visuals.panel_fill = BG_PANEL;
-    visuals.window_stroke = Stroke::new(1.0, FRAME_LO);
+    visuals.window_stroke = Stroke::new(1.0_f32, FRAME_LO);
     visuals.window_rounding = Rounding::same(3.0);
     visuals.window_shadow = egui::epaint::Shadow {
         offset: egui::vec2(0.0, 2.0),
@@ -111,7 +111,7 @@ pub fn apply(ctx: &egui::Context) {
     visuals.faint_bg_color = Color32::from_rgb(0x1A, 0x1C, 0x26);
     visuals.selection = Selection {
         bg_fill: Color32::from_rgba_unmultiplied(0x3C, 0x3B, 0x35, 110),
-        stroke: Stroke::new(1.0, GOLD),
+        stroke: Stroke::new(1.0_f32, GOLD),
     };
     visuals.hyperlink_color = CHAT_NPC;
     visuals.widgets = Widgets {

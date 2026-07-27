@@ -31,7 +31,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     let painter = painter.with_clip_rect(rect);
 
     painter.rect_filled(rect, Rounding::same(2.0), theme::BG_PANEL);
-    painter.rect_stroke(rect, Rounding::same(2.0), Stroke::new(1.0, theme::FRAME_LO));
+    painter.rect_stroke(rect, Rounding::same(2.0), Stroke::new(1.0_f32, theme::FRAME_LO));
 
     let px_per_deg = rect.width() / SPAN_DEG;
     let center_x = rect.center().x;
@@ -63,12 +63,12 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             );
             painter.line_segment(
                 [Pos2::new(x, rect.bottom() - 6.0), Pos2::new(x, rect.bottom() - 1.0)],
-                Stroke::new(1.0, theme::BRASS),
+                Stroke::new(1.0_f32, theme::BRASS),
             );
         } else {
             painter.line_segment(
                 [Pos2::new(x, rect.bottom() - 4.0), Pos2::new(x, rect.bottom() - 1.0)],
-                Stroke::new(1.0, theme::FRAME_LO),
+                Stroke::new(1.0_f32, theme::FRAME_LO),
             );
         }
         a += TICK_DEG;
@@ -80,7 +80,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             Pos2::new(center_x, rect.top() + 1.0),
             Pos2::new(center_x, rect.bottom() - 1.0),
         ],
-        Stroke::new(1.0, theme::GOLD.gamma_multiply(0.55)),
+        Stroke::new(1.0_f32, theme::GOLD.gamma_multiply(0.55)),
     );
     let base = rect.bottom() - 1.0;
     painter.add(egui::Shape::convex_polygon(

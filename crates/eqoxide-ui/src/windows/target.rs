@@ -49,7 +49,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         // Attack toggle mirrors auto-attack state (gold outline while on).
         let attack_label = egui::RichText::new("Attack").size(11.0);
         let attack_btn = if s.auto_attack {
-            egui::Button::new(attack_label).stroke(egui::Stroke::new(1.0, theme::GOLD))
+            egui::Button::new(attack_label).stroke(egui::Stroke::new(1.0_f32, theme::GOLD))
         } else {
             egui::Button::new(attack_label)
         };

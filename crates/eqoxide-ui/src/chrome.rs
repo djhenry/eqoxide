@@ -243,7 +243,7 @@ fn title_strip(ui: &mut egui::Ui, def: &WindowDef, locked: bool) -> bool {
     painter.add(egui::Shape::mesh(mesh));
     painter.line_segment(
         [rect.left_bottom(), rect.right_bottom()],
-        egui::Stroke::new(1.0, theme::FRAME_LO),
+        egui::Stroke::new(1.0_f32, theme::FRAME_LO),
     );
 
     painter.text(
