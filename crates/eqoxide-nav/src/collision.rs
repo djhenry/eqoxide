@@ -1763,6 +1763,15 @@ impl Collision {
     /// character's WIDTH (that is [`Self::path_clear`]'s question). Callers must bound the hop: at
     /// ~2 u spacing the cost is one column probe per 2 u of run.
     ///
+    /// **And the envelope is PER PROBE, not over the hop.** `prev_z` chains, so each probe is judged
+    /// against the last floor found rather than against the hop's own start and end. A descent that
+    /// takes the full allowance at every probe therefore compounds: a staircase of `allow`-sized
+    /// risers is accepted at a mean grade of ~1.83 against `MAX_WALK_GRADE = 1.2`. That is deliberate
+    /// to the extent that a long walkable ramp must not be refused for being long, and unbounded to
+    /// the extent that nothing re-checks the aggregate. Disclosed in the tracking issue with the
+    /// spacing and width gaps above; the caller's hop bound ([`crate::steering::CURSOR_RESYNC_MAX_HOP`])
+    /// is currently the only thing limiting how much can compound.
+    ///
     /// Returns `true` when the zone has no geometry, matching [`Self::carrot_los_clear`]'s own
     /// documented no-geometry behaviour — a client with no world model must not silently answer
     /// "unreachable" to everything.
@@ -4833,6 +4842,73 @@ mod tests {
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
         }
+    }
+
+    // ── #727 round 3: `ground_continuous`'s numeric envelope (review finding C) ──────────────────
+    //
+    // Round 2 shipped the predicate with its behaviour pinned only where it is TOTAL (a void refuses,
+    // a flat floor accepts). The round-2 review showed that left the numbers free: widening
+    // `PROBE_SPACING` 2 → 8, scaling `allow` by 10, and replacing `allow` with `step_up` all survived
+    // the whole suite. These three tests fail under each of those mutations respectively, so the
+    // constants are now claims the suite defends rather than commentary.
+
+    /// Two coplanar floor slabs at z = 0 running east, with a hole of `width` starting at `start`.
+    fn floor_with_hole(start: f32, width: f32) -> Collision {
+        Collision::build(&ZoneAssets {
+            terrain: vec![slab(0.0, -10.0, 10.0, -20.0, start, true),
+                          slab(0.0, -10.0, 10.0, start + width, 20.0, true)],
+            objects: vec![], textures: vec![],
+        }, 32.0)
+    }
+
+    /// A high floor east of 0 and a floor `drop` units lower west of it, meeting at e = 0.
+    fn floor_with_drop(drop: f32) -> Collision {
+        Collision::build(&ZoneAssets {
+            terrain: vec![slab(0.0, -10.0, 10.0, -20.0, 0.0, true),
+                          slab(-drop, -10.0, 10.0, 0.0, 20.0, true)],
+            objects: vec![], textures: vec![],
+        }, 32.0)
+    }
+
+    /// **`PROBE_SPACING` is pinned by the holes it must not step over.** A hole wider than the
+    /// spacing must contain a probe wherever it sits, so sweeping its position over a whole spacing
+    /// interval is what turns "2 u" from a comment into a requirement: widen the constant and some
+    /// offset in this sweep starts being missed.
+    #[test]
+    fn ground_continuous_probe_spacing_catches_every_hole_wider_than_the_spacing() {
+        const WIDTH: f32 = 2.5; // > PROBE_SPACING = 2.0
+        let mut missed = Vec::new();
+        for k in 0..=32 {
+            let start = -8.0 + 0.25 * k as f32;
+            if floor_with_hole(start, WIDTH)
+                .ground_continuous([-18.0, 0.0, 0.0], [18.0, 0.0, 0.0])
+            {
+                missed.push(start);
+            }
+        }
+        assert!(missed.is_empty(),
+            "a {WIDTH} u hole was stepped over at east offsets {missed:?} — the probe spacing is no \
+             longer fine enough to catch holes it claims to catch");
+    }
+
+    /// **The upper end of `allow` is pinned.** A drop of 6 u is outside one 2 u sub-segment of
+    /// `MAX_WALK_GRADE` plus a `step_up` riser (2 · 1.2 + 2 = 4.4), so it must be refused. Scale
+    /// `allow` up and this passes a cliff.
+    #[test]
+    fn ground_continuous_refuses_a_drop_outside_the_walk_envelope() {
+        assert!(!floor_with_drop(6.0).ground_continuous([-6.0, 0.0, 0.0], [6.0, 0.0, -6.0]),
+            "a 6 u drop is outside the walk envelope and must refuse the hop");
+    }
+
+    /// **The lower end of `allow` is pinned too, and this is the half that matters for false
+    /// negatives.** A 4 u drop is INSIDE the same envelope and must be accepted — a walker that
+    /// refuses ordinary walkable terrain would make the resync inert rather than safe. Replace
+    /// `allow` with a bare `step_up` and this goes RED.
+    #[test]
+    fn ground_continuous_accepts_a_drop_inside_the_walk_envelope() {
+        assert!(floor_with_drop(4.0).ground_continuous([-6.0, 0.0, 0.0], [6.0, 0.0, -4.0]),
+            "a 4 u drop is inside the walk envelope; refusing it would make the predicate a false \
+             negative on ordinary terrain");
     }
 
     // ─── Water-span grid (3D-water-volume nav design §5, Slice 1) ──────────────────────────────
