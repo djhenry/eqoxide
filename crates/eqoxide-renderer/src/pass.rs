@@ -15,6 +15,159 @@ fn anim_now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+// ── Instanced placed-object shadow-draw planning (#721) ─────────────────────────────────────────
+//
+// `encode_shadow_pass` used to inline three decisions in its hot loop, none of them reachable from
+// a test because every path to them runs through a `wgpu::RenderPass` and this crate's test harness
+// has no GPU device (see tests/fog_shader.rs / weather_shader.rs for the established device-free
+// precedent):
+//
+//   1. which of the two instanced shadow pipelines a caster is drawn with, from its `RenderMode`
+//      (#707/#718: routing every caster to the fragment-less pipeline makes tree shadows square),
+//   2. which animated-texture frame the masked pipeline alpha-tests against, and
+//   3. whether the masked sub-pass exists at all.
+//
+// #718's mutation check confirmed the gap directly: reverting (1), and separately reverting (2),
+// each left the whole crate suite green. Those decisions now live in `plan_instanced_shadow_draws`
+// below — a pure function over a device-free view of the casters — and `encode_shadow_pass` is a
+// mechanical executor of the plan it returns. The plan is a lazy iterator, NOT a `Vec`: this runs
+// every frame the shadow map is rebuilt (renderer.rs calls `encode_shadow_pass` unconditionally per
+// frame), so it must not add a per-frame heap allocation. tests/shadow_routing.rs asserts zero
+// allocations while draining a plan, with a counting allocator.
+
+/// Which of the two instanced placed-object shadow pipelines draws a caster.
+///
+/// `Opaque` is the fragment-less `shadow_instanced` pipeline: it writes depth for every triangle at
+/// no per-pixel cost, which is correct only for solid geometry. `Masked` is `shadow_instanced_masked`
+/// (#718), which has a fragment stage that discards texels under the alpha cutout so alpha-keyed
+/// foliage casts its cutout silhouette instead of its bounding rectangle (#707).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShadowPipelineKind {
+    Opaque,
+    Masked,
+}
+
+impl ShadowPipelineKind {
+    /// **The #707 routing decision.** `None` means "this render mode casts no instanced shadow at
+    /// all" — `Blend`/`Additive` placed objects are excluded, matching the pre-#721 code, which
+    /// only ever ran its two loops for `RenderMode::Opaque` and `RenderMode::Masked`.
+    pub fn for_render_mode(mode: eqoxide_assets::RenderMode) -> Option<Self> {
+        use eqoxide_assets::RenderMode;
+        match mode {
+            RenderMode::Opaque => Some(Self::Opaque),
+            RenderMode::Masked => Some(Self::Masked),
+            RenderMode::Blend | RenderMode::Additive => None,
+        }
+    }
+}
+
+/// The instanced sub-passes `encode_shadow_pass` issues, **in draw order**. Owning the list here
+/// rather than as two hand-written loops is what makes "the masked sub-pass got deleted" a single
+/// testable edit instead of an invisible one.
+pub const INSTANCED_SHADOW_SUBPASSES: [ShadowPipelineKind; 2] =
+    [ShadowPipelineKind::Opaque, ShadowPipelineKind::Masked];
+
+/// What a planned step needs to do to bind group 1 (the caster's diffuse texture) before it draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowTexBind {
+    /// This sub-pass samples nothing (the opaque shadow pipeline has no fragment stage), so group 1
+    /// is never bound for it.
+    NotSampled,
+    /// Group 1 already holds the right texture from an earlier step in this sub-pass — skip the
+    /// redundant `set_bind_group`.
+    Keep,
+    /// Bind group 1 to this texture index (`None` → the renderer's fallback texture).
+    Set(Option<usize>),
+}
+
+/// One planned instanced placed-object shadow draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstancedShadowStep {
+    /// Index into the caster slice the plan was built from.
+    pub caster: usize,
+    /// Which pipeline draws it.
+    pub pipeline: ShadowPipelineKind,
+    /// True on the first step of each non-empty sub-pass: set the pipeline and bind group 0.
+    pub set_pipeline: bool,
+    /// Group-1 action for this step.
+    pub bind: ShadowTexBind,
+}
+
+/// The device-free slice of a caster the shadow plan actually reads. Implemented for
+/// [`crate::gpu::GpuInstancedMesh`] (whose other fields are `wgpu::Buffer`s, hence unconstructible
+/// in a test) and for plain structs in tests.
+pub trait InstancedShadowCaster {
+    fn render_mode(&self) -> eqoxide_assets::RenderMode;
+    fn texture_idx(&self) -> Option<usize>;
+    fn anim(&self) -> Option<&(u32, Vec<usize>)>;
+}
+
+impl InstancedShadowCaster for crate::gpu::GpuInstancedMesh {
+    fn render_mode(&self) -> eqoxide_assets::RenderMode { self.render_mode }
+    fn texture_idx(&self) -> Option<usize> { self.texture_idx }
+    fn anim(&self) -> Option<&(u32, Vec<usize>)> { self.anim.as_ref() }
+}
+
+/// The texture a mesh should bind at `now_ms`: its current animation frame if animated, else its
+/// static texture. Same selection the color passes use (`encode_zone_pass`'s `frame_tex`).
+///
+/// The masked shadow sub-pass needs this, not the raw `texture_idx`: an animated `RenderMode::Masked`
+/// caster's shadow must alpha-test against the SAME texel the color pass is sampling, or the two
+/// silhouettes disagree on every frame but the first — the identical failure class as #707, just
+/// triggered by time instead of by a missing discard.
+pub fn animated_frame_texture(
+    tex:    Option<usize>,
+    anim:   Option<&(u32, Vec<usize>)>,
+    now_ms: u64,
+) -> Option<usize> {
+    match anim {
+        Some((ms, frames)) if !frames.is_empty() => {
+            Some(frames[(now_ms / (*ms).max(1) as u64) as usize % frames.len()])
+        }
+        _ => tex,
+    }
+}
+
+/// Plans every instanced placed-object shadow draw for one frame: which sub-passes run, in which
+/// order, which caster is in which, and which texture each masked step must bind.
+///
+/// Returns a **lazy iterator** — no allocation, no `Vec` — because `encode_shadow_pass` runs every
+/// frame. Steps come out in exactly the order `encode_shadow_pass` issues them, so a test can
+/// collect them and grade the full draw sequence without a GPU device.
+pub fn plan_instanced_shadow_draws<C: InstancedShadowCaster>(
+    casters: &[C],
+    now_ms:  u64,
+) -> impl Iterator<Item = InstancedShadowStep> + '_ {
+    INSTANCED_SHADOW_SUBPASSES.into_iter().flat_map(move |pipeline| {
+        casters
+            .iter()
+            .enumerate()
+            .filter(move |(_, c)| {
+                ShadowPipelineKind::for_render_mode(c.render_mode()) == Some(pipeline)
+            })
+            .scan(
+                (false, None::<Option<usize>>),
+                move |(started, current_tex), (caster, c)| {
+                    let bind = match pipeline {
+                        ShadowPipelineKind::Opaque => ShadowTexBind::NotSampled,
+                        ShadowPipelineKind::Masked => {
+                            let tex = animated_frame_texture(c.texture_idx(), c.anim(), now_ms);
+                            if *current_tex == Some(tex) {
+                                ShadowTexBind::Keep
+                            } else {
+                                *current_tex = Some(tex);
+                                ShadowTexBind::Set(tex)
+                            }
+                        }
+                    };
+                    let set_pipeline = !*started;
+                    *started = true;
+                    Some(InstancedShadowStep { caster, pipeline, set_pipeline, bind })
+                },
+            )
+    })
+}
+
 /// Entity draw distance (EQ units, measured from the player). Beyond this an NPC's 3D
 /// model is not drawn — it's a distant speck. Combined with a frustum test, this caps
 /// the per-frame entity work in densely-populated zones (e.g. gfaydark, ~400 spawns).
@@ -1227,56 +1380,31 @@ pub fn encode_shadow_pass(
     // `shadow_instanced_masked` (#707), which alpha-tests the caster's diffuse texture at the same
     // 0.5 threshold as the color pass — otherwise a foliage/branch quad casts its full bounding
     // rectangle instead of its cutout silhouette (the tree-shadow-is-square bug).
-    use eqoxide_assets::RenderMode;
+    //
+    // Everything decided here — sub-pass order, which pipeline each caster goes to, which animated
+    // texture frame the masked sub-pass alpha-tests against, and when a group-1 rebind is actually
+    // needed — comes from `plan_instanced_shadow_draws` (#721), which is device-free and unit
+    // tested in tests/shadow_routing.rs. This loop is the mechanical executor of that plan and
+    // makes no routing decisions of its own beyond the two-arm pipeline lookup below.
     let tex_bg = |idx: Option<usize>| -> &wgpu::BindGroup {
         match idx {
             Some(i) if i < r.texture_bind_groups.len() => &r.texture_bind_groups[i],
             _ => &r.fallback_texture_bg,
         }
     };
-    // Same animated-texture frame selection the color pass uses (see draw_instanced above /
-    // encode_zone_pass's `frame_tex`). Only the masked loop needs this: an animated
-    // RenderMode::Masked caster's shadow must alpha-test against the SAME texel the color pass is
-    // currently sampling, or the two silhouettes disagree on any frame but the first (the shadow
-    // would test a stale/base frame while the visible mesh has already advanced) — the identical
-    // failure class #707 fixes, just triggered by time instead of by a missing discard. Opaque
-    // casters never sample a texture in the shadow pass at all, so they don't need this.
     let now_ms = anim_now_ms();
-    let frame_tex = |tex: Option<usize>, anim: &Option<(u32, Vec<usize>)>| -> Option<usize> {
-        match anim {
-            Some((ms, frames)) if !frames.is_empty() => {
-                Some(frames[(now_ms / (*ms).max(1) as u64) as usize % frames.len()])
-            }
-            _ => tex,
-        }
-    };
-    let mut inst_bound = false;
-    for mesh in &r.gpu_instanced {
-        if mesh.render_mode != RenderMode::Opaque { continue; }
-        if !inst_bound {
-            pass.set_pipeline(&r.pipelines.shadow_instanced);
+    for step in plan_instanced_shadow_draws(&r.gpu_instanced, now_ms) {
+        let mesh = &r.gpu_instanced[step.caster];
+        if step.set_pipeline {
+            // tests/shadow_routing.rs source-text-pins these two arms; keep them one-per-line.
+            pass.set_pipeline(match step.pipeline {
+                ShadowPipelineKind::Opaque => &r.pipelines.shadow_instanced,
+                ShadowPipelineKind::Masked => &r.pipelines.shadow_instanced_masked,
+            });
             pass.set_bind_group(0, &r.light_depth_bg, &[]);
-            inst_bound = true;
         }
-        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-        pass.set_vertex_buffer(1, mesh.instance_buf.slice(..));
-        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..mesh.index_count, 0, 0..mesh.instance_count);
-    }
-    let mut inst_masked_bound = false;
-    let mut inst_masked_tex: Option<usize> = None;
-    for mesh in &r.gpu_instanced {
-        if mesh.render_mode != RenderMode::Masked { continue; }
-        let etex = frame_tex(mesh.texture_idx, &mesh.anim);
-        if !inst_masked_bound {
-            pass.set_pipeline(&r.pipelines.shadow_instanced_masked);
-            pass.set_bind_group(0, &r.light_depth_bg, &[]);
-            pass.set_bind_group(1, tex_bg(etex), &[]);
-            inst_masked_tex = etex;
-            inst_masked_bound = true;
-        } else if etex != inst_masked_tex {
-            inst_masked_tex = etex;
-            pass.set_bind_group(1, tex_bg(inst_masked_tex), &[]);
+        if let ShadowTexBind::Set(tex) = step.bind {
+            pass.set_bind_group(1, tex_bg(tex), &[]);
         }
         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
         pass.set_vertex_buffer(1, mesh.instance_buf.slice(..));
