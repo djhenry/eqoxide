@@ -365,9 +365,17 @@ use eqoxide_ipc::MoveIntent;
                 // Without this the scanner's cursor rule is the PRE-#727 one, so it cannot reproduce
                 // (or regress-test) the qcat wedge at all — the gap the #727 round-1 review found.
                 // The predicate is the walker's own conjunction, and both halves are the SAME public
-                // `Collision` methods `Walker::advance_cursor` calls; the clearance is the same
-                // `eqoxide_core::physics::PLAYER_RADIUS` that walker.rs's private
-                // `STEER_LOS_CLEARANCE` is defined as. Nothing here is a copy, so nothing can drift.
+                // `Collision` methods `Walker::advance_cursor` calls.
+                //
+                // ⚠️ Correction (#727 round 4). The clearance IS a divergence, and this comment used
+                // to deny it: it said the `PLAYER_RADIUS` below is "the same" value as walker.rs's
+                // `STEER_LOS_CLEARANCE` and therefore "nothing here is a copy, so nothing can drift".
+                // `STEER_LOS_CLEARANCE` is *defined as* `PLAYER_RADIUS` today, so the two agree by
+                // coincidence, not by construction — change that definition and this scanner silently
+                // stops modelling the walker. This is an integration test, so it cannot name the
+                // `pub(crate)` constant; the in-crate sim in `steering.rs` references it directly and
+                // does not have this gap. Until this file can too, the coincidence is disclosed here
+                // rather than asserted away.
                 {
                     let walked_to = path_i;
                     path_i = eqoxide::nav::steering::resync_cursor(
