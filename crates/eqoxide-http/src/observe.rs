@@ -2184,6 +2184,33 @@ mod tests {
             "a live sync always has an age, so the aggregate always exists: {v}");
     }
 
+    /// The round-2 defect was not a wrong value — it was wrong GUIDANCE, and it shipped inside the
+    /// response. So the guidance is now pinned to the behaviour: every field `semantics` sends a
+    /// caller to must actually exist in the body it is describing. A later change that drops or
+    /// renames one fails here, instead of leaving the string quietly recommending a field the
+    /// endpoint no longer serves — which is the same class of defect in a new place.
+    #[tokio::test]
+    async fn every_field_the_semantics_string_sends_a_caller_to_exists_in_the_body() {
+        let state = empty_state();
+        let g = begin(&state, "zone/neriakc");
+        g.tick(dl(3, 7, 12_451_840, 10_400));
+        let v = asset_sync_json_body(&state).await;
+        let semantics = v["semantics"].as_str().expect("semantics is served").to_string();
+
+        for field in ["active", "syncs", "last_ended", "phase", "downloading",
+                      "published_age_ms", "running_ms", "stalest_published_age_ms"] {
+            assert!(semantics.contains(field), "semantics must document `{field}`: {semantics}");
+            assert!(v.get(field).is_some(),
+                "semantics sends the caller to `{field}`, so the body must carry it: {v}");
+        }
+
+        // The retracted claim, pinned so it cannot come back: the mirror is not a process-health
+        // check and a caller asking "is anything wedged" does have to look past it.
+        assert!(!semantics.contains("need not iterate"),
+            "the top-level mirror describes syncs[0] alone; telling a caller otherwise is the \
+             finding this test exists to keep closed: {semantics}");
+    }
+
     /// #598 finding 1, at the API BOUNDARY — the honesty contract must hold in the SERIALIZED body,
     /// not just in the type. `player.levitating` is three-valued: `true` / `false` / `null`, where
     /// `null` = UNKNOWN. The assertions below check the exact wire form an agent parses:
