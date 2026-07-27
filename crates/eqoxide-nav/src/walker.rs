@@ -503,11 +503,30 @@ impl Walker {
     /// 2. The **stale-cursor resync** (#673): rule 1 assumes the character travels ALONG the route.
     ///    Physics does not. A fall, or a slide down a ramp, can carry it past several waypoints at
     ///    once and leave it beside a segment whose projection parameter then saturates strictly below
-    ///    1.0 — so rule 1 can never fire again. The cursor names a segment the character is nowhere
-    ///    near, [`crate::steering::carrot_along`] measures the carrot's arclength from a projection
-    ///    onto that segment, and the carrot lands ON the character: the aim flips every tick, net
-    ///    displacement is zero, and the walker exhausts its re-paths and stops with `blocked` /
-    ///    `walker_stalled` while standing on a route it could have walked.
+    ///    1.0 — so rule 1 can never fire again. The cursor then names a segment the character is
+    ///    nowhere near, and that lie reaches the steering aim by the route below.
+    ///
+    ///    ⚠️ **Correction (#727 round 3).** Earlier revisions of this comment said simply that "the
+    ///    carrot lands ON the character". That is not what happens at the reach `drive_walk` actually
+    ///    steers with, and the round-2 review was right to reject it: at `LOOK_AHEAD = 5.0` the
+    ///    *coarse* carrot off a stale cursor leads by ~17 u on the captured #673 fixture. The chain
+    ///    is one step longer:
+    ///
+    ///    * [`crate::steering::carrot_along`] measures arclength from a projection onto the stale
+    ///      segment, so `local_goal` — the `LOCAL_REACH` (24 u) point handed to the FINE planner —
+    ///      collapses to ~0.2 u from the body;
+    ///    * `find_path_local` duly returns a degenerate two-waypoint stub;
+    ///    * [`crate::steering::steer_target`] prefers the fine path at exactly `len() >= 2`, so the
+    ///      stub is not discarded as too short — it is preferred over the healthy coarse aim;
+    ///    * the 5 u carrot taken along that stub therefore lands ~0.2 u from the body, inside one
+    ///      controller frame of travel (`RUN_SPEED * 0.01 = 0.44 u`), so it is overshot rather than
+    ///      reached.
+    ///
+    ///    The aim then flips every frame, net displacement is zero, and the walker exhausts its
+    ///    re-paths and stops with `blocked` / `walker_stalled` while standing on a route it could
+    ///    have walked. Measured end to end by the three `#673 step N of 3` tests in
+    ///    [`crate::steering`], the last of which drives the production `steer_target` at `LOOK_AHEAD`
+    ///    on a featureless floor and reproduces the live capture's oscillation band.
     ///
     /// ## A resync is NOT progress, and the walker says so (#727 round 2)
     ///
