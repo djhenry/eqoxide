@@ -158,14 +158,21 @@ fn nearby_casters_are_ordered_nearest_first_to_the_light_center() {
     assert_eq!(u_slots(&steps), vec![0, 1, 2], "slots are handed out in plan order from 0");
 }
 
-/// Equidistant casters keep their input order — the sort is stable. Pins that a future switch to
-/// `sort_unstable_by` (which would make shadow flicker between frames for tied spawns) is a
-/// deliberate decision, not a silent one.
+/// Equidistant casters keep their input order.
+///
+/// **Measured caveat, not a claim:** this test does *not* discriminate `sort_by` from
+/// `sort_unstable_by` — that mutation was run and this test stayed green at every fixture shape
+/// tried (all-tied at 8, 40; tied in groups of 4 at 48). What kills it is the corpus differential
+/// below. So read this as pinning "ties are not reordered by the current sort", not as the
+/// stability guard.
 #[test]
 fn equidistant_casters_keep_input_order() {
-    let cands: Vec<Cand> = (0..8).map(|_| Cand::skinned([100.0, 0.0, 0.0], 2)).collect();
+    // Ties in GROUPS, interleaved with distinct keys — an all-tied fixture does not discriminate
+    // (`sort_unstable_by` happens to preserve order when every key is equal, at every size tried).
+    let cands: Vec<Cand> =
+        (0..48).map(|i| Cand::skinned([(i / 4) as f32 * 10.0, 0.0, 0.0], 2)).collect();
     let steps = plan(&cands, ORIGIN);
-    assert_eq!(picked(&steps), (0..8).collect::<Vec<_>>());
+    assert_eq!(picked(&steps), (0..48).collect::<Vec<_>>());
 }
 
 // ── 2. The view cull ────────────────────────────────────────────────────────────────────────────
