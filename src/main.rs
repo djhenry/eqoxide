@@ -188,8 +188,12 @@ fn main() {
     // "special" early caller, because there is no caller without one.
     let asset_sync_activity: eqoxide::ipc::AssetSyncShared = eqoxide::ipc::asset_sync::new_shared();
     if !testzone_mode {
-        match eqoxide::asset_sync::AssetSync::login(
-            &app_cfg.asset_server_url, &login_cfg.username, &login_cfg.password)
+        // #731: observed like the sets it enables. One login covers BOTH sets below, so it is its
+        // own registry entry rather than a phase of either. Same "nothing can poll it yet" caveat
+        // as the sets themselves — see the comment inside the loop.
+        match eqoxide::asset_sync::login_observed(
+            &app_cfg.asset_server_url, &login_cfg.username, &login_cfg.password,
+            &asset_sync_activity, "startup game data (gamedata, gameequip)")
         {
             Ok(sync) => {
                 // gamedata = string table / spells / maps; gameequip = worn-armor texture + held-

@@ -728,7 +728,13 @@ impl App {
             let cache = crate::asset_sync::CacheDirs::resolve();
             set_status("Connecting to asset server…");
             let loaded = (|| -> anyhow::Result<assets::ZoneAssets> {
-                let sync = crate::asset_sync::AssetSync::login(&url, &user, &pass)?;
+                // #731: the login is observed too. It precedes every sync, it can hang, and while it
+                // was unobserved `GET /v1/observe/asset_sync` answered "no asset sync is running"
+                // for its whole duration — with the HUD showing a loading screen at the same time.
+                // One login covers BOTH sets below, which is why it is its own entry rather than a
+                // phase of either.
+                let sync = crate::asset_sync::login_observed(
+                    &url, &user, &pass, &sync_obs, &format!("zone load: {zone_name}"))?;
                 set_status("Verifying zone assets…");
                 let dl_status = load_status.clone();
                 crate::asset_sync::sync_set_observed(&sync, &format!("zone/{zone_name}"), &cache, &sync_obs, &mut |p| {
@@ -990,7 +996,12 @@ impl App {
                 // `run_model_sync_worker`.
                 run_model_sync_worker(std::panic::AssertUnwindSafe(move || -> String {
                     let wcache = crate::asset_sync::CacheDirs::resolve(); // same XDG path; cheap
-                    let sync = match crate::asset_sync::AssetSync::login(&url, &user, &pass) {
+                    // #731: observed. This login serves an UNBOUNDED queue of `charmodel/<key>`
+                    // sets over the worker's whole life, so there is no set it could be attributed
+                    // to — the reason a login is its own kind of entry and not a sync phase.
+                    let sync = match crate::asset_sync::login_observed(
+                        &url, &user, &pass, &sync_obs, "model-sync worker (charmodel sets)")
+                    {
                         Ok(s) => s,
                         Err(e) => {
                             let reason = format!("model-sync worker: login failed: {e}");
@@ -1032,7 +1043,9 @@ impl App {
             let done_for_body = done.clone();
             run_common_asset_loader(std::panic::AssertUnwindSafe(move || {
                 let result = (|| -> anyhow::Result<()> {
-                    let sync = crate::asset_sync::AssetSync::login(&url, &user, &pass)?;
+                    // #731: observed, like the zone loader's.
+                    let sync = crate::asset_sync::login_observed(
+                        &url, &user, &pass, &sync_obs, "common asset load")?;
                     *status.lock().unwrap() = "Verifying assets…".to_string();
                     crate::asset_sync::sync_set_observed(&sync, "common", &cache, &sync_obs, &mut |p| {
                         match p {
