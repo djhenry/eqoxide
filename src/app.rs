@@ -3007,8 +3007,9 @@ mod tests {
         let now = std::time::Instant::now();
         let surface_z = 4.0_f32;
 
-        // Floating (boat): z untouched, and still untouched on the second frame — the snap's
-        // memo cache must not resurrect it either.
+        // Floating (boat): z untouched, and still untouched on the second frame. The floating
+        // arm never touches the memo cache (it's comment-only), so there's nothing for a later
+        // frame to resurrect from — the second frame is belt-and-braces, not load-bearing.
         let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
         for _ in 0..2 {
             let mut boat = bb(9, [10.0, 0.0, surface_z]);
