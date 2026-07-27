@@ -948,7 +948,9 @@ see.
   "syncs": [
     {
       "set": "zone/freportw",    // which set: "zone/<z>", "zonedoors/<z>", "common", "charmodel/<key>"
-      "phase": "downloading",    // "connecting" | "starting" | "verifying" | "downloading"
+      // A SET entry's phases. "connecting" is NOT one of them: a login is a different kind of
+      // entry, and it never carries a `set` — see "Logins are entries too" below.
+      "phase": "downloading",    // "starting" | "verifying" | "downloading"
       "downloading": {           // present ONLY in the downloading phase
         "chunks_done": 3,
         "chunks_total": 7,
@@ -1071,19 +1073,30 @@ sync (or login) **succeeds**, when it **fails**, and when the loader thread **pa
 removes it on unwind, so there is no "clear at the end of the happy path" to be skipped). No exit
 path can leave a *finished* sync reported as in-flight.
 
-The wrappers that own those guards — `sync_set_observed` and `login_observed` — are the **only** way
-to reach `sync_set` and `AssetSync::login`, both of which are private. An unobserved sync or login is
-a compile error, not a thing to remember (#726 review N3, #731).
+The wrappers that own those guards — `sync_set_observed` and `login_observed` — are the only way to
+reach `sync_set` and `AssetSync::login` **from anywhere outside `src/asset_sync.rs`**, where both are
+private. Every production call site is outside it, so for all of them an unobserved sync or login is
+a compile error rather than a thing to remember (#726 review N3, #731). The privacy is module-scoped,
+not crate-scoped: code added *inside that one file* can still call them directly, so the compiler
+covers every caller but that file, and review covers that file (#743 review N5).
 
 A sync that never exits at all — a hung transfer — is the case a guard cannot address, because it
 has not finished and reporting it as finished would be its own falsehood. That one is covered by
 [`published_age_ms`](#published_age_ms--is-it-progressing-or-wedged) above, not by removal.
 
-`last_ended` names the most recent activity to leave the list, so `active: false` right after a load is
-distinguishable from `active: false` in a process where nothing has ever synced (`last_ended: null`).
+`last_ended` names the most recent activity **of any kind** to leave the list, so `active: false`
+right after a load is distinguishable from `active: false` in a process where nothing has ever synced
+(`last_ended: null`).
 For a **set sync** it says **ended, not succeeded**: `Drop` runs identically on the success return, the error return and
 a panic unwind, and genuinely cannot tell them apart. Do not read it as "the set is now cached".
 For a **login** it does carry a verdict — see [Logins are entries too](#logins-are-entries-too-and-they-are-not-transfers--731).
+
+**`last_ended` is one slot, and it is overwritten by everything.** Logins and set syncs share it, so
+whatever is in it survives only until the *next* activity of either kind ends. During a zone load
+that is milliseconds: two set syncs end per zone, plus a `charmodel` set whenever an unseen race
+appears. It answers "what ended most recently"; it does **not** answer "did X happen at some point",
+for any X. For the login-failure case specifically, use `login_outcomes` / `last_login_failure`
+described [below](#logins-are-entries-too-and-they-are-not-transfers--731).
 
 ### Overlap, and what `syncs` is for
 
@@ -1186,36 +1199,101 @@ wedged in `starting`. Its `published_age_ms` is therefore the whole time it has 
 the documented one-field wedge check is large and growing throughout. `running_ms` and
 `published_age_ms` are the same duration for a login, for the same reason.
 
-**`last_ended` carries a real verdict for a login**, unlike for a set sync:
+### Did a login fail? — `login_outcomes` and `last_login_failure`
+
+**A login's verdict is measured, not guessed.** `login_observed` wraps the call and sees its
+`Result`. (A set sync's `Drop` runs identically on success, error and unwind and genuinely cannot
+tell them apart — that limitation is unchanged.) `unknown` means a panic unwound through the login,
+so it neither returned `Ok` nor returned `Err`. Without a verdict at all, a *failed* login and a
+*successful* one are the same `active: false`, which is #731's falsehood reappearing a moment later.
+
+The verdict is published in **three places with three different retentions**, and the difference is
+the whole point:
 
 ```jsonc
-"last_ended": {
-  "connecting": { "purpose": "common asset load", "outcome": "failed" },  // succeeded | failed | unknown
-  "ago_ms": 210
+// Always present. Counts of logins that have ENDED, by outcome. Monotonic: only ever increases.
+"login_outcomes": { "succeeded": 2, "failed": 1, "unknown": 0 },
+
+// Present only once a login has ended WITHOUT succeeding. Overwritten only by another such login.
+"last_login_failure": {
+  "connecting": { "purpose": "common asset load", "outcome": "failed" },  // failed | unknown
+  "ago_ms": 41220
   // note: NO "set" — a login never had one
+},
+
+// The most recent activity of ANY kind to end. Overwritten by the next one, login or set sync.
+"last_ended": {
+  "connecting": { "purpose": "zone load: neriakc", "outcome": "failed" }, // succeeded|failed|unknown
+  "ago_ms": 210
 }
 ```
 
-`login_observed` wraps the call and sees its `Result`, so the outcome is **measured**, not guessed.
-(A set sync's `Drop` runs identically on success, error and unwind and genuinely cannot tell them
-apart — that limitation is unchanged.) `unknown` means a panic unwound through the login, so it
-neither returned `Ok` nor returned `Err`. This matters because otherwise a *failed* login and a
-*successful* one are the same `active: false`, which is #731's falsehood reappearing a moment later.
-The four states an agent can distinguish:
+**Ask `login_outcomes` — not `last_ended` — whether a login failed.** `failed + unknown > 0` means a
+login did not complete in this process, at *any* polling cadence, and the delta between two polls is
+what happened between them. `last_login_failure` then names which one and how long ago. Logins still
+in flight are counted in neither: they are live entries in `syncs`.
 
-| State | Body |
+> ## ⚠️ Corrections (#743 review, round 2)
+>
+> **Retracted.** This section previously offered this row in its four-state table:
+>
+> | the client has… | the endpoint says |
+> |---|---|
+> | had a login fail | `active: false`, `last_ended.connecting.outcome == "failed"` |
+>
+> **That recipe does not work, and it fails in the direction that matters most.** `last_ended` is a
+> single last-writer-wins slot shared by logins *and* set syncs, so a login's verdict is destroyed by
+> the very next activity of either kind to end. The reviewer measured it on a live run where **all
+> four logins failed**: across **75 polls at 1.5 s**, the genuinely-failed `common asset load` login
+> appeared in `last_ended` **0 times** — it was overwritten before any poll could see it, by
+> `startup game data`, then `model-sync worker`, then `zone load: neriakc`. An agent following the
+> retracted row would have read `last_ended` naming some other activity and concluded **no login
+> failed, when three had.** Every individual field was accurate; the guidance was a confident
+> falsehood.
+>
+> The same round retracts the paired row *"login succeeded → …then the set sync it enabled opens its
+> own entry"* — see the disclosed gap below, where that promise is false at one of the four sites.
+>
+> `login_outcomes` and `last_login_failure` were added in response, so the question the retracted row
+> claimed to answer now has a field that really answers it.
+
+The states an agent can distinguish:
+
+| the client has… | the endpoint says |
 |---|---|
-| never tried | `active: false`, `syncs: []`, `last_ended: null` |
-| logging in | `active: true`, `syncs[0].phase == "connecting"`, `stalest_published_age_ms` present and growing |
-| login failed | `active: false`, `last_ended.connecting.outcome == "failed"` |
-| login succeeded | `active: false` momentarily, `last_ended.connecting.outcome == "succeeded"` — then the set sync it enabled opens its own entry |
+| never tried | `active: false`, `syncs: []`, `last_ended: null`, `login_outcomes` all zero, no `last_login_failure` |
+| a login in flight | `active: true`, `syncs[i].phase == "connecting"`, `stalest_published_age_ms` present and growing |
+| had a login fail, **ever** | `login_outcomes.failed > 0`; `last_login_failure` names the most recent one |
+| had a login panic, **ever** | `login_outcomes.unknown > 0`; it is in `last_login_failure` too, with `outcome: "unknown"` |
+| had a login succeed, **ever** | `login_outcomes.succeeded > 0` |
+| just ended *something* | `last_ended` names it — and only it. Not a history, not a search |
 
-**Known gap, disclosed:** the login's entry ends when `login()` returns and the following
-`sync_set_observed` opens its own a few statements later, so there is a sub-millisecond window in
-which `active` is `false`. No I/O happens in it — it is the same kind of gap that already exists
-between the `zone/<z>` and `zonedoors/<z>` syncs — so it is not a window a client can be *stuck* in,
-but a poll can land there. Closing it would need one guard spanning login and sync, which does not
-generalise to the three logins that serve more than one set.
+**Known gap, disclosed — stated as a rule, because the instance is not the class.** A login's entry
+ends the moment `login()` returns; the sync it enables opens its own entry only when the next
+`sync_set_observed` call runs. In between, `active` is `false` while the pipeline is alive.
+
+> **The rule: the width of that window is whatever stands between those two calls, and it is
+> unbounded wherever the next `sync_set_observed` is gated on a blocking receive.** Do not read this
+> gap as "brief" in general; read the code between the login and the sync at the site you care about.
+
+- **Three of the four sites** (`src/main.rs` startup, and the zone loader and common loader in
+  `src/app.rs`) have only a status-string write and a clone between the two calls — no I/O, no
+  blocking. A poll can land there and see `active: false`; it cannot get *stuck* there.
+- **The model-sync worker (`src/app.rs`) is the unbounded instance.** Its next `sync_set_observed` is
+  inside `while let Ok(key) = model_rx.recv()` — an unbounded receive with no timeout. On a client
+  that meets no new race, that receive never returns and the worker sits in this window **for the
+  rest of the session**. `active: false` is honest there: nothing *is* running. What is not honest is
+  promising a sync will follow. **No sync is promised**, and an agent that waits for one may wait
+  forever.
+
+Closing the gap would need one guard spanning login and sync, which does not generalise to the three
+logins that serve more than one set — and at the model-sync worker there is no "the sync" to span to.
+
+*Epistemic status:* the mechanism at all four sites is **read from the code and certain** — the
+statements between the two calls, and the unbounded `recv()`, are both plainly there. The *durations*
+at the three bounded sites are **inferred from the absence of I/O and blocking in that code, not
+timed**; nothing here instrumented them, and the live runs that could have were pointed at an
+unreachable asset server, so no success path ever ran (#743 review B2).
 
 ---
 

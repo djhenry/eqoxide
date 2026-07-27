@@ -510,9 +510,16 @@ pub fn sync_set_observed(
 
 /// Log in to the asset server, with the login itself agent-observable for its whole duration (#731).
 ///
-/// This is the ONLY way to log in — [`AssetSync::login`] is private — for the same reason
-/// [`sync_set_observed`] is the only way to sync: the property that `active: false` means "nothing
-/// is running" is worth nothing if any new call site can silently opt out of it.
+/// This is the only way to log in from **outside this module** — [`AssetSync::login`] is private to
+/// `src/asset_sync.rs` — for the same reason [`sync_set_observed`] is the only way to sync: the
+/// property that `active: false` means "nothing is running" is worth nothing if any new call site
+/// can silently opt out of it. All four production login sites are elsewhere (`src/main.rs`,
+/// `src/app.rs`), so for them the compiler enforces it: an unobserved login does not compile.
+///
+/// **The limit, stated rather than implied (#743 review N5):** privacy here is module-scoped, not
+/// crate-scoped. Code added inside this file — including its own tests — can still call
+/// `AssetSync::login` directly and bypass the registry. The guarantee is "no *other* module can",
+/// which is what actually covers the call sites; it is not "nothing can".
 ///
 /// `purpose` is free text describing what this login is for (`"zone load: qeynos2"`,
 /// `"common asset load"`). It is deliberately **not** a set name and deliberately not set-shaped:
