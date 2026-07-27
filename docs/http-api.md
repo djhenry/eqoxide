@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `position_provisional`/`crossing_pending_ms` — see [Navigation state](#navigation-state) and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state) and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. Optional `preset`/`pitch`/`yaw`/`distance` params request a one-off diagnostic camera angle for just this capture — see [Camera override for `/frame`](#camera-override-for-observeframe-422). |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses, snapshot_age_ms}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. The default bare-map shape carries the same freshness value in the `X-Snapshot-Age-Ms` header instead — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646). |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -213,8 +213,8 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 
 | `nav_state` | Meaning | `nav_reason` |
 |-------------|---------|--------------|
-| `pending` | A `/move/{goto,follow,zone_cross}` was **just accepted** and the walker has not ticked yet. Transient (≤ ~150 ms), then becomes `planning`/`navigating`/`following`. Its purpose is honesty: the instant a new request is accepted the state resets to `pending` (under a fresh `nav_goal_id`), so a read can **never** return the *previous* goal's terminal `arrived`/`no_path`/`blocked` as if it were the new request's outcome (#349). | — |
-| `idle` | Nothing to do. | — |
+| `pending` | A `/move/{goto,follow,zone_cross}` was **just accepted** and the walker has not ticked yet. Normally it lasts one walker tick (~150 ms) and becomes `planning`/`navigating`/`following`; a `/zone_cross` issued during a zone load holds it until the request is drained (see `zone_loading`). Its purpose is honesty: the instant a new request is accepted the state resets to `pending` (under a fresh `nav_goal_id`), so a read can **never** return the *previous* goal's terminal `arrived`/`no_path`/`blocked` as if it were the new request's outcome (#349). **`pending` always retires.** It is not on the terminal list, and every walker tick that finds no goal in flight and no queued `/zone_cross` retires any non-terminal state to `idle` with a reason — so `pending` cannot outlive the request that stamped it (#725; before that fix a dropped `/zone_cross` left `pending` standing indefinitely — measured at 75 s — with `nav_reason` and `nav_goal` both `null`). | — |
+| `idle` | Nothing to do. **Every `idle` the client publishes after start-up carries a `nav_reason` saying how it got there**, so `nav_state: "idle"` with `nav_reason: null` means exactly one thing: no nav request has been made since this client started (#725). It is otherwise a real outcome, not an absence of one. | `zoned`, `stopped`, `goto_superseded`, `goal_dropped`, `respawned`, `zone_cross_dropped_unhandled` — all below; `null` **only** at start-up |
 | `planning` | A route is being computed on the pathfinding worker thread. The character stands still. Normally < 1 s. | — |
 | `navigating` | Walking a **complete route to your goal**. | `goal_z_snapped` (see below) or — |
 | `navigating_partial` | Walking a **partial** route: the search was cut short, so this is *not* a route to your goal — it's progress toward a frontier, and it will re-plan from the far end. Usually resolves to `navigating` or `arrived`. | `search_node_cap` |
@@ -224,7 +224,37 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_node_cap` |
 | `blocked` | A route exists, but the walker **could not follow it** (wedged after 8 recovery attempts). Not a routing failure. | `walker_stalled`, `local_no_way_through`, `fall_would_be_lethal` |
 | `zone_loading` | **This client has no *usable* model of the zone the character is in yet** — its terrain/collision are still loading, their load failed, or the loaded grid still belongs to the zone the character just LEFT (the stale window, #600). No search was run and no route exists to report; the goal is kept and planned for real once the correct zone's assets land. Since #600 the walker refuses through the SAME `zone_assets::usability` predicate the HTTP world endpoints use, so the reason is that predicate's own verdict — read `zone_assets` (below) for the matching detail. | `zone_assets_pending`, `zone_assets_failed`, `zone_assets_idle`, `zone_assets_stale_for_previous_zone`, `player_zone_unknown` |
-| `dead` | **The character is slain** — navigation was abandoned because a corpse cannot move (#238, #644). Terminal and honest: an agent that issued a goto and then polled must be able to tell "you died and went nowhere" from the ambiguous `idle` (which also means "ready for work"). Clears back to `idle` on respawn. **A movement command issued *while* dead is not accepted at all** — `POST /v1/move/{goto,follow,zone_cross,manual,jump}` returns **`409 Conflict`** with a machine token `dead` (JSON `"status":"dead"` on `/goto` and `/follow`; the text body names `dead` on the others), so you never get a `200 … navigating` for a goal a corpse can never reach. Respawn (`POST /v1/lifecycle/respawn`) before reissuing. | `player_dead` |
+| `dead` | **The character is slain** — navigation was abandoned because a corpse cannot move (#238, #644). Terminal and honest: an agent that issued a goto and then polled must be able to tell "you died and went nowhere" from the ambiguous `idle` (which also means "ready for work"). Clears back to `idle` with `nav_reason: "respawned"` on respawn. **A movement command issued *while* dead is not accepted at all** — `POST /v1/move/{goto,follow,zone_cross,manual,jump}` returns **`409 Conflict`** with a machine token `dead` (JSON `"status":"dead"` on `/goto` and `/follow`; the text body names `dead` on the others), so you never get a `200 … navigating` for a goal a corpse can never reach. Respawn (`POST /v1/lifecycle/respawn`) before reissuing. | `player_dead` |
+
+### Why an in-progress `nav_state` can never stick (#725)
+
+Every `nav_state` is either **terminal** — `idle`, `arrived`, `no_path`, `search_exhausted`,
+`blocked` — or **in progress**. The rule the walker applies each tick is stated over the terminal
+set, not over a list of in-progress words: *if there is no goal in flight and no queued
+`/move/zone_cross`, any state that is not terminal is retired to `idle` with a `nav_reason`.* So an
+in-progress state is only ever published while something is genuinely happening, and a word that is
+neither driven forward nor listed anywhere still retires — you do not have to trust that each state
+remembered to clean itself up.
+
+That rule replaced an opt-in list of states-to-retire, under which any state missing from the list
+survived forever once its goal vanished. Two were missing, and both were observed live: `pending`
+after a dropped `/zone_cross` (#725), and `following` after the followed entity despawned.
+
+### Every `idle` says how it got there (#725)
+
+`idle` used to be published bare from several different places, and one of them was the **success**
+path of `/v1/move/zone_cross` — so a successful crossing and a request the client had thrown away
+looked byte-identical to a polling agent (`"nav_state":"idle","nav_reason":null` in both). Each of
+those call sites now names itself. The complete set of ways to reach `idle`:
+
+| `nav_reason` | Meaning |
+|--------------|---------|
+| `zoned` | **The character changed zone**, and navigation was reset because a route computed in the old zone means nothing in the new one. This is the `nav_state` a *successful* `/v1/move/zone_cross` ends at — read it together with `player.zone`, which is the authoritative statement of where you are. It is deliberately about the zone change and not about the request, so it is equally true of a GM `#zone`, a gate/evac, or a portal door. Not an error. |
+| `stopped` | **You asked** — `POST /v1/move/stop` was accepted and any goto/follow/queued zone-cross was cancelled. |
+| `goto_superseded` | You did **not** ask: something else took over steering — manual movement (keyboard or `POST /v1/move/manual`), or the auto-melee-engage override. Your goto is gone; reissue it if you still want it. |
+| `goal_dropped` | Your goal stopped existing without being reached — e.g. a `/follow` target despawned, or a request was cancelled from elsewhere in the client. Not an error about the route; there is simply nothing left to walk to. Reissue if you still want it. |
+| `respawned` | The `dead` state cleared because the character came back up (#644). |
+| `zone_cross_dropped_unhandled` | **A client bug, reported instead of hidden.** Your `/move/zone_cross` was consumed by the client and produced no outcome at all — no walk, no crossing, no refusal. Nothing is in flight and nothing will happen; retry, or use `/move/goto`. If you see this, please file it with the zone and your position: it means a code path took your request and wrote nothing, which is exactly the defect the backstop that emits this reason exists to make visible (#725). |
 
 ### `levitating` — three-valued levitate buff state, NOT a gravity reading (#598)
 
@@ -426,9 +456,12 @@ matches nothing at all — not even fuzzily — is an honest **404**, never a di
 
 ### `nav_goal_id` and `nav_goal` — goal identity (#349)
 
-`GET /v1/observe/debug` carries two more top-level fields under `player`:
+`GET /v1/observe/debug` carries two more fields. **They are top-level — siblings of `player`, not
+inside it**, unlike `nav_state` and `nav_reason`, which are inside `player`. (Measured on a live
+client while checking the rule below; the previous wording said "top-level fields under `player`",
+which is not a place, and an agent that took it literally would read `null` forever.)
 
-- **`nav_goal_id`** — a monotonically increasing counter, bumped every time a `POST /v1/move/{goto,follow,zone_cross,stop}` is accepted. It is **echoed in each of those POST's response bodies**: as a JSON `"goal_id": N` field on `/goto` and `/follow`, and as `[goal_id=N]` in the text body of `/stop` and `/zone_cross`. `nav_state`/`nav_reason` are the status *of this goal id* — never of an earlier one.
+- **`nav_goal_id`** — a monotonically increasing counter, bumped every time a `POST /v1/move/{goto,follow,zone_cross,stop}` is accepted. It is **echoed in each of those POST's response bodies**: as a JSON `"goal_id": N` field on `/goto` and `/follow`, and as `[goal_id=N]` in the text body of `/stop` and `/zone_cross`. `nav_state`/`nav_reason` are the status *of this goal id* — never of an earlier one. **`/zone_cross` is the one route whose returned id does not end up carrying the outcome**: resolving the request into a concrete walk stamps a fresh, higher id (see below).
 - **`nav_goal`** — that goal's `[x, y, z]` (server coords), or `null` for `idle`/`stop`, or for a `zone_cross` whose concrete zone-line destination the walker has not resolved yet.
 
 **Why this exists.** `POST /goto` returns `200` and sets the target, but the walker only re-labels `nav_state` on its next ~150 ms tick. Without identity, this canonical loop lied:
@@ -438,7 +471,26 @@ POST /v1/move/goto {...}   -> 200 {"goal_id": 8, ...}
 GET  /v1/observe/debug     -> nav_state: "arrived"   <-- but nav_goal_id: 7, the PREVIOUS goto!
 ```
 
-Now the accept **atomically** bumps `nav_goal_id` and resets `nav_state` to `pending`, so the read above returns `nav_state: "pending", nav_goal_id: 8` — honest. **Rule: only trust a terminal `nav_state` (`arrived`/`no_path`/`search_exhausted`/`blocked`) when its `nav_goal_id` matches the `goal_id` the POST you are waiting on returned.** A lower id means you are still seeing an older goal's outcome; a matching id with `pending`/`planning`/`navigating` means your goal is genuinely in flight.
+Now the accept **atomically** bumps `nav_goal_id` and resets `nav_state` to `pending`, so the read above returns `nav_state: "pending", nav_goal_id: 8` — honest.
+
+**Rule: ignore any `nav_state` whose `nav_goal_id` is LOWER than the `goal_id` your POST returned — that is an older goal's outcome. At your id or above, the state is current.** A matching id with `pending`/`planning`/`navigating` means your goal is genuinely in flight — and it will not stay that way, because any in-progress state with nothing behind it retires to `idle` with a reason on the next walker tick ([Why an in-progress `nav_state` can never stick](#why-an-in-progress-nav_state-can-never-stick-725)). `idle` **at or above your own goal id** is therefore an outcome, not a "not started yet": read `nav_reason`, which since #725 always says which outcome it was.
+
+**Why the rule is "at or above" and not "equal" — `/v1/move/zone_cross` in particular.** A *higher*
+id does not mean your read is stale; it means your goal was superseded, **or that the client
+advanced your own request to its next stage under a fresh id.** `/zone_cross` always does the
+latter. The id its 200 returns identifies the *request*; the request has no coordinates yet, so
+`nav_goal` is `null`. One walker tick later the client resolves the requested zone to a concrete
+zone-line region and issues the walk to it internally, and that walk stamps its own new, higher id —
+under which every subsequent `navigating`/`arrived`/`no_path` for your crossing is published. **The
+id from the `/zone_cross` 200 therefore never carries the outcome; waiting for an exact match waits
+forever.** (On every crossing measured so far — seven — the resolved id was the accepted id
++ 1, but do not key on `+1`: any concurrent accept from another caller shifts it. `>=` is the
+property that holds.)
+
+The reliable way to follow a crossing to completion is not the id at all: poll `player.zone` (and
+`crossing_pending_ms`), and treat `nav_state: "idle"` with `nav_reason: "zoned"` as the success
+signal — see [Every `idle` says how it got there](#every-idle-says-how-it-got-there-725). Use the
+returned id only for its guarantee: any state below it is not about you.
 
 **`goal_z_snapped` — the client CHANGED your goal.** The `z` you gave sits below every floor in the
 goal's column (agents commonly pass `z: 0`, or a map coordinate), so the planner snapped the goal onto
@@ -463,6 +515,18 @@ is not snapped: it fails as `no_path` / `goal_not_walkable`.)
 |--------|---------|
 | `no_zone_line_to_zone` | The server never advertised (`OP_SendZonepoints`) any zone line from here to the requested `zone_id` — it will not appear in `/v1/observe/zone_exits` either. A genuinely invalid request: pick a `zone_id` that's actually one of this zone's exits. |
 | `zone_line_not_in_map` | The requested `zone_id` **is** advertised by the server as a real exit, but the locally loaded zone geometry has no matching WLD zone-line (DRNTP) trigger region for it — a client-side `.wtr` map-data gap, not proof the exit doesn't exist in the real game. Before reporting this, the client tries one fallback (#683): if the map has a zone-line region under some OTHER (unadvertised) index — e.g. an exit baked with index 0 — and this zone advertises no same-zone teleport pad and server zone points are available, it walks there instead and lets the server resolve the destination, so this reason now means no usable zone-line region exists at all (or the fallback is gated: a same-zone pad is advertised, or no server zone points are available). It is also omitted from `/v1/observe/zone_exits` (which only lists regions actually found in the loaded map), so "absent from `zone_exits`" does not by itself distinguish this from `no_zone_line_to_zone` — only `nav_reason` does. |
+
+**Distance no longer decides *whether* the client acts (#725).** It still decides how long the
+crossing takes — you are walked to the line, so a line 30 u away takes longer than one 3 u away —
+but there is no distance at which the request is handled differently, and none at which it is
+handled by doing nothing. When a zone-line region *is* located, the client always walks to it and
+re-stamps `nav_goal` with that concrete destination; there is no "close enough, the crossing will
+happen by itself" shortcut. There used to be one, for lines within 15 u,
+and because the actual auto-cross fires only when your body is physically inside the trigger region
+(a much smaller volume), every `/zone_cross` issued from between the region and 15 u was consumed and
+produced nothing at all. That band is where the server's own walk-in arrival point tends to sit
+relative to the *return* line, so "walk into a zone, then ask to go back" was the case most likely to
+hit it.
 
 `nav_reason` for `blocked`:
 
@@ -504,7 +568,8 @@ no such thing as a *verified* same-zone pad here.** A goal reachable only across
 honest `no_path`.
 
 But a bare `no_path` next to a perfectly real pad would be its own quiet falsehood, so
-`GET /v1/observe/debug` **discloses** what nav declined. `null` unless nav is in a terminal
+`GET /v1/observe/debug` **discloses** what nav declined, in top-level `nav_declined_pads` (a sibling of
+`player`, not a field inside it). `null` unless nav is in a terminal
 no-route state (`no_path` / `search_exhausted`) **and** it declined at least one pad:
 
 ```json
@@ -593,7 +658,7 @@ disclosing them.
 Navigation has two tiers. The **coarse** one (8 u cells, whole zone) chooses the route and produces
 `nav_state`. The **fine** one (2 u cells, a 40 u window, re-planned every nav tick) is what actually
 **steers** the character along the last few strides of that route — threading the thin ramps and narrow
-openings the 8 u grid cannot see. `GET /v1/observe/debug` carries **`nav_local`**: what that tier last
+openings the 8 u grid cannot see. `GET /v1/observe/debug` carries **`nav_local`** (top-level, not under `player`): what that tier last
 said. It is **`null` while the tier is healthy** (a complete fine route to its carrot), exactly like
 `nav_support` / `nav_tight`.
 
@@ -1209,7 +1274,7 @@ Top-level shape (`available: false` + a `note` until the walker first publishes)
 
 ## Nav footing verification (`nav_support`)
 
-`GET /v1/observe/debug` also carries **`nav_support`** — whether pathing in the current zone is
+`GET /v1/observe/debug` also carries **`nav_support`** (top-level, not under `player`) — whether pathing in the current zone is
 answering from **winding-blind (inverted-art) ground**. **`null` means every standable surface so far
 faced UP** (properly wound); an object means nav has answered from a down-facing surface:
 

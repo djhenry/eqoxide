@@ -19,6 +19,107 @@
 
 use super::CommandState;
 
+/// `nav_reason` published when a drained `/v1/move/zone_cross` reached the end of its handling
+/// WITHOUT anything observable being written for it (#725). It means: *the client consumed your
+/// request and produced no outcome* — a client bug, reported rather than hidden. See
+/// [`ZoneCrossTicket`], which is the only thing that can publish it.
+pub const NAV_REASON_ZONE_CROSS_UNHANDLED: &str = "zone_cross_dropped_unhandled";
+
+/// `nav_reason` on the `idle` that [`CommandState::request_stop`] publishes (#725 review, B1) —
+/// "idle because YOU cancelled it", not "idle, nothing was ever asked for".
+pub const NAV_REASON_STOPPED: &str = "stopped";
+
+/// `nav_reason` on the `idle` that [`CommandState::request_cancel_goto`] publishes (#725 review,
+/// B1) — the narrower cancel taken when manual movement, the HTTP manual-move escape hatch, or the
+/// auto-melee-engage override takes over steering. Distinct from [`NAV_REASON_STOPPED`] because the
+/// caller did NOT ask to stop: something else took the wheel, and an agent polling its own `/goto`
+/// needs to be able to tell those apart.
+pub const NAV_REASON_GOTO_CANCELLED: &str = "goto_superseded";
+
+/// A `/v1/move/zone_cross` request that has been DRAINED out of its one-shot slot.
+///
+/// # Why this is a type and not a `u16` (#725)
+///
+/// The bug: `ActionLoop::drain_zone_cross` took the request out of the slot and then hit a branch
+/// whose entire body was one `tracing::info!`. The request no longer existed anywhere, nothing an
+/// agent can read was written, and `nav_state` sat at the `pending` the accept had stamped —
+/// measured, unchanged, for 45 s / 48 s / 75 s across three crossings, with `nav_reason`,
+/// `nav_goal` and `crossing_pending_ms` all `null` and no message in the log. `pending` is
+/// documented as "your goal is genuinely in flight", so the agent was instructed to believe it.
+///
+/// **A drained request that publishes nothing is the general shape of that bug**; the distance gate
+/// that triggered it was one instance. This ticket closes the shape by construction instead of by
+/// review: it records `(goal_id, state, reason)` as they stood the instant the request left the
+/// slot, and on `Drop` compares them with the live values. Every way of answering a cross moves at
+/// least one of the three:
+///
+/// * [`CommandState::request_goto`] / [`CommandState::request_zone_cross`] (the load-window
+///   re-queue) bump `goal_id` through `stamp_new_goal`;
+/// * `Walker::set_nav_state_because` changes `state` and/or `reason`.
+///
+/// If NONE of them moved, nothing was published for this request and the ticket publishes the
+/// honest terminal state itself: `idle` + [`NAV_REASON_ZONE_CROSS_UNHANDLED`]. **No call site has
+/// to remember to set a flag** — forgetting is precisely the case this handles, and a flag someone
+/// must remember would have exactly the failure mode of the branch that started this.
+///
+/// It deliberately does NOT overwrite a state that DID move. A concurrent `POST /v1/move/goto` on
+/// the HTTP thread bumps `goal_id` mid-drain; stamping over that would be #349 (a read seeing an
+/// older goal's outcome under a newer id) in reverse.
+///
+/// Being `#[must_use]`, dropping it on the floor is at least a warning at the call site; being a
+/// `Drop` backstop, doing so is still *honest* rather than silent.
+#[must_use = "a drained zone_cross must be answered; dropping the ticket publishes the \
+              zone_cross_dropped_unhandled fallback"]
+pub struct ZoneCrossTicket {
+    zone_id:   u16,
+    nav_state: eqoxide_ipc::NavStateShared,
+    /// `(goal_id, state, reason)` at the instant the request left the slot.
+    at_drain:  (u64, String, Option<String>),
+    /// Shared liveness count (#725 review round 3, B3) — bumped by `take_zone_cross`, lowered by
+    /// this ticket's `Drop`. See [`CommandState::zone_cross_outstanding`].
+    outstanding: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ZoneCrossTicket {
+    /// The requested destination: `0` = "the nearest zone line", otherwise a specific zone id
+    /// (pre-validated as advertised by the HTTP handler).
+    pub fn zone_id(&self) -> u16 { self.zone_id }
+}
+
+impl Drop for ZoneCrossTicket {
+    fn drop(&mut self) {
+        // Lower the liveness count FIRST, before anything that could panic: the count must describe
+        // "a ticket is alive", and a `Drop` that unwound past this point would leave it permanently
+        // raised and turn the B3 assertion into a false positive on every later crossing.
+        self.outstanding.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        // Recover a poisoned guard rather than `unwrap()`: this runs in a `Drop`, and panicking
+        // while another panic unwinds aborts the process. A poisoned nav_state still holds a
+        // readable `NavStatus`, and publishing the honest fallback into it is strictly better than
+        // taking the client down.
+        let mut s = match self.nav_state.lock() {
+            Ok(g)  => g,
+            Err(e) => e.into_inner(),
+        };
+        let moved = (s.goal_id, s.state.as_str(), s.reason.as_deref())
+            != (self.at_drain.0, self.at_drain.1.as_str(), self.at_drain.2.as_deref());
+        if moved {
+            return; // something WAS published for this request (or a newer goal superseded it)
+        }
+        s.state  = "idle".to_string();
+        s.reason = Some(NAV_REASON_ZONE_CROSS_UNHANDLED.to_string());
+        // The same per-instance retirement `Walker::set_nav_state_because` does: a transition must
+        // not leave the previous route's facts standing beside the new state (#343 discipline).
+        s.goal            = None;
+        s.blocked_goal    = None;
+        s.blocked_frontier = None;
+        s.tier            = None;
+        tracing::warn!(
+            "zone_cross: request for zone_id={} was drained without publishing any outcome — \
+             publishing idle/{NAV_REASON_ZONE_CROSS_UNHANDLED} (this is a client bug, #725)",
+            self.zone_id);
+    }
+}
+
 impl CommandState {
     // ── request_* : the VIEW (HTTP handlers, keyboard input) makes these writes ───────────────────
 
@@ -32,11 +133,24 @@ impl CommandState {
     /// see the new `goal_id` paired with the old goal's `arrived`/`no_path`/`blocked`. The previous
     /// route's per-instance facts (`reason`/`blocked_*`/`tier`/`local`) are cleared for the same
     /// reason. Returns the new `goal_id` so the accepting HTTP handler can echo it to the caller.
-    fn stamp_new_goal(&self, new_state: &str, goal: Option<(f32, f32, f32)>) -> u64 {
+    ///
+    /// `reason` is the `nav_reason` to publish alongside `new_state` (#725 review, B1). It is
+    /// `None` for the in-progress stamps — a `pending` needs no explanation, the request itself is
+    /// the explanation — and `Some(..)` for every `idle` stamp, because a bare `idle` is
+    /// indistinguishable from "nothing was ever requested". After #725 that distinction is load
+    /// bearing: on `idle`, `nav_reason: null` means exactly one thing, that no nav request has been
+    /// made since the client started.
+    fn stamp_new_goal(&self, new_state: &str, reason: Option<&str>, goal: Option<(f32, f32, f32)>) -> u64 {
+        // #725 review round 3, B1 — the same writer-level guard as `Walker::set_nav_state_because`;
+        // see the rationale there. These two plus `ZoneCrossTicket::drop` (which always supplies a
+        // reason) are the only production writers of `state`/`reason`, so between them the `idle`
+        // row's universal is a checked invariant rather than prose.
+        debug_assert!(!(new_state == "idle" && reason.is_none()),
+            "#725 B1: `idle` must name how it got there; `nav_reason: null` is reserved for boot");
         let mut s = self.nav.nav_state.lock().unwrap();
         s.goal_id += 1;
         s.state = new_state.to_string();
-        s.reason = None;
+        s.reason = reason.map(str::to_string);
         s.goal = goal.map(|(x, y, z)| [x, y, z]);
         s.blocked_goal = None;
         s.blocked_frontier = None;
@@ -52,7 +166,7 @@ impl CommandState {
     pub fn request_goto(&self, target: (f32, f32, f32)) -> u64 {
         *self.nav.goto_target.lock().unwrap() = Some(target);
         *self.nav.goto_entity.lock().unwrap() = None;
-        self.stamp_new_goal("pending", Some(target))
+        self.stamp_new_goal("pending", None, Some(target))
     }
 
     /// Walk to a named entity's current position and KEEP CHASING it (POST /v1/move/follow). `key`
@@ -61,7 +175,7 @@ impl CommandState {
     pub fn request_follow(&self, key: String, pos: (f32, f32, f32)) -> u64 {
         *self.nav.goto_target.lock().unwrap() = Some(pos);
         *self.nav.goto_entity.lock().unwrap() = Some(key);
-        self.stamp_new_goal("pending", Some(pos))
+        self.stamp_new_goal("pending", None, Some(pos))
     }
 
     /// Cancel any active goto/follow (POST /v1/move/stop). Clears the goto/follow slots AND the
@@ -79,7 +193,9 @@ impl CommandState {
         *self.nav.goto_target.lock().unwrap() = None;
         *self.nav.goto_entity.lock().unwrap() = None;
         *self.nav.zone_cross.lock().unwrap() = None;
-        self.stamp_new_goal("idle", None)
+        // SAY WHY (#725 review, B1): `idle` with no reason is the boot state. An agent that polls
+        // after `/stop` must be able to tell "your stop landed" from "I have no record of anything".
+        self.stamp_new_goal("idle", Some(NAV_REASON_STOPPED), None)
     }
 
     /// Cancel an in-progress goto WITHOUT touching `goto_entity` — used where manual movement
@@ -99,7 +215,10 @@ impl CommandState {
     /// terminal `arrived`/`no_path` under a fresh identity.
     pub fn request_cancel_goto(&self) -> u64 {
         *self.nav.goto_target.lock().unwrap() = None;
-        self.stamp_new_goal("idle", None)
+        // SAY WHY (#725 review, B1), and say something DIFFERENT from `/stop`: from the agent's side
+        // these are not the same event. `stopped` = you asked. `goto_superseded` = you did not, and
+        // steering was taken over by manual movement or the melee-engage override.
+        self.stamp_new_goal("idle", Some(NAV_REASON_GOTO_CANCELLED), None)
     }
 
     /// Queue a zone-line crossing (POST /v1/move/zone_cross). `0` = nearest line, `Some(id)` = a
@@ -110,14 +229,49 @@ impl CommandState {
     /// is left `None` until that resolution — the concrete destination isn't known yet.
     pub fn request_zone_cross(&self, zone_id: u16) -> u64 {
         *self.nav.zone_cross.lock().unwrap() = Some(zone_id);
-        self.stamp_new_goal("pending", None)
+        self.stamp_new_goal("pending", None, None)
     }
 
     // ── take_* : the MODEL (`ActionLoop::drain_zone_cross`) drains this once per tick ──────────────
 
     /// Drain a pending zone-cross request. `zone_cross` is the one genuinely one-shot nav slot.
-    pub fn take_zone_cross(&self) -> Option<u16> {
-        self.nav.zone_cross.lock().unwrap().take()
+    ///
+    /// Returns a [`ZoneCrossTicket`], not a bare `u16` (#725): once the request has left the slot it
+    /// exists nowhere else, so the drainer OWES the agent an observable outcome. The ticket carries
+    /// that obligation and, if the drainer somehow returns without meeting it, publishes the honest
+    /// fallback itself. See its doc comment for the full argument.
+    pub fn take_zone_cross(&self) -> Option<ZoneCrossTicket> {
+        // Take the request FIRST (and release that lock) so the two nav locks are never nested.
+        let zone_id = self.nav.zone_cross.lock().unwrap().take()?;
+        let at_drain = {
+            let s = self.nav.nav_state.lock().unwrap();
+            (s.goal_id, s.state.clone(), s.reason.clone())
+        };
+        self.zone_cross_outstanding.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(ZoneCrossTicket {
+            zone_id,
+            nav_state: self.nav.nav_state.clone(),
+            at_drain,
+            outstanding: self.zone_cross_outstanding.clone(),
+        })
+    }
+
+    /// How many drained [`ZoneCrossTicket`]s are still alive (#725 review round 3, B3).
+    ///
+    /// `ActionLoop::drain_zone_cross` asserts this is `0` before the standing auto-cross runs. Read
+    /// the field's doc comment on [`CommandState`] for why a dynamic count guards a fact the type
+    /// system already enforces — in short, so that undoing the type-level guarantee fails a test
+    /// rather than only contradicting a comment.
+    pub fn zone_cross_outstanding(&self) -> usize {
+        self.zone_cross_outstanding.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Is a zone-cross request queued? A **peek** — it does not drain, so it cannot incur the
+    /// [`ZoneCrossTicket`] obligation. Tests use it to ask "was the one-shot re-queued?" without
+    /// consuming the request they are asserting about.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn peek_zone_cross(&self) -> Option<u16> {
+        *self.nav.zone_cross.lock().unwrap()
     }
 
     /// Peek the active `/goto` destination without draining it (the walker holds it continuously).
@@ -141,7 +295,9 @@ impl CommandState {
 
 #[cfg(test)]
 mod tests {
-    use super::CommandState;
+    use super::{
+        CommandState, NAV_REASON_GOTO_CANCELLED, NAV_REASON_STOPPED, NAV_REASON_ZONE_CROSS_UNHANDLED,
+    };
 
     #[test]
     fn request_goto_sets_target_and_clears_entity() {
@@ -237,7 +393,7 @@ mod tests {
     /// `state: "idle"` (set in-place by `Walker::resolve_goal` on its next tick) paired with the
     /// STALE, non-null coordinates from the cancelled goto.
     ///
-    /// Mutation check: delete the `self.stamp_new_goal("idle", None)` call in `request_cancel_goto`
+    /// Mutation check: delete the `self.stamp_new_goal("idle", …)` call in `request_cancel_goto`
     /// (leave only the `goto_target` clear) and this test goes RED — `s.goal` is still
     /// `Some([10.0, 20.0, 3.0])` after the cancel, the exact stale-`nav_goal` bug #497 reports.
     #[test]
@@ -256,16 +412,82 @@ mod tests {
             "nav_goal must be null after a cancel — a stale non-null goal alongside idle is #497");
     }
 
+    /// **#725 review, B1: a bare `idle` is not an answer.** `docs/http-api.md` tells an agent that
+    /// on `idle` the `nav_reason` says how it got there. That was false: `/stop`, the manual-move
+    /// cancel and the *success* path of a zone crossing all published `idle` with `nav_reason:
+    /// null`, which is byte-identical to "no request has ever been made" — so the endpoint's
+    /// success looked exactly like its failure.
+    ///
+    /// This pins the half of that contract that lives in `CommandState`. The walker's half (the
+    /// retirement reasons and `zoned`) is pinned in `eqoxide-nav`; between them, `idle` +
+    /// `nav_reason: null` is reachable only as the boot default.
+    ///
+    /// **Mutation check:** pass `None` as the reason at either call site → the corresponding case
+    /// goes RED. Give both the SAME reason → the last assertion goes RED, which is the point of
+    /// having two: "you asked me to stop" and "something took the wheel from you" are different
+    /// facts about a goal an agent issued, and collapsing them re-hides one of them.
+    #[test]
+    fn every_idle_command_state_publishes_names_itself_725() {
+        for (label, act, want) in [
+            ("stop",        Box::new(|cs: &CommandState| { cs.request_stop(); })        as Box<dyn Fn(&CommandState)>,
+             NAV_REASON_STOPPED),
+            ("cancel_goto", Box::new(|cs: &CommandState| { cs.request_cancel_goto(); }) as Box<dyn Fn(&CommandState)>,
+             NAV_REASON_GOTO_CANCELLED),
+        ] {
+            let cs = CommandState::default();
+            assert_eq!(cs.nav.nav_state.lock().unwrap().reason, None,
+                "{label}: premise — at boot `idle` genuinely has no reason, which is the ONE case \
+                 a null reason is allowed to mean");
+            cs.request_goto((10.0, 20.0, 3.0));
+            act(&cs);
+
+            let s = cs.nav.nav_state.lock().unwrap();
+            assert_eq!(s.state, "idle", "{label}: still idle");
+            assert_eq!(s.reason.as_deref(), Some(want),
+                "{label}: #725 B1 — an `idle` with no reason is indistinguishable from a client \
+                 that was never asked for anything, so every path to `idle` must name itself");
+        }
+        assert_ne!(NAV_REASON_STOPPED, NAV_REASON_GOTO_CANCELLED,
+            "an explicit /stop and a cancel the caller did not ask for must be distinguishable");
+    }
+
+    /// **#725 review round 3, B3: the liveness count that `drain_zone_cross` asserts on.** The
+    /// assertion there is only as good as this counter, and the counter is the sort of bookkeeping
+    /// that rots silently — a `Drop` that stopped decrementing would make the guard fire on every
+    /// later crossing (loud), but a `take` that stopped incrementing would make it never fire again
+    /// (silent, and exactly the failure mode #725 is about). Both directions are pinned here, and
+    /// `CommandState` being `Clone` is included deliberately: it is cloned per HTTP handler, so a
+    /// clone that did not SHARE the count would read zero while a ticket was alive.
+    #[test]
+    fn a_live_zone_cross_ticket_is_visible_as_outstanding_and_clears_on_drop_725() {
+        let cs = CommandState::default();
+        assert_eq!(cs.zone_cross_outstanding(), 0, "nothing drained yet");
+        cs.request_zone_cross(30);
+        assert_eq!(cs.zone_cross_outstanding(), 0, "queuing is not draining — no obligation yet");
+
+        let clone = cs.clone();
+        {
+            let _t = cs.take_zone_cross().expect("the request was queued");
+            assert_eq!(cs.zone_cross_outstanding(), 1, "a drained ticket is outstanding");
+            assert_eq!(clone.zone_cross_outstanding(), 1,
+                "clones must share the count — `CommandState` is cloned per HTTP handler, and a \
+                 per-clone count would read 0 in the very drain loop that asserts on it");
+        }
+        assert_eq!(cs.zone_cross_outstanding(), 0, "settling the ticket clears the obligation");
+        assert_eq!(clone.zone_cross_outstanding(), 0);
+    }
+
     #[test]
     fn request_then_take_zone_cross_round_trips() {
         let cs = CommandState::default();
-        assert_eq!(cs.take_zone_cross(), None);
+        let taken = |cs: &CommandState| cs.take_zone_cross().map(|t| t.zone_id());
+        assert_eq!(taken(&cs), None);
         cs.request_zone_cross(0);
-        assert_eq!(cs.take_zone_cross(), Some(0));
-        assert_eq!(cs.take_zone_cross(), None, "a drained zone_cross must not re-fire");
+        assert_eq!(taken(&cs), Some(0));
+        assert_eq!(taken(&cs), None, "a drained zone_cross must not re-fire");
 
         cs.request_zone_cross(42);
-        assert_eq!(cs.take_zone_cross(), Some(42));
+        assert_eq!(taken(&cs), Some(42));
     }
 
     /// **#600 review round 3: `/stop` must CANCEL a queued `/zone_cross`.** A cross issued while the
@@ -281,7 +503,103 @@ mod tests {
         let cs = CommandState::default();
         cs.request_zone_cross(30);
         cs.request_stop();
-        assert_eq!(cs.take_zone_cross(), None,
+        assert_eq!(cs.peek_zone_cross(), None,
             "#600: /stop must clear the queued cross so it cannot fire after the load completes");
+    }
+
+    // ───────────────────────── #725: the drained-request obligation ─────────────────────────
+
+    /// **The #725 honesty backstop: a drained `/zone_cross` that publishes NOTHING must still
+    /// leave a state an agent can act on.**
+    ///
+    /// This is the exact shape of the shipped bug, reduced to its essentials: the accept stamps
+    /// `pending`, the drain takes the one-shot request out of its slot, and then — as the old
+    /// "already on the line" branch did — nothing observable is written. The request now exists
+    /// nowhere, so nothing downstream can ever retire the state; measured live, `pending` /
+    /// `nav_reason: null` persisted for 45 s, 48 s and 75 s, which the docs told the agent meant
+    /// "genuinely in flight".
+    ///
+    /// After the fix the ticket notices that neither `goal_id` nor `state`/`reason` moved while it
+    /// was held, and publishes the honest `idle` + `zone_cross_dropped_unhandled` itself.
+    ///
+    /// **Mutation check:** delete the `impl Drop for ZoneCrossTicket` block → the state is still
+    /// `pending` with `reason: None` and this goes RED on the very first assertion.
+    #[test]
+    fn a_drained_zone_cross_that_publishes_nothing_still_retires_the_pending_state() {
+        let cs = CommandState::default();
+        let accepted = cs.request_zone_cross(30);
+        assert_eq!(cs.nav.nav_state.lock().unwrap().state, "pending", "the accept stamps pending");
+
+        // Drain it and answer NOTHING — the old shortcut branch, verbatim in behaviour.
+        drop(cs.take_zone_cross().expect("the request was queued"));
+
+        let s = cs.nav.nav_state.lock().unwrap();
+        assert_ne!(s.state, "pending",
+            "#725: a consumed request must not leave `pending` standing — that is the state the \
+             agent is told means 'in flight', and nothing can ever retire it once the slot is empty");
+        assert_eq!(s.state, "idle");
+        assert_eq!(s.reason.as_deref(), Some(NAV_REASON_ZONE_CROSS_UNHANDLED),
+            "the retirement must SAY WHY — a bare `idle` is indistinguishable from 'ready for work'");
+        assert_eq!(s.goal_id, accepted,
+            "the backstop answers THIS goal; it must not bump the id the POST returned");
+    }
+
+    /// The backstop must be inert when the drain DID answer — otherwise it would overwrite real
+    /// outcomes, which is the same class of lie pointing the other way.
+    ///
+    /// Covers all three ways an answer is published: a fresh goto (bumps `goal_id`), a state change
+    /// (`zone_loading`), and a reason-only change under the same state word.
+    ///
+    /// **Mutation check:** delete the `if moved { return; }` guard in `ZoneCrossTicket::drop` → every
+    /// case here is stomped to `idle`/`zone_cross_dropped_unhandled` and all three go RED.
+    #[test]
+    fn the_backstop_never_overwrites_an_answer_the_drain_did_publish() {
+        // (a) resolved into a concrete walk — `request_goto` bumps the goal id.
+        let cs = CommandState::default();
+        cs.request_zone_cross(30);
+        let t = cs.take_zone_cross().unwrap();
+        let walked = cs.request_goto((10.0, 20.0, 0.0));
+        drop(t);
+        {
+            let s = cs.nav.nav_state.lock().unwrap();
+            assert_eq!((s.state.as_str(), s.goal_id), ("pending", walked),
+                "a resolved cross's own fresh goal must survive the ticket's drop");
+            assert_eq!(s.goal, Some([10.0, 20.0, 0.0]));
+        }
+
+        // (b) refused with a different state word (the #600 load-window `zone_loading`).
+        let cs = CommandState::default();
+        cs.request_zone_cross(30);
+        let t = cs.take_zone_cross().unwrap();
+        { let mut s = cs.nav.nav_state.lock().unwrap(); s.state = "zone_loading".into(); }
+        drop(t);
+        assert_eq!(cs.nav.nav_state.lock().unwrap().state, "zone_loading");
+
+        // (c) answered with a REASON under the same state word — the subtlest case, and why the
+        // ticket compares `reason` and not just `(goal_id, state)`.
+        let cs = CommandState::default();
+        cs.request_zone_cross(30);
+        let t = cs.take_zone_cross().unwrap();
+        { let mut s = cs.nav.nav_state.lock().unwrap(); s.reason = Some("waiting_for_zone_points".into()); }
+        drop(t);
+        let s = cs.nav.nav_state.lock().unwrap();
+        assert_eq!((s.state.as_str(), s.reason.as_deref()), ("pending", Some("waiting_for_zone_points")));
+    }
+
+    /// A concurrent `POST /v1/move/goto` accepted while the cross is being drained must WIN. The
+    /// ticket's backstop is for its own unanswered request, and stamping over a newer goal would be
+    /// #349 in reverse — a read seeing an older request's outcome under the newer goal's id.
+    #[test]
+    fn the_backstop_yields_to_a_newer_goal_accepted_mid_drain() {
+        let cs = CommandState::default();
+        cs.request_zone_cross(30);
+        let t = cs.take_zone_cross().unwrap();
+        let newer = cs.request_goto((5.0, 6.0, 7.0)); // the HTTP thread, mid-drain
+        drop(t);
+        let s = cs.nav.nav_state.lock().unwrap();
+        assert_eq!(s.goal_id, newer);
+        assert_eq!(s.goal, Some([5.0, 6.0, 7.0]),
+            "the newer goal's coordinates must not be cleared by the older request's backstop");
+        assert_eq!(s.reason, None);
     }
 }
