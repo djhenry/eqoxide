@@ -526,7 +526,17 @@ impl Walker {
     ///    trajectory that leaves the spot** while the cursor stays stale. Measured end to end by the
     ///    three `#673 step N of 3` tests in [`crate::steering`], the last of which drives the
     ///    production [`crate::steering::steer_target`] and [`crate::steering::fast_steer_aim`] at
-    ///    `LOOK_AHEAD` on a featureless floor: 0.02 u of net displacement over 200 nav ticks.
+    ///    `LOOK_AHEAD` on a featureless floor: 0.04 u of net displacement over 200 nav ticks
+    ///    (30 s), and never more than 6.6 u from where it landed — less than one 8 u route leg.
+    ///
+    ///    ⚠️ **Correction (#727 round 5).** This line read "0.02 u" from round 2 until now. The
+    ///    figure was not wrong when written, but the harness that produced it was: it dropped 14 of
+    ///    every 15 controller frames on a tick with no fine plan, where the production controller
+    ///    keeps integrating the last `MoveIntent`. The harness was fixed this round (round-4 review
+    ///    finding B-C) and every figure it produces moved; the sibling number in
+    ///    [`crate::steering`]'s test doc was restated to 0.04 u and this one was not swept with it.
+    ///    That miss is the same defect the round-5 review named: correcting by memory instead of by
+    ///    grepping the concept.
     ///
     ///    ⚠️ **Correction (#727 round 4).** This paragraph used to continue "…and the walker
     ///    exhausts its re-paths and stops with `blocked` / `walker_stalled`", citing that sim. The
@@ -536,10 +546,17 @@ impl Walker {
     ///    from the body, and **arrives** (#727 round-3 review, measured). What makes #673 terminal
     ///    rather than a hiccup is the re-plan reproducing the state, which is a property of the
     ///    terrain and not of this mechanism: live on qcat it did, and the walker stopped with
-    ///    `blocked` / `walker_stalled` on 6 of 8 attempts — and that reason code is only emitted once
-    ///    `nav_repaths` has reached 8, so all eight re-plans failed to escape. The cost of a stale
-    ///    cursor is therefore *at least* a wasted backoff-and-re-plan lap per occurrence, and at worst
-    ///    a terminal stop on a route the character could have walked.
+    ///    `blocked` / `walker_stalled` on 6 of 8 attempts. The cost of a stale cursor is therefore
+    ///    *at least* a wasted backoff-and-re-plan lap per occurrence, and at worst a terminal stop on
+    ///    a route the character could have walked.
+    ///
+    ///    ⚠️ **Correction (#727 round 5).** This used to add "and that reason code is only emitted
+    ///    once `nav_repaths` has reached 8, so all eight re-plans failed to escape". The counter does
+    ///    not support that: `nav_repaths` is reset to 0 whenever `gdist < nav_best_gdist -
+    ///    REPATH_RESET_DIST` (200 u) and on `decision.reset_route`, so reaching 8 means *at least
+    ///    eight stall-triggered re-plans since the walker last closed 200 u on the goal* — not eight
+    ///    attempts at one spot. The live record does not place all eight at `[-534.4, 144.4, -6.0]`.
+    ///    The "terminal on real terrain" conclusion stands on the `blocked` outcome itself.
     ///
     /// ## A resync is NOT progress, and the walker says so (#727 round 2)
     ///
@@ -1858,6 +1875,28 @@ mod tests {
         assert_eq!(w.stuck_i, w.path_i,
             "the stall detector's high-water mark must move WITH a resync jump, so the jump reads \
              as zero progress (path_i = {}, stuck_i = {})", w.path_i, w.stuck_i);
+    }
+
+    /// **Every walker test name cited in a doc comment still resolves** (#727 round 5).
+    ///
+    /// Twin of `collision::tests::every_ground_continuous_test_name_cited_in_a_doc_comment_still_exists`
+    /// and `steering::cursor_resync_tests::every_test_name_cited_in_a_doc_comment_still_exists`, and
+    /// it exists for the same reason: round 5 found `resync_cursor`'s rustdoc citing a module that
+    /// never existed and `CURSOR_STALE_DIST`'s citing a test renamed two rounds earlier. Rustdoc
+    /// cannot intra-doc-link a `#[cfg(test)]` item, so a citation to one rots silently. Naming the
+    /// cited tests as `fn()` values makes a rename a COMPILE error.
+    ///
+    /// Add a name here whenever a doc comment — in this module OR in another that cites `walker` by
+    /// name, as `collision::ground_continuous` and `steering::resync_cursor` both do — starts
+    /// citing a test that lives here.
+    #[test]
+    fn every_walker_test_name_cited_in_a_doc_comment_still_exists() {
+        let _cited: &[fn()] = &[
+            // cited by `Walker::advance_cursor`'s rustdoc
+            a_resync_jump_must_not_reset_the_no_progress_clock,
+            // cited by `collision::Collision::ground_continuous` and `steering::resync_cursor`
+            a_resync_must_not_cross_a_chasm_the_character_cannot_walk,
+        ];
     }
 
     // ───────────────────────────── #543: the unverifiable-pad scene ─────────────────────────────
