@@ -42,6 +42,7 @@ use eqoxide_core::physics::{RUN_SPEED, WALK_SPEED};
 /// a real corner cut and never on merely hugging a straight wall — the over-tightening #685 must avoid.
 const STEER_LOS_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS;
 
+
 /// Buffer (beyond the body radius) the committed coarse route is inflated OFF convex wall corners by,
 /// so the walker takes one smooth wider arc with clearance rather than hugging/wiggling the apex
 /// (#685, owner-directed). Modest by design: `radius(1) + buffer(2) = 3u` desired wall clearance, well
@@ -489,7 +490,6 @@ impl Walker {
         self.nav.nav_state.lock().unwrap().state == state
     }
 
-    /// Stop navigating and report WHY, loudly, in every channel an agent can see.
     /// Move the coarse-route cursor `path_i` to the segment the character is actually traversing.
     ///
     /// Two rules, in order:
@@ -498,7 +498,7 @@ impl Walker {
     ///    projection parameter on it reaches 1.0. (3-D, water-nav Slice 3 §8.1: a near-vertical
     ///    dive/ascent leg is not skipped on frame one — the cursor advances past it only once the
     ///    character has actually changed depth. On near-horizontal land the z term vanishes, so this
-    ///    is the same advance as before.)
+    ///    is the same advance as before.) **This rule, and only this rule, means "walked".**
     ///
     /// 2. The **stale-cursor resync** (#673): rule 1 assumes the character travels ALONG the route.
     ///    Physics does not. A fall, or a slide down a ramp, can carry it past several waypoints at
@@ -507,9 +507,37 @@ impl Walker {
     ///    near, [`crate::steering::carrot_along`] measures the carrot's arclength from a projection
     ///    onto that segment, and the carrot lands ON the character: the aim flips every tick, net
     ///    displacement is zero, and the walker exhausts its re-paths and stops with `blocked` /
-    ///    `walker_stalled` while standing on a route it could have walked. `resync_cursor` is
-    ///    forward-only and only adopts a segment the character can reach in a straight line, so it
-    ///    can neither un-count progress nor claim a leg the character never walked.
+    ///    `walker_stalled` while standing on a route it could have walked.
+    ///
+    /// ## A resync is NOT progress, and the walker says so (#727 round 2)
+    ///
+    /// `path_i` has two readers with different needs. STEERING needs it to name the segment the body
+    /// is on — that is what rule 2 restores. The two HONEST-TERMINATION channels
+    /// (`drive_walk`'s stall detector, and #631 channel (a) `advancing_complete_route`) instead need
+    /// it to mean *"the walker got here by walking"*; channel (a)'s comment justifies its verdict
+    /// "by construction" on exactly that premise, which held only while rule 1 was the sole way the
+    /// cursor moved.
+    ///
+    /// Rule 2 breaks that premise, so rather than leave the premise false this raises `stuck_i` to
+    /// the resynced cursor. A resync jump is then invisible to both channels: it can neither reset
+    /// the stall clock nor refresh `nav_progress_at`, and `path_i > stuck_i` can still only arise
+    /// from rule 1. This costs #673's fix nothing — the resync's value is that the walker starts
+    /// MOVING again, and the movement then advances the cursor by rule 1, which does count. It is
+    /// deliberately conservative in the honest direction: in a tick where both rules fire, the
+    /// genuine rule-1 step is swallowed with the jump (under-reporting progress, never over-).
+    ///
+    /// **This is measured, not reasoned.** Delete the `stuck_i` raise below and
+    /// `a_resync_jump_must_not_reset_the_no_progress_clock` goes RED: it drives the real
+    /// [`Walker::drive_walk`] over a route where a resync jump happens, and without the raise the
+    /// walker keeps reporting itself as making progress. The reviewer's question was whether a false
+    /// cursor advance actually reaches a consumer in a way that misleads. It does, and that test is
+    /// the execution-level proof.
+    ///
+    /// The reachability predicate is a conjunction — chest-height LOS (walls) **and** a floor-column
+    /// probe (voids/drops), see [`crate::collision::Collision::ground_continuous`] — because the LOS ray alone cannot
+    /// answer the question rule 2 asks. It is still only a necessary condition; the `stuck_i` raise
+    /// above is what makes a wrong answer harmless to the honesty machinery rather than merely
+    /// unlikely.
     fn advance_cursor(&mut self, p: [f32; 3]) {
         while self.path_i + 2 < self.path.len() {
             let (a, b) = (self.path[self.path_i], self.path[self.path_i + 1]);
@@ -520,12 +548,22 @@ impl Walker {
             };
             if t >= 1.0 { self.path_i += 1; } else { break; }
         }
-        let coll = self.collision.read().unwrap();
-        let clear = |a: [f32; 3], b: [f32; 3]|
-            coll.as_ref().map_or(true, |c| c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE));
-        self.path_i = crate::steering::resync_cursor(&self.path, self.path_i, p, clear);
+        let walked_to = self.path_i;
+        let resynced = {
+            let coll = self.collision.read().unwrap();
+            let reachable = |a: [f32; 3], b: [f32; 3]| coll.as_ref().map_or(true, |c| {
+                c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE) && c.ground_continuous(a, b)
+            });
+            crate::steering::resync_cursor(&self.path, walked_to, p, reachable)
+        };
+        self.path_i = resynced;
+        if resynced > walked_to {
+            // Not walked — not progress. See the doc above.
+            self.stuck_i = self.stuck_i.max(resynced);
+        }
     }
 
+    /// Stop navigating and report WHY, loudly, in every channel an agent can see.
     pub fn stop_nav(&mut self, gs: &mut GameState, state: &str, reason: &str, msg: &str) {
         self.stop_nav_blocked(gs, state, reason, None, None, msg);
     }
@@ -1331,7 +1369,18 @@ impl Walker {
         //       the max seen on this route, while `nav_state == navigating`). A complete route's end
         //       IS the goal, so advancing it is guaranteed goal-ward progress *by construction* — it
         //       cannot be a lap (a lap would be a re-planned PARTIAL, `navigating_partial`, or would
-        //       stop advancing `path_i` and trip `walker_stalled`). This is the fix for the reviewer's
+        //       stop advancing `path_i` and trip `walker_stalled`).
+        //
+        //       THE PREMISE UNDER "by construction" IS THAT `path_i` ONLY ADVANCES BY WALKING, and
+        //       #673's stale-cursor resync would have broken it — a resync can move the cursor
+        //       several segments in one tick without the character walking any of them, and a
+        //       reachability predicate that got it wrong would then reset this very clock with
+        //       progress the walker never made. So `Walker::advance_cursor` raises `stuck_i` with
+        //       any resync jump, which keeps `path_i > stuck_i` reachable ONLY through the monotone
+        //       (walked) advance and leaves this comment's premise true. Read it there before
+        //       changing either side. (#727)
+        //
+        //       This is the fix for the reviewer's
         //       false-fire: a legitimate long go-around across a barrier (river/wall/moat) whose START
         //       is the closest straight-line point to the goal makes NO closest-approach improvement
         //       for most of the trip, yet is plainly getting there — killing it was a confident
@@ -1548,6 +1597,18 @@ mod tests {
     /// As [`walker_with`], but the caller supplies the SHARED `collision` + `zone_assets` handles so a
     /// test can mutate them mid-run through `begin_zone_load`/`finish_zone_load` (the true two-writer
     /// coupling). Returns the walker plus the nav/intent handles.
+    fn walker_with_shared(
+        collision: crate::collision::SharedCollision,
+        zone_assets: crate::zone_assets::ZoneAssetStateShared,
+    ) -> (Walker, eqoxide_ipc::NavSlots, eqoxide_ipc::NavIntent, crate::diagnostics::NavDebugView) {
+        let nav: eqoxide_ipc::NavSlots = Default::default();
+        let world: eqoxide_ipc::WorldSlots = Default::default();
+        let intent: eqoxide_ipc::NavIntent = Default::default();
+        let view: crate::diagnostics::NavDebugView = Default::default();
+        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone(), zone_assets);
+        (w, nav, intent, view)
+    }
+
     /// **#673 wiring guard.** The stale-cursor resync must be part of the walker's cursor advance,
     /// not just a library function nobody calls. Fixture: the coarse route the live client committed
     /// on a FAILING South Qeynos → qcat run (waypoints 44..52 of it), and the position the character
@@ -1589,16 +1650,179 @@ mod tests {
         assert_eq!(w.path_i, 1, "past the waypoint advances exactly one");
     }
 
-    fn walker_with_shared(
-        collision: crate::collision::SharedCollision,
-        zone_assets: crate::zone_assets::ZoneAssetStateShared,
-    ) -> (Walker, eqoxide_ipc::NavSlots, eqoxide_ipc::NavIntent, crate::diagnostics::NavDebugView) {
-        let nav: eqoxide_ipc::NavSlots = Default::default();
-        let world: eqoxide_ipc::WorldSlots = Default::default();
-        let intent: eqoxide_ipc::NavIntent = Default::default();
-        let view: crate::diagnostics::NavDebugView = Default::default();
-        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone(), zone_assets);
-        (w, nav, intent, view)
+    // ─────────────── #727 round 2: the resync under REAL geometry, and its honesty ───────────────
+
+    /// A world with two ledges at z = 0 split by a `gap`-wide chasm whose next floor is 200 u down,
+    /// crossed only by a bridge at the far north (n ∈ [90, 100]). Ledges span n ∈ [-100, 100], the
+    /// west one e ∈ [-60, -gap/2], the east one e ∈ [gap/2, 60].
+    ///
+    /// This is the round-1 reviewer's counterexample to guard 2, rebuilt with the production
+    /// `Collision` so the predicate under test is the production one.
+    fn chasm_zone(gap: f32) -> crate::collision::SharedCollision {
+        // `Collision::build` maps a mesh vertex [x, y, z] to world [east, north, height] = [z, x, y],
+        // so a world slab is written [north, height, east] — wound like `open_plane`'s quad.
+        let slab = |e0: f32, e1: f32, n0: f32, n1: f32, h: f32| {
+            quad(vec![[n0, h, e0], [n1, h, e0], [n1, h, e1], [n0, h, e1]])
+        };
+        let half = gap / 2.0;
+        let terrain = vec![
+            slab(-60.0, -half, -100.0, 100.0, 0.0),   // west ledge
+            slab(half, 60.0, -100.0, 100.0, 0.0),     // east ledge
+            slab(-half, half, 90.0, 100.0, 0.0),      // the only crossing
+            slab(-half, half, -100.0, 90.0, -200.0),  // the chasm floor, 200 u down
+        ];
+        let col = crate::collision::Collision::build(
+            &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+        Arc::new(std::sync::RwLock::new(Some(Arc::new(col))))
+    }
+
+    /// A complete route that runs north up the west ledge, over the far-north bridge, and back south
+    /// down the east ledge. Cursor 2 names the segment `[-40, 0] → [-40, 60]`.
+    const CHASM_ROUTE: [[f32; 3]; 9] = [
+        [-40.0, -80.0, 0.0], [-40.0, -40.0, 0.0], [-40.0, 0.0, 0.0], [-40.0, 60.0, 0.0],
+        [-40.0, 95.0, 0.0], [10.0, 95.0, 0.0], [10.0, 60.0, 0.0], [10.0, 0.0, 0.0],
+        [10.0, -80.0, 0.0],
+    ];
+    /// On the west lip: 34 u off its own segment (stale) but only 16 u from the east-ledge segment
+    /// on the other side of the chasm — which a chest-height ray sees clean through.
+    const CHASM_BODY: [f32; 3] = [-6.0, 0.0, 0.0];
+
+    /// **THE ROUND-1 COUNTEREXAMPLE, PINNED: a hole is not a wall (#727).** `carrot_los_clear` is
+    /// documented in its own rustdoc as a chest-height centre ray chosen to ride ABOVE ground
+    /// undulation and to catch WALLS. Asked "has the character reached that segment" it flies
+    /// straight over a 200 u drop, and on this fixture it moved the cursor **2 → 6** — three
+    /// waypoints and the whole bridge detour, declared walked, over a chasm the character cannot
+    /// cross.
+    ///
+    /// The premise assert below keeps this from passing vacuously: it re-runs the LOS-only predicate
+    /// and requires that it STILL jumps, so if the fixture ever stops reproducing the counterexample
+    /// the test says so instead of going quietly green.
+    ///
+    /// Mutation check (run at authoring time): drop `ground_continuous` from the walker's
+    /// predicate and this goes RED.
+    #[test]
+    fn a_resync_must_not_cross_a_chasm_the_character_cannot_walk() {
+        let col = chasm_zone(10.0);
+        let path: Vec<[f32; 3]> = CHASM_ROUTE.to_vec();
+        // PREMISE: the LOS ray ALONE still declares the far side reachable — otherwise this fixture
+        // is no longer testing anything.
+        let los_only = crate::steering::resync_cursor(&path, 2, CHASM_BODY, |a, b| {
+            col.read().unwrap().as_ref().unwrap().carrot_los_clear(a, b, STEER_LOS_CLEARANCE)
+        });
+        assert!(los_only > 2,
+            "fixture no longer reproduces the round-1 counterexample (LOS-only cursor stayed at {los_only})");
+
+        let (mut w, _nav, _intent, _view) = walker_with(col);
+        w.path = path;
+        w.path_i = 2;
+        w.advance_cursor(CHASM_BODY);
+        assert_eq!(w.path_i, 2,
+            "the cursor crossed a 10 u chasm with the next floor 200 u down and declared the bridge \
+             detour walked — a hole is not a wall; path_i = {}", w.path_i);
+    }
+
+    /// The same guard where the LOS ray genuinely is the load-bearing half: a WALL, not a hole. The
+    /// ground under the hop is continuous (both ledges are one slab), so only `carrot_los_clear`
+    /// can refuse it — and it must, at the real `STEER_LOS_CLEARANCE`.
+    ///
+    /// **This is the test the round-1 review found missing:** every other walker test runs
+    /// `collision = None`, which `carrot_los_clear` documents as vacuously "clear", so the
+    /// `STEER_LOS_CLEARANCE → 0.0` mutant survived. Here the wall sits just PAST the candidate
+    /// point, inside the clearance the ray is extended by, so zeroing the clearance turns this RED.
+    #[test]
+    fn a_resync_must_not_cross_a_wall_and_it_uses_the_real_clearance() {
+        let slab = |e0: f32, e1: f32, n0: f32, n1: f32, h: f32| {
+            quad(vec![[n0, h, e0], [n1, h, e0], [n1, h, e1], [n0, h, e1]])
+        };
+        // A wall is a vertical quad: constant east, spanning north and height.
+        let wall = |e: f32, n0: f32, n1: f32, h0: f32, h1: f32| {
+            quad(vec![[n0, h0, e], [n1, h0, e], [n1, h1, e], [n0, h1, e]])
+        };
+        let terrain = vec![
+            slab(-60.0, 60.0, -100.0, 100.0, 0.0),      // one continuous floor — no hole anywhere
+            wall(0.5, -100.0, 90.0, -1.0, 20.0),        // a wall just PAST the candidate segment
+        ];
+        let col = Arc::new(std::sync::RwLock::new(Some(Arc::new(
+            crate::collision::Collision::build(
+                &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0)))));
+        // The east-side route line sits at e = 0.0, i.e. `STEER_LOS_CLEARANCE` (1.0) PAST the wall:
+        // the ray reaches the candidate cleanly and only its clearance extension crosses the wall.
+        let path: Vec<[f32; 3]> = vec![
+            [-40.0, -80.0, 0.0], [-40.0, -40.0, 0.0], [-40.0, 0.0, 0.0], [-40.0, 60.0, 0.0],
+            [-40.0, 95.0, 0.0], [0.0, 95.0, 0.0], [0.0, 60.0, 0.0], [0.0, 0.0, 0.0],
+            [0.0, -80.0, 0.0],
+        ];
+        let body = [-12.0, 0.0, 0.0]; // 28 u off segment 2, 12 u from segment 7 — through the wall
+        // PREMISE: the ground under the hop really is continuous, so the LOS ray is the only guard
+        // that can refuse this — otherwise the assert below would pass for the wrong reason.
+        assert!(col.read().unwrap().as_ref().unwrap().ground_continuous(body, [0.0, 0.0, 0.0]),
+            "fixture broken: the floor under the hop must be continuous so only the wall can refuse it");
+
+        let (mut w, _nav, _intent, _view) = walker_with(col);
+        w.path = path;
+        w.path_i = 2;
+        w.advance_cursor(body);
+        assert_eq!(w.path_i, 2,
+            "the cursor jumped through a wall; path_i = {}", w.path_i);
+    }
+
+    /// **A RESYNC IS NOT PROGRESS (#727, agent honesty).** #631 channel (a) justifies calling an
+    /// advancing complete route "progress *by construction*" on the premise that `path_i` only moves
+    /// by WALKING. A resync moves it without walking, so a resync must not reach that channel — or
+    /// the no-progress killer's clock is reset by a step the character never took, which is a silent
+    /// wrong answer in the machinery whose whole job is to answer this honestly.
+    ///
+    /// This drives the real `drive_walk` with the no-progress clock fully expired and closest
+    /// approach not improving. The route is COMPLETE and `navigating`, so channel (a) is live; the
+    /// only thing that moves `path_i` this tick is the resync. It must still terminate.
+    ///
+    /// Mutation check (run at authoring time): delete the `stuck_i` raise in `advance_cursor` and
+    /// this goes RED — the walker keeps navigating on progress it did not make.
+    #[test]
+    fn a_resync_jump_must_not_reset_the_no_progress_clock() {
+        let (mut w, nav, _intent, _view) = walker_with(open_plane(600.0));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.world.zone_name = TEST_ZONE.into();
+        // 30 u off its own segment (stale) and 10 u from the next one — a flat open plane, so the
+        // reachability predicate accepts and the resync WILL fire.
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
+        let goal = (500.0, 0.0, 0.0);
+        *nav.goto_target.lock().unwrap() = Some(goal);
+        w.set_nav_state("navigating");
+        w.path = vec![
+            [0.0, -30.0, 0.0], [40.0, -30.0, 0.0], [80.0, -30.0, 0.0],
+            [80.0, -10.0, 0.0], [0.0, -10.0, 0.0], [500.0, 0.0, 0.0],
+        ];
+        w.path_i = 0;
+        w.stuck_i = 0;
+        w.path_goal = Some(goal);
+        w.nav_best_g3d = 10.0; // closest approach has not improved…
+        w.nav_progress_at = std::time::Instant::now() - (NAV_NO_PROGRESS_WINDOW + std::time::Duration::from_secs(1));
+
+        w.drive_walk(&mut gs, goal);
+
+        // PREMISE: the resync really did move the cursor this tick — otherwise nothing is tested.
+        assert!(w.path_i > 0, "fixture no longer resyncs; path_i = {}", w.path_i);
+        assert!(w.nav_state_is("blocked"),
+            "a resync jump reset the no-progress clock: the walker reported progress it did not \
+             make (path_i = {}, stuck_i = {})", w.path_i, w.stuck_i);
+        assert_eq!(nav.nav_state.lock().unwrap().reason.as_deref(), Some("no_progress"));
+    }
+
+    /// The other half of the same rule: a resync must not reset the STALL detector's clock either.
+    /// `stuck_ticks` is reset by `path_i > stuck_i`, so a resync that raised `path_i` without
+    /// raising `stuck_i` would hand the stall detector a fresh clock every time the body drifted.
+    #[test]
+    fn a_resync_jump_leaves_the_stall_detectors_high_water_mark_at_the_new_cursor() {
+        let (mut w, _nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        w.path = CHASM_ROUTE.to_vec();
+        w.path_i = 2;
+        w.stuck_i = 2;
+        w.advance_cursor(CHASM_BODY); // no collision ⇒ predicate vacuously true ⇒ the resync fires
+        assert!(w.path_i > 2, "fixture no longer resyncs; path_i = {}", w.path_i);
+        assert_eq!(w.stuck_i, w.path_i,
+            "the stall detector's high-water mark must move WITH a resync jump, so the jump reads \
+             as zero progress (path_i = {}, stuck_i = {})", w.path_i, w.stuck_i);
     }
 
     // ───────────────────────────── #543: the unverifiable-pad scene ─────────────────────────────

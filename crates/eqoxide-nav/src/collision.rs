@@ -1741,6 +1741,57 @@ impl Collision {
         self.line_clear([from[0], from[1], from[2] + chest], [to[0], to[1], to[2] + chest], radius)
     }
 
+    /// **Is there continuous standable ground under the straight hop `from → to`? (#727.)**
+    ///
+    /// The companion of [`Self::carrot_los_clear`], and it exists because that ray **cannot answer
+    /// this question and was never meant to**: its rustdoc directly above says it is a chest-height
+    /// centre ray, chosen deliberately so the carrot clamp rides ABOVE walkable ground undulation,
+    /// and that what it catches is WALLS. *A hole is not a wall.* Asked "can the character get
+    /// there on foot", a chest ray flies straight over a chasm by construction. Measured: on two
+    /// ledges split by a 10 u gap with the next floor 200 u down, the ray alone let the coarse-route
+    /// cursor jump 2 → 6, declaring an entire bridge detour walked
+    /// (`walker`'s `a_resync_must_not_cross_a_chasm_the_character_cannot_walk`).
+    ///
+    /// So also ask the FLOOR. Probe the column at the fine local tier's 2 u spacing along the hop
+    /// and require a standable surface at every probe, inside the controller's own envelope — one
+    /// sub-segment of walkable slope ([`MAX_WALK_GRADE`]) plus one discrete `step_up` riser, the
+    /// same envelope [`Self::walk_profile_ok`] applies to a planned edge. A void, or a drop steeper
+    /// than that, refuses the hop.
+    ///
+    /// **Necessary, not sufficient — this is NOT a walkability oracle.** It samples a line, so a
+    /// hole narrower than the spacing can fall between probes, and it says nothing about the
+    /// character's WIDTH (that is [`Self::path_clear`]'s question). Callers must bound the hop: at
+    /// ~2 u spacing the cost is one column probe per 2 u of run.
+    ///
+    /// Returns `true` when the zone has no geometry, matching [`Self::carrot_los_clear`]'s own
+    /// documented no-geometry behaviour — a client with no world model must not silently answer
+    /// "unreachable" to everything.
+    pub fn ground_continuous(&self, from: [f32; 3], to: [f32; 3]) -> bool {
+        /// The fine local tier's cell (`steering::LOCAL_CELL`): the finest scale the walker's own
+        /// planner resolves, so a gap missed here is one the fine planner could not express either.
+        const PROBE_SPACING: f32 = 2.0;
+        if !self.has_geometry() { return true; }
+        let step_up = crate::traversability::PLAYER_BODY.step_up;
+        let run = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
+        let n = (run / PROBE_SPACING).ceil().max(1.0) as i32;
+        // One sub-segment of walkable slope plus one discrete step — `walk_profile_ok`'s envelope.
+        let allow = (run / n as f32) * MAX_WALK_GRADE + step_up;
+        let mut prev_z = from[2];
+        for i in 1..=n {
+            let t = i as f32 / n as f32;
+            let e = from[0] + (to[0] - from[0]) * t;
+            let nn = from[1] + (to[1] - from[1]) * t;
+            // Search from one step-up above the last floor down to the envelope's floor;
+            // `ground_below` returns the HIGHEST standable surface in that window (a ramp over a
+            // lower plane wins), so a legitimate slope is followed rather than under-cut.
+            match self.ground_below(e, nn, prev_z + step_up, allow + step_up) {
+                Some(fz) => prev_z = fz,
+                None => return false,
+            }
+        }
+        true
+    }
+
     /// The clearance test A* validates ONE GRID EDGE with, at plan resolution `cell`.
     ///
     /// Sweeps the character's collision volume (`path_clear`) on a FINE grid and casts a centre ray

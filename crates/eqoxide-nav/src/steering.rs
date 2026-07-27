@@ -241,7 +241,43 @@ pub fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
 /// `path_i` is always well inside this, while a character that has been carried onto a *different*
 /// part of the route (a fall, a slide down a ramp) is far outside it. Deliberately generous —
 /// ordinary corner-cutting and server position jitter must never trip a resync.
+///
+/// **The comparison is `<`, not `<=`, and that is measured, not cosmetic (#727 round 2).** The
+/// deadlock #673 describes has an ATTRACTING FIXED POINT sitting exactly ON this boundary: on a
+/// hairpin whose legs are one coarse cell apart the walker converges to a body offset of exactly
+/// 8.0 u and parks there. With `<=` that state is *inside* the guard, so the resync never fires and
+/// the wedge survives — measured 1 of 8 swept starts still wedged after 400 ticks, and 33 of 288 on
+/// the wider 8 u-separation sweep. With `<` it is outside, and both go to zero
+/// (`the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced`,
+/// `the_resync_clears_the_deadlock_above_the_guard_and_is_inert_below_it`).
+///
+/// **What this constant does NOT do — the residual class, stated so nobody re-derives it as a
+/// surprise.** Below the guard the resync is inert by construction, so a route whose legs are
+/// closer together than `CURSOR_STALE_DIST` can still form the #673 cycle. Measured on the same
+/// hairpin sweep (wedged starts / total): 8 u and above → 0 wedged; 7 u → 252/252; 6 u → 216/216;
+/// 4 u → 144/144, i.e. below the guard the fix is not partial, it is absent. (The round-1 review
+/// measured 133/1649 at 8 u against the `<=` code on its own harness; the number above is this
+/// harness's own, not that one re-quoted.) The real deadlock invariant is CARROT COLLAPSE (the
+/// `LOCAL_REACH` carrot landing within ~the body offset of the body while `path_i` is pinned), and
+/// a distance guard is only a proxy for it — wrong on exactly the routes whose legs are closer
+/// together than the guard. Tracked as its own issue; do not read this constant as pinning a
+/// value, it is unpinned over at least [2, 16].
 pub const CURSOR_STALE_DIST: f32 = 8.0;
+
+/// The furthest a resync may reach: a candidate segment whose closest point is further than this
+/// from the character is never adopted, however clear the line to it (#727 round 2).
+///
+/// Two reasons, one honest and one practical.
+///
+/// * **Honest.** The invariant [`resync_cursor`] restores is *"`path_i` names the segment the
+///   character is actually on"*. A segment 60 u away is not a segment the character is on, whatever
+///   a straight-line predicate says about it. 24 u is the walker's own `LOCAL_REACH` — the horizon
+///   its fine planner is re-planned over every tick — so "inside the walker's local horizon" is the
+///   widest reading of "on" that the rest of the walker already commits to.
+/// * **Practical.** It bounds the cost of the geometry predicate, which the round-1 review flagged
+///   as unprofiled: the reachability test now includes column probes at ~2 u spacing, and this caps
+///   them at ~12 per candidate instead of running the length of a 141-waypoint route.
+pub const CURSOR_RESYNC_MAX_HOP: f32 = 24.0;
 
 /// Squared 3-D distance from `p` to segment `a`→`b`, plus the closest point on it.
 fn seg_closest(a: [f32; 3], b: [f32; 3], p: [f32; 3]) -> ([f32; 3], f32) {
@@ -277,22 +313,42 @@ fn seg_closest(a: [f32; 3], b: [f32; 3], p: [f32; 3]) -> ([f32; 3], f32) {
 /// standing on. (Measured in South Qeynos on the qcat aqueduct ramp; reproduced offline from the
 /// captured live route — see `walker_cursor_resync` tests.)
 ///
-/// This restores the cursor's invariant — *`path_i` names the segment the character is actually on* —
-/// with two hard guards that keep it strictly conservative:
+/// This moves the cursor toward its invariant — *`path_i` names the segment the character is
+/// actually on* — under three hard guards that keep it strictly conservative:
 ///
 /// 1. **Forward only.** The scan starts at `start_i`; the cursor can never move backwards, so a lap
 ///    can never be un-counted and the #631/#309 progress channels keep their meaning.
-/// 2. **Only onto a reachable segment.** A later segment is adopted only if `clear(from, closest)`
-///    holds — the same straight-line sweep the carrot's LOS clamp uses — so the cursor can never
-///    jump across a wall and declare a leg of the route walked that the character never walked.
+/// 2. **Inside the local horizon.** A candidate whose closest point is further than
+///    [`CURSOR_RESYNC_MAX_HOP`] from the character is never adopted (see that constant).
+/// 3. **Only onto a segment `reachable(from, closest)` accepts.**
+///
+/// ## What guard 3 does and does not establish — read this before trusting it
+///
+/// `reachable` is a caller-supplied predicate and this function makes **no** claim about
+/// walkability on its own. The walker passes a conjunction of a chest-height line-of-sight ray
+/// (excludes WALLS) and a floor-column probe along the hop (excludes VOIDS and drops steeper than
+/// the controller's own slope+step envelope). That pairing exists because the round-1 review broke
+/// the LOS ray alone with a counterexample and it is worth stating plainly: **a hole is not a
+/// wall.** `Collision::carrot_los_clear` is documented in its own rustdoc as a chest-height centre
+/// ray, chosen deliberately to ride ABOVE ground undulation; asked "has the character reached this
+/// segment" it flies straight over a chasm. Measured: two ledges split by a 10 u gap with the next
+/// floor 200 u down, and the LOS ray alone moved the cursor 2 → 6, declaring an entire bridge
+/// detour walked (`crate::walker`'s `a_resync_must_not_cross_a_chasm_the_character_cannot_walk`).
+///
+/// Even with the floor probe this is a **necessary, not a sufficient** condition: it samples a
+/// line, so a hole narrower than the probe spacing can fall between samples, and it says nothing
+/// about the character's WIDTH. So the honest statement of what a resync means is *"the character
+/// is within [`CURSOR_RESYNC_MAX_HOP`] of this segment, with no wall and no sampled void between"* —
+/// **not** "the character walked this leg". Which is why the walker deliberately does not report a
+/// resync jump as PROGRESS: see `Walker::advance_cursor`.
 ///
 /// A character within [`CURSOR_STALE_DIST`] of its current segment is left alone entirely, so the
-/// normal case is untouched (and the `clear` predicate is not even called).
+/// normal case is untouched (and `reachable` is not even called).
 pub fn resync_cursor(
     path: &[[f32; 3]],
     start_i: usize,
     from: [f32; 3],
-    clear: impl Fn([f32; 3], [f32; 3]) -> bool,
+    reachable: impl Fn([f32; 3], [f32; 3]) -> bool,
 ) -> usize {
     // A cursor needs at least one segment ahead of it to be resyncable; `path_i + 2 <= len` mirrors
     // the walker's own advance bound so a resync can never park the cursor past the last segment.
@@ -300,13 +356,17 @@ pub fn resync_cursor(
         return start_i;
     }
     let (_, d0_sq) = seg_closest(path[start_i], path[start_i + 1], from);
-    if d0_sq <= CURSOR_STALE_DIST * CURSOR_STALE_DIST {
+    // `<`, not `<=`: the deadlock's fixed point sits exactly ON the boundary — see CURSOR_STALE_DIST.
+    if d0_sq < CURSOR_STALE_DIST * CURSOR_STALE_DIST {
         return start_i;
     }
+    let hop_sq = CURSOR_RESYNC_MAX_HOP * CURSOR_RESYNC_MAX_HOP;
     let (mut best_i, mut best_sq) = (start_i, d0_sq);
     for i in (start_i + 1)..(path.len() - 1) {
         let (c, d_sq) = seg_closest(path[i], path[i + 1], from);
-        if d_sq < best_sq && clear(from, c) {
+        // Cheap tests first — the geometry predicate is only consulted for a candidate that both
+        // improves on the current best AND is inside the reach band.
+        if d_sq < best_sq && d_sq <= hop_sq && reachable(from, c) {
             best_i = i;
             best_sq = d_sq;
         }
@@ -647,11 +707,18 @@ mod cursor_resync_tests {
         assert!(!called.get(), "the LOS predicate must not be called for an on-route walker");
     }
 
-    /// **Why the [`CURSOR_STALE_DIST`] guard is load-bearing.** On a tight switchback a walker that
-    /// is genuinely mid-leg can be geometrically CLOSER to a later segment than to its own — here
-    /// 1.5 u from segment 0 but 0.5 u from segment 2, an out-and-back only 2 u wide. A
-    /// nearest-segment snap would skip the entire outbound leg and quietly cut the route; the
-    /// distance guard means a walker still on its segment is never touched.
+    /// **The staleness guard EXISTS — this does not pin its value.** On a tight switchback a walker
+    /// that is genuinely mid-leg can be geometrically CLOSER to a later segment than to its own —
+    /// here 1.5 u from segment 0 but 0.5 u from segment 2, an out-and-back only 2 u wide. A
+    /// nearest-segment snap would skip the entire outbound leg and quietly cut the route; some
+    /// staleness guard means a walker still on its segment is never touched.
+    ///
+    /// ⚠️ **Correction (#727 round 2).** This doc used to open *"Why the `CURSOR_STALE_DIST` guard is
+    /// load-bearing"*, which read as pinning the constant. It does not: the round-1 review mutated
+    /// `CURSOR_STALE_DIST` to both **2.0** and **16.0** and this test survived both (1.5 u is inside
+    /// either guard). What it kills is REMOVING the guard entirely. The constant is unpinned over at
+    /// least [2, 16] and is a judgement call, not a measurement — see the constant's own doc for the
+    /// one thing about it that *is* measured (the `<` boundary).
     #[test]
     fn a_walker_cutting_a_tight_switchback_keeps_its_cursor() {
         let switchback = [[0.0f32, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 2.0, 0.0], [0.0, 2.0, 0.0]];
@@ -676,26 +743,87 @@ mod cursor_resync_tests {
         assert_eq!(resync_cursor(&HAIRPIN, STALE_I, LANDED, |_, _| false), STALE_I);
     }
 
-    /// **Property — the cursor stays a valid segment index for ANY position.** Never backwards,
-    /// never onto the final waypoint (which is not the start of a segment), for a dense sweep of
-    /// positions over and around the fixture, from every starting cursor.
+    /// **THE property test.** For a dense sweep of positions and every starting cursor, the returned
+    /// index must be (i) a valid forward segment start, (ii) never FURTHER from the body than the
+    /// cursor it was handed, and (iii) once the cursor is stale, no admissible forward segment
+    /// (inside [`CURSOR_RESYNC_MAX_HOP`], predicate clear) may be strictly nearer than the one
+    /// chosen. Properties (ii) and (iii) are stated as OUTCOMES and checked against an independent
+    /// scan — not by re-implementing the function.
+    ///
+    /// ⚠️ **Correction (#727 round 2).** The round-1 version of this test asserted only `i >= start_i`
+    /// and `i + 1 < len`. The round-1 review pointed out that **both are true of the identity
+    /// function**, so it passed under the `resync_cursor ≡ identity` mutation and pinned nothing
+    /// about the fix. The retracted assertions are still here — they are correct, just not
+    /// sufficient — with (ii)/(iii) added, plus a premise counter so the sweep cannot go green by
+    /// never exercising a resync at all.
+    ///
+    /// **Mutation-checked by execution (#727 round 2):** with `resync_cursor` replaced by the
+    /// identity function this test now FAILS (it panics on the premise counter at
+    /// `moved = 0`), together with 9 others. The tests that still pass under that mutant are exactly
+    /// the ones whose assertion IS "the cursor does not move" — `resync_never_moves_the_cursor_
+    /// backwards`, `resync_never_jumps_across_blocked_geometry`, `resync_is_inert_on_degenerate_
+    /// paths`, `an_on_route_walker_is_left_alone_...`, `a_walker_cutting_a_tight_switchback_...`,
+    /// `a_resync_must_not_cross_a_wall_...`. An identity mutant satisfying a "must not move" test is
+    /// not a gap in the test; the movement claims are the ones that had to be pinned, and are.
     #[test]
-    fn resync_always_returns_a_valid_forward_segment_index() {
+    fn resync_always_returns_the_nearest_admissible_forward_segment() {
+        let d = |p: [f32; 3], i: usize| seg_closest(HAIRPIN[i], HAIRPIN[i + 1], p).1.sqrt();
+        let (mut swept, mut moved) = (0usize, 0usize);
         for start_i in 0..HAIRPIN.len() - 1 {
             let mut x = -570.0f32;
             while x <= -510.0 {
                 let mut y = 130.0f32;
                 while y <= 175.0 {
                     for z in [-20.0f32, -6.0, 0.0, 12.0] {
-                        let i = resync_cursor(&HAIRPIN, start_i, [x, y, z], always_clear);
+                        let p = [x, y, z];
+                        let i = resync_cursor(&HAIRPIN, start_i, p, always_clear);
+                        swept += 1;
+                        // (i) — retained from round 1.
                         assert!(i >= start_i, "moved backwards: {start_i} -> {i}");
                         assert!(i + 1 < HAIRPIN.len(), "cursor {i} is not a segment start");
+                        if start_i + 2 >= HAIRPIN.len() { continue; }
+                        let d_start = d(p, start_i);
+                        let d_got = d(p, i);
+                        // (ii) a resync may never leave the body further from its own segment.
+                        assert!(d_got <= d_start + 1e-3,
+                            "resync made the cursor WORSE at {p:?}: {start_i}({d_start:.2}u) -> {i}({d_got:.2}u)");
+                        if i != start_i { moved += 1; }
+                        // (iii) with a stale cursor, nothing admissible is nearer than what we took.
+                        if d_start >= CURSOR_STALE_DIST {
+                            for j in (start_i + 1)..(HAIRPIN.len() - 1) {
+                                let dj = d(p, j);
+                                if dj <= CURSOR_RESYNC_MAX_HOP {
+                                    assert!(d_got <= dj + 1e-3,
+                                        "left a nearer admissible segment on the table at {p:?}: took \
+                                         {i} ({d_got:.2}u), segment {j} was {dj:.2}u");
+                                }
+                            }
+                        }
                     }
                     y += 3.0;
                 }
                 x += 3.0;
             }
         }
+        // Premise: the sweep must actually exercise the resync, or (ii)/(iii) are vacuous.
+        assert!(moved > 200, "premise: the sweep resynced only {moved} of {swept} positions");
+    }
+
+    /// **Guard 2 — the reach band.** A segment the predicate says is perfectly clear is still refused
+    /// when it is further than [`CURSOR_RESYNC_MAX_HOP`] away, because "the segment the character is
+    /// actually on" cannot mean one 30 u distant. Here the body is 30 u off segment 0 and 30 u from
+    /// the parallel return leg, with an always-clear predicate: the cursor must not move.
+    #[test]
+    fn resync_refuses_a_segment_beyond_the_reach_band() {
+        let far = [[0.0f32, 0.0, 0.0], [80.0, 0.0, 0.0], [80.0, 60.0, 0.0], [0.0, 60.0, 0.0]];
+        let body = [40.0f32, 30.0, 0.0]; // 30 u from segment 0 and 30 u from segment 2
+        assert!(CURSOR_RESYNC_MAX_HOP < 30.0, "fixture assumes the band is under 30 u");
+        assert_eq!(resync_cursor(&far, 0, body, always_clear), 0,
+            "a segment beyond the reach band must never be adopted, however clear the line to it");
+        // …and the same fixture DOES resync once the far leg is brought inside the band.
+        let near = [[0.0f32, 0.0, 0.0], [80.0, 0.0, 0.0], [80.0, 40.0, 0.0], [0.0, 40.0, 0.0]];
+        assert_eq!(resync_cursor(&near, 0, [40.0, 30.0, 0.0], always_clear), 2,
+            "premise: with the leg inside the band the same geometry must resync");
     }
 
     /// Degenerate inputs must be inert, not panic: an empty path, a single waypoint, and a cursor
@@ -706,6 +834,128 @@ mod cursor_resync_tests {
         assert_eq!(resync_cursor(&[[0.0, 0.0, 0.0]], 0, LANDED, always_clear), 0);
         assert_eq!(resync_cursor(&HAIRPIN, HAIRPIN.len() - 2, LANDED, always_clear), HAIRPIN.len() - 2);
         assert_eq!(resync_cursor(&HAIRPIN, 99, LANDED, always_clear), 99);
+    }
+
+    // ──────────────── #727 round 2: the deadlock sim, and where the fix stops ────────────────
+
+    /// An 8 u-spaced hairpin: out along `y = 0` from `x = 0` to `x = 80`, back along `y = sep`.
+    /// 8 u is the coarse planner's own cell, so this is the shape a real switchback route takes.
+    fn hairpin_route(sep: f32) -> Vec<[f32; 3]> {
+        let mut p: Vec<[f32; 3]> = (0..=10).map(|k| [k as f32 * 8.0, 0.0, 0.0]).collect();
+        p.extend((0..=10).rev().map(|k| [k as f32 * 8.0, sep, 0.0]));
+        p
+    }
+
+    /// Drive the PRODUCTION cursor arithmetic for 400 nav ticks and report whether the body ever
+    /// finishes the route. Each tick: the walker's monotone advance (verbatim), then
+    /// [`resync_cursor`], then [`carrot_along`] at the walker's `LOCAL_REACH`, then one 150 ms step
+    /// at `RUN_SPEED` straight at the carrot.
+    ///
+    /// Deliberately NOT a physics sim: no collision, no controller, so the reachability predicate is
+    /// vacuously clear. That isolates the one thing under test — whether the cursor/carrot loop can
+    /// deadlock — and it is why "wedged" here means *the carrot stopped leading*, nothing else.
+    fn hairpin_wedges(sep: f32, start: [f32; 3], mut cursor: usize) -> bool {
+        const DT: f32 = 0.15;          // the nav tick
+        const LOCAL_REACH: f32 = 24.0; // the walker's own carrot reach
+        let route = hairpin_route(sep);
+        let goal = *route.last().unwrap();
+        let mut p = start;
+        for _ in 0..400 {
+            while cursor + 2 < route.len() {
+                let (a, b) = (route[cursor], route[cursor + 1]);
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                let t = if l2 < 1e-6 { 1.0 } else {
+                    ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / l2
+                };
+                if t >= 1.0 { cursor += 1; } else { break; }
+            }
+            cursor = resync_cursor(&route, cursor, p, always_clear);
+            let carrot = carrot_along(&route, cursor, p, LOCAL_REACH).unwrap_or(goal);
+            let d = [carrot[0] - p[0], carrot[1] - p[1]];
+            let len = (d[0] * d[0] + d[1] * d[1]).sqrt();
+            if len > 1e-4 {
+                let step = (eqoxide_core::physics::RUN_SPEED * DT).min(len);
+                p[0] += d[0] / len * step;
+                p[1] += d[1] / len * step;
+            }
+            if (p[0] - goal[0]).hypot(p[1] - goal[1]) <= 4.0 { return false; }
+        }
+        true
+    }
+
+    /// **MEASURED (#727 round 2): the deadlock's attracting fixed point sits exactly ON the
+    /// [`CURSOR_STALE_DIST`] boundary, and `<=` leaves it inside the guard.**
+    ///
+    /// On the 8 u hairpin the loop converges to a body offset of exactly 8.0 u with the cursor
+    /// pinned, and stays there for the whole run. Swept starts 6.25 … 8.00 u off the outbound leg,
+    /// cursor pinned at the waypoint the body is abreast of:
+    ///
+    /// * with `d0_sq <= CURSOR_STALE_DIST²` (the round-1 code): **1 of 8 wedged** (the 7.00 u start,
+    ///   which converges onto the boundary and is then held there by the `<=`)
+    /// * with `d0_sq <  CURSOR_STALE_DIST²` (this branch): **0 of 8**
+    ///
+    /// Both numbers were measured on this branch by flipping that single token and re-running; the
+    /// same flip takes the 8 u column of
+    /// [`the_resync_clears_the_deadlock_above_the_guard_and_is_inert_below_it`] from 0/288 to
+    /// 33/288. Mutation check: flip it back to `<=` and this test goes RED.
+    #[test]
+    fn the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced() {
+        let mut wedged = Vec::new();
+        for k in 0..8 {
+            let y = 6.25 + 0.25 * k as f32;
+            if hairpin_wedges(8.0, [40.0, y, 0.0], 5) { wedged.push(y); }
+        }
+        assert!(wedged.is_empty(),
+            "the guard-boundary band still deadlocks at offsets {wedged:?} — the fixed point at \
+             exactly CURSOR_STALE_DIST must be OUTSIDE the guard");
+    }
+
+    /// **MEASURED (#727 round 2): where the fix stops.** The resync is inert below
+    /// [`CURSOR_STALE_DIST`] by construction, so a hairpin whose legs are closer together than the
+    /// guard still forms the #673 cycle. This pins both halves of that honestly: **zero** wedged
+    /// starts from 8 u separation (the guard itself) up, and a **total** wipe-out below it.
+    ///
+    /// Measured on this branch (`--nocapture` prints the table):
+    ///
+    /// ```text
+    /// sep  4 u: 144/144 wedged     sep  9 u: 0/324
+    /// sep  6 u: 216/216 wedged     sep 10 u: 0/360
+    /// sep  7 u: 252/252 wedged     sep 12 u: 0/432
+    /// sep  8 u:   0/288
+    /// ```
+    ///
+    /// So the honest claim is *complete at and above the guard, inert below it* — NOT "fixes the
+    /// #673 deadlock". The residual `<= 7 u` class is a real, open defect (a distance guard cannot
+    /// see a cycle whose whole geometry fits inside the guard); it is filed as its own issue and
+    /// described in the PR body, not tolerated here by accident.
+    #[test]
+    fn the_resync_clears_the_deadlock_above_the_guard_and_is_inert_below_it() {
+        let count = |sep: f32| {
+            let (mut wedged, mut total) = (0usize, 0usize);
+            let mut yi = 1;
+            while yi as f32 * 0.25 <= sep {
+                let y = yi as f32 * 0.25;
+                for xi in 1..10 {
+                    let x = xi as f32 * 8.0;
+                    total += 1;
+                    if hairpin_wedges(sep, [x, y, 0.0], xi) { wedged += 1; }
+                }
+                yi += 1;
+            }
+            (wedged, total)
+        };
+        for sep in [4.0f32, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0] {
+            let (w, t) = count(sep);
+            println!("hairpin leg separation {sep:>4} u: wedged {w}/{t}");
+            if sep >= 8.0 {
+                assert_eq!(w, 0, "the fix must be complete at {sep} u separation, got {w}/{t} wedged");
+            }
+        }
+        let (below, _) = count(7.0);
+        assert!(below > 0,
+            "premise: the sub-guard residual must still reproduce, or this test is not measuring \
+             the boundary it claims to");
     }
 }
 

@@ -270,10 +270,26 @@ use eqoxide_ipc::MoveIntent;
     ///   * a COARSE route committed at goal-change (`find_path_ex`), re-planned on stall/backoff;
     ///   * a ~100 Hz FAST-STEER aim: `fast_steer_aim` toward a 5u carrot on `local_path` (cursor
     ///     `local_i`), refreshed EVERY controller frame — the thing that hugs a bend;
-    ///   * a 150 ms NAV TICK that advances `path_i`, RE-POSTS a fresh `find_path_local` from the
-    ///     walker's CURRENT position (1-tick lag, as #399's worker introduces), and runs stall
-    ///     detection → downhill backoff → coarse re-plan (capped at 8 attempts), plus the #246/#379
-    ///     proactive coarse re-plan when the fine tier reports `NoWayThrough`.
+    ///   * a 150 ms NAV TICK that advances `path_i` — monotone advance **then the #673 stale-cursor
+    ///     resync**, both halves of `Walker::advance_cursor` — RE-POSTS a fresh `find_path_local`
+    ///     from the walker's CURRENT position (1-tick lag, as #399's worker introduces), and runs
+    ///     stall detection → downhill backoff → coarse re-plan (capped at 8 attempts), plus the
+    ///     #246/#379 proactive coarse re-plan when the fine tier reports `NoWayThrough`.
+    ///
+    /// ⚠️ **Correction (#727 round 2).** Between #727 round 1 and this commit the claim above was
+    /// FALSE: `Walker::advance_cursor` had gained the stale-cursor resync and this loop had not, so
+    /// the "faithful" scanner modelled a walker that no longer existed and could not have reproduced
+    /// (let alone regressed) the qcat wedge #673 describes. The round-1 review caught it. The resync
+    /// is now called here, through the same public `Collision` predicates production uses.
+    ///
+    /// That change is COMPILE-CHECKED ONLY on the #727 branch: this test is `#[ignore]`d and gated on
+    /// baked zone GLBs at `$ZONE_DIR`, so no before/after corpus number from it appears in the PR.
+    /// The re-runnable #673 measurement lives in `eqoxide-nav`'s own asset-free hairpin sim
+    /// (`steering::cursor_resync_tests`), which is why that sim exists.
+    ///
+    /// **Still not mirrored, stated so the next reader does not assume otherwise:** this loop has no
+    /// #631 route-level no-progress channel, no arrival/follow handling, and no zone-asset gating.
+    /// It is a DRIFT scanner, not a walker replica.
     ///
     /// Then it classifies terminal wedges (never arrived, 8 re-paths spent) by face. THIS is the
     /// number that gates a planner-cell fix — run it before/after PR-B.
@@ -286,8 +302,10 @@ use eqoxide_ipc::MoveIntent;
     #[ignore = "requires baked zone glbs at $ZONE_DIR; the faithful per-tick-recovery drift baseline"]
     fn faithful_walker_drift_corpus() {
 
-        // Production constants, verbatim from navigation.rs (kept in sync — if these drift, the scanner
-        // stops modelling the real walker).
+        // Production constants, COPIED from walker.rs. They are copies, not imports (walker.rs is not
+        // reachable from an integration test), so they can and did drift — see the ⚠️ correction in
+        // this test's doc. Anything with a public home is now CALLED rather than copied
+        // (`steering::resync_cursor`, `Collision::carrot_los_clear`, `Collision::ground_continuous`).
         const RUN_SPEED: f32 = 44.0;
         const LOOK_AHEAD: f32 = 5.0;
         const LOCAL_REACH: f32 = 24.0;
@@ -342,6 +360,22 @@ use eqoxide_ipc::MoveIntent;
                     let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
                     let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1] + (pz - a[2]) * ab[2]) / l2 };
                     if t >= 1.0 { path_i += 1; } else { break; }
+                }
+                // …then the #673 STALE-CURSOR RESYNC, the second half of `Walker::advance_cursor`.
+                // Without this the scanner's cursor rule is the PRE-#727 one, so it cannot reproduce
+                // (or regress-test) the qcat wedge at all — the gap the #727 round-1 review found.
+                // The predicate is the walker's own conjunction, and both halves are the SAME public
+                // `Collision` methods `Walker::advance_cursor` calls; the clearance is the same
+                // `eqoxide_core::physics::PLAYER_RADIUS` that walker.rs's private
+                // `STEER_LOS_CLEARANCE` is defined as. Nothing here is a copy, so nothing can drift.
+                {
+                    let walked_to = path_i;
+                    path_i = eqoxide::nav::steering::resync_cursor(
+                        &coarse, path_i, [px, py, pz],
+                        |a, b| col.carrot_los_clear(a, b, PLAYER_RADIUS) && col.ground_continuous(a, b));
+                    // A resync is NOT progress: raise the stall detector's high-water mark with it,
+                    // exactly as the walker does, so a jump can never reset `stuck_ticks`.
+                    if path_i > walked_to { stuck_i = stuck_i.max(path_i); }
                 }
                 if replan_cd > 0 { replan_cd -= 1; }
 
