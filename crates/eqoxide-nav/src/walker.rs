@@ -930,6 +930,14 @@ impl Walker {
                     // "idle because you came back" is distinguishable from "idle, ready for work".
                     let why = if current == NAV_STATE_DEAD { NAV_REASON_RESPAWNED } else { NAV_REASON_GOAL_DROPPED };
                     self.set_nav_state_because("idle", Some(why));
+                    // KNOWN GAP, deliberately not fixed here (#725 review, N3 → #732).
+                    // `set_nav_state_because` never clears `s.goal`, so this retirement can leave
+                    // the abandoned goal's coordinates standing beside `idle` — the stale-`nav_goal`
+                    // bug. Retiring MORE states (this change added `pending` and `following` to what
+                    // gets retired here) widens the surface it can appear on, so #732 is a slightly
+                    // bigger fix than it was, not a smaller one. It is out of scope on purpose: the
+                    // clear belongs with #732's decision about which transitions own `goal`, and
+                    // guessing at it here would be a second, unreviewed contract change.
                 }
                 // Publish the cleared/terminal state so the snapshot does not keep saying
                 // "arrived"/"navigating" with a route after the goto ended, and REPUBLISH whenever

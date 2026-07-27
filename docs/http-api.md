@@ -456,7 +456,10 @@ matches nothing at all — not even fuzzily — is an honest **404**, never a di
 
 ### `nav_goal_id` and `nav_goal` — goal identity (#349)
 
-`GET /v1/observe/debug` carries two more top-level fields under `player`:
+`GET /v1/observe/debug` carries two more fields. **They are top-level — siblings of `player`, not
+inside it**, unlike `nav_state` and `nav_reason`, which are inside `player`. (Measured on a live
+client while checking the rule below; the previous wording said "top-level fields under `player`",
+which is not a place, and an agent that took it literally would read `null` forever.)
 
 - **`nav_goal_id`** — a monotonically increasing counter, bumped every time a `POST /v1/move/{goto,follow,zone_cross,stop}` is accepted. It is **echoed in each of those POST's response bodies**: as a JSON `"goal_id": N` field on `/goto` and `/follow`, and as `[goal_id=N]` in the text body of `/stop` and `/zone_cross`. `nav_state`/`nav_reason` are the status *of this goal id* — never of an earlier one. **`/zone_cross` is the one route whose returned id does not end up carrying the outcome**: resolving the request into a concrete walk stamps a fresh, higher id (see below).
 - **`nav_goal`** — that goal's `[x, y, z]` (server coords), or `null` for `idle`/`stop`, or for a `zone_cross` whose concrete zone-line destination the walker has not resolved yet.
@@ -480,9 +483,9 @@ latter. The id its 200 returns identifies the *request*; the request has no coor
 zone-line region and issues the walk to it internally, and that walk stamps its own new, higher id —
 under which every subsequent `navigating`/`arrived`/`no_path` for your crossing is published. **The
 id from the `/zone_cross` 200 therefore never carries the outcome; waiting for an exact match waits
-forever.** (Measured over five crossings the resolved id was the accepted id + 1 every time, but do
-not key on `+1`: any concurrent accept from another caller shifts it. `>=` is the property that
-holds.)
+forever.** (On every crossing measured so far — seven — the resolved id was the accepted id
++ 1, but do not key on `+1`: any concurrent accept from another caller shifts it. `>=` is the
+property that holds.)
 
 The reliable way to follow a crossing to completion is not the id at all: poll `player.zone` (and
 `crossing_pending_ms`), and treat `nav_state: "idle"` with `nav_reason: "zoned"` as the success

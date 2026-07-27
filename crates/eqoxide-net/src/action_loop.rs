@@ -1548,6 +1548,13 @@ impl ActionLoop {
     ///
     /// Takes no `stream`: resolution never sends a packet. It walks the character onto the line and
     /// the standing auto-cross does the sending, from physical position.
+    ///
+    /// **Do not change `ticket` to a reference.** The by-value parameter is the whole guarantee: it
+    /// is what makes "settle the ticket after the auto-cross" fail to compile rather than merely be
+    /// discouraged. Measured: as a one-line statement move it is now `E0308`; as a deliberate
+    /// signature change plus a late `drop` it still passes the entire suite, and no test catches it
+    /// (see `a_cross_requested_from_inside_the_region_walks_and_crosses_in_one_tick_725` for why a
+    /// test cannot). This sentence is the only thing standing between that refactor and the bug.
     fn resolve_zone_cross(&mut self, ticket: eqoxide_command::ZoneCrossTicket, gs: &mut GameState) {
         let want_zone = ticket.zone_id();
         // #600 — THE ONE DECISION FUNCTION, at the THIRD world-answering consumer. The resolution
@@ -3967,10 +3974,16 @@ mod tests {
     ///    stamp `idle`/`zone_cross_dropped_unhandled` over a crossing that is genuinely in flight.
     ///    It cannot, because `resolve_zone_cross` owns the ticket and has returned by then.
     ///
-    /// **Mutation check:** move the ticket's settlement after the auto-cross — which now requires
-    /// changing `resolve_zone_cross`'s signature to borrow rather than own, since the ticket is not
-    /// otherwise in scope down there. That is the point: the previous shape lost this to a
-    /// one-line statement move that the whole suite passed.
+    /// **Mutation check, and the honest limit of it.** Moving the ticket's settlement past the
+    /// auto-cross as a one-line statement move — the mutation the previous shape lost — no longer
+    /// compiles (`E0308`), because the ticket is owned by `resolve_zone_cross` and is not in scope
+    /// down there. **Measured, and not caught:** doing it as a deliberate two-part refactor
+    /// (signature changed to `&ZoneCrossTicket`, plus a late `drop`) leaves this test and the whole
+    /// `eqoxide-net` suite GREEN. I could not construct one that catches it: it would need a
+    /// resolution arm that publishes nothing, which is exactly what the ticket exists to make
+    /// impossible, and both orderings leave the same FINAL state (the auto-cross's own publish is
+    /// last either way). So the accidental case is prevented by the type and the deliberate case
+    /// rests on this comment and the one on `resolve_zone_cross` — stated rather than implied.
     #[tokio::test]
     async fn a_cross_requested_from_inside_the_region_walks_and_crosses_in_one_tick_725() {
         use eqoxide_nav::zone_assets;
