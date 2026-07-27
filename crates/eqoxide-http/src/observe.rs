@@ -680,10 +680,13 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                            `region_index` is the LAST region tried, not necessarily the only one — \
                            the allowance is per continuous stand, so a stand spanning several \
                            regions shares it. To retry, walk OFF every zone-line region and back on \
-                           (that clears the tally), or use another exit — see \
-                           GET /v1/observe/zone_exits. NOTE: the tally is only cleared by the \
-                           standing probe, which runs once per 10s auto-cross cooldown, so this can \
-                           persist for up to one cooldown after you step off.",
+                           (that clears the tally on the first tick the client sees you off every \
+                           region — roughly 100x/second, not once per cooldown, see #713 B2), or \
+                           use another exit — see GET /v1/observe/zone_exits. Note the crossing \
+                           itself is still rate-limited to one attempt per ~10s cooldown, so \
+                           stepping back on does not fire instantly. Re-POSTing \
+                           /v1/move/zone_cross does NOT clear this: only stepping off every \
+                           zone-line region, or zoning, does.",
             }));
         let best_effort = gs.zone_cross_plan
             .filter(|p| p.resolution.is_best_effort())
@@ -698,8 +701,12 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                            zone you asked for. Read player.zone after arriving to find out where \
                            you actually went, and note it is PROVISIONAL for a moment \
                            (player.position_provisional). Describes the MOST RECENT zone_cross \
-                           resolution in this zone — not necessarily one still in flight; it is \
-                           cleared by the next resolution and by zoning.",
+                           resolution in this zone — NOT necessarily one still in flight. It is \
+                           cleared only by the next /v1/move/zone_cross resolution and by zoning; \
+                           nothing retires it when the walk arrives, is blocked, or is stopped, so \
+                           it CAN be non-null at the same time as zone_cross_stopped (#713 review \
+                           round 2, B1 — measured). Do not read it as 'a crossing is in progress': \
+                           read nav_state for that.",
             }));
         (stopped, best_effort)
     };
@@ -1723,8 +1730,16 @@ async fn get_zone_entrances(State(s): State<HttpState>) -> Response {
 /// `iterator`). Advertised entrances with no WLD region are omitted. Empty when the zone has no
 /// region map (no `.wtr` / v1 map).
 ///
-/// `gated` (#713 item 3) is `true` when this exit **cannot be auto-crossed from where you are
-/// standing** — see the comment where it is computed.
+/// `gated` (#713 item 3) is `true` when this exit's destination is unadvertised **and** this ZONE's
+/// #679/#683 unresolved-cross gate refuses server-resolved crossings. It is a **zone-level** verdict:
+/// **the player's position is not an input** (see the comment where it is computed), so it does not
+/// mean "cannot be crossed from where you are standing" — an earlier revision of this sentence said
+/// that, and it described a field that does not exist (#713 review round 2, B3).
+///
+/// `gated: false` is therefore **not a promise the auto-cross will fire** when you stand there. The
+/// #713 attempt bound is stand-scoped and this field never consults it, so once the bound has been
+/// reached, standing on a `gated: false` exit does not cross either. Cross-check `zone_cross_stopped`
+/// on `/v1/observe/debug` before concluding that a non-crossing exit is a data problem.
 ///
 /// **503 `zone_assets_not_ready` while the zone's assets are still loading (#579)** — the exits come
 /// out of the collision grid, so before it is built this returned a confident `[]`, i.e. "this zone
@@ -1766,11 +1781,15 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Response {
     // assets are ready, which lags a zone change by seconds — but that is an argument about
     // likelihood, not an impossibility proof, so it is disclosed rather than claimed closed.
     let zone_points = s.world.zone_points.lock().unwrap().clone();
-    let dest_of: std::collections::HashMap<i32, u16> = zone_points
-        .iter()
-        .filter(|zp| zp.zone_id != 0)
-        .map(|zp| (zp.iterator as i32, zp.zone_id))
-        .collect();
+    // FIRST advertised entry wins per index, matching `ActionLoop::resolve_cross_destination`'s
+    // `.find()` over the same filtered list (#713 review round 2, N1). A `.collect()` into a
+    // `HashMap` takes the LAST, so where a zone advertises two points under one iterator the
+    // reported `zone_id` named a destination the client would not actually take. `gated` never
+    // depended on which one won (it only asks `is_none()`), but the `zone_id` printed beside it did.
+    let mut dest_of: std::collections::HashMap<i32, u16> = std::collections::HashMap::new();
+    for zp in zone_points.iter().filter(|zp| zp.zone_id != 0) {
+        dest_of.entry(zp.iterator as i32).or_insert(zp.zone_id);
+    }
     let unresolved_gated = eqoxide_core::zone_cross::classify_unresolved_cross(
         &zone_points, s.game_state.load().world.zone_id,
     ) == eqoxide_core::zone_cross::UnresolvedCross::Ignore;
@@ -4012,6 +4031,32 @@ mod zone_cross_observables_713 {
             assert_eq!(exit["zone_id"].is_null(), !advertised_dest,
                 "{label}: the pre-existing honest-unknown destination is unchanged");
         }
+    }
+
+    /// **#713 review round 2, N1: when a zone advertises TWO points under one iterator, the
+    /// `zone_id` reported beside `gated` must name the one the client would actually take.**
+    ///
+    /// `zone_exits` built its index→destination map with `.collect()` into a `HashMap`, which keeps
+    /// the LAST duplicate; the net thread's `ActionLoop::resolve_cross_destination` uses `.find()`,
+    /// which takes the FIRST. `gated` was never affected (it only asks `is_none()`), but the
+    /// destination printed next to it could name a zone the client would not go to — a confident
+    /// wrong answer with no way for the agent to check it. Both sides now take the first match.
+    ///
+    /// **Mutation check:** restore the `.collect()` (or make the loop overwrite instead of
+    /// `or_insert`) → this goes RED.
+    #[tokio::test]
+    async fn duplicate_advertised_indices_report_the_destination_the_client_would_take_713() {
+        // Two adverts under the SAME iterator as the baked region. `resolve_cross_destination`
+        // takes the first (`OTHER`); the observable must not disagree with it.
+        let s = exits_state(vec![zp(IDX as u32, OTHER), zp(IDX as u32, OTHER + 1)]);
+        let (code, j) = get(s, "/zone_exits").await;
+        assert_eq!(code, StatusCode::OK);
+        let exit = j.as_array().unwrap().iter().find(|e| e["index"] == IDX)
+            .unwrap_or_else(|| panic!("the fixture bakes exactly one exit: {j}"));
+        assert_eq!(exit["zone_id"], OTHER,
+            "the reported destination must be the FIRST advertised match — the one \
+             `resolve_cross_destination`'s `.find()` picks. Reporting the last one names a zone the \
+             client would never take us to: {j}");
     }
 
     /// **#713 item 1: after the bound is hit, an agent polling the client sees a TERMINAL state —

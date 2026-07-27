@@ -98,9 +98,11 @@ pub fn classify_unresolved_cross(zone_points: &[ZonePoint], current_zone_id: u16
 ///   events at three per continuous stand — roughly a 20 s window for a transient to clear —
 ///   instead of the unbounded stream F3 reported.
 /// * A too-low bound is CHEAP to recover from, which argues for the small end: the tally is cleared
-///   when the standing probe finds the character off every zone-line region, so stepping off the
-///   line and back on re-arms it. A too-HIGH bound is not recoverable — it is just more anomaly
-///   events.
+///   on the FIRST tick the standing probe finds the character off every zone-line region, so
+///   stepping off the line and back on re-arms it. (That probe deliberately runs OUTSIDE the
+///   auto-cross cooldown. While it ran inside it, this whole argument was unsound — the recovery
+///   the small bound is justified by did not actually work; #713 review round 2, B2.) A too-HIGH
+///   bound is not recoverable — it is just more anomaly events.
 pub const MAX_CROSS_ATTEMPTS: u32 = 3;
 
 /// Auto-cross attempts made during ONE continuous stand on zone-line geometry that did not result

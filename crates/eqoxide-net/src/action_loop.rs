@@ -1455,21 +1455,59 @@ impl ActionLoop {
                 "#725 B3: a drained zone_cross ticket is still alive at the standing auto-cross — \
                  resolve_zone_cross must OWN it so the obligation is settled before this point");
             const ZONE_CROSS_COOLDOWN_MS: u128 = 10000; // 10 seconds
+            // Probe the STANDING CAPSULE SPAN, not the feet point. A DRNTP trigger volume whose
+            // lower face floats just above the walkable floor (the qeynos2 KoT waterfall, #266:
+            // lower face ≈0.4u over the flat vault floor) sits ABOVE a resting character's feet,
+            // so a feet-only `zone_line_at([x,y,player_z])` never fired while standing on the
+            // disclosed footprint — only a jump crossed. `zone_line_at_standing` sweeps
+            // [feet, feet+height] so the body occupying the trigger fires the crossing, matching
+            // the footprint validator (`teleport_pad_source`, which validates at feet+1). This is
+            // purely the physical auto-cross from the character's real position — it does NOT
+            // auto-route the walker onto the pad (that gate, TRUST_ADVERTISED_SAME_ZONE_CROSSINGS,
+            // stays false); it only makes an agent-driven crossing actually fire (#266).
+            //
+            // **#713 review round 2, B2 — this probe runs EVERY TICK, deliberately OUTSIDE both the
+            // cooldown and the dead guard below.** It used to sit inside them, which meant the
+            // "have I left every zone-line region?" question — the one the client TELLS the agent to
+            // answer by stepping off the line — was only asked once per 10 s cooldown, and the
+            // bound-reaching attempt itself stamps that cooldown (`cross_unresolved`, below), so the
+            // probe was dormant for the entire window right after the client said "step off and back
+            // on to try again". A walk-off/walk-on shorter than the cooldown was sampled ON the line
+            // at both ends and cleared NOTHING — the documented recovery did nothing at all, and the
+            // agent had no way to tell "you did it wrong" from "it didn't work". That is the
+            // agent-honesty failure mode (a confident false statement about the client's own
+            // recoverability), so the fix is to make the sentence TRUE rather than to hedge it.
+            //
+            // It also un-gates the re-arm from `is_player_dead`: a corpse that is off every zone line
+            // has ended its stand like anyone else, and leaving a dead character permanently blocked
+            // was an accident of where the reset sat, not a decision.
+            //
+            // This does NOT re-open the refire storm the bound exists to close. Every path that
+            // SENDS is still inside the cooldown guard AND still behind `blocks()`; the only thing
+            // hoisted is an observation plus the two resets it licenses, and those fire only when the
+            // character is physically off every zone-line region — which never happens during the
+            // continuous stand the bound is stated over. Cost: one BSP leaf descent per ~1 u of body
+            // height per net tick (~100 Hz), against a `RwLock` read — the same query the block
+            // already made, just no longer rate-limited by an unrelated packet cooldown.
+            //
+            // The `eqoxide-core` property test (`auto_cross_attempts_are_bounded_per_stand_713`)
+            // already modelled it this way — its `Tick::Off` arm clears the tally on EVERY off tick.
+            // The model was right and the code was not; before this the two disagreed.
+            let index = self.collision.read().unwrap().as_ref()
+                .and_then(|c| c.zone_line_at_standing([gs.player_x, gs.player_y, gs.player_z]));
+            if index.is_none() {
+                // Off every zone-line region — re-arm the one-shot gated-refusal report so the
+                // NEXT time the character stands on a gated line it is told again (#683 F1), and
+                // re-arm the #713 attempt bound: the stand it counts has ended, so a character
+                // that walks away and comes back gets its full allowance again. This is the
+                // intended escape hatch from a bound that turned out to be too low, and it is
+                // why a small bound is the safe direction (see `MAX_CROSS_ATTEMPTS`).
+                self.gated_cross_reported = None;
+                gs.zone_cross_attempts = None;
+            }
             // A dead corpse standing in a zone-line region must NOT auto-zone (#238) — this fires purely
             // from physical position, so a character killed right at a boundary would cross while dead.
             if !gs.is_player_dead() && self.last_zone_cross.elapsed().as_millis() > ZONE_CROSS_COOLDOWN_MS {
-                // Probe the STANDING CAPSULE SPAN, not the feet point. A DRNTP trigger volume whose
-                // lower face floats just above the walkable floor (the qeynos2 KoT waterfall, #266:
-                // lower face ≈0.4u over the flat vault floor) sits ABOVE a resting character's feet,
-                // so a feet-only `zone_line_at([x,y,player_z])` never fired while standing on the
-                // disclosed footprint — only a jump crossed. `zone_line_at_standing` sweeps
-                // [feet, feet+height] so the body occupying the trigger fires the crossing, matching
-                // the footprint validator (`teleport_pad_source`, which validates at feet+1). This is
-                // purely the physical auto-cross from the character's real position — it does NOT
-                // auto-route the walker onto the pad (that gate, TRUST_ADVERTISED_SAME_ZONE_CROSSINGS,
-                // stays false); it only makes an agent-driven crossing actually fire (#266).
-                let index = self.collision.read().unwrap().as_ref()
-                    .and_then(|c| c.zone_line_at_standing([gs.player_x, gs.player_y, gs.player_z]));
                 if let Some(index) = index {
                     // #713 item 1 (the #683 review's F3) — THE BOUND. A character left standing in a
                     // region the server refuses to zone used to re-request every cooldown for as long
@@ -1526,15 +1564,6 @@ impl ActionLoop {
                             }
                         }
                     }
-                } else {
-                    // Off every zone-line region — re-arm the one-shot gated-refusal report so the
-                    // NEXT time the character stands on a gated line it is told again (#683 F1), and
-                    // re-arm the #713 attempt bound: the stand it counts has ended, so a character
-                    // that walks away and comes back gets its full allowance again. This is the
-                    // intended escape hatch from a bound that turned out to be too low, and it is
-                    // why a small bound is the safe direction (see `MAX_CROSS_ATTEMPTS`).
-                    self.gated_cross_reported = None;
-                    gs.zone_cross_attempts = None;
                 }
             }
         }
@@ -3985,15 +4014,18 @@ mod tests {
     /// (`auto_cross_attempts_are_bounded_per_stand_713`, over all 9841 tick sequences). THIS test is
     /// the specific-regression example: it drives the real auto-cross with a real collision grid and
     /// a real DRNTP region and pins the four things the property cannot see — that the packets stop,
-    /// that the message log says they stopped, that `GameState` carries the terminal fact for the
-    /// HTTP layer to publish, and that walking off the line re-arms it.
+    /// that the message log says they stopped, and that `GameState` carries the terminal fact for
+    /// the HTTP layer to publish. Walking off the line to re-arm is pinned by
+    /// `the_escape_hatch_works_on_the_tick_you_step_off_713` instead — see there for why it cannot
+    /// live under this test's cooldown-rewinding fixture.
     ///
     /// **Mutation checks** (each reverts one part of the #713 change):
     /// * delete the `blocks()` guard in `drain_zone_cross` → the attempt-count assertion goes RED
     ///   (crossings keep firing every tick);
     /// * delete the `gs.log_msg("zone", "Stopped trying …")` → the "told once" assertion goes RED;
-    /// * delete `gs.zone_cross_attempts = None` from the off-region `else` branch → the re-arm
-    ///   assertion goes RED (a character that walks away and comes back can never cross again);
+    /// * delete `gs.zone_cross_attempts = None` from the off-region branch → RED in
+    ///   `the_escape_hatch_works_on_the_tick_you_step_off_713`, not here (a character that walks
+    ///   away and comes back can never cross again);
     /// * count attempts in the `Ignore`/same-zone arms too (i.e. make `cross_unresolved` return
     ///   `true` unconditionally) → nothing here goes red, which is why the gated case is pinned by
     ///   `cross_unresolved`'s own return value rather than by this test alone.
@@ -4051,18 +4083,178 @@ mod tests {
                                     publishes as zone_cross_stopped");
         assert_eq!(tally.count(), MAX_CROSS_ATTEMPTS);
         assert_eq!(tally.last_index(), IDX);
+        // The re-arm (walking off the line) moved to
+        // `the_escape_hatch_works_on_the_tick_you_step_off_713`. It is not a tail of this test any
+        // more because the fixture THIS test needs — a cooldown rewound before every tick, so the
+        // bound rather than the cooldown is what stops the sends — is exactly the fixture that hid
+        // the round-2 B2 defect: it handed the off-region probe a window the field never gives it.
+    }
 
-        // Walking OFF every zone-line region re-arms it: the bound is per continuous stand, and this
-        // is the documented escape hatch that makes a too-low bound cheap to recover from.
+    /// **#713 review round 2, B2: the escape hatch the client TELLS the agent to use works on the
+    /// tick the agent steps off — not one cooldown later, and not never.**
+    ///
+    /// The defect this pins is an agent-honesty defect, not a retry defect. On reaching the bound
+    /// the client writes, unhedged, "Step off every zone line and back on to try again"
+    /// (message log) and "walk OFF every zone-line region and back on (that clears the tally)"
+    /// (`zone_cross_stopped.detail`). The reset that makes those sentences true used to sit inside
+    /// the 10 s auto-cross cooldown guard — and the bound-reaching attempt STAMPS that cooldown on
+    /// its way out (`cross_unresolved`), so the off-region probe was dormant for the whole window
+    /// immediately after the instruction was issued. An agent that complied promptly saw nothing
+    /// change, and `zone_cross_stopped` still read terminal, so it could not tell "I did it wrong"
+    /// from "it doesn't work". A walk-off/walk-on excursion shorter than the cooldown was sampled
+    /// ON the line at both ends and cleared nothing at all.
+    ///
+    /// **Why this is a separate test from the bound test above.** The bound test rewinds
+    /// `last_zone_cross` before every tick, including before its walk-off drain — a fixture
+    /// PRODUCING the precondition instead of the code REACHING it. It therefore graded the reset
+    /// under a cooldown window the field does not supply, and passed throughout. Here the hostile
+    /// precondition is produced by the client itself (the third attempt stamps the cooldown) and
+    /// then ASSERTED as a premise, and nothing after that line touches `last_zone_cross` until the
+    /// cooldown's own effect is what is being measured.
+    ///
+    /// **Mutation checks, measured (#713 review round 2), not reasoned:**
+    /// * re-guard the off-region reset with the cooldown (`if index.is_none() &&
+    ///   self.last_zone_cross.elapsed() > ZONE_CROSS_COOLDOWN_MS`) — i.e. restore the pre-fix
+    ///   behaviour → RED at the "cleared on the very next tick" assertion. The bound test above
+    ///   stays GREEN under exactly this mutation, which is the whole reason this test exists.
+    /// * delete the cooldown from the SEND guard → RED, but at the "re-arm survives stepping back
+    ///   on" assertion rather than the rate-limit one below it: with no cooldown the tick that steps
+    ///   back onto the line already re-attempts and records a fresh tally. Either way this test
+    ///   cannot be satisfied by deleting the cooldown.
+    #[tokio::test]
+    async fn the_escape_hatch_works_on_the_tick_you_step_off_713() {
+        use eqoxide_core::zone_cross::MAX_CROSS_ATTEMPTS;
+        use eqoxide_nav::zone_assets;
+        const DEST: u16 = 30;
+        const IDX: i32 = 7;
+        const HERE: u16 = 54;
+
+        let (mut al, _nav, _command, collision, za) = shared_nav_action_loop();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        *al.world.zone_points.lock().unwrap() = vec![zp_at(99, DEST, [100.0, 200.0, 0.0])];
+        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
+        ))).collision().unwrap().clone();
+        zone_assets::finish_zone_load(&collision, &za, "testfixture", Some(grid), 1, None);
+
+        let mut gs = GameState::new();
+        gs.world.zone_name = "testfixture".into();
+        gs.world.zone_id = HERE;
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
+        let attempts = |gs: &GameState| gs.messages.iter()
+            .filter(|m| m.text.contains("Crossing zone line (destination resolved by server)")).count();
+
+        // Drive EXACTLY the bound. Rewinding the cooldown before each tick is how a unit test spends
+        // 10 s; the last of these ticks is the bound-reaching attempt, and it stamps
+        // `last_zone_cross` through the real code path. Nothing below rewinds it until the cooldown
+        // is itself the thing under measurement.
+        for _ in 0..MAX_CROSS_ATTEMPTS {
+            al.last_zone_cross = Instant::now() - std::time::Duration::from_secs(60);
+            al.drain_zone_cross(&mut stream, &mut gs);
+        }
+        assert_eq!(attempts(&gs), MAX_CROSS_ATTEMPTS as usize, "premise: the bound was driven by real attempts");
+        assert!(gs.zone_cross_attempts.is_some_and(|t| t.blocks()),
+            "premise: the client must be in the terminal state that emits the 'step off' instruction");
+        // PREMISE PRODUCED BY THE CODE, not by the fixture: the attempt that reached the bound
+        // stamped the auto-cross cooldown, so the client is inside the ~10 s window in which it has
+        // just told the agent to step off. This is precisely the window the bound test's fixture
+        // skipped, and the window in which the escape hatch used to do nothing.
+        assert!(al.last_zone_cross.elapsed() < std::time::Duration::from_millis(10_000),
+            "premise: the bound-reaching attempt itself must have stamped the cooldown — if this \
+             ever stops holding, this test is no longer measuring the field's hostile window");
+
+        // The agent does exactly what it was told. One tick, no time travel.
         gs.player_x = 500.0;
-        al.last_zone_cross = Instant::now() - std::time::Duration::from_secs(60);
         al.drain_zone_cross(&mut stream, &mut gs);
-        assert!(gs.zone_cross_attempts.is_none(), "leaving the region ends the stand and clears the tally");
+        assert!(gs.zone_cross_attempts.is_none(),
+            "#713 B2: stepping off every zone-line region must clear the tally on the very next \
+             tick. While the reset sat inside the cooldown guard this stayed blocking, so the \
+             client's own unhedged instruction ('step off … that clears the tally') was false for \
+             up to 10 s — and false FOREVER for any excursion shorter than one cooldown");
+
+        // ...and back on, still inside the same cooldown. The excursion being shorter than a
+        // cooldown is the point: the probe must have SEEN the off state, not merely have been
+        // handed a chance to look.
         gs.player_x = 0.0;
+        al.drain_zone_cross(&mut stream, &mut gs);
+        assert!(gs.zone_cross_attempts.is_none(),
+            "the re-arm survives stepping back on — a fresh stand starts with a fresh allowance");
+        assert_eq!(attempts(&gs), MAX_CROSS_ATTEMPTS as usize,
+            "but the SEND is still rate-limited by the 10 s cooldown: re-arming the bound must not \
+             turn a walk-off/walk-on into an immediate extra OP_ZoneChange, which is the refire \
+             storm #713 exists to close");
+
+        // Once the cooldown is up, the crossing really is attempted again — the recovery is real,
+        // not merely a cleared counter.
         al.last_zone_cross = Instant::now() - std::time::Duration::from_secs(60);
         al.drain_zone_cross(&mut stream, &mut gs);
         assert_eq!(attempts(&gs), MAX_CROSS_ATTEMPTS as usize + 1,
             "stepping back onto the line must be allowed to try again");
+    }
+
+    /// **#713 review round 2, B1: `zone_cross_best_effort` is NOT a "crossing currently in flight"
+    /// signal — it can be non-null at the very moment `zone_cross_stopped` reads TERMINAL.**
+    ///
+    /// `docs/http-api.md` claimed the marker "always describes the request currently in flight and
+    /// never a stale one". `zone_cross_plan` has three writers and **none of them is a nav-terminal
+    /// path**: nothing retires it when the walk arrives, when it is blocked, or when the #713
+    /// attempt bound fires. The claim was therefore false, and it contradicted the field's own
+    /// `detail` string in the same PR. An agent that believed the doc row would read
+    /// "a crossing is in flight" beside "this is a TERMINAL state, do not wait on it" and wait
+    /// forever. The doc row now states the real clearers (next resolution, and zoning) and says the
+    /// two fields can be non-null together; this test is what makes that statement graded.
+    ///
+    /// It reaches the state through the REAL code path rather than by hand-setting two `GameState`
+    /// fields: one real `/zone_cross` that degrades to the #683 fallback, then real auto-cross ticks
+    /// until the real bound fires.
+    ///
+    /// **If a later change DOES retire the plan on nav termination, this test goes RED — and that is
+    /// the correct red.** It is not defending the current behaviour as desirable; it is defending
+    /// the doc from silently drifting away from it again, in either direction.
+    #[tokio::test]
+    async fn a_best_effort_marker_outlives_the_terminal_stop_713() {
+        use eqoxide_core::zone_cross::MAX_CROSS_ATTEMPTS;
+        use eqoxide_nav::zone_assets;
+        const DEST: u16 = 30;
+        const IDX: i32 = 7;
+        const HERE: u16 = 54;
+
+        let (mut al, _nav, command, collision, za) = shared_nav_action_loop();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        // DEST is advertised, but under an index no baked region carries → the #683 fallback.
+        *al.world.zone_points.lock().unwrap() = vec![zp_at(99, DEST, [100.0, 200.0, 0.0])];
+        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
+        ))).collision().unwrap().clone();
+        zone_assets::finish_zone_load(&collision, &za, "testfixture", Some(grid), 1, None);
+
+        let mut gs = GameState::new();
+        gs.world.zone_name = "testfixture".into();
+        gs.world.zone_id = HERE;
+        // Stand outside the region so the request WALKS (and publishes its plan) rather than being
+        // consumed by the standing auto-cross on the same tick.
+        gs.player_x = 30.0; gs.player_y = 0.0; gs.player_z = 0.0;
+        command.request_zone_cross(DEST);
+        al.drain_zone_cross(&mut stream, &mut gs);
+        assert!(gs.zone_cross_plan.is_some_and(|p| p.resolution.is_best_effort()),
+            "premise: the request must really have degraded to the #683 best-effort fallback");
+
+        // The walk arrives — the character is now standing on that same line — and the auto-cross
+        // runs out its allowance. Every state below is reached by the code, not written by hand.
+        gs.player_x = 0.0;
+        for _ in 0..(MAX_CROSS_ATTEMPTS + 2) {
+            al.last_zone_cross = Instant::now() - std::time::Duration::from_secs(60);
+            al.drain_zone_cross(&mut stream, &mut gs);
+        }
+        assert!(gs.zone_cross_attempts.is_some_and(|t| t.blocks()),
+            "premise: the attempt bound must have fired, so zone_cross_stopped is non-null");
+
+        // MEASURED: both disclosures are live on the SAME snapshot. This is the fact the doc row
+        // denied.
+        assert!(gs.zone_cross_plan.is_some_and(|p| p.resolution.is_best_effort()),
+            "#713 B1: zone_cross_best_effort SURVIVES the terminal stop — nothing retires the plan \
+             on a nav-terminal path. The docs must describe it as 'the most recent resolution in \
+             this zone', never as 'the request currently in flight'");
     }
 
     /// **#713 item 2 (the #683 review's F4): the best-effort degradation is STRUCTURED, not prose.**

@@ -929,10 +929,16 @@ pub struct GameState {
     /// `GET /v1/observe/debug` (the `zone_cross_stopped` disclosure), both through
     /// `CrossAttempts::blocks`, so the gate and its observable cannot disagree.
     ///
-    /// Cleared when the standing probe finds the character off every zone-line region (within one
-    /// auto-cross cooldown of stepping off — that probe only runs once the cooldown elapses, so the
-    /// terminal disclosure can outlive the stand by up to one cooldown), and by
-    /// [`GameState::begin_zone_in`] (region indices are a per-zone namespace).
+    /// Cleared on the FIRST net-thread tick on which the standing probe finds the character off
+    /// every zone-line region, and by [`GameState::begin_zone_in`] (region indices are a per-zone
+    /// namespace).
+    ///
+    /// *(An earlier revision of this doc said the probe only runs once per auto-cross cooldown, so
+    /// the terminal disclosure "can outlive the stand by up to one cooldown". That was true of the
+    /// code and understated it: the attempt that reaches the bound stamps the cooldown itself, so a
+    /// walk-off/walk-on shorter than the cooldown was sampled ON the line at both ends and cleared
+    /// nothing at all — the documented escape hatch did not work. The reset was hoisted out of the
+    /// cooldown guard in the #713 review round 2 (B2); see `ActionLoop::drain_zone_cross`.)*
     pub zone_cross_attempts: Option<crate::zone_cross::CrossAttempts>,
     /// #713 item 2 — what the most recently drained `POST /v1/move/zone_cross` decided to do, and
     /// in particular whether it degraded to the #683 best-effort fallback (walk to a line whose
