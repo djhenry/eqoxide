@@ -18,6 +18,15 @@
 //! (`pub use eqoxide_ui as ui;`), so every existing `crate::ui::…` / `eqoxide::ui::…` call site
 //! (app.rs, main.rs, hud.rs) keeps resolving unchanged.
 
+// #730: `epaint`'s `Stroke::new`/`PathStroke::new` take `width: impl Into<f32>`, which gives no
+// hint that a bare literal is wrong — it infers `f64` and only compiles via the legacy
+// `float_literal_f32_fallback` fallback rustc is phasing out (#723/#729 fixed 23 such sites).
+// Denied here, not workspace-wide: this crate is the only `epaint`/egui-stroke consumer, so the
+// blast radius of `deny` is contained to this one crate. Verified clean under
+// `cargo check -p eqoxide-ui --all-targets --all-features --locked` before adding this (this
+// crate has no [features] of its own, so `--all-features` is a no-op combinatorially, not a gap).
+#![deny(float_literal_f32_fallback)]
+
 pub mod chrome;
 pub mod icons;
 pub mod persist;

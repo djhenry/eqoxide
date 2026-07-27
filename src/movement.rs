@@ -1408,6 +1408,9 @@ mod tests {
     }
 
     #[test]
+    // #730: capitalised on purpose — DRY vs wet is the load-bearing distinction this test pins
+    // (see the "BLAST-RADIUS PIN" comment below); lower-casing it would erase that signal.
+    #[allow(non_snake_case)]
     fn depenetration_still_grounds_a_DRY_body_exactly_as_before() {
         // THE BLAST-RADIUS PIN. The net exists because characters genuinely DO get embedded in
         // geometry; over-narrowing it strands them on land — a new bug in the same family. The same
@@ -1469,6 +1472,9 @@ mod tests {
     }
 
     #[test]
+    // #730: capitalised on purpose — BODY-not-feet is the exact #649 regression this test pins
+    // (a feet-only probe calls a submerged body dry, see the comment below); renaming would blur it.
+    #[allow(non_snake_case)]
     fn the_nets_water_probe_is_the_BODY_not_the_feet() {
         // #649 REVIEW FINDING 5 — the reviewer's own mutation: `body_in_water(col, p)` →
         // `col.in_water(p)` (feet-only) inside the net left the whole suite green. This pins the
