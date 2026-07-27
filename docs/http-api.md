@@ -964,7 +964,10 @@ see.
   ],
   "last_ended": null,
 
-  // …and the same fields as syncs[0], copied verbatim, for callers that only want the primary:
+  // The one aggregate: the largest published_age_ms over EVERY entry above. Absent when idle.
+  "stalest_published_age_ms": 120,
+
+  // …and the same fields as syncs[0], copied verbatim. These describe syncs[0] ALONE:
   "set": "zone/freportw",
   "phase": "downloading",
   "downloading": { /* … */ },
@@ -1086,10 +1089,33 @@ own. A finishing sync therefore cannot blank out a different one that is still r
 direction, whether it started earlier or later. That is why `active: false` means *no asset sync is
 running in this process*, subject to the one startup exclusion below.
 
-`syncs` is ordered **oldest-started first**, and `syncs[0]` — the long-running one an agent is
-waiting on, and the one whose wedge matters — is mirrored onto the top level so a caller that only
-wants "is the load I am waiting on alive?" need not iterate. The mirror is a copy of the same
-encoded object, so the two can never disagree.
+`syncs` is ordered **oldest-started first**, and the fields of `syncs[0]` are mirrored onto the top
+level as the *primary*, for callers that do not want to iterate to find out whether anything is
+running at all. The mirror is a copy of the same encoded object, so the two can never disagree.
+
+**The primary describes one sync — the one `set` names — and nothing else.** Oldest-started is
+chosen because it is *stable*: it does not change identity when a sibling's age or rate changes, so
+a caller polling `set` sees the same sync from poll to poll. It is deliberately **not** chosen as
+"the sync that matters", because the client cannot know which sync the caller is waiting on, and a
+guess dressed as an answer is exactly the failure this endpoint exists to avoid. To follow a
+particular set, find it **by name** in `syncs`.
+
+> ⚠️ **Correction (#726 review, round 2).** This section previously read: *"`syncs[0]` — the
+> long-running one an agent is waiting on, and the one whose wedge matters — is mirrored onto the
+> top level so a caller that only wants 'is the load I am waiting on alive?' need not iterate."*
+> That is retracted. Two claims in it are false. (1) `syncs[0]` is not always the long zone
+> download: a `charmodel/<key>` sync queued during the *previous* zone can still be in flight when
+> the next `zone/<zone>` opens, and is then the older of the two. (2) A healthy primary does **not**
+> mean the process is healthy — a sibling can be wedged for minutes behind it. No field value was
+> ever wrong; the guidance was, and it shipped inside the response's own `semantics` string.
+
+**`stalest_published_age_ms` — the one-field wedge check.** The largest `published_age_ms` over
+**every** live sync. Because it is a maximum, it is large and growing whenever *any* sync is wedged,
+whatever `syncs[0]` is doing, so it is the field to poll when the question is "is this process stuck"
+rather than "how is set X doing". It is taken from the ages already encoded in `syncs` — never
+re-measured — so it always equals one of them exactly. It is **absent, not zero**, when nothing is
+running: a maximum over no samples is not a measurement, and `0` would read as "everything is
+perfectly fresh". Read `active` to tell idle from fresh.
 
 **Startup exclusion.** The `gamedata` and `gameequip` sets are synced during early startup, **before
 this HTTP server binds its port**. They are recorded in the registry like any other sync, but

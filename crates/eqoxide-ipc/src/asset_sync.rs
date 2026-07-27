@@ -326,13 +326,23 @@ pub struct AssetSyncGuard {
 impl AssetSyncGuard {
     /// Starts observing a sync of `set`, publishing [`AssetSyncPhase::Starting`] immediately.
     pub fn begin(shared: &AssetSyncShared, set: &str) -> Self {
+        // The clock is read INSIDE the lock (#726 review round 2, nit 4). `live()` promises
+        // oldest-started order and delivers insertion order; those are the same thing only if no
+        // other thread can insert between our timestamp and our push. Stamping outside the lock left
+        // a microseconds-wide window in which two racing loaders could be listed in the opposite
+        // order to their `started_at`, making the ordering claim approximately rather than exactly
+        // true. Nothing was lost when it happened — both syncs were still listed — but "insertion
+        // order IS start order" is the sentence the ordering contract rests on, so it should be a
+        // fact rather than a near-certainty.
+        let mut slots = lock(shared);
         let now = Instant::now();
-        let id = lock(shared).begin(AssetSyncActivity {
+        let id = slots.begin(AssetSyncActivity {
             set: set.to_string(),
             phase: AssetSyncPhase::Starting,
             started_at: now,
             published_at: now,
         });
+        drop(slots);
         Self { shared: shared.clone(), id }
     }
 
@@ -563,6 +573,25 @@ mod tests {
             Err("sample_too_stale"));
     }
 
+    /// #726 review round 2 — the documented precedence between the two withholding rules. When a
+    /// sample is BOTH under the 100 ms minimum elapsed and older than the staleness bound, the
+    /// reasons are not interchangeable: `phase_too_young` reads as "a rate is coming, wait", and
+    /// telling an agent to keep waiting on a transfer that has moved nothing for five minutes is the
+    /// more harmful of the two answers. The reviewer's mutation M-R6 reordered the checks and the
+    /// whole suite stayed green; nothing pinned a rule the docs state outright.
+    ///
+    /// The case is reachable, not hypothetical: a download enters `Downloading`, publishes its first
+    /// sample before 100 ms of phase elapsed, and then wedges.
+    #[test]
+    fn staleness_outranks_youth_when_a_sample_is_both() {
+        assert_eq!(
+            observed_download_rate(4_096, Duration::from_millis(50), Duration::from_secs(300)),
+            Err("sample_too_stale"),
+            "a sample that is both too young to divide AND five minutes old must report the \
+             staleness — 'wait, a rate is coming' is the wrong thing to tell an agent about a \
+             transfer that has stopped");
+    }
+
     #[test]
     fn the_rate_threshold_is_the_documented_one() {
         // The number is quoted in docs/http-api.md and in the response's own `semantics` string, so
@@ -572,5 +601,19 @@ mod tests {
             MAX_RATE_SAMPLE_AGE).is_ok(), "exactly at the bound is still published");
         assert_eq!(observed_download_rate(1_000_000, Duration::from_secs(1),
             MAX_RATE_SAMPLE_AGE + Duration::from_millis(1)), Err("sample_too_stale"));
+        // #726 review round 2 observed that widening the constant is caught SOLELY by the assert_eq
+        // above, because every other assertion in this test is expressed relative to
+        // MAX_RATE_SAMPLE_AGE and moves with it — a test that pins a value while blind to whether
+        // anything acts on it. These two bounds are ABSOLUTE, so they fail on a widened or narrowed
+        // threshold even if the literal above were updated to match. 400 ms is inside the measured
+        // healthy cadence (worst observed gap 491 ms); 2500 ms is outside any cadence measured.
+        assert!(observed_download_rate(1_000_000, Duration::from_secs(1),
+            Duration::from_millis(400)).is_ok(),
+            "narrowing the threshold under the measured healthy cadence would withhold rates \
+             during a perfectly healthy load");
+        assert_eq!(observed_download_rate(1_000_000, Duration::from_secs(1),
+            Duration::from_millis(2500)), Err("sample_too_stale"),
+            "widening the threshold past ~2 s would republish rates the client has no current \
+             evidence for");
     }
 }

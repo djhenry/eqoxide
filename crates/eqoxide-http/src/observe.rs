@@ -188,8 +188,14 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
          because several loaders run at once (a zone download, its door set, the common set, and \
          on-demand charmodel sets) and a short one can begin and end inside a long one; the \
          top-level set/phase/downloading/published_age_ms/running_ms fields are a copy of syncs[0], \
-         the longest-running one, so a caller that only wants 'is the load I am waiting on alive' \
-         need not iterate. Transfer data appears ONLY inside the `downloading` object, which exists \
+         the OLDEST-STARTED one, and they describe that sync ALONE — `set` names which. syncs[0] is \
+         not necessarily the sync you are waiting on (a charmodel sync begun during the previous \
+         zone can outlive it), and a healthy syncs[0] says nothing about the others, so do NOT read \
+         the top-level fields as the process's health. To follow a particular set, find it by name \
+         in `syncs`. To ask 'is anything wedged' with one field, read \
+         stalest_published_age_ms: the largest published_age_ms over every live sync, so it is \
+         large and growing whenever ANY sync is wedged, whatever syncs[0] is doing. It is absent \
+         when nothing is running. Transfer data appears ONLY inside the `downloading` object, which exists \
          only in that phase, so a rate can never be read for a phase that has none. Inside \
          `downloading`, an ABSENT rate_bytes_per_sec never means zero: `rate_unavailable` says \
          which rule withheld it — phase_too_young (under the producer's 100 ms minimum elapsed, no \
@@ -200,7 +206,8 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
          and it ticks only when a chunk completes — including elapsed_secs, so the phase has \
          actually been running elapsed_secs+published_age_ms/1000. running_ms is measured at read \
          time and keeps moving even while a sync is wedged; a large and GROWING published_age_ms \
-         means wedged, not progressing. last_ended names the most recent sync to LEAVE this list \
+         means THAT sync is wedged, not progressing — for the process, use \
+         stalest_published_age_ms. last_ended names the most recent sync to LEAVE this list \
          and is how 'nothing is syncing now' is told apart from 'nothing has ever synced' — it says \
          ended, NOT succeeded: the client cannot tell a success from a failure or a panic here.";
 
@@ -217,10 +224,36 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
         })),
         "semantics": SEMANTICS,
     });
-    // The PRIMARY sync, mirrored to the top level: `syncs[0]`, the longest-running one. Copied from
+    // The process-wide wedge signal (#726 review round 2, finding 1). Derived from the ages ALREADY
+    // ENCODED in `syncs`, not re-measured, for the same reason the mirror below is a copy: two
+    // `elapsed()` calls on one sample can straddle a threshold, and a top-level age that matched no
+    // entry in its own body would be a response contradicting itself.
+    //
+    // This exists because the mirror is a scalar view of a plural fact. `syncs[0]` is a real sync
+    // and every one of its numbers is true, but a caller who reads only the top level learns
+    // nothing about the others — and the previous wording sent them there for exactly the question
+    // the top level cannot answer. The max is the honest one-field answer: it is large whenever ANY
+    // live sync is wedged, so a caller following it can never be told "healthy" while this process
+    // holds evidence to the contrary. Which sync is stale still requires `syncs`; that is a lookup,
+    // not a false all-clear.
+    //
+    // Absent, not zero, when nothing is running: a max over no samples is not a measurement, and 0
+    // would read as "everything is perfectly fresh".
+    let stalest = syncs_encoded_max_age(&body);
+    if let Some(ms) = stalest {
+        body.as_object_mut().expect("json! object")
+            .insert("stalest_published_age_ms".into(), serde_json::json!(ms));
+    }
+    // The PRIMARY sync, mirrored to the top level: `syncs[0]`, the oldest-STARTED one. Copied from
     // the very same encoded object the array carries — not re-derived — so the two cannot drift.
-    // It is the long zone download in every overlap the client actually produces, which is both the
-    // sync an agent is waiting on and the one whose wedge matters.
+    //
+    // It is deliberately NOT chosen as "the sync that matters", because the client cannot know
+    // which sync the caller is waiting on and a guess dressed as an answer is the defect this
+    // endpoint exists to avoid. Oldest-started is chosen for STABILITY: it does not hop between
+    // syncs from poll to poll, so a caller tracking the common single-sync case sees one identity.
+    // The previous comment here claimed it was "the long zone download in every overlap the client
+    // actually produces"; that universal is false — a `charmodel/<key>` sync begun during the
+    // previous zone can still be live when the next zone load starts, and is then older.
     if let Some(primary) = body["syncs"].as_array().and_then(|a| a.first()).cloned() {
         let (obj, primary) = (body.as_object_mut().expect("json! object"), primary);
         for (k, v) in primary.as_object().expect("sync_json builds an object") {
@@ -228,6 +261,12 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
         }
     }
     body
+}
+
+/// The largest `published_age_ms` among the ALREADY-ENCODED `syncs` entries, or `None` if there are
+/// none. Reads the encoded array rather than the snapshot on purpose — see the call site.
+fn syncs_encoded_max_age(body: &serde_json::Value) -> Option<u64> {
+    body["syncs"].as_array()?.iter().filter_map(|s| s["published_age_ms"].as_u64()).max()
 }
 
 /// One live sync, encoded. Used for BOTH the `syncs` array and the mirrored top-level primary.
@@ -1908,17 +1947,27 @@ mod tests {
              it has: {v}");
         assert!(v.get("downloading").is_none(), "…and no transfer data whatsoever: {v}");
 
-        // A frozen downloading sample claiming TEN MINUTES of phase elapsed, on a call that began
-        // milliseconds ago. The two must not be confused for one another: reporting the producer's
-        // frozen `elapsed` under this name would answer "10 minutes" to "how long has this call
-        // been running?". The gap between the two is wide enough that no scheduling delay closes it.
+        // A frozen downloading sample claiming TEN MINUTES of phase elapsed, published THIRTY
+        // SECONDS ago, on a call that began milliseconds ago. Three durations, all different, and
+        // `running_ms` must be none of the other two: reporting the producer's frozen `elapsed`
+        // would answer "10 minutes", and reporting the SAMPLE's age would answer "30 s" — the
+        // latter being `published_age_ms`, which is right there in the same body.
+        //
+        // The bound below is 5 s, not 60 s. #726 review round 2 found the 60 s version was a
+        // passenger sibling of the one already fixed above: it excluded the 600 s frozen elapsed but
+        // admitted the 30 s sample age, so a mutation swapping `started_at.elapsed()` for
+        // `published_at.elapsed()` — collapsing the exact distinction this field exists to make —
+        // survived it with the whole suite green.
         g.tick_stamped(dl(3, 7, 2_000_000, 600_000), ago(30));
         let v = asset_sync_json_body(&state).await;
         assert_eq!(v["downloading"]["elapsed_secs"], serde_json::json!(600.0),
             "the producer's own frozen measurement, reported verbatim");
-        assert!(v["running_ms"].as_u64().unwrap() < 60_000,
-            "…while running_ms is measured from the call's start at READ time, and must not be \
-             the frozen phase elapsed wearing a different name: {v}");
+        assert!(v["published_age_ms"].as_u64().unwrap() >= 30_000,
+            "…the sample really is 30 s old, which is what makes the next assertion mean \
+             something: {v}");
+        assert!(v["running_ms"].as_u64().unwrap() < 5_000,
+            "…while running_ms is measured from the CALL's start at read time: not the frozen \
+             phase elapsed, and not the sample's age, wearing a different name: {v}");
     }
 
     /// #726 review N5 — an empty list used to be the same answer for "a sync just finished" and
@@ -1984,9 +2033,11 @@ mod tests {
         let sets: Vec<&str> = both["syncs"].as_array().unwrap().iter()
             .map(|s| s["set"].as_str().unwrap()).collect();
         assert_eq!(sets, ["zone/neriakc", "charmodel/hum"],
-            "every sync in flight must be listed, longest-running first: {both}");
+            "every sync in flight must be listed, oldest-started first: {both}");
         assert_eq!(both["set"], serde_json::json!("zone/neriakc"),
-            "…and the mirrored primary is syncs[0], the long download an agent is waiting on: \
+            "…and the mirrored primary is syncs[0], the oldest-started sync — which happens to be \
+             the zone download HERE only because it started first; see \
+             `the_primary_is_not_the_zone_download_when_a_model_sync_outlived_the_last_zone`: \
              {both}");
 
         // The short one ends inside the long one.
@@ -2018,6 +2069,119 @@ mod tests {
              surface, and it must not be erased by an unrelated sync finishing: {v}");
         assert_eq!(v["set"], serde_json::json!("zone/neriakc"));
         assert_eq!(v["phase"], serde_json::json!("starting"));
+    }
+
+    // ── #726 review ROUND 2, finding 1: the primary is one sync, not the process ────────────────
+    //
+    // The registry made every field true of the sync it names. What was still false was the
+    // GUIDANCE — carried in `semantics`, so an agent reads it — that the top-level copy of syncs[0]
+    // answered "is the load I am waiting on alive?" and that a caller "need not iterate". Both of
+    // the sequences below are ones the client really produces, and both are the reviewer's.
+
+    /// The universal claim that syncs[0] is "the long zone download in every overlap the client
+    /// actually produces" is false. The model-sync worker is a long-lived thread with a queue, so a
+    /// `charmodel/<key>` requested during the PREVIOUS zone can still be in flight when the next
+    /// zone load opens `zone/<zone>` — and is then the older of the two.
+    ///
+    /// This test pins the corrected contract rather than a repaired guess: the primary is whichever
+    /// sync started first, stated as such, and a caller who wants a NAMED set looks it up in `syncs`.
+    #[tokio::test]
+    async fn the_primary_is_not_the_zone_download_when_a_model_sync_outlived_the_last_zone() {
+        let state = empty_state();
+        let model = begin(&state, "charmodel/hum"); // queued during the previous zone
+        model.tick(dl(4, 149, 400_000, 900));
+        let zone = begin(&state, "zone/neriakc"); // the load the agent is actually waiting on
+        zone.tick(dl(2, 374, 900_000, 800));
+
+        let v = asset_sync_json_body(&state).await;
+        assert_eq!(v["set"], serde_json::json!("charmodel/hum"),
+            "the primary is the oldest-STARTED sync, which here is the small model set — the \
+             endpoint must not pretend it is the zone download: {v}");
+
+        // …and the route to the sync the caller actually cares about is by NAME, which is why the
+        // list is the contract and the mirror is only a convenience.
+        let by_name: Vec<&str> = v["syncs"].as_array().unwrap().iter()
+            .map(|s| s["set"].as_str().unwrap()).collect();
+        assert_eq!(by_name, ["charmodel/hum", "zone/neriakc"],
+            "every live sync is listed, oldest-started first: {v}");
+    }
+
+    /// The consequence, and the reason this was blocking: a caller following the documented
+    /// one-field wedge check reads the top level, sees a fresh age and a healthy rate, and concludes
+    /// "not wedged" — while a different sync in the same process has published nothing for five
+    /// minutes and the client is holding the evidence.
+    ///
+    /// Sequence: a model sync opens; the zone load's door set opens after it and is what the agent
+    /// is now waiting on; the door set wedges while the model sibling keeps ticking.
+    #[tokio::test]
+    async fn a_healthy_primary_cannot_report_an_all_clear_while_a_sibling_is_wedged() {
+        let state = empty_state();
+        let model = begin(&state, "charmodel/hum");
+        let doors = begin(&state, "zonedoors/neriakc");
+        // The door set published once and then stopped — five minutes ago.
+        doors.tick_stamped(dl(12, 88, 1_200_000, 3_000), ago(300));
+        // The model sibling is perfectly healthy and is the primary, because it started first.
+        model.tick(dl(140, 149, 12_000_000, 13_000));
+
+        let v = asset_sync_json_body(&state).await;
+
+        // Nothing here is a WRONG VALUE — that is the point. The primary really is fresh.
+        assert_eq!(v["set"], serde_json::json!("charmodel/hum"));
+        assert!(v["published_age_ms"].as_u64().unwrap() < 1_000,
+            "the primary genuinely is fresh — no field is lying: {v}");
+        assert!(v["downloading"]["rate_bytes_per_sec"].is_number(),
+            "…and it genuinely does have a current rate: {v}");
+
+        // What must not happen is that a single-field check on this body returns an all-clear.
+        assert!(v["stalest_published_age_ms"].as_u64().unwrap() >= 300_000,
+            "a caller following the documented one-field wedge check must not read 'healthy' \
+             while a sync in this very process has published nothing for five minutes: {v}");
+
+        // And the wedged sibling is fully described where it lives.
+        let doors_entry = v["syncs"].as_array().unwrap().iter()
+            .find(|s| s["set"] == serde_json::json!("zonedoors/neriakc"))
+            .expect("the wedged sync must be listed");
+        assert_eq!(doors_entry["downloading"]["rate_unavailable"],
+            serde_json::json!("sample_too_stale"),
+            "…and its own rate is withheld, as round 1 required: {doors_entry}");
+    }
+
+    /// The aggregate must be a VIEW of the ages in the same body, not a second measurement of the
+    /// same clocks. Two independent `elapsed()` calls can straddle a threshold, and a top-level age
+    /// matching no entry in its own response is a body that contradicts itself.
+    #[tokio::test]
+    async fn the_stalest_age_is_one_of_the_ages_the_body_already_reports() {
+        let state = empty_state();
+        let a = begin(&state, "zone/neriakc");
+        a.tick_stamped(dl(1, 9, 100, 500), ago(42));
+        let b = begin(&state, "common");
+        b.tick(dl(1, 9, 100, 500));
+
+        let v = asset_sync_json_body(&state).await;
+        let ages: Vec<u64> = v["syncs"].as_array().unwrap().iter()
+            .map(|s| s["published_age_ms"].as_u64().unwrap()).collect();
+        let stalest = v["stalest_published_age_ms"].as_u64().unwrap();
+        assert_eq!(Some(stalest), ages.iter().copied().max(),
+            "the stalest age must be the largest age the body itself reports: {v}");
+        assert!(ages.contains(&stalest), "…and must be one of them verbatim: {v}");
+    }
+
+    /// A max over no samples is not a measurement. `0` would read as "everything is perfectly
+    /// fresh", which is the confident-falsehood shape; absence is the honest answer, and `active`
+    /// already explains it.
+    #[tokio::test]
+    async fn the_stalest_age_is_absent_rather_than_zero_when_nothing_is_running() {
+        let state = empty_state();
+        let v = asset_sync_json_body(&state).await;
+        assert_eq!(v["active"], serde_json::json!(false));
+        assert!(v.get("stalest_published_age_ms").is_none(),
+            "an aggregate over an empty list must be absent, not 0: {v}");
+
+        // …and it appears as soon as there is something to aggregate over.
+        let _g = begin(&state, "common");
+        let v = asset_sync_json_body(&state).await;
+        assert!(v["stalest_published_age_ms"].is_u64(),
+            "a live sync always has an age, so the aggregate always exists: {v}");
     }
 
     /// #598 finding 1, at the API BOUNDARY — the honesty contract must hold in the SERIALIZED body,
