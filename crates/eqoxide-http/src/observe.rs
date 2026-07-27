@@ -659,6 +659,50 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // forever. `ready` cannot be published without a terrain mesh count AND a collision grid with
     // geometry (see `ZoneAssetState::ready`), so it always carries its own evidence.
     let zone_assets = zone_assets_json(&s);
+    // #713 items 1 & 2 — the two zone-cross disclosures. Both `null` while there is nothing to say,
+    // like every other disclosure object here. Both are RELAYED from the net thread's `GameState`,
+    // not re-derived: `zone_cross_stopped` reads `CrossAttempts::blocks`, which is the very
+    // predicate the auto-cross gate consults, so "stopped trying" and "says it stopped trying"
+    // cannot disagree.
+    let (zone_cross_stopped, zone_cross_best_effort) = {
+        let gs = s.game_state.load();
+        let stopped = gs.zone_cross_attempts
+            .filter(|t| t.blocks())
+            .map(|t| serde_json::json!({
+                "reason": "cross_attempt_limit",
+                "region_index": t.last_index(),
+                "attempts": t.count(),
+                "detail": "the client sent this many OP_ZoneChange requests without leaving \
+                           zone-line geometry, so it has stopped requesting and will NOT retry on \
+                           its own. This is a TERMINAL state, not a crossing in progress — do not \
+                           wait on it. It is not a claim about why: the server may be refusing, or \
+                           answering nothing at all; the client cannot tell those apart. \
+                           `region_index` is the LAST region tried, not necessarily the only one — \
+                           the allowance is per continuous stand, so a stand spanning several \
+                           regions shares it. To retry, walk OFF every zone-line region and back on \
+                           (that clears the tally), or use another exit — see \
+                           GET /v1/observe/zone_exits. NOTE: the tally is only cleared by the \
+                           standing probe, which runs once per 10s auto-cross cooldown, so this can \
+                           persist for up to one cooldown after you step off.",
+            }));
+        let best_effort = gs.zone_cross_plan
+            .filter(|p| p.resolution.is_best_effort())
+            .map(|p| serde_json::json!({
+                "reason": p.resolution.token(),
+                "requested_zone_id": p.requested_zone_id,
+                "region_index": p.index,
+                "detail": "the zone line this cross is walking to carries no advertised \
+                           destination, so the DESTINATION IS THE SERVER'S TO PICK and the client \
+                           does not know it — including when you named a zone_id in the request. \
+                           The crossing is best effort: it may land you somewhere other than the \
+                           zone you asked for. Read player.zone after arriving to find out where \
+                           you actually went, and note it is PROVISIONAL for a moment \
+                           (player.position_provisional). Describes the MOST RECENT zone_cross \
+                           resolution in this zone — not necessarily one still in flight; it is \
+                           cleared by the next resolution and by zoning.",
+            }));
+        (stopped, best_effort)
+    };
     // #616 (agent-honesty): terminal background-worker failures. `null` while healthy. Before this
     // wiring, a panic in either worker was made honest INTERNALLY (App stopped lying to itself about
     // its own state) but never reached this endpoint — so a driving agent polling here saw nothing
@@ -826,6 +870,18 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // Is this client's model of the CURRENT ZONE actually loaded? Gate every world-shaped
         // conclusion on `zone_assets.state == "ready"` (#579). See the comment where it's built.
         "zone_assets": zone_assets,
+        // #713 item 1 — the auto-cross has STOPPED retrying at a zone-line region (`null` while it
+        // has not). The bound exists because an unbounded refire is a server-side anomaly event
+        // every 10s for as long as the character stands there; this field exists because replacing
+        // an infinite retry with a SILENT stop is worse — an agent would wait forever for a
+        // crossing that will never be attempted again. See where it is built.
+        "zone_cross_stopped": zone_cross_stopped,
+        // #713 item 2 — the last zone_cross resolution DEGRADED to the #683 best-effort fallback:
+        // it is walking to a line whose destination only the server knows. `null` when the last
+        // resolution had an advertised destination (or there has been none since zoning). Nothing
+        // false was ever asserted here — the degradation was simply undetectable, being prose in
+        // the message log. See where it is built.
+        "zone_cross_best_effort": zone_cross_best_effort,
         // Terminal background-worker failures (#616). `null` while healthy — see the comment where
         // these are built, above.
         "common_assets_failed": common_assets_failed,
@@ -1667,6 +1723,9 @@ async fn get_zone_entrances(State(s): State<HttpState>) -> Response {
 /// `iterator`). Advertised entrances with no WLD region are omitted. Empty when the zone has no
 /// region map (no `.wtr` / v1 map).
 ///
+/// `gated` (#713 item 3) is `true` when this exit **cannot be auto-crossed from where you are
+/// standing** — see the comment where it is computed.
+///
 /// **503 `zone_assets_not_ready` while the zone's assets are still loading (#579)** — the exits come
 /// out of the collision grid, so before it is built this returned a confident `[]`, i.e. "this zone
 /// has no exits at all". That is a falsehood an agent cannot detect; an explicit refusal is the
@@ -1684,24 +1743,51 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Response {
     // the "server resolves from position" SENTINEL, not a destination (the same filter
     // `resolve_cross_destination` applies) — dropping them makes such an exit report
     // `"zone_id": null` (destination honestly unknown, #683) instead of a nonexistent "zone 0".
-    let dest_of: std::collections::HashMap<i32, u16> = s
-        .world.zone_points
-        .lock()
-        .unwrap()
+    // #713 item 3 — the UNRESOLVED-EXIT GATE VERDICT, reported rather than re-derived.
+    //
+    // An exit with `zone_id: null` is one whose baked WLD index matches no advertised entrance. The
+    // client can still cross it, by asking the server to resolve the destination from position
+    // (the #683 fallback) — but ONLY when `classify_unresolved_cross` allows it in this zone. Where
+    // it does not, standing on that exit does nothing, and before this the agent learned that from
+    // a message-log line AFTER it had already walked there. `gated: true` says it beforehand.
+    //
+    // This calls the SAME function the net thread's `cross_unresolved` calls, from the crate both
+    // sides depend on — deliberately not a second copy of the rule, because a `gated` flag that
+    // drifted from the gate would be a confident falsehood the agent has no way to check (#713 moved
+    // the function into `eqoxide-core` for exactly this). Nothing here changes what the gate
+    // decides; the same-zone-pad question (#543/#266/#582) is untouched.
+    //
+    // NOT MEASURED (reasoned): the two inputs come from two places — `zone_points` from the IPC
+    // slot the net thread syncs, `zone_id` from the `ArcSwap` GameState snapshot — so a read that
+    // lands between those two publishes can pair one zone's points with the other's id, and the
+    // rule is "any reported verdict computed from inputs sampled at two instants can straddle an
+    // event that changes both". The instance here is a zone change. I did not observe it: the
+    // window is one publish wide and this endpoint already refuses with 503 until the new zone's
+    // assets are ready, which lags a zone change by seconds — but that is an argument about
+    // likelihood, not an impossibility proof, so it is disclosed rather than claimed closed.
+    let zone_points = s.world.zone_points.lock().unwrap().clone();
+    let dest_of: std::collections::HashMap<i32, u16> = zone_points
         .iter()
         .filter(|zp| zp.zone_id != 0)
         .map(|zp| (zp.iterator as i32, zp.zone_id))
         .collect();
+    let unresolved_gated = eqoxide_core::zone_cross::classify_unresolved_cross(
+        &zone_points, s.game_state.load().world.zone_id,
+    ) == eqoxide_core::zone_cross::UnresolvedCross::Ignore;
     let mut exits = Vec::new();
     if let Some(col) = s.shared_collision.read().unwrap().as_ref() {
         for index in col.zone_line_indices() {
             let location = col
                 .find_zone_line_near(Some(index), pos)
                 .map(|(_, p)| serde_json::json!([p[0], p[1], p[2]]));
+            // An exit with a known destination is crossed by `perform_cross`, which never consults
+            // the unresolved gate — so the gate can only ever close a `zone_id: null` exit.
+            let gated = dest_of.get(&index).is_none() && unresolved_gated;
             exits.push(serde_json::json!({
                 "index": index,
                 "zone_id": dest_of.get(&index),
                 "location": location,
+                "gated": gated,
             }));
         }
     }
@@ -3831,5 +3917,168 @@ mod zone_asset_gate_tests {
         let body = String::from_utf8_lossy(&bytes);
         assert!(!body.contains("zone_assets_not_ready"),
             "?allow_pending must bypass the #579 gate, got: {body}");
+    }
+}
+
+/// **#713 — the zone-cross observables at the HTTP boundary.**
+///
+/// These are the agent-facing half of #713's three items. Each pins that a fact the net thread
+/// decided actually REACHES something an agent can poll: the #409 failure mode is a value that is
+/// computed correctly, stored correctly, and published nowhere.
+#[cfg(test)]
+mod zone_cross_observables_713 {
+    use super::*;
+    use crate::testkit::{empty_state, set_gs};
+    use axum::body::Body;
+    use axum::http::Request;
+    use eqoxide_core::game_state::ZonePoint;
+    use eqoxide_core::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
+    use eqoxide_nav::zone_assets::ZoneAssetState;
+    use tower::ServiceExt;
+
+    const FIXTURE_ZONE: &str = "testfixture";
+    /// The baked region index the fixture's DRNTP box carries.
+    const IDX: i32 = 7;
+    const HERE: u16 = 54;
+    const OTHER: u16 = 181;
+
+    fn zp(iterator: u32, zone_id: u16) -> ZonePoint {
+        ZonePoint { iterator, server_x: 1.0, server_y: 2.0, server_z: 3.0, heading: 0.0, zone_id }
+    }
+
+    async fn get(state: HttpState, uri: &str) -> (StatusCode, serde_json::Value) {
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let code = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (code, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// A ready state whose collision grid carries ONE zone-line region (index [`IDX`]), plus the
+    /// advertised entrance list the gate reads.
+    fn exits_state(points: Vec<ZonePoint>) -> HttpState {
+        let s = empty_state();
+        set_gs(&s, |gs| {
+            gs.world.zone_name = FIXTURE_ZONE.to_string();
+            gs.world.zone_id = HERE;
+        });
+        let ready = ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
+        )));
+        *s.shared_collision.write().unwrap() = ready.collision().cloned();
+        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) = ready;
+        *s.world.zone_points.lock().unwrap() = points;
+        s
+    }
+
+    /// **#713 item 3: an exit that CANNOT be auto-crossed says so BEFORE the agent walks there.**
+    ///
+    /// A `zone_id: null` exit in a zone where the #679/#683 gate is closed is inert: standing on it
+    /// does nothing. The only signal used to be a message-log line emitted once the character had
+    /// already arrived — an answer to a question the agent could only ask by making the trip. The
+    /// `gated` flag is that verdict, reported from the SAME function the net thread acts on.
+    ///
+    /// Note what is NOT claimed: `gated: false` is not a promise that crossing will succeed (the
+    /// server still decides), and this changes nothing about what the gate decides.
+    ///
+    /// **Mutation checks:** hardcode `gated: false` → the first two cases go RED; hardcode `true` →
+    /// the other two go RED; drop the `dest_of.get(&index).is_none()` conjunct → the
+    /// `advertised_exit_in_a_gated_zone` case goes RED (an exit with a known destination is crossed
+    /// by `perform_cross`, which never consults this gate).
+    #[tokio::test]
+    async fn a_zone_exit_that_cannot_be_auto_crossed_is_marked_gated_713() {
+        // (label, advertised points, expected `gated` for the region-IDX exit)
+        let cases: Vec<(&str, Vec<ZonePoint>, bool)> = vec![
+            // No server adverts have arrived: every index is unresolved, so the fallback is shut.
+            ("no_adverts_yet", vec![], true),
+            // A same-zone pad is advertised here → the fallback refuses in this zone (#679).
+            ("same_zone_pad_advertised", vec![zp(9, HERE)], true),
+            // Cross-zone adverts only (the qrg shape) → the fallback is open, the exit IS crossable.
+            ("cross_zone_adverts_only", vec![zp(99, OTHER)], false),
+            // The exit's OWN index is advertised → it has a known destination and is crossed by the
+            // resolved path, which never consults the unresolved gate — even though the gate is shut.
+            ("advertised_exit_in_a_gated_zone", vec![zp(IDX as u32, OTHER), zp(5, HERE)], false),
+        ];
+        for (label, points, want_gated) in cases {
+            let advertised_dest = points.iter().any(|p| p.iterator as i32 == IDX);
+            let (code, j) = get(exits_state(points), "/zone_exits").await;
+            assert_eq!(code, StatusCode::OK, "{label}");
+            let exits = j.as_array().unwrap_or_else(|| panic!("{label}: expected an array, got {j}"));
+            let exit = exits.iter().find(|e| e["index"] == IDX)
+                .unwrap_or_else(|| panic!("{label}: the fixture bakes exactly one exit: {j}"));
+            assert_eq!(exit["gated"], want_gated,
+                "{label}: `gated` must let an agent see BEFORE walking there whether this exit can \
+                 be auto-crossed at all");
+            assert_eq!(exit["zone_id"].is_null(), !advertised_dest,
+                "{label}: the pre-existing honest-unknown destination is unchanged");
+        }
+    }
+
+    /// **#713 item 1: after the bound is hit, an agent polling the client sees a TERMINAL state —
+    /// not silence.** Silence would be worse than the retry storm it replaced: the agent would wait
+    /// forever for a crossing that will never be attempted again.
+    ///
+    /// **Mutation checks:** publish `null` unconditionally → the non-null assertion goes RED; drop
+    /// the `.filter(|t| t.blocks())` → the "a tally below the bound says nothing" case goes RED
+    /// (the client would announce it had given up while it is still trying).
+    #[tokio::test]
+    async fn debug_publishes_the_terminal_zone_cross_stop_713() {
+        // Below the bound: still trying, so there is nothing to disclose.
+        let s = empty_state();
+        set_gs(&s, |gs| gs.zone_cross_attempts = Some(CrossAttempts::record(None, IDX)));
+        let (_, j) = get(s, "/debug").await;
+        assert!(j["zone_cross_stopped"].is_null(),
+            "a client that is still retrying must not report that it stopped");
+
+        // At the bound: terminal, and it says so with the region and the count.
+        let s = empty_state();
+        set_gs(&s, |gs| {
+            let mut t = CrossAttempts::record(None, IDX);
+            while !t.blocks() { t = CrossAttempts::record(Some(t), IDX); }
+            gs.zone_cross_attempts = Some(t);
+        });
+        let (_, j) = get(s, "/debug").await;
+        let stopped = &j["zone_cross_stopped"];
+        assert!(!stopped.is_null(), "the terminal state must be OBSERVABLE, not silent: {j}");
+        assert_eq!(stopped["reason"], "cross_attempt_limit");
+        assert_eq!(stopped["region_index"], IDX);
+        assert_eq!(stopped["attempts"], MAX_CROSS_ATTEMPTS);
+        let detail = stopped["detail"].as_str().unwrap();
+        assert!(detail.contains("TERMINAL"), "and it must be distinguishable from a crossing in flight");
+        assert!(detail.contains("cannot tell"),
+            "it must NOT claim to know WHY — a denial and a server that answered nothing look identical");
+    }
+
+    /// **#713 item 2: the best-effort degradation is machine-readable.** `POST /v1/move/zone_cross`
+    /// returning 200 and then walking to a line whose destination only the server knows is not a
+    /// lie, but before this it was undetectable — prose in a message log is not a signal.
+    ///
+    /// **Mutation checks:** publish the object for `Advertised` too (drop the `is_best_effort`
+    /// filter) → the null case goes RED; publish `null` always → the non-null case goes RED.
+    #[tokio::test]
+    async fn debug_publishes_the_best_effort_zone_cross_marker_713() {
+        // A resolution with an advertised destination is NOT a degradation — stay quiet.
+        let s = empty_state();
+        set_gs(&s, |gs| gs.zone_cross_plan = Some(ZoneCrossPlan {
+            requested_zone_id: Some(OTHER), index: IDX,
+            resolution: ZoneCrossResolution::Advertised { zone_id: OTHER },
+        }));
+        let (_, j) = get(s, "/debug").await;
+        assert!(j["zone_cross_best_effort"].is_null(),
+            "a cross to an advertised line is the normal case and must not read as degraded");
+
+        let s = empty_state();
+        set_gs(&s, |gs| gs.zone_cross_plan = Some(ZoneCrossPlan {
+            requested_zone_id: Some(OTHER), index: IDX,
+            resolution: ZoneCrossResolution::ServerResolved,
+        }));
+        let (_, j) = get(s, "/debug").await;
+        let be = &j["zone_cross_best_effort"];
+        assert!(!be.is_null(), "the degradation must be detectable without diffing after the fact: {j}");
+        assert_eq!(be["reason"], "server_resolved_destination");
+        assert_eq!(be["requested_zone_id"], OTHER);
+        assert_eq!(be["region_index"], IDX);
+        assert!(be["detail"].as_str().unwrap().contains("may land you somewhere other than"),
+            "and it must say what the caller actually risks");
     }
 }

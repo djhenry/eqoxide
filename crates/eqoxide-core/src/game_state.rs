@@ -917,6 +917,32 @@ pub struct GameState {
     /// Client-side writers (nav, the HTTP move API) do NOT clear it — they are not evidence about
     /// where the server thinks we are.
     pub position_provisional_since: Option<std::time::Instant>,
+    /// #713 item 1 — auto-cross attempts during the current continuous stand on zone-line geometry
+    /// that did not result in a crossing. `None` = the character is not on (or has just left) a
+    /// region it has tried to cross. See [`crate::zone_cross::CrossAttempts`] for why this counts
+    /// attempts rather than server denials AND why the tally is per stand rather than per region
+    /// index, and [`crate::zone_cross::MAX_CROSS_ATTEMPTS`] for the bound and its reasoning.
+    ///
+    /// **Deliberately NOT a [`WorldState`] field.** It is a record of what THIS CLIENT decided to
+    /// do, not server truth — same reasoning as `position_provisional_since` above. Written only by
+    /// `eqoxide_net::action_loop`'s standing auto-cross; read by it (the gate) and by
+    /// `GET /v1/observe/debug` (the `zone_cross_stopped` disclosure), both through
+    /// `CrossAttempts::blocks`, so the gate and its observable cannot disagree.
+    ///
+    /// Cleared when the standing probe finds the character off every zone-line region (within one
+    /// auto-cross cooldown of stepping off — that probe only runs once the cooldown elapses, so the
+    /// terminal disclosure can outlive the stand by up to one cooldown), and by
+    /// [`GameState::begin_zone_in`] (region indices are a per-zone namespace).
+    pub zone_cross_attempts: Option<crate::zone_cross::CrossAttempts>,
+    /// #713 item 2 — what the most recently drained `POST /v1/move/zone_cross` decided to do, and
+    /// in particular whether it degraded to the #683 best-effort fallback (walk to a line whose
+    /// destination only the server knows). `None` = no request has been resolved to a zone line in
+    /// this zone. See [`crate::zone_cross::ZoneCrossPlan`].
+    ///
+    /// Also client-side-decision state rather than server truth, so also not in [`WorldState`].
+    /// Cleared at the start of every resolution (a request that located no line leaves no stale
+    /// plan) and by [`GameState::begin_zone_in`].
+    pub zone_cross_plan: Option<crate::zone_cross::ZoneCrossPlan>,
     pub player_heading: f32,
     pub player_level: u32,
     pub player_race: String,
@@ -1273,6 +1299,14 @@ impl GameState {
         // lie as a missing one — verified live that without this it stayed true in the new zone for
         // 30s+ while `pos` was actually the correct zone-in point).
         self.position_provisional_since = None;
+        // #713: both zone-cross bookkeeping facts are about the zone we are LEAVING. A zone-line
+        // region index is a per-zone namespace (index 0 is the universal unresolvable index), and
+        // an advertised destination zone id is only meaningful against the zone that advertised it
+        // — so carrying either across a crossing would make the client report the previous zone's
+        // attempt history / crossing plan as if it were this zone's. Same reasoning as the #683
+        // round-3 re-arm of the gated-refusal latch in `sync_zone_points`.
+        self.zone_cross_attempts = None;
+        self.zone_cross_plan = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
         // target_name/target_hp_pct fall back to the stale cached snapshot — /observe/debug then
