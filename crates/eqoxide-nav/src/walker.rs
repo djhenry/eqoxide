@@ -77,8 +77,17 @@ pub const NAV_STATE_DEAD: &str = "dead";
 pub const TERMINAL_NAV_STATES: [&str; 5] = ["idle", "arrived", "no_path", "search_exhausted", "blocked"];
 
 /// Is `state` a finished outcome (see [`TERMINAL_NAV_STATES`]) rather than a claim that work is
-/// still in flight? An unrecognised word is treated as IN-PROGRESS — the fail-safe direction: a
-/// future state that someone forgets to classify retires honestly instead of sticking forever.
+/// still in flight? An unrecognised word is treated as IN-PROGRESS.
+///
+/// **That is the safe direction for the #725 defect class, and it is NOT safe in the other
+/// direction — state both, because only one of them is obvious.** A future *in-progress* word
+/// nobody adds here retires honestly instead of sticking forever, which is the whole point. But a
+/// future *terminal* word nobody adds here is **retired to `idle`/`goal_dropped` one tick after it
+/// is published**, replacing a true outcome with a false one — #725's defect class running
+/// backwards, and strictly worse than what it replaced (an agent polling for its answer would see
+/// the answer, then see it vanish). So: **adding a genuinely terminal `nav_state` word REQUIRES
+/// adding it to [`TERMINAL_NAV_STATES`] in the same change.** The array is the contract, not a
+/// convenience list, and `docs/http-api.md`'s state table must agree with it.
 pub fn nav_state_is_terminal(state: &str) -> bool { TERMINAL_NAV_STATES.contains(&state) }
 
 /// `nav_reason` on the `idle` a goal is retired to when it vanished without ever producing an
@@ -90,6 +99,20 @@ pub const NAV_REASON_GOAL_DROPPED: &str = "goal_dropped";
 /// `nav_reason` on the `idle` that [`NAV_STATE_DEAD`] retires to once the character is alive again
 /// (#644) — "idle because you respawned", not "idle, nothing happened".
 pub const NAV_REASON_RESPAWNED: &str = "respawned";
+
+/// `nav_reason` on the `idle` that [`Walker::reset_for_zone_change`] publishes when the character
+/// changes zone — **including the SUCCESS path of `/v1/move/zone_cross`** (#725 review, B1).
+///
+/// Without it, a crossing that worked published bare `idle` + `nav_reason: null`, which is
+/// byte-identical to "no request was ever outstanding": the agent that asked to cross, and whose
+/// cross succeeded in about a second, could not tell success from "my request evaporated" — the
+/// same indistinguishability #725 is about, at the other end of the same call. With it, `idle` +
+/// `zoned` (read alongside `player.zone`) is a positive success signal.
+///
+/// It is deliberately about the ZONE CHANGE, not about the crossing request: `reset_for_zone_change`
+/// also runs for GM `#zone`, gate/evac, portal doors and server-initiated moves, and "your
+/// navigation was reset because you changed zone" is true of all of them.
+pub const NAV_REASON_ZONED: &str = "zoned";
 
 /// How many standable spots one pad offer carries in total (the one to try + its `alternates`).
 /// Bounded: a pad's full leaf list is diagnostics, not an offer.
@@ -384,7 +407,10 @@ impl Walker {
         // through a zone it is no longer in.
         self.planner.cancel();
         self.awaiting_first_plan = false;
-        self.set_nav_state("idle");
+        // SAY WHY (#725 review B1). A bare `idle` here is indistinguishable from "nothing was ever
+        // requested" — and this is the line that runs on a SUCCESSFUL `/v1/move/zone_cross`, so the
+        // endpoint's success looked exactly like its failure to a polling agent.
+        self.set_nav_state_because("idle", Some(NAV_REASON_ZONED));
         self.nav.nav_state.lock().unwrap().tier = None; // no route committed → no per-route tier
         // Publish the cleared snapshot so no consumer keeps drawing the previous zone's state.
         // Position: None — the old zone's coordinates would be a confident wrong answer in the
@@ -2113,6 +2139,33 @@ mod tests {
         w.reset_for_zone_change();
         assert!(nav.zone_cross.lock().unwrap().is_none(),
             "#600: a one-shot cross that never resolved must not survive into the next zone");
+    }
+
+    /// **#725 review, B1: a successful crossing must not look like a dropped one.** This is the line
+    /// that runs when the character actually arrives in the new zone — including on the SUCCESS path
+    /// of `/v1/move/zone_cross`. It published a bare `idle` with `nav_reason: null`, which is
+    /// exactly what an agent sees when nothing was ever requested, so the endpoint's success and its
+    /// failure were indistinguishable on the channel the docs tell agents to poll.
+    ///
+    /// **Mutation check:** change `set_nav_state_because("idle", Some(NAV_REASON_ZONED))` back to
+    /// `set_nav_state("idle")` → RED on the reason assertion. Publish `zoned` from somewhere that is
+    /// not a zone change and the meaning is gone, but nothing here can catch that — which is why the
+    /// constant's doc comment states what the word is *about* (the zone change, not the request).
+    #[test]
+    fn a_zone_change_publishes_idle_with_a_reason_not_a_bare_idle_725() {
+        let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        // Mid-crossing: a cross was queued and a goal was in flight, as on the real success path.
+        *nav.zone_cross.lock().unwrap() = Some(30);
+        *nav.goto_target.lock().unwrap() = Some((10.0, 20.0, 3.0));
+        w.set_nav_state("pending");
+
+        w.reset_for_zone_change();
+
+        let s = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(s.state, "idle", "a zone change ends navigation");
+        assert_eq!(s.reason.as_deref(), Some(NAV_REASON_ZONED),
+            "#725 B1: `idle` + `nav_reason: null` is the boot state — a SUCCESSFUL crossing must not \
+             be reported with it, or success and 'your request was thrown away' are the same read");
     }
 
     /// #644: the honest terminal `dead` state must NOT become a new never-clearing observable — once

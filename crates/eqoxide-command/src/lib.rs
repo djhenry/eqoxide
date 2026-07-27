@@ -113,7 +113,9 @@ mod nav;
 // #725: the drained-zone-cross obligation token + the `nav_reason` its backstop publishes. Public
 // because `ActionLoop::drain_zone_cross` (eqoxide-net) is the drainer and the honesty tests assert
 // on the reason token by name rather than by literal.
-pub use nav::{ZoneCrossTicket, NAV_REASON_ZONE_CROSS_UNHANDLED};
+pub use nav::{
+    ZoneCrossTicket, NAV_REASON_GOTO_CANCELLED, NAV_REASON_STOPPED, NAV_REASON_ZONE_CROSS_UNHANDLED,
+};
 mod lifecycle;
 
 /// The typed write-path facade. Holds `.clone()`d handles of the same `ipc` command bundles that

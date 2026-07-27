@@ -214,7 +214,7 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `nav_state` | Meaning | `nav_reason` |
 |-------------|---------|--------------|
 | `pending` | A `/move/{goto,follow,zone_cross}` was **just accepted** and the walker has not ticked yet. Normally it lasts one walker tick (~150 ms) and becomes `planning`/`navigating`/`following`; a `/zone_cross` issued during a zone load holds it until the request is drained (see `zone_loading`). Its purpose is honesty: the instant a new request is accepted the state resets to `pending` (under a fresh `nav_goal_id`), so a read can **never** return the *previous* goal's terminal `arrived`/`no_path`/`blocked` as if it were the new request's outcome (#349). **`pending` always retires.** It is not on the terminal list, and every walker tick that finds no goal in flight and no queued `/zone_cross` retires any non-terminal state to `idle` with a reason — so `pending` cannot outlive the request that stamped it (#725; before that fix a dropped `/zone_cross` left `pending` standing indefinitely — measured at 75 s — with `nav_reason` and `nav_goal` both `null`). | — |
-| `idle` | Nothing to do — **either** no request is outstanding, **or** one ended without reaching a goal. `nav_reason` tells you which. | `goal_dropped`, `respawned`, `zone_cross_dropped_unhandled` (see below), or — for a plain "ready for work" idle |
+| `idle` | Nothing to do. **Every `idle` the client publishes after start-up carries a `nav_reason` saying how it got there**, so `nav_state: "idle"` with `nav_reason: null` means exactly one thing: no nav request has been made since this client started (#725). It is otherwise a real outcome, not an absence of one. | `zoned`, `stopped`, `goto_superseded`, `goal_dropped`, `respawned`, `zone_cross_dropped_unhandled` — all below; `null` **only** at start-up |
 | `planning` | A route is being computed on the pathfinding worker thread. The character stands still. Normally < 1 s. | — |
 | `navigating` | Walking a **complete route to your goal**. | `goal_z_snapped` (see below) or — |
 | `navigating_partial` | Walking a **partial** route: the search was cut short, so this is *not* a route to your goal — it's progress toward a frontier, and it will re-plan from the far end. Usually resolves to `navigating` or `arrived`. | `search_node_cap` |
@@ -240,10 +240,18 @@ That rule replaced an opt-in list of states-to-retire, under which any state mis
 survived forever once its goal vanished. Two were missing, and both were observed live: `pending`
 after a dropped `/zone_cross` (#725), and `following` after the followed entity despawned.
 
-The `nav_reason` values it publishes:
+### Every `idle` says how it got there (#725)
+
+`idle` used to be published bare from several different places, and one of them was the **success**
+path of `/v1/move/zone_cross` — so a successful crossing and a request the client had thrown away
+looked byte-identical to a polling agent (`"nav_state":"idle","nav_reason":null` in both). Each of
+those call sites now names itself. The complete set of ways to reach `idle`:
 
 | `nav_reason` | Meaning |
 |--------------|---------|
+| `zoned` | **The character changed zone**, and navigation was reset because a route computed in the old zone means nothing in the new one. This is the `nav_state` a *successful* `/v1/move/zone_cross` ends at — read it together with `player.zone`, which is the authoritative statement of where you are. It is deliberately about the zone change and not about the request, so it is equally true of a GM `#zone`, a gate/evac, or a portal door. Not an error. |
+| `stopped` | **You asked** — `POST /v1/move/stop` was accepted and any goto/follow/queued zone-cross was cancelled. |
+| `goto_superseded` | You did **not** ask: something else took over steering — manual movement (keyboard or `POST /v1/move/manual`), or the auto-melee-engage override. Your goto is gone; reissue it if you still want it. |
 | `goal_dropped` | Your goal stopped existing without being reached — e.g. a `/follow` target despawned, or a request was cancelled from elsewhere in the client. Not an error about the route; there is simply nothing left to walk to. Reissue if you still want it. |
 | `respawned` | The `dead` state cleared because the character came back up (#644). |
 | `zone_cross_dropped_unhandled` | **A client bug, reported instead of hidden.** Your `/move/zone_cross` was consumed by the client and produced no outcome at all — no walk, no crossing, no refusal. Nothing is in flight and nothing will happen; retry, or use `/move/goto`. If you see this, please file it with the zone and your position: it means a code path took your request and wrote nothing, which is exactly the defect the backstop that emits this reason exists to make visible (#725). |
@@ -450,7 +458,7 @@ matches nothing at all — not even fuzzily — is an honest **404**, never a di
 
 `GET /v1/observe/debug` carries two more top-level fields under `player`:
 
-- **`nav_goal_id`** — a monotonically increasing counter, bumped every time a `POST /v1/move/{goto,follow,zone_cross,stop}` is accepted. It is **echoed in each of those POST's response bodies**: as a JSON `"goal_id": N` field on `/goto` and `/follow`, and as `[goal_id=N]` in the text body of `/stop` and `/zone_cross`. `nav_state`/`nav_reason` are the status *of this goal id* — never of an earlier one.
+- **`nav_goal_id`** — a monotonically increasing counter, bumped every time a `POST /v1/move/{goto,follow,zone_cross,stop}` is accepted. It is **echoed in each of those POST's response bodies**: as a JSON `"goal_id": N` field on `/goto` and `/follow`, and as `[goal_id=N]` in the text body of `/stop` and `/zone_cross`. `nav_state`/`nav_reason` are the status *of this goal id* — never of an earlier one. **`/zone_cross` is the one route whose returned id does not end up carrying the outcome**: resolving the request into a concrete walk stamps a fresh, higher id (see below).
 - **`nav_goal`** — that goal's `[x, y, z]` (server coords), or `null` for `idle`/`stop`, or for a `zone_cross` whose concrete zone-line destination the walker has not resolved yet.
 
 **Why this exists.** `POST /goto` returns `200` and sets the target, but the walker only re-labels `nav_state` on its next ~150 ms tick. Without identity, this canonical loop lied:
@@ -460,7 +468,26 @@ POST /v1/move/goto {...}   -> 200 {"goal_id": 8, ...}
 GET  /v1/observe/debug     -> nav_state: "arrived"   <-- but nav_goal_id: 7, the PREVIOUS goto!
 ```
 
-Now the accept **atomically** bumps `nav_goal_id` and resets `nav_state` to `pending`, so the read above returns `nav_state: "pending", nav_goal_id: 8` — honest. **Rule: only trust a terminal `nav_state` (`arrived`/`no_path`/`search_exhausted`/`blocked`/`idle`) when its `nav_goal_id` matches the `goal_id` the POST you are waiting on returned.** A lower id means you are still seeing an older goal's outcome; a matching id with `pending`/`planning`/`navigating` means your goal is genuinely in flight — and it will not stay that way, because any in-progress state with nothing behind it retires to `idle` with a reason on the next walker tick ([Why an in-progress `nav_state` can never stick](#why-an-in-progress-nav_state-can-never-stick-725)). `idle` **under your own goal id** is therefore an outcome, not a "not started yet": read `nav_reason` — `goal_dropped` or `zone_cross_dropped_unhandled` means your goal is over and nothing is coming.
+Now the accept **atomically** bumps `nav_goal_id` and resets `nav_state` to `pending`, so the read above returns `nav_state: "pending", nav_goal_id: 8` — honest.
+
+**Rule: ignore any `nav_state` whose `nav_goal_id` is LOWER than the `goal_id` your POST returned — that is an older goal's outcome. At your id or above, the state is current.** A matching id with `pending`/`planning`/`navigating` means your goal is genuinely in flight — and it will not stay that way, because any in-progress state with nothing behind it retires to `idle` with a reason on the next walker tick ([Why an in-progress `nav_state` can never stick](#why-an-in-progress-nav_state-can-never-stick-725)). `idle` **at or above your own goal id** is therefore an outcome, not a "not started yet": read `nav_reason`, which since #725 always says which outcome it was.
+
+**Why the rule is "at or above" and not "equal" — `/v1/move/zone_cross` in particular.** A *higher*
+id does not mean your read is stale; it means your goal was superseded, **or that the client
+advanced your own request to its next stage under a fresh id.** `/zone_cross` always does the
+latter. The id its 200 returns identifies the *request*; the request has no coordinates yet, so
+`nav_goal` is `null`. One walker tick later the client resolves the requested zone to a concrete
+zone-line region and issues the walk to it internally, and that walk stamps its own new, higher id —
+under which every subsequent `navigating`/`arrived`/`no_path` for your crossing is published. **The
+id from the `/zone_cross` 200 therefore never carries the outcome; waiting for an exact match waits
+forever.** (Measured over five crossings the resolved id was the accepted id + 1 every time, but do
+not key on `+1`: any concurrent accept from another caller shifts it. `>=` is the property that
+holds.)
+
+The reliable way to follow a crossing to completion is not the id at all: poll `player.zone` (and
+`crossing_pending_ms`), and treat `nav_state: "idle"` with `nav_reason: "zoned"` as the success
+signal — see [Every `idle` says how it got there](#every-idle-says-how-it-got-there-725). Use the
+returned id only for its guarantee: any state below it is not about you.
 
 **`goal_z_snapped` — the client CHANGED your goal.** The `z` you gave sits below every floor in the
 goal's column (agents commonly pass `z: 0`, or a map coordinate), so the planner snapped the goal onto
@@ -486,9 +513,12 @@ is not snapped: it fails as `no_path` / `goal_not_walkable`.)
 | `no_zone_line_to_zone` | The server never advertised (`OP_SendZonepoints`) any zone line from here to the requested `zone_id` — it will not appear in `/v1/observe/zone_exits` either. A genuinely invalid request: pick a `zone_id` that's actually one of this zone's exits. |
 | `zone_line_not_in_map` | The requested `zone_id` **is** advertised by the server as a real exit, but the locally loaded zone geometry has no matching WLD zone-line (DRNTP) trigger region for it — a client-side `.wtr` map-data gap, not proof the exit doesn't exist in the real game. Before reporting this, the client tries one fallback (#683): if the map has a zone-line region under some OTHER (unadvertised) index — e.g. an exit baked with index 0 — and this zone advertises no same-zone teleport pad and server zone points are available, it walks there instead and lets the server resolve the destination, so this reason now means no usable zone-line region exists at all (or the fallback is gated: a same-zone pad is advertised, or no server zone points are available). It is also omitted from `/v1/observe/zone_exits` (which only lists regions actually found in the loaded map), so "absent from `zone_exits`" does not by itself distinguish this from `no_zone_line_to_zone` — only `nav_reason` does. |
 
-**Distance to the line does not matter (#725).** When a zone-line region *is* located, the client
-always walks to it and re-stamps `nav_goal` with that concrete destination — there is no "close
-enough, the crossing will happen by itself" shortcut. There used to be one, for lines within 15 u,
+**Distance no longer decides *whether* the client acts (#725).** It still decides how long the
+crossing takes — you are walked to the line, so a line 30 u away takes longer than one 3 u away —
+but there is no distance at which the request is handled differently, and none at which it is
+handled by doing nothing. When a zone-line region *is* located, the client always walks to it and
+re-stamps `nav_goal` with that concrete destination; there is no "close enough, the crossing will
+happen by itself" shortcut. There used to be one, for lines within 15 u,
 and because the actual auto-cross fires only when your body is physically inside the trigger region
 (a much smaller volume), every `/zone_cross` issued from between the region and 15 u was consumed and
 produced nothing at all. That band is where the server's own walk-in arrival point tends to sit

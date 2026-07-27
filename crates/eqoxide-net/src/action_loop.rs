@@ -1463,189 +1463,19 @@ impl ActionLoop {
         // cheat-flags the crossing (the root cause of #174). Resolve the target zone to its
         // zone-point index (iterator), locate that DRNTP region in the zone BSP, and walk there.
         //
-        // #725: the drain returns a `ZoneCrossTicket`, not a bare `u16`. Once the request leaves the
-        // slot it exists nowhere else, so every path out of the block below OWES the agent something
+        // #725: the drain yields a `ZoneCrossTicket`, not a bare `u16`. Once the request leaves the
+        // slot it exists nowhere else, so every path out of the resolution OWES the agent something
         // observable; the ticket's `Drop` publishes `idle`/`zone_cross_dropped_unhandled` if none of
-        // them did. It is a BACKSTOP, not the mechanism — each arm here publishes for itself — but it
-        // is what makes "a branch that consumes the request and writes nothing" impossible to ship
+        // them did. It is a BACKSTOP, not the mechanism — each arm publishes for itself — but it is
+        // what makes "a branch that consumes the request and writes nothing" impossible to ship
         // silently, which is the general shape of #725 rather than its particular trigger.
-        let cross_req = self.command.take_zone_cross();
-        if let Some(want_zone) = cross_req.as_ref().map(|t| t.zone_id()) {
-            // #600 — THE ONE DECISION FUNCTION, at the THIRD world-answering consumer. The resolution
-            // below reads the SAME shared collision grid the walker/HTTP read AND publishes an
-            // agent-observable nav_state. While the zone's assets are not usable — still loading
-            // (`collision == None`, ~10s), a failed load, or the previous zone's grid in the ~1-frame
-            // stale window — `located` would be `None` and the old code published `no_path`
-            // ("DEFINITIVE: no route exists, do not retry"). That is a confident falsehood: the cross
-            // may be perfectly reachable once the world finishes loading, and telling the agent to
-            // give up permanently is WORSE than the walker case. Gate it through `usability` first and
-            // answer the honest transient `zone_loading` with the predicate's own verdict (the SAME
-            // vocabulary the HTTP surface and the walker publish). RE-QUEUE the one-shot request so it
-            // resolves for real once the correct zone's assets land — mirroring the `zone_loading`
-            // contract the walker's kept goto already honours. `None` (usable) ⇒ the collision read
-            // below is the right zone's grid, and a genuine `no_path` there is truthful.
-            let not_ready = {
-                let st = eqoxide_nav::zone_assets::lock_state(&self.zone_assets);
-                eqoxide_nav::zone_assets::usability(&st, &gs.world.zone_name)
-            };
-            if let Some(why) = not_ready {
-                // Re-queue the one-shot request FIRST so the cross resolves for real once the correct
-                // zone's assets land (mirroring the kept-goto `zone_loading` contract). `request_zone_
-                // cross` stamps a transient `pending` on the SHARED nav_state; publish the honest
-                // `zone_loading` AFTER it so the load-window state is the accurate one, not `pending`'s
-                // ≤150ms promise. The queued request also keeps `resolve_goal` from resetting this
-                // `zone_loading` back to `idle` (see its zone-cross guard) — so the state is STABLE
-                // across the whole load, not a one-tick flash.
-                self.command.request_zone_cross(want_zone);
-                self.walker.set_nav_state_because(
-                    eqoxide_nav::walker::NAV_STATE_ZONE_LOADING, Some(why.as_str()));
-            } else {
-                // want_zone != 0 → resolve it to a zone-point index; want_zone == 0 → any nearest line.
-                let want_index = if want_zone != 0 {
-                    match self.world.zone_points.lock().unwrap().iter()
-                        .find(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32)
-                    {
-                        Some(idx) => Some(idx),
-                        None => {
-                            tracing::info!("zone_cross: no zone point advertised for zone_id={want_zone}");
-                            gs.log_msg("zone", "No zone line found to cross");
-                            // Make the failure observable instead of a silent no-op (#267): a caller that
-                            // got 200 from POST /zone_cross can poll nav_state and see it didn't happen.
-                            // With a REASON — a terminal state with `nav_reason: null` contradicts the
-                            // contract this PR documents (#377 review, N2). Reached only when the zone IS
-                            // usable (gated above), so this is a truthful definitive no, not a load artefact.
-                            self.walker.set_nav_state_because("no_path", Some("no_zone_line_to_zone"));
-                            None
-                        }
-                    }
-                } else {
-                    None // any zone line
-                };
-                // Only proceed if we actually have a target (want_zone==0 always may; want_zone!=0 needs a match).
-                if want_zone == 0 || want_index.is_some() {
-                    // Locate the NEAREST reachable zone-line region for the wanted zone (not the first
-                    // zone-point index that matches — a zone with several lines to the same target, or an
-                    // in-zone translocator with multiple advertised points, would otherwise pick one with
-                    // no nearby region and no-op, #266). want_index==None → any nearest line.
-                    let located = self.collision.read().unwrap().as_ref().and_then(|c| {
-                        let pos = [gs.player_x, gs.player_y, gs.player_z];
-                        match (want_zone, want_index) {
-                            (0, _) => c.find_zone_line_near(None, pos),
-                            (_, _) => {
-                                // Every zone-point index advertised for `want_zone`, nearest region wins.
-                                let idxs: Vec<i32> = self.world.zone_points.lock().unwrap().iter()
-                                    .filter(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32).collect();
-                                idxs.iter()
-                                    .filter_map(|&idx| c.find_zone_line_near(Some(idx), pos))
-                                    .min_by(|a, b| {
-                                        let da = (a.1[0]-pos[0]).hypot(a.1[1]-pos[1]);
-                                        let db = (b.1[0]-pos[0]).hypot(b.1[1]-pos[1]);
-                                        da.total_cmp(&db)
-                                    })
-                                    // #683: `want_zone` IS advertised but no located region carries
-                                    // any of its indices (qrg: the only exit region is baked with
-                                    // index 0). Fall back to the nearest UNRESOLVABLE zone line —
-                                    // one whose index matches no advertised destination — and let
-                                    // the standing auto-cross + server echo determine the real
-                                    // destination. ONLY unresolvable lines are candidates: a region
-                                    // whose index resolves to an advertised zone point is KNOWN to
-                                    // lead to that OTHER zone, and walking onto it would cross the
-                                    // caller somewhere it never asked to go (qeynos: a zone_cross
-                                    // to qeynos2, whose gate lines are baked index 0, must not walk
-                                    // onto the nearer RESOLVABLE catacombs line and cross to qcat).
-                                    // Gated exactly like the auto-cross fallback (see
-                                    // `classify_unresolved_cross`): never in a zone that advertises
-                                    // a same-zone pad, and never before zone points arrive — so
-                                    // this can't route a character onto an intra-zone pad (#679).
-                                    .or_else(|| {
-                                        let (allowed, resolvable): (bool, Vec<i32>) = {
-                                            let zps = self.world.zone_points.lock().unwrap();
-                                            (classify_unresolved_cross(&zps, gs.world.zone_id)
-                                                 == UnresolvedCross::SendServerResolved,
-                                             zps.iter().filter(|zp| zp.zone_id != 0)
-                                                .map(|zp| zp.iterator as i32).collect())
-                                        };
-                                        if !allowed { return None; }
-                                        c.zone_line_indices().into_iter()
-                                            .filter(|idx| !resolvable.contains(idx))
-                                            .filter_map(|idx| c.find_zone_line_near(Some(idx), pos))
-                                            .min_by(|a, b| {
-                                                let da = (a.1[0]-pos[0]).hypot(a.1[1]-pos[1]);
-                                                let db = (b.1[0]-pos[0]).hypot(b.1[1]-pos[1]);
-                                                da.total_cmp(&db)
-                                            })
-                                    })
-                            }
-                        }
-                    });
-                    match located {
-                        Some((index, [tx, ty, tz])) => {
-                            // Destination zone for logging — resolve the located region's index
-                            // against the advertised list. `None` = an UNADVERTISED index (the #683
-                            // fallback): the destination is genuinely unknown until the server
-                            // resolves the crossing, so say that — never claim the requested zone,
-                            // which the server may tie-break elsewhere (agent-honesty). The
-                            // `zone_id != 0` filter mirrors `resolve_cross_destination`: a zone
-                            // point advertising zone_id 0 is the "server resolves from position"
-                            // SENTINEL (qrg ships one with iterator 0), not a destination — without
-                            // the filter this claimed "walking to the zone_id=0 line" (seen live).
-                            let known_dest = self.world.zone_points.lock().unwrap().iter()
-                                .find(|zp| zp.iterator as i32 == index && zp.zone_id != 0).map(|zp| zp.zone_id);
-                            let dest_label = match known_dest {
-                                Some(z) => format!("zone_id={z}"),
-                                None => "server-resolved-destination".to_string(),
-                            };
-                            // ALWAYS walk to the located line. There is deliberately no "close
-                            // enough, skip it" shortcut here (#725).
-                            //
-                            // There used to be one: `if d2 <= 15.0*15.0 { tracing::info!(…) }`, whose
-                            // entire body was that log line, on the belief that the standing
-                            // auto-cross below would "fire this tick". It gates on
-                            // `zone_line_at_standing` — the capsule must be physically INSIDE the
-                            // DRNTP region — so the two conditions never met, and every request from
-                            // between the region and 15.0u evaporated: no goto, no packet, nothing
-                            // published, `nav_state` left at `pending` forever. Measured: 11.87u /
-                            // 12.90u / 14.66u dropped 100%; 19.54u / 31.57u crossed in under a
-                            // second. Worse, the server's walk-in ARRIVAL point sits inside that band
-                            // for the RETURN line, so the natural agent loop (walk in, ask to go
-                            // back) failed by construction.
-                            //
-                            // Re-tuning the threshold would only move the band. Testing
-                            // `zone_line_at_standing` here would close it, but leaves two conditions
-                            // that must agree forever. Walking is unconditionally correct instead:
-                            // `find_zone_line_near` returns a point PROJECTED onto the walkable floor
-                            // and re-verified to still be inside the region
-                            // (`zone_line_floor_point`), so arriving there IS standing in the trigger
-                            // volume; and if we are already inside it, the goal is metres away, the
-                            // walker reports `arrived` at once, and the auto-cross below fires from
-                            // physical position exactly as it would have anyway. One path, one
-                            // publish (`request_goto` stamps a fresh goal id + `nav_goal`), no band.
-                            let dist = (tx - gs.player_x).hypot(ty - gs.player_y);
-                            tracing::info!("zone_cross: walking {dist:.1}u to the {dest_label} line at ({tx:.0},{ty:.0}) (index={index})");
-                            match known_dest {
-                                Some(z) => gs.log_msg("zone", &format!("Walking to the zone {} line", z)),
-                                None => gs.log_msg("zone", "Walking to a zone line (destination resolved by server)"),
-                            }
-                            self.command.request_goto((tx, ty, tz));
-                        }
-                        None => {
-                            tracing::info!("zone_cross: no zone-line region found for zone_id={want_zone}");
-                            gs.log_msg("zone", "No zone line found to cross");
-                            // Advertised in OP_SendZonepoints but no DRNTP region in the loaded map (a .wtr
-                            // gap): report it so the caller isn't left thinking the 200 meant success (#267).
-                            // Gated above, so the grid IS this zone's — a truthful definitive no.
-                            self.walker.set_nav_state_because("no_path", Some("zone_line_not_in_map"));
-                        }
-                    }
-                }
-            }
+        //
+        // `resolve_zone_cross` takes the ticket BY VALUE, so the obligation is settled by the time
+        // it returns — before the standing auto-cross below. The ticket is deliberately out of
+        // scope for the remainder of this function; see that method for why the order matters.
+        if let Some(ticket) = self.command.take_zone_cross() {
+            self.resolve_zone_cross(ticket, gs);
         }
-
-        // Settle the request's obligation HERE, before the standing auto-cross runs (#725). Dropping
-        // it later would let the auto-cross's own publish satisfy a request the resolution above had
-        // in fact dropped — the backstop must judge the resolution, not be paid off by an unrelated
-        // crossing that would have fired from position with no request at all.
-        drop(cross_req);
 
         // Auto zone-cross (native mechanism): when the player stands in a DRNTP zone-line region
         // baked into the zone BSP, resolve its zone-point index to a destination via the
@@ -1694,6 +1524,200 @@ impl ActionLoop {
         // position sentinel, correct only for client-initiated WALK-IN crossings). That misrouted
         // every server-initiated teleport to a wrong zone (#235) — so it's removed; the wire
         // zoneID=0 path is now confined to /v1/move/zone_cross.
+    }
+
+    /// Resolve one drained `/v1/move/zone_cross` request (#725 review, B3).
+    ///
+    /// **The ticket is taken BY VALUE, and that is the point.** The obligation it carries is
+    /// settled when this function returns — which is before the standing auto-cross in
+    /// [`Self::drain_zone_cross`] runs, because the ticket is not in scope there and cannot be
+    /// moved into it. The previous shape kept the ticket alive in `drain_zone_cross` and relied on
+    /// a hand-placed `drop()` statement sitting above the auto-cross; moving that one statement to
+    /// the end of the function was a mutation the ENTIRE SUITE passed, so the ordering was a
+    /// convention held by a comment, not a fact. Now it is a fact about scope.
+    ///
+    /// Why the ordering matters at all, stated precisely — the comment this replaces overstated it.
+    /// Of the three auto-cross outcomes, only `perform_cross`'s SAME-ZONE branch publishes anything
+    /// (`request_stop()`), so it is the only one that could pay off a ticket the resolution had in
+    /// fact dropped: an unrelated crossing firing from physical position, with no request behind
+    /// it, silently discharging one. The cross-zone branch and `cross_unresolved` publish NOTHING,
+    /// which is the hazard running the other way: a ticket dropped after either of them would see
+    /// `moved == false` and stamp `idle`/`zone_cross_dropped_unhandled` over a crossing that is
+    /// genuinely in flight — the backstop itself publishing the falsehood it exists to prevent.
+    /// Both hazards disappear when the ticket simply does not exist down there.
+    ///
+    /// Takes no `stream`: resolution never sends a packet. It walks the character onto the line and
+    /// the standing auto-cross does the sending, from physical position.
+    fn resolve_zone_cross(&mut self, ticket: eqoxide_command::ZoneCrossTicket, gs: &mut GameState) {
+        let want_zone = ticket.zone_id();
+        // #600 — THE ONE DECISION FUNCTION, at the THIRD world-answering consumer. The resolution
+        // below reads the SAME shared collision grid the walker/HTTP read AND publishes an
+        // agent-observable nav_state. While the zone's assets are not usable — still loading
+        // (`collision == None`, ~10s), a failed load, or the previous zone's grid in the ~1-frame
+        // stale window — `located` would be `None` and the old code published `no_path`
+        // ("DEFINITIVE: no route exists, do not retry"). That is a confident falsehood: the cross
+        // may be perfectly reachable once the world finishes loading, and telling the agent to
+        // give up permanently is WORSE than the walker case. Gate it through `usability` first and
+        // answer the honest transient `zone_loading` with the predicate's own verdict (the SAME
+        // vocabulary the HTTP surface and the walker publish). RE-QUEUE the one-shot request so it
+        // resolves for real once the correct zone's assets land — mirroring the `zone_loading`
+        // contract the walker's kept goto already honours. `None` (usable) ⇒ the collision read
+        // below is the right zone's grid, and a genuine `no_path` there is truthful.
+        let not_ready = {
+            let st = eqoxide_nav::zone_assets::lock_state(&self.zone_assets);
+            eqoxide_nav::zone_assets::usability(&st, &gs.world.zone_name)
+        };
+        if let Some(why) = not_ready {
+            // Re-queue the one-shot request FIRST so the cross resolves for real once the correct
+            // zone's assets land (mirroring the kept-goto `zone_loading` contract). `request_zone_
+            // cross` stamps a transient `pending` on the SHARED nav_state; publish the honest
+            // `zone_loading` AFTER it so the load-window state is the accurate one, not `pending`'s
+            // ≤150ms promise. The queued request also keeps `resolve_goal` from resetting this
+            // `zone_loading` back to `idle` (see its zone-cross guard) — so the state is STABLE
+            // across the whole load, not a one-tick flash.
+            self.command.request_zone_cross(want_zone);
+            self.walker.set_nav_state_because(
+                eqoxide_nav::walker::NAV_STATE_ZONE_LOADING, Some(why.as_str()));
+        } else {
+            // want_zone != 0 → resolve it to a zone-point index; want_zone == 0 → any nearest line.
+            let want_index = if want_zone != 0 {
+                match self.world.zone_points.lock().unwrap().iter()
+                    .find(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32)
+                {
+                    Some(idx) => Some(idx),
+                    None => {
+                        tracing::info!("zone_cross: no zone point advertised for zone_id={want_zone}");
+                        gs.log_msg("zone", "No zone line found to cross");
+                        // Make the failure observable instead of a silent no-op (#267): a caller that
+                        // got 200 from POST /zone_cross can poll nav_state and see it didn't happen.
+                        // With a REASON — a terminal state with `nav_reason: null` contradicts the
+                        // contract this PR documents (#377 review, N2). Reached only when the zone IS
+                        // usable (gated above), so this is a truthful definitive no, not a load artefact.
+                        self.walker.set_nav_state_because("no_path", Some("no_zone_line_to_zone"));
+                        None
+                    }
+                }
+            } else {
+                None // any zone line
+            };
+            // Only proceed if we actually have a target (want_zone==0 always may; want_zone!=0 needs a match).
+            if want_zone == 0 || want_index.is_some() {
+                // Locate the NEAREST reachable zone-line region for the wanted zone (not the first
+                // zone-point index that matches — a zone with several lines to the same target, or an
+                // in-zone translocator with multiple advertised points, would otherwise pick one with
+                // no nearby region and no-op, #266). want_index==None → any nearest line.
+                let located = self.collision.read().unwrap().as_ref().and_then(|c| {
+                    let pos = [gs.player_x, gs.player_y, gs.player_z];
+                    match (want_zone, want_index) {
+                        (0, _) => c.find_zone_line_near(None, pos),
+                        (_, _) => {
+                            // Every zone-point index advertised for `want_zone`, nearest region wins.
+                            let idxs: Vec<i32> = self.world.zone_points.lock().unwrap().iter()
+                                .filter(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32).collect();
+                            idxs.iter()
+                                .filter_map(|&idx| c.find_zone_line_near(Some(idx), pos))
+                                .min_by(|a, b| {
+                                    let da = (a.1[0]-pos[0]).hypot(a.1[1]-pos[1]);
+                                    let db = (b.1[0]-pos[0]).hypot(b.1[1]-pos[1]);
+                                    da.total_cmp(&db)
+                                })
+                                // #683: `want_zone` IS advertised but no located region carries
+                                // any of its indices (qrg: the only exit region is baked with
+                                // index 0). Fall back to the nearest UNRESOLVABLE zone line —
+                                // one whose index matches no advertised destination — and let
+                                // the standing auto-cross + server echo determine the real
+                                // destination. ONLY unresolvable lines are candidates: a region
+                                // whose index resolves to an advertised zone point is KNOWN to
+                                // lead to that OTHER zone, and walking onto it would cross the
+                                // caller somewhere it never asked to go (qeynos: a zone_cross
+                                // to qeynos2, whose gate lines are baked index 0, must not walk
+                                // onto the nearer RESOLVABLE catacombs line and cross to qcat).
+                                // Gated exactly like the auto-cross fallback (see
+                                // `classify_unresolved_cross`): never in a zone that advertises
+                                // a same-zone pad, and never before zone points arrive — so
+                                // this can't route a character onto an intra-zone pad (#679).
+                                .or_else(|| {
+                                    let (allowed, resolvable): (bool, Vec<i32>) = {
+                                        let zps = self.world.zone_points.lock().unwrap();
+                                        (classify_unresolved_cross(&zps, gs.world.zone_id)
+                                             == UnresolvedCross::SendServerResolved,
+                                         zps.iter().filter(|zp| zp.zone_id != 0)
+                                            .map(|zp| zp.iterator as i32).collect())
+                                    };
+                                    if !allowed { return None; }
+                                    c.zone_line_indices().into_iter()
+                                        .filter(|idx| !resolvable.contains(idx))
+                                        .filter_map(|idx| c.find_zone_line_near(Some(idx), pos))
+                                        .min_by(|a, b| {
+                                            let da = (a.1[0]-pos[0]).hypot(a.1[1]-pos[1]);
+                                            let db = (b.1[0]-pos[0]).hypot(b.1[1]-pos[1]);
+                                            da.total_cmp(&db)
+                                        })
+                                })
+                        }
+                    }
+                });
+                match located {
+                    Some((index, [tx, ty, tz])) => {
+                        // Destination zone for logging — resolve the located region's index
+                        // against the advertised list. `None` = an UNADVERTISED index (the #683
+                        // fallback): the destination is genuinely unknown until the server
+                        // resolves the crossing, so say that — never claim the requested zone,
+                        // which the server may tie-break elsewhere (agent-honesty). The
+                        // `zone_id != 0` filter mirrors `resolve_cross_destination`: a zone
+                        // point advertising zone_id 0 is the "server resolves from position"
+                        // SENTINEL (qrg ships one with iterator 0), not a destination — without
+                        // the filter this claimed "walking to the zone_id=0 line" (seen live).
+                        let known_dest = self.world.zone_points.lock().unwrap().iter()
+                            .find(|zp| zp.iterator as i32 == index && zp.zone_id != 0).map(|zp| zp.zone_id);
+                        let dest_label = match known_dest {
+                            Some(z) => format!("zone_id={z}"),
+                            None => "server-resolved-destination".to_string(),
+                        };
+                        // ALWAYS walk to the located line. There is deliberately no "close
+                        // enough, skip it" shortcut here (#725).
+                        //
+                        // There used to be one: `if d2 <= 15.0*15.0 { tracing::info!(…) }`, whose
+                        // entire body was that log line, on the belief that the standing
+                        // auto-cross below would "fire this tick". It gates on
+                        // `zone_line_at_standing` — the capsule must be physically INSIDE the
+                        // DRNTP region — so the two conditions never met, and every request from
+                        // between the region and 15.0u evaporated: no goto, no packet, nothing
+                        // published, `nav_state` left at `pending` forever. Measured: 11.87u /
+                        // 12.90u / 14.66u dropped 100%; 19.54u / 31.57u crossed in under a
+                        // second. Worse, the server's walk-in ARRIVAL point sits inside that band
+                        // for the RETURN line, so the natural agent loop (walk in, ask to go
+                        // back) failed by construction.
+                        //
+                        // Re-tuning the threshold would only move the band. Testing
+                        // `zone_line_at_standing` here would close it, but leaves two conditions
+                        // that must agree forever. Walking is unconditionally correct instead:
+                        // `find_zone_line_near` returns a point PROJECTED onto the walkable floor
+                        // and re-verified to still be inside the region
+                        // (`zone_line_floor_point`), so arriving there IS standing in the trigger
+                        // volume; and if we are already inside it, the goal is metres away, the
+                        // walker reports `arrived` at once, and the auto-cross below fires from
+                        // physical position exactly as it would have anyway. One path, one
+                        // publish (`request_goto` stamps a fresh goal id + `nav_goal`), no band.
+                        let dist = (tx - gs.player_x).hypot(ty - gs.player_y);
+                        tracing::info!("zone_cross: walking {dist:.1}u to the {dest_label} line at ({tx:.0},{ty:.0}) (index={index})");
+                        match known_dest {
+                            Some(z) => gs.log_msg("zone", &format!("Walking to the zone {} line", z)),
+                            None => gs.log_msg("zone", "Walking to a zone line (destination resolved by server)"),
+                        }
+                        self.command.request_goto((tx, ty, tz));
+                    }
+                    None => {
+                        tracing::info!("zone_cross: no zone-line region found for zone_id={want_zone}");
+                        gs.log_msg("zone", "No zone line found to cross");
+                        // Advertised in OP_SendZonepoints but no DRNTP region in the loaded map (a .wtr
+                        // gap): report it so the caller isn't left thinking the 200 meant success (#267).
+                        // Gated above, so the grid IS this zone's — a truthful definitive no.
+                        self.walker.set_nav_state_because("no_path", Some("zone_line_not_in_map"));
+                    }
+                }
+            }
+        }
     }
 
     fn drain_chat(&mut self, stream: &mut EqStream, gs: &mut GameState) {
@@ -3863,6 +3887,134 @@ mod tests {
                 "and the message log must say so — `tracing` output is invisible to an HTTP agent, \
                  which is what made the dropped request undebuggable");
         }
+    }
+
+    /// **#725 review, B1: the `idle` row in `docs/http-api.md` is pinned to the code, in BOTH
+    /// directions.** The finding that produced this test was not a wrong field value — it was a true
+    /// sentence in the docs that stopped being true when a code path was added. Rewriting the prose
+    /// fixes today; only a test keeps it fixed, and it has to fail both ways or it only guards the
+    /// direction someone happened to think of:
+    ///
+    /// * add a new way to reach `idle` and forget the docs → the constant is absent from the row →
+    ///   RED. (This is #725's own defect class: a doc sentence the code quietly falsified.)
+    /// * list a reason in the docs that nothing publishes → the token matches no constant → RED.
+    ///   (Guidance that reads correct and sends an agent to wait for something that never arrives —
+    ///   the shape of the B2 finding.)
+    ///
+    /// The set is the whole point of the row: **`nav_reason: null` on `idle` is only the boot
+    /// state**, so every other route to `idle` must be named here and named in the docs.
+    ///
+    /// It lives in `eqoxide-net` because that is the crate that can see both halves — `zoned`,
+    /// `goal_dropped` and `respawned` are the walker's, `stopped`, `goto_superseded` and
+    /// `zone_cross_dropped_unhandled` are `CommandState`'s. Splitting the assertion by crate would
+    /// let a reason exist in one half and be missing from the docs, which is the bug.
+    #[test]
+    fn the_documented_idle_reasons_are_exactly_the_ones_the_code_can_publish_725() {
+        const DOC: &str = include_str!("../../../docs/http-api.md");
+        // Every constant that can end up as `nav_reason` alongside `nav_state: "idle"`.
+        let published = [
+            eqoxide_nav::walker::NAV_REASON_ZONED,
+            eqoxide_nav::walker::NAV_REASON_GOAL_DROPPED,
+            eqoxide_nav::walker::NAV_REASON_RESPAWNED,
+            eqoxide_command::NAV_REASON_STOPPED,
+            eqoxide_command::NAV_REASON_GOTO_CANCELLED,
+            eqoxide_command::NAV_REASON_ZONE_CROSS_UNHANDLED,
+        ];
+
+        // The `idle` row of the nav_state table; its last cell is the reason list.
+        let row = DOC.lines().find(|l| l.starts_with("| `idle` |"))
+            .expect("docs/http-api.md must document the `idle` nav_state");
+        let cell = row.trim_end_matches('|').rsplit('|').next().unwrap();
+        let documented: Vec<&str> = cell.split('`')
+            .skip(1).step_by(2)                 // the odd-indexed pieces are the backticked tokens
+            .filter(|t| *t != "null" && *t != "idle" && *t != "nav_reason" && *t != "nav_state")
+            .collect();
+
+        // Direction 1: code → docs.
+        for reason in published {
+            assert!(documented.contains(&reason),
+                "#725 B1: `{reason}` can be published on `idle` but the `idle` row of \
+                 docs/http-api.md does not list it. An agent reading that row would treat it as an \
+                 unexplained idle. Documented: {documented:?}");
+            assert!(DOC.contains(&format!("| `{reason}` |")),
+                "`{reason}` is listed on the `idle` row but has no entry in the reason table — the \
+                 row tells an agent the reason explains itself, so it has to be explained");
+        }
+        // Direction 2: docs → code. This is the half that catches guidance pointing at something
+        // that never arrives; nothing else in the suite fails when the docs over-promise.
+        for token in &documented {
+            assert!(published.contains(token),
+                "docs/http-api.md lists `{token}` as a reason `idle` can carry, but no code path \
+                 publishes it. Either wire it up or stop telling agents to expect it.");
+        }
+    }
+
+    /// **#725 review, N1 + B3: the case the sweep deliberately excluded — standing INSIDE the
+    /// region.** The sweep above asserts its own premise that the character is outside the trigger
+    /// volume, so nothing in the suite exercised the one call where BOTH halves of
+    /// `drain_zone_cross` do work: the resolution issues a walk, and the standing auto-cross fires
+    /// from physical position, in the same tick.
+    ///
+    /// That is also the call where the ticket's lifetime is load-bearing (B3). It asserts three
+    /// things a reader of the resolution's doc comment should be able to rely on:
+    ///
+    /// 1. an inside-the-region cross still resolves to a walk (the removed shortcut's "we are
+    ///    already close enough, do nothing" case — now the goal is metres away and honest);
+    /// 2. the auto-cross still fires in the same call, i.e. removing the shortcut did not cost the
+    ///    delegation it was wrongly assuming;
+    /// 3. **nothing publishes `zone_cross_dropped_unhandled`.** The cross-zone auto-cross branch
+    ///    writes no `nav_state` at all, so a ticket still alive at that point would be free to
+    ///    stamp `idle`/`zone_cross_dropped_unhandled` over a crossing that is genuinely in flight.
+    ///    It cannot, because `resolve_zone_cross` owns the ticket and has returned by then.
+    ///
+    /// **Mutation check:** move the ticket's settlement after the auto-cross — which now requires
+    /// changing `resolve_zone_cross`'s signature to borrow rather than own, since the ticket is not
+    /// otherwise in scope down there. That is the point: the previous shape lost this to a
+    /// one-line statement move that the whole suite passed.
+    #[tokio::test]
+    async fn a_cross_requested_from_inside_the_region_walks_and_crosses_in_one_tick_725() {
+        use eqoxide_nav::zone_assets;
+        const DEST: u16 = 30;
+        const IDX: i32 = 7;
+
+        let (mut al, nav, command, collision, za) = shared_nav_action_loop();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        *al.world.zone_points.lock().unwrap() = vec![zp_at(IDX as u32, DEST, [100.0, 200.0, 0.0])];
+        al.last_zone_cross = Instant::now() - Duration::from_secs(11); // past the auto-cross cooldown
+        let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
+        ))).collision().unwrap().clone();
+        zone_assets::finish_zone_load(&collision, &za, "testfixture", Some(grid), 1, None);
+
+        let mut gs = GameState::new();
+        gs.world.zone_name = "testfixture".into();
+        gs.world.zone_id = 1; // != DEST, so the auto-cross takes the genuine CROSS-zone branch
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
+
+        // PREMISE, asserted: the capsule really is inside the trigger volume here — the exact
+        // condition the deleted shortcut assumed held from up to 15u away.
+        assert!(collision.read().unwrap().as_ref().unwrap()
+                .zone_line_at_standing([gs.player_x, gs.player_y, gs.player_z]).is_some(),
+            "premise: standing inside the DRNTP region");
+
+        command.request_zone_cross(DEST);
+        al.drain_zone_cross(&mut stream, &mut gs);
+
+        // (1) resolved to a walk rather than being swallowed
+        assert!(nav.goto_target.lock().unwrap().is_some(),
+            "#725: an inside-the-region cross resolves to a walk like any other — the goal is just \
+             metres away, which is honest, unlike the shortcut that published nothing");
+        assert!(gs.messages.iter().any(|m| m.text.contains("Walking to the zone")),
+            "and says so on the channel an HTTP agent can read");
+        // (2) the auto-cross fired in the SAME call
+        assert!(gs.messages.iter().any(|m| m.text.contains("Crossing to zone")),
+            "the standing auto-cross must still fire from physical position in this same tick");
+        // (3) the backstop did not fire over a live crossing
+        let s = nav.nav_state.lock().unwrap().clone();
+        assert_ne!(s.reason.as_deref(), Some(eqoxide_command::NAV_REASON_ZONE_CROSS_UNHANDLED),
+            "#725 B3: the cross-zone auto-cross branch publishes no nav_state, so a ticket still \
+             alive here would stamp `dropped_unhandled` ON TOP of a crossing that is in flight — \
+             the backstop telling the very kind of lie it exists to prevent");
     }
 
     /// **#725, the honesty half, through the real drain.** Even with the band closed, the thing that

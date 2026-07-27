@@ -25,6 +25,17 @@ use super::CommandState;
 /// [`ZoneCrossTicket`], which is the only thing that can publish it.
 pub const NAV_REASON_ZONE_CROSS_UNHANDLED: &str = "zone_cross_dropped_unhandled";
 
+/// `nav_reason` on the `idle` that [`CommandState::request_stop`] publishes (#725 review, B1) —
+/// "idle because YOU cancelled it", not "idle, nothing was ever asked for".
+pub const NAV_REASON_STOPPED: &str = "stopped";
+
+/// `nav_reason` on the `idle` that [`CommandState::request_cancel_goto`] publishes (#725 review,
+/// B1) — the narrower cancel taken when manual movement, the HTTP manual-move escape hatch, or the
+/// auto-melee-engage override takes over steering. Distinct from [`NAV_REASON_STOPPED`] because the
+/// caller did NOT ask to stop: something else took the wheel, and an agent polling its own `/goto`
+/// needs to be able to tell those apart.
+pub const NAV_REASON_GOTO_CANCELLED: &str = "goto_superseded";
+
 /// A `/v1/move/zone_cross` request that has been DRAINED out of its one-shot slot.
 ///
 /// # Why this is a type and not a `u16` (#725)
@@ -115,11 +126,18 @@ impl CommandState {
     /// see the new `goal_id` paired with the old goal's `arrived`/`no_path`/`blocked`. The previous
     /// route's per-instance facts (`reason`/`blocked_*`/`tier`/`local`) are cleared for the same
     /// reason. Returns the new `goal_id` so the accepting HTTP handler can echo it to the caller.
-    fn stamp_new_goal(&self, new_state: &str, goal: Option<(f32, f32, f32)>) -> u64 {
+    ///
+    /// `reason` is the `nav_reason` to publish alongside `new_state` (#725 review, B1). It is
+    /// `None` for the in-progress stamps — a `pending` needs no explanation, the request itself is
+    /// the explanation — and `Some(..)` for every `idle` stamp, because a bare `idle` is
+    /// indistinguishable from "nothing was ever requested". After #725 that distinction is load
+    /// bearing: on `idle`, `nav_reason: null` means exactly one thing, that no nav request has been
+    /// made since the client started.
+    fn stamp_new_goal(&self, new_state: &str, reason: Option<&str>, goal: Option<(f32, f32, f32)>) -> u64 {
         let mut s = self.nav.nav_state.lock().unwrap();
         s.goal_id += 1;
         s.state = new_state.to_string();
-        s.reason = None;
+        s.reason = reason.map(str::to_string);
         s.goal = goal.map(|(x, y, z)| [x, y, z]);
         s.blocked_goal = None;
         s.blocked_frontier = None;
@@ -135,7 +153,7 @@ impl CommandState {
     pub fn request_goto(&self, target: (f32, f32, f32)) -> u64 {
         *self.nav.goto_target.lock().unwrap() = Some(target);
         *self.nav.goto_entity.lock().unwrap() = None;
-        self.stamp_new_goal("pending", Some(target))
+        self.stamp_new_goal("pending", None, Some(target))
     }
 
     /// Walk to a named entity's current position and KEEP CHASING it (POST /v1/move/follow). `key`
@@ -144,7 +162,7 @@ impl CommandState {
     pub fn request_follow(&self, key: String, pos: (f32, f32, f32)) -> u64 {
         *self.nav.goto_target.lock().unwrap() = Some(pos);
         *self.nav.goto_entity.lock().unwrap() = Some(key);
-        self.stamp_new_goal("pending", Some(pos))
+        self.stamp_new_goal("pending", None, Some(pos))
     }
 
     /// Cancel any active goto/follow (POST /v1/move/stop). Clears the goto/follow slots AND the
@@ -162,7 +180,9 @@ impl CommandState {
         *self.nav.goto_target.lock().unwrap() = None;
         *self.nav.goto_entity.lock().unwrap() = None;
         *self.nav.zone_cross.lock().unwrap() = None;
-        self.stamp_new_goal("idle", None)
+        // SAY WHY (#725 review, B1): `idle` with no reason is the boot state. An agent that polls
+        // after `/stop` must be able to tell "your stop landed" from "I have no record of anything".
+        self.stamp_new_goal("idle", Some(NAV_REASON_STOPPED), None)
     }
 
     /// Cancel an in-progress goto WITHOUT touching `goto_entity` — used where manual movement
@@ -182,7 +202,10 @@ impl CommandState {
     /// terminal `arrived`/`no_path` under a fresh identity.
     pub fn request_cancel_goto(&self) -> u64 {
         *self.nav.goto_target.lock().unwrap() = None;
-        self.stamp_new_goal("idle", None)
+        // SAY WHY (#725 review, B1), and say something DIFFERENT from `/stop`: from the agent's side
+        // these are not the same event. `stopped` = you asked. `goto_superseded` = you did not, and
+        // steering was taken over by manual movement or the melee-engage override.
+        self.stamp_new_goal("idle", Some(NAV_REASON_GOTO_CANCELLED), None)
     }
 
     /// Queue a zone-line crossing (POST /v1/move/zone_cross). `0` = nearest line, `Some(id)` = a
@@ -193,7 +216,7 @@ impl CommandState {
     /// is left `None` until that resolution — the concrete destination isn't known yet.
     pub fn request_zone_cross(&self, zone_id: u16) -> u64 {
         *self.nav.zone_cross.lock().unwrap() = Some(zone_id);
-        self.stamp_new_goal("pending", None)
+        self.stamp_new_goal("pending", None, None)
     }
 
     // ── take_* : the MODEL (`ActionLoop::drain_zone_cross`) drains this once per tick ──────────────
@@ -243,7 +266,9 @@ impl CommandState {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandState, NAV_REASON_ZONE_CROSS_UNHANDLED};
+    use super::{
+        CommandState, NAV_REASON_GOTO_CANCELLED, NAV_REASON_STOPPED, NAV_REASON_ZONE_CROSS_UNHANDLED,
+    };
 
     #[test]
     fn request_goto_sets_target_and_clears_entity() {
@@ -339,7 +364,7 @@ mod tests {
     /// `state: "idle"` (set in-place by `Walker::resolve_goal` on its next tick) paired with the
     /// STALE, non-null coordinates from the cancelled goto.
     ///
-    /// Mutation check: delete the `self.stamp_new_goal("idle", None)` call in `request_cancel_goto`
+    /// Mutation check: delete the `self.stamp_new_goal("idle", …)` call in `request_cancel_goto`
     /// (leave only the `goto_target` clear) and this test goes RED — `s.goal` is still
     /// `Some([10.0, 20.0, 3.0])` after the cancel, the exact stale-`nav_goal` bug #497 reports.
     #[test]
@@ -356,6 +381,45 @@ mod tests {
         assert_eq!(s.goal_id, b);
         assert_eq!(s.goal, None,
             "nav_goal must be null after a cancel — a stale non-null goal alongside idle is #497");
+    }
+
+    /// **#725 review, B1: a bare `idle` is not an answer.** `docs/http-api.md` tells an agent that
+    /// on `idle` the `nav_reason` says how it got there. That was false: `/stop`, the manual-move
+    /// cancel and the *success* path of a zone crossing all published `idle` with `nav_reason:
+    /// null`, which is byte-identical to "no request has ever been made" — so the endpoint's
+    /// success looked exactly like its failure.
+    ///
+    /// This pins the half of that contract that lives in `CommandState`. The walker's half (the
+    /// retirement reasons and `zoned`) is pinned in `eqoxide-nav`; between them, `idle` +
+    /// `nav_reason: null` is reachable only as the boot default.
+    ///
+    /// **Mutation check:** pass `None` as the reason at either call site → the corresponding case
+    /// goes RED. Give both the SAME reason → the last assertion goes RED, which is the point of
+    /// having two: "you asked me to stop" and "something took the wheel from you" are different
+    /// facts about a goal an agent issued, and collapsing them re-hides one of them.
+    #[test]
+    fn every_idle_command_state_publishes_names_itself_725() {
+        for (label, act, want) in [
+            ("stop",        Box::new(|cs: &CommandState| { cs.request_stop(); })        as Box<dyn Fn(&CommandState)>,
+             NAV_REASON_STOPPED),
+            ("cancel_goto", Box::new(|cs: &CommandState| { cs.request_cancel_goto(); }) as Box<dyn Fn(&CommandState)>,
+             NAV_REASON_GOTO_CANCELLED),
+        ] {
+            let cs = CommandState::default();
+            assert_eq!(cs.nav.nav_state.lock().unwrap().reason, None,
+                "{label}: premise — at boot `idle` genuinely has no reason, which is the ONE case \
+                 a null reason is allowed to mean");
+            cs.request_goto((10.0, 20.0, 3.0));
+            act(&cs);
+
+            let s = cs.nav.nav_state.lock().unwrap();
+            assert_eq!(s.state, "idle", "{label}: still idle");
+            assert_eq!(s.reason.as_deref(), Some(want),
+                "{label}: #725 B1 — an `idle` with no reason is indistinguishable from a client \
+                 that was never asked for anything, so every path to `idle` must name itself");
+        }
+        assert_ne!(NAV_REASON_STOPPED, NAV_REASON_GOTO_CANCELLED,
+            "an explicit /stop and a cancel the caller did not ask for must be distinguishable");
     }
 
     #[test]
