@@ -293,6 +293,58 @@ pub struct ShadowCasterStep {
     pub draw:   ShadowCasterDraw,
 }
 
+/// What the planner **looked at** on its way to a plan, reported by the planner itself.
+///
+/// Nothing in `encode_shadow_pass` reads this. It exists so the coverage corpus in
+/// tests/shadow_caster_selection.rs can *observe* reach instead of re-deriving it, and it is here
+/// rather than behind `#[cfg(test)]` because an integration test links the crate as a dependency
+/// and cannot see `cfg(test)` items.
+///
+/// **Why it exists at all**, since a reader will otherwise reasonably ask why a renderer returns
+/// telemetry it ignores. Two of the corpus's coverage counters need to know which candidates the
+/// loop examined, and the plan alone cannot show that: a culled candidate, an `Absent` one, and a
+/// candidate the loop never reached are all three no-ops, identical in `steps`. #747 shipped two
+/// wrong answers to that before this one — reach computed from the fixture (round 2), then reach
+/// reconstructed from a second copy of the planner's own "stop at the bound" rule (round 3), whose
+/// self-check was a *subsequence* test and so constrained the ordering while placing no constraint
+/// whatsoever on the cut. The round-3 review falsified it by measurement: capping the nearby loop
+/// at 100 examined candidates lost real reach in 85 of 400 scenes and moved **not one counter**.
+/// Reported from inside the loop, the cut has exactly one source and there is nothing to drift.
+///
+/// The same argument covers the two `Absent` arms, which emit no step: an empty match arm is
+/// indistinguishable from a dead one, so a `continue` inserted before it would silently zero that
+/// cell's coverage. Counting inside the arm is what makes the arm observable.
+///
+/// `nearby_examined == nearby_culled + nearby_absent + nearby_static + nearby_skinned` holds by
+/// construction, and the corpus asserts that identity on every scene — so a misplaced or duplicated
+/// increment here reports as a broken counter rather than as quietly wrong coverage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShadowCasterReach {
+    /// Nearby candidates whose loop body ran — i.e. those reached before the slot bound stopped the
+    /// loop. Counted at the top of the body, before the cull.
+    pub nearby_examined: usize,
+    /// …of those, rejected by `entity_in_view`.
+    pub nearby_culled: usize,
+    /// …of those that survived the cull, how many landed in each `ShadowModelKind` arm.
+    /// `nearby_skinned` is counted on entry to the arm, before the (documented-dead) `j_slot`
+    /// guard, so the identity above holds regardless of whether that guard ever fires.
+    pub nearby_absent: usize,
+    pub nearby_static: usize,
+    pub nearby_skinned: usize,
+    /// A player was supplied and took the player path's `Absent` arm — also step-less, and
+    /// otherwise inferable only as "supplied but missing from the plan".
+    pub player_absent: bool,
+}
+
+/// A frame's caster selection: the steps to draw, plus what the planner examined to produce them.
+///
+/// Only `steps` drives rendering; see [`ShadowCasterReach`] for why `reach` is here.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ShadowCasterPlan {
+    pub steps: Vec<ShadowCasterStep>,
+    pub reach: ShadowCasterReach,
+}
+
 /// The device-free slice of a shadow-caster candidate that SELECTION reads. `encode_shadow_pass`
 /// implements it over `(&Billboard, Option<&GpuModel>)`; tests implement it on a plain struct.
 pub trait ShadowCasterCandidate {
@@ -321,8 +373,9 @@ pub fn shadow_pose_for(anim: Option<(usize, f32)>, clip_count: usize) -> ShadowP
 /// `SHADOW_CASTER_SLOTS` uniform slots are spent.
 ///
 /// Returns steps in write/draw order with their pool slots already assigned, so the pass has no
-/// selection decision left to make. Allocates: the nearest-first sort needs an owned index order
-/// (unlike [`plan_instanced_shadow_draws`], which is lazy).
+/// selection decision left to make, alongside a [`ShadowCasterReach`] the pass ignores and the
+/// coverage corpus reads. Allocates: the nearest-first sort needs an owned index order (unlike
+/// [`plan_instanced_shadow_draws`], which is lazy).
 ///
 /// `model_kind()` is called only for candidates that survive the cull *within this function*.
 ///
@@ -338,10 +391,11 @@ pub fn plan_shadow_casters<C: ShadowCasterCandidate>(
     light_center: [f32; 3],
     player_pos:   [f32; 3],
     view_proj:    [[f32; 4]; 4],
-) -> Vec<ShadowCasterStep> {
+) -> ShadowCasterPlan {
     use crate::renderer::SHADOW_CASTER_SLOTS;
 
     let mut steps: Vec<ShadowCasterStep> = Vec::new();
+    let mut reach = ShadowCasterReach::default();
     let mut u_slot = 0usize;
     let mut j_slot = 0usize;
 
@@ -366,7 +420,10 @@ pub fn plan_shadow_casters<C: ShadowCasterCandidate>(
                 });
                 u_slot += 1;
             }
-            ShadowModelKind::Absent => {}
+            // Counted, not empty: an empty arm cannot be told apart from a dead one. NOTE the
+            // counter is `reach.player_absent`, NOT `u_slot` — an absent player must consume no
+            // slot (`a_player_with_no_model_casts_nothing_and_consumes_no_slot`).
+            ShadowModelKind::Absent => reach.player_absent = true,
         }
     }
 
@@ -388,14 +445,21 @@ pub fn plan_shadow_casters<C: ShadowCasterCandidate>(
         if u_slot >= SHADOW_CASTER_SLOTS {
             break;
         }
+        // The one place the cut is observable. Everything after the `break` above is unexamined,
+        // and nothing in `steps` distinguishes "culled", "absent" and "never looked at".
+        reach.nearby_examined += 1;
         let c = &nearby[i];
         if !crate::camera::entity_in_view(
             c.pos(), player_pos, view_proj, ENTITY_DRAW_DIST, ENTITY_CULL_MARGIN,
         ) {
+            reach.nearby_culled += 1;
             continue;
         }
         match c.model_kind() {
             ShadowModelKind::Skinned { clip_count } => {
+                // Counted before the guard below, so `examined == culled + absent + static +
+                // skinned` holds whether or not the guard fires.
+                reach.nearby_skinned += 1;
                 // Unreachable in practice (`j_slot <= u_slot` always, and `u_slot <
                 // SHADOW_CASTER_SLOTS` was just checked), kept because the pre-#740 pass wrote it.
                 // `joint_slots_never_outrun_uniform_slots` pins the invariant that makes it dead.
@@ -412,6 +476,7 @@ pub fn plan_shadow_casters<C: ShadowCasterCandidate>(
                 j_slot += 1;
             }
             ShadowModelKind::Static => {
+                reach.nearby_static += 1;
                 steps.push(ShadowCasterStep {
                     caster: ShadowCasterRef::Nearby(i),
                     u_slot,
@@ -419,11 +484,13 @@ pub fn plan_shadow_casters<C: ShadowCasterCandidate>(
                 });
                 u_slot += 1;
             }
-            ShadowModelKind::Absent => {}
+            // Counted, not empty — same reason as the player arm above. NOTE the counter is
+            // `reach.nearby_absent`, NOT `u_slot`: an absent candidate consumes no slot.
+            ShadowModelKind::Absent => reach.nearby_absent += 1,
         }
     }
 
-    steps
+    ShadowCasterPlan { steps, reach }
 }
 
 /// Vestigial: this used to HIDE an armor mesh whose exact material+variant texture was
@@ -1576,7 +1643,9 @@ pub fn encode_shadow_pass(
     let plan = plan_shadow_casters(
         player_view.as_ref(), &nearby, light_center, scene.player_pos, r.last_view_proj);
 
-    for step in &plan {
+    // `plan.reach` is coverage telemetry for tests/shadow_caster_selection.rs and is deliberately
+    // unread here; see `ShadowCasterReach`.
+    for step in &plan.steps {
         // Placement differs between the player and a nearby character (the player uses
         // `humanoid_placement`, nearby characters the feet-offset/dominant-scale form), so the two
         // arms stay separate — but neither decides *whether* to draw.

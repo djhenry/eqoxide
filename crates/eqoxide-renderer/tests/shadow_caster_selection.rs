@@ -28,7 +28,9 @@
 //!
 //! The planner writes its slot bookkeeping out **once per path** — a player block and a nearby
 //! block — so either copy can rot alone, exactly as the pre-#740 pass wrote the #692/#694 clip
-//! guard out twice. Coverage is therefore a matrix, not a list, and every cell is reached:
+//! guard out twice. Coverage is therefore a matrix, not a list, and the corpus asserts a floor on
+//! every cell against a reach report the **planner** produces from inside its own loop
+//! (`pass::ShadowCasterReach`):
 //!
 //! | | player path | nearby path |
 //! |---|---|---|
@@ -38,17 +40,31 @@
 //! | `Skinned` | `the_player_takes_the_first_slot_…`, `the_player_is_never_view_culled`, `clip_index_out_of_range_…`, corpus | most of the file |
 //!
 //! `player` × `Absent` was the cell that was empty on the first draft, and it is a live production
-//! branch (a player whose race model has not loaded). The corpus now asserts its own reach for
-//! every cell, so a future fixture edit cannot silently empty one again.
+//! branch (a player whose race model has not loaded).
 //!
 //! **Corrected (#747 round 3):** an earlier draft of this table said every cell was "reached" while
 //! the corpus assertions behind three of the cells were computed from `cands` — the *generator* —
 //! and not from the returned plan. That is a claim about what the fixture built, and it cannot move
 //! when the *planner* stops reaching a variant, which is the only failure the assertions exist to
 //! catch. The two quantities differed measurably: 373/392/397 scenes generated a
-//! nearby `Absent`/`Static`/`Skinned`, but only 334/376/392 had the planner reach one. The struck
-//! claim is preserved here rather than deleted; all the reach counters are now derived from the
-//! plan, and `examined_nearby` reconstructs which candidates the loop actually inspected.
+//! nearby `Absent`/`Static`/`Skinned`, but only 334/376/392 had the planner reach one. Struck
+//! claims are preserved rather than deleted.
+//!
+//! **Corrected again (#747 round 4):** round 3's replacement — an `examined_nearby` helper that
+//! *reconstructed* the examined set from the plan — was wrong the same way one level down, and its
+//! own doc claimed otherwise ("if it ever drifts from the planner, that assertion fires instead of
+//! the counts quietly going wrong"). It was a second copy of the planner's termination rule, and
+//! its self-check was a *subsequence* test: a prefix is always a subsequence of the full order, so
+//! the check constrained the ordering and placed **no constraint on the cut** — the branch it took
+//! in 320 of 400 scenes. The round-3 review falsified the doc by measurement: capping the nearby
+//! loop at 100 examined candidates lost real reach in 85 of 400 scenes, over-claimed 1317
+//! candidate-examinations, and moved not one counter (18 passed, 0 failed). It also showed the
+//! nearby `Absent` cell could not observe its own arm going dead — 334 with the arm unreachable.
+//! Both are now fixed by construction rather than by a tighter guard: `plan_shadow_casters` reports
+//! its own reach, counted inside the loop and inside each arm, so there is one source for the cut,
+//! `examined_nearby` is deleted, and an `Absent` arm that stops running reports zero. Two scene-level
+//! asserts keep the report honest — the arm identity, and "the planner must not stop short of the
+//! order with slots to spare", which is what the 100-candidate cap now fails.
 //!
 //! ## What this file does NOT cover
 //!
@@ -134,7 +150,7 @@ fn in_view(pos: [f32; 3], player_pos: [f32; 3]) -> bool {
 }
 
 fn plan(nearby: &[Cand], light_center: [f32; 3]) -> Vec<ShadowCasterStep> {
-    plan_shadow_casters(None::<&Cand>, nearby, light_center, ORIGIN, VP)
+    plan_shadow_casters(None::<&Cand>, nearby, light_center, ORIGIN, VP).steps
 }
 
 /// The `Nearby` indices a plan selected, in plan order.
@@ -233,7 +249,7 @@ fn the_distance_cull_is_measured_from_the_player_not_the_light() {
     assert!(!in_view(c.pos, ORIGIN), "fixture: 1000 units from the player is past the draw distance");
     assert!(in_view(c.pos, light), "fixture: it WOULD pass if culled against the light center");
 
-    let steps = plan_shadow_casters(None::<&Cand>, std::slice::from_ref(&c), light, ORIGIN, VP);
+    let steps = plan_shadow_casters(None::<&Cand>, std::slice::from_ref(&c), light, ORIGIN, VP).steps;
     assert!(steps.is_empty(), "a candidate past the draw distance from the player casts nothing");
 }
 
@@ -250,7 +266,7 @@ fn frustum_culled_candidates_are_dropped_even_when_within_draw_distance() {
     assert!(!in_view(off_screen, player), "fixture: this one must be frustum-culled");
 
     let cands = [Cand::skinned(off_screen, 3), Cand::skinned(on_screen, 3)];
-    let steps = plan_shadow_casters(None::<&Cand>, &cands, player, player, VP);
+    let steps = plan_shadow_casters(None::<&Cand>, &cands, player, player, VP).steps;
     assert_eq!(picked(&steps), vec![1], "only the on-screen candidate casts");
     assert_eq!(u_slots(&steps), vec![0], "and it takes slot 0, not slot 1");
 }
@@ -323,7 +339,7 @@ fn the_player_takes_the_first_slot_and_shrinks_the_nearby_budget() {
         Cand::skinned([i as f32 * 0.5, 0.0, 0.0], 3)
     }).collect();
 
-    let steps = plan_shadow_casters(Some(&player), &cands, ORIGIN, ORIGIN, VP);
+    let steps = plan_shadow_casters(Some(&player), &cands, ORIGIN, ORIGIN, VP).steps;
     assert_eq!(steps.len(), SHADOW_CASTER_SLOTS, "the budget covers the player too");
     assert_eq!(steps[0].caster, ShadowCasterRef::Player, "the player is planned first");
     assert_eq!(steps[0].u_slot, 0);
@@ -342,7 +358,7 @@ fn the_player_takes_the_first_slot_and_shrinks_the_nearby_budget() {
 fn the_player_is_never_view_culled() {
     let player = Cand::skinned([9_000.0, 9_000.0, 9_000.0], 2);
     assert!(!in_view(player.pos, ORIGIN), "fixture: this position fails the cull");
-    let steps = plan_shadow_casters(Some(&player), &[] as &[Cand], ORIGIN, ORIGIN, VP);
+    let steps = plan_shadow_casters(Some(&player), &[] as &[Cand], ORIGIN, ORIGIN, VP).steps;
     assert_eq!(steps.len(), 1, "the player always casts when it has a model");
     assert_eq!(steps[0].caster, ShadowCasterRef::Player);
 }
@@ -391,7 +407,7 @@ fn a_player_with_no_model_casts_nothing_and_consumes_no_slot() {
         Cand::statik([20.0, 0.0, 0.0]),
         Cand::skinned([30.0, 0.0, 0.0], 3),
     ];
-    let steps = plan_shadow_casters(Some(&player), &cands, ORIGIN, ORIGIN, VP);
+    let steps = plan_shadow_casters(Some(&player), &cands, ORIGIN, ORIGIN, VP).steps;
 
     assert!(
         steps.iter().all(|s| s.caster != ShadowCasterRef::Player),
@@ -412,7 +428,7 @@ fn a_player_with_no_model_casts_nothing_and_consumes_no_slot() {
     // …and, unlike a drawn player, it does not shrink the nearby budget.
     let many: Vec<Cand> =
         (0..SHADOW_CASTER_SLOTS * 2).map(|i| Cand::skinned([i as f32 * 0.5, 0.0, 0.0], 3)).collect();
-    let steps = plan_shadow_casters(Some(&player), &many, ORIGIN, ORIGIN, VP);
+    let steps = plan_shadow_casters(Some(&player), &many, ORIGIN, ORIGIN, VP).steps;
     assert_eq!(
         steps.len(), SHADOW_CASTER_SLOTS,
         "an absent player leaves the whole budget to the nearby casters",
@@ -476,7 +492,7 @@ fn clip_index_out_of_range_falls_back_to_bind_pose() {
              bind pose (eqoxide#692/#694) — evaluating it would index past the clip list", clips, idx,
         );
 
-        let player = plan_shadow_casters(Some(&c), &[] as &[Cand], ORIGIN, ORIGIN, VP);
+        let player = plan_shadow_casters(Some(&c), &[] as &[Cand], ORIGIN, ORIGIN, VP).steps;
         assert_eq!(player.len(), 1, "clips={} idx={}: the player must be selected", clips, idx);
         assert_eq!(
             pose_of(&player[0]), expect,
@@ -605,44 +621,6 @@ fn old_selection(
     out
 }
 
-/// Coverage accounting for the corpus — **not** a correctness oracle.
-///
-/// Two of the reach counters below need to know which nearby candidates the planner actually
-/// *examined*, and the plan alone does not show that: a culled candidate and an `Absent` one are
-/// both no-ops, indistinguishable in the output from a candidate the loop never looked at.
-///
-/// It is recoverable, because the planner checks the bound at the **top** of its loop: the last
-/// candidate it examined is exactly the one that produced the final step, and everything after that
-/// in nearest-first order was never inspected. If the plan did not fill the budget, the loop ran to
-/// the end and everything was examined.
-///
-/// This restates the ordering rule a third time (the planner, `old_selection`, here), so it is
-/// **self-checked on every scene**: the planner's own selections must appear in this order, as a
-/// subsequence. If it ever drifts from the planner, that assertion fires instead of the counts
-/// quietly going wrong. Correctness is graded by the differential, never by this.
-fn examined_nearby(cands: &[Cand], light: [f32; 3], got: &[ShadowCasterStep]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..cands.len()).collect();
-    order.sort_by(|&a, &b| {
-        dist2_to(cands[a].pos, light)
-            .partial_cmp(&dist2_to(cands[b].pos, light))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let sel = picked(got);
-    let mut it = order.iter();
-    for i in &sel {
-        assert!(it.any(|o| o == i), "reach accounting drifted from the planner's ordering");
-    }
-
-    if got.len() < SHADOW_CASTER_SLOTS {
-        return order; // the bound was never hit, so the loop ran to the end of the order
-    }
-    let last = *sel.last().expect("a budget-filling plan must end on a nearby caster");
-    let cut = order.iter().position(|&i| i == last).expect("a selected index must be in the order");
-    order.truncate(cut + 1);
-    order
-}
-
 fn dist2_to(p: [f32; 3], c: [f32; 3]) -> f32 {
     (p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2)
 }
@@ -670,11 +648,22 @@ impl Rng {
 /// four decisions are pinned exhaustively at their boundaries by the tests above; this catches
 /// interaction bugs between them.
 ///
-/// **The reach counters read the planner's output, never the generator.** A counter computed from
-/// `cands` states what the fixture built; it cannot move when the *planner* stops reaching a
-/// variant, which is the only thing these exist to catch. Measured before this was fixed:
-/// 373/392/397 scenes *generated* a nearby `Absent`/`Static`/`Skinned`, but only 334/376/392 had the
-/// planner *reach* one — the loop breaks at the bound and skips the rest of the order.
+/// **The reach counters are reported by the planner itself** (`ShadowCasterReach`), not computed
+/// out here. Two earlier drafts computed them, and both were wrong in the same way:
+///
+/// - round 2 read `cands` — the *generator* — so the counters stated what the fixture built and were
+///   structurally incapable of moving when the *planner* stopped reaching a variant. Measured:
+///   373/392/397 scenes generated a nearby `Absent`/`Static`/`Skinned`, only 334/376/392 reached one.
+/// - round 3 read a reconstruction of the loop, i.e. a **second copy of the planner's termination
+///   rule**, self-checked only by a *subsequence* test — which constrains the ordering and places no
+///   constraint at all on the cut. Measured by the round-3 review: capping the nearby loop at 100
+///   examined candidates lost real reach in 85 of 400 scenes (1317 candidate-examinations claimed
+///   that never happened) and left every counter byte-identical.
+///
+/// There is now exactly one source for the cut and for each arm, and it is inside the loop. The two
+/// asserts that keep it honest are in the scene body: the arm identity
+/// (`examined == culled + absent + static + skinned`), which fails on a misplaced increment, and the
+/// no-early-stop assert, which fails on the 100-candidate cap above.
 ///
 /// **The thresholds below are smoke alarms, not safeguards — do not tighten them.** They sit far
 /// under the observed values on purpose. What actually protects the sort-stability mutant (`sort_by`
@@ -686,7 +675,27 @@ impl Rng {
 /// empties a category outright, and that is their whole job.
 ///
 /// Observed at the current seed, for reference and not as targets: truncation 80, cull 317, clip
-/// guard 391, ties 369, and the matrix cells 98/45/95/162 (player) and 334/376/392 (nearby).
+/// guard 391, ties 369, and the matrix cells 98/45/95/162 (player) and 334/376/392 (nearby). Every
+/// one of these is unchanged from round 3 — the round-3 reconstruction *was* accurate at this seed,
+/// which is exactly why nothing here caught that it could not be falsified.
+///
+/// **`saw_ties = 369` vs the round-2 review's `377`, reconciled by measurement, not by argument.**
+/// They are different quantities, not a discrepancy. Re-measured over the identical corpus (the
+/// generator has not changed since round 2 — "any tie in `cands`" still reproduces round 2's 390
+/// exactly, which pins that the scenes are the same):
+///
+/// | definition | scenes |
+/// |---|---|
+/// | two **selected** casters equidistant — what `saw_ties` counts | **369** |
+/// | two candidates the planner examined **and that survived the cull** are equidistant | **377** |
+/// | two candidates the planner examined are equidistant | 390 |
+/// | two candidates anywhere in `cands` are equidistant — round 2's `saw_ties` | 390 |
+///
+/// So round 2's `377` is the second row, and its label "(both in the plan)" was imprecise: a tie
+/// between two examined, in-view candidates counts there even when one of them is `Absent` and
+/// therefore never enters the plan. `369` is the right number for this assertion's stated purpose —
+/// only casters that actually reach `steps` can discriminate `sort_by` from `sort_unstable_by`,
+/// because a reordering that touches an `Absent` candidate is invisible in the output.
 ///
 /// The reason they are needed at all: a pseudo-random corpus only covers what it happens to
 /// generate, and an unrelated edit to the generator silently moves the whole stream — not
@@ -703,12 +712,15 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
     // can rot alone. This is asserted rather than reasoned: the corpus used to reach
     // `Absent` only on the nearby path, and the player-path `Absent` arm had no coverage at all.
     //
-    // EVERY counter here is computed from `got` — the planner's output — or from
-    // `examined_nearby(…)`, which is derived from `got` and self-checked against it. None of them
-    // read `cands`. A counter computed from the generator asserts what the FIXTURE produced and is
-    // structurally incapable of moving when the PLANNER stops reaching a variant, which is the
-    // exact loss these exist to catch. The two quantities already differed measurably before this
-    // was fixed (nearby/Absent: 373 generated vs 334 reached).
+    // Where each counter's SUBJECT comes from: the four nearby cells and `player/Absent` come from
+    // `plan.reach`, which the planner reports from inside its own loop; `nearby/Static` and
+    // `nearby/Skinned` are cross-checked against `got` on every scene, since those two arms do emit
+    // steps. Nothing here re-derives the loop's termination rule, and nothing here counts what the
+    // GENERATOR built. `cands` is still indexed — for `saw_ties`' positions and the clip guard's
+    // anim states — but only at indices the PLAN supplies: the index SET is plan-derived, the
+    // per-index lookup is necessarily fixture-side. (Round 3 claimed "none of them read `cands`";
+    // three of them did, on the same screen. The claim was about the index set and was written as
+    // if it were about the whole expression.)
     let (mut saw_player_none, mut saw_player_absent) = (0usize, 0usize);
     let (mut saw_player_static, mut saw_player_skinned) = (0usize, 0usize);
     let (mut saw_nearby_absent, mut saw_nearby_static, mut saw_nearby_skinned) = (0usize, 0usize, 0usize);
@@ -767,7 +779,8 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
         let light = [rng.coord(half), rng.coord(half), rng.coord(half)];
         let player_pos = ppos(&mut rng);
 
-        let got = plan_shadow_casters(player.as_ref(), &cands, light, player_pos, VP);
+        let plan = plan_shadow_casters(player.as_ref(), &cands, light, player_pos, VP);
+        let (got, reach) = (plan.steps, plan.reach);
         let want = old_selection(player.as_ref(), &cands, light, player_pos, VP);
         assert_eq!(
             got, want,
@@ -776,15 +789,53 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
 
         // ── Corpus-reach accounting ─────────────────────────────────────────────────────────────
         // A differential that never reaches the interesting states is a differential over the empty
-        // set. Every counter below reads the PLANNER's output, never `cands`; see the declarations.
-        let examined = examined_nearby(&cands, light, &got);
+        // set. The subject of every counter below is the PLANNER; see the declarations.
+
+        // The planner's reach report must add up. Every examined candidate lands in exactly one of
+        // the four buckets, so a misplaced, duplicated or dropped increment inside the loop reports
+        // here as a broken counter instead of as quietly wrong coverage. This is the one thing the
+        // reach struct cannot get wrong silently.
+        assert_eq!(
+            reach.nearby_examined,
+            reach.nearby_culled + reach.nearby_absent + reach.nearby_static + reach.nearby_skinned,
+            "scene {}: the planner's reach report does not add up — {:?}", scene, reach,
+        );
+        // …and the two arms that DO emit steps must agree with the plan, which is an independent
+        // subject: `reach` is written inside the loop, `got` is what came out of it.
+        assert_eq!(
+            reach.nearby_static,
+            got.iter().filter(|s| matches!(s.caster, ShadowCasterRef::Nearby(_))
+                && matches!(s.draw, ShadowCasterDraw::Static)).count(),
+            "scene {}: reported nearby/Static reach disagrees with the plan", scene,
+        );
+        assert_eq!(
+            reach.nearby_skinned,
+            got.iter().filter(|s| matches!(s.caster, ShadowCasterRef::Nearby(_))
+                && matches!(s.draw, ShadowCasterDraw::Skinned { .. })).count(),
+            "scene {}: reported nearby/Skinned reach disagrees with the plan (the dead `j_slot` \
+             guard is the only way these can legitimately differ, and it never fires)", scene,
+        );
+        // **The planner must not stop early with slots to spare.** `u_slot` advances once per
+        // emitted step, so a plan short of the budget means the bound never fired and the loop owed
+        // the whole order a look. Stated as an asserted property of the system, not used as a
+        // derivation feeding a counter — that inversion is what #747 round 3 got wrong. This is the
+        // assert that fails when the nearby loop is capped early (the round-3 review's R2 mutation,
+        // which previously survived with every counter unmoved).
+        if got.len() < SHADOW_CASTER_SLOTS {
+            assert_eq!(
+                reach.nearby_examined, cands.len(),
+                "scene {}: the planner examined {} of {} candidates but filled only {} of {} slots \
+                 — it stopped short of the order with budget left", scene,
+                reach.nearby_examined, cands.len(), got.len(), SHADOW_CASTER_SLOTS,
+            );
+        }
 
         if got.len() == SHADOW_CASTER_SLOTS { saw_truncation += 1; }
 
-        // A real `entity_in_view` rejection *inside the loop*. The previous form
-        // (`nearby steps < n`) also counted `Absent` candidates and truncation as "culls", which
-        // made it near-vacuous — 397 of 400 scenes — while its message said "culled".
-        if examined.iter().any(|&i| !in_view(cands[i].pos, player_pos)) { saw_cull += 1; }
+        // A real `entity_in_view` rejection *inside the loop*, counted by the loop. The round-2
+        // form (`nearby steps < n`) also counted `Absent` candidates and truncation as "culls",
+        // which made it near-vacuous — 397 of 400 scenes — while its message said "culled".
+        if reach.nearby_culled > 0 { saw_cull += 1; }
 
         // The clip guard FIRING, not merely a bind pose: a caster that had an animation state and
         // was still bind-posed. `Cand::skinned` has no anim state and bind-poses through the `_ =>`
@@ -804,20 +855,22 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
         sel_d.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         if sel_d.windows(2).any(|w| w[0] == w[1]) { saw_ties += 1; }
 
-        // The variant × path matrix. `Absent` emits no step on either path, so it is observed as
-        // "examined and in view but absent from the plan" (nearby) and "a player was supplied and
-        // produced no step" (player) — both still statements about the planner, not the fixture.
-        if examined.iter().any(|&i| {
-            matches!(cands[i].kind, ShadowModelKind::Absent) && in_view(cands[i].pos, player_pos)
-        }) { saw_nearby_absent += 1; }
-        if got.iter().any(|s| matches!(s.caster, ShadowCasterRef::Nearby(_))
-            && matches!(s.draw, ShadowCasterDraw::Static)) { saw_nearby_static += 1; }
-        if got.iter().any(|s| matches!(s.caster, ShadowCasterRef::Nearby(_))
-            && matches!(s.draw, ShadowCasterDraw::Skinned { .. })) { saw_nearby_skinned += 1; }
+        // The variant × path matrix, straight off the planner's own report. The two `Absent` cells
+        // emit no step, so before this they were the two cells nothing could observe: an empty
+        // match arm is indistinguishable from a dead one, and the round-3 review proved it by
+        // making the nearby `Absent` arm unreachable with a plan-neutral `continue` and watching
+        // this counter hold at 334. It is counted *inside* the arm now, so that mutation zeroes it.
+        if reach.nearby_absent > 0 { saw_nearby_absent += 1; }
+        if reach.nearby_static > 0 { saw_nearby_static += 1; }
+        if reach.nearby_skinned > 0 { saw_nearby_skinned += 1; }
 
         match (player.as_ref(), got.iter().find(|s| s.caster == ShadowCasterRef::Player)) {
-            (None, _)       => saw_player_none += 1,
-            (Some(_), None) => saw_player_absent += 1, // supplied, planned nothing → the Absent arm
+            (None, _) => saw_player_none += 1,
+            (Some(_), None) => {
+                assert!(reach.player_absent, "scene {}: a supplied player produced no step and the \
+                    planner did not report taking the player `Absent` arm", scene);
+                saw_player_absent += 1;
+            }
             (Some(_), Some(s)) if matches!(s.draw, ShadowCasterDraw::Static) => saw_player_static += 1,
             (Some(_), Some(_)) => saw_player_skinned += 1,
         }
@@ -825,7 +878,8 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
 
     // Floors, not targets — see this test's doc comment. Each message names the object it counts,
     // because the round-2 review of #747 found three of these saying "reached" while counting what
-    // the generator built.
+    // the generator built, and the round-3 review found the replacements saying "reached" while
+    // counting a reconstruction that could not be falsified.
     assert!(
         saw_truncation >= 60,
         "the returned plan filled all {} slots in only {} of 400 scenes",
@@ -849,10 +903,11 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
          `equidistant_casters_keep_input_order`", saw_ties,
     );
 
-    // The variant × path matrix, asserted against the PLAN. A variant the planner stops reaching on
-    // either path is a silent loss of coverage for a live production branch, not harmless corpus
-    // drift. `Absent` emits nothing, so its two cells are "examined, in view, and absent from the
-    // plan" (nearby) and "a player was supplied and produced no step" (player).
+    // The variant × path matrix, asserted against the planner's own reach report. A variant the
+    // planner stops reaching on either path is a silent loss of coverage for a live production
+    // branch, not harmless corpus drift. The two `Absent` cells emit no step, so they are counted
+    // inside their arms — which is the only way they are observable at all, and is what makes
+    // "reached" true of every row here rather than merely inferred for two of them.
     for (label, n) in [
         ("player/None", saw_player_none), ("player/Absent", saw_player_absent),
         ("player/Static", saw_player_static), ("player/Skinned", saw_player_skinned),
