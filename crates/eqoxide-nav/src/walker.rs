@@ -40,7 +40,7 @@ use eqoxide_core::physics::{RUN_SPEED, WALK_SPEED};
 /// via the same `Collision::path_clear` volume-sweep the controller moves under and A* validates fine
 /// edges with (#358). Kept at `PLAYER_RADIUS` (not padded wider) precisely so the clamp trips ONLY on
 /// a real corner cut and never on merely hugging a straight wall — the over-tightening #685 must avoid.
-const STEER_LOS_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS;
+pub(crate) const STEER_LOS_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS;
 
 
 /// Buffer (beyond the body radius) the committed coarse route is inflated OFF convex wall corners by,
@@ -522,11 +522,24 @@ impl Walker {
     ///      controller frame of travel (`RUN_SPEED * 0.01 = 0.44 u`), so it is overshot rather than
     ///      reached.
     ///
-    ///    The aim then flips every frame, net displacement is zero, and the walker exhausts its
-    ///    re-paths and stops with `blocked` / `walker_stalled` while standing on a route it could
-    ///    have walked. Measured end to end by the three `#673 step N of 3` tests in
-    ///    [`crate::steering`], the last of which drives the production `steer_target` at `LOOK_AHEAD`
-    ///    on a featureless floor and reproduces the live capture's oscillation band.
+    ///    The aim then flips every frame and net displacement is zero: **the steering loop has no
+    ///    trajectory that leaves the spot** while the cursor stays stale. Measured end to end by the
+    ///    three `#673 step N of 3` tests in [`crate::steering`], the last of which drives the
+    ///    production [`crate::steering::steer_target`] and [`crate::steering::fast_steer_aim`] at
+    ///    `LOOK_AHEAD` on a featureless floor: 0.02 u of net displacement over 200 nav ticks.
+    ///
+    ///    ⚠️ **Correction (#727 round 4).** This paragraph used to continue "…and the walker
+    ///    exhausts its re-paths and stops with `blocked` / `walker_stalled`", citing that sim. The
+    ///    sim does not contain the walker's stall detector, `NAV_STUCK_TICKS` backoff or re-plan, so
+    ///    it cannot say that. Driven through the **production** `drive_walk` loop on that same
+    ///    fixture, the walker sits in the cycle for ~22 nav ticks (~3.3 s), then backs off, re-plans
+    ///    from the body, and **arrives** (#727 round-3 review, measured). What makes #673 terminal
+    ///    rather than a hiccup is the re-plan reproducing the state, which is a property of the
+    ///    terrain and not of this mechanism: live on qcat it did, and the walker stopped with
+    ///    `blocked` / `walker_stalled` on 6 of 8 attempts — and that reason code is only emitted once
+    ///    `nav_repaths` has reached 8, so all eight re-plans failed to escape. The cost of a stale
+    ///    cursor is therefore *at least* a wasted backoff-and-re-plan lap per occurrence, and at worst
+    ///    a terminal stop on a route the character could have walked.
     ///
     /// ## A resync is NOT progress, and the walker says so (#727 round 2)
     ///
@@ -1632,8 +1645,11 @@ mod tests {
     /// not just a library function nobody calls. Fixture: the coarse route the live client committed
     /// on a FAILING South Qeynos → qcat run (waypoints 44..52 of it), and the position the character
     /// physically reaches after dropping off the street into the aqueduct trench. The monotone
-    /// advance alone leaves `path_i` three segments behind — where the carrot collapses onto the
-    /// character and the walker deadlocks at `walker_stalled`.
+    /// advance alone leaves `path_i` three segments behind — where the fine planner's goal collapses
+    /// onto the character and the steering loop has no trajectory that leaves the spot (see
+    /// [`Walker::advance_cursor`]'s root-cause note for the four-step chain, and for why "deadlocks
+    /// at `walker_stalled`" — this comment's wording through round 3 — overstated what the offline
+    /// sim measures).
     #[test]
     fn a_cursor_the_character_has_overtaken_is_resynced_by_the_walkers_advance() {
         let (mut w, _nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));

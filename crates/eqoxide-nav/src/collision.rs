@@ -1765,12 +1765,31 @@ impl Collision {
     ///
     /// **And the envelope is PER PROBE, not over the hop.** `prev_z` chains, so each probe is judged
     /// against the last floor found rather than against the hop's own start and end. A descent that
-    /// takes the full allowance at every probe therefore compounds: a staircase of `allow`-sized
-    /// risers is accepted at a mean grade of ~1.83 against `MAX_WALK_GRADE = 1.2`. That is deliberate
-    /// to the extent that a long walkable ramp must not be refused for being long, and unbounded to
-    /// the extent that nothing re-checks the aggregate. Disclosed in the tracking issue with the
-    /// spacing and width gaps above; the caller's hop bound ([`crate::steering::CURSOR_RESYNC_MAX_HOP`])
-    /// is currently the only thing limiting how much can compound.
+    /// takes the full allowance at every probe therefore compounds, and the aggregate it compounds to
+    /// is analytic:
+    ///
+    /// ```text
+    /// allow      = PROBE_SPACING * MAX_WALK_GRADE + step_up      (when run/n == PROBE_SPACING)
+    /// mean grade = allow / PROBE_SPACING = MAX_WALK_GRADE + step_up / PROBE_SPACING
+    ///            = 1.2 + 2.0 / 2.0 = 2.2
+    /// ```
+    ///
+    /// So a staircase of `allow`-sized risers is accepted up to a mean grade of **2.2** against
+    /// `MAX_WALK_GRADE = 1.2` — 1.83× the walk envelope this doc claims to enforce. Measured to the
+    /// boundary by `ground_continuous_compounding_descent_is_capped_at_grade_plus_one_step_per_probe`
+    /// (2.15 accepted, 2.20 refused). Note which way the cap moves: it gets **worse** if
+    /// `PROBE_SPACING` is ever reduced, because the discrete `step_up` term is divided by it.
+    ///
+    /// That is deliberate to the extent that a long walkable ramp must not be refused for being long,
+    /// and unbounded to the extent that nothing re-checks the aggregate. Disclosed in the tracking
+    /// issue with the spacing and width gaps above; the caller's hop bound
+    /// ([`crate::steering::CURSOR_RESYNC_MAX_HOP`]) is currently the only thing limiting how much can
+    /// compound.
+    ///
+    /// ⚠️ **Correction (#727 round 4).** Round 3 wrote this gap as "a mean grade of ~1.83". That was
+    /// the round-2 reviewer's measurement, adopted here in good faith, and the reviewer has since
+    /// retracted it: 1.83 understates the envelope by ~18% (it is the *ratio* to `MAX_WALK_GRADE`,
+    /// not the grade). The correct figure is 2.2, derived above and measured.
     ///
     /// Returns `true` when the zone has no geometry, matching [`Self::carrot_los_clear`]'s own
     /// documented no-geometry behaviour — a client with no world model must not silently answer
@@ -4909,6 +4928,51 @@ mod tests {
         assert!(floor_with_drop(4.0).ground_continuous([-6.0, 0.0, 0.0], [6.0, 0.0, -4.0]),
             "a 4 u drop is inside the walk envelope; refusing it would make the predicate a false \
              negative on ordinary terrain");
+    }
+
+    /// A staircase descending WEST from e = 0, one `riser` per 2 u tread — the shape that makes the
+    /// per-probe allowance compound, because `prev_z` chains from probe to probe.
+    fn staircase(riser: f32) -> Collision {
+        Collision::build(&ZoneAssets {
+            terrain: (0..16)
+                .map(|i| slab(-(i as f32) * riser, -20.0, 20.0, -2.0 * (i + 1) as f32, -2.0 * i as f32, true))
+                .collect(),
+            objects: vec![], textures: vec![],
+        }, 32.0)
+    }
+
+    /// **The compounding-descent gap, pinned at the number the rustdoc now claims.**
+    ///
+    /// `allow` is granted PER PROBE and `prev_z` chains, so a staircase that takes the full allowance
+    /// at every tread is accepted however long it runs. The aggregate cap is analytic:
+    ///
+    /// ```text
+    /// allow      = PROBE_SPACING * MAX_WALK_GRADE + step_up   (when run/n == PROBE_SPACING)
+    /// mean grade = allow / PROBE_SPACING = MAX_WALK_GRADE + step_up / PROBE_SPACING
+    ///            = 1.2 + 2.0 / 2.0 = 2.2
+    /// ```
+    ///
+    /// which is **1.83× `MAX_WALK_GRADE`**, and the sweep below confirms it to the boundary. This
+    /// exists so the disclosed gap is a measured claim rather than commentary: scale `allow` up and
+    /// the refusal goes green; replace `allow` with a bare `step_up` and the acceptance goes red.
+    ///
+    /// ⚠️ **Correction (#727 round 4).** Round 3 recorded this gap as "mean grade ~1.83 accepted".
+    /// That figure came from a coarser sweep and understates the envelope by ~18%; 1.83 is the
+    /// *ratio* to `MAX_WALK_GRADE`, not the grade. Measured here: 2.15 accepted, 2.20 refused.
+    #[test]
+    fn ground_continuous_compounding_descent_is_capped_at_grade_plus_one_step_per_probe() {
+        // 12 probes over a 24 u hop, so each probe spans exactly one 2 u tread.
+        let hop = |riser: f32| staircase(riser)
+            .ground_continuous([0.0, 0.0, 0.0], [-24.0, 0.0, -12.0 * riser]);
+        // Mean grade 2.15 — 79% steeper than MAX_WALK_GRADE, and accepted. This is the GAP, asserted
+        // so that it is disclosed by execution and not only by prose.
+        assert!(hop(4.3),
+            "the compounding gap is documented as reaching a mean grade of 2.15; if this now refuses, \
+             the rustdoc's disclosure overstates the gap and must be narrowed");
+        // …and 2.20 = MAX_WALK_GRADE + step_up/PROBE_SPACING is the cap, which must hold.
+        assert!(!hop(4.4),
+            "a mean grade of 2.20 is the analytic per-probe cap and must be refused; if this passes, \
+             the compounding is unbounded and the rustdoc's cap is wrong");
     }
 
     // ─── Water-span grid (3D-water-volume nav design §5, Slice 1) ──────────────────────────────

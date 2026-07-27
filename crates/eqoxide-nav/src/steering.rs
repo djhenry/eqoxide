@@ -734,12 +734,35 @@ mod cursor_resync_tests {
     /// Drive the #673 fixture through the walker's REAL steering rule and report how far the
     /// character actually gets along the route.
     ///
-    /// Structure mirrors `navigation.rs`'s two-rate loop: a 150 ms NAV TICK (cursor + fine plan) and
-    /// 15 fast-steer frames at ~100 Hz in between. The steering itself is **not mirrored** — every
-    /// frame calls the production [`steer_target`], which is what decides whether the walker steers
-    /// along the fine path or the coarse one, and the fine plan comes from the production
-    /// `find_path_local` with the production `LOCAL_REACH` goal. The only copied numbers are the loop
-    /// rates and `RUN_SPEED`.
+    /// Structure mirrors `navigation.rs`'s two-rate loop: a 150 ms NAV TICK (cursor + `steer_target`
+    /// + a fine-plan request) and 14 fast-steer frames at ~100 Hz in between, each calling the
+    /// production [`fast_steer_aim`] exactly as `Walker::apply_fast_steering` does. The steering
+    /// itself is **not mirrored** — it is the production functions, called with the production
+    /// arguments and the production `STEER_LOS_CLEARANCE`. The only copied numbers are the loop
+    /// rates, `LOOK_AHEAD` / `LOCAL_REACH` / `LOCAL_BOUND` and `RUN_SPEED`.
+    ///
+    /// # What this fixture does NOT model
+    ///
+    /// Stated bluntly and in one place, because scattered caveats are how a sim's result gets read
+    /// as the walker's behaviour (#727 round-3 review, blocking 1). This is a model of the
+    /// **steering loop**, not of the walker:
+    ///
+    /// 1. **No stall detector, no `NAV_STUCK_TICKS` backoff, and no re-plan.** That is precisely the
+    ///    machinery that decides whether a limit cycle is a *wedge* or a three-second hiccup. A
+    ///    `net = 0` result here means "the steering loop has no trajectory that leaves the spot",
+    ///    **not** "the walker never leaves the spot" — measured, the walker escapes this featureless
+    ///    fixture via its own stall/backoff/re-plan. See the doc on
+    ///    `the_stale_cursor_leaves_the_steering_loop_no_escaping_trajectory_and_the_resync_clears_it`.
+    /// 2. **No controller.** Position is `wish_dir * RUN_SPEED * dt` with a floor snap: no gravity,
+    ///    no collision response, no acceleration, no slope handling. On this floor there is nothing
+    ///    for those to do, which is the point of the floor being featureless — but it is a model.
+    /// 3. **The fine plan is synchronous with one tick of latency**, where production posts it with
+    ///    `post_if_idle` and applies whatever the worker has finished. The one-tick delay reproduces
+    ///    production's "tick 0 has no fine plan and steers the healthy coarse carrot"; a *variable*
+    ///    planner latency is not modelled, and a synchronous zero-latency plan (what this harness did
+    ///    through round 3) makes the fixed point artificially perfect.
+    /// 4. **One flat slab of floor**, not qcat. Nothing here says how often the live client enters
+    ///    this state, and the featureless floor is why the re-plan in (1) can rescue it.
     ///
     /// **On not building the answer into the instrument.** The floor is featureless, so nothing here
     /// can trap the character except the steering rule itself; the harness is never told what a
@@ -752,16 +775,25 @@ mod cursor_resync_tests {
     fn fixture_run(col: &crate::collision::Collision, start_i: usize, resync: bool, verbose: bool)
         -> Run
     {
-        const DT: f32 = 0.01;        // ~100 Hz controller frame
-        const FRAMES: u32 = 15;      // 150 ms nav tick
+        const DT: f32 = 0.01;          // ~100 Hz controller frame
+        const FRAMES: u32 = 14;        // 150 ms nav tick = 1 steer_target + 14 fast_steer_aim frames
         const TICKS: u32 = 200;
-        let radius = eqoxide_core::physics::PLAYER_RADIUS;
-        let los = |a: [f32; 3], b: [f32; 3]| col.carrot_los_clear(a, b, radius);
+        const LOOK_AHEAD: f32 = 5.0;   // walker.rs `drive_walk`
+        const LOCAL_REACH: f32 = 24.0; // walker.rs `drive_walk`
+        const LOCAL_BOUND: f32 = 40.0; // walker.rs `drive_walk`
+        // The walker's own clearance, referenced rather than re-derived: it is defined as
+        // `PLAYER_RADIUS` today, so a copy would agree by coincidence and drift silently.
+        let clearance = crate::walker::STEER_LOS_CLEARANCE;
+        let los = |a: [f32; 3], b: [f32; 3]| col.carrot_los_clear(a, b, clearance);
         let goal = *HAIRPIN.last().unwrap();
         let mut p = LANDED;
         let mut path_i = start_i;
+        // Production applies the fine plan a tick after it is requested (`post_if_idle` + `poll`), so
+        // tick 0 has none — which is why tick 0 steers the healthy coarse carrot.
         let mut local: Vec<[f32; 3]> = Vec::new();
+        let mut pending: Vec<[f32; 3]> = Vec::new();
         let mut local_i = 0usize;
+        let mut local_from = p;
         let (mut x_min, mut x_max) = (p[0], p[0]);
         for tick in 0..TICKS {
             let before = p;
@@ -776,36 +808,57 @@ mod cursor_resync_tests {
             }
             if resync {
                 path_i = resync_cursor(&HAIRPIN, path_i, p, |a, b| {
-                    col.carrot_los_clear(a, b, radius) && col.ground_continuous(a, b)
+                    col.carrot_los_clear(a, b, clearance) && col.ground_continuous(a, b)
                 });
+            }
+            let coarse = carrot_along(&HAIRPIN, path_i, p, LOOK_AHEAD).unwrap_or(goal);
+            // `drive_walk`: apply whatever the fine planner finished, then drop it if the body has
+            // wandered outside the window it was planned from.
+            if !pending.is_empty() { local = std::mem::take(&mut pending); local_i = 0; }
+            if !local.is_empty() && (p[0] - local_from[0]).hypot(p[1] - local_from[1]) > LOCAL_BOUND {
+                local.clear();
+                local_i = 0;
             }
             // The fine plan, exactly as `drive_walk` requests it: goal = the LOCAL_REACH carrot off
             // the CURRENT cursor. This is where a stale cursor is consumed.
-            let coarse5 = carrot_along_los(&HAIRPIN, path_i, p, 5.0, &los).unwrap_or(goal);
-            let local_goal = carrot_along(&HAIRPIN, path_i, p, 24.0).unwrap_or(coarse5);
-            local = match col.find_path_local(p, local_goal, LOCAL_CELL, 40.0, LOCAL_CELL * 2.0) {
+            let local_goal = carrot_along(&HAIRPIN, path_i, p, LOCAL_REACH).unwrap_or(coarse);
+            local_from = p;
+            pending = match col.find_path_local(p, local_goal, LOCAL_CELL, LOCAL_BOUND, LOCAL_CELL * 2.0) {
                 crate::collision::LocalOutcome::Threaded(s) => s,
                 crate::collision::LocalOutcome::NoWayThrough { steer, .. } => steer,
                 crate::collision::LocalOutcome::Exhausted { steer, .. } => steer,
             };
-            local_i = 0;
-            for _ in 0..FRAMES {
-                let coarse5 = carrot_along_los(&HAIRPIN, path_i, p, 5.0, &los).unwrap_or(goal);
-                let aim = steer_target(&HAIRPIN, path_i, &local, &mut local_i, p, 5.0, coarse5, &los);
+            // A unit wish_dir driven at RUN_SPEED for the whole frame — the controller does NOT slow
+            // down for a near carrot, which is why an aim inside one frame's travel
+            // (44 * 0.01 = 0.44 u) is overshot rather than reached.
+            let step = |p: &mut [f32; 3], aim: [f32; 3], x_min: &mut f32, x_max: &mut f32| {
                 let (dx, dy) = (aim[0] - p[0], aim[1] - p[1]);
                 let d = (dx * dx + dy * dy).sqrt();
-                if d <= 1e-3 { continue; }
-                // A unit wish_dir driven at RUN_SPEED for the whole frame — the controller does NOT
-                // slow down for a near carrot, which is why an aim inside one frame's travel
-                // (44 * 0.01 = 0.44 u) is overshot rather than reached.
+                if d <= 1e-3 { return; }
                 p[0] += dx / d * eqoxide_core::physics::RUN_SPEED * DT;
                 p[1] += dy / d * eqoxide_core::physics::RUN_SPEED * DT;
                 if let Some(fz) = col.ground_below(p[0], p[1], p[2] + 4.0, 40.0) { p[2] = fz; }
-                x_min = x_min.min(p[0]);
-                x_max = x_max.max(p[0]);
+                *x_min = x_min.min(p[0]);
+                *x_max = x_max.max(p[0]);
+            };
+            // ONE `steer_target` per nav tick (the 150 ms coarse tick, with the LOS clamp)…
+            let aim = steer_target(&HAIRPIN, path_i, &local, &mut local_i, p, LOOK_AHEAD, coarse, &los);
+            step(&mut p, aim, &mut x_min, &mut x_max);
+            // …then the ~10 ms fast loop, which is plain pursuit along the FINE path with no LOS
+            // clamp (`apply_fast_steering`, #685) and does nothing at all without a fine path.
+            for _ in 0..FRAMES {
+                let aim = if local.is_empty() { None } else {
+                    fast_steer_aim(&local, &mut local_i, p, LOOK_AHEAD, |_, _| true).map(|(w, _)| {
+                        [p[0] + w[0], p[1] + w[1], p[2]]
+                    })
+                };
+                match aim {
+                    Some(a) => step(&mut p, a, &mut x_min, &mut x_max),
+                    None => break,
+                }
             }
-            if verbose && (tick < 4 || tick % 40 == 0) {
-                println!("  t{tick:<3} cursor {path_i} local.len {:<3} moved {:.3} u  pos ({:.2},{:.2})",
+            if verbose {
+                println!("  t{tick:<3} cursor {path_i} local.len {:<3} moved {:.3} u  pos ({:.3},{:.3})",
                     local.len(), (p[0] - before[0]).hypot(p[1] - before[1]), p[0], p[1]);
             }
             let net = (p[0] - LANDED[0]).hypot(p[1] - LANDED[1]);
@@ -862,13 +915,35 @@ mod cursor_resync_tests {
             "aim {:.2} u is further than one frame of travel; the overshoot argument would not hold", d(aim));
     }
 
-    /// **#673 step 3 of 3 — the walker wedges at its real steering reach, and the resync clears it.**
+    /// **#673 step 3 of 3 — the STEERING LOOP has no escaping trajectory, and the resync clears it.**
     ///
-    /// This is the test the round-2 review asked for: the whole chain, driven at `LOOK_AHEAD` through
-    /// the production [`steer_target`], on a floor with nothing in it to blame. Pre-#727 the
-    /// character never leaves the spot; post-#727 it walks the fixture out in four nav ticks.
+    /// The whole chain, driven at `LOOK_AHEAD` through the production [`steer_target`] and
+    /// [`fast_steer_aim`], on a floor with nothing in it to blame. With the stale cursor the loop
+    /// enters a limit cycle and stays in it for the whole run: **0.02 u net displacement over 200 nav
+    /// ticks** (30 s of simulated time). With the resync it walks the fixture out in **5** nav ticks.
+    ///
+    /// ⚠️ **Correction (#727 round 4).** Through round 3 this test was named
+    /// `..._wedges_the_walker_...` and its doc said "pre-#727 the character never leaves the spot".
+    /// **That was a claim about the walker made by an instrument that does not contain the walker.**
+    /// [`fixture_run`] has no stall detector, no `NAV_STUCK_TICKS` backoff and no re-plan — the exact
+    /// machinery that decides whether a limit cycle is a wedge or a hiccup. The round-3 reviewer
+    /// drove the **production** `drive_walk` + `apply_fast_steering` loop on this same fixture with
+    /// the resync mutated out and measured the walker sitting in this cycle for ~22 nav ticks
+    /// (~3.3 s), then escaping via its own backoff + re-plan and **arriving** at t27. So on this
+    /// featureless floor the pre-#727 cost is a wasted re-plan lap, not a permanent stop.
+    ///
+    /// **What the defect is, then.** The steering loop having no escaping trajectory is the
+    /// mechanism; whether that is terminal is decided outside this sim, by whether the re-plan
+    /// reproduces the state. Live on qcat it did: #673 records `blocked` / `walker_stalled` at
+    /// `[-534.4, 144.4, -6.0]` on **6 of 8** attempts, and `walker.rs` only emits `walker_stalled`
+    /// after `nav_repaths` reaches 8 — i.e. eight backoff-and-re-plan attempts ran and none escaped.
+    /// The residual #673 defect therefore ranges from ~22 wasted ticks plus a re-plan lap (measured,
+    /// featureless floor) to a terminal stop (observed, real terrain). *Reasoned, not measured:* the
+    /// flat slab is probably why the re-plan rescues it here — a re-plan starts at the body, and this
+    /// floor offers no second fall to carry the character off the new route, where the aqueduct
+    /// trench does.
     #[test]
-    fn the_stale_cursor_wedges_the_walker_at_its_real_steering_reach_and_the_resync_clears_it() {
+    fn the_stale_cursor_leaves_the_steering_loop_no_escaping_trajectory_and_the_resync_clears_it() {
         let col = fixture_floor();
 
         let stale = fixture_run(&col, STALE_I, false, false);
@@ -894,37 +969,51 @@ mod cursor_resync_tests {
              cannot attribute a stall to a stale one (moved {:.2} u in {} ticks)", run.net, run.ticks);
     }
 
-    /// **The simulated stall oscillates where the live capture said it did.** #673 was observed live,
-    /// and the capture shows the character's east coordinate moving between -534.2856 and -534.73 at
-    /// zero net displacement — a 0.44 u excursion, which is exactly `RUN_SPEED * 0.01`, one controller
-    /// frame of travel. That is the signature of an aim nearer than one frame: overshoot, flip,
-    /// overshoot.
+    /// **The simulated stall is a BOUNDED overshoot cycle a few frames wide** — it does not drift,
+    /// and it does not creep along the route. That is the property worth pinning: an aim nearer than
+    /// one frame of travel (`RUN_SPEED * 0.01 = 0.44 u`) is overshot, the direction flips, and the
+    /// body orbits the stub instead of following the route.
     ///
-    /// The sim was not fitted to those numbers — it was built out of `drive_walk`'s steering chain
-    /// and the captured route — so the agreement is evidence that it reproduces the live defect
-    /// rather than a similar-looking one.
+    /// ⚠️ **Correction (#727 round 4) — the corroboration claim is WITHDRAWN.** Through round 3 this
+    /// test was named `..._oscillates_in_the_band_the_live_capture_recorded` and asserted
+    /// `|x_min − (−534.73)| < 0.05` against the live capture, with the doc claiming "the sim was not
+    /// fitted to those numbers … the agreement is evidence that it reproduces the live defect rather
+    /// than a similar-looking one". The round-3 reviewer showed that was an **identity, not
+    /// evidence**:
     ///
-    /// **What is and is not claimed.** The measured per-frame excursion here is 0.88 u
-    /// (`[-534.726, -533.846]`), i.e. TWO frames of travel, not one: the fine plan is re-made once
-    /// per nav tick, so within a tick the body crosses the stub and comes back. Sampled at nav-tick
-    /// boundaries it alternates between two points 0.44 u apart. The capture's 0.44 u figure is
-    /// therefore consistent with, but does not uniquely determine, the sampling rate — so the
-    /// assertions below pin the near end (-534.726 vs -534.73 captured), the boundedness, and the
-    /// excursion as a small multiple of one frame, and claim nothing sharper.
+    /// ```text
+    /// LANDED[0]                  = -534.285_583   <- the capture's east end: a harness INPUT
+    /// RUN_SPEED * 0.01           =    0.440_000   <- a code constant
+    /// LANDED[0] - RUN_SPEED*0.01 = -534.725_586   <- what the assertion was matching
+    /// ```
+    ///
+    /// Any harness seeded at `LANDED` that aims west and steps a full frame produces that number,
+    /// whatever the mechanism, so the assertion discriminated "oscillates at the start" from "moves"
+    /// and nothing finer. Two further corrections on the same point: the round-4 harness (one
+    /// `steer_target` + 14 [`fast_steer_aim`] frames, one tick of planner latency) puts `x_min` at
+    /// **-535.185**, so even the identity no longer holds; and the band is **not** reproduced — the
+    /// reviewer's production `drive_walk` loop oscillates over roughly `[-536.5, -533.0]` (~2.6 u)
+    /// against this sim's 1.32 u, so the sim's width is a property of the harness, not of the defect.
+    /// The capture's −534.73 lies inside this sim's band and is *consistent* with an overshoot cycle;
+    /// it is **not** independent evidence of one.
+    ///
+    /// Measured on this branch: `x ∈ [-535.185, -533.865]`, span 1.32 u = 3 frames of travel; at
+    /// nav-tick boundaries the body cycles through 3 points. The assertions below pin boundedness and
+    /// the eastward limit, and claim nothing about the live capture.
     #[test]
-    fn the_simulated_stall_oscillates_in_the_band_the_live_capture_recorded() {
-        const LIVE_X_LO: f32 = -534.73; // the far side of the captured oscillation
+    fn the_simulated_stall_is_a_bounded_overshoot_cycle_a_few_frames_wide() {
         const FRAME: f32 = eqoxide_core::physics::RUN_SPEED * 0.01;
         let run = fixture_run(&fixture_floor(), STALE_I, false, false);
-        assert!((run.x_min - LIVE_X_LO).abs() < 0.05,
-            "the stall's far side should sit where the capture put it: simulated {:.3}, captured \
-             {LIVE_X_LO:.3}", run.x_min);
-        assert!(run.x_max - run.x_min < 3.0 * FRAME,
+        assert!(run.x_max - run.x_min < 5.0 * FRAME,
             "the excursion must stay within a few frames of travel — a wider band would be drift, \
              not a limit cycle; it was {:.3} u", run.x_max - run.x_min);
-        assert!(run.x_max <= LANDED[0] + FRAME,
-            "the character must never get EAST of one frame past where it landed; it reached {:.3}",
-            run.x_max);
+        assert!(run.x_max <= LANDED[0] + 2.0 * FRAME,
+            "the character must never get materially EAST of where it landed — that would be travel, \
+             not an orbit; it reached {:.3} against a landing of {:.3}", run.x_max, LANDED[0]);
+        // And it must not creep WEST along the route either: a limit cycle that slowly made ground
+        // would be slow progress, which is a different (and much less serious) defect.
+        assert!(LANDED[0] - run.x_min < 5.0 * FRAME,
+            "the cycle drifted {:.3} u west — that is progress, not a stall", LANDED[0] - run.x_min);
     }
 
     /// **The normal case is untouched, and pays nothing.** A walker within `CURSOR_STALE_DIST` of
@@ -1104,8 +1193,9 @@ mod cursor_resync_tests {
     /// whether the CURSOR/CARROT arithmetic can reach a fixed point, because that is pure function
     /// composition and does not depend on how the body is propelled. The tables below are kept for
     /// that, and only that. Arrival is measured instead by
-    /// `the_stale_cursor_wedges_the_walker_at_its_real_steering_reach_and_the_resync_clears_it`,
-    /// which drives the production [`steer_target`] at `LOOK_AHEAD`.
+    /// `the_stale_cursor_leaves_the_steering_loop_no_escaping_trajectory_and_the_resync_clears_it`,
+    /// which drives the production [`steer_target`] and [`fast_steer_aim`] at `LOOK_AHEAD` (and which
+    /// carries its own disclosure that it models the steering loop, not the whole walker).
     ///
     /// Deliberately NOT a physics sim: no collision, no controller, so the reachability predicate is
     /// vacuously clear. That isolates the one thing under test.
