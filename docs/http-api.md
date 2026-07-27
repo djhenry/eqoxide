@@ -213,8 +213,8 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 
 | `nav_state` | Meaning | `nav_reason` |
 |-------------|---------|--------------|
-| `pending` | A `/move/{goto,follow,zone_cross}` was **just accepted** and the walker has not ticked yet. Transient (≤ ~150 ms), then becomes `planning`/`navigating`/`following`. Its purpose is honesty: the instant a new request is accepted the state resets to `pending` (under a fresh `nav_goal_id`), so a read can **never** return the *previous* goal's terminal `arrived`/`no_path`/`blocked` as if it were the new request's outcome (#349). | — |
-| `idle` | Nothing to do. | — |
+| `pending` | A `/move/{goto,follow,zone_cross}` was **just accepted** and the walker has not ticked yet. Normally it lasts one walker tick (~150 ms) and becomes `planning`/`navigating`/`following`; a `/zone_cross` issued during a zone load holds it until the request is drained (see `zone_loading`). Its purpose is honesty: the instant a new request is accepted the state resets to `pending` (under a fresh `nav_goal_id`), so a read can **never** return the *previous* goal's terminal `arrived`/`no_path`/`blocked` as if it were the new request's outcome (#349). **`pending` always retires.** It is not on the terminal list, and every walker tick that finds no goal in flight and no queued `/zone_cross` retires any non-terminal state to `idle` with a reason — so `pending` cannot outlive the request that stamped it (#725; before that fix a dropped `/zone_cross` left `pending` standing indefinitely — measured at 75 s — with `nav_reason` and `nav_goal` both `null`). | — |
+| `idle` | Nothing to do — **either** no request is outstanding, **or** one ended without reaching a goal. `nav_reason` tells you which. | `goal_dropped`, `respawned`, `zone_cross_dropped_unhandled` (see below), or — for a plain "ready for work" idle |
 | `planning` | A route is being computed on the pathfinding worker thread. The character stands still. Normally < 1 s. | — |
 | `navigating` | Walking a **complete route to your goal**. | `goal_z_snapped` (see below) or — |
 | `navigating_partial` | Walking a **partial** route: the search was cut short, so this is *not* a route to your goal — it's progress toward a frontier, and it will re-plan from the far end. Usually resolves to `navigating` or `arrived`. | `search_node_cap` |
@@ -224,7 +224,29 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_node_cap` |
 | `blocked` | A route exists, but the walker **could not follow it** (wedged after 8 recovery attempts). Not a routing failure. | `walker_stalled`, `local_no_way_through`, `fall_would_be_lethal` |
 | `zone_loading` | **This client has no *usable* model of the zone the character is in yet** — its terrain/collision are still loading, their load failed, or the loaded grid still belongs to the zone the character just LEFT (the stale window, #600). No search was run and no route exists to report; the goal is kept and planned for real once the correct zone's assets land. Since #600 the walker refuses through the SAME `zone_assets::usability` predicate the HTTP world endpoints use, so the reason is that predicate's own verdict — read `zone_assets` (below) for the matching detail. | `zone_assets_pending`, `zone_assets_failed`, `zone_assets_idle`, `zone_assets_stale_for_previous_zone`, `player_zone_unknown` |
-| `dead` | **The character is slain** — navigation was abandoned because a corpse cannot move (#238, #644). Terminal and honest: an agent that issued a goto and then polled must be able to tell "you died and went nowhere" from the ambiguous `idle` (which also means "ready for work"). Clears back to `idle` on respawn. **A movement command issued *while* dead is not accepted at all** — `POST /v1/move/{goto,follow,zone_cross,manual,jump}` returns **`409 Conflict`** with a machine token `dead` (JSON `"status":"dead"` on `/goto` and `/follow`; the text body names `dead` on the others), so you never get a `200 … navigating` for a goal a corpse can never reach. Respawn (`POST /v1/lifecycle/respawn`) before reissuing. | `player_dead` |
+| `dead` | **The character is slain** — navigation was abandoned because a corpse cannot move (#238, #644). Terminal and honest: an agent that issued a goto and then polled must be able to tell "you died and went nowhere" from the ambiguous `idle` (which also means "ready for work"). Clears back to `idle` with `nav_reason: "respawned"` on respawn. **A movement command issued *while* dead is not accepted at all** — `POST /v1/move/{goto,follow,zone_cross,manual,jump}` returns **`409 Conflict`** with a machine token `dead` (JSON `"status":"dead"` on `/goto` and `/follow`; the text body names `dead` on the others), so you never get a `200 … navigating` for a goal a corpse can never reach. Respawn (`POST /v1/lifecycle/respawn`) before reissuing. | `player_dead` |
+
+### Why an in-progress `nav_state` can never stick (#725)
+
+Every `nav_state` is either **terminal** — `idle`, `arrived`, `no_path`, `search_exhausted`,
+`blocked` — or **in progress**. The rule the walker applies each tick is stated over the terminal
+set, not over a list of in-progress words: *if there is no goal in flight and no queued
+`/move/zone_cross`, any state that is not terminal is retired to `idle` with a `nav_reason`.* So an
+in-progress state is only ever published while something is genuinely happening, and a word that is
+neither driven forward nor listed anywhere still retires — you do not have to trust that each state
+remembered to clean itself up.
+
+That rule replaced an opt-in list of states-to-retire, under which any state missing from the list
+survived forever once its goal vanished. Two were missing, and both were observed live: `pending`
+after a dropped `/zone_cross` (#725), and `following` after the followed entity despawned.
+
+The `nav_reason` values it publishes:
+
+| `nav_reason` | Meaning |
+|--------------|---------|
+| `goal_dropped` | Your goal stopped existing without being reached — e.g. a `/follow` target despawned, or a request was cancelled from elsewhere in the client. Not an error about the route; there is simply nothing left to walk to. Reissue if you still want it. |
+| `respawned` | The `dead` state cleared because the character came back up (#644). |
+| `zone_cross_dropped_unhandled` | **A client bug, reported instead of hidden.** Your `/move/zone_cross` was consumed by the client and produced no outcome at all — no walk, no crossing, no refusal. Nothing is in flight and nothing will happen; retry, or use `/move/goto`. If you see this, please file it with the zone and your position: it means a code path took your request and wrote nothing, which is exactly the defect the backstop that emits this reason exists to make visible (#725). |
 
 ### `levitating` — three-valued levitate buff state, NOT a gravity reading (#598)
 
@@ -438,7 +460,7 @@ POST /v1/move/goto {...}   -> 200 {"goal_id": 8, ...}
 GET  /v1/observe/debug     -> nav_state: "arrived"   <-- but nav_goal_id: 7, the PREVIOUS goto!
 ```
 
-Now the accept **atomically** bumps `nav_goal_id` and resets `nav_state` to `pending`, so the read above returns `nav_state: "pending", nav_goal_id: 8` — honest. **Rule: only trust a terminal `nav_state` (`arrived`/`no_path`/`search_exhausted`/`blocked`) when its `nav_goal_id` matches the `goal_id` the POST you are waiting on returned.** A lower id means you are still seeing an older goal's outcome; a matching id with `pending`/`planning`/`navigating` means your goal is genuinely in flight.
+Now the accept **atomically** bumps `nav_goal_id` and resets `nav_state` to `pending`, so the read above returns `nav_state: "pending", nav_goal_id: 8` — honest. **Rule: only trust a terminal `nav_state` (`arrived`/`no_path`/`search_exhausted`/`blocked`/`idle`) when its `nav_goal_id` matches the `goal_id` the POST you are waiting on returned.** A lower id means you are still seeing an older goal's outcome; a matching id with `pending`/`planning`/`navigating` means your goal is genuinely in flight — and it will not stay that way, because any in-progress state with nothing behind it retires to `idle` with a reason on the next walker tick ([Why an in-progress `nav_state` can never stick](#why-an-in-progress-nav_state-can-never-stick-725)). `idle` **under your own goal id** is therefore an outcome, not a "not started yet": read `nav_reason` — `goal_dropped` or `zone_cross_dropped_unhandled` means your goal is over and nothing is coming.
 
 **`goal_z_snapped` — the client CHANGED your goal.** The `z` you gave sits below every floor in the
 goal's column (agents commonly pass `z: 0`, or a map coordinate), so the planner snapped the goal onto
@@ -463,6 +485,15 @@ is not snapped: it fails as `no_path` / `goal_not_walkable`.)
 |--------|---------|
 | `no_zone_line_to_zone` | The server never advertised (`OP_SendZonepoints`) any zone line from here to the requested `zone_id` — it will not appear in `/v1/observe/zone_exits` either. A genuinely invalid request: pick a `zone_id` that's actually one of this zone's exits. |
 | `zone_line_not_in_map` | The requested `zone_id` **is** advertised by the server as a real exit, but the locally loaded zone geometry has no matching WLD zone-line (DRNTP) trigger region for it — a client-side `.wtr` map-data gap, not proof the exit doesn't exist in the real game. Before reporting this, the client tries one fallback (#683): if the map has a zone-line region under some OTHER (unadvertised) index — e.g. an exit baked with index 0 — and this zone advertises no same-zone teleport pad and server zone points are available, it walks there instead and lets the server resolve the destination, so this reason now means no usable zone-line region exists at all (or the fallback is gated: a same-zone pad is advertised, or no server zone points are available). It is also omitted from `/v1/observe/zone_exits` (which only lists regions actually found in the loaded map), so "absent from `zone_exits`" does not by itself distinguish this from `no_zone_line_to_zone` — only `nav_reason` does. |
+
+**Distance to the line does not matter (#725).** When a zone-line region *is* located, the client
+always walks to it and re-stamps `nav_goal` with that concrete destination — there is no "close
+enough, the crossing will happen by itself" shortcut. There used to be one, for lines within 15 u,
+and because the actual auto-cross fires only when your body is physically inside the trigger region
+(a much smaller volume), every `/zone_cross` issued from between the region and 15 u was consumed and
+produced nothing at all. That band is where the server's own walk-in arrival point tends to sit
+relative to the *return* line, so "walk into a zone, then ask to go back" was the case most likely to
+hit it.
 
 `nav_reason` for `blocked`:
 
