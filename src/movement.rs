@@ -53,6 +53,12 @@ const GROUND_SNAP_TOL: f32 = 0.5;
 const STUCK_FALLBACK_SECS: f32 = 0.5;
 /// How often (seconds) a good grounded position is sampled into the ring buffer.
 const GOOD_SAMPLE_SECS: f32 = 0.5;
+/// Capacity of the last-good ring — how many recent grounded positions the recovery paths may
+/// choose from before the oldest is dropped. Was a bare literal `8` at the one push site; #720's
+/// round-2 review then cited a `GOOD_RING` constant that did not exist, and #724 asked for the
+/// name so the next citation is checkable. Only `good.back()` is ever read today, so the depth is
+/// slack, not a tuned value.
+const GOOD_RING_LEN: usize = 8;
 /// Minimum spacing (seconds) between fall-through-guard log lines while the guard is HOLDING a
 /// body it has no recovery position for. That branch changes nothing, so it re-runs every frame.
 const UNDERWORLD_HOLD_LOG_SECS: f32 = 5.0;
@@ -366,22 +372,44 @@ impl CharacterController {
     /// yields a [`Recovery`], and the 0.5 s stuck fallback restored that same point every 0.5 s
     /// indefinitely — while the nav planner, correctly, reported `start_isolated`.
     ///
-    /// This is deliberately NOT folded into [`Self::teleport`], but the reason is narrower than
-    /// "the history is still good". What is true is only that a same-zone correction leaves the
-    /// ring naming positions in the CURRENT zone, so restoring one is not nonsense the way a
-    /// cross-zone restore is. It can still be wrong: a GM summon or other large same-zone
-    /// relocation travels the same >12 u correction path, and for a few seconds afterwards
-    /// `good.back()` names the pre-relocation position — a fall-through or stuck fallback in that
-    /// window silently puts the character back there. That is pre-existing, not introduced with
-    /// this method, and is tracked separately in #724 (hypothesised from the code path, NOT
-    /// reproduced — see the issue); it is written down here rather than papered
-    /// over (#720 review, non-blocking B).
+    /// > ### ⚠️ Correction (#724)
+    /// > This paragraph used to say the clear is "deliberately NOT folded into [`Self::teleport`]",
+    /// > on the ground that a same-zone correction leaves the ring naming positions in the CURRENT
+    /// > zone, so restoring one "is not nonsense the way a cross-zone restore is". The first half is
+    /// > still true and the conclusion drawn from it was wrong: not-nonsense is not correct, and
+    /// > #724's controller-level tests measure the same-zone failure end to end
+    /// > (`a_large_same_zone_relocation_forgets_the_pre_relocation_recovery_ring` and the stuck
+    /// > -fallback twin). `teleport` now clears the ring itself. The retracted reasoning is kept
+    /// > here rather than deleted, because it is the reasoning that would otherwise be re-derived.
+    /// >
+    /// > That same paragraph also said the stale window lasts "for a few seconds". Measured: the
+    /// > ring banks ONLY while `on_ground`, so a body relocated into a column it can only fall out
+    /// > of never banks again and the window is unbounded — it is not `GOOD_SAMPLE_SECS`-shaped.
+    ///
+    /// This method survives the fold because a zone change must drop the ring whether or not a
+    /// [`Self::teleport`] happens to accompany it: `app.rs` calls it at the moment the old zone's
+    /// collision is dropped, which is earlier than, and independent of, the arrival reground.
     pub fn forget_recovery_history(&mut self) {
         self.good.clear();
     }
 
     /// Hard-set the position (zone-in, teleport, large server correction). Clears velocity & stuck.
     pub fn teleport(&mut self, pos: [f32; 3]) {
+        // #724: a position discontinuity SUPERSEDES the recovery history. Every sample in the ring
+        // describes where the body was before this write, so any recovery that restores one undoes
+        // the relocation the server just performed — silently, with a perfectly plausible in-zone
+        // coordinate. Both recovery paths read the ring (the #150 fall-through guard and the
+        // depenetration stuck fallback) and both are reachable in the window; see the two example
+        // tests and the sweep at the bottom of this file.
+        //
+        // Cost, stated plainly: for as long as it takes the body to become grounded again after a
+        // relocation, neither recovery path has anything to restore, so a body that lands somewhere
+        // unrecoverable HOLDS rather than rubber-bands. That is the deliberate trade — holding is a
+        // visible failure a further server correction can fix, whereas the restore is a wrong answer
+        // the client reports as success, and #712 measured that the wrong answer re-fires every
+        // 0.5 s and wedges permanently. Small corrections do not pay this: under `CORRECTION_SQ`
+        // (12 u, 2D) the net never calls `teleport` at all.
+        self.forget_recovery_history();
         self.pos = pos;
         self.vel_z = 0.0;
         self.on_ground = false;
@@ -818,7 +846,7 @@ impl CharacterController {
             self.good_timer += dt;
             if self.on_ground && self.good_timer >= GOOD_SAMPLE_SECS {
                 self.good_timer = 0.0;
-                if self.good.len() >= 8 { self.good.pop_front(); }
+                if self.good.len() >= GOOD_RING_LEN { self.good.pop_front(); }
                 self.good.push_back(self.pos);
             }
             return false;
@@ -2131,5 +2159,175 @@ mod tests {
             "#712: the guard recovered onto a PREVIOUS-zone coordinate {stale:?}");
         assert!(ctrl.pos[2] > -222.0,
             "the underworld guard must still hold the body above −222, got {:?}", ctrl.pos);
+    }
+
+    /// One zone, one hole: a platform the character banks good samples on (east −100…−50, z=0) and,
+    /// far to the east, a deck at −232 that is BELOW the −222 underworld so nothing can land on it.
+    /// Everything between is void. This is the same-zone shape of the #712 geometry.
+    fn zone_with_a_hole() -> Collision {
+        col(vec![floor(0.0, -100.0, -50.0), floor(-232.0, 40.0, 100.0)])
+    }
+
+    /// #724 — reachability of the stale-ring recovery after a LARGE SAME-ZONE relocation
+    /// (GM summon / `#movechar` within a zone / any server correction over `CORRECTION_SQ` = 12 u).
+    ///
+    /// The relocation goes through [`CharacterController::teleport`], which — before this fix — left
+    /// the last-good ring intact. The ring only banks while `on_ground`, so a body teleported into a
+    /// column it can only fall out of NEVER banks a fresh sample: the stale window is not
+    /// `GOOD_SAMPLE_SECS` wide as #724 supposed, it lasts until the body is grounded again, which
+    /// for a fall-through is never. The #150 guard then restores the pre-summon coordinate and
+    /// silently undoes the server's relocation.
+    ///
+    /// MUTATION-CHECK: delete the `self.good.clear()` line from `teleport` and this test FAILS on
+    /// the `pos[0]` assertion with the body back at the pre-summon east.
+    #[test]
+    fn a_large_same_zone_relocation_forgets_the_pre_relocation_recovery_ring() {
+        let c = zone_with_a_hole();
+        let mut ctrl = CharacterController::new([-80.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        ctrl.set_underworld(Some(-222.0));
+        // Stand on the platform long enough to bank good samples (GOOD_SAMPLE_SECS = 0.5).
+        for _ in 0..60 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); }
+        let stale = *ctrl.good.back()
+            .expect("fixture: the platform must bank a good sample, else this test proves nothing");
+        assert!((stale[0] - (-80.0)).abs() < 1e-3,
+            "fixture: the banked sample is the pre-summon position, got {stale:?}");
+
+        // The summon: 160 u east, far over the 12 u correction threshold, SAME zone — so the #712
+        // zone-change clear in `app.rs` never runs and cannot help here. The arrival z is #712's
+        // own measured one, which puts the deck below within `GROUND_DEPTH` so this is a genuine
+        // FALL (the fixture assert below pins that) and not the embedded/depenetration vector the
+        // next test covers.
+        let target = [80.0, 0.0, -114.4];
+        assert!(!is_embedded(&c, target),
+            "fixture: the relocation target must take the gravity path, not the depenetration net");
+        ctrl.teleport(target);
+
+        for _ in 0..150 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); }
+
+        // Bounded on BOTH sides: the body must still be where the server put it horizontally (not
+        // merely "not exactly the stale point"), and held in the narrow band the guard leaves —
+        // just above the underworld, having actually fallen. A one-sided `> -222` would pass for a
+        // body that never moved at all, and `!= stale` would pass for any wrong answer but one.
+        assert!(ctrl.pos != stale, "#724: recovered onto the superseded position {stale:?}");
+        assert!((ctrl.pos[0] - 80.0).abs() < 1e-3 && ctrl.pos[1].abs() < 1e-3,
+            "#724: the guard moved the body away from where the server relocated it: {:?} \
+             (pre-relocation sample was {stale:?})", ctrl.pos);
+        assert!(ctrl.pos[2] > -222.0 && ctrl.pos[2] < -217.0,
+            "the body must have fallen and been HELD in the one-frame band just above the \
+             underworld, got z={}", ctrl.pos[2]);
+        assert!(ctrl.good.is_empty(),
+            "#724: a position discontinuity must supersede the recovery ring, got {:?}", ctrl.good);
+    }
+
+    /// #724, second vector — the same stale ring is read by the DEPENETRATION stuck fallback, which
+    /// #724 does not mention. A summon into geometry the push-out net cannot escape rubber-bands the
+    /// body to `good.back()` after `STUCK_FALLBACK_SECS`, i.e. straight back out of the summon.
+    ///
+    /// MUTATION-CHECK: delete the `self.good.clear()` line from `teleport` and this test FAILS with
+    /// the body back at the pre-summon platform.
+    #[test]
+    fn a_large_same_zone_relocation_forgets_the_ring_for_the_stuck_fallback_too() {
+        // Platform to bank on, plus a walled slot with no floor anywhere near it: every push-out
+        // radius finds no column that yields a `Recovery`, so the stuck fallback is the only exit.
+        let c = col(vec![floor(0.0, -100.0, -50.0), wall(39.2, 0.0, 10.0), wall(40.8, 0.0, 10.0)]);
+        let mut ctrl = CharacterController::new([-80.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        ctrl.set_underworld(Some(-222.0));
+        for _ in 0..60 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); }
+        let stale = *ctrl.good.back().expect("fixture: must bank a good sample");
+
+        // Fixture, checked against the pure predicate so it holds under the mutation too: the slot
+        // is a place the body reads as embedded, with nothing in push-out range to recover onto.
+        let target = [40.0, 40.0, 0.0]; // summoned into the slot, 120 u from the platform
+        assert!(is_embedded(&c, target), "fixture: the slot must read as embedded");
+
+        ctrl.teleport(target);
+        for _ in 0..40 { ctrl.step(walk(0.0, [0.0, 0.0]), 0.05, &c); } // 2 s ≫ STUCK_FALLBACK_SECS
+
+        assert!(ctrl.pos != stale, "#724: stuck fallback restored the superseded position {stale:?}");
+        assert!((ctrl.pos[0] - 40.0).abs() < 1e-3 && (ctrl.pos[1] - 40.0).abs() < 1e-3,
+            "#724: the body must be held where the server put it, got {:?}", ctrl.pos);
+        // …and it is genuinely still STUCK there, i.e. the fallback branch really was reached and
+        // declined for want of history — not a body that quietly walked out of the fixture.
+        assert!(ctrl.stuck_time >= STUCK_FALLBACK_SECS,
+            "the stuck fallback branch must have been reached (stuck_time={})", ctrl.stuck_time);
+    }
+
+    /// #724 — the UNIVERSAL. "A recovery never restores a position the server has superseded" is a
+    /// claim about all relocations, not about the two shapes pinned above, so it gets a sweep rather
+    /// than an example: 240 seeded combinations of pre-relocation stance, relocation target and
+    /// post-relocation predicament (free fall through a hole vs. embedded in a walled slot), each
+    /// asserting that no frame after the relocation ever puts the body on a pre-relocation sample.
+    ///
+    /// Deterministic — a hand-rolled xorshift, not a `proptest` dependency, so the sweep is exactly
+    /// reproducible and adds nothing to `Cargo.lock`.
+    ///
+    /// MUTATION-CHECK: delete the `self.good.clear()` line from `teleport` and this test FAILS.
+    #[test]
+    fn no_recovery_ever_restores_a_position_a_relocation_superseded() {
+        struct Xs(u32);
+        impl Xs {
+            fn next(&mut self) -> u32 {
+                self.0 ^= self.0 << 13; self.0 ^= self.0 >> 17; self.0 ^= self.0 << 5; self.0
+            }
+            fn frac(&mut self) -> f32 { (self.next() % 10_000) as f32 / 10_000.0 }
+        }
+        let mut rng = Xs(0x5eed_0724);
+
+        let mut fell_through = 0usize;
+        let mut got_stuck = 0usize;
+        for case in 0..240 {
+            let embedded_case = case % 2 == 0;
+            let c = if embedded_case {
+                col(vec![floor(0.0, -100.0, -50.0), wall(39.2, 0.0, 10.0), wall(40.8, 0.0, 10.0)])
+            } else {
+                zone_with_a_hole()
+            };
+            // Vary where the body stands before the relocation, and for how long.
+            let start_e = -95.0 + rng.frac() * 40.0;
+            let mut ctrl = CharacterController::new([start_e, -40.0 + rng.frac() * 80.0, 0.0]);
+            ctrl.on_ground = true;
+            ctrl.set_underworld(Some(-222.0));
+            let settle = 20 + (rng.next() % 100) as usize;
+            for _ in 0..settle { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); }
+            let superseded: Vec<[f32; 3]> = ctrl.good.iter().copied().collect();
+            if superseded.is_empty() { continue; } // too short a settle to bank; nothing to prove
+
+            // Vary the relocation target. Both branches are ≫ 12 u from the platform, i.e. exactly
+            // the corrections that reach `teleport` at all.
+            let target = if embedded_case {
+                [40.0, 40.0, 0.0]
+            } else {
+                // z chosen so the sub-underworld deck is inside `GROUND_DEPTH` of the arrival:
+                // the body then takes the gravity path and meets the #150 guard, rather than
+                // reading as embedded (which is the other half of the sweep).
+                [45.0 + rng.frac() * 50.0, -40.0 + rng.frac() * 80.0, -120.0 + rng.frac() * 60.0]
+            };
+            assert_eq!(is_embedded(&c, target), embedded_case,
+                "case {case}: fixture must exercise the intended recovery path at {target:?}");
+            ctrl.teleport(target);
+
+            for f in 0..200 {
+                ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c);
+                for s in &superseded {
+                    assert!(ctrl.pos != *s,
+                        "case {case} frame {f}: recovery restored superseded position {s:?} \
+                         (relocated to {target:?})");
+                }
+            }
+            // Confirm the sweep actually exercised a recovery path rather than a body that simply
+            // stood still: an embedded case must be stuck, a hole case must be held above the
+            // underworld having fallen well below its relocation z.
+            if embedded_case {
+                if ctrl.stuck_time >= STUCK_FALLBACK_SECS { got_stuck += 1; }
+            } else if ctrl.pos[2] > -222.0 && ctrl.pos[2] < target[2] - 20.0 {
+                fell_through += 1;
+            }
+            assert!(ctrl.good.is_empty(),
+                "case {case}: a superseded sample survived the relocation: {:?}", ctrl.good);
+        }
+        assert!(got_stuck >= 100, "sweep did not exercise the stuck fallback enough: {got_stuck}");
+        assert!(fell_through >= 100, "sweep did not exercise the fall-through guard enough: {fell_through}");
     }
 }
