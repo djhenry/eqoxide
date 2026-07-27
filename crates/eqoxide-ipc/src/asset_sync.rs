@@ -78,10 +78,16 @@
 //!
 //! The sole writers are [`AssetSyncGuard`], created by the app crate's
 //! `asset_sync::sync_set_observed` around every `sync_set` call, and [`AssetConnectGuard`], created
-//! by `asset_sync::login_observed` around every `AssetSync::login` call. Both wrapped functions are
-//! the *only* way to reach the thing they wrap (`sync_set` and `AssetSync::login` are both private
-//! to that module), so an unobserved in-session sync OR login is unrepresentable rather than merely
-//! discouraged. Each guard removes its own entry in `Drop`, so the "published but never cleared"
+//! by `asset_sync::login_observed` around every `AssetSync::login` call.
+//!
+//! `sync_set` and `AssetSync::login` are both **private to the app crate's `asset_sync` module**, so
+//! the wrappers are the only way to reach them **from anywhere else in the workspace** — an
+//! unobserved sync or login added at any other call site does not compile. The limit, stated because
+//! the stronger phrasing was here first (#743 review N5): code added *inside that one file* is
+//! within the privacy boundary and can still call them directly. The compiler enforces the rule for
+//! every caller outside it; inside it, review does.
+//!
+//! Each guard removes its own entry in `Drop`, so the "published but never cleared"
 //! failure (an endpoint confidently reporting a long-finished sync as if it were live) cannot happen
 //! on ANY exit path — success, error return, or a panic unwinding through the loader thread.
 //!
@@ -134,6 +140,8 @@ pub struct AssetSyncSlots {
     live: Vec<(SyncId, AssetSyncActivity)>,
     next_id: u64,
     last_ended: Option<EndedActivity>,
+    last_login_failure: Option<EndedActivity>,
+    login_outcomes: LoginOutcomeTally,
 }
 
 impl AssetSyncSlots {
@@ -142,9 +150,41 @@ impl AssetSyncSlots {
         self.live.iter().map(|(_, a)| a)
     }
 
-    /// The most recent sync to leave the registry, or `None` if none ever has.
+    /// The most recent activity **of any kind** to leave the registry, or `None` if none ever has.
+    ///
+    /// **This is one slot, and everything that ends overwrites it** — a login's verdict survives here
+    /// only until the next login *or set sync* ends. Under the concurrency this client actually runs
+    /// (three logins at startup, two set syncs per zone load) that is milliseconds, so a poller can
+    /// and does miss a failure entirely: #743's reviewer measured a genuinely-failed login appearing
+    /// in this slot in **0 of 75 samples** while three other activities cycled through it. Do not use
+    /// it to answer "did a login fail" — that is what [`Self::last_login_failure`] and
+    /// [`Self::login_outcomes`] are for.
     pub fn last_ended(&self) -> Option<&EndedActivity> {
         self.last_ended.as_ref()
+    }
+
+    /// The most recent login that did **not** succeed, retained for the life of the process.
+    ///
+    /// Unlike [`Self::last_ended`] this slot is overwritten *only by another unsuccessful login*, so
+    /// a failure cannot be destroyed by unrelated activity ending afterwards. `None` means no login
+    /// has ended other than successfully in this process — a real negative answer, not an absence of
+    /// evidence.
+    ///
+    /// "Unsuccessful" is [`ConnectOutcome::Failed`] **or** [`ConnectOutcome::Unknown`]: a panic that
+    /// unwound through a login did not succeed either, and filing it as a success (by omission) would
+    /// be the same falsehood at smaller scale. The retained record carries the outcome, so the two
+    /// stay distinguishable.
+    pub fn last_login_failure(&self) -> Option<&EndedActivity> {
+        self.last_login_failure.as_ref()
+    }
+
+    /// Monotonic counts of every login that has **ended** in this process, by outcome.
+    ///
+    /// Counters only ever increase, so a caller polling at any cadence can answer "has a login failed
+    /// at all" (`failed > 0`) and "has one failed *since my last poll*" (a delta) without needing to
+    /// be looking when it happened. In-flight logins are not counted — they are in [`Self::live`].
+    pub fn login_outcomes(&self) -> LoginOutcomeTally {
+        self.login_outcomes
     }
 
     fn begin(&mut self, activity: AssetSyncActivity) -> SyncId {
@@ -161,6 +201,14 @@ impl AssetSyncSlots {
     /// Also a no-op for a `Connecting` entry: a login has no phase and must never acquire one. That
     /// is belt-and-braces — [`AssetConnectGuard`] has no `tick` method to call — but the registry
     /// should not depend on the guard type to keep an invariant it can keep itself.
+    ///
+    /// **Stated plainly because it looks covered and is not (#743 review N4):** the
+    /// `if let AssetSyncWork::Sync` guard below is **unreachable in production and unkillable by any
+    /// test.** Reaching it needs a `Connecting` entry's `SyncId` passed to `tick`, and no path can
+    /// produce one — `AssetConnectGuard` exposes no `tick`, and [`SyncId`]s are never reused, so a
+    /// sync guard's id can never come to name a login's entry. Removing the guard would therefore
+    /// leave the whole suite green. It is kept as an invariant this type enforces for itself, not as
+    /// behaviour any test asserts; treat it as unverified defence, not as tested code.
     fn tick(&mut self, id: SyncId, phase: AssetSyncPhase, published_at: Instant) {
         if let Some((_, a)) = self.live.iter_mut().find(|(i, _)| *i == id) {
             if let AssetSyncWork::Sync { phase: p, .. } = &mut a.work {
@@ -178,13 +226,73 @@ impl AssetSyncSlots {
     fn end(&mut self, id: SyncId, connect_outcome: ConnectOutcome) {
         if let Some(pos) = self.live.iter().position(|(i, _)| *i == id) {
             let (_, a) = self.live.remove(pos);
+            let at = Instant::now();
             let what = match a.work {
                 AssetSyncWork::Sync { set, .. } => EndedWhat::Sync { set },
-                AssetSyncWork::Connecting { purpose } =>
-                    EndedWhat::Connect { purpose, outcome: connect_outcome },
+                AssetSyncWork::Connecting { purpose } => {
+                    // #743 review B1. `last_ended` below is a single last-writer-wins slot: the very
+                    // next activity to end — a `charmodel` sync, a door set, another login — erases
+                    // whatever verdict is written there. A failure recorded ONLY in that slot is
+                    // therefore evidence with a lifetime of milliseconds, and the reviewer measured
+                    // exactly that: a login that really did fail appeared in `last_ended` in 0 of 75
+                    // polls, because three other activities ended on top of it first. An agent
+                    // following the documented recipe was told "no login failed" while three had.
+                    //
+                    // So a non-success is ALSO recorded where nothing but another non-success can
+                    // overwrite it, plus a monotonic tally that no amount of later activity can walk
+                    // back. Neither invents information: both are written from the same measured
+                    // `Result` the verdict comes from.
+                    self.login_outcomes.record(connect_outcome);
+                    if connect_outcome != ConnectOutcome::Succeeded {
+                        self.last_login_failure = Some(EndedActivity {
+                            what: EndedWhat::Connect {
+                                purpose: purpose.clone(), outcome: connect_outcome,
+                            },
+                            at,
+                        });
+                    }
+                    EndedWhat::Connect { purpose, outcome: connect_outcome }
+                }
             };
-            self.last_ended = Some(EndedActivity { what, at: Instant::now() });
+            self.last_ended = Some(EndedActivity { what, at });
         }
+    }
+}
+
+/// How many logins have **ended** in this process, by outcome. Monotonic: every field only ever
+/// increases, for the life of the process.
+///
+/// This exists because [`AssetSyncSlots::last_ended`] is a single slot that any subsequent activity
+/// overwrites, so it cannot answer "did a login fail" for a caller that was not polling at the
+/// instant it happened (#743 review B1, measured at 0 of 75 samples). A counter answers that at any
+/// cadence, and a counter that only goes up cannot become a falsehood later: `failed > 0` means a
+/// login failed, full stop, and the *delta* between two polls means one failed in between.
+///
+/// The three outcomes are kept separate rather than summed into "failures" because they are not the
+/// same claim — [`ConnectOutcome::Unknown`] is "a panic unwound through the login", which is neither
+/// of the two real answers and must not be filed as either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoginOutcomeTally {
+    pub succeeded: u64,
+    pub failed: u64,
+    /// A panic unwound through the login: it neither returned `Ok` nor returned `Err`.
+    pub unknown: u64,
+}
+
+impl LoginOutcomeTally {
+    fn record(&mut self, outcome: ConnectOutcome) {
+        match outcome {
+            ConnectOutcome::Succeeded => self.succeeded += 1,
+            ConnectOutcome::Failed => self.failed += 1,
+            ConnectOutcome::Unknown => self.unknown += 1,
+        }
+    }
+
+    /// Logins that ended without succeeding — `failed + unknown`. The one-number answer to "is there
+    /// any login this process could not complete", for a caller that does not want to add two fields
+    /// and risk forgetting the second.
+    pub fn unsuccessful(self) -> u64 {
+        self.failed + self.unknown
     }
 }
 
@@ -240,7 +348,13 @@ impl ConnectOutcome {
 pub struct AssetSyncSnapshot {
     /// Oldest-started first — see [`AssetSyncSlots`].
     pub live: Vec<AssetSyncActivity>,
+    /// The most recent activity of ANY kind to end — see [`AssetSyncSlots::last_ended`] for why this
+    /// is not the field that answers "did a login fail".
     pub last_ended: Option<EndedActivity>,
+    /// See [`AssetSyncSlots::last_login_failure`].
+    pub last_login_failure: Option<EndedActivity>,
+    /// See [`AssetSyncSlots::login_outcomes`].
+    pub login_outcomes: LoginOutcomeTally,
 }
 
 /// Copy the registry for a reader. The clone is deliberate: every age in the response is measured
@@ -251,6 +365,8 @@ pub fn snapshot(shared: &AssetSyncShared) -> AssetSyncSnapshot {
     AssetSyncSnapshot {
         live: slots.live().cloned().collect(),
         last_ended: slots.last_ended().cloned(),
+        last_login_failure: slots.last_login_failure().cloned(),
+        login_outcomes: slots.login_outcomes(),
     }
 }
 
@@ -852,6 +968,134 @@ mod tests {
             "a guard dropped without a verdict must say Unknown, not default to a real answer");
     }
 
+    /// **#743 review B1, as the reviewer measured it.** `last_ended` is one slot that every ending
+    /// activity overwrites, so a login's verdict there has a lifetime of milliseconds. On a live run
+    /// where all four logins failed, the reviewer polled 75 times at 1.5 s and the genuinely-failed
+    /// `common asset load` login appeared in `last_ended` **0 times** — three other activities ended
+    /// on top of it first. An agent following the then-documented recipe read "no login failed" while
+    /// three had, which is #731's own shape (absence read as a negative answer) surviving inside the
+    /// failure path `ConnectOutcome` was added to expose.
+    ///
+    /// This replays that exact transition sequence and pins the fix: the failure must still be
+    /// answerable after everything else has ended on top of it.
+    #[test]
+    fn a_login_failure_outlives_every_later_activity_that_overwrites_last_ended() {
+        let s = new_shared();
+
+        // The measured sequence. `common asset load` fails FIRST and is then buried.
+        AssetConnectGuard::begin(&s, "common asset load").finish(ConnectOutcome::Failed);
+        assert_eq!(lock(&s).login_outcomes().failed, 1);
+
+        AssetConnectGuard::begin(&s, "startup game data (gamedata, gameequip)")
+            .finish(ConnectOutcome::Failed);
+        AssetConnectGuard::begin(&s, "model-sync worker (charmodel sets)")
+            .finish(ConnectOutcome::Failed);
+        // …and a SET SYNC ending is enough on its own: the slot is not login-only. On a healthy
+        // client this is the common case — every zone load ends two syncs.
+        drop(AssetSyncGuard::begin(&s, "zonedoors/neriakc"));
+
+        // The measured falsehood, pinned as the behaviour it actually is: `last_ended` no longer
+        // knows anything about a login at all.
+        assert_eq!(lock(&s).last_ended().unwrap().what,
+            EndedWhat::Sync { set: "zonedoors/neriakc".into() },
+            "last_ended is a single slot; this documents that it really is destroyed, so anyone \
+             reading it as a failure history is reading a field that does not do that");
+
+        // …and the fix: the failure is still answerable, at any cadence, by both new routes.
+        let slots = lock(&s);
+        assert_eq!(slots.login_outcomes().failed, 3,
+            "three logins failed and nothing may walk that back");
+        assert_eq!(slots.login_outcomes().unsuccessful(), 3);
+        assert_eq!(slots.last_login_failure().map(|e| e.what.clone()),
+            Some(EndedWhat::Connect {
+                purpose: "model-sync worker (charmodel sets)".into(),
+                outcome: ConnectOutcome::Failed,
+            }),
+            "a set sync ending must not erase the most recent login failure: {:?}",
+            slots.last_login_failure());
+    }
+
+    /// The retention rule, in the direction that would quietly undo it: a *successful* login must not
+    /// clear the record of an earlier failure, and the counters must never decrease. A "last login
+    /// outcome" field would pass every assertion in the test above and still lose the failure here.
+    #[test]
+    fn a_later_success_neither_erases_a_failure_nor_decrements_anything() {
+        let s = new_shared();
+        assert!(lock(&s).last_login_failure().is_none(),
+            "no login has ended other than successfully: absent is the honest answer, and it is a \
+             real negative — not 'unknown'");
+        assert_eq!(lock(&s).login_outcomes(), LoginOutcomeTally::default());
+
+        AssetConnectGuard::begin(&s, "common asset load").finish(ConnectOutcome::Failed);
+        AssetConnectGuard::begin(&s, "zone load: neriakc").finish(ConnectOutcome::Succeeded);
+        AssetConnectGuard::begin(&s, "zone load: qeynos2").finish(ConnectOutcome::Succeeded);
+
+        let slots = lock(&s);
+        assert_eq!(slots.login_outcomes(),
+            LoginOutcomeTally { succeeded: 2, failed: 1, unknown: 0 },
+            "counters are monotonic per outcome; a success is not the absence of a failure");
+        assert_eq!(slots.last_login_failure().map(|e| e.what.clone()),
+            Some(EndedWhat::Connect {
+                purpose: "common asset load".into(), outcome: ConnectOutcome::Failed,
+            }),
+            "two later successes must not make an earlier failure unobservable");
+        assert_eq!(slots.last_ended().unwrap().what,
+            EndedWhat::Connect { purpose: "zone load: qeynos2".into(),
+                                 outcome: ConnectOutcome::Succeeded },
+            "…while last_ended honestly reports the most recent thing, which is the success");
+    }
+
+    /// A panic unwinding through a login did not succeed, so it must be retained as a non-success —
+    /// filing it as a success by omission is the same falsehood at smaller scale. It is kept
+    /// SEPARATE from `failed` because "neither Ok nor Err" is not the same claim as "returned Err".
+    #[test]
+    fn a_panic_through_a_login_is_retained_as_a_non_success_but_not_as_a_failure() {
+        let s = new_shared();
+        let s2 = s.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _g = AssetConnectGuard::begin(&s2, "model-sync worker (charmodel sets)");
+            panic!("boom");
+        });
+        // Bury it under a later successful login, as any real client would.
+        AssetConnectGuard::begin(&s, "zone load: neriakc").finish(ConnectOutcome::Succeeded);
+
+        let slots = lock(&s);
+        assert_eq!(slots.login_outcomes(),
+            LoginOutcomeTally { succeeded: 1, failed: 0, unknown: 1 },
+            "a panic is counted, and counted as its own outcome");
+        assert_eq!(slots.login_outcomes().unsuccessful(), 1,
+            "`unsuccessful` must include unknown, or 'could every login complete?' answers yes");
+        assert_eq!(slots.last_login_failure().map(|e| e.what.clone()),
+            Some(EndedWhat::Connect {
+                purpose: "model-sync worker (charmodel sets)".into(),
+                outcome: ConnectOutcome::Unknown,
+            }),
+            "…and it is retained with its own outcome, not relabelled as a failure");
+    }
+
+    /// The shared-`Arc` identity trap, pinned at the type level (#743 review). A registry written
+    /// through one clone MUST be readable through another — a severed write path is how this project
+    /// has previously served a confident, silent, wrong answer.
+    ///
+    /// **What this does NOT cover, stated because the gap is the interesting part:** it pins the
+    /// TYPE's sharing semantics, not that the four production login sites and `HttpState` were handed
+    /// clones of the *same* registry. That is `main.rs`/`app.rs` wiring, unreachable from a unit
+    /// test, and its only evidence is a live run in which one response body named all four purposes.
+    #[test]
+    fn a_clone_of_the_registry_is_the_same_registry_not_a_second_one() {
+        let writer = new_shared();
+        let reader = writer.clone();
+        assert!(lock(&reader).live().len() == 0 && lock(&reader).last_ended().is_none());
+
+        let g = AssetConnectGuard::begin(&writer, "zone load: neriakc");
+        assert_eq!(live_all(&reader), ["connecting:zone load: neriakc"],
+            "a login published through one handle must be visible through the other, or the \
+             endpoint reads 'idle' forever no matter what the loaders publish");
+        g.finish(ConnectOutcome::Failed);
+        assert_eq!(lock(&reader).login_outcomes().failed, 1,
+            "…and so must its verdict: {:?}", lock(&reader).login_outcomes());
+    }
+
     /// **The universal, exhaustively.** "The endpoint never reports idle while the client is
     /// blocked" is a *never* claim, and no number of passing live runs discharges one. So this
     /// enumerates EVERY interleaving of three overlapping activities' begin/end — a login and two
@@ -862,68 +1106,142 @@ mod tests {
     /// outlives its guard (a finished sync reported as live) and a guard whose entry is missing
     /// (the #731 falsehood, and the #726 nested-clear one) each fail here regardless of ORDER,
     /// which is what a fixed example test cannot say.
+    ///
+    /// **Two alphabets (#743 review N1).** The original 1 login + 2 syncs (90 orderings) is kept
+    /// verbatim, and a second alphabet of **2 logins + 2 syncs** (2520 orderings) is added, because
+    /// three concurrent logins is the *normal* startup shape when the asset server is unreachable and
+    /// the one-login alphabet never exercised two logins overlapping at all — the exact concurrency
+    /// #743's B1 defect lives in. The larger alphabet is added, not substituted: it is a different
+    /// enumeration, not a superset, and dropping the first would lose coverage rather than gain it.
     #[test]
     fn no_interleaving_of_logins_and_syncs_can_report_idle_while_one_is_alive() {
-        // Every multiset permutation of [0,0,1,1,2,2]; the first occurrence of `k` begins activity
-        // k, the second ends it. 6!/(2!·2!·2!) = 90 sequences.
-        fn orderings() -> Vec<Vec<usize>> {
-            let mut out = Vec::new();
-            let mut cur = Vec::new();
-            let mut used = [0usize; 3];
-            fn go(cur: &mut Vec<usize>, used: &mut [usize; 3], out: &mut Vec<Vec<usize>>) {
-                if cur.len() == 6 { out.push(cur.clone()); return; }
-                for k in 0..3 {
+        /// Every multiset permutation of `[0,0,1,1,…,n-1,n-1]`; the first occurrence of `k` begins
+        /// activity k, the second ends it. (2n)!/2^n sequences: 90 for n=3, 2520 for n=4.
+        fn orderings(n: usize) -> Vec<Vec<usize>> {
+            fn go(n: usize, cur: &mut Vec<usize>, used: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+                if cur.len() == 2 * n { out.push(cur.clone()); return; }
+                for k in 0..n {
                     if used[k] < 2 {
                         used[k] += 1;
                         cur.push(k);
-                        go(cur, used, out);
+                        go(n, cur, used, out);
                         cur.pop();
                         used[k] -= 1;
                     }
                 }
             }
-            go(&mut cur, &mut used, &mut out);
+            let mut out = Vec::new();
+            go(n, &mut Vec::new(), &mut vec![0usize; n], &mut out);
             out
         }
 
         /// One live guard, either kind. `Option` so "ended" is `None` and dropping is explicit.
         enum Held { Sync(AssetSyncGuard), Connect(AssetConnectGuard) }
 
-        let all = orderings();
-        assert_eq!(all.len(), 90, "the enumeration itself must be complete");
-        for order in all {
-            let s = new_shared();
-            let mut held: [Option<Held>; 3] = [None, None, None];
-            let mut alive = 0usize;
-            for &k in &order {
-                match held[k].take() {
-                    None => {
-                        // Activity 0 is a LOGIN; 1 and 2 are set syncs. The mix is the point: the
-                        // registry must not care which kind an entry is.
-                        held[k] = Some(if k == 0 {
-                            Held::Connect(AssetConnectGuard::begin(&s, "zone load: qeynos2"))
-                        } else {
-                            Held::Sync(AssetSyncGuard::begin(&s, &format!("set{k}")))
-                        });
-                        alive += 1;
-                    }
-                    Some(g) => {
-                        match g {
-                            Held::Sync(g) => drop(g),
-                            Held::Connect(g) => g.finish(ConnectOutcome::Succeeded),
+        // `logins` activities are LOGINS and the rest are set syncs. The mix is the point: the
+        // registry must not care which kind an entry is, nor how many of each.
+        for (n, logins, expected) in [(3usize, 1usize, 90usize), (4, 2, 2520)] {
+            let all = orderings(n);
+            assert_eq!(all.len(), expected,
+                "the enumeration itself must be complete for {n} activities");
+            for order in all {
+                let s = new_shared();
+                let mut held: Vec<Option<Held>> = (0..n).map(|_| None).collect();
+                let mut alive = 0usize;
+                for &k in &order {
+                    match held[k].take() {
+                        None => {
+                            held[k] = Some(if k < logins {
+                                Held::Connect(AssetConnectGuard::begin(
+                                    &s, &format!("login{k}: zone load: qeynos2")))
+                            } else {
+                                Held::Sync(AssetSyncGuard::begin(&s, &format!("set{k}")))
+                            });
+                            alive += 1;
                         }
-                        alive -= 1;
+                        Some(g) => {
+                            match g {
+                                Held::Sync(g) => drop(g),
+                                Held::Connect(g) => g.finish(ConnectOutcome::Succeeded),
+                            }
+                            alive -= 1;
+                        }
+                    }
+                    let live = lock(&s).live().len();
+                    assert_eq!(live, alive,
+                        "after {order:?} step, {alive} activities are in flight but the registry \
+                         lists {live} — an agent polling now would be told the client is doing \
+                         {live} things while it is blocked in {alive}");
+                    assert_eq!(live == 0, alive == 0,
+                        "`active` is derived from emptiness, so these must agree exactly: {order:?}");
+                }
+                assert_eq!(lock(&s).live().len(), 0, "everything ended: {order:?}");
+            }
+        }
+    }
+
+    /// The same exhaustive treatment for the property #743's B1 turns on: **no interleaving of two
+    /// logins and two syncs can make an ended login failure unobservable.** `last_ended` fails this
+    /// for most orderings, which is why the assertion is against the retained fields.
+    ///
+    /// One login always fails, and the count of failures the registry reports must equal the count
+    /// that happened, at every step, regardless of what ended on top of it.
+    #[test]
+    fn no_interleaving_can_bury_a_login_failure_where_a_poller_cannot_find_it() {
+        fn orderings(n: usize) -> Vec<Vec<usize>> {
+            fn go(n: usize, cur: &mut Vec<usize>, used: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+                if cur.len() == 2 * n { out.push(cur.clone()); return; }
+                for k in 0..n {
+                    if used[k] < 2 {
+                        used[k] += 1;
+                        cur.push(k);
+                        go(n, cur, used, out);
+                        cur.pop();
+                        used[k] -= 1;
                     }
                 }
-                let live = lock(&s).live().len();
-                assert_eq!(live, alive,
-                    "after {order:?} step, {alive} activities are in flight but the registry lists \
-                     {live} — an agent polling now would be told the client is doing {live} things \
-                     while it is blocked in {alive}");
-                assert_eq!(live == 0, alive == 0,
-                    "`active` is derived from emptiness, so these must agree exactly: {order:?}");
             }
-            assert_eq!(lock(&s).live().len(), 0, "everything ended: {order:?}");
+            let mut out = Vec::new();
+            go(n, &mut Vec::new(), &mut vec![0usize; n], &mut out);
+            out
+        }
+        enum Held { Sync(AssetSyncGuard), Connect(AssetConnectGuard) }
+
+        for order in orderings(4) {
+            let s = new_shared();
+            let mut held: Vec<Option<Held>> = (0..4).map(|_| None).collect();
+            // Activity 0 is the login that FAILS; 1 is a login that succeeds; 2 and 3 are set syncs.
+            let mut failed_so_far = 0u64;
+            for &k in &order {
+                match held[k].take() {
+                    None => held[k] = Some(match k {
+                        0 => Held::Connect(AssetConnectGuard::begin(&s, "common asset load")),
+                        1 => Held::Connect(AssetConnectGuard::begin(&s, "zone load: neriakc")),
+                        _ => Held::Sync(AssetSyncGuard::begin(&s, &format!("set{k}"))),
+                    }),
+                    Some(g) => match g {
+                        Held::Sync(g) => drop(g),
+                        Held::Connect(g) => {
+                            if k == 0 { g.finish(ConnectOutcome::Failed); failed_so_far += 1; }
+                            else { g.finish(ConnectOutcome::Succeeded); }
+                        }
+                    },
+                }
+                let slots = lock(&s);
+                assert_eq!(slots.login_outcomes().failed, failed_so_far,
+                    "after {order:?} step: {failed_so_far} login(s) have failed, but the registry \
+                     reports {} — a caller polling here is told the wrong thing about a failure \
+                     that already happened", slots.login_outcomes().failed);
+                assert_eq!(slots.last_login_failure().is_some(), failed_so_far > 0,
+                    "the retained failure must be present exactly when one has occurred: {order:?}");
+            }
+            let slots = lock(&s);
+            assert_eq!(slots.login_outcomes().failed, 1, "…and at the end, for {order:?}");
+            assert_eq!(slots.last_login_failure().map(|e| e.what.clone()),
+                Some(EndedWhat::Connect {
+                    purpose: "common asset load".into(), outcome: ConnectOutcome::Failed,
+                }),
+                "no ordering of the other three activities may bury it: {order:?}");
         }
     }
 

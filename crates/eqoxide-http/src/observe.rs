@@ -186,6 +186,27 @@ async fn get_asset_sync(State(s): State<HttpState>) -> Json<serde_json::Value> {
     Json(asset_sync_json(&eqoxide_ipc::asset_sync::snapshot(&s.asset_sync)))
 }
 
+/// One ended activity, encoded. Shared by `last_ended` and `last_login_failure` (#743 review B1) so
+/// the two can never grow different shapes for the same fact — they are the same record with
+/// different retention rules, and a caller that can parse one can parse the other.
+///
+/// `ago_ms` is measured at READ time like every other age (#343), never cached.
+fn ended_activity_json(e: &eqoxide_ipc::asset_sync::EndedActivity) -> serde_json::Value {
+    let ago_ms = e.at.elapsed().as_millis() as u64;
+    match &e.what {
+        eqoxide_ipc::EndedWhat::Sync { set } =>
+            serde_json::json!({ "set": set, "ago_ms": ago_ms }),
+        // #731. A login that has ended carries NO `set` (it never had one) and DOES carry a verdict,
+        // which a sync cannot: `login_observed` sees the login's `Result`, whereas the sync guard's
+        // `Drop` runs identically on success, error and unwind. Without it a failed login and a
+        // successful one are the same `active: false` — #731's falsehood reappearing a moment later.
+        eqoxide_ipc::EndedWhat::Connect { purpose, outcome } => serde_json::json!({
+            "connecting": { "purpose": purpose, "outcome": outcome.as_str() },
+            "ago_ms": ago_ms,
+        }),
+    }
+}
+
 /// The pure projection behind [`get_asset_sync`] — takes the snapshot explicitly so the encoding is
 /// testable without an `HttpState`, and so the handler holds no lock while serializing.
 fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
@@ -224,14 +245,23 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
          actually been running elapsed_secs+published_age_ms/1000. running_ms is measured at read \
          time and keeps moving even while a sync is wedged; a large and GROWING published_age_ms \
          means THAT sync is wedged, not progressing — for the process, use \
-         stalest_published_age_ms. last_ended names the most recent activity to LEAVE this list \
-         and is how 'nothing is syncing now' is told apart from 'nothing has ever synced' (null). \
-         For a SET SYNC it carries `set` and says ended, NOT succeeded: the client cannot tell a \
-         success from a failure or a panic there. For a LOGIN it carries `connecting` with a \
+         stalest_published_age_ms. last_ended names the most recent activity of ANY KIND to LEAVE \
+         this list and is how 'nothing is syncing now' is told apart from 'nothing has ever synced' \
+         (null). For a SET SYNC it carries `set` and says ended, NOT succeeded: the client cannot \
+         tell a success from a failure or a panic there. For a LOGIN it carries `connecting` with a \
          `purpose` and an `outcome` of succeeded/failed/unknown — measured, not guessed, because \
-         the login wrapper sees the call's result; `unknown` means a panic unwound through it. So \
-         active:false with last_ended.connecting.outcome=='failed' is a FAILED login, which is a \
-         different state from an idle client that never tried.";
+         the login wrapper sees the call's result; `unknown` means a panic unwound through it. But \
+         last_ended is a SINGLE last-writer-wins slot: the next activity to end, login or set sync, \
+         overwrites it, so a login's verdict there survives milliseconds and a poller MISSES \
+         failures (measured: a login that really failed was visible in last_ended in 0 of 75 polls \
+         while other activity cycled through it). Do NOT ask last_ended whether a login failed. Ask \
+         login_outcomes, which counts every ENDED login by outcome \
+         {succeeded,failed,unknown} and only ever increases: failed+unknown > 0 means a login did \
+         not complete, at ANY polling cadence, and the delta between two polls is what happened in \
+         between. last_login_failure carries the most recent NON-SUCCEEDING login in full \
+         (`connecting.purpose`, `connecting.outcome`, `ago_ms`); only another non-succeeding login \
+         overwrites it, and it is ABSENT — never null — when no login has ended other than \
+         successfully. Logins still in flight are counted in neither: they are in `syncs`.";
 
     let syncs: Vec<serde_json::Value> = snap.live.iter().map(sync_json).collect();
     let mut body = serde_json::json!({
@@ -240,24 +270,30 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
         // #726 review N5: an empty `syncs` used to be the same answer for "a sync just finished" and
         // "no sync has ever run in this process". `null` here is the honest "no sync has ended yet";
         // `ago_ms` is measured at READ time like every other age (#343).
-        "last_ended": snap.last_ended.as_ref().map(|e| {
-            let ago_ms = e.at.elapsed().as_millis() as u64;
-            match &e.what {
-                eqoxide_ipc::EndedWhat::Sync { set } =>
-                    serde_json::json!({ "set": set, "ago_ms": ago_ms }),
-                // #731. A login that has ended carries NO `set` (it never had one) and DOES carry a
-                // verdict, which a sync cannot: `login_observed` sees the login's `Result`, whereas
-                // the sync guard's `Drop` runs identically on success, error and unwind. Without it
-                // a failed login and a successful one are the same `active: false` — #731's
-                // falsehood reappearing a moment later.
-                eqoxide_ipc::EndedWhat::Connect { purpose, outcome } => serde_json::json!({
-                    "connecting": { "purpose": purpose, "outcome": outcome.as_str() },
-                    "ago_ms": ago_ms,
-                }),
-            }
-        }),
+        // #726 review N5 / #743 review B1. `null` is the honest "nothing has ended yet"; anything
+        // else is the SINGLE most recent activity of any kind, and the next one to end overwrites it.
+        "last_ended": snap.last_ended.as_ref().map(ended_activity_json),
+        // #743 review B1: the field that actually answers "did a login fail". `last_ended` cannot —
+        // it is one slot every activity overwrites, and the reviewer measured a genuinely failed
+        // login surviving there for 0 of 75 polls. These two are written from the same measured
+        // `Result` as the verdict in `last_ended`; they differ only in RETENTION.
+        //
+        // `login_outcomes` is present-with-zeros rather than absent, unlike `stalest_published_age_ms`
+        // above: a count of zero here is a real measurement ("no login has ended this way yet"),
+        // whereas a max over no samples is not a measurement at all.
+        "login_outcomes": {
+            "succeeded": snap.login_outcomes.succeeded,
+            "failed": snap.login_outcomes.failed,
+            "unknown": snap.login_outcomes.unknown,
+        },
         "semantics": SEMANTICS,
     });
+    // Absent when no login has ended other than successfully — a real negative answer, and the same
+    // absent-not-null rule the rest of this body follows.
+    if let Some(e) = snap.last_login_failure.as_ref() {
+        body.as_object_mut().expect("json! object")
+            .insert("last_login_failure".into(), ended_activity_json(e));
+    }
     // The process-wide wedge signal (#726 review round 2, finding 1). Derived from the ages ALREADY
     // ENCODED in `syncs`, not re-measured, for the same reason the mirror below is a copy: two
     // `elapsed()` calls on one sample can straddle a threshold, and a top-level age that matched no
@@ -2372,6 +2408,95 @@ mod tests {
             "a successful login and a failed one must not read identically: {ok}");
     }
 
+    /// **#743 review B1, at the wire.** The reviewer blackholed the asset server, all four logins
+    /// failed, and across **75 polls at 1.5 s** the genuinely-failed `common asset load` login
+    /// appeared in `last_ended` **0 times** — buried by `startup game data`, then `model-sync
+    /// worker`, then `zone load: neriakc`. The documented recipe ("had a login fail →
+    /// `last_ended.connecting.outcome == 'failed'`") therefore answered *no login failed* while three
+    /// had. Accurate fields, false guidance — #731's own shape one level in.
+    ///
+    /// This replays that sequence through the encoder and asserts what a poller arriving LATE — the
+    /// normal case — can still learn.
+    #[tokio::test]
+    async fn a_failed_login_is_still_answerable_after_later_activity_buries_last_ended() {
+        let state = empty_state();
+
+        // The measured order. `common asset load` fails first and is then overwritten three times.
+        begin_login(&state, "common asset load").finish(eqoxide_ipc::ConnectOutcome::Failed);
+        begin_login(&state, "startup game data (gamedata, gameequip)")
+            .finish(eqoxide_ipc::ConnectOutcome::Failed);
+        begin_login(&state, "model-sync worker (charmodel sets)")
+            .finish(eqoxide_ipc::ConnectOutcome::Failed);
+        drop(begin(&state, "zonedoors/neriakc"));   // a SET SYNC is enough to bury a login verdict
+
+        let v = asset_sync_json_body(&state).await;
+
+        // The behaviour the retracted guidance mis-described, pinned as what it really is.
+        assert_eq!(v["last_ended"]["set"], serde_json::json!("zonedoors/neriakc"),
+            "last_ended is one slot shared by logins and syncs; this is the measured overwrite: {v}");
+        assert!(v["last_ended"].get("connecting").is_none(),
+            "…so at this instant last_ended says nothing about any login at all: {v}");
+
+        // What a caller polling here CAN learn — the fields the fix adds.
+        assert_eq!(v["login_outcomes"]["failed"], serde_json::json!(3),
+            "three logins failed and the body must say so however late the poll arrives: {v}");
+        assert_eq!(v["login_outcomes"]["succeeded"], serde_json::json!(0), "{v}");
+        assert_eq!(v["last_login_failure"]["connecting"]["purpose"],
+            serde_json::json!("model-sync worker (charmodel sets)"),
+            "the most recent NON-SUCCEEDING login, not the most recent activity: {v}");
+        assert_eq!(v["last_login_failure"]["connecting"]["outcome"], serde_json::json!("failed"));
+        assert!(v["last_login_failure"].get("set").is_none(),
+            "a login never had a set, so the retained record must not invent one: {v}");
+        assert!(v["last_login_failure"]["ago_ms"].is_u64(), "{v}");
+
+        // And a later SUCCESS must not walk any of it back — a "last login outcome" field would.
+        begin_login(&state, "zone load: qeynos2").finish(eqoxide_ipc::ConnectOutcome::Succeeded);
+        let after = asset_sync_json_body(&state).await;
+        assert_eq!(after["login_outcomes"]["failed"], serde_json::json!(3),
+            "counters are monotonic: a success is not the absence of a failure: {after}");
+        assert_eq!(after["login_outcomes"]["succeeded"], serde_json::json!(1), "{after}");
+        assert_eq!(after["last_login_failure"]["connecting"]["purpose"],
+            serde_json::json!("model-sync worker (charmodel sets)"),
+            "…and only another non-succeeding login may overwrite this: {after}");
+        assert_eq!(after["last_ended"]["connecting"]["outcome"], serde_json::json!("succeeded"),
+            "…while last_ended honestly reports the most recent thing, the success: {after}");
+    }
+
+    /// The absent-not-null rule, for the two fields #743 adds. A client that has never had a login
+    /// fail must get a real negative answer, not a `null` that reads as "unknown".
+    #[tokio::test]
+    async fn a_client_with_no_login_failure_says_so_by_absence_and_by_zero() {
+        let state = empty_state();
+        let v = asset_sync_json_body(&state).await;
+        assert!(v.get("last_login_failure").is_none(),
+            "absent, never null: no login has ended other than successfully: {v}");
+        assert_eq!(v["login_outcomes"],
+            serde_json::json!({ "succeeded": 0, "failed": 0, "unknown": 0 }),
+            "the counters are PRESENT with zeros — unlike stalest_published_age_ms, a count of zero \
+             here is a real measurement, not a max over no samples: {v}");
+
+        // A succeeded login moves one counter and creates no failure record.
+        begin_login(&state, "common asset load").finish(eqoxide_ipc::ConnectOutcome::Succeeded);
+        let ok = asset_sync_json_body(&state).await;
+        assert_eq!(ok["login_outcomes"]["succeeded"], serde_json::json!(1), "{ok}");
+        assert!(ok.get("last_login_failure").is_none(),
+            "a successful login must not fabricate a failure record: {ok}");
+
+        // A panic through a login is a non-success and is retained as one, under its own name.
+        let state2 = empty_state();
+        let s2 = crate::testkit::asset_sync_slot(&state2);
+        let _ = std::panic::catch_unwind(move || {
+            let _g = eqoxide_ipc::AssetConnectGuard::begin(&s2, "model-sync worker (charmodel sets)");
+            panic!("boom");
+        });
+        let p = asset_sync_json_body(&state2).await;
+        assert_eq!(p["login_outcomes"],
+            serde_json::json!({ "succeeded": 0, "failed": 0, "unknown": 1 }),
+            "a panic is neither Ok nor Err and must be counted as neither: {p}");
+        assert_eq!(p["last_login_failure"]["connecting"]["outcome"], serde_json::json!("unknown"),
+            "…but it did NOT succeed, so it is retained — under its own outcome: {p}");
+    }
+
     /// A login is one entry among many and must obey the same ownership rules — a login finishing
     /// cannot blank a zone download still in flight, and vice versa (#726's property, extended to
     /// the new entry kind).
@@ -2411,11 +2536,27 @@ mod tests {
         let semantics = v["semantics"].as_str().expect("semantics is served").to_string();
 
         for field in ["active", "syncs", "last_ended", "phase", "downloading",
-                      "published_age_ms", "running_ms", "stalest_published_age_ms"] {
+                      "published_age_ms", "running_ms", "stalest_published_age_ms",
+                      "login_outcomes"] {
             assert!(semantics.contains(field), "semantics must document `{field}`: {semantics}");
             assert!(v.get(field).is_some(),
                 "semantics sends the caller to `{field}`, so the body must carry it: {v}");
         }
+
+        // #743 review N2: `get(..).is_some()` above is satisfied by JSON `null`, so on its own it
+        // would pass for a field the encoder emits as null. Every field named here except
+        // `last_ended` must carry a REAL value; `last_ended` is legitimately null in this state
+        // (nothing has ended yet) and that null IS the documented answer, which is why it is the one
+        // exception rather than a gap in the loop.
+        for field in ["active", "syncs", "phase", "downloading", "published_age_ms",
+                      "running_ms", "stalest_published_age_ms", "login_outcomes"] {
+            assert!(!v[field].is_null(),
+                "`{field}` must be a real value, not null — an assertion that only checks the key \
+                 exists passes vacuously on null: {v}");
+        }
+        assert!(v["last_ended"].is_null(),
+            "…and `last_ended` really is null here, so the exception above is exercised, not \
+             assumed: {v}");
 
         // The retracted claim, pinned so it cannot come back: the mirror is not a process-health
         // check and a caller asking "is anything wedged" does have to look past it.
@@ -2438,11 +2579,37 @@ mod tests {
 
         // Direction 1: everything the guidance names for THIS state must be in the body.
         for field in ["active", "syncs", "last_ended", "phase", "connecting",
-                      "published_age_ms", "running_ms", "stalest_published_age_ms"] {
+                      "published_age_ms", "running_ms", "stalest_published_age_ms",
+                      "login_outcomes"] {
             assert!(semantics.contains(field), "semantics must document `{field}`: {semantics}");
             assert!(v.get(field).is_some(),
                 "semantics sends the caller to `{field}`, so a connecting body must carry it: {v}");
         }
+
+        // #743 review N2, the finding that motivated this: `is_some()` is satisfied by JSON `null`,
+        // and in the connecting state `last_ended` IS null — so that iteration of the loop above was
+        // passing vacuously. Everything else must be a real value; `last_ended` is the one field
+        // whose null is itself the honest answer here, and it is asserted as such rather than left
+        // silently exempt.
+        for field in ["active", "syncs", "phase", "connecting", "published_age_ms",
+                      "running_ms", "stalest_published_age_ms", "login_outcomes"] {
+            assert!(!v[field].is_null(),
+                "`{field}` must be a real value, not null: {v}");
+        }
+        assert!(v["last_ended"].is_null(),
+            "nothing has ended yet, so `last_ended` is null — the case the loop above could not \
+             have distinguished from a missing value: {v}");
+
+        // Direction 1b (#743 review B1): the guidance must send the caller to the field that can
+        // actually answer "did a login fail", and must NOT still be sending them to `last_ended`
+        // for it. The retracted recipe is pinned closed the same way #726's was.
+        assert!(semantics.contains("login_outcomes") && semantics.contains("last_login_failure"),
+            "the guidance must name the fields that survive later activity: {semantics}");
+        assert!(semantics.contains("Do NOT ask last_ended whether a login failed"),
+            "…and must say plainly that the single-slot field cannot answer it — the measured \
+             defect was guidance, not a value: {semantics}");
+        assert!(v.get("last_login_failure").is_none(),
+            "no login has ended unsuccessfully in this state, so it is ABSENT, not null: {v}");
 
         // Direction 2: the guidance must state the two ABSENCES, because a caller who does not know
         // `set` can be missing will read its absence as a bug or, worse, as the previous entry's.
