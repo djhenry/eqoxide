@@ -84,8 +84,9 @@ pub fn classify_unresolved_cross(zone_points: &[ZonePoint], current_zone_id: u16
     }
 }
 
-/// How many consecutive auto-cross attempts the client will make at ONE zone-line region before it
-/// stops and publishes the terminal state (#713 item 1, from the #683 review's F3).
+/// How many auto-cross attempts the client will make during ONE continuous stand on zone-line
+/// geometry before it stops and publishes the terminal state (#713 item 1, from the #683 review's
+/// F3). See [`CrossAttempts`] for why the tally is per stand rather than per region index.
 ///
 /// **Why 3 — a judgement, not a measurement.** I did not measure the distribution of server
 /// denials, so this is reasoned:

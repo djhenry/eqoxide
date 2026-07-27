@@ -4036,7 +4036,7 @@ mod tests {
             al.drain_zone_cross(&mut stream, &mut gs);
         }
         assert_eq!(attempts(&gs), MAX_CROSS_ATTEMPTS as usize,
-            "#713 F3: the auto-cross must STOP after {MAX_CROSS_ATTEMPTS} attempts at one region — \
+            "#713 F3: the auto-cross must STOP after {MAX_CROSS_ATTEMPTS} attempts in one stand — \
              an unbounded refire is a server anomaly event every cooldown for as long as we stand here");
 
         // The terminal state is OBSERVABLE and DISTINGUISHABLE, on both channels an agent reads.
@@ -4131,6 +4131,21 @@ mod tests {
             assert_eq!(gs.zone_cross_plan.map(|p| p.resolution),
                        Some(ZoneCrossResolution::Advertised { zone_id: DEST }),
                 "{label}: the marker describes the LAST resolution — it must not latch on");
+
+            // …and a resolution that locates NO line at all must not leave the previous plan
+            // standing either. This is the arm that actually needs the clear at the TOP of
+            // `resolve_zone_cross`: the located branch overwrites the plan on its own, so a marker
+            // cleared only there would survive every FAILED request and describe a crossing the
+            // client is no longer attempting — a stale observable with no clear-on-event path,
+            // which is the #343 failure mode.
+            gs.zone_cross_plan = Some(ZoneCrossPlan {
+                requested_zone_id: Some(DEST), index: IDX,
+                resolution: ZoneCrossResolution::ServerResolved,
+            });
+            command.request_zone_cross(9999); // advertised nowhere → the resolution locates nothing
+            al.drain_zone_cross(&mut stream, &mut gs);
+            assert!(gs.zone_cross_plan.is_none(),
+                "{label}: a request that resolved to no line must clear the marker, not inherit it");
         }
     }
 
