@@ -1663,10 +1663,12 @@ impl App {
                     v.pos = cpos;
                     v.heading = self.heading_target;
                     v.moving = intent.wish_dir[0] != 0.0 || intent.wish_dir[1] != 0.0 || !self.on_ground;
-                    // #724 review B1: republish the controller's hold EVERY frame — a level signal,
-                    // never latched. `hold()` is `None` unless a recovery branch stopped the body on
-                    // the frame just stepped, so this write is also the clear: the frame the body is
-                    // freed, `None` overwrites the previous `Some` here with no further ceremony.
+                    // #724 review B1: republish the controller's hold every RENDERED frame — a level
+                    // signal, never latched. `hold()` is `None` unless a recovery branch stopped the
+                    // body on the frame just stepped, so this write is also the clear: the frame the
+                    // body is freed, `None` overwrites the previous `Some` here with no ceremony.
+                    // On frames that render but do NOT step, that `None` comes from the explicit
+                    // `clear_hold()` above, not from a recompute (#724 round-3 review, B1/N1).
                     v.hold = self.controller.hold();
                     // Latch a fresh landing ONLY into an empty view slot, and only TAKE it from the
                     // controller when the slot is free (§442 #442 DEFECT-3 — never drop a real fall's

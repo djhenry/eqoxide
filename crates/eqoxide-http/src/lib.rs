@@ -512,8 +512,23 @@ fn ser_error_kind<S: serde::Serializer>(
 /// observable at all. An agent has no independent channel to reality; it would have built every
 /// downstream decision on "everything is fine".
 ///
-/// It is emitted only while the hold is IN FORCE. The controller recomputes it from scratch on every
-/// frame, so it clears itself the moment the body is freed; nothing here latches.
+/// It is emitted only while the hold is IN FORCE; nothing here latches. Three separate things make
+/// that true, and it is worth knowing which one is carrying you (#724 round-3 review, N1 — this
+/// paragraph previously said "recomputes it from scratch on every frame", which is false of the
+/// paths below and contradicted [`PlayerHoldView::held_secs`] twenty lines down):
+///
+/// * **On every RENDERED frame** the controller recomputes it from scratch — the value is taken
+///   before any branch can re-arm it — so it clears the moment the body is freed. `render_frame` is
+///   the only caller of the controller's step.
+/// * **While a zone's assets load** (~10 s, no collision) nothing steps, so an explicit clear runs
+///   instead; likewise a zone-in clears the mirrored copy. Both are pinned by name.
+/// * **While the render loop is idle** it does not render at all, so nothing recomputes — but a
+///   held body cannot be *freed* without a stepped frame either, so idling cannot manufacture a
+///   false hold. What it can do is freeze `held_secs`; see that field, which tells you how to
+///   detect it.
+///
+/// So: a non-`null` `hold` is never stale-because-idle in the sense of describing a predicament the
+/// body has left. It can be stale in *age* (`held_secs`), which is measurable from the caller.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlayerHoldView {
     /// `embedded_no_recovery` — embedded in geometry, push-out found nowhere to go, no recovery

@@ -334,8 +334,14 @@ this frame*. `underworld_no_recovery` has no such lag; it is raised on the first
 
 **The key is always present** (never omitted), so an agent that greps for `hold` and finds nothing
 knows it is talking to a client too old to report the state, rather than concluding all is well.
-And it does not latch: the controller recomputes it from scratch every frame, so it disappears the
-frame the body is freed.
+And it does not latch. On every **rendered** frame the controller recomputes it from scratch, so it
+disappears the frame the body is freed. On the paths where nothing renders it is cleared explicitly
+instead: while a zone's assets load (~10 s, no collision) and on zone-in, so a hold never survives
+into a zone the character has left. If the render loop goes idle it stops recomputing altogether —
+but a held body cannot be *freed* without a stepped frame either, so idling cannot manufacture a
+false hold; what it freezes is `held_secs`, and the paragraph above tells you how to detect that.
+(#724 round-3 review, N1 — this used to say "recomputes it from scratch every frame", which is not
+true of the load, zone-in or idle paths.)
 
 ### `zone_assets` — is the world this response describes actually loaded? (#579)
 

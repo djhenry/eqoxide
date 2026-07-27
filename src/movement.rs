@@ -488,13 +488,25 @@ impl CharacterController {
     /// "standing still because nothing asked me to move", which is exactly the state a hold is
     /// otherwise indistinguishable from.
     ///
-    /// Published every frame by `app.rs` into `ControllerView::hold`; never latched.
+    /// Published by `app.rs` into `ControllerView::hold` on every RENDERED frame; never latched.
+    /// On frames that render but do not step (no collision, mid zone-load) `app.rs` calls
+    /// [`Self::clear_hold`] instead; an idle render loop does not publish at all, and cannot
+    /// manufacture a false hold because freeing the body also requires a stepped frame.
+    /// (#724 round-3 review, N1 — this used to say "every frame" flatly.)
     pub fn hold(&self) -> Option<ControllerHold> { self.hold }
 
     /// Drop any hold WITHOUT stepping (`app.rs` calls this on the frames it does not step the
     /// controller — no collision loaded, i.e. mid zone-load). The last hold described geometry that
     /// has been dropped, and nothing is going to recompute it until the new zone lands, so the
     /// honest published value is "not holding" rather than a stale alarm about a zone we have left.
+    ///
+    /// **This call site is load-bearing and must not be deleted.** It is the ONLY thing making the
+    /// published "nothing here latches" true on frames that do not step — `step`'s `take()` argument
+    /// reaches stepping frames only. Round-3 review MEASURED it unpinned (deleting it, with
+    /// `GameState::begin_zone_in`'s `player_hold = None`, left the whole workspace green). Both are
+    /// pinned now: `the_frames_that_do_not_step_still_clear_the_hold` (a source scan of `app.rs`'s
+    /// not-stepped arm) and `clear_hold_drops_a_hold_without_stepping` in this module's tests, and
+    /// `begin_zone_in_clears_the_previous_zones_hold_724` in `eqoxide-core`.
     pub fn clear_hold(&mut self) { self.hold = None; }
 
     /// Record — and, throttled, log — that a recovery branch has stopped the body this frame with
@@ -772,11 +784,33 @@ impl CharacterController {
             // inside a water volume we cannot measure would drive the body down onto the #150
             // underworld guard for no reason.
             //
-            // ⚠️ CORRECTED (#724 round-2 review, B2). This used to read "(a server correction or the
-            // #150 underworld guard would otherwise have to recover us)". The server-correction half
-            // is the claim #724 retracts — see `forget_recovery_history` and `teleport` — and it was
-            // never true here either: a swimmer holding altitude streams a position the server
-            // agrees with, so no correction is generated.
+            // ⚠️ CORRECTED (#724 round-2 review B2; the STATED GROUND corrected again in round 3
+            // review B2). This used to read "(a server correction or the #150 underworld guard would
+            // otherwise have to recover us)". The server-correction half is dropped.
+            //
+            // Why, precisely — because the first attempt at this correction got the reason wrong and
+            // the reason is itself a claim. The retracted parenthetical is a COUNTERFACTUAL about
+            // the branch we do not take: *if* we free-fell, one of those two would have to recover
+            // us. Round 3 justified dropping it with "a swimmer holding altitude streams a position
+            // the server agrees with, so no correction is generated" — which is a fact about the
+            // branch we DO take, and so cannot bear on the counterfactual at all. That was a
+            // category error, and shipping it inside a correction is the same defect wearing the
+            // fix's clothes. It is retracted here rather than silently rewritten.
+            //
+            // The ground that does reach it: whether a free-falling swimmer sinking past the world
+            // would in fact draw a server-side relocation is SERVER behaviour. No run in this PR or
+            // in any of its review rounds measured it, and the review that raised this said the same
+            // in as many words. It is not established FALSE — it is not established. Naming an
+            // unmeasured server rescue as a known consequence, in a comment that a future reader
+            // will lean on, is exactly the habit #724 exists to break (see `forget_recovery_history`
+            // and `teleport`: the client had been treating "the server will put us back" as a
+            // mechanism it could rely on). So the half we cannot check is dropped, and the half we
+            // can — the #150 underworld guard, which is our own code — is kept, above, in the same
+            // counterfactual form it always had.
+            //
+            // Residual, labelled: the retained "would drive the body down onto the #150 underworld
+            // guard" is REASONED FROM THE BRANCH STRUCTURE, not captured in a run. It is a claim
+            // about code in this repository, which is why it survives and the server half does not.
             //
             // This is NOT a `ControllerHold`, and #724 round-2 review (N4) was right to ask why not.
             // The reason is that it is not distinguishable from correct behaviour: the branch three
@@ -2737,5 +2771,90 @@ mod tests {
              ring — the previous zone's untagged coordinates are what wedged #712, and #724's fold \
              into `teleport` does NOT cover this path: this clear runs when the OLD zone's collision \
              is dropped, earlier than and independent of any arrival. Block was:\n{block}");
+    }
+
+    /// #724 round-3 review (B1) — the frames that do NOT step must still clear the hold.
+    ///
+    /// The published claim is "nothing here latches". Round 2 established that for frames that
+    /// **step**: `step` does `self.hold.take()` before any branch can re-arm it (pinned by
+    /// `a_hold_clears_as_soon_as_the_body_is_free_again`). That argument covers only stepping
+    /// frames, and `app.rs` has a run of frames — the whole ~10 s zone-asset load, when
+    /// `self.collision` is `None` — where the controller is deliberately not stepped. On those
+    /// frames the property is not structural at all: it is supplied by one imperative call,
+    /// [`CharacterController::clear_hold`], in the `else` arm beside the step.
+    ///
+    /// **Round-3 review MEASURED that call unpinned**: deleting it (together with
+    /// `GameState::begin_zone_in`'s `player_hold = None`) left the whole workspace green,
+    /// 158 passed / 0 failed. Nothing noticed. What is *measured* is the survivor; the consequence
+    /// — `ControllerView::hold` keeping the OLD zone's `Some(...)`, `ActionLoop::stream_position`
+    /// re-mirroring it into `gs.player_hold`, and `/v1/observe/debug` reporting *"the character is
+    /// EMBEDDED in world geometry … ask a GM to move the character"* about a zone already left — is
+    /// READ OFF THE BRANCH STRUCTURE, not captured in a run. It is a short trace over code in this
+    /// repository (one `step` call site, one `clear_hold` call site, two `player_hold` writers), but
+    /// no client was run to watch the stale value appear.
+    ///
+    /// **What this test does NOT establish** (it is a source scan, so be precise about its reach):
+    ///
+    /// * It does not prove the `else` arm is ever *reached* — only that, if it is, it clears.
+    ///   Reachability is `self.collision == None`, which is the ordinary pre-load state.
+    /// * It does not prove [`CharacterController::clear_hold`] clears anything; that is
+    ///   `clear_hold_drops_a_hold_without_stepping` below, which is the behavioural half.
+    /// * It cannot see a rewrite that keeps the call but stops the `else` arm being the
+    ///   not-stepped one. It is anchored on the `if let Some(c) = self.collision` / `step` pair so
+    ///   that such a rewrite moves the anchor and reds the `expect` rather than passing silently.
+    ///
+    /// Triage if this reds — same order as the sibling pin above: fired `expect` on the anchor →
+    /// the step block was respelled or restructured, re-anchor and keep the test; fired `expect` on
+    /// the `} else {` search → the not-stepped arm is gone, which needs a fresh look at whether the
+    /// property still holds; fired `assert!` → the clear really was deleted, put it back.
+    #[test]
+    fn the_frames_that_do_not_step_still_clear_the_hold() {
+        const APP_RS: &str = include_str!("app.rs");
+        // Anchored on the camera-init + collision pair together: `if let Some(c) =
+        // self.collision.as_deref() {` alone occurs twice in app.rs, and only this one guards the
+        // controller step.
+        let start = APP_RS.find(
+            "if self.camera_initialized {\n                if let Some(c) = self.collision.as_deref() {")
+            .expect("app.rs no longer has the camera-init/collision-guarded controller step this \
+                     pin is about — if it moved, move this pin with it; do not delete it");
+        // The `if self.camera_initialized` block is indented 12 spaces; its closing brace is the
+        // first newline followed by exactly 12 spaces and `}`. Everything inside closes at 16 or
+        // deeper, so this cannot match early.
+        let end = APP_RS[start..].find("\n            }")
+            .expect("could not find the end of the controller-step block in app.rs");
+        let block = &APP_RS[start..start + end];
+        // Narrow to the NOT-stepped arm specifically: a `clear_hold` that had drifted into the
+        // stepping arm would satisfy a whole-block scan while leaving the load window unguarded.
+        let else_at = block.find("} else {")
+            .expect("the controller-step block in app.rs no longer has a not-stepped arm — the \
+                     no-collision frames this pin is about may have moved; do not delete this test \
+                     without establishing where they went");
+        let not_stepped = &block[else_at..];
+        assert!(not_stepped.contains("self.controller.clear_hold();"),
+            "#724 B1: the NOT-stepped arm of app.rs's controller block (no collision loaded, i.e. \
+             the whole zone-asset load) MUST clear the hold. Nothing recomputes it on those frames, \
+             so without this call the last hold — computed against geometry that has since been \
+             dropped — is published as a confident \"you are wedged\" about a zone we have already \
+             left, and re-mirrored into gs.player_hold on every net tick for the whole ~10 s load. \
+             The `step` take does NOT cover this path: these frames do not step. Arm was:\n{not_stepped}");
+    }
+
+    /// The behavioural half of the pin above: [`CharacterController::clear_hold`] actually drops
+    /// the hold.
+    ///
+    /// Trivial by construction, and that is the point — the source pin can only see that the call
+    /// is written, so something has to see that the call does anything. Deleting the body of
+    /// `clear_hold` reds here and nowhere else.
+    #[test]
+    fn clear_hold_drops_a_hold_without_stepping() {
+        let mut c = CharacterController::new([0.0, 0.0, 0.0]);
+        c.enter_hold(ControllerHoldReason::EmbeddedNoRecovery, 0.1, None);
+        assert!(c.hold().is_some(), "fixture: the controller should be holding before we clear it");
+
+        c.clear_hold();
+
+        assert!(c.hold().is_none(),
+            "#724 B1: clear_hold must drop the hold WITHOUT a step — it is the only thing making \
+             \"nothing here latches\" true on the frames app.rs does not step the controller");
     }
 }

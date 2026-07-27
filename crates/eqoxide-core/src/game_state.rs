@@ -1977,7 +1977,8 @@ mod pose_tests_643 {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{Door, GameState, MerchantItem, ZonePoint, make_entity};
+    use super::{ControllerHold, ControllerHoldReason, Door, GameState, MerchantItem, ZonePoint,
+                make_entity};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
     /// including the FULL-SNAPSHOT (`resync_from_snapshot`) path that carries the real mid-zone
@@ -2827,6 +2828,44 @@ pub(crate) mod tests {
             "a zone-in makes the crossing guess moot — the marker must not stick true across it");
         assert!(!gs.player_pos_known,
             "…and the honest post-zone-in position state is UNKNOWN, not a provisional guess");
+    }
+
+    /// #724 round-3 review (B1) — the previous zone's hold must NOT survive a zone-in.
+    ///
+    /// A [`ControllerHold`] describes the body's predicament in specific collision geometry. A
+    /// zone-in drops that geometry, and the controller stops being stepped while the new zone
+    /// loads, so nothing recomputes the value. Left in place, the last mirrored hold sits in
+    /// `player_hold` — and `/v1/observe/debug` reports *"the character is EMBEDDED in world
+    /// geometry … ask a GM to move the character"* about a zone the character has already left —
+    /// until the first frame after the new collision lands. The honest state for that window is
+    /// `None` (no hold in force), not a stale alarm.
+    ///
+    /// This field has exactly two writers — this clear, and `ActionLoop::stream_position`'s mirror
+    /// of `ControllerView::hold` (`git grep player_hold`, verified for this test). So while the
+    /// zone-entry handshake runs, this clear is the only thing that can make the field honest.
+    /// Round-3 review additionally traced that the net tick loop is *suspended* across the
+    /// handshake, so the mirror cannot even race it — that is the REVIEWER'S CODE TRACE of an async
+    /// call graph, recorded here as attribution, not re-derived and not measured at runtime. This
+    /// test does not depend on it: the two-writer fact alone is enough reason for the clear to
+    /// exist, and the test pins the clear directly.
+    ///
+    /// Round-3 review MEASURED this clear unpinned: deleting it (with `app.rs`'s `clear_hold` call)
+    /// left the whole workspace green, 158 passed / 0 failed. Mutation check: drop the
+    /// `player_hold = None` from `begin_zone_in` → RED here.
+    #[test]
+    fn begin_zone_in_clears_the_previous_zones_hold_724() {
+        let mut gs = GameState::new();
+        gs.player_hold = Some(ControllerHold {
+            reason: ControllerHoldReason::EmbeddedNoRecovery,
+            secs: 9.5,
+        });
+
+        gs.begin_zone_in();
+
+        assert!(gs.player_hold.is_none(),
+            "a hold describes geometry the zone-in just dropped, and nothing recomputes it while \
+             the new zone loads — a zone-in must clear it so the load window reads honestly \
+             \"no hold\" instead of a confident wedge alarm about the zone we left");
     }
 
 }
