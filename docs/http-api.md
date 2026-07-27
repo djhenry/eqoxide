@@ -48,7 +48,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | `GET /v1/observe/packets[?summary=1]` | Packet-telemetry ring dump (#525), default-off capture. `{enabled, count, packets, snapshot_age_ms}`, or with `?summary=1`, `{enabled, summary, snapshot_age_ms}` (opcode histogram + reliable-sequence-gap analysis). |
 | `GET /v1/observe/who` | Server-wide `/who all` roster `{online:[{name, level, class, race, zone_id, guild, anon}], snapshot_age_ms}`. 503 if no response arrives in time. |
 | `GET /v1/observe/nav_debug` | The nav diagnostics snapshot navigation **publishes** (#608) — see [Nav diagnostics](#nav-diagnostics-get-v1observenav_debug--608). |
-| `GET /v1/observe/asset_sync` | Every asset sync in flight (#715) — phase, chunks, bytes and download rate while the client downloads a zone's (or the common) asset set. `{"active": false}` when nothing is syncing. See [Asset sync progress](#asset-sync-progress-get-v1observeasset_sync--715). |
+| `GET /v1/observe/asset_sync` | Every asset-server activity in flight (#715, #731) — phase, chunks, bytes and download rate while the client downloads a zone's (or the common) asset set, plus the logins that precede them. `{"active": false}` when nothing is running. See [Asset sync progress](#asset-sync-progress-get-v1observeasset_sync--715). |
 
 Every route above that lacked ANY freshness signal before #646 now carries one — either a
 top-level `"snapshot_age_ms"` JSON field or, where the body is a bare array/map/PNG that cannot
@@ -948,7 +948,7 @@ see.
   "syncs": [
     {
       "set": "zone/freportw",    // which set: "zone/<z>", "zonedoors/<z>", "common", "charmodel/<key>"
-      "phase": "downloading",    // "starting" | "verifying" | "downloading"
+      "phase": "downloading",    // "connecting" | "starting" | "verifying" | "downloading"
       "downloading": {           // present ONLY in the downloading phase
         "chunks_done": 3,
         "chunks_total": 7,
@@ -1049,6 +1049,9 @@ itself.
 
 ### Phases
 
+- **`connecting`** — an asset-server **login** is in flight (#731). Not a set sync at all: this entry
+  has no `set` and no `downloading`, and carries a `connecting.purpose` instead. See
+  [Logins are entries too](#logins-are-entries-too-and-they-are-not-transfers--731).
 - **`starting`** — the `sync_set` call has begun; its manifest request is in flight and the producer
   has not reported a phase yet. This phase is published by the client, not by the sync producer, and
   it exists so the "a sync is running" window covers the whole call: leaving it `active: false`
@@ -1063,19 +1066,24 @@ itself.
 
 ### When an entry is REMOVED
 
-Each sync's entry is written by an RAII guard wrapped around it, so the entry disappears when that
-sync **succeeds**, when it **fails**, and when the loader thread **panics** mid-sync (the guard
+Each entry is written by an RAII guard wrapped around it, so the entry disappears when that
+sync (or login) **succeeds**, when it **fails**, and when the loader thread **panics** mid-call (the guard
 removes it on unwind, so there is no "clear at the end of the happy path" to be skipped). No exit
 path can leave a *finished* sync reported as in-flight.
+
+The wrappers that own those guards — `sync_set_observed` and `login_observed` — are the **only** way
+to reach `sync_set` and `AssetSync::login`, both of which are private. An unobserved sync or login is
+a compile error, not a thing to remember (#726 review N3, #731).
 
 A sync that never exits at all — a hung transfer — is the case a guard cannot address, because it
 has not finished and reporting it as finished would be its own falsehood. That one is covered by
 [`published_age_ms`](#published_age_ms--is-it-progressing-or-wedged) above, not by removal.
 
-`last_ended` names the most recent sync to leave the list, so `active: false` right after a load is
+`last_ended` names the most recent activity to leave the list, so `active: false` right after a load is
 distinguishable from `active: false` in a process where nothing has ever synced (`last_ended: null`).
-It says **ended, not succeeded**: `Drop` runs identically on the success return, the error return and
+For a **set sync** it says **ended, not succeeded**: `Drop` runs identically on the success return, the error return and
 a panic unwind, and genuinely cannot tell them apart. Do not read it as "the set is now cached".
+For a **login** it does carry a verdict — see [Logins are entries too](#logins-are-entries-too-and-they-are-not-transfers--731).
 
 ### Overlap, and what `syncs` is for
 
@@ -1110,7 +1118,7 @@ particular set, find it **by name** in `syncs`.
 > ever wrong; the guidance was, and it shipped inside the response's own `semantics` string.
 
 **`stalest_published_age_ms` — the one-field wedge check.** The largest `published_age_ms` over
-**every** live sync. Because it is a maximum, it is large and growing whenever *any* sync is wedged,
+**every** live entry, **including logins** (#731). Because it is a maximum, it is large and growing whenever *any* sync is wedged,
 whatever `syncs[0]` is doing, so it is the field to poll when the question is "is this process stuck"
 rather than "how is set X doing". It is taken from the ages already encoded in `syncs` — never
 re-measured — so it always equals one of them exactly. It is **absent, not zero**, when nothing is
@@ -1125,9 +1133,89 @@ caller waiting for the API port to open should expect a multi-minute wait on fir
 distinguish it from a hung launch through this endpoint. It is not a hole in `active`: by the time
 anything can reach this endpoint, they are done, and `last_ended` names the later of the two.
 
-**Not covered by the guarded window:** the asset server `login()` that precedes each zone sync sits
-*outside* it, so a hung or slow login reads as `active: false` rather than as a `starting` sync. The
-guarded window begins at `sync_set`. Tracked as #731.
+### Logins are entries too, and they are not transfers — #731
+
+Every `sync_set` is preceded by an asset-server `login()`. Until #731 that call sat **outside** the
+guarded window, so a login that was slow, hung, or retrying against an unreachable asset server made
+this endpoint answer `{"active": false}` — "no asset sync is running" — while a loader thread was
+blocked inside it. The HUD said "Verifying zone assets…"; the API said idle.
+
+A login in flight is now an entry:
+
+```jsonc
+{
+  "active": true,
+  "syncs": [
+    {
+      "phase": "connecting",
+      "connecting": { "purpose": "zone load: neriakc" },
+      "published_age_ms": 8140,
+      "running_ms": 8140
+      // note: NO "set", and NO "downloading"
+    }
+  ],
+  "stalest_published_age_ms": 8140,
+  "phase": "connecting",                        // …mirrored, as syncs[0]
+  "connecting": { "purpose": "zone load: neriakc" },
+  "published_age_ms": 8140,
+  "running_ms": 8140,
+  "last_ended": null,
+  "semantics": "…"
+}
+```
+
+**Why `connecting` is its own kind of entry rather than a fourth sync phase.** A phase would need a
+`set`, and **three of the client's four logins do not have one**: the model-sync worker logs in once
+and then serves an unbounded queue of `charmodel/<key>` sets, startup logs in once for `gamedata`
+*and* `gameequip`, and the zone loader's single login covers both `zone/<z>` and `zonedoors/<z>`.
+Only `common` is 1:1. Filling `set` in at the other three would be a guess, and a caller looking that
+set up in `syncs` would find it and read a transfer that had not started.
+
+**Why it carries no transfer data.** A login has no set, no chunk count, no byte total and no rate.
+Reporting it through the sync shape would make it read as *a download stalled at 0 bytes* — which is
+a subtler version of the same falsehood, not a fix for it. `set` and `downloading` are therefore
+**absent** on a `connecting` entry (and absent from the top-level mirror when `syncs[0]` is a login),
+following the same absent-not-zero rule as the rate.
+
+**`purpose` is free text, not a set name**, and is deliberately not set-shaped (`"zone load:
+neriakc"`, not `"zone/neriakc"`). It says what the login is for; it is not a lookup key.
+
+**A hung login shows up in `stalest_published_age_ms`** with no special case. A login is one atomic
+request: it publishes exactly once, at `begin`, and never ticks — structurally identical to a sync
+wedged in `starting`. Its `published_age_ms` is therefore the whole time it has been blocked, and
+the documented one-field wedge check is large and growing throughout. `running_ms` and
+`published_age_ms` are the same duration for a login, for the same reason.
+
+**`last_ended` carries a real verdict for a login**, unlike for a set sync:
+
+```jsonc
+"last_ended": {
+  "connecting": { "purpose": "common asset load", "outcome": "failed" },  // succeeded | failed | unknown
+  "ago_ms": 210
+  // note: NO "set" — a login never had one
+}
+```
+
+`login_observed` wraps the call and sees its `Result`, so the outcome is **measured**, not guessed.
+(A set sync's `Drop` runs identically on success, error and unwind and genuinely cannot tell them
+apart — that limitation is unchanged.) `unknown` means a panic unwound through the login, so it
+neither returned `Ok` nor returned `Err`. This matters because otherwise a *failed* login and a
+*successful* one are the same `active: false`, which is #731's falsehood reappearing a moment later.
+The four states an agent can distinguish:
+
+| State | Body |
+|---|---|
+| never tried | `active: false`, `syncs: []`, `last_ended: null` |
+| logging in | `active: true`, `syncs[0].phase == "connecting"`, `stalest_published_age_ms` present and growing |
+| login failed | `active: false`, `last_ended.connecting.outcome == "failed"` |
+| login succeeded | `active: false` momentarily, `last_ended.connecting.outcome == "succeeded"` — then the set sync it enabled opens its own entry |
+
+**Known gap, disclosed:** the login's entry ends when `login()` returns and the following
+`sync_set_observed` opens its own a few statements later, so there is a sub-millisecond window in
+which `active` is `false`. No I/O happens in it — it is the same kind of gap that already exists
+between the `zone/<z>` and `zonedoors/<z>` syncs — so it is not a window a client can be *stuck* in,
+but a poll can land there. Closing it would need one guard spanning login and sync, which does not
+generalise to the three logins that serve more than one set.
 
 ---
 

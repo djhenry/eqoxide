@@ -2,7 +2,7 @@
 //! http://localhost:8088) with account $ASSET_USER/$ASSET_PASS.
 //! Run: ASSET_USER=claude ASSET_PASS=REDACTED cargo test --test asset_sync_live -- --ignored
 
-use eqoxide::asset_sync::{AssetSync, ManifestFetch, Transport};
+use eqoxide::asset_sync::{login_observed, ManifestFetch, Transport};
 
 #[test]
 #[ignore]
@@ -11,7 +11,10 @@ fn live_login_manifest_chunk() {
     let user = std::env::var("ASSET_USER").unwrap_or_else(|_| "claude".into());
     let pass = std::env::var("ASSET_PASS").unwrap_or_else(|_| "REDACTED".into());
 
-    let sync = AssetSync::login(&base, &user, &pass).expect("login");
+    // #731: `AssetSync::login` is private — `login_observed` is the only way in, so that no call
+    // site can leave a blocking login unobservable. Tests get a throwaway registry.
+    let obs = eqoxide::ipc::asset_sync::new_shared();
+    let sync = login_observed(&base, &user, &pass, &obs, "asset_sync_live test").expect("login");
     // Conditional fetch: pass no ETag so a cold fetch always returns the full manifest.
     let m = match sync.get_manifest("common", None).expect("manifest") {
         ManifestFetch::Changed(m) => m,
