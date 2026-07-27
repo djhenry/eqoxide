@@ -50,7 +50,7 @@ pub use result::{BuyOk, CastEnd, CommandResult, GiveOk, OpenOk};
 pub mod asset_sync;
 pub use asset_sync::{
     AssetConnectGuard, AssetSyncActivity, AssetSyncGuard, AssetSyncPhase, AssetSyncShared,
-    AssetSyncSnapshot, AssetSyncWork, ConnectOutcome, EndedWhat,
+    AssetSyncSnapshot, AssetSyncWork, ConnectOutcome, EndedWhat, LoginOutcomeTally,
 };
 
 // ── Relocated shared type definitions (#544 Step 2c) ─────────────────────────────────────────────
