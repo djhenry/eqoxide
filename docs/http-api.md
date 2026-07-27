@@ -931,7 +931,9 @@ see.
 {
   "active": false,
   "syncs": [],
-  "last_ended": {                // null if no sync has ever run in this process
+  // The most recent activity of ANY kind to end — one slot, overwritten by the next one.
+  // null only if nothing has ever run in this process.
+  "last_ended": {
     "set": "zone/freportw",
     "ago_ms": 4210               // measured at read time
   },
@@ -1144,7 +1146,14 @@ nothing can poll the endpoint until after they finish, so they are effectively i
 cache that window was measured at **349 s** (launch to port bind, empty asset cache, one run) — a
 caller waiting for the API port to open should expect a multi-minute wait on first run, and cannot
 distinguish it from a hung launch through this endpoint. It is not a hole in `active`: by the time
-anything can reach this endpoint, they are done, and `last_ended` names the later of the two.
+anything can reach this endpoint, they are done.
+
+They are also not readable from `last_ended` in general, for the reason above: it holds only the most
+recent activity, and the first thing the client does after binding the port is start more of them —
+the reviewer's live run saw the pre-bind startup login pushed out of that slot within seconds. The
+startup **login**'s verdict does survive, in `login_outcomes` / `last_login_failure`; the two pre-bind
+**set syncs** have no equivalent, so whether they succeeded is not observable through this endpoint
+at all.
 
 ### Logins are entries too, and they are not transfers — #731
 
