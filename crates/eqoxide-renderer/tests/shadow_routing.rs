@@ -12,20 +12,32 @@
 //!
 //! There is no GPU device in this crate's test harness (`fog_shader.rs` / `weather_shader.rs`
 //! established that precedent deliberately), and `GpuInstancedMesh` is unconstructible without one
-//! — it owns four `wgpu::Buffer`s. So #721's fix pulls the decisions out of the render-pass hot
+//! — it owns three `wgpu::Buffer`s. So #721's fix pulls the decisions out of the render-pass hot
 //! loop into `pass::plan_instanced_shadow_draws`, a pure function over the
 //! `pass::InstancedShadowCaster` trait, which this file implements on a plain struct.
 //!
+//! ## ⚠ This test binary installs a `#[global_allocator]`
+//!
+//! `plan_is_lazy_and_allocates_nothing` needs to count allocations, so `CountingAlloc` below is the
+//! allocator for **every test in this file**, not just that one. It is a thin per-thread counter
+//! over `System` and adds no behaviour, but anything added here runs through it — if you need a
+//! test that must not, put it in another file.
+//!
 //! ## What this file does NOT cover
 //!
-//! - **The executor.** `encode_shadow_pass`'s loop that turns a plan into `set_pipeline` /
-//!   `set_bind_group` / `draw_indexed` calls still needs a device to observe. The one decision left
-//!   in it — the two-arm `ShadowPipelineKind` → `r.pipelines.*` lookup — is pinned by
+//! - **The `wgpu` handle lookups.** `encode_shadow_pass`'s `PassSink` impl of
+//!   `pass::InstancedShadowSink` is four one-expression bodies that turn plan vocabulary into
+//!   `wgpu` handles: the two-arm `ShadowPipelineKind` → `r.pipelines.*` lookup, `light_depth_bg`,
+//!   the `texture_bind_groups[i]` out-of-range fallback, and the caster's buffer slices. All four
+//!   need a live device. The pipeline lookup is pinned by
 //!   `executor_binds_each_kind_to_the_pipeline_this_file_grades` below, but that is a *source-text*
 //!   assert, not a semantic one (same technique, and same caveat, as the `PIPELINE_RS` asserts in
-//!   `fog_shader.rs` / `weather_shader.rs` / `nav_debug_shader.rs`).
-//! - **That the plan is executed at all.** Nothing here would fail if the executor loop were
-//!   deleted outright, or wrapped in `if false`.
+//!   `fog_shader.rs` / `weather_shader.rs` / `nav_debug_shader.rs`); the other three are not
+//!   covered at all.
+//! - **That the plan is executed at all.** Nothing in *this file* would fail if the
+//!   `execute_instanced_shadow_plan` call in `encode_shadow_pass` were deleted or wrapped in
+//!   `if false`. (The executor's own logic *is* graded, in `shadow_routing_equivalence.rs`; it is
+//!   the one call site that is not.)
 //! - **Anything about the other four sub-passes** in `encode_shadow_pass` (skinned casters, static
 //!   casters, the depth-attachment clear, the caster-selection/culling that fills `casters`). Those
 //!   remain as untested as they were before #721.
@@ -241,6 +253,18 @@ fn frame_selector_edge_cases() {
         Some(2),
         "a 0ms interval must be clamped to 1ms, not divide by zero",
     );
+
+    // Texture index 0 is an ordinary `texture_bind_groups` entry, not a "no texture" sentinel.
+    // The round-2 reviewer's MY6 mutation special-cased it and survived, because neither this file
+    // nor the differential alphabet ever emitted a 0.
+    let frame_zero = (10u32, vec![0usize, 5]);
+    assert_eq!(
+        animated_frame_texture(Some(4), Some(&frame_zero), 0),
+        Some(0),
+        "frame index 0 must be bound as texture 0, not fall through to the base texture",
+    );
+    assert_eq!(animated_frame_texture(Some(4), Some(&frame_zero), 10), Some(5));
+    assert_eq!(animated_frame_texture(Some(0), None, 12_345), Some(0));
 }
 
 // ── 4. Bind-group bookkeeping ───────────────────────────────────────────────────────────────────
@@ -325,9 +349,13 @@ fn empty_scene_plans_nothing() {
 
 // ── 5. Cost ─────────────────────────────────────────────────────────────────────────────────────
 
-/// `encode_shadow_pass` runs every frame the shadow map is rebuilt, so the plan must not introduce
-/// a per-frame heap allocation where the two hand-written loops had none. This measures it with a
-/// per-thread counting allocator rather than asserting it from reading the code.
+/// `encode_shadow_pass` runs every frame the shadow map is rebuilt, so the plan should not add a
+/// *new* per-frame heap allocation — the two hand-written loops it replaced had none, and a lazy
+/// iterator was free. This is a "don't regress for nothing" pin, not a claim that one `Vec` would
+/// have been a measurable frame-time cost: the enclosing `encode_shadow_pass` already builds a
+/// `Vec<Caster>` and a sorted `Vec<&Billboard>` per call. (That last sentence is from reading the
+/// function, not from a profiler.) This test measures the plan's own allocations with a per-thread
+/// counting allocator rather than asserting them from reading the code.
 ///
 /// The plan is *drained* (not collected) — `collect()` would allocate the `Vec`, which is a test
 /// artifact, not something `encode_shadow_pass` does.
@@ -370,16 +398,19 @@ fn plan_is_lazy_and_allocates_nothing() {
 
 const PASS_RS: &str = include_str!("../src/pass.rs");
 
-/// The executor's `ShadowPipelineKind` → `r.pipelines.*` lookup needs a live `Pipelines` (hence a
-/// device) to observe semantically, so it is pinned as source text instead — the same technique as
-/// the `PIPELINE_RS` asserts in `fog_shader.rs`, `weather_shader.rs` and `nav_debug_shader.rs`.
-/// Without this, swapping those two arms would invert the routing while every semantic test above
-/// stayed green.
+/// `PassSink::set_pipeline`'s `ShadowPipelineKind` → `r.pipelines.*` lookup needs a live
+/// `Pipelines` (hence a device) to observe semantically, so it is pinned as source text instead —
+/// the same technique as the `PIPELINE_RS` asserts in `fog_shader.rs`, `weather_shader.rs` and
+/// `nav_debug_shader.rs`. Without this, swapping those two arms would invert the routing while
+/// every semantic test in this crate stayed green.
 ///
-/// Whole-line `//` comments are stripped first so a decoy comment cannot satisfy the assert. A
-/// *trailing* comment appended to a code line still could — that is a known, accepted weakness of
-/// source-text pinning, and the reason this is a backstop for one two-line lookup rather than the
-/// primary mechanism.
+/// #721's review round 2 argued this pin could be deleted once the executor became device-free.
+/// It is kept, because deleting it strictly loses coverage: the swap is still a real bug, and it is
+/// still caught here (measured — round 2's A2 goes RED with this pin, GREEN without it). What round
+/// 2 was right about is that this is a *guard*, not a type: whole-line `//` comments are stripped so
+/// a decoy comment cannot satisfy the assert, but a *trailing* comment appended to a code line still
+/// can (measured, mutation A2b). Treat it as a backstop over the one lookup that genuinely cannot be
+/// made device-free, not as the mechanism.
 #[test]
 fn executor_binds_each_kind_to_the_pipeline_this_file_grades() {
     let code: String = PASS_RS

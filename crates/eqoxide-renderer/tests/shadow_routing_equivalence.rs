@@ -4,9 +4,16 @@
 //! #721 is a testability refactor with a hard "no rendering behaviour change" constraint, and the
 //! only way to discharge that claim without a GPU device is differentially: `old()` below is a
 //! verbatim transcription of the pre-#721 instanced loops (commit d977706, the merge-base of the
-//! #721 branch), `new()` is a transcription of the executor loop that replaced them, and every case
-//! asserts the two emit an identical `Cmd` stream — same sub-pass order, same pipeline switches,
-//! same group-1 binds (including the redundant-bind elision), same draw order.
+//! #721 branch), `new()` runs the **real** executor — `pass::execute_instanced_shadow_plan`, the
+//! exact function `encode_shadow_pass` calls — into a recording sink, and every case asserts the
+//! two emit an identical `Cmd` stream: same sub-pass order, same pipeline switches, same group-1
+//! binds (including the redundant-bind elision), same draw order.
+//!
+//! `new()` was a hand-written *transcription* of the executor until review round 2, which is how the
+//! reviewer was able to reintroduce #718's N2 bug (`tex_bg(mesh.texture_idx)` for `tex_bg(tex)`) in
+//! `encode_shadow_pass` with all 14 tests green. The sink closed that: the only production code the
+//! executor can now reach that this file does not is the four `wgpu`-handle lookups in
+//! `encode_shadow_pass`'s `PassSink` impl.
 //!
 //! **This grades the new code against the OLD implementation, not against itself.** Confirmed to
 //! discriminate: inverting `ShadowPipelineKind::for_render_mode`'s two arms makes both tests here
@@ -17,12 +24,12 @@
 //! casters by texture to cut rebinds). That is a decision to make explicitly — update or delete
 //! this file as part of that change, do not weaken it to make a diff go green.
 //!
-//! It covers the plan only. Nothing here executes a `wgpu::RenderPass`, so it cannot prove the real
-//! executor issues these commands — see `shadow_routing.rs`'s "What this file does NOT cover".
+//! Nothing here creates a `wgpu::RenderPass`, so it grades the command *sequence*, not the wgpu
+//! calls that sequence turns into — see `shadow_routing.rs`'s "What this file does NOT cover".
 
 use eqoxide_assets::RenderMode;
 use eqoxide_renderer::pass::{
-    plan_instanced_shadow_draws, InstancedShadowCaster, ShadowPipelineKind, ShadowTexBind,
+    execute_instanced_shadow_plan, InstancedShadowCaster, InstancedShadowSink, ShadowPipelineKind,
 };
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -85,23 +92,40 @@ fn old(casters: &[Caster], now_ms: u64) -> Vec<Cmd> {
     out
 }
 
-/// The #721 executor loop, transcribed the same way.
-fn new(casters: &[Caster], now_ms: u64) -> Vec<Cmd> {
-    let mut out = Vec::new();
-    for step in plan_instanced_shadow_draws(casters, now_ms) {
-        if step.set_pipeline {
-            out.push(Cmd::SetPipeline(match step.pipeline {
-                ShadowPipelineKind::Opaque => "shadow_instanced",
-                ShadowPipelineKind::Masked => "shadow_instanced_masked",
-            }));
-            out.push(Cmd::BindGroup0);
-        }
-        if let ShadowTexBind::Set(tex) = step.bind {
-            out.push(Cmd::BindGroup1(tex));
-        }
-        out.push(Cmd::Draw(step.caster));
+/// A device-free [`InstancedShadowSink`]: the same four methods `encode_shadow_pass`'s `PassSink`
+/// implements against a live `wgpu::RenderPass`, recording into a `Vec` instead.
+///
+/// Note what is *absent*: `bind_texture` receives an index and has no caster in scope, which is why
+/// the round-2 reviewer's MY3 mutation (bind the caster's base `texture_idx` instead of the
+/// resolved animation frame) is no longer expressible in the executor at all.
+#[derive(Default)]
+struct Recorder {
+    out: Vec<Cmd>,
+}
+
+impl InstancedShadowSink for Recorder {
+    fn set_pipeline(&mut self, kind: ShadowPipelineKind) {
+        self.out.push(Cmd::SetPipeline(match kind {
+            ShadowPipelineKind::Opaque => "shadow_instanced",
+            ShadowPipelineKind::Masked => "shadow_instanced_masked",
+        }));
     }
-    out
+    fn bind_light_depth(&mut self) {
+        self.out.push(Cmd::BindGroup0);
+    }
+    fn bind_texture(&mut self, idx: Option<usize>) {
+        self.out.push(Cmd::BindGroup1(idx));
+    }
+    fn draw(&mut self, caster: usize) {
+        self.out.push(Cmd::Draw(caster));
+    }
+}
+
+/// The #721 executor — **the real one**, `pass::execute_instanced_shadow_plan`, not a copy of it.
+fn new(casters: &[Caster], now_ms: u64) -> Vec<Cmd> {
+    let mut rec = Recorder::default();
+    execute_instanced_shadow_plan(casters, now_ms, &mut rec);
+    rec.out
 }
 
 struct Lcg(u64);
@@ -128,14 +152,18 @@ fn plan_reproduces_the_pre_721_command_sequence() {
                     2 => RenderMode::Blend,
                     _ => RenderMode::Additive,
                 };
-                let tex = match rng.upto(4) {
+                // Index 0 is in the alphabet deliberately: `texture_bind_groups[0]` is an ordinary
+                // texture, not a sentinel, and an alphabet that never emits it cannot catch a
+                // mutant that special-cases 0 (round 2's MY6).
+                let tex = match rng.upto(5) {
                     0 => None,
-                    k => Some(k as usize),
+                    k => Some(k as usize - 1), // 0, 1, 2, 3
                 };
-                let anim = match rng.upto(4) {
+                let anim = match rng.upto(5) {
                     0 => None,
                     1 => Some((0u32, vec![])),          // degenerate: zero interval, no frames
                     2 => Some((rng.upto(3) as u32, vec![7])),
+                    3 => Some((rng.upto(200) as u32, vec![0, 8])), // frame index 0
                     _ => Some((rng.upto(200) as u32, vec![7, 8, 9][..1 + rng.upto(3) as usize].to_vec())),
                 };
                 Caster { mode, tex, anim }
@@ -162,6 +190,11 @@ fn plan_reproduces_the_pre_721_command_sequence_exhaustively_for_small_scenes() 
         (RenderMode::Masked, Some(2), None),
         (RenderMode::Masked, None, None),
         (RenderMode::Masked, Some(3), Some((0, vec![]))),
+        // Texture index 0, both as a static bind and as an animation frame. `texture_bind_groups[0]`
+        // is an ordinary entry; round 2's MY6 mutation (treat frame 0 as "no frame") survived an
+        // alphabet that could not express it.
+        (RenderMode::Masked, Some(0), None),
+        (RenderMode::Masked, Some(2), Some((10, vec![0, 5]))),
         (RenderMode::Blend, Some(1), None),
         (RenderMode::Additive, Some(1), None),
     ];
