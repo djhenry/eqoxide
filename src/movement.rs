@@ -53,6 +53,9 @@ const GROUND_SNAP_TOL: f32 = 0.5;
 const STUCK_FALLBACK_SECS: f32 = 0.5;
 /// How often (seconds) a good grounded position is sampled into the ring buffer.
 const GOOD_SAMPLE_SECS: f32 = 0.5;
+/// Minimum spacing (seconds) between fall-through-guard log lines while the guard is HOLDING a
+/// body it has no recovery position for. That branch changes nothing, so it re-runs every frame.
+const UNDERWORLD_HOLD_LOG_SECS: f32 = 5.0;
 /// Ring push-out search radii (units).
 const PUSHOUT_RADII: [f32; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 /// Directions sampled per push-out ring.
@@ -93,6 +96,9 @@ pub struct CharacterController {
     /// Recent grounded, non-embedded positions for the last-good fallback (§3.3).
     good:          std::collections::VecDeque<[f32; 3]>,
     good_timer:    f32,
+    /// Seconds until the underworld-hold log line may be emitted again (see
+    /// `UNDERWORLD_HOLD_LOG_SECS`). Diagnostics only — no physics reads this.
+    hold_log_cooldown: f32,
     stuck_time:    f32,
     /// Seconds until another nav auto-hop is allowed (prevents jump-spamming a wall we can't clear).
     hop_cooldown:  f32,
@@ -171,6 +177,89 @@ fn is_embedded(col: &Collision, p: [f32; 3]) -> bool {
         || col.ground_below(p[0], p[1], p[2] + GROUND_ORIGIN, GROUND_DEPTH).is_none()
 }
 
+/// What the one-shot zone-in reground should do with a freshly-arrived body (#712).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Reground {
+    /// Lift the body onto this floor height and mark it grounded.
+    Lift(f32),
+    /// Do nothing, and retire the one-shot. This is a control-flow verdict, NOT a claim that the
+    /// body is settled on anything: a swimmer gets `Retire` because the swim branch owns it, not
+    /// because it is standing on a floor.
+    Retire,
+    /// Nothing to stand on anywhere — leave the one-shot armed and look again next frame.
+    Wait,
+}
+
+/// Decide the one-shot reground applied after a zone change, once the new zone's collision is in.
+///
+/// The server's arrival coordinate and our baked collision are two independent models of the same
+/// zone, so the spawn z routinely lands a fraction UNDER the arrival surface. That is invisible to
+/// the ground clamp, which probes downward from `foot + GROUND_ORIGIN` (1 u): a floor even 1.1 u
+/// overhead sits above the probe origin and is not seen, so the body free-falls to whatever the
+/// next surface down happens to be.
+///
+/// #712, measured live (lfaydark → steamfont): the server corrected the character to
+/// `(2205, 579, -114.4)`; our baked floor in that column is `-113.25` — 1.15 u overhead — with the
+/// next floor down at `-232.0` and the zone underworld at `-222.0`. The body fell past the
+/// underworld, the #150 fall-through guard fired, and it recovered onto a stale PREVIOUS-zone
+/// coordinate (see [`CharacterController::forget_recovery_history`]) and wedged permanently.
+///
+/// **The discriminator is what is BELOW, not how far above.** An earlier revision of this function
+/// lifted whenever a floor sat 1–3 u overhead, and #720 review measured what that costs: a body
+/// arriving 3 u above ordinary ground with a walkable slab 2.4 u overhead was teleported onto the
+/// slab, because [`Collision::nearest_floor`] anchors on distance to the body and the body's own
+/// floor falls outside the band as soon as it is more than 1 u away. Height above is simply not the
+/// signal — many arrivals sit a few units above their floor, and that is an ordinary drop.
+///
+/// What actually distinguished #712 is that the body had **nowhere legal to land**: the only
+/// surface under it was 117 u down and *below the zone's underworld*, which the fall-through guard
+/// was going to refuse. So the gate here is that guard's *underworld* conjunct — `landing_valid` is
+/// `cand <= f && f > underworld`, and this applies only the second half, because there is no
+/// candidate step height to compare against at zone-in. (An earlier revision of this sentence
+/// claimed the gate was "exactly that guard's own `landing_valid` test"; #720 review measured that
+/// it is not, and the narrower claim is the true one.) If a
+/// floor below would be accepted, the body just falls onto it and we do nothing. Only when there is
+/// no such floor — void, or nothing but sub-underworld geometry — do we look up, and then we take
+/// the nearest floor above wherever it is, because the alternative is falling out of the world. The
+/// same landability test applies to the destination: a floor that is itself below the underworld is
+/// not worth lifting onto, because the body would simply meet the guard from there instead.
+///
+/// A body in water is never touched. #649 made "in water AND `on_ground`" unrepresentable through
+/// [`Recovery`], and the caller marks every `Lift` `on_ground`; the swim/buoyancy branch owns a
+/// swimmer, so the one-shot retires without acting rather than inventing a water recovery here.
+///
+/// With no underworld known (`None` — before `OP_NewZone`) every floor is landable, so this reduces
+/// to the original "nothing below at all" behaviour. That is the right conservative answer, because
+/// the fall-through guard this exists to pre-empt is itself disabled in that state
+/// (`fall_through_guard_disabled_when_underworld_unknown`).
+///
+/// Known and NOT changed here: `ground_below` inherits the nav headroom filter, so a body standing
+/// on ground with less than `NAV_AGENT_HEIGHT` of clearance reports nothing below and takes the
+/// upward branch — it can be lifted onto the low deck above it. #720 review measured that
+/// (floor 0, deck 4 u up, body at 0 → `Lift(4.0)`). It is pre-existing (the original code did the
+/// same) and is recorded here rather than claimed away.
+pub fn zone_in_reground(col: &Collision, p: [f32; 3], underworld: Option<f32>) -> Reground {
+    if body_in_water(col, p) { return Reground::Retire; }
+    let underworld = underworld.unwrap_or(f32::NEG_INFINITY);
+    // The same predicate as the fall-through guard's `landing_valid` in `step`: a floor at or below
+    // the underworld is not somewhere the body is allowed to come to rest.
+    if col.ground_below(p[0], p[1], p[2] + GROUND_ORIGIN, GROUND_DEPTH)
+          .is_some_and(|f| f > underworld) {
+        return Reground::Retire;
+    }
+    // `down = GROUND_ORIGIN` keeps a floor the body is already resting on inside the band, so
+    // `nearest_floor`'s distance anchoring returns THAT rather than something higher up, and the
+    // `f > p[2]` arm below then declines to move.
+    match col.nearest_floor(p[0], p[1], p[2], GROUND_DEPTH, GROUND_ORIGIN) {
+        // The target has to be somewhere the guard would ACCEPT, or the lift accomplishes nothing —
+        // moving a body from one sub-underworld position to another still ends in the guard.
+        // (`f > p[2]` is a rail rather than a behaviour: any landable floor at or below the feet
+        // would have been returned by `ground_below` above and retired us already.)
+        Some(f) if f > p[2] && f > underworld => Reground::Lift(f),
+        _ => Reground::Wait,
+    }
+}
+
 /// Where the depenetration net is allowed to put a body — **and in what support state**.
 ///
 /// The net used to write `pos` and `on_ground` inline, which made an illegal state trivially
@@ -232,7 +321,8 @@ impl Recovery {
 impl CharacterController {
     pub fn new(pos: [f32; 3]) -> Self {
         Self { pos, vel_z: 0.0, on_ground: false, in_water: false,
-               good: std::collections::VecDeque::new(), good_timer: 0.0, stuck_time: 0.0,
+               good: std::collections::VecDeque::new(), good_timer: 0.0, hold_log_cooldown: 0.0,
+               stuck_time: 0.0,
                hop_cooldown: 0.0, underworld: f32::NEG_INFINITY,
                airborne_start_z: None, landed_fall_height: None, levitating: false,
                swim_sinking: false }
@@ -261,6 +351,35 @@ impl CharacterController {
         self.levitating = levitating;
     }
 
+    /// Forget the last-good recovery ring. **Call this on every zone change.**
+    ///
+    /// `good` holds bare `[east, north, height]` samples with no zone tag, and both paths that read
+    /// it — the underworld fall-through guard in [`Self::step`] and the stuck fallback in
+    /// [`Self::depenetrate`] — restore `pos` from it verbatim. Carried across a zone change those
+    /// numbers name a point in a DIFFERENT zone's coordinate space, so "recovery" drops the body
+    /// wherever they happen to land in the new one. There is no way for either caller to tell: the
+    /// ring is just three floats, and they are always finite and always plausible.
+    ///
+    /// Measured in #712 (lfaydark → steamfont): the ring's newest sample was the lfaydark position
+    /// `(-2190.08, 911.27, -4.78)`; steamfont has no geometry AT ALL in that column (nearest
+    /// standable floor 133 u away), so [`is_embedded`] is permanently true there, no ring candidate
+    /// yields a [`Recovery`], and the 0.5 s stuck fallback restored that same point every 0.5 s
+    /// indefinitely — while the nav planner, correctly, reported `start_isolated`.
+    ///
+    /// This is deliberately NOT folded into [`Self::teleport`], but the reason is narrower than
+    /// "the history is still good". What is true is only that a same-zone correction leaves the
+    /// ring naming positions in the CURRENT zone, so restoring one is not nonsense the way a
+    /// cross-zone restore is. It can still be wrong: a GM summon or other large same-zone
+    /// relocation travels the same >12 u correction path, and for a few seconds afterwards
+    /// `good.back()` names the pre-relocation position — a fall-through or stuck fallback in that
+    /// window silently puts the character back there. That is pre-existing, not introduced with
+    /// this method, and is tracked separately in #724 (hypothesised from the code path, NOT
+    /// reproduced — see the issue); it is written down here rather than papered
+    /// over (#720 review, non-blocking B).
+    pub fn forget_recovery_history(&mut self) {
+        self.good.clear();
+    }
+
     /// Hard-set the position (zone-in, teleport, large server correction). Clears velocity & stuck.
     pub fn teleport(&mut self, pos: [f32; 3]) {
         self.pos = pos;
@@ -277,6 +396,7 @@ impl CharacterController {
 
     /// Advance one frame. Returns the new authoritative position.
     pub fn step(&mut self, intent: MoveIntent, dt: f32, col: &Collision) -> [f32; 3] {
+        self.hold_log_cooldown = (self.hold_log_cooldown - dt).max(0.0);
         // Depenetration / unstuck net runs first (§3.3). If it handled an embedded frame, freeze
         // the rest of the step so we neither slide deeper nor fall through void.
         if self.depenetrate(dt, col) {
@@ -535,14 +655,31 @@ impl CharacterController {
                         }
                     }
                     _ if cand <= self.underworld => {
-                        match self.good.back() {
-                            Some(&g) => { self.pos = g; self.on_ground = true; }
-                            None => {} // hold current pos; don't sink below underworld
-                        }
+                        let recovered = match self.good.back() {
+                            Some(&g) => { self.pos = g; self.on_ground = true; true }
+                            None => false, // hold current pos; don't sink below underworld
+                        };
                         self.vel_z = 0.0;
                         self.airborne_start_z = None; // underworld recovery is not a fall landing (§442)
-                        tracing::info!("fall-through guard: blocked descent below underworld {:.1} → {:?}",
-                                       self.underworld, self.pos);
+                        // The no-history branch changes NOTHING — it holds `pos`, leaves `on_ground`
+                        // false, and so re-runs every frame for as long as the hold lasts. Left
+                        // unthrottled it emits this line at frame rate for ever, which #720 review
+                        // flagged once clearing the ring on a zone change made an empty ring
+                        // routine. The recovering branch stays unthrottled: it moves the body, so
+                        // each of its lines reports a distinct event.
+                        if recovered {
+                            tracing::info!(
+                                "fall-through guard: blocked descent below underworld {:.1} → {:?}",
+                                self.underworld, self.pos);
+                        } else if self.hold_log_cooldown <= 0.0 {
+                            self.hold_log_cooldown = UNDERWORLD_HOLD_LOG_SECS;
+                            tracing::info!(
+                                "fall-through guard: blocked descent below underworld {:.1} → \
+                                 HOLDING at {:?} (no recovery history to restore; body is not \
+                                 grounded and this line is throttled to one per {:.0}s while the \
+                                 hold persists)",
+                                self.underworld, self.pos, UNDERWORLD_HOLD_LOG_SECS);
+                        }
                     }
                     _ => self.pos[2] = cand,
                 }
@@ -1786,5 +1923,207 @@ mod tests {
         let h = ctrl.take_landed_fall_height();
         assert!(h.is_some_and(|h| (h - 3.0).abs() < 1.0),
             "the hop-launch must record the airborne start so the 3u drop is reported, got {h:?}");
+    }
+
+    // ── #712: a walk-in arrival must not end wedged in the PREVIOUS zone's coordinates ──────────
+    //
+    // Measured live (lfaydark → steamfont), and the numbers below are those measurements, not a
+    // sketch: the server corrected the character to (2205, 579, −114.4); steamfont's baked floor in
+    // that column is −113.25 — 1.15 u OVERHEAD, i.e. just past the ground clamp's `foot + 1.0`
+    // probe origin and therefore invisible to it — with the next floor down at −232.0 and the zone
+    // underworld at −222.0. The body free-fell past the underworld, the #150 guard recovered it to
+    // the newest `good` sample, and that sample was still the LFAYDARK position
+    // (−2190.08, 911.27, −4.78). Steamfont has no geometry at all in that column (nearest standable
+    // floor 133 u away), so `is_embedded` was permanently true, no ring candidate yielded a
+    // `Recovery`, and the 0.5 s stuck fallback restored the same point every 0.5 s for ever.
+    //
+    // Two independent defects, fixed separately and pinned separately: the reground stops the fall,
+    // the ring clear stops any fall from being able to land in another zone's coordinate space.
+
+    /// The measured steamfont arrival column: arrival floor at −113.25, next surface 117 u down at
+    /// −232.0 — which is BELOW the zone's measured underworld of −222.0, and that, not the 1.15 u
+    /// gap above, is what makes this position unrecoverable and so what the reground keys on.
+    fn steamfont_arrival_column() -> Collision {
+        col(vec![floor(-113.25, -100.0, 100.0), floor(-232.0, -100.0, 100.0)])
+    }
+
+    #[test]
+    fn zone_in_reground_lifts_a_body_that_arrived_just_under_the_arrival_floor() {
+        let c = steamfont_arrival_column();
+        let p = [0.0, 0.0, -114.4];
+        assert!(c.ground_below(p[0], p[1], p[2] + GROUND_ORIGIN, GROUND_DEPTH).is_some(),
+            "fixture: there IS a floor below (the −232 deck) — that is exactly why the old \
+             'no floor at all below' condition declared this settled and let the body fall");
+        match zone_in_reground(&c, p, Some(-222.0)) {
+            Reground::Lift(f) => assert!((f + 113.25).abs() < 1e-2,
+                "#712: must lift onto the arrival floor −113.25, got {f}"),
+            other => panic!("#712: a body 1.15u under its arrival floor must be lifted, got {other:?}"),
+        }
+    }
+
+    // The next two are the #720 reviewer's constructions, reproduced verbatim as acceptance
+    // criteria. Both were RED when first added — the reviewer's findings are confirmed, not taken
+    // on trust.
+
+    #[test]
+    fn zone_in_reground_does_not_mount_an_airborne_arrival_onto_an_overhead_slab() {
+        // Ground at −3, a walkable slab top 2.4 u OVERHEAD, body arriving airborne at z=0 with a
+        // perfectly ordinary 3 u drop ahead of it. `nearest_floor` anchors on distance to the
+        // body, so its own floor is outside the [z−1, z+3] band and the slab wins by default —
+        // which would teleport the character ON TOP of the bridge it was arriving under.
+        let c = col(vec![floor(-3.0, -100.0, 100.0), floor(2.4, -100.0, 100.0)]);
+        let p = [0.0, 0.0, 0.0];
+        assert!(c.ground_below(p[0], p[1], p[2] + GROUND_ORIGIN, GROUND_DEPTH)
+                 .is_some_and(|f| (f + 3.0).abs() < 1e-2),
+            "fixture: the body must have landable ground 3 u below it");
+        assert!(c.nearest_floor(p[0], p[1], p[2], 3.0, 1.0).is_some_and(|f| (f - 2.4).abs() < 1e-2),
+            "fixture: and a standable slab inside the upward band, or this proves nothing");
+        assert_eq!(zone_in_reground(&c, p, Some(-222.0)), Reground::Retire,
+            "#720 B1: a body with landable ground beneath it must be left to FALL onto it, not \
+             lifted onto whatever happens to be overhead");
+    }
+
+    #[test]
+    fn zone_in_reground_never_hauls_a_swimmer_onto_a_submerged_shelf() {
+        // #649 made "in water AND on_ground" unrepresentable through `Recovery`; the reground must
+        // not reach that state by another route.
+        //
+        // The reviewer's construction — pool bottom −20, shelf +2, water to +10, body at 0 — is
+        // asserted first, but note WHY it passes: the −20 bottom is above the underworld, so the
+        // landability gate retires it before the water check is ever consulted. Mutation-checked and
+        // confirmed: deleting the water branch leaves that case green, so on its own it does not
+        // pin the swimmer rule at all.
+        let shallow = flooded_corridor(
+            vec![floor(-20.0, -100.0, 100.0), floor(2.0, -100.0, 100.0)], -20.0, 10.0);
+        assert_eq!(zone_in_reground(&shallow, [0.0, 0.0, 0.0], Some(-222.0)), Reground::Retire,
+            "#720 B2 (reviewer's construction; retired by the landability gate)");
+
+        // So here is the same shape with the gate taken away: deep water whose bottom is 230 u down
+        // and BELOW the underworld, i.e. exactly the "nowhere legal to land" state the reground
+        // exists to act on — with a submerged shelf 2 u overhead. Only the water short-circuit
+        // stands between this swimmer and being planted on that shelf.
+        let deep = flooded_corridor(
+            vec![floor(-230.0, -100.0, 100.0), floor(2.0, -100.0, 100.0)], -230.0, 10.0);
+        let p = [0.0, 0.0, 0.0];
+        assert!(body_in_water(&deep, p), "fixture: the body must be in water");
+        assert!(deep.ground_below(p[0], p[1], p[2] + GROUND_ORIGIN, GROUND_DEPTH).is_none(),
+            "fixture: and NOTHING landable below, or the gate retires before the water check and \
+             this test pins nothing");
+        assert!(deep.nearest_floor(p[0], p[1], p[2], GROUND_DEPTH, GROUND_ORIGIN)
+                    .is_some_and(|f| (f - 2.0).abs() < 1e-2),
+            "fixture: with a shelf the lift branch WOULD take");
+        assert_eq!(zone_in_reground(&deep, p, Some(-222.0)), Reground::Retire,
+            "#720 B2: the reground must not act on a swimmer at all — the swim/buoyancy branch \
+             owns that body, and `app.rs` marks every Lift `on_ground`");
+    }
+
+    #[test]
+    fn zone_in_reground_leaves_a_body_that_is_standing_on_its_floor() {
+        let c = col(vec![floor(0.0, -100.0, 100.0)]);
+        assert_eq!(zone_in_reground(&c, [0.0, 0.0, 0.0], Some(-222.0)), Reground::Retire);
+    }
+
+    #[test]
+    fn zone_in_reground_does_not_yank_a_body_up_through_the_terrain_above_it() {
+        // Surface at z=0, a cellar/cave floor at z=−12, body arriving in between with 2 u to fall.
+        // It is somewhere else entirely, and it has landable ground of its own — so it falls onto
+        // that, and is not teleported 10 u up through solid rock.
+        let c = col(vec![floor(0.0, -100.0, 100.0), floor(-12.0, -100.0, 100.0)]);
+        assert!(c.ground_below(0.0, 0.0, -10.0 + GROUND_ORIGIN, GROUND_DEPTH)
+                 .is_some_and(|f| f > -222.0),
+            "fixture: the body must have LANDABLE ground beneath it (above the underworld)");
+        assert_eq!(zone_in_reground(&c, [0.0, 0.0, -10.0], Some(-222.0)), Reground::Retire,
+            "#712: a body with a floor the fall-through guard would accept must be left to fall");
+    }
+
+    #[test]
+    fn zone_in_reground_lifts_only_when_the_floor_below_is_under_the_underworld() {
+        // The same column twice, differing ONLY in where the underworld sits — which is the whole
+        // gate. Floor 10 u below the body: with the underworld beneath it that floor is a legal
+        // landing and we do nothing; with the underworld above it the guard would refuse that
+        // landing, so the body has nowhere to go but the surface overhead.
+        let c = col(vec![floor(2.0, -100.0, 100.0), floor(-10.0, -100.0, 100.0)]);
+        let p = [0.0, 0.0, 0.0];
+        assert_eq!(zone_in_reground(&c, p, Some(-222.0)), Reground::Retire,
+            "floor at −10 is above the underworld −222 → a legal landing, leave it alone");
+        match zone_in_reground(&c, p, Some(-5.0)) {
+            Reground::Lift(f) => assert!((f - 2.0).abs() < 1e-2, "expected Lift(2.0), got {f}"),
+            other => panic!("floor at −10 is BELOW the underworld −5 → the guard would refuse it, \
+                             so the body must be lifted onto the surface above; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zone_in_reground_does_nothing_when_the_underworld_is_unknown() {
+        // Same column as #712's, but with no underworld from OP_NewZone yet. The fall-through guard
+        // is disabled in that state, so there is no wedge to pre-empt and we must not act.
+        let c = steamfont_arrival_column();
+        assert_eq!(zone_in_reground(&c, [0.0, 0.0, -114.4], None), Reground::Retire);
+    }
+
+    #[test]
+    fn zone_in_reground_still_lifts_a_body_spawned_far_below_the_terrain() {
+        // The case the block was originally written for, preserved: arrival z deep under the new
+        // zone's floor with nothing at all beneath it — lifted from any distance.
+        let c = col(vec![floor(0.0, -100.0, 100.0)]);
+        match zone_in_reground(&c, [0.0, 0.0, -150.0], Some(-222.0)) {
+            Reground::Lift(f) => assert!(f.abs() < 1e-2, "must lift onto the z=0 terrain, got {f}"),
+            other => panic!("a body 150u below the terrain with nothing beneath it must be \
+                             lifted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zone_in_reground_will_not_lift_onto_a_floor_that_is_itself_below_the_underworld() {
+        // Body at −300 with a floor 10 u overhead at −290 — but the underworld is −222, so that
+        // floor is not a place the fall-through guard would let anything rest either. Lifting onto
+        // it would move the body 10 u and change nothing. `Wait` leaves the one-shot armed instead.
+        let c = col(vec![floor(-290.0, -100.0, 100.0)]);
+        let p = [0.0, 0.0, -300.0];
+        assert!(c.ground_below(p[0], p[1], p[2] + GROUND_ORIGIN, GROUND_DEPTH).is_none(),
+            "fixture: nothing below, so we reach the lift branch");
+        assert!(c.nearest_floor(p[0], p[1], p[2], GROUND_DEPTH, GROUND_ORIGIN)
+                 .is_some_and(|f| (f + 290.0).abs() < 1e-2),
+            "fixture: with a floor above that the lift branch would otherwise take");
+        assert_eq!(zone_in_reground(&c, p, Some(-222.0)), Reground::Wait,
+            "the lift target has to be somewhere the guard would accept, not merely higher up");
+    }
+
+    #[test]
+    fn zone_in_reground_waits_when_the_column_is_empty() {
+        // Geometry exists, but not in this column — the one-shot must stay armed rather than
+        // retire on a position with nothing to stand on.
+        let c = col(vec![floor(0.0, 500.0, 600.0)]);
+        assert_eq!(zone_in_reground(&c, [0.0, 0.0, 0.0], Some(-222.0)), Reground::Wait);
+    }
+
+    #[test]
+    fn a_zone_change_forgets_the_previous_zones_recovery_ring() {
+        // Zone A: stand on a floor long enough to bank a good sample (GOOD_SAMPLE_SECS = 0.5).
+        let a = col(vec![floor(0.0, -100.0, 100.0)]);
+        let mut ctrl = CharacterController::new([10.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        ctrl.set_underworld(Some(-222.0));
+        for _ in 0..60 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &a); }
+        let stale = *ctrl.good.back()
+            .expect("fixture: zone A must bank a good sample, else this test proves nothing");
+
+        // The zone change. `app.rs` drops the old collision here; it must drop this with it.
+        ctrl.forget_recovery_history();
+        assert!(ctrl.good.is_empty(),
+            "#712: the previous zone's coordinates must not survive a zone change, got {:?}",
+            ctrl.good);
+
+        // Zone B: the arrival column has no floor within reach and the only deck is BELOW the
+        // underworld, so the fall-through guard is guaranteed to fire — and zone A's coordinates
+        // are still perfectly plausible floats, which is why the stale restore looked like success.
+        let b = col(vec![floor(-232.0, -100.0, 100.0)]);
+        ctrl.teleport([10.0, 0.0, -114.4]);
+        for _ in 0..120 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &b); }
+
+        assert!(ctrl.pos != stale,
+            "#712: the guard recovered onto a PREVIOUS-zone coordinate {stale:?}");
+        assert!(ctrl.pos[2] > -222.0,
+            "the underworld guard must still hold the body above −222, got {:?}", ctrl.pos);
     }
 }
