@@ -180,9 +180,12 @@ fn masked_only_scene_still_produces_masked_draws() {
 /// Symmetric guard for the opaque sub-pass, and for the sub-pass list itself.
 #[test]
 fn both_instanced_subpasses_run_in_opaque_then_masked_order() {
+    // Compared as SLICES, not arrays: dropping a sub-pass changes the const's length, and an
+    // array-vs-array `assert_eq!` would turn that into a compile error in this file rather than a
+    // readable test failure.
     assert_eq!(
-        INSTANCED_SHADOW_SUBPASSES,
-        [ShadowPipelineKind::Opaque, ShadowPipelineKind::Masked],
+        INSTANCED_SHADOW_SUBPASSES.as_slice(),
+        [ShadowPipelineKind::Opaque, ShadowPipelineKind::Masked].as_slice(),
         "both instanced shadow sub-passes must run, opaque first (grouping by pipeline is what \
          keeps the pass to one pipeline switch per kind)",
     );
