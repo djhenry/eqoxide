@@ -48,7 +48,9 @@ pub use result::{BuyOk, CastEnd, CommandResult, GiveOk, OpenOk};
 /// slot in this crate: it is a contract between the app/loader threads and the HTTP thread, and
 /// `eqoxide-http` must be able to name it without depending on the app crate above it.
 pub mod asset_sync;
-pub use asset_sync::{AssetSyncActivity, AssetSyncGuard, AssetSyncPhase, AssetSyncShared};
+pub use asset_sync::{
+    AssetSyncActivity, AssetSyncGuard, AssetSyncPhase, AssetSyncShared, AssetSyncSnapshot,
+};
 
 // ── Relocated shared type definitions (#544 Step 2c) ─────────────────────────────────────────────
 // Pure-data types the slots above/below wrap, moved down out of the app crate so `ipc` no longer

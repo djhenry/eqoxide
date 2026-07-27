@@ -142,17 +142,17 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/asset_sync", get(get_asset_sync))
 }
 
-/// GET /v1/observe/asset_sync (#715) — the in-flight asset sync, phase-modelled.
+/// GET /v1/observe/asset_sync (#715) — every asset sync in flight, phase-modelled.
 ///
 /// The driving agent has no eyes on the loading screen. `zone_assets` (#579) already says whether
 /// the world is usable; this says whether the load behind it is *progressing*, and how fast — the
 /// difference between "still downloading, 3 of 7 chunks, 1.2 MB/s" and "wedged".
 ///
-/// ## The two distinctions this body is shaped to keep
+/// ## The three distinctions this body is shaped to keep
 ///
-/// **Idle is not zero progress.** `active` is `false` and NO other field is present when nothing is
-/// syncing. A download that has not finished a chunk yet is `active: true` with
-/// `downloading.chunks_done: 0`. An agent must branch on `active`, never on a count being zero.
+/// **Idle is not zero progress.** `active` is `false` and `syncs` is empty when nothing is syncing.
+/// A download that has not finished a chunk yet is `active: true` with `downloading.chunks_done: 0`.
+/// An agent must branch on `active`, never on a count being zero.
 ///
 /// **The phase is modelled, not flattened.** Transfer data lives in a `downloading` sub-object that
 /// EXISTS ONLY in the downloading phase, mirroring the producer enum (#708) where a rate is
@@ -160,48 +160,95 @@ pub(super) fn router() -> Router<HttpState> {
 /// indistinguishable from "downloading, rate not yet derivable" — so the two are different
 /// structures here, not two spellings of null.
 ///
-/// Within `downloading`, `rate_bytes_per_sec` is present only when the producer's
-/// `download_rate_bytes_per_sec` yields one; it is OMITTED (never null, never 0) for the first
-/// ~100 ms of a downloading phase, where the elapsed time is too small to divide by honestly. Its
-/// absence there means "not derivable yet", and is unambiguous precisely because the enclosing
-/// `downloading` object is present.
+/// **Concurrent syncs are a LIST, not a slot.** The client runs three loaders, and a short
+/// `charmodel/<key>` sync routinely begins and ends inside a long `zone/<zone>` download. A single
+/// last-writer-wins slot answered `active: false` for the rest of that zone download (#726 review
+/// finding 1). `syncs` carries every live one, oldest-started first; `active` means *at least one*
+/// sync is running, which is what the docs have always promised.
 ///
-/// The slot is read here, per request, from the same `Arc` the loader threads write — a live read,
-/// not a value captured when the server was constructed.
+/// Within `downloading`, `rate_bytes_per_sec` is present only when a rate can honestly be asserted;
+/// otherwise it is OMITTED (never null, never 0) and `rate_unavailable` names the rule that
+/// withheld it — `phase_too_young` under the producer's 100 ms minimum, `sample_too_stale` once the
+/// sample is older than `MAX_RATE_SAMPLE_AGE`. Its absence is unambiguous precisely because the
+/// enclosing `downloading` object is present, with `bytes` and `elapsed_secs` still in it.
+///
+/// The registry is read here, per request, from the same `Arc` the loader threads write — a live
+/// read, not a value captured when the server was constructed.
 async fn get_asset_sync(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let activity = s.asset_sync.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    Json(asset_sync_json(activity.as_ref()))
+    Json(asset_sync_json(&eqoxide_ipc::asset_sync::snapshot(&s.asset_sync)))
 }
 
-/// The pure projection behind [`get_asset_sync`] — takes the activity explicitly so the encoding is
+/// The pure projection behind [`get_asset_sync`] — takes the snapshot explicitly so the encoding is
 /// testable without an `HttpState`, and so the handler holds no lock while serializing.
-fn asset_sync_json(activity: Option<&eqoxide_ipc::AssetSyncActivity>) -> serde_json::Value {
+fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
     const SEMANTICS: &str =
-        "active:false means NO asset sync is running — that is a different state from a sync \
-         sitting at zero progress, which is active:true with downloading.chunks_done:0. Transfer \
-         data appears ONLY inside the `downloading` object, which exists only in that phase, so a \
-         rate can never be read for a phase that has none. Inside `downloading`, an ABSENT \
-         rate_bytes_per_sec means the phase is younger than the producer's 100 ms minimum and no \
-         honest rate can be derived yet — it does not mean zero. `set` names which sync a sample \
-         describes: during a zone change the previous zone's loader may still be running, and \
-         samples from the two can interleave. EVERY field except published_age_ms is frozen at the \
-         producer's last tick, and it ticks only when a chunk completes — so check \
-         published_age_ms before believing chunks_done/bytes/rate_bytes_per_sec. A large and \
-         GROWING published_age_ms means the sync is wedged, not progressing: the numbers beside it \
-         describe the last moment it was alive, not now.";
+        "active:false means NO asset sync is running anywhere in this process — that is a different \
+         state from a sync sitting at zero progress, which is active:true with \
+         downloading.chunks_done:0. `syncs` lists EVERY sync in flight, oldest-started first, \
+         because several loaders run at once (a zone download, its door set, the common set, and \
+         on-demand charmodel sets) and a short one can begin and end inside a long one; the \
+         top-level set/phase/downloading/published_age_ms/running_ms fields are a copy of syncs[0], \
+         the longest-running one, so a caller that only wants 'is the load I am waiting on alive' \
+         need not iterate. Transfer data appears ONLY inside the `downloading` object, which exists \
+         only in that phase, so a rate can never be read for a phase that has none. Inside \
+         `downloading`, an ABSENT rate_bytes_per_sec never means zero: `rate_unavailable` says \
+         which rule withheld it — phase_too_young (under the producer's 100 ms minimum elapsed, no \
+         honest rate can be divided yet) or sample_too_stale (nothing has ticked for over 2000 ms, \
+         so the last rate has stopped being an assertion about NOW; bytes and elapsed_secs are \
+         still there, and bytes/(elapsed_secs+published_age_ms/1000) is the honest lower bound). \
+         EVERY field except published_age_ms and running_ms is frozen at the producer's last tick, \
+         and it ticks only when a chunk completes — including elapsed_secs, so the phase has \
+         actually been running elapsed_secs+published_age_ms/1000. running_ms is measured at read \
+         time and keeps moving even while a sync is wedged; a large and GROWING published_age_ms \
+         means wedged, not progressing. last_ended names the most recent sync to LEAVE this list \
+         and is how 'nothing is syncing now' is told apart from 'nothing has ever synced' — it says \
+         ended, NOT succeeded: the client cannot tell a success from a failure or a panic here.";
 
-    let Some(a) = activity else {
-        return serde_json::json!({ "active": false, "semantics": SEMANTICS });
-    };
+    let syncs: Vec<serde_json::Value> = snap.live.iter().map(sync_json).collect();
     let mut body = serde_json::json!({
-        "active": true,
+        "active": !syncs.is_empty(),
+        "syncs": syncs,
+        // #726 review N5: an empty `syncs` used to be the same answer for "a sync just finished" and
+        // "no sync has ever run in this process". `null` here is the honest "no sync has ended yet";
+        // `ago_ms` is measured at READ time like every other age (#343).
+        "last_ended": snap.last_ended.as_ref().map(|e| serde_json::json!({
+            "set": e.set,
+            "ago_ms": e.at.elapsed().as_millis() as u64,
+        })),
+        "semantics": SEMANTICS,
+    });
+    // The PRIMARY sync, mirrored to the top level: `syncs[0]`, the longest-running one. Copied from
+    // the very same encoded object the array carries — not re-derived — so the two cannot drift.
+    // It is the long zone download in every overlap the client actually produces, which is both the
+    // sync an agent is waiting on and the one whose wedge matters.
+    if let Some(primary) = body["syncs"].as_array().and_then(|a| a.first()).cloned() {
+        let (obj, primary) = (body.as_object_mut().expect("json! object"), primary);
+        for (k, v) in primary.as_object().expect("sync_json builds an object") {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    body
+}
+
+/// One live sync, encoded. Used for BOTH the `syncs` array and the mirrored top-level primary.
+fn sync_json(a: &eqoxide_ipc::AssetSyncActivity) -> serde_json::Value {
+    // Measured ONCE, here, and used for both the reported age and the rate-staleness decision. Two
+    // separate `elapsed()` calls could straddle the threshold and produce a body that omits the rate
+    // as `sample_too_stale` while reporting a `published_age_ms` under the bound — a response that
+    // contradicts its own documented rule.
+    let sample_age = a.published_at.elapsed();
+    let mut body = serde_json::json!({
         "set": a.set,
         // Freshness, computed AT READ TIME (the #343 discipline — an age must never be cached).
         // Every other field here is frozen at the producer's last tick, and the producer ticks only
         // when a chunk completes: a WEDGED download leaves them all in place with nobody left to
         // update them. This is the field that tells a stalled sync apart from a progressing one.
-        "published_age_ms": a.published_at.elapsed().as_millis() as u64,
-        "semantics": SEMANTICS,
+        "published_age_ms": sample_age.as_millis() as u64,
+        // How long the whole `sync_set` call has been running, also at read time. Unlike
+        // `downloading.elapsed_secs` this keeps MOVING while a sync is wedged, and it is the only
+        // duration that exists at all in the `starting` phase — a hung manifest fetch has no
+        // chunks, no bytes and no elapsed, just an age.
+        "running_ms": a.started_at.elapsed().as_millis() as u64,
     });
     let obj = body.as_object_mut().expect("json! object");
     match &a.phase {
@@ -219,12 +266,14 @@ fn asset_sync_json(activity: Option<&eqoxide_ipc::AssetSyncActivity>) -> serde_j
                 "bytes":        bytes,
                 "elapsed_secs": elapsed.as_secs_f64(),
             });
-            // Same guard, same threshold, as the HUD's rate line — derived here rather than
-            // carried, because the slot deliberately publishes the raw (bytes, elapsed) the
-            // producer measured and nothing else.
-            if let Some(rate) = eqoxide_ipc::asset_sync::download_rate_bytes_per_sec(*bytes, *elapsed) {
-                dl.as_object_mut().expect("json! object")
-                    .insert("rate_bytes_per_sec".into(), serde_json::json!(rate));
+            let dl_obj = dl.as_object_mut().expect("json! object");
+            // The producer's own 100 ms guard, PLUS the read-time staleness rule the HUD does not
+            // need (it redraws from the tick that produced the sample; this endpoint can be polled
+            // minutes later). Either way the key is omitted rather than faked, and the reason is
+            // named — see `eqoxide_ipc::asset_sync::observed_download_rate`.
+            match eqoxide_ipc::asset_sync::observed_download_rate(*bytes, *elapsed, sample_age) {
+                Ok(rate) => { dl_obj.insert("rate_bytes_per_sec".into(), serde_json::json!(rate)); }
+                Err(why) => { dl_obj.insert("rate_unavailable".into(), serde_json::json!(why)); }
             }
             obj.insert("downloading".into(), dl);
         }
@@ -1656,6 +1705,12 @@ mod tests {
         }
     }
 
+    /// Open a sync on the state's OWN registry, the only way production writes it. The returned
+    /// guard must be held for the sync to stay live — dropping it is how a sync ends.
+    fn begin(state: &HttpState, set: &str) -> eqoxide_ipc::AssetSyncGuard {
+        eqoxide_ipc::AssetSyncGuard::begin(&crate::testkit::asset_sync_slot(state), set)
+    }
+
     /// #715 trap 2 — "no sync in progress" and "a sync sitting at zero progress" are different
     /// states an agent acts on differently, so they must be different BODIES. A zero-initialized
     /// default that makes an idle client look like a download stalled at 0% is the failure class
@@ -1669,9 +1724,10 @@ mod tests {
         assert!(idle.get("downloading").is_none(),
             "an idle client must carry NO transfer data at all: {idle}");
         assert!(idle.get("set").is_none(), "an idle client is not syncing any set: {idle}");
+        assert_eq!(idle["syncs"], serde_json::json!([]), "…and no sync is listed: {idle}");
 
-        eqoxide_ipc::asset_sync::publish(
-            &crate::testkit::asset_sync_slot(&state), "zone/qeynos2", dl(0, 7, 0, 0));
+        let g = begin(&state, "zone/qeynos2");
+        g.tick(dl(0, 7, 0, 0));
         let zero = asset_sync_json_body(&state).await;
         assert_eq!(zero["active"], serde_json::json!(true),
             "a download that has not finished a chunk yet is still a RUNNING sync");
@@ -1690,13 +1746,13 @@ mod tests {
     #[tokio::test]
     async fn non_downloading_phases_carry_no_transfer_data_at_all() {
         let state = empty_state();
-        let slot = crate::testkit::asset_sync_slot(&state);
+        let g = begin(&state, "zone/qeynos2");
 
         for (phase, tag) in [
             (eqoxide_ipc::AssetSyncPhase::Starting,  "starting"),
             (eqoxide_ipc::AssetSyncPhase::Verifying, "verifying"),
         ] {
-            eqoxide_ipc::asset_sync::publish(&slot, "zone/qeynos2", phase);
+            g.tick(phase);
             let v = asset_sync_json_body(&state).await;
             assert_eq!(v["active"], serde_json::json!(true));
             assert_eq!(v["phase"], serde_json::json!(tag));
@@ -1714,7 +1770,7 @@ mod tests {
                 "byte counts must be unreachable outside the downloading phase: {v}");
         }
 
-        eqoxide_ipc::asset_sync::publish(&slot, "zone/qeynos2", dl(3, 7, 2_000_000, 2_000));
+        g.tick(dl(3, 7, 2_000_000, 2_000));
         let v = asset_sync_json_body(&state).await;
         assert_eq!(v["phase"], serde_json::json!("downloading"));
         assert_eq!(v["downloading"]["bytes"], serde_json::json!(2_000_000u64));
@@ -1727,20 +1783,78 @@ mod tests {
     #[tokio::test]
     async fn the_rate_is_omitted_rather_than_faked_while_the_phase_is_too_young() {
         let state = empty_state();
-        let slot = crate::testkit::asset_sync_slot(&state);
+        let g = begin(&state, "common");
 
-        eqoxide_ipc::asset_sync::publish(&slot, "common", dl(1, 7, 1_048_576, 50));
+        g.tick(dl(1, 7, 1_048_576, 50));
         let young = asset_sync_json_body(&state).await;
         assert!(young["downloading"].get("rate_bytes_per_sec").is_none(),
             "50 ms is under the producer's minimum — no rate can be derived honestly: {young}");
+        assert_eq!(young["downloading"]["rate_unavailable"], serde_json::json!("phase_too_young"),
+            "…and an omission with no stated reason is its own small ambiguity: {young}");
         assert_eq!(young["downloading"]["bytes"], serde_json::json!(1_048_576u64),
             "…while the raw evidence is still reported");
 
-        eqoxide_ipc::asset_sync::publish(&slot, "common", dl(1, 7, 2_000_000, 2_000));
+        g.tick(dl(1, 7, 2_000_000, 2_000));
         let v = asset_sync_json_body(&state).await;
         let rate = v["downloading"]["rate_bytes_per_sec"].as_f64()
             .unwrap_or_else(|| panic!("a 2s-old phase must carry a rate: {v}"));
         assert!((rate - 1_000_000.0).abs() < 1.0, "2 MB over 2 s is 1 MB/s, got {rate}");
+        assert!(v["downloading"].get("rate_unavailable").is_none(),
+            "a published rate must not also carry a reason it is missing: {v}");
+    }
+
+    /// #726 review finding 2 — a WEDGED download's rate is not a stale truth, it is a falsehood.
+    ///
+    /// The reviewer's live numbers: the last tick of a real cold zone load was 31,294,024 B over
+    /// 20.65 s = 1,515,404 B/s. Wedge that transfer for five minutes and the endpoint kept asserting
+    /// 1,515,404 while the true phase average was ~97,600 B/s (15× lower) and the instantaneous
+    /// rate was zero. `published_age_ms` DOCUMENTS the staleness but does not remove it, and there
+    /// was no threshold anywhere for a caller to apply. The precedent already in this file — the
+    /// 100 ms guard, which omits the key rather than publishing a fake number — is the fix.
+    #[tokio::test]
+    async fn a_wedged_syncs_rate_is_withheld_rather_than_asserted_from_a_five_minute_old_sample() {
+        let state = empty_state();
+        let g = begin(&state, "zone/neriakc");
+        let wedged = dl(374, 374, 31_294_024, 20_650);
+
+        // Healthy: the sample is current and the rate is real.
+        g.tick(wedged.clone());
+        let live = asset_sync_json_body(&state).await;
+        let rate = live["downloading"]["rate_bytes_per_sec"].as_f64()
+            .unwrap_or_else(|| panic!("a fresh sample must carry its rate: {live}"));
+        assert!((rate - 1_515_449.0).abs() < 1_000.0, "1.5 MB/s, got {rate}");
+
+        // …and the SAME sample, five minutes later with nothing having ticked since.
+        g.tick_stamped(wedged, ago(300));
+        let v = asset_sync_json_body(&state).await;
+        assert!(v["downloading"].get("rate_bytes_per_sec").is_none(),
+            "a rate is an assertion about NOW, and this transfer has moved nothing for five \
+             minutes — publishing 1.5 MB/s beside a 300000 ms age is still a confident \
+             falsehood: {v}");
+        assert_eq!(v["downloading"]["rate_unavailable"], serde_json::json!("sample_too_stale"),
+            "…and the caller must be told WHICH rule withheld it, not left to infer: {v}");
+        // The measurements stay — they are still the last known truth, which is exactly why the age
+        // has to sit beside them. Only the derived assertion is withheld.
+        assert_eq!(v["downloading"]["bytes"], serde_json::json!(31_294_024u64));
+        assert_eq!(v["downloading"]["elapsed_secs"], serde_json::json!(20.65));
+        assert!(v["published_age_ms"].as_u64().unwrap() >= 300_000, "{v}");
+        assert_eq!(v["active"], serde_json::json!(true),
+            "a wedged sync is still RUNNING — withholding the rate must not be mistaken for \
+             clearing the sync: {v}");
+    }
+
+    /// The threshold must not fire during a healthy load. The reviewer measured live inter-tick
+    /// gaps at median 41 ms, p95 185 ms, max 469 ms; a rule that suppressed the rate at 469 ms
+    /// would be its own false alarm, and would make the field useless exactly when it works.
+    #[tokio::test]
+    async fn the_slowest_healthy_inter_tick_gap_measured_live_still_publishes_a_rate() {
+        let state = empty_state();
+        let g = begin(&state, "zone/neriakc");
+        g.tick_stamped(dl(200, 374, 16_000_000, 10_000),
+            std::time::Instant::now() - std::time::Duration::from_millis(469));
+        let v = asset_sync_json_body(&state).await;
+        assert!(v["downloading"]["rate_bytes_per_sec"].is_f64(),
+            "469 ms is the worst gap measured on a HEALTHY link — the rate must survive it: {v}");
     }
 
     /// #715 / the #343 class, the half a guard cannot fix — a WEDGED sync. The producer ticks only
@@ -1752,12 +1866,8 @@ mod tests {
     async fn a_frozen_sample_reports_its_age_so_a_wedged_sync_is_not_read_as_a_healthy_one() {
         let state = empty_state();
         // A sync whose last tick was 30 s ago: mid-download, nothing published since.
-        *crate::testkit::asset_sync_slot(&state).lock().unwrap() =
-            Some(eqoxide_ipc::AssetSyncActivity {
-                set: "zone/freportw".into(),
-                phase: dl(3, 7, 2_000_000, 2_000),
-                published_at: ago(30),
-            });
+        let g = begin(&state, "zone/freportw");
+        g.tick_stamped(dl(3, 7, 2_000_000, 2_000), ago(30));
 
         let v = asset_sync_json_body(&state).await;
         let age = v["published_age_ms"].as_u64()
@@ -1771,10 +1881,64 @@ mod tests {
 
         // …and a sample published just now must NOT read as old, so the field is a real read-time
         // measurement rather than a constant that happens to satisfy the assertion above.
-        eqoxide_ipc::asset_sync::publish(
-            &crate::testkit::asset_sync_slot(&state), "zone/freportw", dl(3, 7, 2_000_000, 2_000));
+        g.tick(dl(3, 7, 2_000_000, 2_000));
         let fresh = asset_sync_json_body(&state).await["published_age_ms"].as_u64().unwrap();
         assert!(fresh < 5_000, "a just-published sample must read as fresh, got {fresh} ms");
+    }
+
+    /// `running_ms` is the one duration that keeps MOVING while a sync is wedged: `elapsed_secs` is
+    /// frozen at the last tick like everything else in `downloading`, and in the `starting` phase
+    /// (a hung manifest fetch) there is no duration at all. Without it an agent asking "how long
+    /// has this been going?" reads a number that stopped advancing when the sync stopped.
+    #[tokio::test]
+    async fn running_ms_measures_the_whole_call_at_read_time_not_the_frozen_phase_elapsed() {
+        let state = empty_state();
+        // A sync wedged in `starting` — one sample, at begin, and no producer tick will ever come.
+        // There is no phase duration to fall back on here, so the field can only come from a
+        // read-time measurement; the sleep is a real lower bound on a monotonic clock, which is what
+        // makes this assertion able to FAIL rather than merely able to pass. (It could: the first
+        // version of this test asserted only `is_u64()` and `< 5_000`, and a mutation reporting the
+        // frozen phase elapsed survived both.)
+        let g = begin(&state, "zone/neriakc");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let v = asset_sync_json_body(&state).await;
+        assert_eq!(v["phase"], serde_json::json!("starting"));
+        assert!(v["running_ms"].as_u64().expect("running_ms") >= 25,
+            "a sync wedged before its first tick still has an age, and it is the only number \
+             it has: {v}");
+        assert!(v.get("downloading").is_none(), "…and no transfer data whatsoever: {v}");
+
+        // A frozen downloading sample claiming TEN MINUTES of phase elapsed, on a call that began
+        // milliseconds ago. The two must not be confused for one another: reporting the producer's
+        // frozen `elapsed` under this name would answer "10 minutes" to "how long has this call
+        // been running?". The gap between the two is wide enough that no scheduling delay closes it.
+        g.tick_stamped(dl(3, 7, 2_000_000, 600_000), ago(30));
+        let v = asset_sync_json_body(&state).await;
+        assert_eq!(v["downloading"]["elapsed_secs"], serde_json::json!(600.0),
+            "the producer's own frozen measurement, reported verbatim");
+        assert!(v["running_ms"].as_u64().unwrap() < 60_000,
+            "…while running_ms is measured from the call's start at READ time, and must not be \
+             the frozen phase elapsed wearing a different name: {v}");
+    }
+
+    /// #726 review N5 — an empty list used to be the same answer for "a sync just finished" and
+    /// "nothing has ever synced in this process", which is the known-empty-vs-unknown collapse this
+    /// repo has been bitten by before.
+    #[tokio::test]
+    async fn idle_says_whether_a_sync_has_ever_run_rather_than_collapsing_the_two() {
+        let state = empty_state();
+        let never = asset_sync_json_body(&state).await;
+        assert_eq!(never["last_ended"], serde_json::json!(null),
+            "before any sync has run there is nothing to report, and that is not a completion: \
+             {never}");
+
+        drop(begin(&state, "zone/neriakc"));
+        let after = asset_sync_json_body(&state).await;
+        assert_eq!(after["active"], serde_json::json!(false), "…the sync really is over: {after}");
+        assert_eq!(after["last_ended"]["set"], serde_json::json!("zone/neriakc"),
+            "…but 'idle after a zone sync' must be distinguishable from 'idle, nothing ever \
+             ran': {after}");
+        assert!(after["last_ended"]["ago_ms"].as_u64().unwrap() < 5_000, "{after}");
     }
 
     /// #715 trap 3 / the #343 class — the handler must read the LIVE cell every request. A value
@@ -1784,10 +1948,10 @@ mod tests {
     #[tokio::test]
     async fn the_handler_re_reads_the_live_slot_on_every_request() {
         let state = empty_state();
-        let slot = crate::testkit::asset_sync_slot(&state);
         assert_eq!(asset_sync_json_body(&state).await["active"], serde_json::json!(false));
 
-        eqoxide_ipc::asset_sync::publish(&slot, "zone/freportw", dl(2, 9, 4096, 1_000));
+        let g = begin(&state, "zone/freportw");
+        g.tick(dl(2, 9, 4096, 1_000));
         let mid = asset_sync_json_body(&state).await;
         assert_eq!(mid["active"], serde_json::json!(true),
             "a sync started AFTER the state was built must still be visible");
@@ -1795,12 +1959,65 @@ mod tests {
 
         // …and the transition back OUT, which is the half that gets forgotten: a finished sync
         // that keeps reading as live is a confident lie about work that is over.
-        eqoxide_ipc::asset_sync::finish(&slot, "zone/freportw");
+        drop(g);
         let after = asset_sync_json_body(&state).await;
         assert_eq!(after["active"], serde_json::json!(false),
             "a finished sync must stop being reported as in-flight: {after}");
         assert!(after.get("downloading").is_none(),
             "…and must leave no transfer data behind: {after}");
+    }
+
+    /// #726 review finding 1, AT THE API BOUNDARY. The client runs three loaders, and the
+    /// model-sync worker's short `charmodel/<key>` sync routinely begins and ends inside the zone
+    /// loader's long `zone/<zone>` download. With one last-writer-wins slot the nested sync's exit
+    /// cleared it, and this endpoint answered `{"active": false}` while a 31 MB download was still
+    /// in flight — for the rest of that download, and forever if it was wedged.
+    #[tokio::test]
+    async fn a_nested_sync_finishing_does_not_make_the_endpoint_deny_the_long_one_still_running() {
+        let state = empty_state();
+        let zone = begin(&state, "zone/neriakc");
+        zone.tick(dl(120, 374, 10_000_000, 8_000));
+
+        // Both live: the endpoint must show BOTH, not interleave them into one slot.
+        let model = begin(&state, "charmodel/hum");
+        let both = asset_sync_json_body(&state).await;
+        let sets: Vec<&str> = both["syncs"].as_array().unwrap().iter()
+            .map(|s| s["set"].as_str().unwrap()).collect();
+        assert_eq!(sets, ["zone/neriakc", "charmodel/hum"],
+            "every sync in flight must be listed, longest-running first: {both}");
+        assert_eq!(both["set"], serde_json::json!("zone/neriakc"),
+            "…and the mirrored primary is syncs[0], the long download an agent is waiting on: \
+             {both}");
+
+        // The short one ends inside the long one.
+        drop(model);
+        let v = asset_sync_json_body(&state).await;
+        assert_eq!(v["active"], serde_json::json!(true),
+            "zone/neriakc is STILL DOWNLOADING, but the endpoint now reports 'no asset sync is \
+             running' — a confident falsehood, not a stale truth: {v}");
+        assert_eq!(v["set"], serde_json::json!("zone/neriakc"));
+        assert_eq!(v["downloading"]["chunks_done"], serde_json::json!(120),
+            "…with its progress intact, not reset: {v}");
+        assert_eq!(v["syncs"].as_array().unwrap().len(), 1,
+            "…and the nested sync, which really is over, must be gone: {v}");
+    }
+
+    /// The same defect in its worst form: the outer sync is wedged in `starting` — a hung manifest
+    /// request — so it has published exactly once and will never publish again. A single slot that
+    /// a nested sync deleted stayed empty for the entire wedge, so the failure this endpoint exists
+    /// to expose became invisible while it reported the healthiest possible answer.
+    #[tokio::test]
+    async fn a_nested_sync_cannot_permanently_hide_a_zone_sync_wedged_in_starting() {
+        let state = empty_state();
+        let _wedged = begin(&state, "zone/neriakc"); // one sample, at begin; no tick ever follows
+        drop(begin(&state, "charmodel/hum"));
+
+        let v = asset_sync_json_body(&state).await;
+        assert_eq!(v["active"], serde_json::json!(true),
+            "a manifest fetch hung in `starting` is exactly the wedge this endpoint was built to \
+             surface, and it must not be erased by an unrelated sync finishing: {v}");
+        assert_eq!(v["set"], serde_json::json!("zone/neriakc"));
+        assert_eq!(v["phase"], serde_json::json!("starting"));
     }
 
     /// #598 finding 1, at the API BOUNDARY — the honesty contract must hold in the SERIALIZED body,

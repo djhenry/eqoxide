@@ -382,7 +382,17 @@ pub enum SyncProgress {
 /// rate" means. One definition, two readers.
 pub use crate::ipc::asset_sync::download_rate_bytes_per_sec;
 
-pub fn sync_set(
+/// **Private on purpose (#726 review N3).** [`sync_set_observed`] is the only way in.
+///
+/// The review's mutation M11 reverted two of the four call sites from `sync_set_observed` back to
+/// this function and the entire 1442-test suite still passed: the "every in-session sync is
+/// observed" property — the one that makes `active: false` mean anything at all — was enforced by
+/// nothing but the author's care, and the next `sync_set` added anywhere in `app.rs` would have
+/// reintroduced the falsehood silently. This project's verification hierarchy puts "make the bad
+/// state unrepresentable" above any test, so an unobserved sync is now a compile error rather than
+/// a thing to remember. There is no `Option<&AssetSyncShared>` escape hatch either: the registry is
+/// constructed before the very first sync in `main.rs`, so every caller has one to pass.
+fn sync_set(
     t: &dyn Transport,
     set: &str,
     cache: &CacheDirs,
@@ -452,14 +462,17 @@ pub fn sync_set(
     }
 }
 
-/// [`sync_set`], with the agent-observable activity slot (#715) published for the whole call.
+/// Run a `sync_set`, with the agent-observable activity (#715) published for the whole call.
 ///
-/// This is the ONLY writer of [`crate::ipc::AssetSyncShared`]. It exists so the observable window
-/// is bounded by an RAII guard rather than by remembering to clear at each return: `observable`
-/// goes back to "no sync in progress" on the success return, on the error return, and on a panic
-/// unwinding out of the calling loader thread. The alternative — publishing progress with no
-/// clear-on-completion — turns `/v1/observe/asset_sync` into a confident report of a sync that
-/// finished long ago, which is a worse answer than the nothing it replaced.
+/// This is the ONLY way to run a sync — `sync_set` itself is private (#726 review N3) — and the
+/// ONLY writer of [`crate::ipc::AssetSyncShared`]. It exists so the observable window is bounded by
+/// an RAII guard rather than by remembering to clear at each return: this sync's entry leaves the
+/// registry on the success return, on the error return, and on a panic unwinding out of the calling
+/// loader thread, and the guard can only ever remove ITS OWN entry, so a short sync nested inside a
+/// long one cannot blank the long one on its way out (#726 review finding 1). The alternative —
+/// publishing progress with no clear-on-completion — turns `/v1/observe/asset_sync` into a
+/// confident report of a sync that finished long ago, which is a worse answer than the nothing it
+/// replaced.
 ///
 /// `progress` is still called for every producer tick, unchanged, so the existing loading-screen
 /// status lines are unaffected: this wrapper only ADDS an observer.
@@ -1230,7 +1243,6 @@ mod observed_sync_tests {
     use super::*;
     use crate::ipc::{AssetSyncPhase, AssetSyncShared};
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
 
     struct FakeTransport {
         manifest: Manifest,
@@ -1283,7 +1295,13 @@ mod observed_sync_tests {
     }
 
     fn slot() -> AssetSyncShared {
-        Arc::new(Mutex::new(None))
+        crate::ipc::asset_sync::new_shared()
+    }
+
+    /// The sets currently reported as in flight, oldest-started first — i.e. what
+    /// `GET /v1/observe/asset_sync` would list at this instant.
+    fn live_sets(obs: &AssetSyncShared) -> Vec<String> {
+        crate::ipc::asset_sync::snapshot(obs).live.into_iter().map(|a| a.set).collect()
     }
 
     #[test]
@@ -1297,9 +1315,7 @@ mod observed_sync_tests {
         let seen: std::cell::RefCell<Vec<crate::ipc::AssetSyncActivity>> = Default::default();
 
         sync_set_observed(&fixture(), "zone/qeynos2", &cache, &obs, &mut |_p| {
-            if let Some(a) = obs.lock().unwrap().clone() {
-                seen.borrow_mut().push(a);
-            }
+            seen.borrow_mut().extend(crate::ipc::asset_sync::snapshot(&obs).live);
         }).unwrap();
 
         let seen = seen.into_inner();
@@ -1325,7 +1341,7 @@ mod observed_sync_tests {
         let cache = CacheDirs::with_root(dir.path());
         let obs = slot();
         sync_set_observed(&fixture(), "zone/qeynos2", &cache, &obs, &mut |_| {}).unwrap();
-        assert_eq!(*obs.lock().unwrap(), None,
+        assert!(live_sets(&obs).is_empty(),
             "a COMPLETED sync must read as 'no sync in progress', not as its last phase");
     }
 
@@ -1339,7 +1355,7 @@ mod observed_sync_tests {
         let obs = slot();
         let r = sync_set_observed(&FailingTransport, "zone/qeynos2", &cache, &obs, &mut |_| {});
         assert!(r.is_err(), "the fixture must actually fail (digest mismatch)");
-        assert_eq!(*obs.lock().unwrap(), None,
+        assert!(live_sets(&obs).is_empty(),
             "a FAILED sync must read as 'no sync in progress', not as its last phase");
     }
 
@@ -1362,7 +1378,9 @@ mod observed_sync_tests {
             }
             fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>> { self.inner.get_chunk(hash) }
         }
-        let sample = || { *sampled.borrow_mut() = obs.lock().unwrap().clone(); };
+        let sample = || {
+            *sampled.borrow_mut() = crate::ipc::asset_sync::snapshot(&obs).live.into_iter().next();
+        };
         let warm = Warm { inner: fixture(), sample: &sample };
         sync_set_observed(&warm, "zone/qeynos2", &cache, &obs, &mut |_| {}).unwrap();
 
@@ -1370,7 +1388,7 @@ mod observed_sync_tests {
             .expect("a sync in flight must be observable even before its first progress tick");
         assert_eq!(a.set, "zone/qeynos2");
         assert_eq!(a.phase, AssetSyncPhase::Starting);
-        assert_eq!(*obs.lock().unwrap(), None, "…and cleared once it returns");
+        assert!(live_sets(&obs).is_empty(), "…and cleared once it returns");
     }
 
     #[test]
@@ -1381,22 +1399,53 @@ mod observed_sync_tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = CacheDirs::with_root(dir.path());
         let obs = slot();
-        // The OLD zone's sync is running; partway through, the NEW zone's loader takes the slot
-        // over (last writer wins — a single slot cannot hold two syncs). Then the old one returns.
+        // The OLD zone's sync is running; partway through, the NEW zone's loader starts too. Then
+        // the old one returns while the new one is still in flight.
+        let newer: std::cell::RefCell<Option<crate::ipc::AssetSyncGuard>> = Default::default();
         sync_set_observed(&fixture(), "zone/qeynos2", &cache, &obs, &mut |p| {
             if let SyncProgress::Downloading { done, total, .. } = p {
-                if done == total {
-                    crate::ipc::asset_sync::publish(&obs, "zone/freportw", AssetSyncPhase::Downloading {
-                        chunks_done: 1, chunks_total: 9, bytes: 512,
-                        elapsed: std::time::Duration::from_secs(1),
-                    });
+                if done == total && newer.borrow().is_none() {
+                    *newer.borrow_mut() =
+                        Some(crate::ipc::AssetSyncGuard::begin(&obs, "zone/freportw"));
                 }
             }
         }).unwrap();
-        assert_eq!(
-            obs.lock().unwrap().as_ref().map(|a| a.set.clone()).as_deref(),
-            Some("zone/freportw"),
-            "the finishing loader must only clear ITS OWN activity"
-        );
+        assert_eq!(live_sets(&obs), ["zone/freportw"],
+            "the finishing loader must only remove ITS OWN activity");
+    }
+
+    /// #726 review finding 1, through the REAL wrapper rather than a hand-built guard — the
+    /// converse of the test above and the one the client runs routinely. The model-sync worker's
+    /// short `charmodel/<key>` sync begins AND ends inside the zone loader's long `zone/<zone>`
+    /// download. Under the old set-scoped single slot the nested sync's `Drop` saw its own set
+    /// published, cleared, and `GET /v1/observe/asset_sync` answered `active: false` for the rest
+    /// of a 31 MB zone download — and forever, if that download was wedged.
+    #[test]
+    fn reviewer_a_nested_charmodel_sync_reports_idle_while_the_zone_sync_still_runs() {
+        let outer_dir = tempfile::tempdir().unwrap();
+        let inner_dir = tempfile::tempdir().unwrap();
+        let (outer_cache, inner_cache) =
+            (CacheDirs::with_root(outer_dir.path()), CacheDirs::with_root(inner_dir.path()));
+        let obs = slot();
+
+        // Sampled from INSIDE the outer sync, immediately after the nested one has fully returned —
+        // exactly where an HTTP poll would land during a real zone load.
+        let after_nested: std::cell::RefCell<Option<Vec<String>>> = Default::default();
+        let mut ran_nested = false;
+        sync_set_observed(&fixture(), "zone/neriakc", &outer_cache, &obs, &mut |_p| {
+            if !ran_nested {
+                ran_nested = true;
+                sync_set_observed(&fixture(), "charmodel/hum", &inner_cache, &obs, &mut |_| {})
+                    .expect("the nested model sync must complete");
+                *after_nested.borrow_mut() = Some(live_sets(&obs));
+            }
+        }).unwrap();
+
+        let live = after_nested.into_inner().expect("the nested sync must actually have run");
+        assert!(live.iter().any(|s| s == "zone/neriakc"),
+            "GET /v1/observe/asset_sync answered 'active:false' while zone/neriakc was \
+             mid-download — live sets were {live:?}");
+        assert!(!live.iter().any(|s| s == "charmodel/hum"),
+            "…and the nested sync, which really is over, must NOT still be listed: {live:?}");
     }
 }

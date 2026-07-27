@@ -601,13 +601,14 @@ pub struct HttpState {
     /// it is reading is frozen FOREVER, which no age can say. Written only by
     /// `eqoxide::model::run_net_thread`; same shared-`Arc`-identity discipline as the two above.
     pub(crate) net_thread_dead: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    /// The in-flight asset sync, if any (#715, agent-honesty). `None` = no sync is in progress;
-    /// `Some(activity)` names the set and the phase of the one that is. Written ONLY by the app
-    /// crate's `asset_sync::sync_set_observed`, whose RAII guard clears it on every exit path
-    /// (success, error, panic) — so this can never report a long-finished sync as live. Read here
-    /// per request, not cached, so `GET /v1/observe/asset_sync` reflects the loader's current
-    /// phase rather than a snapshot frozen at server construction. Same shared-`Arc`-identity
-    /// discipline as the three fields above.
+    /// Every asset sync in flight (#715, agent-honesty). Empty = no sync is in progress; each entry
+    /// names a set and its phase. Written ONLY by the app crate's `asset_sync::sync_set_observed`
+    /// (the only way to reach `sync_set` at all), whose RAII guard removes ITS OWN entry on every
+    /// exit path (success, error, panic) — so this can neither report a long-finished sync as live
+    /// nor let a short nested sync blank a long one that is still running (#726 review finding 1).
+    /// Read here per request, not cached, so `GET /v1/observe/asset_sync` reflects the loaders'
+    /// current phases rather than a snapshot frozen at server construction. Same
+    /// shared-`Arc`-identity discipline as the three fields above.
     pub(crate) asset_sync: eqoxide_ipc::AssetSyncShared,
     /// The typed write-path facade (#446). Combat is fully migrated onto it — combat/pet handlers
     /// write via `s.command.request_*` (no direct `ipc::CombatSlots` field any more); other domains
