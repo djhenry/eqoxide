@@ -28,7 +28,9 @@ fn anim_now_ms() -> u64 {
 //   3. whether the masked sub-pass exists at all.
 //
 // #718's mutation check confirmed the gap directly: reverting (1), and separately reverting (2),
-// each left the whole crate suite green. Those decisions now live in `plan_instanced_shadow_draws`
+// each left the whole crate suite green. (1) was re-measured on this branch's merge-base while
+// writing #721 — swapping the two `RenderMode` guards there left all 171 `eqoxide-renderer` tests
+// passing. Those decisions now live in `plan_instanced_shadow_draws`
 // below — a pure function over a device-free view of the casters — and `encode_shadow_pass` is a
 // mechanical executor of the plan it returns. The plan is a lazy iterator, NOT a `Vec`: this runs
 // every frame the shadow map is rebuilt (renderer.rs calls `encode_shadow_pass` unconditionally per
