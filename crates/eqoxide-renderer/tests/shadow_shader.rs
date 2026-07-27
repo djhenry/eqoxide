@@ -344,6 +344,17 @@ fn shadow_masked_alpha_cutout_matches_expected_value() {
 /// source file — mutations A and B above were both re-run against this version: both go RED, with
 /// the other 8 tests in this file staying green, matching the pristine-green/mutant-red pattern the
 /// round-1 test was supposed to establish in the first place.
+///
+/// **Two remaining limits, both known and both deliberate** (eqoxide#721, from #718's round-3
+/// review):
+///   - [`block_has_kill`] does not descend `Statement::Call`, so factoring the `discard` out into a
+///     helper function called from the cutout branch makes this test go RED on a shader that is
+///     *correct*. WGSL permits `discard` in any function reachable from a fragment stage. That is
+///     the safe direction — it fails loud and never blesses a bug — and the right tradeoff for an
+///     18-line helper, but if you refactor that shader and hit a red here, this is why.
+///   - The entry-point NAME above is a string literal, and the name `pipeline.rs` binds is a
+///     separate literal that merely reads the same. `masked_shadow_pipeline_binds_the_entry_point_
+///     this_file_grades` below couples them.
 #[test]
 fn shadow_masked_alpha_cutout_actually_discards() {
     for (source, label, entry_point) in [
@@ -360,6 +371,33 @@ fn shadow_masked_alpha_cutout_actually_discards() {
              though the threshold literal is present and numerically correct."
         );
     }
+}
+
+const PIPELINE_RS: &str = include_str!("../src/pipeline.rs");
+
+/// eqoxide#721, third instance: `shadow_masked_alpha_cutout_actually_discards` grades an entry point
+/// it looks up by the string literal `"fs_instanced_masked"`. The name `pipeline.rs` actually binds
+/// is a *separate* string literal that happens to read the same today, and nothing coupled them.
+///
+/// The owner recorded a measured mutation on #721: leave `fs_instanced_masked` byte-identical, append
+/// a discard-less `fs_instanced_masked_hq` to `shadow_masked_instanced.wgsl`, and point
+/// `pipeline.rs`'s `entry_point` at the new name. All 9 tests in this file stayed green while the
+/// shader that ships reproduced #707 exactly. `shadow_masked_instanced.wgsl`'s own header anticipates
+/// the file growing a second masked path, so that is a foreseeable edit, not a contrived one.
+///
+/// This is source-text matching — the technique #718 spent two review rounds *removing* from the
+/// shader-side checks. The distinction is deliberate: the shader side is IR-based because that is
+/// where comment-style and decoy-entry-point mutations live; the drift this assert catches is on the
+/// **Rust** side, where there is no IR to walk, and its failure mode is loud rather than silently
+/// green. Its own weakness is the usual one for source-text pins: a decoy comment containing this
+/// exact substring, or a legitimate reformat of that descriptor, would defeat/false-red it.
+#[test]
+fn masked_shadow_pipeline_binds_the_entry_point_this_file_grades() {
+    assert!(
+        PIPELINE_RS.contains(r#"module: &shadow_masked_shader, entry_point: "fs_instanced_masked","#),
+        "pipeline.rs no longer binds `fs_instanced_masked` for the masked shadow caster, so \
+         shadow_masked_alpha_cutout_actually_discards is grading an entry point that does not ship."
+    );
 }
 
 /// Regression guard for eqoxide#718 NON-BLOCKING-3: `shadow_masked_instanced.wgsl` duplicates
