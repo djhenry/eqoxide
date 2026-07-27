@@ -1544,26 +1544,38 @@ impl App {
                 self.controller.teleport(corr);
             }
 
-            // One-shot reground after a zone change: if the controller arrived below the floor, lift
-            // it onto that floor once the new zone's collision is loaded. "Below the floor" is
-            // decided by `zone_in_reground`, which asks UPWARD — it also covers the #712 case of
-            // arriving 1–3u under the surface with a long drop beneath, which the old
-            // "no floor at all below" test read as perfectly settled and which ended in a
-            // free-fall past the zone's underworld.
+            // One-shot reground after a zone change: if the controller arrived somewhere it can
+            // only fall out of the world from, lift it onto the floor above once the new zone's
+            // collision is loaded. `zone_in_reground` decides; the #712 case is an arrival a little
+            // UNDER the surface whose only ground is below the zone's underworld, which the old
+            // "no floor at all below" test read as perfectly settled.
             if self.needs_reground && !self.loading {
                 if let Some(c) = self.collision.as_deref() {
                     let p = self.controller.pos;
-                    match crate::movement::zone_in_reground(c, p) {
-                        crate::movement::Reground::Lift(f) => {
-                            self.controller.teleport([p[0], p[1], f]);
-                            self.controller.on_ground = true;
-                            self.needs_reground = false;
-                            tracing::info!(
-                                "zone-in: regrounded controller to floor z={:.2} (arrived at z={:.2})",
-                                f, p[2]);
+                    // Once the body is standing on something the arrival is over, so retire the
+                    // one-shot rather than leave it armed to fire at some position the character
+                    // has since walked to (#720 review, non-blocking C).
+                    if self.controller.on_ground {
+                        self.needs_reground = false;
+                    } else {
+                        // Underworld comes from the live world state, not `controller.underworld`:
+                        // `set_underworld` is only called from the step below, which does not run
+                        // while collision is None, so on this first post-load frame the controller
+                        // still holds the PREVIOUS zone's threshold.
+                        let uw = self.game_state_view.world.zone_underworld;
+                        match crate::movement::zone_in_reground(c, p, uw) {
+                            crate::movement::Reground::Lift(f) => {
+                                self.controller.teleport([p[0], p[1], f]);
+                                self.controller.on_ground = true;
+                                self.needs_reground = false;
+                                tracing::info!(
+                                    "zone-in: regrounded controller to floor z={:.2} (arrived at \
+                                     z={:.2}; nothing landable below, underworld {:?})",
+                                    f, p[2], uw);
+                            }
+                            crate::movement::Reground::Retire => self.needs_reground = false,
+                            crate::movement::Reground::Wait => {}
                         }
-                        crate::movement::Reground::Settled => self.needs_reground = false,
-                        crate::movement::Reground::Wait => {}
                     }
                 }
             }
