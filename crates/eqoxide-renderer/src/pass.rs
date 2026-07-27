@@ -324,8 +324,14 @@ pub fn shadow_pose_for(anim: Option<(usize, f32)>, clip_count: usize) -> ShadowP
 /// selection decision left to make. Allocates: the nearest-first sort needs an owned index order
 /// (unlike [`plan_instanced_shadow_draws`], which is lazy).
 ///
-/// `model_kind()` is called only for candidates that survive the cull, matching the pre-#740 order
-/// of work.
+/// `model_kind()` is called only for candidates that survive the cull *within this function*.
+///
+/// **Do not read that as a statement about the pass.** The production call site
+/// ([`encode_shadow_pass`]) resolves every billboard's `GpuModel` eagerly into its `CandidateView`s
+/// *before* calling this, so the pass's order of work does differ from pre-#740 — that is the one
+/// disclosed behaviour-neutral delta (#740 §2). An earlier draft of this comment claimed the order
+/// of work "matches the pre-#740 order"; it does not, and the claim is retracted here rather than
+/// deleted.
 pub fn plan_shadow_casters<C: ShadowCasterCandidate>(
     player:       Option<&C>,
     nearby:       &[C],
@@ -1547,6 +1553,12 @@ pub fn encode_shadow_pass(
         model: r.character_model_for(&scene.player_race, scene.player_gender),
         anim:  r.anim_states.get(&0).map(|s| (s.clip_idx, s.time)),
     });
+    // COST NOTE (#740 §2), reasoned from source and not benchmarked: this resolves EVERY billboard,
+    // where the pre-#740 loop resolved only candidates that both survived the cull and were reached
+    // before the 64-slot `break` — so the work goes from at most ~SHADOW_CASTER_SLOTS resolutions
+    // per frame to `billboards.len()`. Each resolution is a `character_model_key` (one or two
+    // `str::to_uppercase()` String allocations), one or two `gpu_character_models` gets, and one
+    // `anim_states` get, plus this `Vec`. The OUTPUT is unchanged — all of it is side-effect-free.
     let nearby: Vec<CandidateView> = scene.billboards.iter().map(|b| {
         let (key, slot) = character_model_key(&b.race, b.gender);
         CandidateView {

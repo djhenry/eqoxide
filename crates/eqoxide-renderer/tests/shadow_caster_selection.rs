@@ -24,6 +24,23 @@
 //! `pass::ShadowCasterCandidate` trait, the same shape #721 used for the instanced draws. Every
 //! test below calls that **production** function; `encode_shadow_pass` calls exactly the same one.
 //!
+//! ## The `ShadowModelKind` × path matrix
+//!
+//! The planner writes its slot bookkeeping out **once per path** — a player block and a nearby
+//! block — so either copy can rot alone, exactly as the pre-#740 pass wrote the #692/#694 clip
+//! guard out twice. Coverage is therefore a matrix, not a list, and every cell is reached:
+//!
+//! | | player path | nearby path |
+//! |---|---|---|
+//! | *(no candidate)* | `plan()` helper, corpus | trivial (empty slice) |
+//! | `Absent` | `a_player_with_no_model_casts_nothing_and_consumes_no_slot`, corpus | `static_casters_take_a_uniform_slot_but_no_joint_slot`, corpus |
+//! | `Static` | corpus | `static_casters_…`, `joint_slots_never_outrun_uniform_slots`, both bound tests, corpus |
+//! | `Skinned` | `the_player_takes_the_first_slot_…`, `the_player_is_never_view_culled`, `clip_index_out_of_range_…`, corpus | most of the file |
+//!
+//! `player` × `Absent` was the cell that was empty on the first draft, and it is a live production
+//! branch (a player whose race model has not loaded). The corpus now asserts its own reach for
+//! every cell, so a future fixture edit cannot silently empty one again.
+//!
 //! ## What this file does NOT cover
 //!
 //! Stated as rules, not examples — the gaps are categories, not single cases:
@@ -163,8 +180,10 @@ fn nearby_casters_are_ordered_nearest_first_to_the_light_center() {
 /// **Measured caveat, not a claim:** this test does *not* discriminate `sort_by` from
 /// `sort_unstable_by` — that mutation was run and this test stayed green at every fixture shape
 /// tried (all-tied at 8, 40; tied in groups of 4 at 48). What kills it is the corpus differential
-/// below. So read this as pinning "ties are not reordered by the current sort", not as the
-/// stability guard.
+/// below — which for that reason now generates exact ties **by construction** and asserts their
+/// reach, rather than relying on a tie happening to fall out of the RNG (it stopped falling out
+/// once, when an unrelated fixture edit shifted the stream). So read this as pinning "ties are not
+/// reordered by the current sort", not as the stability guard.
 #[test]
 fn equidistant_casters_keep_input_order() {
     // Ties in GROUPS, interleaved with distinct keys — an all-tied fixture does not discriminate
@@ -239,6 +258,14 @@ fn shadow_caster_slot_budget_is_sixty_four() {
 
 /// Exercised **at** the bound, one under, and one over. Under → everything selected; at → still
 /// everything; over → truncated to exactly the budget, and the *nearest* ones survive.
+///
+/// **The fixture's model-kind MIX is load-bearing, and the boundary rows are not what makes this
+/// test work.** For an all-skinned population the documented-dead `j_slot >= SHADOW_CASTER_SLOTS`
+/// guard wakes up and re-imposes the *exact same* 64-cap, so a skinned-only fixture cannot grade
+/// the uniform bound at all: it would run at `-1` / exactly / `+1` / `*3`, pass every row, and
+/// still stay green when the `u_slot` bound is **deleted outright**. That was measured, not
+/// reasoned. Every fourth candidate is therefore static — statics spend a uniform slot and no joint
+/// slot, so `u_slot` outruns `j_slot` and nothing but the real bound can produce these counts.
 #[test]
 fn selection_is_bounded_at_exactly_shadow_caster_slots() {
     for (n, expect) in [
@@ -247,9 +274,14 @@ fn selection_is_bounded_at_exactly_shadow_caster_slots() {
         (SHADOW_CASTER_SLOTS + 1, SHADOW_CASTER_SLOTS),
         (SHADOW_CASTER_SLOTS * 3, SHADOW_CASTER_SLOTS),
     ] {
-        // Candidate i sits at x = i * 0.5, so index order == nearest-first order.
-        let cands: Vec<Cand> =
-            (0..n).map(|i| Cand::skinned([i as f32 * 0.5, 0.0, 0.0], 3)).collect();
+        // Candidate i sits at x = i * 0.5, so index order == nearest-first order. Mixed kinds — see
+        // the doc comment: a skinned-only population is graded by the dead joint guard, not by the
+        // uniform bound this test is named for.
+        let cands: Vec<Cand> = (0..n).map(|i| if i % 4 == 3 {
+            Cand::statik([i as f32 * 0.5, 0.0, 0.0])
+        } else {
+            Cand::skinned([i as f32 * 0.5, 0.0, 0.0], 3)
+        }).collect();
         for c in &cands {
             assert!(in_view(c.pos, ORIGIN), "fixture: all {} candidates are in view", n);
         }
@@ -268,11 +300,19 @@ fn selection_is_bounded_at_exactly_shadow_caster_slots() {
 
 /// The player is selected first and eats slot 0, which shrinks the nearby budget by one. A mutant
 /// that plans the player outside the budget (or after the loop) fails on the total.
+///
+/// Mixed static/skinned for the same reason as
+/// `selection_is_bounded_at_exactly_shadow_caster_slots` — with an all-skinned population the dead
+/// `j_slot` guard substitutes for the `u_slot` bound and this test stays green when the bound is
+/// deleted.
 #[test]
 fn the_player_takes_the_first_slot_and_shrinks_the_nearby_budget() {
     let player = Cand::playing([0.0, 0.0, 0.0], 5, 2, 0.25);
-    let cands: Vec<Cand> =
-        (0..SHADOW_CASTER_SLOTS * 2).map(|i| Cand::skinned([i as f32 * 0.5, 0.0, 0.0], 3)).collect();
+    let cands: Vec<Cand> = (0..SHADOW_CASTER_SLOTS * 2).map(|i| if i % 4 == 3 {
+        Cand::statik([i as f32 * 0.5, 0.0, 0.0])
+    } else {
+        Cand::skinned([i as f32 * 0.5, 0.0, 0.0], 3)
+    }).collect();
 
     let steps = plan_shadow_casters(Some(&player), &cands, ORIGIN, ORIGIN, VP);
     assert_eq!(steps.len(), SHADOW_CASTER_SLOTS, "the budget covers the player too");
@@ -320,6 +360,55 @@ fn static_casters_take_a_uniform_slot_but_no_joint_slot() {
         ShadowCasterDraw::Static => None,
     }).collect();
     assert_eq!(j, vec![0, 1, 2], "joint slots are dense from 0 and count only skinned casters");
+}
+
+/// **The player path's `Absent` arm.** A player whose race model has not loaded — a real state
+/// during zone-in, and permanent for any race whose model never loads — casts nothing and consumes
+/// **neither** a uniform slot nor a joint slot.
+///
+/// This row exists because the slot bookkeeping is written out twice (player block, nearby block)
+/// and either copy can rot alone — the same argument this file already applies to the #692/#694
+/// clip guard. It was measured, not assumed: without this test,
+/// `ShadowModelKind::Absent => { u_slot += 1; }` in the **player** block survives every other test
+/// in this file *including* the 400-scene differential, while the identical slip in the **nearby**
+/// block is caught. The permitted failure is an ordinary tidy-up — hoisting the `u_slot += 1` out
+/// of the two match arms, which the arms already end with — and it shifts every nearby caster onto
+/// the wrong pre-allocated uniform buffer while silently dropping the frame's shadow budget to 63.
+#[test]
+fn a_player_with_no_model_casts_nothing_and_consumes_no_slot() {
+    let player = Cand::absent(ORIGIN);
+    let cands = [
+        Cand::skinned([10.0, 0.0, 0.0], 3),
+        Cand::statik([20.0, 0.0, 0.0]),
+        Cand::skinned([30.0, 0.0, 0.0], 3),
+    ];
+    let steps = plan_shadow_casters(Some(&player), &cands, ORIGIN, ORIGIN, VP);
+
+    assert!(
+        steps.iter().all(|s| s.caster != ShadowCasterRef::Player),
+        "a player with no model must not be planned at all",
+    );
+    assert_eq!(picked(&steps), vec![0, 1, 2], "the nearby casters are unaffected");
+    assert_eq!(
+        u_slots(&steps), vec![0, 1, 2],
+        "the absent player must not burn uniform slot 0 — if it did, every nearby caster would \
+         bind the wrong pre-allocated uniform buffer and the frame budget would drop to 63",
+    );
+    let j: Vec<usize> = steps.iter().filter_map(|s| match s.draw {
+        ShadowCasterDraw::Skinned { j_slot, .. } => Some(j_slot),
+        ShadowCasterDraw::Static => None,
+    }).collect();
+    assert_eq!(j, vec![0, 1], "nor a joint slot");
+
+    // …and, unlike a drawn player, it does not shrink the nearby budget.
+    let many: Vec<Cand> =
+        (0..SHADOW_CASTER_SLOTS * 2).map(|i| Cand::skinned([i as f32 * 0.5, 0.0, 0.0], 3)).collect();
+    let steps = plan_shadow_casters(Some(&player), &many, ORIGIN, ORIGIN, VP);
+    assert_eq!(
+        steps.len(), SHADOW_CASTER_SLOTS,
+        "an absent player leaves the whole budget to the nearby casters",
+    );
+    assert_eq!(u_slots(&steps), (0..SHADOW_CASTER_SLOTS).collect::<Vec<_>>());
 }
 
 /// The invariant that makes the `j_slot >= SHADOW_CASTER_SLOTS` guard in the planner dead code:
@@ -519,21 +608,36 @@ impl Rng {
     fn coord(&mut self, half: i64) -> f32 { (self.range(half as u64 * 2 + 1) as i64 - half) as f32 }
 }
 
-/// 400 pseudo-random scenes: mixed model kinds, mixed clip counts (including zero), clip indices
-/// on both sides of the bound plus the `usize::MAX` sentinel, populations straddling
-/// `SHADOW_CASTER_SLOTS`, and light centers that differ from the player. The extracted planner must
-/// emit a byte-identical step stream to the pre-#740 loops in every one.
+/// 400 pseudo-random scenes: **all four model kinds on both paths**, mixed clip counts (including
+/// zero), clip indices on both sides of the bound plus the `usize::MAX` sentinel, populations
+/// straddling `SHADOW_CASTER_SLOTS`, deliberate exact ties, and light centers that differ from the
+/// player. The extracted planner must emit a byte-identical step stream to the pre-#740 loops in
+/// every one.
 ///
 /// Coverage bound, as a rule: this is *sampled*, not exhaustive — it is a differential over a fixed
 /// pseudo-random corpus, so it can only catch divergences some scene in that corpus reaches. The
 /// four decisions are pinned exhaustively at their boundaries by the tests above; this catches
 /// interaction bugs between them.
+///
+/// **Every property this corpus is relied on for is asserted, not assumed.** A pseudo-random corpus
+/// only covers what it happens to generate, and an unrelated edit to the generator silently moves
+/// the whole stream — that is not hypothetical, it happened while fixing #747's B1 (adding the
+/// absent-player arm shifted the stream and the tie that was killing M14 vanished). Hence the reach
+/// assertions at the bottom: truncation, culling, the clip guard, the kind × path matrix, and ties.
 #[test]
 fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
     let mut rng = Rng(0x5EED_740);
     let mut saw_truncation = 0usize;
     let mut saw_cull = 0usize;
     let mut saw_bind_fallback = 0usize;
+    // Per-PATH model-kind reach, asserted below. Every `ShadowModelKind` variant must be reached on
+    // BOTH paths, because the planner writes the slot bookkeeping out once per path and either copy
+    // can rot alone. This is asserted rather than reasoned: the corpus used to reach
+    // `Absent` only on the nearby path, and the player-path `Absent` arm had no coverage at all.
+    let (mut saw_player_none, mut saw_player_absent) = (0usize, 0usize);
+    let (mut saw_player_static, mut saw_player_skinned) = (0usize, 0usize);
+    let (mut saw_nearby_absent, mut saw_nearby_static, mut saw_nearby_skinned) = (0usize, 0usize, 0usize);
+    let (mut saw_ties, mut scene_ties) = (0usize, 0usize);
 
     for scene in 0..400 {
         // Every 5th scene is DENSE: a crowded zone where every candidate is comfortably inside the
@@ -546,9 +650,23 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
         } else {
             rng.range(SHADOW_CASTER_SLOTS as u64 * 2 + 4) as usize
         };
-        let cands: Vec<Cand> = (0..n).map(|_| {
-            let pos = [rng.coord(half), rng.coord(half), rng.coord(half)];
-            match rng.range(10) {
+        let mut cands: Vec<Cand> = Vec::with_capacity(n);
+        for k in 0..n {
+            // **Deliberate exact ties**: roughly one candidate in four lands exactly on its
+            // predecessor. This is the only thing in the whole file that discriminates `sort_by`
+            // from `sort_unstable_by` (see `equidistant_casters_keep_input_order`), and it used to
+            // be *incidental* — the corpus happened to contain a discriminating tie. An incidental
+            // property is one an unrelated fixture edit silently deletes, and that is exactly what
+            // happened: adding the absent-player arm below shifted the RNG stream and M14 went from
+            // killed to surviving. `saw_ties` asserts the coverage rather than hoping for it.
+            let tie = k > 0 && rng.range(4) == 0;
+            let pos = if tie {
+                cands[k - 1].pos
+            } else {
+                [rng.coord(half), rng.coord(half), rng.coord(half)]
+            };
+            if tie { scene_ties += 1; }
+            cands.push(match rng.range(10) {
                 0 => Cand::absent(pos),
                 1 | 2 => Cand::statik(pos),
                 3 => Cand::skinned(pos, rng.range(6) as usize),
@@ -562,14 +680,28 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
                     };
                     Cand::playing(pos, clips, idx, rng.range(1000) as f32 / 64.0)
                 }
-            }
-        }).collect();
+            });
+        }
+        if scene_ties > 0 { saw_ties += 1; }
+        scene_ties = 0;
+        if cands.iter().any(|c| matches!(c.kind, ShadowModelKind::Absent)) { saw_nearby_absent += 1; }
+        if cands.iter().any(|c| matches!(c.kind, ShadowModelKind::Static)) { saw_nearby_static += 1; }
+        if cands.iter().any(|c| matches!(c.kind, ShadowModelKind::Skinned { .. })) { saw_nearby_skinned += 1; }
         let ppos = |rng: &mut Rng| [rng.coord(player_half), rng.coord(player_half), rng.coord(player_half)];
-        let player = match rng.range(4) {
-            0 => None,
-            1 => Some(Cand::statik(ppos(&mut rng))),
+        // All four player states, including `Absent` — the corpus originally never built an absent
+        // player, which left that production branch with zero coverage of any kind.
+        let player = match rng.range(8) {
+            0 | 1 => None,
+            2 | 3 => Some(Cand::statik(ppos(&mut rng))),
+            4 => Some(Cand::absent(ppos(&mut rng))),
             _ => Some(Cand::playing(ppos(&mut rng), 4, rng.range(6) as usize, 0.5)),
         };
+        match player.as_ref().map(|p| p.kind) {
+            None                             => saw_player_none += 1,
+            Some(ShadowModelKind::Absent)    => saw_player_absent += 1,
+            Some(ShadowModelKind::Static)    => saw_player_static += 1,
+            Some(ShadowModelKind::Skinned { .. }) => saw_player_skinned += 1,
+        }
         let light = [rng.coord(half), rng.coord(half), rng.coord(half)];
         let player_pos = ppos(&mut rng);
 
@@ -594,6 +726,22 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
     assert!(saw_truncation >= 60, "corpus reached the slot bound in only {} scenes", saw_truncation);
     assert!(saw_cull >= 150, "corpus culled in only {} scenes", saw_cull);
     assert!(saw_bind_fallback >= 150, "corpus hit the clip guard in only {} scenes", saw_bind_fallback);
+    assert!(
+        saw_ties >= 150,
+        "corpus contained equidistant candidates in only {} scenes — this is the only thing that \
+         discriminates `sort_by` from `sort_unstable_by` anywhere in this file", saw_ties,
+    );
+
+    // The variant × path matrix, asserted. A variant that stops being generated on either path is a
+    // silent loss of coverage for a live production branch, not a harmless corpus drift.
+    for (label, n) in [
+        ("player/None", saw_player_none), ("player/Absent", saw_player_absent),
+        ("player/Static", saw_player_static), ("player/Skinned", saw_player_skinned),
+        ("nearby/Absent", saw_nearby_absent), ("nearby/Static", saw_nearby_static),
+        ("nearby/Skinned", saw_nearby_skinned),
+    ] {
+        assert!(n >= 20, "corpus reached {} in only {} of 400 scenes", label, n);
+    }
 }
 
 // ── 6. Call-site pin (source text, not semantics) ───────────────────────────────────────────────

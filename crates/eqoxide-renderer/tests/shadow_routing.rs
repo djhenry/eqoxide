@@ -38,11 +38,13 @@
 //!   `execute_instanced_shadow_plan` call in `encode_shadow_pass` were deleted or wrapped in
 //!   `if false`. (The executor's own logic *is* graded, in `shadow_routing_equivalence.rs`; it is
 //!   the one call site that is not.)
-//! - **Anything about the other four sub-passes** in `encode_shadow_pass` (skinned casters, static
+//! - **Anything about the other three sub-passes** in `encode_shadow_pass` (skinned casters, static
 //!   casters, the depth-attachment clear). Those remain as untested as they were before #721. The
-//!   caster-selection/culling that fills `casters` was in this list until #740, which extracted it
-//!   to `pass::plan_shadow_casters` and graded it in `shadow_caster_selection.rs`; what selection
-//!   *turns into* (matrices, buffer writes) is still uncovered.
+//!   caster-selection/culling that fills `casters` was a *fourth* item in this list until #740,
+//!   which extracted it to `pass::plan_shadow_casters` and graded it in
+//!   `shadow_caster_selection.rs`; what selection *turns into* (matrices, buffer writes) is still
+//!   uncovered. (**Corrected:** #740's first draft dropped the item but left the count reading
+//!   "four" — an off-by-one this file introduced, not an inherited one.)
 
 use eqoxide_assets::RenderMode;
 use eqoxide_renderer::pass::{
