@@ -80,6 +80,13 @@ pub struct Pipelines {
     pub shadow_static:    wgpu::RenderPipeline,
     pub shadow_skinned:   wgpu::RenderPipeline,
     pub shadow_instanced: wgpu::RenderPipeline,
+    /// Masked variant of `shadow_instanced` (#707): adds a fragment stage that alpha-tests the
+    /// caster's diffuse texture at the same 0.5 threshold as the color pass, so alpha-keyed foliage/
+    /// branch quads cast their cutout silhouette instead of their full bounding rectangle.
+    /// `RenderMode::Opaque` instanced casters keep using the cheap fragment-less `shadow_instanced`
+    /// above; only `RenderMode::Masked` ones route through this pipeline (pass.rs picks by
+    /// render_mode). See shadow_masked_instanced.wgsl for why this is a separate shader module.
+    pub shadow_instanced_masked: wgpu::RenderPipeline,
     /// Weather precipitation particles (eqoxide#542): instanced billboard quads, alpha-blended,
     /// depth-tested against the scene but depth-write off. Drawn only when weather is active.
     pub weather: wgpu::RenderPipeline,
@@ -859,6 +866,39 @@ pub fn build_pipelines(
         multiview: None, cache: None,
     });
 
+    // Masked instanced caster (#707): same geometry/transform as `shadow_instanced`, but with a
+    // fragment stage that alpha-tests the caster's diffuse texture (see shadow_masked_instanced.wgsl
+    // for why this lives in its own shader module). Group 1 = the same `texture_bgl` layout the
+    // color passes use, so the caster's existing texture bind group can be reused as-is.
+    let shadow_masked_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("shadow_masked_instanced"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/shadow_masked_instanced.wgsl").into()),
+    });
+    let shadow_instanced_masked_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("shadow_instanced_masked_layout"),
+        bind_group_layouts: &[&layouts.shadow_light_bgl, &layouts.texture_bgl],
+        push_constant_ranges: &[],
+    });
+    let shadow_instanced_masked = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("shadow_instanced_masked"),
+        layout: Some(&shadow_instanced_masked_layout),
+        vertex: wgpu::VertexState {
+            module: &shadow_masked_shader, entry_point: "vs_instanced_masked",
+            buffers: &[shadow_vbl.clone(), instance_vbl.clone()], compilation_options: Default::default(),
+        },
+        // No color target — this fragment stage exists only to `discard` before the depth write.
+        fragment: Some(wgpu::FragmentState {
+            module: &shadow_masked_shader, entry_point: "fs_instanced_masked",
+            targets: &[], compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default()
+        },
+        depth_stencil: Some(shadow_depth.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None, cache: None,
+    });
+
     // ── Weather particle pipeline (eqoxide#542) ────────────────────────────
     // Instanced billboard quads: group 0 = camera (view_proj + camera_pos), group 1 = weather
     // params. vbuf 0 = the static quad corner (vec2, per-vertex); vbuf 1 = per-particle instance
@@ -952,7 +992,7 @@ pub fn build_pipelines(
         sky, zone, zone_instanced,
         zone_blend, zone_additive, zone_instanced_blend, zone_instanced_additive,
         billboard, character, skinned, skinned_overlay, weather,
-        shadow_static, shadow_skinned, shadow_instanced,
+        shadow_static, shadow_skinned, shadow_instanced, shadow_instanced_masked,
         nav_debug,
     }
 }
@@ -1040,6 +1080,14 @@ mod tests {
             let _: &wgpu::RenderPipeline = &p.shadow_static;
             let _: &wgpu::RenderPipeline = &p.shadow_skinned;
             let _: &wgpu::RenderPipeline = &p.shadow_instanced;
+        }
+    }
+
+    #[test]
+    fn pipelines_has_shadow_instanced_masked() {
+        // The masked shadow-caster pipeline (#707) must be present on the Pipelines struct.
+        fn _check(p: &Pipelines) {
+            let _: &wgpu::RenderPipeline = &p.shadow_instanced_masked;
         }
     }
 }
