@@ -213,7 +213,11 @@ pub enum Reground {
 ///
 /// What actually distinguished #712 is that the body had **nowhere legal to land**: the only
 /// surface under it was 117 u down and *below the zone's underworld*, which the fall-through guard
-/// was going to refuse. So the gate here is exactly that guard's own `landing_valid` test. If a
+/// was going to refuse. So the gate here is that guard's *underworld* conjunct — `landing_valid` is
+/// `cand <= f && f > underworld`, and this applies only the second half, because there is no
+/// candidate step height to compare against at zone-in. (An earlier revision of this sentence
+/// claimed the gate was "exactly that guard's own `landing_valid` test"; #720 review measured that
+/// it is not, and the narrower claim is the true one.) If a
 /// floor below would be accepted, the body just falls onto it and we do nothing. Only when there is
 /// no such floor — void, or nothing but sub-underworld geometry — do we look up, and then we take
 /// the nearest floor above wherever it is, because the alternative is falling out of the world. The
