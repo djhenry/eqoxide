@@ -601,6 +601,14 @@ pub struct HttpState {
     /// it is reading is frozen FOREVER, which no age can say. Written only by
     /// `eqoxide::model::run_net_thread`; same shared-`Arc`-identity discipline as the two above.
     pub(crate) net_thread_dead: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The in-flight asset sync, if any (#715, agent-honesty). `None` = no sync is in progress;
+    /// `Some(activity)` names the set and the phase of the one that is. Written ONLY by the app
+    /// crate's `asset_sync::sync_set_observed`, whose RAII guard clears it on every exit path
+    /// (success, error, panic) — so this can never report a long-finished sync as live. Read here
+    /// per request, not cached, so `GET /v1/observe/asset_sync` reflects the loader's current
+    /// phase rather than a snapshot frozen at server construction. Same shared-`Arc`-identity
+    /// discipline as the three fields above.
+    pub(crate) asset_sync: eqoxide_ipc::AssetSyncShared,
     /// The typed write-path facade (#446). Combat is fully migrated onto it — combat/pet handlers
     /// write via `s.command.request_*` (no direct `ipc::CombatSlots` field any more); other domains
     /// still use their own bundle fields until Wave-2 migrates them. See `eqoxide_command`.
@@ -843,6 +851,7 @@ pub fn spawn_camera_server(
     common_assets_failed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     model_sync_dead:      std::sync::Arc<std::sync::Mutex<Option<String>>>,
     net_thread_dead:      std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    asset_sync:           eqoxide_ipc::AssetSyncShared,
     command:         eqoxide_command::CommandState,
     social:          eqoxide_ipc::SocialSlots,
     merchant_slots:  eqoxide_ipc::MerchantSlots,
@@ -876,7 +885,7 @@ pub fn spawn_camera_server(
         rt.block_on(async move {
             let state = HttpState {
                 camera, nav, world, shared_collision, zone_assets, common_assets_failed,
-                model_sync_dead, net_thread_dead, command, social, merchant_slots,
+                model_sync_dead, net_thread_dead, asset_sync, command, social, merchant_slots,
                 inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
                 quest, group_slots, lifecycle, guild_slots, nav_debug_view,
             };

@@ -375,6 +375,12 @@ fn main() {
     // Model is running; `Some(reason)` = it is gone for good and every world field served by this
     // process is a frozen snapshot. See `eqoxide::model::run_net_thread`.
     let net_thread_dead: eqoxide::model::NetThreadDeadShared = Arc::new(Mutex::new(None));
+    // #715 (agent-honesty): the asset-sync activity an agent polls during a zone load, constructed
+    // here for the same shared-`Arc` reason as the three above — ONE cell, cloned into `App::new`
+    // (whose loader threads are the only writers, via `asset_sync::sync_set_observed`) and into
+    // `spawn_camera_server` which reads it for `GET /v1/observe/asset_sync`. `None` = no sync is in
+    // progress; `Some(activity)` = one is, with its set and phase.
+    let asset_sync_activity: eqoxide::ipc::AssetSyncShared = Arc::new(Mutex::new(None));
     // Single-owner GameState snapshot (see
     // docs/superpowers/plans/2026-07-12-gamestate-single-owner-snapshot.md). The network thread is
     // the sole writer of GameState; it publishes here every tick. `last_inbound` is a separate,
@@ -537,6 +543,7 @@ fn main() {
         common_assets_failed.clone(),
         model_sync_dead.clone(),
         net_thread_dead,
+        asset_sync_activity.clone(),
         command.clone(),
         social,
         merchant_slots,
@@ -573,6 +580,7 @@ fn main() {
         zone_assets,
         common_assets_failed,
         model_sync_dead,
+        asset_sync_activity,
         app_frame_profile,
         testzone_mode,
         nav_debug_flag,

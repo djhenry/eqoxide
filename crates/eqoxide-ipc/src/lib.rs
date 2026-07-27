@@ -43,6 +43,13 @@ use tokio::sync::oneshot;
 pub mod result;
 pub use result::{BuyOk, CastEnd, CommandResult, GiveOk, OpenOk};
 
+/// The agent-observable asset-sync activity slot (#715) — written by the app crate's asset-sync
+/// wrapper, read by `GET /v1/observe/asset_sync`. Lives here for the same reason as every other
+/// slot in this crate: it is a contract between the app/loader threads and the HTTP thread, and
+/// `eqoxide-http` must be able to name it without depending on the app crate above it.
+pub mod asset_sync;
+pub use asset_sync::{AssetSyncActivity, AssetSyncGuard, AssetSyncPhase, AssetSyncShared};
+
 // ── Relocated shared type definitions (#544 Step 2c) ─────────────────────────────────────────────
 // Pure-data types the slots above/below wrap, moved down out of the app crate so `ipc` no longer
 // up-references `movement`/`camera_state`/`profiling`. Definitions only — the behavior that operates

@@ -48,6 +48,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | `GET /v1/observe/packets[?summary=1]` | Packet-telemetry ring dump (#525), default-off capture. `{enabled, count, packets, snapshot_age_ms}`, or with `?summary=1`, `{enabled, summary, snapshot_age_ms}` (opcode histogram + reliable-sequence-gap analysis). |
 | `GET /v1/observe/who` | Server-wide `/who all` roster `{online:[{name, level, class, race, zone_id, guild, anon}], snapshot_age_ms}`. 503 if no response arrives in time. |
 | `GET /v1/observe/nav_debug` | The nav diagnostics snapshot navigation **publishes** (#608) — see [Nav diagnostics](#nav-diagnostics-get-v1observenav_debug--608). |
+| `GET /v1/observe/asset_sync` | The asset sync currently in flight, if any (#715) — phase, chunks, bytes and download rate while the client downloads a zone's (or the common) asset set. `{"active": false}` when nothing is syncing. See [Asset sync progress](#asset-sync-progress-get-v1observeasset_sync--715). |
 
 Every route above that lacked ANY freshness signal before #646 now carries one — either a
 top-level `"snapshot_age_ms"` JSON field or, where the body is a bare array/map/PNG that cannot
@@ -914,6 +915,125 @@ world hung", read `world_responsive`, not `last_packet_age_ms`.**
 > if future server content adds one, it would silently turn every idle session `world_responsive:
 > false`. If that signal ever misfires on a known-healthy idle zone, check for a global consider hook
 > before trusting it.
+
+---
+
+## Asset sync progress (`GET /v1/observe/asset_sync`) — #715
+
+`zone_assets` (above) tells you whether the world is usable. This tells you whether the load behind
+it is **progressing** — the difference between "still downloading, 3 of 7 chunks at 1.2 MB/s" and
+"wedged". Before #715 that information existed only on the loading-screen HUD, which an agent cannot
+see.
+
+**Idle:**
+
+```jsonc
+{
+  "active": false,
+  "semantics": "…"
+}
+```
+
+**A sync in flight:**
+
+```jsonc
+{
+  "active": true,
+  "set": "zone/freportw",        // which set: "zone/<z>", "zonedoors/<z>", "common", "charmodel/<key>"
+  "phase": "downloading",        // "starting" | "verifying" | "downloading"
+  "downloading": {               // present ONLY in the downloading phase
+    "chunks_done": 3,
+    "chunks_total": 7,
+    "bytes": 12451840,           // cumulative bytes this downloading phase
+    "elapsed_secs": 10.4,        // since this downloading phase began
+    "rate_bytes_per_sec": 1197292.3   // omitted while the phase is younger than 100 ms
+  },
+  "published_age_ms": 120,       // how long ago this sample was published — read this FIRST
+  "semantics": "…"
+}
+```
+
+### `published_age_ms` — is it progressing, or wedged?
+
+**Every field above except `published_age_ms` is frozen at the producer's last tick, and the
+producer ticks only when a chunk completes.** A download that hangs mid-chunk — a dead socket, an
+asset server that stopped answering — leaves `chunks_done`, `bytes`, `elapsed_secs` and
+`rate_bytes_per_sec` sitting at their last values with nothing left to update them. Read on its own,
+`"rate_bytes_per_sec": 1197292` would keep confidently asserting 1.2 MB/s for a transfer that has
+moved zero bytes in five minutes.
+
+Clearing the slot is not the fix — a wedged sync genuinely *is* still in progress, and reporting
+"no sync running" would be a worse answer than a stale one. What makes the stale answer honest is
+its age. `published_age_ms` is computed **at read time**, so:
+
+- **small, and staying small across polls** → the loader is ticking; the numbers beside it are current.
+- **large and growing** → the sync is **wedged**. The numbers beside it describe the last moment it
+  was alive, not now, and the rate in particular is meaningless.
+
+A chunk can legitimately take a while, so a single large reading is not proof of a stall — a value
+that keeps growing across polls is. Do not treat `chunks_done` or `rate_bytes_per_sec` as current
+without checking it.
+
+### The two distinctions this shape exists to keep
+
+**`active: false` is not "zero progress".** An idle client and a download stuck at 0 of 7 chunks are
+different situations an agent acts on differently, so they are different bodies: idle carries
+`"active": false` and **no** `set`, `phase` or `downloading` key at all, while a stalled download is
+`"active": true` with `downloading.chunks_done: 0`. Branch on `active` — never on a count being zero.
+
+**The phase is modelled, not flattened.** Transfer data lives inside `downloading`, an object that
+exists **only** in that phase. This mirrors the producer, where a rate is structurally
+unrepresentable outside downloading (#708). A flat body with a nullable `rate` would make "not
+downloading" indistinguishable from "downloading, rate not derivable yet"; here they are different
+structures, not two spellings of `null`.
+
+`rate_bytes_per_sec` is derived by the same function, with the same 100 ms minimum-elapsed guard,
+that the HUD's speed line uses. Under that threshold no honest rate can be divided out, and the key
+is **omitted** — not `null`, and certainly not `0`, which would read as "the download has stopped".
+Its absence is unambiguous because the enclosing `downloading` object is present. `bytes` and
+`elapsed_secs` are still reported there, so you can watch raw progress move before a rate exists.
+
+### Phases
+
+- **`starting`** — the `sync_set` call has begun; its manifest request is in flight and the producer
+  has not reported a phase yet. This phase is published by the client, not by the sync producer, and
+  it exists so the "a sync is running" window covers the whole call: leaving it `active: false`
+  would report "no sync in progress" while one demonstrably was. A set that turns out to be already
+  up to date is only ever seen in this phase.
+- **`verifying`** — the producer's `SyncProgress::Verifying`, emitted once the manifest has been
+  accepted and before any chunk transfer begins. Carries no transfer data.
+- **`downloading`** — fetching chunks. Ticks once per fetched chunk, so `chunks_done`/`chunks_total`
+  count the chunks this sync actually has to transfer, not the set's total file count. A set whose
+  chunks are all already cached emits no downloading tick at all rather than a misleading 0 B/s one
+  (#708). The only phase with transfer data.
+
+### When it CLEARS
+
+The slot is written by an RAII guard wrapped around each observed sync, so it returns to
+`{"active": false}` when the sync **succeeds**, when it **fails**, and when the loader thread
+**panics** mid-sync (the guard clears on unwind, so there is no "clear at the end of the happy path"
+to be skipped). No exit path can leave a *finished* sync reported as in-flight.
+
+A sync that never exits at all — a hung transfer — is the case a guard cannot address, because it
+has not finished and reporting it as finished would be its own falsehood. That one is covered by
+[`published_age_ms`](#published_age_ms--is-it-progressing-or-wedged) above, not by clearing.
+
+### Overlap, and what `set` is for
+
+The client runs several syncs: the zone's terrain (`zone/<zone>`) and door models
+(`zonedoors/<zone>`) during a zone load, the shared `common` set once the window comes up, and
+`charmodel/<key>` sets on demand as an unseen race model is first needed. All of these are reported
+here, so `active: false` means *no asset sync is running in this process*.
+
+One exception, stated so it is not mistaken for a lie: the `gamedata` and `gameequip` sets are
+synced during early startup, **before this HTTP server binds its port**, and are not reported. There
+is no window in which a caller could poll and be told "idle" while one of them runs — by the time
+anything can reach this endpoint, they are done.
+
+Only one can be published at a time, and the last writer wins. On a zone change the previous zone's
+loader keeps running, so samples from two syncs can interleave for a while — `set` is what tells you
+which sync a given sample describes. A finishing loader only clears the slot if what is published is
+still **its own** set, so an old loader completing cannot blank out the current zone's live progress.
 
 ---
 
