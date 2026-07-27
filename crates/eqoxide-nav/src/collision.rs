@@ -581,8 +581,9 @@ pub const NAV_PREFERRED_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS * 
 /// floor — the qcat live wedge, #375) AND its `column_bottom` recovery valve.
 ///
 /// `NAV_NEAR_HORIZONTAL` is tied to the walk-grade limit: a unit normal's `|z|` for a surface at grade
-/// `g` is `1/sqrt(1+g²)`, and `MAX_WALK_GRADE = 1.2` (the astar climb cap) gives `1/sqrt(1+1.44) ≈
-/// 0.64`. So a surface `is_standable` rejects for flatness is exactly one astar's grade limit would
+/// `g` is `1/sqrt(1+g²)`, and `MAX_WALK_GRADE = 1.2` (the astar climb cap) gives
+/// `1/sqrt(1+1.44) ≈ 0.64`.
+/// So a surface `is_standable` rejects for flatness is exactly one astar's grade limit would
 /// reject anyway — no new seal there.
 ///
 /// `NAV_AGENT_HEIGHT` is the clearance a standing character needs. It must EXCEED a real ceiling's
@@ -7877,8 +7878,8 @@ mod tests {
     /// planner must no longer COMMIT to the steep lip step-down that the fine/swept tier refuses.
     /// Before the fix `find_path` from the lip top returns a short route whose descent is a steep
     /// (>`MAX_WALK_GRADE`) >8u lip drop; after the fix it routes around the walkable ramp instead.
-    /// Run: `ZONE_DIR=~/.local/share/eqoxide/assets/models cargo test -p eqoxide-nav --lib \
-    /// fix_700_coarse_agrees_with_fine_at_canal_lip -- --ignored --nocapture`
+    /// Run (one line; `ZONE_DIR` points at the cached zone GLBs):
+    /// `ZONE_DIR=<models-dir> cargo test -p eqoxide-nav --lib fix_700_coarse_agrees_with_fine_at_canal_lip -- --ignored --nocapture`
     #[test]
     #[ignore = "requires the cached qeynos glb; #700 canal-lip coarse/fine agreement pin"]
     fn fix_700_coarse_agrees_with_fine_at_canal_lip() {

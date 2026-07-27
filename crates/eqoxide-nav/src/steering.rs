@@ -1121,8 +1121,9 @@ mod cursor_resync_tests {
     /// `walker_stalled` after `nav_repaths` reaches 8 — i.e. eight backoff-and-re-plan attempts ran
     /// and none escaped". That over-reads the counter. `drive_walk` resets `nav_repaths` to 0
     /// whenever `gdist < nav_best_gdist - REPATH_RESET_DIST` (200 u) and on `decision.reset_route`,
-    /// so `nav_repaths == 8` at the emission site (`walker.rs`'s `stop_nav(gs, "blocked",
-    /// "walker_stalled", …)`) establishes *at least eight stall-triggered re-plans since the walker
+    /// so `nav_repaths == 8` at the emission site
+    /// (`walker.rs`'s `stop_nav(gs, "blocked", "walker_stalled", …)`)
+    /// establishes *at least eight stall-triggered re-plans since the walker
     /// last closed 200 u on the goal* — not eight attempts **at this spot**. Nothing in the live
     /// record places all eight there. The conclusion is unchanged and rests on the `blocked` outcome
     /// itself, not on the count.
@@ -1246,9 +1247,19 @@ mod cursor_resync_tests {
     /// `the_stale_cursor_leaves_the_steering_loop_no_escaping_trajectory_and_the_resync_clears_it`.
     ///
     /// The assertions below were re-checked against per-frame sampling and all three still hold with
-    /// headroom: span 1.320 < 2.200; east excursion 0.402; west excursion 0.918 (2.3× what round 5
-    /// reported for it, and still inside the 2.200 bound). Nothing here was a green test that should
-    /// have been red — it was a reporting defect, and a retraction whose stated cause was untested.
+    /// headroom: span 1.3200 < 2.2000; east excursion 0.4011; west excursion 0.9189 (2.3× what
+    /// round 5 reported for it, and still inside the 2.200 bound). Nothing here was a green test that
+    /// should have been red — it was a reporting defect, and a retraction whose stated cause was
+    /// untested.
+    ///
+    /// ⚠️ **Correction (#727 round 7 review, non-blocking 4).** Round 6 wrote those two excursions as
+    /// `0.402` and `0.918`. Those are what you get by subtracting the **printed 3-decimal band**
+    /// above from a 3-decimal `LANDED[0]` — arithmetic on rounded endpoints, sitting under a heading
+    /// that reads *"Measured, not reasoned."* The heading makes the precision a claim, and the claim
+    /// was not paid for: measured in `f32` off `Run`, they are **0.4011** and **0.9189**, each 0.001
+    /// out and in *opposite* directions. Immaterial to every assertion, which is exactly why it
+    /// survived — a figure nothing depends on is a figure nobody re-derives. The test now prints all
+    /// three (`cargo test … -- --nocapture`), so the next person to quote them reads them off a run.
     ///
     /// Ticks 0–2 are a transient: no fine plan has arrived, so the walker steers the *healthy* ~17 u
     /// coarse carrot and lunges back up the route — real motion, and the reason "never gets east" was
@@ -1287,6 +1298,11 @@ mod cursor_resync_tests {
 
         // The SETTLED cycle (ticks >= 100), which is the thing "a few frames wide" describes.
         let span = run.late_x_max - run.late_x_min;
+        // Round 7 (non-blocking 4): the doc above quotes these three. Print them, so the quoted
+        // figures come from THIS run and not from arithmetic on the band's printed 3 decimals.
+        eprintln!(
+            "settled span {span:.4}   east of LANDED {:.4}   west of LANDED {:.4}",
+            run.late_x_max - LANDED[0], LANDED[0] - run.late_x_min);
         assert!(span < 5.0 * FRAME,
             "the settled cycle must stay within a few frames of travel — a wider band would be \
              drift, not a limit cycle; it was {span:.3} u");
@@ -1353,10 +1369,21 @@ mod cursor_resync_tests {
     /// So this stands in for the link: naming each cited item as a value makes a rename a **compile
     /// error** in the same commit, not a silent rot found four review rounds later.
     ///
-    /// **You do not have to remember to add a line here.** The list below is the *enforcement*; its
-    /// *completeness* is checked mechanically by
+    /// **You do not have to remember to add a line here — for every citation shape that scan can
+    /// see.** The list below is the *enforcement*; its *completeness* is checked mechanically by
     /// `every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard`, which reads the source
     /// and fails if a doc comment cites a test this array does not name.
+    ///
+    /// ⚠️ **Correction (#727 round 7 review, non-blocking 1).** Round 6 wrote that first sentence
+    /// without the qualifier, and it was **false for two shapes at once**: `::`-qualified paths
+    /// failed the scan's charset filter, and a citation hand-wrapped across two lines never appears
+    /// whole on any line. Both were live — the review found
+    /// `zone_assets::no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone` in `walker.rs`
+    /// hitting *both*, inside the scan's own corpus. Round 7 extended the scan to cover both (the
+    /// charset now admits `:` and resolves on the tail; unbalanced spans are rejected outright), so
+    /// the sentence is true again — but it is true of a **stated rule**, not of "any citation", and
+    /// the rule's remaining blind spots are written down in "What it does NOT do" below. A guard
+    /// that claims coverage it does not have is worse than no guard.
     #[test]
     fn every_test_name_cited_in_a_doc_comment_still_exists() {
         let _cited: &[fn()] = &[
@@ -1431,10 +1458,34 @@ mod cursor_resync_tests {
     /// added and not guarded; and on the paragraph you are reading, whose quoted mutation name it
     /// flagged as unresolvable — correctly — forcing the `NOT_A_FN` entry below.
     ///
-    /// **What it does NOT do**, so nobody reads it as more: it does not check that a citation is
-    /// *apt* — only that the name exists and is pinned against renaming. And its `>= 3 underscores`
-    /// filter is a heuristic about this crate's naming, not a proof; `walker_cursor_resync`, the
-    /// round-4 dangling citation, has two and would still slip past it.
+    /// **Round 7 added two more halves and both were verified the same way** (mutation applied → run
+    /// → reverted, `md5sum -c` clean). Re-wrapping `walker.rs`'s `zone_assets::…` citation back
+    /// across two lines reports *"a code span opens on this line and closes on another"* on **both**
+    /// lines, and — because `:` is now in the charset — the truncated leading fragment additionally
+    /// reports *"resolves to NO fn"*; retyping a `::`-qualified citation to a name that does not
+    /// exist (`steering::route_goal_offset_reports_vertical_shortfall_only`) reports the same. Four
+    /// problems from two mutations, one run, `0 passed; 1 failed`.
+    ///
+    /// **What it does NOT do**, so nobody reads it as more:
+    ///
+    /// * it does not check that a citation is *apt* — only that the name exists and is pinned
+    ///   against renaming;
+    /// * its `>= 3 underscores` filter is a heuristic about this crate's naming, not a proof;
+    ///   `walker_cursor_resync`, the round-4 dangling citation, has two and would still slip past it;
+    /// * for a `::`-qualified path it resolves the **tail only** (`resolution_name`). A citation
+    ///   whose module prefix is wrong but whose final identifier exists elsewhere in the workspace
+    ///   resolves and is not reported. Prefixes are prose here, not links;
+    /// * lines inside a triple-backtick fence are exempt from the unbalanced-span check, so a
+    ///   citation written inside a fenced example is neither balance-checked nor guarded;
+    /// * the citation corpus is still the four files #727 touches. Nothing here claims anything
+    ///   about the other 151 `.rs` files in the workspace.
+    ///
+    /// ⚠️ **Correction (#727 round 7 review, non-blocking 1).** The first two bullets are all round 6
+    /// listed, and the round-6 review demonstrated the list was incomplete by finding a live citation
+    /// that two *unlisted* blind spots hid. The third and fourth bullets exist because the round-7
+    /// fix for those two introduced blind spots of its own: widening the charset to `:` buys nothing
+    /// about the prefix, and skipping fences to avoid false positives is a real exemption. Both are
+    /// stated rather than discovered next round.
     #[test]
     fn every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard() {
         use std::collections::{HashMap, HashSet};
@@ -1458,6 +1509,12 @@ mod cursor_resync_tests {
              "a `stop_nav` reason string, not a fn."),
             ("arrived_at_goal_tier",
              "a local binding in the walker sim's arrival check, not a fn."),
+            ("route_goal_offset_reports_vertical_shortfall_only",
+             "the deliberately-wrong name round 7's `::`-resolution mutation retyped \
+              `steering::route_goal_offset_reports_horizontal_shortfall_only` to, quoted in this \
+              fn's rustdoc as the evidence that half bites. It resolves to nothing by design — and \
+              the scan caught it here too, on the run that added the paragraph, which is the second \
+              time this doc has had to buy its own exception."),
             ("a_test_that_does_not_exist_anywhere",
              "the deliberately-nonexistent name this scan's own mutation check injected, quoted in \
               this fn's rustdoc as the evidence that the check bites. Its whole point is that it \
@@ -1531,15 +1588,16 @@ mod cursor_resync_tests {
             let own_tests = tests_by_file.get(p).cloned().unwrap_or_default();
             for (name, line) in doc_citations(&src) {
                 let where_ = format!("{}:{line}", p.file_name().unwrap().to_string_lossy());
-                if own_tests.contains(&name) {
-                    if !guard.contains(&name) {
+                let resolved = resolution_name(&name).to_string();
+                if own_tests.contains(&resolved) {
+                    if !guard.contains(&resolved) {
                         problems.push(format!(
                             "{where_}: `{name}` is a #[test] in this file cited in a doc comment, \
                              but no `_cited`/`_helpers` guard in this file names it — a rename would \
                              rot the citation silently. Add it to the guard array."));
                     }
-                } else if !all_fns.contains(&name) {
-                    if !NOT_A_FN.iter().any(|(n, _)| *n == name) {
+                } else if !all_fns.contains(&resolved) {
+                    if !NOT_A_FN.iter().any(|(n, _)| *n == resolved) {
                         problems.push(format!(
                             "{where_}: `{name}` is cited in a doc comment and resolves to NO fn in \
                              the resolution corpus. Either the citation is stale, or it names \
@@ -1548,10 +1606,26 @@ mod cursor_resync_tests {
                     }
                 }
             }
+            // The shape the round-6 review found surviving INSIDE this corpus: a citation
+            // hand-wrapped across two lines. The loop above cannot see it — the name never appears
+            // whole on any line — so the wrapping itself is what gets rejected.
+            for line in unbalanced_doc_spans(&src) {
+                problems.push(format!(
+                    "{}:{line}: a code span opens on this line and closes on another. `cargo doc` \
+                     renders the break inside the span, and a citation wrapped this way is invisible \
+                     to the citation scan above — which is exactly how \
+                     `zone_assets::no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone` \
+                     survived six review rounds in `walker.rs`. Keep the span on one line.",
+                    p.file_name().unwrap().to_string_lossy()));
+            }
         }
         // Dead exceptions are their own kind of stale claim.
-        let all_cited: HashSet<String> =
-            cited_in.iter().flat_map(|p| doc_citations(&read(p)).into_iter().map(|(n, _)| n)).collect();
+        // Under the RESOLUTION name, not the written one — `NOT_A_FN` is keyed on what a citation
+        // resolves to, so a `::`-qualified exception must match here too or it reads as dead.
+        let all_cited: HashSet<String> = cited_in.iter()
+            .flat_map(|p| doc_citations(&read(p)).into_iter()
+                .map(|(n, _)| resolution_name(&n).to_string()))
+            .collect();
         for (n, _) in NOT_A_FN {
             if !all_cited.contains(*n) {
                 problems.push(format!(
@@ -1582,6 +1656,12 @@ mod cursor_resync_tests {
 
     /// Every backticked lower-snake identifier of four or more words appearing in a doc comment,
     /// with its 1-based line number.
+    ///
+    /// `::`-qualified paths are included (round 7). They were excluded until the round-6 review
+    /// found `zone_assets::no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone` cited in
+    /// `walker.rs` and unseen by this scan, because `:` failed the charset filter. There are eight
+    /// such citations in the corpus and every one of them now goes through the same resolution as an
+    /// unqualified name — see `resolution_name`.
     fn doc_citations(src: &str) -> Vec<(String, usize)> {
         let mut out = Vec::new();
         for (i, line) in src.lines().enumerate() {
@@ -1590,12 +1670,44 @@ mod cursor_resync_tests {
             for chunk in t.split('`').skip(1).step_by(2) {
                 if chunk.len() > 2
                     && chunk.starts_with(|c: char| c.is_ascii_lowercase())
-                    && chunk.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    && chunk.chars().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == ':'
+                    })
                     && chunk.matches('_').count() >= 3
+                    && !chunk.ends_with(':')
                 {
                     out.push((chunk.to_string(), i + 1));
                 }
             }
+        }
+        out
+    }
+
+    /// The name a citation is RESOLVED under: the tail after the last `::`. `walker.rs` cites tests
+    /// in `collision`, `steering`, `zone_assets` and `eqoxide-net`; the module prefix is not
+    /// checked, only that the final identifier exists — see this scan's "What it does NOT do".
+    fn resolution_name(citation: &str) -> &str {
+        citation.rsplit("::").next().unwrap_or(citation)
+    }
+
+    /// Every doc-comment line outside a triple-backtick fence whose backtick count is odd — i.e. a
+    /// code span that opens on one line and closes on another. Round 7: this is the shape that hid the
+    /// round-6 review's surviving citation, and no amount of widening the charset would have caught
+    /// it, because the name never appears whole on any line.
+    fn unbalanced_doc_spans(src: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut in_fence = false;
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            let Some(body) = t.strip_prefix("///").or_else(|| t.strip_prefix("//!")) else {
+                // A fence cannot span a gap in the doc comment; a stray unterminated one must not
+                // silence every later line in the file.
+                in_fence = false;
+                continue;
+            };
+            if body.trim_start().starts_with("```") { in_fence = !in_fence; continue; }
+            if in_fence { continue; }
+            if body.matches('`').count() % 2 == 1 { out.push(i + 1); }
         }
         out
     }
@@ -1702,9 +1814,10 @@ mod cursor_resync_tests {
     /// sufficient — with (ii)/(iii) added, plus a premise counter so the sweep cannot go green by
     /// never exercising a resync at all.
     ///
-    /// **Mutation-checked by execution (#727 round 2):** with `resync_cursor` replaced by the
-    /// identity function this test now FAILS (it panics on the premise counter at
-    /// `moved = 0`), together with 9 others. The tests that still pass under that mutant are exactly
+    /// **Mutation-checked by execution (#727 round 2; count re-measured round 7):** with
+    /// `resync_cursor` replaced by the identity function this test now FAILS (it panics on the
+    /// premise counter at `moved = 0`), together with **11 others — 12 in total**. The tests that
+    /// still pass under that mutant are exactly
     /// the ones whose assertion IS "the cursor does not move":
     /// `resync_never_moves_the_cursor_backwards`,
     /// `resync_never_jumps_across_blocked_geometry`,
@@ -1717,6 +1830,15 @@ mod cursor_resync_tests {
     /// — a citation that cannot be grepped and cannot be checked. One identifier, one line.)
     /// An identity mutant satisfying a "must not move" test is
     /// not a gap in the test; the movement claims are the ones that had to be pinned, and are.
+    ///
+    /// ⚠️ **Correction (#727 round 7 review, non-blocking 3).** This said *"together with 9 others"*
+    /// and the PR body said *"11 tests in total"*. Both were wrong, and wrong in the safe direction:
+    /// re-run on `4cc217f` the mutant gives `test result: FAILED. 191 passed; 12 failed`, so the
+    /// honest figure is **12**. Nothing eroded — rounds 3–6 *added* tests over `resync_cursor` and
+    /// nobody re-ran the mutant, because the number reads like prose. **An enumerated count is a
+    /// measurement with an expiry date:** it is invalidated by every test added anywhere near the
+    /// mutated function, which is precisely the kind of change nobody thinks of as touching a doc.
+    /// If you add a test here, re-run the mutant or delete the count; do not update it by reasoning.
     #[test]
     fn resync_always_returns_the_nearest_admissible_forward_segment() {
         let d = |p: [f32; 3], i: usize| seg_closest(HAIRPIN[i], HAIRPIN[i + 1], p).1.sqrt();

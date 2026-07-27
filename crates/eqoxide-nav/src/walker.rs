@@ -552,8 +552,9 @@ impl Walker {
     ///
     ///    ⚠️ **Correction (#727 round 5).** This used to add "and that reason code is only emitted
     ///    once `nav_repaths` has reached 8, so all eight re-plans failed to escape". The counter does
-    ///    not support that: `nav_repaths` is reset to 0 whenever `gdist < nav_best_gdist -
-    ///    REPATH_RESET_DIST` (200 u) and on `decision.reset_route`, so reaching 8 means *at least
+    ///    not support that: `nav_repaths` is reset to 0 whenever
+    ///    `gdist < nav_best_gdist - REPATH_RESET_DIST` (200 u) and on `decision.reset_route`, so
+    ///    reaching 8 means *at least
     ///    eight stall-triggered re-plans since the walker last closed 200 u on the goal* — not eight
     ///    attempts at one spot. The live record does not place all eight at `[-534.4, 144.4, -6.0]`.
     ///    The "terminal on real terrain" conclusion stands on the `blocked` outcome itself.
@@ -2258,8 +2259,9 @@ mod tests {
     }
 
     /// **#600 — THE UNIVERSAL: the walker can NEVER route on a collision grid whose zone is not the
-    /// one the character is in.** The sibling of `zone_assets::no_interleaving_of_the_two_writers_
-    /// yields_a_usable_wrong_zone`, but exercising the CONSUMER (`drive_walk`) rather than the pure
+    /// one the character is in.** The sibling of
+    /// `zone_assets::no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone`, but exercising
+    /// the CONSUMER (`drive_walk`) rather than the pure
     /// predicate — because before this fix the walker consulted `collision.is_none()`, not
     /// `usability`, and so opted out of the guarantee #595 built.
     ///
@@ -2274,8 +2276,9 @@ mod tests {
     ///
     /// **Mutation check (do this to trust the test):** revert the `drive_walk` gate to
     /// `if self.collision.read().unwrap().is_none()` → in every `net_first` iteration with
-    /// `render_lag >= 1` the walker routes on the previous zone's grid and the `state ==
-    /// NAV_STATE_ZONE_LOADING` assertion in the stale window goes RED. A test that passes both ways
+    /// `render_lag >= 1` the walker routes on the previous zone's grid and the
+    /// `state == NAV_STATE_ZONE_LOADING` assertion in the stale window goes RED. A test that passes
+    /// both ways
     /// pins nothing; this one does not.
     #[test]
     fn walker_never_routes_on_a_collision_grid_whose_zone_is_not_the_players() {
