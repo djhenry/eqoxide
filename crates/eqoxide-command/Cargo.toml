@@ -22,6 +22,12 @@ test-fixtures = []
 # app-layer crate (wgpu/winit/egui/eq_net/http/app/renderer/nav/assets).
 eqoxide-core = { path = "../eqoxide-core" }
 eqoxide-ipc = { path = "../eqoxide-ipc" }
+# The logging FACADE only (no subscriber, no app-layer types) — `ZoneCrossTicket::drop` records the
+# "a drained request published nothing" backstop firing (#725). That is a client bug, so it belongs
+# in the process log for a developer as well as in `nav_reason` for the agent; a silent backstop
+# would be the same "you cannot tell" defect one layer down. Does not widen the crate's layering
+# argument above: `tracing` is a leaf facade, not an app-layer crate.
+tracing = "0.1"
 # tokio::sync::oneshot — the awaited-command reply channel (`request_open_await`/`request_buy_await`/
 # `request_who`/`request_friends`), mirroring the same `Sender<T>` shape `ipc`'s await slots hold.
 tokio = { version = "1", features = ["sync"] }

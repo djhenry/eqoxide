@@ -1462,8 +1462,15 @@ impl ActionLoop {
         // so walking to them lands the player nowhere near the trigger and the server safe-coords /
         // cheat-flags the crossing (the root cause of #174). Resolve the target zone to its
         // zone-point index (iterator), locate that DRNTP region in the zone BSP, and walk there.
+        //
+        // #725: the drain returns a `ZoneCrossTicket`, not a bare `u16`. Once the request leaves the
+        // slot it exists nowhere else, so every path out of the block below OWES the agent something
+        // observable; the ticket's `Drop` publishes `idle`/`zone_cross_dropped_unhandled` if none of
+        // them did. It is a BACKSTOP, not the mechanism — each arm here publishes for itself — but it
+        // is what makes "a branch that consumes the request and writes nothing" impossible to ship
+        // silently, which is the general shape of #725 rather than its particular trigger.
         let cross_req = self.command.take_zone_cross();
-        if let Some(want_zone) = cross_req {
+        if let Some(want_zone) = cross_req.as_ref().map(|t| t.zone_id()) {
             // #600 — THE ONE DECISION FUNCTION, at the THIRD world-answering consumer. The resolution
             // below reads the SAME shared collision grid the walker/HTTP read AND publishes an
             // agent-observable nav_state. While the zone's assets are not usable — still loading
@@ -1588,19 +1595,38 @@ impl ActionLoop {
                                 Some(z) => format!("zone_id={z}"),
                                 None => "server-resolved-destination".to_string(),
                             };
-                            let d2 = (tx - gs.player_x).powi(2) + (ty - gs.player_y).powi(2);
-                            const ZONE_LINE_DIST2: f32 = 15.0 * 15.0;
-                            if d2 <= ZONE_LINE_DIST2 {
-                                // Already standing on the line — the auto-cross below fires this tick.
-                                tracing::info!("zone_cross: already on the {dest_label} line (index={index})");
-                            } else {
-                                tracing::info!("zone_cross: walking {:.0}u to the {dest_label} line at ({tx:.0},{ty:.0}) (index={index})", d2.sqrt());
-                                match known_dest {
-                                    Some(z) => gs.log_msg("zone", &format!("Walking to the zone {} line", z)),
-                                    None => gs.log_msg("zone", "Walking to a zone line (destination resolved by server)"),
-                                }
-                                self.command.request_goto((tx, ty, tz));
+                            // ALWAYS walk to the located line. There is deliberately no "close
+                            // enough, skip it" shortcut here (#725).
+                            //
+                            // There used to be one: `if d2 <= 15.0*15.0 { tracing::info!(…) }`, whose
+                            // entire body was that log line, on the belief that the standing
+                            // auto-cross below would "fire this tick". It gates on
+                            // `zone_line_at_standing` — the capsule must be physically INSIDE the
+                            // DRNTP region — so the two conditions never met, and every request from
+                            // between the region and 15.0u evaporated: no goto, no packet, nothing
+                            // published, `nav_state` left at `pending` forever. Measured: 11.87u /
+                            // 12.90u / 14.66u dropped 100%; 19.54u / 31.57u crossed in under a
+                            // second. Worse, the server's walk-in ARRIVAL point sits inside that band
+                            // for the RETURN line, so the natural agent loop (walk in, ask to go
+                            // back) failed by construction.
+                            //
+                            // Re-tuning the threshold would only move the band. Testing
+                            // `zone_line_at_standing` here would close it, but leaves two conditions
+                            // that must agree forever. Walking is unconditionally correct instead:
+                            // `find_zone_line_near` returns a point PROJECTED onto the walkable floor
+                            // and re-verified to still be inside the region
+                            // (`zone_line_floor_point`), so arriving there IS standing in the trigger
+                            // volume; and if we are already inside it, the goal is metres away, the
+                            // walker reports `arrived` at once, and the auto-cross below fires from
+                            // physical position exactly as it would have anyway. One path, one
+                            // publish (`request_goto` stamps a fresh goal id + `nav_goal`), no band.
+                            let dist = (tx - gs.player_x).hypot(ty - gs.player_y);
+                            tracing::info!("zone_cross: walking {dist:.1}u to the {dest_label} line at ({tx:.0},{ty:.0}) (index={index})");
+                            match known_dest {
+                                Some(z) => gs.log_msg("zone", &format!("Walking to the zone {} line", z)),
+                                None => gs.log_msg("zone", "Walking to a zone line (destination resolved by server)"),
                             }
+                            self.command.request_goto((tx, ty, tz));
                         }
                         None => {
                             tracing::info!("zone_cross: no zone-line region found for zone_id={want_zone}");
@@ -1614,6 +1640,12 @@ impl ActionLoop {
                 }
             }
         }
+
+        // Settle the request's obligation HERE, before the standing auto-cross runs (#725). Dropping
+        // it later would let the auto-cross's own publish satisfy a request the resolution above had
+        // in fact dropped — the backstop must judge the resolution, not be paid off by an unrelated
+        // crossing that would have fired from position with no request at all.
+        drop(cross_req);
 
         // Auto zone-cross (native mechanism): when the player stands in a DRNTP zone-line region
         // baked into the zone BSP, resolve its zone-point index to a destination via the
@@ -3629,7 +3661,9 @@ mod tests {
             al.drain_zone_cross(&mut stream, &mut gs);
 
             let s = al.nav.nav_state.lock().unwrap().clone();
-            let requeued = al.command.take_zone_cross().is_some();
+            // PEEK, don't drain (#725): draining here would take out a `ZoneCrossTicket` whose drop
+            // publishes the unhandled-request fallback over the very state this test asserts on.
+            let requeued = al.command.peek_zone_cross().is_some();
             if want_loading {
                 assert_eq!(s.state, "zone_loading",
                     "{label}: a zone_cross while assets aren't usable must be the honest transient \
@@ -3747,6 +3781,149 @@ mod tests {
         assert_eq!(nav2.nav_state.lock().unwrap().state, "no_path",
             "without /stop the re-queued cross is still live and resolves after load — /stop is the differentiator");
         assert!(nav2.zone_cross.lock().unwrap().is_none(), "a usable resolution consumes the cross");
+    }
+
+    /// **#725: `/v1/move/zone_cross` had a silent dead band, and this sweeps for one anywhere.**
+    ///
+    /// The shipped code took a shortcut when the located zone line was within 15.0 u —
+    /// `if d2 <= 15.0*15.0 { tracing::info!(…) }`, a branch whose entire body was that log line —
+    /// on the belief that the standing auto-cross would fire instead. The auto-cross gates on
+    /// `zone_line_at_standing` (the capsule must be physically INSIDE the DRNTP region), so from
+    /// outside the region but within 15 u the request was consumed and NOTHING happened: no goto, no
+    /// packet, no state, no message. Live measurements: 11.87 u / 12.90 u / 14.66 u dropped every
+    /// time; 19.54 u / 31.57 u crossed in under a second.
+    ///
+    /// This drives the REAL `drain_zone_cross` against a real collision grid carrying a real DRNTP
+    /// region, and asserts the invariant that makes a band impossible rather than merely absent at
+    /// the five distances that were measured: **from any position outside the trigger region, an
+    /// accepted cross produces a walk to that region.** The sweep steps 0.25 u from just outside the
+    /// footprint out to 40 u — 140 positions straddling the old threshold in both directions — plus
+    /// the five live distances by name, so a re-tuned threshold cannot pass this either.
+    ///
+    /// **Mutation check:** restore the `d2 <= ZONE_LINE_DIST2` shortcut → every sample inside the
+    /// band fails the `goto_target` assertion (RED, ~40 of the 140 sweep points and 3 of the 5
+    /// named live cases). Change the threshold to any other positive value → still RED, just at
+    /// different samples; only removing the distance test passes.
+    #[tokio::test]
+    async fn a_zone_cross_from_outside_the_line_region_always_walks_no_silent_band_725() {
+        use eqoxide_nav::zone_assets;
+        const DEST: u16 = 30;
+        const IDX: i32 = 7;
+
+        // The five distances measured live (the three that dropped, and the two that crossed), then
+        // a fine sweep across and well past the old 15.0 u threshold.
+        let mut cases: Vec<f32> = vec![11.87, 12.90, 14.66, 19.54, 31.57];
+        let mut d = 6.0f32;
+        while d <= 40.0 { cases.push(d); d += 0.25; }
+
+        for east in cases {
+            let (mut al, nav, command, collision, za) = shared_nav_action_loop();
+            let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+            *al.world.zone_points.lock().unwrap() = vec![zp_at(IDX as u32, DEST, [100.0, 200.0, 0.0])];
+            // A DRNTP trigger box on the flat test floor: north/east ∈ [-4, 4], z ∈ [-2, 2]. Its
+            // floor-projected representative point is inside the region (`zone_line_floor_point`
+            // re-verifies that), which is exactly why walking to it is unconditionally correct.
+            let grid = zone_assets::ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+                eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, IDX),
+            ))).collision().unwrap().clone();
+            zone_assets::finish_zone_load(&collision, &za, "testfixture", Some(grid), 1, None);
+
+            let mut gs = GameState::new();
+            gs.world.zone_name = "testfixture".into();
+            gs.player_x = east; gs.player_y = 0.0; gs.player_z = 0.0;
+
+            // PREMISE, asserted rather than assumed: the character is genuinely OUTSIDE the trigger
+            // volume at this position, so the standing auto-cross cannot fire and the request has
+            // nothing to delegate to. (This is the assumption the shipped shortcut got wrong.)
+            let (line_at, dist) = {
+                let guard = collision.read().unwrap();
+                let c = guard.as_ref().unwrap();
+                assert!(c.zone_line_at_standing([gs.player_x, gs.player_y, gs.player_z]).is_none(),
+                    "east={east}: premise — the sweep must stand OUTSIDE the region");
+                let (_, p) = c.find_zone_line_near(Some(IDX), [gs.player_x, gs.player_y, gs.player_z])
+                    .expect("the fixture bakes exactly one zone-line region");
+                (p, (p[0] - gs.player_x).hypot(p[1] - gs.player_y))
+            };
+
+            let goal_id = command.request_zone_cross(DEST);
+            al.drain_zone_cross(&mut stream, &mut gs);
+
+            // The fix: a walk was ISSUED, to the region the cross resolved to.
+            assert_eq!(*nav.goto_target.lock().unwrap(), Some((line_at[0], line_at[1], line_at[2])),
+                "#725: standing {dist:.2}u from the zone line, an accepted cross must WALK there — \
+                 not vanish because a distance gate assumed something else would handle it");
+
+            // ...and it is OBSERVABLE on both channels an agent actually reads.
+            let s = nav.nav_state.lock().unwrap().clone();
+            assert!(s.goal_id > goal_id,
+                "the resolved walk stamps its own fresh goal id (so a read can correlate it)");
+            assert_eq!(s.goal, Some(line_at),
+                "nav_goal must carry the concrete zone-line destination once it is resolved");
+            assert!(gs.messages.iter().any(|m| m.text.contains("Walking to the zone")),
+                "and the message log must say so — `tracing` output is invisible to an HTTP agent, \
+                 which is what made the dropped request undebuggable");
+        }
+    }
+
+    /// **#725, the honesty half, through the real drain.** Even with the band closed, the thing that
+    /// made it undebuggable must be structurally impossible: a request that leaves the one-shot slot
+    /// and produces no observable outcome. `drain_zone_cross` now drains a `ZoneCrossTicket`, so the
+    /// *default* behaviour of any path that forgets to publish is an honest terminal state.
+    ///
+    /// This pins the property at the drain boundary for every refusal the drain can reach — none may
+    /// leave the accept's `pending` standing, because with the slot empty nothing downstream can
+    /// retire it (the walker's own retirement is pinned separately in
+    /// `no_in_progress_nav_state_survives_a_tick_with_no_goal_725`).
+    ///
+    /// **Mutation check:** delete `impl Drop for ZoneCrossTicket` AND make any single arm of the
+    /// resolution silent (e.g. return early on `known_dest.is_none()`) → that case reads `pending`
+    /// and goes RED. With the ticket in place the same edit is still caught, now as
+    /// `zone_cross_dropped_unhandled`, which is the difference between a silent bug and a reported
+    /// one.
+    #[tokio::test]
+    async fn no_drained_zone_cross_ever_leaves_pending_standing_725() {
+        use eqoxide_nav::zone_assets;
+        const DEST: u16 = 30;
+
+        // (label, advertise the destination?, install a grid with a matching region?)
+        for (label, advertised, region) in [
+            ("no zone point advertised for the requested zone", false, false),
+            ("advertised but no region in the loaded map",      true,  false),
+            ("advertised with a real region to walk to",        true,  true),
+        ] {
+            let (mut al, nav, command, collision, za) = shared_nav_action_loop();
+            let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+            if advertised {
+                *al.world.zone_points.lock().unwrap() = vec![zp_at(7, DEST, [100.0, 200.0, 0.0])];
+            }
+            let water = region.then(|| std::sync::Arc::new(
+                eqoxide_core::region_map::RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, 7)));
+            let grid = zone_assets::ZoneAssetState::test_ready_with_water(water)
+                .collision().unwrap().clone();
+            zone_assets::finish_zone_load(&collision, &za, "testfixture", Some(grid), 1, None);
+
+            let mut gs = GameState::new();
+            gs.world.zone_name = "testfixture".into();
+            gs.player_x = 20.0; gs.player_y = 0.0; gs.player_z = 0.0;
+
+            command.request_zone_cross(DEST);
+            assert_eq!(nav.nav_state.lock().unwrap().state, "pending", "{label}: the accept stamps pending");
+            al.drain_zone_cross(&mut stream, &mut gs);
+
+            let s = nav.nav_state.lock().unwrap().clone();
+            if region {
+                // Resolved into a walk: `pending` here belongs to the NEW goal `request_goto`
+                // stamped, and a live `goto_target` backs it — the walker carries it forward.
+                assert!(nav.goto_target.lock().unwrap().is_some(),
+                    "{label}: a resolved cross leaves a real goal in flight");
+            } else {
+                assert_ne!(s.state, "pending",
+                    "{label}: the request is gone from its slot, so `pending` can never be retired \
+                     by anything downstream — a drained request must publish its outcome (#725)");
+                assert!(s.reason.is_some(),
+                    "{label}: and terminal states carry a machine-readable reason");
+            }
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────
