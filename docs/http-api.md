@@ -310,9 +310,27 @@ server agrees with it, so no further server correction is coming. A GM `#goto`/`
 out, is what ends it.
 
 **`held_secs` is controller frame time as of the last stepped frame, not wall clock since entry.**
-A frozen body's meaningful clock is the physics clock; if the render loop is not stepping then no
-frames are elapsing, the hold is not progressing, and the `pos` beside it is stale by exactly the
-same amount. Read the [connection health](#connection-health) block for whether the client is live.
+A frozen body's meaningful clock is the physics clock. If the render loop is not stepping, no frames
+elapse, `held_secs` stops advancing, and the `pos` beside it is stale by exactly the same amount.
+
+**How to detect that — and what does *not* detect it.** Poll twice and compare the change in
+`held_secs` against the wall-clock time between your two reads. If `held_secs` did not advance, the
+controller is not stepping and every physics field in the payload is stale by that much. Do **not**
+use the [connection health](#connection-health) block for this: every field there measures the
+*network thread*, the link, or the world — `snapshot_age_ms` is milliseconds since the network
+thread last ticked, and `connected` is derived at HTTP read time and needs no render at all — so a
+stalled render loop with a live network reads as perfectly healthy there. Nothing in this API tracks
+the render loop directly; `held_secs` against your own clock is the check. (#724 round-2 review, N3
+— an earlier draft of this paragraph pointed at the health block, which structurally cannot answer
+the question it was offered for.)
+
+**`hold` lags the onset of an embedded freeze by up to 0.5 s.** `embedded_no_recovery` is raised
+only after the push-out search has failed continuously for that long. During the lag the body is
+already frozen — movement commands return `200` and produce no motion — but the client is still
+retrying the push-out every frame and may yet succeed, so the lag is a genuine "still trying"
+window rather than a silence. Read `"hold": null` as *no hold is in force*, never as *the body moved
+this frame*. `underworld_no_recovery` has no such lag; it is raised on the first refused descent.
+(#724 round-2 review, N5.)
 
 **The key is always present** (never omitted), so an agent that greps for `hold` and finds nothing
 knows it is talking to a client too old to report the state, rather than concluding all is well.

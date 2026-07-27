@@ -768,8 +768,26 @@ impl CharacterController {
                 }
                 // At/above the float line: hold — don't sink (no gravity while submerged).
             }
-            // No bounded surface found: hold position rather than free-fall (a server correction or
-            // the #150 underworld guard would otherwise have to recover us).
+            // No bounded surface found: hold altitude rather than free-fall, because free-falling
+            // inside a water volume we cannot measure would drive the body down onto the #150
+            // underworld guard for no reason.
+            //
+            // ⚠️ CORRECTED (#724 round-2 review, B2). This used to read "(a server correction or the
+            // #150 underworld guard would otherwise have to recover us)". The server-correction half
+            // is the claim #724 retracts — see `forget_recovery_history` and `teleport` — and it was
+            // never true here either: a swimmer holding altitude streams a position the server
+            // agrees with, so no correction is generated.
+            //
+            // This is NOT a `ControllerHold`, and #724 round-2 review (N4) was right to ask why not.
+            // The reason is that it is not distinguishable from correct behaviour: the branch three
+            // lines above — a swimmer at or above its float line — also holds altitude and also
+            // leaves `on_ground` false. Neutral buoyancy IS what a swimmer does. Reporting this
+            // shape would raise `player.hold` on every ordinary floating character, which is a false
+            // alarm, and a false alarm in an honesty observable is the same defect as a silence.
+            // The state is also not a predicament: lateral movement and swim input work normally and
+            // leaving the volume resumes ordinary physics, whereas both real hold shapes are states
+            // the body cannot leave under any driver. If this is ever made reportable it needs its
+            // own reason and a way to tell it apart from an ordinary float — not this branch.
         } else if self.levitating {
             // §529: Levitate — gravity OFF. The self-player HOVERS at altitude and free-floats over
             // land, gaps, and water instead of being pulled down. A floor that has risen to/above the
@@ -845,7 +863,20 @@ impl CharacterController {
                 // drop us onto deep below-world boundary geometry (or the void) below `underworld`,
                 // which the server treats as fallen-through-the-world → ZoneToBindPoint, then CLE
                 // linkdead. Recover to the last good grounded position instead; if we have none yet,
-                // just stop sinking (hold above underworld) and let a server correction sort it. (#150)
+                // just stop sinking and hold above the underworld. (#150)
+                //
+                // ⚠️ CORRECTED (#724 round-2 review, B2). This line used to end "…and let a server
+                // correction sort it". That was WRONG, and it was wrong about the exact branch #724
+                // now labels `UnderworldNoRecovery`: the held body goes on streaming its own
+                // unchanged position, the server agrees with it, and so nothing generates a further
+                // correction. Nothing sorts it. The hold is terminal until a GM `#goto`/`#summon`
+                // moves the character or it zones out — which is why the branch below now reports a
+                // `ControllerHold` instead of relying on a rescue that was never coming. Retracted
+                // in place rather than deleted: `forget_recovery_history` retracts the same claim in
+                // this file, `docs/http-api.md` states the opposite in bold, and this comment is the
+                // FIRST thing a reader of the underworld hold meets. (Found by the reviewer grepping
+                // the CONCEPT, "server correction", not the #724 label — my own audit was scoped to
+                // what this PR wrote and could not reach a pre-existing line.)
                 let landing_valid = |f: f32| cand <= f && f > self.underworld;
                 match floor {
                     Some(f) if landing_valid(f) => {
@@ -2668,6 +2699,28 @@ mod tests {
     /// A source scan rather than a behavioural test because `App` owns a window, a GPU and an event
     /// loop; the same `include_str!` technique is used in `eqoxide-net`'s `transport.rs` for exactly
     /// this kind of "one call site must not disappear" pin.
+    ///
+    /// # If this test reds and you did not touch the recovery ring — READ THIS BEFORE DELETING IT
+    ///
+    /// It scans another file's source, so **any** edit to `app.rs` that moves, renames, re-indents
+    /// or re-wraps the `zone_needs_reload` block can red it — including an edit git merges cleanly,
+    /// which makes it a cross-PR tripwire of the shape that has turned `main` red here before
+    /// (#724 round-2 review, N7). It reds by design in that case; it is not a false positive to be
+    /// silenced. Triage in this order:
+    ///
+    /// 1. **`expect` on `find` fired** (`app.rs no longer has the zone-change reload block…`): the
+    ///    `if zone_needs_reload(…)` line was respelled or the block moved. Re-anchor the search
+    ///    string on the new spelling. Do not delete the test.
+    /// 2. **`expect` on the closing-brace search fired**: the block's indentation changed. Update
+    ///    the `"\n        }"` sentinel to the new depth, and re-check that a nested block still
+    ///    cannot close first.
+    /// 3. **The `assert!` fired** with the block printed: the call really is gone. Put it back —
+    ///    that is a #712 regression, not a test problem. Read `forget_recovery_history`'s doc for
+    ///    why the `teleport` fold does not cover this path.
+    ///
+    /// Deleting this test is only correct if `app.rs` no longer drops the old zone's collision at a
+    /// point distinct from the arrival, i.e. if the premise above stopped being true. Say so in the
+    /// commit if you conclude that.
     #[test]
     fn the_zone_change_reload_block_still_forgets_the_recovery_ring() {
         const APP_RS: &str = include_str!("app.rs");

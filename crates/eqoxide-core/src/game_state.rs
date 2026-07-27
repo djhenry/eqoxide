@@ -866,6 +866,26 @@ impl ControllerHoldReason {
 /// a branch that is actively holding the body *this frame* re-sets it, so it cannot outlive the
 /// condition it describes. That clear-path is the point — an observable that latches on and never
 /// clears is its own honesty bug (#343/#679), not a fix for one.
+///
+/// # `secs` defeats `publish_snapshot`'s dedup for the hold's whole duration — deliberately
+///
+/// This type's `PartialEq` reaches [`GameState`]'s, which `eqoxide_net::gameplay::publish_snapshot`
+/// uses to skip republishing an unchanged snapshot. `secs` advances on every stepped frame, so a
+/// held body compares unequal on every net tick and stores a fresh `Arc` each time, for as long as
+/// the hold lasts (#724 round-2 review, N6).
+///
+/// **Nothing downstream amplifies that, and here is why.** The only consumer of the snapshot `Arc`'s
+/// *identity* is `App::poll_external`, which sets `activity = true` on `!Arc::ptr_eq` to wake the
+/// render loop. That same function already sets `activity = true` unconditionally on `!on_ground`,
+/// which every `underworld_no_recovery` hold guarantees (its arm runs only inside `if
+/// !self.on_ground`) — so on that shape the republish cannot wake a loop that was not already
+/// awake. HTTP reads the snapshot by value (`.load()`), never by identity, and no endpoint or
+/// long-poll waits on a pointer change. The residual cost is one `GameState::clone` per net tick
+/// instead of a pointer compare, bounded per tick and unbounded only in duration.
+///
+/// Excluding `secs` from equality was considered and rejected: it would make two genuinely different
+/// states compare equal, so a hold that changed duration could go unpublished, and the field exists
+/// precisely so an agent can watch it advance.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ControllerHold {
     pub reason: ControllerHoldReason,

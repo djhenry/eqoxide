@@ -502,15 +502,8 @@ fn ser_error_kind<S: serde::Serializer>(
     }
 }
 
-/// A cast in flight, for `/v1/observe/debug` → `casting` (#348).
-///
-/// NOTE the missing `elapsed_ms`: it is derived at **HTTP read time** from `started`, never stored.
-/// An age baked in when the value is *projected* is only true at that instant; every moment after,
-/// it is wrong, and nothing in the payload says so. That is #343 in miniature — and it is why the
-/// whole player view is now derived on read rather than published by a loop that sleeps. A duration
-/// must be measured when it is read, or it is just another lie with a timestamp on it.
-/// **The character is physically stuck and the client cannot free it** — `player.hold` (#724
-/// review, B1). `null` for a healthy character, including one that is simply standing still.
+/// **The character is physically stuck and the client cannot free it** — `player.hold` (#724).
+/// `null` for a healthy character, including one that is simply standing still.
 ///
 /// This exists because "standing still because nothing asked me to move" and "frozen in rock and
 /// unable to move in any direction" were indistinguishable through this API. `pos` is correct in
@@ -527,17 +520,52 @@ pub struct PlayerHoldView {
     /// history: **the body cannot move at all**, in any direction, under any driver.
     /// `underworld_no_recovery` — a descent below the zone's underworld floor was refused with no
     /// recovery history: the body hangs at the height it reached. Lateral movement still works.
+    ///
+    /// `embedded_no_recovery` LAGS the freeze it reports by up to `STUCK_FALLBACK_SECS` (0.5 s):
+    /// `depenetrate` freezes the whole step from the first embedded frame, but only raises the hold
+    /// once the push-out search has failed continuously for that long. The lag is a genuine "still
+    /// retrying" window — the push-out may succeed inside it — but it means a `None` hold says *no
+    /// hold is in force*, never *the body moved this frame*. `underworld_no_recovery` has no lag.
+    /// (#724 round-2 review, N5.)
     pub reason: &'static str,
     /// How long the hold has been continuously in force, in CONTROLLER FRAME TIME as of the last
     /// stepped frame — deliberately not wall-clock-since-entry. A frozen body's meaningful clock is
-    /// the physics clock, and if the render loop is not stepping then no frames are elapsing, the
-    /// hold is not progressing, and the `pos` beside this field is stale by exactly the same amount.
-    /// Compare `/v1/observe`'s health block for whether the client is live at all.
+    /// the physics clock, and if the render loop is not stepping then no frames are elapsing, this
+    /// stops advancing, and the `pos` beside it is stale by exactly the same amount.
+    ///
+    /// **The check for that is this field against the caller's own clock** — poll twice, compare the
+    /// delta here with the wall-clock gap between the reads. Do NOT point an agent at [`Health`]:
+    /// every field on it measures the network thread, the link or the world (`snapshot_age_ms` is
+    /// ms since the *network* thread ticked; `connected` is derived at read time and needs no render
+    /// at all), so a stalled render loop with a live network reads as healthy there. Nothing in this
+    /// API tracks the render loop directly.
+    ///
+    /// (#724 round-2 review, N3, which found this doc pointing at [`Health`] — structurally unable
+    /// to answer it — and argued the staleness may be unreachable because both hold shapes leave
+    /// `on_ground == false`, an unconditional render-loop activity signal. That holds for
+    /// `underworld_no_recovery`, whose arm runs only inside `if !self.on_ground`. It does NOT hold
+    /// for `embedded_no_recovery`: `depenetrate` never writes `on_ground`, and while `teleport` does
+    /// clear it, the zone-change ring clear in `app.rs` does not — so a cross-zone arrival inside
+    /// geometry that fires no `teleport` (the #593 gap) can hold with `on_ground` still `true`. That
+    /// path is reasoned from the branch structure, not measured, but it is enough that the caveat
+    /// must stay.)
     pub held_secs: f32,
     /// Plain-language statement of what is true and what an agent can do about it.
     pub detail: &'static str,
 }
 
+/// A cast in flight, for `/v1/observe/debug` → `casting` (#348).
+///
+/// NOTE the missing `elapsed_ms`: it is derived at **HTTP read time** from `started`, never stored.
+/// An age baked in when the value is *projected* is only true at that instant; every moment after,
+/// it is wrong, and nothing in the payload says so. That is #343 in miniature — and it is why the
+/// whole player view is now derived on read rather than published by a loop that sleeps. A duration
+/// must be measured when it is read, or it is just another lie with a timestamp on it.
+//
+// (#724 round-2 review, B1: this comment was orphaned when `PlayerHoldView` was inserted between it
+// and its struct, leaving `PlayerHoldView` documented as "a cast in flight" and `CastingView`
+// documented as nothing at all. Restored verbatim. If you add a type near here, put its doc above
+// its OWN `#[derive]`, not on the end of the previous one.)
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CastingView {
     pub spell_id:   u32,
