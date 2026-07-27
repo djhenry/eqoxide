@@ -56,7 +56,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     if !s.task_offers.is_empty() {
         egui::Frame::none()
             .fill(theme::BG_PANEL)
-            .stroke(egui::Stroke::new(1.0, theme::GOLD))
+            .stroke(egui::Stroke::new(1.0_f32, theme::GOLD))
             .rounding(egui::Rounding::same(2.0))
             .inner_margin(egui::Margin::same(5.0))
             .show(ui, |ui| {

@@ -155,7 +155,7 @@ fn gem_row(
             ui.painter().rect_stroke(
                 icon_rect,
                 2.0,
-                egui::Stroke::new(1.0, egui::Color32::from_black_alpha(180)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(180)),
             );
         }
     }

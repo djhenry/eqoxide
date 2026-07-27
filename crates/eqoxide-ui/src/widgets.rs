@@ -25,7 +25,7 @@ pub fn gauge(ui: &mut Ui, id: impl std::hash::Hash, label: &str, frac: f32, tint
     let shown = ui.ctx().animate_value_with_time(id, frac, 0.25);
 
     painter.rect_filled(rect, 2.0, theme::GAUGE_BG);
-    painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, Color32::from_black_alpha(180)));
+    painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, Color32::from_black_alpha(180)));
 
     if shown > 0.001 {
         let fill = Rect::from_min_size(
@@ -86,7 +86,7 @@ pub fn item_slot(ui: &mut Ui, icon: Option<IconRef>, fallback: &str, tooltip: &s
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter();
     painter.rect_filled(rect, 2.0, Color32::from_rgb(0x13, 0x13, 0x13));
-    painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, Color32::from_black_alpha(200)));
+    painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, Color32::from_black_alpha(200)));
     match icon {
         Some(ic) => {
             egui::Image::new((ic.tex, size)).uv(ic.uv).paint_at(ui, rect.shrink(1.0));
@@ -104,9 +104,9 @@ pub fn item_slot(ui: &mut Ui, icon: Option<IconRef>, fallback: &str, tooltip: &s
         None => {}
     }
     if selected {
-        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.5, theme::GOLD));
+        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.5_f32, theme::GOLD));
     } else if resp.hovered() {
-        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, theme::BRASS));
+        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, theme::BRASS));
     }
     if !tooltip.is_empty() {
         resp.clone().on_hover_text(tooltip);

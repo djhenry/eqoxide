@@ -130,7 +130,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     // line_segment call takes egui's graphics lock, and ~4k locked pushes per
     // frame made the map the most expensive window in --profile.
     let mut shapes: Vec<egui::Shape> = Vec::with_capacity(1024);
-    let tick = Stroke::new(0.5, Color32::from_white_alpha(16));
+    let tick = Stroke::new(0.5_f32, Color32::from_white_alpha(16));
     let step = 100.0_f32;
     let mut ge = (view_left / step).ceil() * step;
     while ge <= view_left + view_w {
@@ -163,7 +163,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                 continue;
             }
             let color = Color32::from_rgba_unmultiplied(line.r, line.g, line.b, 180);
-            shapes.push(egui::Shape::line_segment([p1, p2], Stroke::new(0.8, color)));
+            shapes.push(egui::Shape::line_segment([p1, p2], Stroke::new(0.8_f32, color)));
         }
         // Flush before the POI labels so text draws on top of the line art.
         painter.extend(shapes.drain(..));
@@ -203,7 +203,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         };
         painter.circle_filled(p, 3.0, color);
         if b.is_target && !b.dead {
-            painter.circle_stroke(p, 5.0, Stroke::new(1.0, theme::HP));
+            painter.circle_stroke(p, 5.0, Stroke::new(1.0_f32, theme::HP));
         }
     }
 
@@ -217,10 +217,10 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     painter.add(egui::Shape::convex_polygon(
         vec![tip, back_l, back_r],
         theme::CHAT_GROUP,
-        Stroke::new(1.0, Color32::from_black_alpha(200)),
+        Stroke::new(1.0_f32, Color32::from_black_alpha(200)),
     ));
 
-    painter.rect_stroke(rect, 3.0, Stroke::new(1.0, theme::FRAME_LO));
+    painter.rect_stroke(rect, 3.0, Stroke::new(1.0_f32, theme::FRAME_LO));
     });
 }
 
