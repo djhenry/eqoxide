@@ -356,11 +356,17 @@ fn seg_closest(a: [f32; 3], b: [f32; 3], p: [f32; 3]) -> ([f32; 3], f32) {
 /// >   `the_stale_cursor_reaches_the_steering_aim_through_the_fine_plan_not_the_coarse_carrot`.
 /// > * *"flipping to the opposite side each **tick**"* — **retracted (round 3).** The flip is per
 /// >   controller FRAME (~10 ms), not per nav tick (150 ms).
-/// > * *"oscillates over ~0.4 u"* — **retracted (round 4, restated round 5).** Measured settled band
-/// >   in `fixture_run` is **0.88 u**; over the whole run including the transient the body covers
-/// >   8.13 u and reaches 6.60 u from where it landed. The round-3 reviewer's production `drive_walk`
-/// >   loop gives the same figures. (Round 4 quoted "1.32 u" here; that was measured on a harness
-/// >   that dropped 14 frames of every 15 on a tick with no fine plan — see `fixture_run`.)
+/// > * *"oscillates over ~0.4 u"* — **retracted (round 4, restated round 5, corrected round 6).**
+/// >   Measured settled band in `fixture_run` is **1.32 u**; over the whole run including the
+/// >   transient the body covers 8.13 u and reaches 6.60 u from where it landed. The round-3
+/// >   reviewer's production `drive_walk` log matches the *transient* figures (its three tick
+/// >   positions are what the 8.13 u and 6.60 u extremes are attained at) and does **not** match the
+/// >   settled width: production oscillates over ~2.6 u against this harness's 1.32 u.
+/// >   **Round 5 wrote 0.88 u here and blamed round 4's "1.32 u" on dropped frames. Both were
+/// >   wrong** — 0.88 u was the settled band sampled once per nav tick, and 1.32 u is what the same
+/// >   window measures per frame. See the correction on
+/// >   `the_simulated_stall_is_a_bounded_overshoot_cycle_a_few_frames_wide` for the A/B that
+/// >   settles it.
 /// > * *"exhausts its re-paths and stops with `blocked` / `walker_stalled`"* — **retracted
 /// >   (round 4).** This exact sentence was struck from `crate::walker::Walker`'s `advance_cursor`
 /// >   rustdoc because no offline instrument on this branch contains the stall detector,
@@ -792,23 +798,54 @@ mod cursor_resync_tests {
     /// 2-point stub arrives does the limit cycle close. So the whole-run extent (`x_min` / `x_max`)
     /// and the settled extent (`late_x_min` / `late_x_max`) measure different things, and both are
     /// recorded rather than one standing in for the other.
+    ///
+    /// # Sampling rate — one rule, no exceptions
+    ///
+    /// **Every positional extent in this struct is sampled ONCE PER CONTROLLER FRAME** (~100 Hz),
+    /// inside [`fixture_run`]'s `step`. Not per nav tick. The single exception is `head`, which is
+    /// defined as a tick-boundary quantity and says so on its own line.
+    ///
+    /// ⚠️ **Correction (#727 round 5 review, B-1).** Round 5 sampled `x_min`/`x_max` per frame and
+    /// `late_x_min`/`late_x_max` per **tick**, then printed both in one table as "the same
+    /// measurement at two times". They were two different measurements. The settled cycle flips the
+    /// aim **every frame** — that is this PR's own root-cause mechanism — so a once-per-15-frames
+    /// sampler is structurally incapable of seeing its width: it understated the settled span by
+    /// **50%** (0.880 u tick-sampled vs 1.320 u frame-sampled over the identical `tick >= 100`
+    /// window). The fix is not to sample the two bands the same way by hand, which is how they drifted
+    /// apart in the first place; it is that there is now exactly ONE place a position is recorded, so
+    /// a future extent cannot pick a different rate.
     struct Run {
         arrived: bool,
         ticks: u32,
         /// Straight-line distance from the start position to wherever the run ended.
         net: f32,
-        /// Extent of the east coordinate over the WHOLE run, transient included.
+        /// Extent of the east coordinate over the WHOLE run, transient included. Per frame.
         x_min: f32,
         x_max: f32,
         /// Extent of the east coordinate over ticks ≥ 100 — long past any transient, so this is the
-        /// settled limit cycle and nothing else.
+        /// settled limit cycle and nothing else. Per frame.
         late_x_min: f32,
         late_x_max: f32,
-        /// The furthest the body ever got from where it landed, at any tick boundary.
+        /// The furthest the body ever got from where it landed. Per frame.
         max_from_landed: f32,
-        /// Position at the end of each of the first three nav ticks — the transient, kept so it can
-        /// be compared against the production loop's own log.
+        /// Position at the end of each of the first three nav ticks. **The one tick-boundary
+        /// quantity here**, and deliberately so: it exists to be compared against the production
+        /// `drive_walk` loop's log, which is written once per nav tick. Sampling it per frame would
+        /// compare two different things.
         head: Vec<[f32; 2]>,
+    }
+
+    /// Everything [`fixture_run`]'s `step` records, in one place so there is one sampling rate.
+    ///
+    /// `late` is set once at the top of each nav tick and read by `step`, so the `tick >= 100`
+    /// window is a property of the tick while the *sampling* inside it stays per frame.
+    struct Bands {
+        x_min: f32,
+        x_max: f32,
+        late_x_min: f32,
+        late_x_max: f32,
+        max_from_landed: f32,
+        late: bool,
     }
 
     /// Drive the #673 fixture through the walker's REAL steering rule and report how far the
@@ -885,12 +922,17 @@ mod cursor_resync_tests {
         // The controller's live `MoveIntent.wish_dir`. It persists across frames exactly as
         // production's does — see the fast loop below.
         let mut wish = [0.0f32; 2];
-        let (mut x_min, mut x_max) = (p[0], p[0]);
-        let (mut late_x_min, mut late_x_max) = (f32::MAX, f32::MIN);
-        let mut max_from_landed = 0.0f32;
+        let mut b = Bands {
+            x_min: p[0], x_max: p[0],
+            late_x_min: f32::MAX, late_x_max: f32::MIN,
+            max_from_landed: 0.0,
+            late: false,
+        };
         let mut head: Vec<[f32; 2]> = Vec::new();
         for tick in 0..TICKS {
             let before = p;
+            // The settled-cycle window is chosen per TICK; the sampling inside it is per FRAME.
+            b.late = tick >= 100;
             while path_i + 2 < HAIRPIN.len() {
                 let (a, b) = (HAIRPIN[path_i], HAIRPIN[path_i + 1]);
                 let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
@@ -926,12 +968,22 @@ mod cursor_resync_tests {
             // RUN_SPEED for the whole frame. The controller does NOT slow down for a near carrot,
             // which is why an aim inside one frame's travel (44 * 0.01 = 0.44 u) is overshot rather
             // than reached.
-            let step = |p: &mut [f32; 3], wish: [f32; 2], x_min: &mut f32, x_max: &mut f32| {
+            //
+            // **This is the ONLY place a position is recorded** (round-5 review, B-1). Every extent
+            // on `Run` is therefore sampled at the same rate — this one, per frame — and a new
+            // extent cannot quietly be added at the tick boundary instead.
+            let step = |p: &mut [f32; 3], wish: [f32; 2], b: &mut Bands| {
                 p[0] += wish[0] * eqoxide_core::physics::RUN_SPEED * DT;
                 p[1] += wish[1] * eqoxide_core::physics::RUN_SPEED * DT;
                 if let Some(fz) = col.ground_below(p[0], p[1], p[2] + 4.0, 40.0) { p[2] = fz; }
-                *x_min = x_min.min(p[0]);
-                *x_max = x_max.max(p[0]);
+                b.x_min = b.x_min.min(p[0]);
+                b.x_max = b.x_max.max(p[0]);
+                if b.late {
+                    b.late_x_min = b.late_x_min.min(p[0]);
+                    b.late_x_max = b.late_x_max.max(p[0]);
+                }
+                b.max_from_landed =
+                    b.max_from_landed.max((p[0] - LANDED[0]).hypot(p[1] - LANDED[1]));
             };
             // ONE `steer_target` per nav tick (the 150 ms coarse tick, with the LOS clamp). Its aim
             // is what `drive_walk` turns into `MoveIntent.wish_dir` — and `wish_dir` then PERSISTS:
@@ -943,7 +995,7 @@ mod cursor_resync_tests {
             // `drive_walk` publishes no intent for a degenerate aim; the previous tick's intent is
             // what the controller would still be holding, so carry `wish` over unchanged.
             if ad > 1e-3 { wish = [adx / ad, ady / ad]; }
-            step(&mut p, wish, &mut x_min, &mut x_max);
+            step(&mut p, wish, &mut b);
             // …then the ~10 ms fast loop. `Walker::apply_fast_steering` OVERRIDES `wish_dir` — and
             // only when `!self.local_path.is_empty()`. It never clears it and never stops the body.
             // So on a tick with NO fine plan the controller integrates the tick's own MoveIntent for
@@ -963,22 +1015,29 @@ mod cursor_resync_tests {
                         wish = w;
                     }
                 }
-                step(&mut p, wish, &mut x_min, &mut x_max);
+                step(&mut p, wish, &mut b);
             }
             if verbose {
                 println!("  t{tick:<3} cursor {path_i} local.len {:<3} moved {:.3} u  pos ({:.3},{:.3})",
                     local.len(), (p[0] - before[0]).hypot(p[1] - before[1]), p[0], p[1]);
             }
             let net = (p[0] - LANDED[0]).hypot(p[1] - LANDED[1]);
-            max_from_landed = max_from_landed.max(net);
+            // `head` is the ONE tick-boundary quantity: it is compared against a production log that
+            // is itself written once per nav tick. Everything else was recorded inside `step`.
             if head.len() < 3 { head.push([p[0], p[1]]); }
-            if tick >= 100 { late_x_min = late_x_min.min(p[0]); late_x_max = late_x_max.max(p[0]); }
             if (p[0] - goal[0]).hypot(p[1] - goal[1]) <= 3.0 {
-                return Run { arrived: true, ticks: tick + 1, net, x_min, x_max, late_x_min, late_x_max, max_from_landed, head };
+                return Run { arrived: true, ticks: tick + 1, net,
+                    x_min: b.x_min, x_max: b.x_max,
+                    late_x_min: b.late_x_min, late_x_max: b.late_x_max,
+                    max_from_landed: b.max_from_landed, head };
             }
         }
-        Run { arrived: false, ticks: TICKS, net: (p[0] - LANDED[0]).hypot(p[1] - LANDED[1]), x_min, x_max, late_x_min, late_x_max, max_from_landed, head }
+        Run { arrived: false, ticks: TICKS, net: (p[0] - LANDED[0]).hypot(p[1] - LANDED[1]),
+            x_min: b.x_min, x_max: b.x_max,
+            late_x_min: b.late_x_min, late_x_max: b.late_x_max,
+            max_from_landed: b.max_from_landed, head }
     }
+
 
     /// **#673 step 2 of 3 — how the collapse reaches the steering aim.** The round-2 review's
     /// finding A was half right and this test records both halves, because getting this wrong in
@@ -1143,16 +1202,53 @@ mod cursor_resync_tests {
     /// the harness dropping frames**, not by the character: with no fine plan the old [`fixture_run`]
     /// `break`ed out of its fast loop, so tick 0 advanced the body 1 frame of 15 and set the eastern
     /// extreme right there. Production keeps integrating the last `MoveIntent`, and the round-3
-    /// reviewer's production run reached `x = -528.39` — **5.9 u east**, ~6.7× that budget. Round 4's
-    /// quoted band, "1.32 u in the sim", is retracted for the same reason.
+    /// reviewer's production run reached `x = -528.39` — **5.9 u east**, ~6.7× that budget. ~~Round
+    /// 4's quoted band, "1.32 u in the sim", is retracted for the same reason.~~
     ///
     /// [`fixture_run`] now carries `wish_dir` across frames, and the picture that comes back is
     /// **two-phase**, which is why one number could not describe it:
     ///
     /// ```text
     /// whole run    x ∈ [-536.524, -528.391]   span 8.13 u   max 6.60 u from LANDED
-    /// ticks ≥ 100  x ∈ [-534.764, -533.884]   span 0.88 u = 2 frames of travel
+    /// ticks ≥ 100  x ∈ [-535.204, -533.884]   span 1.32 u = 3 frames of travel
+    ///                                         0.40 u east of LANDED, 0.92 u west
     /// ```
+    ///
+    /// ⚠️ **Correction (#727 round 6 review, B-1) — the round-5 retraction above is struck, and its
+    /// two numbers are restated. Measured, not reasoned.** Two independent defects:
+    ///
+    /// 1. **The 0.88 u was a sampling artifact of round 5's own making.** Round 5 recorded
+    ///    `x_min`/`x_max` per *frame* but `late_x_min`/`late_x_max` per *nav tick*, then printed both
+    ///    in one table as though they were one measurement at two times. The settled cycle flips the
+    ///    aim **every frame** — this PR's own root-cause mechanism — so a once-per-15-frames sampler
+    ///    cannot see its width. Over the identical `tick >= 100` window: **0.880 u tick-sampled,
+    ///    1.320 u frame-sampled**, a 50% understatement. Every extent on `Run` is now recorded in one
+    ///    place, inside `step`; see `Run`'s own "one sampling rate" note.
+    /// 2. **"Retracted for the same reason" was false, and the reason was never measured.** The
+    ///    frame drop did not change the cycle's width at all. Round 4's harness was reconstructed on
+    ///    this branch (its `None => break` restored, everything else left alone) and re-run under
+    ///    per-frame sampling:
+    ///
+    /// ```text
+    /// harness            whole-run band              settled band (ticks >= 100)   net      fixed
+    /// round 4 (break)    [-535.185, -533.865] 1.320  [-535.185, -533.865] 1.320    0.0197   5 ticks
+    /// round 5/6 (carry)  [-536.524, -528.391] 8.134  [-535.204, -533.884] 1.320    0.0389   4 ticks
+    /// ```
+    ///
+    /// The reconstruction reproduces round 4's reported `[-535.185, -533.865]`, its `0.0197 u` net
+    /// and its 5-tick arrival exactly, so it is the round-4 harness and not a lookalike. Read across:
+    /// the frame drop left the settled width **identical to three decimal places** (1.320 vs 1.320,
+    /// the band shifted 0.019 u west) and collapsed the *whole-run* band from 8.134 u to 1.320 u by
+    /// suppressing the transient — which is why round 4's whole-run figure happened to equal the
+    /// settled width. So **1.32 u was a correct settled-cycle width mislabelled as a whole-run band**,
+    /// not an artifact of dropped frames. The figures the frame drop *did* earn are `net` and the
+    /// arrival tick count (0.0197 → 0.0389 u, 5 → 4 ticks), and those are corrected on
+    /// `the_stale_cursor_leaves_the_steering_loop_no_escaping_trajectory_and_the_resync_clears_it`.
+    ///
+    /// The assertions below were re-checked against per-frame sampling and all three still hold with
+    /// headroom: span 1.320 < 2.200; east excursion 0.402; west excursion 0.918 (2.3× what round 5
+    /// reported for it, and still inside the 2.200 bound). Nothing here was a green test that should
+    /// have been red — it was a reporting defect, and a retraction whose stated cause was untested.
     ///
     /// Ticks 0–2 are a transient: no fine plan has arrived, so the walker steers the *healthy* ~17 u
     /// coarse carrot and lunges back up the route — real motion, and the reason "never gets east" was
@@ -1162,9 +1258,23 @@ mod cursor_resync_tests {
     ///
     /// **On the production agreement.** Fixing the frame drop was motivated by B-C, not by chasing
     /// these numbers — and the harness now reproduces the round-3 reviewer's production `drive_walk`
-    /// log tick for tick: `(-528.39, 147.34)`, `(-534.33, 144.46)`, `(-536.52, 144.37)`. Unlike the
-    /// round-3 identity, three 2-D positions including a north excursion are not something any
-    /// west-stepping harness produces by construction. But be precise about what it is worth: both
+    /// log tick for tick: `(-528.39, 147.34)`, `(-534.33, 144.46)`, `(-536.52, 144.37)`.
+    ///
+    /// ⚠️ **Correction (#727 round 6 review, non-blocking 2) — the anti-identity argument was
+    /// overstated, in exactly the position it leaned on.** This paragraph used to say "three 2-D
+    /// positions including a north excursion are not something any west-stepping harness produces by
+    /// construction", and pointed at tick 0's north excursion as the reason. Measured:
+    /// `|head[0] − LANDED| = 6.5997` against `15 × RUN_SPEED × 0.01 = 6.6000`. Tick 0's endpoint lies
+    /// on the circle of one nav tick's travel around a harness INPUT — its *magnitude* is a code
+    /// constant times a loop count and discriminates nothing, exactly the round-3 identity's shape.
+    /// What position 0 contributes is one number, its **direction**, and both instruments compute
+    /// that from the same `carrot_along` on the same fixture. The agreements that do discriminate are
+    /// `head[1]` (0.091 u from `LANDED`) and `head[2]` (2.239 u), which depend on the stub geometry
+    /// and the aim flip and are not derivable from a constant. Three positions are still not the
+    /// round-3 identity — but the honest count is **two independent agreements plus one direction**,
+    /// not three, and no sentence here should be quotable as more.
+    ///
+    /// Be precise about what even that is worth: both
     /// instruments run the *same* production `steer_target` / `carrot_along` / `find_path_local` on
     /// the *same* fixture, so this is two faithful instruments agreeing — evidence about the
     /// harness's fidelity, **not** independent evidence about the live defect. Those three positions
@@ -1241,8 +1351,12 @@ mod cursor_resync_tests {
     /// item is invisible to the rustdoc pass that would check the link.
     ///
     /// So this stands in for the link: naming each cited item as a value makes a rename a **compile
-    /// error** in the same commit, not a silent rot found four review rounds later. Add a line here
-    /// whenever a doc comment starts citing a test by name.
+    /// error** in the same commit, not a silent rot found four review rounds later.
+    ///
+    /// **You do not have to remember to add a line here.** The list below is the *enforcement*; its
+    /// *completeness* is checked mechanically by
+    /// `every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard`, which reads the source
+    /// and fails if a doc comment cites a test this array does not name.
     #[test]
     fn every_test_name_cited_in_a_doc_comment_still_exists() {
         let _cited: &[fn()] = &[
@@ -1255,10 +1369,259 @@ mod cursor_resync_tests {
             a_stale_cursor_collapses_the_fine_planners_goal_onto_the_character,
             // cited by `fixture_run`'s "not building the answer into the instrument" note
             a_walker_whose_cursor_is_honest_walks_this_same_fixture_out,
+            // added in round 6 by the mechanical scan below — all three were cited in doc comments
+            // in this file and named in no guard list, which is the defect the scan exists to find.
+            resync_never_jumps_across_blocked_geometry,
+            every_test_name_cited_in_a_doc_comment_still_exists,
+            every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard,
+            // …and this one the scan caught on its first run, on a citation added in round 6
+            // itself — which is the whole argument for having it.
+            the_simulated_stall_is_a_bounded_overshoot_cycle_a_few_frames_wide,
+            // The identity-mutant survivor list in `the_resync_moves_the_cursor_...`'s doc. All four
+            // were invisible to any grep until round 6: three were elided to `..._` and two were
+            // hand-wrapped across a line break INSIDE their backticks. Un-eliding them is what
+            // exposed them to the scan.
+            resync_never_moves_the_cursor_backwards,
+            resync_is_inert_on_degenerate_paths,
+            an_on_route_walker_is_left_alone_without_consulting_geometry,
+            a_walker_cutting_a_tight_switchback_keeps_its_cursor,
         ];
         // Helpers cited by name in the same docs.
         let _helpers: (fn(&crate::collision::Collision, usize, bool, bool) -> Run,
                        fn(f32, [f32; 3], usize) -> bool) = (fixture_run, hairpin_carrot_stops_leading);
+    }
+
+    /// **The citation guard's ALPHABET is now mechanical, not remembered (#727 round 6 review,
+    /// non-blocking 1).**
+    ///
+    /// The round-5 review accepted that the `fn()` guard *bites* — it renamed a cited test and got a
+    /// compile error — and then made the obvious next point: the guard's list is hand-maintained, so
+    /// it is the memory-scoped act this PR has spent five rounds failing at, one level down. A
+    /// twenty-line scan found two misses in seconds: a real test cited in a doc comment in the guard's
+    /// own file and named in no list, and a citation in `collision.rs` that resolved to nothing
+    /// anywhere in the workspace. Both are fixed; this test is what stops the third.
+    ///
+    /// **The two corpora, named — because a sweep is (terms × corpus) and this PR's recurring defect
+    /// has been running the right terms over the wrong corpus.**
+    ///
+    /// * **Citations are READ from** the four files #727 touches. Widening this to the whole crate is
+    ///   a follow-up, not a silent assumption: files outside it are not scanned and this test claims
+    ///   nothing about them.
+    /// * **Names are RESOLVED against** every `.rs` in the whole workspace (`crates/`, `tests/`,
+    ///   `src/`, minus any `target/`) — deliberately wider than the citation corpus, so a citation
+    ///   that points at another crate's test resolves instead of being reported as rot. `walker.rs`
+    ///   cites one in `eqoxide-net`, so this width is load-bearing, not decorative.
+    ///
+    /// **The rule.** For every backticked, lower-snake identifier in a doc comment with at least
+    /// three underscores (four or more words — the shape test names take in this crate, and a stated
+    /// heuristic rather than a proof: a cited two-word test name would slip through):
+    ///
+    /// 1. if it is a `#[test] fn` **in the same file as the citation** → it must appear in that
+    ///    file's `_cited` / `_helpers` guard, so a rename is a compile error;
+    /// 2. else if it resolves to any `fn` in the resolution corpus → fine (rustdoc's own link check
+    ///    covers the public ones, and cross-module test items cannot be named from here anyway);
+    /// 3. else it must be listed in `NOT_A_FN` below **with a reason**. That inversion is the point:
+    ///    the default is "must resolve", and every exception is written down and argued.
+    ///
+    /// **Verified to bite, by execution, on both halves** (round 6, each mutation applied → run →
+    /// reverted): deleting one name from the `_cited` array above reports *"is a #[test] in this file
+    /// … but no `_cited`/`_helpers` guard in this file names it"*; adding `a_test_that_does_not_exist_anywhere`
+    /// to `resync_cursor`'s rustdoc reports *"resolves to NO fn in the resolution corpus"*. It has
+    /// also bitten twice unprompted: on its very first run, on a citation this same round had just
+    /// added and not guarded; and on the paragraph you are reading, whose quoted mutation name it
+    /// flagged as unresolvable — correctly — forcing the `NOT_A_FN` entry below.
+    ///
+    /// **What it does NOT do**, so nobody reads it as more: it does not check that a citation is
+    /// *apt* — only that the name exists and is pinned against renaming. And its `>= 3 underscores`
+    /// filter is a heuristic about this crate's naming, not a proof; `walker_cursor_resync`, the
+    /// round-4 dangling citation, has two and would still slip past it.
+    #[test]
+    fn every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard() {
+        use std::collections::{HashMap, HashSet};
+        use std::path::PathBuf;
+
+        /// Citations that deliberately name something that is not a `fn` in this workspace. Each
+        /// entry is a claim in its own right; if one stops being true, delete it and the scan will
+        /// say so.
+        const NOT_A_FN: &[(&str, &str)] = &[
+            ("the_resync_clears_the_deadlock_above_the_guard_and_is_inert_below_it",
+             "a test renamed in round 3, quoted verbatim inside a ⚠️ Corrections block so the \
+              retracted name is preserved rather than deleted. Inherently unguardable."),
+            ("open_air_ceiling_is_never_returned_as_floor",
+             "a fixture RETRACTED at PR-D/D-2 and deleted; the doc that names it IS its retraction \
+              note."),
+            ("baked_zone_has_collision_mesh_with_invisible_faces",
+             "a test in the asset-server repository, not this workspace; the doc says so."),
+            ("zone_assets_stale_for_previous_zone",
+             "a `nav_reason` string (`NotUsable::StaleForPreviousZone::as_str`), not a fn."),
+            ("local_no_way_through",
+             "a `stop_nav` reason string, not a fn."),
+            ("arrived_at_goal_tier",
+             "a local binding in the walker sim's arrival check, not a fn."),
+            ("a_test_that_does_not_exist_anywhere",
+             "the deliberately-nonexistent name this scan's own mutation check injected, quoted in \
+              this fn's rustdoc as the evidence that the check bites. Its whole point is that it \
+              resolves to nothing — and the scan caught it here, unprompted, on the run that added \
+              that paragraph."),
+        ];
+
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let ws = crate_root.parent().and_then(|p| p.parent())
+            .expect("crate is two levels under the workspace root").to_path_buf();
+
+        // ── corpus 1: where citations are read from ──────────────────────────────────────────────
+        let cited_in: Vec<PathBuf> = vec![
+            crate_root.join("src/steering.rs"),
+            crate_root.join("src/walker.rs"),
+            crate_root.join("src/collision.rs"),
+            ws.join("tests/walker_sim.rs"),
+        ];
+        // ── corpus 2: where names are resolved against ───────────────────────────────────────────
+        let mut resolve_in: Vec<PathBuf> = Vec::new();
+        let mut stack = vec![ws.join("crates"), ws.join("tests"), ws.join("src")];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    // `target/` holds generated sources; resolving against them would let a stale
+                    // build artifact vouch for a citation.
+                    if p.file_name().is_some_and(|n| n == "target") { continue; }
+                    stack.push(p);
+                } else if p.extension().is_some_and(|s| s == "rs") { resolve_in.push(p); }
+            }
+        }
+        // A silently empty corpus would make this test vacuously green — the exact failure mode it
+        // exists to prevent. Pin both ends.
+        for p in &cited_in {
+            assert!(p.is_file(), "citation corpus file is missing: {}", p.display());
+        }
+        assert!(resolve_in.len() >= cited_in.len(),
+            "resolution corpus is smaller than the citation corpus ({} files) — the source tree is \
+             not where this test thinks it is, and every check below would pass vacuously",
+            resolve_in.len());
+
+        let read = |p: &PathBuf| std::fs::read_to_string(p)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
+
+        // `fn NAME` declarations, and which of them carry a `#[test]` above them.
+        let scan_fns = |src: &str, tests_out: &mut HashSet<String>, all_out: &mut HashSet<String>| {
+            let mut pending_test = false;
+            for line in src.lines() {
+                let t = line.trim_start();
+                if t.starts_with("#[test]") { pending_test = true; continue; }
+                let Some(name) = fn_name_on(line) else { continue };
+                if pending_test { tests_out.insert(name.clone()); pending_test = false; }
+                all_out.insert(name);
+            }
+        };
+        let mut all_fns: HashSet<String> = HashSet::new();
+        let mut tests_by_file: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+        for p in &resolve_in {
+            let src = read(p);
+            let mut tests = HashSet::new();
+            scan_fns(&src, &mut tests, &mut all_fns);
+            tests_by_file.insert(p.clone(), tests);
+        }
+
+        let mut problems: Vec<String> = Vec::new();
+        for p in &cited_in {
+            let src = read(p);
+            let guard = guard_entries(&src);
+            let own_tests = tests_by_file.get(p).cloned().unwrap_or_default();
+            for (name, line) in doc_citations(&src) {
+                let where_ = format!("{}:{line}", p.file_name().unwrap().to_string_lossy());
+                if own_tests.contains(&name) {
+                    if !guard.contains(&name) {
+                        problems.push(format!(
+                            "{where_}: `{name}` is a #[test] in this file cited in a doc comment, \
+                             but no `_cited`/`_helpers` guard in this file names it — a rename would \
+                             rot the citation silently. Add it to the guard array."));
+                    }
+                } else if !all_fns.contains(&name) {
+                    if !NOT_A_FN.iter().any(|(n, _)| *n == name) {
+                        problems.push(format!(
+                            "{where_}: `{name}` is cited in a doc comment and resolves to NO fn in \
+                             the resolution corpus. Either the citation is stale, or it names \
+                             something that is not a fn — in which case add it to NOT_A_FN with a \
+                             reason."));
+                    }
+                }
+            }
+        }
+        // Dead exceptions are their own kind of stale claim.
+        let all_cited: HashSet<String> =
+            cited_in.iter().flat_map(|p| doc_citations(&read(p)).into_iter().map(|(n, _)| n)).collect();
+        for (n, _) in NOT_A_FN {
+            if !all_cited.contains(*n) {
+                problems.push(format!(
+                    "NOT_A_FN lists `{n}`, which no doc comment in the citation corpus cites any \
+                     more. Delete the exception."));
+            }
+        }
+        assert!(problems.is_empty(), "doc-comment citation scan found {} problem(s):\n  {}",
+            problems.len(), problems.join("\n  "));
+    }
+
+    /// The `NAME` in a `fn NAME` declaration on this line, if any. Deliberately dumb — it is a
+    /// lexical scan, not a parser, and both callers only need it to be right about ordinary
+    /// declarations. `&[fn()]` and `fn(f32) -> bool` do not match (no space after `fn`).
+    fn fn_name_on(line: &str) -> Option<String> {
+        let mut rest = line;
+        loop {
+            let i = rest.find("fn ")?;
+            let before_ok = i == 0 || !rest[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_');
+            let tail = &rest[i + 3..];
+            let name: String = tail.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            if before_ok && !name.is_empty() && name.starts_with(|c: char| c.is_ascii_lowercase()) {
+                return Some(name);
+            }
+            rest = &rest[i + 3..];
+        }
+    }
+
+    /// Every backticked lower-snake identifier of four or more words appearing in a doc comment,
+    /// with its 1-based line number.
+    fn doc_citations(src: &str) -> Vec<(String, usize)> {
+        let mut out = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            if !(t.starts_with("///") || t.starts_with("//!")) { continue; }
+            for chunk in t.split('`').skip(1).step_by(2) {
+                if chunk.len() > 2
+                    && chunk.starts_with(|c: char| c.is_ascii_lowercase())
+                    && chunk.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    && chunk.matches('_').count() >= 3
+                {
+                    out.push((chunk.to_string(), i + 1));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every identifier named inside a `let _cited: &[fn()] = &[ … ];` or `let _helpers … = ( … );`
+    /// block in this source — i.e. the set a rename would break the build on.
+    fn guard_entries(src: &str) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        let mut depth: Option<&str> = None;
+        for line in src.lines() {
+            let t = line.trim();
+            if depth.is_none() {
+                if t.starts_with("let _cited") { depth = Some("];"); continue; }
+                if t.starts_with("let _helpers") { depth = Some(");"); }
+                else { continue; }
+            }
+            let end = depth.unwrap();
+            let mut cur = String::new();
+            for c in line.chars() {
+                if c.is_ascii_alphanumeric() || c == '_' { cur.push(c); }
+                else { if cur.len() > 2 { out.insert(std::mem::take(&mut cur)); } else { cur.clear(); } }
+            }
+            if cur.len() > 2 { out.insert(cur); }
+            if t.ends_with(end) { depth = None; }
+        }
+        out
     }
 
     /// **A distance TIE resolves to the EARLIER segment, and that is the conservative half of the
@@ -1342,10 +1705,17 @@ mod cursor_resync_tests {
     /// **Mutation-checked by execution (#727 round 2):** with `resync_cursor` replaced by the
     /// identity function this test now FAILS (it panics on the premise counter at
     /// `moved = 0`), together with 9 others. The tests that still pass under that mutant are exactly
-    /// the ones whose assertion IS "the cursor does not move" — `resync_never_moves_the_cursor_
-    /// backwards`, `resync_never_jumps_across_blocked_geometry`, `resync_is_inert_on_degenerate_
-    /// paths`, `an_on_route_walker_is_left_alone_...`, `a_walker_cutting_a_tight_switchback_...`,
-    /// `a_resync_must_not_cross_a_wall_...`. An identity mutant satisfying a "must not move" test is
+    /// the ones whose assertion IS "the cursor does not move":
+    /// `resync_never_moves_the_cursor_backwards`,
+    /// `resync_never_jumps_across_blocked_geometry`,
+    /// `resync_is_inert_on_degenerate_paths`,
+    /// `an_on_route_walker_is_left_alone_without_consulting_geometry`,
+    /// `a_walker_cutting_a_tight_switchback_keeps_its_cursor`,
+    /// `walker`'s `a_resync_must_not_cross_a_wall_and_it_uses_the_real_clearance`.
+    /// (Round 6: those six names were previously hand-wrapped *inside* their backticks, so
+    /// `cargo doc` rendered them with a space in the middle and three of them were elided to `...`
+    /// — a citation that cannot be grepped and cannot be checked. One identifier, one line.)
+    /// An identity mutant satisfying a "must not move" test is
     /// not a gap in the test; the movement claims are the ones that had to be pinned, and are.
     #[test]
     fn resync_always_returns_the_nearest_admissible_forward_segment() {

@@ -1896,6 +1896,9 @@ mod tests {
             a_resync_jump_must_not_reset_the_no_progress_clock,
             // cited by `collision::Collision::ground_continuous` and `steering::resync_cursor`
             a_resync_must_not_cross_a_chasm_the_character_cannot_walk,
+            // added in round 6 by `steering`'s mechanical citation scan: cited in a doc comment in
+            // this file and named in no guard list.
+            cancelling_the_goto_while_loading_returns_to_idle,
         ];
     }
 
@@ -2377,8 +2380,11 @@ mod tests {
     /// (`nav.zone_cross`) because `CommandState`/`request_stop` live in a crate ABOVE this one and are
     /// not reachable here. What actually WRITES that slot in production — `drain_zone_cross` re-queuing
     /// during a load, and `request_stop`/`reset_for_zone_change` CLEARING it — is exercised through the
-    /// real drivers in the eqoxide-net test `zone_cross_queued_during_load_is_cancellable_by_stop_
-    /// and_never_leaks`. Here we only pin the guard's response: a present slot HOLDS `zone_loading`; an
+    /// real drivers in the eqoxide-net test
+    /// `zone_cross_queued_during_load_is_cancellable_by_stop_and_never_leaks`
+    /// (round 6: the name used to be hand-wrapped inside its backticks, which both broke the
+    /// `cargo doc` rendering and hid it from every grep for it).
+    /// Here we only pin the guard's response: a present slot HOLDS `zone_loading`; an
     /// absent slot retires it to `idle`.
     ///
     /// Mutation check: drop `&& !zone_cross_pending` from the reset guard in `resolve_goal` → this

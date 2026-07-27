@@ -1770,7 +1770,15 @@ impl Collision {
     /// coverage — the cursor resync simply declines to advance and the walker keeps the cursor it
     /// had — whereas widening the window widens what a resync may adopt, which is the direction
     /// every #727 safety argument runs against. Correcting it is a live-behaviour change and wants
-    /// its own measurement, not a documentation round; see the tracking issue.
+    /// its own measurement, not a documentation round; filed as **gap 4 on #734**
+    /// (`issuecomment-5097268224`, 2026-07-27), with the measured band and the reason it is being
+    /// left alone.
+    ///
+    /// ⚠️ **Correction (#727 round 6 review, B-3).** Rounds 5 and earlier ended that sentence with
+    /// "see the tracking issue" while **#734 said nothing about ascent, uphill or asymmetry** — the
+    /// pointer was dangling in the direction that mattered, and a reader of the rustdoc was told a
+    /// gap was tracked that a reader of the issue could not find. The issue is now updated and named
+    /// by number here, so the pointer is checkable instead of atmospheric.
     ///
     /// ⚠️ **Correction (#727 round 5).** Every round of this doc up to round 4 ended the paragraph
     /// above with "*the same envelope [`Self::walk_profile_ok`] applies to a planned edge*". That
@@ -1811,11 +1819,15 @@ impl Collision {
     /// ⚠️ **Correction (#727 round 5).** Rounds 3–4 wrote 2.2 as the predicate's cap without the
     /// `run/n == PROBE_SPACING` qualifier that the code block itself carried, and the pinning test
     /// chose the one hop length (24 u) that makes the qualifier vacuous. The 2.2 measurement stands
-    /// for that hop; the unqualified *claim* is withdrawn and replaced by the formula above.
+    /// for that hop; the unqualified *claim* is withdrawn and replaced by the formula above. **The
+    /// same unqualified 2.2 was written into #734** and is retracted there too (round 6) — a
+    /// correction that lands only in the file and not in the issue the file points at is how a
+    /// retracted number comes back.
     ///
     /// That is deliberate to the extent that a long walkable ramp must not be refused for being long,
-    /// and unbounded to the extent that nothing re-checks the aggregate. Disclosed in the tracking
-    /// issue with the spacing and width gaps above; the caller's hop bound
+    /// and unbounded to the extent that nothing re-checks the aggregate. Disclosed as **gap 3 on
+    /// #734** — in that issue's comments, not its body, whose "what is still not established" list is
+    /// only the spacing and width gaps and predates this one; the caller's hop bound
     /// ([`crate::steering::CURSOR_RESYNC_MAX_HOP`]) is currently the only thing limiting how much can
     /// compound.
     ///
@@ -1835,7 +1847,9 @@ impl Collision {
         let step_up = crate::traversability::PLAYER_BODY.step_up;
         let run = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
         let n = (run / PROBE_SPACING).ceil().max(1.0) as i32;
-        // One sub-segment of walkable slope plus one discrete step — `walk_profile_ok`'s envelope.
+        // One sub-segment of walkable slope plus one discrete step. NOT `walk_profile_ok`'s envelope
+        // — see the rustdoc's round-5 correction: this is the DESCENT allowance only, and the window
+        // it opens is `[prev_z - allow, prev_z + step_up]`, so uphill is capped at `step_up` alone.
         let allow = (run / n as f32) * MAX_WALK_GRADE + step_up;
         let mut prev_z = from[2];
         for i in 1..=n {
@@ -5099,6 +5113,16 @@ mod tests {
             ground_continuous_compounding_descent_is_capped_at_grade_plus_one_step_per_probe,
             ground_continuous_the_grade_cap_is_a_function_of_the_hop_length_not_a_constant,
             ground_continuous_ascent_is_capped_at_step_up_not_the_walk_grade,
+            // Added in round 6 by `steering`'s mechanical citation scan. Every one of these was
+            // cited by name in a doc comment in this file and named in no guard list — which is
+            // why the guard's ALPHABET, not just its mechanism, had to stop being hand-maintained.
+            close_roof_ceiling_is_rejected_by_headroom,
+            column_whose_only_surface_is_inverted_still_finds_a_floor,
+            floating_swimmer_is_anchored_to_the_water_surface_not_the_pool_bottom,
+            probe_qcat_column_vs_fixture,
+            qcat_pocket_nearest_floor_is_never_the_ceiling,
+            qcat_support_floor_is_visible_to_the_planner,
+            worst_case_reachable_component,
         ];
     }
 
@@ -7439,8 +7463,15 @@ mod tests {
     /// An UP-facing floor plane at height `z` over east [e0,e1] × north [-100,100] (`tri_nz > 0`, seen
     /// by `nearest_floor`). NB: the older `floor_band` helper's winding is actually *down*-facing — it
     /// is only ever used with facing-BLIND queries (`path_clear`/`line_clear`), so its facing never
-    /// mattered; these PR-D fixtures DO care about facing, so they use these explicit helpers instead
-    /// (both windings verified by `floor_and_ceiling_windings_are_as_labelled`).
+    /// mattered; these PR-D fixtures DO care about facing, so they use these explicit helpers instead.
+    ///
+    /// ⚠️ **Correction (#727 round 6 review, non-blocking 1).** This line used to end "(both windings
+    /// verified by \[a winding-sanity test\])". **No such test exists anywhere in the workspace** — it
+    /// was the "winding-sanity companion" retracted at D-2 along with the open-air-ceiling fixture
+    /// (see the RETRACTED note ~20 lines below), and the citation was left behind pointing at nothing.
+    /// So the windings here are asserted by these helpers' own `normals`/`indices`, not verified by a
+    /// test. Found by the mechanical citation scan added in this round, which is the point of it:
+    /// a hand-maintained list of citations cannot catch a citation nobody remembered to list.
     fn floor_up(z: f32, e0: f32, e1: f32) -> MeshData {
         MeshData {
             positions: vec![[-100.0, z, e0], [100.0, z, e0], [100.0, z, e1], [-100.0, z, e1]],
