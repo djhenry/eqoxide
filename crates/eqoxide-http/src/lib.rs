@@ -601,9 +601,11 @@ pub struct HttpState {
     /// it is reading is frozen FOREVER, which no age can say. Written only by
     /// `eqoxide::model::run_net_thread`; same shared-`Arc`-identity discipline as the two above.
     pub(crate) net_thread_dead: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    /// Every asset sync in flight (#715, agent-honesty). Empty = no sync is in progress; each entry
-    /// names a set and its phase. Written ONLY by the app crate's `asset_sync::sync_set_observed`
-    /// (the only way to reach `sync_set` at all), whose RAII guard removes ITS OWN entry on every
+    /// Every asset-server activity in flight (#715/#731, agent-honesty). Empty = nothing is in
+    /// progress; each entry is either a set sync (naming its set and phase) or the login that
+    /// precedes one (#731). Written ONLY by the app crate's `asset_sync::sync_set_observed` and
+    /// `asset_sync::login_observed` — the only ways to reach `sync_set` and `AssetSync::login` at
+    /// all, both of which are private to that module — whose RAII guards remove THEIR OWN entry on every
     /// exit path (success, error, panic) — so this can neither report a long-finished sync as live
     /// nor let a short nested sync blank a long one that is still running (#726 review finding 1).
     /// Read here per request, not cached, so `GET /v1/observe/asset_sync` reflects the loaders'

@@ -46,15 +46,49 @@
 //! 2. **"No sync in progress" is an EMPTY registry, not a zeroed struct.** An idle client and a
 //!    download stalled at 0/N are different situations an agent acts on differently.
 //!
+//! ## Why a LOGIN is a different kind of entry, not a phase (#731)
+//!
+//! Every `sync_set` call is preceded by an asset-server `login()` — an HTTP POST to `/auth` that
+//! can be slow, can hang, and (until #731) sat entirely outside the observed window. The endpoint
+//! answered `{"active": false}` — "no asset sync is running" — while a loader thread was blocked
+//! inside it. That is the same falsehood the registry above exists to prevent, one step earlier in
+//! the call.
+//!
+//! #731 suggested an `AssetSyncPhase::Connecting` variant with one guard spanning login *and* sync.
+//! That shape does not survive contact with the call sites: it needs a `set` name, and **three of
+//! the four logins in this client do not have one**. The model-sync worker logs in once and then
+//! serves an unbounded queue of `charmodel/<key>` sets; startup logs in once for `gamedata` *and*
+//! `gameequip`; the zone loader's single login covers both `zone/<z>` and `zonedoors/<z>`. Only
+//! `common` is 1:1. A `set` field filled in at those sites would be a guess, and a guess dressed as
+//! an answer is the defect this endpoint exists to avoid.
+//!
+//! So a login is modelled as its own [`AssetSyncWork`] variant. A login **has no set, no chunks, no
+//! bytes and no rate**, and in this shape it cannot acquire them: [`AssetSyncWork::Connecting`]
+//! carries only a free-text `purpose`, and only [`AssetSyncWork::Sync`] has a
+//! [`AssetSyncPhase`] at all. A login can therefore never masquerade as a transfer stalled at 0
+//! bytes — which would have been a subtler version of the same lie.
+//!
+//! What it DOES inherit, for free and coherently, is the staleness machinery: a login is one atomic
+//! request that publishes exactly once, at `begin`, and never ticks — structurally identical to a
+//! sync wedged in [`AssetSyncPhase::Starting`]. Its `published_age_ms` therefore grows for as long
+//! as it is blocked and feeds `stalest_published_age_ms` like any other entry, so the documented
+//! one-field wedge check reports a hung login without any special case.
+//!
 //! ## Who writes it, and when an entry is REMOVED
 //!
-//! The sole writer is [`AssetSyncGuard`], created by the app crate's
-//! `asset_sync::sync_set_observed` around every `sync_set` call — which is the *only* way to reach
-//! `sync_set` at all (it is private to that module), so an unobserved in-session sync is
-//! unrepresentable rather than merely discouraged. The guard removes its own entry in `Drop`, so
-//! the "published but never cleared" failure (an endpoint confidently reporting a long-finished
-//! sync as if it were live) cannot happen on ANY exit path — success, error return, or a panic
-//! unwinding through the loader thread.
+//! The sole writers are [`AssetSyncGuard`], created by the app crate's
+//! `asset_sync::sync_set_observed` around every `sync_set` call, and [`AssetConnectGuard`], created
+//! by `asset_sync::login_observed` around every `AssetSync::login` call. Both wrapped functions are
+//! the *only* way to reach the thing they wrap (`sync_set` and `AssetSync::login` are both private
+//! to that module), so an unobserved in-session sync OR login is unrepresentable rather than merely
+//! discouraged. Each guard removes its own entry in `Drop`, so the "published but never cleared"
+//! failure (an endpoint confidently reporting a long-finished sync as if it were live) cannot happen
+//! on ANY exit path — success, error return, or a panic unwinding through the loader thread.
+//!
+//! A login's guard additionally records an [`ConnectOutcome`], because unlike `Drop` a wrapper
+//! function CAN see the `Result` it is wrapping. That is what lets an agent tell "the login failed"
+//! from "the login succeeded and the sync has not opened yet" once the entry is gone; for set syncs
+//! the outcome remains genuinely unknown at `Drop` (see [`EndedWhat::Sync`]).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -99,7 +133,7 @@ pub struct SyncId(u64);
 pub struct AssetSyncSlots {
     live: Vec<(SyncId, AssetSyncActivity)>,
     next_id: u64,
-    last_ended: Option<EndedSync>,
+    last_ended: Option<EndedActivity>,
 }
 
 impl AssetSyncSlots {
@@ -109,7 +143,7 @@ impl AssetSyncSlots {
     }
 
     /// The most recent sync to leave the registry, or `None` if none ever has.
-    pub fn last_ended(&self) -> Option<&EndedSync> {
+    pub fn last_ended(&self) -> Option<&EndedActivity> {
         self.last_ended.as_ref()
     }
 
@@ -123,33 +157,82 @@ impl AssetSyncSlots {
 
     /// Republish `id`'s phase. A no-op if `id` is not live — a guard whose entry was somehow already
     /// removed must never be able to resurrect it as a phantom sync.
+    ///
+    /// Also a no-op for a `Connecting` entry: a login has no phase and must never acquire one. That
+    /// is belt-and-braces — [`AssetConnectGuard`] has no `tick` method to call — but the registry
+    /// should not depend on the guard type to keep an invariant it can keep itself.
     fn tick(&mut self, id: SyncId, phase: AssetSyncPhase, published_at: Instant) {
         if let Some((_, a)) = self.live.iter_mut().find(|(i, _)| *i == id) {
-            a.phase = phase;
-            a.published_at = published_at;
+            if let AssetSyncWork::Sync { phase: p, .. } = &mut a.work {
+                *p = phase;
+                a.published_at = published_at;
+            }
         }
     }
 
     /// Remove `id`'s entry — and ONLY `id`'s. `Vec::remove` preserves the relative order of the
     /// rest, so the oldest-first invariant survives a middle entry ending.
-    fn end(&mut self, id: SyncId) {
+    ///
+    /// `connect_outcome` is used only when the removed entry is a login; a set sync's outcome is
+    /// genuinely unknowable here (see [`EndedWhat::Sync`]) and the argument is discarded.
+    fn end(&mut self, id: SyncId, connect_outcome: ConnectOutcome) {
         if let Some(pos) = self.live.iter().position(|(i, _)| *i == id) {
             let (_, a) = self.live.remove(pos);
-            self.last_ended = Some(EndedSync { set: a.set, at: Instant::now() });
+            let what = match a.work {
+                AssetSyncWork::Sync { set, .. } => EndedWhat::Sync { set },
+                AssetSyncWork::Connecting { purpose } =>
+                    EndedWhat::Connect { purpose, outcome: connect_outcome },
+            };
+            self.last_ended = Some(EndedActivity { what, at: Instant::now() });
         }
     }
 }
 
-/// A sync that has left the registry. **`ended` means ended, not succeeded** — the guard's `Drop`
-/// runs identically on the success return, the error return, and a panic unwind, and it genuinely
-/// cannot tell them apart. This exists only so an agent can distinguish "a sync finished a moment
-/// ago" from "no sync has ever run in this process", which were previously the same empty answer
-/// (the known-empty vs unknown collapse, #726 review N5).
+/// An activity that has left the registry. This exists so an agent can distinguish "something
+/// finished a moment ago" from "nothing has ever run in this process", which were previously the
+/// same empty answer (the known-empty vs unknown collapse, #726 review N5).
 #[derive(Clone, Debug, PartialEq)]
-pub struct EndedSync {
-    pub set: String,
+pub struct EndedActivity {
+    pub what: EndedWhat,
     /// When it ended. An `Instant`, turned into an age at READ time — never a cached age (#343).
     pub at: Instant,
+}
+
+/// What the last-ended activity was, and — for a login only — how it went.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EndedWhat {
+    /// A `sync_set` call. **`ended` means ended, not succeeded**: [`AssetSyncGuard`]'s `Drop` runs
+    /// identically on the success return, the error return and a panic unwind, and genuinely cannot
+    /// tell them apart. Inventing a verdict here would be a confident falsehood; there is none.
+    Sync { set: String },
+    /// An asset-server login. Unlike a sync, this one DOES carry a verdict: `login_observed` wraps
+    /// the call and sees its `Result`, so the outcome is measured rather than guessed. This is what
+    /// answers "did the login fail?" after the entry is gone — without it, a failed login and a
+    /// succeeded one are the same `active: false`, which is the #731 falsehood reappearing one
+    /// moment later.
+    Connect { purpose: String, outcome: ConnectOutcome },
+}
+
+/// How a login ended. Three-valued on purpose: a `Drop` that never saw a verdict must report
+/// [`ConnectOutcome::Unknown`], not default to one of the two real answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectOutcome {
+    Succeeded,
+    Failed,
+    /// The guard was dropped without a verdict — i.e. a panic unwound through the login call. The
+    /// login neither succeeded nor returned an error, and saying either would be an invention.
+    Unknown,
+}
+
+impl ConnectOutcome {
+    /// The wire token, so the JSON encoder and this enum cannot drift apart.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConnectOutcome::Succeeded => "succeeded",
+            ConnectOutcome::Failed => "failed",
+            ConnectOutcome::Unknown => "unknown",
+        }
+    }
 }
 
 /// A read-time copy of the whole registry, so the HTTP handler holds no lock while serializing.
@@ -157,7 +240,7 @@ pub struct EndedSync {
 pub struct AssetSyncSnapshot {
     /// Oldest-started first — see [`AssetSyncSlots`].
     pub live: Vec<AssetSyncActivity>,
-    pub last_ended: Option<EndedSync>,
+    pub last_ended: Option<EndedActivity>,
 }
 
 /// Copy the registry for a reader. The clone is deliberate: every age in the response is measured
@@ -171,16 +254,13 @@ pub fn snapshot(shared: &AssetSyncShared) -> AssetSyncSnapshot {
     }
 }
 
-/// One in-flight `sync_set` call, as an observer sees it.
+/// One in-flight asset-pipeline call, as an observer sees it: either a `sync_set` or the
+/// asset-server login that precedes one (#731).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssetSyncActivity {
-    /// The asset-server set being synced, verbatim — e.g. `"zone/qeynos2"`, `"zonedoors/qeynos2"`,
-    /// `"common"`, `"charmodel/hum"`. This is what tells an observer WHICH sync a sample describes
-    /// when loaders overlap. It is NOT an identity: two syncs of the same set can be live at once,
-    /// which is why ownership is by [`SyncId`].
-    pub set: String,
-    pub phase: AssetSyncPhase,
-    /// When the `sync_set` call began. Turned into a live "has been running for N ms" at read time.
+    /// WHICH kind of work this is, and the only place its kind-specific data lives.
+    pub work: AssetSyncWork,
+    /// When the call began. Turned into a live "has been running for N ms" at read time.
     ///
     /// Unlike everything in `phase`, this yields a number that keeps moving while the sync is
     /// wedged, and it is the ONLY duration available at all in [`AssetSyncPhase::Starting`] (a hung
@@ -202,7 +282,65 @@ pub struct AssetSyncActivity {
     /// measurement but an assertion about *now*: see [`observed_download_rate`]. Stored as an
     /// `Instant` and turned into an age at READ time; an age computed at WRITE time is itself a
     /// value that goes stale, which is the same bug one level down.
+    ///
+    /// A `Connecting` entry never ticks — a login is one atomic request — so this stays at
+    /// `started_at` for its whole life and its read-time age IS the time the login has been blocked.
     pub published_at: Instant,
+}
+
+impl AssetSyncActivity {
+    /// The set this activity is syncing, or `None` for a login — which has no set (#731). An
+    /// `Option` rather than a placeholder string: a login labelled `"zone/qeynos2"` would be found
+    /// by a caller looking that set up in `syncs` and read as a transfer that has not started.
+    pub fn set(&self) -> Option<&str> {
+        match &self.work {
+            AssetSyncWork::Sync { set, .. } => Some(set),
+            AssetSyncWork::Connecting { .. } => None,
+        }
+    }
+
+    /// The sync phase, or `None` for a login — a login has no phase (#731).
+    pub fn phase(&self) -> Option<&AssetSyncPhase> {
+        match &self.work {
+            AssetSyncWork::Sync { phase, .. } => Some(phase),
+            AssetSyncWork::Connecting { .. } => None,
+        }
+    }
+
+    /// What this login is for, or `None` if this activity is a set sync.
+    pub fn connecting_purpose(&self) -> Option<&str> {
+        match &self.work {
+            AssetSyncWork::Connecting { purpose } => Some(purpose),
+            AssetSyncWork::Sync { .. } => None,
+        }
+    }
+}
+
+/// The two kinds of work the asset pipeline does, as an observer sees them.
+///
+/// Modelled as one enum rather than as `Option<set>` + `Option<phase>` fields on the struct for the
+/// reason the whole module exists: a login carrying a set, or a phase, or (worst) transfer data
+/// would be a plausible, well-formed, false answer, and an agent has no independent channel to
+/// detect one. Here it is not a rule to remember — it does not typecheck.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AssetSyncWork {
+    /// An asset-server `login()` is in flight (#731). It has no set, no phase and no transfer data,
+    /// and this variant has nowhere to put any.
+    ///
+    /// `purpose` is **free text describing what the login is for**, e.g. `"zone load: qeynos2"`. It
+    /// is deliberately NOT a set name and is deliberately not set-shaped: three of the client's four
+    /// logins serve several sets (or an unbounded queue of them), so there is no set to name, and a
+    /// name-shaped guess would be found by a caller looking a set up.
+    Connecting { purpose: String },
+    /// A `sync_set` call for one named set.
+    Sync {
+        /// The asset-server set being synced, verbatim — e.g. `"zone/qeynos2"`,
+        /// `"zonedoors/qeynos2"`, `"common"`, `"charmodel/hum"`. This is what tells an observer WHICH
+        /// sync a sample describes when loaders overlap. It is NOT an identity: two syncs of the
+        /// same set can be live at once, which is why ownership is by [`SyncId`].
+        set: String,
+        phase: AssetSyncPhase,
+    },
 }
 
 /// Where an in-flight sync is. Mirrors the producer's `asset_sync::SyncProgress` (#708) plus
@@ -337,8 +475,7 @@ impl AssetSyncGuard {
         let mut slots = lock(shared);
         let now = Instant::now();
         let id = slots.begin(AssetSyncActivity {
-            set: set.to_string(),
-            phase: AssetSyncPhase::Starting,
+            work: AssetSyncWork::Sync { set: set.to_string(), phase: AssetSyncPhase::Starting },
             started_at: now,
             published_at: now,
         });
@@ -364,7 +501,67 @@ impl AssetSyncGuard {
 
 impl Drop for AssetSyncGuard {
     fn drop(&mut self) {
-        lock(&self.shared).end(self.id);
+        // A set sync's outcome is genuinely unknown at `Drop`; the argument is discarded for this
+        // variant (see `EndedWhat::Sync`).
+        lock(&self.shared).end(self.id, ConnectOutcome::Unknown);
+    }
+}
+
+/// RAII writer for an asset-server LOGIN (#731): registers an [`AssetSyncWork::Connecting`] entry on
+/// construction and removes **its own** entry in `Drop`, exactly like [`AssetSyncGuard`].
+///
+/// A separate type rather than a mode flag on that guard, because the two support different
+/// operations and conflating them is how a login would end up carrying a download rate. This guard
+/// has **no `tick`** — a login publishes once, at `begin`, and there is nothing to republish — and
+/// it has a [`Self::finish`] the sync guard cannot have, because `login_observed` sees the login's
+/// `Result` and `sync_set_observed`'s `Drop` does not see a sync's.
+pub struct AssetConnectGuard {
+    shared: AssetSyncShared,
+    id: SyncId,
+    outcome: ConnectOutcome,
+}
+
+impl AssetConnectGuard {
+    /// Starts observing a login. `purpose` is free text (see [`AssetSyncWork::Connecting`]).
+    pub fn begin(shared: &AssetSyncShared, purpose: &str) -> Self {
+        Self::begin_stamped(shared, purpose, Instant::now())
+    }
+
+    /// [`Self::begin`] with an explicit start timestamp.
+    ///
+    /// Exists so tests can stage a login that has been BLOCKED for minutes without sleeping for
+    /// minutes — the same role, and the same caveat, as [`AssetSyncGuard::tick_stamped`]. Production
+    /// code always uses [`Self::begin`]: a login has exactly one sample and it is taken when the
+    /// call actually starts, because the whole staleness contract rests on that.
+    ///
+    /// A login never ticks, so this sets `started_at` AND `published_at` — for this variant they are
+    /// the same instant by construction.
+    pub fn begin_stamped(shared: &AssetSyncShared, purpose: &str, now: Instant) -> Self {
+        // Clock read inside the lock, for the same ordering reason as `AssetSyncGuard::begin`.
+        let mut slots = lock(shared);
+        let id = slots.begin(AssetSyncActivity {
+            work: AssetSyncWork::Connecting { purpose: purpose.to_string() },
+            started_at: now,
+            published_at: now,
+        });
+        drop(slots);
+        Self { shared: shared.clone(), id, outcome: ConnectOutcome::Unknown }
+    }
+
+    /// Record the login's verdict and end the entry. Consumes the guard, so the entry is removed by
+    /// the `Drop` that immediately follows — one removal path, not two.
+    ///
+    /// Not calling this (a panic unwinding out of the login) leaves the outcome
+    /// [`ConnectOutcome::Unknown`], which is the honest answer: the call neither returned `Ok` nor
+    /// returned `Err`.
+    pub fn finish(mut self, outcome: ConnectOutcome) {
+        self.outcome = outcome;
+    }
+}
+
+impl Drop for AssetConnectGuard {
+    fn drop(&mut self) {
+        lock(&self.shared).end(self.id, self.outcome);
     }
 }
 
@@ -372,8 +569,18 @@ impl Drop for AssetSyncGuard {
 mod tests {
     use super::*;
 
+    /// The live SET SYNCS, by set name. A login has no set, so it is not listed here — which is
+    /// what the `set()` accessor being an `Option` buys.
     fn live_sets(s: &AssetSyncShared) -> Vec<String> {
-        lock(s).live().map(|a| a.set.clone()).collect()
+        lock(s).live().filter_map(|a| a.set().map(str::to_string)).collect()
+    }
+
+    /// Every live entry, as `"set"` or `"connecting:<purpose>"` — the whole registry, not just syncs.
+    fn live_all(s: &AssetSyncShared) -> Vec<String> {
+        lock(s).live().map(|a| match &a.work {
+            AssetSyncWork::Sync { set, .. } => set.clone(),
+            AssetSyncWork::Connecting { purpose } => format!("connecting:{purpose}"),
+        }).collect()
     }
 
     fn dl(chunks_done: usize) -> AssetSyncPhase {
@@ -383,7 +590,7 @@ mod tests {
     }
 
     fn phase_of(s: &AssetSyncShared, set: &str) -> Option<AssetSyncPhase> {
-        lock(s).live().find(|a| a.set == set).map(|a| a.phase.clone())
+        lock(s).live().find(|a| a.set() == Some(set)).and_then(|a| a.phase().cloned())
     }
 
     #[test]
@@ -514,8 +721,8 @@ mod tests {
         let _g = AssetSyncGuard::begin(&s, "common");
         let slots = lock(&s);
         let a = slots.live().next().expect("a sync that has begun must be observable before its first tick");
-        assert_eq!(a.set, "common");
-        assert_eq!(a.phase, AssetSyncPhase::Starting);
+        assert_eq!(a.set(), Some("common"));
+        assert_eq!(a.phase(), Some(&AssetSyncPhase::Starting));
     }
 
     /// #726 review N5 — "nothing is syncing" and "nothing has EVER synced" were the same answer.
@@ -530,7 +737,7 @@ mod tests {
         }
         let slots = lock(&s);
         let ended = slots.last_ended().expect("a sync that ran and ended must be distinguishable from one that never ran");
-        assert_eq!(ended.set, "zone/neriakc");
+        assert_eq!(ended.what, EndedWhat::Sync { set: "zone/neriakc".into() });
     }
 
     #[test]
@@ -539,9 +746,201 @@ mod tests {
         // re-inserting a phantom entry that no guard owns and nothing will ever clear.
         let s = new_shared();
         let g = AssetSyncGuard::begin(&s, "common");
-        lock(&s).end(g.id);
+        lock(&s).end(g.id, ConnectOutcome::Unknown);
         g.tick(dl(1));
         assert!(live_sets(&s).is_empty(), "a tick after the end must not republish the sync");
+    }
+
+    // ── #731: the login window ──────────────────────────────────────────────────────────────────
+
+    /// #731, the bug itself at the registry level. A blocked `AssetSync::login()` used to leave the
+    /// registry EMPTY, so `GET /v1/observe/asset_sync` answered "no asset sync is running" while a
+    /// loader thread sat inside it. An agent polling that concludes the client is idle and healthy;
+    /// it is neither, and it has no other channel to find out.
+    #[test]
+    fn a_login_in_flight_is_observable_rather_than_reading_as_idle() {
+        let s = new_shared();
+        let _g = AssetConnectGuard::begin(&s, "zone load: qeynos2");
+        let slots = lock(&s);
+        assert_eq!(slots.live().len(), 1,
+            "a client blocked inside login() must not read as idle — that is #731");
+        let a = slots.live().next().unwrap();
+        assert_eq!(a.connecting_purpose(), Some("zone load: qeynos2"));
+    }
+
+    /// The subtler falsehood the naive fix would have introduced: a login reported through the sync
+    /// shape, i.e. as a transfer sitting at 0 bytes. It is not a transfer at all, and here it cannot
+    /// become one — `set()` and `phase()` are `None` by construction, and there is no variant field
+    /// that could hold bytes, chunks or a rate.
+    #[test]
+    fn a_login_carries_no_set_no_phase_and_no_transfer_data() {
+        let s = new_shared();
+        let _g = AssetConnectGuard::begin(&s, "common asset load");
+        let slots = lock(&s);
+        let a = slots.live().next().unwrap();
+        assert_eq!(a.set(), None,
+            "a login is not a sync of any set — naming one would be found by a caller looking that \
+             set up in `syncs` and read as a transfer that had started");
+        assert_eq!(a.phase(), None, "a login has no phase");
+        assert!(matches!(a.work, AssetSyncWork::Connecting { .. }));
+        // …and it is not listed among the SET syncs at all.
+        drop(slots);
+        assert!(live_sets(&s).is_empty());
+        assert_eq!(live_all(&s), ["connecting:common asset load"]);
+    }
+
+    /// A login never ticks, so `published_at` stays at `started_at` and its read-time age IS how
+    /// long the login has been blocked. That is what makes a hung login feed the endpoint's
+    /// `stalest_published_age_ms` with no special case.
+    #[test]
+    fn a_logins_sample_is_never_republished_so_its_age_measures_the_block() {
+        let s = new_shared();
+        let _g = AssetConnectGuard::begin(&s, "zone load: neriakc");
+        let slots = lock(&s);
+        let a = slots.live().next().unwrap();
+        assert_eq!(a.published_at, a.started_at,
+            "a login publishes exactly once, at begin — the same shape as a sync wedged in \
+             Starting, and the reason its age is a wedge signal");
+    }
+
+    /// The guard clears on every exit path, exactly like the sync guard — including the one a
+    /// hand-written "clear after the happy path" would miss.
+    #[test]
+    fn a_login_guard_clears_on_success_on_failure_and_on_a_panic() {
+        let s = new_shared();
+        AssetConnectGuard::begin(&s, "p").finish(ConnectOutcome::Succeeded);
+        assert!(live_all(&s).is_empty(), "success must clear");
+        AssetConnectGuard::begin(&s, "p").finish(ConnectOutcome::Failed);
+        assert!(live_all(&s).is_empty(), "failure must clear");
+
+        let s2 = s.clone();
+        let r = std::panic::catch_unwind(move || {
+            let _g = AssetConnectGuard::begin(&s2, "p");
+            panic!("login thread died");
+        });
+        assert!(r.is_err(), "the test must actually have panicked");
+        assert!(live_all(&s).is_empty(), "an unwind must still leave the registry honest");
+    }
+
+    /// #731's failure question: an agent must be able to tell "not started" from "failed" from
+    /// "succeeded". A failed login that simply returns the registry to empty reproduces the original
+    /// falsehood one moment later. `login_observed` sees the `Result`, so unlike a sync's `Drop` the
+    /// verdict here is MEASURED — and `Unknown` exists so a panic is not silently filed as a failure.
+    #[test]
+    fn a_finished_login_records_which_way_it_went() {
+        let s = new_shared();
+        assert!(lock(&s).last_ended().is_none(), "nothing has run: not started");
+
+        AssetConnectGuard::begin(&s, "common asset load").finish(ConnectOutcome::Failed);
+        assert_eq!(lock(&s).last_ended().unwrap().what,
+            EndedWhat::Connect { purpose: "common asset load".into(), outcome: ConnectOutcome::Failed },
+            "a failed login must be distinguishable from a successful one after the fact");
+
+        AssetConnectGuard::begin(&s, "common asset load").finish(ConnectOutcome::Succeeded);
+        assert_eq!(lock(&s).last_ended().unwrap().what,
+            EndedWhat::Connect { purpose: "common asset load".into(), outcome: ConnectOutcome::Succeeded });
+
+        // A panic unwinding out of the login: neither Ok nor Err was returned, and claiming either
+        // would be an invention.
+        let s2 = s.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _g = AssetConnectGuard::begin(&s2, "common asset load");
+            panic!("boom");
+        });
+        assert_eq!(lock(&s).last_ended().unwrap().what,
+            EndedWhat::Connect { purpose: "common asset load".into(), outcome: ConnectOutcome::Unknown },
+            "a guard dropped without a verdict must say Unknown, not default to a real answer");
+    }
+
+    /// **The universal, exhaustively.** "The endpoint never reports idle while the client is
+    /// blocked" is a *never* claim, and no number of passing live runs discharges one. So this
+    /// enumerates EVERY interleaving of three overlapping activities' begin/end — a login and two
+    /// set syncs, 90 orderings — and after every single step asserts the registry is empty if and
+    /// only if no guard is alive.
+    ///
+    /// That is the property `active` is derived from, and it covers both directions: an entry that
+    /// outlives its guard (a finished sync reported as live) and a guard whose entry is missing
+    /// (the #731 falsehood, and the #726 nested-clear one) each fail here regardless of ORDER,
+    /// which is what a fixed example test cannot say.
+    #[test]
+    fn no_interleaving_of_logins_and_syncs_can_report_idle_while_one_is_alive() {
+        // Every multiset permutation of [0,0,1,1,2,2]; the first occurrence of `k` begins activity
+        // k, the second ends it. 6!/(2!·2!·2!) = 90 sequences.
+        fn orderings() -> Vec<Vec<usize>> {
+            let mut out = Vec::new();
+            let mut cur = Vec::new();
+            let mut used = [0usize; 3];
+            fn go(cur: &mut Vec<usize>, used: &mut [usize; 3], out: &mut Vec<Vec<usize>>) {
+                if cur.len() == 6 { out.push(cur.clone()); return; }
+                for k in 0..3 {
+                    if used[k] < 2 {
+                        used[k] += 1;
+                        cur.push(k);
+                        go(cur, used, out);
+                        cur.pop();
+                        used[k] -= 1;
+                    }
+                }
+            }
+            go(&mut cur, &mut used, &mut out);
+            out
+        }
+
+        /// One live guard, either kind. `Option` so "ended" is `None` and dropping is explicit.
+        enum Held { Sync(AssetSyncGuard), Connect(AssetConnectGuard) }
+
+        let all = orderings();
+        assert_eq!(all.len(), 90, "the enumeration itself must be complete");
+        for order in all {
+            let s = new_shared();
+            let mut held: [Option<Held>; 3] = [None, None, None];
+            let mut alive = 0usize;
+            for &k in &order {
+                match held[k].take() {
+                    None => {
+                        // Activity 0 is a LOGIN; 1 and 2 are set syncs. The mix is the point: the
+                        // registry must not care which kind an entry is.
+                        held[k] = Some(if k == 0 {
+                            Held::Connect(AssetConnectGuard::begin(&s, "zone load: qeynos2"))
+                        } else {
+                            Held::Sync(AssetSyncGuard::begin(&s, &format!("set{k}")))
+                        });
+                        alive += 1;
+                    }
+                    Some(g) => {
+                        match g {
+                            Held::Sync(g) => drop(g),
+                            Held::Connect(g) => g.finish(ConnectOutcome::Succeeded),
+                        }
+                        alive -= 1;
+                    }
+                }
+                let live = lock(&s).live().len();
+                assert_eq!(live, alive,
+                    "after {order:?} step, {alive} activities are in flight but the registry lists \
+                     {live} — an agent polling now would be told the client is doing {live} things \
+                     while it is blocked in {alive}");
+                assert_eq!(live == 0, alive == 0,
+                    "`active` is derived from emptiness, so these must agree exactly: {order:?}");
+            }
+            assert_eq!(lock(&s).live().len(), 0, "everything ended: {order:?}");
+        }
+    }
+
+    /// A login and the syncs it enables share the registry, keep the oldest-first order, and own
+    /// their entries independently — the same ownership property #726 established for syncs.
+    #[test]
+    fn a_login_and_a_sync_coexist_and_neither_erases_the_other() {
+        let s = new_shared();
+        let zone = AssetSyncGuard::begin(&s, "zone/neriakc");
+        zone.tick(dl(120));
+        let login = AssetConnectGuard::begin(&s, "model-sync worker (charmodel sets)");
+        assert_eq!(live_all(&s),
+            ["zone/neriakc", "connecting:model-sync worker (charmodel sets)"]);
+        login.finish(ConnectOutcome::Succeeded);
+        assert_eq!(live_all(&s), ["zone/neriakc"],
+            "a login finishing must not erase a zone download that is still in flight");
+        assert_eq!(phase_of(&s, "zone/neriakc"), Some(dl(120)), "…nor reset its progress");
     }
 
     // ── the rate's honesty rules ────────────────────────────────────────────────────────────────

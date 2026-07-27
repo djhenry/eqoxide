@@ -166,6 +166,14 @@ pub(super) fn router() -> Router<HttpState> {
 /// finding 1). `syncs` carries every live one, oldest-started first; `active` means *at least one*
 /// sync is running, which is what the docs have always promised.
 ///
+/// **A LOGIN is an entry, and it is not a transfer (#731).** Every `sync_set` is preceded by an
+/// asset-server `login()`, which used to sit outside the observed window: a hung login answered
+/// `{"active": false}` while a loader thread was blocked inside it. It is now an entry with
+/// `phase: "connecting"` — but it carries **no `set`** (three of the client's four logins serve
+/// several sets, or an unbounded queue of them, so there is no true set to name) and **no
+/// `downloading`**. Reporting it through the transfer shape, as a download stalled at 0 bytes,
+/// would have swapped one falsehood for a subtler one.
+///
 /// Within `downloading`, `rate_bytes_per_sec` is present only when a rate can honestly be asserted;
 /// otherwise it is OMITTED (never null, never 0) and `rate_unavailable` names the rule that
 /// withheld it — `phase_too_young` under the producer's 100 ms minimum, `sample_too_stale` once the
@@ -182,19 +190,28 @@ async fn get_asset_sync(State(s): State<HttpState>) -> Json<serde_json::Value> {
 /// testable without an `HttpState`, and so the handler holds no lock while serializing.
 fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
     const SEMANTICS: &str =
-        "active:false means NO asset sync is running anywhere in this process — that is a different \
-         state from a sync sitting at zero progress, which is active:true with \
-         downloading.chunks_done:0. `syncs` lists EVERY sync in flight, oldest-started first, \
+        "active:false means NO asset-server work is running anywhere in this process — that is a \
+         different state from a sync sitting at zero progress, which is active:true with \
+         downloading.chunks_done:0. `syncs` lists EVERY activity in flight, oldest-started first, \
          because several loaders run at once (a zone download, its door set, the common set, and \
-         on-demand charmodel sets) and a short one can begin and end inside a long one; the \
-         top-level set/phase/downloading/published_age_ms/running_ms fields are a copy of syncs[0], \
-         the OLDEST-STARTED one, and they describe that sync ALONE — `set` names which. syncs[0] is \
+         on-demand charmodel sets) and a short one can begin and end inside a long one. An entry is \
+         EITHER a set sync (it has `set`, and phase starting/verifying/downloading) OR an \
+         asset-server LOGIN (phase:\"connecting\", a `connecting` object naming the free-text \
+         purpose, and NO `set` — a login serves several sets, or an unbounded queue of them, so it \
+         has no set to name and carries no bytes, chunks or rate; do not read it as a transfer at \
+         0 bytes). A login publishes once and never ticks, so its published_age_ms IS how long it \
+         has been blocked. The \
+         top-level set/phase/downloading/connecting/published_age_ms/running_ms fields are a copy of syncs[0], \
+         the OLDEST-STARTED one, and they describe that activity ALONE — `set` names which, and is \
+         ABSENT when syncs[0] is a login. syncs[0] is \
          not necessarily the sync you are waiting on (a charmodel sync begun during the previous \
          zone can outlive it), and a healthy syncs[0] says nothing about the others, so do NOT read \
          the top-level fields as the process's health. To follow a particular set, find it by name \
          in `syncs`. To ask 'is anything wedged' with one field, read \
-         stalest_published_age_ms: the largest published_age_ms over every live sync, so it is \
-         large and growing whenever ANY sync is wedged, whatever syncs[0] is doing. It is absent \
+         stalest_published_age_ms: the largest published_age_ms over every live entry INCLUDING \
+         logins, so it is \
+         large and growing whenever ANY sync is wedged OR any login is blocked, whatever syncs[0] \
+         is doing. It is absent \
          when nothing is running. Transfer data appears ONLY inside the `downloading` object, which exists \
          only in that phase, so a rate can never be read for a phase that has none. Inside \
          `downloading`, an ABSENT rate_bytes_per_sec never means zero: `rate_unavailable` says \
@@ -207,9 +224,14 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
          actually been running elapsed_secs+published_age_ms/1000. running_ms is measured at read \
          time and keeps moving even while a sync is wedged; a large and GROWING published_age_ms \
          means THAT sync is wedged, not progressing — for the process, use \
-         stalest_published_age_ms. last_ended names the most recent sync to LEAVE this list \
-         and is how 'nothing is syncing now' is told apart from 'nothing has ever synced' — it says \
-         ended, NOT succeeded: the client cannot tell a success from a failure or a panic here.";
+         stalest_published_age_ms. last_ended names the most recent activity to LEAVE this list \
+         and is how 'nothing is syncing now' is told apart from 'nothing has ever synced' (null). \
+         For a SET SYNC it carries `set` and says ended, NOT succeeded: the client cannot tell a \
+         success from a failure or a panic there. For a LOGIN it carries `connecting` with a \
+         `purpose` and an `outcome` of succeeded/failed/unknown — measured, not guessed, because \
+         the login wrapper sees the call's result; `unknown` means a panic unwound through it. So \
+         active:false with last_ended.connecting.outcome=='failed' is a FAILED login, which is a \
+         different state from an idle client that never tried.";
 
     let syncs: Vec<serde_json::Value> = snap.live.iter().map(sync_json).collect();
     let mut body = serde_json::json!({
@@ -218,10 +240,22 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
         // #726 review N5: an empty `syncs` used to be the same answer for "a sync just finished" and
         // "no sync has ever run in this process". `null` here is the honest "no sync has ended yet";
         // `ago_ms` is measured at READ time like every other age (#343).
-        "last_ended": snap.last_ended.as_ref().map(|e| serde_json::json!({
-            "set": e.set,
-            "ago_ms": e.at.elapsed().as_millis() as u64,
-        })),
+        "last_ended": snap.last_ended.as_ref().map(|e| {
+            let ago_ms = e.at.elapsed().as_millis() as u64;
+            match &e.what {
+                eqoxide_ipc::EndedWhat::Sync { set } =>
+                    serde_json::json!({ "set": set, "ago_ms": ago_ms }),
+                // #731. A login that has ended carries NO `set` (it never had one) and DOES carry a
+                // verdict, which a sync cannot: `login_observed` sees the login's `Result`, whereas
+                // the sync guard's `Drop` runs identically on success, error and unwind. Without it
+                // a failed login and a successful one are the same `active: false` — #731's
+                // falsehood reappearing a moment later.
+                eqoxide_ipc::EndedWhat::Connect { purpose, outcome } => serde_json::json!({
+                    "connecting": { "purpose": purpose, "outcome": outcome.as_str() },
+                    "ago_ms": ago_ms,
+                }),
+            }
+        }),
         "semantics": SEMANTICS,
     });
     // The process-wide wedge signal (#726 review round 2, finding 1). Derived from the ages ALREADY
@@ -265,11 +299,15 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
 
 /// The largest `published_age_ms` among the ALREADY-ENCODED `syncs` entries, or `None` if there are
 /// none. Reads the encoded array rather than the snapshot on purpose — see the call site.
+///
+/// #731: this needs no special case for a login. Every entry carries `published_age_ms`, and a
+/// login's is its whole blocked duration (it publishes once, at begin, and never ticks), so a hung
+/// login makes the documented one-field wedge check large and growing exactly like a wedged sync.
 fn syncs_encoded_max_age(body: &serde_json::Value) -> Option<u64> {
     body["syncs"].as_array()?.iter().filter_map(|s| s["published_age_ms"].as_u64()).max()
 }
 
-/// One live sync, encoded. Used for BOTH the `syncs` array and the mirrored top-level primary.
+/// One live activity, encoded. Used for BOTH the `syncs` array and the mirrored top-level primary.
 fn sync_json(a: &eqoxide_ipc::AssetSyncActivity) -> serde_json::Value {
     // Measured ONCE, here, and used for both the reported age and the rate-staleness decision. Two
     // separate `elapsed()` calls could straddle the threshold and produce a body that omits the rate
@@ -277,7 +315,6 @@ fn sync_json(a: &eqoxide_ipc::AssetSyncActivity) -> serde_json::Value {
     // contradicts its own documented rule.
     let sample_age = a.published_at.elapsed();
     let mut body = serde_json::json!({
-        "set": a.set,
         // Freshness, computed AT READ TIME (the #343 discipline — an age must never be cached).
         // Every other field here is frozen at the producer's last tick, and the producer ticks only
         // when a chunk completes: a WEDGED download leaves them all in place with nobody left to
@@ -290,7 +327,23 @@ fn sync_json(a: &eqoxide_ipc::AssetSyncActivity) -> serde_json::Value {
         "running_ms": a.started_at.elapsed().as_millis() as u64,
     });
     let obj = body.as_object_mut().expect("json! object");
-    match &a.phase {
+    let phase = match &a.work {
+        // #731. A login gets NO `set` key — it is not a sync of any set, and three of the client's
+        // four logins serve several sets (or an unbounded queue), so there is nothing true to put
+        // there. It also gets no `downloading` object, so `bytes`/`rate`/`chunks` are as
+        // unreachable here as they are in `verifying`. Reporting a login through the transfer shape
+        // — "downloading, 0 bytes" — would have replaced #731's falsehood with a subtler one.
+        eqoxide_ipc::AssetSyncWork::Connecting { purpose } => {
+            obj.insert("phase".into(), serde_json::json!("connecting"));
+            obj.insert("connecting".into(), serde_json::json!({ "purpose": purpose }));
+            return body;
+        }
+        eqoxide_ipc::AssetSyncWork::Sync { set, phase } => {
+            obj.insert("set".into(), serde_json::json!(set));
+            phase
+        }
+    };
+    match phase {
         eqoxide_ipc::AssetSyncPhase::Starting => {
             obj.insert("phase".into(), serde_json::json!("starting"));
         }
@@ -2184,6 +2237,166 @@ mod tests {
             "a live sync always has an age, so the aggregate always exists: {v}");
     }
 
+    // ── #731: the asset-server login is inside the observed window ──────────────────────────────
+
+    /// Open a LOGIN on the state's own registry — the #731 half of `begin` above.
+    fn begin_login(state: &HttpState, purpose: &str) -> eqoxide_ipc::AssetConnectGuard {
+        eqoxide_ipc::AssetConnectGuard::begin(&crate::testkit::asset_sync_slot(state), purpose)
+    }
+
+    /// #731, the bug. `AssetSync::login()` precedes every `sync_set` and sat OUTSIDE the guarded
+    /// window, so a login that is slow, hung, or retrying against an unreachable asset server made
+    /// this endpoint answer `{"active": false}` — "no asset sync is running" — while a loader thread
+    /// was blocked inside it. The HUD said "Verifying zone assets…"; the API said idle. An agent
+    /// polling this has no other channel to reality: it concludes the client is idle and healthy.
+    #[tokio::test]
+    async fn a_login_in_flight_is_not_reported_as_an_idle_client() {
+        let state = empty_state();
+        let idle = asset_sync_json_body(&state).await;
+        assert_eq!(idle["active"], serde_json::json!(false));
+
+        let _g = begin_login(&state, "zone load: qeynos2");
+        let v = asset_sync_json_body(&state).await;
+        assert_eq!(v["active"], serde_json::json!(true),
+            "the client is BLOCKED inside login() — reporting 'no asset sync is running' here is \
+             the #731 falsehood: {v}");
+        assert_eq!(v["syncs"].as_array().unwrap().len(), 1, "…and it must be listed: {v}");
+        assert_eq!(v["phase"], serde_json::json!("connecting"));
+        assert_eq!(v["connecting"]["purpose"], serde_json::json!("zone load: qeynos2"));
+        assert_ne!(idle, v, "idle and logging-in must not serialize to the same thing: {v}");
+    }
+
+    /// The subtler falsehood the NAIVE fix would have shipped. A login is not a transfer: it has no
+    /// set, no chunk count, no byte total and no rate. Reporting it through the sync shape would
+    /// make it read as a download stalled at 0 bytes — plausible, well-formed, and false, which is
+    /// the failure class this project ranks worst. Zero is a lie; absent is honest.
+    #[tokio::test]
+    async fn a_login_never_masquerades_as_a_transfer_stalled_at_zero() {
+        let state = empty_state();
+        let _g = begin_login(&state, "model-sync worker (charmodel sets)");
+        let v = asset_sync_json_body(&state).await;
+
+        let entry = &v["syncs"][0];
+        assert!(entry.get("downloading").is_none(),
+            "a login has no transfer data — the key must be ABSENT, not a zeroed object: {v}");
+        assert!(entry.get("set").is_none(),
+            "a login serves several sets (or an unbounded queue of them); naming one would be \
+             found by a caller looking that set up in `syncs`: {v}");
+        assert!(v.get("set").is_none(), "…and the same at the mirrored top level: {v}");
+
+        // Belt and braces, the same scan the phase test uses: no transfer field anywhere in the
+        // DATA at any nesting. `semantics` is prose that names them to explain them.
+        let mut data = v.clone();
+        data.as_object_mut().unwrap().remove("semantics");
+        let text = data.to_string();
+        for forbidden in ["rate_bytes_per_sec", "\"bytes\"", "chunks_done", "chunks_total",
+                          "elapsed_secs"] {
+            assert!(!text.contains(forbidden),
+                "`{forbidden}` must be unreachable for a login: {v}");
+        }
+    }
+
+    /// #731's aggregate question, with the sequence that makes it matter: a healthy sync is running
+    /// and a login has been blocked for five minutes behind it. A caller following the documented
+    /// one-field wedge check must not be told everything is fresh.
+    ///
+    /// This works with no special case because a login publishes exactly ONCE, at begin, and never
+    /// ticks — structurally identical to a sync wedged in `starting` — so its `published_age_ms` is
+    /// the whole time it has been blocked.
+    #[tokio::test]
+    async fn a_hung_login_is_visible_in_the_one_field_wedge_check() {
+        let state = empty_state();
+        // A login opened five minutes ago and still blocked.
+        let _hung = eqoxide_ipc::AssetConnectGuard::begin_stamped(
+            &crate::testkit::asset_sync_slot(&state), "zone load: neriakc", ago(300));
+        // …and a perfectly healthy sync alongside it, ticking now.
+        let sync = begin(&state, "common");
+        sync.tick(dl(140, 149, 12_000_000, 13_000));
+
+        let v = asset_sync_json_body(&state).await;
+        assert!(v["stalest_published_age_ms"].as_u64().unwrap() >= 300_000,
+            "a login blocked for five minutes must make the process-wide wedge check large — \
+             otherwise an agent reads 'healthy' while the client holds the evidence: {v}");
+
+        let login = v["syncs"].as_array().unwrap().iter()
+            .find(|s| s["phase"] == serde_json::json!("connecting"))
+            .expect("the login must be listed");
+        assert!(login["published_age_ms"].as_u64().unwrap() >= 300_000, "{v}");
+        assert!(login["running_ms"].as_u64().unwrap() >= 300_000,
+            "a login's running_ms and published_age_ms are the same duration — it publishes once \
+             and never ticks: {v}");
+    }
+
+    /// #731: "not started", "in progress", "failed" and "succeeded" must be four distinguishable
+    /// answers. A failed login that simply returns the endpoint to `active: false` reproduces the
+    /// original bug one moment later — the agent is told nothing happened.
+    ///
+    /// The verdict is available here and NOT for a set sync because the login wrapper sees the
+    /// call's `Result`, whereas the sync guard's `Drop` runs identically on success, error and a
+    /// panic unwind (#715's documented limit, unchanged).
+    #[tokio::test]
+    async fn a_failed_login_is_distinguishable_from_a_client_that_never_tried() {
+        let state = empty_state();
+
+        // NOT STARTED.
+        let never = asset_sync_json_body(&state).await;
+        assert_eq!(never["active"], serde_json::json!(false));
+        assert_eq!(never["last_ended"], serde_json::json!(null));
+
+        // IN PROGRESS.
+        let g = begin_login(&state, "common asset load");
+        let during = asset_sync_json_body(&state).await;
+        assert_eq!(during["active"], serde_json::json!(true));
+
+        // FAILED.
+        g.finish(eqoxide_ipc::ConnectOutcome::Failed);
+        let failed = asset_sync_json_body(&state).await;
+        assert_eq!(failed["active"], serde_json::json!(false),
+            "nothing is running any more, and saying otherwise would be its own lie");
+        assert_eq!(failed["last_ended"]["connecting"]["outcome"], serde_json::json!("failed"),
+            "…but an agent must be able to see WHY it is idle: {failed}");
+        assert_eq!(failed["last_ended"]["connecting"]["purpose"],
+            serde_json::json!("common asset load"));
+        assert!(failed["last_ended"].get("set").is_none(),
+            "a login has no set, so the ended record must not invent one: {failed}");
+        assert_ne!(never["last_ended"], failed["last_ended"],
+            "'never tried' and 'tried and failed' must not serialize the same: {failed}");
+
+        // SUCCEEDED — the same shape with the opposite verdict, so the field is a real reading and
+        // not a constant that happens to satisfy the assertion above.
+        begin_login(&state, "common asset load").finish(eqoxide_ipc::ConnectOutcome::Succeeded);
+        let ok = asset_sync_json_body(&state).await;
+        assert_eq!(ok["last_ended"]["connecting"]["outcome"], serde_json::json!("succeeded"),
+            "{ok}");
+        assert_ne!(ok["last_ended"], failed["last_ended"],
+            "a successful login and a failed one must not read identically: {ok}");
+    }
+
+    /// A login is one entry among many and must obey the same ownership rules — a login finishing
+    /// cannot blank a zone download still in flight, and vice versa (#726's property, extended to
+    /// the new entry kind).
+    #[tokio::test]
+    async fn a_login_finishing_does_not_erase_a_sync_that_is_still_running() {
+        let state = empty_state();
+        let zone = begin(&state, "zone/neriakc");
+        zone.tick(dl(120, 374, 10_000_000, 8_000));
+        let login = begin_login(&state, "model-sync worker (charmodel sets)");
+
+        let both = asset_sync_json_body(&state).await;
+        assert_eq!(both["syncs"].as_array().unwrap().len(), 2,
+            "a login opened during a zone download is a second activity, not a replacement: {both}");
+        assert_eq!(both["set"], serde_json::json!("zone/neriakc"),
+            "…and the oldest-started primary is still the zone download: {both}");
+
+        login.finish(eqoxide_ipc::ConnectOutcome::Succeeded);
+        let v = asset_sync_json_body(&state).await;
+        assert_eq!(v["active"], serde_json::json!(true), "{v}");
+        assert_eq!(v["set"], serde_json::json!("zone/neriakc"));
+        assert_eq!(v["downloading"]["chunks_done"], serde_json::json!(120),
+            "…with its progress intact, not reset: {v}");
+        assert_eq!(v["syncs"].as_array().unwrap().len(), 1);
+    }
+
     /// The round-2 defect was not a wrong value — it was wrong GUIDANCE, and it shipped inside the
     /// response. So the guidance is now pinned to the behaviour: every field `semantics` sends a
     /// caller to must actually exist in the body it is describing. A later change that drops or
@@ -2209,6 +2422,56 @@ mod tests {
         assert!(!semantics.contains("need not iterate"),
             "the top-level mirror describes syncs[0] alone; telling a caller otherwise is the \
              finding this test exists to keep closed: {semantics}");
+    }
+
+    /// The same both-directions pin, for the state #731 adds — because a new state that slips past
+    /// the guidance test is exactly how round 3's defect (accurate values, false advice) would come
+    /// back. A `connecting` entry has a DIFFERENT field set from a sync — no `set`, no
+    /// `downloading` — so the sync-state test above cannot cover it, and a body that documents
+    /// fields it does not serve is a lie an agent cannot detect.
+    #[tokio::test]
+    async fn the_semantics_string_and_the_body_agree_in_the_connecting_state_too() {
+        let state = empty_state();
+        let _g = begin_login(&state, "zone load: neriakc");
+        let v = asset_sync_json_body(&state).await;
+        let semantics = v["semantics"].as_str().expect("semantics is served").to_string();
+
+        // Direction 1: everything the guidance names for THIS state must be in the body.
+        for field in ["active", "syncs", "last_ended", "phase", "connecting",
+                      "published_age_ms", "running_ms", "stalest_published_age_ms"] {
+            assert!(semantics.contains(field), "semantics must document `{field}`: {semantics}");
+            assert!(v.get(field).is_some(),
+                "semantics sends the caller to `{field}`, so a connecting body must carry it: {v}");
+        }
+
+        // Direction 2: the guidance must state the two ABSENCES, because a caller who does not know
+        // `set` can be missing will read its absence as a bug or, worse, as the previous entry's.
+        assert!(semantics.contains("NO `set`") || semantics.contains("ABSENT when syncs[0] is a login"),
+            "the guidance must say a login carries no set, since the body omits it: {semantics}");
+        assert!(v["syncs"][0].get("set").is_none(), "…and it really is omitted: {v}");
+        assert!(v["syncs"][0].get("downloading").is_none(), "…as is the transfer object: {v}");
+
+        // Direction 3: the phase tag the guidance quotes must be the one the encoder emits. A
+        // rename on either side fails here rather than leaving the string recommending a value the
+        // endpoint never produces.
+        assert!(semantics.contains("connecting"), "{semantics}");
+        assert_eq!(v["syncs"][0]["phase"], serde_json::json!("connecting"), "{v}");
+
+        // Direction 4: the outcome vocabulary. The guidance promises three tokens; each must be
+        // producible, so a caller branching on them cannot hit a value that was documented but
+        // never emitted (or a value emitted but never documented).
+        for (outcome, tag) in [
+            (eqoxide_ipc::ConnectOutcome::Succeeded, "succeeded"),
+            (eqoxide_ipc::ConnectOutcome::Failed, "failed"),
+            (eqoxide_ipc::ConnectOutcome::Unknown, "unknown"),
+        ] {
+            assert!(semantics.contains(tag), "semantics must document outcome `{tag}`: {semantics}");
+            let s2 = empty_state();
+            begin_login(&s2, "p").finish(outcome);
+            let b = asset_sync_json_body(&s2).await;
+            assert_eq!(b["last_ended"]["connecting"]["outcome"], serde_json::json!(tag),
+                "the documented token `{tag}` must be the one actually served: {b}");
+        }
     }
 
     /// #598 finding 1, at the API BOUNDARY — the honesty contract must hold in the SERIALIZED body,

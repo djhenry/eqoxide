@@ -301,7 +301,16 @@ pub struct AssetSync {
 }
 
 impl AssetSync {
-    pub fn login(base: &str, username: &str, password: &str) -> anyhow::Result<Self> {
+    /// **Private on purpose (#731), for the reason `sync_set` is (#726 review N3).** [`login_observed`]
+    /// is the only way in.
+    ///
+    /// This call was the last unobserved blocking step in the asset pipeline: it precedes every
+    /// `sync_set`, it does a full HTTP round trip to `/auth`, and while it was blocked
+    /// `GET /v1/observe/asset_sync` answered `{"active": false}` — "no asset sync is running" — to an
+    /// agent that has no other channel to reality. Leaving it public and merely *documenting* that
+    /// callers should wrap it would put the property back where #726 found it: enforced by the
+    /// author's care, and quietly lost by the next call site added.
+    fn login(base: &str, username: &str, password: &str) -> anyhow::Result<Self> {
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(30))
             .build();
@@ -497,6 +506,45 @@ pub fn sync_set_observed(
         progress(p);
     })
     // `guard` drops here — on BOTH arms of the result.
+}
+
+/// Log in to the asset server, with the login itself agent-observable for its whole duration (#731).
+///
+/// This is the ONLY way to log in — [`AssetSync::login`] is private — for the same reason
+/// [`sync_set_observed`] is the only way to sync: the property that `active: false` means "nothing
+/// is running" is worth nothing if any new call site can silently opt out of it.
+///
+/// `purpose` is free text describing what this login is for (`"zone load: qeynos2"`,
+/// `"common asset load"`). It is deliberately **not** a set name and deliberately not set-shaped:
+/// three of this client's four logins serve more than one set — the model-sync worker logs in once
+/// for an unbounded queue of `charmodel/<key>` sets, startup logs in once for `gamedata` *and*
+/// `gameequip`, and the zone loader's login covers both `zone/<z>` and `zonedoors/<z>` — so there is
+/// no set to name, and a set-shaped label would be found by a caller looking that set up in `syncs`
+/// and read as a transfer that had begun. That is why #731's suggested shape (an
+/// `AssetSyncPhase::Connecting` on an entry that has a `set`, with one guard spanning login and
+/// sync) was not taken: it does not generalise past the one 1:1 call site.
+///
+/// The outcome is recorded from the `Result` this function can see, so a caller polling after the
+/// entry is gone can still tell a failed login from a successful one — otherwise both are the same
+/// `active: false` and #731's falsehood simply moves a moment later.
+pub fn login_observed(
+    base: &str,
+    username: &str,
+    password: &str,
+    observable: &crate::ipc::AssetSyncShared,
+    purpose: &str,
+) -> anyhow::Result<AssetSync> {
+    let guard = crate::ipc::AssetConnectGuard::begin(observable, purpose);
+    let r = AssetSync::login(base, username, password);
+    // `finish` consumes the guard, so the entry is removed by the `Drop` that follows — and if this
+    // line is never reached (a panic unwinding out of `login`) the same `Drop` still removes it,
+    // with the outcome left at `Unknown` rather than defaulted to a real answer.
+    guard.finish(if r.is_ok() {
+        crate::ipc::ConnectOutcome::Succeeded
+    } else {
+        crate::ipc::ConnectOutcome::Failed
+    });
+    r
 }
 
 /// Verifies a freshly-fetched manifest against its own claimed digest, downloads/reassembles its
@@ -1301,7 +1349,8 @@ mod observed_sync_tests {
     /// The sets currently reported as in flight, oldest-started first — i.e. what
     /// `GET /v1/observe/asset_sync` would list at this instant.
     fn live_sets(obs: &AssetSyncShared) -> Vec<String> {
-        crate::ipc::asset_sync::snapshot(obs).live.into_iter().map(|a| a.set).collect()
+        crate::ipc::asset_sync::snapshot(obs).live.iter()
+            .filter_map(|a| a.set().map(str::to_string)).collect()
     }
 
     #[test]
@@ -1320,13 +1369,13 @@ mod observed_sync_tests {
 
         let seen = seen.into_inner();
         assert!(!seen.is_empty(), "the slot must be populated WHILE the sync runs, not only after");
-        assert!(seen.iter().all(|a| a.set == "zone/qeynos2"),
+        assert!(seen.iter().all(|a| a.set() == Some("zone/qeynos2")),
             "every sample must name the set it describes: {seen:?}");
-        assert!(seen.iter().any(|a| matches!(a.phase, AssetSyncPhase::Downloading { .. })),
+        assert!(seen.iter().any(|a| matches!(a.phase(), Some(AssetSyncPhase::Downloading { .. }))),
             "a cold sync downloads chunks — that phase must be observable: {seen:?}");
         let last_dl = seen.iter().rev()
-            .find_map(|a| match a.phase {
-                AssetSyncPhase::Downloading { chunks_done, chunks_total, .. } => Some((chunks_done, chunks_total)),
+            .find_map(|a| match a.phase() {
+                Some(&AssetSyncPhase::Downloading { chunks_done, chunks_total, .. }) => Some((chunks_done, chunks_total)),
                 _ => None,
             })
             .expect("a downloading sample");
@@ -1386,8 +1435,8 @@ mod observed_sync_tests {
 
         let a = sampled.into_inner()
             .expect("a sync in flight must be observable even before its first progress tick");
-        assert_eq!(a.set, "zone/qeynos2");
-        assert_eq!(a.phase, AssetSyncPhase::Starting);
+        assert_eq!(a.set(), Some("zone/qeynos2"));
+        assert_eq!(a.phase(), Some(&AssetSyncPhase::Starting));
         assert!(live_sets(&obs).is_empty(), "…and cleared once it returns");
     }
 
@@ -1447,5 +1496,100 @@ mod observed_sync_tests {
              mid-download — live sets were {live:?}");
         assert!(!live.iter().any(|s| s == "charmodel/hum"),
             "…and the nested sync, which really is over, must NOT still be listed: {live:?}");
+    }
+
+    // ── #731: the LOGIN window, through the real `login_observed` against a real socket ──────────
+
+    /// Accept one connection, read the request, and hand the caller the stream WITHOUT answering —
+    /// so the client is genuinely blocked inside `AssetSync::login()`, in a real `ureq` HTTP call on
+    /// a real TCP socket. This is the live failure mode (a slow/hung/unreachable asset server)
+    /// reproduced in-process, not a mock of the registry.
+    fn hung_asset_server() -> (String, std::net::TcpListener) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!("http://{}", l.local_addr().unwrap());
+        (url, l)
+    }
+
+    /// #731, end to end. Before the fix this loop could never succeed: the registry stayed EMPTY
+    /// for the whole blocked login and `GET /v1/observe/asset_sync` answered `{"active": false}`
+    /// while the loader thread sat inside the `/auth` round trip.
+    #[test]
+    fn a_login_blocked_on_a_real_socket_is_observable_and_then_clears_with_its_verdict() {
+        use std::io::Read;
+        let (url, listener) = hung_asset_server();
+        let obs = slot();
+        let obs_for_thread = obs.clone();
+        let h = std::thread::spawn(move || {
+            login_observed(&url, "u", "p", &obs_for_thread, "zone load: qeynos2")
+        });
+
+        // The server accepts and reads the POST /auth, then says nothing. The client is now blocked.
+        let (mut stream, _) = listener.accept().expect("the client must actually connect");
+        let _ = stream.read(&mut [0u8; 4096]);
+
+        // Poll the registry the way the HTTP handler does. Bounded so a regression FAILS rather
+        // than hanging the suite.
+        let mut seen = None;
+        for _ in 0..500 {
+            if let Some(a) = crate::ipc::asset_sync::snapshot(&obs).live.into_iter().next() {
+                seen = Some(a);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let a = seen.expect(
+            "the client is BLOCKED inside login() and the registry is empty — that is #731: the \
+             endpoint answers 'no asset sync is running' while the client is stuck");
+        assert_eq!(a.connecting_purpose(), Some("zone load: qeynos2"));
+        assert_eq!(a.set(), None, "a login is not a sync of any set");
+        assert_eq!(a.phase(), None, "…and has no phase, so no bytes or rate can be read from it");
+
+        // Cut the connection: the login fails fast and the whole window must close honestly.
+        drop(stream);
+        drop(listener);
+        let r = h.join().expect("the login thread must not panic");
+        assert!(r.is_err(), "a server that hangs up must surface as an Err");
+        let snap = crate::ipc::asset_sync::snapshot(&obs);
+        assert!(snap.live.is_empty(),
+            "a finished login must stop being reported as in flight: {:?}", snap.live);
+        assert_eq!(snap.last_ended.expect("an ended login must be recorded").what,
+            crate::ipc::EndedWhat::Connect {
+                purpose: "zone load: qeynos2".into(),
+                outcome: crate::ipc::ConnectOutcome::Failed,
+            },
+            "…and a FAILED login must stay distinguishable from a successful one, or an agent \
+             polling after the fact is back to 'nothing happened'");
+    }
+
+    /// The opposite verdict on the same path, so `outcome` is a real reading of the `Result` rather
+    /// than a constant that happens to satisfy the assertion above. A minimal `/auth` reply is
+    /// enough for `AssetSync::login` to succeed.
+    #[test]
+    fn a_successful_login_records_succeeded_and_leaves_nothing_in_flight() {
+        use std::io::{Read, Write};
+        let (url, listener) = hung_asset_server();
+        let obs = slot();
+        let obs_for_thread = obs.clone();
+        let h = std::thread::spawn(move || {
+            login_observed(&url, "u", "p", &obs_for_thread, "common asset load")
+        });
+
+        let (mut stream, _) = listener.accept().expect("connect");
+        let _ = stream.read(&mut [0u8; 4096]);
+        let body = br#"{"token":"t"}"#;
+        stream.write_all(
+            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        stream.flush().unwrap();
+        drop(stream);
+
+        assert!(h.join().expect("no panic").is_ok(), "the fixture must actually authenticate");
+        let snap = crate::ipc::asset_sync::snapshot(&obs);
+        assert!(snap.live.is_empty(), "the login is over: {:?}", snap.live);
+        assert_eq!(snap.last_ended.unwrap().what, crate::ipc::EndedWhat::Connect {
+            purpose: "common asset load".into(),
+            outcome: crate::ipc::ConnectOutcome::Succeeded,
+        });
     }
 }
