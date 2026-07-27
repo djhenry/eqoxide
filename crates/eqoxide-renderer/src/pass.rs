@@ -1559,6 +1559,11 @@ pub fn encode_shadow_pass(
     // per frame to `billboards.len()`. Each resolution is a `character_model_key` (one or two
     // `str::to_uppercase()` String allocations), one or two `gpu_character_models` gets, and one
     // `anim_states` get, plus this `Vec`. The OUTPUT is unchanged — all of it is side-effect-free.
+    //
+    // What would settle it (nobody has done this): a frame-time A/B in a crowded zone with this
+    // eager resolve versus a lazy one, at a known `billboards.len()`. The missing input is how large
+    // `billboards.len()` actually gets in the field, which is exactly the open question in #748 —
+    // until that number exists, any figure here is arithmetic, not a measurement.
     let nearby: Vec<CandidateView> = scene.billboards.iter().map(|b| {
         let (key, slot) = character_model_key(&b.race, b.gender);
         CandidateView {

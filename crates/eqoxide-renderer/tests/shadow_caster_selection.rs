@@ -41,6 +41,15 @@
 //! branch (a player whose race model has not loaded). The corpus now asserts its own reach for
 //! every cell, so a future fixture edit cannot silently empty one again.
 //!
+//! **Corrected (#747 round 3):** an earlier draft of this table said every cell was "reached" while
+//! the corpus assertions behind three of the cells were computed from `cands` — the *generator* —
+//! and not from the returned plan. That is a claim about what the fixture built, and it cannot move
+//! when the *planner* stops reaching a variant, which is the only failure the assertions exist to
+//! catch. The two quantities differed measurably: 373/392/397 scenes generated a
+//! nearby `Absent`/`Static`/`Skinned`, but only 334/376/392 had the planner reach one. The struck
+//! claim is preserved here rather than deleted; all the reach counters are now derived from the
+//! plan, and `examined_nearby` reconstructs which candidates the loop actually inspected.
+//!
 //! ## What this file does NOT cover
 //!
 //! Stated as rules, not examples — the gaps are categories, not single cases:
@@ -596,6 +605,48 @@ fn old_selection(
     out
 }
 
+/// Coverage accounting for the corpus — **not** a correctness oracle.
+///
+/// Two of the reach counters below need to know which nearby candidates the planner actually
+/// *examined*, and the plan alone does not show that: a culled candidate and an `Absent` one are
+/// both no-ops, indistinguishable in the output from a candidate the loop never looked at.
+///
+/// It is recoverable, because the planner checks the bound at the **top** of its loop: the last
+/// candidate it examined is exactly the one that produced the final step, and everything after that
+/// in nearest-first order was never inspected. If the plan did not fill the budget, the loop ran to
+/// the end and everything was examined.
+///
+/// This restates the ordering rule a third time (the planner, `old_selection`, here), so it is
+/// **self-checked on every scene**: the planner's own selections must appear in this order, as a
+/// subsequence. If it ever drifts from the planner, that assertion fires instead of the counts
+/// quietly going wrong. Correctness is graded by the differential, never by this.
+fn examined_nearby(cands: &[Cand], light: [f32; 3], got: &[ShadowCasterStep]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..cands.len()).collect();
+    order.sort_by(|&a, &b| {
+        dist2_to(cands[a].pos, light)
+            .partial_cmp(&dist2_to(cands[b].pos, light))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let sel = picked(got);
+    let mut it = order.iter();
+    for i in &sel {
+        assert!(it.any(|o| o == i), "reach accounting drifted from the planner's ordering");
+    }
+
+    if got.len() < SHADOW_CASTER_SLOTS {
+        return order; // the bound was never hit, so the loop ran to the end of the order
+    }
+    let last = *sel.last().expect("a budget-filling plan must end on a nearby caster");
+    let cut = order.iter().position(|&i| i == last).expect("a selected index must be in the order");
+    order.truncate(cut + 1);
+    order
+}
+
+fn dist2_to(p: [f32; 3], c: [f32; 3]) -> f32 {
+    (p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2)
+}
+
 /// Deterministic LCG — a fixed corpus, so a failure is reproducible from the seed alone.
 struct Rng(u64);
 impl Rng {
@@ -619,11 +670,28 @@ impl Rng {
 /// four decisions are pinned exhaustively at their boundaries by the tests above; this catches
 /// interaction bugs between them.
 ///
-/// **Every property this corpus is relied on for is asserted, not assumed.** A pseudo-random corpus
-/// only covers what it happens to generate, and an unrelated edit to the generator silently moves
-/// the whole stream — that is not hypothetical, it happened while fixing #747's B1 (adding the
-/// absent-player arm shifted the stream and the tie that was killing M14 vanished). Hence the reach
-/// assertions at the bottom: truncation, culling, the clip guard, the kind × path matrix, and ties.
+/// **The reach counters read the planner's output, never the generator.** A counter computed from
+/// `cands` states what the fixture built; it cannot move when the *planner* stops reaching a
+/// variant, which is the only thing these exist to catch. Measured before this was fixed:
+/// 373/392/397 scenes *generated* a nearby `Absent`/`Static`/`Skinned`, but only 334/376/392 had the
+/// planner *reach* one — the loop breaks at the bound and skips the rest of the order.
+///
+/// **The thresholds below are smoke alarms, not safeguards — do not tighten them.** They sit far
+/// under the observed values on purpose. What actually protects the sort-stability mutant (`sort_by`
+/// → `sort_unstable_by`) is the by-construction tie *generation* above, not the `saw_ties` floor:
+/// #747's round-2 review measured that cutting tie generation to ~one pair in half the scenes drops
+/// tie coverage by more than half (390 → 185 scenes generating a tie, 377 → 90 reaching one) and the
+/// mutant is *still* killed. A threshold pinned at observed-minus-epsilon would buy no grading power
+/// and would make the test flaky under unrelated generator edits. These fail loudly if a future edit
+/// empties a category outright, and that is their whole job.
+///
+/// Observed at the current seed, for reference and not as targets: truncation 80, cull 317, clip
+/// guard 391, ties 369, and the matrix cells 98/45/95/162 (player) and 334/376/392 (nearby).
+///
+/// The reason they are needed at all: a pseudo-random corpus only covers what it happens to
+/// generate, and an unrelated edit to the generator silently moves the whole stream — not
+/// hypothetical, it happened while fixing #747's B1 (adding the absent-player arm shifted the stream
+/// and the incidental tie that was killing that mutant vanished).
 #[test]
 fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
     let mut rng = Rng(0x5EED_740);
@@ -634,10 +702,17 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
     // BOTH paths, because the planner writes the slot bookkeeping out once per path and either copy
     // can rot alone. This is asserted rather than reasoned: the corpus used to reach
     // `Absent` only on the nearby path, and the player-path `Absent` arm had no coverage at all.
+    //
+    // EVERY counter here is computed from `got` — the planner's output — or from
+    // `examined_nearby(…)`, which is derived from `got` and self-checked against it. None of them
+    // read `cands`. A counter computed from the generator asserts what the FIXTURE produced and is
+    // structurally incapable of moving when the PLANNER stops reaching a variant, which is the
+    // exact loss these exist to catch. The two quantities already differed measurably before this
+    // was fixed (nearby/Absent: 373 generated vs 334 reached).
     let (mut saw_player_none, mut saw_player_absent) = (0usize, 0usize);
     let (mut saw_player_static, mut saw_player_skinned) = (0usize, 0usize);
     let (mut saw_nearby_absent, mut saw_nearby_static, mut saw_nearby_skinned) = (0usize, 0usize, 0usize);
-    let (mut saw_ties, mut scene_ties) = (0usize, 0usize);
+    let mut saw_ties = 0usize;
 
     for scene in 0..400 {
         // Every 5th scene is DENSE: a crowded zone where every candidate is comfortably inside the
@@ -659,13 +734,11 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
             // property is one an unrelated fixture edit silently deletes, and that is exactly what
             // happened: adding the absent-player arm below shifted the RNG stream and M14 went from
             // killed to surviving. `saw_ties` asserts the coverage rather than hoping for it.
-            let tie = k > 0 && rng.range(4) == 0;
-            let pos = if tie {
+            let pos = if k > 0 && rng.range(4) == 0 {
                 cands[k - 1].pos
             } else {
                 [rng.coord(half), rng.coord(half), rng.coord(half)]
             };
-            if tie { scene_ties += 1; }
             cands.push(match rng.range(10) {
                 0 => Cand::absent(pos),
                 1 | 2 => Cand::statik(pos),
@@ -682,11 +755,6 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
                 }
             });
         }
-        if scene_ties > 0 { saw_ties += 1; }
-        scene_ties = 0;
-        if cands.iter().any(|c| matches!(c.kind, ShadowModelKind::Absent)) { saw_nearby_absent += 1; }
-        if cands.iter().any(|c| matches!(c.kind, ShadowModelKind::Static)) { saw_nearby_static += 1; }
-        if cands.iter().any(|c| matches!(c.kind, ShadowModelKind::Skinned { .. })) { saw_nearby_skinned += 1; }
         let ppos = |rng: &mut Rng| [rng.coord(player_half), rng.coord(player_half), rng.coord(player_half)];
         // All four player states, including `Absent` — the corpus originally never built an absent
         // player, which left that production branch with zero coverage of any kind.
@@ -696,12 +764,6 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
             4 => Some(Cand::absent(ppos(&mut rng))),
             _ => Some(Cand::playing(ppos(&mut rng), 4, rng.range(6) as usize, 0.5)),
         };
-        match player.as_ref().map(|p| p.kind) {
-            None                             => saw_player_none += 1,
-            Some(ShadowModelKind::Absent)    => saw_player_absent += 1,
-            Some(ShadowModelKind::Static)    => saw_player_static += 1,
-            Some(ShadowModelKind::Skinned { .. }) => saw_player_skinned += 1,
-        }
         let light = [rng.coord(half), rng.coord(half), rng.coord(half)];
         let player_pos = ppos(&mut rng);
 
@@ -712,36 +774,103 @@ fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
             "scene {} ({} candidates) diverged from the pre-#740 selection loops", scene, n,
         );
 
-        // Corpus-reach accounting: a differential that never reaches the interesting states is a
-        // differential over the empty set.
+        // ── Corpus-reach accounting ─────────────────────────────────────────────────────────────
+        // A differential that never reaches the interesting states is a differential over the empty
+        // set. Every counter below reads the PLANNER's output, never `cands`; see the declarations.
+        let examined = examined_nearby(&cands, light, &got);
+
         if got.len() == SHADOW_CASTER_SLOTS { saw_truncation += 1; }
-        if got.iter().filter(|s| matches!(s.caster, ShadowCasterRef::Nearby(_))).count() < n {
-            saw_cull += 1;
-        }
-        if got.iter().any(|s| matches!(s.draw, ShadowCasterDraw::Skinned { pose: ShadowPose::BindPose, .. })) {
-            saw_bind_fallback += 1;
+
+        // A real `entity_in_view` rejection *inside the loop*. The previous form
+        // (`nearby steps < n`) also counted `Absent` candidates and truncation as "culls", which
+        // made it near-vacuous — 397 of 400 scenes — while its message said "culled".
+        if examined.iter().any(|&i| !in_view(cands[i].pos, player_pos)) { saw_cull += 1; }
+
+        // The clip guard FIRING, not merely a bind pose: a caster that had an animation state and
+        // was still bind-posed. `Cand::skinned` has no anim state and bind-poses through the `_ =>`
+        // arm without ever evaluating `idx < clip_count`.
+        let anim_of = |s: &ShadowCasterStep| match s.caster {
+            ShadowCasterRef::Player    => player.as_ref().and_then(|p| p.anim),
+            ShadowCasterRef::Nearby(i) => cands[i].anim,
+        };
+        if got.iter().any(|s| {
+            matches!(s.draw, ShadowCasterDraw::Skinned { pose: ShadowPose::BindPose, .. })
+                && anim_of(s).is_some()
+        }) { saw_bind_fallback += 1; }
+
+        // A tie the planner actually SAW: two selected casters equidistant from the light. A tie
+        // among candidates the loop never reached cannot discriminate the sort.
+        let mut sel_d: Vec<f32> = picked(&got).iter().map(|&i| dist2_to(cands[i].pos, light)).collect();
+        sel_d.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if sel_d.windows(2).any(|w| w[0] == w[1]) { saw_ties += 1; }
+
+        // The variant × path matrix. `Absent` emits no step on either path, so it is observed as
+        // "examined and in view but absent from the plan" (nearby) and "a player was supplied and
+        // produced no step" (player) — both still statements about the planner, not the fixture.
+        if examined.iter().any(|&i| {
+            matches!(cands[i].kind, ShadowModelKind::Absent) && in_view(cands[i].pos, player_pos)
+        }) { saw_nearby_absent += 1; }
+        if got.iter().any(|s| matches!(s.caster, ShadowCasterRef::Nearby(_))
+            && matches!(s.draw, ShadowCasterDraw::Static)) { saw_nearby_static += 1; }
+        if got.iter().any(|s| matches!(s.caster, ShadowCasterRef::Nearby(_))
+            && matches!(s.draw, ShadowCasterDraw::Skinned { .. })) { saw_nearby_skinned += 1; }
+
+        match (player.as_ref(), got.iter().find(|s| s.caster == ShadowCasterRef::Player)) {
+            (None, _)       => saw_player_none += 1,
+            (Some(_), None) => saw_player_absent += 1, // supplied, planned nothing → the Absent arm
+            (Some(_), Some(s)) if matches!(s.draw, ShadowCasterDraw::Static) => saw_player_static += 1,
+            (Some(_), Some(_)) => saw_player_skinned += 1,
         }
     }
 
-    assert!(saw_truncation >= 60, "corpus reached the slot bound in only {} scenes", saw_truncation);
-    assert!(saw_cull >= 150, "corpus culled in only {} scenes", saw_cull);
-    assert!(saw_bind_fallback >= 150, "corpus hit the clip guard in only {} scenes", saw_bind_fallback);
+    // Floors, not targets — see this test's doc comment. Each message names the object it counts,
+    // because the round-2 review of #747 found three of these saying "reached" while counting what
+    // the generator built.
+    assert!(
+        saw_truncation >= 60,
+        "the returned plan filled all {} slots in only {} of 400 scenes",
+        SHADOW_CASTER_SLOTS, saw_truncation,
+    );
+    assert!(
+        saw_cull >= 150,
+        "only {} of 400 scenes had the planner examine a candidate and reject it on `entity_in_view` \
+         (candidates past the bound are not examined and do not count)", saw_cull,
+    );
+    assert!(
+        saw_bind_fallback >= 150,
+        "only {} of 400 scenes produced a bind-posed step for a caster that HAD an animation state \
+         — i.e. the #692/#694 clip guard actually firing, not a no-anim bind pose", saw_bind_fallback,
+    );
     assert!(
         saw_ties >= 150,
-        "corpus contained equidistant candidates in only {} scenes — this is the only thing that \
-         discriminates `sort_by` from `sort_unstable_by` anywhere in this file", saw_ties,
+        "only {} of 400 scenes had two SELECTED casters equidistant from the light — a tie among \
+         candidates the planner never reached cannot discriminate `sort_by` from `sort_unstable_by`, \
+         and that discrimination exists nowhere else in this file except \
+         `equidistant_casters_keep_input_order`", saw_ties,
     );
 
-    // The variant × path matrix, asserted. A variant that stops being generated on either path is a
-    // silent loss of coverage for a live production branch, not a harmless corpus drift.
+    // The variant × path matrix, asserted against the PLAN. A variant the planner stops reaching on
+    // either path is a silent loss of coverage for a live production branch, not harmless corpus
+    // drift. `Absent` emits nothing, so its two cells are "examined, in view, and absent from the
+    // plan" (nearby) and "a player was supplied and produced no step" (player).
     for (label, n) in [
         ("player/None", saw_player_none), ("player/Absent", saw_player_absent),
         ("player/Static", saw_player_static), ("player/Skinned", saw_player_skinned),
         ("nearby/Absent", saw_nearby_absent), ("nearby/Static", saw_nearby_static),
         ("nearby/Skinned", saw_nearby_skinned),
     ] {
-        assert!(n >= 20, "corpus reached {} in only {} of 400 scenes", label, n);
+        assert!(n >= 20, "the planner reached {} in only {} of 400 scenes", label, n);
     }
+
+    // NOT asserted, deliberately: that some truncated scene truncates a MIXED static/skinned
+    // population — the condition that stops the documented-dead `j_slot` guard from masking a
+    // deleted `u_slot` bound (see `selection_is_bounded_at_exactly_shadow_caster_slots`). Measured
+    // here: 80 of 80 truncating scenes are mixed and 0 are all-skinned, because a truncating scene
+    // draws ~64+ candidates that are each static with probability ~0.2 — all-skinned has
+    // probability ~0.8^64 ≈ 6e-7. That is the law of large numbers, not a coincidence one edit can
+    // delete, and the mixed-fixture bound test above is the primary grader for it (this corpus is
+    // redundancy). Asserting every property merely *relied on* would grow this test without
+    // grading anything; the criterion for adding one is unasserted AND fragile.
 }
 
 // ── 6. Call-site pin (source text, not semantics) ───────────────────────────────────────────────
