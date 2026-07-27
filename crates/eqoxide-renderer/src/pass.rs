@@ -232,6 +232,194 @@ pub const ENTITY_DRAW_DIST: f32 = 500.0;
 /// nameplates cull on the exact same distance+frustum test as models (#177).
 pub const ENTITY_CULL_MARGIN: f32 = 0.5;
 
+// ── Shadow caster SELECTION (#740) ───────────────────────────────────────────────────────────────
+//
+// `encode_shadow_pass` decides, per frame, which entities make it into the shadow map: the player,
+// then the nearby characters nearest-first, culled to the view frustum and bounded by
+// `SHADOW_CASTER_SLOTS`, each posed either at its current animation clip or at bind pose. Those
+// four decisions were inline in the pass until #740 and therefore unreachable from any test:
+// `encode_shadow_pass` takes `&EqRenderer` + `&mut wgpu::CommandEncoder`, and neither
+// `wgpu::Device` nor `wgpu::Queue` implements `Default` or has any non-adapter constructor
+// (wgpu 22 has no `noop` backend), so an integration test cannot build the arguments at all.
+// The extraction below is the same shape #721 used for the instanced draws: a pure planner over a
+// device-free trait, graded in tests/shadow_caster_selection.rs.
+
+/// The model resolved for a shadow-caster candidate, reduced to what SELECTION reads. The real
+/// `GpuModel` is unconstructible in a test (it owns `wgpu::Buffer`s); selection only ever asks
+/// "skinned or static, and how many clips does the skin have".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowModelKind {
+    Skinned { clip_count: usize },
+    Static,
+    /// No model loaded for this race/gender — the candidate casts nothing and consumes no slot.
+    Absent,
+}
+
+/// How a selected skinned caster is posed for the depth pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShadowPose {
+    /// Evaluate the skin at this clip/time.
+    Clip { idx: usize, time: f32 },
+    /// Fall back to the rest pose. **This is the #692/#694 guard's output**: the bind-pose sentinel
+    /// is `clip_idx = usize::MAX`, and a `clip_idx` carried over from a different model can exceed
+    /// the current skin's clip count, so an unguarded `evaluate` would index out of range.
+    BindPose,
+}
+
+/// What a selected caster draws as. Static casters need no joint palette, so they consume a
+/// `shadow_uniform_pool` slot but not a `shadow_joint_pool` slot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShadowCasterDraw {
+    Skinned { j_slot: usize, pose: ShadowPose },
+    Static,
+}
+
+/// Which candidate a step selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowCasterRef {
+    /// The local player (entity id 0), selected before the nearby loop and never frustum-culled.
+    Player,
+    /// Index into the `nearby` slice the plan was built from — NOT the post-sort position, so the
+    /// caller can index its own unsorted data with it.
+    Nearby(usize),
+}
+
+/// One selected shadow caster, in the order `encode_shadow_pass` writes and draws it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShadowCasterStep {
+    pub caster: ShadowCasterRef,
+    /// `shadow_uniform_pool` index for this caster's model matrix.
+    pub u_slot: usize,
+    pub draw:   ShadowCasterDraw,
+}
+
+/// The device-free slice of a shadow-caster candidate that SELECTION reads. `encode_shadow_pass`
+/// implements it over `(&Billboard, Option<&GpuModel>)`; tests implement it on a plain struct.
+pub trait ShadowCasterCandidate {
+    /// World position — the sort key (distance to the light center) and the frustum-cull input.
+    fn pos(&self) -> [f32; 3];
+    fn model_kind(&self) -> ShadowModelKind;
+    /// This entity's animation state as `(clip_idx, time)`, or `None` if it has none.
+    fn anim_state(&self) -> Option<(usize, f32)>;
+}
+
+/// **The #692/#694 guard.** Picks the pose for a skinned caster: its live clip if that clip index
+/// is actually in range for *this* skin, otherwise the rest pose.
+///
+/// `clip_count != 0` is redundant with `idx < clip_count` (no `usize` is less than 0) and is kept
+/// only because the pass wrote both halves; `redundant_is_empty_half_of_the_guard_is_provably_dead`
+/// in tests/shadow_caster_selection.rs pins that redundancy rather than leaving it as folklore.
+pub fn shadow_pose_for(anim: Option<(usize, f32)>, clip_count: usize) -> ShadowPose {
+    match anim {
+        Some((idx, time)) if clip_count != 0 && idx < clip_count => ShadowPose::Clip { idx, time },
+        _ => ShadowPose::BindPose,
+    }
+}
+
+/// Selects the frame's shadow casters: player first, then the nearby candidates **nearest-first to
+/// `light_center`**, dropping anything outside the entity frustum/distance cull, until
+/// `SHADOW_CASTER_SLOTS` uniform slots are spent.
+///
+/// Returns steps in write/draw order with their pool slots already assigned, so the pass has no
+/// selection decision left to make. Allocates: the nearest-first sort needs an owned index order
+/// (unlike [`plan_instanced_shadow_draws`], which is lazy).
+///
+/// `model_kind()` is called only for candidates that survive the cull, matching the pre-#740 order
+/// of work.
+pub fn plan_shadow_casters<C: ShadowCasterCandidate>(
+    player:       Option<&C>,
+    nearby:       &[C],
+    light_center: [f32; 3],
+    player_pos:   [f32; 3],
+    view_proj:    [[f32; 4]; 4],
+) -> Vec<ShadowCasterStep> {
+    use crate::renderer::SHADOW_CASTER_SLOTS;
+
+    let mut steps: Vec<ShadowCasterStep> = Vec::new();
+    let mut u_slot = 0usize;
+    let mut j_slot = 0usize;
+
+    // ── Player (id 0): always selected when it has a model; no cull, no bound (it is first). ──
+    if let Some(p) = player {
+        match p.model_kind() {
+            ShadowModelKind::Skinned { clip_count } => {
+                let pose = shadow_pose_for(p.anim_state(), clip_count);
+                steps.push(ShadowCasterStep {
+                    caster: ShadowCasterRef::Player,
+                    u_slot,
+                    draw: ShadowCasterDraw::Skinned { j_slot, pose },
+                });
+                u_slot += 1;
+                j_slot += 1;
+            }
+            ShadowModelKind::Static => {
+                steps.push(ShadowCasterStep {
+                    caster: ShadowCasterRef::Player,
+                    u_slot,
+                    draw: ShadowCasterDraw::Static,
+                });
+                u_slot += 1;
+            }
+            ShadowModelKind::Absent => {}
+        }
+    }
+
+    // ── Nearby characters, nearest-first to the light center, bounded ────────────────────────
+    let dist2 = |p: [f32; 3]| {
+        (p[0] - light_center[0]).powi(2)
+            + (p[1] - light_center[1]).powi(2)
+            + (p[2] - light_center[2]).powi(2)
+    };
+    let mut order: Vec<usize> = (0..nearby.len()).collect();
+    // Stable, like the pre-#740 `Vec<&Billboard>` sort: equidistant candidates keep spawn order.
+    order.sort_by(|&a, &b| {
+        dist2(nearby[a].pos())
+            .partial_cmp(&dist2(nearby[b].pos()))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for i in order {
+        if u_slot >= SHADOW_CASTER_SLOTS {
+            break;
+        }
+        let c = &nearby[i];
+        if !crate::camera::entity_in_view(
+            c.pos(), player_pos, view_proj, ENTITY_DRAW_DIST, ENTITY_CULL_MARGIN,
+        ) {
+            continue;
+        }
+        match c.model_kind() {
+            ShadowModelKind::Skinned { clip_count } => {
+                // Unreachable in practice (`j_slot <= u_slot` always, and `u_slot <
+                // SHADOW_CASTER_SLOTS` was just checked), kept because the pre-#740 pass wrote it.
+                // `joint_slots_never_outrun_uniform_slots` pins the invariant that makes it dead.
+                if j_slot >= SHADOW_CASTER_SLOTS {
+                    continue;
+                }
+                let pose = shadow_pose_for(c.anim_state(), clip_count);
+                steps.push(ShadowCasterStep {
+                    caster: ShadowCasterRef::Nearby(i),
+                    u_slot,
+                    draw: ShadowCasterDraw::Skinned { j_slot, pose },
+                });
+                u_slot += 1;
+                j_slot += 1;
+            }
+            ShadowModelKind::Static => {
+                steps.push(ShadowCasterStep {
+                    caster: ShadowCasterRef::Nearby(i),
+                    u_slot,
+                    draw: ShadowCasterDraw::Static,
+                });
+                u_slot += 1;
+            }
+            ShadowModelKind::Absent => {}
+        }
+    }
+
+    steps
+}
+
 /// Vestigial: this used to HIDE an armor mesh whose exact material+variant texture was
 /// missing (e.g. the variant-03 main chest torso for an armor material that only ships
 /// variants 01/02). But the chest variant pieces are DISJOINT (zero shared verts), so
@@ -1303,7 +1491,6 @@ pub fn encode_shadow_pass(
     scene:        &SceneState,
     light_center: [f32; 3],
 ) {
-    use crate::renderer::SHADOW_CASTER_SLOTS;
     use crate::models::{race_to_archetype, character_model_key, archetype_scale, target_height_for,
                         archetype_correction, humanoid_placement};
     use crate::gpu::{EntityUniform, GpuModel};
@@ -1315,8 +1502,6 @@ pub fn encode_shadow_pass(
     let id4 = [[1f32,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]];
 
     let mut casters: Vec<Caster> = Vec::new();
-    let mut u_slot = 0usize; // shadow_uniform_pool index
-    let mut j_slot = 0usize; // shadow_joint_pool index
 
     // Write a padded 128-joint palette to shadow_joint_pool[slot], returning nothing.
     let write_joints = |slot: usize, mats: &[[[f32;4];4]]| {
@@ -1329,88 +1514,119 @@ pub fn encode_shadow_pass(
             bytemuck::bytes_of(&EntityUniform { model: mat, tint: [1.0; 4] }));
     };
 
-    // ── Player (id 0) ───────────────────────────────────────────────────────
-    if !scene.player_race.is_empty() {
-        let archetype = race_to_archetype(&scene.player_race);
-        match r.character_model_for(&scene.player_race, scene.player_gender) {
-            Some(GpuModel::Skinned(model)) => {
-                // #694 hardening: same guard as the NPC shadow-caster branch below (~line 1165) —
-                // `!clips.is_empty()` alone does not bound `clip_idx`, and the #692/#694 bind-pose
-                // sentinel is `usize::MAX`, which would index out of range without this check.
-                let matrices = match r.anim_states.get(&0) {
-                    Some(s) if !model.skin.clips.is_empty() && s.clip_idx < model.skin.clips.len() =>
-                        model.skin.evaluate(s.clip_idx, s.time),
-                    _ => model.skin.bind_pose(),
-                };
-                write_joints(j_slot, &matrices);
-                let target = target_height_for(&scene.player_race, archetype);
-                let p = humanoid_placement(model.true_height, model.feet_offset, target);
-                let mat = crate::camera::entity_model_matrix_heading(
-                    scene.player_pos, scene.player_heading, p.visual_scale, p.mesh_scale,
-                    [0.0, 0.0], true, 0.0, archetype_correction(archetype));
-                write_model(u_slot, mat);
-                casters.push(Caster::Skinned { model, u_slot, j_slot });
-                u_slot += 1; j_slot += 1;
+    // ── SELECTION ───────────────────────────────────────────────────────────
+    //
+    // Which entities cast this frame — nearest-first order, the frustum/distance cull, the
+    // `SHADOW_CASTER_SLOTS` bound, the pool-slot assignment, and the #692/#694 clip guard — is
+    // decided by `plan_shadow_casters` (#740), which is device-free and unit tested in
+    // tests/shadow_caster_selection.rs (with a differential pin against the pre-#740 loops in the
+    // same file). Nothing below this point makes a selection decision: it turns each planned step
+    // into a matrix + buffer write. If you find yourself adding a condition here, it belongs in
+    // the planner.
+    /// A candidate's selection inputs, with its `GpuModel` resolved (a pure `HashMap` get).
+    struct CandidateView<'a> {
+        pos:   [f32; 3],
+        model: Option<&'a GpuModel>,
+        anim:  Option<(usize, f32)>,
+    }
+    impl ShadowCasterCandidate for CandidateView<'_> {
+        fn pos(&self) -> [f32; 3] { self.pos }
+        fn model_kind(&self) -> ShadowModelKind {
+            match self.model {
+                Some(GpuModel::Skinned(m)) =>
+                    ShadowModelKind::Skinned { clip_count: m.skin.clips.len() },
+                Some(GpuModel::Static(_))  => ShadowModelKind::Static,
+                None                       => ShadowModelKind::Absent,
             }
-            Some(GpuModel::Static(model)) => {
-                let arch_scale   = archetype_scale(archetype);
-                let visual_scale = 2.0 * model.y_extent * arch_scale;
-                let mat = crate::camera::entity_model_matrix_heading(
-                    scene.player_pos, scene.player_heading, visual_scale, arch_scale,
-                    [model.x_center, model.z_center], true, model.y_bottom, archetype_correction(archetype));
-                write_model(u_slot, mat);
-                casters.push(Caster::Static { model, u_slot });
-                u_slot += 1;
-            }
-            None => {}
         }
+        fn anim_state(&self) -> Option<(usize, f32)> { self.anim }
     }
 
-    // ── Nearby character casters (nearest-first, bounded) ────────────────────
-    let pp = light_center;
-    let mut order: Vec<&crate::scene::Billboard> = scene.billboards.iter().collect();
-    order.sort_by(|a, b| {
-        let da = (a.pos[0]-pp[0]).powi(2) + (a.pos[1]-pp[1]).powi(2) + (a.pos[2]-pp[2]).powi(2);
-        let db = (b.pos[0]-pp[0]).powi(2) + (b.pos[1]-pp[1]).powi(2) + (b.pos[2]-pp[2]).powi(2);
-        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    let player_view = (!scene.player_race.is_empty()).then(|| CandidateView {
+        pos:   scene.player_pos,
+        model: r.character_model_for(&scene.player_race, scene.player_gender),
+        anim:  r.anim_states.get(&0).map(|s| (s.clip_idx, s.time)),
     });
-    for b in order {
-        if u_slot >= SHADOW_CASTER_SLOTS { break; }
-        if !crate::camera::entity_in_view(b.pos, scene.player_pos, r.last_view_proj,
-                                          ENTITY_DRAW_DIST, ENTITY_CULL_MARGIN) { continue; }
-        let archetype = race_to_archetype(&b.race);
+    let nearby: Vec<CandidateView> = scene.billboards.iter().map(|b| {
         let (key, slot) = character_model_key(&b.race, b.gender);
-        match r.model_by_key(key, slot) {
-            Some(GpuModel::Skinned(model)) => {
-                if j_slot >= SHADOW_CASTER_SLOTS { continue; }
-                let matrices = match r.anim_states.get(&b.id) {
-                    Some(s) if !model.skin.clips.is_empty() && s.clip_idx < model.skin.clips.len() =>
-                        model.skin.evaluate(s.clip_idx, s.time),
-                    _ => model.skin.bind_pose(),
-                };
-                write_joints(j_slot, &matrices);
-                let target = target_height_for(&b.race, archetype);
-                let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
-                let dominant_scale = target / height;
-                let visual_scale   = -2.0 * model.feet_offset * dominant_scale;
-                let mat = crate::camera::entity_model_matrix_heading(
-                    b.pos, b.heading, visual_scale, dominant_scale,
-                    [0.0, 0.0], true, 0.0, archetype_correction(archetype));
-                write_model(u_slot, mat);
-                casters.push(Caster::Skinned { model, u_slot, j_slot });
-                u_slot += 1; j_slot += 1;
+        CandidateView {
+            pos:   b.pos,
+            model: r.model_by_key(key, slot),
+            anim:  r.anim_states.get(&b.id).map(|s| (s.clip_idx, s.time)),
+        }
+    }).collect();
+
+    let plan = plan_shadow_casters(
+        player_view.as_ref(), &nearby, light_center, scene.player_pos, r.last_view_proj);
+
+    for step in &plan {
+        // Placement differs between the player and a nearby character (the player uses
+        // `humanoid_placement`, nearby characters the feet-offset/dominant-scale form), so the two
+        // arms stay separate — but neither decides *whether* to draw.
+        match step.caster {
+            ShadowCasterRef::Player => {
+                let archetype = race_to_archetype(&scene.player_race);
+                match (player_view.as_ref().and_then(|v| v.model), step.draw) {
+                    (Some(GpuModel::Skinned(model)), ShadowCasterDraw::Skinned { j_slot, pose }) => {
+                        let matrices = match pose {
+                            ShadowPose::Clip { idx, time } => model.skin.evaluate(idx, time),
+                            ShadowPose::BindPose           => model.skin.bind_pose(),
+                        };
+                        write_joints(j_slot, &matrices);
+                        let target = target_height_for(&scene.player_race, archetype);
+                        let p = humanoid_placement(model.true_height, model.feet_offset, target);
+                        let mat = crate::camera::entity_model_matrix_heading(
+                            scene.player_pos, scene.player_heading, p.visual_scale, p.mesh_scale,
+                            [0.0, 0.0], true, 0.0, archetype_correction(archetype));
+                        write_model(step.u_slot, mat);
+                        casters.push(Caster::Skinned { model, u_slot: step.u_slot, j_slot });
+                    }
+                    (Some(GpuModel::Static(model)), ShadowCasterDraw::Static) => {
+                        let arch_scale   = archetype_scale(archetype);
+                        let visual_scale = 2.0 * model.y_extent * arch_scale;
+                        let mat = crate::camera::entity_model_matrix_heading(
+                            scene.player_pos, scene.player_heading, visual_scale, arch_scale,
+                            [model.x_center, model.z_center], true, model.y_bottom,
+                            archetype_correction(archetype));
+                        write_model(step.u_slot, mat);
+                        casters.push(Caster::Static { model, u_slot: step.u_slot });
+                    }
+                    _ => {}
+                }
             }
-            Some(GpuModel::Static(model)) => {
-                let arch_scale   = archetype_scale(archetype);
-                let visual_scale = 2.0 * model.y_extent * arch_scale;
-                let mat = crate::camera::entity_model_matrix_heading(
-                    b.pos, b.heading, visual_scale, arch_scale,
-                    [model.x_center, model.z_center], true, model.y_bottom, archetype_correction(archetype));
-                write_model(u_slot, mat);
-                casters.push(Caster::Static { model, u_slot });
-                u_slot += 1;
+            ShadowCasterRef::Nearby(i) => {
+                let b = &scene.billboards[i];
+                let archetype = race_to_archetype(&b.race);
+                match (nearby[i].model, step.draw) {
+                    (Some(GpuModel::Skinned(model)), ShadowCasterDraw::Skinned { j_slot, pose }) => {
+                        let matrices = match pose {
+                            ShadowPose::Clip { idx, time } => model.skin.evaluate(idx, time),
+                            ShadowPose::BindPose           => model.skin.bind_pose(),
+                        };
+                        write_joints(j_slot, &matrices);
+                        let target = target_height_for(&b.race, archetype);
+                        let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
+                        let dominant_scale = target / height;
+                        let visual_scale   = -2.0 * model.feet_offset * dominant_scale;
+                        let mat = crate::camera::entity_model_matrix_heading(
+                            b.pos, b.heading, visual_scale, dominant_scale,
+                            [0.0, 0.0], true, 0.0, archetype_correction(archetype));
+                        write_model(step.u_slot, mat);
+                        casters.push(Caster::Skinned { model, u_slot: step.u_slot, j_slot });
+                    }
+                    (Some(GpuModel::Static(model)), ShadowCasterDraw::Static) => {
+                        let arch_scale   = archetype_scale(archetype);
+                        let visual_scale = 2.0 * model.y_extent * arch_scale;
+                        let mat = crate::camera::entity_model_matrix_heading(
+                            b.pos, b.heading, visual_scale, arch_scale,
+                            [model.x_center, model.z_center], true, model.y_bottom,
+                            archetype_correction(archetype));
+                        write_model(step.u_slot, mat);
+                        casters.push(Caster::Static { model, u_slot: step.u_slot });
+                    }
+                    _ => {}
+                }
             }
-            None => {}
         }
     }
 
