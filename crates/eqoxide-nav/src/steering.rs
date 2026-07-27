@@ -235,6 +235,85 @@ pub fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
     }
 }
 
+/// How far off its CURRENT segment the character may drift before the coarse-route cursor is
+/// treated as STALE and resynced (see [`resync_cursor`]). One coarse cell (8 u) is the natural
+/// scale: the coarse route is planned on an 8 u grid, so a character genuinely traversing segment
+/// `path_i` is always well inside this, while a character that has been carried onto a *different*
+/// part of the route (a fall, a slide down a ramp) is far outside it. Deliberately generous —
+/// ordinary corner-cutting and server position jitter must never trip a resync.
+pub const CURSOR_STALE_DIST: f32 = 8.0;
+
+/// Squared 3-D distance from `p` to segment `a`→`b`, plus the closest point on it.
+fn seg_closest(a: [f32; 3], b: [f32; 3], p: [f32; 3]) -> ([f32; 3], f32) {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    let t = if l2 < 1e-6 {
+        0.0
+    } else {
+        (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / l2).clamp(0.0, 1.0)
+    };
+    let c = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+    let d = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+    (c, d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+}
+
+/// **Resync a stale coarse-route cursor (#673).**
+///
+/// The walker advances `path_i` monotonically, one segment at a time, and only when the character's
+/// projection parameter on the CURRENT segment reaches 1.0. That rule silently assumes the character
+/// travels along the route. Physics does not honour that assumption: a fall, or a slide down a ramp,
+/// can carry the character *past* several waypoints in one step, landing it beside a segment whose
+/// projection parameter then saturates strictly below 1.0 — forever. The cursor is now pointing at a
+/// segment the character is nowhere near, and every consumer of it is computing against a false
+/// premise:
+///
+/// * [`carrot_along`] measures the carrot's arclength budget from the projection onto that stale
+///   segment, so the budget is eaten by a phantom leg and the carrot lands essentially ON TOP of the
+///   character — in the measured #673 case, 0.2–0.5 u away, flipping to the opposite side each tick.
+/// * The stall detector watches `path_i`, which can now never advance.
+///
+/// The result is a stable limit cycle: the character oscillates over ~0.4 u, makes zero net progress,
+/// exhausts its re-paths and stops with `blocked` / `walker_stalled` on a route it is physically
+/// standing on. (Measured in South Qeynos on the qcat aqueduct ramp; reproduced offline from the
+/// captured live route — see `walker_cursor_resync` tests.)
+///
+/// This restores the cursor's invariant — *`path_i` names the segment the character is actually on* —
+/// with two hard guards that keep it strictly conservative:
+///
+/// 1. **Forward only.** The scan starts at `start_i`; the cursor can never move backwards, so a lap
+///    can never be un-counted and the #631/#309 progress channels keep their meaning.
+/// 2. **Only onto a reachable segment.** A later segment is adopted only if `clear(from, closest)`
+///    holds — the same straight-line sweep the carrot's LOS clamp uses — so the cursor can never
+///    jump across a wall and declare a leg of the route walked that the character never walked.
+///
+/// A character within [`CURSOR_STALE_DIST`] of its current segment is left alone entirely, so the
+/// normal case is untouched (and the `clear` predicate is not even called).
+pub fn resync_cursor(
+    path: &[[f32; 3]],
+    start_i: usize,
+    from: [f32; 3],
+    clear: impl Fn([f32; 3], [f32; 3]) -> bool,
+) -> usize {
+    // A cursor needs at least one segment ahead of it to be resyncable; `path_i + 2 <= len` mirrors
+    // the walker's own advance bound so a resync can never park the cursor past the last segment.
+    if path.len() < 3 || start_i + 2 >= path.len() {
+        return start_i;
+    }
+    let (_, d0_sq) = seg_closest(path[start_i], path[start_i + 1], from);
+    if d0_sq <= CURSOR_STALE_DIST * CURSOR_STALE_DIST {
+        return start_i;
+    }
+    let (mut best_i, mut best_sq) = (start_i, d0_sq);
+    for i in (start_i + 1)..(path.len() - 1) {
+        let (c, d_sq) = seg_closest(path[i], path[i + 1], from);
+        if d_sq < best_sq && clear(from, c) {
+            best_i = i;
+            best_sq = d_sq;
+        }
+    }
+    best_i
+}
+
 /// A pure-pursuit carrot: the point `reach` units (3D arclength) along `path` (starting from segment
 /// `start_i`), measured from the 3D projection of `from` = `[east, north, z]` onto that segment.
 /// Returns `[east, north, z]` INTERPOLATED at the carrot point. Used at two scales: a far carrot
@@ -480,6 +559,154 @@ pub fn steer_target(
 /// `Threaded` obviously does not: the walker is threading it right now.
 pub fn arms_coarse_replan(outcome: &crate::collision::LocalOutcome) -> bool {
     matches!(outcome, crate::collision::LocalOutcome::NoWayThrough { .. })
+}
+
+#[cfg(test)]
+mod cursor_resync_tests {
+    use super::*;
+
+    /// The real #673 fixture, verbatim from the coarse route the live walker committed on a FAILING
+    /// South Qeynos → qcat run (captured off `/v1/observe/nav_debug`, so these are the client's own
+    /// bytes, not a recomputation). Index 0 here is route waypoint 44.
+    ///
+    /// Shape: the route runs EAST along the street at y≈160 (idx 0..2), turns into the aqueduct
+    /// trench mouth (idx 3), then doubles back WEST down the ramp at y≈144 (idx 4..8).
+    const HAIRPIN: [[f32; 3]; 9] = [
+        [-542.718_75, 160.375, -0.000_007_629_394_5],
+        [-534.718_75, 160.375, -0.000_007_629_394_5],
+        [-526.718_75, 160.375, -0.000_007_629_394_5],
+        [-518.718_75, 152.375, -2.226_699_8],
+        [-526.718_75, 144.375, -4.161_232],
+        [-534.718_75, 144.375, -6.095_749],
+        [-542.718_75, 144.375, -8.030_266],
+        [-550.718_75, 144.375, -9.964_805_6],
+        [-558.718_75, 144.375, -11.899_315],
+    ];
+    /// Where the character physically ENDS UP, measured in the offline replay of that live route:
+    /// it drops off the street into the trench between idx 2 and idx 3 and lands on the ramp at
+    /// idx 5 — three waypoints further along than the cursor thinks.
+    const LANDED: [f32; 3] = [-534.285_6, 144.375, -5.991_005];
+    /// The cursor the walker's monotone advance is left holding when that happens.
+    const STALE_I: usize = 2;
+
+    fn always_clear(_: [f32; 3], _: [f32; 3]) -> bool { true }
+
+    /// **#673 — a cursor the character has physically overtaken must resync.**
+    ///
+    /// The projection of `LANDED` onto segment `STALE_I` is t≈0.61, so the walker's `t >= 1.0`
+    /// advance rule can never move past it; the character is 17 u from that segment while standing
+    /// exactly on segment 5.
+    #[test]
+    fn stale_cursor_after_a_fall_resyncs_to_the_segment_the_character_is_on() {
+        // Premise: the monotone advance really is stuck here (this is why the bug exists).
+        let (a, b) = (HAIRPIN[STALE_I], HAIRPIN[STALE_I + 1]);
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+        let t = ((LANDED[0] - a[0]) * ab[0] + (LANDED[1] - a[1]) * ab[1] + (LANDED[2] - a[2]) * ab[2]) / l2;
+        assert!(t < 1.0, "fixture no longer pins the advance rule (t = {t})");
+
+        let i = resync_cursor(&HAIRPIN, STALE_I, LANDED, always_clear);
+        // The character is standing on the idx4→idx5 / idx5→idx6 joint; either segment names where
+        // it actually is. What must NOT survive is the stale cursor three segments behind.
+        assert!((4..=5).contains(&i),
+            "cursor must resync to the segment the character is standing on, got {i}");
+    }
+
+    /// **#673 — the OBSERVABLE consequence: the carrot must lead, not sit on the character.**
+    ///
+    /// This is the deadlock itself, expressed as a pure function. With the stale cursor the
+    /// LOCAL_REACH-scale carrot lands 0.2 u from the character (and flips side each tick — a limit
+    /// cycle at zero net displacement, which the walker reports as `blocked` / `walker_stalled`).
+    /// With the cursor resynced it leads by ~the full reach, down the ramp the character is on.
+    #[test]
+    fn a_stale_cursor_collapses_the_carrot_onto_the_character() {
+        const REACH: f32 = 24.0; // the walker's LOCAL_REACH
+        let stale = carrot_along(&HAIRPIN, STALE_I, LANDED, REACH).unwrap();
+        let d_stale = (stale[0] - LANDED[0]).hypot(stale[1] - LANDED[1]);
+        assert!(d_stale < 1.0,
+            "fixture no longer reproduces the collapse (carrot was {d_stale:.2} u ahead)");
+
+        let i = resync_cursor(&HAIRPIN, STALE_I, LANDED, always_clear);
+        let fixed = carrot_along(&HAIRPIN, i, LANDED, REACH).unwrap();
+        let d_fixed = (fixed[0] - LANDED[0]).hypot(fixed[1] - LANDED[1]);
+        assert!(d_fixed > 8.0,
+            "after resync the carrot must actually lead the character; it was {d_fixed:.2} u ahead");
+        // …and it must lead DOWN the ramp (west), i.e. forward along the route.
+        assert!(fixed[0] < LANDED[0], "carrot must lead forward along the route, got {fixed:?}");
+    }
+
+    /// **The normal case is untouched, and pays nothing.** A walker within `CURSOR_STALE_DIST` of
+    /// its own segment keeps its cursor and the `clear` predicate is never even consulted.
+    #[test]
+    fn an_on_route_walker_is_left_alone_without_consulting_geometry() {
+        let called = std::cell::Cell::new(false);
+        for (i, on_seg) in [(0usize, [-538.0f32, 160.375, 0.0]), (4, [-530.0, 144.375, -5.0])] {
+            let got = resync_cursor(&HAIRPIN, i, on_seg, |_, _| { called.set(true); true });
+            assert_eq!(got, i, "an on-route cursor must not move");
+        }
+        assert!(!called.get(), "the LOS predicate must not be called for an on-route walker");
+    }
+
+    /// **Why the [`CURSOR_STALE_DIST`] guard is load-bearing.** On a tight switchback a walker that
+    /// is genuinely mid-leg can be geometrically CLOSER to a later segment than to its own — here
+    /// 1.5 u from segment 0 but 0.5 u from segment 2, an out-and-back only 2 u wide. A
+    /// nearest-segment snap would skip the entire outbound leg and quietly cut the route; the
+    /// distance guard means a walker still on its segment is never touched.
+    #[test]
+    fn a_walker_cutting_a_tight_switchback_keeps_its_cursor() {
+        let switchback = [[0.0f32, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 2.0, 0.0], [0.0, 2.0, 0.0]];
+        assert_eq!(resync_cursor(&switchback, 0, [5.0, 1.5, 0.0], always_clear), 0,
+            "a walker mid-leg must not be snapped onto a nearer later segment");
+    }
+
+    /// **Guard 1 — forward only.** A character that has fallen BACKWARDS onto an earlier part of the
+    /// route must not have its cursor rewound: rewinding would un-count progress the walker has
+    /// genuinely made and hand the lap detectors (#631/#309) a false premise.
+    #[test]
+    fn resync_never_moves_the_cursor_backwards() {
+        // Standing on segment 0 while the cursor has advanced to 6 — 30 u away from segment 6.
+        let back = [-538.0f32, 160.375, 0.0];
+        assert_eq!(resync_cursor(&HAIRPIN, 6, back, always_clear), 6);
+    }
+
+    /// **Guard 2 — never across geometry.** With everything blocked the cursor must stay put: a
+    /// resync must never declare a leg of the route walked that the character could not reach.
+    #[test]
+    fn resync_never_jumps_across_blocked_geometry() {
+        assert_eq!(resync_cursor(&HAIRPIN, STALE_I, LANDED, |_, _| false), STALE_I);
+    }
+
+    /// **Property — the cursor stays a valid segment index for ANY position.** Never backwards,
+    /// never onto the final waypoint (which is not the start of a segment), for a dense sweep of
+    /// positions over and around the fixture, from every starting cursor.
+    #[test]
+    fn resync_always_returns_a_valid_forward_segment_index() {
+        for start_i in 0..HAIRPIN.len() - 1 {
+            let mut x = -570.0f32;
+            while x <= -510.0 {
+                let mut y = 130.0f32;
+                while y <= 175.0 {
+                    for z in [-20.0f32, -6.0, 0.0, 12.0] {
+                        let i = resync_cursor(&HAIRPIN, start_i, [x, y, z], always_clear);
+                        assert!(i >= start_i, "moved backwards: {start_i} -> {i}");
+                        assert!(i + 1 < HAIRPIN.len(), "cursor {i} is not a segment start");
+                    }
+                    y += 3.0;
+                }
+                x += 3.0;
+            }
+        }
+    }
+
+    /// Degenerate inputs must be inert, not panic: an empty path, a single waypoint, and a cursor
+    /// already parked on the last segment.
+    #[test]
+    fn resync_is_inert_on_degenerate_paths() {
+        assert_eq!(resync_cursor(&[], 0, LANDED, always_clear), 0);
+        assert_eq!(resync_cursor(&[[0.0, 0.0, 0.0]], 0, LANDED, always_clear), 0);
+        assert_eq!(resync_cursor(&HAIRPIN, HAIRPIN.len() - 2, LANDED, always_clear), HAIRPIN.len() - 2);
+        assert_eq!(resync_cursor(&HAIRPIN, 99, LANDED, always_clear), 99);
+    }
 }
 
 #[cfg(test)]

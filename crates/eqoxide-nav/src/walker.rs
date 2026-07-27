@@ -490,6 +490,42 @@ impl Walker {
     }
 
     /// Stop navigating and report WHY, loudly, in every channel an agent can see.
+    /// Move the coarse-route cursor `path_i` to the segment the character is actually traversing.
+    ///
+    /// Two rules, in order:
+    ///
+    /// 1. The **monotone advance**: step past the current segment once the character's 3-D
+    ///    projection parameter on it reaches 1.0. (3-D, water-nav Slice 3 §8.1: a near-vertical
+    ///    dive/ascent leg is not skipped on frame one — the cursor advances past it only once the
+    ///    character has actually changed depth. On near-horizontal land the z term vanishes, so this
+    ///    is the same advance as before.)
+    ///
+    /// 2. The **stale-cursor resync** (#673): rule 1 assumes the character travels ALONG the route.
+    ///    Physics does not. A fall, or a slide down a ramp, can carry it past several waypoints at
+    ///    once and leave it beside a segment whose projection parameter then saturates strictly below
+    ///    1.0 — so rule 1 can never fire again. The cursor names a segment the character is nowhere
+    ///    near, [`crate::steering::carrot_along`] measures the carrot's arclength from a projection
+    ///    onto that segment, and the carrot lands ON the character: the aim flips every tick, net
+    ///    displacement is zero, and the walker exhausts its re-paths and stops with `blocked` /
+    ///    `walker_stalled` while standing on a route it could have walked. `resync_cursor` is
+    ///    forward-only and only adopts a segment the character can reach in a straight line, so it
+    ///    can neither un-count progress nor claim a leg the character never walked.
+    fn advance_cursor(&mut self, p: [f32; 3]) {
+        while self.path_i + 2 < self.path.len() {
+            let (a, b) = (self.path[self.path_i], self.path[self.path_i + 1]);
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+            let t = if l2 < 1e-6 { 1.0 } else {
+                ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / l2
+            };
+            if t >= 1.0 { self.path_i += 1; } else { break; }
+        }
+        let coll = self.collision.read().unwrap();
+        let clear = |a: [f32; 3], b: [f32; 3]|
+            coll.as_ref().map_or(true, |c| c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE));
+        self.path_i = crate::steering::resync_cursor(&self.path, self.path_i, p, clear);
+    }
+
     pub fn stop_nav(&mut self, gs: &mut GameState, state: &str, reason: &str, msg: &str) {
         self.stop_nav_blocked(gs, state, reason, None, None, msg);
     }
@@ -1147,16 +1183,7 @@ impl Walker {
         let px = gs.player_x;
         let py = gs.player_y;
         let pz = gs.player_z;
-        while self.path_i + 2 < self.path.len() {
-            let (a, b) = (self.path[self.path_i], self.path[self.path_i + 1]);
-            // 3D projection (water-nav Slice 3, §8.1): a near-vertical dive/ascent leg is not skipped
-            // on frame one — path_i advances past it only once the char has actually changed depth.
-            // Near-horizontal land: the z term vanishes, so this is the same advance as before.
-            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-            let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
-            let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1] + (pz - a[2]) * ab[2]) / l2 };
-            if t >= 1.0 { self.path_i += 1; } else { break; }
-        }
+        self.advance_cursor([px, py, pz]);
         let have_path = !self.path.is_empty();
         let target: (f32, f32, f32) = if have_path {
             const LOCAL_REACH: f32 = 24.0;   // how far ahead on the coarse route the fine plan aims
@@ -1521,6 +1548,47 @@ mod tests {
     /// As [`walker_with`], but the caller supplies the SHARED `collision` + `zone_assets` handles so a
     /// test can mutate them mid-run through `begin_zone_load`/`finish_zone_load` (the true two-writer
     /// coupling). Returns the walker plus the nav/intent handles.
+    /// **#673 wiring guard.** The stale-cursor resync must be part of the walker's cursor advance,
+    /// not just a library function nobody calls. Fixture: the coarse route the live client committed
+    /// on a FAILING South Qeynos → qcat run (waypoints 44..52 of it), and the position the character
+    /// physically reaches after dropping off the street into the aqueduct trench. The monotone
+    /// advance alone leaves `path_i` three segments behind — where the carrot collapses onto the
+    /// character and the walker deadlocks at `walker_stalled`.
+    #[test]
+    fn a_cursor_the_character_has_overtaken_is_resynced_by_the_walkers_advance() {
+        let (mut w, _nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        w.path = vec![
+            [-542.718_75, 160.375, -0.000_007_629_394_5],
+            [-534.718_75, 160.375, -0.000_007_629_394_5],
+            [-526.718_75, 160.375, -0.000_007_629_394_5],
+            [-518.718_75, 152.375, -2.226_699_8],
+            [-526.718_75, 144.375, -4.161_232],
+            [-534.718_75, 144.375, -6.095_749],
+            [-542.718_75, 144.375, -8.030_266],
+            [-550.718_75, 144.375, -9.964_805_6],
+            [-558.718_75, 144.375, -11.899_315],
+        ];
+        w.path_i = 2;
+        w.advance_cursor([-534.285_6, 144.375, -5.991_005]);
+        assert!(w.path_i >= 4,
+            "the walker must resync a cursor the character has physically overtaken; path_i = {}",
+            w.path_i);
+    }
+
+    /// The ordinary case still advances exactly one segment at a time, and only when the character
+    /// has actually passed the current waypoint — the resync must not turn the cursor into a
+    /// nearest-segment snap.
+    #[test]
+    fn the_cursor_still_advances_monotonically_along_a_route_being_walked() {
+        let (mut w, _nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        w.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0], [30.0, 0.0, 0.0]];
+        w.path_i = 0;
+        w.advance_cursor([5.0, 0.0, 0.0]);
+        assert_eq!(w.path_i, 0, "mid-segment must not advance");
+        w.advance_cursor([12.0, 0.0, 0.0]);
+        assert_eq!(w.path_i, 1, "past the waypoint advances exactly one");
+    }
+
     fn walker_with_shared(
         collision: crate::collision::SharedCollision,
         zone_assets: crate::zone_assets::ZoneAssetStateShared,
