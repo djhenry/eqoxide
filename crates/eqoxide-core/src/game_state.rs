@@ -824,6 +824,56 @@ pub struct WorldState {
     pub zone_points: Vec<ZonePoint>,
 }
 
+/// Why the render `CharacterController` is holding the body still — a predicament it cannot leave
+/// under its own power, and which no other published field reveals (#724 review, B1).
+///
+/// Both variants are the SAME shape: a recovery path decided it must not let the body go where the
+/// physics was taking it, looked for a banked "last good" position to put it at instead, and found
+/// none. The frame then changes nothing and re-runs identically next frame, so the body is frozen
+/// until something external moves it. Before #724 the ring was almost never empty, so these branches
+/// were rare; #724 clears the ring on every position discontinuity, which makes an empty ring the
+/// NORMAL post-relocation state and these holds an ordinary outcome of a GM summon into rock.
+///
+/// This is deliberately NOT "am I stuck?" in general — a character walking into a wall is blocked
+/// and is not this. It is specifically "the controller has stopped the body and has no way to
+/// resume", which is the state an agent would otherwise read as a perfectly healthy stand-still.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerHoldReason {
+    /// The body is embedded in geometry, the depenetration push-out ring found nowhere it can
+    /// occupy, and there is no banked good position to fall back to. `depenetrate` returns `true`
+    /// every frame, so the whole rest of the step is skipped: the body cannot move at all, in any
+    /// direction, under any driver (WASD, `/goto`, `/move`).
+    EmbeddedNoRecovery,
+    /// The #150 fall-through guard refused a descent to/below the zone's underworld floor and had
+    /// no banked good position to restore. The body hangs at the height it reached, not falling and
+    /// not landing. Lateral movement still works; the body is out of the world vertically.
+    UnderworldNoRecovery,
+}
+
+impl ControllerHoldReason {
+    /// Stable machine token for the API. Never reword these — agents match on them.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ControllerHoldReason::EmbeddedNoRecovery   => "embedded_no_recovery",
+            ControllerHoldReason::UnderworldNoRecovery => "underworld_no_recovery",
+        }
+    }
+}
+
+/// A hold in force RIGHT NOW, with how long it has lasted.
+///
+/// Level-triggered by construction: the controller clears this at the top of every `step` and only
+/// a branch that is actively holding the body *this frame* re-sets it, so it cannot outlive the
+/// condition it describes. That clear-path is the point — an observable that latches on and never
+/// clears is its own honesty bug (#343/#679), not a fix for one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ControllerHold {
+    pub reason: ControllerHoldReason,
+    /// Seconds this hold has been continuously in force (controller frame time, accumulated only
+    /// while the reason is unchanged). A change of reason restarts it at one frame.
+    pub secs: f32,
+}
+
 /// All state the renderer needs for one frame.
 ///
 /// `PartialEq` is load-bearing: `eq_net::gameplay::publish_snapshot` compares the freshly-mutated
@@ -917,6 +967,21 @@ pub struct GameState {
     /// Client-side writers (nav, the HTTP move API) do NOT clear it — they are not evidence about
     /// where the server thinks we are.
     pub position_provisional_since: Option<std::time::Instant>,
+    /// **#724 review B1: the render controller is holding the body still and cannot resume.**
+    /// `None` = it is not (which includes "it is simply standing still because nothing asked it to
+    /// move"); `Some` = a recovery path has frozen the body and has nothing to restore it onto. See
+    /// [`ControllerHold`] for the two shapes and for why this cannot latch.
+    ///
+    /// Mirrored here from `ControllerView::hold` by `ActionLoop::stream_position`, exactly like
+    /// `player_x/y/z` and with exactly the same freshness: it is as current as the last render frame
+    /// that stepped the controller. If the render loop is not stepping, the controller is not moving
+    /// the body either and this holds its last computed value — the position beside it is stale in
+    /// the same breath and by the same amount.
+    ///
+    /// This is a CLIENT-SIDE physics fact, not server truth. It deliberately does not live in
+    /// [`WorldState`]: the server has no opinion about it and would happily agree with the position
+    /// we keep streaming from inside the rock.
+    pub player_hold: Option<ControllerHold>,
     pub player_heading: f32,
     pub player_level: u32,
     pub player_race: String,
@@ -1273,6 +1338,11 @@ impl GameState {
         // lie as a missing one — verified live that without this it stayed true in the new zone for
         // 30s+ while `pos` was actually the correct zone-in point).
         self.position_provisional_since = None;
+        // #724 review B1: a hold describes the body's predicament in geometry that is about to be
+        // dropped. The controller stops being stepped while the new zone loads, so without this the
+        // last mirrored value would sit here — a confident "you are wedged" about a zone we have
+        // left — until the first frame after the new collision lands. Unknown, not false-positive.
+        self.player_hold = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
         // target_name/target_hp_pct fall back to the stale cached snapshot — /observe/debug then

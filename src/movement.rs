@@ -16,6 +16,12 @@ use crate::nav::collision::Collision;
 // `crate::movement::{MoveIntent,ControllerView}` path across the tree keeps resolving unchanged.
 pub use eqoxide_ipc::{ControllerView, MoveIntent};
 
+// The controller's "I have stopped the body and cannot resume" disclosure (#724 review B1). Lives
+// in `eqoxide-core` because it has to be nameable by BOTH `eqoxide-ipc` (`ControllerView::hold`)
+// and `GameState::player_hold`, and core is the only crate below both. Re-exported here so the rest
+// of the app crate can keep saying `crate::movement::ControllerHold`.
+pub use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason};
+
 // Pure physics constants + kinematics moved DOWN into `eqoxide-core::physics` (#544 Step 2d) so nav
 // stops up-referencing this app-layer module for them. Re-exported here so every existing
 // `crate::movement::{PLAYER_RADIUS,STEP_UP,JUMP_VELOCITY,running_jump_reach}` path keeps resolving.
@@ -53,15 +59,34 @@ const GROUND_SNAP_TOL: f32 = 0.5;
 const STUCK_FALLBACK_SECS: f32 = 0.5;
 /// How often (seconds) a good grounded position is sampled into the ring buffer.
 const GOOD_SAMPLE_SECS: f32 = 0.5;
-/// Capacity of the last-good ring — how many recent grounded positions the recovery paths may
-/// choose from before the oldest is dropped. Was a bare literal `8` at the one push site; #720's
-/// round-2 review then cited a `GOOD_RING` constant that did not exist, and #724 asked for the
-/// name so the next citation is checkable. Only `good.back()` is ever read today, so the depth is
-/// slack, not a tuned value.
+/// Capacity of the last-good ring. Was a bare literal `8` at the one push site; #720's round-2
+/// review then cited a `GOOD_RING` constant that did not exist, and #724 asked for the name so the
+/// next citation is checkable.
+///
+/// **This number is DEAD, not merely untested.** The only production reads of the ring are
+/// `self.good.back()` at the two recovery sites (the #150 fall-through guard in [`
+/// CharacterController::step`] and the stuck fallback in [`CharacterController::depenetrate`]);
+/// the push site below is its only other use, and it reads this constant solely to decide when to
+/// drop the *oldest* entry — which nothing will ever look at. `GOOD_RING_LEN = 1` is therefore
+/// behaviourally identical to `8`, the whole `VecDeque` could be an `Option<[f32; 3]>`, and #724's
+/// M3 mutation (8 → 3, suite green) does not measure a tolerance — it measures that the depth is
+/// unreachable. Do not read this as a tuned value, and do not "tune" it: changing it cannot change
+/// behaviour. It is kept as a ring because a future recovery that *chooses* among candidates is the
+/// obvious next step, and collapsing the type would have to be undone to take it.
+/// (#724 round-2 review, N3 — which measured this and was sharper than the PR's own caveat.)
 const GOOD_RING_LEN: usize = 8;
-/// Minimum spacing (seconds) between fall-through-guard log lines while the guard is HOLDING a
-/// body it has no recovery position for. That branch changes nothing, so it re-runs every frame.
-const UNDERWORLD_HOLD_LOG_SECS: f32 = 5.0;
+/// Minimum spacing (seconds) between "the controller is HOLDING the body and cannot resume" log
+/// lines. Such a branch changes nothing, so it re-runs every frame and would otherwise log at frame
+/// rate for ever.
+///
+/// Introduced by #720's review as `UNDERWORLD_HOLD_LOG_SECS` for the fall-through guard alone.
+/// Renamed and generalised by #724's review (B1): #724 clears the recovery ring on every position
+/// discontinuity, which makes an empty ring routine on the DEPENETRATION path too — and that path
+/// had no log at all, because its only `tracing::info!` sits inside `if let Some(&g) = good.back()`.
+/// One constant, one throttle, both paths; a duplicated second copy is how #266/#543-class drift
+/// starts. The throttle is re-armed whenever the hold's REASON changes, so a transition from one
+/// hold to the other is never swallowed by the previous one's cooldown.
+const HOLD_LOG_SECS: f32 = 5.0;
 /// Ring push-out search radii (units).
 const PUSHOUT_RADII: [f32; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 /// Directions sampled per push-out ring.
@@ -102,9 +127,17 @@ pub struct CharacterController {
     /// Recent grounded, non-embedded positions for the last-good fallback (§3.3).
     good:          std::collections::VecDeque<[f32; 3]>,
     good_timer:    f32,
-    /// Seconds until the underworld-hold log line may be emitted again (see
-    /// `UNDERWORLD_HOLD_LOG_SECS`). Diagnostics only — no physics reads this.
+    /// Seconds until the hold log line may be emitted again (see `HOLD_LOG_SECS`). Diagnostics
+    /// only — no physics reads this.
     hold_log_cooldown: f32,
+    /// The hold in force THIS frame, or `None` (#724 review B1). Cleared unconditionally at the top
+    /// of every [`Self::step`] and re-set only by a branch that is actively holding the body, so it
+    /// is level-triggered by construction and cannot outlive its cause. Read by `app.rs` into
+    /// `ControllerView::hold` → `GameState::player_hold` → `GET /v1/observe` `player.hold`.
+    ///
+    /// Physics never reads this; it is purely the disclosure that the body is frozen. `secs` is the
+    /// controller's own accumulated frame time for the current, unbroken hold.
+    hold:          Option<ControllerHold>,
     stuck_time:    f32,
     /// Seconds until another nav auto-hop is allowed (prevents jump-spamming a wall we can't clear).
     hop_cooldown:  f32,
@@ -328,6 +361,7 @@ impl CharacterController {
     pub fn new(pos: [f32; 3]) -> Self {
         Self { pos, vel_z: 0.0, on_ground: false, in_water: false,
                good: std::collections::VecDeque::new(), good_timer: 0.0, hold_log_cooldown: 0.0,
+               hold: None,
                stuck_time: 0.0,
                hop_cooldown: 0.0, underworld: f32::NEG_INFINITY,
                airborne_start_z: None, landed_fall_height: None, levitating: false,
@@ -382,15 +416,109 @@ impl CharacterController {
     /// > -fallback twin). `teleport` now clears the ring itself. The retracted reasoning is kept
     /// > here rather than deleted, because it is the reasoning that would otherwise be re-derived.
     /// >
-    /// > That same paragraph also said the stale window lasts "for a few seconds". Measured: the
-    /// > ring banks ONLY while `on_ground`, so a body relocated into a column it can only fall out
-    /// > of never banks again and the window is unbounded — it is not `GOOD_SAMPLE_SECS`-shaped.
+    /// > That same paragraph also said the stale window lasts "for a few seconds". That is wrong —
+    /// > the window is unbounded, and it is not `GOOD_SAMPLE_SECS`-shaped. The MECHANISM first
+    /// > written here was wrong too; see the amendment below.
     ///
-    /// This method survives the fold because a zone change must drop the ring whether or not a
-    /// [`Self::teleport`] happens to accompany it: `app.rs` calls it at the moment the old zone's
-    /// collision is dropped, which is earlier than, and independent of, the arrival reground.
+    /// > ### ⚠️ Correction to the correction (#724 round-2 review, B2)
+    /// > The paragraph above originally read, under a **"Measured:"** label:
+    /// >
+    /// > > *the ring banks ONLY while `on_ground`, so a body relocated into a column it can only
+    /// > > fall out of never banks again and the window is unbounded.*
+    /// >
+    /// > **That mechanism was measured FALSE**, and the "Measured" label was unearned — it was
+    /// > reasoned from the banking site's `on_ground` gate and never instrumented. Round-2 review
+    /// > instrumented the pre-fix behaviour (this method's own `zone_with_a_hole` fixture, driven by
+    /// > a `teleport` that does not clear, printing the ring every 30 frames) and I re-ran it and
+    /// > got the same numbers:
+    /// >
+    /// > ```text
+    /// > f0 : pos=[80.0, 0.0, -114.53]  on_ground=false ring_len=4
+    /// > f30: pos=[80.0, 0.0, -180.53]  on_ground=false ring_len=4
+    /// > f60: pos=[-80.0, 0.0, 0.0]     on_ground=TRUE  ring_len=6
+    /// > f90: pos=[-80.0, 0.0, 0.0]     on_ground=true  ring_len=8
+    /// > ```
+    /// >
+    /// > The body IS grounded again ~1.5 s later and the ring DOES bank again (4 → 6 → 8). The real
+    /// > mechanism is the fall-through guard's recovering arm in [`Self::step`]: it does
+    /// > `self.pos = g; self.on_ground = true;` — it re-grounds the body **onto the stale sample**,
+    /// > so every fresh bank is a copy of that same stale point. The window is unbounded because the
+    /// > loop **self-reinforces**, not because banking stops. (The old sentence's "the ring still
+    /// > holds only pre-relocation *samples*" was true of the values and false of the count, which
+    /// > is why it read as evidence for a claim it did not support.)
+    /// >
+    /// > The conclusion is unchanged and still holds: the stale window is unbounded, so #724's
+    /// > framing of a 0.5 s race the descent has to win is wrong. Only the reason is different.
+    /// >
+    /// > This was not an inert error. It is what hid the hold disclosure now implemented as
+    /// > [`ControllerHold`]: had `step`'s recovering arm been read instead of reasoned about, the
+    /// > obvious next question was what its `None` arm does *after* the fix — leave `on_ground`
+    /// > false for ever — and what the depenetration twin of that arm does, which is nothing at all,
+    /// > silently. "Never grounded again" made the hold look self-announcing when it was mute.
+    ///
+    /// **The `app.rs` zone-change call is NOT made redundant by the fold, and must not be deleted.**
+    /// A zone change must drop the ring whether or not a [`Self::teleport`] happens to accompany it,
+    /// and there is a measured arrival where none does: `eqoxide-net`'s `gameplay.rs` #593 note
+    /// documents a cross-zone arrival landing *within* `CORRECTION_SQ` (12 u, 2-D) of the last
+    /// position we streamed from the OLD zone, in which case the streamer's correction branch is
+    /// skipped entirely and no `teleport` is ever called. `app.rs` also calls this at the moment the
+    /// old zone's collision is dropped — earlier than, and independent of, the arrival reground.
+    ///
+    /// Round-2 review (N4) measured that the call site had no test holding it in place: deleting it
+    /// from `app.rs`, together with the #712 test's own direct call and `is_empty` assert, left the
+    /// suite green (154 passed), because that test's *behavioural* assertions are now satisfied by
+    /// the `teleport` two lines below them rather than by the zone-change clear. The call site is
+    /// pinned now — see `the_zone_change_reload_block_still_forgets_the_recovery_ring` in this
+    /// module's tests, which reads `app.rs`'s own source and fails by name if the call leaves the
+    /// `zone_needs_reload` block.
     pub fn forget_recovery_history(&mut self) {
         self.good.clear();
+    }
+
+    /// The hold currently in force, or `None` — see [`ControllerHold`]. `None` includes the ordinary
+    /// "standing still because nothing asked me to move", which is exactly the state a hold is
+    /// otherwise indistinguishable from.
+    ///
+    /// Published every frame by `app.rs` into `ControllerView::hold`; never latched.
+    pub fn hold(&self) -> Option<ControllerHold> { self.hold }
+
+    /// Drop any hold WITHOUT stepping (`app.rs` calls this on the frames it does not step the
+    /// controller — no collision loaded, i.e. mid zone-load). The last hold described geometry that
+    /// has been dropped, and nothing is going to recompute it until the new zone lands, so the
+    /// honest published value is "not holding" rather than a stale alarm about a zone we have left.
+    pub fn clear_hold(&mut self) { self.hold = None; }
+
+    /// Record — and, throttled, log — that a recovery branch has stopped the body this frame with
+    /// nothing to restore it onto.
+    ///
+    /// `prev` is the hold taken at the top of this `step`, which is how `secs` accumulates without
+    /// the field ever being able to survive the condition ending: the ONLY way a hold persists is
+    /// for the same branch to re-set it on the very next frame. A change of reason restarts both the
+    /// clock and the log throttle, so the transition is always disclosed.
+    fn enter_hold(&mut self, reason: ControllerHoldReason, dt: f32, prev: Option<ControllerHold>) {
+        let secs = match prev {
+            Some(p) if p.reason == reason => p.secs + dt,
+            // New hold (or a different one): restart the clock and re-arm the log immediately.
+            _ => { self.hold_log_cooldown = 0.0; dt }
+        };
+        self.hold = Some(ControllerHold { reason, secs });
+        if self.hold_log_cooldown <= 0.0 {
+            self.hold_log_cooldown = HOLD_LOG_SECS;
+            match reason {
+                ControllerHoldReason::EmbeddedNoRecovery => tracing::info!(
+                    "controller HOLD [embedded_no_recovery]: embedded at {:?} for {:.1}s, push-out \
+                     found nowhere to go and there is no recovery history to fall back to — the \
+                     body is FROZEN (every step is skipped) until something relocates it. Published \
+                     as player.hold; this line is throttled to one per {:.0}s while it lasts.",
+                    self.pos, secs, HOLD_LOG_SECS),
+                ControllerHoldReason::UnderworldNoRecovery => tracing::info!(
+                    "controller HOLD [underworld_no_recovery]: blocked descent below underworld \
+                     {:.1} → holding at {:?} for {:.1}s (no recovery history to restore; the body \
+                     is not grounded). Published as player.hold; this line is throttled to one per \
+                     {:.0}s while it lasts.",
+                    self.underworld, self.pos, secs, HOLD_LOG_SECS),
+            }
+        }
     }
 
     /// Hard-set the position (zone-in, teleport, large server correction). Clears velocity & stuck.
@@ -404,12 +532,35 @@ impl CharacterController {
         //
         // Cost, stated plainly: for as long as it takes the body to become grounded again after a
         // relocation, neither recovery path has anything to restore, so a body that lands somewhere
-        // unrecoverable HOLDS rather than rubber-bands. That is the deliberate trade — holding is a
-        // visible failure a further server correction can fix, whereas the restore is a wrong answer
-        // the client reports as success, and #712 measured that the wrong answer re-fires every
-        // 0.5 s and wedges permanently. Small corrections do not pay this: under `CORRECTION_SQ`
-        // (12 u, 2D) the net never calls `teleport` at all.
+        // unrecoverable HOLDS rather than rubber-bands. The restore is a wrong answer the client
+        // reports as success, and #712 measured that the wrong answer re-fires every 0.5 s and
+        // wedges permanently, so the hold is the better of the two — but it is NOT free, and the
+        // first draft of this comment said something false about it:
+        //
+        //   ⚠️ RETRACTED (#724 round-2 review, B1). This comment used to justify the trade with
+        //   "holding is a visible failure a further server correction can fix". Both halves were
+        //   wrong on the depenetration path, and measured wrong. (a) NOT VISIBLE: `depenetrate`'s
+        //   only `tracing::info!` sat inside `if let Some(&g) = self.good.back()`, so with the ring
+        //   cleared — which this very fix makes the normal post-relocation state — the branch
+        //   emitted nothing, changed nothing and returned `true` every frame; re-measured on this
+        //   module's own stuck fixture, post-fix: `pos=[40.0, 40.0, 0.0] stuck_time=2.0
+        //   on_ground=false`, 0 of 40 frames moved the body, and `hold_log_cooldown` was still 0 —
+        //   i.e. not even the underworld hold log had ever armed. Zero output for the whole episode,
+        //   and no agent-visible field said anything either. (b) NO AUTOMATIC SECOND CORRECTION: the
+        //   client goes on streaming its own unchanged position and the server agrees with it, so
+        //   nothing generates one; the wedge clears only if a human or a GM acts.
+        //
+        // The trade stands, but it is paid for by DISCLOSURE, not by an imaginary rescue: both
+        // recovery paths now record a `ControllerHold` (see `enter_hold`), which is logged on a
+        // throttle and published to agents as `player.hold` on `GET /v1/observe`. A hold is a
+        // reported failure, which is what makes it better than a silent wrong answer.
+        //
+        // Small corrections do not pay any of this: under `CORRECTION_SQ` (12 u, 2D) the net never
+        // calls `teleport` at all.
         self.forget_recovery_history();
+        // A discontinuity supersedes the hold too: whatever predicament the body was in, it is not
+        // in it at this new position. `step` recomputes from scratch next frame.
+        self.hold = None;
         self.pos = pos;
         self.vel_z = 0.0;
         self.on_ground = false;
@@ -425,9 +576,18 @@ impl CharacterController {
     /// Advance one frame. Returns the new authoritative position.
     pub fn step(&mut self, intent: MoveIntent, dt: f32, col: &Collision) -> [f32; 3] {
         self.hold_log_cooldown = (self.hold_log_cooldown - dt).max(0.0);
+        // #724 review B1 — THE CLEAR PATH, and the whole reason this is a `take` and not a read.
+        // The hold is dropped here, unconditionally, before anything can look at it. The only code
+        // that can put one back is a branch that is actively holding the body on THIS frame (there
+        // are exactly two, both routed through `enter_hold`). So a hold cannot outlive its cause:
+        // the frame the push-out succeeds, or the fall finds a floor, or a correction relocates the
+        // body, nothing re-sets it and `hold()` reads `None` again. `prev` carries the previous
+        // frame's value forward only so `enter_hold` can accumulate `secs` and decide whether the
+        // reason changed — an observable with no clear-path is its own honesty bug (#343/#679).
+        let prev_hold = self.hold.take();
         // Depenetration / unstuck net runs first (§3.3). If it handled an embedded frame, freeze
         // the rest of the step so we neither slide deeper nor fall through void.
-        if self.depenetrate(dt, col) {
+        if self.depenetrate(dt, col, prev_hold) {
             return self.pos;
         }
         // §444: remember whether we were in water AND actively swim-sinking LAST frame, before
@@ -683,30 +843,29 @@ impl CharacterController {
                         }
                     }
                     _ if cand <= self.underworld => {
-                        let recovered = match self.good.back() {
-                            Some(&g) => { self.pos = g; self.on_ground = true; true }
+                        // NOTE (#724 review B2): the recovering arm re-grounds the body ON the
+                        // restored sample. Pre-#724 that is what made the stale-ring window
+                        // unbounded — the ring then re-banks copies of the stale point, 4 → 6 → 8 —
+                        // and it is the mechanism the retracted "never banks again" claim in
+                        // `forget_recovery_history` got wrong.
+                        let recovered = match self.good.back().copied() {
+                            Some(g) => { self.pos = g; self.on_ground = true; true }
                             None => false, // hold current pos; don't sink below underworld
                         };
                         self.vel_z = 0.0;
                         self.airborne_start_z = None; // underworld recovery is not a fall landing (§442)
                         // The no-history branch changes NOTHING — it holds `pos`, leaves `on_ground`
                         // false, and so re-runs every frame for as long as the hold lasts. Left
-                        // unthrottled it emits this line at frame rate for ever, which #720 review
-                        // flagged once clearing the ring on a zone change made an empty ring
-                        // routine. The recovering branch stays unthrottled: it moves the body, so
-                        // each of its lines reports a distinct event.
+                        // unthrottled it emits at frame rate for ever, which #720 review flagged
+                        // once clearing the ring on a zone change made an empty ring routine. The
+                        // recovering branch stays unthrottled: it moves the body, so each of its
+                        // lines reports a distinct event.
                         if recovered {
                             tracing::info!(
                                 "fall-through guard: blocked descent below underworld {:.1} → {:?}",
                                 self.underworld, self.pos);
-                        } else if self.hold_log_cooldown <= 0.0 {
-                            self.hold_log_cooldown = UNDERWORLD_HOLD_LOG_SECS;
-                            tracing::info!(
-                                "fall-through guard: blocked descent below underworld {:.1} → \
-                                 HOLDING at {:?} (no recovery history to restore; body is not \
-                                 grounded and this line is throttled to one per {:.0}s while the \
-                                 hold persists)",
-                                self.underworld, self.pos, UNDERWORLD_HOLD_LOG_SECS);
+                        } else {
+                            self.enter_hold(ControllerHoldReason::UnderworldNoRecovery, dt, prev_hold);
                         }
                     }
                     _ => self.pos[2] = cand,
@@ -834,7 +993,10 @@ impl CharacterController {
     /// Depenetration / unstuck net (§3.3). Returns `true` when this frame was embedded and handled
     /// (push-out moved us, or the last-good fallback fired, or we are still searching) — the caller
     /// then freezes the rest of the step. Returns `false` on a normal (clear) frame.
-    fn depenetrate(&mut self, dt: f32, col: &Collision) -> bool {
+    ///
+    /// `prev_hold` is the hold `step` took at the top of this frame — see `enter_hold`. Nothing in
+    /// here reads it for physics; it exists so a continuing hold can accumulate its duration.
+    fn depenetrate(&mut self, dt: f32, col: &Collision, prev_hold: Option<ControllerHold>) -> bool {
         // No geometry loaded → no constraints; never teleport the free player.
         if !col.has_geometry() {
             self.stuck_time = 0.0;
@@ -872,12 +1034,23 @@ impl CharacterController {
         // Push-out failed: count time stuck, then fall back to the most recent good position.
         self.stuck_time += dt;
         if self.stuck_time >= STUCK_FALLBACK_SECS {
-            if let Some(&g) = self.good.back() {
-                tracing::info!("depenetrate: stuck {:.1}s, falling back to last good pos {:?}", self.stuck_time, g);
-                // The ring buffer only ever samples GROUNDED positions (see the `!embedded` arm
-                // above), so this fallback is a `Grounded` recovery by construction — routed through
-                // the same single writer so the net has exactly one place that sets the support flags.
-                self.recover(g[0], g[1], Recovery::Grounded(g[2]));
+            match self.good.back().copied() {
+                Some(g) => {
+                    tracing::info!("depenetrate: stuck {:.1}s, falling back to last good pos {:?}", self.stuck_time, g);
+                    // The ring buffer only ever samples GROUNDED positions (see the `!embedded` arm
+                    // above), so this fallback is a `Grounded` recovery by construction — routed through
+                    // the same single writer so the net has exactly one place that sets the support flags.
+                    self.recover(g[0], g[1], Recovery::Grounded(g[2]));
+                }
+                // #724 review B1 — the branch that used not to exist. With an empty ring this arm
+                // changes nothing and `depenetrate` returns `true`, so `step` skips the entire rest
+                // of the frame: the body cannot move in ANY direction, under any driver, for ever.
+                // Before #724 an empty ring here was rare; #724 makes it the normal state after
+                // every relocation, so this is now an ordinary outcome of a GM summon into rock. It
+                // was completely silent — the `tracing::info!` above is inside the `Some` arm, and
+                // no agent-visible field carried a stuck/embedded signal at all. Say so, on both
+                // channels.
+                None => self.enter_hold(ControllerHoldReason::EmbeddedNoRecovery, dt, prev_hold),
             }
         }
         true
@@ -2329,5 +2502,171 @@ mod tests {
         }
         assert!(got_stuck >= 100, "sweep did not exercise the stuck fallback enough: {got_stuck}");
         assert!(fell_through >= 100, "sweep did not exercise the fall-through guard enough: {fell_through}");
+    }
+
+    /// Fixture shared by the hold tests: a platform to bank good samples on, plus a walled slot far
+    /// away with no floor anywhere near it, so every push-out radius fails and the stuck fallback is
+    /// the only exit. Identical to the fixture in
+    /// `a_large_same_zone_relocation_forgets_the_ring_for_the_stuck_fallback_too`.
+    fn platform_and_inescapable_slot() -> Collision {
+        col(vec![floor(0.0, -100.0, -50.0), wall(39.2, 0.0, 10.0), wall(40.8, 0.0, 10.0)])
+    }
+
+    /// #724 round-2 review, **B1 — the mutation that catches the silent freeze.**
+    ///
+    /// #724 clears the recovery ring on every position discontinuity, which makes "embedded with an
+    /// empty ring" the NORMAL post-relocation state rather than a rarity. In that state
+    /// `depenetrate` changes nothing and returns `true`, so `step` skips the whole frame and the
+    /// body is frozen for ever — and before this fix it was frozen SILENTLY: `depenetrate`'s only
+    /// `tracing::info!` is inside `if let Some(&g) = self.good.back()`, and no agent-visible field
+    /// carried any stuck/embedded signal. That is the "wedged but reporting normal" shape (#343/
+    /// #679), which on this project outranks the wrong answer #724 removes.
+    ///
+    /// This test pins BOTH halves — the freeze is real, and it is now disclosed.
+    ///
+    /// MUTATION-CHECK: delete the `enter_hold` call from `depenetrate`'s `None` arm (i.e. restore
+    /// the old `if let Some(&g)` shape) and this test FAILS on the `hold` assertion while every
+    /// other test in this file stays green — which is exactly how the defect shipped.
+    #[test]
+    fn an_embedded_body_with_no_recovery_history_freezes_and_says_so() {
+        let c = platform_and_inescapable_slot();
+        let mut ctrl = CharacterController::new([-80.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        ctrl.set_underworld(Some(-222.0));
+        for _ in 0..60 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); }
+        assert!(ctrl.hold().is_none(),
+            "fixture: a body standing on ordinary ground must NOT report a hold, else this test \
+             would pass on a field that is always set");
+
+        let target = [40.0, 40.0, 0.0];
+        assert!(is_embedded(&c, target), "fixture: the slot must read as embedded");
+        ctrl.teleport(target); // the relocation — clears the ring, per this PR
+
+        // The freeze itself, measured rather than assumed: 2 s of frames, none of which move the
+        // body by any amount.
+        let mut moved_frames = 0usize;
+        let mut last = ctrl.pos;
+        for _ in 0..40 {
+            ctrl.step(walk(0.0, [0.0, 0.0]), 0.05, &c);
+            if ctrl.pos != last { moved_frames += 1; last = ctrl.pos; }
+        }
+        assert_eq!(moved_frames, 0,
+            "fixture: the body must be genuinely frozen at {target:?}, got {:?}", ctrl.pos);
+        assert!(ctrl.good.is_empty(), "fixture: the ring must be empty (that is the point)");
+
+        // …and the freeze is DISCLOSED. This is the assertion the pre-review code fails.
+        let h = ctrl.hold().expect(
+            "#724 review B1: a body frozen with nothing to recover onto must report a hold — \
+             otherwise an agent reads a perfectly plausible position and a perfectly normal state \
+             while every movement command it issues does nothing");
+        assert_eq!(h.reason, ControllerHoldReason::EmbeddedNoRecovery);
+        // Duration is the controller's own accumulated frame time for the UNBROKEN hold. It starts
+        // at STUCK_FALLBACK_SECS into the episode (the fallback branch is what discovers the hold),
+        // so it is bounded below by "we really have been here a while" and above by the episode.
+        assert!(h.secs > 1.0 && h.secs <= 2.0 + 1e-3,
+            "the hold must report how long it has lasted, got {}", h.secs);
+    }
+
+    /// #724 round-2 review, B1 — **the clear path.** An observable that latches on and never clears
+    /// is its own honesty bug (#343/#679), so the hold gets a test for going away, by both routes:
+    /// the recovery becoming possible again, and a relocation out of the predicament.
+    ///
+    /// The clear is structural — `step` does `self.hold.take()` before anything can re-set it — so
+    /// there is no "clear" code path to forget; this test pins that property rather than a branch.
+    ///
+    /// MUTATION-CHECK: change the `take()` at the top of `step` to a plain read and this test FAILS
+    /// on the first `is_none` assertion.
+    #[test]
+    fn a_hold_clears_as_soon_as_the_body_is_free_again() {
+        let c = platform_and_inescapable_slot();
+        let mut ctrl = CharacterController::new([-80.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        ctrl.set_underworld(Some(-222.0));
+        for _ in 0..60 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); }
+        ctrl.teleport([40.0, 40.0, 0.0]);
+        for _ in 0..40 { ctrl.step(walk(0.0, [0.0, 0.0]), 0.05, &c); }
+        assert!(ctrl.hold().is_some(), "fixture: the body must be held before we test the clear");
+
+        // Route 1 — the recovery becomes available. Hand the controller a good sample; the very next
+        // stuck-fallback frame takes the branch that was previously empty, moves the body, and the
+        // hold must be gone on that same frame.
+        ctrl.good.push_back([-80.0, 0.0, 0.0]);
+        ctrl.step(walk(0.0, [0.0, 0.0]), 0.05, &c);
+        assert!(ctrl.hold().is_none(),
+            "the hold must clear the frame the body is recovered, got {:?}", ctrl.hold());
+        assert!((ctrl.pos[0] - (-80.0)).abs() < 1e-3, "fixture: the fallback really did fire");
+
+        // Route 2 — a relocation out of the predicament. Get held again, then teleport somewhere
+        // standable; the hold must not survive either the `teleport` itself or the next step.
+        ctrl.teleport([40.0, 40.0, 0.0]);
+        for _ in 0..40 { ctrl.step(walk(0.0, [0.0, 0.0]), 0.05, &c); }
+        assert!(ctrl.hold().is_some(), "fixture: held again");
+        ctrl.teleport([-80.0, 0.0, 0.0]);
+        assert!(ctrl.hold().is_none(), "a position discontinuity must supersede the hold too");
+        for _ in 0..10 { ctrl.step(walk(0.0, [0.0, 0.0]), 0.05, &c); }
+        assert!(ctrl.hold().is_none(),
+            "…and it must not come back once the body is standing normally, got {:?}", ctrl.hold());
+    }
+
+    /// #724 round-2 review, B1 — the SECOND hold path, so the disclosure is symmetric with #720's.
+    /// #720's review added the throttled hold log to the fall-through guard; #724 extends the empty
+    /// ring to the depenetration path, and both now report the same way.
+    ///
+    /// MUTATION-CHECK: delete the `enter_hold` call from `step`'s underworld `else` arm and this
+    /// test FAILS on the `hold` assertion.
+    #[test]
+    fn a_body_held_above_the_underworld_with_no_recovery_history_says_so_too() {
+        let c = zone_with_a_hole();
+        let mut ctrl = CharacterController::new([-80.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        ctrl.set_underworld(Some(-222.0));
+        for _ in 0..60 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); }
+        ctrl.teleport([80.0, 0.0, -114.4]);
+        for _ in 0..150 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); }
+
+        assert!(ctrl.pos[2] > -222.0 && ctrl.pos[2] < -217.0,
+            "fixture: the guard must be holding the body just above the underworld, got {:?}", ctrl.pos);
+        let h = ctrl.hold().expect(
+            "#724 review B1: a body the fall-through guard is holding with nothing to restore must \
+             report a hold");
+        assert_eq!(h.reason, ControllerHoldReason::UnderworldNoRecovery);
+        assert!(h.secs > 0.0, "the hold must report how long it has lasted, got {}", h.secs);
+    }
+
+    /// #724 round-2 review, **N4 — pin the `app.rs` zone-change call site**, which had nothing
+    /// holding it in place.
+    ///
+    /// Review measured that deleting `self.controller.forget_recovery_history()` from the
+    /// `zone_needs_reload` block in `app.rs`, together with the #712 test's own direct call and its
+    /// `is_empty` assert, left the suite green (154 passed) — because that test's *behavioural*
+    /// assertions are now satisfied by the `teleport` two lines below them rather than by the
+    /// zone-change clear. The method was pinned; the call was not.
+    ///
+    /// It is not redundant. `eqoxide-net`'s `gameplay.rs` #593 note documents a cross-zone arrival
+    /// landing within `CORRECTION_SQ` of the last-streamed OLD-zone position, where the streamer's
+    /// correction branch is skipped and **no `teleport` fires at all** — so on that path this call
+    /// is the only thing that drops the previous zone's coordinates. `app.rs` also runs it at the
+    /// moment the old collision is dropped, earlier than and independent of the arrival reground.
+    ///
+    /// A source scan rather than a behavioural test because `App` owns a window, a GPU and an event
+    /// loop; the same `include_str!` technique is used in `eqoxide-net`'s `transport.rs` for exactly
+    /// this kind of "one call site must not disappear" pin.
+    #[test]
+    fn the_zone_change_reload_block_still_forgets_the_recovery_ring() {
+        const APP_RS: &str = include_str!("app.rs");
+        let start = APP_RS.find("if zone_needs_reload(&self.scene.zone, &self.current_zone) {")
+            .expect("app.rs no longer has the zone-change reload block this pin is about — if it \
+                     moved, move this pin with it; do not delete it");
+        // The block body is indented 12 spaces; its closing brace is the first newline followed by
+        // exactly 8 spaces and `}`. Nested blocks close deeper, so this cannot match early.
+        let end = APP_RS[start..].find("\n        }")
+            .expect("could not find the end of the zone-change reload block in app.rs");
+        let block = &APP_RS[start..start + end];
+        assert!(block.contains("self.controller.forget_recovery_history();"),
+            "#712/#724: the zone-change reload block in app.rs MUST drop the controller's recovery \
+             ring — the previous zone's untagged coordinates are what wedged #712, and #724's fold \
+             into `teleport` does NOT cover this path (see #593: a cross-zone arrival within \
+             CORRECTION_SQ of the last-streamed old-zone position fires no correction and therefore \
+             no teleport). Block was:\n{block}");
     }
 }

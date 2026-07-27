@@ -281,6 +281,44 @@ cross-referenced to SPA 57. GM `#flymode 1` (Flying) genuinely turns gravity off
 mode. An agent reasoning specifically about the levitate *buff* can trust it; an agent that wants a
 general gravity answer must not read this field as one.
 
+### `hold` — the character is physically stuck and the client cannot free it (#724)
+
+`player.hold` is `null` for a healthy character — **including one that is simply standing still** —
+and non-null only while the movement controller has stopped the body and has no way to resume.
+
+It exists because those two states were indistinguishable through this API. `pos` is correct in
+both. `nav_state` is `idle` in both. `nav_state.stuck_ticks` is the *walker's* counter and only
+advances while a `/goto` is actively driving, so a character that was summoned into a rock and is
+standing there produced **no observable at all** — every movement command returned `200`, nothing
+moved, and every other field read normal.
+
+```jsonc
+"hold": {
+  "reason":    "embedded_no_recovery",   // or "underworld_no_recovery"
+  "held_secs": 12.4,                     // controller frame time, this unbroken hold
+  "detail":    "…what is true and what you can do about it…"
+}
+```
+
+| `reason` | What is true | Can the character move? |
+|----------|--------------|-------------------------|
+| `embedded_no_recovery` | The body is **embedded in world geometry**. The push-out search found nowhere it can legally stand, and there is no recovery position to fall back to (a position discontinuity — a GM summon, a large server correction — supersedes that history, #724). | **No.** Physics is frozen; every movement command is accepted and produces no motion in any direction. |
+| `underworld_no_recovery` | The body fell to the zone's **underworld floor** and the client is holding it there rather than let it drop out of the world (#150), with no recovery position to restore. It is hanging: not falling, not landing, not grounded. | Horizontally, yes — but there is probably nothing under it. |
+
+**Neither clears on its own.** The client goes on streaming its own (unchanged) position and the
+server agrees with it, so no further server correction is coming. A GM `#goto`/`#summon`, or zoning
+out, is what ends it.
+
+**`held_secs` is controller frame time as of the last stepped frame, not wall clock since entry.**
+A frozen body's meaningful clock is the physics clock; if the render loop is not stepping then no
+frames are elapsing, the hold is not progressing, and the `pos` beside it is stale by exactly the
+same amount. Read the [connection health](#connection-health) block for whether the client is live.
+
+**The key is always present** (never omitted), so an agent that greps for `hold` and finds nothing
+knows it is talking to a client too old to report the state, rather than concluding all is well.
+And it does not latch: the controller recomputes it from scratch every frame, so it disappears the
+frame the body is freed.
+
 ### `zone_assets` — is the world this response describes actually loaded? (#579)
 
 A zone's terrain arrives from the asset server as one large GLB (freportw: ~30 MB) and is decoded,
