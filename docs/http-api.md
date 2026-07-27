@@ -1162,7 +1162,7 @@ For a **login** it does carry a verdict — see [Logins are entries too](#logins
 whatever is in it survives only until the *next* activity of either kind ends. During a zone load
 that is milliseconds: two set syncs end per zone, plus a `charmodel` set whenever an unseen race
 appears. It answers "what ended most recently"; it does **not** answer "did X happen at some point",
-for any X. For the login-failure case specifically, use `login_outcomes` / `last_login_failure`
+for any X. For the login-failure case specifically, use `login_outcomes` / `last_login_failed`
 described [below](#logins-are-entries-too-and-they-are-not-transfers--731).
 
 ### Overlap, and what `syncs` is for
@@ -1216,7 +1216,7 @@ anything can reach this endpoint, they are done.
 They are also not readable from `last_ended` in general, for the reason above: it holds only the most
 recent activity, and the first thing the client does after binding the port is start more of them —
 the reviewer's live run saw the pre-bind startup login pushed out of that slot within seconds. The
-startup **login**'s verdict does survive, in `login_outcomes` / `last_login_failure`; the two pre-bind
+startup **login**'s verdict does survive, in `login_outcomes` / `last_login_<outcome>`; the two pre-bind
 **set syncs** have no equivalent, so whether they succeeded is not observable through this endpoint
 at all.
 
@@ -1273,7 +1273,7 @@ wedged in `starting`. Its `published_age_ms` is therefore the whole time it has 
 the documented one-field wedge check is large and growing throughout. `running_ms` and
 `published_age_ms` are the same duration for a login, for the same reason.
 
-### Did a login fail? — `login_outcomes` and `last_login_failure`
+### Did a login fail? — `login_outcomes` and `last_login_<outcome>`
 
 **A login's verdict is measured, not guessed.** `login_observed` wraps the call and sees its
 `Result`. (A set sync's `Drop` runs identically on success, error and unwind and genuinely cannot
@@ -1285,15 +1285,20 @@ The verdict is published in **three places with three different retentions**, an
 the whole point:
 
 ```jsonc
-// Always present. Counts of logins that have ENDED, by outcome. Monotonic: only ever increases.
+// Always present. Counts of logins that have ENDED, by outcome. Monotonic WITHIN ONE PROCESS.
 "login_outcomes": { "succeeded": 2, "failed": 1, "unknown": 0 },
 
-// Present only once a login has ended WITHOUT succeeding. Overwritten only by another such login.
-"last_login_failure": {
-  "connecting": { "purpose": "common asset load", "outcome": "failed" },  // failed | unknown
+// ONE SLOT PER OUTCOME — `last_login_<outcome>` for each key in `login_outcomes` above.
+// Each is present exactly when its counter is non-zero, and each is overwritten only by a LATER
+// login with the SAME outcome. A failure and a panic never compete: neither can hide the other.
+"last_login_failed": {
+  "connecting": { "purpose": "common asset load", "outcome": "failed" },
   "ago_ms": 41220
   // note: NO "set" — a login never had one
 },
+"last_login_succeeded": { "connecting": { "purpose": "zone load: qeynos2",
+                                          "outcome": "succeeded" }, "ago_ms": 210 },
+// "last_login_unknown" would appear here too, had a panic ever unwound through a login.
 
 // The most recent activity of ANY kind to end. Overwritten by the next one, login or set sync.
 "last_ended": {
@@ -1303,9 +1308,16 @@ the whole point:
 ```
 
 **Ask `login_outcomes` — not `last_ended` — whether a login failed.** `failed + unknown > 0` means a
-login did not complete in this process, at *any* polling cadence, and the delta between two polls is
-what happened between them. `last_login_failure` then names which one and how long ago. Logins still
-in flight are counted in neither: they are live entries in `syncs`.
+login did not complete in this process, at *any* polling cadence. `last_login_failed` /
+`last_login_unknown` then name which one and how long ago, each within its own outcome. Logins still
+in flight are counted in none of them: they are live entries in `syncs`.
+
+**Monotonic means monotonic *within one client process*.** The counters start again at zero when the
+client restarts, which it does routinely (`POST /v1/lifecycle/exit`, crash, relaunch), and this body
+carries no restart marker. So the delta between two polls is what happened in between **only if the
+client did not restart between them** — a poller keeping a cursor across restarts must read a
+*decrease* as a new process, not as a correction. The served `semantics` string says this too, since
+that is what an agent actually reads.
 
 > ## ⚠️ Corrections (#743 review, round 2)
 >
@@ -1328,19 +1340,63 @@ in flight are counted in neither: they are live entries in `syncs`.
 > The same round retracts the paired row *"login succeeded → …then the set sync it enabled opens its
 > own entry"* — see the disclosed gap below, where that promise is false at one of the four sites.
 >
-> `login_outcomes` and `last_login_failure` were added in response, so the question the retracted row
-> claimed to answer now has a field that really answers it.
+> `login_outcomes` and the `last_login_<outcome>` records were added in response, so the question the
+> retracted row claimed to answer now has fields that really answer it.
 
 The states an agent can distinguish:
 
 | the client has… | the endpoint says |
 |---|---|
-| never tried | `active: false`, `syncs: []`, `last_ended: null`, `login_outcomes` all zero, no `last_login_failure` |
+| never tried | `active: false`, `syncs: []`, `last_ended: null`, `login_outcomes` all zero, no `last_login_*` |
 | a login in flight | `active: true`, `syncs[i].phase == "connecting"`, `stalest_published_age_ms` present and growing |
-| had a login fail, **ever** | `login_outcomes.failed > 0`; `last_login_failure` names the most recent one |
-| had a login panic, **ever** | `login_outcomes.unknown > 0`; it is in `last_login_failure` too, with `outcome: "unknown"` |
-| had a login succeed, **ever** | `login_outcomes.succeeded > 0` |
+| had a login **succeed**, ever | `login_outcomes.succeeded > 0` ⟺ `last_login_succeeded` present, naming the most recent one |
+| had a login **fail**, ever | `login_outcomes.failed > 0` ⟺ `last_login_failed` present, naming the most recent **failed** login |
+| had a login **panic**, ever | `login_outcomes.unknown > 0` ⟺ `last_login_unknown` present, naming the most recent **panicked** login |
+| had *any* login not complete | `login_outcomes.failed + .unknown > 0`; the two records above name both, independently |
 | just ended *something* | `last_ended` names it — and only it. Not a history, not a search |
+
+Those three ⟺ are the contract, and each is *per outcome*: the record beside a counter always
+describes a login that ended **that** way. A second failure does replace the first failure's
+`purpose` (these are "most recent per outcome", not a log) — one question, one answer, and both
+still counted.
+
+> ## ⚠️ Correction (#743 review, round 3): `last_login_failure` was ONE slot for TWO categories
+>
+> **Retracted, and fixed in code rather than in wording.** Round 2 served a single
+> `last_login_failure` holding the most recent login that did not succeed *of either kind*, and these
+> two rows offered it to two different questions:
+>
+> | the client has… | the endpoint says |
+> |---|---|
+> | had a login fail, **ever** | `login_outcomes.failed > 0`; `last_login_failure` names the most recent one |
+> | had a login panic, **ever** | `login_outcomes.unknown > 0`; it is in `last_login_failure` too, with `outcome: "unknown"` |
+>
+> **At most one of those could be true at a time.** The reviewer proved it with two probes, both RED
+> against that body:
+>
+> - panic, then failure → `unknown == 1`, but `last_login_failure` named the **failed** login
+> - failure, then panic → `failed == 1`, but `last_login_failure` named the **panicked** login
+>
+> **The harm:** an agent sees `unknown > 0`, follows the row, and reads *a different login's*
+> `purpose` — attributing the panic to a login that did not panic. And the superseded login's
+> identity was recoverable from the endpoint **nowhere at all**. That is round 1's B1 shape one level
+> down, inside the fix for B1: one observable, two meanings.
+>
+> **What changed.** The remedy is not a caveat telling readers to check an `outcome` field. There is
+> now **one slot per outcome**, so both rows above are true simultaneously and neither login is lost.
+> Structurally, in `crates/eqoxide-ipc/src/asset_sync.rs`:
+>
+> - `LastLoginByOutcome` reaches its slots only through an exhaustive `match` on `ConnectOutcome`, so
+>   which slot a record lands in is a function of the outcome and not a choice at the call site;
+> - the retained `RetainedLogin` **carries no outcome field at all** — the outcome is *which slot it
+>   is in*, so a record cannot claim an outcome that disagrees with the category it answers for; and
+> - the encoder derives the wire field name, the `outcome` token inside it and the counter key from
+>   the same `outcome.as_str()`, in one pass, so no category can be counted without its record being
+>   served beside it.
+>
+> Both of the reviewer's probes are now shipped as tests (`crates/eqoxide-ipc/src/asset_sync.rs` and
+> `crates/eqoxide-http/src/observe.rs`) and both pass, with the *earlier* login recoverable in full
+> in both orderings — the assertion neither probe could make against round 2.
 
 **Known gap, disclosed — stated as a rule, because the instance is not the class.** A login's entry
 ends the moment `login()` returns; the sync it enables opens its own entry only when the next

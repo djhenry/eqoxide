@@ -140,7 +140,7 @@ pub struct AssetSyncSlots {
     live: Vec<(SyncId, AssetSyncActivity)>,
     next_id: u64,
     last_ended: Option<EndedActivity>,
-    last_login_failure: Option<EndedActivity>,
+    last_login: LastLoginByOutcome,
     login_outcomes: LoginOutcomeTally,
 }
 
@@ -157,25 +157,17 @@ impl AssetSyncSlots {
     /// (three logins at startup, two set syncs per zone load) that is milliseconds, so a poller can
     /// and does miss a failure entirely: #743's reviewer measured a genuinely-failed login appearing
     /// in this slot in **0 of 75 samples** while three other activities cycled through it. Do not use
-    /// it to answer "did a login fail" — that is what [`Self::last_login_failure`] and
+    /// it to answer "did a login fail" — that is what [`Self::last_login`] and
     /// [`Self::login_outcomes`] are for.
     pub fn last_ended(&self) -> Option<&EndedActivity> {
         self.last_ended.as_ref()
     }
 
-    /// The most recent login that did **not** succeed, retained for the life of the process.
-    ///
-    /// Unlike [`Self::last_ended`] this slot is overwritten *only by another unsuccessful login*, so
-    /// a failure cannot be destroyed by unrelated activity ending afterwards. `None` means no login
-    /// has ended other than successfully in this process — a real negative answer, not an absence of
-    /// evidence.
-    ///
-    /// "Unsuccessful" is [`ConnectOutcome::Failed`] **or** [`ConnectOutcome::Unknown`]: a panic that
-    /// unwound through a login did not succeed either, and filing it as a success (by omission) would
-    /// be the same falsehood at smaller scale. The retained record carries the outcome, so the two
-    /// stay distinguishable.
-    pub fn last_login_failure(&self) -> Option<&EndedActivity> {
-        self.last_login_failure.as_ref()
+    /// The most recent login to end with **each** outcome, retained for the life of the process —
+    /// one slot per outcome. See [`LastLoginByOutcome`] for why it is one-per-outcome and not one
+    /// shared "last non-success" slot (#743 review B3).
+    pub fn last_login(&self) -> &LastLoginByOutcome {
+        &self.last_login
     }
 
     /// Monotonic counts of every login that has **ended** in this process, by outcome.
@@ -218,16 +210,39 @@ impl AssetSyncSlots {
         }
     }
 
+    /// End a LOGIN's entry, with the verdict `login_observed` measured from its `Result`.
+    fn end_login(&mut self, id: SyncId, outcome: ConnectOutcome) {
+        self.end(id, Some(outcome));
+    }
+
+    /// End a SET SYNC's entry. Takes no outcome **because there is none to take**: the sync guard's
+    /// `Drop` runs identically on success, error and unwind (see [`EndedWhat::Sync`]).
+    ///
+    /// This is the type-level half of #743 review N8. The previous shape was one `end(id, outcome)`
+    /// with the sync guard passing [`ConnectOutcome::Unknown`] as a filler, defended by a comment
+    /// arguing that [`SyncId`]s cannot alias so the filler could never reach the login arm. The
+    /// argument was right, but the cost of it being wrong was that a set sync ending would
+    /// **fabricate** a login failure — count an `unknown` and retain a login that never ran, under
+    /// some other call's purpose. There is now no argument to be wrong about: a caller with a sync's
+    /// id has no way to supply a verdict, so no set sync can write a login observable **whatever the
+    /// ids do**. `end` below still has to decide what an aliased id would mean, and it decides it in
+    /// the one direction that cannot invent: no tally, no retention.
+    fn end_sync(&mut self, id: SyncId) {
+        self.end(id, None);
+    }
+
     /// Remove `id`'s entry — and ONLY `id`'s. `Vec::remove` preserves the relative order of the
     /// rest, so the oldest-first invariant survives a middle entry ending.
     ///
-    /// `connect_outcome` is used only when the removed entry is a login; a set sync's outcome is
-    /// genuinely unknowable here (see [`EndedWhat::Sync`]) and the argument is discarded.
-    fn end(&mut self, id: SyncId, connect_outcome: ConnectOutcome) {
+    /// `verdict` is `Some` only on [`Self::end_login`]. It is the *only* thing that unlocks the
+    /// login observables; see that method and [`Self::end_sync`].
+    fn end(&mut self, id: SyncId, verdict: Option<ConnectOutcome>) {
         if let Some(pos) = self.live.iter().position(|(i, _)| *i == id) {
             let (_, a) = self.live.remove(pos);
             let at = Instant::now();
             let what = match a.work {
+                // A verdict passed for a Sync entry is impossible (only `end_login` can supply one,
+                // and only a login guard calls it) and would be meaningless anyway — discarded.
                 AssetSyncWork::Sync { set, .. } => EndedWhat::Sync { set },
                 AssetSyncWork::Connecting { purpose } => {
                     // #743 review B1. `last_ended` below is a single last-writer-wins slot: the very
@@ -238,25 +253,110 @@ impl AssetSyncSlots {
                     // polls, because three other activities ended on top of it first. An agent
                     // following the documented recipe was told "no login failed" while three had.
                     //
-                    // So a non-success is ALSO recorded where nothing but another non-success can
-                    // overwrite it, plus a monotonic tally that no amount of later activity can walk
-                    // back. Neither invents information: both are written from the same measured
-                    // `Result` the verdict comes from.
-                    self.login_outcomes.record(connect_outcome);
-                    if connect_outcome != ConnectOutcome::Succeeded {
-                        self.last_login_failure = Some(EndedActivity {
-                            what: EndedWhat::Connect {
-                                purpose: purpose.clone(), outcome: connect_outcome,
-                            },
-                            at,
-                        });
+                    // So the verdict is ALSO recorded in two places nothing but another login of the
+                    // SAME outcome can touch: a monotonic tally, and a per-outcome retained record.
+                    // Neither invents information — both are written from the same measured `Result`
+                    // as the verdict in `last_ended`, in one statement pair, under this one lock.
+                    match verdict {
+                        Some(outcome) => {
+                            self.login_outcomes.record(outcome);
+                            self.last_login.record(outcome, purpose.clone(), at);
+                            EndedWhat::Connect { purpose, outcome }
+                        }
+                        // Unreachable: only `end_sync` passes `None`, and it is called only with a
+                        // sync guard's own id, which can never name a `Connecting` entry (ids are a
+                        // `u64` minted under this lock and never reused). Decided anyway, because
+                        // "unreachable" is an argument and the durable observables must not rest on
+                        // one: NOTHING is counted and NOTHING is retained. `last_ended` — the
+                        // transient slot the next activity overwrites — reports it as `Unknown`,
+                        // which is what it is: a login entry left with no verdict ever seen. The
+                        // asymmetry is deliberate. A fabricated `login_outcomes.unknown` would be a
+                        // monotonic counter that can never be walked back, and a fabricated
+                        // `last_login` record would name a login that never happened.
+                        None => EndedWhat::Connect { purpose, outcome: ConnectOutcome::Unknown },
                     }
-                    EndedWhat::Connect { purpose, outcome: connect_outcome }
                 }
             };
             self.last_ended = Some(EndedActivity { what, at });
         }
     }
+}
+
+/// The most recent login to END with each outcome — **one slot per outcome, never one slot for two.**
+///
+/// ## Why this is a per-outcome map and not a single "last unsuccessful login" (#743 review B3)
+///
+/// It was a single slot holding the most recent login that did not succeed, of either kind, and the
+/// docs offered it as the answer to two different questions: *which login failed* and *which login
+/// panicked*. Only one of those could be true at a time. With a panic followed by a failure,
+/// `login_outcomes.unknown` said a panic had happened and the one slot named the **failed** login —
+/// so a caller that read the purpose out of it attributed the panic to a login that did not panic,
+/// and the panicked login's identity was not recoverable from the endpoint at all. That is the same
+/// "one observable, two meanings" defect this whole PR exists to fix, re-instantiated inside its own
+/// fix one level down.
+///
+/// A guard or a doc sentence would have papered over it. This makes it unrepresentable instead, in
+/// two steps:
+///
+/// 1. **One slot per [`ConnectOutcome`]**, reached only through [`Self::slot_mut`] — an exhaustive
+///    match, so the slot is never a free choice at the call site and a new outcome variant fails to
+///    compile until it is given its own slot.
+/// 2. **[`RetainedLogin`] carries no outcome field.** The outcome is *which slot the record is in*.
+///    A record therefore cannot claim an outcome that disagrees with the category it answers for,
+///    because it has nothing to claim it with, and the encoder derives both the wire field name and
+///    the wire `outcome` token from the same key.
+///
+/// The resulting contract is one biconditional **per outcome**, which is what the docs may promise:
+/// `login_outcomes.<o> > 0` ⟺ `last_login.get(<o>).is_some()`, and when present it is a login that
+/// ended with exactly `<o>`.
+///
+/// Within one outcome this is still a *most recent*, not a log: a second failure overwrites the
+/// first failure's purpose. That is one question with one answer, so it cannot mislead the way the
+/// shared slot did — and the count of both survives in [`LoginOutcomeTally`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LastLoginByOutcome {
+    succeeded: Option<RetainedLogin>,
+    failed: Option<RetainedLogin>,
+    unknown: Option<RetainedLogin>,
+}
+
+impl LastLoginByOutcome {
+    /// The most recent login that ended with `outcome`, or `None` if none ever has — a real negative
+    /// answer about *that outcome alone*, not "nothing interesting happened".
+    pub fn get(&self, outcome: ConnectOutcome) -> Option<&RetainedLogin> {
+        match outcome {
+            ConnectOutcome::Succeeded => self.succeeded.as_ref(),
+            ConnectOutcome::Failed => self.failed.as_ref(),
+            ConnectOutcome::Unknown => self.unknown.as_ref(),
+        }
+    }
+
+    /// The one write path. Exhaustive, so which slot a record lands in is a function of the outcome
+    /// and nothing else.
+    fn slot_mut(&mut self, outcome: ConnectOutcome) -> &mut Option<RetainedLogin> {
+        match outcome {
+            ConnectOutcome::Succeeded => &mut self.succeeded,
+            ConnectOutcome::Failed => &mut self.failed,
+            ConnectOutcome::Unknown => &mut self.unknown,
+        }
+    }
+
+    fn record(&mut self, outcome: ConnectOutcome, purpose: String, at: Instant) {
+        *self.slot_mut(outcome) = Some(RetainedLogin { purpose, at });
+    }
+}
+
+/// One retained login, kept for the life of the process in the [`LastLoginByOutcome`] slot for its
+/// outcome.
+///
+/// **It deliberately carries no outcome of its own.** The outcome is which slot it is in, so the
+/// record and the category it is filed under cannot disagree — see [`LastLoginByOutcome`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetainedLogin {
+    /// Free text naming what the login was for — see [`AssetSyncWork::Connecting`].
+    pub purpose: String,
+    /// When it ended. An `Instant`, turned into an age at READ time — never a cached age (#343).
+    pub at: Instant,
 }
 
 /// How many logins have **ended** in this process, by outcome. Monotonic: every field only ever
@@ -281,10 +381,26 @@ pub struct LoginOutcomeTally {
 
 impl LoginOutcomeTally {
     fn record(&mut self, outcome: ConnectOutcome) {
+        *self.count_mut(outcome) += 1;
+    }
+
+    fn count_mut(&mut self, outcome: ConnectOutcome) -> &mut u64 {
         match outcome {
-            ConnectOutcome::Succeeded => self.succeeded += 1,
-            ConnectOutcome::Failed => self.failed += 1,
-            ConnectOutcome::Unknown => self.unknown += 1,
+            ConnectOutcome::Succeeded => &mut self.succeeded,
+            ConnectOutcome::Failed => &mut self.failed,
+            ConnectOutcome::Unknown => &mut self.unknown,
+        }
+    }
+
+    /// How many logins ended with `outcome`. Keyed by the same enum as
+    /// [`LastLoginByOutcome::get`], so "the count for `o`" and "the record for `o`" are addressed
+    /// identically and the per-outcome biconditional between them is one loop to check, not three
+    /// hand-written pairs that can drift.
+    pub fn count(self, outcome: ConnectOutcome) -> u64 {
+        match outcome {
+            ConnectOutcome::Succeeded => self.succeeded,
+            ConnectOutcome::Failed => self.failed,
+            ConnectOutcome::Unknown => self.unknown,
         }
     }
 
@@ -333,6 +449,18 @@ pub enum ConnectOutcome {
 }
 
 impl ConnectOutcome {
+    /// Every outcome, once each. The encoder walks this to emit `login_outcomes` and the
+    /// `last_login_<outcome>` records **in one pass**, so a category can never be counted without
+    /// its record being served alongside it.
+    ///
+    /// Adding a variant to this enum fails to compile in [`LoginOutcomeTally::count`],
+    /// [`LoginOutcomeTally::count_mut`] and [`LastLoginByOutcome::slot_mut`], which is the prompt to
+    /// extend this array too; and if it were still missed,
+    /// `every_outcome_is_in_all_so_no_category_can_go_unserved` fails, because the per-outcome counts
+    /// would no longer sum to the number of logins that ended.
+    pub const ALL: [ConnectOutcome; 3] =
+        [ConnectOutcome::Succeeded, ConnectOutcome::Failed, ConnectOutcome::Unknown];
+
     /// The wire token, so the JSON encoder and this enum cannot drift apart.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -351,8 +479,8 @@ pub struct AssetSyncSnapshot {
     /// The most recent activity of ANY kind to end — see [`AssetSyncSlots::last_ended`] for why this
     /// is not the field that answers "did a login fail".
     pub last_ended: Option<EndedActivity>,
-    /// See [`AssetSyncSlots::last_login_failure`].
-    pub last_login_failure: Option<EndedActivity>,
+    /// See [`AssetSyncSlots::last_login`] and [`LastLoginByOutcome`].
+    pub last_login: LastLoginByOutcome,
     /// See [`AssetSyncSlots::login_outcomes`].
     pub login_outcomes: LoginOutcomeTally,
 }
@@ -365,7 +493,7 @@ pub fn snapshot(shared: &AssetSyncShared) -> AssetSyncSnapshot {
     AssetSyncSnapshot {
         live: slots.live().cloned().collect(),
         last_ended: slots.last_ended().cloned(),
-        last_login_failure: slots.last_login_failure().cloned(),
+        last_login: slots.last_login().clone(),
         login_outcomes: slots.login_outcomes(),
     }
 }
@@ -617,9 +745,13 @@ impl AssetSyncGuard {
 
 impl Drop for AssetSyncGuard {
     fn drop(&mut self) {
-        // A set sync's outcome is genuinely unknown at `Drop`; the argument is discarded for this
-        // variant (see `EndedWhat::Sync`).
-        lock(&self.shared).end(self.id, ConnectOutcome::Unknown);
+        // A set sync's outcome is genuinely unknown at `Drop` (see `EndedWhat::Sync`), and #743
+        // review N8 is now answered by there being no argument here to get wrong: `end_sync` takes
+        // no verdict, so this call cannot write `login_outcomes` or `last_login` however the ids
+        // behave. What that would have cost is recorded on `AssetSyncSlots::end_sync`, and the
+        // aliased-id case is asserted in
+        // `a_set_syncs_end_cannot_fabricate_a_login_observable_even_with_an_aliased_id`.
+        lock(&self.shared).end_sync(self.id);
     }
 }
 
@@ -677,7 +809,7 @@ impl AssetConnectGuard {
 
 impl Drop for AssetConnectGuard {
     fn drop(&mut self) {
-        lock(&self.shared).end(self.id, self.outcome);
+        lock(&self.shared).end_login(self.id, self.outcome);
     }
 }
 
@@ -862,7 +994,7 @@ mod tests {
         // re-inserting a phantom entry that no guard owns and nothing will ever clear.
         let s = new_shared();
         let g = AssetSyncGuard::begin(&s, "common");
-        lock(&s).end(g.id, ConnectOutcome::Unknown);
+        lock(&s).end_sync(g.id);
         g.tick(dl(1));
         assert!(live_sets(&s).is_empty(), "a tick after the end must not republish the sync");
     }
@@ -1006,13 +1138,9 @@ mod tests {
         assert_eq!(slots.login_outcomes().failed, 3,
             "three logins failed and nothing may walk that back");
         assert_eq!(slots.login_outcomes().unsuccessful(), 3);
-        assert_eq!(slots.last_login_failure().map(|e| e.what.clone()),
-            Some(EndedWhat::Connect {
-                purpose: "model-sync worker (charmodel sets)".into(),
-                outcome: ConnectOutcome::Failed,
-            }),
-            "a set sync ending must not erase the most recent login failure: {:?}",
-            slots.last_login_failure());
+        assert_eq!(slots.last_login().get(ConnectOutcome::Failed).map(|r| r.purpose.clone()),
+            Some("model-sync worker (charmodel sets)".into()),
+            "a set sync ending must not erase the most recent login failure");
     }
 
     /// The retention rule, in the direction that would quietly undo it: a *successful* login must not
@@ -1021,9 +1149,11 @@ mod tests {
     #[test]
     fn a_later_success_neither_erases_a_failure_nor_decrements_anything() {
         let s = new_shared();
-        assert!(lock(&s).last_login_failure().is_none(),
-            "no login has ended other than successfully: absent is the honest answer, and it is a \
-             real negative — not 'unknown'");
+        for o in ConnectOutcome::ALL {
+            assert!(lock(&s).last_login().get(o).is_none(),
+                "no login has ended {o:?}: absent is the honest answer, and it is a real negative — \
+                 not 'unknown'");
+        }
         assert_eq!(lock(&s).login_outcomes(), LoginOutcomeTally::default());
 
         AssetConnectGuard::begin(&s, "common asset load").finish(ConnectOutcome::Failed);
@@ -1034,11 +1164,12 @@ mod tests {
         assert_eq!(slots.login_outcomes(),
             LoginOutcomeTally { succeeded: 2, failed: 1, unknown: 0 },
             "counters are monotonic per outcome; a success is not the absence of a failure");
-        assert_eq!(slots.last_login_failure().map(|e| e.what.clone()),
-            Some(EndedWhat::Connect {
-                purpose: "common asset load".into(), outcome: ConnectOutcome::Failed,
-            }),
+        assert_eq!(slots.last_login().get(ConnectOutcome::Failed).map(|r| r.purpose.clone()),
+            Some("common asset load".into()),
             "two later successes must not make an earlier failure unobservable");
+        assert_eq!(slots.last_login().get(ConnectOutcome::Succeeded).map(|r| r.purpose.clone()),
+            Some("zone load: qeynos2".into()),
+            "…and the successes land in their OWN slot, where they displace nothing");
         assert_eq!(slots.last_ended().unwrap().what,
             EndedWhat::Connect { purpose: "zone load: qeynos2".into(),
                                  outcome: ConnectOutcome::Succeeded },
@@ -1048,6 +1179,13 @@ mod tests {
     /// A panic unwinding through a login did not succeed, so it must be retained as a non-success —
     /// filing it as a success by omission is the same falsehood at smaller scale. It is kept
     /// SEPARATE from `failed` because "neither Ok nor Err" is not the same claim as "returned Err".
+    ///
+    /// **Scope, stated because round 2's version of this test was cited as coverage it did not
+    /// provide (#743 review B3):** the later activity here is a *success*, and a success has its own
+    /// slot, so this shows retention against something that was never going to disturb it. The
+    /// interesting neighbour — a non-success of the OTHER kind, which under round 2's single shared
+    /// slot really did destroy this one — is
+    /// [`a_failure_and_a_panic_never_compete_for_a_slot_so_neither_can_hide_the_other`].
     #[test]
     fn a_panic_through_a_login_is_retained_as_a_non_success_but_not_as_a_failure() {
         let s = new_shared();
@@ -1065,12 +1203,140 @@ mod tests {
             "a panic is counted, and counted as its own outcome");
         assert_eq!(slots.login_outcomes().unsuccessful(), 1,
             "`unsuccessful` must include unknown, or 'could every login complete?' answers yes");
-        assert_eq!(slots.last_login_failure().map(|e| e.what.clone()),
+        assert_eq!(slots.last_login().get(ConnectOutcome::Unknown).map(|r| r.purpose.clone()),
+            Some("model-sync worker (charmodel sets)".into()),
+            "…and it is retained in its OWN outcome's slot, not relabelled as a failure");
+        assert!(slots.last_login().get(ConnectOutcome::Failed).is_none(),
+            "…and NOT under `failed`, which is the counter an alarm is most likely wired to");
+    }
+
+    /// **#743 review B3 — the reviewer's two probes, at the registry.**
+    ///
+    /// Round 2 kept the most recent non-success of EITHER kind in one `last_login_failure` slot and
+    /// documented it as the answer to two questions. The reviewer's probes ran both orderings and
+    /// both were RED: with a panic then a failure, `unknown == 1` while the slot named the FAILED
+    /// login — so a caller reading the purpose on the strength of that counter attributed the panic
+    /// to a login that did not panic, and the panicked login's identity was recoverable nowhere.
+    ///
+    /// Both orderings are reproduced here with real `catch_unwind` panics through a real guard, and
+    /// both now hold, because [`LastLoginByOutcome`] gives each outcome its own slot. Losing the
+    /// *earlier* login's purpose is no longer a limitation to be documented — it does not happen.
+    ///
+    /// The remaining loss is one question with one answer (a second failure replaces the first
+    /// failure's purpose, both still counted), which cannot mislead the way a shared slot did.
+    #[test]
+    fn a_failure_and_a_panic_never_compete_for_a_slot_so_neither_can_hide_the_other() {
+        fn panic_through_a_login(s: &AssetSyncShared, purpose: &'static str) {
+            // The panic hook is process-global and these tests run in parallel, so it is left alone:
+            // the "boom" backtrace on stderr is expected output, not a failing test.
+            let s2 = s.clone();
+            let r = std::panic::catch_unwind(move || {
+                let _g = AssetConnectGuard::begin(&s2, purpose);
+                panic!("boom");
+            });
+            assert!(r.is_err(), "the fixture must actually have panicked");
+        }
+        fn purpose_of(s: &AssetSyncShared, o: ConnectOutcome) -> Option<String> {
+            lock(s).last_login().get(o).map(|r| r.purpose.clone())
+        }
+
+        // Probe 1: panic first, then a failure. Both must be fully recoverable.
+        let s = new_shared();
+        panic_through_a_login(&s, "model-sync worker (charmodel sets)");
+        AssetConnectGuard::begin(&s, "common asset load").finish(ConnectOutcome::Failed);
+        assert_eq!(lock(&s).login_outcomes(),
+            LoginOutcomeTally { succeeded: 0, failed: 1, unknown: 1 },
+            "both are counted, separately, and neither count is walked back");
+        assert_eq!(purpose_of(&s, ConnectOutcome::Unknown),
+            Some("model-sync worker (charmodel sets)".into()),
+            "`unknown == 1`, so the record for `unknown` must be the login that PANICKED — round 2 \
+             returned the failed login's purpose here, which is the defect");
+        assert_eq!(purpose_of(&s, ConnectOutcome::Failed), Some("common asset load".into()),
+            "…and the later failure did not overwrite it, because it never shared the slot");
+
+        // Probe 2, the mirror. Round 2 lost the FAILURE's identity in this ordering.
+        let s = new_shared();
+        AssetConnectGuard::begin(&s, "common asset load").finish(ConnectOutcome::Failed);
+        panic_through_a_login(&s, "zone load: neriakc");
+        assert_eq!(lock(&s).login_outcomes(),
+            LoginOutcomeTally { succeeded: 0, failed: 1, unknown: 1 });
+        assert_eq!(purpose_of(&s, ConnectOutcome::Failed), Some("common asset load".into()),
+            "`failed == 1`, and the record for `failed` is the login that FAILED — a later panic \
+             cannot displace it");
+        assert_eq!(purpose_of(&s, ConnectOutcome::Unknown), Some("zone load: neriakc".into()));
+        assert_eq!(lock(&s).login_outcomes().unsuccessful(), 2,
+            "two logins did not complete, and BOTH are named — not just the later one");
+    }
+
+    /// **#743 review B3, as the rule rather than the pair of examples.** For every outcome, the
+    /// counter and the retained record must agree, and a record must never appear under an outcome
+    /// other than its own. This is what a shared slot could not satisfy at all.
+    ///
+    /// MUTATION-CHECK: make `LastLoginByOutcome::slot_mut` return `&mut self.failed` for
+    /// `Unknown` — the round-2 collapse in miniature — and the `unknown` iteration goes RED.
+    #[test]
+    fn every_outcome_is_in_all_so_no_category_can_go_unserved() {
+        let s = new_shared();
+        AssetConnectGuard::begin(&s, "zone load: qeynos2").finish(ConnectOutcome::Succeeded);
+        AssetConnectGuard::begin(&s, "common asset load").finish(ConnectOutcome::Failed);
+        drop(AssetConnectGuard::begin(&s, "model-sync worker (charmodel sets)"));
+        // A set sync ends too, to prove it is counted in none of the login categories.
+        drop(AssetSyncGuard::begin(&s, "zonedoors/neriakc"));
+
+        let slots = lock(&s);
+        let tally = slots.login_outcomes();
+        assert_eq!(ConnectOutcome::ALL.iter().map(|o| tally.count(*o)).sum::<u64>(), 3,
+            "three logins ended, so the per-outcome counts must sum to three — an outcome missing \
+             from `ALL` shows up here as a login the endpoint would never serve a record for");
+        for o in ConnectOutcome::ALL {
+            assert_eq!(tally.count(o) > 0, slots.last_login().get(o).is_some(),
+                "count and record must be present together for {o:?}: {tally:?}");
+        }
+        assert_eq!(slots.last_login().get(ConnectOutcome::Succeeded).map(|r| r.purpose.clone()),
+            Some("zone load: qeynos2".into()));
+        assert_eq!(slots.last_login().get(ConnectOutcome::Failed).map(|r| r.purpose.clone()),
+            Some("common asset load".into()));
+        assert_eq!(slots.last_login().get(ConnectOutcome::Unknown).map(|r| r.purpose.clone()),
+            Some("model-sync worker (charmodel sets)".into()));
+    }
+
+    /// **#743 review N8, as behaviour instead of a comment.** Round 2 had one `end(id, outcome)` and
+    /// the SET SYNC guard passing `ConnectOutcome::Unknown` as filler, defended by an argument that
+    /// [`SyncId`]s cannot alias so the filler could never reach the login arm. The argument holds,
+    /// but the reviewer's point stands: if it ever stopped holding, a set sync ending would
+    /// **fabricate** a login failure — a monotonic `unknown` that can never be walked back, and a
+    /// retained record naming a login that never ran, under another call's purpose.
+    ///
+    /// `end_sync` now takes no outcome, so there is nothing to fabricate FROM. This asserts the
+    /// remaining half — what `end` does when handed the impossible input anyway. It is reachable
+    /// only from inside this module, which is exactly why it can be tested here and could not be
+    /// tested through the guards: the aliasing that would produce it in production cannot be staged.
+    #[test]
+    fn a_set_syncs_end_cannot_fabricate_a_login_observable_even_with_an_aliased_id() {
+        let s = new_shared();
+        let g = AssetConnectGuard::begin(&s, "common asset load");
+        let login_id = g.id;
+        std::mem::forget(g);            // keep the entry live; end it the wrong way, by hand
+
+        lock(&s).end_sync(login_id);    // the aliased-id case, staged directly
+
+        let slots = lock(&s);
+        assert_eq!(slots.login_outcomes(), LoginOutcomeTally::default(),
+            "no verdict was ever seen, so NOTHING may be counted — a fabricated `unknown` here is \
+             monotonic and can never be corrected");
+        for o in ConnectOutcome::ALL {
+            assert!(slots.last_login().get(o).is_none(),
+                "…and nothing may be retained under {o:?}: a record here names a login that, as far \
+                 as this registry ever measured, did not end that way");
+        }
+        assert_eq!(slots.last_ended().map(|e| e.what.clone()),
             Some(EndedWhat::Connect {
-                purpose: "model-sync worker (charmodel sets)".into(),
-                outcome: ConnectOutcome::Unknown,
+                purpose: "common asset load".into(), outcome: ConnectOutcome::Unknown,
             }),
-            "…and it is retained with its own outcome, not relabelled as a failure");
+            "the entry did leave, so the TRANSIENT slot reports it — as `unknown`, which is what it \
+             is: a login entry with no verdict ever seen. The asymmetry with the durable fields is \
+             the point: last_ended is overwritten by the next activity, the counters never are");
+        assert_eq!(slots.live().len(), 0, "and the entry must not be left behind as a phantom");
     }
 
     /// The shared-`Arc` identity trap, pinned at the type level (#743 review). A registry written
@@ -1184,8 +1450,27 @@ mod tests {
     /// logins and two syncs can make an ended login failure unobservable.** `last_ended` fails this
     /// for most orderings, which is why the assertion is against the retained fields.
     ///
-    /// One login always fails, and the count of failures the registry reports must equal the count
-    /// that happened, at every step, regardless of what ended on top of it.
+    /// **Extended for #743 review round 3 (N9).** The first version drew login outcomes from
+    /// `{Succeeded, Failed}` only, with exactly one failure per run — so the property it enumerated
+    /// exhaustively was never the one B3 is about: two non-successes of DIFFERENT kinds, in both
+    /// orders. Under round 2's single shared slot they destroyed each other, and no test in the
+    /// alphabet could see it. The alphabet now spans **all 9 outcome pairs** over
+    /// `{Succeeded, Failed, Unknown}` × 2520 orderings, and the model tracked alongside is the whole
+    /// contract, re-asserted after every one of the 8 steps:
+    ///
+    /// - each of the three counters equals the number of logins that ended that way, and
+    /// - for **each** outcome, `last_login().get(o)` is present **iff** that outcome's count is
+    ///   non-zero, and
+    /// - when present it is the **most recently ENDED login with that outcome** — never another
+    ///   outcome's login, and never displaced by one.
+    ///
+    /// The per-outcome form is what makes B3 unrepeatable: any change that lets one outcome's login
+    /// land in another's slot fails here in hundreds of orderings, rather than surviving because the
+    /// only test that looked happened to use one kind.
+    ///
+    /// A login that ends WITHOUT `finish` is not a stand-in for the panic path — it *is* that path
+    /// (`AssetConnectGuard::drop` with the untouched `Unknown`). The real `catch_unwind` panics live
+    /// in `a_failure_and_a_panic_never_compete_for_a_slot_so_neither_can_hide_the_other`.
     #[test]
     fn no_interleaving_can_bury_a_login_failure_where_a_poller_cannot_find_it() {
         fn orderings(n: usize) -> Vec<Vec<usize>> {
@@ -1207,42 +1492,72 @@ mod tests {
         }
         enum Held { Sync(AssetSyncGuard), Connect(AssetConnectGuard) }
 
+        // Activities 0 and 1 are LOGINS; 2 and 3 are set syncs.
+        const PURPOSE: [&str; 2] = ["common asset load", "zone load: neriakc"];
+        // The model indexes by position in `ConnectOutcome::ALL`, so an outcome dropped from `ALL`
+        // is a compile-time `position()` panic here rather than a silently unchecked category.
+        let idx = |o: ConnectOutcome| ConnectOutcome::ALL.iter().position(|x| *x == o).unwrap();
+
+        let mut checked = 0usize;
         for order in orderings(4) {
-            let s = new_shared();
-            let mut held: Vec<Option<Held>> = (0..4).map(|_| None).collect();
-            // Activity 0 is the login that FAILS; 1 is a login that succeeds; 2 and 3 are set syncs.
-            let mut failed_so_far = 0u64;
-            for &k in &order {
-                match held[k].take() {
-                    None => held[k] = Some(match k {
-                        0 => Held::Connect(AssetConnectGuard::begin(&s, "common asset load")),
-                        1 => Held::Connect(AssetConnectGuard::begin(&s, "zone load: neriakc")),
-                        _ => Held::Sync(AssetSyncGuard::begin(&s, &format!("set{k}"))),
-                    }),
-                    Some(g) => match g {
-                        Held::Sync(g) => drop(g),
-                        Held::Connect(g) => {
-                            if k == 0 { g.finish(ConnectOutcome::Failed); failed_so_far += 1; }
-                            else { g.finish(ConnectOutcome::Succeeded); }
+            for a in ConnectOutcome::ALL {
+                for b in ConnectOutcome::ALL {
+                    let verdict = [a, b];
+                    let s = new_shared();
+                    let mut held: Vec<Option<Held>> = (0..4).map(|_| None).collect();
+                    // The contract, modelled independently of the code under test: a tally, and ONE
+                    // most-recent purpose PER OUTCOME.
+                    let mut tally = LoginOutcomeTally::default();
+                    let mut slots_model: [Option<String>; 3] = [None, None, None];
+                    for &k in &order {
+                        match held[k].take() {
+                            None => held[k] = Some(match k {
+                                0 | 1 => Held::Connect(AssetConnectGuard::begin(&s, PURPOSE[k])),
+                                _ => Held::Sync(AssetSyncGuard::begin(&s, &format!("set{k}"))),
+                            }),
+                            Some(g) => match g {
+                                Held::Sync(g) => drop(g),
+                                Held::Connect(g) => {
+                                    let o = verdict[k];
+                                    // Dropping without `finish` IS the panic path, not a mock of it.
+                                    if o == ConnectOutcome::Unknown { drop(g) } else { g.finish(o) }
+                                    tally.record(o);
+                                    slots_model[idx(o)] = Some(PURPOSE[k].into());
+                                }
+                            },
                         }
-                    },
+                        let slots = lock(&s);
+                        assert_eq!(slots.login_outcomes(), tally,
+                            "after {order:?} with verdicts {verdict:?}: the registry reports {:?} \
+                             but {tally:?} is what happened — a caller polling here is told the \
+                             wrong thing about logins that have already ended",
+                            slots.login_outcomes());
+                        for o in ConnectOutcome::ALL {
+                            assert_eq!(slots.last_login().get(o).is_some(), tally.count(o) > 0,
+                                "the record for {o:?} must be present exactly when its counter is \
+                                 non-zero — one biconditional PER OUTCOME, which is what round 2's \
+                                 shared slot could not offer: {order:?} {verdict:?}");
+                            assert_eq!(slots.last_login().get(o).map(|r| r.purpose.clone()),
+                                slots_model[idx(o)],
+                                "the record for {o:?} must be the most recent login that ended \
+                                 {o:?} — not another outcome's login, and not displaced by one: \
+                                 {order:?} {verdict:?}");
+                        }
+                        drop(slots);
+                        checked += 1;
+                    }
+                    // Ending state: every login has ended, so the tally is the whole verdict set.
+                    let slots = lock(&s);
+                    assert_eq!(slots.login_outcomes().unsuccessful(),
+                        verdict.iter().filter(|o| **o != ConnectOutcome::Succeeded).count() as u64,
+                        "…and at the end, for {order:?} {verdict:?}");
+                    assert_eq!(slots.live().len(), 0);
                 }
-                let slots = lock(&s);
-                assert_eq!(slots.login_outcomes().failed, failed_so_far,
-                    "after {order:?} step: {failed_so_far} login(s) have failed, but the registry \
-                     reports {} — a caller polling here is told the wrong thing about a failure \
-                     that already happened", slots.login_outcomes().failed);
-                assert_eq!(slots.last_login_failure().is_some(), failed_so_far > 0,
-                    "the retained failure must be present exactly when one has occurred: {order:?}");
             }
-            let slots = lock(&s);
-            assert_eq!(slots.login_outcomes().failed, 1, "…and at the end, for {order:?}");
-            assert_eq!(slots.last_login_failure().map(|e| e.what.clone()),
-                Some(EndedWhat::Connect {
-                    purpose: "common asset load".into(), outcome: ConnectOutcome::Failed,
-                }),
-                "no ordering of the other three activities may bury it: {order:?}");
         }
+        assert_eq!(checked, 2520 * 9 * 8,
+            "2520 orderings × 9 outcome pairs × 8 steps must each have been asserted; a shrunken \
+             enumeration is how this property stops covering the ordering it exists for");
     }
 
     /// A login and the syncs it enables share the registry, keep the oldest-first order, and own

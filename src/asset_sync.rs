@@ -1390,6 +1390,13 @@ mod observed_sync_tests {
     }
 
     #[test]
+    // #743: capitalised on purpose — SUCCEEDS vs FAILS are the two exit paths that must BOTH clear
+    // the slot, and the pair of shouted names is what makes the second test obviously not a
+    // duplicate of the first. Function-scoped like #730/#738's two `movement.rs` allows, never
+    // module- or crate-scoped: a wide allow would silently tolerate accidental `non_snake_case`
+    // anywhere in this 1500-line test module. (Warning pre-dates this PR — introduced by #715 in
+    // this PR's own merge base, and disclosed as unattributed in #738's body.)
+    #[allow(non_snake_case)]
     fn the_slot_is_cleared_when_a_sync_SUCCEEDS() {
         // Transition OUT of the phase, not into it. Without this, a finished load keeps reading as
         // an in-flight one forever and an agent waits on a download that is long over.
@@ -1402,6 +1409,10 @@ mod observed_sync_tests {
     }
 
     #[test]
+    // #743: capitalised on purpose — the ERROR return is a separate code path from the success
+    // return, and it is the one a hand-written "clear at the end of the happy path" would miss.
+    // Function-scoped for the same reason as its sibling above.
+    #[allow(non_snake_case)]
     fn the_slot_is_cleared_when_a_sync_FAILS() {
         // The error return is a separate code path from the success return, and it is the one a
         // hand-written "clear at the end of the happy path" would miss. A failed sync frozen on
