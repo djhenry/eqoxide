@@ -108,42 +108,39 @@ fn extract_alpha_cutout(source: &str, label: &str) -> f32 {
         .unwrap_or_else(|e| panic!("{label}: `{literal}` (the alpha-cutout threshold) isn't a valid f32 literal: {e}"))
 }
 
-/// Extracts the raw source text *inside* the `if (texel.a < ...) { ... }` block that follows the
-/// cutout condition — as opposed to [`extract_alpha_cutout_literal`], which only extracts the
-/// condition itself. An independent review of eqoxide#718 found that naga parses and validates an
-/// EMPTY `if` block just fine, so a test that only checks the condition text cannot tell "texels
-/// below the cutout are discarded" from "texels below the cutout are compared against and then
-/// nothing happens" — the latter reproduces #707 exactly. This extracts the block body, WITH `//`
-/// line comments stripped from each line first, so a test can assert something is actually *done*
-/// with the comparison rather than merely *mentioned* in a comment.
-///
-/// The comment-stripping is load-bearing, not decoration: the first version of this helper returned
-/// the block's raw text, and a self mutation-check against the reviewer's exact repro (commenting out
-/// `discard;` to `// discard;`, leaving the body otherwise byte-for-byte intact) revealed that
-/// `block.contains("discard")` still matched — the word "discard" is still literally present in the
-/// comment. That mutation-check is exactly what caught this and is why the stripping exists.
-fn extract_alpha_cutout_block<'a>(source: &'a str, label: &str) -> String {
-    let marker = "texel.a < ";
-    let at = source
-        .find(marker)
-        .unwrap_or_else(|| panic!("{label}: couldn't find `{marker}` (no alpha-test cutout?)"));
-    let after = &source[at..];
-    let brace_open = after
-        .find('{')
-        .unwrap_or_else(|| panic!("{label}: couldn't find the `{{` opening the `texel.a < ...` block"));
-    let brace_close = after[brace_open..]
-        .find('}')
-        .unwrap_or_else(|| panic!("{label}: couldn't find the `}}` closing the `texel.a < ...` block"));
-    let raw = &after[brace_open + 1..brace_open + brace_close];
-    raw.lines()
-        .map(|line| match line.find("//") {
-            Some(idx) => &line[..idx],
-            None => line,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
+/// Recursively walks a naga IR statement block — including nested `if`/`loop`/`switch`/`block`
+/// statements — looking for a `discard;` statement, which naga's parsed & validated IR represents as
+/// [`naga::Statement::Kill`] regardless of how it's spelled, commented around, or where it sits in
+/// the source file. Operating on the IR rather than source text is what makes this immune to comment
+/// style (line or block), to substrings inside identifiers (e.g. a local named
+/// `discard_threshold`), and to entry-point ordering in the file — see the doc comment on
+/// `shadow_masked_alpha_cutout_actually_discards` below for why a source-text version of this check
+/// failed against exactly those three things, across two independent-review rounds.
+fn block_has_kill(block: &naga::Block) -> bool {
+    block.iter().any(|stmt| match stmt {
+        naga::Statement::Kill => true,
+        naga::Statement::If { accept, reject, .. } => block_has_kill(accept) || block_has_kill(reject),
+        naga::Statement::Block(inner) => block_has_kill(inner),
+        naga::Statement::Loop { body, continuing, .. } => {
+            block_has_kill(body) || block_has_kill(continuing)
+        }
+        naga::Statement::Switch { cases, .. } => cases.iter().any(|c| block_has_kill(&c.body)),
+        _ => false,
+    })
+}
+
+/// Looks up the entry point named `entry_point_name` in an already-parsed-and-validated
+/// [`naga::Module`] and asks [`block_has_kill`] whether its body contains a `discard` anywhere in its
+/// control flow. Targeting a SPECIFIC named entry point (rather than "the first cutout-shaped region
+/// found in the raw source") is what makes this immune to a second, unrelated
+/// `if (texel.a < ...) { discard; }` appearing earlier in the same file.
+fn entry_point_kills(module: &naga::Module, entry_point_name: &str, label: &str) -> bool {
+    let ep = module
+        .entry_points
+        .iter()
+        .find(|ep| ep.name == entry_point_name)
+        .unwrap_or_else(|| panic!("{label}: no entry point named `{entry_point_name}` in the parsed module"));
+    block_has_kill(&ep.function.body)
 }
 
 /// Extracts the raw source text of the EQ WLD → render axis swizzle
@@ -317,35 +314,50 @@ fn shadow_masked_alpha_cutout_matches_expected_value() {
     }
 }
 
-/// Structural guard added in response to an independent review (eqoxide#718 BLOCKING-2): the two
-/// tests above only look at the `texel.a < X` *condition* — they never check what the `if` block
-/// controlled by that condition does. naga parses and validates `if (texel.a < 0.5) { }` (an empty
-/// body) without complaint, so both tests above stay green even when nothing is actually discarded —
-/// which reproduces #707 exactly: a masked caster's shadow pass would compare every texel against
-/// the cutout and then do nothing, writing full depth for all of them, the same square-shadow bug
-/// this PR fixes. This test reads the block body and requires it to actually `discard`.
+/// Structural guard added in response to an independent review (eqoxide#718 BLOCKING-2), and
+/// REWRITTEN in response to a second independent-review round after the first version turned out to
+/// prove less than its own doc comment claimed.
 ///
-/// Mutation-checked against the reviewer's own repro: replacing `discard;` with a comment inside
-/// `shadow_masked_instanced.wgsl`'s `fs_instanced_masked` — leaving `if (texel.a < 0.5) { }`
-/// otherwise byte-for-byte intact — makes this test panic (`extract_alpha_cutout_block` returns an
-/// empty/comment-only string that doesn't contain `"discard"`); restoring `discard;` makes it pass
-/// again. The two sibling tests above were confirmed to stay green throughout that mutation, exactly
-/// as the reviewer found — this test exists because they don't catch it and nothing else in this
-/// file did either.
+/// **Round 1** established that the two tests above only look at the `texel.a < X` *condition* —
+/// never at what the `if` block controlled by that condition does. naga parses and validates
+/// `if (texel.a < 0.5) { }` (an empty body) without complaint, so both tests above stay green even
+/// when nothing is actually discarded — which reproduces #707 exactly. The round-1 fix was a
+/// source-text helper (`extract_alpha_cutout_block`, since removed) that located the first
+/// `texel.a < ` in the file and checked whether the following `{ ... }` block's text — with `//`
+/// line comments stripped — contained the substring `"discard"`.
+///
+/// **Round 2** found that helper proved a *weaker* property than its doc comment claimed, via two
+/// mutations against `shadow_masked_instanced.wgsl`'s `fs_instanced_masked`, both of which left every
+/// test in this file green:
+///   - **Mutation A**: `discard;` → `/* discard; */`. Only `//` line comments were stripped, so
+///     `"discard"` survived inside a `/* ... */` block comment.
+///   - **Mutation B**: an unbound `fs_unused_masked` entry point added *earlier* in the file, with
+///     its own `if (texel.a < ...) { discard; }`, while the real `fs_instanced_masked` was emptied
+///     out. The helper located the FIRST `texel.a < ` in the source, so it graded the decoy and never
+///     looked at the entry point `pipeline.rs` actually binds.
+///
+/// This version drops the source-text search entirely and instead walks the parsed & validated
+/// `naga::Module`'s IR: [`entry_point_kills`] looks up a SPECIFIC entry point by name and asks
+/// [`block_has_kill`] whether a `Statement::Kill` (naga's IR form of `discard`) appears anywhere in
+/// its control flow, recursively through nested `if`/`loop`/`switch`/`block` statements. This is
+/// immune to comment style, to substrings inside identifiers, and to entry-point ordering in the
+/// source file — mutations A and B above were both re-run against this version: both go RED, with
+/// the other 8 tests in this file staying green, matching the pristine-green/mutant-red pattern the
+/// round-1 test was supposed to establish in the first place.
 #[test]
 fn shadow_masked_alpha_cutout_actually_discards() {
-    for (source, label) in [
-        (ZONE_WGSL, "zone.wgsl"),
-        (ZONE_INSTANCED_WGSL, "zone_instanced.wgsl"),
-        (SHADOW_MASKED_INSTANCED_WGSL, "shadow_masked_instanced.wgsl"),
+    for (source, label, entry_point) in [
+        (ZONE_WGSL, "zone.wgsl", "fs_main"),
+        (ZONE_INSTANCED_WGSL, "zone_instanced.wgsl", "fs_main"),
+        (SHADOW_MASKED_INSTANCED_WGSL, "shadow_masked_instanced.wgsl", "fs_instanced_masked"),
     ] {
-        let block = extract_alpha_cutout_block(source, label);
+        let module = parse_and_validate(source, label);
         assert!(
-            block.contains("discard"),
-            "{label}: the `if (texel.a < ...) {{ ... }}` block body is `{block:?}` — it doesn't \
-             contain `discard`, so texels below the cutout are compared against but never dropped. \
-             That reproduces #707 (or the color-pass equivalent) even though the threshold literal \
-             is present and numerically correct."
+            entry_point_kills(&module, entry_point, label),
+            "{label}: entry point `{entry_point}` never executes a `discard` statement (naga's \
+             `Statement::Kill`) anywhere in its body — texels are compared against the alpha cutout \
+             but nothing is ever dropped. That reproduces #707 (or the color-pass equivalent) even \
+             though the threshold literal is present and numerically correct."
         );
     }
 }
