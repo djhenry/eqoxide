@@ -1734,7 +1734,7 @@ mod cursor_resync_tests {
     /// escape so each line's count comes out even, passes this check silently — a FALSE PASS, and
     /// the exact shape it exists to catch. Parity implies a crossing span only when nothing else on
     /// the line contributes an odd backtick count of its own; it is not equivalent to it. See "What
-    /// it does NOT do" below for the sixth bullet this forces.
+    /// it does NOT do" above for the sixth bullet this forces.
     ///
     /// ⚠️ **Correction (#727 round 9 review, blocking).** Round 8's rewrite struck the `i.e.`
     /// equivalence above but left a second, stronger absolute standing: "no amount of widening the
@@ -1751,17 +1751,19 @@ mod cursor_resync_tests {
     /// used to close with a comparison between this check and `doc_citations`: "They catch
     /// overlapping but different subsets of wrapped citations; neither subsumes the other." Found
     /// false in one direction and deleted, not repaired — this is the third round running in which
-    /// a sentence summarising the relationship between the two checks turned out to be a new
-    /// falsifiable absolute (round 8's `i.e.` equivalence in the paragraph above, round 9's own
-    /// "neither subsumes" replacement for it, now this one). No replacement sentence is written.
-    /// What this check does
+    /// a single absolute claim in this doc turned out to be false: round 8's `i.e.` equivalence
+    /// above (a claim about this check alone, not a comparison), round 9's causal claim that no
+    /// amount of charset widening could have caught the round-6 citation, and now this one. (#764:
+    /// the PR body and the round-10 review comment carry an earlier list with the same intent that
+    /// omits the round-9 item and double-counts this one; left as merged history, not rewritten.)
+    /// No replacement sentence is written. What this check does
     /// is stated in the paragraph above, on its own terms; what `doc_citations` does is stated in
-    /// its own doc, on its own terms. Nothing here compares them, and nothing should.
+    /// its own doc, on its own terms. This block adds no claim about how they relate.
     ///
     /// ⚠️ **Correction (#727 round 10 review, non-blocking).** The round-9 block above says the
     /// wrapped fragment "IS visible" to `doc_citations`, unqualified. Left as originally written,
     /// as history — but for the reader, it holds only when the opening line's own backtick count
-    /// is odd; the sixth bullet below (padding onto an even count) is the case where it does not.
+    /// is odd; the sixth bullet above (padding onto an even count) is the case where it does not.
     fn unbalanced_doc_spans(src: &str) -> Vec<usize> {
         let mut out = Vec::new();
         let mut in_fence = false;
