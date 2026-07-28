@@ -1478,8 +1478,9 @@ mod tests {
     /// is the single variable that decides which assertion the second red lands on, so the mutation
     /// script asserts the two-field body is still present verbatim and aborts if it is not. Call
     /// this **variant A**; **variant B** is the same mutation with `unsuccessful()` wired
-    /// (`+ self.refused`). Both were run at round 9, at this head and at the round-7 head, so which
-    /// run produced which number below is measured rather than inferred.
+    /// (`+ self.refused`). Both were run at round 9, at `55ecbff` (the head round 9 started from) and at
+    /// the round-7 head `5df7099`, so which run produced which number below is measured rather than
+    /// inferred. Commit SHAs, not "this head" — this very edit moves HEAD past `55ecbff`.
     ///
     /// ⚠️ **[EDIT, round 7 (#755 review, B2): "every other test in this module and in `eqoxide-http`
     /// stayed green; this one alone went RED" was false.]** ⚠️ **[EDIT, round 9 (#755 review, B1-r8):
@@ -1487,7 +1488,7 @@ mod tests {
     /// of the two bullets below. That is a collapsed referent. Both runs print `52 passed; 2 failed`
     /// — 54 tests, two red either way — which hides the seam, but the round-7 review's second red was
     /// a **different assertion at a different line**; see the adjudication below.]** The two bullets
-    /// are this round's own re-run of **variant A** at this head, `eqoxide-ipc`,
+    /// are this round's own re-run of **variant A** at `55ecbff`, `eqoxide-ipc`,
     /// `test result: FAILED. 52 passed; 2 failed`:
     ///
     /// - this test, exactly as designed — `left: 3, right: 4` distinct tokens
@@ -1517,8 +1518,8 @@ mod tests {
     /// |---|---|---|---|
     /// | round-7 `5df7099` | A, unwired | per-iteration `unsuccessful()` check, `0` vs `2` | `52 passed; 2 failed` |
     /// | round-7 `5df7099` | B, wired | the `checked` literal, **`322560` vs `181440`** | `52 passed; 2 failed` |
-    /// | this head `55ecbff` | A, unwired | per-iteration `unsuccessful()` check, `0` vs `2` | `52 passed; 2 failed` |
-    /// | this head `55ecbff` | B, wired | **none — that test is GREEN** | `53 passed; 1 failed` |
+    /// | round-8 `55ecbff` | A, unwired | per-iteration `unsuccessful()` check, `0` vs `2` | `52 passed; 2 failed` |
+    /// | round-8 `55ecbff` | B, wired | **none — that test is GREEN** | `53 passed; 1 failed` |
     ///
     /// So the round-7 review's `322560 vs 181440` was neither a mistake nor a different bug: it is
     /// row 2, the same mutation plus the one line that lets the loop run to completion. And row 4 is
@@ -1876,8 +1877,8 @@ mod tests {
         // Whether it is reached is therefore a property of the mutation, not of this defect: the
         // divergence is real either way. Derived from `ALL.len()` so the count self-scales with the
         // alphabet the loops actually walk, regardless of which assertion a given mutation trips
-        // first — and at this head, with `unsuccessful()` wired, that test is GREEN under the same
-        // mutation that reddened it at the round-7 head.]
+        // first — and at `55ecbff`, with `unsuccessful()` wired, that test is GREEN under the same
+        // mutation that reddened it at the round-7 head `5df7099`.]
         assert_eq!(checked, 2520 * ConnectOutcome::ALL.len().pow(2) * 8,
             "2520 orderings × ALL.len()² outcome pairs × 8 steps must each have been asserted; a \
              shrunken enumeration is how this property stops covering the ordering it exists for");
