@@ -340,6 +340,17 @@ mod no_silent_overwrite_guard {
     /// The statement bounds are the previous `;`/`{`/`}` and — because the canonical shape carries
     /// its `return busy;` inside a block — the first `;` after the statement's opening brace, when
     /// a brace comes before the next `;`.
+    ///
+    /// **Do not add a "which terminator did this site use" field here (#770 B1, round 2 attempted
+    /// exactly this and it was reverted).** The span above ends at the first `;` *after* the
+    /// opening brace, so a malformed site missing its `;` inside `{ return busy` — the very thing
+    /// conjunct 3 exists to flag — lets the span run on into the FOLLOWING statement and pick up
+    /// *its* terminator instead. A message that echoes "the terminator this span contains" is then
+    /// not "the terminator this call site uses"; it can name the wrong one, on exactly the
+    /// malformed input the guard is supposed to describe accurately. Fixing the span to stop at
+    /// the offending statement's own closing brace would be a behaviour change, out of place in a
+    /// docs-only fix; until that happens, [`offender_message`] states both accepted shapes rather
+    /// than guessing which one applies.
     fn refusal_sites(src: &str) -> Vec<Site> {
         const NEEDLE: &str = "s.command.request_";
         let (text, map) = normalize(src);
@@ -365,6 +376,28 @@ mod no_silent_overwrite_guard {
             });
         }
         out
+    }
+
+    /// The offender message for a non-canonical [`Site`]. Kept as its own function, rather than
+    /// inlined at the one call site, so a test can pin its exact text without needing the scanner
+    /// to find a real non-canonical site on this (canonical) tree — see
+    /// `offender_message_names_both_accepted_shapes` below.
+    ///
+    /// #770 B1, round 2: this used to echo back "the" terminator found in the site's scanned
+    /// statement, labelled as the one accepted spelling / guaranteed to compile. Both claims were
+    /// false — conjunct 2 accepts two non-interchangeable terminators, and the span that finds one
+    /// of them is not reliably bounded to the flagged call (see the note on [`refusal_sites`]). So
+    /// this states both accepted shapes plainly instead of asserting which one is correct here: a
+    /// message that says less but is never wrong beats one that is usually right.
+    fn offender_message(file: &str, line: usize, name: &str, faults: &[u8]) -> String {
+        format!(
+            "{file}:{line}: {name} — not the canonical refusal (violates conjunct(s) {faults:?} of \
+             refusal_shape_faults). The accepted shape is one of:\n    \
+             if let Some(busy) = s.command.{name}(..).refused(MSG) {{ return busy; }} \
+             // handler returns (StatusCode, String)\n    \
+             if let Some(busy) = s.command.{name}(..).refused_json(json!({{ .. }})) {{ return busy; }} \
+             // handler returns Response"
+        )
     }
 
     /// R2-1 + R2-3 + R3-1, pinned. Every row is a literal source snippet; the expectation is the
@@ -524,6 +557,36 @@ mod no_silent_overwrite_guard {
         );
     }
 
+    /// #770 B1, round 2: [`offender_message`] is built inside `!canonical`, which no site on this
+    /// (canonical) tree ever reaches — a green run of
+    /// [`every_refusable_command_request_is_checked_by_its_http_caller`] exercises it zero times, so
+    /// it was possible to publish a false claim ("guaranteed to compile") about a code path no test
+    /// ever executed. Calling the function directly, on a fabricated non-canonical case, is what
+    /// makes it not-dead: this test fails if the message text drifts from either accepted shape, or
+    /// if it starts claiming to know which one applies to a given site (the thing that was false).
+    #[test]
+    fn offender_message_names_both_accepted_shapes() {
+        let msg = offender_message("combat.rs", 152, "request_attack", &[1, 3]);
+        assert_eq!(
+            msg,
+            "combat.rs:152: request_attack — not the canonical refusal (violates conjunct(s) [1, 3] \
+             of refusal_shape_faults). The accepted shape is one of:\n    \
+             if let Some(busy) = s.command.request_attack(..).refused(MSG) { return busy; } \
+             // handler returns (StatusCode, String)\n    \
+             if let Some(busy) = s.command.request_attack(..).refused_json(json!({ .. })) { return busy; } \
+             // handler returns Response"
+        );
+        // Anti-vacuity against the exact failure mode this replaces: the message must not single
+        // out one shape as "the" accepted one, or name a terminator without the other beside it —
+        // both `.refused(` and `.refused_json(` must be present, uncoupled from which one (if
+        // either) actually appears at the flagged site, because the scanner cannot reliably tell
+        // (see the note on `refusal_sites`).
+        assert!(msg.contains(".refused(MSG)") && msg.contains(".refused_json(json!({ .. }))"),
+            "offender_message must always name BOTH accepted shapes, not the one it guesses: {msg:?}");
+        assert!(!msg.to_lowercase().contains("guarantee"),
+            "offender_message must not claim a compile guarantee it cannot back: {msg:?}");
+    }
+
     /// The universal at the HTTP boundary: a handler that calls a refusable `request_*` and IGNORES
     /// the returned `bool` has re-created exactly the #347 defect — the command was dropped on the
     /// floor and the caller was still told `200`. Every such call site must consume the result.
@@ -567,10 +630,7 @@ mod no_silent_overwrite_guard {
                 } else if canonical {
                     checked.push(format!("{file}:{line}: {name}"));
                 } else {
-                    offenders.push(format!(
-                        "{file}:{line}: {name} — not the canonical refusal (violates conjunct(s) \
-                         {faults:?} of refusal_shape_faults)"
-                    ));
+                    offenders.push(offender_message(&file, line, &name, &faults));
                 }
             }
         }
