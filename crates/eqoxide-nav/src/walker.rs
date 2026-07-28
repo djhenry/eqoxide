@@ -453,8 +453,10 @@ impl Walker {
         let mut s = self.nav.nav_state.lock().unwrap();
         // #732: `idle` means the goal is over, so it goes through the ONE writer that retires the
         // goal's facts — including `goal` itself, which the transition branch below never touched.
-        // Unconditional, not gated on `s.state != state`: retiring to `idle` twice (a zone change
-        // while already idle) must not skip the clear on the second pass.
+        // Unconditional, not gated on `s.state != state`: defence in depth, so no caller can
+        // reintroduce the leak by making a second retirement a no-op. (#732 review N1 measured that
+        // re-gating it is currently fully GREEN — every route now clears `goal`, so an already-`idle`
+        // row has nothing left to clear. This guards the shape, not a scenario I can exhibit.)
         if state == "idle" { s.retire_to_idle(reason); return; }
         let reason = reason.map(str::to_string);
         if s.state != state || s.reason != reason {
@@ -2577,6 +2579,42 @@ mod tests {
         assert_eq!(s.reason.as_deref(), Some(NAV_REASON_GOAL_DROPPED));
         assert_eq!(s.goal, None,
             "#732: a goal that vanished must not keep publishing its coordinates beside `idle`");
+    }
+
+    /// **#732 review round 1, N1: the `idle` branch is deliberately NOT gated on the transition
+    /// check, and this is what pins that.**
+    ///
+    /// The rest of `set_nav_state_because` only retires the previous route's facts when `state` or
+    /// `reason` actually CHANGES. If the `idle` branch inherited that gate, a retirement into a row
+    /// that is already `idle` with the same reason would skip the clear entirely.
+    ///
+    /// **Honest scope.** The reviewer measured that re-gating the branch is currently fully green,
+    /// and that is right: under the fixed code every route to `idle` clears `goal`, so an
+    /// already-`idle` row reached through production has nothing left to clear. This test therefore
+    /// plants the `idle` + non-null `goal` pair DIRECTLY — the state a hypothetical future writer
+    /// (or a partially-reverted one) would leave behind. It pins the SHAPE of the guard, not a
+    /// scenario reachable through today's production paths, and it should be read that way.
+    ///
+    /// Mutation check: re-gate the branch as `if state == "idle" && s.state != state` → RED here,
+    /// and green everywhere else in the workspace, which is the whole reason this test exists.
+    #[test]
+    fn retiring_into_an_already_idle_row_still_clears_the_goal_732() {
+        let (w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        {
+            // NOT reachable through production today (see the doc comment) — planted to model the
+            // row a writer that set `idle` without retiring would leave.
+            let mut s = nav.nav_state.lock().unwrap();
+            s.state = "idle".to_string();
+            s.reason = Some(NAV_REASON_ZONED.to_string());
+            s.goal = Some([10.0, 20.0, 3.0]);
+            assert_eq!(s.goal, Some([10.0, 20.0, 3.0]),
+                "PREMISE: the row is already `idle` with the SAME reason the call below passes, so \
+                 a transition-gated branch would take the no-op path");
+        }
+        w.set_nav_state_because("idle", Some(NAV_REASON_ZONED));
+        assert_eq!(nav.nav_state.lock().unwrap().goal, None,
+            "#732: retiring to `idle` must clear the goal even when the row is already `idle` — a \
+             second retirement is not permitted to be a no-op that leaves the goal standing");
     }
 
     /// **#725 review, B1: a successful crossing must not look like a dropped one.** This is the line

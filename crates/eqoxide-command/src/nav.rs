@@ -153,6 +153,22 @@ impl CommandState {
             "#732: `idle` owns no goal — `nav_goal` must be null for idle/stop (docs/http-api.md)");
         let mut s = self.nav.nav_state.lock().unwrap();
         s.goal_id += 1;
+        // #732 review round 1, B1 — `stopped` and `goto_superseded` are two of the six documented
+        // routes to `idle`, and they used to reach it through the flat assignment list below. That
+        // list has no exhaustiveness: a field added to `NavStatus` is force-decided in
+        // `retire_to_idle` (E0027) and was SILENTLY FORGOTTEN here, so the guard #732 installs would
+        // have re-opened #732's own defect shape on the next per-goal field added. Measured with a
+        // throwaway `probe_route_len` field: E0027 in `eqoxide-ipc`, `eqoxide-command` compiled
+        // clean, and `request_stop` published the field beside `state: "idle"`.
+        //
+        // Behaviour-identical: `retire_to_idle` writes a strict subset of what this list writes for
+        // `idle` (it deliberately keeps `local`, which is cleared just below), and both `idle` call
+        // sites already pass `goal: None`.
+        if new_state == "idle" {
+            s.local = None;
+            s.retire_to_idle(reason);
+            return s.goal_id;
+        }
         s.state = new_state.to_string();
         s.reason = reason.map(str::to_string);
         s.goal = goal.map(|(x, y, z)| [x, y, z]);
@@ -453,6 +469,65 @@ mod tests {
         }
         assert_ne!(NAV_REASON_STOPPED, NAV_REASON_GOTO_CANCELLED,
             "an explicit /stop and a cancel the caller did not ask for must be distinguishable");
+    }
+
+    /// **#732 review round 1, B1** — `/v1/move/stop` and the manual-move cancel are two of the six
+    /// documented routes to `idle`, and they reach it through `stamp_new_goal`, NOT through the
+    /// walker. Before this they retired the per-goal facts with a flat, hand-maintained assignment
+    /// list; `NavStatus::retire_to_idle`'s exhaustive destructure (`error[E0027]` on a new field)
+    /// did not cover them, so a per-goal field added later would have been force-decided in the
+    /// walker's route and silently forgotten in these two. That is #732's own defect shape — a fact
+    /// about a finished goal published beside `idle` — re-opened by the guard #732 installs.
+    ///
+    /// This pins the OUTCOME of the delegation. Every per-goal fact is planted directly on the
+    /// shared `NavStatus` first, with a premise block asserting they are really loaded, so each
+    /// assertion below is load-bearing rather than satisfied by `NavStatus::default()`.
+    ///
+    /// **Mutation check:** delete `*goal = None;` (or `*tier = None;`, or the `blocked_*` clears)
+    /// from `NavStatus::retire_to_idle` → the corresponding assertion goes RED for BOTH routes.
+    /// Restore the old inline list in `stamp_new_goal` instead of delegating → still green, because
+    /// the old list happened to clear the fields that exist TODAY; what the delegation buys is that
+    /// the NEXT field cannot be forgotten here, and that property is the compiler's (E0027), not
+    /// this test's. Stated so nobody reads this test as evidence for the compile-time guarantee.
+    #[test]
+    fn stop_and_cancel_retire_every_per_goal_fact_732() {
+        for (label, act, want) in [
+            ("stop",        Box::new(|cs: &CommandState| { cs.request_stop(); })        as Box<dyn Fn(&CommandState)>,
+             NAV_REASON_STOPPED),
+            ("cancel_goto", Box::new(|cs: &CommandState| { cs.request_cancel_goto(); }) as Box<dyn Fn(&CommandState)>,
+             NAV_REASON_GOTO_CANCELLED),
+        ] {
+            let cs = CommandState::default();
+            let goal_id = cs.request_goto((2216.0, 579.0, -113.0));
+            {
+                // A committed route that then went terminal: every per-goal fact loaded at once.
+                let mut s = cs.nav.nav_state.lock().unwrap();
+                s.state = "no_path".to_string();
+                s.tier = Some("preferred");
+                s.blocked_goal = Some(eqoxide_ipc::NavBlockage { hazard: "wall", at: [1.0, 2.0, 3.0] });
+                s.blocked_frontier = Some(eqoxide_ipc::NavBlockage { hazard: "floor", at: [4.0, 5.0, 6.0] });
+                assert_eq!(s.goal, Some([2216.0, 579.0, -113.0]),
+                    "{label}: PREMISE — the goal an observer reads really is loaded");
+                assert!(s.tier.is_some() && s.blocked_goal.is_some() && s.blocked_frontier.is_some(),
+                    "{label}: PREMISE — the per-route facts really are loaded, so the assertions \
+                     below cannot pass on the struct's default");
+            }
+
+            act(&cs);
+
+            let s = cs.nav.nav_state.lock().unwrap();
+            assert_eq!(s.state, "idle", "{label}: the route ends at idle");
+            assert_eq!(s.reason.as_deref(), Some(want), "{label}: naming how it got there (#725)");
+            assert_eq!(s.goal, None,
+                "{label}: #732 — a cancelled goal's coordinates must not survive beside `idle`; \
+                 they carry no zone tag, so a stale one is indistinguishable from a live one");
+            assert_eq!(s.tier, None, "{label}: the per-route clearance tier died with the route");
+            assert_eq!(s.blocked_goal, None, "{label}: the blockage described the retired goal");
+            assert_eq!(s.blocked_frontier, None, "{label}: likewise the frontier");
+            assert!(s.goal_id > goal_id,
+                "{label}: the identity stamp is MONOTONIC, not retired (#349) — a fresh accept, so \
+                 a read cannot attribute this outcome to the goal that was cancelled");
+        }
     }
 
     /// **#725 review round 3, B3: the liveness count that `drain_zone_cross` asserts on.** The

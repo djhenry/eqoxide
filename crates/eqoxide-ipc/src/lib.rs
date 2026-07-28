@@ -1398,16 +1398,28 @@ pub struct NavLocal {
 impl NavStatus {
     /// Retire to `idle`: the goal is over, so every fact that was ABOUT that goal goes with it.
     ///
-    /// **This is the single writer for the `idle` row of the `docs/http-api.md` state table**, which
-    /// says `nav_goal` is "`null` for `idle`/`stop`". Before #732 that row was documented but not
-    /// enforced: `Walker::set_nav_state_because` retired `blocked_*`/`tier` on a transition and never
-    /// touched `goal`, so every walker-side route to `idle` — `zoned` (a zone change),
-    /// `goal_dropped`, `respawned` — left the finished goal's `[x, y, z]` published beside it. Across
-    /// a zone change that is the sharp case: coordinates are a per-zone namespace and carry no zone
-    /// tag, so the pair reads as a well-formed answer about a zone the numbers do not belong to.
+    /// **Every production TRANSITION into `idle` goes through here**, which is what makes the
+    /// `docs/http-api.md` state table's "`nav_goal` is `null` for `idle`/`stop`" a checked invariant
+    /// rather than prose. The three writers that reach `idle` — `Walker::set_nav_state_because`
+    /// (`zoned`, `goal_dropped`, `respawned`), `CommandState::stamp_new_goal` (`stopped`,
+    /// `goto_superseded`) and `ZoneCrossTicket::drop` (`zone_cross_dropped_unhandled`) — all
+    /// delegate here; that is all six documented `nav_reason` values for `idle`.
     ///
-    /// Called unconditionally (never gated on "the state actually changed") so a second retirement
-    /// with no request in between cannot skip the clear.
+    /// The one `idle` that does NOT come through here is [`NavStatus::default`], the boot row. That
+    /// is not a retirement: it builds the struct from scratch with every field at its zero value, so
+    /// it cannot leave a previous goal's fact standing. It is also the only `idle` allowed to carry
+    /// `reason: None` (#725 B1) — see the `debug_assert` below.
+    ///
+    /// Before #732 the row was documented but not enforced: `Walker::set_nav_state_because` retired
+    /// `blocked_*`/`tier` on a transition and never touched `goal`, so every walker-side route to
+    /// `idle` left the finished goal's `[x, y, z]` published beside it. Across a zone change that is
+    /// the sharp case: coordinates are a per-zone namespace and carry no zone tag, so the pair reads
+    /// as a well-formed answer about a zone the numbers do not belong to.
+    ///
+    /// Called unconditionally (never gated on "the state actually changed"): defence in depth, so no
+    /// caller can reintroduce the leak by making a second retirement a no-op. (#732 review N1: under
+    /// the fixed code every route clears `goal`, so an already-`idle` row has nothing left to clear —
+    /// this guards the *shape*, not a scenario I can exhibit.)
     ///
     /// **The destructure is exhaustive with no `..` on purpose.** Adding a field to [`NavStatus`]
     /// is an `error[E0027]` here until someone decides whether it survives a goal's retirement —

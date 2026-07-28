@@ -5146,8 +5146,11 @@ mod tests {
     /// `debug_publishes_no_nav_goal_once_the_goal_is_retired_to_idle_732` in that crate, which
     /// cannot be called from here (eqoxide-http depends on this crate's siblings, not the reverse).
     ///
-    /// Mutation check: delete `*goal = None;` from `NavStatus::retire_to_idle`
-    /// (`crates/eqoxide-ipc/src/lib.rs`) → the post-zone `goal` assertion goes RED.
+    /// Mutation checks (both run): delete `*goal = None;` from `NavStatus::retire_to_idle`
+    /// (`crates/eqoxide-ipc/src/lib.rs`) → the post-zone `goal` assertion goes RED. Delete
+    /// `*tier = None;` from the same function → the `tier` assertion goes RED, which is what pins
+    /// the explicit `tier` clear this PR removed from `Walker::reset_for_zone_change` **through the
+    /// real zone-change path** (the eqoxide-http test covers `retire_to_idle` called directly).
     #[tokio::test]
     async fn a_zone_change_retires_the_previous_zones_nav_goal_732() {
         // `shared_nav_action_loop` (not `new_loop`) because this test spans the command side and
@@ -5163,6 +5166,12 @@ mod tests {
         // concrete walk, which is the path #732 was measured on.
         let goal_id = command.request_goto((2216.0, 579.0, -113.0));
         al.walker.set_nav_state_because("navigating", None);
+        // A committed route in the old zone has a clearance tier (#378 Phase 2). Planted AFTER the
+        // state transition, because `set_nav_state_because` retires `tier` on a transition.
+        // #732 review round 1, B2: without this the `tier` assertion below is satisfied by
+        // `NavStatus::default()` before the code under test runs — and it is the ONLY thing pinning
+        // the explicit `tier = None` this PR DELETED from `Walker::reset_for_zone_change`.
+        nav.nav_state.lock().unwrap().tier = Some("preferred");
         {
             let s = nav.nav_state.lock().unwrap();
             assert_eq!(s.goal, Some([2216.0, 579.0, -113.0]),
@@ -5171,6 +5180,9 @@ mod tests {
                 "PREMISE: a NON-terminal, non-idle state — otherwise the retirement under test \
                  would not be the thing that clears the goal");
             assert_eq!(s.goal_id, goal_id, "PREMISE: that goal carries the id the accept returned");
+            assert_eq!(s.tier, Some("preferred"),
+                "PREMISE: a per-route tier really is loaded, so the post-zone `tier` assertion is \
+                 load-bearing rather than satisfied by the struct's default");
         }
 
         // Cross into lfaydark. This is the production entry point: the packet path sets the new
