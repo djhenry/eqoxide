@@ -161,7 +161,7 @@ mod tests {
     /// out of the sources. **No reformatting evades a behavioural test.** Wrap a write across five
     /// lines and the second write still has to be refused, or that test fails. This static rule is
     /// a redundant early-warning on top of it, catching a *newly added* blind write before anyone
-    /// writes a behaviour test for it; a reflow can cost it a line, not the guarantee.
+    /// writes a behaviour test for it.
     #[test]
     fn no_domain_module_blind_writes_a_command_slot() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

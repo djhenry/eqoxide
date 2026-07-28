@@ -569,7 +569,8 @@ mod no_silent_overwrite_guard {
                 } else {
                     offenders.push(format!(
                         "{file}:{line}: {name} — not the canonical refusal (violates conjunct(s) \
-                         {faults:?} of refusal_shape_faults)"
+                         {faults:?} of refusal_shape_faults). The one accepted spelling is:\n    \
+                         if let Some(busy) = s.command.{name}(..).refused(MSG) {{ return busy; }}"
                     ));
                 }
             }
