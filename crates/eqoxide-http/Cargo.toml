@@ -15,7 +15,9 @@ path = "src/lib.rs"
 # tests, which need `eq_net::packet_handler` — an app-crate module BELOW which http sits) can build
 # an `HttpState` and hit the observe router. Off in normal builds; the release binary never has it.
 # Forwards to eqoxide-nav so `testkit::empty_state` can build a real `ZoneAssetState::Ready`.
-test-fixtures = ["eqoxide-nav/test-fixtures"]
+# Forwards to eqoxide-ipc so `testkit::empty_state` can build a `NetHealth::frozen_at` — the pinned
+# health clock that stops a downstream handler test's HTTP status depending on machine load (#760).
+test-fixtures = ["eqoxide-nav/test-fixtures", "eqoxide-ipc/test-fixtures"]
 
 [dependencies]
 # eqoxide-http is the agent-facing REST API (axum). It sits at the TOP of the extracted-crate stack:

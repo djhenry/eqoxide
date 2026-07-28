@@ -355,6 +355,58 @@ impl SessionDropCause {
     }
 }
 
+/// Where a health projection reads **"now"** from when it turns [`NetHealth`]'s stamps into ages.
+///
+/// #760. Every age in the projection is `now - stamp`. In production `now` is the real monotonic
+/// clock, which is correct and must stay that way — silence *is* the signal (#343). But a TEST
+/// fixture stamps its clocks at construction and is then read some unbounded time later, so its
+/// ages are a function of **how long the test took**, i.e. of machine load. That made
+/// `combat::tests::cast_empty_gem_is_409_and_queues_nothing` answer `503 stale session` instead of
+/// the `409` it asserts whenever the box was busy enough to put >5s (`SESSION_STALE_TICK_MS`)
+/// between `empty_state()` and the request being served — measured, not theorised: sleeping 5.1s
+/// between the fixture and that request reproduces the 503 exactly.
+///
+/// Freezing the clock removes the wall clock from the test's answer entirely, rather than moving
+/// the threshold it races against. A fixture built with [`NetHealth::frozen_at`] has
+/// `now == stamp`, so every age it projects is **exactly** zero however long the test takes.
+///
+/// **A release build cannot construct a frozen clock.** The inner field is private and the only
+/// constructor that can set it, [`HealthClock::frozen_at`], is behind the `test-fixtures` feature —
+/// so the frozen variant is *unrepresentable* outside a test build. That matters for the honesty
+/// invariant in the other direction: a frozen health clock would pin `snapshot_age_ms` at 0 and
+/// report a dead net thread as live forever, which is exactly the #343 lie this projection exists
+/// to prevent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HealthClock(Option<std::time::Instant>);
+
+impl HealthClock {
+    /// The real monotonic clock — the only clock a non-test build can have, and the `Default`.
+    pub const WALL: HealthClock = HealthClock(None);
+
+    /// A clock PINNED at `t`. Test fixtures only (see the type doc for why this is gated).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn frozen_at(t: std::time::Instant) -> Self {
+        HealthClock(Some(t))
+    }
+
+    /// The instant every age in the projection is measured back from.
+    pub fn now(self) -> std::time::Instant {
+        self.0.unwrap_or_else(std::time::Instant::now)
+    }
+
+    /// True for a pinned clock. Lets a test assert its fixture really is load-independent instead
+    /// of inferring it from a reading that happened to be 0.
+    pub fn is_frozen(self) -> bool {
+        self.0.is_some()
+    }
+
+    /// The age of `stamp` against this clock, saturating at zero for a stamp in the future (which a
+    /// pinned clock makes reachable: a test may re-stamp a field after freezing).
+    pub fn age_of(self, stamp: std::time::Instant) -> std::time::Duration {
+        self.now().saturating_duration_since(stamp)
+    }
+}
+
 /// The three clocks that answer "can I trust anything else in this payload?", owned and stamped by
 /// the network thread and turned into `Health` **at HTTP read time** (`HttpState::health`), never
 /// cached (#8, #343). They are deliberately separate signals, because they fail independently:
@@ -388,6 +440,9 @@ impl SessionDropCause {
 /// still-ACKing reader thread; this server does not work that way — do not reason from that model.)
 #[derive(Debug, Clone, Copy)]
 pub struct NetHealth {
+    /// Where the health projection reads "now" from (#760). `HealthClock::WALL` in every build that
+    /// is not a test; see [`HealthClock`].
+    pub clock: HealthClock,
     /// Last inbound datagram of ANY kind, session-layer ACKs/keepalives included → link liveness.
     pub last_datagram: std::time::Instant,
     /// Last inbound APPLICATION packet (a decoded opcode that mutated `GameState`) → world activity.
@@ -639,6 +694,7 @@ impl Default for NetHealth {
     fn default() -> Self {
         let now = std::time::Instant::now();
         NetHealth {
+            clock: HealthClock::WALL,
             last_datagram: now, last_packet: now, last_tick: now,
             last_probe_sent: None, last_probe_reply: None,
             first_unanswered_probe_sent: None,
@@ -653,6 +709,37 @@ impl Default for NetHealth {
 }
 
 impl NetHealth {
+    /// #760: a fixture whose clock is PINNED at `now`, with `last_datagram`/`last_packet`/`last_tick`
+    /// stamped at that same instant *minus* the ages the caller asks for (in seconds). Every age the
+    /// health projection derives from it is then **exactly** the number passed in — not "that number
+    /// plus however long the test has been running so far" — so a test's liveness verdict cannot
+    /// depend on machine load. `(0, 0, 0)` is a perfectly live session, permanently.
+    ///
+    /// Test fixtures only; see [`HealthClock`] for why a release build cannot reach this.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn frozen_at(
+        now: std::time::Instant,
+        datagram_ago_secs: u64,
+        tick_ago_secs: u64,
+        packet_ago_secs: u64,
+    ) -> Self {
+        // `checked_sub` + `expect` (the same shape as `eqoxide_http::testkit::ago`): on a host whose
+        // monotonic epoch is younger than the age asked for there is no instant to name, and a loud
+        // panic naming the cause beats silently clamping to the epoch and reporting a smaller age
+        // than the fixture asked for.
+        let back = |secs: u64| {
+            now.checked_sub(std::time::Duration::from_secs(secs))
+                .expect("monotonic clock younger than the requested fixture age")
+        };
+        NetHealth {
+            clock: HealthClock::frozen_at(now),
+            last_datagram: back(datagram_ago_secs),
+            last_tick: back(tick_ago_secs),
+            last_packet: back(packet_ago_secs),
+            ..NetHealth::default()
+        }
+    }
+
     /// #656: stamp a `send_wouldblock_rescued`/`send_deferred` event and update the consecutive-
     /// burst streak that `send_starved` reads. Call this from BOTH increment sites (never bump
     /// `send_pressure_streak`/`last_send_pressure_at` any other way, or the two would drift from the
@@ -2096,6 +2183,76 @@ mod world_responsive_tests {
         // gone (#470) → condemn.
         assert!(!world_responsive(true, None, None, STALE, TIMEOUT, STALE),
             "at/after the passive bound with no probe ever, the prober is dead → zombie (#470)");
+    }
+}
+
+/// #760: `HealthClock` — where a health projection reads "now" when it turns [`NetHealth`]'s
+/// stamps into ages. These pin the two properties the fix rests on: the production/`Default` clock
+/// is the real wall clock (anything else would freeze every published age at process start — the
+/// #343 lie), and a pinned clock yields ages that are a pure function of the stamps, so a fixture
+/// built from it cannot drift with machine load.
+#[cfg(test)]
+mod health_clock_tests {
+    use super::{HealthClock, NetHealth};
+
+    // ── `HealthClock` — where a health projection reads "now" (#760) ────────────────────────────
+
+    /// The production clock is the wall clock, and `Default` is the production clock. If this ever
+    /// flipped, every age the client publishes would freeze at process start and `connected` would
+    /// latch true forever — the exact #343 lie.
+    #[test]
+    fn the_default_health_clock_is_the_wall_clock() {
+        assert!(!HealthClock::default().is_frozen(), "the default clock must be the real wall clock");
+        assert!(!HealthClock::WALL.is_frozen());
+        assert!(!NetHealth::default().clock.is_frozen(),
+            "a NetHealth built the production way must carry the wall clock");
+        let before = std::time::Instant::now();
+        let a = HealthClock::WALL.now();
+        assert!(a >= before, "the wall clock must actually read the wall clock");
+    }
+
+    /// A pinned clock reads back the SAME instant every time, so an age against it is a pure
+    /// function of the two values and cannot move with machine load. This is the whole of #760.
+    #[test]
+    fn a_frozen_clock_does_not_advance_and_ages_exactly() {
+        let t = std::time::Instant::now();
+        let c = HealthClock::frozen_at(t);
+        assert!(c.is_frozen());
+        assert_eq!(c.now(), t);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(c.now(), t, "a pinned clock must not advance with wall time");
+        assert_eq!(c.age_of(t), std::time::Duration::ZERO,
+            "a stamp taken at the pin reads exactly zero, however long ago that was");
+        assert_eq!(
+            c.age_of(t - std::time::Duration::from_secs(4)),
+            std::time::Duration::from_secs(4),
+            "and an older stamp reads exactly its own age, with no wall-clock drift added");
+    }
+
+    /// A stamp AHEAD of the clock saturates to zero rather than panicking — reachable once the clock
+    /// is pinnable, because a fixture may re-stamp a field after freezing.
+    #[test]
+    fn a_stamp_ahead_of_the_clock_saturates_to_zero() {
+        let t = std::time::Instant::now();
+        let c = HealthClock::frozen_at(t);
+        assert_eq!(c.age_of(t + std::time::Duration::from_secs(9)), std::time::Duration::ZERO);
+    }
+
+    /// `NetHealth::frozen_at` stamps the three liveness clocks at exactly the ages asked for,
+    /// measured against its own pin — so a fixture's `(0,0,0)` is a permanently live session and its
+    /// `(20,0,20)` is a permanently disconnected one, with no margin for load to eat.
+    #[test]
+    fn net_health_frozen_at_yields_exact_ages() {
+        let now = std::time::Instant::now();
+        let h = NetHealth::frozen_at(now, 20, 6, 41);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(h.clock.age_of(h.last_datagram), std::time::Duration::from_secs(20));
+        assert_eq!(h.clock.age_of(h.last_tick), std::time::Duration::from_secs(6));
+        assert_eq!(h.clock.age_of(h.last_packet), std::time::Duration::from_secs(41));
+        let live = NetHealth::frozen_at(std::time::Instant::now(), 0, 0, 0);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(live.clock.age_of(live.last_tick), std::time::Duration::ZERO,
+            "a (0,0,0) fixture stays exactly fresh no matter how long the test runs");
     }
 }
 

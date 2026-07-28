@@ -87,7 +87,8 @@ fn zone_assets_not_ready(s: &HttpState) -> Option<Response> {
 /// frozen map and no marker of any kind.
 ///
 /// **This is the SAME clock as `/debug`'s `snapshot_age_ms`, not a second one** — both are
-/// `HttpState::health().snapshot_age_ms`, i.e. `NetHealth::last_tick.elapsed()` measured fresh on
+/// `HttpState::health().snapshot_age_ms`, i.e. `NetHealth::last_tick`'s age against the health clock
+/// (`Instant::now()` in every non-test build — see `HealthClock`, #760) measured fresh on
 /// every request (#343: an age is only true at the instant it's read, so nothing here is cached).
 /// `last_tick` is bumped, unconditionally, once per gameplay tick by the SAME `eq-net` thread loop
 /// iteration that publishes `GameState` and drains `ActionLoop::tick` — the single writer of every
@@ -1816,7 +1817,7 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{ago, empty_state, set_gs};
+    use crate::testkit::{ago, empty_state, empty_state_wall_clock, set_gs};
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -2638,7 +2639,7 @@ mod tests {
     /// publisher has to be alive for the answer to be honest.
     #[tokio::test]
     async fn debug_reports_disconnected_when_the_world_froze_and_nothing_republished() {
-        let state = empty_state();
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         // The world as it was when the link was still up — a sitting character, full HP.
         set_gs(&state, |gs| {
             gs.player_name = "Gmkblr".into();
@@ -2730,7 +2731,7 @@ mod tests {
     /// same number across consecutive polls whenever the render loop slept.
     #[tokio::test]
     async fn last_packet_age_advances_between_reads_with_no_publisher_running() {
-        let state = empty_state();
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         state.net_health.lock().unwrap().last_packet = ago(5);
         let first = debug_json(state.clone()).await["player"]["last_packet_age_ms"].as_u64().unwrap();
         // Nothing renders, nothing publishes, no packet arrives — just time passing.
@@ -2744,7 +2745,7 @@ mod tests {
     /// SERVER went quiet is not the same failure as a client whose own network thread wedged.
     #[tokio::test]
     async fn server_silence_and_publisher_stall_are_distinguishable() {
-        let state = empty_state();
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         // The link is dead (no datagrams at all), but our network thread is fine and still ticking.
         {
             let mut h = state.net_health.lock().unwrap();
@@ -2766,7 +2767,7 @@ mod tests {
     /// the LINK clock, and `last_packet_age_ms` is left free to say "the world is quiet".
     #[tokio::test]
     async fn a_quiet_world_on_a_live_link_is_still_connected() {
-        let state = empty_state();
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         {
             let mut h = state.net_health.lock().unwrap();
             h.last_packet   = ago(45);                    // the world has nothing to say...
@@ -2814,7 +2815,7 @@ mod tests {
     /// NOT reset it).
     #[tokio::test]
     async fn debug_reports_idle_but_answered_world_as_responsive() {
-        let state = empty_state();
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         {
             let mut h = state.net_health.lock().unwrap();
             h.last_datagram    = std::time::Instant::now();
@@ -3644,7 +3645,7 @@ mod tests {
     /// one.
     #[tokio::test]
     async fn snapshot_age_ms_climbs_across_reads_of_a_frozen_source() {
-        let state = empty_state();
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         state.net_health.lock().unwrap().last_tick = ago(5);
         let first = body_json(get(state.clone(), "/messages").await).await["snapshot_age_ms"].as_u64().unwrap();
         // Nothing ticks, nothing republishes — just time passing, exactly like a wedged net thread.
@@ -3658,7 +3659,7 @@ mod tests {
     /// Same climb, over the header channel this time (`/doors`, a bare-array endpoint).
     #[tokio::test]
     async fn snapshot_age_header_climbs_across_reads_of_a_frozen_source() {
-        let state = empty_state();
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         state.net_health.lock().unwrap().last_tick = ago(5);
         let first = header_age_ms(&get(state.clone(), "/doors").await);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

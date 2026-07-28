@@ -31,6 +31,27 @@ pub fn set_gs(state: &HttpState, f: impl FnOnce(&mut eqoxide_core::game_state::G
     state.game_state.store(Arc::new(gs));
 }
 
+/// As [`empty_state`], but with the health clock left on the REAL WALL CLOCK (#760).
+///
+/// For the small, deliberate set of tests whose SUBJECT is the clock: the #343 read-time-derivation
+/// guards, which stamp a stale source and then assert the projected age is genuinely `>= N` seconds,
+/// or that it CLIMBS between two reads with no publisher running. Those properties are meaningless
+/// against a pinned clock — an age that cannot move cannot be shown to move — so they opt out here,
+/// explicitly and visibly, rather than the whole fixture staying wall-driven for their sake.
+///
+/// **Everything else must use [`empty_state`].** A handler test on a wall clock is racing
+/// `SESSION_STALE_TICK_MS`: if the machine puts 5s between this call and the request, the handler
+/// answers `503 stale session` instead of whatever the test asserted (#760). There are exactly seven
+/// call sites of this function, all in `observe`'s clock tests; if you are adding an eighth, check
+/// that the age moving is really the property under test.
+pub fn empty_state_wall_clock() -> HttpState {
+    let state = empty_state();
+    // `NetHealth::default()` is the production constructor: `HealthClock::WALL`, all three stamps at
+    // `Instant::now()`. This is exactly what `empty_state` used to hand every test.
+    *state.net_health.lock().unwrap() = crate::NetHealth::default();
+    state
+}
+
 /// As [`empty_state`], but wired to a CALLER-OWNED `NetHealthShared` — the same `Arc` the network
 /// thread's `EqStream` stamps. Exposed for #612's cross-crate test: eqoxide-net drives a REAL
 /// `EqStream` into a REAL send failure and then asserts the failure is visible in THIS crate's
@@ -121,7 +142,16 @@ pub fn empty_state() -> HttpState {
         chat: Default::default(),
         spells: std::sync::Arc::new(eqoxide_core::spells::SpellDb::default()),
         game_state: Arc::new(arc_swap::ArcSwap::from_pointee(eqoxide_core::game_state::GameState::new())),
-        net_health: Arc::new(Mutex::new(crate::NetHealth::default())),
+        // #760: a FROZEN health clock, stamped at the same instant it is pinned to, so every age
+        // `HttpState::health()` projects for this fixture is exactly 0 — permanently, and whatever
+        // the machine is doing. With `NetHealth::default()` (the real wall clock) the ages were
+        // "however long this test has been running", so a handler test that took >5s to reach its
+        // request got `503 stale session` from `require_live_session` instead of the status it
+        // asserted. That is #760, and it fired on a diff that had nothing to do with it.
+        // Tests that WANT a stale session build their own `NetHealth::frozen_at(now, …)`.
+        net_health: Arc::new(Mutex::new(crate::NetHealth::frozen_at(
+            std::time::Instant::now(), 0, 0, 0,
+        ))),
         frame_profile: Arc::new(Mutex::new(eqoxide_ipc::FrameProfile::default())),
         quest: Default::default(),
         group_slots: Default::default(),
