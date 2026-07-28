@@ -452,3 +452,52 @@ fn every_static_placement_call_site_in_pass_rs_decides_floating_explicitly() {
         "the player pass and the player shadow-caster arm must pass a literal `false`; \
          found {player} of 2");
 }
+
+/// **The other half of #768, pinned as source text** — because the behavioural tests above cannot
+/// reach it.
+///
+/// Dropping `visual_scale` from `StaticPlacement` removes the second lift term from the SHARED
+/// helper. It does not remove it from the four call sites: `model` is in scope at every one of them
+/// and `GpuStaticModel::y_extent` is a public field, so `2.0 * model.y_extent * p.mesh_scale` is one
+/// edit away from being passed as `entity_model_matrix_heading`'s `visual_scale` again — which is
+/// exactly the pre-#768 lift. The placement tests at the top of this file would stay green through
+/// that edit, because they build the matrix themselves and pass the literal `0.0` rather than
+/// reading what `pass.rs` passes. Measured: making that edit at one call site leaves every other
+/// test in this crate green and reddens only this one.
+///
+/// Source text, not semantics, and with the same caveats as the pin above: it proves the argument
+/// is *written* as `0.0`, not that the call is reached. Whitespace is normalized first so a
+/// re-wrapped argument list does not read as a violation. It cannot see a static placement built in
+/// another file.
+#[test]
+fn every_static_entity_matrix_in_pass_rs_passes_a_zero_visual_scale() {
+    // Anti-escape, same class as #769's: the extractor needs the name and the paren adjacent.
+    assert!(!PASS_RS.contains("entity_model_matrix_heading ("),
+        "an `entity_model_matrix_heading (…)` call (space before the paren) is invisible to the \
+         parser below");
+
+    let statics: Vec<String> = PASS_RS
+        .match_indices("entity_model_matrix_heading(")
+        .map(|(i, _)| {
+            let rest = &PASS_RS[i..];
+            let call = &rest[..rest.find(");").expect("unterminated matrix call in pass.rs")];
+            call.split_whitespace().collect::<Vec<_>>().join(" ")
+        })
+        // A static placement is the only thing that feeds `p.y_bottom` into this call; the skinned
+        // and non-entity sites do not.
+        .filter(|c| c.contains("p.y_bottom"))
+        .collect();
+
+    assert_eq!(statics.len(), 4,
+        "pass.rs must build exactly the 4 known static-model matrices (entity, player, and both \
+         static shadow-caster arms); found {}", statics.len());
+
+    for call in &statics {
+        assert!(call.contains(", 0.0, p.mesh_scale"),
+            "#768: a static model's whole vertical lift comes from `p.y_bottom`, so every static \
+             call site must pass the literal `0.0` for `visual_scale` (the argument immediately \
+             before `mesh_scale`). `entity_model_matrix_heading` adds `visual_scale * 0.5` on top \
+             of `y_bottom * mesh_scale`, so anything else here re-creates the over-lift that put \
+             the model a full rendered height above its stored z. Offending call: {call}");
+    }
+}

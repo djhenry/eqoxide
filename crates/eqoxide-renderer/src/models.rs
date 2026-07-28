@@ -916,9 +916,15 @@ pub struct StaticPlacement {
     ///
     /// There is deliberately no `visual_scale` field. `entity_model_matrix_heading` lifts by
     /// `visual_scale * 0.5 + y_bottom * mesh_scale`, and the static call sites pass a literal `0.0`
-    /// for `visual_scale`, so this field is the only lift a static placement can express. #768 was
-    /// exactly a second lift term hiding in `visual_scale`; dropping the field is what keeps it from
-    /// coming back rather than a comment asking future readers not to add one.
+    /// for `visual_scale`, so this field is the only lift a static *placement* can express. #768 was
+    /// exactly a second lift term hiding in `visual_scale`.
+    ///
+    /// Dropping the field removes that term from this shared helper — it does NOT make it
+    /// unwritable. `model` is in scope at all four `pass.rs` call sites and `GpuStaticModel::y_extent`
+    /// is public, so `2.0 * model.y_extent * p.mesh_scale` can still be handed to
+    /// `entity_model_matrix_heading` there, and no behavioural test would see it. That half is held
+    /// by a source-text pin instead:
+    /// `tests/floating_placement.rs::every_static_entity_matrix_in_pass_rs_passes_a_zero_visual_scale`.
     pub y_bottom: f32,
 }
 
