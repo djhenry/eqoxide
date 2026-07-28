@@ -370,8 +370,13 @@ impl SessionDropCause {
 /// the threshold it races against. A fixture built with [`NetHealth::frozen_at`] has
 /// `now == stamp`, so every age it projects is **exactly** zero however long the test takes.
 ///
-/// **A release build cannot construct a frozen clock.** The inner field is private and the only
-/// constructor that can set it, [`HealthClock::frozen_at`], is behind the `test-fixtures` feature —
+/// **A release build cannot construct a frozen clock.** The inner field is private *to this crate*
+/// — production code inside `eqoxide-ipc`'s own `src/` could still write `HealthClock(Some(t))`
+/// directly, which is the normal Rust module boundary; the guarantee is against every OTHER crate,
+/// and it is measured, not reasoned (a `compile_error!` probe on the `test-fixtures` feature does
+/// not fire in `cargo build --release --bin eqoxide`, and does fire under `cargo test`). The only
+/// constructor that can set it from outside, [`HealthClock::frozen_at`], is behind the
+/// `test-fixtures` feature —
 /// so the frozen variant is *unrepresentable* outside a test build. That matters for the honesty
 /// invariant in the other direction: a frozen health clock would pin `snapshot_age_ms` at 0 and
 /// report a dead net thread as live forever, which is exactly the #343 lie this projection exists
@@ -404,6 +409,27 @@ impl HealthClock {
     /// pinned clock makes reachable: a test may re-stamp a field after freezing).
     pub fn age_of(self, stamp: std::time::Instant) -> std::time::Duration {
         self.now().saturating_duration_since(stamp)
+    }
+
+    /// The stamp that THIS clock will read back as exactly `secs` old — the inverse of [`age_of`].
+    ///
+    /// Every past-dated net-health stamp in a test must come from here rather than from a bare
+    /// `Instant::now() - secs`. On a wall clock the two are the same expression; on a PINNED clock
+    /// they are not, and the difference is a silent, drifting error:
+    /// `now() - secs` read back against a clock pinned at fixture construction ages to
+    /// `secs − (time since construction)`, so any assertion that needs the stamp to stay ABOVE a
+    /// bound has a margin that machine load eats. That is #760's own failure mode, re-armed one
+    /// level down — it happened, in review, to `debug_reports_world_unresponsive_when_a_probe_goes_
+    /// unanswered_while_the_link_acks` (a 15s stamp that had to clear a 10s bound: a 5s margin).
+    /// Deriving the stamp from the clock that will read it makes the age exact for both kinds of
+    /// clock, so the correct call has no wrong variant to choose between.
+    ///
+    /// [`age_of`]: HealthClock::age_of
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn ago(self, secs: u64) -> std::time::Instant {
+        self.now()
+            .checked_sub(std::time::Duration::from_secs(secs))
+            .expect("monotonic clock younger than the requested stamp age")
     }
 }
 

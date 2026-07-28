@@ -2651,9 +2651,10 @@ mod tests {
         // genuinely gone), and no publish of any kind.
         {
             let mut h = state.net_health.lock().unwrap();
-            h.last_datagram = ago(60);
-            h.last_packet   = ago(60);
-            h.last_tick     = ago(60);
+            let c = h.clock;
+            h.last_datagram = c.ago(60);
+            h.last_packet   = c.ago(60);
+            h.last_tick     = c.ago(60);
         }
 
         let v = debug_json(state).await;
@@ -2732,7 +2733,7 @@ mod tests {
     #[tokio::test]
     async fn last_packet_age_advances_between_reads_with_no_publisher_running() {
         let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
-        state.net_health.lock().unwrap().last_packet = ago(5);
+        { let mut h = state.net_health.lock().unwrap(); let c = h.clock; h.last_packet = c.ago(5); }
         let first = debug_json(state.clone()).await["player"]["last_packet_age_ms"].as_u64().unwrap();
         // Nothing renders, nothing publishes, no packet arrives — just time passing.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2749,8 +2750,9 @@ mod tests {
         // The link is dead (no datagrams at all), but our network thread is fine and still ticking.
         {
             let mut h = state.net_health.lock().unwrap();
-            h.last_datagram = ago(30);
-            h.last_packet   = ago(30);
+            let c = h.clock;
+            h.last_datagram = c.ago(30);
+            h.last_packet   = c.ago(30);
         }
         let p = debug_json(state).await["player"].clone();
         assert_eq!(p["connected"], serde_json::json!(false));
@@ -2770,8 +2772,9 @@ mod tests {
         let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         {
             let mut h = state.net_health.lock().unwrap();
-            h.last_packet   = ago(45);                    // the world has nothing to say...
-            h.last_datagram = std::time::Instant::now();  // ...but the link is demonstrably alive.
+            let c = h.clock;
+            h.last_packet   = c.ago(45);                  // the world has nothing to say...
+            h.last_datagram = c.now();                    // ...but the link is demonstrably alive.
         }
         let p = debug_json(state).await["player"].clone();
         assert_eq!(p["connected"], serde_json::json!(true),
@@ -2792,21 +2795,77 @@ mod tests {
         let state = empty_state();
         {
             let mut h = state.net_health.lock().unwrap();
-            h.last_datagram = std::time::Instant::now(); // link is demonstrably alive (ACKing)...
-            h.last_packet   = ago(30);                    // ...but the world has produced nothing...
-            h.last_probe_sent = Some(ago(15));            // ...and our probe (15s ago) went...
+            // #760/B1: every stamp below is derived from the fixture's OWN health clock (`c`), which
+            // is what `health()` will read them back against. Written as `ago(15)` — the wall clock —
+            // this test's probe age became `15s − (time since empty_state())` and the assertion below
+            // needed it to clear a 10s bound: a 5s margin that machine load ate. Measured, with a
+            // 5.1s sleep injected after `empty_state()`: `ago(15)` → world_responsive `true`
+            // (assertion FAILS), `c.ago(15)` → `false` (passes). Same sleep, opposite outcome.
+            let c = h.clock;
+            h.last_datagram = c.now();                    // link is demonstrably alive (ACKing)...
+            h.last_packet   = c.ago(30);                  // ...but the world has produced nothing...
+            h.last_probe_sent = Some(c.ago(15));          // ...and our probe (15s ago) went...
             h.last_probe_reply = None;                    // ...unanswered, past the 10s bound.
             // #371 wedge-flicker fix: `health()` reads the wedge-timeout clock off
             // `first_unanswered_probe_sent`, not `last_probe_sent` — this is the first (and, in this
             // scenario, only) unanswered send of the streak, so in production `record_probe_sent`
             // would have stamped both together. Mirror that here.
-            h.first_unanswered_probe_sent = Some(ago(15));
+            h.first_unanswered_probe_sent = Some(c.ago(15));
         }
         let p = debug_json(state).await["player"].clone();
         assert_eq!(p["connected"], serde_json::json!(true),
             "the socket is still ACKing — connected must stay honest about the LINK");
         assert_eq!(p["world_responsive"], serde_json::json!(false),
             "an unanswered probe on a live link is a WEDGED world — the #371 signal must fire");
+    }
+
+    /// #760/B1 — the rule about past-dated net-health stamps, as a TEST rather than as a doc comment.
+    ///
+    /// A stamp written `ago(N)` comes from the wall clock; `health()` reads it back against
+    /// `NetHealth::clock`. On a frozen fixture those are different clocks, so the age is
+    /// `N − (time since the fixture was built)` — it SHRINKS with machine load, silently, and any
+    /// assertion needing it to stay above a bound has a margin that load eats. That is #760's own
+    /// failure mode one level down, and it is what review found in
+    /// `debug_reports_world_unresponsive_when_a_probe_goes_unanswered_while_the_link_acks`.
+    ///
+    /// A prose rule did not prevent it (the rule named only "an age that must move", not "an age
+    /// that must exceed a bound"), so this scans the source instead. `HealthClock::ago` is correct
+    /// for BOTH clocks — on a wall clock it is exactly `Instant::now() - N` — so there is no case
+    /// where the flagged form is the right one, which is why this is a blanket ban and not a
+    /// judgement call. Bare `Instant::now()` is deliberately NOT flagged: it dates a stamp to the
+    /// present, which saturates to age 0 against either clock.
+    #[test]
+    fn no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it() {
+        /// Exactly the `NetHealth` fields `HttpState::health()` turns into an age. Adding a stamp
+        /// field to that projection without adding it here leaves the new field unguarded.
+        const STAMP_FIELDS: [&str; 8] = [
+            "last_datagram", "last_packet", "last_tick",
+            "last_probe_sent", "last_probe_reply", "first_unanswered_probe_sent",
+            "last_send_pressure_at", "last_send_error_at",
+        ];
+        let sources = [
+            ("observe.rs", include_str!("observe.rs")),
+            ("lib.rs",     include_str!("lib.rs")),
+            ("combat.rs",  include_str!("combat.rs")),
+            ("testkit.rs", include_str!("testkit.rs")),
+        ];
+        let mut offenders = Vec::new();
+        for (file, src) in sources {
+            for (i, line) in src.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") { continue; }          // prose, including this doc block
+                let Some(eq) = code.find('=') else { continue };
+                let (lhs, rhs) = code.split_at(eq);
+                if !STAMP_FIELDS.iter().any(|f| lhs.contains(f)) { continue; }
+                if !rhs.contains("ago(") { continue; }
+                if rhs.contains(".ago(") { continue; }            // clock-relative: the correct form
+                offenders.push(format!("{file}:{}: {}", i + 1, code.trim_end()));
+            }
+        }
+        assert!(offenders.is_empty(),
+            "these past-date a net-health stamp from the wall clock while `health()` will read it \
+             back against `NetHealth::clock` — use `let c = h.clock; … = c.ago(N)` instead (#760):\n{}",
+            offenders.join("\n"));
     }
 
     /// #371, the false-alarm we must NOT raise (the #343 trap in reverse): a legitimately idle world
@@ -2818,10 +2877,11 @@ mod tests {
         let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         {
             let mut h = state.net_health.lock().unwrap();
-            h.last_datagram    = std::time::Instant::now();
-            h.last_packet      = ago(45);          // no spontaneous world output for 45s (normal idle)
-            h.last_probe_sent  = Some(ago(20));
-            h.last_probe_reply = Some(ago(2));     // ...but the probe was answered 2s ago → alive
+            let c = h.clock;
+            h.last_datagram    = c.now();
+            h.last_packet      = c.ago(45);        // no spontaneous world output for 45s (normal idle)
+            h.last_probe_sent  = Some(c.ago(20));
+            h.last_probe_reply = Some(c.ago(2));   // ...but the probe was answered 2s ago → alive
             // `first_unanswered_probe_sent` deliberately left `None` (the `empty_state()` default): in
             // production `record_probe_reply` clears it the instant a genuine reply lands, so an
             // ANSWERED probe's real state has no outstanding streak at all — this is what makes
@@ -2844,7 +2904,7 @@ mod tests {
     #[tokio::test]
     async fn debug_defaults_world_responsive_true_before_the_first_probe() {
         let state = empty_state();
-        state.net_health.lock().unwrap().last_packet = ago(20);
+        { let mut h = state.net_health.lock().unwrap(); let c = h.clock; h.last_packet = c.ago(20); }
         let p = debug_json(state).await["player"].clone();
         assert_eq!(p["world_responsive"], serde_json::json!(true),
             "no probe sent yet → no verdict → true (read connected/last_packet_age_ms instead)");
@@ -3646,7 +3706,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_age_ms_climbs_across_reads_of_a_frozen_source() {
         let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
-        state.net_health.lock().unwrap().last_tick = ago(5);
+        { let mut h = state.net_health.lock().unwrap(); let c = h.clock; h.last_tick = c.ago(5); }
         let first = body_json(get(state.clone(), "/messages").await).await["snapshot_age_ms"].as_u64().unwrap();
         // Nothing ticks, nothing republishes — just time passing, exactly like a wedged net thread.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3660,7 +3720,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_age_header_climbs_across_reads_of_a_frozen_source() {
         let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
-        state.net_health.lock().unwrap().last_tick = ago(5);
+        { let mut h = state.net_health.lock().unwrap(); let c = h.clock; h.last_tick = c.ago(5); }
         let first = header_age_ms(&get(state.clone(), "/doors").await);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let second = header_age_ms(&get(state, "/doors").await);

@@ -15,7 +15,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::HttpState;
 
-/// An `Instant` `secs` in the past (saturating — a just-booted host can't go below its epoch).
+/// An `Instant` `secs` in the past, on the WALL clock.
+///
+/// Fine for stamps that are aged against `Instant::now()` at read time — the asset-sync publisher's
+/// `tick_stamped`, for instance. **Not** for a `NetHealth` stamp: `health()` ages those against
+/// `NetHealth::clock`, which a fixture pins, so a wall-clock stamp read back against it drifts by
+/// however long the test took (#760). Use `h.clock.ago(secs)` there; the ban is enforced by
+/// `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it`.
 pub fn ago(secs: u64) -> std::time::Instant {
     std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(secs))
@@ -42,8 +48,22 @@ pub fn set_gs(state: &HttpState, f: impl FnOnce(&mut eqoxide_core::game_state::G
 /// **Everything else must use [`empty_state`].** A handler test on a wall clock is racing
 /// `SESSION_STALE_TICK_MS`: if the machine puts 5s between this call and the request, the handler
 /// answers `503 stale session` instead of whatever the test asserted (#760). There are exactly seven
-/// call sites of this function, all in `observe`'s clock tests; if you are adding an eighth, check
-/// that the age moving is really the property under test.
+/// call sites of this function, all in `observe`'s clock tests.
+///
+/// If you are adding an eighth, there are **two** shapes to tell apart, and the earlier version of
+/// this rule named only the first — which is precisely how a load-fragile test got past review:
+///
+/// 1. **An age that must MOVE** (`assert!(second > first)` across two reads). Genuinely needs the
+///    wall clock: an age that cannot move cannot be shown to move. This function is for these.
+/// 2. **An age that must EXCEED A BOUND** (`assert!(age >= N)`, or a stamp placed past a timeout so
+///    a verdict fires). These do **not** need the wall clock, and must not use it — stay on
+///    [`empty_state`] and derive the stamp from the fixture's own clock (`let c = h.clock;
+///    h.last_probe_sent = Some(c.ago(15));`). A wall-clock `ago(15)` read back against a pinned
+///    clock ages to `15s − (time since the fixture was built)`, so the margin over the bound is
+///    eaten by machine load — #760's failure mode, one level down.
+///
+/// Shape 2 is enforced, not merely documented: see
+/// `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it`.
 pub fn empty_state_wall_clock() -> HttpState {
     let state = empty_state();
     // `NetHealth::default()` is the production constructor: `HealthClock::WALL`, all three stamps at
