@@ -344,9 +344,33 @@ impl LastLoginByOutcome {
     /// 2. the returned array's length is `ConnectOutcome::ALL.len()`, so listing a new slot below
     ///    without adding its outcome to `ALL` fails to compile here too.
     ///
-    /// An outcome given its own slot therefore cannot reach the wire without being in `ALL`, and
-    /// cannot be in this struct while silently missing from `ALL`. The residual — an outcome whose
-    /// match arms are pointed at an *existing* slot, adding no field — is stated on `ALL`.
+    /// ⚠️ **[EDIT, round 5 (#755 review): the two sentences that used to stand here were false, and
+    /// the counterexample is rustc's own suggested fix for the very error this function raises.]**
+    /// The previous wording said an outcome given its own slot "cannot reach the wire without being
+    /// in `ALL`, and cannot be in this struct while silently missing from `ALL`". Both halves are
+    /// false, measured:
+    ///
+    /// - **What the pin actually guarantees:** a new field added to this struct forces the author to
+    ///   *name it in the destructure pattern* — check 1 above — because there is no `..` to fall
+    ///   back on. That much is real: E0027 fires, on the library, not only its tests.
+    /// - **Naming it is not the same as serving it, and two evasions satisfy the former while
+    ///   defeating the latter.** rustc's own second `help:` for that E0027 is
+    ///   `refused: _` — take it verbatim, change nothing else, and the crate builds with **zero**
+    ///   errors and **zero** warnings (`refused: _` is not even an `unused_variables` lint), while
+    ///   `refused` sits in this struct, fully wired, silently absent from the returned array and
+    ///   from `ALL`. Pointing a new variant's match arms at an *existing* slot (no new field at all)
+    ///   evades check 1 the same way — see the residual on `ALL`, whose consequence is sharper than
+    ///   "nothing fires": it produces a body where `last_login_failed.connecting.outcome == "failed"`
+    ///   for a login that ended a *different* way.
+    /// - **"Reach the wire" is not this function's claim to make.** [`EndedWhat::Connect`] stores the
+    ///   raw `ConnectOutcome` and [`ConnectOutcome::as_str`] serves it into `last_ended` directly —
+    ///   neither consults `ALL` nor this function. In the `refused: _` state above, a login that
+    ///   ended `Refused` is absent from `login_outcomes` and `last_login_refused` **and simultaneously
+    ///   present** as `last_ended.connecting.outcome == "refused"` — one body giving two answers
+    ///   about one login, which is #731's own defect shape, re-instantiated inside this fix.
+    ///
+    /// So: this function forces a decision at the call site. It does not force that decision to be
+    /// *correct*, and it has no reach at all over the separate `as_str`-driven path to `last_ended`.
     pub fn slots(&self) -> [(ConnectOutcome, Option<&RetainedLogin>); ConnectOutcome::ALL.len()] {
         let LastLoginByOutcome { succeeded, failed, unknown } = self;
         [
@@ -432,6 +456,15 @@ impl LoginOutcomeTally {
     /// Logins that ended without succeeding — `failed + unknown`. The one-number answer to "is there
     /// any login this process could not complete", for a caller that does not want to add two fields
     /// and risk forgetting the second.
+    ///
+    /// ⚠️ **Disclosed residual (round 5, #755 review, N3 — measured, not just reasoned about).**
+    /// This sum is hand-written and **not** covered by [`ConnectOutcome::ALL`] or
+    /// [`LastLoginByOutcome::slots`] the way `login_outcomes`' own fields are. A fourth non-success
+    /// outcome correctly wired everywhere — its own field, its own counter, all five exhaustive
+    /// matches, and listed in `ALL` — still contributes **zero** here unless this line is also
+    /// edited by hand. Measured: adding such a variant and calling this function returns `0` for a
+    /// login that ended that way, while the dedicated counter for it is `1`. Neither the compiler nor
+    /// any existing test catches the omission.
     pub fn unsuccessful(self) -> u64 {
         self.failed + self.unknown
     }
@@ -503,6 +536,14 @@ impl ConnectOutcome {
     /// `53 passed; 0 failed`. It is not a new category, it is an alias of one — the #743 B3 defect
     /// [`LastLoginByOutcome`] exists to make unrepresentable — but neither the compiler nor any test
     /// catches it here, and this doc does not claim otherwise.
+    ///
+    /// ⚠️ **[EDIT, round 5 (#755 review): the consequence is sharper than "nothing fires."]** A
+    /// login that ends with the aliased variant produces a **self-contradicting** body, not merely a
+    /// missing category. Measured by aliasing a `Refused` outcome onto `Failed`'s slot/counter
+    /// (leaving [`ConnectOutcome::as_str`]'s own arm honest, since that path is independent — see
+    /// below): `login_outcomes.failed == 1` and `last_login_failed.connecting.outcome == "failed"`
+    /// for a login that actually ended `Refused`, while `last_ended.connecting.outcome == "refused"`
+    /// for the *same* login. Two fields, both present, both confidently wrong about each other.
     ///
     /// **What the test does and does not cover.**
     /// `every_outcome_is_in_all_so_no_category_can_go_unserved` has no power over a variant that is

@@ -306,12 +306,22 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
         let obj = body.as_object_mut().expect("json! object");
         let mut counts = serde_json::Map::new();
         // #743 round-3 review B1: the loop is driven by `last_login.slots()`, not by
-        // `ConnectOutcome::ALL` directly. `slots()` is an exhaustive destructure of the per-outcome
-        // storage returning an array of length `ALL.len()`, so an outcome that has its own retained
-        // slot cannot be missing from this enumeration — the crate does not build if it is. Walking
-        // `ALL` here would have served whatever `ALL` happened to list, which is exactly the gap the
-        // review measured. The counter is still looked up BY OUTCOME rather than zipped, so the
-        // pairing of a count with its record does not depend on two arrays being in the same order.
+        // `ConnectOutcome::ALL` directly. Walking `ALL` here would have served whatever `ALL`
+        // happened to list, which is exactly the gap the review measured. The counter is still
+        // looked up BY OUTCOME rather than zipped, so the pairing of a count with its record does
+        // not depend on two arrays being in the same order.
+        //
+        // ⚠️ [EDIT, round 5 (#755 review): "the crate does not build if it is" was false, measured.]
+        // `slots()` forces a NEW FIELD to be named at its destructure site (see its rustdoc in
+        // `eqoxide-ipc/src/asset_sync.rs` for what that does and does not cover) — but naming it
+        // there is not the same as this loop serving it. rustc's own suggested fix for the E0027 the
+        // pin raises is `refused: _`, and taking it verbatim builds clean, with zero warnings, while
+        // that outcome stays absent from `login_outcomes` and from every `last_login_<outcome>` this
+        // loop emits. Separately, and unconditionally: THIS LOOP is not what makes an outcome reach
+        // the wire at all. `last_ended`, encoded above via `ended_activity_json`, calls
+        // `ConnectOutcome::as_str()` on the raw stored outcome directly — it never touches `ALL` or
+        // `slots()`. So a login that ends with an outcome missing from `ALL` can be simultaneously
+        // absent here and present in `last_ended`: one body, two answers about one login.
         for (outcome, record) in snap.last_login.slots() {
             let token = outcome.as_str();
             counts.insert(token.into(), snap.login_outcomes.count(outcome).into());
