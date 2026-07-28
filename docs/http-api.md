@@ -855,6 +855,11 @@ collision grid that no longer exists — and it is the only kind that publishes,
 `threaded` verdict is filtered out anyway. It **does** survive a terminal `blocked` / `no_path`, on
 purpose: there it is the *evidence* behind the failure you are being told about.
 
+This holds for the whole `idle` row, not just the moment it becomes `idle`, and it takes two writers to
+say so. `NavStatus::retire_to_idle` clears the field on the transition; `Walker::set_nav_local` then
+refuses to store a verdict onto a row that is already `idle`, which is what covers a fine-tier reply
+that was still in flight on another thread when the goal was retired.
+
 **Why this field exists.** The fine tier is bounded *spatially* (a 40 u window) plus a deterministic
 node cap (#394 removed its old 150 ms wall clock, so its answer no longer depends on machine load), and
 until #382 it ran **inline on the network thread**, every nav tick — the last A* left on that thread, a

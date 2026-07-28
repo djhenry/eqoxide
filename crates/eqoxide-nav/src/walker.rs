@@ -410,18 +410,19 @@ impl Walker {
         // #766: the identical sentence is true of the FINE plan in flight, and this line was
         // MISSING. Not a considered asymmetry — archaeology: the coarse `cancel()` above predates
         // the fine worker (it is in the zone reset at f2dce47^, before #382 existed), and #382's own
-        // diff added `local_planner.cancel()` beside the fine-plan drop at every OTHER site it
-        // touched — `clear_local_plan`, `stop_nav_blocked`, `resolve_goal`, `drive_teleport_detect`
-        // — while this reset, which already cleared `local_path`/`local_i`/`local_stuck_ticks`
-        // three lines up, was never revisited. No comment anywhere records a reason for the gap.
+        // diff dropped the fine plan — directly or through `clear_local_plan` — at the sites it
+        // touched, while this reset, which already cleared `local_path`/`local_i`/
+        // `local_stuck_ticks` three lines up, was never revisited. No comment anywhere records a
+        // reason for the gap.
         //
-        // HONEST SCOPE: I could not construct a production route on which a previous zone's fine
-        // reply is actually APPLIED in the new zone — every path from here to the next
-        // `local_planner.poll()` (which is gated on a non-empty `self.path`, cleared above) passes
-        // through a `clear_local_plan()` first. So this is defence in depth restoring #382's own
-        // pattern, not a leak I measured. What it does fix outright is the ARMED `pending` slot:
-        // `post_if_idle` is a no-op while one is in flight, so until the stale reply is drained the
-        // new zone's first fine plans are silently refused.
+        // SCOPE: this line is defence in depth restoring #382's own pattern. No production route
+        // can reach a `post_if_idle` that the stale `pending` slot would refuse. Its only
+        // production caller is in `drive_walk`, behind `!self.path.is_empty()`; `self.path` is made
+        // non-empty at exactly two sites (`apply_plan`'s `Route` and `Exhausted { progress }`
+        // arms — every other write to it is a `.clear()`), and each of those calls
+        // `clear_local_plan()`, hence `local_planner.cancel()`, within three lines; `drive_walk`'s
+        // empty-path `else` arm cancels as well. So a cancel always intervenes first, and this line
+        // is not backed by any measured failure of the new zone's planning.
         self.local_planner.cancel();
         self.awaiting_first_plan = false;
         // SAY WHY (#725 review B1). A bare `idle` here is indistinguishable from "nothing was ever
@@ -498,8 +499,25 @@ impl Walker {
     }
 
     /// Publish the FINE tier's last honest outcome (#382). Never touches `state`/`reason`.
+    ///
+    /// **A verdict is never stored on an `idle` row (#766).** `NavLocal` is the fine planner's
+    /// verdict on threading toward *a goal*, and `idle` is the state that means there is no goal —
+    /// so `Some` beside `idle` is precisely the stale-fact class this issue is about.
+    /// `NavStatus::retire_to_idle` clears the field at the TRANSITION; this is the other half, the
+    /// writer-level guard that keeps it clear for the row's whole lifetime. Without it
+    /// `docs/http-api.md`'s "`nav_local` is `null` on every `idle`" is only true at the instant of
+    /// retirement, which is not what a polling agent reads.
+    ///
+    /// **It is a coercion, not a `debug_assert!`, and that is deliberate.** The gap is a runtime
+    /// race, not a programming error: `local` is published from the net thread, and `POST /v1/move/stop`
+    /// can retire the row from the HTTP thread in between, so a verdict computed while the goal was
+    /// live can arrive after it is gone — no call site is wrong. An assert cannot prevent that, and
+    /// it is compiled out of `--release` besides, so it would leave the documented universal false
+    /// in the shipped binary. Dropping the value instead makes it true in every profile. Nothing is
+    /// lost: the verdict describes a goal that no longer exists.
     pub fn set_nav_local(&self, local: Option<eqoxide_ipc::NavLocal>) {
         let mut s = self.nav.nav_state.lock().unwrap();
+        let local = if s.state == "idle" { None } else { local };
         if s.local != local { s.local = local; }
     }
 
@@ -2695,6 +2713,12 @@ mod tests {
         let col = open_plane(400.0);
         let (mut w, nav, _intent, _view) = walker_with(col.clone());
 
+        // We are mid-goal in the previous zone. This is not scene-setting: `set_nav_local` refuses
+        // to store a verdict on an `idle` row (#766, see its doc comment), and the fixture row
+        // starts `idle`, so a plant without this line would be swallowed and the PREMISE below
+        // would catch it.
+        w.set_nav_state_because("navigating", None);
+
         // The previous zone's fine tier reached a verdict, and it is the UNHEALTHY kind — the only
         // kind `observe.rs` publishes at all (it filters `threaded` out), so this is the shape a
         // reader actually sees.
@@ -2729,9 +2753,55 @@ mod tests {
              computed against a collision grid that no longer exists — publishing it beside \
              `idle`/`zoned` tells the agent something false about the zone it is standing in");
         assert!(!w.local_planner.is_planning(),
-            "#766: and the fine plan in flight must be abandoned like the coarse one — while \
-             `pending` is armed, `post_if_idle` is a no-op, so the NEW zone's first fine plans are \
-             silently refused until the stale reply drains");
+            "#766: the fine plan in flight is abandoned like the coarse one — it was computed \
+             against the previous zone's collision grid. Defence in depth: no production route \
+             reaches a `post_if_idle` this stale `pending` would refuse (see the SCOPE note in \
+             `reset_for_zone_change`), so this pins the line, not a measured failure");
+    }
+
+    /// **#766 review B2: the documented universal holds for the whole `idle` row, not just its
+    /// first instant.** `docs/http-api.md` says "`nav_local` is `null` on every `idle`". Retiring
+    /// the field in `retire_to_idle` only makes that true at the TRANSITION — and the two writers
+    /// race, because `set_nav_local` is called from the net thread while `POST /v1/move/stop` retires the
+    /// row from the HTTP thread, each taking the `nav_state` lock separately. A verdict computed
+    /// while the goal was live can therefore land after it is gone, with no call site at fault.
+    /// `set_nav_local` coerces it away; this measures both directions of that coercion, because a
+    /// guard that swallowed everything would satisfy the negative half on its own.
+    ///
+    /// Mutation check: delete `let local = if s.state == "idle" { None } else { local };` from
+    /// `Walker::set_nav_local` → the post-retirement assertion goes RED and the mid-goal one stays
+    /// GREEN. The line can fire, and it fires only where it should.
+    #[test]
+    fn a_verdict_arriving_after_the_goal_is_retired_is_not_published_766() {
+        let (w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        let verdict = || Some(eqoxide_ipc::NavLocal {
+            state: "no_way_through".into(), reason: "search_closed".into(),
+            stuck_ticks: 7, plan_us: 1234,
+        });
+
+        // Direction 1 — mid-goal, the verdict publishes exactly as #382 intended. Without this the
+        // test would pass on a `set_nav_local` that had been gutted to a no-op.
+        w.set_nav_state_because("navigating", None);
+        w.set_nav_local(verdict());
+        assert_eq!(nav.nav_state.lock().unwrap().local, verdict(),
+            "PREMISE: the guard does not disturb the tier's normal publication — a verdict on a \
+             live goal is still what a reader gets");
+
+        // Direction 2 — the goal is retired, and only THEN does the fine tier's reply come back.
+        // This is the interleaving, not a hypothetical: the reply was in flight across the
+        // retirement. Which of the six reasons retired the row is immaterial — they all land in
+        // `retire_to_idle` — so this uses the one whose constant lives in this crate.
+        w.set_nav_state_because("idle", Some(NAV_REASON_ZONED));
+        assert_eq!(nav.nav_state.lock().unwrap().local, None,
+            "PREMISE: retirement cleared the field, so the assertion below is about the LATE \
+             write and cannot be satisfied by leftover state");
+
+        w.set_nav_local(verdict());
+        assert_eq!(nav.nav_state.lock().unwrap().local, None,
+            "#766 B2: `idle` means there is no goal, and `NavLocal` is a verdict about threading \
+             toward one — publishing it here would tell the agent the fine planner is stuck on a \
+             goal it no longer has. `docs/http-api.md` states this as a universal over the row, \
+             so the row must hold it for its whole lifetime, not just at the transition");
     }
 
     /// **#766, the OTHER walker route to `idle` — and it is here to MEASURE a claim, not to guard a

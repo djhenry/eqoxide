@@ -1435,14 +1435,32 @@ impl NavStatus {
     /// design (`Walker::stop_nav_blocked` publishes `blocked`/`no_path`, never `idle`, so it does not
     /// come through here). It does not hold for the published FIELD on an `idle` row: `NavLocal` is
     /// the fine planner's verdict on threading toward *the goal that just ended*, so it is a per-goal
-    /// fact by the same argument as `tier`. Two of the six routes left it standing (`zoned` — #766's
-    /// report — and `zone_cross_dropped_unhandled`); the other four already cleared it — `goal_dropped`
-    /// and `respawned` because `Walker::resolve_goal`'s no-goto branch calls `clear_local_plan()` on
-    /// the same tick before it retires, `stopped` and `goto_superseded` through an explicit
-    /// `s.local = None;` in `CommandState::stamp_new_goal`, now deleted as redundant. Both halves of
-    /// that four are RUN, not read: `eqoxide-nav`'s
-    /// `the_goal_dropped_route_already_cleared_the_fine_verdict_before_766` and `eqoxide-command`'s
-    /// `every_command_side_retirement_retires_the_fine_tiers_verdict_766`.
+    /// fact by the same argument as `tier`.
+    ///
+    /// Before #766 the routes did not agree with each other. `zoned` — the reported one — and
+    /// `zone_cross_dropped_unhandled` left the verdict standing. The rest already cleared it, by two
+    /// different mechanisms that are RUN here rather than read off the source: `goal_dropped` (and
+    /// `respawned`, which shares its branch) because `Walker::resolve_goal`'s no-goto branch calls
+    /// `clear_local_plan()` on the same tick before it retires — `eqoxide-nav`'s
+    /// `the_goal_dropped_route_already_cleared_the_fine_verdict_before_766`; and the command-side
+    /// ones through an explicit `s.local = None;` in `CommandState::stamp_new_goal`, now deleted as
+    /// redundant — `eqoxide-command`'s
+    /// `every_command_side_retirement_retires_the_fine_tiers_verdict_766`. Routing them all through
+    /// here replaces that agreement-by-coincidence with one writer. (`respawned` is covered by
+    /// reading the shared branch, not by its own test.)
+    ///
+    /// **This covers the transition only.** `docs/http-api.md` states `nav_local: null` as a
+    /// universal over every `idle` row, and a retirement writer cannot deliver that on its own — the
+    /// fine tier publishes from another thread and can land a verdict after the row went `idle`.
+    /// The other half of the guarantee is the coercion in `Walker::set_nav_local`; see its doc
+    /// comment for why that one is a coercion and not an assert.
+    ///
+    /// **The `stop_nav_blocked` half of the #382 argument is true by convention, not by
+    /// construction.** Its `state` is a `&str`, so nothing stops a future caller passing `"idle"`
+    /// and routing a terminal `blocked` through this retirement after all. Every call site in the
+    /// tree today passes a literal — `blocked`, `no_path`, `search_exhausted` — so the design holds
+    /// now; a `debug_assert!(state != "idle", …)` there would make it structural, and is worth
+    /// doing outside this issue's scope. Recorded as a known limit rather than left implied.
     pub fn retire_to_idle(&mut self, why: Option<&str>) {
         // The same writer-level guard as `Walker::set_nav_state_because` and
         // `CommandState::stamp_new_goal`: on `idle`, `nav_reason: null` is reserved for boot (#725).
@@ -1459,7 +1477,11 @@ impl NavStatus {
             // that is now over — a `no_way_through` published beside `idle`/`zoned` asserts something
             // about a corridor in a zone we have left, computed against a collision grid that no
             // longer exists. See the "#766 moved `local`" paragraph above for why this does not
-            // undo #382's ownership: only the `idle` row is touched, and only the published field.
+            // undo #382's ownership: only the `idle` row is affected, and this function does not
+            // touch `LocalPlanner` — but note the effect is not merely cosmetic, because
+            // `Walker::local_says_no_way_through` reads this same field back as a steering input.
+            // Clearing it on `idle` clears that input too, which is what we want: on an `idle` row
+            // there is no goal, so there is no corridor for it to be an opinion about.
             local,
         } = self;
         *state  = "idle".to_string();
