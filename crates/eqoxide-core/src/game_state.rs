@@ -2910,45 +2910,68 @@ pub(crate) mod tests {
 
     /// #757 — `zone_cross_attempts` and `zone_cross_plan` must NOT survive a zone-in.
     ///
-    /// Both fields are per-zone-namespace facts: a zone-line region *index* is only meaningful
+    /// Both fields are per-zone-namespace facts: a zone-line region index is only meaningful
     /// against the zone that baked it, and an advertised destination `zone_id` is only meaningful
     /// against the zone that advertised it (see the fields' doc comments). Left in place across a
-    /// zone-in, `zone_cross_attempts` would gate the new zone's auto-cross using a tally the OLD
-    /// zone accumulated, and `zone_cross_plan` would let `GET /v1/observe/debug` report a
-    /// best-effort/advertised split for a crossing the new zone never made — a confident answer to
-    /// a question about the new zone, built from the old zone's data.
+    /// zone-in, a BLOCKED `zone_cross_attempts` tally would leave the new zone's auto-cross gate
+    /// refusing to retry for a limit the OLD zone's stand reached, and a BEST-EFFORT
+    /// `zone_cross_plan` would let `GET /v1/observe/debug` keep reporting a degraded-destination
+    /// crossing for a request the new zone never made — a confident answer to a question about the
+    /// new zone, built from the old zone's data. The fixture below is built to actually reach both
+    /// of those states (see the setup assertions), not merely a `Some(..)` that happens to clear.
     ///
-    /// This is the asymmetry #757 measured directly: `begin_zone_in`'s third sibling clear
+    /// #757's own issue body states the asymmetry precisely: `begin_zone_in`'s third sibling clear
     /// (`player_hold`, pinned by `begin_zone_in_clears_the_previous_zones_hold_724` above) was
     /// ADDED by #744 while #750 was independently adding these two, and `git` resolved the merge
     /// as an ordinary text conflict — keeping three independent clears arriving from two
-    /// directions. Dropping any ONE of the three still compiles and passes the suite; only
-    /// `player_hold` had a test standing guard over it. This test closes that gap for the other
-    /// two. Mutation check (each run independently, see the #757 PR body for the verbatim output):
-    /// drop `self.zone_cross_attempts = None;` from `begin_zone_in` → RED at the first assertion;
-    /// restore it, then drop `self.zone_cross_plan = None;` → RED at the second.
+    /// directions. Dropping either of THESE TWO still compiles and passes the suite — `player_hold`
+    /// is the one exception, because it already had a test guarding it (round-1 review of this PR
+    /// measured that directly: reverting `player_hold`'s clear alone turns `..._hold_724` RED).
+    /// This test closes the gap for the other two. Mutation check (each run independently, see the
+    /// #757 PR body for the verbatim output): drop `self.zone_cross_attempts = None;` from
+    /// `begin_zone_in` → RED at the first assertion; restore it, then drop
+    /// `self.zone_cross_plan = None;` → RED at the second.
     #[test]
     fn begin_zone_in_clears_the_previous_zones_cross_attempts_and_plan_757() {
-        use crate::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution};
+        use crate::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
 
         let mut gs = GameState::new();
-        gs.zone_cross_attempts = Some(CrossAttempts::record(None, 3));
+        // Build a tally that has actually REACHED the bound (`blocks() == true`), not just any
+        // `Some`. `CrossAttempts`'s own doc ("why the tally is NOT per region index") establishes
+        // the count is a per-stand total, not keyed to whichever index was last attempted — the
+        // predicate that matters here is `blocks()`, so the fixture drives it there directly rather
+        // than asserting a claim about the type that its own docs disclaim.
+        let mut tally = None;
+        for index in 0..MAX_CROSS_ATTEMPTS as i32 {
+            tally = Some(CrossAttempts::record(tally, index));
+        }
+        gs.zone_cross_attempts = tally;
+        assert!(gs.zone_cross_attempts.unwrap().blocks(),
+            "test setup: the fixture must reach the actual blocking bound, or this test does not \
+             exercise the harm its assertion describes");
         gs.zone_cross_plan = Some(ZoneCrossPlan {
             requested_zone_id: Some(181),
             index: 3,
-            resolution: ZoneCrossResolution::Advertised { zone_id: 181 },
+            resolution: ZoneCrossResolution::ServerResolved,
         });
+        assert!(gs.zone_cross_plan.unwrap().resolution.is_best_effort(),
+            "test setup: the fixture must be the best-effort case, since that is the only case \
+             GET /v1/observe/debug discloses (`observe.rs`'s `.filter(|p| p.resolution.is_best_effort())`)");
 
         gs.begin_zone_in();
 
         assert!(gs.zone_cross_attempts.is_none(),
-            "a cross-attempt tally is keyed to region indices in the OLD zone's namespace — a \
-             zone-in must clear it so the new zone's auto-cross gate starts from zero, not a \
-             stale bound carried over from a zone we already left");
+            "a cross-attempt tally counts attempts made during ONE continuous stand and blocks \
+             further auto-cross once the count reaches MAX_CROSS_ATTEMPTS — carried into a new \
+             zone, an already-blocked tally would leave the new zone's auto-cross gate stuck \
+             refusing to retry for a limit the OLD zone's stand reached, not this one's; a \
+             zone-in must clear it so the new zone starts unblocked");
         assert!(gs.zone_cross_plan.is_none(),
-            "a zone-cross plan's index and advertised zone_id are only meaningful against the \
-             zone that produced them — a zone-in must clear it so /v1/observe/debug cannot report \
-             a best-effort/advertised split for a crossing the new zone never made");
+            "a zone-cross plan's index and requested zone id are only meaningful against the zone \
+             that produced them, and a best-effort resolution left in place would keep \
+             /v1/observe/debug reporting a degraded-destination crossing for a request the new \
+             zone never made — a zone-in must clear it so that disclosure reads null until this \
+             zone resolves a crossing of its own");
     }
 
 }
