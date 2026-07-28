@@ -3008,6 +3008,43 @@ mod tests {
         }
     }
 
+    /// #194: a FLOATING entity (the boat/ship races — `is_boat_race` → `Entity::floating()` →
+    /// `Billboard::floating`) keeps its server-sent z, while a non-floating entity at the same
+    /// spot still snaps. A boat rides the water SURFACE; `floor_z` probes 100u down and returns
+    /// the seabed/dock beneath it, so snapping would render the ship below the waterline — the
+    /// client showing the driving agent a boat where there is no boat. The server skips this for
+    /// boats too (`Mob::FixZ` early-returns for `GetIsBoat`, they are `GravityBehavior::Floating`).
+    /// BOTH directions are asserted: a widened exemption that swallowed every entity would fail
+    /// the second half, so this cannot pass by exempting too much.
+    #[test]
+    fn floating_entity_keeps_server_z_and_grounded_one_still_snaps() {
+        let col = flat_collision_at(0.0); // "seabed" 4u below the surface the boat sits on
+        let now = std::time::Instant::now();
+        let surface_z = 4.0_f32;
+
+        // Floating (boat): z untouched, and still untouched on the second frame. The floating
+        // arm never touches the memo cache (it's comment-only), so there's nothing for a later
+        // frame to resurrect from — the second frame is belt-and-braces, not load-bearing.
+        let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
+        for _ in 0..2 {
+            let mut boat = bb(9, [10.0, 0.0, surface_z]);
+            boat.floating = true;
+            let mut bbs = vec![boat];
+            smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col), now, 1.0 / 60.0);
+            assert!((bbs[0].pos[2] - surface_z).abs() < 1e-3,
+                "a floating boat must ride its server-sent z={surface_z}, not the seabed at 0.0: got z={}",
+                bbs[0].pos[2]);
+        }
+
+        // Identical position, NOT floating: still grounded, exactly as before.
+        let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
+        let mut bbs = vec![bb(9, [10.0, 0.0, surface_z])];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col), now, 1.0 / 60.0);
+        assert!(bbs[0].pos[2].abs() < 1e-3,
+            "a non-floating entity at the same spot must still snap to the floor, got z={}",
+            bbs[0].pos[2]);
+    }
+
     #[test]
     fn first_zone_in_triggers_load() {
         // current_zone starts empty; arriving in a real zone must load it.
