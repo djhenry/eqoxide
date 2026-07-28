@@ -129,7 +129,10 @@ pub struct ModelAsset {
     /// raw pre-node-scale positions.  Lift = y_bottom × mesh_scale (dominant).
     pub y_bottom:          f32,
     /// Vertical extent of the model (max_y - min_y) in buffer vertex space.
-    /// Used for visual_scale: visual_scale = 2 × y_extent × arch_scale.
+    /// Read here as the `true_height` fallback when the glTF carries no `eq_height` extra. It is
+    /// NOT part of static placement: since #768 `static_placement` takes the whole lift from
+    /// `y_bottom`. `visual_scale = 2 × y_extent × arch_scale` survives only in the standalone
+    /// `render_model` viewer bin (`src/bin/render_model.rs:1097`).
     pub y_extent:          f32,
     /// Center of the model in the X and Z axes (raw pre-node-scale space, dominant meshes only).
     /// Used as a centering correction so models are rendered at their entity position rather than
@@ -712,12 +715,6 @@ pub fn race_to_archetype(race: &str) -> &'static str {
     }
 }
 
-/// Fixed display scale (EQ units) for each glTF archetype.
-/// All models with node_scale=100 have that applied during loading, so these
-/// values reflect the effective post-scale model height in EQ units.
-/// Arch-scale is a multiplier such that `visual_scale = 2 * y_bottom * arch_scale * node_scale`
-/// equals the desired total character height in EQ units (feet-to-head).
-/// Calibrated from actual GLTF vertex bounds; review after adding new models.
 /// Per-archetype model-space orientation fix-up applied in `entity_model_matrix_heading` (#149).
 /// Most models need none (identity). The shared substitute `fish.glb` is authored with its
 /// nose→tail along the model's Y axis; after the standard Y-up→Z-up conversion that axis points
@@ -898,20 +895,44 @@ pub fn skinned_target_height(race: &str, archetype: &str, true_height: f32) -> f
 ///
 /// It is NOT the only copy in the repository, and saying otherwise would be false: the standalone
 /// model-viewer binary (`src/bin/render_model.rs`, in the root `eqoxide` crate — it cannot depend on
-/// this crate's pass module) still writes `2.0 * y_extent * arch_scale` and
-/// `vscale * 0.5 + y_bottom * arch_scale` by hand at three places. Consequence, stated because it is
-/// real: the viewer has no `floating` concept at all, so it still draws `boat.glb` 13.9275u above
-/// its turntable while the game now draws it at the stored z. #756 did not change the viewer;
-/// converging it is its own change.
+/// this crate's pass module) still writes `2.0 * y_extent * arch_scale` (`render_model.rs:1097`
+/// and `:1266`) and `vscale * 0.5 + y_bottom * arch_scale` (`:1271`) by hand. Consequence, stated
+/// because it is real: the viewer has no `floating` concept at all and did not take #768's
+/// correction either, so its static arm still lifts a model by `(y_extent + y_bottom) * arch_scale`
+/// — the formula #768 replaced here. How far off that puts a given model on the turntable is not
+/// stated, because the viewer's `arch_scale` comes from a CLI-supplied archetype name
+/// (`render_model.rs:814`) and no run of the viewer was made for this change. Neither #756 nor #768
+/// changed the viewer; converging it is its own change, and it is not a pure deletion there — the
+/// viewer also feeds `visual_scale` to its camera distance (`:1098`), its camera focus height
+/// (`:1291`) and its marker placement (`:1471`), so removing the term reframes the turntable.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StaticPlacement {
     /// Uniform mesh scale fed to `entity_model_matrix_heading`'s `mesh_scale`.
     pub mesh_scale: f32,
-    /// Z-lift fed to `entity_model_matrix_heading`'s `visual_scale` (halved there).
-    pub visual_scale: f32,
     /// Horizontal recentre fed to `entity_model_matrix_heading`'s `center_xz`.
     pub center_xz: [f32; 2],
-    /// Extra lift fed to `entity_model_matrix_heading`'s `y_bottom` (scaled by `mesh_scale` there).
+    /// The WHOLE vertical lift, fed to `entity_model_matrix_heading`'s `y_bottom` (scaled by
+    /// `mesh_scale` there). `0.0` on the floating arm.
+    ///
+    /// There is deliberately no `visual_scale` field. `entity_model_matrix_heading` lifts by
+    /// `visual_scale * 0.5 + y_bottom * mesh_scale`, and the static call sites pass a literal `0.0`
+    /// for `visual_scale`, so this field is the only lift a static *placement* can express. #768 was
+    /// exactly a second lift term hiding in `visual_scale`.
+    ///
+    /// Dropping the field removes that term from this shared helper. It does NOT make the term
+    /// unwritable, and there are TWO ways back to it, not one — a caller can hand
+    /// `2.0 * model.y_extent * p.mesh_scale` to `entity_model_matrix_heading` (nothing here
+    /// constrains that argument), and a caller can hand `model.y_bottom + model.y_extent` to this
+    /// function's `y_bottom` (nothing here constrains that either — an `f32` is an `f32`). Both were
+    /// measured to leave every behavioural test in this crate green.
+    ///
+    /// What holds them today is a source-text pin over `pass.rs`,
+    /// `tests/floating_placement.rs::every_static_placement_in_pass_rs_is_written_exactly_as_reviewed`,
+    /// which requires each of the four call sites to be spelled exactly as reviewed. That bounds the
+    /// four call sites in that one file. It is NOT a type-level guarantee and it does not reach a
+    /// caller in another file; making the state unrepresentable would mean this function taking the
+    /// model's measured bounds as an opaque value only the loader can mint, which is a wider change
+    /// than #768 and is not done here.
     pub y_bottom: f32,
 }
 
@@ -921,30 +942,46 @@ pub struct StaticPlacement {
 /// different meanings of the entity's stored **z** (#756):
 ///
 /// - **grounded** (`false`) — the stored z is eqoxide's FOOT datum: the ingest path subtracted
-///   `WIRE_Z_OFFSET` (`crates/eqoxide-core/src/coord.rs:115` `wire_z_to_foot`). The model's local
-///   bounding box is arbitrary, so the model is lifted off that z. This arm is byte-for-byte the
-///   pre-#756 formula.
+///   `WIRE_Z_OFFSET` (`crates/eqoxide-core/src/coord.rs:115` `wire_z_to_foot`). The model is lifted
+///   so its **lowest vertex sits on that z**, which is the rule `GpuStaticModel::y_bottom` already
+///   states (`gpu.rs:141-142`, "used to compute the ground lift so models stand at Z=0 instead of
+///   floating or sinking").
 ///
-///   It does **not** lift the model to *stand on* that z, and saying so would be false. Measured by
-///   building this arm's matrix and mapping `boat.glb`'s bounding box through it (stored z 4,
-///   heading 0): drawn origin z `17.927488`, **lowest vertex z `13.945171`** — the hull's bottom
-///   lands `9.945171` ABOVE the stored z, which is exactly `y_extent * mesh_scale`, a full rendered
-///   model height. Standing on the z would need a lift of `y_bottom * mesh_scale` = `3.982317`,
-///   which is what `gpu.rs:180` states the rule to be ("lift = y_bottom × mesh_scale") and what the
-///   calibration note at line 718 above assumes (`visual_scale = 2 * y_bottom * arch_scale`, where
-///   the code computes `2 * y_extent`). The axis direction is not assumed:
+///   The lift is `y_bottom * mesh_scale` and nothing else. Until #768 this arm ALSO passed
+///   `visual_scale = 2 * y_extent * mesh_scale`, which `entity_model_matrix_heading` halves and adds
+///   on top, so the real lift was `(y_extent + y_bottom) * mesh_scale` and the model's bottom landed
+///   a full rendered model height above the stored z. Measured by mapping `boat.glb`'s bounding box
+///   through this arm's production matrix (stored z 4, heading 0): drawn origin z was `17.927488`
+///   with the lowest vertex at `13.945171` — `9.945171` too high, exactly `y_extent * mesh_scale`.
+///   It is now `7.982317` / `4.000000`. The axis direction is not assumed:
 ///   `camera.rs:264` `static_model_y_up_axis_maps_to_world_up` pins that a static model's +Y
-///   becomes world +Z.
+///   becomes world +Z, and `tests/floating_placement.rs` re-derives it from the matrix's own
+///   columns before reading a lowest vertex off it.
 ///
-///   So of the `13.927488` that #756 removes for a floating hull, only `3.982317` is the datum
-///   error #756 is about; the other `9.945171` is the grounded arm over-lifting *any* static model.
-///   That is a separate defect with a separate blast radius and is NOT fixed here — filed as #768
-///   with the measurement above. Nothing renders wrong today because of it, which follows from two
-///   measured facts: `Entity::floating()` is `skips_wire_z_offset(is_boat, flymode)`
-///   (`eqoxide-core/src/game_state.rs:192`), true for every boat regardless of flymode; and
-///   `boat.glb` is the only model `model_for` can load with no skin. Since the grounded arm is only
-///   reached by a static model, the inference is that it has **no live consumer** today. That is
-///   also why a false sentence could sit here undetected.
+///   Residual, stated because it is real and NOT fixed here: `y_bottom` is `-y_min` only when
+///   `y_min < 0` and `0.0` otherwise (see the loader's reduction in this file). For a model whose
+///   vertices all sit above its local origin this arm therefore lifts by `0` and the bottom lands
+///   `y_min * mesh_scale` above the stored z. No shipped model exercises that clamp — `boat.glb` is
+///   the only unskinned model `model_for` can load and its `y_min` is `-3.982317` — so #768 left the
+///   clamp alone rather than change a datum the skinned path also reads.
+///
+///   Nothing rendered wrong because of the over-lift — true as measured on 2026-07-28, and stated
+///   with the mechanism that actually decides it, because an earlier version of this paragraph got
+///   that mechanism wrong. A model takes the static arm when
+///   `!(0 < joint_count <= 128)` (`renderer.rs:663-664`): no skin at all, **or** a skin with zero
+///   joints, **or** a skin with MORE than 128 joints. "Unskinned" is sufficient, not necessary.
+///   Scanned every name `model_for` can ask for (18 archetypes + 29 `race_*` + the 3 `_f` variants
+///   that exist = 50 files): exactly one lands on the static arm, `boat.glb`, at `skins == 0`.
+///   Nothing is over the 128 cap. `Entity::floating()` is `skips_wire_z_offset(is_boat, flymode)`
+///   (`eqoxide-core/src/game_state.rs:192`), true for every boat regardless of flymode, so the
+///   grounded arm has no live consumer today.
+///
+///   **The margin is one joint, and it is not ours to hold.** `race_pcfroglok.glb` has 127 joints
+///   against the 128 cap; 11 rigs are at 109 or more. The model directory is an externally rebaked
+///   sync target. A two-joint rebake of that one file would put a PC race on the grounded arm,
+///   where `floating()` is false — which is why this arm has to be correct rather than merely
+///   unreached. The absence of a live consumer is also why a false sentence could sit here
+///   undetected, and why #768 has no live before/after to show.
 /// - **floating** (`true`) — two separate steps, held to different standards:
 ///
 ///   1. *That the current lift is wrong* is certain from the code alone. `wire_z_to_foot`
@@ -981,16 +1018,20 @@ pub struct StaticPlacement {
 ///   real and unresolved; it is not what #756 is about.
 ///
 /// Magnitude of the grounded arm applied to a floating hull, from the measured `boat.glb` bounds
-/// (`y_extent = 9.9452`, `y_bottom = 3.9823`, `archetype_scale("boat") = 1.0`):
-/// `2*9.9452*1.0*0.5 + 3.9823*1.0 = 13.9275` units of lift on a 9.9452-unit-tall model.
+/// (`y_extent = 9.9452`, `y_bottom = 3.9823`, `archetype_scale("boat") = 1.0`): before #768 the two
+/// arms differed by `2*9.9452*1.0*0.5 + 3.9823*1.0 = 13.9275` units of lift on a 9.9452-unit-tall
+/// model; after it they differ by `3.9823`, the grounded arm's whole lift.
+///
+/// `y_extent` is no longer a parameter. It was only ever read to build the `visual_scale` term #768
+/// removed, so keeping it would have left the over-lift one edit away from returning.
 pub fn static_placement(
-    archetype: &str, y_extent: f32, y_bottom: f32, center_xz: [f32; 2], floating: bool,
+    archetype: &str, y_bottom: f32, center_xz: [f32; 2], floating: bool,
 ) -> StaticPlacement {
     let mesh_scale = archetype_scale(archetype);
     if floating {
-        StaticPlacement { mesh_scale, visual_scale: 0.0, center_xz, y_bottom: 0.0 }
+        StaticPlacement { mesh_scale, center_xz, y_bottom: 0.0 }
     } else {
-        StaticPlacement { mesh_scale, visual_scale: 2.0 * y_extent * mesh_scale, center_xz, y_bottom }
+        StaticPlacement { mesh_scale, center_xz, y_bottom }
     }
 }
 
