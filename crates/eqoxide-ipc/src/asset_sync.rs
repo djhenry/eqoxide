@@ -548,8 +548,18 @@ impl ConnectOutcome {
     /// E0027, `refused: _`, satisfies check 1 while never adding the slot to the returned array or to
     /// `ALL` — the crate builds clean, zero warnings, and the outcome is unserved. See
     /// [`LastLoginByOutcome::slots`]'s rustdoc for the corrected claim and its full measurement
-    /// (MX-c); it is intentionally not restated here a third time, so it cannot drift from that copy
-    /// again.
+    /// (MX-c); it is intentionally not restated here a third time.
+    ///
+    /// ⚠️ **[EDIT, round 7 (#755 review): "so it cannot drift from that copy again" was false the
+    /// moment it was written.]** A fourth copy of the same completeness claim, compressed and
+    /// un-retracted, was already sitting in this file's tests, at
+    /// `the_slot_enumeration_and_all_are_the_same_list_in_the_same_order`'s rustdoc — not a new
+    /// drift caused by this edit, just one this edit did not find. Not restating the correction here
+    /// does not, by itself, stop a *different* sentence elsewhere from asserting the same false thing
+    /// in its own words; only a grep and a retraction do that, and that fourth copy is now also
+    /// retracted (see its own rustdoc). As of this commit a tree-wide grep for the completeness
+    /// claim's phrasings turns up none outside [`LastLoginByOutcome::slots`]'s rustdoc — stated as a
+    /// measured fact about this commit, not a guarantee about the next one.
     ///
     /// **The residual, stated rather than glossed, and measured too.** A variant whose match arms
     /// are pointed at an *existing* slot and counter adds no field, so `slots` is unchanged and
@@ -1384,11 +1394,21 @@ mod tests {
             "two logins did not complete, and BOTH are named — not just the later one");
     }
 
-    /// **#743 round-3 review B1.** [`LastLoginByOutcome::slots`] is the compile-time pin that keeps
-    /// [`ConnectOutcome::ALL`] complete, and it is what the HTTP encoder walks. It is therefore a
-    /// second enumeration of the outcomes, and two enumerations that can disagree are how the defect
-    /// this PR is about got in. The compiler pins their *length*; this pins their *contents and
-    /// order*, so `slots()[i]` and `ALL[i]` are the same outcome and a caller may zip them.
+    /// **#743 round-3 review B1.**
+    ///
+    /// ⚠️ **[EDIT, round 7 (#755 review): this used to open "[`LastLoginByOutcome::slots`] is the
+    /// compile-time pin that keeps [`ConnectOutcome::ALL`] complete" — a fourth, compressed,
+    /// un-retracted copy of the same completeness claim already corrected at `slots()`'s own
+    /// rustdoc, at the HTTP encoder, and at `ALL` itself. Found by a round-7 tree-wide grep, after
+    /// round 6 had claimed the correction was down to one copy — it was not; see
+    /// [`ConnectOutcome::ALL`]'s rustdoc for that correction.]** See [`LastLoginByOutcome::slots`]'s
+    /// own rustdoc for what is actually true, and measured, about completeness.
+    ///
+    /// What still holds: `slots()` IS what the HTTP encoder walks, and it is a second enumeration of
+    /// the outcomes — independent of whether either enumeration is *complete*, two enumerations that
+    /// can disagree in *contents or order* are how the defect this PR is about got in. The compiler
+    /// pins their *length*; this test pins their *contents and order*, so `slots()[i]` and `ALL[i]`
+    /// are the same outcome and a caller may zip them.
     ///
     /// MUTATION-CHECK: swap two entries in `slots`, or point one at another outcome's field, and
     /// this goes RED.
@@ -1427,14 +1447,43 @@ mod tests {
     /// having ended the OTHER way — not merely absent, but affirmatively mislabelled. That is the
     /// #743 B3 shape again, and this is the only test in this module that can see it.
     ///
-    /// MUTATION-CHECK, run (not reasoned about) at #755 round 6: added a fifth `Refused` variant
-    /// end-to-end — own field on `LastLoginByOutcome`, own counter on `LoginOutcomeTally`, its own
-    /// entry in `slots()`, listed in `ALL`, all five exhaustive matches wired — with `as_str()`
-    /// returning `"failed"` for it (copy-pasted from `Failed`'s arm) instead of `"refused"`. Every
-    /// other test in this module and in `eqoxide-http` stayed green; this one alone went RED, on
-    /// exactly this assertion. Reverted afterward, `cp`-aside restored and `md5sum`-verified.
+    /// **Scope, stated precisely (round 7, non-blocking review note).** This test's power is over
+    /// [`ConnectOutcome::ALL`], not the enum in general: in the `refused: _` evasion state
+    /// [`LastLoginByOutcome::slots`]'s rustdoc documents as reachable with a clean build, a variant
+    /// left OUT of `ALL` still reaches `last_ended` via `as_str()` (that path never consults `ALL`),
+    /// so a colliding token on such a variant is unseen here. That gap is a reading of the three
+    /// lines below, not a separate measurement — flagged as a hypothesis, not re-run as its own
+    /// mutation.
+    ///
+    /// MUTATION-CHECK, run (not reasoned about) at #755 round 6, RE-RUN at round 7 after the review
+    /// found the round-6 claim below wrong: added a fifth `Refused` variant end-to-end — own field on
+    /// `LastLoginByOutcome`, own counter on `LoginOutcomeTally`, its own entry in `slots()`, listed
+    /// **first** in `ALL` (the round-7 review's ordering, chosen as the one most favourable to the
+    /// round-6 claim), all five exhaustive matches wired — with `as_str()` returning `"failed"` for
+    /// it (copy-pasted from `Failed`'s arm) instead of `"refused"`.
+    ///
+    /// ⚠️ **[EDIT, round 7 (#755 review, B2): "every other test in this module and in `eqoxide-http`
+    /// stayed green; this one alone went RED" was false, and the round-7 review's own re-run
+    /// (`52 passed; 2 failed`) is the proof — re-run again here, independently, before writing this
+    /// correction.]** Real output, `eqoxide-ipc`, `52 passed; 2 failed`:
+    ///
+    /// - this test, exactly as designed — `left: 3, right: 4` distinct tokens. The claim this test
+    ///   itself makes is correct.
+    /// - [`no_interleaving_can_bury_a_login_failure_where_a_poller_cannot_find_it`] also goes RED, on
+    ///   the very first verdict pair it tries (`[Refused, Refused]`): `left: 0, right: 2` at its
+    ///   per-iteration [`LoginOutcomeTally::unsuccessful`] check. **This is not a second symptom of
+    ///   the token collision** — it is the already-disclosed N3 residual on `unsuccessful()` (a
+    ///   hand-written `failed + unknown` that cannot see a variant added outside those two fields),
+    ///   reached here only because reproducing this mutation requires adding a real new outcome, and
+    ///   that property test happens to assert `unsuccessful()` once per verdict pair. It fires before
+    ///   the loop ever reaches that test's own `checked == 2520 * ALL.len().pow(2) * 8` assertion —
+    ///   which used to be the literal `2520 * 9 * 8`, a same-class alphabet-size restatement, now
+    ///   fixed on its own merits (see the note there) but not what caused this particular red.
+    /// - No `eqoxide-http` test went red in this reproduction.
+    ///
+    /// Reverted afterward, `cp`-aside restored and `md5sum`-verified.
     #[test]
-    fn as_str_is_injective_over_all_so_two_outcomes_can_never_collide_on_one_wire_token() {
+    fn as_str_is_injective_over_all_so_no_two_outcomes_in_all_collide_on_one_wire_token() {
         let tokens: Vec<&str> = ConnectOutcome::ALL.iter().map(|o| o.as_str()).collect();
         let mut distinct = tokens.clone();
         distinct.sort_unstable();
@@ -1753,9 +1802,21 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 2520 * 9 * 8,
-            "2520 orderings × 9 outcome pairs × 8 steps must each have been asserted; a shrunken \
-             enumeration is how this property stops covering the ordering it exists for");
+        // ⚠️ [EDIT, round 7 (#755 review): this used to be the literal `2520 * 9 * 8` — 9 = 3², the
+        // same un-enumerated alphabet-size restatement `slots_model` had twelve lines above, in the
+        // same test. The review named it as a live bug: add a variant and `ALL.len()` grows from 3
+        // to 4, so the *actual* pair count the two nested `for … in ConnectOutcome::ALL` loops walk
+        // grows to 16 while the hard-coded `9` stays put, so `checked` (322560) and the literal
+        // (181440) diverge — a real defect on its own terms, independent of whether any one
+        // reproduction happens to reach this line before an earlier assertion panics first (in the
+        // round-7 MX-E2 re-run this line was never reached — an earlier, unrelated, already-disclosed
+        // gap fired first; see the note on
+        // `as_str_is_injective_over_all_so_no_two_outcomes_in_all_collide_on_one_wire_token`).
+        // Derived from `ALL.len()` so the count self-scales with the alphabet the loops actually
+        // walk, regardless of which assertion a given mutation happens to trip first.]
+        assert_eq!(checked, 2520 * ConnectOutcome::ALL.len().pow(2) * 8,
+            "2520 orderings × ALL.len()² outcome pairs × 8 steps must each have been asserted; a \
+             shrunken enumeration is how this property stops covering the ordering it exists for");
     }
 
     /// A login and the syncs it enables share the registry, keep the oldest-first order, and own
