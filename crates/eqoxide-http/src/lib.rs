@@ -73,6 +73,8 @@ mod events;
 mod social;
 mod camera;
 mod lifecycle;
+// #347/B1: the single polarity site for "queued or refused" — see `refusal.rs`.
+mod refusal;
 
 // Shared test fixtures (`HttpState` builder + snapshot-seeding helpers). Available to this crate's
 // own unit tests and, via the `test-fixtures` feature, to the app crate's integration tests — see

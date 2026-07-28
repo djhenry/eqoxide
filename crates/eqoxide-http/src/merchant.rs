@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{BuyOk, CommandResult, OpenOk};
 use super::*;
+use crate::refusal::Refusal;
 
 pub(super) fn router() -> Router<HttpState> {
     Router::new()
@@ -72,12 +73,8 @@ async fn post_trade_open(
 
     // Park the open with a result channel and await the TRUE outcome (park → fulfil → timeout).
     let (tx, rx) = oneshot::channel::<CommandResult<OpenOk>>();
-    if !s.command.request_open_await(id, tx) {
-        return json(
-            StatusCode::CONFLICT,
-            serde_json::json!({ "status": "refused", "reason": BUSY_OPEN }),
-        );
-    }
+    if let Some(busy) = s.command.request_open_await(id, tx)
+        .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_OPEN })) { return busy; }
     tracing::info!("trade: awaited open queued — merchant {:?} (spawn_id={})", key, id);
 
     match tokio::time::timeout(Duration::from_secs(4), rx).await {
@@ -112,9 +109,7 @@ async fn post_trade_open(
 /// POST /v1/merchant/close — close the currently open merchant window (OP_ShopRequest command=Close).
 async fn post_trade_close(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    if !s.command.request_merchant_trade(TradeCmd::Close) {
-        return (StatusCode::CONFLICT, BUSY_CLOSE.into());
-    }
+    if let Some(busy) = s.command.request_merchant_trade(TradeCmd::Close).refused(BUSY_CLOSE) { return busy; }
     (StatusCode::OK, "closing merchant window".into())
 }
 
@@ -204,12 +199,8 @@ async fn post_buy(
 
     // Park the buy with a result channel and await the TRUE outcome (park → fulfil → timeout).
     let (tx, rx) = oneshot::channel::<CommandResult<BuyOk>>();
-    if !s.command.request_buy_await(id, b.slot, tx) {
-        return json(
-            StatusCode::CONFLICT,
-            serde_json::json!({ "status": "refused", "reason": BUSY_BUY }),
-        );
-    }
+    if let Some(busy) = s.command.request_buy_await(id, b.slot, tx)
+        .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_BUY })) { return busy; }
     tracing::info!("buy: awaited buy queued — merchant {:?} (spawn_id={}) slot={}", key, id, b.slot);
 
     match tokio::time::timeout(Duration::from_secs(4), rx).await {
@@ -282,14 +273,23 @@ async fn post_sell(
             // #347 step 1 (reject at the door): an empty `slot` cannot be sold. The drain would
             // send OP_ShopPlayerSell for a slot the server sees as empty and the server answers
             // with nothing at all, yet the caller was told 200 "selling slot N". Checked against
-            // the last published inventory (GET /v1/observe/inventory).
+            // the inventory the net thread has published (the same snapshot GET
+            // /v1/observe/inventory serves), which since #347/B2 is republished by the loop's own
+            // mirror edits too, not only by an inbound packet — see `ActionLoop::mirror_move_item`.
+            //
+            // KNOWN GAP, pre-existing and NOT fixed by this check (round-1 review, N5): a flat bag
+            // slot (251..=350, `eqoxide_core::game_state::bag_wire_slot`) IS in the published
+            // inventory, so it passes here — but `drain_merchant` builds Merchant_Purchase_Struct
+            // with `SubIndex = -1` ("not inside a bag"), so the server cannot resolve the item and
+            // drops the sell silently. The door check does not create that bug and does not fix it;
+            // it just no longer stands between the caller and it. Selling from a bag needs the
+            // (parent, sub_index) decode at the SEND site (`action_loop.rs`), which is a wire-format
+            // change outside this PR's two steps.
             let occupied = s.inventory_slots.inventory.lock().unwrap().iter().any(|i| i.slot == b.slot as i32);
             if !occupied {
                 return (StatusCode::NOT_FOUND, format!("no item in slot {} to sell", b.slot));
             }
-            if !s.command.request_merchant_sell(id, b.slot, qty) {
-                return (StatusCode::CONFLICT, BUSY_SELL.into());
-            }
+            if let Some(busy) = s.command.request_merchant_sell(id, b.slot, qty).refused(BUSY_SELL) { return busy; }
             tracing::info!("sell: queued merchant {:?} (spawn_id={}) slot={} qty={}", key, id, b.slot, qty);
             (StatusCode::OK, format!("selling slot {} x{} to {} (spawn_id={})", b.slot, qty, clean_entity_name(&key), id))
         }

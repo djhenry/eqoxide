@@ -5,6 +5,7 @@
 
 use axum::{routing::post, extract::State, Json, http::StatusCode, Router};
 use crate::{HttpState, require_live_session};
+use crate::refusal::Refusal;
 
 pub fn router() -> Router<HttpState> {
     Router::new().route("/command", post(post_command))
@@ -55,11 +56,60 @@ async fn post_command(
     });
     match cmd {
         Some(c) => {
-            if !s.command.request_pet_command(c) {
-                return (StatusCode::CONFLICT, BUSY_PET.into());
-            }
+            if let Some(busy) = s.command.request_pet_command(c).refused(BUSY_PET) { return busy; }
             (StatusCode::OK, format!("pet command {c} queued"))
         }
         None => (StatusCode::BAD_REQUEST, "unknown pet command — use a PET_* number or attack|backoff|follow|guard|sit".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::empty_state;
+    use axum::body::Body;
+    use axum::http::Request;
+    use eqoxide_core::pet::PET_ATTACK;
+    use tower::ServiceExt;
+
+    fn cmd_req(name: &str) -> Request<Body> {
+        Request::post("/command")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"name":"{name}"}}"#)))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_pet_command_is_200_and_queues_the_command_byte() {
+        let state = empty_state();
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(cmd_req("attack")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(command.take_pet_command(), Some(PET_ATTACK as u8));
+    }
+
+    /// #347 step 2 (review round 1, B1): two pet commands inside one undrained tick. Before the fix
+    /// the second OVERWROTE the first and BOTH callers were told `200`, so one command silently
+    /// never happened. This route had NO test at all, which is why the reviewer's one-character
+    /// mutation at the `request_pet_command` call site shipped fully green — this is the assertion
+    /// that mutation now has to get past.
+    #[tokio::test]
+    async fn a_second_pet_command_before_the_drain_is_409_and_the_first_survives() {
+        let state = empty_state();
+        let command = state.command.clone();
+        let app = router().with_state(state);
+
+        let first = app.clone().oneshot(cmd_req("attack")).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app.oneshot(cmd_req("follow")).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT,
+            "the second pet command must be refused, not silently swallowed");
+
+        assert_eq!(command.take_pet_command(), Some(PET_ATTACK as u8),
+            "the FIRST command must be the one that survives to the net thread");
+        assert_eq!(command.take_pet_command(), None,
+            "and nothing else may be queued behind it");
     }
 }

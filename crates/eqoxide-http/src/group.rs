@@ -3,6 +3,7 @@
 
 use axum::{extract::State, http::StatusCode, routing::{get, post}, Json, Router};
 use super::*;
+use crate::refusal::Refusal;
 
 pub(super) fn router() -> Router<HttpState> {
     Router::new()
@@ -54,9 +55,7 @@ async fn post_invite(
 ) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
-    if !s.command.request_group_invite(name.clone()) {
-        return (StatusCode::CONFLICT, BUSY_GROUP.into());
-    }
+    if let Some(busy) = s.command.request_group_invite(name.clone()).refused(BUSY_GROUP) { return busy; }
     tracing::info!("group: queued invite to {name}");
     (StatusCode::OK, format!("inviting {name}"))
 }
@@ -67,9 +66,7 @@ async fn post_accept(State(s): State<HttpState>) -> (StatusCode, String) {
     if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending invite".into());
     }
-    if !s.command.request_group_accept() {
-        return (StatusCode::CONFLICT, BUSY_GROUP.into());
-    }
+    if let Some(busy) = s.command.request_group_accept().refused(BUSY_GROUP) { return busy; }
     tracing::info!("group: queued accept");
     (StatusCode::OK, "accepting invite".into())
 }
@@ -81,9 +78,7 @@ async fn post_decline(State(s): State<HttpState>) -> (StatusCode, String) {
     if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending invite".into());
     }
-    if !s.command.request_group_decline() {
-        return (StatusCode::CONFLICT, BUSY_GROUP.into());
-    }
+    if let Some(busy) = s.command.request_group_decline().refused(BUSY_GROUP) { return busy; }
     tracing::info!("group: queued decline");
     (StatusCode::OK, "declining invite".into())
 }
@@ -95,9 +90,7 @@ async fn post_leave(State(s): State<HttpState>) -> (StatusCode, String) {
     if s.group_slots.group.lock().unwrap().members.is_empty() {
         return (StatusCode::BAD_REQUEST, "not in a group".into());
     }
-    if !s.command.request_group_leave() {
-        return (StatusCode::CONFLICT, BUSY_GROUP.into());
-    }
+    if let Some(busy) = s.command.request_group_leave().refused(BUSY_GROUP) { return busy; }
     tracing::info!("group: queued leave");
     (StatusCode::OK, "leaving group".into())
 }
@@ -118,9 +111,7 @@ async fn post_kick(
         return (StatusCode::BAD_REQUEST, format!("{name} is not a current group member"));
     }
     drop(g);
-    if !s.command.request_group_kick(name.clone()) {
-        return (StatusCode::CONFLICT, BUSY_GROUP.into());
-    }
+    if let Some(busy) = s.command.request_group_kick(name.clone()).refused(BUSY_GROUP) { return busy; }
     tracing::info!("group: queued kick of {name}");
     (StatusCode::OK, format!("kicking {name}"))
 }
@@ -141,9 +132,7 @@ async fn post_makeleader(
         return (StatusCode::BAD_REQUEST, format!("{name} is not a current group member"));
     }
     drop(g);
-    if !s.command.request_group_make_leader(name.clone()) {
-        return (StatusCode::CONFLICT, BUSY_GROUP.into());
-    }
+    if let Some(busy) = s.command.request_group_make_leader(name.clone()).refused(BUSY_GROUP) { return busy; }
     tracing::info!("group: queued makeleader {name}");
     (StatusCode::OK, format!("transferring leadership to {name}"))
 }
@@ -157,6 +146,13 @@ mod tests {
 
     fn empty_state() -> HttpState {
         crate::testkit::empty_state()
+    }
+
+    fn invite_req(name: &str) -> Request<Body> {
+        Request::post("/invite")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"name":"{name}"}}"#)))
+            .unwrap()
     }
 
     #[tokio::test]
@@ -335,5 +331,49 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(command.take_group_make_leader(), Some("Sariel".to_string()));
+    }
+
+    /// #347 step 2 (review round 1, B1): two invites inside one undrained tick. Before the fix the
+    /// second OVERWROTE the first and BOTH callers were told `200`, so one invite silently never
+    /// went out — the agent believed it had invited two people and had invited one.
+    #[tokio::test]
+    async fn a_second_invite_before_the_drain_is_409_and_the_first_survives() {
+        let state = empty_state();
+        let command = state.command.clone();
+        let app = router().with_state(state);
+
+        let first = app.clone().oneshot(invite_req("Sariel")).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app.oneshot(invite_req("Aldric")).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT,
+            "the second invite must be refused, not silently swallowed");
+
+        assert_eq!(command.take_group_invite(), Some("Sariel".to_string()),
+            "the FIRST invite must be the one that survives to the net thread");
+        assert_eq!(command.take_group_invite(), None,
+            "and nothing else may be queued behind it");
+    }
+
+    /// The unit-slot verbs (`accept`/`decline`/`leave`) carry no payload, so a lost overwrite is
+    /// invisible in the drained value — the only observable difference is the status code. `accept`
+    /// stands in for all three.
+    #[tokio::test]
+    async fn a_second_accept_before_the_drain_is_409() {
+        let state = empty_state();
+        state.group_slots.group.lock().unwrap().pending_invite = Some("Sariel".into());
+        let command = state.command.clone();
+        let app = router().with_state(state);
+
+        let first = app.clone().oneshot(Request::post("/accept").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app.oneshot(Request::post("/accept").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT,
+            "the second accept must be refused, not silently swallowed");
+
+        assert!(command.take_group_accept().is_some());
+        assert!(command.take_group_accept().is_none(),
+            "and nothing else may be queued behind it");
     }
 }

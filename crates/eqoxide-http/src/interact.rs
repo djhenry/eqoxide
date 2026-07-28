@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{CommandResult, GiveOk};
 use super::*;
+use crate::refusal::Refusal;
 
 /// HTTP-side await budget for POST /v1/interact/give (#448). Set GREATER than the net-side worst-case
 /// verdict time — the two `tick_give` timeouts run in SEQUENCE, so the net side delivers a verdict by
@@ -29,8 +30,27 @@ pub const GIVE_HTTP_TIMEOUT_SECS: u64 = 8;
 const BUSY_HAIL: &str = "a hail is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_SAY: &str = "a say is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_LOOT: &str = "a loot request is already queued and undrained — retry in a moment (it was NOT queued)";
+// N4 (round-1 review): `give` is the ONE slot whose drain sits after `tick()`'s dead-player
+// early-return — `tick_give` is called past `walker.nav_halt_if_dead(gs) { return; }` (verified by
+// reading `ActionLoop::tick`, `action_loop.rs`). So while the character is dead a queued give is
+// never drained, and the SECOND give inside that window gets this 409 with "retry in a moment" —
+// truthful about not being queued, misleading about when retrying will help. Not fixed here: the
+// honest fix is a dead-player door check on `/v1/interact/give`, which is a new refusal rule rather
+// than the two this PR is scoped to, and it needs the same "is `gs` sure the player is dead?"
+// analysis the pet door check was deferred for (see `BUSY_PET` in `pet.rs`).
 const BUSY_GIVE: &str = "a give is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_DOOR: &str = "a door click is already queued and undrained — retry in a moment (it was NOT queued)";
+// `sit`/`stand` and `run`/`walk` are TOGGLES and still refuse, where `request_camp` — also a toggle
+// — is deliberately last-wins. That asymmetry is not an oversight (round-1 review, N1); the line is
+// whether the command carries the caller's intended END STATE:
+//   * `/sit` vs `/stand` and `/run` vs `/walk` pass an explicit `true`/`false`. Dropping one leaves
+//     the agent believing a posture it does not have, which is #347 exactly — so they refuse, and
+//     the caller learns its request did not happen.
+//   * `request_camp` passes `CampCmd`, and `CampCmd::Start` (POST /v1/lifecycle/exit) MUST be able
+//     to override an in-progress camp — it is the only way to tear down a wedged session. Refusing
+//     there would strand it, so that slot is last-wins by design (see `eqoxide_command::lifecycle`).
+// Neither is "the toggle rule"; the rule is that a slot may only be last-wins when a later write is
+// strictly more authoritative than the one it replaces.
 const BUSY_SIT: &str = "a sit/stand is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_RUN_MODE: &str = "a run/walk toggle is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_DIALOGUE: &str = "a dialogue click is already queued and undrained — retry in a moment (it was NOT queued)";
@@ -91,9 +111,7 @@ async fn post_read(
         .map(|i| !i.filename.is_empty());
     match readable {
         Some(true) => {
-            if !s.command.request_read_book(b.slot) {
-                return (StatusCode::CONFLICT, BUSY_READ.into());
-            }
+            if let Some(busy) = s.command.request_read_book(b.slot).refused(BUSY_READ) { return busy; }
             tracing::info!("read: queued book slot={}", b.slot);
             (StatusCode::OK, format!("reading item in slot {}", b.slot))
         }
@@ -136,9 +154,7 @@ async fn post_dialogue(
     match chosen {
         Some(c) => {
             let label = c.text.clone();
-            if !s.command.request_dialogue_click(c) {
-                return (StatusCode::CONFLICT, BUSY_DIALOGUE.into());
-            }
+            if let Some(busy) = s.command.request_dialogue_click(c).refused(BUSY_DIALOGUE) { return busy; }
             tracing::info!("dialogue: queued click {:?}", label);
             (StatusCode::OK, format!("clicking '{}'", label))
         }
@@ -192,9 +208,7 @@ async fn post_hail(
             // Resolve the NPC's spawn_id so the nav thread can target it before saying — the
             // server only fires EVENT_SAY on the player's current target (#130).
             let spawn_id = s.world.entity_ids().get(&key).copied();
-            if !s.command.request_hail(display_name.clone(), spawn_id) {
-                return (StatusCode::CONFLICT, BUSY_HAIL.into());
-            }
+            if let Some(busy) = s.command.request_hail(display_name.clone(), spawn_id).refused(BUSY_HAIL) { return busy; }
             tracing::info!("hail: queued hail to {:?} (spawn_id={:?})", display_name, spawn_id);
             (StatusCode::OK, format!("hailing {}", display_name))
         }
@@ -228,9 +242,7 @@ async fn post_say(
     if text.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "empty text".into());
     }
-    if !s.command.request_say(text.clone()) {
-        return (StatusCode::CONFLICT, BUSY_SAY.into());
-    }
+    if let Some(busy) = s.command.request_say(text.clone()).refused(BUSY_SAY) { return busy; }
     tracing::info!("say: queued {:?}", text);
     (StatusCode::OK, format!("saying {}", text))
 }
@@ -251,9 +263,7 @@ fn is_corpse_key(key: &str) -> bool {
 }
 
 fn queue_loot(s: &HttpState, name: String, id: u32) -> (StatusCode, String) {
-    if !s.command.request_loot(id) {
-        return (StatusCode::CONFLICT, BUSY_LOOT.into());
-    }
+    if let Some(busy) = s.command.request_loot(id).refused(BUSY_LOOT) { return busy; }
     tracing::info!("loot: queued corpse {:?} (spawn_id={})", name, id);
     (StatusCode::OK, format!("looting {} (spawn_id={})", clean_entity_name(&name), id))
 }
@@ -382,16 +392,12 @@ async fn post_give(
 
     // Park the give with a result channel and await the TRUE outcome (park → fulfil → timeout).
     let (tx, rx) = oneshot::channel::<CommandResult<GiveOk>>();
-    if !s.command.request_give_await(id, b.from, tx) {
-        // #347 step 2: the give mailbox already holds an undrained give. Before the fix this
-        // OVERWROTE it — the first caller's oneshot Sender was dropped, so THAT caller fell into
-        // the `_` arm and was told 202 for a give that was never sent. Now the second caller is
-        // refused outright and the first give is preserved.
-        return json(
-            StatusCode::CONFLICT,
-            serde_json::json!({ "status": "refused", "reason": BUSY_GIVE }),
-        );
-    }
+    // #347 step 2: if the give mailbox already holds an undrained give, refuse. Before the fix
+    // this OVERWROTE it — the first caller's oneshot Sender was dropped, so THAT caller fell into
+    // the `_` arm and was told 202 for a give that was never sent. Now the second caller is
+    // refused outright and the first give is preserved.
+    if let Some(busy) = s.command.request_give_await(id, b.from, tx)
+        .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_GIVE })) { return busy; }
     tracing::info!("give: awaited give queued — npc {:?} (spawn_id={}) from_slot={}", key, id, b.from);
 
     match tokio::time::timeout(Duration::from_secs(GIVE_HTTP_TIMEOUT_SECS), rx).await {
@@ -450,9 +456,7 @@ async fn post_door_click(
     };
     match id {
         Some(id) => {
-            if !s.command.request_door_click(id) {
-                return (StatusCode::CONFLICT, BUSY_DOOR.into());
-            }
+            if let Some(busy) = s.command.request_door_click(id).refused(BUSY_DOOR) { return busy; }
             (StatusCode::OK, format!("clicking door {}", id))
         }
         None => (StatusCode::BAD_REQUEST,
@@ -463,18 +467,14 @@ async fn post_door_click(
 /// POST /v1/interact/sit — sit down (mana/HP regen).
 async fn post_sit(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    if !s.command.request_sit(true) {
-        return (StatusCode::CONFLICT, BUSY_SIT.into());
-    }
+    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; }
     (StatusCode::OK, "sit queued".into())
 }
 
 /// POST /v1/interact/stand — stand up.
 async fn post_stand(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    if !s.command.request_sit(false) {
-        return (StatusCode::CONFLICT, BUSY_SIT.into());
-    }
+    if let Some(busy) = s.command.request_sit(false).refused(BUSY_SIT) { return busy; }
     (StatusCode::OK, "stand queued".into())
 }
 
@@ -483,9 +483,7 @@ async fn post_stand(State(s): State<HttpState>) -> (StatusCode, String) {
 /// (a send-time intent — the opcode has no server ack, same epistemic level as sit/auto_attack).
 async fn post_run(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    if !s.command.request_run_mode(true) {
-        return (StatusCode::CONFLICT, BUSY_RUN_MODE.into());
-    }
+    if let Some(busy) = s.command.request_run_mode(true).refused(BUSY_RUN_MODE) { return busy; }
     (StatusCode::OK, "run queued".into())
 }
 
@@ -493,9 +491,7 @@ async fn post_run(State(s): State<HttpState>) -> (StatusCode, String) {
 /// nav walker to `WALK_SPEED`.
 async fn post_walk(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    if !s.command.request_run_mode(false) {
-        return (StatusCode::CONFLICT, BUSY_RUN_MODE.into());
-    }
+    if let Some(busy) = s.command.request_run_mode(false).refused(BUSY_RUN_MODE) { return busy; }
     (StatusCode::OK, "walk queued".into())
 }
 

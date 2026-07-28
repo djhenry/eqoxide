@@ -2,6 +2,7 @@
 
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use super::*;
+use crate::refusal::Refusal;
 
 pub(super) fn router() -> Router<HttpState> {
     Router::new()
@@ -43,9 +44,7 @@ async fn post_move(
     if !occupied {
         return (StatusCode::NOT_FOUND, format!("no item in slot {} to move", b.from));
     }
-    if !s.command.request_inventory_move(b.from, b.to) {
-        return (StatusCode::CONFLICT, BUSY_MOVE.into());
-    }
+    if let Some(busy) = s.command.request_inventory_move(b.from, b.to).refused(BUSY_MOVE) { return busy; }
     tracing::info!("move: queued from_slot={} to_slot={}", b.from, b.to);
     (StatusCode::OK, format!("moving item from slot {} to slot {}", b.from, b.to))
 }

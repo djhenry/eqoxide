@@ -4,6 +4,7 @@
 
 use axum::{extract::State, http::StatusCode, routing::{get, post}, Json, Router};
 use super::*;
+use crate::refusal::Refusal;
 
 pub(super) fn router() -> Router<HttpState> {
     Router::new()
@@ -48,6 +49,11 @@ fn extract_name(body: Result<Json<NameBody>, axum::extract::rejection::JsonRejec
     }
 }
 
+/// 409 CONFLICT body for an occupied guild-action slot. This module already refused rather than
+/// overwrote before #347 (it is the pattern the other domains were converted to); the wording is
+/// unchanged so an existing caller's string match still works.
+const BUSY_GUILD: &str = "a guild action is already pending";
+
 /// Queue a single guild action (rejecting if one is already pending and undrained).
 fn queue(s: &HttpState, action: GuildAction) -> (StatusCode, String) {
     let msg = match &action {
@@ -56,11 +62,8 @@ fn queue(s: &HttpState, action: GuildAction) -> (StatusCode, String) {
         GuildAction::Leave     => "leaving guild".into(),
         GuildAction::Remove(n) => format!("removing {n} from the guild"),
     };
-    if s.command.request_guild_action(action) {
-        (StatusCode::OK, msg)
-    } else {
-        (StatusCode::CONFLICT, "a guild action is already pending".into())
-    }
+    if let Some(busy) = s.command.request_guild_action(action).refused(BUSY_GUILD) { return busy; }
+    (StatusCode::OK, msg)
 }
 
 /// POST /v1/guild/invite {"name":"X"} — invite player X to our guild (requires invite rights).
@@ -155,6 +158,13 @@ mod no_silent_overwrite_guard {
     /// the returned `bool` has re-created exactly the #347 defect — the command was dropped on the
     /// floor and the caller was still told `200`. Every such call site must consume the result.
     ///
+    /// **Round-1 review, B1:** the first version of this guard accepted `if !s.command.request_x(..)`
+    /// and `if s.command.request_x(..)` *identically*, so deleting one `!` restored #347 with the
+    /// whole suite green. It only ever checked that the `bool` was read, never how. The polarity now
+    /// lives in one place (`crate::refusal::Refusal`) and this guard requires the canonical shape —
+    /// `if let Some(busy) = s.command.request_x(..).refused(MSG) { return busy; }` — so a call site
+    /// cannot express the inverted form at all. (`if let None = …` does not compile: nothing binds.)
+    ///
     /// Search key: `grep -rn 's\.command\.request_' crates/eqoxide-http/src/*.rs`. Handlers reach the
     /// facade through the `HttpState` binding `s`, so this prefix is what distinguishes a real call
     /// site from the `command.take_*` / `command.request_*` forms used inside test bodies.
@@ -170,6 +180,9 @@ mod no_silent_overwrite_guard {
             let file = path.file_name().unwrap().to_string_lossy().to_string();
             for (n, line) in text.lines().enumerate() {
                 let Some(pos) = line.find("s.command.request_") else { continue };
+                // Prose, not code: `refusal.rs`'s module docs quote both the old and the new call
+                // shape, and this guard is exactly the thing they are describing.
+                if line.trim_start().starts_with("//") { continue; }
                 let name_start = pos + "s.command.".len();
                 let name: String = line[name_start..]
                     .chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
@@ -178,11 +191,21 @@ mod no_silent_overwrite_guard {
                     continue;
                 }
                 let code = line.trim_start();
-                // Accepted shapes: `if !s.command.request_x(..)`, `if s.command.request_x(..)`, and
-                // `let ok = s.command.request_x(..)`. Anything else discards the refusal.
-                let consumed = code.starts_with("if !s.command.request_")
-                    || code.starts_with("if s.command.request_")
-                    || code.starts_with("let ");
+                // The ONE accepted shape (B1):
+                //   `if let Some(busy) = s.command.request_x(..).refused(MSG) { return busy; }`
+                // The `.refused(..)` / `.refused_json(..)` call may wrap onto the next line, so the
+                // statement is accumulated up to its opening brace before being matched. Nothing
+                // else is accepted — not `if !…`, not `if …`, not `let ok = …` — because those are
+                // the forms in which a one-character polarity mutation is expressible.
+                let mut stmt = String::new();
+                for l in text.lines().skip(n) {
+                    stmt.push_str(l.trim());
+                    if l.contains('{') { break; }
+                    stmt.push(' ');
+                }
+                let consumed = code.starts_with("if let Some(busy) = s.command.request_")
+                    && (stmt.contains(".refused(") || stmt.contains(".refused_json("))
+                    && stmt.contains("return busy;");
                 if consumed {
                     checked.push(format!("{file}:{}: {name}", n + 1));
                 } else {
@@ -219,9 +242,15 @@ mod no_silent_overwrite_guard {
     /// `/v1/guild` can answer `409`" — is itself a claim, so it is checked here rather than trusted.
     ///
     /// For each of those modules this reads the `router()` table, collects every handler mounted
-    /// with `post(..)` or `.delete(..)`, and requires that handler's body to mention
-    /// `StatusCode::CONFLICT`. `get(..)` routes are reads and are skipped. If a route is added to one
-    /// of these modules without a busy-slot refusal, this fails with its name.
+    /// with `post(..)` or `.delete(..)`, and requires that handler's body to route its queue outcome
+    /// through `Refusal::refused` / `refused_json` — directly or via a module-local helper.
+    /// `get(..)` routes are reads and are skipped. If a route is added to one of these modules
+    /// without a busy-slot refusal, this fails with its name.
+    ///
+    /// **Round-1 review, B1:** this used to accept the mere presence of the string
+    /// `StatusCode::CONFLICT` anywhere in the handler body, which an inverted `if` satisfies just as
+    /// well as a correct one (the string is still there, on the wrong branch). Requiring the
+    /// `.refused(..)` combinator instead ties the route to the single tested polarity site.
     ///
     /// Search key: `grep -n '\.route(' crates/eqoxide-http/src/{combat,interact,inventory,merchant,trainer,pet,group,quests,guild}.rs`
     #[test]
@@ -250,25 +279,26 @@ mod no_silent_overwrite_guard {
                 collect_route(rest, &mut handlers);
             }
 
-            // 2. Module-local helpers that themselves answer CONFLICT — `guild.rs::queue` and
+            // 2. Module-local helpers that themselves refuse — `guild.rs::queue` and
             //    `interact.rs::queue_loot` hold the refusal for several handlers each, so a
             //    handler that delegates to one of them is just as capable of a 409.
+            let refuses = |b: &str| b.contains(".refused(") || b.contains(".refused_json(");
             let conflict_helpers: Vec<String> = text.lines()
                 .filter_map(|l| l.trim_start().strip_prefix("fn ").map(|r| {
                     r.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>()
                 }))
                 .filter(|n| !n.is_empty())
                 .filter(|n| fn_body_named(&text, &format!("fn {n}("))
-                    .is_some_and(|b| b.contains("StatusCode::CONFLICT")))
+                    .is_some_and(|b| refuses(&b)))
                 .collect();
 
-            // 3. Each handler's body must be able to produce a CONFLICT, directly or via one of
-            //    those helpers.
+            // 3. Each handler's body must run its queue outcome through the refusal combinator,
+            //    directly or via one of those helpers.
             for (route, func) in handlers {
                 let body = fn_body(&text, &func)
                     .unwrap_or_else(|| panic!("{m}.rs: no body found for handler `{func}`"));
                 let via_helper = conflict_helpers.iter().any(|h| body.contains(&format!("{h}(")));
-                if body.contains("StatusCode::CONFLICT") || via_helper {
+                if refuses(&body) || via_helper {
                     checked.push(format!("/{m}{route} → {func}"));
                 } else {
                     offenders.push(format!("/{m}{route} → {func} (in {m}.rs)"));

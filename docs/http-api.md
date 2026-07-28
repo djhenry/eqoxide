@@ -227,9 +227,19 @@ contradicts, instead of queueing it and answering `200`. Nothing is queued and n
 | `POST /v1/combat/scribe` | `GET /v1/observe/inventory` | `from` is supplied and holds no item |
 | `POST /v1/interact/read` | `GET /v1/observe/inventory` | `slot` holds no item (`409` if it holds something unreadable) |
 
+The snapshot these are checked against is the one the network thread publishes. It is refreshed on
+every inbound packet, **and** — since #347 — immediately after the client mirrors a change the server
+applies without echoing it (an item move: EQEmu sends no `OP_MoveItem` back for a move you asked
+for). So a `/v1/inventory/move` that has already been drained is visible to the next door check
+without waiting for a packet to arrive. It is still a snapshot: it cannot know about a change only
+the server has made and not yet told the client about.
+
 **`409` — the slot is busy.** Each action endpoint queues into a single-slot mailbox the net thread
-drains once per tick (~150 ms). A second request arriving inside that window used to **replace** the
-first, and both callers were told `200` — one of the two actions simply never happened and nothing
+drains in its next pass. That pass runs on the network loop's ~10 ms cadence, not on the ~150 ms
+walker tick — of the drains, only `give` sits behind the walker gate (and behind the dead-player
+early return, so while you are dead a queued `give` is not drained at all). A second request arriving
+inside that window used to **replace** the first, and both callers were told `200` — one of the two
+actions simply never happened and nothing
 said so. It is now refused: the pending request is kept untouched and the second caller gets `409`
 with a body ending `(it was NOT queued)`. A `409` is definitive — that request did not happen, so
 retrying it after the drain is safe and cannot double-fire.

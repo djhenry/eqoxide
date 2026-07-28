@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 use std::time::Duration;
 use eqoxide_command::{CastEnd, CommandResult};
 use super::*;
+use crate::refusal::Refusal;
 
 /// How long POST /v1/combat/cast AWAITS the cast's true outcome before answering `202` "unknown".
 /// This is the SOLE bound on the pure-silence case (the server accepts the cast but never sends a
@@ -29,6 +30,10 @@ const CAST_HTTP_TIMEOUT_SECS: u64 = 12;
 // write and keeps the first, and these are what the caller is told instead. A 409 here means the
 // request was NOT queued and definitively did not happen — retrying after the drain is safe.
 const BUSY_TARGET: &str = "a target request is already queued and undrained — retry in a moment (it was NOT queued)";
+// `/attack/on` vs `/attack/off` carries the caller's intended END STATE (`request_attack(true/false)`),
+// so a silently dropped one leaves the agent believing it is swinging when it is not. It refuses,
+// unlike the deliberately last-wins `request_camp`; see the criterion written out at `BUSY_SIT` in
+// `interact.rs` (round-1 review, N1).
 const BUSY_ATTACK: &str = "an auto-attack toggle is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_CONSIDER: &str = "a consider request is already queued and undrained — retry in a moment (it was NOT queued)";
 const BUSY_CAST: &str = "a cast is already queued and undrained — retry in a moment (it was NOT queued)";
@@ -91,9 +96,7 @@ async fn post_target(
     if !known {
         return (StatusCode::NOT_FOUND, format!("no spawn with id {id} in this zone"));
     }
-    if !s.command.request_target(id) {
-        return (StatusCode::CONFLICT, BUSY_TARGET.into());
-    }
+    if let Some(busy) = s.command.request_target(id).refused(BUSY_TARGET) { return busy; }
     tracing::info!("target: queued spawn_id={}", id);
     (StatusCode::OK, format!("targeting spawn {}", id))
 }
@@ -128,11 +131,8 @@ async fn post_target_name(
     let found = crate::name_match::resolve_in_world(&s.world, &name, s.player_pos());
     match found {
         Some(m) => {
-            if !s.command.request_target(m.id) {
-                return json(StatusCode::CONFLICT, serde_json::json!({
-                    "status": "refused", "reason": BUSY_TARGET,
-                }));
-            }
+            if let Some(busy) = s.command.request_target(m.id)
+                .refused_json(serde_json::json!({ "status": "refused", "reason": BUSY_TARGET })) { return busy; }
             tracing::info!("target_name: {:?} → {:?} spawn_id={} ({:?})", name, m.name, m.id, m.quality);
             json(StatusCode::OK, serde_json::json!({
                 "status": "targeting",
@@ -149,9 +149,7 @@ async fn post_target_name(
 /// POST /v1/combat/attack — enable auto-attack (sends OP_AUTO_ATTACK 1).
 async fn post_attack_on(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    if !s.command.request_attack(true) {
-        return (StatusCode::CONFLICT, BUSY_ATTACK.into());
-    }
+    if let Some(busy) = s.command.request_attack(true).refused(BUSY_ATTACK) { return busy; }
     tracing::info!("attack: queued auto-attack ON");
     (StatusCode::OK, "auto-attack ON".into())
 }
@@ -159,9 +157,7 @@ async fn post_attack_on(State(s): State<HttpState>) -> (StatusCode, String) {
 /// DELETE /v1/combat/attack — disable auto-attack (sends OP_AUTO_ATTACK 0).
 async fn post_attack_off(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    if !s.command.request_attack(false) {
-        return (StatusCode::CONFLICT, BUSY_ATTACK.into());
-    }
+    if let Some(busy) = s.command.request_attack(false).refused(BUSY_ATTACK) { return busy; }
     tracing::info!("attack: queued auto-attack OFF");
     (StatusCode::OK, "auto-attack OFF".into())
 }
@@ -186,9 +182,7 @@ async fn post_consider(State(s): State<HttpState>, OptionalJson(body): OptionalJ
             if !(is_self || s.world.entity_ids().values().any(|&v| v == id)) {
                 return (StatusCode::NOT_FOUND, format!("no spawn with id {id} in this zone"));
             }
-            if !s.command.request_consider(id) {
-                return (StatusCode::CONFLICT, BUSY_CONSIDER.into());
-            }
+            if let Some(busy) = s.command.request_consider(id).refused(BUSY_CONSIDER) { return busy; }
             (StatusCode::OK, format!("consider {id} queued"))
         }
         None => (StatusCode::BAD_REQUEST, "no target; provide {\"id\":N}".into()),
@@ -254,11 +248,8 @@ async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<
 
     // Park the cast with a result channel and await the TRUE outcome (park → fulfil → timeout).
     let (tx, rx) = oneshot::channel::<CommandResult<CastEnd>>();
-    if !s.command.request_cast_await(req, tx) {
-        return json(StatusCode::CONFLICT, serde_json::json!({
-            "status": "refused", "landed": false, "reason": BUSY_CAST,
-        }));
-    }
+    if let Some(busy) = s.command.request_cast_await(req, tx)
+        .refused_json(serde_json::json!({ "status": "refused", "landed": false, "reason": BUSY_CAST })) { return busy; }
     tracing::info!("cast: awaited cast queued (gem={} item_slot={:?})", req.gem, req.item_slot);
 
     match tokio::time::timeout(Duration::from_secs(CAST_HTTP_TIMEOUT_SECS), rx).await {
@@ -314,9 +305,7 @@ async fn post_memorize(
     if let Err(e) = require_live_session(&s) { return e; }
     let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"gem\":0-8}".into()) };
     if b.gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
-    if !s.command.request_mem_spell(b.gem, b.spell_id, 1, None) {
-        return (StatusCode::CONFLICT, BUSY_MEM_SPELL.into());
-    }
+    if let Some(busy) = s.command.request_mem_spell(b.gem, b.spell_id, 1, None).refused(BUSY_MEM_SPELL) { return busy; }
     (StatusCode::OK, format!("memorizing spell {} into gem {}", b.spell_id, b.gem))
 }
 
@@ -346,9 +335,7 @@ async fn post_scribe(
             return (StatusCode::NOT_FOUND, format!("no item in slot {from} to scribe"));
         }
     }
-    if !s.command.request_mem_spell(slot, b.spell_id, 0, b.from) {
-        return (StatusCode::CONFLICT, BUSY_MEM_SPELL.into());
-    }
+    if let Some(busy) = s.command.request_mem_spell(slot, b.spell_id, 0, b.from).refused(BUSY_MEM_SPELL) { return busy; }
     (StatusCode::OK, match b.from {
         Some(f) => format!("scribing spell {} into book slot {} (scroll from slot {})", b.spell_id, slot, f),
         None    => format!("scribing spell {} into book slot {} (scroll assumed on cursor)", b.spell_id, slot),

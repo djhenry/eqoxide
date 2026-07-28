@@ -5,6 +5,7 @@
 
 use axum::{routing::{get, post}, extract::State, Json, http::StatusCode, Router};
 use crate::{HttpState, clean_entity_name, require_live_session};
+use crate::refusal::Refusal;
 
 pub fn router() -> Router<HttpState> {
     Router::new()
@@ -53,9 +54,7 @@ async fn post_open(
         .map(|(k, &id)| (k.clone(), id));
     match found {
         Some((key, id)) => {
-            if !s.command.request_open_trainer(id) {
-                return (StatusCode::CONFLICT, BUSY_TRAINER.into());
-            }
+            if let Some(busy) = s.command.request_open_trainer(id).refused(BUSY_TRAINER) { return busy; }
             (StatusCode::OK, format!("opening training with {} (spawn_id={})", clean_entity_name(&key), id))
         }
         None => (StatusCode::NOT_FOUND, format!("no entity matching {:?}", name)),
@@ -101,9 +100,7 @@ async fn post_train(
     if !s.player().trainer_open {
         return (StatusCode::BAD_REQUEST, "no trainer window open — call /v1/trainer/open first".into());
     }
-    if !s.command.request_train_skill(b.skill_id) {
-        return (StatusCode::CONFLICT, BUSY_TRAIN.into());
-    }
+    if let Some(busy) = s.command.request_train_skill(b.skill_id).refused(BUSY_TRAIN) { return busy; }
     let name = eqoxide_core::skills::skill_name(b.skill_id).unwrap_or("?");
     (StatusCode::OK, format!("training {} (skill_id={})", name, b.skill_id))
 }
@@ -113,8 +110,90 @@ async fn post_train(
 /// request slot needs threading through the nav chain (#162).
 async fn post_close(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    if !s.command.request_open_trainer(0) {
-        return (StatusCode::CONFLICT, BUSY_TRAINER.into());
-    }
+    if let Some(busy) = s.command.request_open_trainer(0).refused(BUSY_TRAINER) { return busy; }
     (StatusCode::OK, "closing trainer".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::{empty_state, set_gs};
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn post(path: &'static str) -> Request<Body> {
+        Request::post(path).body(Body::empty()).unwrap()
+    }
+
+    fn train_req(skill_id: u32) -> Request<Body> {
+        Request::post("/train")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"skill_id":{skill_id}}}"#)))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn close_is_200_and_queues_the_zero_sentinel() {
+        let state = empty_state();
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(post("/close")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(command.take_trainer_open(), Some(0));
+    }
+
+    /// #347 step 2 (review round 1, B1): `open` and `close` share one slot, so a second window verb
+    /// inside the same undrained tick used to OVERWRITE the first with both callers told `200`.
+    /// `/close` is used for both shots because it needs no resolvable entity — the slot, not the
+    /// name lookup, is what is under test.
+    #[tokio::test]
+    async fn a_second_trainer_window_verb_before_the_drain_is_409_and_the_first_survives() {
+        let state = empty_state();
+        let command = state.command.clone();
+        let app = router().with_state(state);
+
+        let first = app.clone().oneshot(post("/close")).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app.oneshot(post("/close")).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT,
+            "the second trainer window verb must be refused, not silently swallowed");
+
+        assert_eq!(command.take_trainer_open(), Some(0),
+            "the FIRST request must be the one that survives to the net thread");
+        assert_eq!(command.take_trainer_open(), None,
+            "and nothing else may be queued behind it");
+    }
+
+    #[tokio::test]
+    async fn train_with_no_window_open_is_400_and_queues_nothing() {
+        let state = empty_state();
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(train_req(1)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(command.take_train_skill(), None);
+    }
+
+    /// The `train` slot is separate from the window slot, and carries the same #347 step 2 promise.
+    #[tokio::test]
+    async fn a_second_train_before_the_drain_is_409_and_the_first_survives() {
+        let state = empty_state();
+        set_gs(&state, |gs| gs.trainer_open = Some(7));
+        let command = state.command.clone();
+        let app = router().with_state(state);
+
+        let first = app.clone().oneshot(train_req(1)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app.oneshot(train_req(2)).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT,
+            "the second train must be refused, not silently swallowed");
+
+        assert_eq!(command.take_train_skill(), Some(1),
+            "the FIRST train must be the one that survives to the net thread");
+        assert_eq!(command.take_train_skill(), None,
+            "and nothing else may be queued behind it");
+    }
 }
