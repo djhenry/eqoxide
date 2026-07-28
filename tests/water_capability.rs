@@ -20,9 +20,11 @@
 //! ```
 //!
 //! Two of them pin capability (what a swimmer CAN do, so a future gate cannot quietly forbid it);
-//! the third used to pin the #329/#661 strand at the coordinate the live client wedged on, and
-//! since the #661 fix pins the ESCAPE from it instead — same start, same drive, opposite
-//! expectation (see its doc comment for the measured mechanism and the flip's history).
+//! the strand test's lineage pins the #329/#661 wedge coordinate: it asserted the strand, then
+//! (round 2) the escape under the same horizontal drive, and now (round 3) the escape under a
+//! DRIVEN dive plus a wet-stall disclosure for the horizontal drive — each flip's history is in
+//! the test docs, because the drive that can honestly escape changed as the duck's re-divability
+//! bounds landed.
 
 use eqoxide::assets::ZoneAssets;
 use eqoxide::movement::CharacterController;
@@ -185,15 +187,34 @@ fn stepped_canal_surfaces_are_swimmable_between() {
 /// The fix is three-sided (`movement.rs`): a floating body never enters the depenetration net;
 /// the net's only constructible recovery is `Grounded` and only dry bodies can reach it; and a
 /// blocked swimmer tries `try_duck_under` — the step-up's downward mirror — before the haul-out,
-/// taking it only when diving measurably gains lateral progress. From the plane the swimmer now
-/// ducks under the lip, crosses the flooded corridor, and buoyancy lifts it onto the SHAFT's swim
-/// plane (−44.982): the same escape the deep starts (−61 … −63) always performed.
+/// taking it only when diving measurably gains lateral progress. In round 2 the duck itself
+/// carried the horizontal-only swimmer under the lip to the shaft plane; round 3 changed which
+/// drive performs the escape — read on.
+///
+/// # ⚠️ Round 3 changed WHICH drive escapes — the history matters, read it
+///
+/// Round 2's version of this test escaped under a horizontal-only wish, via the autonomous
+/// duck-under crossing from the pocket's swim plane into the shaft's water column. The round-2
+/// review then measured that an unconstrained duck is itself a one-way transition over any
+/// surface mismatch beyond the duck envelope (R2-B1) — and the pocket→shaft crossing is a ~13 u
+/// mismatch, i.e. genuinely one-way for the autonomous driver. `try_duck_under`'s surface bound
+/// now refuses it, so the horizontal-only drive stalls wet at the mouth (the test below this one)
+/// and the ESCAPE is executed the way the system actually intends: a DRIVEN dive — the explicit
+/// down-wish a dive-first route (or a manual down+lateral drive) sends — which passes under the
+/// lip with no duck involved and can always be driven back the same way.
+///
+/// (Also measured this round, filed separately: driving the REAL planner route with the REAL
+/// steering still wedges at this pocket — the planner emits a rise-at-destination `swim_surface`
+/// hop, `swim_vspeed` turns the high carrot into an up-wish, and the up-wish pins the body under
+/// the lid. That walker/steering residue is outside this PR's file set; the offline repro is in
+/// the follow-up issue. The controller-level capabilities this test and its sibling pin are the
+/// substrate that fix needs either way.)
 ///
 /// The start-depth sweep covers the band #661 measured as STRANDED on the #658 controller
-/// (−58.00 … −60.75); every depth in it must now end where the deep starts always did.
+/// (−58.00 … −60.75); every depth in it must reach the shaft under the driven dive.
 #[test]
 #[ignore = "asset-gated: needs baked qcat.glb + qcat.wtr at $EQZONES (#357)"]
-fn qcat_pocket_swim_plane_swimmer_escapes_to_the_shaft() {
+fn qcat_pocket_swimmer_escapes_to_the_shaft_under_a_driven_dive() {
     let col = zone("qcat");
     let pocket_xy = [-42.3f32, 1036.8];
     let shaft = [-45.75f32, 1030.0625, -42.98];
@@ -203,16 +224,56 @@ fn qcat_pocket_swim_plane_swimmer_escapes_to_the_shaft() {
     assert!((plane - (-57.978)).abs() < 0.01, "fixture: pocket swim plane {plane}");
 
     for z in [plane, -59.0, -60.5] {
-        let end = swim_toward(&col, [pocket_xy[0], pocket_xy[1], z], shaft, 12.0);
+        // The dive-first driver: an explicit down-wish until below the corridor lid, horizontal
+        // toward the shaft throughout, neutral once the dive has cleared the passage — the intent
+        // shape a dive-first route (or `/move/manual` down+lateral) sends.
+        let mut c = CharacterController::new([pocket_xy[0], pocket_xy[1], z]);
+        let dt = 1.0 / 60.0;
+        for _ in 0..(12 * 60) {
+            let d = [shaft[0] - c.pos[0], shaft[1] - c.pos[1]];
+            let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
+            let dir = if l > 0.2 { [d[0] / l, d[1] / l] } else { [0.0, 0.0] };
+            let vs = if c.pos[2] > -60.0 && l > 4.0 { -20.0 } else { 0.0 };
+            c.step(MoveIntent { wish_dir: dir, wish_vspeed: vs, jump: false, want_swim: true,
+                                speed: 44.0, climb: 0.0, hop: false }, dt, &col);
+        }
+        let end = c.pos;
         assert!((end[2] - shaft_plane).abs() < 0.05,
-            "#661: from z={z:.3} the swimmer must ESCAPE the pocket and settle on the SHAFT's swim \
-             plane {shaft_plane:.4} — the pre-fix controller stranded this start dry on the tile \
-             floor at −55.9687, the live #329 wedge coordinate; got {end:?}");
+            "#661: from z={z:.3} a DRIVEN dive must carry the swimmer out of the pocket and \
+             buoyancy must settle it on the SHAFT's swim plane {shaft_plane:.4} — the pre-fix \
+             controller stranded these starts dry on the tile floor at −55.9687, the live #329 \
+             wedge coordinate; got {end:?}");
         assert!((end[0] - shaft[0]).hypot(end[1] - shaft[1]) < 1.5,
             "#661: and actually arrive at the shaft XY; got {end:?}");
         assert!(col.in_water(end),
             "#661: still swimming — the escape must never pass through a dry mount; got {end:?}");
     }
+}
+
+/// **The horizontal-only driver's honest outcome at the pocket: a WET STALL, never a strand.**
+///
+/// This is what round 2's escape drive now gets, by design: the pocket→shaft crossing is one-way
+/// for the autonomous duck (~13 u surface mismatch, beyond the return envelope), so
+/// `try_duck_under`'s surface bound refuses it and the body presses at the mouth — wet,
+/// unsupported, at its own swim plane, input still honoured. Every part of that end state is the
+/// #661 fix: the pre-fix controller turned this exact drive into the dry `on_ground` strand at
+/// −55.9687 (via the net's beach) where `want_swim` was inert for ever. A stall is visible to nav
+/// (`walker_stalled` → replan); the strand was terminal.
+#[test]
+#[ignore = "asset-gated: needs baked qcat.glb + qcat.wtr at $EQZONES (#357)"]
+fn qcat_pocket_horizontal_wish_alone_stalls_wet_at_the_mouth() {
+    let col = zone("qcat");
+    let pocket_xy = [-42.3f32, 1036.8];
+    let shaft = [-45.75f32, 1030.0625, -42.98];
+    let surface = col.water_surface([pocket_xy[0], pocket_xy[1], -60.0]).unwrap();
+    let plane = surface - PLAYER_BODY.float_depth;
+
+    let end = swim_toward(&col, [pocket_xy[0], pocket_xy[1], plane], shaft, 12.0);
+    assert!(col.in_water(end) && (end[2] - plane).abs() < 0.05,
+        "#661: the horizontal-only driver must stall WET at its own swim plane ({plane:.4}) — \
+         never the dry −55.9687 strand, never a one-way crossing; got {end:?}");
+    assert!((end[2] - (-55.9687)).abs() > 1.0,
+        "#661: specifically NOT the old strand coordinate; got {end:?}");
 }
 
 /// **#649/#661 AT THE REAL COORDINATE: the first frame never lifts a swimmer dry.**

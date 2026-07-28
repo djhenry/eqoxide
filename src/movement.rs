@@ -664,26 +664,25 @@ impl CharacterController {
             let mut ducked = false;
             if (self.on_ground || swimming) && low_hit && low_prog + 0.01 < hlen(wish) {
                 // #661: a blocked SWIMMER first tries to pass UNDER the obstruction — the exact
-                // mirror of the step-up below, pointing down. The ordering rationale, stated as
-                // the property the code actually has (#661 review, B1 — the first version of this
-                // comment claimed "a swimmer that dives can always surface again", and the review
-                // FALSIFIED that on a shallow far shelf; the sentence was not reworded, the
-                // missing condition was built):
+                // mirror of the step-up below, pointing down.
                 //
-                //   * a haul-out that lands DRY is irreversible under every driver — `want_swim`
-                //     is inert on dry ground and nothing can sink through a floor — so it must be
-                //     the last resort;
-                //   * a duck is only constructible when its landing column is re-divable
-                //     (`try_duck_under`'s floor bound), so the passage it crosses can be dived
-                //     back through; the duck is therefore the option that KEEPS options.
+                // The ordering is NOT a reversibility argument. Two earlier versions of this
+                // comment justified it with universals ("a swimmer that dives can always surface
+                // again"; "a dry haul-out is irreversible under every driver") and review
+                // measurement falsified BOTH: a duck could be one-way over a shallow shelf or a
+                // higher far surface (both now refused by `try_duck_under`'s two re-divability
+                // bounds), and a hauled-out body can walk back off the very lip it climbed. The
+                // honest, measured basis for the ordering is narrower:
                 //
-                // The step-up may only haul a swimmer out once the water route has been MEASURED
-                // shut — `try_duck_under` found no more lateral progress at diving depth. At a
-                // real bank that measurement fails (the bank face is solid all the way down, so
-                // diving gains nothing) and the haul-out proceeds exactly as before (#191); at
-                // qcat's pocket mouth the passage to the shaft is open water 2 u below the swim
-                // plane, so the duck carries the swimmer through instead of letting the lip
-                // strand it.
+                //   * at every measured legitimate bank the duck refuses ITSELF (a face that is
+                //     solid to the bottom gives a dive no extra progress), so trying it first
+                //     costs the haul-out nothing — pinned by
+                //     `a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191`
+                //     and walker_sim's P1 sweep;
+                //   * where both moves genuinely pass, the duck keeps the body in the medium its
+                //     current driver is steering it through, and an admitted duck is round-trip-
+                //     capable by construction (the bounds in `try_duck_under`), while a haul-out
+                //     changes medium and hands the vertical to gravity.
                 //
                 // Gated on `wish_vspeed <= 0`: an explicit upward swim wish is the walker's
                 // haul-out drive (water design §4c) and must never be countermanded by an
@@ -770,13 +769,17 @@ impl CharacterController {
                 // feet clamped to exactly `surf` read as DRY for the frame — the body probe sees
                 // feet-at-boundary + chest-in-air and calls the whole body dry — and the DRY
                 // depenetration net then owns a body that is actually swimming at the surface.
-                // Measured: a surfaced swimmer pressed against a face inside footprint radius was
-                // ring-recovered by `nearest_floor` straight to the pool floor 40 u down,
-                // `Grounded`, in one frame — the #649 teleport shape, alive on `main` too
-                // (pre-existing; this fix's door made it SUSTAINED rather than new, because the
-                // up-wish now pins the feet at the clamp indefinitely instead of the net churning
-                // the body). One `SKIN` of depth keeps the clamped swimmer in its own medium, so
-                // the sentence above about the water column stays true in the probe's own terms.
+                // The mechanism is confirmed on `main` too (review round 2: feet reach z = 3.7e-7,
+                // body reads dry, the dry net takes it) — pre-existing, not introduced here. The
+                // magnitude is geometry-dependent: in the
+                // `an_upward_haul_out_drive_is_never_countermanded_by_the_duck` scene (lintel at
+                // east 4, pool floor −40, `water_slab(-40, 0)`, up-wish 5), the clamp-less frame
+                // trace measured `f28 z=0.0 wet=0` → `f29 pos=(2.81, 0.38, -40.0) Grounded` — a
+                // one-frame `nearest_floor` teleport to the pool bottom, because no nearer floor
+                // exists in any candidate column there; in shallow-slot scenes the net shoves
+                // laterally instead. One `SKIN` of depth keeps the clamped swimmer in its own
+                // medium, so the sentence above about the water column stays true in the probe's
+                // own terms; that scene's test pins the clamp by name.
                 let want = intent.wish_vspeed * dt;
                 if want > 0.0 {
                     let mut rise = self.swim_rise(want, col);
@@ -1162,12 +1165,40 @@ impl CharacterController {
         if !col.in_water(lowered) { return None; }
         let (lo, _) = self.slide(lowered, wish, col);
         if !col.in_water(lo) { return None; }
-        // Re-divability (B1): the landing column's floor must admit re-occupying the passage
-        // depth. `ground_below`'s probe origin is `feet + GROUND_ORIGIN`, so a floor slightly
-        // above the ducked feet would still be FOUND — hence the explicit `<=` bound, not just
-        // `is_some()`: a floor above the ducked feet shallows the return sink and shuts the door.
+        // Re-divability, floor axis (#661 review B1): the landing column's floor must admit
+        // re-occupying the passage depth. `ground_below`'s probe origin is `feet + GROUND_ORIGIN`,
+        // so a floor slightly above the ducked feet would still be FOUND — hence the explicit `<=`
+        // bound, not just `is_some()`: a floor above the ducked feet shallows the return sink and
+        // shuts the door (far floor −4.0 vs duck depth −4.5 is a measured one-way trap under
+        // `is_some()` alone; both values are pinned in
+        // `a_duck_never_crosses_into_a_column_it_cannot_dive_back_out_of`).
         let floor = col.ground_below(lo[0], lo[1], lo[2] + GROUND_ORIGIN, GROUND_DEPTH)?;
-        (floor <= lo[2]).then_some(lo)
+        if floor > lo[2] { return None; }
+        // Re-divability, surface axis (#661 review R2-B1): the landing column's own float plane
+        // must be inside the duck envelope of the passage depth, or the return duck — whose sink
+        // starts from wherever buoyancy parks the body on the far side — cannot get the chest
+        // back under the lip (measured: a 2 u surface mismatch across the author's lintel traps
+        // permanently, `hold()=None`, every observable reading "swimming normally"). With BOTH
+        // bounds an admitted duck's crossing is autonomously round-trip-capable: the return sink
+        // can reach the passage depth (this bound), the floor provably admits it (the floor
+        // bound), and the passage is wet at both ends (the water checks) — up to the SKIN-sized
+        // clearance residual, which review N1 measured unreachable in practice.
+        //
+        // Cost, stated plainly: this also refuses the qcat pocket-mouth duck for a HORIZONTAL-only
+        // wish (the shaft's surface is ~13 u above the pocket's, so that crossing is genuinely
+        // one-way for the autonomous driver — the same shape as the trap, distinguishable only by
+        // global knowledge the controller does not have; the planner has it and can always route
+        // a dive back). Measured against the real system, the cost is nearly nil: a DRIVEN dive
+        // (an explicit down-wish, what a dive-first route sends) crosses with no duck involved
+        // (`qcat_pocket_swimmer_escapes_to_the_shaft_under_a_driven_dive`), and the walker's own
+        // rise-y steering at this pocket sends an UP-wish, which the `wish_vspeed` gate already
+        // excludes from ducking — with or without this bound. What the bound actually forecloses
+        // is a horizontal-wish driver (e.g. `/move/manual`) making a one-way crossing it cannot
+        // undo; that driver now stalls wet at the mouth instead
+        // (`qcat_pocket_horizontal_wish_alone_stalls_wet_at_the_mouth`).
+        let surf = col.water_surface(lo)?;
+        ((surf - crate::traversability::PLAYER_BODY.float_depth) - lo[2]
+            <= STEP_UP + GROUND_SNAP_TOL).then_some(lo)
     }
 
     /// Is the wedged-against barrier a *hoppable* fence — i.e. is there walkable floor `HOP_REACH`
@@ -2062,29 +2093,74 @@ mod tests {
 
     /// **B1 — the duck must not be a one-way transition: a far side too shallow to dive back out
     /// of is REFUSED.** The reviewer's falsifying scene, adopted as the pin: same lintel, but the
-    /// far column's floor is at −3.0 — above the −4.5 duck depth — so a body that crossed could
-    /// never re-sink far enough to get its chest back under the lip (measured pre-guard: crossed
-    /// once, then converged against the far face for ever, every observable reading "swimming
-    /// normally"). `try_duck_under`'s floor bound (`floor ≤ ducked feet`, the re-divability
-    /// condition) refuses the crossing instead; the body presses at the lip — wet, at its plane,
-    /// still answering input — which nav sees as a stall and can replan around.
+    /// far column's floor sits above the −4.5 duck depth, so a body that crossed could never
+    /// re-sink far enough to get its chest back under the lip (measured pre-guard: crossed once,
+    /// then converged against the far face for ever, every observable reading "swimming
+    /// normally"). `try_duck_under`'s floor bound (`floor ≤ ducked feet`) refuses the crossing;
+    /// the body presses at the lip — wet, at its plane, still answering input — which nav sees as
+    /// a stall and can replan around.
+    ///
+    /// Two far-floor values, each killing a different half of the bound (#661 review R2-B2 —
+    /// round 2 shipped only −3.0, which sits above `ground_below`'s probe origin (−3.5) and so
+    /// pins the `?` while leaving the `<=` refinement pinned by NOTHING; the reviewer measured
+    /// the whole lib green with `<=` deleted, and −4.0 crossing into the same permanent trap):
+    ///
+    ///   * −3.0 — above the probe origin: `ground_below` finds nothing → the `?` refuses;
+    ///   * −4.0 — inside the probe band but ABOVE the ducked feet: found, and only
+    ///     `floor <= lo[2]` refuses it. Its return sink would clamp ~0.5 u short of the passage
+    ///     depth and the chest never gets back under the lip.
     #[test]
     fn a_duck_never_crosses_into_a_column_it_cannot_dive_back_out_of() {
-        let c = flooded_corridor(
-            vec![floor(-40.0, -100.0, 4.0), floor(-3.0, 4.0, 100.0), wall(4.0, -0.2, 20.0)],
-            -40.0, 0.0);
-        // Fixture: the far column must NOT be divable to the passage depth (−4.5): its floor sits
-        // above it, so `ground_below` from the ducked feet finds nothing at or below them.
-        assert!(c.ground_below(8.0, 0.0, -4.5 + 1.0, 200.0).map_or(true, |f| f > -4.5),
-            "fixture: the far shelf must be shallower than the duck depth, or this is the \
-             round-trip scene");
+        for far_floor in [-3.0f32, -4.0] {
+            let c = flooded_corridor(
+                vec![floor(-40.0, -100.0, 4.0), floor(far_floor, 4.0, 100.0), wall(4.0, -0.2, 20.0)],
+                -40.0, 0.0);
+            // Fixture: the far column must NOT be divable to the passage depth (−4.5) — either no
+            // floor within the probe, or a floor above the ducked feet.
+            assert!(c.ground_below(8.0, 0.0, -4.5 + 1.0, 200.0).map_or(true, |f| f > -4.5),
+                "fixture: the far shelf ({far_floor}) must be shallower than the duck depth, or \
+                 this is the round-trip scene");
+            let mut ctrl = CharacterController::new([-2.0, 0.0, -2.0]);
+            drive_east(&mut ctrl, &c, 240, 0.0);
+            assert!(ctrl.pos[0] < 4.0,
+                "#661 review B1/R2-B2: the duck must REFUSE a crossing whose far side (floor \
+                 {far_floor}) cannot be dived back out of — crossing is a one-way trap (measured \
+                 for both values); got {:?}", ctrl.pos);
+            assert!(c.in_water(ctrl.pos) && (ctrl.pos[2] - (-2.0)).abs() < 0.3 && !ctrl.on_ground,
+                "…and the refused swimmer stays wet at its plane, still a swimmer: {:?}", ctrl.pos);
+        }
+    }
+
+    /// **R2-B1 — the SURFACE axis of re-divability: a far column whose float plane is beyond the
+    /// duck envelope above the passage depth is REFUSED.** The round-2 floor bound closed the
+    /// shelf half of the one-way trap; the reviewer then measured the same trap on the surface
+    /// axis — floor −40 on BOTH sides (so the floor bound admits) and adjacent water volumes
+    /// whose surfaces differ by 2 u: the body crosses under the lintel, buoyancy parks it at the
+    /// FAR column's float plane, and the return duck's 2.5 u sink from there can no longer reach
+    /// the passage depth. Permanently trapped, `hold()=None`, every observable reading "swimming
+    /// normally". Adjacent surfaces at different heights are a first-class modelled case
+    /// (`region_map::tests::water_boxes_gives_each_box_its_own_bounded_surface`), not exotica.
+    /// `try_duck_under`'s surface bound refuses the crossing; deleting it re-opens the trap and
+    /// turns this red.
+    #[test]
+    fn a_duck_never_crosses_into_a_column_whose_float_plane_is_beyond_the_return_envelope() {
+        let mut c = col(vec![floor(-40.0, -100.0, 100.0), wall(4.0, -0.2, 20.0)]);
+        c.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_boxes(&[
+            [-100.0, 100.0, -100.0, 4.0, -40.0, 0.0], // near column: surface 0
+            [-100.0, 100.0, 4.0, 100.0, -40.0, 2.0],  // far column: surface +2 — the reviewer's trap
+        ]))));
+        assert!((c.water_surface([2.0, 0.0, -2.0]).unwrap() - 0.0).abs() < 1e-3
+                && (c.water_surface([6.0, 0.0, -2.0]).unwrap() - 2.0).abs() < 1e-3,
+            "fixture: a 2 u surface mismatch across the lintel — the smallest measured trapping \
+             mismatch");
         let mut ctrl = CharacterController::new([-2.0, 0.0, -2.0]);
         drive_east(&mut ctrl, &c, 240, 0.0);
         assert!(ctrl.pos[0] < 4.0,
-            "#661 review B1: the duck must REFUSE a crossing whose far side cannot be dived back \
-             out of — crossing here is a one-way trap (measured); got {:?}", ctrl.pos);
+            "#661 review R2-B1: the duck must REFUSE a crossing whose far float plane is beyond \
+             the return duck's envelope — measured, crossing at a 2 u mismatch traps permanently \
+             and silently; got {:?}", ctrl.pos);
         assert!(c.in_water(ctrl.pos) && (ctrl.pos[2] - (-2.0)).abs() < 0.3 && !ctrl.on_ground,
-            "…and the refused swimmer stays wet at its plane, still a swimmer: {:?}", ctrl.pos);
+            "…and the refused swimmer stays wet at its plane: {:?}", ctrl.pos);
     }
 
     /// **B1's other half — a divable far side is a ROUND TRIP.** Identical scene with the far
@@ -2131,6 +2207,19 @@ mod tests {
              the autonomous duck — the up-wish is the walker's haul-out drive; got {:?}", ctrl.pos);
         assert!(ctrl.pos[2] > -2.4 + 0.05 && c.in_water(ctrl.pos),
             "…and the up-wish must actually be rising it toward the surface: {:?}", ctrl.pos);
+        // The surface CLAMP's own pin, under its own name (#661 review N4 — previously this test
+        // pinned the clamp only by coupling): a fully-risen up-wishing swimmer parks `SKIN` UNDER
+        // the waterline, still wet by the strict probe. Reverting the clamp to exactly `surf`
+        // parks the feet ON the boundary, the body reads dry for the frame, and the DRY
+        // depenetration net owns a swimming body (in THIS scene, pre-clamp-fix, it ring-recovered
+        // the body to the pool floor 40 u down — `nearest_floor` at the first clear candidate,
+        // `dz = -40.0`, `Grounded` — because every floor nearer than the pool bottom is outside
+        // the candidate columns here; in shallower scenes it shoves laterally instead, the
+        // reviewer's measured 2 u variant. Same mechanism, geometry-dependent magnitude).
+        assert!(ctrl.pos[2] <= -SKIN + 1e-4,
+            "the up-wish clamp must park the feet SKIN under the surface, never ON it — feet at \
+             the exact waterline read DRY and hand a swimming body to the dry net; got z={}",
+            ctrl.pos[2]);
     }
 
     /// **The destination water check (review M5): a duck never exits the water SIDEWAYS.** The

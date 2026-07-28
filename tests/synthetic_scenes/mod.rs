@@ -37,8 +37,9 @@
 //! `tests/walker_sim.rs` (`p1_haul_out_admission_matches_controller_execution`) and in
 //! `movement::tests::a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191`,
 //! both RED when it is disabled; the duck-under's lives in
-//! `movement::tests::a_swimmer_ducks_under_a_hanging_face_instead_of_stranding_at_it` and the
-//! asset-gated `qcat_pocket_swim_plane_swimmer_escapes_to_the_shaft`, both RED without it.
+//! `movement::tests::a_swimmer_ducks_under_a_hanging_face_instead_of_stranding_at_it` (the
+//! asset-gated qcat escape now goes through a DRIVEN dive rather than the duck — see
+//! `tests/water_capability.rs`'s round-3 note), RED without it.
 //! A future reader must not infer from "these tests stayed green" that those branches are
 //! unprotected.
 //!

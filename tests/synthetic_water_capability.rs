@@ -94,7 +94,8 @@ fn try_to_sink(col: &Collision, from: [f32; 3], secs: f32) -> [f32; 3] {
 ///
 /// `tests/water_capability.rs`'s pocket test shows the same coordinate live: under #658 the
 /// swimmer still ended dry at −55.9687 (that residual wedge was #661), and since the #661 fix that
-/// test asserts the ESCAPE (`qcat_pocket_swim_plane_swimmer_escapes_to_the_shaft`). This chamber
+/// test asserts the ESCAPE (`qcat_pocket_swimmer_escapes_to_the_shaft_under_a_driven_dive`; the
+/// horizontal-only drive now stalls wet by design — see that file's round-3 note). This chamber
 /// is sealed on all six sides, so there is no escape to assert here — a swimmer that stays wet at
 /// its own depth beside the wall is the whole correct outcome.
 ///
