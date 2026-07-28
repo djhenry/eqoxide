@@ -2626,8 +2626,9 @@ mod tests {
     /// state words is unbounded, and the property is checked against representatives of both
     /// classes AND against arbitrary unrecognised words, which must retire (fail-safe by default).
     ///
-    /// **Mutation check:** restore the old opt-in list (`navigating || navigating_partial ||
-    /// planning || (zone_loading && !pending) || dead`) → `pending`, `following` and both unknown
+    /// **Mutation check:** restore the old opt-in list
+    /// (`navigating || navigating_partial || planning || (zone_loading && !pending) || dead`)
+    /// → `pending`, `following` and both unknown
     /// words stay put and this goes RED four times over. Alternatively add `"pending"` to
     /// [`TERMINAL_NAV_STATES`] → RED, since a terminal `pending` is precisely the lie.
     #[test]
