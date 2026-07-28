@@ -1,4 +1,22 @@
-//! #756 — a floating spawn must be drawn at the position the server sent, not lifted off it.
+//! #756 — the grounding lift must not be applied to a floating spawn's z.
+//!
+//! ## What is certain here, and what is inferred
+//!
+//! Read this before quoting a test name out of this file.
+//!
+//! **Certain, from the code alone:** applying the grounding lift to a floating spawn is wrong.
+//! `eqoxide_core::coord::wire_z_to_foot` (`coord.rs:115-117`) returns a floating entity's wire z
+//! UNCHANGED, so its stored z is by construction *not* in the FOOT datum. The grounding lift is a
+//! foot-datum→placement conversion; applying it to a z that was never converted is wrong whatever
+//! the wire datum turns out to be. That is what these tests grade.
+//!
+//! **Inferred, NOT measured:** that the resulting placement — authored origin exactly on the
+//! stored z — is where a hull actually sits at the waterline. `coord.rs:8-9` states that EQ's wire
+//! z is the model-origin position, but says it of *characters*; extending it to a boat hull is an
+//! inference from `coord.rs`, not something measured against a running server, and no live E2E run
+//! backs it (see `static_placement`'s doc). So where a test below says a floating spawn's origin
+//! "lands on" the stored z, that is a statement about what the code does and why it is not the old
+//! (definitely wrong) lift — it is not a verified claim about the waterline.
 //!
 //! The failure is a numeric offset, so it is pinned numerically rather than by screenshot: these
 //! tests build the SAME model matrix the render passes build (`models::static_placement` fed into
@@ -22,22 +40,27 @@
 //!
 //! ## Provenance of the two supporting scans quoted below
 //!
-//! Both were run against the installed asset set (130 `.glb` files) with the same GLB-JSON parse
-//! — for each file, read the 12-byte header, walk the chunks, take the `JSON` chunk, and report
-//! `len(skins)` plus the min/max over every `meshes[*].primitives[*].attributes.POSITION`
-//! accessor's `min`/`max`:
+//! Both were run against the installed asset set with the same GLB-JSON parse — for each file,
+//! read the 12-byte header, walk the chunks, take the `JSON` chunk, and report `len(skins)` plus
+//! the min/max over every `meshes[*].primitives[*].attributes.POSITION` accessor's `min`/`max`.
+//! The set held **136** `.glb` files when the scan was last re-run (2026-07-27). An earlier run the
+//! same day counted 130: the model directory is a live sync target, so the *total* moves. The
+//! loadable subset below and the result did not.
 //!
-//! 1. **`boat.glb` is the only entity-archetype GLB with `skins == 0`.** Of the 130 files, the
-//!    ones `model_for` can load are the archetype names (`humanoid`, `elf`, `dwarf`, `gnoll`,
-//!    `skeleton`, `zombie`, `creature`, `rat`, `snake`, `frog`, `wasp`, `wolf`, `bat`, `bird`,
-//!    `worm`, `fish`, `bear`, `boat`) plus the 29 `race_*` player models. Every one of those
-//!    reported `skins == 1` except `boat.glb`, which reported `skins == 0`. The remaining files
-//!    are zone/door/weapon assets that never reach `model_for`.
+//! 1. **`boat.glb` is the only model `model_for` can load with `skins == 0`.** The loadable names
+//!    are the 18 distinct archetypes `race_to_archetype` can return (`humanoid`, `elf`, `dwarf`,
+//!    `gnoll`, `skeleton`, `zombie`, `creature`, `rat`, `snake`, `frog`, `wasp`, `wolf`, `bat`,
+//!    `bird`, `worm`, `fish`, `bear`, `boat`) plus the 29 `race_*` player models — 47 names, all 47
+//!    present. Every one reported `skins == 1` except `boat.glb`, at `skins == 0`. The remaining
+//!    files are zone/door/weapon assets `model_for` never names. Also scanned, because the first
+//!    pass missed them: the `<key>_f.glb` female variants `model_for` prefers for `gender == 1`
+//!    (`renderer.rs:610`). Three exist on disk — `humanoid_f`, `elf_f`, `dwarf_f` — and all three
+//!    reported `skins == 1`, so they do not change the conclusion.
 //! 2. **A skinned rig's raw vertex origin is not a stable EQ datum.** `race_hum.glb` reported
-//!    `y_min = -10.4305`; `race_huf.glb` reported `y_min = -3.6888`. Both are nominally 6.0-foot
-//!    humans (`race_target_height("HUM") == 6.0`), so their raw origins sit at wildly different
-//!    heights within the same body. This is why #756's zero-lift rule was NOT extended to the
-//!    skinned path: "put the origin at the stored z" has no defined meaning there.
+//!    `y_min = -10.430519`; `race_huf.glb` reported `y_min = -3.688780`. Both are nominally
+//!    6.0-foot humans (`race_target_height("HUM") == 6.0`), so their raw origins sit at wildly
+//!    different heights within the same body. This is why #756's zero-lift rule was NOT extended to
+//!    the skinned path: "put the origin at the stored z" has no defined meaning there.
 
 use eqoxide_renderer::camera::entity_model_matrix_heading;
 use eqoxide_renderer::models::{
@@ -77,18 +100,23 @@ fn drawn_origin(pos: [f32; 3], heading: f32, floating: bool) -> [f32; 3] {
     [m[3][0], m[3][1], m[3][2]]
 }
 
-/// THE regression. A floating hull's authored origin must land exactly on the server-sent
-/// position — the position eqoxide stores verbatim for a floating spawn, because
-/// `eqoxide_core::coord::wire_z_to_foot` passes a floating entity's wire z through unchanged.
+/// THE regression: no grounding lift is applied to a floating spawn's stored z, which leaves the
+/// hull's authored origin on that z.
+///
+/// The name states the *mechanism* deliberately, not "the boat floats correctly". Zero applied lift
+/// is what the code is certain to owe (the stored z never went through `wire_z_to_foot`'s foot
+/// conversion, so the foot→placement lift does not apply to it). That the resulting placement is
+/// the true waterline is the INFERENCE this file's header flags and no test here can settle.
 #[test]
-fn a_floating_spawn_is_drawn_at_its_server_position_not_lifted_off_it() {
+fn a_floating_spawn_gets_no_grounding_lift_so_its_origin_stays_on_the_stored_z() {
     let pos = [1200.0_f32, -640.0, 4.0];
     let got = drawn_origin(pos, 137.0, true);
 
     assert!(
         (got[2] - pos[2]).abs() < 1e-3,
-        "a floating spawn's model origin must be drawn at the server-sent z; \
-         drawn z {}, server z {} (delta {})",
+        "no grounding lift may be applied to a floating spawn's stored z, so its model origin \
+         stays on that z; drawn z {}, stored z {} (delta {}). NB: that zero is the RIGHT lift is \
+         inferred from coord.rs, not measured live — see this file's header.",
         got[2], pos[2], got[2] - pos[2]
     );
 }
@@ -176,18 +204,85 @@ fn skinned_target_height_is_unchanged_for_non_native_archetypes() {
     }
 }
 
-/// The two model paths must agree that a native-units archetype renders at native size. This is
-/// the trap #756 names: fixing one path and leaving the other sets a defect that only fires after
-/// an unrelated asset change (a boat asset gaining a skeleton).
+/// Every archetype `race_to_archetype` can return — the closed set, so this quantifies over the
+/// whole domain rather than over the one member that motivated it.
+const ALL_ARCHETYPES: [&str; 18] = [
+    "humanoid", "elf", "dwarf", "boat", "gnoll", "skeleton", "zombie", "creature", "bear", "wolf",
+    "rat", "snake", "frog", "bat", "bird", "wasp", "worm", "fish",
+];
+
+/// **Property**, over every archetype: `archetype_native_units(a)` ⟹ both model paths render `a`
+/// at native size. This is the trap #756 names — fixing one path and leaving the other sets a
+/// defect that only fires after an unrelated asset change (a boat asset gaining a skeleton).
+///
+/// Quantified rather than written as `for archetype in ["boat"]`, because the single-member loop
+/// graded only today's membership: adding, say, `"creature"` to `archetype_native_units` would make
+/// the two paths disagree silently (`archetype_scale("creature") == 0.45`, while the skinned path
+/// would render it at 1.0) and nothing would redden. Now that addition fails here.
+///
+/// Note the direction. This is a one-way implication, and only that: it does NOT say a non-native
+/// archetype scales to anything in particular — those are per-archetype calibration constants with
+/// no shared law, which is exactly why the property is stated as a conditional.
 #[test]
-fn both_model_paths_agree_on_native_scale_for_native_units_archetypes() {
-    for archetype in ["boat"] {
-        assert!(archetype_native_units(archetype));
+fn native_units_archetypes_render_at_native_scale_on_both_model_paths() {
+    let mut checked = 0;
+    for archetype in ALL_ARCHETYPES {
+        if !archetype_native_units(archetype) { continue; }
+        checked += 1;
         assert_eq!(archetype_scale(archetype), 1.0,
-            "static path: {archetype} must render at native scale");
-        let h = 9.9452_f32;
-        assert!((humanoid_placement(h, 0.0, skinned_target_height("SHP", archetype, h)).mesh_scale
-                 - 1.0).abs() < 1e-6,
-            "skinned path: {archetype} must render at native scale");
+            "static path: native-units {archetype} must render at native scale");
+        for h in [1.5_f32, 9.9452, 220.0] {
+            let scale =
+                humanoid_placement(h, 0.0, skinned_target_height("SHP", archetype, h)).mesh_scale;
+            assert!((scale - 1.0).abs() < 1e-6,
+                "skinned path: native-units {archetype} at true_height {h} must render at native \
+                 scale, got {scale}");
+        }
     }
+    assert!(checked > 0, "no archetype is native-units, so this property graded nothing");
+}
+
+// ── Call-site pin (source text, not semantics) ──────────────────────────────────────────────────
+
+const PASS_RS: &str = include_str!("../src/pass.rs");
+
+/// Nothing above would fail if `pass.rs` computed a correct `StaticPlacement` and then passed a
+/// literal `false` for `floating` at the two entity call sites — which is the whole user-visible
+/// fix, reverted. Measured, not argued: with `b.floating` changed to a literal `false` at both
+/// sites, this pin is the ONLY test in `eqoxide-renderer` that fails; every other test in the crate
+/// stays green.
+///
+/// This is a **source-text** assert, the same technique (and the same caveat) as
+/// `shadow_caster_selection.rs`'s `encode_shadow_pass_calls_the_planner_this_file_grades`: it
+/// proves the argument is written, not that the branch is reached. Semantic coverage would need the
+/// draw path to be device-free, which is a larger refactor than #756.
+///
+/// Split 2/2 by design. The two entity sites take `floating` from the spawn; the two player sites
+/// pass a literal `false` on purpose — the player's z is the `CharacterController`'s FOOT datum, not
+/// a wire passthrough, so the player is never a model-origin placement.
+#[test]
+fn every_static_placement_call_site_in_pass_rs_decides_floating_explicitly() {
+    let calls: Vec<&str> = PASS_RS
+        .match_indices("static_placement(")
+        .map(|(i, _)| {
+            let rest = &PASS_RS[i..];
+            &rest[..rest.find(");").expect("unterminated static_placement( call in pass.rs")]
+        })
+        .collect();
+
+    assert_eq!(calls.len(), 4,
+        "pass.rs must place static models at exactly the 4 known sites (entity, player, and both \
+         static shadow-caster arms); found {}. A new site is not necessarily wrong — but it has to \
+         be reviewed for the #756 exemption, which is why this count is pinned.", calls.len());
+
+    let from_spawn = calls.iter().filter(|c| c.contains("b.floating")).count();
+    let player = calls.iter().filter(|c| c.trim_end().ends_with("false")).count();
+
+    assert_eq!(from_spawn, 2,
+        "the entity pass and the nearby shadow-caster arm must pass `b.floating`, not a literal — \
+         passing `false` there restores the pre-#756 rendering (a boat 13.9275u above the water) \
+         and no other test in this crate would notice; found {from_spawn} of 2");
+    assert_eq!(player, 2,
+        "the player pass and the player shadow-caster arm must pass a literal `false`; \
+         found {player} of 2");
 }

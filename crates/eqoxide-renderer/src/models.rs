@@ -890,11 +890,19 @@ pub fn skinned_target_height(race: &str, archetype: &str, true_height: f32) -> f
 /// Scale, vertical lift and horizontal recentre for placing a **static** (unskinned) entity model,
 /// as the live render path uses them.
 ///
-/// This is the SINGLE source of that math — the entity pass, the player pass, both static
-/// shadow-caster arms and the regression test all call it, so the test guards the ACTUAL render
-/// placement rather than a hand-copied formula (the lesson [`HumanoidPlacement`] records for the
-/// skinned path, #357). Before #756 the same three lines were written out inline at four sites in
-/// `src/pass.rs`, and the `floating` exemption below was in none of them.
+/// This is the single source of that math **for the render passes** — the entity pass, the player
+/// pass, both static shadow-caster arms and the regression test all call it, so the test guards the
+/// ACTUAL render placement rather than a hand-copied formula (the lesson [`HumanoidPlacement`]
+/// records for the skinned path, #357). Before #756 the same three lines were written out inline at
+/// four sites in `src/pass.rs`, and the `floating` exemption below was in none of them.
+///
+/// It is NOT the only copy in the repository, and saying otherwise would be false: the standalone
+/// model-viewer binary (`src/bin/render_model.rs`, in the root `eqoxide` crate — it cannot depend on
+/// this crate's pass module) still writes `2.0 * y_extent * arch_scale` and
+/// `vscale * 0.5 + y_bottom * arch_scale` by hand at three places. Consequence, stated because it is
+/// real: the viewer has no `floating` concept at all, so it still draws `boat.glb` 13.9275u above
+/// its turntable while the game now draws it at the stored z. #756 did not change the viewer;
+/// converging it is its own change.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StaticPlacement {
     /// Uniform mesh scale fed to `entity_model_matrix_heading`'s `mesh_scale`.
@@ -928,8 +936,12 @@ pub struct StaticPlacement {
 ///      `coord.rs:34-35` records that boats skip the server's Z-offset entirely (`Mob::FixZ`
 ///      early-returns for them). Read together, a floating spawn's stored z is the position of
 ///      the model origin, so the origin goes there and the lift is zero. Note that `coord.rs:8-9`
-///      is stated for *characters*; extending it to a boat hull is my inference from `coord.rs`,
-///      not something I measured against a running server.
+///      is stated for *characters*; extending it to a boat hull is an inference from `coord.rs`,
+///      not something measured against a running server. To be explicit about the gap: **no live
+///      end-to-end run backs this.** #756 was verified by source-tracing, GLB measurement and unit
+///      tests only — nobody has watched a hull placed this way sit on the water in play, because
+///      the observable needs a boat-race spawn in a harbour zone. If it turns out the hull rides
+///      high or low by a fixed amount, THIS is the line that was wrong; step (1) still holds.
 ///
 ///   Corroborating but NOT probative: `boat.glb`'s origin sits 3.9823u above the hull's lowest
 ///   vertex and 5.9629u below its highest, which is the shape you would expect of a rowboat
