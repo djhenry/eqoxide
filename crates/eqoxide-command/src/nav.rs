@@ -105,14 +105,12 @@ impl Drop for ZoneCrossTicket {
         if moved {
             return; // something WAS published for this request (or a newer goal superseded it)
         }
-        s.state  = "idle".to_string();
-        s.reason = Some(NAV_REASON_ZONE_CROSS_UNHANDLED.to_string());
         // The same per-instance retirement `Walker::set_nav_state_because` does: a transition must
         // not leave the previous route's facts standing beside the new state (#343 discipline).
-        s.goal            = None;
-        s.blocked_goal    = None;
-        s.blocked_frontier = None;
-        s.tier            = None;
+        // #732 moved that hand-written list into `NavStatus::retire_to_idle` so the three routes to
+        // `idle` cannot drift apart — and so a field added to `NavStatus` has to decide its fate
+        // there (the destructure is exhaustive) instead of being silently forgotten in one of them.
+        s.retire_to_idle(Some(NAV_REASON_ZONE_CROSS_UNHANDLED));
         tracing::warn!(
             "zone_cross: request for zone_id={} was drained without publishing any outcome — \
              publishing idle/{NAV_REASON_ZONE_CROSS_UNHANDLED} (this is a client bug, #725)",
@@ -147,6 +145,12 @@ impl CommandState {
         // row's universal is a checked invariant rather than prose.
         debug_assert!(!(new_state == "idle" && reason.is_none()),
             "#725 B1: `idle` must name how it got there; `nav_reason: null` is reserved for boot");
+        // #732: the third route to `idle` (`request_stop`, `request_cancel_goto`). It already passes
+        // `goal: None` for both, so this pins the existing behavior rather than changing it — but it
+        // pins it at the writer, so `stamp_new_goal("idle", .., Some(g))` cannot be introduced later
+        // and quietly publish an `idle` that carries coordinates.
+        debug_assert!(!(new_state == "idle" && goal.is_some()),
+            "#732: `idle` owns no goal — `nav_goal` must be null for idle/stop (docs/http-api.md)");
         let mut s = self.nav.nav_state.lock().unwrap();
         s.goal_id += 1;
         s.state = new_state.to_string();

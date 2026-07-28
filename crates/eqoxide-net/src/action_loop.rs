@@ -5126,6 +5126,72 @@ mod tests {
             "an unreconciled in-flight buy must keep coin unverified — the balance is not trustworthy");
     }
 
+    /// **#732 (agent-honesty): `nav_goal` must not survive a zone change.**
+    ///
+    /// Measured live during the #725 investigation: standing in lfaydark, `GET /v1/observe/debug`
+    /// reported `nav_state: "idle"` alongside `nav_goal: [2216.87, 579.17, -113.25]` — the goal from
+    /// the zone just left. Each half is individually true and the pair is false: coordinates are a
+    /// per-zone namespace and carry no zone tag, so a surviving goal is a confident, well-formed
+    /// answer to "where was I going" about a different world.
+    ///
+    /// Driven through the REAL production hook, not `reset_for_zone_change` directly: the goal is
+    /// set by `CommandState::request_goto` (the same call `drain_zone_cross` makes once it resolves
+    /// a crossing into a concrete walk), and the zone change is a new `gs.world.zone_name` observed
+    /// by `sync_zone_points`, which is what the packet path actually calls.
+    ///
+    /// The assertions read `nav.nav_state.lock().goal` — the *identical* expression
+    /// `eqoxide_http::observe`'s `/debug` handler reads for its `"nav_goal"` field (it locks and
+    /// clones this same `Arc`, then serializes `nav.goal` with no filter in between). The JSON end
+    /// of that path is pinned separately by
+    /// `debug_publishes_no_nav_goal_once_the_goal_is_retired_to_idle_732` in that crate, which
+    /// cannot be called from here (eqoxide-http depends on this crate's siblings, not the reverse).
+    ///
+    /// Mutation check: delete `*goal = None;` from `NavStatus::retire_to_idle`
+    /// (`crates/eqoxide-ipc/src/lib.rs`) → the post-zone `goal` assertion goes RED.
+    #[tokio::test]
+    async fn a_zone_change_retires_the_previous_zones_nav_goal_732() {
+        // `shared_nav_action_loop` (not `new_loop`) because this test spans the command side and
+        // the walker side of the SAME `nav_state`: `new_loop` hands the `CommandState` its own
+        // `Default` slots, so a `request_goto` there would never reach `al.nav.nav_state` at all.
+        let (mut al, nav, command, _collision, _za) = shared_nav_action_loop();
+        let mut gs = GameState::new();
+        gs.world.zone_name = "gfaydark".into();
+        al.sync_zone_points(&gs); // settle `current_zone` so the next call is a real CHANGE
+
+        // The walker is walking to a goal in gfaydark. `request_goto` is what publishes `nav_goal`
+        // — and it is also the call `drain_zone_cross` makes once it resolves a crossing into a
+        // concrete walk, which is the path #732 was measured on.
+        let goal_id = command.request_goto((2216.0, 579.0, -113.0));
+        al.walker.set_nav_state_because("navigating", None);
+        {
+            let s = nav.nav_state.lock().unwrap();
+            assert_eq!(s.goal, Some([2216.0, 579.0, -113.0]),
+                "PREMISE: the field an observer reads really is loaded with this zone's goal");
+            assert_eq!(s.state, "navigating",
+                "PREMISE: a NON-terminal, non-idle state — otherwise the retirement under test \
+                 would not be the thing that clears the goal");
+            assert_eq!(s.goal_id, goal_id, "PREMISE: that goal carries the id the accept returned");
+        }
+
+        // Cross into lfaydark. This is the production entry point: the packet path sets the new
+        // zone name on the GameState and `sync_zone_points` notices on its next tick.
+        gs.begin_zone_in();
+        gs.world.zone_name = "lfaydark".into();
+        al.sync_zone_points(&gs);
+
+        let s = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(s.goal, None,
+            "#732: the previous zone's goal must not be published in the new zone — coordinates \
+             carry no zone tag, so a stale one is numerically indistinguishable from a valid one");
+        assert_eq!(s.state, "idle", "a zone change ends navigation (#248)");
+        assert_eq!(s.reason.as_deref(), Some(eqoxide_nav::walker::NAV_REASON_ZONED),
+            "and says WHY, so a successful crossing is distinguishable from a dropped request (#725)");
+        assert_eq!(s.tier, None, "the per-route clearance tier described the OLD zone's route");
+        assert_eq!(s.goal_id, goal_id,
+            "the monotonic identity stamp is deliberately KEPT (#349): it is what lets the caller \
+             match this `idle` to the goal it issued. Only the per-goal facts are retired.");
+    }
+
     /// REAPER: a zone change while a buy is parked fires `Unconfirmed` for the stranded Sender and
     /// clears `pending_buy`, so a shop echo in the NEW zone can't mis-correlate it. Driven through the
     /// real `sync_zone_points` zone-change hook.
