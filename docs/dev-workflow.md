@@ -171,6 +171,26 @@ Tests that require real zone assets are marked `#[ignore]`:
 cargo test -- --ignored       # run asset-dependent tests (needs ~/eq_assets)
 ```
 
+### Capitalised words in test names (`non_snake_case`) — the convention (#742)
+
+Some test names shout one word to name the axis under test: `..._a_DRY_body_...`,
+`..._the_BODY_not_the_feet`, `..._when_a_sync_SUCCEEDS`, `..._when_a_sync_FAILS`. Four such names
+exist, across `src/movement.rs` (#730/PR #738) and `src/asset_sync.rs` (#731/PR #755), written by
+two different authors — so it is a convention, not a one-off, and #742 asked for it to be written
+down rather than rediscovered.
+
+**The rule: silence `non_snake_case` with a `#[allow(non_snake_case)]` attached to the individual
+test function, and never at module or crate scope.** A module- or crate-scope `allow` would also
+silence every *accidental* `non_snake_case` in that scope — a typo'd `fn myTest`, a stray
+capitalised local — which is precisely the "the warning you meant to keep gets lost with the ones
+you meant to suppress" failure mode #723/#730 exist to close. The per-function form suppresses
+exactly the one name whose capitalisation is deliberate, and each of the four carries a comment
+saying which word is load-bearing and why lower-casing it would erase the signal. Keep that comment
+when adding a fifth.
+
+This is a naming convenience with no runtime meaning: if a name does not have a specific word whose
+capitalisation carries information, use plain `snake_case` and no `allow`.
+
 Key test modules:
 - `src/assets.rs` — collision grid (floor_z, segment_blocked, path_clear)
 - `src/eq_net/navigation.rs` — the nav walker/planner loop, packet builders (say, target, consider)
