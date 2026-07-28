@@ -906,7 +906,7 @@ pub fn encode_player_pass(
     scene:     &SceneState,
 ) {
     use crate::renderer::PLAYER_UNIFORM_SLOTS;
-    use crate::models::{race_to_archetype, archetype_scale};
+    use crate::models::race_to_archetype;
     use crate::gpu::{EntityUniform, GpuModel};
 
     if !scene.player_race.is_empty() {
@@ -930,7 +930,8 @@ pub fn encode_player_pass(
                 // Write to pool slot 0 (reserved for player).
                 r.queue.write_buffer(&r.joint_buf_pool[0].0, 0, bytemuck::cast_slice(&joint_array));
 
-                let target = crate::models::target_height_for(&scene.player_race, archetype);
+                let target = crate::models::skinned_target_height(
+                    &scene.player_race, archetype, model.true_height);
                 // Normalize to `target` height and ground by the model's own feet. This math
                 // lives in `models::humanoid_placement` so the placement regression test can
                 // exercise the exact production computation (see the fn's doc; #357).
@@ -1103,11 +1104,14 @@ pub fn encode_player_pass(
                 return;
             }
             Some(GpuModel::Static(model)) => {
-                let arch_scale = archetype_scale(archetype);
-                let visual_scale = 2.0 * model.y_extent * arch_scale;
+                // `floating: false` — the player's z is the CharacterController's FOOT datum, not
+                // a wire passthrough, so the player is never a model-origin placement (#756).
+                let p = crate::models::static_placement(
+                    archetype, model.y_extent, model.y_bottom,
+                    [model.x_center, model.z_center], false);
                 let mat = crate::camera::entity_model_matrix_heading(
-                    scene.player_pos, scene.player_heading, visual_scale, arch_scale,
-                    [model.x_center, model.z_center], true, model.y_bottom,
+                    scene.player_pos, scene.player_heading, p.visual_scale, p.mesh_scale,
+                    p.center_xz, true, p.y_bottom,
                     crate::models::archetype_correction(archetype),
                 );
                 for (i, mesh) in model.meshes.iter().enumerate() {
@@ -1243,7 +1247,7 @@ pub fn encode_entity_pass(
     _cam_pos: [f32; 3],
 ) {
     use crate::renderer::PLAYER_UNIFORM_SLOTS;
-    use crate::models::{race_to_archetype, archetype_scale};
+    use crate::models::race_to_archetype;
     use crate::gpu::GpuModel;
 
     struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, equipment: [u32; 9], gender: u8, face: u8, hairstyle: u8 }
@@ -1258,10 +1262,13 @@ pub fn encode_entity_pass(
                                           ENTITY_DRAW_DIST, ENTITY_CULL_MARGIN) { continue; }
         let archetype = race_to_archetype(&b.race);
         let Some(GpuModel::Static(model)) = r.model_for(archetype, b.gender) else { continue };
-        let arch_scale   = archetype_scale(archetype);
-        let visual_scale = 2.0 * model.y_extent * arch_scale;
-        let mat = crate::camera::entity_model_matrix_heading(b.pos, b.heading, visual_scale, arch_scale,
-            [model.x_center, model.z_center], true, model.y_bottom, crate::models::archetype_correction(archetype));
+        // A floating spawn's stored z never went through `wire_z_to_foot`'s foot conversion,
+        // so `static_placement` drops the grounding lift for it (#756). The horizontal
+        // recentre is unchanged — that datum was not established; see the fn's doc.
+        let p = crate::models::static_placement(
+            archetype, model.y_extent, model.y_bottom, [model.x_center, model.z_center], b.floating);
+        let mat = crate::camera::entity_model_matrix_heading(b.pos, b.heading, p.visual_scale, p.mesh_scale,
+            p.center_xz, true, p.y_bottom, crate::models::archetype_correction(archetype));
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
             if slot >= slot_end { break; }
             let slot_meta = model.equip_slots[mesh_idx];
@@ -1396,7 +1403,7 @@ pub fn encode_skinned_entity_pass(
         for (i, m) in matrices.iter().enumerate().take(128) { joint_array[i] = *m; }
         r.queue.write_buffer(&r.joint_buf_pool[j_slot].0, 0, bytemuck::cast_slice(&joint_array));
 
-        let target = crate::models::target_height_for(&b.race, archetype);
+        let target = crate::models::skinned_target_height(&b.race, archetype, model.true_height);
         let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
         // See the player pass: normalize to `target` only — do not re-apply the authored
         // `node_scale` (it would re-inflate; the scale-100 `fish.glb` rendered ~100× too big).
@@ -1564,8 +1571,8 @@ pub fn encode_shadow_pass(
     scene:        &SceneState,
     light_center: [f32; 3],
 ) {
-    use crate::models::{race_to_archetype, character_model_key, archetype_scale, target_height_for,
-                        archetype_correction, humanoid_placement};
+    use crate::models::{race_to_archetype, character_model_key, skinned_target_height,
+                        archetype_correction, humanoid_placement, static_placement};
     use crate::gpu::{EntityUniform, GpuModel};
 
     enum Caster<'a> {
@@ -1659,7 +1666,7 @@ pub fn encode_shadow_pass(
                             ShadowPose::BindPose           => model.skin.bind_pose(),
                         };
                         write_joints(j_slot, &matrices);
-                        let target = target_height_for(&scene.player_race, archetype);
+                        let target = skinned_target_height(&scene.player_race, archetype, model.true_height);
                         let p = humanoid_placement(model.true_height, model.feet_offset, target);
                         let mat = crate::camera::entity_model_matrix_heading(
                             scene.player_pos, scene.player_heading, p.visual_scale, p.mesh_scale,
@@ -1668,11 +1675,13 @@ pub fn encode_shadow_pass(
                         casters.push(Caster::Skinned { model, u_slot: step.u_slot, j_slot });
                     }
                     (Some(GpuModel::Static(model)), ShadowCasterDraw::Static) => {
-                        let arch_scale   = archetype_scale(archetype);
-                        let visual_scale = 2.0 * model.y_extent * arch_scale;
+                        // Same placement call as the color pass, so the shadow tracks the body
+                        // (see this fn's doc). `floating: false` — the player is never one (#756).
+                        let p = static_placement(archetype, model.y_extent, model.y_bottom,
+                            [model.x_center, model.z_center], false);
                         let mat = crate::camera::entity_model_matrix_heading(
-                            scene.player_pos, scene.player_heading, visual_scale, arch_scale,
-                            [model.x_center, model.z_center], true, model.y_bottom,
+                            scene.player_pos, scene.player_heading, p.visual_scale, p.mesh_scale,
+                            p.center_xz, true, p.y_bottom,
                             archetype_correction(archetype));
                         write_model(step.u_slot, mat);
                         casters.push(Caster::Static { model, u_slot: step.u_slot });
@@ -1690,7 +1699,7 @@ pub fn encode_shadow_pass(
                             ShadowPose::BindPose           => model.skin.bind_pose(),
                         };
                         write_joints(j_slot, &matrices);
-                        let target = target_height_for(&b.race, archetype);
+                        let target = skinned_target_height(&b.race, archetype, model.true_height);
                         let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
                         let dominant_scale = target / height;
                         let visual_scale   = -2.0 * model.feet_offset * dominant_scale;
@@ -1701,11 +1710,13 @@ pub fn encode_shadow_pass(
                         casters.push(Caster::Skinned { model, u_slot: step.u_slot, j_slot });
                     }
                     (Some(GpuModel::Static(model)), ShadowCasterDraw::Static) => {
-                        let arch_scale   = archetype_scale(archetype);
-                        let visual_scale = 2.0 * model.y_extent * arch_scale;
+                        // Same placement call as the color pass, so a floating hull's shadow
+                        // tracks the hull instead of staying 13.9275u above it (#756).
+                        let p = static_placement(archetype, model.y_extent, model.y_bottom,
+                            [model.x_center, model.z_center], b.floating);
                         let mat = crate::camera::entity_model_matrix_heading(
-                            b.pos, b.heading, visual_scale, arch_scale,
-                            [model.x_center, model.z_center], true, model.y_bottom,
+                            b.pos, b.heading, p.visual_scale, p.mesh_scale,
+                            p.center_xz, true, p.y_bottom,
                             archetype_correction(archetype));
                         write_model(step.u_slot, mat);
                         casters.push(Caster::Static { model, u_slot: step.u_slot });

@@ -854,6 +854,113 @@ pub fn humanoid_placement(true_height: f32, feet_offset: f32, target: f32) -> Hu
     HumanoidPlacement { mesh_scale, visual_scale }
 }
 
+/// True when the archetype's GLB is a converted EQ **world prop**, authored directly in EQ world
+/// units with its own origin preserved — not a character rig that the renderer normalizes to a
+/// character height.
+///
+/// `"boat"` is the only one today. Measured from the baked `boat.glb` (2026-07-27): a single glTF
+/// node carrying no `scale`/`rotation`/`translation`, one mesh named `row.mod`, `POSITION` bounds
+/// `x [-14.8816, 22.8514] y [-3.9823, 5.9629] z [-8.3050, 8.4137]` — i.e. raw EQ-unit vertices in
+/// the source asset's own frame. `archetype_scale("boat")` is already `1.0` for exactly this
+/// reason (#194: "the EQG model is already authored in EQ units").
+///
+/// There is no correct *constant* height for this class — a rowboat and a three-master share the
+/// archetype — so the asset's own measured height is the target, which gives `mesh_scale == 1.0`.
+/// That is what [`skinned_target_height`] returns, and it is why #756 added **no** `"boat"` arm to
+/// [`archetype_target_height`]: any number written there would be invented rather than measured.
+pub fn archetype_native_units(archetype: &str) -> bool {
+    matches!(archetype, "boat")
+}
+
+/// [`target_height_for`] for the **skinned** model path, with the native-units exemption
+/// ([`archetype_native_units`]) applied: a converted world prop renders at its authored size
+/// (`target == true_height`, so `humanoid_placement` yields `mesh_scale == 1.0`) instead of being
+/// normalized to a character height.
+///
+/// Latent today, deliberately (#756): every entity-archetype GLB in the shipped asset set except
+/// `boat.glb` has a skin, so `boat` is the only archetype that reaches the static path and the
+/// only one this exemption names — a skinned boat asset does not exist yet. Without this, a boat
+/// that shipped with a skeleton would fall through `archetype_target_height`'s `_ => 6.0` and be
+/// squashed to a 6-foot hull.
+pub fn skinned_target_height(race: &str, archetype: &str, true_height: f32) -> f32 {
+    if archetype_native_units(archetype) && true_height > 0.001 { true_height }
+    else { target_height_for(race, archetype) }
+}
+
+/// Scale, vertical lift and horizontal recentre for placing a **static** (unskinned) entity model,
+/// as the live render path uses them.
+///
+/// This is the SINGLE source of that math — the entity pass, the player pass, both static
+/// shadow-caster arms and the regression test all call it, so the test guards the ACTUAL render
+/// placement rather than a hand-copied formula (the lesson [`HumanoidPlacement`] records for the
+/// skinned path, #357). Before #756 the same three lines were written out inline at four sites in
+/// `src/pass.rs`, and the `floating` exemption below was in none of them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StaticPlacement {
+    /// Uniform mesh scale fed to `entity_model_matrix_heading`'s `mesh_scale`.
+    pub mesh_scale: f32,
+    /// Z-lift fed to `entity_model_matrix_heading`'s `visual_scale` (halved there).
+    pub visual_scale: f32,
+    /// Horizontal recentre fed to `entity_model_matrix_heading`'s `center_xz`.
+    pub center_xz: [f32; 2],
+    /// Extra lift fed to `entity_model_matrix_heading`'s `y_bottom` (scaled by `mesh_scale` there).
+    pub y_bottom: f32,
+}
+
+/// Compute the static-model placement from the model's measured bounds and the archetype scale.
+///
+/// `floating` is a REQUIRED argument rather than a default because it selects between two
+/// different meanings of the entity's stored **z** (#756):
+///
+/// - **grounded** (`false`) — the stored z is eqoxide's FOOT datum: the ingest path subtracted
+///   `WIRE_Z_OFFSET` (`crates/eqoxide-core/src/coord.rs:115` `wire_z_to_foot`). The model's local
+///   bounding box is arbitrary, so it is lifted to stand on that z. This arm is byte-for-byte the
+///   pre-#756 formula.
+/// - **floating** (`true`) — two separate steps, held to different standards:
+///
+///   1. *That the current lift is wrong* is certain from the code alone. `wire_z_to_foot`
+///      (`coord.rs:115-117`) returns the wire z UNCHANGED for a floating entity, so a floating
+///      spawn's stored z is by construction NOT in the foot datum. The grounding lift is a
+///      foot-datum→placement conversion. Applying it to a z that was never converted is wrong
+///      whatever the wire datum turns out to be.
+///   2. *That the right lift is zero* is an INFERENCE, not a measurement. `coord.rs:8-9` states
+///      the datum — "EQ's character `z` is the position of the **model origin**" — and
+///      `coord.rs:34-35` records that boats skip the server's Z-offset entirely (`Mob::FixZ`
+///      early-returns for them). Read together, a floating spawn's stored z is the position of
+///      the model origin, so the origin goes there and the lift is zero. Note that `coord.rs:8-9`
+///      is stated for *characters*; extending it to a boat hull is my inference from `coord.rs`,
+///      not something I measured against a running server.
+///
+///   Corroborating but NOT probative: `boat.glb`'s origin sits 3.9823u above the hull's lowest
+///   vertex and 5.9629u below its highest, which is the shape you would expect of a rowboat
+///   authored to be placed at its waterline. That is consistent with (2); it does not establish it.
+///
+/// Two things are deliberately NOT changed by the `floating` arm:
+///
+/// - **Scale.** `archetype_scale` applies on both arms: a floating spawn is placed differently,
+///   not sized differently.
+/// - **The horizontal recentre (`center_xz`).** The citations above are about **z** only. I did
+///   not establish which datum the wire *xy* addresses — whether it is the model origin or the
+///   mesh's xz centroid — so the recentre is passed through unchanged on both arms rather than
+///   dropped on an assumption. For `boat.glb` the two differ by a measured
+///   `center_xz = [3.9849, 0.0543]`, i.e. ~3.98u along the hull's own length axis (the recentre
+///   is applied in model space, before the heading yaw, so it rotates with heading). That gap is
+///   real and unresolved; it is not what #756 is about.
+///
+/// Magnitude of the grounded arm applied to a floating hull, from the measured `boat.glb` bounds
+/// (`y_extent = 9.9452`, `y_bottom = 3.9823`, `archetype_scale("boat") = 1.0`):
+/// `2*9.9452*1.0*0.5 + 3.9823*1.0 = 13.9275` units of lift on a 9.9452-unit-tall model.
+pub fn static_placement(
+    archetype: &str, y_extent: f32, y_bottom: f32, center_xz: [f32; 2], floating: bool,
+) -> StaticPlacement {
+    let mesh_scale = archetype_scale(archetype);
+    if floating {
+        StaticPlacement { mesh_scale, visual_scale: 0.0, center_xz, y_bottom: 0.0 }
+    } else {
+        StaticPlacement { mesh_scale, visual_scale: 2.0 * y_extent * mesh_scale, center_xz, y_bottom }
+    }
+}
+
 /// Every per-race character model the asset server produces (`race_<code>.glb`,
 /// one file per race+gender, gender encoded in the 3-letter code). Used at load
 /// time to register the models that are present and log the ones that are not.
