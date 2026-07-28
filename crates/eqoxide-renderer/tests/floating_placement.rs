@@ -242,9 +242,44 @@ fn native_units_archetypes_render_at_native_scale_on_both_model_paths() {
     assert!(checked > 0, "no archetype is native-units, so this property graded nothing");
 }
 
-// ── Call-site pin (source text, not semantics) ──────────────────────────────────────────────────
+// ── Source-text pins ────────────────────────────────────────────────────────────────────────────
 
 const PASS_RS: &str = include_str!("../src/pass.rs");
+const MODELS_RS: &str = include_str!("../src/models.rs");
+
+/// The property above quantifies over `ALL_ARCHETYPES`, a hardcoded list — so it is only total if
+/// that list really is every archetype. It is not total one step outside itself: adding
+/// `"AIR" => "airship"` to `race_to_archetype` **and** `"airship"` to `archetype_native_units`,
+/// while leaving `"airship"` out of `ALL_ARCHETYPES`, reintroduces exactly the silent two-path
+/// disagreement the property was written to close, and the property never looks at it.
+///
+/// So the list is pinned set-equal to the archetypes `race_to_archetype` can actually return,
+/// parsed from its source. Same technique and same caveat as the call-site pin below: source text,
+/// not semantics.
+#[test]
+fn all_archetypes_is_every_archetype_race_to_archetype_can_return() {
+    let body = MODELS_RS
+        .split_once("pub fn race_to_archetype(")
+        .expect("race_to_archetype not found in models.rs").1;
+    let body = body.split_once("\npub fn ").map(|(b, _)| b).unwrap_or(body);
+
+    let mut from_source: Vec<&str> = body
+        .match_indices("=> \"")
+        .map(|(i, _)| {
+            let rest = &body[i + 4..];
+            &rest[..rest.find('"').expect("unterminated archetype string literal")]
+        })
+        .collect();
+    from_source.sort_unstable();
+    from_source.dedup();
+    assert!(!from_source.is_empty(), "parsed no archetypes — the parser broke, not the code");
+
+    let mut listed = ALL_ARCHETYPES.to_vec();
+    listed.sort_unstable();
+    assert_eq!(from_source, listed,
+        "ALL_ARCHETYPES must be exactly the set race_to_archetype can return, or the property \
+         above silently stops covering whatever is missing");
+}
 
 /// Nothing above would fail if `pass.rs` computed a correct `StaticPlacement` and then passed a
 /// literal `false` for `floating` at the two entity call sites — which is the whole user-visible
@@ -260,6 +295,11 @@ const PASS_RS: &str = include_str!("../src/pass.rs");
 /// Split 2/2 by design. The two entity sites take `floating` from the spawn; the two player sites
 /// pass a literal `false` on purpose — the player's z is the `CharacterController`'s FOOT datum, not
 /// a wire passthrough, so the player is never a model-origin placement.
+///
+/// Asserting BOTH halves is what makes this more than a `contains` check, and it catches an attack
+/// the "must pass `b.floating`" half alone would miss. Measured: rewriting the entity sites to
+/// `b.floating && false` — which still mentions `b.floating`, so `from_spawn` stays at 2 — trips the
+/// `player` half instead, at `found 4 of 2`, because those call sites now end in `false` too.
 #[test]
 fn every_static_placement_call_site_in_pass_rs_decides_floating_explicitly() {
     let calls: Vec<&str> = PASS_RS

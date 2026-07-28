@@ -922,8 +922,29 @@ pub struct StaticPlacement {
 ///
 /// - **grounded** (`false`) — the stored z is eqoxide's FOOT datum: the ingest path subtracted
 ///   `WIRE_Z_OFFSET` (`crates/eqoxide-core/src/coord.rs:115` `wire_z_to_foot`). The model's local
-///   bounding box is arbitrary, so it is lifted to stand on that z. This arm is byte-for-byte the
+///   bounding box is arbitrary, so the model is lifted off that z. This arm is byte-for-byte the
 ///   pre-#756 formula.
+///
+///   It does **not** lift the model to *stand on* that z, and saying so would be false. Measured by
+///   building this arm's matrix and mapping `boat.glb`'s bounding box through it (stored z 4,
+///   heading 0): drawn origin z `17.927488`, **lowest vertex z `13.945171`** — the hull's bottom
+///   lands `9.945171` ABOVE the stored z, which is exactly `y_extent * mesh_scale`, a full rendered
+///   model height. Standing on the z would need a lift of `y_bottom * mesh_scale` = `3.982317`,
+///   which is what `gpu.rs:180` states the rule to be ("lift = y_bottom × mesh_scale") and what the
+///   calibration note at line 718 above assumes (`visual_scale = 2 * y_bottom * arch_scale`, where
+///   the code computes `2 * y_extent`). The axis direction is not assumed:
+///   `camera.rs:264` `static_model_y_up_axis_maps_to_world_up` pins that a static model's +Y
+///   becomes world +Z.
+///
+///   So of the `13.927488` that #756 removes for a floating hull, only `3.982317` is the datum
+///   error #756 is about; the other `9.945171` is the grounded arm over-lifting *any* static model.
+///   That is a separate defect with a separate blast radius and is NOT fixed here — filed as #768
+///   with the measurement above. Nothing renders wrong today because of it, which follows from two
+///   measured facts: `Entity::floating()` is `skips_wire_z_offset(is_boat, flymode)`
+///   (`eqoxide-core/src/game_state.rs:192`), true for every boat regardless of flymode; and
+///   `boat.glb` is the only model `model_for` can load with no skin. Since the grounded arm is only
+///   reached by a static model, the inference is that it has **no live consumer** today. That is
+///   also why a false sentence could sit here undetected.
 /// - **floating** (`true`) — two separate steps, held to different standards:
 ///
 ///   1. *That the current lift is wrong* is certain from the code alone. `wire_z_to_foot`
