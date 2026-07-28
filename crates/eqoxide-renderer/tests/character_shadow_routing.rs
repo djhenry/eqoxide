@@ -34,11 +34,27 @@
 //!
 //! ## What this file does NOT cover
 //!
-//! - **The two-arm pipeline lookup in `encode_shadow_pass`'s `CharacterSink::set_pipeline`.**
-//!   Swapping `shadow_skinned` and `shadow_static` *there* is not observable from here, because this
-//!   file's sink maps the same `CharacterShadowKind` to a string. Left open deliberately rather than
-//!   pinned as source text: a source-text pin has been measured on this crate to be evadable by
-//!   shadowing a local (#773 review, evasions E1b/E2), so it would buy a claim it cannot keep.
+//! - **All five bodies of `encode_shadow_pass`'s `CharacterSink`.** This file supplies its own sink,
+//!   so nothing it does can reach the production one. Enumerated, in the style `shadow_routing.rs`
+//!   already uses for the instanced sub-pass:
+//!
+//!   1. `set_pipeline` — the two-arm `CharacterShadowKind` → `&wgpu::RenderPipeline` match. Swapping
+//!      `shadow_skinned` and `shadow_static` there is invisible here, because this file's sink maps
+//!      the same kind to a string. Left open **deliberately** rather than for cost: pinning it means
+//!      asserting on the source text of `pass.rs`, and a source-text pin has been measured on this
+//!      crate to be evadable by shadowing a local (#773 review, evasions E1b/E2).
+//!   2. `bind_light_depth` — `light_depth_bg` at group 0. A straight lookup.
+//!   3. `bind_model_uniform` — `shadow_uniform_pool[u_slot].1` at group 1. A straight lookup; an
+//!      out-of-range slot panics rather than falling back.
+//!   4. `bind_joints` — `shadow_joint_pool[j_slot].1` at group 2. Same.
+//!   5. `draw` — re-matches the caster's own variant to reach `model.meshes`. A branch, but not a
+//!      decision: the two arms differ only in the concrete model type and are otherwise the same
+//!      loop, so swapping them does not compile.
+//!
+//!   None of the five decides anything a mutation could silently flip. That is **not** true of the
+//!   sibling `ZoneSink` in `encode_zone_pass`, where two bodies do decide and are ungraded — see
+//!   `zone_pass_routing.rs`'s list. The distinction is stated because an earlier draft of both files
+//!   used one blanket sentence for both sinks, and for the zone one it was measurably false.
 //! - **wgpu semantics**, and **whether a flip is visible in play** — #739 listed the second as not
 //!   established, and this PR does not settle it. No client was run.
 //! - **Which entities are selected at all** — that is `plan_shadow_casters` (#740), graded in

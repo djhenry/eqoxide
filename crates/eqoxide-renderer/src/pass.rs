@@ -113,9 +113,10 @@ impl InstancedShadowCaster for crate::gpu::GpuInstancedMesh {
 }
 
 /// The texture a mesh should bind at `now_ms`: its current animation frame if animated, else its
-/// static texture. **The single definition** — `encode_zone_pass`'s `frame_tex` closure delegates
-/// here, so the color pass and the masked shadow sub-pass cannot drift apart, and this function's
-/// tests grade both.
+/// static texture. **The single definition** — both the colour pass and the masked shadow sub-pass
+/// reach it through their planners ([`plan_zone_draws`] and [`plan_instanced_shadow_draws`]), so
+/// they cannot drift apart, and this function's tests grade both. (Until #741 the colour side went
+/// through a `frame_tex` closure in `encode_zone_pass` that delegated here; that closure is gone.)
 ///
 /// The masked shadow sub-pass needs this, not the raw `texture_idx`: an animated `RenderMode::Masked`
 /// caster's shadow must alpha-test against the SAME texel the color pass is sampling, or the two
@@ -1011,13 +1012,28 @@ pub fn encode_zone_pass(
         occlusion_query_set: None,
     });
 
-    // Everything decided for this pass — the six sub-passes and their order, which mesh list and
-    // which render modes each one draws, which animated texture frame a mesh binds, and when a
-    // group-1 rebind is actually needed — comes from `plan_zone_draws` (#741), which is device-free
-    // and unit tested in tests/zone_pass_routing.rs (with a differential pin against the pre-#741
-    // closures in the same file). All that is left here is `ZoneSink`: five bodies that turn plan
-    // vocabulary into `wgpu` handles. Nothing in this impl decides anything — if you find yourself
-    // adding a condition to it, it belongs in the planner.
+    // The pass ROUTING — the six sub-passes and their order, which mesh list and which render modes
+    // each one draws, which animated texture frame a mesh binds, and when a group-1 rebind is
+    // actually needed — comes from `plan_zone_draws` (#741), which is device-free and unit tested in
+    // tests/zone_pass_routing.rs (with a differential pin against the pre-#741 closures there).
+    //
+    // `ZoneSink` below is the rest: five bodies that turn plan vocabulary into `wgpu` handles, ALL
+    // of which need a live device and NONE of which any test can reach. Two of the five make real
+    // decisions, so "nothing here decides anything" would be false — measured, by the #784 reviewer,
+    // with two mutations that both left the crate green at 226 passed / 0 failed:
+    //
+    //   * `draw` picks `gpu_meshes` vs `gpu_instanced` from the `ZoneMeshSource`. Pointing the
+    //     `Static` arm at `gpu_instanced` draws the wrong geometry for every static zone mesh, and
+    //     no test notices (mutation S1).
+    //   * `bind_texture` picks `texture_bind_groups[i]` vs `fallback_texture_bg`. Ignoring the index
+    //     and always binding the fallback untextures the whole zone, and no test notices (S2).
+    //
+    // Both predate #741 (they survive identically on the base file) and are recorded rather than
+    // fixed here; closing them needs a device or a further indirection, not another planner test.
+    // The other three bodies — the six-arm pipeline lookup, `camera_uniform.bind_group`,
+    // `shadow_sample_bg` — are straight lookups with no condition in them.
+    //
+    // If you add a condition to this impl, it belongs in the planner, where it is testable.
     struct ZoneSink<'r, 'p, 'e> {
         r:    &'r EqRenderer,
         pass: &'p mut wgpu::RenderPass<'e>,
@@ -2124,7 +2140,8 @@ pub fn encode_shadow_pass(
         }
         fn bind_texture(&mut self, idx: Option<usize>) {
             let r = self.r;
-            // The out-of-range fallback is the same one `encode_zone_pass`'s `tex_bg` applies.
+            // The out-of-range fallback is the same one `encode_zone_pass`'s `ZoneSink::bind_texture`
+            // applies. (It named a `tex_bg` closure there until #741 replaced it with that method.)
             let bg = match idx {
                 Some(i) if i < r.texture_bind_groups.len() => &r.texture_bind_groups[i],
                 _ => &r.fallback_texture_bg,
@@ -2149,7 +2166,14 @@ pub fn encode_shadow_pass(
     // the one-time pipeline/group-0 bind per sub-pass, and the fact that only skinned casters bind a
     // joint palette all come from `plan_character_shadow_draws` (#739), device-free and unit tested
     // in tests/character_shadow_routing.rs (with a differential pin against the pre-#739 loops).
-    // `CharacterSink` below is the `wgpu`-handle translation and decides nothing.
+    // `CharacterSink` below is the `wgpu`-handle translation: five bodies, none reachable by a test.
+    // Four are straight lookups (`shadow_skinned`/`shadow_static`, `light_depth_bg`,
+    // `shadow_uniform_pool[u_slot]`, `shadow_joint_pool[j_slot]`). `draw` re-matches the caster's own
+    // variant, which is a branch but not a decision: the two arms differ only in the concrete model
+    // type and are otherwise the same loop, so they cannot be swapped — the compiler rejects it.
+    // Contrast `encode_zone_pass`'s `ZoneSink`, where two bodies DO decide and are ungraded; see the
+    // note there. Do not paraphrase this as "decides nothing" — an earlier draft did, and the
+    // equivalent sentence in the zone pass was measurably false.
     impl CharacterShadowCaster for Caster<'_> {
         fn shadow_bind(&self) -> CharacterShadowBind {
             match *self {

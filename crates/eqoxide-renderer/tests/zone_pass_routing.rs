@@ -18,13 +18,32 @@
 //!
 //! ## What this file does NOT cover
 //!
-//! - **The six-arm pipeline lookup in `encode_zone_pass`'s `ZoneSink::set_pipeline`.** That match
-//!   turns a `(ZoneMeshSource, ZoneBlendClass)` pair into a `&wgpu::RenderPipeline`, and this file's
-//!   sink turns the same pair into a `&'static str`. Swapping two arms *in the production sink* is
-//!   not observable from here. That is a real hole and it is left open deliberately: pinning it
-//!   would mean asserting on the source text of `pass.rs`, and a source-text pin has now been
-//!   measured on this crate to be evadable by shadowing a local (#773 review, evasions E1b/E2). The
-//!   honest boundary is that everything which *decides* is graded and the handle lookup is not.
+//! - **All five bodies of `encode_zone_pass`'s `ZoneSink`.** This file supplies its own sink, so
+//!   nothing it does can reach the production one. Enumerated, in the style `shadow_routing.rs`
+//!   already uses for the instanced sub-pass:
+//!
+//!   1. `set_pipeline` — the six-arm `(ZoneMeshSource, ZoneBlendClass)` → `&wgpu::RenderPipeline`
+//!      match. Swapping two arms there is invisible here, because this file's sink maps the same
+//!      pair to a `&'static str`.
+//!   2. `bind_texture` — `texture_bind_groups[i]` vs `fallback_texture_bg`. **This one decides.**
+//!      Ignoring the index and always binding the fallback untextures the whole zone (mutation S2).
+//!   3. `draw` — `gpu_meshes` vs `gpu_instanced`, and the static vs instanced buffer/draw form.
+//!      **This one decides too.** Pointing the `Static` arm at `gpu_instanced` draws the wrong
+//!      geometry for every static zone mesh (mutation S1).
+//!   4. `bind_camera` — `camera_uniform.bind_group` at group 0. A straight lookup.
+//!   5. `bind_shadow_sample` — `shadow_sample_bg` at group 2. A straight lookup.
+//!
+//!   **An earlier draft of this paragraph claimed "everything which *decides* is graded and the
+//!   handle lookup is not". That was false**, and items 2 and 3 are why: the #784 reviewer mutated
+//!   both in the production sink and both left the crate green at 226 passed / 0 failed. Neither is
+//!   a regression — both survive identically on the base file — but the description was wrong about
+//!   where the hole is and how wide it is. **They remain ungraded after this PR.** Closing them
+//!   needs a live device or a further indirection between the plan and the mesh list, which is a
+//!   refactor rather than the coverage this issue asked for.
+//!
+//!   Item 1 is additionally left open *deliberately* rather than for cost: pinning it would mean
+//!   asserting on the source text of `pass.rs`, and a source-text pin has now been measured on this
+//!   crate to be evadable by shadowing a local (#773 review, evasions E1b/E2).
 //! - **wgpu semantics.** Nothing here creates a `wgpu::RenderPass`, so a command sequence that is
 //!   correct as a sequence but invalid as wgpu (wrong group index for a layout, say) still passes.
 //! - **Whether a flip is visible in play.** #741 asked; it is still not established. A wrong
@@ -187,9 +206,11 @@ const ALL_MODES: [RenderMode; 4] =
 /// this test**: it deliberately freezes pre-#741 behaviour, so it is exactly what should fail if
 /// someone later *intends* to change the zone draw order (say, sorting meshes by texture to cut
 /// rebinds). Update it as part of that change; do not weaken it to make a diff go green.
-#[test]
-fn the_extracted_plan_emits_the_pre_741_command_stream() {
-    let cases: Vec<(&str, Vec<Mesh>, Vec<Mesh>, u64)> = vec![
+/// The frame corpus: every mode in both lists, texture runs, animated meshes at three points of
+/// their cycle, degenerate animations, and empty sub-passes. Shared by the differential pin and by
+/// the `set_pipeline ⟹ Set` property below, so a case added for one is graded by both.
+fn corpus() -> Vec<(&'static str, Vec<Mesh>, Vec<Mesh>, u64)> {
+    vec![
         ("empty", vec![], vec![], 0),
         ("statics only, one of each mode",
             ALL_MODES.iter().map(|&m| Mesh::new(m, Some(1))).collect(), vec![], 0),
@@ -219,11 +240,37 @@ fn the_extracted_plan_emits_the_pre_741_command_stream() {
             vec![Mesh::animated(RenderMode::Opaque, 0, &[2, 2]),
                  Mesh { mode: RenderMode::Opaque, tex: Some(11), anim: Some((50, vec![])) }],
             vec![], 5_000),
-    ];
+    ]
+}
 
-    for (name, statics, instanced, now_ms) in &cases {
+#[test]
+fn the_extracted_plan_emits_the_pre_741_command_stream() {
+    for (name, statics, instanced, now_ms) in &corpus() {
         assert_eq!(new(statics, instanced, *now_ms), old(statics, instanced, *now_ms),
             "#741: the extracted zone plan diverged from the pre-#741 closures on case {name:?}");
+    }
+}
+
+/// **A pipeline-setting step always carries `Set`, never `Keep`.**
+///
+/// This is the invariant the deleted `*started &&` guard used to assert by hand. Removing that
+/// guard (see `the_texture_cache_does_not_survive_a_subpass_boundary`) was correct — it was
+/// unreachable — but it left the invariant true only by construction and asserted nowhere, so a
+/// later change to the cache could make a sub-pass start with group 1 holding the *previous*
+/// sub-pass's texture and nothing would say so. This turns that reading argument into a check.
+///
+/// Universal over the whole corpus rather than one example, because the claim is universal.
+#[test]
+fn a_pipeline_setting_step_never_elides_its_texture_bind() {
+    for (name, statics, instanced, now_ms) in &corpus() {
+        for step in plan_zone_draws(statics, instanced, *now_ms) {
+            if step.set_pipeline {
+                assert!(matches!(step.bind, ZoneTexBind::Set(_)),
+                    "case {name:?}: sub-pass {} starts with {:?} — the first step of a sub-pass must \
+                     bind group 1, since the pipeline switch does not preserve it",
+                    step.subpass, step.bind);
+            }
+        }
     }
 }
 
@@ -289,7 +336,8 @@ fn depth_writing_subpasses_run_before_transparent_ones_static_first() {
 /// it is unreachable. That was measured, not assumed: mutation Z5 (`if *started && …`) left this
 /// file and the whole crate green, which is why that dead guard was deleted rather than kept as
 /// belt-and-braces. What this test does catch is the state being hoisted out of the `flat_map` so it
-/// genuinely spans sub-passes — mutation Z7, which turns this red.
+/// genuinely spans sub-passes — mutation Z7 — and the elision being removed outright — mutation Z4.
+/// Both turn this red; Z7 is the one that targets the boundary specifically.
 #[test]
 fn the_texture_cache_does_not_survive_a_subpass_boundary() {
     // One blend mesh and one additive mesh, same texture, adjacent sub-passes of the same source.

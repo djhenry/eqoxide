@@ -38,13 +38,23 @@
 //!   `execute_instanced_shadow_plan` call in `encode_shadow_pass` were deleted or wrapped in
 //!   `if false`. (The executor's own logic *is* graded, in `shadow_routing_equivalence.rs`; it is
 //!   the one call site that is not.)
-//! - **Anything about the other three sub-passes** in `encode_shadow_pass` (skinned casters, static
-//!   casters, the depth-attachment clear). Those remain as untested as they were before #721. The
-//!   caster-selection/culling that fills `casters` was a *fourth* item in this list until #740,
-//!   which extracted it to `pass::plan_shadow_casters` and graded it in
-//!   `shadow_caster_selection.rs`; what selection *turns into* (matrices, buffer writes) is still
-//!   uncovered. (**Corrected:** #740's first draft dropped the item but left the count reading
-//!   "four" — an off-by-one this file introduced, not an inherited one.)
+//! - **The depth-attachment clear** in `encode_shadow_pass`. That is the last of the three items
+//!   this bullet originally listed and the only one still uncovered here.
+//!
+//!   This bullet is a **recurring maintenance point** — it has now been discharged twice, and the
+//!   count has been wrong after each discharge, so check it rather than trusting it. It read "the
+//!   other three sub-passes (skinned casters, static casters, the depth-attachment clear) … remain
+//!   as untested as they were before #721", plus a *fourth* item for the caster selection that
+//!   fills `casters`. #740 extracted that fourth to `pass::plan_shadow_casters` and graded it in
+//!   `shadow_caster_selection.rs` (leaving the count reading "four" — an off-by-one this file
+//!   introduced). #739 then extracted the **skinned and static** sub-passes to
+//!   `pass::plan_character_shadow_draws` and graded them in `character_shadow_routing.rs`, which
+//!   falsified two more of the three without touching this sentence.
+//!
+//!   What is *still* uncovered from those discharges, and is not restated by the files that took
+//!   them over: what caster selection turns into (matrices, buffer writes), and — exactly as in the
+//!   first bullet above — `encode_shadow_pass`'s `CharacterSink` handle lookups, which
+//!   `character_shadow_routing.rs` enumerates for itself.
 
 use eqoxide_assets::RenderMode;
 use eqoxide_renderer::pass::{
