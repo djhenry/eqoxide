@@ -1395,6 +1395,63 @@ pub struct NavLocal {
     pub plan_us:     u64,
 }
 
+impl NavStatus {
+    /// Retire to `idle`: the goal is over, so every fact that was ABOUT that goal goes with it.
+    ///
+    /// **Every production TRANSITION into `idle` goes through here**, which is what makes the
+    /// `docs/http-api.md` state table's "`nav_goal` is `null` for `idle`/`stop`" a checked invariant
+    /// rather than prose. The three writers that reach `idle` — `Walker::set_nav_state_because`
+    /// (`zoned`, `goal_dropped`, `respawned`), `CommandState::stamp_new_goal` (`stopped`,
+    /// `goto_superseded`) and `ZoneCrossTicket::drop` (`zone_cross_dropped_unhandled`) — all
+    /// delegate here; that is all six documented `nav_reason` values for `idle`.
+    ///
+    /// The one `idle` that does NOT come through here is [`NavStatus::default`], the boot row. That
+    /// is not a retirement: it builds the struct from scratch with every field at its zero value, so
+    /// it cannot leave a previous goal's fact standing. It is also the only `idle` allowed to carry
+    /// `reason: None` (#725 B1) — see the `debug_assert` below.
+    ///
+    /// Before #732 the row was documented but not enforced: `Walker::set_nav_state_because` retired
+    /// `blocked_*`/`tier` on a transition and never touched `goal`, so every walker-side route to
+    /// `idle` left the finished goal's `[x, y, z]` published beside it. Across a zone change that is
+    /// the sharp case: coordinates are a per-zone namespace and carry no zone tag, so the pair reads
+    /// as a well-formed answer about a zone the numbers do not belong to.
+    ///
+    /// Called unconditionally (never gated on "the state actually changed"): defence in depth, so no
+    /// caller can reintroduce the leak by making a second retirement a no-op. (#732 review N1: under
+    /// the fixed code every route clears `goal`, so an already-`idle` row has nothing left to clear —
+    /// this guards the *shape*, not a scenario I can exhibit.)
+    ///
+    /// **The destructure is exhaustive with no `..` on purpose.** Adding a field to [`NavStatus`]
+    /// is an `error[E0027]` here until someone decides whether it survives a goal's retirement —
+    /// the same construction `AssetSyncState::slots()` uses in `eqoxide-ipc::asset_sync`. Note the
+    /// weaker precondition: `NavStatus`'s fields are `pub` and read directly by several crates, so
+    /// this pins the *retirement path* only. It does not stop other code writing the fields.
+    pub fn retire_to_idle(&mut self, why: Option<&str>) {
+        // The same writer-level guard as `Walker::set_nav_state_because` and
+        // `CommandState::stamp_new_goal`: on `idle`, `nav_reason: null` is reserved for boot (#725).
+        debug_assert!(why.is_some(),
+            "#725 B1: `idle` must name how it got there; `nav_reason: null` is reserved for boot");
+        let NavStatus {
+            state, reason,
+            // KEPT, deliberately. `goal_id` is a monotonic IDENTITY stamp, not a per-goal fact: it
+            // is what lets a caller say "this `idle` is the outcome of the goal I asked for" (#349).
+            // Zeroing or bumping it here would break that correlation.
+            goal_id: _keep_goal_id,
+            goal, blocked_goal, blocked_frontier, tier,
+            // KEPT, deliberately — `local` is the FINE tier's own last word, an independent fact
+            // about a different tier (#382), and `Walker::clear_local_plan` owns clearing it. Wiring
+            // it in here would silently take that ownership away from #382's design.
+            local: _keep_local,
+        } = self;
+        *state  = "idle".to_string();
+        *reason = why.map(str::to_string);
+        *goal   = None;
+        *blocked_goal     = None;
+        *blocked_frontier = None;
+        *tier             = None;
+    }
+}
+
 impl Default for NavStatus {
     fn default() -> Self {
         NavStatus { state: "idle".into(), reason: None, local: None,

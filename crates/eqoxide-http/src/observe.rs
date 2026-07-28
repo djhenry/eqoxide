@@ -2893,6 +2893,56 @@ mod tests {
             "stale target_hp_pct must not leak into the new zone (#408)");
     }
 
+    /// **#732 (agent-honesty) — the OBSERVER half: a retired goal must not be published.**
+    ///
+    /// `nav_goal` is read straight off the shared `NavStatus` (`"nav_goal": nav.goal`, from a plain
+    /// `nav_state.lock().clone()` at the top of this handler) with nothing between the walker's
+    /// write and the JSON body — no filter, no gate on `nav_state`. So whatever the retirement path
+    /// leaves in that field is what an agent reads.
+    ///
+    /// The first half of this test is the PREMISE, asserted rather than assumed (#759's lesson: a
+    /// fixture whose planted value a downstream filter discards proves nothing). It pins that an
+    /// un-retired `goal` really does reach the response body — if that ever stops being true, this
+    /// fails here rather than passing vacuously below.
+    ///
+    /// Coordinates are the values measured live on #732, rounded to whole units so the `f32`→JSON
+    /// widening is exact and the comparison is not a float-formatting test.
+    ///
+    /// Mutation check: delete `*goal = None;` from `NavStatus::retire_to_idle` → the `nav_goal`
+    /// assertion below goes RED with the previous zone's coordinates in the diff.
+    #[tokio::test]
+    async fn debug_publishes_no_nav_goal_once_the_goal_is_retired_to_idle_732() {
+        let state = empty_state();
+        {
+            let mut s = state.nav.nav_state.lock().unwrap();
+            s.goal_id = 4;
+            s.state   = "navigating".into();
+            s.goal    = Some([2216.0, 579.0, -113.0]);
+            s.tier    = Some("preferred");
+        }
+        let v = debug_json(state.clone()).await;
+        assert_eq!(v["nav_goal"], serde_json::json!([2216.0, 579.0, -113.0]),
+            "PREMISE: an un-retired goal is published verbatim — the harm this test is about is \
+             reachable by a reader of GET /v1/observe/debug, not merely resident in memory");
+        assert_eq!(v["nav_goal_id"], serde_json::json!(4), "PREMISE: the identity stamp is published too");
+
+        // What every route to `idle` now calls — a zone change (`zoned`) among them.
+        state.nav.nav_state.lock().unwrap().retire_to_idle(Some("zoned"));
+
+        let v = debug_json(state).await;
+        assert_eq!(v["player"]["nav_state"], serde_json::json!("idle"));
+        assert_eq!(v["player"]["nav_reason"], serde_json::json!("zoned"));
+        assert_eq!(v["nav_goal"], serde_json::json!(null),
+            "#732: `idle` owns no goal. Coordinates are a per-zone namespace and carry no zone tag, \
+             so a goal left standing beside `idle` after a zone change is a well-formed answer about \
+             a world the reader is no longer in (docs/http-api.md: nav_goal is null for idle/stop)");
+        assert_eq!(v["nav_tier"], serde_json::json!(null),
+            "the per-route clearance tier goes with the route it described");
+        assert_eq!(v["nav_goal_id"], serde_json::json!(4),
+            "the IDENTITY stamp survives on purpose (#349) — it is what lets a caller match this \
+             `idle` to the goal it asked for; only the per-goal FACTS are retired");
+    }
+
     /// #471 (agent-honesty): the server placed two Mobs (consecutive spawn_ids, e.g. 526/527) at a
     /// byte-identical position; the wire disambiguates their names with a numeric suffix
     /// ("Geeda"/"Geeda00"), so in the name-keyed roster they survive as TWO entries. The observe
