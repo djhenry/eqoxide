@@ -407,6 +407,22 @@ impl Walker {
         // coordinate space. Abandon it — applying it here would drive the character at a route
         // through a zone it is no longer in.
         self.planner.cancel();
+        // #766: the identical sentence is true of the FINE plan in flight, and this line was
+        // MISSING. Not a considered asymmetry — archaeology: the coarse `cancel()` above predates
+        // the fine worker (it is in the zone reset at f2dce47^, before #382 existed), and #382's own
+        // diff added `local_planner.cancel()` beside the fine-plan drop at every OTHER site it
+        // touched — `clear_local_plan`, `stop_nav_blocked`, `resolve_goal`, `drive_teleport_detect`
+        // — while this reset, which already cleared `local_path`/`local_i`/`local_stuck_ticks`
+        // three lines up, was never revisited. No comment anywhere records a reason for the gap.
+        //
+        // HONEST SCOPE: I could not construct a production route on which a previous zone's fine
+        // reply is actually APPLIED in the new zone — every path from here to the next
+        // `local_planner.poll()` (which is gated on a non-empty `self.path`, cleared above) passes
+        // through a `clear_local_plan()` first. So this is defence in depth restoring #382's own
+        // pattern, not a leak I measured. What it does fix outright is the ARMED `pending` slot:
+        // `post_if_idle` is a no-op while one is in flight, so until the stale reply is drained the
+        // new zone's first fine plans are silently refused.
+        self.local_planner.cancel();
         self.awaiting_first_plan = false;
         // SAY WHY (#725 review B1). A bare `idle` here is indistinguishable from "nothing was ever
         // requested" — and this is the line that runs on a SUCCESSFUL `/v1/move/zone_cross`, so the
@@ -417,6 +433,11 @@ impl Walker {
         // (`nav_goal: [2216.87, 579.17, -113.25]` read in lfaydark, from the zone before it).
         // `NavStatus::retire_to_idle` also clears `tier` (no route committed → no per-route tier),
         // which is why the explicit clear that used to sit on the next line is gone: one owner.
+        // #766: and `local` — the fine tier's last verdict was about threading a corridor in the
+        // zone we just left, against a collision grid that no longer exists. Before this it was left
+        // standing until some LATER tick reached `resolve_goal` with no goal and called
+        // `clear_local_plan`; in between, `nav_local: {"state":"no_way_through", ...}` published
+        // beside `nav_state: idle` / `nav_reason: zoned`.
         self.set_nav_state_because("idle", Some(NAV_REASON_ZONED));
         // Publish the cleared snapshot so no consumer keeps drawing the previous zone's state.
         // Position: None — the old zone's coordinates would be a confident wrong answer in the
@@ -437,8 +458,14 @@ impl Walker {
     /// `reason` is the machine-readable WHY behind a terminal state.
     pub fn set_nav_state(&self, state: &str) { self.set_nav_state_because(state, None); }
 
-    /// Set the walker's state + reason. **Deliberately does NOT touch `local`** — the fine tier's
-    /// last word is an independent fact about a different tier (#382).
+    /// Set the walker's state + reason. **On any NON-`idle` state this deliberately does not touch
+    /// `local`** — the fine tier's last word is an independent fact about a different tier (#382),
+    /// and it is the evidence behind a terminal `blocked`/`no_path`.
+    ///
+    /// `idle` is the exception, and #766 made it one: an `idle` goes through
+    /// `NavStatus::retire_to_idle`, which retires `local` along with the rest of the finished goal's
+    /// facts. `idle` means the goal is over, so the fine tier's verdict about threading toward it is
+    /// over too. Nothing here touches the fine PLANNER — see `Walker::clear_local_plan`.
     pub fn set_nav_state_because(&self, state: &str, reason: Option<&str>) {
         // #725 review round 3, B1: enforce the `idle` row's universal at the WRITER, not per call
         // site. `nav_reason: null` on `idle` means exactly one thing — no nav request has been made
@@ -2642,6 +2669,105 @@ mod tests {
         assert_eq!(s.reason.as_deref(), Some(NAV_REASON_ZONED),
             "#725 B1: `idle` + `nav_reason: null` is the boot state — a SUCCESSFUL crossing must not \
              be reported with it, or success and 'your request was thrown away' are the same read");
+    }
+
+    /// **#766: a zone change must retire the FINE tier too — the published verdict AND the plan in
+    /// flight.** `reset_for_zone_change` cleared the coarse tier's every trace and the fine tier's
+    /// *walker-side* state (`local_path`, `local_i`, `local_stuck_ticks`) but left two things
+    /// standing: the published `NavStatus.local` (the field `/v1/observe/debug` serves as
+    /// `nav_local`) and `LocalPlanner`'s `pending` slot.
+    ///
+    /// **What this test measures, precisely.** It reads the row IMMEDIATELY after
+    /// `reset_for_zone_change` returns, with no intervening tick — which is the whole point. The
+    /// pre-fix code did eventually clear `local`, on some LATER tick that reached `resolve_goal`
+    /// with no goal and called `clear_local_plan`; the defect was the window in between, during
+    /// which a reader got `nav_local: {"state":"no_way_through"}` beside `nav_state: idle` /
+    /// `nav_reason: zoned`. So "the field is already retired at the instant the reset returns" is
+    /// the property, and an immediate read is what states it. This test does **not** measure how
+    /// WIDE that window was in wall-clock terms on a live client — see the PR body.
+    ///
+    /// Mutation check: delete `*local = None;` from `NavStatus::retire_to_idle` → the `local`
+    /// assertion goes RED. Delete `self.local_planner.cancel();` from `reset_for_zone_change` → the
+    /// `is_planning` assertion goes RED. They are separate lines in separate crates and each has its
+    /// own assertion here, so neither can ride on the other.
+    #[test]
+    fn a_zone_change_retires_the_fine_tiers_verdict_and_its_in_flight_plan_766() {
+        let col = open_plane(400.0);
+        let (mut w, nav, _intent, _view) = walker_with(col.clone());
+
+        // The previous zone's fine tier reached a verdict, and it is the UNHEALTHY kind — the only
+        // kind `observe.rs` publishes at all (it filters `threaded` out), so this is the shape a
+        // reader actually sees.
+        w.set_nav_local(Some(eqoxide_ipc::NavLocal {
+            state: "no_way_through".into(), reason: "search_closed".into(),
+            stuck_ticks: 7, plan_us: 1234,
+        }));
+        assert_eq!(nav.nav_state.lock().unwrap().local.as_ref().map(|l| l.state.clone()),
+            Some("no_way_through".to_string()),
+            "PREMISE: the observable field is genuinely loaded before the reset — otherwise the \
+             post-condition below would be satisfied by the default row and prove nothing");
+
+        // …and a fine plan is genuinely in flight, posted the way `drive_walk` posts one.
+        let c = col.read().unwrap().as_ref().cloned().expect("PREMISE: the fixture has collision");
+        assert!(w.local_planner.post_if_idle(crate::planner::LocalRequest {
+            gen: 0, // assigned by the planner
+            start: [0.0, 0.0, 0.0], goal: [20.0, 0.0, 0.0],
+            cell: 2.0, bound: 40.0, carrot_tol: 4.0, collision: c,
+        }), "PREMISE: the post succeeded, so there IS a plan to abandon");
+        assert!(w.local_planner.is_planning(),
+            "PREMISE: the fine planner's `pending` slot is armed — without this the cancel \
+             assertion below would pass on a planner that was never busy");
+
+        w.reset_for_zone_change();
+
+        // Read the row RIGHT HERE — no tick between the reset and this read.
+        let after_reset = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(after_reset.state, "idle");
+        assert_eq!(after_reset.reason.as_deref(), Some(NAV_REASON_ZONED));
+        assert_eq!(after_reset.local, None,
+            "#766: the fine tier's verdict is about threading a corridor in the zone we just LEFT, \
+             computed against a collision grid that no longer exists — publishing it beside \
+             `idle`/`zoned` tells the agent something false about the zone it is standing in");
+        assert!(!w.local_planner.is_planning(),
+            "#766: and the fine plan in flight must be abandoned like the coarse one — while \
+             `pending` is armed, `post_if_idle` is a no-op, so the NEW zone's first fine plans are \
+             silently refused until the stale reply drains");
+    }
+
+    /// **#766, the OTHER walker route to `idle` — and it is here to MEASURE a claim, not to guard a
+    /// line.** The fix's rationale (in `NavStatus::retire_to_idle`'s doc comment and this PR's body)
+    /// says four of the six routes to `idle` already cleared `local` before #766, two of them —
+    /// `goal_dropped` and `respawned` — because `resolve_goal`'s no-goto branch calls
+    /// `clear_local_plan()` on the same tick, *before* it retires. That was read off the source, and
+    /// a mechanism claim read off the source is exactly the kind this project keeps getting wrong,
+    /// so it is run here instead.
+    ///
+    /// **Deliberately NOT mutation-pinned.** Deleting `*local = None;` from `retire_to_idle` leaves
+    /// this GREEN, because `clear_local_plan()` gets there first — that is the whole finding. Read
+    /// it as a measurement of the pre-existing behaviour and a regression guard on this route, not
+    /// as evidence for the fix.
+    #[test]
+    fn the_goal_dropped_route_already_cleared_the_fine_verdict_before_766() {
+        let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        let gs = eqoxide_core::game_state::GameState::new();
+        *nav.goto_target.lock().unwrap() = Some((10.0, 20.0, 3.0));
+        w.set_nav_state_because("following", None);
+        w.set_nav_local(Some(eqoxide_ipc::NavLocal {
+            state: "no_way_through".into(), reason: "search_closed".into(),
+            stuck_ticks: 7, plan_us: 1234,
+        }));
+        assert!(nav.nav_state.lock().unwrap().local.is_some(),
+            "PREMISE: the verdict is loaded, and `following` is non-terminal so the tick below \
+             genuinely reaches the retirement branch");
+
+        *nav.goto_target.lock().unwrap() = None; // the leader despawned
+        assert!(w.resolve_goal(&gs).is_none());
+
+        let s = nav.nav_state.lock().unwrap();
+        assert_eq!(s.reason.as_deref(), Some(NAV_REASON_GOAL_DROPPED));
+        assert_eq!(s.local, None,
+            "#766: this route was never the leaky one — `clear_local_plan()` runs on the same tick. \
+             Measured here so the PR's four-of-six claim is not just read off the source.");
     }
 
     /// **#725 review round 3: the writer-level guard itself is pinned.** The test above is a

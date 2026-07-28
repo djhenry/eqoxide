@@ -2943,6 +2943,49 @@ mod tests {
              `idle` to the goal it asked for; only the per-goal FACTS are retired");
     }
 
+    /// **#766 (agent-honesty) — the OBSERVER half of the fine tier's retirement.**
+    ///
+    /// The sibling of the test above, for the field #732 left standing. `nav_local` is read off the
+    /// same cloned `NavStatus` and passed through exactly one filter — `.filter(|l| l.state !=
+    /// "threaded")` — so an UNHEALTHY verdict reaches the response body verbatim, and an unhealthy
+    /// verdict is the only kind an agent can ever see. That makes `no_way_through` the right fixture
+    /// and makes the first half of this test a real premise: it asserts that the planted verdict
+    /// genuinely publishes, so the `null` below is the retirement's doing and not the filter's.
+    ///
+    /// Mutation check: delete `*local = None;` from `NavStatus::retire_to_idle`
+    /// (`crates/eqoxide-ipc/src/lib.rs`) → the `nav_local` assertion goes RED with the previous
+    /// zone's `no_way_through` object in the diff.
+    #[tokio::test]
+    async fn debug_publishes_no_nav_local_once_the_goal_is_retired_to_idle_766() {
+        let state = empty_state();
+        {
+            let mut s = state.nav.nav_state.lock().unwrap();
+            s.goal_id = 4;
+            s.state   = "navigating".into();
+            s.local   = Some(eqoxide_ipc::NavLocal {
+                state: "no_way_through".into(), reason: "search_closed".into(),
+                stuck_ticks: 7, plan_us: 1234,
+            });
+        }
+        let v = debug_json(state.clone()).await;
+        assert_eq!(v["nav_local"]["state"], serde_json::json!("no_way_through"),
+            "PREMISE: an un-retired UNHEALTHY fine verdict is published — the harm is reachable by a \
+             reader of GET /v1/observe/debug, not merely resident in memory");
+        assert_eq!(v["nav_local"]["stuck_ticks"], serde_json::json!(7),
+            "PREMISE: and the whole object comes through, not just a state string");
+
+        // The zone-change retirement, which is where #766 was reported.
+        state.nav.nav_state.lock().unwrap().retire_to_idle(Some("zoned"));
+
+        let v = debug_json(state).await;
+        assert_eq!(v["player"]["nav_state"], serde_json::json!("idle"));
+        assert_eq!(v["player"]["nav_reason"], serde_json::json!("zoned"));
+        assert_eq!(v["nav_local"], serde_json::json!(null),
+            "#766: `no_way_through` beside `idle`/`zoned` describes a corridor in the zone the \
+             reader has LEFT, computed against a collision grid that no longer exists — the fine \
+             tier's verdict is about threading toward a goal, so it retires with the goal");
+    }
+
     /// #471 (agent-honesty): the server placed two Mobs (consecutive spawn_ids, e.g. 526/527) at a
     /// byte-identical position; the wire disambiguates their names with a numeric suffix
     /// ("Geeda"/"Geeda00"), so in the name-keyed roster they survive as TWO entries. The observe

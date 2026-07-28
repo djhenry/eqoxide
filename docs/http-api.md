@@ -846,6 +846,15 @@ said. It is **`null` while the tier is healthy** (a complete fine route to its c
 > *goal* unreachable, so a tight doorway must never be able to tell an agent its destination does not
 > exist. Only the coarse planner, which closes the whole zone's frontier, may say `no_path`.
 
+**`nav_local` is `null` on every `idle`, whichever `nav_reason` got you there** (#766) — `zoned`,
+`goal_dropped`, `respawned`, `stopped`, `goto_superseded`, `zone_cross_dropped_unhandled`. The fine
+tier's verdict is about threading toward *a goal*, so when the goal is retired the verdict goes with
+it, exactly like `nav_goal` and `nav_tier` (#732). The `zoned` case is the sharp one: a `no_way_through`
+left standing across a crossing describes a corridor in the zone you just left, computed against a
+collision grid that no longer exists — and it is the only kind that publishes, because a healthy
+`threaded` verdict is filtered out anyway. It **does** survive a terminal `blocked` / `no_path`, on
+purpose: there it is the *evidence* behind the failure you are being told about.
+
 **Why this field exists.** The fine tier is bounded *spatially* (a 40 u window) plus a deterministic
 node cap (#394 removed its old 150 ms wall clock, so its answer no longer depends on machine load), and
 until #382 it ran **inline on the network thread**, every nav tick — the last A* left on that thread, a

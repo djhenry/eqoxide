@@ -1426,6 +1426,23 @@ impl NavStatus {
     /// the same construction `AssetSyncState::slots()` uses in `eqoxide-ipc::asset_sync`. Note the
     /// weaker precondition: `NavStatus`'s fields are `pub` and read directly by several crates, so
     /// this pins the *retirement path* only. It does not stop other code writing the fields.
+    ///
+    /// **#766 moved `local` from KEPT to retired.** #732 left it standing with a `_keep_local`
+    /// binding on the grounds that the FINE tier is "a different tier" whose clearing
+    /// `Walker::clear_local_plan` owns. That reasoning holds for the tier's *machinery* and it still
+    /// does — this function does not touch `LocalPlanner`, and every NON-`idle` state keeps `local`
+    /// exactly as before, which is what preserves #382's deliberate keep-the-fine-verdict-on-`blocked`
+    /// design (`Walker::stop_nav_blocked` publishes `blocked`/`no_path`, never `idle`, so it does not
+    /// come through here). It does not hold for the published FIELD on an `idle` row: `NavLocal` is
+    /// the fine planner's verdict on threading toward *the goal that just ended*, so it is a per-goal
+    /// fact by the same argument as `tier`. Two of the six routes left it standing (`zoned` — #766's
+    /// report — and `zone_cross_dropped_unhandled`); the other four already cleared it — `goal_dropped`
+    /// and `respawned` because `Walker::resolve_goal`'s no-goto branch calls `clear_local_plan()` on
+    /// the same tick before it retires, `stopped` and `goto_superseded` through an explicit
+    /// `s.local = None;` in `CommandState::stamp_new_goal`, now deleted as redundant. Both halves of
+    /// that four are RUN, not read: `eqoxide-nav`'s
+    /// `the_goal_dropped_route_already_cleared_the_fine_verdict_before_766` and `eqoxide-command`'s
+    /// `every_command_side_retirement_retires_the_fine_tiers_verdict_766`.
     pub fn retire_to_idle(&mut self, why: Option<&str>) {
         // The same writer-level guard as `Walker::set_nav_state_because` and
         // `CommandState::stamp_new_goal`: on `idle`, `nav_reason: null` is reserved for boot (#725).
@@ -1438,10 +1455,12 @@ impl NavStatus {
             // Zeroing or bumping it here would break that correlation.
             goal_id: _keep_goal_id,
             goal, blocked_goal, blocked_frontier, tier,
-            // KEPT, deliberately — `local` is the FINE tier's own last word, an independent fact
-            // about a different tier (#382), and `Walker::clear_local_plan` owns clearing it. Wiring
-            // it in here would silently take that ownership away from #382's design.
-            local: _keep_local,
+            // #766: RETIRED, not kept. The fine tier's verdict is about threading toward the goal
+            // that is now over — a `no_way_through` published beside `idle`/`zoned` asserts something
+            // about a corridor in a zone we have left, computed against a collision grid that no
+            // longer exists. See the "#766 moved `local`" paragraph above for why this does not
+            // undo #382's ownership: only the `idle` row is touched, and only the published field.
+            local,
         } = self;
         *state  = "idle".to_string();
         *reason = why.map(str::to_string);
@@ -1449,6 +1468,7 @@ impl NavStatus {
         *blocked_goal     = None;
         *blocked_frontier = None;
         *tier             = None;
+        *local            = None;
     }
 }
 

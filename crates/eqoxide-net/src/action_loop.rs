@@ -5237,6 +5237,62 @@ mod tests {
              match this `idle` to the goal it issued. Only the per-goal facts are retired.");
     }
 
+    /// **#766 (agent-honesty), the sibling of the test above: `nav_local` must not survive a zone
+    /// change either.** #732 retired `nav_goal` and `nav_tier`; the fine tier's verdict (#382) was
+    /// left standing, so the same crossing that produced #732's measured `idle` + stale `nav_goal`
+    /// pair could also publish `nav_local: {"state":"no_way_through", …}` beside `nav_state: idle` /
+    /// `nav_reason: zoned` — an assertion about a corridor in the zone we have left, computed
+    /// against a collision grid that no longer exists.
+    ///
+    /// Driven through the REAL production hook for the same reason: `sync_zone_points` observing a
+    /// new `gs.world.zone_name` is what the packet path calls, and it is the only thing that reaches
+    /// `Walker::reset_for_zone_change` in production. `eqoxide-nav`'s
+    /// `a_zone_change_retires_the_fine_tiers_verdict_and_its_in_flight_plan_766` pins the walker
+    /// call directly (and the `LocalPlanner` cancel, which is not observable from here);
+    /// `eqoxide-http`'s `debug_publishes_no_nav_local_once_the_goal_is_retired_to_idle_766` pins the
+    /// JSON end. This one pins that the production path in between actually runs it.
+    ///
+    /// Mutation check: delete `*local = None;` from `NavStatus::retire_to_idle`
+    /// (`crates/eqoxide-ipc/src/lib.rs`) → the post-zone `local` assertion goes RED.
+    #[tokio::test]
+    async fn a_zone_change_retires_the_previous_zones_nav_local_766() {
+        let (mut al, nav, command, _collision, _za) = shared_nav_action_loop();
+        let mut gs = GameState::new();
+        gs.world.zone_name = "gfaydark".into();
+        al.sync_zone_points(&gs); // settle `current_zone` so the next call is a real CHANGE
+
+        let _goal_id = command.request_goto((2216.0, 579.0, -113.0));
+        al.walker.set_nav_state_because("navigating", None);
+        // The fine tier's last word in the OLD zone. Planted after the transition for the same
+        // reason #732's `tier` is: otherwise the post-condition is satisfied by the default row.
+        // `no_way_through` specifically, because `observe.rs` filters `threaded` out — the
+        // unhealthy verdict is the only kind that reaches an agent at all.
+        nav.nav_state.lock().unwrap().local = Some(eqoxide_ipc::NavLocal {
+            state: "no_way_through".into(), reason: "search_closed".into(),
+            stuck_ticks: 7, plan_us: 1234,
+        });
+        {
+            let s = nav.nav_state.lock().unwrap();
+            assert_eq!(s.local.as_ref().map(|l| l.state.clone()), Some("no_way_through".to_string()),
+                "PREMISE: the field an observer reads really is loaded with the OLD zone's verdict");
+            assert_eq!(s.state, "navigating",
+                "PREMISE: a NON-terminal, non-idle state — so the retirement under test is what \
+                 clears it, not some earlier transition");
+        }
+
+        gs.begin_zone_in();
+        gs.world.zone_name = "lfaydark".into();
+        al.sync_zone_points(&gs);
+
+        let s = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(s.state, "idle", "a zone change ends navigation (#248)");
+        assert_eq!(s.reason.as_deref(), Some(eqoxide_nav::walker::NAV_REASON_ZONED));
+        assert_eq!(s.local, None,
+            "#766: the fine tier's verdict is a per-goal fact by the same argument as `nav_goal` \
+             and `nav_tier` — when the goal is retired at the zone line, the verdict about \
+             threading toward it goes with it");
+    }
+
     /// REAPER: a zone change while a buy is parked fires `Unconfirmed` for the stranded Sender and
     /// clears `pending_buy`, so a shop echo in the NEW zone can't mis-correlate it. Driven through the
     /// real `sync_zone_points` zone-change hook.
