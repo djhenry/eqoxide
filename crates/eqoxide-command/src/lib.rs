@@ -84,6 +84,7 @@
 //!    already removed its field — that is the eventual end state, NOT what a Wave-2 domain does.)
 
 mod combat;
+mod slot;
 /// A3 Migration 1 (#448): the reusable Command-with-result infra. `CommandResult<T>` is the honest
 /// three-way outcome (Resolved/Refused/Unconfirmed) an HTTP handler awaits so it reports the TRUE
 /// server outcome instead of a premature queued-action 200. See `eqoxide_ipc::result`'s module doc

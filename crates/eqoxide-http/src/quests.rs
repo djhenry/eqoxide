@@ -2,6 +2,7 @@
 
 use axum::{extract::State, http::StatusCode, routing::{get, post}, Json, Router};
 use super::*;
+use crate::refusal::Refusal;
 
 pub(super) fn router() -> Router<HttpState> {
     Router::new()
@@ -39,6 +40,16 @@ async fn get_offers(State(s): State<HttpState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "count": offers.len(), "offers": offers }))
 }
 
+// ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ──────────────────────────
+// Each `/v1/quests/*` verb queues into a single-slot mailbox the net thread drains once per tick.
+// Before #347 a second request inside that window OVERWROTE the pending one and BOTH callers were
+// told `200`, so one of the two actions silently never happened. The slot now refuses the second
+// write and keeps the first. A 409 here means the request was NOT queued and definitively did not
+// happen — retrying after the drain is safe. `accept` and `decline` share a slot (a decline is an
+// accept of task 0), so either can 409 the other.
+const BUSY_TASK: &str = "a task accept/decline is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_CANCEL: &str = "a task cancel is already queued and undrained — retry in a moment (it was NOT queued)";
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaskIdBody { task_id: u32 }
@@ -58,7 +69,7 @@ async fn post_accept(
     if !known {
         return (StatusCode::BAD_REQUEST, format!("no pending task offer with task_id={task_id}"));
     }
-    s.command.request_accept_task(task_id);
+    if let Some(busy) = s.command.request_accept_task(task_id).refused(BUSY_TASK) { return busy; }
     tracing::info!("quests: queued accept task_id={task_id}");
     (StatusCode::OK, format!("accepting task_id={task_id}"))
 }
@@ -69,7 +80,7 @@ async fn post_decline(State(s): State<HttpState>) -> (StatusCode, String) {
     if s.quest.task_offers_shared.lock().unwrap().is_empty() {
         return (StatusCode::OK, "no pending task offers".into());
     }
-    s.command.request_accept_task(0);
+    if let Some(busy) = s.command.request_accept_task(0).refused(BUSY_TASK) { return busy; }
     tracing::info!("quests: queued decline-all");
     (StatusCode::OK, "declining pending task offer(s)".into())
 }
@@ -90,7 +101,7 @@ async fn post_cancel(
     if !known {
         return (StatusCode::BAD_REQUEST, format!("no active task with task_id={task_id}"));
     }
-    s.command.request_cancel_task(task_id);
+    if let Some(busy) = s.command.request_cancel_task(task_id).refused(BUSY_CANCEL) { return busy; }
     tracing::info!("quests: queued cancel task_id={task_id}");
     (StatusCode::OK, format!("cancelling task_id={task_id}"))
 }
@@ -103,6 +114,20 @@ pub(crate) mod tests {
     use tower::ServiceExt;
 
     use crate::testkit::empty_state;
+
+    fn accept_req(task_id: u32) -> Request<Body> {
+        Request::post("/accept")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"task_id":{task_id}}}"#)))
+            .unwrap()
+    }
+
+    fn cancel_req(task_id: u32) -> Request<Body> {
+        Request::post("/cancel")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"task_id":{task_id}}}"#)))
+            .unwrap()
+    }
 
     #[tokio::test]
     async fn accept_unknown_task_id_is_400() {
@@ -183,5 +208,59 @@ pub(crate) mod tests {
         // (status == Active -> != Active) would also yield a count of 1 (task_id 2), but with
         // the wrong task. See #355 M3.
         assert_eq!(json["tasks"][0]["task_id"], 1);
+    }
+
+    /// #347 step 2 (review round 1, B1): two accepts inside one undrained tick. Before the fix the
+    /// second OVERWROTE the first and BOTH callers were told `200`, so one of the two tasks was
+    /// never accepted while the agent believed both were.
+    #[tokio::test]
+    async fn a_second_accept_before_the_drain_is_409_and_the_first_survives() {
+        let state = empty_state();
+        state.quest.task_offers_shared.lock().unwrap().extend([
+            eqoxide_core::game_state::TaskOffer {
+                task_id: 42, npc_id: 7, title: "First".into(), description: String::new(), has_rewards: false,
+            },
+            eqoxide_core::game_state::TaskOffer {
+                task_id: 43, npc_id: 7, title: "Second".into(), description: String::new(), has_rewards: false,
+            },
+        ]);
+        let command = state.command.clone();
+        let app = router().with_state(state);
+
+        let first = app.clone().oneshot(accept_req(42)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app.oneshot(accept_req(43)).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT,
+            "the second accept must be refused, not silently swallowed");
+
+        assert_eq!(command.take_accept_task(), Some(42),
+            "the FIRST accept must be the one that survives to the net thread");
+        assert_eq!(command.take_accept_task(), None,
+            "and nothing else may be queued behind it");
+    }
+
+    /// Same promise on the `cancel` slot, which is a different mailbox from `accept`.
+    #[tokio::test]
+    async fn a_second_cancel_before_the_drain_is_409_and_the_first_survives() {
+        let state = empty_state();
+        state.quest.task_log.lock().unwrap().extend([
+            eqoxide_core::game_state::ActiveTask { task_id: 42, sequence_number: 3, ..Default::default() },
+            eqoxide_core::game_state::ActiveTask { task_id: 43, sequence_number: 4, ..Default::default() },
+        ]);
+        let command = state.command.clone();
+        let app = router().with_state(state);
+
+        let first = app.clone().oneshot(cancel_req(42)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app.oneshot(cancel_req(43)).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT,
+            "the second cancel must be refused, not silently swallowed");
+
+        assert_eq!(command.take_cancel_task(), Some(42),
+            "the FIRST cancel must be the one that survives to the net thread");
+        assert_eq!(command.take_cancel_task(), None,
+            "and nothing else may be queued behind it");
     }
 }

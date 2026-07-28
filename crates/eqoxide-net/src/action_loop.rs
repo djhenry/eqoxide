@@ -754,6 +754,39 @@ impl ActionLoop {
         inv.extend(gs.inventory.iter().cloned());
     }
 
+    /// Apply a slot move to `gs` **and immediately republish** the inventory (#347, review round 1,
+    /// finding B2).
+    ///
+    /// EQEmu sends no OP_MoveItem echo for a move we initiated, so this loop mirrors the move into
+    /// `gs.inventory` itself. `sync_inventory` — the only thing that copies `gs.inventory` into the
+    /// slot HTTP reads — is called from the *packet* loop (`gameplay.rs`), never from `tick()`. So
+    /// a bare `gs.move_item(..)` here left the published inventory describing the layout as it was
+    /// BEFORE our own move, until the next inbound packet happened to arrive.
+    ///
+    /// That is now load-bearing rather than merely stale, because #347 step 1 turned that published
+    /// snapshot into a door check: `/v1/inventory/move`, `/v1/combat/scribe`, `/v1/interact/give`
+    /// and `/v1/merchant/sell` all refuse `404 no item in slot N` when the snapshot says the source
+    /// slot is empty. Against a stale snapshot that 404 is a confident falsehood about a request
+    /// that would have worked — the agent-honesty invariant inverted by the check meant to serve it.
+    ///
+    /// Every local mirror edit in this file goes through this method or
+    /// [`ActionLoop::mirror_remove_item`]; the test
+    /// `every_local_inventory_mirror_edit_in_this_file_goes_through_a_republishing_helper` fails if a
+    /// raw `gs.move_item(` / `gs.inventory.retain(` reappears in this file outside them.
+    fn mirror_move_item(&self, gs: &mut GameState, from: i32, to: i32) {
+        gs.move_item(from, to);
+        self.sync_inventory(gs);
+    }
+
+    /// Drop the item in `slot` from `gs` **and immediately republish** — the deletion half of
+    /// [`ActionLoop::mirror_move_item`], for the case where the server removes an item without
+    /// telling us (the scribed scroll it consumes off the cursor). Same staleness reason, same
+    /// republish.
+    fn mirror_remove_item(&self, gs: &mut GameState, slot: i32) {
+        gs.inventory.retain(|i| i.slot != slot);
+        self.sync_inventory(gs);
+    }
+
     /// Deliver the freshly-parsed `/who all` roster to the pending GET /v1/observe/who (#300). Called
     /// from the gameplay drain loop right after an OP_WhoAllResponse updates `gs.who_roster`. No-op if
     /// no request is in flight (e.g. an unsolicited/duplicate response).
@@ -2142,7 +2175,7 @@ impl ActionLoop {
                 if let Some(from_slot) = from {
                     if from_slot != SLOT_CURSOR {
                         stream.send_app_packet(OP_MOVE_ITEM, &build_move_item(from_slot, SLOT_CURSOR));
-                        gs.move_item(from_slot as i32, SLOT_CURSOR as i32); // mirror locally
+                        self.mirror_move_item(gs, from_slot as i32, SLOT_CURSOR as i32);
                         tracing::info!("EQ: scribe — moved scroll slot {} → cursor", from_slot);
                     }
                 }
@@ -2155,7 +2188,7 @@ impl ActionLoop {
                 // that deletion locally — otherwise the (now server-deleted) scroll stays stuck on
                 // cursor slot 33 in our view, blocking looting and any later cursor move (#271). No
                 // OP_DeleteItem is sent: the server already removed it, so that would double-delete.
-                gs.inventory.retain(|i| i.slot != SLOT_CURSOR as i32);
+                self.mirror_remove_item(gs, SLOT_CURSOR as i32);
             }
             let what = match scribing { 0 => "scribe", 1 => "memorize", _ => "unmem" };
             tracing::info!("EQ: {what} spell={spell_id} slot={slot}");
@@ -2352,7 +2385,7 @@ impl ActionLoop {
             stream.send_app_packet(OP_MOVE_ITEM, &build_move_item(from_slot, to_slot));
             // EQEmu applies the move silently (no echo), so mirror it into our snapshot or
             // /inventory goes stale and the next move corrupts it (phantom items).
-            gs.move_item(from_slot as i32, to_slot as i32);
+            self.mirror_move_item(gs, from_slot as i32, to_slot as i32);
             tracing::info!("EQ: move item — from_slot={} to_slot={} qty=0(whole)", from_slot, to_slot);
             gs.log_msg("inventory", &format!("Moved item (slot {} -> {})", from_slot, to_slot));
         }
@@ -2591,7 +2624,7 @@ impl ActionLoop {
                 // slot needs RoF2 typeTrade encoding (not possessions) — build_move_item_to_trade emits
                 // the 28-byte structured MoveItem the server actually accepts (eqoxide#26).
                 stream.send_app_packet(OP_MOVE_ITEM, &build_move_item_to_trade(SLOT_CURSOR, SLOT_TRADE_BEGIN));
-                gs.move_item(SLOT_CURSOR as i32, SLOT_TRADE_BEGIN as i32); // mirror locally
+                self.mirror_move_item(gs, SLOT_CURSOR as i32, SLOT_TRADE_BEGIN as i32);
                 let mut accept = [0u8; 8];
                 accept[0..4].copy_from_slice(&gs.player_id.to_le_bytes());
                 // unknown4 = 0 (already zeroed).
@@ -2742,7 +2775,7 @@ impl ActionLoop {
         // server, so the item never reached the cursor (eqoxide#26).
         if from_slot != SLOT_CURSOR {
             stream.send_app_packet(OP_MOVE_ITEM, &build_move_item(from_slot, SLOT_CURSOR));
-            gs.move_item(from_slot as i32, SLOT_CURSOR as i32); // mirror locally
+            self.mirror_move_item(gs, from_slot as i32, SLOT_CURSOR as i32);
         }
         // Send OP_TradeRequest { to_mob_id = npc, from_mob_id = player }.
         let mut req = [0u8; 8];
@@ -6480,5 +6513,211 @@ mod tests {
         assert_eq!(&p[8..12], &(3.5f32 + eqoxide_core::coord::WIRE_Z_OFFSET).to_le_bytes(),
             "Z field @8 = foot + WIRE_Z_OFFSET (wire datum)");
         assert_eq!(p[12], 1, "type = Collision (benign; skips teleport/zoneline cheat checks)");
+    }
+
+    // ── #347 review round 1, finding B2: the client's own mirror must be PUBLISHED ──────────────
+    //
+    // `sync_inventory` is called from the packet loop (`gameplay.rs`), never from `tick()`. Every
+    // local mirror edit in this file therefore used to leave the published inventory describing the
+    // layout as it was BEFORE our own move, until the next inbound packet happened to arrive. #347
+    // step 1 turned that published snapshot into a door check (`404 no item in slot N`), so the
+    // staleness stopped being cosmetic and became a confident falsehood about a valid request.
+    //
+    // The seam: these tests assert on `inventory_slots.inventory`, which is *exactly* the slot the
+    // HTTP door checks read (`s.inventory_slots.inventory` in `inventory.rs` / `combat.rs` /
+    // `interact.rs` / `merchant.rs`). The other half of the link — that a request whose source slot
+    // is absent from that slot is refused 404, and one whose source slot is present is accepted —
+    // is pinned by `eqoxide-http`'s own `move_from_an_empty_slot_is_404_and_queues_nothing` and
+    // `move_from_an_occupied_slot_is_200_and_queues_it`. Neither crate can host both halves:
+    // `test_stream` is `pub(crate)` here, so the app crate's integration tests cannot drive a real
+    // drain.
+
+    fn inv_item(slot: i32, item_id: u32) -> eqoxide_core::game_state::InvItem {
+        eqoxide_core::game_state::InvItem {
+            slot, item_id, name: "Bone Chips".into(), charges: 1, ..Default::default()
+        }
+    }
+
+    /// Slots present in the PUBLISHED inventory (the one `/v1/inventory` and every #347 door check
+    /// read), sorted.
+    fn published_slots(al: &ActionLoop) -> Vec<i32> {
+        let mut v: Vec<i32> = al.inventory_slots.inventory.lock().unwrap().iter().map(|i| i.slot).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// **B2, the core.** Drive the REAL `/v1/inventory/move` path — `request_inventory_move` into the
+    /// real command slot, then the real `drain_move_item` — and assert the PUBLISHED inventory agrees
+    /// with `gs` the moment the drain returns, with no inbound packet and no `sync_inventory` call in
+    /// between. Before the fix the published slot list was still `[23]` here while `gs` said `[30]`:
+    /// a follow-up `/v1/combat/scribe from=30` would have been refused `404 no item in slot 30` for
+    /// an item that is there, and `from=23` accepted for an item that is not.
+    ///
+    /// **Mutation check:** replace `self.mirror_move_item(gs, ..)` in `drain_move_item` with the old
+    /// `gs.move_item(..)` → this goes RED on the published list (`[23]` vs `[30]`) while the `gs`
+    /// assertion below still passes, which is precisely the divergence the reviewer described.
+    #[tokio::test]
+    async fn a_drained_move_republishes_the_inventory_before_any_inbound_packet() {
+        let mut al = new_loop();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let mut gs = GameState::new();
+        gs.inventory.push(inv_item(23, 13073));
+        al.sync_inventory(&gs); // the last publish an inbound packet would have done
+        assert_eq!(published_slots(&al), vec![23]);
+
+        assert!(al.command.request_inventory_move(23, 30), "the slot must start free");
+        al.drain_move_item(&mut stream, &mut gs);
+
+        assert_eq!(gs.inventory.iter().map(|i| i.slot).collect::<Vec<_>>(), vec![30],
+            "the loop's own view moved the item");
+        assert_eq!(published_slots(&al), vec![30],
+            "the PUBLISHED inventory — the one every #347 door check reads — must agree with `gs` \
+             the moment the drain returns, with no inbound packet to trigger sync_inventory");
+    }
+
+    /// The same promise for the deletion half: the RoF2 server consumes the scribed scroll off the
+    /// cursor and sends nothing back, so the loop deletes it locally. An unpublished delete leaves a
+    /// phantom item in the door check's view — the mirror-image lie, a `200` for a move of something
+    /// that is gone.
+    #[tokio::test]
+    async fn a_mirrored_delete_republishes_the_inventory_too() {
+        let al = new_loop();
+        let mut gs = GameState::new();
+        gs.inventory.push(inv_item(SLOT_CURSOR as i32, 13073));
+        gs.inventory.push(inv_item(23, 1001));
+        al.sync_inventory(&gs);
+        assert_eq!(published_slots(&al), vec![23, SLOT_CURSOR as i32]);
+
+        al.mirror_remove_item(&mut gs, SLOT_CURSOR as i32);
+
+        assert_eq!(published_slots(&al), vec![23],
+            "the consumed scroll must leave the PUBLISHED inventory immediately, not at the next \
+             inbound packet");
+    }
+
+    /// Every raw local-mirror edit in `src`, as `(line, enclosing fn)`.
+    ///
+    /// **Round-2 review, R2-1 corollary.** The first cut matched a single PHYSICAL line, so
+    /// `gs\n    .inventory\n    .retain(..)` evaded it — the identical hole the HTTP caller guard
+    /// had, inherited from the same copy-a-grep-into-a-test habit. Continuation lines that begin
+    /// with `.` are joined onto their statement and spaces touching a `.` are dropped, so a wrapped
+    /// method chain is byte-identical to its one-line spelling. (`eqoxide-http`'s
+    /// `no_silent_overwrite_guard` does the full normalising version — comments, string literals,
+    /// the lot; this file only needs the method-chain case, and says so rather than implying it is
+    /// the same strength.)
+    fn raw_mirror_edits(src: &str) -> Vec<(usize, String)> {
+        // Split so this scanner's own source is not itself a match (the first cut of this guard
+        // flagged its own needle line).
+        let move_needle   = concat!("gs.", "move_item(");
+        let retain_needle = concat!("gs.", "inventory.retain(");
+
+        // Blank string literals, then cut a trailing `//` comment, then drop spaces touching a `.`.
+        // Blanking is not decoration: without it this scanner reads its OWN table-test snippets as
+        // code and reports three offenders in the test that exists to pin it — the same
+        // flagged-itself failure the first cut of this guard hit, one level up.
+        let sanitize = |s: &str| -> String {
+            let mut out = String::new();
+            let mut chars = s.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    out.push('"');
+                    while let Some(d) = chars.next() {
+                        if d == '\\' { chars.next(); continue; }
+                        if d == '"' { out.push('"'); break; }
+                    }
+                    continue;
+                }
+                if c == '/' && chars.peek() == Some(&'/') { break; }
+                out.push(c);
+            }
+            let mut squeezed = String::new();
+            let bytes: Vec<char> = out.chars().collect();
+            for (i, &c) in bytes.iter().enumerate() {
+                if c == ' ' {
+                    let prev = squeezed.chars().last();
+                    let next = bytes.get(i + 1).copied();
+                    if prev == Some('.') || next == Some('.') { continue; }
+                }
+                squeezed.push(c);
+            }
+            squeezed
+        };
+
+        // Join `.`-continuations onto the statement they belong to, keeping its FIRST line number.
+        let mut logical: Vec<(usize, String)> = Vec::new();
+        for (n, line) in src.lines().enumerate() {
+            let t = line.trim();
+            if t.starts_with('.') && !t.starts_with("..") {
+                if let Some(last) = logical.last_mut() { last.1.push_str(t); continue; }
+            }
+            logical.push((n + 1, line.to_string()));
+        }
+
+        let mut current_fn = String::new();
+        let mut hits = Vec::new();
+        for (n, line) in logical {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix("fn ").or_else(|| t.strip_prefix("pub fn "))
+                .or_else(|| t.strip_prefix("pub(crate) fn ")) {
+                current_fn = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            }
+            let squeezed = sanitize(&line);
+            if !(squeezed.contains(move_needle) || squeezed.contains(retain_needle)) { continue; }
+            hits.push((n, current_fn.clone()));
+        }
+        hits
+    }
+
+    /// R2-1 corollary, pinned: the wrapped spelling must be found. Without this, the joiner could be
+    /// deleted and every mirror-edit guarantee below would silently weaken back to a line grep.
+    #[test]
+    fn the_mirror_edit_scanner_sees_a_wrapped_method_chain() {
+        let one_line = "fn f() {\n    gs.inventory.retain(|i| i.slot != slot);\n}";
+        let wrapped  = "fn f() {\n    gs\n        .inventory\n        .retain(|i| i.slot != slot);\n}";
+        let spaced   = "fn f() {\n    gs . inventory . retain(|i| i.slot != slot);\n}";
+        let prose    = "fn f() {\n    // gs.inventory.retain(..) is the shape\n}";
+        for (label, src) in [("one line", one_line), ("wrapped", wrapped), ("spaced", spaced)] {
+            let hits = raw_mirror_edits(src);
+            assert_eq!(hits.len(), 1, "{label}: expected one mirror edit, got {hits:?}");
+            assert_eq!(hits[0].1, "f", "{label}: wrong enclosing fn");
+        }
+        assert!(raw_mirror_edits(prose).is_empty(), "a comment is not a mirror edit");
+
+        // The blanking half, pinned for the same reason: these are what this test's own snippets
+        // look like to the scanner, and a regression here makes the guard flag itself rather than
+        // the code it protects.
+        let in_string = "fn f() {\n    let s = \"gs.inventory.retain(x)\";\n}";
+        assert!(raw_mirror_edits(in_string).is_empty(), "a string literal is not a mirror edit");
+        let trailing = "fn f() {\n    let x = 1; // gs.inventory.retain(x)\n}";
+        assert!(raw_mirror_edits(trailing).is_empty(), "a trailing comment is not a mirror edit");
+    }
+
+    /// A guard, not a substitute for the two behaviour tests above: it catches the *sixth* mirror
+    /// edit someone adds next year, which no existing test would cover. It is deliberately narrow —
+    /// it only knows about this one file and these two mutating call shapes.
+    #[test]
+    fn every_local_inventory_mirror_edit_in_this_file_goes_through_a_republishing_helper() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/action_loop.rs");
+        let text = std::fs::read_to_string(&path).unwrap();
+        const ALLOWED: [&str; 2] = ["mirror_move_item", "mirror_remove_item"];
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut allowed_hits = 0usize;
+        for (line, enclosing) in raw_mirror_edits(&text) {
+            if ALLOWED.contains(&enclosing.as_str()) { allowed_hits += 1; continue; }
+            offenders.push(format!("action_loop.rs:{line}: in `{enclosing}`"));
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these edit the local inventory mirror without republishing it, so every #347 door \
+             check keeps answering from the pre-edit snapshot until the next inbound packet — use \
+             `self.mirror_move_item(..)` / `self.mirror_remove_item(..)`:\n  {}",
+            offenders.join("\n  ")
+        );
+        // Anti-vacuity: the scanner must actually be finding the two helpers' own edits. If a
+        // rename made this zero, `offenders.is_empty()` would pass for the wrong reason.
+        assert_eq!(allowed_hits, 2,
+            "expected exactly the two republishing helpers' own mirror edits, found {allowed_hits}");
     }
 }

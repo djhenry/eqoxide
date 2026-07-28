@@ -24,6 +24,9 @@ impl CommandState {
     /// Start or toggle a camp (POST /v1/lifecycle/exit uses `Start`; POST /v1/lifecycle/camp, the
     /// HUD Camp button, and the `/camp` chat keyword use `Toggle`). See `ipc::CampCmd`.
     pub fn request_camp(&self, cmd: CampCmd) {
+        // LAST-WINS (#347): `camp` is a toggle whose LATEST value is the intended one, and
+        // POST /v1/lifecycle/exit (`CampCmd::Start`) must be able to override an in-progress camp —
+        // it is the only way to tear down a wedged session. Refusing here would strand it.
         *self.lifecycle.camp.lock().unwrap() = Some(cmd);
     }
 
