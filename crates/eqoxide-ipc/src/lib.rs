@@ -2312,6 +2312,29 @@ mod health_clock_tests {
             "and an older stamp reads exactly its own age, with no wall-clock drift added");
     }
 
+    /// `ago` is the exact inverse of `age_of` **on the same clock**, for a pinned clock and for the
+    /// wall clock alike — that is the whole reason a test never has to choose between two spellings.
+    /// The second half is the one that matters: a stamp taken from the WALL clock and read back
+    /// against a PINNED one drifts by the gap between them, which is #760's failure mode one level
+    /// down (review finding B1). Asserted here as a strict inequality, not a tolerance window.
+    #[test]
+    fn ago_is_the_inverse_of_age_of_on_the_same_clock_and_drifts_across_clocks() {
+        let pin = std::time::Instant::now();
+        let frozen = HealthClock::frozen_at(pin);
+        assert_eq!(frozen.age_of(frozen.ago(15)), std::time::Duration::from_secs(15),
+            "on a pinned clock, ago(15) must read back as exactly 15s");
+        assert_eq!(HealthClock::WALL.age_of(HealthClock::WALL.ago(0)), std::time::Duration::ZERO,
+            "and the wall clock is the same operation, not a special case");
+
+        // The cross-clock error the guard test exists to ban: stamp from the wall clock AFTER the
+        // pin, read back against the pin. The gap is real elapsed time, so the age comes back SHORT.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let wall_stamp = HealthClock::WALL.ago(15);
+        assert!(frozen.age_of(wall_stamp) < std::time::Duration::from_secs(15),
+            "a wall-clock stamp read against a pinned clock must age SHORT — this is the drift that \
+             eats a threshold test's margin (#760/B1)");
+    }
+
     /// A stamp AHEAD of the clock saturates to zero rather than panicking — reachable once the clock
     /// is pinnable, because a fixture may re-stamp a field after freezing.
     #[test]
