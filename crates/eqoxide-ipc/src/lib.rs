@@ -411,7 +411,12 @@ impl HealthClock {
         self.now().saturating_duration_since(stamp)
     }
 
-    /// The stamp that THIS clock will read back as exactly `secs` old — the inverse of [`age_of`].
+    /// A stamp `secs` behind this clock's own reading of now — the inverse of [`age_of`].
+    ///
+    /// On a **pinned** clock the round trip is exact: `age_of(ago(n)) == n`. On the **wall** clock it
+    /// is not, and cannot be — `now` advances between minting and reading, so `age_of(ago(n)) >= n`
+    /// is the strongest true statement. Both are asserted in
+    /// `ago_is_the_inverse_of_age_of_on_the_same_clock_and_drifts_across_clocks`.
     ///
     /// Every past-dated net-health stamp in a test must come from here rather than from a bare
     /// `Instant::now() - secs`. On a wall clock the two are the same expression; on a PINNED clock
@@ -421,8 +426,8 @@ impl HealthClock {
     /// bound has a margin that machine load eats. That is #760's own failure mode, re-armed one
     /// level down — it happened, in review, to `debug_reports_world_unresponsive_when_a_probe_goes_
     /// unanswered_while_the_link_acks` (a 15s stamp that had to clear a 10s bound: a 5s margin).
-    /// Deriving the stamp from the clock that will read it makes the age exact for both kinds of
-    /// clock, so the correct call has no wrong variant to choose between.
+    /// Deriving the stamp from the clock that will read it removes that drift, so the correct call
+    /// has no wrong variant to choose between.
     ///
     /// [`age_of`]: HealthClock::age_of
     #[cfg(any(test, feature = "test-fixtures"))]
@@ -2312,9 +2317,11 @@ mod health_clock_tests {
             "and an older stamp reads exactly its own age, with no wall-clock drift added");
     }
 
-    /// `ago` is the exact inverse of `age_of` **on the same clock**, for a pinned clock and for the
-    /// wall clock alike — that is the whole reason a test never has to choose between two spellings.
-    /// The second half is the one that matters: a stamp taken from the WALL clock and read back
+    /// `ago` inverts `age_of` **on the same clock**: exactly, on a pinned clock; up to the elapsed
+    /// gap between the two calls, on the wall clock — where an exact round trip is impossible, which
+    /// is why the wall-clock arm below is an inequality and the pinned arm is not. Either way the
+    /// call is the right one, so a test never has to choose between two spellings.
+    /// The cross-clock half is the one that matters: a stamp taken from the WALL clock and read back
     /// against a PINNED one drifts by the gap between them, which is #760's failure mode one level
     /// down (review finding B1). Asserted here as a strict inequality, not a tolerance window.
     #[test]

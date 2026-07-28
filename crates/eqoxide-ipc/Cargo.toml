@@ -12,6 +12,10 @@ path = "src/lib.rs"
 # deliberately-mismatched entity roster. Enable it as a DEV-dependency feature only — it is what
 # keeps a roster writable at all, and production must have exactly one writer (#643). See the
 # `Roster` doc comment.
+#
+# Also exposes the health-clock injection points `HealthClock::frozen_at`, `HealthClock::ago` and
+# `NetHealth::frozen_at` (#760) — which is why `eqoxide-http` forwards to this feature: a handler
+# test must be able to pin the clock `HttpState::health()` ages every stamp against.
 test-fixtures = []
 
 [dependencies]

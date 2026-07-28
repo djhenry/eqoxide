@@ -2834,6 +2834,29 @@ mod tests {
     /// where the flagged form is the right one, which is why this is a blanket ban and not a
     /// judgement call. Bare `Instant::now()` is deliberately NOT flagged: it dates a stamp to the
     /// present, which saturates to age 0 against either clock.
+    ///
+    /// # What this actually matches, and what it therefore cannot see
+    ///
+    /// The unit of matching is a **comment-stripped statement**, not a physical line: the source is
+    /// stripped of `//` and `/* */` comments and then cut at `;`, `{` and `}`. A statement offends
+    /// when it mentions one of the eight [`STAMP_FIELDS`] *and* past-dates via a form that is not
+    /// clock-relative. This unit was chosen after review measured the physical-line version catching
+    /// **1 of 6** injected violation shapes; the misses included the shape **rustfmt itself writes**
+    /// (an assignment wrapped so the `=` and the `ago(` land on different lines), which already
+    /// occurs on `NetHealth` stamps in `eqoxide-net` today — benign there only because those
+    /// fixtures read on the wall clock.
+    ///
+    /// Past-dating forms flagged: any `ago(` whose receiver is not the reading clock (see
+    /// `receiver_is_the_reading_clock` — a bare `ago(` and `WALL.ago(` are both flagged; exempting
+    /// *any* `.ago(` regardless of receiver was review's sharpest miss), plus `now() -` / `now()-`
+    /// and `checked_sub`. Those last two are here because review's own sweep found past-dated sites
+    /// a bare `ago(` grep cannot see: **grep the concept, not the spelling.**
+    ///
+    /// Known blind spot, stated because it is real and not closable by a text scan: **aliasing
+    /// through a local.** `let s = ago(15); h.last_probe_sent = Some(s);` is two statements, neither
+    /// of which contains both halves, so it lands. Closing it needs dataflow, not text. Two lesser
+    /// ones: files outside the four scanned, and a ninth `Instant` field added to `NetHealth` and to
+    /// `health()` but not to [`STAMP_FIELDS`] — there is no cross-check against the struct.
     #[test]
     fn no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it() {
         /// Exactly the `NetHealth` fields `HttpState::health()` turns into an age. Adding a stamp
@@ -2843,6 +2866,56 @@ mod tests {
             "last_probe_sent", "last_probe_reply", "first_unanswered_probe_sent",
             "last_send_pressure_at", "last_send_error_at",
         ];
+
+        /// Comment-stripped statements, each kept as its (1-based line, text) fragments so an
+        /// offender can still be reported at the exact line that names the field.
+        fn statements(src: &str) -> Vec<Vec<(usize, String)>> {
+            let mut out: Vec<Vec<(usize, String)>> = Vec::new();
+            let mut cur: Vec<(usize, String)> = Vec::new();
+            let mut in_block = false;
+            for (i, raw) in src.lines().enumerate() {
+                // Strip `/* … */` (possibly spanning lines), then a trailing `//`.
+                let (mut code, mut rest) = (String::new(), raw);
+                while !rest.is_empty() {
+                    if in_block {
+                        match rest.find("*/") {
+                            Some(k) => { in_block = false; rest = &rest[k + 2..]; }
+                            None => break,
+                        }
+                    } else {
+                        match rest.find("/*") {
+                            Some(k) => { code.push_str(&rest[..k]); in_block = true; rest = &rest[k + 2..]; }
+                            None => { code.push_str(rest); break; }
+                        }
+                    }
+                }
+                if let Some(k) = code.find("//") { code.truncate(k); }
+                // Cut at statement and block boundaries so unrelated code never merges into one
+                // statement (which would invent co-occurrences and fire falsely).
+                for (n, piece) in code.split([';', '{', '}']).enumerate() {
+                    if n > 0 && !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
+                    if !piece.trim().is_empty() { cur.push((i + 1, piece.to_string())); }
+                }
+            }
+            if !cur.is_empty() { out.push(cur); }
+            out
+        }
+
+        /// Is this `ago(` call's RECEIVER the health clock that will read the stamp back?
+        ///
+        /// Exempt spellings are `c.ago(` (the convention every call site uses, `let c = h.clock;`)
+        /// and `….clock.ago(`. Everything else is flagged — a free `ago(`, and equally
+        /// `HealthClock::WALL.ago(` or any other receiver. The old rule exempted *any* `.ago(`,
+        /// which review showed lets `wall.ago(30)` into a pinned fixture: that is #760 exactly.
+        ///
+        /// This is a SPELLING rule, so it is deliberately conservative — a correct stamp taken from
+        /// a binding named something other than `c` is flagged too. The fix is to rename it to `c`.
+        fn receiver_is_the_reading_clock(prefix: &str) -> bool {
+            if prefix.ends_with(".clock.") { return true; }
+            let Some(rest) = prefix.strip_suffix("c.") else { return false };
+            !rest.chars().next_back().is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+        }
+
         let sources = [
             ("observe.rs", include_str!("observe.rs")),
             ("lib.rs",     include_str!("lib.rs")),
@@ -2851,20 +2924,22 @@ mod tests {
         ];
         let mut offenders = Vec::new();
         for (file, src) in sources {
-            for (i, line) in src.lines().enumerate() {
-                let code = line.trim_start();
-                if code.starts_with("//") { continue; }          // prose, including this doc block
-                let Some(eq) = code.find('=') else { continue };
-                let (lhs, rhs) = code.split_at(eq);
-                if !STAMP_FIELDS.iter().any(|f| lhs.contains(f)) { continue; }
-                if !rhs.contains("ago(") { continue; }
-                if rhs.contains(".ago(") { continue; }            // clock-relative: the correct form
-                offenders.push(format!("{file}:{}: {}", i + 1, code.trim_end()));
+            for stmt in statements(src) {
+                let joined: String = stmt.iter().map(|(_, t)| t.as_str()).collect();
+                let Some((line, _)) = stmt.iter().find(|(_, t)| STAMP_FIELDS.iter().any(|f| t.contains(f)))
+                else { continue };
+                let past_dated = joined.match_indices("ago(")
+                        .any(|(k, _)| !receiver_is_the_reading_clock(&joined[..k]))
+                    || joined.contains("now() -")
+                    || joined.contains("now()-")
+                    || joined.contains("checked_sub");
+                if !past_dated { continue; }
+                offenders.push(format!("{file}:{line}: {}", joined.trim()));
             }
         }
         assert!(offenders.is_empty(),
-            "these past-date a net-health stamp from the wall clock while `health()` will read it \
-             back against `NetHealth::clock` — use `let c = h.clock; … = c.ago(N)` instead (#760):\n{}",
+            "these past-date a net-health stamp from a clock other than the one `health()` will read \
+             it back against — use `let c = h.clock; … = c.ago(N)` instead (#760):\n{}",
             offenders.join("\n"));
     }
 

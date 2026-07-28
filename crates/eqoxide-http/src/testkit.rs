@@ -20,8 +20,12 @@ use crate::HttpState;
 /// Fine for stamps that are aged against `Instant::now()` at read time — the asset-sync publisher's
 /// `tick_stamped`, for instance. **Not** for a `NetHealth` stamp: `health()` ages those against
 /// `NetHealth::clock`, which a fixture pins, so a wall-clock stamp read back against it drifts by
-/// however long the test took (#760). Use `h.clock.ago(secs)` there; the ban is enforced by
-/// `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it`.
+/// however long the test took (#760). Use `h.clock.ago(secs)` there. That ban is **partially**
+/// guarded by `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_
+/// one_that_reads_it` — a source scan over four files that reads one statement at a time, so it does
+/// catch the rustfmt-wrapped and struct-literal spellings but cannot see a stamp aliased through a
+/// local. Read that test's doc for the measured blind spots before relying on it: a wrong spelling
+/// it misses still compiles and still lands.
 pub fn ago(secs: u64) -> std::time::Instant {
     std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(secs))
@@ -62,8 +66,9 @@ pub fn set_gs(state: &HttpState, f: impl FnOnce(&mut eqoxide_core::game_state::G
 ///    clock ages to `15s − (time since the fixture was built)`, so the margin over the bound is
 ///    eaten by machine load — #760's failure mode, one level down.
 ///
-/// Shape 2 is enforced, not merely documented: see
-/// `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it`.
+/// Shape 2 is documented here and **partially** guarded by
+/// `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it`,
+/// which names its own measured blind spots. Do not read it as making the mistake unlandable.
 pub fn empty_state_wall_clock() -> HttpState {
     let state = empty_state();
     // `NetHealth::default()` is the production constructor: `HealthClock::WALL`, all three stamps at
