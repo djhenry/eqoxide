@@ -367,7 +367,8 @@ impl LastLoginByOutcome {
     ///   neither consults `ALL` nor this function. In the `refused: _` state above, a login that
     ///   ended `Refused` is absent from `login_outcomes` and `last_login_refused` **and simultaneously
     ///   present** as `last_ended.connecting.outcome == "refused"` — one body giving two answers
-    ///   about one login, which is #731's own defect shape, re-instantiated inside this fix.
+    ///   about one login, which is the #743 B3 defect shape (two fields disagreeing about the same
+    ///   login), re-instantiated inside this fix.
     ///
     /// So: this function forces a decision at the call site. It does not force that decision to be
     /// *correct*, and it has no reach at all over the separate `as_str`-driven path to `last_ended`.
@@ -463,8 +464,17 @@ impl LoginOutcomeTally {
     /// outcome correctly wired everywhere — its own field, its own counter, all five exhaustive
     /// matches, and listed in `ALL` — still contributes **zero** here unless this line is also
     /// edited by hand. Measured: adding such a variant and calling this function returns `0` for a
-    /// login that ended that way, while the dedicated counter for it is `1`. Neither the compiler nor
-    /// any existing test catches the omission.
+    /// login that ended that way, while the dedicated counter for it is `1`.
+    ///
+    /// ⚠️ **[EDIT, round 6 (#755 review): "neither the compiler nor any existing test catches the
+    /// omission" overstated what was measured.]** Wiring the new variant in fully (own field, own
+    /// counter, all five exhaustive matches, listed in `ALL`) does trip diagnostics — four
+    /// pre-existing test sites construct `LoginOutcomeTally { succeeded, failed, unknown }`
+    /// positionally and fail `E0063` (missing field), and once those are patched the run reports
+    /// `220 passed; 3 failed` (eqoxide-http) / `53 passed; 1 failed` (eqoxide-ipc). None of those 8
+    /// diagnostics is *about* `unsuccessful()` — they fire on unrelated struct literals and
+    /// assertions that were never testing this sum. The accurate claim is narrower: **nothing points
+    /// at this sum**, not "nothing catches the omission."
     pub fn unsuccessful(self) -> u64 {
         self.failed + self.unknown
     }
@@ -523,12 +533,23 @@ impl ConnectOutcome {
     /// green suite — the review added a fourth variant, wired those sites, left it out of `ALL`, and
     /// measured `223 passed; 0 failed` / `52 passed; 0 failed`.
     ///
-    /// **That hole is closed by [`LastLoginByOutcome::slots`], at compile time.** A new outcome means
-    /// a new retained slot; that function destructures the slot struct exhaustively and returns an
-    /// array of length `ALL.len()`, so the new slot must be listed there (check 1) and its outcome
-    /// must be in `ALL` (check 2) before the crate builds. Re-run and measured: the review's
-    /// mutation now stops the build with `E0027: pattern does not mention field "refused"` — the
-    /// LIBRARY, not only its tests.
+    /// ⚠️ **[EDIT, round 6 (#755 review): the paragraph that stood here restated, un-retracted, the
+    /// same false claim already corrected at [`LastLoginByOutcome::slots`] and at the HTTP
+    /// encoder — in the most-authoritative spot a reader lands, since it sits directly on `ALL`
+    /// itself.]** It read:
+    ///
+    /// > *"That hole is closed by `LastLoginByOutcome::slots`, at compile time. A new outcome means
+    /// > a new retained slot; that function destructures the slot struct exhaustively and returns an
+    /// > array of length `ALL.len()`, so the new slot must be listed there (check 1) and its outcome
+    /// > must be in `ALL` (check 2) before the crate builds."*
+    ///
+    /// Check 1 is real — a new field must be *named* at `slots()`'s destructure, or E0027 stops the
+    /// library build. "Before the crate builds" is not: rustc's own suggested fix for that same
+    /// E0027, `refused: _`, satisfies check 1 while never adding the slot to the returned array or to
+    /// `ALL` — the crate builds clean, zero warnings, and the outcome is unserved. See
+    /// [`LastLoginByOutcome::slots`]'s rustdoc for the corrected claim and its full measurement
+    /// (MX-c); it is intentionally not restated here a third time, so it cannot drift from that copy
+    /// again.
     ///
     /// **The residual, stated rather than glossed, and measured too.** A variant whose match arms
     /// are pointed at an *existing* slot and counter adds no field, so `slots` is unchanged and
@@ -1394,6 +1415,36 @@ mod tests {
         }
     }
 
+    /// **#755 round 6 review — the fourth evasion, none of the other pins reach.** Every check above
+    /// pins *whether* a slot exists and *where* it is walked from; none of them pins the *wire token*
+    /// [`ConnectOutcome::as_str`] hands out. The HTTP encoder keys a `serde_json::Map` by that token
+    /// (`counts.insert(token, …)`, `obj.insert(format!("last_login_{token}"), …)`), so two outcomes
+    /// sharing one token do not both land on the wire — the second `insert` silently overwrites the
+    /// first. A variant added with every OTHER pin satisfied (own field, own counter, in `slots()`,
+    /// in `ALL`, all five exhaustive matches) but with an `as_str()` arm copy-pasted from an existing
+    /// one compiles clean, every existing test stays green, and produces a body where a whole outcome
+    /// category is missing from `login_outcomes` while a login that ended that way is reported as
+    /// having ended the OTHER way — not merely absent, but affirmatively mislabelled. That is the
+    /// #743 B3 shape again, and this is the only test in this module that can see it.
+    ///
+    /// MUTATION-CHECK, run (not reasoned about) at #755 round 6: added a fifth `Refused` variant
+    /// end-to-end — own field on `LastLoginByOutcome`, own counter on `LoginOutcomeTally`, its own
+    /// entry in `slots()`, listed in `ALL`, all five exhaustive matches wired — with `as_str()`
+    /// returning `"failed"` for it (copy-pasted from `Failed`'s arm) instead of `"refused"`. Every
+    /// other test in this module and in `eqoxide-http` stayed green; this one alone went RED, on
+    /// exactly this assertion. Reverted afterward, `cp`-aside restored and `md5sum`-verified.
+    #[test]
+    fn as_str_is_injective_over_all_so_two_outcomes_can_never_collide_on_one_wire_token() {
+        let tokens: Vec<&str> = ConnectOutcome::ALL.iter().map(|o| o.as_str()).collect();
+        let mut distinct = tokens.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), tokens.len(),
+            "as_str() must return a distinct token for every outcome in ALL — two outcomes sharing \
+             one token collide in the encoder's token-keyed JSON map (last insert wins), which hides \
+             a whole outcome category and mislabels the login that produced it: {tokens:?}");
+    }
+
     /// **#743 review B3, as the rule rather than the pair of examples.** For every outcome, the
     /// counter and the retained record must agree, and a record must never appear under an outcome
     /// other than its own. This is what a shared slot could not satisfy at all.
@@ -1650,7 +1701,12 @@ mod tests {
                     // The contract, modelled independently of the code under test: a tally, and ONE
                     // most-recent purpose PER OUTCOME.
                     let mut tally = LoginOutcomeTally::default();
-                    let mut slots_model: [Option<String>; 3] = [None, None, None];
+                    // ⚠️ [EDIT, round 6 (#755 review): this used to be a hard-coded `[Option<String>; 3]`
+                    // — an un-enumerated restatement of the alphabet's size, in this property test's
+                    // own model. An outcome added to `ALL` would have made `idx(o)` return 3+ and
+                    // panicked here with "index out of bounds" before ever reaching this test's own
+                    // `unsuccessful()` assertion, rather than failing informatively.]
+                    let mut slots_model: Vec<Option<String>> = vec![None; ConnectOutcome::ALL.len()];
                     for &k in &order {
                         match held[k].take() {
                             None => held[k] = Some(match k {

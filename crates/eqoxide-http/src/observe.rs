@@ -317,11 +317,14 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
         // there is not the same as this loop serving it. rustc's own suggested fix for the E0027 the
         // pin raises is `refused: _`, and taking it verbatim builds clean, with zero warnings, while
         // that outcome stays absent from `login_outcomes` and from every `last_login_<outcome>` this
-        // loop emits. Separately, and unconditionally: THIS LOOP is not what makes an outcome reach
-        // the wire at all. `last_ended`, encoded above via `ended_activity_json`, calls
-        // `ConnectOutcome::as_str()` on the raw stored outcome directly — it never touches `ALL` or
-        // `slots()`. So a login that ends with an outcome missing from `ALL` can be simultaneously
-        // absent here and present in `last_ended`: one body, two answers about one login.
+        // loop emits. Separately: THIS LOOP is not the only thing that puts an outcome on the wire
+        // [EDIT, round 6: "not what makes an outcome reach the wire at all" read as "this loop puts
+        // nothing on the wire", which is false — it is the sole producer of every `login_outcomes`
+        // key and every `last_login_<outcome>` record]. `last_ended`, encoded above via
+        // `ended_activity_json`, calls `ConnectOutcome::as_str()` on the raw stored outcome directly
+        // — it never touches `ALL` or `slots()`. So a login that ends with an outcome missing from
+        // `ALL` can be simultaneously absent here and present in `last_ended`: one body, two answers
+        // about one login.
         for (outcome, record) in snap.last_login.slots() {
             let token = outcome.as_str();
             counts.insert(token.into(), snap.login_outcomes.count(outcome).into());
