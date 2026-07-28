@@ -581,8 +581,9 @@ pub const NAV_PREFERRED_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS * 
 /// floor — the qcat live wedge, #375) AND its `column_bottom` recovery valve.
 ///
 /// `NAV_NEAR_HORIZONTAL` is tied to the walk-grade limit: a unit normal's `|z|` for a surface at grade
-/// `g` is `1/sqrt(1+g²)`, and `MAX_WALK_GRADE = 1.2` (the astar climb cap) gives `1/sqrt(1+1.44) ≈
-/// 0.64`. So a surface `is_standable` rejects for flatness is exactly one astar's grade limit would
+/// `g` is `1/sqrt(1+g²)`, and `MAX_WALK_GRADE = 1.2` (the astar climb cap) gives
+/// `1/sqrt(1+1.44) ≈ 0.64`.
+/// So a surface `is_standable` rejects for flatness is exactly one astar's grade limit would
 /// reject anyway — no new seal there.
 ///
 /// `NAV_AGENT_HEIGHT` is the clearance a standing character needs. It must EXCEED a real ceiling's
@@ -1739,6 +1740,132 @@ impl Collision {
     pub fn carrot_los_clear(&self, from: [f32; 3], to: [f32; 3], radius: f32) -> bool {
         let chest = crate::traversability::PLAYER_BODY.chest;
         self.line_clear([from[0], from[1], from[2] + chest], [to[0], to[1], to[2] + chest], radius)
+    }
+
+    /// **Is there continuous standable ground under the straight hop `from → to`? (#727.)**
+    ///
+    /// The companion of [`Self::carrot_los_clear`], and it exists because that ray **cannot answer
+    /// this question and was never meant to**: its rustdoc directly above says it is a chest-height
+    /// centre ray, chosen deliberately so the carrot clamp rides ABOVE walkable ground undulation,
+    /// and that what it catches is WALLS. *A hole is not a wall.* Asked "can the character get
+    /// there on foot", a chest ray flies straight over a chasm by construction. Measured: on two
+    /// ledges split by a 10 u gap with the next floor 200 u down, the ray alone let the coarse-route
+    /// cursor jump 2 → 6, declaring an entire bridge detour walked
+    /// (`walker`'s `a_resync_must_not_cross_a_chasm_the_character_cannot_walk`).
+    ///
+    /// So also ask the FLOOR. Probe the column at the fine local tier's 2 u spacing along the hop
+    /// and require a standable surface at every probe, inside a per-probe envelope of one
+    /// sub-segment of walkable slope ([`MAX_WALK_GRADE`]) plus one discrete `step_up` riser. A void,
+    /// or a drop steeper than that, refuses the hop.
+    ///
+    /// **That envelope is NOT symmetric, and it is NOT `walk_profile_ok`'s.** The probe window is
+    /// `ground_below(e, n, prev_z + step_up, allow + step_up)`: it opens `step_up` ABOVE the last
+    /// floor and `allow` BELOW it. So the descent allowance is `allow` but the ascent allowance is
+    /// the bare `step_up`, giving an ascent grade cap of `step_up / PROBE_SPACING = 1.0` against
+    /// `MAX_WALK_GRADE = 1.2`. A continuous slope in the band **1.0 < grade ≤ 1.2** is walkable,
+    /// `walk_profile_ok` and A*'s own grade test both accept it, and this predicate refuses it.
+    /// Pinned by `ground_continuous_ascent_is_capped_at_step_up_not_the_walk_grade`, which asserts
+    /// both halves: the refusal here and the acceptance by [`Self::walk_profile_ok`] on the same hop.
+    ///
+    /// The asymmetry is left in place deliberately. A false NEGATIVE costs this feature nothing but
+    /// coverage — the cursor resync simply declines to advance and the walker keeps the cursor it
+    /// had — whereas widening the window widens what a resync may adopt, which is the direction
+    /// every #727 safety argument runs against. Correcting it is a live-behaviour change and wants
+    /// its own measurement, not a documentation round; filed as **gap 4 on #734**
+    /// (`issuecomment-5097268224`, 2026-07-27), with the measured band and the reason it is being
+    /// left alone.
+    ///
+    /// ⚠️ **Correction (#727 round 6 review, B-3).** Rounds 5 and earlier ended that sentence with
+    /// "see the tracking issue" while **#734 said nothing about ascent, uphill or asymmetry** — the
+    /// pointer was dangling in the direction that mattered, and a reader of the rustdoc was told a
+    /// gap was tracked that a reader of the issue could not find. The issue is now updated and named
+    /// by number here, so the pointer is checkable instead of atmospheric.
+    ///
+    /// ⚠️ **Correction (#727 round 5).** Every round of this doc up to round 4 ended the paragraph
+    /// above with "*the same envelope [`Self::walk_profile_ok`] applies to a planned edge*". That
+    /// was false uphill, and the false-negative class it hid was undisclosed. Nothing measured it;
+    /// it was asserted from the shape of the `allow` expression without reading the window the
+    /// expression is used to open.
+    ///
+    /// **Necessary, not sufficient — this is NOT a walkability oracle.** It samples a line, so a
+    /// hole narrower than the spacing can fall between probes, and it says nothing about the
+    /// character's WIDTH (that is [`Self::path_clear`]'s question). Callers must bound the hop: at
+    /// ~2 u spacing the cost is one column probe per 2 u of run.
+    ///
+    /// **And the envelope is PER PROBE, not over the hop.** `prev_z` chains, so each probe is judged
+    /// against the last floor found rather than against the hop's own start and end. A descent that
+    /// takes the full allowance at every probe therefore compounds, and the aggregate it compounds to
+    /// is analytic:
+    ///
+    /// ```text
+    /// sub        = run / n                       (n = ceil(run / PROBE_SPACING), min 1)
+    /// allow      = sub * MAX_WALK_GRADE + step_up
+    /// mean grade = allow / sub = MAX_WALK_GRADE + step_up / sub
+    /// ```
+    ///
+    /// `sub == PROBE_SPACING` — a hop that is an exact multiple of 2 u — gives `1.2 + 2.0/2.0 =`
+    /// **2.2**, measured to the boundary by
+    /// `ground_continuous_compounding_descent_is_capped_at_grade_plus_one_step_per_probe`
+    /// (2.15 accepted, 2.20 refused) on a 24 u hop. **2.2 is that hop length's cap, not the
+    /// predicate's.** `n` is a `ceil`, so `sub` is generally SHORTER than `PROBE_SPACING` and the
+    /// cap is correspondingly HIGHER: `sub → PROBE_SPACING/2` (a hop just over a multiple of 2 u)
+    /// approaches `1.2 + 2.0/1.0 =` **3.2**, and a hop shorter than one spacing runs a single
+    /// sub-segment whose mean-grade cap `1.2 + 2.0/run` is unbounded as `run → 0` — though there
+    /// the ABSOLUTE fall stays inside `run * 1.2 + step_up`, i.e. one ordinary step down.
+    /// `ground_continuous_the_grade_cap_is_a_function_of_the_hop_length_not_a_constant` pins the
+    /// short-hop end: a 1 u hop accepts a 3.1 u fall — mean grade **3.1**, 41% past the 2.2 this
+    /// doc used to state as *the* cap. Note which way all of this moves: the cap gets **worse** if
+    /// `PROBE_SPACING` is ever reduced, because the discrete `step_up` term is divided by it.
+    ///
+    /// ⚠️ **Correction (#727 round 5).** Rounds 3–4 wrote 2.2 as the predicate's cap without the
+    /// `run/n == PROBE_SPACING` qualifier that the code block itself carried, and the pinning test
+    /// chose the one hop length (24 u) that makes the qualifier vacuous. The 2.2 measurement stands
+    /// for that hop; the unqualified *claim* is withdrawn and replaced by the formula above. **The
+    /// same unqualified 2.2 was written into #734** and is retracted there too (round 6) — a
+    /// correction that lands only in the file and not in the issue the file points at is how a
+    /// retracted number comes back.
+    ///
+    /// That is deliberate to the extent that a long walkable ramp must not be refused for being long,
+    /// and unbounded to the extent that nothing re-checks the aggregate. Disclosed as **gap 3 on
+    /// #734** — in that issue's comments, not its body, whose "what is still not established" list is
+    /// only the spacing and width gaps and predates this one; the caller's hop bound
+    /// ([`crate::steering::CURSOR_RESYNC_MAX_HOP`]) is currently the only thing limiting how much can
+    /// compound.
+    ///
+    /// ⚠️ **Correction (#727 round 4).** Round 3 wrote this gap as "a mean grade of ~1.83". That was
+    /// the round-2 reviewer's measurement, adopted here in good faith, and the reviewer has since
+    /// retracted it: 1.83 understates the envelope by ~18% (it is the *ratio* to `MAX_WALK_GRADE`,
+    /// not the grade). The correct figure is 2.2, derived above and measured.
+    ///
+    /// Returns `true` when the zone has no geometry, matching [`Self::carrot_los_clear`]'s own
+    /// documented no-geometry behaviour — a client with no world model must not silently answer
+    /// "unreachable" to everything.
+    pub fn ground_continuous(&self, from: [f32; 3], to: [f32; 3]) -> bool {
+        /// The fine local tier's cell (`steering::LOCAL_CELL`): the finest scale the walker's own
+        /// planner resolves, so a gap missed here is one the fine planner could not express either.
+        const PROBE_SPACING: f32 = 2.0;
+        if !self.has_geometry() { return true; }
+        let step_up = crate::traversability::PLAYER_BODY.step_up;
+        let run = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
+        let n = (run / PROBE_SPACING).ceil().max(1.0) as i32;
+        // One sub-segment of walkable slope plus one discrete step. NOT `walk_profile_ok`'s envelope
+        // — see the rustdoc's round-5 correction: this is the DESCENT allowance only, and the window
+        // it opens is `[prev_z - allow, prev_z + step_up]`, so uphill is capped at `step_up` alone.
+        let allow = (run / n as f32) * MAX_WALK_GRADE + step_up;
+        let mut prev_z = from[2];
+        for i in 1..=n {
+            let t = i as f32 / n as f32;
+            let e = from[0] + (to[0] - from[0]) * t;
+            let nn = from[1] + (to[1] - from[1]) * t;
+            // Search from one step-up above the last floor down to the envelope's floor;
+            // `ground_below` returns the HIGHEST standable surface in that window (a ramp over a
+            // lower plane wins), so a legitimate slope is followed rather than under-cut.
+            match self.ground_below(e, nn, prev_z + step_up, allow + step_up) {
+                Some(fz) => prev_z = fz,
+                None => return false,
+            }
+        }
+        true
     }
 
     /// The clearance test A* validates ONE GRID EDGE with, at plan resolution `cell`.
@@ -4784,6 +4911,222 @@ mod tests {
         }
     }
 
+    // ── #727 round 3: `ground_continuous`'s numeric envelope (review finding C) ──────────────────
+    //
+    // Round 2 shipped the predicate with its behaviour pinned only where it is TOTAL (a void refuses,
+    // a flat floor accepts). The round-2 review showed that left the numbers free: widening
+    // `PROBE_SPACING` 2 → 8, scaling `allow` by 10, and replacing `allow` with `step_up` all survived
+    // the whole suite. These three tests fail under each of those mutations respectively, so the
+    // constants are now claims the suite defends rather than commentary.
+
+    /// Two coplanar floor slabs at z = 0 running east, with a hole of `width` starting at `start`.
+    fn floor_with_hole(start: f32, width: f32) -> Collision {
+        Collision::build(&ZoneAssets {
+            terrain: vec![slab(0.0, -10.0, 10.0, -20.0, start, true),
+                          slab(0.0, -10.0, 10.0, start + width, 20.0, true)],
+            objects: vec![], textures: vec![],
+        }, 32.0)
+    }
+
+    /// A high floor east of 0 and a floor `drop` units lower west of it, meeting at e = 0.
+    fn floor_with_drop(drop: f32) -> Collision {
+        Collision::build(&ZoneAssets {
+            terrain: vec![slab(0.0, -10.0, 10.0, -20.0, 0.0, true),
+                          slab(-drop, -10.0, 10.0, 0.0, 20.0, true)],
+            objects: vec![], textures: vec![],
+        }, 32.0)
+    }
+
+    /// **`PROBE_SPACING` is pinned by the holes it must not step over.** A hole wider than the
+    /// spacing must contain a probe wherever it sits, so sweeping its position over a whole spacing
+    /// interval is what turns "2 u" from a comment into a requirement: widen the constant and some
+    /// offset in this sweep starts being missed.
+    #[test]
+    fn ground_continuous_probe_spacing_catches_every_hole_wider_than_the_spacing() {
+        const WIDTH: f32 = 2.5; // > PROBE_SPACING = 2.0
+        let mut missed = Vec::new();
+        for k in 0..=32 {
+            let start = -8.0 + 0.25 * k as f32;
+            if floor_with_hole(start, WIDTH)
+                .ground_continuous([-18.0, 0.0, 0.0], [18.0, 0.0, 0.0])
+            {
+                missed.push(start);
+            }
+        }
+        assert!(missed.is_empty(),
+            "a {WIDTH} u hole was stepped over at east offsets {missed:?} — the probe spacing is no \
+             longer fine enough to catch holes it claims to catch");
+    }
+
+    /// **The upper end of `allow` is pinned.** A drop of 6 u is outside one 2 u sub-segment of
+    /// `MAX_WALK_GRADE` plus a `step_up` riser (2 · 1.2 + 2 = 4.4), so it must be refused. Scale
+    /// `allow` up and this passes a cliff.
+    #[test]
+    fn ground_continuous_refuses_a_drop_outside_the_walk_envelope() {
+        assert!(!floor_with_drop(6.0).ground_continuous([-6.0, 0.0, 0.0], [6.0, 0.0, -6.0]),
+            "a 6 u drop is outside the walk envelope and must refuse the hop");
+    }
+
+    /// **The lower end of `allow` is pinned too, and this is the half that matters for false
+    /// negatives.** A 4 u drop is INSIDE the same envelope and must be accepted — a walker that
+    /// refuses ordinary walkable terrain would make the resync inert rather than safe. Replace
+    /// `allow` with a bare `step_up` and this goes RED.
+    #[test]
+    fn ground_continuous_accepts_a_drop_inside_the_walk_envelope() {
+        assert!(floor_with_drop(4.0).ground_continuous([-6.0, 0.0, 0.0], [6.0, 0.0, -4.0]),
+            "a 4 u drop is inside the walk envelope; refusing it would make the predicate a false \
+             negative on ordinary terrain");
+    }
+
+    /// A staircase descending WEST from e = 0, one `riser` per 2 u tread — the shape that makes the
+    /// per-probe allowance compound, because `prev_z` chains from probe to probe.
+    fn staircase(riser: f32) -> Collision {
+        Collision::build(&ZoneAssets {
+            terrain: (0..16)
+                .map(|i| slab(-(i as f32) * riser, -20.0, 20.0, -2.0 * (i + 1) as f32, -2.0 * i as f32, true))
+                .collect(),
+            objects: vec![], textures: vec![],
+        }, 32.0)
+    }
+
+    /// **The compounding-descent gap, pinned — FOR A HOP THAT IS AN EXACT MULTIPLE OF THE SPACING.**
+    ///
+    /// `allow` is granted PER PROBE and `prev_z` chains, so a staircase that takes the full allowance
+    /// at every tread is accepted however long it runs. The aggregate cap is analytic:
+    ///
+    /// ```text
+    /// sub        = run / n = 24 / 12 = PROBE_SPACING       (this fixture only)
+    /// mean grade = MAX_WALK_GRADE + step_up / sub = 1.2 + 2.0 / 2.0 = 2.2
+    /// ```
+    ///
+    /// and the two assertions below confirm it to the boundary. This exists so the disclosed gap is
+    /// a measured claim rather than commentary: scale `allow` up and the refusal goes green; replace
+    /// `allow` with a bare `step_up` and the acceptance goes red.
+    ///
+    /// The 24 u hop is chosen to make `sub == PROBE_SPACING` exactly. That is the FAVOURABLE case —
+    /// see `ground_continuous_the_grade_cap_is_a_function_of_the_hop_length_not_a_constant` for what
+    /// the same predicate accepts when the hop is not a multiple of the spacing.
+    ///
+    /// ⚠️ **Correction (#727 round 4).** Round 3 recorded this gap as "mean grade ~1.83 accepted".
+    /// That figure came from a coarser sweep and understates the envelope by ~18%; 1.83 is the
+    /// *ratio* to `MAX_WALK_GRADE`, not the grade. Measured here: 2.15 accepted, 2.20 refused.
+    ///
+    /// ⚠️ **Correction (#727 round 5).** Rounds 3–4 let this one fixture stand as the cap for the
+    /// predicate, and its assertion messages said "the analytic per-probe cap" with no hop-length
+    /// qualifier. Withdrawn: 2.2 is this HOP LENGTH's cap. The messages below now say so, and the
+    /// companion test measures the other end.
+    #[test]
+    fn ground_continuous_compounding_descent_is_capped_at_grade_plus_one_step_per_probe() {
+        // 12 probes over a 24 u hop, so each probe spans exactly one 2 u tread.
+        let hop = |riser: f32| staircase(riser)
+            .ground_continuous([0.0, 0.0, 0.0], [-24.0, 0.0, -12.0 * riser]);
+        // Mean grade 2.15 — 79% steeper than MAX_WALK_GRADE, and accepted. This is the GAP, asserted
+        // so that it is disclosed by execution and not only by prose.
+        assert!(hop(4.3),
+            "the compounding gap is documented as reaching a mean grade of 2.15 on a 24 u hop; if \
+             this now refuses, the rustdoc's disclosure overstates the gap and must be narrowed");
+        // …and 2.20 = MAX_WALK_GRADE + step_up/PROBE_SPACING is the cap FOR sub == PROBE_SPACING.
+        assert!(!hop(4.4),
+            "a mean grade of 2.20 is the per-probe cap when the hop is an exact multiple of \
+             PROBE_SPACING, as this 24 u one is, and must be refused here; if this passes, the \
+             compounding is unbounded even in the favourable case and the rustdoc's cap is wrong");
+    }
+
+    /// **2.2 is a hop length's cap, not the predicate's** (#727 round 5, non-blocking finding 2).
+    ///
+    /// `n = ceil(run / PROBE_SPACING)`, so the sub-segment `run / n` is generally SHORTER than the
+    /// spacing, and the discrete `step_up` term is divided by that shorter length:
+    ///
+    /// ```text
+    /// mean grade cap = MAX_WALK_GRADE + step_up / (run / n)
+    /// ```
+    ///
+    /// A hop under one spacing runs a single sub-segment, so `run / n == run`. At `run = 1.0` the
+    /// cap is `1.2 + 2.0/1.0 = 3.2` — 41% past the 2.2 the sibling test measures, and 2.7× the
+    /// `MAX_WALK_GRADE` the predicate is described as enforcing. Both bounds are asserted so the
+    /// hop-length dependence is a measured claim: the acceptance is the disclosed gap, the refusal
+    /// is the analytic cap for THIS length.
+    ///
+    /// This does not contradict the sibling test; it is the same formula evaluated somewhere else.
+    /// Note what stays bounded: the ABSOLUTE fall is still `run * MAX_WALK_GRADE + step_up = 3.2 u`,
+    /// about one step down. It is the GRADE that is unbounded as `run → 0`, and grade is what the
+    /// rustdoc used to quote as a single number.
+    #[test]
+    fn ground_continuous_the_grade_cap_is_a_function_of_the_hop_length_not_a_constant() {
+        // run = 1.0 u ⇒ n = ceil(0.5).max(1) = 1 ⇒ sub = 1.0 ⇒ allow = 1.0·1.2 + 2.0 = 3.2.
+        let hop = |drop: f32| floor_with_drop(drop)
+            .ground_continuous([-0.5, 0.0, 0.0], [0.5, 0.0, -drop]);
+        assert!(hop(3.1),
+            "a 1 u hop accepts a 3.1 u fall — mean grade 3.1, against the 2.2 the rustdoc used to \
+             give as the predicate's cap. If this refuses, the round-5 correction overstates the \
+             hop-length dependence and must be narrowed");
+        assert!(!hop(3.3),
+            "3.2 = MAX_WALK_GRADE·run + step_up is the analytic allowance at run = 1.0 and 3.3 must \
+             be refused; if this passes, the per-probe envelope is not what the code computes");
+    }
+
+    /// **The ascent envelope is `step_up` alone, and it is NARROWER than `walk_profile_ok`'s**
+    /// (#727 round 5, non-blocking finding 3).
+    ///
+    /// The probe window opens `step_up` above `prev_z` and `allow` below it, so climbing is capped
+    /// at a grade of `step_up / PROBE_SPACING = 1.0` while `MAX_WALK_GRADE = 1.2`. Grades in the
+    /// band `(1.0, 1.2]` are walkable, `walk_profile_ok` accepts them, and `ground_continuous`
+    /// refuses them. Both halves are asserted here, on the SAME hop, because the claim being pinned
+    /// is a DISAGREEMENT between two predicates — asserting only the refusal would leave "…that
+    /// `walk_profile_ok` accepts" as one more unmeasured sentence, which is the exact defect class
+    /// this PR has spent five rounds on.
+    ///
+    /// The direction matters: this is a false NEGATIVE. A refused hop leaves the cursor where it
+    /// was, so the cost is coverage of the #727 fix, never a resync onto ground the character
+    /// cannot walk. The code is therefore deliberately unchanged — see `ground_continuous`'s doc.
+    #[test]
+    fn ground_continuous_ascent_is_capped_at_step_up_not_the_walk_grade() {
+        // A 2 u run rising 2.2 u: grade 1.1, inside MAX_WALK_GRADE = 1.2, outside step_up = 2.0.
+        const RISE: f32 = 2.2;
+        // floor_with_drop(RISE) is low (z = -RISE) east of 0 and high (z = 0) west of it, so walking
+        // WEST from the low side is the climb.
+        let c = floor_with_drop(RISE);
+        assert!(!c.ground_continuous([1.0, 0.0, -RISE], [-1.0, 0.0, 0.0]),
+            "grade {} is inside MAX_WALK_GRADE yet ground_continuous refuses it — this refusal IS \
+             the documented asymmetry; if it now accepts, the ascent window was widened and the \
+             rustdoc's disclosure is stale", RISE / 2.0);
+        assert!(c.walk_profile_ok([1.0, 0.0], -RISE, [-1.0, 0.0], 0.0, 60.0),
+            "walk_profile_ok must accept the same hop — without this half, the claim that the two \
+             predicates DISAGREE is unmeasured");
+    }
+
+    /// **Every `ground_continuous` test name cited in a doc comment still resolves** (#727 round 5).
+    ///
+    /// The round-5 review found `resync_cursor`'s rustdoc citing `walker_cursor_resync`, a module
+    /// that has never existed, and `CURSOR_STALE_DIST`'s citing a test renamed two rounds earlier.
+    /// Rustdoc cannot intra-doc-link a `#[cfg(test)]` item, so those citations rot silently. Naming
+    /// each cited test as a `fn()` value here makes a rename a COMPILE error instead.
+    ///
+    /// Add a name to this list whenever a doc comment in this module starts citing a test.
+    /// `walker::tests::a_resync_must_not_cross_a_chasm_the_character_cannot_walk`, cited by
+    /// [`Collision::ground_continuous`], is guarded by the twin of this test in `walker`.
+    #[test]
+    fn every_ground_continuous_test_name_cited_in_a_doc_comment_still_exists() {
+        let _cited: &[fn()] = &[
+            ground_continuous_probe_spacing_catches_every_hole_wider_than_the_spacing,
+            ground_continuous_refuses_a_drop_outside_the_walk_envelope,
+            ground_continuous_accepts_a_drop_inside_the_walk_envelope,
+            ground_continuous_compounding_descent_is_capped_at_grade_plus_one_step_per_probe,
+            ground_continuous_the_grade_cap_is_a_function_of_the_hop_length_not_a_constant,
+            ground_continuous_ascent_is_capped_at_step_up_not_the_walk_grade,
+            // Added in round 6 by `steering`'s mechanical citation scan. Every one of these was
+            // cited by name in a doc comment in this file and named in no guard list — which is
+            // why the guard's ALPHABET, not just its mechanism, had to stop being hand-maintained.
+            close_roof_ceiling_is_rejected_by_headroom,
+            column_whose_only_surface_is_inverted_still_finds_a_floor,
+            floating_swimmer_is_anchored_to_the_water_surface_not_the_pool_bottom,
+            probe_qcat_column_vs_fixture,
+            qcat_pocket_nearest_floor_is_never_the_ceiling,
+            qcat_support_floor_is_visible_to_the_planner,
+            worst_case_reachable_component,
+        ];
+    }
+
     // ─── Water-span grid (3D-water-volume nav design §5, Slice 1) ──────────────────────────────
     //
     // These assert the built grid against HAND-AUTHORED analytic fixture geometry (the pool/ceiling
@@ -7121,8 +7464,15 @@ mod tests {
     /// An UP-facing floor plane at height `z` over east [e0,e1] × north [-100,100] (`tri_nz > 0`, seen
     /// by `nearest_floor`). NB: the older `floor_band` helper's winding is actually *down*-facing — it
     /// is only ever used with facing-BLIND queries (`path_clear`/`line_clear`), so its facing never
-    /// mattered; these PR-D fixtures DO care about facing, so they use these explicit helpers instead
-    /// (both windings verified by `floor_and_ceiling_windings_are_as_labelled`).
+    /// mattered; these PR-D fixtures DO care about facing, so they use these explicit helpers instead.
+    ///
+    /// ⚠️ **Correction (#727 round 6 review, non-blocking 1).** This line used to end "(both windings
+    /// verified by \[a winding-sanity test\])". **No such test exists anywhere in the workspace** — it
+    /// was the "winding-sanity companion" retracted at D-2 along with the open-air-ceiling fixture
+    /// (see the RETRACTED note ~20 lines below), and the citation was left behind pointing at nothing.
+    /// So the windings here are asserted by these helpers' own `normals`/`indices`, not verified by a
+    /// test. Found by the mechanical citation scan added in this round, which is the point of it:
+    /// a hand-maintained list of citations cannot catch a citation nobody remembered to list.
     fn floor_up(z: f32, e0: f32, e1: f32) -> MeshData {
         MeshData {
             positions: vec![[-100.0, z, e0], [100.0, z, e0], [100.0, z, e1], [-100.0, z, e1]],
@@ -7528,8 +7878,8 @@ mod tests {
     /// planner must no longer COMMIT to the steep lip step-down that the fine/swept tier refuses.
     /// Before the fix `find_path` from the lip top returns a short route whose descent is a steep
     /// (>`MAX_WALK_GRADE`) >8u lip drop; after the fix it routes around the walkable ramp instead.
-    /// Run: `ZONE_DIR=~/.local/share/eqoxide/assets/models cargo test -p eqoxide-nav --lib \
-    /// fix_700_coarse_agrees_with_fine_at_canal_lip -- --ignored --nocapture`
+    /// Run (one line; `ZONE_DIR` points at the cached zone GLBs):
+    /// `ZONE_DIR=<models-dir> cargo test -p eqoxide-nav --lib fix_700_coarse_agrees_with_fine_at_canal_lip -- --ignored --nocapture`
     #[test]
     #[ignore = "requires the cached qeynos glb; #700 canal-lip coarse/fine agreement pin"]
     fn fix_700_coarse_agrees_with_fine_at_canal_lip() {

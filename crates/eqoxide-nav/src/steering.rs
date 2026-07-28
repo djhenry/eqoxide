@@ -235,6 +235,211 @@ pub fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
     }
 }
 
+/// How far off its CURRENT segment the character may drift before the coarse-route cursor is
+/// treated as STALE and resynced (see [`resync_cursor`]). One coarse cell (8 u) is the natural
+/// scale: the coarse route is planned on an 8 u grid, so a character genuinely traversing segment
+/// `path_i` is always well inside this, while a character that has been carried onto a *different*
+/// part of the route (a fall, a slide down a ramp) is far outside it. Deliberately generous —
+/// ordinary corner-cutting and server position jitter must never trip a resync.
+///
+/// **The comparison is `<`, not `<=`, and that is measured, not cosmetic (#727 round 2).** The
+/// cycle #673 describes has an ATTRACTING FIXED POINT sitting exactly ON this boundary: on a
+/// hairpin whose legs are one coarse cell apart the cursor/carrot loop converges to a body offset of
+/// exactly 8.0 u and parks there. With `<=` that state is *inside* the guard, so the resync never
+/// fires and the carrot never leads again — measured 1 of 8 swept starts still CARROT-PINNED after
+/// 400 ticks, and 33 of 288 on the wider 8 u-separation sweep. With `<` it is outside, and both go
+/// to zero (`the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced`,
+/// `the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it`).
+///
+/// **What this constant does NOT do — the residual class, stated so nobody re-derives it as a
+/// surprise.** Below the guard the resync is inert by construction, so a route whose legs are
+/// closer together than `CURSOR_STALE_DIST` can still form the #673 cycle. Measured on the same
+/// hairpin sweep (carrot-pinned starts / total): 8 u and above → 0 pinned; 7 u → 252/252;
+/// 6 u → 216/216; 4 u → 144/144, i.e. below the guard the fix is not partial, it is absent. The
+/// real deadlock invariant is CARROT COLLAPSE (the `LOCAL_REACH` carrot landing within ~the body
+/// offset of the body while `path_i` is pinned), and a distance guard is only a proxy for it —
+/// wrong on exactly the routes whose legs are closer together than the guard. Tracked as its own
+/// issue; do not read this constant as pinning a value, it is unpinned over at least [2, 16].
+///
+/// > ## ⚠️ Corrections
+/// >
+/// > * *"1 of 8 swept starts still **wedged**"*, *"(**wedged** starts / total)"*, *"0 **wedged**"* —
+/// >   **retracted (round 3, swept here round 5).** Every count on this page comes from
+/// >   `hairpin_carrot_stops_leading`, a loop that steps the body straight at `local_goal` (24 u).
+/// >   That is not how `drive_walk` moves, so the loop can measure CARROT PINNING soundly — it is
+/// >   pure function composition — but it cannot measure whether a walker wedges. The counts are
+/// >   unchanged and were re-run; only the noun is. The correction was made in round 3 on the tests'
+/// >   own docs and missed here, which is the whole of round-4 finding B-B: the sweep was scoped by
+/// >   memory instead of by grepping the concept.
+/// > * *"…and is inert below it" cited as
+/// >   `the_resync_clears_the_deadlock_above_the_guard_and_is_inert_below_it`* — **that test no
+/// >   longer exists.** Round 3 renamed it to
+/// >   `the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it` *precisely
+/// >   because* the old name asserted the retracted "deadlock" reading of these counts. So this doc
+/// >   was citing the retracted claim by its retracted name, as evidence for itself.
+/// > * *"The round-1 review measured 133/1649 at 8 u…"* — **removed.** The round-2 reviewer retracted
+/// >   that figure on the same grounds (it was the same 24 u-step model on a denser grid), and it is
+/// >   preserved with its retraction on
+/// >   `the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it` rather than
+/// >   repeated here.
+/// >
+/// > None of this weakens the `<` finding, which is about the fixed point sitting on the boundary
+/// > and is independent of what the loop's outcome is called.
+pub const CURSOR_STALE_DIST: f32 = 8.0;
+
+/// The furthest a resync may reach: a candidate segment whose closest point is further than this
+/// from the character is never adopted, however clear the line to it (#727 round 2).
+///
+/// Two reasons, one honest and one practical.
+///
+/// * **Honest.** The invariant [`resync_cursor`] restores is *"`path_i` names the segment the
+///   character is actually on"*. A segment 60 u away is not a segment the character is on, whatever
+///   a straight-line predicate says about it. 24 u is the walker's own `LOCAL_REACH` — the horizon
+///   its fine planner is re-planned over every tick — so "inside the walker's local horizon" is the
+///   widest reading of "on" that the rest of the walker already commits to.
+/// * **Practical.** It bounds the cost of the geometry predicate, which the round-1 review flagged
+///   as unprofiled: the reachability test now includes column probes at ~2 u spacing, and this caps
+///   them at ~12 per candidate instead of running the length of a 141-waypoint route.
+pub const CURSOR_RESYNC_MAX_HOP: f32 = 24.0;
+
+/// Squared 3-D distance from `p` to segment `a`→`b`, plus the closest point on it.
+fn seg_closest(a: [f32; 3], b: [f32; 3], p: [f32; 3]) -> ([f32; 3], f32) {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    let t = if l2 < 1e-6 {
+        0.0
+    } else {
+        (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / l2).clamp(0.0, 1.0)
+    };
+    let c = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+    let d = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+    (c, d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+}
+
+/// **Resync a stale coarse-route cursor (#673).**
+///
+/// The walker advances `path_i` monotonically, one segment at a time, and only when the character's
+/// projection parameter on the CURRENT segment reaches 1.0. That rule silently assumes the character
+/// travels along the route. Physics does not honour that assumption: a fall, or a slide down a ramp,
+/// can carry the character *past* several waypoints in one step, landing it beside a segment whose
+/// projection parameter then saturates strictly below 1.0 — forever. The cursor is now pointing at a
+/// segment the character is nowhere near, and every consumer of it is computing against a false
+/// premise:
+///
+/// * [`carrot_along`] measures the carrot's arclength budget from the projection onto that stale
+///   segment, so the budget is eaten by a phantom leg. What that collapses is **`local_goal`** — the
+///   `LOCAL_REACH` (24 u) point `drive_walk` hands the FINE planner — to ~0.2 u from the body. The
+///   *steering* carrot at `LOOK_AHEAD` (5 u) does **not** collapse; off the same stale cursor it
+///   still leads by ~17 u. The collapse reaches the steering aim one step later: `find_path_local`
+///   returns a degenerate two-waypoint stub, [`steer_target`] prefers the fine path at exactly
+///   `len() >= 2` rather than discarding it as too short, and the 5 u carrot taken *along that stub*
+///   is inside one controller frame of travel (`RUN_SPEED * 0.01 = 0.44 u`), so it is overshot and
+///   the aim flips **each frame** — 15 times per 150 ms nav tick.
+/// * The stall detector watches `path_i`, which can now never advance.
+///
+/// The result is a stable limit cycle with zero net progress on a route the character is physically
+/// standing on. (Observed live in South Qeynos on the qcat aqueduct ramp — `blocked` /
+/// `walker_stalled` at `[-534.4, 144.4, -6.0]` on 6 of 8 attempts; reproduced offline from the
+/// captured live route by the three `#673 step N of 3` tests in `steering::cursor_resync_tests`.)
+///
+/// > ## ⚠️ Corrections — read these before quoting this doc
+/// >
+/// > This paragraph was written at round 1 and left untouched while the claims in it were retracted
+/// > one at a time elsewhere in the PR. It is the `cargo doc` page for the #673 fix, so the retracted
+/// > text is preserved here rather than deleted — a silently deleted wrong claim is how a wrong claim
+/// > comes back.
+/// >
+/// > * *"the carrot lands essentially ON TOP of the character"* — **retracted (round 3).** True of
+/// >   `local_goal` at `LOCAL_REACH`; false of the carrot the walker steers with. Measured on the
+/// >   captured fixture: 0.21 u at 24 u reach, **17.06 u** at `LOOK_AHEAD`. Replaced by the
+/// >   four-step chain above; measured by
+/// >   `the_stale_cursor_reaches_the_steering_aim_through_the_fine_plan_not_the_coarse_carrot`.
+/// > * *"flipping to the opposite side each **tick**"* — **retracted (round 3).** The flip is per
+/// >   controller FRAME (~10 ms), not per nav tick (150 ms).
+/// > * *"oscillates over ~0.4 u"* — **retracted (round 4, restated round 5, corrected round 6).**
+/// >   Measured settled band in `fixture_run` is **1.32 u**; over the whole run including the
+/// >   transient the body covers 8.13 u and reaches 6.60 u from where it landed. The round-3
+/// >   reviewer's production `drive_walk` log matches the *transient* figures (its three tick
+/// >   positions are what the 8.13 u and 6.60 u extremes are attained at) and does **not** match the
+/// >   settled width: production oscillates over ~2.6 u against this harness's 1.32 u.
+/// >   **Round 5 wrote 0.88 u here and blamed round 4's "1.32 u" on dropped frames. Both were
+/// >   wrong** — 0.88 u was the settled band sampled once per nav tick, and 1.32 u is what the same
+/// >   window measures per frame. See the correction on
+/// >   `the_simulated_stall_is_a_bounded_overshoot_cycle_a_few_frames_wide` for the A/B that
+/// >   settles it.
+/// > * *"exhausts its re-paths and stops with `blocked` / `walker_stalled`"* — **retracted
+/// >   (round 4).** This exact sentence was struck from `crate::walker::Walker`'s `advance_cursor`
+/// >   rustdoc because no offline instrument on this branch contains the stall detector,
+/// >   `NAV_STUCK_TICKS` backoff or re-plan that decide it. Driven through the **production**
+/// >   `drive_walk` on this fixture the walker sits in the cycle ~22 nav ticks, re-plans, and
+/// >   **arrives**; #673 is terminal on real terrain, which is a property of the terrain and not of
+/// >   this mechanism.
+/// > * *"see `walker_cursor_resync` tests"* — **no such module has ever existed.** The tests are in
+/// >   `steering::cursor_resync_tests`. Test items are `#[cfg(test)]` and so cannot be intra-doc
+/// >   linked from public rustdoc; `every_test_name_cited_in_a_doc_comment_still_exists` stands in
+/// >   for the link, naming each cited test as a value so a rename is a COMPILE error.
+///
+/// This moves the cursor toward its invariant — *`path_i` names the segment the character is
+/// actually on* — under three hard guards that keep it strictly conservative:
+///
+/// 1. **Forward only.** The scan starts at `start_i`; the cursor can never move backwards, so a lap
+///    can never be un-counted and the #631/#309 progress channels keep their meaning.
+/// 2. **Inside the local horizon.** A candidate whose closest point is further than
+///    [`CURSOR_RESYNC_MAX_HOP`] from the character is never adopted (see that constant).
+/// 3. **Only onto a segment `reachable(from, closest)` accepts.**
+///
+/// ## What guard 3 does and does not establish — read this before trusting it
+///
+/// `reachable` is a caller-supplied predicate and this function makes **no** claim about
+/// walkability on its own. The walker passes a conjunction of a chest-height line-of-sight ray
+/// (excludes WALLS) and a floor-column probe along the hop (excludes VOIDS and drops steeper than
+/// the controller's own slope+step envelope). That pairing exists because the round-1 review broke
+/// the LOS ray alone with a counterexample and it is worth stating plainly: **a hole is not a
+/// wall.** `Collision::carrot_los_clear` is documented in its own rustdoc as a chest-height centre
+/// ray, chosen deliberately to ride ABOVE ground undulation; asked "has the character reached this
+/// segment" it flies straight over a chasm. Measured: two ledges split by a 10 u gap with the next
+/// floor 200 u down, and the LOS ray alone moved the cursor 2 → 6, declaring an entire bridge
+/// detour walked (`crate::walker`'s `a_resync_must_not_cross_a_chasm_the_character_cannot_walk`).
+///
+/// Even with the floor probe this is a **necessary, not a sufficient** condition: it samples a
+/// line, so a hole narrower than the probe spacing can fall between samples, and it says nothing
+/// about the character's WIDTH. So the honest statement of what a resync means is *"the character
+/// is within [`CURSOR_RESYNC_MAX_HOP`] of this segment, with no wall and no sampled void between"* —
+/// **not** "the character walked this leg". Which is why the walker deliberately does not report a
+/// resync jump as PROGRESS: see `Walker::advance_cursor`.
+///
+/// A character within [`CURSOR_STALE_DIST`] of its current segment is left alone entirely, so the
+/// normal case is untouched (and `reachable` is not even called).
+pub fn resync_cursor(
+    path: &[[f32; 3]],
+    start_i: usize,
+    from: [f32; 3],
+    reachable: impl Fn([f32; 3], [f32; 3]) -> bool,
+) -> usize {
+    // A cursor needs at least one segment ahead of it to be resyncable; `path_i + 2 <= len` mirrors
+    // the walker's own advance bound so a resync can never park the cursor past the last segment.
+    if path.len() < 3 || start_i + 2 >= path.len() {
+        return start_i;
+    }
+    let (_, d0_sq) = seg_closest(path[start_i], path[start_i + 1], from);
+    // `<`, not `<=`: the deadlock's fixed point sits exactly ON the boundary — see CURSOR_STALE_DIST.
+    if d0_sq < CURSOR_STALE_DIST * CURSOR_STALE_DIST {
+        return start_i;
+    }
+    let hop_sq = CURSOR_RESYNC_MAX_HOP * CURSOR_RESYNC_MAX_HOP;
+    let (mut best_i, mut best_sq) = (start_i, d0_sq);
+    for i in (start_i + 1)..(path.len() - 1) {
+        let (c, d_sq) = seg_closest(path[i], path[i + 1], from);
+        // Cheap tests first — the geometry predicate is only consulted for a candidate that both
+        // improves on the current best AND is inside the reach band.
+        if d_sq < best_sq && d_sq <= hop_sq && reachable(from, c) {
+            best_i = i;
+            best_sq = d_sq;
+        }
+    }
+    best_i
+}
+
 /// A pure-pursuit carrot: the point `reach` units (3D arclength) along `path` (starting from segment
 /// `start_i`), measured from the 3D projection of `from` = `[east, north, z]` onto that segment.
 /// Returns `[east, north, z]` INTERPOLATED at the carrot point. Used at two scales: a far carrot
@@ -480,6 +685,1458 @@ pub fn steer_target(
 /// `Threaded` obviously does not: the walker is threading it right now.
 pub fn arms_coarse_replan(outcome: &crate::collision::LocalOutcome) -> bool {
     matches!(outcome, crate::collision::LocalOutcome::NoWayThrough { .. })
+}
+
+#[cfg(test)]
+mod cursor_resync_tests {
+    use super::*;
+
+    /// The real #673 fixture, verbatim from the coarse route the live walker committed on a FAILING
+    /// South Qeynos → qcat run (captured off `/v1/observe/nav_debug`, so these are the client's own
+    /// bytes, not a recomputation). Index 0 here is route waypoint 44.
+    ///
+    /// Shape: the route runs EAST along the street at y≈160 (idx 0..2), turns into the aqueduct
+    /// trench mouth (idx 3), then doubles back WEST down the ramp at y≈144 (idx 4..8).
+    const HAIRPIN: [[f32; 3]; 9] = [
+        [-542.718_75, 160.375, -0.000_007_629_394_5],
+        [-534.718_75, 160.375, -0.000_007_629_394_5],
+        [-526.718_75, 160.375, -0.000_007_629_394_5],
+        [-518.718_75, 152.375, -2.226_699_8],
+        [-526.718_75, 144.375, -4.161_232],
+        [-534.718_75, 144.375, -6.095_749],
+        [-542.718_75, 144.375, -8.030_266],
+        [-550.718_75, 144.375, -9.964_805_6],
+        [-558.718_75, 144.375, -11.899_315],
+    ];
+    /// Where the character physically ENDS UP, measured in the offline replay of that live route:
+    /// it drops off the street into the trench between idx 2 and idx 3 and lands on the ramp at
+    /// idx 5 — three waypoints further along than the cursor thinks.
+    const LANDED: [f32; 3] = [-534.285_6, 144.375, -5.991_005];
+    /// The cursor the walker's monotone advance is left holding when that happens.
+    const STALE_I: usize = 2;
+
+    fn always_clear(_: [f32; 3], _: [f32; 3]) -> bool { true }
+
+    /// **#673 — a cursor the character has physically overtaken must resync.**
+    ///
+    /// The projection of `LANDED` onto segment `STALE_I` is t≈0.61, so the walker's `t >= 1.0`
+    /// advance rule can never move past it; the character is 17 u from that segment while standing
+    /// exactly on segment 5.
+    #[test]
+    fn stale_cursor_after_a_fall_resyncs_to_the_segment_the_character_is_on() {
+        // Premise: the monotone advance really is stuck here (this is why the bug exists).
+        let (a, b) = (HAIRPIN[STALE_I], HAIRPIN[STALE_I + 1]);
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+        let t = ((LANDED[0] - a[0]) * ab[0] + (LANDED[1] - a[1]) * ab[1] + (LANDED[2] - a[2]) * ab[2]) / l2;
+        assert!(t < 1.0, "fixture no longer pins the advance rule (t = {t})");
+
+        let i = resync_cursor(&HAIRPIN, STALE_I, LANDED, always_clear);
+        // The character is standing on the idx4→idx5 / idx5→idx6 joint; either segment names where
+        // it actually is. What must NOT survive is the stale cursor three segments behind.
+        assert!((4..=5).contains(&i),
+            "cursor must resync to the segment the character is standing on, got {i}");
+    }
+
+    /// **#673 step 1 of 3 — the stale cursor collapses the FINE PLANNER'S GOAL onto the character.**
+    ///
+    /// ⚠️ **Correction (round 3).** Through round 2 this test was documented as measuring "the
+    /// walker's carrot", and the reach below was commented `// the walker's LOCAL_REACH` as though
+    /// 24 u were a steering target. It is not. `drive_walk` steers with `LOOK_AHEAD = 5.0`;
+    /// `LOCAL_REACH = 24.0` is only the *goal it hands the fine planner*. The round-2 review was
+    /// right that at 5 u off the coarse route this carrot does **not** collapse (17.06 u ahead on
+    /// this very fixture). The collapse measured here is real, but it is a collapse of `local_goal`,
+    /// and it reaches the steering aim by a different route — see the two tests that follow, which
+    /// carry that chain the rest of the way. ⚠️ **Correction (round 5).** That sentence used to end
+    /// "…and are the ones that measure a wedge". They do not: they measure the STEERING LOOP having
+    /// no escaping trajectory. Whether that is a wedge is decided by the stall detector, backoff and
+    /// re-plan, none of which any instrument on this branch contains — round-4's blocking finding 1,
+    /// and the same retracted noun as the `CURSOR_STALE_DIST` sweep counts.
+    #[test]
+    fn a_stale_cursor_collapses_the_fine_planners_goal_onto_the_character() {
+        // Not a steering carrot: this is `drive_walk`'s `local_goal`, the point handed to
+        // `find_path_local` as the fine plan's destination.
+        const REACH: f32 = 24.0;
+        let stale = carrot_along(&HAIRPIN, STALE_I, LANDED, REACH).unwrap();
+        let d_stale = (stale[0] - LANDED[0]).hypot(stale[1] - LANDED[1]);
+        assert!(d_stale < 1.0,
+            "fixture no longer reproduces the collapse (carrot was {d_stale:.2} u ahead)");
+
+        let i = resync_cursor(&HAIRPIN, STALE_I, LANDED, always_clear);
+        let fixed = carrot_along(&HAIRPIN, i, LANDED, REACH).unwrap();
+        let d_fixed = (fixed[0] - LANDED[0]).hypot(fixed[1] - LANDED[1]);
+        assert!(d_fixed > 8.0,
+            "after resync the carrot must actually lead the character; it was {d_fixed:.2} u ahead");
+        // …and it must lead DOWN the ramp (west), i.e. forward along the route.
+        assert!(fixed[0] < LANDED[0], "carrot must lead forward along the route, got {fixed:?}");
+    }
+
+    // ───────── #727 round 3: the sim at the walker's REAL steering reach (review finding A) ─────────
+
+    /// A flat floor under the whole #673 fixture. Deliberately FEATURELESS: no trench wall, no ramp,
+    /// nothing that could trap the character. If the walker still fails to make headway on this, the
+    /// failure is in the steering loop, not in terrain the harness invented to produce it.
+    fn fixture_floor() -> crate::collision::Collision {
+        let quad = |v: Vec<[f32; 3]>| eqoxide_assets::MeshData {
+            positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: eqoxide_assets::RenderMode::Opaque, anim: None,
+        };
+        // `Collision::build` maps mesh [x, y, z] -> world [east, north, height], so a vertex is
+        // written [north, height, east].
+        let floor = quad(vec![[100.0, -6.0, -600.0], [200.0, -6.0, -600.0],
+                              [200.0, -6.0, -480.0], [100.0, -6.0, -480.0]]);
+        crate::collision::Collision::build(
+            &eqoxide_assets::ZoneAssets { terrain: vec![floor], objects: vec![], textures: vec![] }, 32.0)
+    }
+
+    /// What one `fixture_run` observed.
+    ///
+    /// The run has two phases and they must not be averaged together. Ticks 0–2 are a **transient**:
+    /// the fine planner has not answered yet, so the walker steers the healthy ~17 u coarse carrot
+    /// off the stale cursor and lunges several units back up the route. Only after the degenerate
+    /// 2-point stub arrives does the limit cycle close. So the whole-run extent (`x_min` / `x_max`)
+    /// and the settled extent (`late_x_min` / `late_x_max`) measure different things, and both are
+    /// recorded rather than one standing in for the other.
+    ///
+    /// # Sampling rate — one rule, no exceptions
+    ///
+    /// **Every positional extent in this struct is sampled ONCE PER CONTROLLER FRAME** (~100 Hz),
+    /// inside [`fixture_run`]'s `step`. Not per nav tick. The single exception is `head`, which is
+    /// defined as a tick-boundary quantity and says so on its own line.
+    ///
+    /// ⚠️ **Correction (#727 round 5 review, B-1).** Round 5 sampled `x_min`/`x_max` per frame and
+    /// `late_x_min`/`late_x_max` per **tick**, then printed both in one table as "the same
+    /// measurement at two times". They were two different measurements. The settled cycle flips the
+    /// aim **every frame** — that is this PR's own root-cause mechanism — so a once-per-15-frames
+    /// sampler is structurally incapable of seeing its width: it understated the settled span by
+    /// **50%** (0.880 u tick-sampled vs 1.320 u frame-sampled over the identical `tick >= 100`
+    /// window). The fix is not to sample the two bands the same way by hand, which is how they drifted
+    /// apart in the first place; it is that there is now exactly ONE place a position is recorded, so
+    /// a future extent cannot pick a different rate.
+    struct Run {
+        arrived: bool,
+        ticks: u32,
+        /// Straight-line distance from the start position to wherever the run ended.
+        net: f32,
+        /// Extent of the east coordinate over the WHOLE run, transient included. Per frame.
+        x_min: f32,
+        x_max: f32,
+        /// Extent of the east coordinate over ticks ≥ 100 — long past any transient, so this is the
+        /// settled limit cycle and nothing else. Per frame.
+        late_x_min: f32,
+        late_x_max: f32,
+        /// The furthest the body ever got from where it landed. Per frame.
+        max_from_landed: f32,
+        /// Position at the end of each of the first three nav ticks. **The one tick-boundary
+        /// quantity here**, and deliberately so: it exists to be compared against the production
+        /// `drive_walk` loop's log, which is written once per nav tick. Sampling it per frame would
+        /// compare two different things.
+        head: Vec<[f32; 2]>,
+    }
+
+    /// Everything [`fixture_run`]'s `step` records, in one place so there is one sampling rate.
+    ///
+    /// `late` is set once at the top of each nav tick and read by `step`, so the `tick >= 100`
+    /// window is a property of the tick while the *sampling* inside it stays per frame.
+    struct Bands {
+        x_min: f32,
+        x_max: f32,
+        late_x_min: f32,
+        late_x_max: f32,
+        max_from_landed: f32,
+        late: bool,
+    }
+
+    /// Drive the #673 fixture through the walker's REAL steering rule and report how far the
+    /// character actually gets along the route.
+    ///
+    /// Structure mirrors `navigation.rs`'s two-rate loop: a 150 ms NAV TICK (cursor + `steer_target`
+    /// + a fine-plan request) and 14 fast-steer frames at ~100 Hz in between, each calling the
+    /// production [`fast_steer_aim`] exactly as `Walker::apply_fast_steering` does. The steering
+    /// itself is **not mirrored** — it is the production functions, called with the production
+    /// arguments and the production `STEER_LOS_CLEARANCE`. The only copied numbers are the loop
+    /// rates, `LOOK_AHEAD` / `LOCAL_REACH` / `LOCAL_BOUND` and `RUN_SPEED`.
+    ///
+    /// **`wish_dir` PERSISTS, which is the one thing a per-frame harness gets wrong by default.**
+    /// `Walker::apply_fast_steering` runs only when `!self.local_path.is_empty()`, and all it does
+    /// is *overwrite* `MoveIntent.wish_dir`. It never clears the intent and never stops the body.
+    /// So a tick with no fine plan is not a tick where the character stands still: the controller
+    /// integrates the tick's own `steer_target` direction for all 15 frames. This harness holds
+    /// `wish` across frames for that reason (round-4 review, B-C — the earlier version `break`ed out
+    /// of the fast loop instead, moving the body 1 frame in 15 on such a tick).
+    ///
+    /// # What this fixture does NOT model
+    ///
+    /// Stated bluntly and in one place, because scattered caveats are how a sim's result gets read
+    /// as the walker's behaviour (#727 round-3 review, blocking 1). This is a model of the
+    /// **steering loop**, not of the walker:
+    ///
+    /// 1. **No stall detector, no `NAV_STUCK_TICKS` backoff, and no re-plan.** That is precisely the
+    ///    machinery that decides whether a limit cycle is a *wedge* or a three-second hiccup. A
+    ///    `net = 0` result here means "the steering loop has no trajectory that leaves the spot",
+    ///    **not** "the walker never leaves the spot" — measured, the walker escapes this featureless
+    ///    fixture via its own stall/backoff/re-plan. See the doc on
+    ///    `the_stale_cursor_leaves_the_steering_loop_no_escaping_trajectory_and_the_resync_clears_it`.
+    /// 2. **No controller.** Position is `wish_dir * RUN_SPEED * dt` with a floor snap: no gravity,
+    ///    no collision response, no acceleration, no slope handling. On this floor there is nothing
+    ///    for those to do, which is the point of the floor being featureless — but it is a model.
+    /// 3. **The fine plan is synchronous with one tick of latency**, where production posts it with
+    ///    `post_if_idle` and applies whatever the worker has finished. The one-tick delay reproduces
+    ///    production's "tick 0 has no fine plan and steers the healthy coarse carrot"; a *variable*
+    ///    planner latency is not modelled, and a synchronous zero-latency plan (what this harness did
+    ///    through round 3) makes the fixed point artificially perfect.
+    /// 4. **One flat slab of floor**, not qcat. Nothing here says how often the live client enters
+    ///    this state, and the featureless floor is why the re-plan in (1) can rescue it.
+    ///
+    /// **On not building the answer into the instrument.** The floor is featureless, so nothing here
+    /// can trap the character except the steering rule itself; the harness is never told what a
+    /// stall is, it only integrates position and reports it; and
+    /// `a_walker_whose_cursor_is_honest_walks_this_same_fixture_out` runs it with a correct cursor
+    /// and no fix, so a harness that reported a stall unconditionally would fail its own control.
+    ///
+    /// `resync` selects the cursor rule: `false` = the monotone advance alone (pre-#727), `true` =
+    /// the advance plus [`resync_cursor`] with the walker's own predicate.
+    fn fixture_run(col: &crate::collision::Collision, start_i: usize, resync: bool, verbose: bool)
+        -> Run
+    {
+        const DT: f32 = 0.01;          // ~100 Hz controller frame
+        const FRAMES: u32 = 14;        // 150 ms nav tick = 1 steer_target + 14 fast_steer_aim frames
+        const TICKS: u32 = 200;
+        const LOOK_AHEAD: f32 = 5.0;   // walker.rs `drive_walk`
+        const LOCAL_REACH: f32 = 24.0; // walker.rs `drive_walk`
+        const LOCAL_BOUND: f32 = 40.0; // walker.rs `drive_walk`
+        // The walker's own clearance, referenced rather than re-derived: it is defined as
+        // `PLAYER_RADIUS` today, so a copy would agree by coincidence and drift silently.
+        let clearance = crate::walker::STEER_LOS_CLEARANCE;
+        let los = |a: [f32; 3], b: [f32; 3]| col.carrot_los_clear(a, b, clearance);
+        let goal = *HAIRPIN.last().unwrap();
+        let mut p = LANDED;
+        let mut path_i = start_i;
+        // Production applies the fine plan a tick after it is requested (`post_if_idle` + `poll`), so
+        // tick 0 has none — which is why tick 0 steers the healthy coarse carrot.
+        let mut local: Vec<[f32; 3]> = Vec::new();
+        let mut pending: Vec<[f32; 3]> = Vec::new();
+        let mut local_i = 0usize;
+        let mut local_from = p;
+        // The controller's live `MoveIntent.wish_dir`. It persists across frames exactly as
+        // production's does — see the fast loop below.
+        let mut wish = [0.0f32; 2];
+        let mut b = Bands {
+            x_min: p[0], x_max: p[0],
+            late_x_min: f32::MAX, late_x_max: f32::MIN,
+            max_from_landed: 0.0,
+            late: false,
+        };
+        let mut head: Vec<[f32; 2]> = Vec::new();
+        for tick in 0..TICKS {
+            let before = p;
+            // The settled-cycle window is chosen per TICK; the sampling inside it is per FRAME.
+            b.late = tick >= 100;
+            while path_i + 2 < HAIRPIN.len() {
+                let (a, b) = (HAIRPIN[path_i], HAIRPIN[path_i + 1]);
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                let t = if l2 < 1e-6 { 1.0 } else {
+                    ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / l2
+                };
+                if t >= 1.0 { path_i += 1; } else { break; }
+            }
+            if resync {
+                path_i = resync_cursor(&HAIRPIN, path_i, p, |a, b| {
+                    col.carrot_los_clear(a, b, clearance) && col.ground_continuous(a, b)
+                });
+            }
+            let coarse = carrot_along(&HAIRPIN, path_i, p, LOOK_AHEAD).unwrap_or(goal);
+            // `drive_walk`: apply whatever the fine planner finished, then drop it if the body has
+            // wandered outside the window it was planned from.
+            if !pending.is_empty() { local = std::mem::take(&mut pending); local_i = 0; }
+            if !local.is_empty() && (p[0] - local_from[0]).hypot(p[1] - local_from[1]) > LOCAL_BOUND {
+                local.clear();
+                local_i = 0;
+            }
+            // The fine plan, exactly as `drive_walk` requests it: goal = the LOCAL_REACH carrot off
+            // the CURRENT cursor. This is where a stale cursor is consumed.
+            let local_goal = carrot_along(&HAIRPIN, path_i, p, LOCAL_REACH).unwrap_or(coarse);
+            local_from = p;
+            pending = match col.find_path_local(p, local_goal, LOCAL_CELL, LOCAL_BOUND, LOCAL_CELL * 2.0) {
+                crate::collision::LocalOutcome::Threaded(s) => s,
+                crate::collision::LocalOutcome::NoWayThrough { steer, .. } => steer,
+                crate::collision::LocalOutcome::Exhausted { steer, .. } => steer,
+            };
+            // One frame of the controller integrating a MoveIntent: a UNIT `wish_dir` driven at
+            // RUN_SPEED for the whole frame. The controller does NOT slow down for a near carrot,
+            // which is why an aim inside one frame's travel (44 * 0.01 = 0.44 u) is overshot rather
+            // than reached.
+            //
+            // **This is the ONLY place a position is recorded** (round-5 review, B-1). Every extent
+            // on `Run` is therefore sampled at the same rate — this one, per frame — and a new
+            // extent cannot quietly be added at the tick boundary instead.
+            let step = |p: &mut [f32; 3], wish: [f32; 2], b: &mut Bands| {
+                p[0] += wish[0] * eqoxide_core::physics::RUN_SPEED * DT;
+                p[1] += wish[1] * eqoxide_core::physics::RUN_SPEED * DT;
+                if let Some(fz) = col.ground_below(p[0], p[1], p[2] + 4.0, 40.0) { p[2] = fz; }
+                b.x_min = b.x_min.min(p[0]);
+                b.x_max = b.x_max.max(p[0]);
+                if b.late {
+                    b.late_x_min = b.late_x_min.min(p[0]);
+                    b.late_x_max = b.late_x_max.max(p[0]);
+                }
+                b.max_from_landed =
+                    b.max_from_landed.max((p[0] - LANDED[0]).hypot(p[1] - LANDED[1]));
+            };
+            // ONE `steer_target` per nav tick (the 150 ms coarse tick, with the LOS clamp). Its aim
+            // is what `drive_walk` turns into `MoveIntent.wish_dir` — and `wish_dir` then PERSISTS:
+            // the controller keeps integrating that same vector every frame until something writes
+            // a new one.
+            let aim = steer_target(&HAIRPIN, path_i, &local, &mut local_i, p, LOOK_AHEAD, coarse, &los);
+            let (adx, ady) = (aim[0] - p[0], aim[1] - p[1]);
+            let ad = (adx * adx + ady * ady).sqrt();
+            // `drive_walk` publishes no intent for a degenerate aim; the previous tick's intent is
+            // what the controller would still be holding, so carry `wish` over unchanged.
+            if ad > 1e-3 { wish = [adx / ad, ady / ad]; }
+            step(&mut p, wish, &mut b);
+            // …then the ~10 ms fast loop. `Walker::apply_fast_steering` OVERRIDES `wish_dir` — and
+            // only when `!self.local_path.is_empty()`. It never clears it and never stops the body.
+            // So on a tick with NO fine plan the controller integrates the tick's own MoveIntent for
+            // all 15 frames.
+            //
+            // ⚠️ **Correction (#727 round 4 review, B-C).** This loop used to `break` on a tick with
+            // no fine plan, advancing the body **1 frame of the 15**. That is not a physics
+            // simplification, it is the harness declining to move the body, and it manufactured a
+            // lateral bound the character does not have: the eastern extreme of the whole run was
+            // set on tick 0 (`t0 cursor 2 local.len 0 moved 0.440 u`) purely because 14 frames were
+            // dropped. The round-3 reviewer's production `drive_walk` loop reached `x = -528.39` at
+            // t1 — 5.9 u east — on this same fixture. Fixed here rather than disclosed, because a
+            // bound derived from dropped frames cannot say anything about the character.
+            for _ in 0..FRAMES {
+                if !local.is_empty() {
+                    if let Some((w, _)) = fast_steer_aim(&local, &mut local_i, p, LOOK_AHEAD, |_, _| true) {
+                        wish = w;
+                    }
+                }
+                step(&mut p, wish, &mut b);
+            }
+            if verbose {
+                println!("  t{tick:<3} cursor {path_i} local.len {:<3} moved {:.3} u  pos ({:.3},{:.3})",
+                    local.len(), (p[0] - before[0]).hypot(p[1] - before[1]), p[0], p[1]);
+            }
+            let net = (p[0] - LANDED[0]).hypot(p[1] - LANDED[1]);
+            // `head` is the ONE tick-boundary quantity: it is compared against a production log that
+            // is itself written once per nav tick. Everything else was recorded inside `step`.
+            if head.len() < 3 { head.push([p[0], p[1]]); }
+            if (p[0] - goal[0]).hypot(p[1] - goal[1]) <= 3.0 {
+                return Run { arrived: true, ticks: tick + 1, net,
+                    x_min: b.x_min, x_max: b.x_max,
+                    late_x_min: b.late_x_min, late_x_max: b.late_x_max,
+                    max_from_landed: b.max_from_landed, head };
+            }
+        }
+        Run { arrived: false, ticks: TICKS, net: (p[0] - LANDED[0]).hypot(p[1] - LANDED[1]),
+            x_min: b.x_min, x_max: b.x_max,
+            late_x_min: b.late_x_min, late_x_max: b.late_x_max,
+            max_from_landed: b.max_from_landed, head }
+    }
+
+
+    /// **#673 step 2 of 3 — how the collapse reaches the steering aim.** The round-2 review's
+    /// finding A was half right and this test records both halves, because getting this wrong in
+    /// either direction is what cost two review rounds.
+    ///
+    /// * **Right:** the walker does not steer with a 24 u carrot, and at its real `LOOK_AHEAD = 5.0`
+    ///   the *coarse* carrot off the stale cursor is not collapsed at all — it leads by ~17 u.
+    /// * **Wrong:** that carrot is not what the walker steers with either. [`steer_target`] prefers
+    ///   the fine path whenever it has two or more points, and the fine path is planned to the
+    ///   collapsed `local_goal`, so it is a degenerate 2-point stub 0.2 u long. The 5 u carrot
+    ///   measured *along that stub* is the aim, and it is collapsed.
+    ///
+    /// So the stale cursor reaches the steering aim through the fine tier, not the coarse one.
+    #[test]
+    fn the_stale_cursor_reaches_the_steering_aim_through_the_fine_plan_not_the_coarse_carrot() {
+        let col = fixture_floor();
+        let radius = eqoxide_core::physics::PLAYER_RADIUS;
+        let los = |a: [f32; 3], b: [f32; 3]| col.carrot_los_clear(a, b, radius);
+        let d = |q: [f32; 3]| (q[0] - LANDED[0]).hypot(q[1] - LANDED[1]);
+
+        let coarse = carrot_along_los(&HAIRPIN, STALE_I, LANDED, 5.0, &los).unwrap();
+        assert!(d(coarse) > 10.0,
+            "the COARSE carrot at LOOK_AHEAD is not the collapsed one — if this ever fails, the \
+             round-3 account of #673 is wrong and the round-2 one may be right (was {:.2} u)", d(coarse));
+
+        let local_goal = carrot_along(&HAIRPIN, STALE_I, LANDED, 24.0).unwrap();
+        assert!(d(local_goal) < 1.0, "local_goal must be the collapsed one (was {:.2} u)", d(local_goal));
+
+        let steer = match col.find_path_local(LANDED, local_goal, LOCAL_CELL, 40.0, LOCAL_CELL * 2.0) {
+            crate::collision::LocalOutcome::Threaded(s) => s,
+            crate::collision::LocalOutcome::NoWayThrough { steer, .. } => steer,
+            crate::collision::LocalOutcome::Exhausted { steer, .. } => steer,
+        };
+        // Two points is the threshold at which `steer_target` starts preferring the fine tier. A
+        // degenerate stub is therefore not ignored as too short — it is preferred.
+        assert_eq!(steer.len(), 2, "expected a degenerate fine plan, got {steer:?}");
+
+        let mut local_i = 0usize;
+        let aim = steer_target(&HAIRPIN, STALE_I, &steer, &mut local_i, LANDED, 5.0, coarse, &los);
+        assert!(d(aim) < 1.0,
+            "the steering aim must be collapsed even though the coarse carrot is not (was {:.2} u)", d(aim));
+        // One frame's travel is RUN_SPEED * 0.01 = 0.44 u, so an aim this near is overshot, not
+        // reached. That is the limit cycle.
+        assert!(d(aim) < eqoxide_core::physics::RUN_SPEED * 0.01,
+            "aim {:.2} u is further than one frame of travel; the overshoot argument would not hold", d(aim));
+    }
+
+    /// **#673 step 3 of 3 — the STEERING LOOP has no escaping trajectory, and the resync clears it.**
+    ///
+    /// The whole chain, driven at `LOOK_AHEAD` through the production [`steer_target`] and
+    /// [`fast_steer_aim`], on a floor with nothing in it to blame. With the stale cursor the loop
+    /// enters a limit cycle and stays in it for the whole run: **0.04 u net displacement over 200 nav
+    /// ticks** (30 s of simulated time), never getting further than **6.6 u** from where it landed —
+    /// less than one 8 u leg of the route it is standing on. With the resync it walks the fixture out
+    /// in **4** nav ticks.
+    ///
+    /// ⚠️ **Correction (#727 round 5).** Through round 4 the figures here were "0.02 u net" and
+    /// "5 nav ticks". Those were measured on a harness that stopped moving the body for 14 frames of
+    /// every 15 whenever the fine plan was empty (round-4 review, B-C); [`fixture_run`] now carries
+    /// `wish_dir` across frames the way the controller does. The numbers moved to 0.04 u / 4 ticks.
+    /// Nothing about the conclusion changed — but the OLD numbers were partly an artifact of dropped
+    /// frames and should not be quoted.
+    ///
+    /// ⚠️ **Correction (#727 round 4).** Through round 3 this test was named
+    /// `..._wedges_the_walker_...` and its doc said "pre-#727 the character never leaves the spot".
+    /// **That was a claim about the walker made by an instrument that does not contain the walker.**
+    /// [`fixture_run`] has no stall detector, no `NAV_STUCK_TICKS` backoff and no re-plan — the exact
+    /// machinery that decides whether a limit cycle is a wedge or a hiccup. The round-3 reviewer
+    /// drove the **production** `drive_walk` + `apply_fast_steering` loop on this same fixture with
+    /// the resync mutated out and measured the walker sitting in this cycle for ~22 nav ticks
+    /// (~3.3 s), then escaping via its own backoff + re-plan and **arriving** at t27. So on this
+    /// featureless floor the pre-#727 cost is a wasted re-plan lap, not a permanent stop.
+    ///
+    /// **What the defect is, then.** The steering loop having no escaping trajectory is the
+    /// mechanism; whether that is terminal is decided outside this sim, by whether the re-plan
+    /// reproduces the state. Live on qcat it did: #673 records `blocked` / `walker_stalled` at
+    /// `[-534.4, 144.4, -6.0]` on **6 of 8** attempts. The terminal state itself is what carries that
+    /// — the walker stopped, on a route it was standing on.
+    ///
+    /// ⚠️ **Correction (#727 round 5).** This paragraph used to add "and `walker.rs` only emits
+    /// `walker_stalled` after `nav_repaths` reaches 8 — i.e. eight backoff-and-re-plan attempts ran
+    /// and none escaped". That over-reads the counter. `drive_walk` resets `nav_repaths` to 0
+    /// whenever `gdist < nav_best_gdist - REPATH_RESET_DIST` (200 u) and on `decision.reset_route`,
+    /// so `nav_repaths == 8` at the emission site
+    /// (`walker.rs`'s `stop_nav(gs, "blocked", "walker_stalled", …)`)
+    /// establishes *at least eight stall-triggered re-plans since the walker
+    /// last closed 200 u on the goal* — not eight attempts **at this spot**. Nothing in the live
+    /// record places all eight there. The conclusion is unchanged and rests on the `blocked` outcome
+    /// itself, not on the count.
+    ///
+    /// The residual #673 defect therefore ranges from ~22 wasted ticks plus a re-plan lap (measured,
+    /// featureless floor) to a terminal stop (observed, real terrain). *Reasoned, not measured:* the
+    /// flat slab is probably why the re-plan rescues it here — a re-plan starts at the body, and this
+    /// floor offers no second fall to carry the character off the new route, where the aqueduct
+    /// trench does.
+    #[test]
+    fn the_stale_cursor_leaves_the_steering_loop_no_escaping_trajectory_and_the_resync_clears_it() {
+        let col = fixture_floor();
+
+        let stale = fixture_run(&col, STALE_I, false, false);
+        assert!(!stale.arrived, "pre-#727 the fixture must reproduce the stall");
+        assert!(stale.net < 0.5,
+            "the stall is ZERO net displacement, not slow progress; moved {:.2} u in {} ticks",
+            stale.net, stale.ticks);
+        // Zero NET is not the same as never moving — the transient below is real motion. Bound the
+        // excursion against the route's own scale: one 8 u leg. In 200 nav ticks (30 s) a walker
+        // that were merely slow covers 1320 u; this one never advances a single leg.
+        assert!(stale.max_from_landed < 8.0,
+            "the body wandered {:.2} u from where it landed — that is more than one route leg, so \
+             this is not the no-escaping-trajectory state the test is named for", stale.max_from_landed);
+
+        let fixed = fixture_run(&col, STALE_I, true, false);
+        assert!(fixed.arrived, "the resync must get the character to the goal; it moved {:.2} u", fixed.net);
+        assert!(fixed.ticks <= 20, "arrival took {} nav ticks, expected a handful", fixed.ticks);
+    }
+
+
+    /// The control for the test above: same harness, same floor, same route, cursor NOT stale and the
+    /// fix NOT applied. It arrives. A harness that reports a stall whatever you feed it proves
+    /// nothing, so
+    /// this is the assertion that makes the one above mean something.
+    #[test]
+    fn a_walker_whose_cursor_is_honest_walks_this_same_fixture_out() {
+        let col = fixture_floor();
+        let run = fixture_run(&col, 4, false, false);
+        assert!(run.arrived,
+            "control failed: the harness cannot complete the route even with an honest cursor, so it \
+             cannot attribute a stall to a stale one (moved {:.2} u in {} ticks)", run.net, run.ticks);
+    }
+
+    /// **The simulated stall is a BOUNDED overshoot cycle a few frames wide** — it does not drift,
+    /// and it does not creep along the route. That is the property worth pinning: an aim nearer than
+    /// one frame of travel (`RUN_SPEED * 0.01 = 0.44 u`) is overshot, the direction flips, and the
+    /// body orbits the stub instead of following the route.
+    ///
+    /// ⚠️ **Correction (#727 round 4) — the corroboration claim is WITHDRAWN.** Through round 3 this
+    /// test was named `..._oscillates_in_the_band_the_live_capture_recorded` and asserted
+    /// `|x_min − (−534.73)| < 0.05` against the live capture, with the doc claiming "the sim was not
+    /// fitted to those numbers … the agreement is evidence that it reproduces the live defect rather
+    /// than a similar-looking one". The round-3 reviewer showed that was an **identity, not
+    /// evidence**:
+    ///
+    /// ```text
+    /// LANDED[0]                  = -534.285_583   <- the capture's east end: a harness INPUT
+    /// RUN_SPEED * 0.01           =    0.440_000   <- a code constant
+    /// LANDED[0] - RUN_SPEED*0.01 = -534.725_586   <- what the assertion was matching
+    /// ```
+    ///
+    /// Any harness seeded at `LANDED` that aims west and steps a full frame produces that number,
+    /// whatever the mechanism, so the assertion discriminated "oscillates at the start" from "moves"
+    /// and nothing finer. Two further corrections on the same point: the round-4 harness (one
+    /// `steer_target` + 14 [`fast_steer_aim`] frames, one tick of planner latency) puts `x_min` at
+    /// **-535.185**, so even the identity no longer holds; and the band is **not** reproduced — the
+    /// reviewer's production `drive_walk` loop oscillates over roughly `[-536.5, -533.0]` (~2.6 u)
+    /// against this sim's 1.32 u, so the sim's width is a property of the harness, not of the defect.
+    /// The capture's −534.73 lies inside this sim's band and is *consistent* with an overshoot cycle;
+    /// it is **not** independent evidence of one.
+    ///
+    /// ⚠️ **Correction (#727 round 5) — the round-4 replacement assertion is WITHDRAWN and the band
+    /// figure is restated.** Round 4 replaced the identity above with three assertions, one of them
+    /// `run.x_max <= LANDED[0] + 2.0 * FRAME` (0.88 u) under the message *"the character must never
+    /// get materially EAST of where it landed"*. The round-4 review showed that bound was **earned by
+    /// the harness dropping frames**, not by the character: with no fine plan the old [`fixture_run`]
+    /// `break`ed out of its fast loop, so tick 0 advanced the body 1 frame of 15 and set the eastern
+    /// extreme right there. Production keeps integrating the last `MoveIntent`, and the round-3
+    /// reviewer's production run reached `x = -528.39` — **5.9 u east**, ~6.7× that budget. ~~Round
+    /// 4's quoted band, "1.32 u in the sim", is retracted for the same reason.~~
+    ///
+    /// [`fixture_run`] now carries `wish_dir` across frames, and the picture that comes back is
+    /// **two-phase**, which is why one number could not describe it:
+    ///
+    /// ```text
+    /// whole run    x ∈ [-536.524, -528.391]   span 8.13 u   max 6.60 u from LANDED
+    /// ticks ≥ 100  x ∈ [-535.204, -533.884]   span 1.32 u = 3 frames of travel
+    ///                                         0.40 u east of LANDED, 0.92 u west
+    /// ```
+    ///
+    /// ⚠️ **Correction (#727 round 6 review, B-1) — the round-5 retraction above is struck, and its
+    /// two numbers are restated. Measured, not reasoned.** Two independent defects:
+    ///
+    /// 1. **The 0.88 u was a sampling artifact of round 5's own making.** Round 5 recorded
+    ///    `x_min`/`x_max` per *frame* but `late_x_min`/`late_x_max` per *nav tick*, then printed both
+    ///    in one table as though they were one measurement at two times. The settled cycle flips the
+    ///    aim **every frame** — this PR's own root-cause mechanism — so a once-per-15-frames sampler
+    ///    cannot see its width. Over the identical `tick >= 100` window: **0.880 u tick-sampled,
+    ///    1.320 u frame-sampled**, a 50% understatement. Every extent on `Run` is now recorded in one
+    ///    place, inside `step`; see `Run`'s own "one sampling rate" note.
+    /// 2. **"Retracted for the same reason" was false, and the reason was never measured.** The
+    ///    frame drop did not change the cycle's width at all. Round 4's harness was reconstructed on
+    ///    this branch (its `None => break` restored, everything else left alone) and re-run under
+    ///    per-frame sampling:
+    ///
+    /// ```text
+    /// harness            whole-run band              settled band (ticks >= 100)   net      fixed
+    /// round 4 (break)    [-535.185, -533.865] 1.320  [-535.185, -533.865] 1.320    0.0197   5 ticks
+    /// round 5/6 (carry)  [-536.524, -528.391] 8.134  [-535.204, -533.884] 1.320    0.0389   4 ticks
+    /// ```
+    ///
+    /// The reconstruction reproduces round 4's reported `[-535.185, -533.865]`, its `0.0197 u` net
+    /// and its 5-tick arrival exactly, so it is the round-4 harness and not a lookalike. Read across:
+    /// the frame drop left the settled width **identical to three decimal places** (1.320 vs 1.320,
+    /// the band shifted 0.019 u west) and collapsed the *whole-run* band from 8.134 u to 1.320 u by
+    /// suppressing the transient — which is why round 4's whole-run figure happened to equal the
+    /// settled width. So **1.32 u was a correct settled-cycle width mislabelled as a whole-run band**,
+    /// not an artifact of dropped frames. The figures the frame drop *did* earn are `net` and the
+    /// arrival tick count (0.0197 → 0.0389 u, 5 → 4 ticks), and those are corrected on
+    /// `the_stale_cursor_leaves_the_steering_loop_no_escaping_trajectory_and_the_resync_clears_it`.
+    ///
+    /// The assertions below were re-checked against per-frame sampling and all three still hold with
+    /// headroom: span 1.3200 < 2.2000; east excursion 0.4011; west excursion 0.9189 (2.3× what
+    /// round 5 reported for it, and still inside the 2.200 bound). Nothing here was a green test that
+    /// should have been red — it was a reporting defect, and a retraction whose stated cause was
+    /// untested.
+    ///
+    /// ⚠️ **Correction (#727 round 7 review, non-blocking 4).** Round 6 wrote those two excursions as
+    /// `0.402` and `0.918`. Those are what you get by subtracting the **printed 3-decimal band**
+    /// above from a 3-decimal `LANDED[0]` — arithmetic on rounded endpoints, sitting under a heading
+    /// that reads *"Measured, not reasoned."* The heading makes the precision a claim, and the claim
+    /// was not paid for: measured in `f32` off `Run`, they are **0.4011** and **0.9189**, each 0.001
+    /// out and in *opposite* directions. Immaterial to every assertion, which is exactly why it
+    /// survived — a figure nothing depends on is a figure nobody re-derives. The test now prints all
+    /// three (`cargo test … -- --nocapture`), so the next person to quote them reads them off a run.
+    ///
+    /// Ticks 0–2 are a transient: no fine plan has arrived, so the walker steers the *healthy* ~17 u
+    /// coarse carrot and lunges back up the route — real motion, and the reason "never gets east" was
+    /// never true of the character. From tick 3 on the degenerate stub is in hand and the cycle
+    /// closes. **The settled cycle is what "a few frames wide" was always about**, and that is what
+    /// the assertions below now measure.
+    ///
+    /// **On the production agreement.** Fixing the frame drop was motivated by B-C, not by chasing
+    /// these numbers — and the harness now reproduces the round-3 reviewer's production `drive_walk`
+    /// log tick for tick: `(-528.39, 147.34)`, `(-534.33, 144.46)`, `(-536.52, 144.37)`.
+    ///
+    /// ⚠️ **Correction (#727 round 6 review, non-blocking 2) — the anti-identity argument was
+    /// overstated, in exactly the position it leaned on.** This paragraph used to say "three 2-D
+    /// positions including a north excursion are not something any west-stepping harness produces by
+    /// construction", and pointed at tick 0's north excursion as the reason. Measured:
+    /// `|head[0] − LANDED| = 6.5997` against `15 × RUN_SPEED × 0.01 = 6.6000`. Tick 0's endpoint lies
+    /// on the circle of one nav tick's travel around a harness INPUT — its *magnitude* is a code
+    /// constant times a loop count and discriminates nothing, exactly the round-3 identity's shape.
+    /// What position 0 contributes is one number, its **direction**, and both instruments compute
+    /// that from the same `carrot_along` on the same fixture. The agreements that do discriminate are
+    /// `head[1]` (0.091 u from `LANDED`) and `head[2]` (2.239 u), which depend on the stub geometry
+    /// and the aim flip and are not derivable from a constant. Three positions are still not the
+    /// round-3 identity — but the honest count is **two independent agreements plus one direction**,
+    /// not three, and no sentence here should be quotable as more.
+    ///
+    /// Be precise about what even that is worth: both
+    /// instruments run the *same* production `steer_target` / `carrot_along` / `find_path_local` on
+    /// the *same* fixture, so this is two faithful instruments agreeing — evidence about the
+    /// harness's fidelity, **not** independent evidence about the live defect. Those three positions
+    /// are quoted from the round-3 review and were not re-measured here; the assertion below is what
+    /// keeps this branch honest about continuing to match them.
+    #[test]
+    fn the_simulated_stall_is_a_bounded_overshoot_cycle_a_few_frames_wide() {
+        const FRAME: f32 = eqoxide_core::physics::RUN_SPEED * 0.01;
+        let run = fixture_run(&fixture_floor(), STALE_I, false, false);
+
+        // The SETTLED cycle (ticks >= 100), which is the thing "a few frames wide" describes.
+        let span = run.late_x_max - run.late_x_min;
+        // Round 7 (non-blocking 4): the doc above quotes these three. Print them, so the quoted
+        // figures come from THIS run and not from arithmetic on the band's printed 3 decimals.
+        eprintln!(
+            "settled span {span:.4}   east of LANDED {:.4}   west of LANDED {:.4}",
+            run.late_x_max - LANDED[0], LANDED[0] - run.late_x_min);
+        assert!(span < 5.0 * FRAME,
+            "the settled cycle must stay within a few frames of travel — a wider band would be \
+             drift, not a limit cycle; it was {span:.3} u");
+        // …and it must sit ON the landing spot, neither creeping west down the route nor east back
+        // up it. This is the character claim the withdrawn assertion was reaching for, made about
+        // the phase where the harness is actually integrating every frame.
+        assert!(run.late_x_max - LANDED[0] < 5.0 * FRAME && LANDED[0] - run.late_x_min < 5.0 * FRAME,
+            "the settled cycle drifted off the landing spot to [{:.3}, {:.3}] against a landing of \
+             {:.3} — a cycle that makes ground is slow progress, not a stall",
+            run.late_x_min, run.late_x_max, LANDED[0]);
+
+        // Fidelity: the transient must keep matching the production loop, or the frame-carry fix
+        // that earns the assertions above has been undone. (Round-3 review's log, quoted.)
+        const PRODUCTION_HEAD: [[f32; 2]; 3] =
+            [[-528.39, 147.34], [-534.33, 144.46], [-536.52, 144.37]];
+        for (i, (got, want)) in run.head.iter().zip(PRODUCTION_HEAD.iter()).enumerate() {
+            assert!((got[0] - want[0]).abs() < 0.02 && (got[1] - want[1]).abs() < 0.02,
+                "tick {i} ended at ({:.3}, {:.3}); the production drive_walk loop ended it at \
+                 ({:.2}, {:.2}). The harness has stopped modelling the controller's persistent \
+                 wish_dir, so any bound it reports is about the harness, not the character.",
+                got[0], got[1], want[0], want[1]);
+        }
+    }
+
+    /// **The normal case is untouched, and pays nothing.** A walker within `CURSOR_STALE_DIST` of
+    /// its own segment keeps its cursor and the `clear` predicate is never even consulted.
+    #[test]
+    fn an_on_route_walker_is_left_alone_without_consulting_geometry() {
+        let called = std::cell::Cell::new(false);
+        for (i, on_seg) in [(0usize, [-538.0f32, 160.375, 0.0]), (4, [-530.0, 144.375, -5.0])] {
+            let got = resync_cursor(&HAIRPIN, i, on_seg, |_, _| { called.set(true); true });
+            assert_eq!(got, i, "an on-route cursor must not move");
+        }
+        assert!(!called.get(), "the LOS predicate must not be called for an on-route walker");
+    }
+
+    /// **The staleness guard EXISTS — this does not pin its value.** On a tight switchback a walker
+    /// that is genuinely mid-leg can be geometrically CLOSER to a later segment than to its own —
+    /// here 1.5 u from segment 0 but 0.5 u from segment 2, an out-and-back only 2 u wide. A
+    /// nearest-segment snap would skip the entire outbound leg and quietly cut the route; some
+    /// staleness guard means a walker still on its segment is never touched.
+    ///
+    /// ⚠️ **Correction (#727 round 2).** This doc used to open *"Why the `CURSOR_STALE_DIST` guard is
+    /// load-bearing"*, which read as pinning the constant. It does not: the round-1 review mutated
+    /// `CURSOR_STALE_DIST` to both **2.0** and **16.0** and this test survived both (1.5 u is inside
+    /// either guard). What it kills is REMOVING the guard entirely. The constant is unpinned over at
+    /// least [2, 16] and is a judgement call, not a measurement — see the constant's own doc for the
+    /// one thing about it that *is* measured (the `<` boundary).
+    #[test]
+    fn a_walker_cutting_a_tight_switchback_keeps_its_cursor() {
+        let switchback = [[0.0f32, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 2.0, 0.0], [0.0, 2.0, 0.0]];
+        assert_eq!(resync_cursor(&switchback, 0, [5.0, 1.5, 0.0], always_clear), 0,
+            "a walker mid-leg must not be snapped onto a nearer later segment");
+    }
+
+    /// **Every test name this crate's rustdoc cites must still exist (#727 round 5).**
+    ///
+    /// Round-4's blocking findings were both dangling citations: `walker_cursor_resync` (a module
+    /// that never existed) and `the_resync_clears_the_deadlock_above_the_guard_and_is_inert_below_it`
+    /// (renamed in round 3 *because* its name asserted a retracted claim). Nothing caught either,
+    /// because both were plain backticks — and they cannot be intra-doc links, since a `#[cfg(test)]`
+    /// item is invisible to the rustdoc pass that would check the link.
+    ///
+    /// So this stands in for the link: naming each cited item as a value makes a rename a **compile
+    /// error** in the same commit, not a silent rot found four review rounds later.
+    ///
+    /// **You do not have to remember to add a line here — for every citation shape that scan can
+    /// see.** The list below is the *enforcement*; its *completeness* is checked mechanically by
+    /// `every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard`, which reads the source
+    /// and fails if a doc comment cites a test this array does not name.
+    ///
+    /// ⚠️ **Correction (#727 round 7 review, non-blocking 1).** Round 6 wrote that first sentence
+    /// without the qualifier, and it was **false for two shapes at once**: `::`-qualified paths
+    /// failed the scan's charset filter, and a citation hand-wrapped across two lines never appears
+    /// whole on any line. Both were live — the review found
+    /// `zone_assets::no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone` in `walker.rs`
+    /// hitting *both*, inside the scan's own corpus. Round 7 extended the scan to cover both (the
+    /// charset now admits `:` and resolves on the tail; unbalanced spans are rejected outright), so
+    /// the sentence is true again — but it is true of a **stated rule**, not of "any citation", and
+    /// the rule's remaining blind spots are written down in "What it does NOT do" below. A guard
+    /// that claims coverage it does not have is worse than no guard.
+    #[test]
+    fn every_test_name_cited_in_a_doc_comment_still_exists() {
+        let _cited: &[fn()] = &[
+            // cited by `CURSOR_STALE_DIST`
+            the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced,
+            the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it,
+            // cited by `resync_cursor` and by `Walker::advance_cursor`
+            the_stale_cursor_reaches_the_steering_aim_through_the_fine_plan_not_the_coarse_carrot,
+            the_stale_cursor_leaves_the_steering_loop_no_escaping_trajectory_and_the_resync_clears_it,
+            a_stale_cursor_collapses_the_fine_planners_goal_onto_the_character,
+            // cited by `fixture_run`'s "not building the answer into the instrument" note
+            a_walker_whose_cursor_is_honest_walks_this_same_fixture_out,
+            // added in round 6 by the mechanical scan below — all three were cited in doc comments
+            // in this file and named in no guard list, which is the defect the scan exists to find.
+            resync_never_jumps_across_blocked_geometry,
+            every_test_name_cited_in_a_doc_comment_still_exists,
+            every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard,
+            // …and this one the scan caught on its first run, on a citation added in round 6
+            // itself — which is the whole argument for having it.
+            the_simulated_stall_is_a_bounded_overshoot_cycle_a_few_frames_wide,
+            // The identity-mutant survivor list in `the_resync_moves_the_cursor_...`'s doc. All four
+            // were invisible to any grep until round 6: three were elided to `..._` and two were
+            // hand-wrapped across a line break INSIDE their backticks. Un-eliding them is what
+            // exposed them to the scan.
+            resync_never_moves_the_cursor_backwards,
+            resync_is_inert_on_degenerate_paths,
+            an_on_route_walker_is_left_alone_without_consulting_geometry,
+            a_walker_cutting_a_tight_switchback_keeps_its_cursor,
+        ];
+        // Helpers cited by name in the same docs.
+        let _helpers: (fn(&crate::collision::Collision, usize, bool, bool) -> Run,
+                       fn(f32, [f32; 3], usize) -> bool) = (fixture_run, hairpin_carrot_stops_leading);
+    }
+
+    /// **The citation guard's ALPHABET is now mechanical, not remembered (#727 round 6 review,
+    /// non-blocking 1).**
+    ///
+    /// The round-5 review accepted that the `fn()` guard *bites* — it renamed a cited test and got a
+    /// compile error — and then made the obvious next point: the guard's list is hand-maintained, so
+    /// it is the memory-scoped act this PR has spent five rounds failing at, one level down. A
+    /// twenty-line scan found two misses in seconds: a real test cited in a doc comment in the guard's
+    /// own file and named in no list, and a citation in `collision.rs` that resolved to nothing
+    /// anywhere in the workspace. Both are fixed; this test is what stops the third.
+    ///
+    /// **The two corpora, named — because a sweep is (terms × corpus) and this PR's recurring defect
+    /// has been running the right terms over the wrong corpus.**
+    ///
+    /// * **Citations are READ from** the four files #727 touches. Widening this to the whole crate is
+    ///   a follow-up, not a silent assumption: files outside it are not scanned and this test claims
+    ///   nothing about them.
+    /// * **Names are RESOLVED against** every `.rs` in the whole workspace (`crates/`, `tests/`,
+    ///   `src/`, minus any `target/`) — deliberately wider than the citation corpus, so a citation
+    ///   that points at another crate's test resolves instead of being reported as rot. `walker.rs`
+    ///   cites one in `eqoxide-net`, so this width is load-bearing, not decorative.
+    ///
+    /// **The rule.** For every backticked, lower-snake identifier in a doc comment with at least
+    /// three underscores (four or more words — the shape test names take in this crate, and a stated
+    /// heuristic rather than a proof: a cited two-word test name would slip through):
+    ///
+    /// 1. if it is a `#[test] fn` **in the same file as the citation** → it must appear in that
+    ///    file's `_cited` / `_helpers` guard, so a rename is a compile error;
+    /// 2. else if it resolves to any `fn` in the resolution corpus → fine (rustdoc's own link check
+    ///    covers the public ones, and cross-module test items cannot be named from here anyway);
+    /// 3. else it must be listed in `NOT_A_FN` below **with a reason**. That inversion is the point:
+    ///    the default is "must resolve", and every exception is written down and argued.
+    ///
+    /// **Verified to bite, by execution, on both halves** (round 6, each mutation applied → run →
+    /// reverted): deleting one name from the `_cited` array above reports *"is a #[test] in this file
+    /// … but no `_cited`/`_helpers` guard in this file names it"*; adding `a_test_that_does_not_exist_anywhere`
+    /// to `resync_cursor`'s rustdoc reports *"resolves to NO fn in the resolution corpus"*. It has
+    /// also bitten twice unprompted: on its very first run, on a citation this same round had just
+    /// added and not guarded; and on the paragraph you are reading, whose quoted mutation name it
+    /// flagged as unresolvable — correctly — forcing the `NOT_A_FN` entry below.
+    ///
+    /// **Round 7 added two more halves and both were verified the same way** (mutation applied → run
+    /// → reverted, `md5sum -c` clean). Re-wrapping `walker.rs`'s `zone_assets::…` citation back
+    /// across two lines reports *"a code span opens on this line and closes on another"* on **both**
+    /// lines, and — because `:` is now in the charset — the truncated leading fragment additionally
+    /// reports *"resolves to NO fn"*; retyping a `::`-qualified citation to a name that does not
+    /// exist (`steering::route_goal_offset_reports_vertical_shortfall_only`) reports the same. Four
+    /// problems from two mutations, one run, `0 passed; 1 failed`.
+    ///
+    /// **What it does NOT do**, so nobody reads it as more:
+    ///
+    /// * it does not check that a citation is *apt* — only that the name exists and is pinned
+    ///   against renaming;
+    /// * its `>= 3 underscores` filter is a heuristic about this crate's naming, not a proof;
+    ///   `walker_cursor_resync`, the round-4 dangling citation, has two and would still slip past it;
+    /// * for a `::`-qualified path it resolves the **tail only** (`resolution_name`). A citation
+    ///   whose module prefix is wrong but whose final identifier exists elsewhere in the workspace
+    ///   resolves and is not reported. Prefixes are prose here, not links;
+    /// * lines inside a triple-backtick fence are exempt from the **unbalanced-span check only**;
+    ///   `doc_citations` does not skip fences, so a citation written inside a fenced example is
+    ///   still resolved (rule 2/3) and, if it is a same-file `#[test]`, still required to be in the
+    ///   `_cited`/`_helpers` guard (rule 1) — only the *parity* balance check is fence-exempt;
+    /// * the citation corpus is still the four files #727 touches. Nothing here claims anything
+    ///   about the other `.rs` files in the workspace;
+    /// * backtick parity is not span-crossing (round 8): escaping a literal backtick in prose (the
+    ///   standard CommonMark double-backtick escape) both false-fails the balance check on its own
+    ///   line, and — applied the same way on both sides of a genuine wrap — can make both lines land
+    ///   on an even count and hide it from `unbalanced_doc_spans` entirely. The same padding evades
+    ///   `doc_citations` too, and for a distinct reason: that scan selects citation text by its
+    ///   position in the line's backtick-split (`skip(1).step_by(2)`, only odd indices read), and
+    ///   the padding shifts the citation's fragment off an odd index onto an even one, where nothing
+    ///   ever reads it. Demonstrated by execution against this exact corpus.
+    ///
+    /// ⚠️ **Correction (#727 round 7 review, non-blocking 1).** The first two bullets are all round 6
+    /// listed, and the round-6 review demonstrated the list was incomplete by finding a live citation
+    /// that two *unlisted* blind spots hid. The third and fourth bullets exist because the round-7
+    /// fix for those two introduced blind spots of its own: widening the charset to `:` buys nothing
+    /// about the prefix, and skipping fences to avoid false positives is a real exemption. Both are
+    /// stated rather than discovered next round.
+    ///
+    /// ⚠️ **Correction (#727 round 8 review, blocking).** The fourth bullet was wrong: it said a
+    /// fenced citation is "neither balance-checked nor guarded". Only the first half is true.
+    /// Verified by execution on this head: a nonexistent name and an unguarded same-file `#[test]`
+    /// name, both cited from inside a triple-backtick-fenced example, are still reported by rules
+    /// 2/3 and rule 1 respectively — `doc_citations` has no fence check at all, only
+    /// `unbalanced_doc_spans` does. Corrected above, and the sixth bullet (parity ≠ span-crossing)
+    /// is the blind spot this list was actually missing. The fifth bullet's file count was also
+    /// stale (151 → 154, drift from
+    /// unrelated merges, not a mechanism error) and is corrected in the same pass.
+    ///
+    /// ⚠️ **Correction (#727 round 9 review, non-blocking).** Two more cleanups, same pass as the
+    /// causal-claim fix on `unbalanced_doc_spans` below. First: the fifth bullet's count is deleted,
+    /// not re-counted — it went stale within a single round (154 correct at `d01d338`; `origin/main`
+    /// moved to 159 tracked files one round later, true figure 155 on landing), which is exactly the
+    /// "measurement with an expiry date" the round-7 correction two bullets up already warns about,
+    /// just not yet applied to this number. The sentence needs no number to make its point. Second:
+    /// the sixth bullet's closing cross-reference pointed at `unbalanced_doc_spans`'s doc for "the
+    /// counts" — that doc states no counts and never did; removed. Its attribution was also
+    /// incomplete: the false pass on this exact padded example is not parity alone, `doc_citations`
+    /// misses it independently, verified by tracing `skip(1).step_by(2)` against the literal text —
+    /// the citation's fragment lands at split index 6 on the 6-backtick line, and only odd indices
+    /// (1, 3, 5, …) are ever read.
+    #[test]
+    fn every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard() {
+        use std::collections::{HashMap, HashSet};
+        use std::path::PathBuf;
+
+        /// Citations that deliberately name something that is not a `fn` in this workspace. Each
+        /// entry is a claim in its own right; if one stops being true, delete it and the scan will
+        /// say so.
+        const NOT_A_FN: &[(&str, &str)] = &[
+            ("the_resync_clears_the_deadlock_above_the_guard_and_is_inert_below_it",
+             "a test renamed in round 3, quoted verbatim inside a ⚠️ Corrections block so the \
+              retracted name is preserved rather than deleted. Inherently unguardable."),
+            ("open_air_ceiling_is_never_returned_as_floor",
+             "a fixture RETRACTED at PR-D/D-2 and deleted; the doc that names it IS its retraction \
+              note."),
+            ("baked_zone_has_collision_mesh_with_invisible_faces",
+             "a test in the asset-server repository, not this workspace; the doc says so."),
+            ("zone_assets_stale_for_previous_zone",
+             "a `nav_reason` string (`NotUsable::StaleForPreviousZone::as_str`), not a fn."),
+            ("local_no_way_through",
+             "a `stop_nav` reason string, not a fn."),
+            ("arrived_at_goal_tier",
+             "a local binding in the walker sim's arrival check, not a fn."),
+            ("route_goal_offset_reports_vertical_shortfall_only",
+             "the deliberately-wrong name round 7's `::`-resolution mutation retyped \
+              `steering::route_goal_offset_reports_horizontal_shortfall_only` to, quoted in this \
+              fn's rustdoc as the evidence that half bites. It resolves to nothing by design — and \
+              the scan caught it here too, on the run that added the paragraph, which is the second \
+              time this doc has had to buy its own exception."),
+            ("a_test_that_does_not_exist_anywhere",
+             "the deliberately-nonexistent name this scan's own mutation check injected, quoted in \
+              this fn's rustdoc as the evidence that the check bites. Its whole point is that it \
+              resolves to nothing — and the scan caught it here, unprompted, on the run that added \
+              that paragraph."),
+        ];
+
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let ws = crate_root.parent().and_then(|p| p.parent())
+            .expect("crate is two levels under the workspace root").to_path_buf();
+
+        // ── corpus 1: where citations are read from ──────────────────────────────────────────────
+        let cited_in: Vec<PathBuf> = vec![
+            crate_root.join("src/steering.rs"),
+            crate_root.join("src/walker.rs"),
+            crate_root.join("src/collision.rs"),
+            ws.join("tests/walker_sim.rs"),
+        ];
+        // ── corpus 2: where names are resolved against ───────────────────────────────────────────
+        let mut resolve_in: Vec<PathBuf> = Vec::new();
+        let mut stack = vec![ws.join("crates"), ws.join("tests"), ws.join("src")];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    // `target/` holds generated sources; resolving against them would let a stale
+                    // build artifact vouch for a citation.
+                    if p.file_name().is_some_and(|n| n == "target") { continue; }
+                    stack.push(p);
+                } else if p.extension().is_some_and(|s| s == "rs") { resolve_in.push(p); }
+            }
+        }
+        // A silently empty corpus would make this test vacuously green — the exact failure mode it
+        // exists to prevent. Pin both ends.
+        for p in &cited_in {
+            assert!(p.is_file(), "citation corpus file is missing: {}", p.display());
+        }
+        assert!(resolve_in.len() >= cited_in.len(),
+            "resolution corpus is smaller than the citation corpus ({} files) — the source tree is \
+             not where this test thinks it is, and every check below would pass vacuously",
+            resolve_in.len());
+
+        let read = |p: &PathBuf| std::fs::read_to_string(p)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
+
+        // `fn NAME` declarations, and which of them carry a `#[test]` above them.
+        let scan_fns = |src: &str, tests_out: &mut HashSet<String>, all_out: &mut HashSet<String>| {
+            let mut pending_test = false;
+            for line in src.lines() {
+                let t = line.trim_start();
+                if t.starts_with("#[test]") { pending_test = true; continue; }
+                let Some(name) = fn_name_on(line) else { continue };
+                if pending_test { tests_out.insert(name.clone()); pending_test = false; }
+                all_out.insert(name);
+            }
+        };
+        let mut all_fns: HashSet<String> = HashSet::new();
+        let mut tests_by_file: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+        for p in &resolve_in {
+            let src = read(p);
+            let mut tests = HashSet::new();
+            scan_fns(&src, &mut tests, &mut all_fns);
+            tests_by_file.insert(p.clone(), tests);
+        }
+
+        let mut problems: Vec<String> = Vec::new();
+        for p in &cited_in {
+            let src = read(p);
+            let guard = guard_entries(&src);
+            let own_tests = tests_by_file.get(p).cloned().unwrap_or_default();
+            for (name, line) in doc_citations(&src) {
+                let where_ = format!("{}:{line}", p.file_name().unwrap().to_string_lossy());
+                let resolved = resolution_name(&name).to_string();
+                if own_tests.contains(&resolved) {
+                    if !guard.contains(&resolved) {
+                        problems.push(format!(
+                            "{where_}: `{name}` is a #[test] in this file cited in a doc comment, \
+                             but no `_cited`/`_helpers` guard in this file names it — a rename would \
+                             rot the citation silently. Add it to the guard array."));
+                    }
+                } else if !all_fns.contains(&resolved) {
+                    if !NOT_A_FN.iter().any(|(n, _)| *n == resolved) {
+                        problems.push(format!(
+                            "{where_}: `{name}` is cited in a doc comment and resolves to NO fn in \
+                             the resolution corpus. Either the citation is stale, or it names \
+                             something that is not a fn — in which case add it to NOT_A_FN with a \
+                             reason."));
+                    }
+                }
+            }
+            // A structural check for a code span wrapped across two lines — independent of the
+            // citation loop above, which reads each line's chunks on its own and so can ALSO fire
+            // on a wrapped citation's truncated fragment (round 9 review: verified by execution,
+            // both halves firing together in the same run). Neither check subsumes the other.
+            for line in unbalanced_doc_spans(&src) {
+                problems.push(format!(
+                    "{}:{line}: a code span opens on this line and closes on another. `cargo doc` \
+                     renders the break inside the span. Keep the span on one line.",
+                    p.file_name().unwrap().to_string_lossy()));
+            }
+        }
+        // Dead exceptions are their own kind of stale claim.
+        // Under the RESOLUTION name, not the written one — `NOT_A_FN` is keyed on what a citation
+        // resolves to, so a `::`-qualified exception must match here too or it reads as dead.
+        let all_cited: HashSet<String> = cited_in.iter()
+            .flat_map(|p| doc_citations(&read(p)).into_iter()
+                .map(|(n, _)| resolution_name(&n).to_string()))
+            .collect();
+        for (n, _) in NOT_A_FN {
+            if !all_cited.contains(*n) {
+                problems.push(format!(
+                    "NOT_A_FN lists `{n}`, which no doc comment in the citation corpus cites any \
+                     more. Delete the exception."));
+            }
+        }
+        assert!(problems.is_empty(), "doc-comment citation scan found {} problem(s):\n  {}",
+            problems.len(), problems.join("\n  "));
+    }
+
+    /// The `NAME` in a `fn NAME` declaration on this line, if any. Deliberately dumb — it is a
+    /// lexical scan, not a parser, and both callers only need it to be right about ordinary
+    /// declarations. `&[fn()]` and `fn(f32) -> bool` do not match (no space after `fn`).
+    fn fn_name_on(line: &str) -> Option<String> {
+        let mut rest = line;
+        loop {
+            let i = rest.find("fn ")?;
+            let before_ok = i == 0 || !rest[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_');
+            let tail = &rest[i + 3..];
+            let name: String = tail.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            if before_ok && !name.is_empty() && name.starts_with(|c: char| c.is_ascii_lowercase()) {
+                return Some(name);
+            }
+            rest = &rest[i + 3..];
+        }
+    }
+
+    /// Every backticked lower-snake identifier of four or more words appearing in a doc comment,
+    /// with its 1-based line number.
+    ///
+    /// `::`-qualified paths are included (round 7). They were excluded until the round-6 review
+    /// found `zone_assets::no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone` cited in
+    /// `walker.rs` and unseen by this scan, because `:` failed the charset filter. There are eight
+    /// such citations in the corpus and every one of them now goes through the same resolution as an
+    /// unqualified name — see `resolution_name`.
+    fn doc_citations(src: &str) -> Vec<(String, usize)> {
+        let mut out = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            if !(t.starts_with("///") || t.starts_with("//!")) { continue; }
+            for chunk in t.split('`').skip(1).step_by(2) {
+                if chunk.len() > 2
+                    && chunk.starts_with(|c: char| c.is_ascii_lowercase())
+                    && chunk.chars().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == ':'
+                    })
+                    && chunk.matches('_').count() >= 3
+                    && !chunk.ends_with(':')
+                {
+                    out.push((chunk.to_string(), i + 1));
+                }
+            }
+        }
+        out
+    }
+
+    /// The name a citation is RESOLVED under: the tail after the last `::`. `walker.rs` cites tests
+    /// in `collision`, `steering`, `zone_assets` and `eqoxide-net`; the module prefix is not
+    /// checked, only that the final identifier exists — see this scan's "What it does NOT do".
+    fn resolution_name(citation: &str) -> &str {
+        citation.rsplit("::").next().unwrap_or(citation)
+    }
+
+    /// A backtick-PARITY heuristic: every doc-comment line outside a triple-backtick fence whose
+    /// backtick count is odd. Round 7: this is what caught the round-6 review's surviving
+    /// citation, once the hand-wrap made the opening line's count odd.
+    ///
+    /// ⚠️ **Correction (#727 round 8 review, blocking).** This doc used to call the odd-count check
+    /// "i.e. a code span that opens on one line and closes on another" — an equivalence. It is false
+    /// in both directions, demonstrated by execution. Escaping a literal backtick in prose (the
+    /// standard CommonMark double-backtick escape) puts an odd backtick count on one line with
+    /// nothing crossing anything — a FALSE FAILURE, and this check hard-fails it, reporting a defect
+    /// that is not there. And a citation genuinely wrapped across two lines, padded with the same
+    /// escape so each line's count comes out even, passes this check silently — a FALSE PASS, and
+    /// the exact shape it exists to catch. Parity implies a crossing span only when nothing else on
+    /// the line contributes an odd backtick count of its own; it is not equivalent to it. See "What
+    /// it does NOT do" below for the sixth bullet this forces.
+    ///
+    /// ⚠️ **Correction (#727 round 9 review, blocking).** Round 8's rewrite struck the `i.e.`
+    /// equivalence above but left a second, stronger absolute standing: "no amount of widening the
+    /// charset would have caught it, because the name never appears whole on any line." Falsified
+    /// by execution: `doc_citations` reads each line's chunks independently, so a wrapped
+    /// citation's truncated leading fragment IS visible to it, and — once `:` was added to the
+    /// charset (round 7) — resolves to nothing and is reported by the citation half. Verified by
+    /// re-wrapping the exact round-6 citation, and separately a plain citation with no `::` at all;
+    /// both fire the citation-half diagnostic in the same run as this check's own, on this head. The
+    /// round-6 citation survived because `:` was not yet in the charset, not because a wrapped name
+    /// is inherently invisible to citation resolution. No further mechanism claim is made here.
+    ///
+    /// ⚠️ **Correction (#727 round 10 review, blocking).** The paragraph at the top of this doc
+    /// used to close with a comparison between this check and `doc_citations`: "They catch
+    /// overlapping but different subsets of wrapped citations; neither subsumes the other." Found
+    /// false in one direction and deleted, not repaired — this is the third round running in which
+    /// a sentence summarising the relationship between the two checks turned out to be a new
+    /// falsifiable absolute (round 8's `i.e.` equivalence in the paragraph above, round 9's own
+    /// "neither subsumes" replacement for it, now this one). No replacement sentence is written.
+    /// What this check does
+    /// is stated in the paragraph above, on its own terms; what `doc_citations` does is stated in
+    /// its own doc, on its own terms. Nothing here compares them, and nothing should.
+    ///
+    /// ⚠️ **Correction (#727 round 10 review, non-blocking).** The round-9 block above says the
+    /// wrapped fragment "IS visible" to `doc_citations`, unqualified. Left as originally written,
+    /// as history — but for the reader, it holds only when the opening line's own backtick count
+    /// is odd; the sixth bullet below (padding onto an even count) is the case where it does not.
+    fn unbalanced_doc_spans(src: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut in_fence = false;
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            let Some(body) = t.strip_prefix("///").or_else(|| t.strip_prefix("//!")) else {
+                // A fence cannot span a gap in the doc comment; a stray unterminated one must not
+                // silence every later line in the file.
+                in_fence = false;
+                continue;
+            };
+            if body.trim_start().starts_with("```") { in_fence = !in_fence; continue; }
+            if in_fence { continue; }
+            if body.matches('`').count() % 2 == 1 { out.push(i + 1); }
+        }
+        out
+    }
+
+    /// Every identifier named inside a `let _cited: &[fn()] = &[ … ];` or `let _helpers … = ( … );`
+    /// block in this source — i.e. the set a rename would break the build on.
+    fn guard_entries(src: &str) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        let mut depth: Option<&str> = None;
+        for line in src.lines() {
+            let t = line.trim();
+            if depth.is_none() {
+                if t.starts_with("let _cited") { depth = Some("];"); continue; }
+                if t.starts_with("let _helpers") { depth = Some(");"); }
+                else { continue; }
+            }
+            let end = depth.unwrap();
+            let mut cur = String::new();
+            for c in line.chars() {
+                if c.is_ascii_alphanumeric() || c == '_' { cur.push(c); }
+                else { if cur.len() > 2 { out.insert(std::mem::take(&mut cur)); } else { cur.clear(); } }
+            }
+            if cur.len() > 2 { out.insert(cur); }
+            if t.ends_with(end) { depth = None; }
+        }
+        out
+    }
+
+    /// **A distance TIE resolves to the EARLIER segment, and that is the conservative half of the
+    /// tie (#727 round-4 review, non-blocking 1).**
+    ///
+    /// The candidate loop's test is `d_sq < best_sq`, strictly. Mutate it to `<=` and the *latest*
+    /// equidistant admissible segment wins instead, so the cursor jumps further forward on a tie —
+    /// and the round-4 review measured that mutation surviving the whole suite (196 passed).
+    /// Unpinned is the wrong state for this token in particular: round-2's finding B turned entirely
+    /// on the strictness of this comparison (a candidate 30 u from the body was refused by the TIE,
+    /// not by the reach band, which is what made a test look like it pinned
+    /// `CURSOR_RESYNC_MAX_HOP` when it did not).
+    ///
+    /// Fixture: two parallel bars at y = ±6 either side of the body, both **exactly** 6.0 u away
+    /// (the closest points are `[0, 6]` and `[0, -6]`, computed at t = 0.5 with no rounding, so the
+    /// tie is exact in f32 and not a near-miss). Segment 0 is 10 u away, so the body is stale and
+    /// both bars improve on it; both are inside `CURSOR_RESYNC_MAX_HOP`. The earlier bar is
+    /// segment 2, the later is segment 4.
+    ///
+    /// Forward-only means the cursor may only ADVANCE, so on a tie the smallest advance is the one
+    /// that claims the least. `resync_cursor` makes no walkability claim (see its rustdoc), so when
+    /// two segments are equally good evidence, taking the nearer-to-current one is the reading that
+    /// asserts less about where the character has been.
+    #[test]
+    fn a_distance_tie_between_two_admissible_segments_resolves_to_the_earlier_one() {
+        let bars = [
+            [-20.0f32, 10.0, 0.0], [20.0, 10.0, 0.0],   // seg 0: 10 u from the body
+            [20.0, 6.0, 0.0],                            // seg 1: the east connector
+            [-20.0, 6.0, 0.0],                           // seg 2: the +6 bar  ← must win
+            [-20.0, -6.0, 0.0],                          // seg 3: the west connector
+            [20.0, -6.0, 0.0],                           // seg 4: the -6 bar  (ties with seg 2)
+            [20.0, -10.0, 0.0], [-20.0, -10.0, 0.0],
+        ];
+        let body = [0.0f32, 0.0, 0.0];
+        // Premise: the two candidates really are EXACTLY equidistant, or this pins nothing.
+        let (_, d2) = seg_closest(bars[2], bars[3], body);
+        let (_, d4) = seg_closest(bars[4], bars[5], body);
+        assert_eq!(d2, d4, "fixture no longer produces an exact tie ({d2} vs {d4})");
+        // Premise: both are admissible — stale (seg 0 is 10 u away) and inside the reach band.
+        let (_, d0) = seg_closest(bars[0], bars[1], body);
+        assert!(d0 > CURSOR_STALE_DIST * CURSOR_STALE_DIST, "fixture is not stale (d0² = {d0})");
+        assert!(d2 <= CURSOR_RESYNC_MAX_HOP * CURSOR_RESYNC_MAX_HOP,
+            "fixture's tied candidates are outside the reach band and would be refused by it");
+
+        assert_eq!(resync_cursor(&bars, 0, body, always_clear), 2,
+            "a tie must resolve to the EARLIER segment — the smallest forward jump the evidence \
+             supports. Flip `d_sq < best_sq` to `<=` and this goes to 4.");
+    }
+
+    /// **Guard 1 — forward only.** A character that has fallen BACKWARDS onto an earlier part of the
+    /// route must not have its cursor rewound: rewinding would un-count progress the walker has
+    /// genuinely made and hand the lap detectors (#631/#309) a false premise.
+    #[test]
+    fn resync_never_moves_the_cursor_backwards() {
+        // Standing on segment 0 while the cursor has advanced to 6 — 30 u away from segment 6.
+        let back = [-538.0f32, 160.375, 0.0];
+        assert_eq!(resync_cursor(&HAIRPIN, 6, back, always_clear), 6);
+    }
+
+    /// **Guard 2 — never across geometry.** With everything blocked the cursor must stay put: a
+    /// resync must never declare a leg of the route walked that the character could not reach.
+    #[test]
+    fn resync_never_jumps_across_blocked_geometry() {
+        assert_eq!(resync_cursor(&HAIRPIN, STALE_I, LANDED, |_, _| false), STALE_I);
+    }
+
+    /// **THE property test.** For a dense sweep of positions and every starting cursor, the returned
+    /// index must be (i) a valid forward segment start, (ii) never FURTHER from the body than the
+    /// cursor it was handed, and (iii) once the cursor is stale, no admissible forward segment
+    /// (inside [`CURSOR_RESYNC_MAX_HOP`], predicate clear) may be strictly nearer than the one
+    /// chosen. Properties (ii) and (iii) are stated as OUTCOMES and checked against an independent
+    /// scan — not by re-implementing the function.
+    ///
+    /// ⚠️ **Correction (#727 round 2).** The round-1 version of this test asserted only `i >= start_i`
+    /// and `i + 1 < len`. The round-1 review pointed out that **both are true of the identity
+    /// function**, so it passed under the `resync_cursor ≡ identity` mutation and pinned nothing
+    /// about the fix. The retracted assertions are still here — they are correct, just not
+    /// sufficient — with (ii)/(iii) added, plus a premise counter so the sweep cannot go green by
+    /// never exercising a resync at all.
+    ///
+    /// **Mutation-checked by execution (#727 round 2; count re-measured round 7):** with
+    /// `resync_cursor` replaced by the identity function this test now FAILS (it panics on the
+    /// premise counter at `moved = 0`), together with **11 others — 12 in total**. The tests that
+    /// still pass under that mutant are exactly
+    /// the ones whose assertion IS "the cursor does not move":
+    /// `resync_never_moves_the_cursor_backwards`,
+    /// `resync_never_jumps_across_blocked_geometry`,
+    /// `resync_is_inert_on_degenerate_paths`,
+    /// `an_on_route_walker_is_left_alone_without_consulting_geometry`,
+    /// `a_walker_cutting_a_tight_switchback_keeps_its_cursor`,
+    /// `walker`'s `a_resync_must_not_cross_a_wall_and_it_uses_the_real_clearance`.
+    /// (Round 6: those six names were previously hand-wrapped *inside* their backticks, so
+    /// `cargo doc` rendered them with a space in the middle and three of them were elided to `...`
+    /// — a citation that cannot be grepped and cannot be checked. One identifier, one line.)
+    /// An identity mutant satisfying a "must not move" test is
+    /// not a gap in the test; the movement claims are the ones that had to be pinned, and are.
+    ///
+    /// ⚠️ **Correction (#727 round 7 review, non-blocking 3).** This said *"together with 9 others"*
+    /// and the PR body said *"11 tests in total"*. Both were wrong, and wrong in the safe direction:
+    /// re-run on `4cc217f` the mutant gives `test result: FAILED. 191 passed; 12 failed`, so the
+    /// honest figure is **12**. Nothing eroded — rounds 3–6 *added* tests over `resync_cursor` and
+    /// nobody re-ran the mutant, because the number reads like prose. **An enumerated count is a
+    /// measurement with an expiry date:** it is invalidated by every test added anywhere near the
+    /// mutated function, which is precisely the kind of change nobody thinks of as touching a doc.
+    /// If you add a test here, re-run the mutant or delete the count; do not update it by reasoning.
+    #[test]
+    fn resync_always_returns_the_nearest_admissible_forward_segment() {
+        let d = |p: [f32; 3], i: usize| seg_closest(HAIRPIN[i], HAIRPIN[i + 1], p).1.sqrt();
+        let (mut swept, mut moved) = (0usize, 0usize);
+        for start_i in 0..HAIRPIN.len() - 1 {
+            let mut x = -570.0f32;
+            while x <= -510.0 {
+                let mut y = 130.0f32;
+                while y <= 175.0 {
+                    for z in [-20.0f32, -6.0, 0.0, 12.0] {
+                        let p = [x, y, z];
+                        let i = resync_cursor(&HAIRPIN, start_i, p, always_clear);
+                        swept += 1;
+                        // (i) — retained from round 1.
+                        assert!(i >= start_i, "moved backwards: {start_i} -> {i}");
+                        assert!(i + 1 < HAIRPIN.len(), "cursor {i} is not a segment start");
+                        if start_i + 2 >= HAIRPIN.len() { continue; }
+                        let d_start = d(p, start_i);
+                        let d_got = d(p, i);
+                        // (ii) a resync may never leave the body further from its own segment.
+                        assert!(d_got <= d_start + 1e-3,
+                            "resync made the cursor WORSE at {p:?}: {start_i}({d_start:.2}u) -> {i}({d_got:.2}u)");
+                        if i != start_i { moved += 1; }
+                        // (iii) with a stale cursor, nothing admissible is nearer than what we took.
+                        if d_start >= CURSOR_STALE_DIST {
+                            for j in (start_i + 1)..(HAIRPIN.len() - 1) {
+                                let dj = d(p, j);
+                                if dj <= CURSOR_RESYNC_MAX_HOP {
+                                    assert!(d_got <= dj + 1e-3,
+                                        "left a nearer admissible segment on the table at {p:?}: took \
+                                         {i} ({d_got:.2}u), segment {j} was {dj:.2}u");
+                                }
+                            }
+                        }
+                    }
+                    y += 3.0;
+                }
+                x += 3.0;
+            }
+        }
+        // Premise: the sweep must actually exercise the resync, or (ii)/(iii) are vacuous.
+        assert!(moved > 200, "premise: the sweep resynced only {moved} of {swept} positions");
+    }
+
+    /// **Guard 2 — the reach band.** A segment the predicate says is perfectly clear is still refused
+    /// when it is further than [`CURSOR_RESYNC_MAX_HOP`] away, because "the segment the character is
+    /// actually on" cannot mean one 30 u distant. Here the body is 30 u off segment 0 and 30 u from
+    /// the parallel return leg, with an always-clear predicate: the cursor must not move.
+    #[test]
+    fn resync_refuses_a_segment_beyond_the_reach_band() {
+        // ⚠️ **Correction (round 3).** Through round 2 the far leg here sat at n = 60, putting the
+        // body 30 u from segment 0 *and* 30 u from segment 2. Segment 2 was then refused by the
+        // strict `d_sq < best_sq` tie, not by the band at all, so deleting `&& d_sq <= hop_sq`
+        // survived this test — it looked sensitive only because of its own premise line. The far leg
+        // is now at n = 59 so segment 2 is strictly NEARER than segment 0 and would be adopted on
+        // proximity alone; the band is the only thing that can refuse it. Retracted text: "30 u from
+        // segment 0 and 30 u from segment 2".
+        let far = [[0.0f32, 0.0, 0.0], [80.0, 0.0, 0.0], [80.0, 59.0, 0.0], [0.0, 59.0, 0.0]];
+        let body = [40.0f32, 30.0, 0.0];
+        let d = |i: usize, path: &[[f32; 3]]| seg_closest(path[i], path[i + 1], body).1.sqrt();
+        assert!(d(2, &far) < d(0, &far),
+            "premise: the far segment must WIN on proximity ({:.1} u vs {:.1} u), or this test passes \
+             for the wrong reason", d(2, &far), d(0, &far));
+        assert!(CURSOR_RESYNC_MAX_HOP < d(2, &far),
+            "premise: the far segment must sit outside the band ({:.1} u)", d(2, &far));
+        assert_eq!(resync_cursor(&far, 0, body, always_clear), 0,
+            "a segment beyond the reach band must never be adopted, however clear the line to it");
+        // …and the same fixture DOES resync once the far leg is brought inside the band.
+        let near = [[0.0f32, 0.0, 0.0], [80.0, 0.0, 0.0], [80.0, 40.0, 0.0], [0.0, 40.0, 0.0]];
+        assert_eq!(resync_cursor(&near, 0, body, always_clear), 2,
+            "premise: with the leg inside the band the same geometry must resync");
+    }
+
+    /// Degenerate inputs must be inert, not panic: an empty path, a single waypoint, and a cursor
+    /// already parked on the last segment.
+    #[test]
+    fn resync_is_inert_on_degenerate_paths() {
+        assert_eq!(resync_cursor(&[], 0, LANDED, always_clear), 0);
+        assert_eq!(resync_cursor(&[[0.0, 0.0, 0.0]], 0, LANDED, always_clear), 0);
+        assert_eq!(resync_cursor(&HAIRPIN, HAIRPIN.len() - 2, LANDED, always_clear), HAIRPIN.len() - 2);
+        assert_eq!(resync_cursor(&HAIRPIN, 99, LANDED, always_clear), 99);
+    }
+
+    // ──────────────── #727 round 2: the deadlock sim, and where the fix stops ────────────────
+
+    /// An 8 u-spaced hairpin: out along `y = 0` from `x = 0` to `x = 80`, back along `y = sep`.
+    /// 8 u is the coarse planner's own cell, so this is the shape a real switchback route takes.
+    fn hairpin_route(sep: f32) -> Vec<[f32; 3]> {
+        let mut p: Vec<[f32; 3]> = (0..=10).map(|k| [k as f32 * 8.0, 0.0, 0.0]).collect();
+        p.extend((0..=10).rev().map(|k| [k as f32 * 8.0, sep, 0.0]));
+        p
+    }
+
+    /// Drive the PRODUCTION cursor arithmetic for 400 nav ticks and report whether the cursor/carrot
+    /// loop reaches a fixed point instead of running the route out. Each tick: the walker's monotone
+    /// advance (verbatim), then [`resync_cursor`], then [`carrot_along`] at `LOCAL_REACH`, then one
+    /// 150 ms step at `RUN_SPEED` straight at that point.
+    ///
+    /// ⚠️ **Correction (round 3) — read the name literally.** Through round 2 this was called
+    /// `hairpin_wedges` and its results were reported as walker outcomes, on the stated grounds that
+    /// 24 u is "the walker's own carrot reach". It is not: `drive_walk` steers with
+    /// `LOOK_AHEAD = 5.0`, and 24 u is only the goal it hands the fine planner. A body that steps
+    /// straight at `local_goal` is therefore **not the walker's motion**, and the round-2 review was
+    /// right to reject arrival claims measured this way. What this loop does measure — soundly — is
+    /// whether the CURSOR/CARROT arithmetic can reach a fixed point, because that is pure function
+    /// composition and does not depend on how the body is propelled. The tables below are kept for
+    /// that, and only that. Arrival is measured instead by
+    /// `the_stale_cursor_leaves_the_steering_loop_no_escaping_trajectory_and_the_resync_clears_it`,
+    /// which drives the production [`steer_target`] and [`fast_steer_aim`] at `LOOK_AHEAD` (and which
+    /// carries its own disclosure that it models the steering loop, not the whole walker).
+    ///
+    /// Deliberately NOT a physics sim: no collision, no controller, so the reachability predicate is
+    /// vacuously clear. That isolates the one thing under test.
+    fn hairpin_carrot_stops_leading(sep: f32, start: [f32; 3], mut cursor: usize) -> bool {
+        const DT: f32 = 0.15;          // the nav tick
+        // `drive_walk`'s `local_goal` reach — the fine planner's destination, NOT a steering carrot.
+        const LOCAL_REACH: f32 = 24.0;
+        let route = hairpin_route(sep);
+        let goal = *route.last().unwrap();
+        let mut p = start;
+        for _ in 0..400 {
+            while cursor + 2 < route.len() {
+                let (a, b) = (route[cursor], route[cursor + 1]);
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                let t = if l2 < 1e-6 { 1.0 } else {
+                    ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / l2
+                };
+                if t >= 1.0 { cursor += 1; } else { break; }
+            }
+            cursor = resync_cursor(&route, cursor, p, always_clear);
+            let carrot = carrot_along(&route, cursor, p, LOCAL_REACH).unwrap_or(goal);
+            let d = [carrot[0] - p[0], carrot[1] - p[1]];
+            let len = (d[0] * d[0] + d[1] * d[1]).sqrt();
+            if len > 1e-4 {
+                let step = (eqoxide_core::physics::RUN_SPEED * DT).min(len);
+                p[0] += d[0] / len * step;
+                p[1] += d[1] / len * step;
+            }
+            if (p[0] - goal[0]).hypot(p[1] - goal[1]) <= 4.0 { return false; }
+        }
+        true
+    }
+
+    /// **MEASURED (#727 round 2): the deadlock's attracting fixed point sits exactly ON the
+    /// [`CURSOR_STALE_DIST`] boundary, and `<=` leaves it inside the guard.**
+    ///
+    /// On the 8 u hairpin the loop converges to a body offset of exactly 8.0 u with the cursor
+    /// pinned, and stays there for the whole run. Swept starts 6.25 … 8.00 u off the outbound leg,
+    /// cursor pinned at the waypoint the body is abreast of:
+    ///
+    /// * with `d0_sq <= CURSOR_STALE_DIST²` (the round-1 code): **1 of 8 pinned** (the 7.00 u start,
+    ///   which converges onto the boundary and is then held there by the `<=`)
+    /// * with `d0_sq <  CURSOR_STALE_DIST²` (this branch): **0 of 8**
+    ///
+    /// Both numbers were measured on this branch by flipping that single token and re-running; the
+    /// same flip takes the 8 u column of
+    /// [`the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it`] from 0/288 to
+    /// 33/288. Mutation check: flip it back to `<=` and this test goes RED.
+    ///
+    /// ⚠️ **Correction (round 3).** These counts are of *carrot pinning*, not of a walker failing to
+    /// arrive — see [`hairpin_carrot_stops_leading`]. Round 2 reported them as wedged walkers.
+    #[test]
+    fn the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced() {
+        let mut pinned = Vec::new();
+        for k in 0..8 {
+            let y = 6.25 + 0.25 * k as f32;
+            if hairpin_carrot_stops_leading(8.0, [40.0, y, 0.0], 5) { pinned.push(y); }
+        }
+        assert!(pinned.is_empty(),
+            "the guard-boundary band still deadlocks at offsets {pinned:?} — the fixed point at \
+             exactly CURSOR_STALE_DIST must be OUTSIDE the guard");
+    }
+
+    /// **MEASURED (#727 round 2, re-labelled round 3): where the fix stops.** The resync is inert
+    /// below [`CURSOR_STALE_DIST`] by construction, so a hairpin whose legs are closer together than
+    /// the guard still forms the #673 cycle. This pins both halves of that honestly: **zero** pinned
+    /// starts from 8 u separation (the guard itself) up, and a **total** wipe-out below it.
+    ///
+    /// Measured on this branch (`--nocapture` prints the table):
+    ///
+    /// ```text
+    /// sep  4 u: 144/144 pinned     sep  9 u: 0/324
+    /// sep  6 u: 216/216 pinned     sep 10 u: 0/360
+    /// sep  7 u: 252/252 pinned     sep 12 u: 0/432
+    /// sep  8 u:   0/288
+    /// ```
+    ///
+    /// ⚠️ **Correction (round 3).** The column above counted *carrot pinning* all along, but round 2
+    /// labelled it "wedged" and read it as walker arrival. It is not a walker outcome — the loop it
+    /// comes from steps straight at `local_goal`, which is not how `drive_walk` moves. Retracted
+    /// wording: "**zero** wedged starts … a **total** wipe-out". The counts themselves are unchanged
+    /// and were re-run at round 3; only the claim they support is narrower. The round-1 review's own
+    /// 133/1649 figure was measured on a comparable 24 u-step model and the reviewer has since
+    /// retracted it on the same grounds.
+    ///
+    /// So the honest claim is *carrot pinning is cleared completely at and above the guard, and the
+    /// fix is inert below it* — NOT "fixes the #673 deadlock". The residual `<= 7 u` class is a real,
+    /// open defect (a distance guard cannot see a cycle whose whole geometry fits inside the guard);
+    /// it is filed as its own issue and described in the PR body, not tolerated here by accident.
+    #[test]
+    fn the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it() {
+        let count = |sep: f32| {
+            let (mut pinned, mut total) = (0usize, 0usize);
+            let mut yi = 1;
+            while yi as f32 * 0.25 <= sep {
+                let y = yi as f32 * 0.25;
+                for xi in 1..10 {
+                    let x = xi as f32 * 8.0;
+                    total += 1;
+                    if hairpin_carrot_stops_leading(sep, [x, y, 0.0], xi) { pinned += 1; }
+                }
+                yi += 1;
+            }
+            (pinned, total)
+        };
+        for sep in [4.0f32, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0] {
+            let (w, t) = count(sep);
+            println!("hairpin leg separation {sep:>4} u: carrot pinned {w}/{t}");
+            if sep >= 8.0 {
+                // "carrot-pinned", NOT "wedged" — see this test's round-3 correction block.
+                assert_eq!(w, 0,
+                    "the fix must be complete at {sep} u separation, got {w}/{t} carrot-pinned");
+            }
+        }
+        let (below, _) = count(7.0);
+        assert!(below > 0,
+            "premise: the sub-guard residual must still reproduce, or this test is not measuring \
+             the boundary it claims to");
+    }
 }
 
 #[cfg(test)]

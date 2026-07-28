@@ -40,7 +40,8 @@ use eqoxide_core::physics::{RUN_SPEED, WALK_SPEED};
 /// via the same `Collision::path_clear` volume-sweep the controller moves under and A* validates fine
 /// edges with (#358). Kept at `PLAYER_RADIUS` (not padded wider) precisely so the clamp trips ONLY on
 /// a real corner cut and never on merely hugging a straight wall — the over-tightening #685 must avoid.
-const STEER_LOS_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS;
+pub(crate) const STEER_LOS_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS;
+
 
 /// Buffer (beyond the body radius) the committed coarse route is inflated OFF convex wall corners by,
 /// so the walker takes one smooth wider arc with clearance rather than hugging/wiggling the apex
@@ -551,6 +552,129 @@ impl Walker {
     /// Read the current nav state word (without the reason).
     pub fn nav_state_is(&self, state: &str) -> bool {
         self.nav.nav_state.lock().unwrap().state == state
+    }
+
+    /// Move the coarse-route cursor `path_i` to the segment the character is actually traversing.
+    ///
+    /// Two rules, in order:
+    ///
+    /// 1. The **monotone advance**: step past the current segment once the character's 3-D
+    ///    projection parameter on it reaches 1.0. (3-D, water-nav Slice 3 §8.1: a near-vertical
+    ///    dive/ascent leg is not skipped on frame one — the cursor advances past it only once the
+    ///    character has actually changed depth. On near-horizontal land the z term vanishes, so this
+    ///    is the same advance as before.) **This rule, and only this rule, means "walked".**
+    ///
+    /// 2. The **stale-cursor resync** (#673): rule 1 assumes the character travels ALONG the route.
+    ///    Physics does not. A fall, or a slide down a ramp, can carry it past several waypoints at
+    ///    once and leave it beside a segment whose projection parameter then saturates strictly below
+    ///    1.0 — so rule 1 can never fire again. The cursor then names a segment the character is
+    ///    nowhere near, and that lie reaches the steering aim by the route below.
+    ///
+    ///    ⚠️ **Correction (#727 round 3).** Earlier revisions of this comment said simply that "the
+    ///    carrot lands ON the character". That is not what happens at the reach `drive_walk` actually
+    ///    steers with, and the round-2 review was right to reject it: at `LOOK_AHEAD = 5.0` the
+    ///    *coarse* carrot off a stale cursor leads by ~17 u on the captured #673 fixture. The chain
+    ///    is one step longer:
+    ///
+    ///    * [`crate::steering::carrot_along`] measures arclength from a projection onto the stale
+    ///      segment, so `local_goal` — the `LOCAL_REACH` (24 u) point handed to the FINE planner —
+    ///      collapses to ~0.2 u from the body;
+    ///    * `find_path_local` duly returns a degenerate two-waypoint stub;
+    ///    * [`crate::steering::steer_target`] prefers the fine path at exactly `len() >= 2`, so the
+    ///      stub is not discarded as too short — it is preferred over the healthy coarse aim;
+    ///    * the 5 u carrot taken along that stub therefore lands ~0.2 u from the body, inside one
+    ///      controller frame of travel (`RUN_SPEED * 0.01 = 0.44 u`), so it is overshot rather than
+    ///      reached.
+    ///
+    ///    The aim then flips every frame and net displacement is zero: **the steering loop has no
+    ///    trajectory that leaves the spot** while the cursor stays stale. Measured end to end by the
+    ///    three `#673 step N of 3` tests in [`crate::steering`], the last of which drives the
+    ///    production [`crate::steering::steer_target`] and [`crate::steering::fast_steer_aim`] at
+    ///    `LOOK_AHEAD` on a featureless floor: 0.04 u of net displacement over 200 nav ticks
+    ///    (30 s), and never more than 6.6 u from where it landed — less than one 8 u route leg.
+    ///
+    ///    ⚠️ **Correction (#727 round 5).** This line read "0.02 u" from round 2 until now. The
+    ///    figure was not wrong when written, but the harness that produced it was: it dropped 14 of
+    ///    every 15 controller frames on a tick with no fine plan, where the production controller
+    ///    keeps integrating the last `MoveIntent`. The harness was fixed this round (round-4 review
+    ///    finding B-C) and every figure it produces moved; the sibling number in
+    ///    [`crate::steering`]'s test doc was restated to 0.04 u and this one was not swept with it.
+    ///    That miss is the same defect the round-5 review named: correcting by memory instead of by
+    ///    grepping the concept.
+    ///
+    ///    ⚠️ **Correction (#727 round 4).** This paragraph used to continue "…and the walker
+    ///    exhausts its re-paths and stops with `blocked` / `walker_stalled`", citing that sim. The
+    ///    sim does not contain the walker's stall detector, `NAV_STUCK_TICKS` backoff or re-plan, so
+    ///    it cannot say that. Driven through the **production** `drive_walk` loop on that same
+    ///    fixture, the walker sits in the cycle for ~22 nav ticks (~3.3 s), then backs off, re-plans
+    ///    from the body, and **arrives** (#727 round-3 review, measured). What makes #673 terminal
+    ///    rather than a hiccup is the re-plan reproducing the state, which is a property of the
+    ///    terrain and not of this mechanism: live on qcat it did, and the walker stopped with
+    ///    `blocked` / `walker_stalled` on 6 of 8 attempts. The cost of a stale cursor is therefore
+    ///    *at least* a wasted backoff-and-re-plan lap per occurrence, and at worst a terminal stop on
+    ///    a route the character could have walked.
+    ///
+    ///    ⚠️ **Correction (#727 round 5).** This used to add "and that reason code is only emitted
+    ///    once `nav_repaths` has reached 8, so all eight re-plans failed to escape". The counter does
+    ///    not support that: `nav_repaths` is reset to 0 whenever
+    ///    `gdist < nav_best_gdist - REPATH_RESET_DIST` (200 u) and on `decision.reset_route`, so
+    ///    reaching 8 means *at least
+    ///    eight stall-triggered re-plans since the walker last closed 200 u on the goal* — not eight
+    ///    attempts at one spot. The live record does not place all eight at `[-534.4, 144.4, -6.0]`.
+    ///    The "terminal on real terrain" conclusion stands on the `blocked` outcome itself.
+    ///
+    /// ## A resync is NOT progress, and the walker says so (#727 round 2)
+    ///
+    /// `path_i` has two readers with different needs. STEERING needs it to name the segment the body
+    /// is on — that is what rule 2 restores. The two HONEST-TERMINATION channels
+    /// (`drive_walk`'s stall detector, and #631 channel (a) `advancing_complete_route`) instead need
+    /// it to mean *"the walker got here by walking"*; channel (a)'s comment justifies its verdict
+    /// "by construction" on exactly that premise, which held only while rule 1 was the sole way the
+    /// cursor moved.
+    ///
+    /// Rule 2 breaks that premise, so rather than leave the premise false this raises `stuck_i` to
+    /// the resynced cursor. A resync jump is then invisible to both channels: it can neither reset
+    /// the stall clock nor refresh `nav_progress_at`, and `path_i > stuck_i` can still only arise
+    /// from rule 1. This costs #673's fix nothing — the resync's value is that the walker starts
+    /// MOVING again, and the movement then advances the cursor by rule 1, which does count. It is
+    /// deliberately conservative in the honest direction: in a tick where both rules fire, the
+    /// genuine rule-1 step is swallowed with the jump (under-reporting progress, never over-).
+    ///
+    /// **This is measured, not reasoned.** Delete the `stuck_i` raise below and
+    /// `a_resync_jump_must_not_reset_the_no_progress_clock` goes RED: it drives the real
+    /// [`Walker::drive_walk`] over a route where a resync jump happens, and without the raise the
+    /// walker keeps reporting itself as making progress. The reviewer's question was whether a false
+    /// cursor advance actually reaches a consumer in a way that misleads. It does, and that test is
+    /// the execution-level proof.
+    ///
+    /// The reachability predicate is a conjunction — chest-height LOS (walls) **and** a floor-column
+    /// probe (voids/drops), see [`crate::collision::Collision::ground_continuous`] — because the LOS ray alone cannot
+    /// answer the question rule 2 asks. It is still only a necessary condition; the `stuck_i` raise
+    /// above is what makes a wrong answer harmless to the honesty machinery rather than merely
+    /// unlikely.
+    fn advance_cursor(&mut self, p: [f32; 3]) {
+        while self.path_i + 2 < self.path.len() {
+            let (a, b) = (self.path[self.path_i], self.path[self.path_i + 1]);
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+            let t = if l2 < 1e-6 { 1.0 } else {
+                ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / l2
+            };
+            if t >= 1.0 { self.path_i += 1; } else { break; }
+        }
+        let walked_to = self.path_i;
+        let resynced = {
+            let coll = self.collision.read().unwrap();
+            let reachable = |a: [f32; 3], b: [f32; 3]| coll.as_ref().map_or(true, |c| {
+                c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE) && c.ground_continuous(a, b)
+            });
+            crate::steering::resync_cursor(&self.path, walked_to, p, reachable)
+        };
+        self.path_i = resynced;
+        if resynced > walked_to {
+            // Not walked — not progress. See the doc above.
+            self.stuck_i = self.stuck_i.max(resynced);
+        }
     }
 
     /// Stop navigating and report WHY, loudly, in every channel an agent can see.
@@ -1252,16 +1376,7 @@ impl Walker {
         let px = gs.player_x;
         let py = gs.player_y;
         let pz = gs.player_z;
-        while self.path_i + 2 < self.path.len() {
-            let (a, b) = (self.path[self.path_i], self.path[self.path_i + 1]);
-            // 3D projection (water-nav Slice 3, §8.1): a near-vertical dive/ascent leg is not skipped
-            // on frame one — path_i advances past it only once the char has actually changed depth.
-            // Near-horizontal land: the z term vanishes, so this is the same advance as before.
-            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-            let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
-            let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1] + (pz - a[2]) * ab[2]) / l2 };
-            if t >= 1.0 { self.path_i += 1; } else { break; }
-        }
+        self.advance_cursor([px, py, pz]);
         let have_path = !self.path.is_empty();
         let target: (f32, f32, f32) = if have_path {
             const LOCAL_REACH: f32 = 24.0;   // how far ahead on the coarse route the fine plan aims
@@ -1409,7 +1524,18 @@ impl Walker {
         //       the max seen on this route, while `nav_state == navigating`). A complete route's end
         //       IS the goal, so advancing it is guaranteed goal-ward progress *by construction* — it
         //       cannot be a lap (a lap would be a re-planned PARTIAL, `navigating_partial`, or would
-        //       stop advancing `path_i` and trip `walker_stalled`). This is the fix for the reviewer's
+        //       stop advancing `path_i` and trip `walker_stalled`).
+        //
+        //       THE PREMISE UNDER "by construction" IS THAT `path_i` ONLY ADVANCES BY WALKING, and
+        //       #673's stale-cursor resync would have broken it — a resync can move the cursor
+        //       several segments in one tick without the character walking any of them, and a
+        //       reachability predicate that got it wrong would then reset this very clock with
+        //       progress the walker never made. So `Walker::advance_cursor` raises `stuck_i` with
+        //       any resync jump, which keeps `path_i > stuck_i` reachable ONLY through the monotone
+        //       (walked) advance and leaves this comment's premise true. Read it there before
+        //       changing either side. (#727)
+        //
+        //       This is the fix for the reviewer's
         //       false-fire: a legitimate long go-around across a barrier (river/wall/moat) whose START
         //       is the closest straight-line point to the goal makes NO closest-approach improvement
         //       for most of the trip, yet is plainly getting there — killing it was a confident
@@ -1636,6 +1762,250 @@ mod tests {
         let view: crate::diagnostics::NavDebugView = Default::default();
         let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone(), zone_assets);
         (w, nav, intent, view)
+    }
+
+    /// **#673 wiring guard.** The stale-cursor resync must be part of the walker's cursor advance,
+    /// not just a library function nobody calls. Fixture: the coarse route the live client committed
+    /// on a FAILING South Qeynos → qcat run (waypoints 44..52 of it), and the position the character
+    /// physically reaches after dropping off the street into the aqueduct trench. The monotone
+    /// advance alone leaves `path_i` three segments behind — where the fine planner's goal collapses
+    /// onto the character and the steering loop has no trajectory that leaves the spot (see
+    /// [`Walker::advance_cursor`]'s root-cause note for the four-step chain, and for why "deadlocks
+    /// at `walker_stalled`" — this comment's wording through round 3 — overstated what the offline
+    /// sim measures).
+    #[test]
+    fn a_cursor_the_character_has_overtaken_is_resynced_by_the_walkers_advance() {
+        let (mut w, _nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        w.path = vec![
+            [-542.718_75, 160.375, -0.000_007_629_394_5],
+            [-534.718_75, 160.375, -0.000_007_629_394_5],
+            [-526.718_75, 160.375, -0.000_007_629_394_5],
+            [-518.718_75, 152.375, -2.226_699_8],
+            [-526.718_75, 144.375, -4.161_232],
+            [-534.718_75, 144.375, -6.095_749],
+            [-542.718_75, 144.375, -8.030_266],
+            [-550.718_75, 144.375, -9.964_805_6],
+            [-558.718_75, 144.375, -11.899_315],
+        ];
+        w.path_i = 2;
+        w.advance_cursor([-534.285_6, 144.375, -5.991_005]);
+        assert!(w.path_i >= 4,
+            "the walker must resync a cursor the character has physically overtaken; path_i = {}",
+            w.path_i);
+    }
+
+    /// The ordinary case still advances exactly one segment at a time, and only when the character
+    /// has actually passed the current waypoint — the resync must not turn the cursor into a
+    /// nearest-segment snap.
+    #[test]
+    fn the_cursor_still_advances_monotonically_along_a_route_being_walked() {
+        let (mut w, _nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        w.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0], [30.0, 0.0, 0.0]];
+        w.path_i = 0;
+        w.advance_cursor([5.0, 0.0, 0.0]);
+        assert_eq!(w.path_i, 0, "mid-segment must not advance");
+        w.advance_cursor([12.0, 0.0, 0.0]);
+        assert_eq!(w.path_i, 1, "past the waypoint advances exactly one");
+    }
+
+    // ─────────────── #727 round 2: the resync under REAL geometry, and its honesty ───────────────
+
+    /// A world with two ledges at z = 0 split by a `gap`-wide chasm whose next floor is 200 u down,
+    /// crossed only by a bridge at the far north (n ∈ [90, 100]). Ledges span n ∈ [-100, 100], the
+    /// west one e ∈ [-60, -gap/2], the east one e ∈ [gap/2, 60].
+    ///
+    /// This is the round-1 reviewer's counterexample to guard 2, rebuilt with the production
+    /// `Collision` so the predicate under test is the production one.
+    fn chasm_zone(gap: f32) -> crate::collision::SharedCollision {
+        // `Collision::build` maps a mesh vertex [x, y, z] to world [east, north, height] = [z, x, y],
+        // so a world slab is written [north, height, east] — wound like `open_plane`'s quad.
+        let slab = |e0: f32, e1: f32, n0: f32, n1: f32, h: f32| {
+            quad(vec![[n0, h, e0], [n1, h, e0], [n1, h, e1], [n0, h, e1]])
+        };
+        let half = gap / 2.0;
+        let terrain = vec![
+            slab(-60.0, -half, -100.0, 100.0, 0.0),   // west ledge
+            slab(half, 60.0, -100.0, 100.0, 0.0),     // east ledge
+            slab(-half, half, 90.0, 100.0, 0.0),      // the only crossing
+            slab(-half, half, -100.0, 90.0, -200.0),  // the chasm floor, 200 u down
+        ];
+        let col = crate::collision::Collision::build(
+            &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+        Arc::new(std::sync::RwLock::new(Some(Arc::new(col))))
+    }
+
+    /// A complete route that runs north up the west ledge, over the far-north bridge, and back south
+    /// down the east ledge. Cursor 2 names the segment `[-40, 0] → [-40, 60]`.
+    const CHASM_ROUTE: [[f32; 3]; 9] = [
+        [-40.0, -80.0, 0.0], [-40.0, -40.0, 0.0], [-40.0, 0.0, 0.0], [-40.0, 60.0, 0.0],
+        [-40.0, 95.0, 0.0], [10.0, 95.0, 0.0], [10.0, 60.0, 0.0], [10.0, 0.0, 0.0],
+        [10.0, -80.0, 0.0],
+    ];
+    /// On the west lip: 34 u off its own segment (stale) but only 16 u from the east-ledge segment
+    /// on the other side of the chasm — which a chest-height ray sees clean through.
+    const CHASM_BODY: [f32; 3] = [-6.0, 0.0, 0.0];
+
+    /// **THE ROUND-1 COUNTEREXAMPLE, PINNED: a hole is not a wall (#727).** `carrot_los_clear` is
+    /// documented in its own rustdoc as a chest-height centre ray chosen to ride ABOVE ground
+    /// undulation and to catch WALLS. Asked "has the character reached that segment" it flies
+    /// straight over a 200 u drop, and on this fixture it moved the cursor **2 → 6** — three
+    /// waypoints and the whole bridge detour, declared walked, over a chasm the character cannot
+    /// cross.
+    ///
+    /// The premise assert below keeps this from passing vacuously: it re-runs the LOS-only predicate
+    /// and requires that it STILL jumps, so if the fixture ever stops reproducing the counterexample
+    /// the test says so instead of going quietly green.
+    ///
+    /// Mutation check (run at authoring time): drop `ground_continuous` from the walker's
+    /// predicate and this goes RED.
+    #[test]
+    fn a_resync_must_not_cross_a_chasm_the_character_cannot_walk() {
+        let col = chasm_zone(10.0);
+        let path: Vec<[f32; 3]> = CHASM_ROUTE.to_vec();
+        // PREMISE: the LOS ray ALONE still declares the far side reachable — otherwise this fixture
+        // is no longer testing anything.
+        let los_only = crate::steering::resync_cursor(&path, 2, CHASM_BODY, |a, b| {
+            col.read().unwrap().as_ref().unwrap().carrot_los_clear(a, b, STEER_LOS_CLEARANCE)
+        });
+        assert!(los_only > 2,
+            "fixture no longer reproduces the round-1 counterexample (LOS-only cursor stayed at {los_only})");
+
+        let (mut w, _nav, _intent, _view) = walker_with(col);
+        w.path = path;
+        w.path_i = 2;
+        w.advance_cursor(CHASM_BODY);
+        assert_eq!(w.path_i, 2,
+            "the cursor crossed a 10 u chasm with the next floor 200 u down and declared the bridge \
+             detour walked — a hole is not a wall; path_i = {}", w.path_i);
+    }
+
+    /// The same guard where the LOS ray genuinely is the load-bearing half: a WALL, not a hole. The
+    /// ground under the hop is continuous (both ledges are one slab), so only `carrot_los_clear`
+    /// can refuse it — and it must, at the real `STEER_LOS_CLEARANCE`.
+    ///
+    /// **This is the test the round-1 review found missing:** every other walker test runs
+    /// `collision = None`, which `carrot_los_clear` documents as vacuously "clear", so the
+    /// `STEER_LOS_CLEARANCE → 0.0` mutant survived. Here the wall sits just PAST the candidate
+    /// point, inside the clearance the ray is extended by, so zeroing the clearance turns this RED.
+    #[test]
+    fn a_resync_must_not_cross_a_wall_and_it_uses_the_real_clearance() {
+        let slab = |e0: f32, e1: f32, n0: f32, n1: f32, h: f32| {
+            quad(vec![[n0, h, e0], [n1, h, e0], [n1, h, e1], [n0, h, e1]])
+        };
+        // A wall is a vertical quad: constant east, spanning north and height.
+        let wall = |e: f32, n0: f32, n1: f32, h0: f32, h1: f32| {
+            quad(vec![[n0, h0, e], [n1, h0, e], [n1, h1, e], [n0, h1, e]])
+        };
+        let terrain = vec![
+            slab(-60.0, 60.0, -100.0, 100.0, 0.0),      // one continuous floor — no hole anywhere
+            wall(0.5, -100.0, 90.0, -1.0, 20.0),        // a wall just PAST the candidate segment
+        ];
+        let col = Arc::new(std::sync::RwLock::new(Some(Arc::new(
+            crate::collision::Collision::build(
+                &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0)))));
+        // The east-side route line sits at e = 0.0, i.e. `STEER_LOS_CLEARANCE` (1.0) PAST the wall:
+        // the ray reaches the candidate cleanly and only its clearance extension crosses the wall.
+        let path: Vec<[f32; 3]> = vec![
+            [-40.0, -80.0, 0.0], [-40.0, -40.0, 0.0], [-40.0, 0.0, 0.0], [-40.0, 60.0, 0.0],
+            [-40.0, 95.0, 0.0], [0.0, 95.0, 0.0], [0.0, 60.0, 0.0], [0.0, 0.0, 0.0],
+            [0.0, -80.0, 0.0],
+        ];
+        let body = [-12.0, 0.0, 0.0]; // 28 u off segment 2, 12 u from segment 7 — through the wall
+        // PREMISE: the ground under the hop really is continuous, so the LOS ray is the only guard
+        // that can refuse this — otherwise the assert below would pass for the wrong reason.
+        assert!(col.read().unwrap().as_ref().unwrap().ground_continuous(body, [0.0, 0.0, 0.0]),
+            "fixture broken: the floor under the hop must be continuous so only the wall can refuse it");
+
+        let (mut w, _nav, _intent, _view) = walker_with(col);
+        w.path = path;
+        w.path_i = 2;
+        w.advance_cursor(body);
+        assert_eq!(w.path_i, 2,
+            "the cursor jumped through a wall; path_i = {}", w.path_i);
+    }
+
+    /// **A RESYNC IS NOT PROGRESS (#727, agent honesty).** #631 channel (a) justifies calling an
+    /// advancing complete route "progress *by construction*" on the premise that `path_i` only moves
+    /// by WALKING. A resync moves it without walking, so a resync must not reach that channel — or
+    /// the no-progress killer's clock is reset by a step the character never took, which is a silent
+    /// wrong answer in the machinery whose whole job is to answer this honestly.
+    ///
+    /// This drives the real `drive_walk` with the no-progress clock fully expired and closest
+    /// approach not improving. The route is COMPLETE and `navigating`, so channel (a) is live; the
+    /// only thing that moves `path_i` this tick is the resync. It must still terminate.
+    ///
+    /// Mutation check (run at authoring time): delete the `stuck_i` raise in `advance_cursor` and
+    /// this goes RED — the walker keeps navigating on progress it did not make.
+    #[test]
+    fn a_resync_jump_must_not_reset_the_no_progress_clock() {
+        let (mut w, nav, _intent, _view) = walker_with(open_plane(600.0));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.world.zone_name = TEST_ZONE.into();
+        // 30 u off its own segment (stale) and 10 u from the next one — a flat open plane, so the
+        // reachability predicate accepts and the resync WILL fire.
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
+        let goal = (500.0, 0.0, 0.0);
+        *nav.goto_target.lock().unwrap() = Some(goal);
+        w.set_nav_state("navigating");
+        w.path = vec![
+            [0.0, -30.0, 0.0], [40.0, -30.0, 0.0], [80.0, -30.0, 0.0],
+            [80.0, -10.0, 0.0], [0.0, -10.0, 0.0], [500.0, 0.0, 0.0],
+        ];
+        w.path_i = 0;
+        w.stuck_i = 0;
+        w.path_goal = Some(goal);
+        w.nav_best_g3d = 10.0; // closest approach has not improved…
+        w.nav_progress_at = std::time::Instant::now() - (NAV_NO_PROGRESS_WINDOW + std::time::Duration::from_secs(1));
+
+        w.drive_walk(&mut gs, goal);
+
+        // PREMISE: the resync really did move the cursor this tick — otherwise nothing is tested.
+        assert!(w.path_i > 0, "fixture no longer resyncs; path_i = {}", w.path_i);
+        assert!(w.nav_state_is("blocked"),
+            "a resync jump reset the no-progress clock: the walker reported progress it did not \
+             make (path_i = {}, stuck_i = {})", w.path_i, w.stuck_i);
+        assert_eq!(nav.nav_state.lock().unwrap().reason.as_deref(), Some("no_progress"));
+    }
+
+    /// The other half of the same rule: a resync must not reset the STALL detector's clock either.
+    /// `stuck_ticks` is reset by `path_i > stuck_i`, so a resync that raised `path_i` without
+    /// raising `stuck_i` would hand the stall detector a fresh clock every time the body drifted.
+    #[test]
+    fn a_resync_jump_leaves_the_stall_detectors_high_water_mark_at_the_new_cursor() {
+        let (mut w, _nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        w.path = CHASM_ROUTE.to_vec();
+        w.path_i = 2;
+        w.stuck_i = 2;
+        w.advance_cursor(CHASM_BODY); // no collision ⇒ predicate vacuously true ⇒ the resync fires
+        assert!(w.path_i > 2, "fixture no longer resyncs; path_i = {}", w.path_i);
+        assert_eq!(w.stuck_i, w.path_i,
+            "the stall detector's high-water mark must move WITH a resync jump, so the jump reads \
+             as zero progress (path_i = {}, stuck_i = {})", w.path_i, w.stuck_i);
+    }
+
+    /// **Every walker test name cited in a doc comment still resolves** (#727 round 5).
+    ///
+    /// Twin of `collision::tests::every_ground_continuous_test_name_cited_in_a_doc_comment_still_exists`
+    /// and `steering::cursor_resync_tests::every_test_name_cited_in_a_doc_comment_still_exists`, and
+    /// it exists for the same reason: round 5 found `resync_cursor`'s rustdoc citing a module that
+    /// never existed and `CURSOR_STALE_DIST`'s citing a test renamed two rounds earlier. Rustdoc
+    /// cannot intra-doc-link a `#[cfg(test)]` item, so a citation to one rots silently. Naming the
+    /// cited tests as `fn()` values makes a rename a COMPILE error.
+    ///
+    /// Add a name here whenever a doc comment — in this module OR in another that cites `walker` by
+    /// name, as `collision::ground_continuous` and `steering::resync_cursor` both do — starts
+    /// citing a test that lives here.
+    #[test]
+    fn every_walker_test_name_cited_in_a_doc_comment_still_exists() {
+        let _cited: &[fn()] = &[
+            // cited by `Walker::advance_cursor`'s rustdoc
+            a_resync_jump_must_not_reset_the_no_progress_clock,
+            // cited by `collision::Collision::ground_continuous` and `steering::resync_cursor`
+            a_resync_must_not_cross_a_chasm_the_character_cannot_walk,
+            // added in round 6 by `steering`'s mechanical citation scan: cited in a doc comment in
+            // this file and named in no guard list.
+            cancelling_the_goto_while_loading_returns_to_idle,
+        ];
     }
 
     // ───────────────────────────── #543: the unverifiable-pad scene ─────────────────────────────
@@ -1994,8 +2364,9 @@ mod tests {
     }
 
     /// **#600 — THE UNIVERSAL: the walker can NEVER route on a collision grid whose zone is not the
-    /// one the character is in.** The sibling of `zone_assets::no_interleaving_of_the_two_writers_
-    /// yields_a_usable_wrong_zone`, but exercising the CONSUMER (`drive_walk`) rather than the pure
+    /// one the character is in.** The sibling of
+    /// `zone_assets::no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone`, but exercising
+    /// the CONSUMER (`drive_walk`) rather than the pure
     /// predicate — because before this fix the walker consulted `collision.is_none()`, not
     /// `usability`, and so opted out of the guarantee #595 built.
     ///
@@ -2010,8 +2381,9 @@ mod tests {
     ///
     /// **Mutation check (do this to trust the test):** revert the `drive_walk` gate to
     /// `if self.collision.read().unwrap().is_none()` → in every `net_first` iteration with
-    /// `render_lag >= 1` the walker routes on the previous zone's grid and the `state ==
-    /// NAV_STATE_ZONE_LOADING` assertion in the stale window goes RED. A test that passes both ways
+    /// `render_lag >= 1` the walker routes on the previous zone's grid and the
+    /// `state == NAV_STATE_ZONE_LOADING` assertion in the stale window goes RED. A test that passes
+    /// both ways
     /// pins nothing; this one does not.
     #[test]
     fn walker_never_routes_on_a_collision_grid_whose_zone_is_not_the_players() {
@@ -2116,8 +2488,11 @@ mod tests {
     /// (`nav.zone_cross`) because `CommandState`/`request_stop` live in a crate ABOVE this one and are
     /// not reachable here. What actually WRITES that slot in production — `drain_zone_cross` re-queuing
     /// during a load, and `request_stop`/`reset_for_zone_change` CLEARING it — is exercised through the
-    /// real drivers in the eqoxide-net test `zone_cross_queued_during_load_is_cancellable_by_stop_
-    /// and_never_leaks`. Here we only pin the guard's response: a present slot HOLDS `zone_loading`; an
+    /// real drivers in the eqoxide-net test
+    /// `zone_cross_queued_during_load_is_cancellable_by_stop_and_never_leaks`
+    /// (round 6: the name used to be hand-wrapped inside its backticks, which both broke the
+    /// `cargo doc` rendering and hid it from every grep for it).
+    /// Here we only pin the guard's response: a present slot HOLDS `zone_loading`; an
     /// absent slot retires it to `idle`.
     ///
     /// Mutation check: drop `&& !zone_cross_pending` from the reset guard in `resolve_goal` → this
@@ -2251,8 +2626,9 @@ mod tests {
     /// state words is unbounded, and the property is checked against representatives of both
     /// classes AND against arbitrary unrecognised words, which must retire (fail-safe by default).
     ///
-    /// **Mutation check:** restore the old opt-in list (`navigating || navigating_partial ||
-    /// planning || (zone_loading && !pending) || dead`) → `pending`, `following` and both unknown
+    /// **Mutation check:** restore the old opt-in list
+    /// (`navigating || navigating_partial || planning || (zone_loading && !pending) || dead`)
+    /// → `pending`, `following` and both unknown
     /// words stay put and this goes RED four times over. Alternatively add `"pending"` to
     /// [`TERMINAL_NAV_STATES`] → RED, since a terminal `pending` is precisely the lie.
     #[test]
