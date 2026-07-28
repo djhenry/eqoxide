@@ -142,7 +142,10 @@ pub struct GpuStaticModel {
     /// Used to compute the ground lift so models stand at Z=0 instead of floating or sinking.
     pub y_bottom:            f32,
     /// Vertical extent of the model (max_y - min_y) in buffer vertex space.
-    /// Used to compute visual_scale: visual_scale = 2 * y_extent * arch_scale.
+    /// NOT read by this crate's render path: since #768 a static placement takes its whole vertical
+    /// lift from `y_bottom` (see `models::static_placement`). `visual_scale = 2 * y_extent *
+    /// arch_scale` survives only in the standalone `render_model` viewer bin, which reads this
+    /// field at `src/bin/render_model.rs:1266`.
     /// Separate from y_bottom because chr.s3d models may have vertices far above Y=0
     /// (e.g. feet at Y=20), making y_bottom unreliable as a height proxy.
     pub y_extent:            f32,
