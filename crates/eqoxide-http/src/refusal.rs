@@ -31,11 +31,15 @@
 //! [`Refusal::refused`] was measured at **33 failing tests** in this crate, and the same swap in
 //! [`Refusal::refused_json`] at **20** (mutations M-B1d / M-B1e in the PR's mutation table).
 //!
-//! This is the "make the bad state unrepresentable rather than guarded" rule from the repo's
-//! verification hierarchy, applied to a defect that a guard had already failed to catch once.
+//! This reaches for the "make the bad state unrepresentable rather than guarded" rule from the
+//! repo's verification hierarchy, applied to a defect that a guard had already failed to catch
+//! once. It does not fully get there, and the honest statement of what it achieves is: the polarity
+//! lives at ONE site, and the remaining expressible bad forms are provably RED rather than silent.
 //!
-//! Structure alone is not the whole answer, because a determined edit can still write
-//! `(!s.command.request_x(..)).refused(MSG)`, which compiles. That form is caught two ways: the
+//! Structure alone is not the whole answer, because at least two edits still compile. One is
+//! `(!s.command.request_x(..)).refused(MSG)`. The other — found only by running it, after this
+//! module's docs had already claimed otherwise — is `if let Some(_) = …refused(MSG) { }`, which
+//! discards the refusal with an empty body and answers `200`; see M-B1f. Both are caught two ways: the
 //! caller guard rejects it (the statement no longer starts with the one accepted shape), and — the
 //! part that does not depend on a guard — the four modules the reviewer measured as having *zero*
 //! `409` assertions (`pet`, `trainer`, `group`, `quests`) now each have a double-fire test that

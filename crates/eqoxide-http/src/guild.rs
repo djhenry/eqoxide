@@ -162,8 +162,15 @@ mod no_silent_overwrite_guard {
     /// and `if s.command.request_x(..)` *identically*, so deleting one `!` restored #347 with the
     /// whole suite green. It only ever checked that the `bool` was read, never how. The polarity now
     /// lives in one place (`crate::refusal::Refusal`) and this guard requires the canonical shape —
-    /// `if let Some(busy) = s.command.request_x(..).refused(MSG) { return busy; }` — so a call site
-    /// cannot express the inverted form at all. (`if let None = …` does not compile: nothing binds.)
+    /// `if let Some(busy) = s.command.request_x(..).refused(MSG) { return busy; }`.
+    ///
+    /// Precisely what that buys, measured rather than reasoned — the compiler rejects the literal
+    /// `!`-drop (`if let None = …` binds nothing, so the `return busy;` is `E0425`), but it does
+    /// NOT reject every silent drop: `if let Some(_) = …refused(MSG) { }` compiles cleanly. That
+    /// form is caught here, by the shape match, and — for the four modules that gained tests in
+    /// round 1 — independently by a behavioural double-fire test that sees the `200` where a `409`
+    /// belongs. So: the inverted form is not unrepresentable, it is provably RED. Do not weaken
+    /// this test to a "the bool is read somewhere" check; that is the exact hole B1 found.
     ///
     /// Search key: `grep -rn 's\.command\.request_' crates/eqoxide-http/src/*.rs`. Handlers reach the
     /// facade through the `HttpState` binding `s`, so this prefix is what distinguishes a real call
