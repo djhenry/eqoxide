@@ -2908,4 +2908,47 @@ pub(crate) mod tests {
              \"no hold\" instead of a confident wedge alarm about the zone we left");
     }
 
+    /// #757 — `zone_cross_attempts` and `zone_cross_plan` must NOT survive a zone-in.
+    ///
+    /// Both fields are per-zone-namespace facts: a zone-line region *index* is only meaningful
+    /// against the zone that baked it, and an advertised destination `zone_id` is only meaningful
+    /// against the zone that advertised it (see the fields' doc comments). Left in place across a
+    /// zone-in, `zone_cross_attempts` would gate the new zone's auto-cross using a tally the OLD
+    /// zone accumulated, and `zone_cross_plan` would let `GET /v1/observe/debug` report a
+    /// best-effort/advertised split for a crossing the new zone never made — a confident answer to
+    /// a question about the new zone, built from the old zone's data.
+    ///
+    /// This is the asymmetry #757 measured directly: `begin_zone_in`'s third sibling clear
+    /// (`player_hold`, pinned by `begin_zone_in_clears_the_previous_zones_hold_724` above) was
+    /// ADDED by #744 while #750 was independently adding these two, and `git` resolved the merge
+    /// as an ordinary text conflict — keeping three independent clears arriving from two
+    /// directions. Dropping any ONE of the three still compiles and passes the suite; only
+    /// `player_hold` had a test standing guard over it. This test closes that gap for the other
+    /// two. Mutation check (each run independently, see the #757 PR body for the verbatim output):
+    /// drop `self.zone_cross_attempts = None;` from `begin_zone_in` → RED at the first assertion;
+    /// restore it, then drop `self.zone_cross_plan = None;` → RED at the second.
+    #[test]
+    fn begin_zone_in_clears_the_previous_zones_cross_attempts_and_plan_757() {
+        use crate::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution};
+
+        let mut gs = GameState::new();
+        gs.zone_cross_attempts = Some(CrossAttempts::record(None, 3));
+        gs.zone_cross_plan = Some(ZoneCrossPlan {
+            requested_zone_id: Some(181),
+            index: 3,
+            resolution: ZoneCrossResolution::Advertised { zone_id: 181 },
+        });
+
+        gs.begin_zone_in();
+
+        assert!(gs.zone_cross_attempts.is_none(),
+            "a cross-attempt tally is keyed to region indices in the OLD zone's namespace — a \
+             zone-in must clear it so the new zone's auto-cross gate starts from zero, not a \
+             stale bound carried over from a zone we already left");
+        assert!(gs.zone_cross_plan.is_none(),
+            "a zone-cross plan's index and advertised zone_id are only meaningful against the \
+             zone that produced them — a zone-in must clear it so /v1/observe/debug cannot report \
+             a best-effort/advertised split for a crossing the new zone never made");
+    }
+
 }
