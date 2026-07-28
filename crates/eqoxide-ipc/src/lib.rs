@@ -49,7 +49,9 @@ pub use result::{BuyOk, CastEnd, CommandResult, GiveOk, OpenOk};
 /// `eqoxide-http` must be able to name it without depending on the app crate above it.
 pub mod asset_sync;
 pub use asset_sync::{
-    AssetSyncActivity, AssetSyncGuard, AssetSyncPhase, AssetSyncShared, AssetSyncSnapshot,
+    AssetConnectGuard, AssetSyncActivity, AssetSyncGuard, AssetSyncPhase, AssetSyncShared,
+    AssetSyncSnapshot, AssetSyncWork, ConnectOutcome, EndedWhat, LastLoginByOutcome,
+    LoginOutcomeTally, RetainedLogin,
 };
 
 // ── Relocated shared type definitions (#544 Step 2c) ─────────────────────────────────────────────
