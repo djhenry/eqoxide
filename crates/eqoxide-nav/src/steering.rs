@@ -1480,12 +1480,15 @@ mod cursor_resync_tests {
     ///   still resolved (rule 2/3) and, if it is a same-file `#[test]`, still required to be in the
     ///   `_cited`/`_helpers` guard (rule 1) — only the *parity* balance check is fence-exempt;
     /// * the citation corpus is still the four files #727 touches. Nothing here claims anything
-    ///   about the other 154 `.rs` files in the workspace;
+    ///   about the other `.rs` files in the workspace;
     /// * backtick parity is not span-crossing (round 8): escaping a literal backtick in prose (the
     ///   standard CommonMark double-backtick escape) both false-fails the balance check on its own
     ///   line, and — applied the same way on both sides of a genuine wrap — can make both lines land
-    ///   on an even count and hide it entirely. Both demonstrated by execution against this exact
-    ///   corpus; see `unbalanced_doc_spans`'s doc for the counts.
+    ///   on an even count and hide it from `unbalanced_doc_spans` entirely. The same padding evades
+    ///   `doc_citations` too, and for a distinct reason: that scan selects citation text by its
+    ///   position in the line's backtick-split (`skip(1).step_by(2)`, only odd indices read), and
+    ///   the padding shifts the citation's fragment off an odd index onto an even one, where nothing
+    ///   ever reads it. Demonstrated by execution against this exact corpus.
     ///
     /// ⚠️ **Correction (#727 round 7 review, non-blocking 1).** The first two bullets are all round 6
     /// listed, and the round-6 review demonstrated the list was incomplete by finding a live citation
@@ -1503,6 +1506,19 @@ mod cursor_resync_tests {
     /// is the blind spot this list was actually missing. The fifth bullet's file count was also
     /// stale (151 → 154, drift from
     /// unrelated merges, not a mechanism error) and is corrected in the same pass.
+    ///
+    /// ⚠️ **Correction (#727 round 9 review, non-blocking).** Two more cleanups, same pass as the
+    /// causal-claim fix on `unbalanced_doc_spans` below. First: the fifth bullet's count is deleted,
+    /// not re-counted — it went stale within a single round (154 correct at `d01d338`; `origin/main`
+    /// moved to 159 tracked files one round later, true figure 155 on landing), which is exactly the
+    /// "measurement with an expiry date" the round-7 correction two bullets up already warns about,
+    /// just not yet applied to this number. The sentence needs no number to make its point. Second:
+    /// the sixth bullet's closing cross-reference pointed at `unbalanced_doc_spans`'s doc for "the
+    /// counts" — that doc states no counts and never did; removed. Its attribution was also
+    /// incomplete: the false pass on this exact padded example is not parity alone, `doc_citations`
+    /// misses it independently, verified by tracing `skip(1).step_by(2)` against the literal text —
+    /// the citation's fragment lands at split index 6 on the 6-backtick line, and only odd indices
+    /// (1, 3, 5, …) are ever read.
     #[test]
     fn every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard() {
         use std::collections::{HashMap, HashSet};
@@ -1623,16 +1639,14 @@ mod cursor_resync_tests {
                     }
                 }
             }
-            // The shape the round-6 review found surviving INSIDE this corpus: a citation
-            // hand-wrapped across two lines. The loop above cannot see it — the name never appears
-            // whole on any line — so the wrapping itself is what gets rejected.
+            // A structural check for a code span wrapped across two lines — independent of the
+            // citation loop above, which reads each line's chunks on its own and so can ALSO fire
+            // on a wrapped citation's truncated fragment (round 9 review: verified by execution,
+            // both halves firing together in the same run). Neither check subsumes the other.
             for line in unbalanced_doc_spans(&src) {
                 problems.push(format!(
                     "{}:{line}: a code span opens on this line and closes on another. `cargo doc` \
-                     renders the break inside the span, and a citation wrapped this way is invisible \
-                     to the citation scan above — which is exactly how \
-                     `zone_assets::no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone` \
-                     survived six review rounds in `walker.rs`. Keep the span on one line.",
+                     renders the break inside the span. Keep the span on one line.",
                     p.file_name().unwrap().to_string_lossy()));
             }
         }
@@ -1708,9 +1722,10 @@ mod cursor_resync_tests {
     }
 
     /// A backtick-PARITY heuristic: every doc-comment line outside a triple-backtick fence whose
-    /// backtick count is odd. Round 7: this is the shape that hid the round-6 review's surviving
-    /// citation, and no amount of widening the charset would have caught it, because the name never
-    /// appears whole on any line.
+    /// backtick count is odd. Round 7: parity is one of two independent checks that caught the
+    /// round-6 review's surviving citation once the wrap made this line's count odd — parity here,
+    /// and charset-based resolution in `doc_citations` above. They catch overlapping but different
+    /// subsets of wrapped citations; neither subsumes the other.
     ///
     /// ⚠️ **Correction (#727 round 8 review, blocking).** This doc used to call the odd-count check
     /// "i.e. a code span that opens on one line and closes on another" — an equivalence. It is false
@@ -1722,6 +1737,17 @@ mod cursor_resync_tests {
     /// the exact shape it exists to catch. Parity implies a crossing span only when nothing else on
     /// the line contributes an odd backtick count of its own; it is not equivalent to it. See "What
     /// it does NOT do" below for the sixth bullet this forces.
+    ///
+    /// ⚠️ **Correction (#727 round 9 review, blocking).** Round 8's rewrite struck the `i.e.`
+    /// equivalence above but left a second, stronger absolute standing: "no amount of widening the
+    /// charset would have caught it, because the name never appears whole on any line." Falsified
+    /// by execution: `doc_citations` reads each line's chunks independently, so a wrapped
+    /// citation's truncated leading fragment IS visible to it, and — once `:` was added to the
+    /// charset (round 7) — resolves to nothing and is reported by the citation half. Verified by
+    /// re-wrapping the exact round-6 citation, and separately a plain citation with no `::` at all;
+    /// both fire the citation-half diagnostic in the same run as this check's own, on this head. The
+    /// round-6 citation survived because `:` was not yet in the charset, not because a wrapped name
+    /// is inherently invisible to citation resolution. No further mechanism claim is made here.
     fn unbalanced_doc_spans(src: &str) -> Vec<usize> {
         let mut out = Vec::new();
         let mut in_fence = false;
