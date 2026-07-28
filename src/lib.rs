@@ -82,6 +82,7 @@ pub mod debug_zone;
 pub mod logging;
 pub mod movement;
 pub mod profiling;
+pub mod zone_in;
 
 // The agent-facing HTTP/REST API now lives in the `eqoxide-http` workspace crate (#544 Step 2l),
 // depending only on the lower structural crates (`eqoxide-core`/`ipc`/`command`/`nav`/`telemetry`/
