@@ -331,6 +331,31 @@ impl LastLoginByOutcome {
         }
     }
 
+    /// Every slot, paired with the outcome it answers for, in [`ConnectOutcome::ALL`] order. This is
+    /// what the HTTP encoder walks to emit the `last_login_<outcome>` records, so it is the wire's
+    /// enumeration of the outcomes and not a second one beside it.
+    ///
+    /// **It is also the completeness pin for [`ConnectOutcome::ALL`]** — see that constant's
+    /// rustdoc for the review finding that motivated it. Two compile-time checks live in this one
+    /// function:
+    ///
+    /// 1. the `let` destructure is **exhaustive** — no `..` — so a slot added to this struct without
+    ///    being listed below fails to compile here; and
+    /// 2. the returned array's length is `ConnectOutcome::ALL.len()`, so listing a new slot below
+    ///    without adding its outcome to `ALL` fails to compile here too.
+    ///
+    /// An outcome given its own slot therefore cannot reach the wire without being in `ALL`, and
+    /// cannot be in this struct while silently missing from `ALL`. The residual — an outcome whose
+    /// match arms are pointed at an *existing* slot, adding no field — is stated on `ALL`.
+    pub fn slots(&self) -> [(ConnectOutcome, Option<&RetainedLogin>); ConnectOutcome::ALL.len()] {
+        let LastLoginByOutcome { succeeded, failed, unknown } = self;
+        [
+            (ConnectOutcome::Succeeded, succeeded.as_ref()),
+            (ConnectOutcome::Failed, failed.as_ref()),
+            (ConnectOutcome::Unknown, unknown.as_ref()),
+        ]
+    }
+
     /// The one write path. Exhaustive, so which slot a record lands in is a function of the outcome
     /// and nothing else.
     fn slot_mut(&mut self, outcome: ConnectOutcome) -> &mut Option<RetainedLogin> {
@@ -453,11 +478,40 @@ impl ConnectOutcome {
     /// `last_login_<outcome>` records **in one pass**, so a category can never be counted without
     /// its record being served alongside it.
     ///
-    /// Adding a variant to this enum fails to compile in [`LoginOutcomeTally::count`],
-    /// [`LoginOutcomeTally::count_mut`] and [`LastLoginByOutcome::slot_mut`], which is the prompt to
-    /// extend this array too; and if it were still missed,
-    /// `every_outcome_is_in_all_so_no_category_can_go_unserved` fails, because the per-outcome counts
-    /// would no longer sum to the number of logins that ended.
+    /// ## What keeps this array complete — and what does not
+    ///
+    /// Written from mutations that were run, because the previous version of this paragraph was a
+    /// false safety-net claim that #743's round-3 review falsified by measurement.
+    ///
+    /// **Adding a variant to this enum fails to compile in five exhaustive matches:**
+    /// [`ConnectOutcome::as_str`], [`LastLoginByOutcome::get`], [`LastLoginByOutcome::slot_mut`],
+    /// [`LoginOutcomeTally::count`] and [`LoginOutcomeTally::count_mut`]. Note what is *not* in that
+    /// list: this array. Fixing all five and leaving `ALL` alone used to compile and ship a fully
+    /// green suite — the review added a fourth variant, wired those sites, left it out of `ALL`, and
+    /// measured `223 passed; 0 failed` / `52 passed; 0 failed`.
+    ///
+    /// **That hole is closed by [`LastLoginByOutcome::slots`], at compile time.** A new outcome means
+    /// a new retained slot; that function destructures the slot struct exhaustively and returns an
+    /// array of length `ALL.len()`, so the new slot must be listed there (check 1) and its outcome
+    /// must be in `ALL` (check 2) before the crate builds. Re-run and measured: the review's
+    /// mutation now stops the build with `E0027: pattern does not mention field "refused"` — the
+    /// LIBRARY, not only its tests.
+    ///
+    /// **The residual, stated rather than glossed, and measured too.** A variant whose match arms
+    /// are pointed at an *existing* slot and counter adds no field, so `slots` is unchanged and
+    /// nothing fires. Run: that shape compiles and the suite is `223 passed; 0 failed` /
+    /// `53 passed; 0 failed`. It is not a new category, it is an alias of one — the #743 B3 defect
+    /// [`LastLoginByOutcome`] exists to make unrepresentable — but neither the compiler nor any test
+    /// catches it here, and this doc does not claim otherwise.
+    ///
+    /// **What the test does and does not cover.**
+    /// `every_outcome_is_in_all_so_no_category_can_go_unserved` has no power over a variant that is
+    /// added and left out, because nothing constructs one, so it contributes zero to both sides of
+    /// its sum. The doc here used to claim it did. Its real power is over the *opposite* mutation —
+    /// an outcome **removed** from this array — and even that is now the compiler's job rather than
+    /// its own: shrinking `ALL` changes the length `slots` must return, so it stops the build
+    /// (`expected an array with a size of 2, found one with a size of 3`) before any test runs.
+    /// Measured on both trees; see the review-correction note in the PR body.
     pub const ALL: [ConnectOutcome; 3] =
         [ConnectOutcome::Succeeded, ConnectOutcome::Failed, ConnectOutcome::Unknown];
 
@@ -1268,12 +1322,59 @@ mod tests {
             "two logins did not complete, and BOTH are named — not just the later one");
     }
 
+    /// **#743 round-3 review B1.** [`LastLoginByOutcome::slots`] is the compile-time pin that keeps
+    /// [`ConnectOutcome::ALL`] complete, and it is what the HTTP encoder walks. It is therefore a
+    /// second enumeration of the outcomes, and two enumerations that can disagree are how the defect
+    /// this PR is about got in. The compiler pins their *length*; this pins their *contents and
+    /// order*, so `slots()[i]` and `ALL[i]` are the same outcome and a caller may zip them.
+    ///
+    /// MUTATION-CHECK: swap two entries in `slots`, or point one at another outcome's field, and
+    /// this goes RED.
+    #[test]
+    fn the_slot_enumeration_and_all_are_the_same_list_in_the_same_order() {
+        let s = new_shared();
+        // One login per outcome, each with a distinguishable purpose, so a mis-ordered pairing shows
+        // up as a record filed under the wrong outcome rather than as a length mismatch alone.
+        AssetConnectGuard::begin(&s, "ok").finish(ConnectOutcome::Succeeded);
+        AssetConnectGuard::begin(&s, "bad").finish(ConnectOutcome::Failed);
+        drop(AssetConnectGuard::begin(&s, "panicked"));
+
+        let slots = lock(&s);
+        let last = slots.last_login();
+        let enumerated: Vec<ConnectOutcome> = last.slots().iter().map(|(o, _)| *o).collect();
+        assert_eq!(enumerated, ConnectOutcome::ALL.to_vec(),
+            "`slots()` and `ALL` must be the same outcomes in the same order — they are two \
+             enumerations of one alphabet and the encoder pairs them positionally");
+        for (o, record) in last.slots() {
+            assert_eq!(record, last.get(o),
+                "`slots()` and `get()` must return the same record for {o:?} — one is an exhaustive \
+                 destructure of the fields, the other an exhaustive match on the outcome, and a \
+                 disagreement means a record is filed under an outcome that is not its own");
+        }
+    }
+
     /// **#743 review B3, as the rule rather than the pair of examples.** For every outcome, the
     /// counter and the retained record must agree, and a record must never appear under an outcome
     /// other than its own. This is what a shared slot could not satisfy at all.
     ///
     /// MUTATION-CHECK: make `LastLoginByOutcome::slot_mut` return `&mut self.failed` for
     /// `Unknown` — the round-2 collapse in miniature — and the `unknown` iteration goes RED.
+    ///
+    /// **Stated limit (#743 round-3 review B1, measured).** Despite the name, this test cannot see
+    /// an outcome that was *added* to the enum and left out of [`ConnectOutcome::ALL`]: the `3`
+    /// below is the number of logins this test stages, not `ALL.len()`, so a variant nothing
+    /// constructs contributes zero to both sides. The review ran exactly that mutation and the whole
+    /// suite stayed green (`223 passed; 0 failed` / `52 passed; 0 failed`). That direction is now a
+    /// compile error in [`LastLoginByOutcome::slots`], not a failure here.
+    ///
+    /// The other direction — an outcome **removed** from `ALL` — is what this test genuinely used to
+    /// kill, and its RED count was victim-dependent, which is worth recording because it was once
+    /// quoted as if it were not: on the round-3 tree, dropping `Failed` killed 5 tests
+    /// (`220 passed; 3 failed` / `50 passed; 2 failed`) and dropping `Unknown` killed 4
+    /// (`221 passed; 2 failed` / `50 passed; 2 failed`). On *this* tree that mutation no longer
+    /// reaches the suite at all: it fails to compile in `slots`. So the honest statement of this
+    /// test's remaining value is that it pins the count/record biconditional per outcome, not that
+    /// it guards `ALL`'s membership — the compiler does that in both directions now.
     #[test]
     fn every_outcome_is_in_all_so_no_category_can_go_unserved() {
         let s = new_shared();

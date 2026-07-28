@@ -262,8 +262,10 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
          counter, last_login_succeeded / last_login_failed / last_login_unknown name the most recent \
          login that ended THAT way, in full (`connecting.purpose`, `connecting.outcome`, `ago_ms`) \
          — ONE FIELD PER OUTCOME, so a count and the record beside it always describe the same \
-         login: login_outcomes.X > 0 if and only if last_login_X is present, for each of the three \
-         X, and last_login_X.connecting.outcome is always X. A failure and a panic therefore do not \
+         login: login_outcomes.X > 0 if and only if last_login_X is present, for each X in \
+         login_outcomes, and last_login_X.connecting.outcome is always X. Read the set of outcomes \
+         off login_outcomes' own keys rather than hard-coding it from this sentence. A failure and \
+         a panic therefore do not \
          compete for one slot and neither hides the other. Each is ABSENT — never null — until a \
          login ends that way, and each is overwritten only by a LATER login of the SAME outcome: so \
          these are 'most recent per outcome', not a log, and a second failure does replace the first \
@@ -287,7 +289,7 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
     // measured a genuinely failed login surviving there for 0 of 75 polls. These are written from
     // the same measured `Result` as the verdict in `last_ended`; they differ only in RETENTION.
     //
-    // **Encoded in ONE pass over `ConnectOutcome::ALL`, deliberately (B3).** Round 2 shipped a count
+    // **Encoded in ONE pass over the per-outcome slots, deliberately (B3).** Round 2 shipped a count
     // per outcome next to a SINGLE `last_login_failure` shared by `failed` and `unknown`, so a
     // caller who read the record on the strength of a counter could be handed the other outcome's
     // login. Here the counter and the record for an outcome are emitted from the same loop
@@ -303,10 +305,17 @@ fn asset_sync_json(snap: &eqoxide_ipc::AssetSyncSnapshot) -> serde_json::Value {
     {
         let obj = body.as_object_mut().expect("json! object");
         let mut counts = serde_json::Map::new();
-        for outcome in eqoxide_ipc::ConnectOutcome::ALL {
+        // #743 round-3 review B1: the loop is driven by `last_login.slots()`, not by
+        // `ConnectOutcome::ALL` directly. `slots()` is an exhaustive destructure of the per-outcome
+        // storage returning an array of length `ALL.len()`, so an outcome that has its own retained
+        // slot cannot be missing from this enumeration — the crate does not build if it is. Walking
+        // `ALL` here would have served whatever `ALL` happened to list, which is exactly the gap the
+        // review measured. The counter is still looked up BY OUTCOME rather than zipped, so the
+        // pairing of a count with its record does not depend on two arrays being in the same order.
+        for (outcome, record) in snap.last_login.slots() {
             let token = outcome.as_str();
             counts.insert(token.into(), snap.login_outcomes.count(outcome).into());
-            if let Some(r) = snap.last_login.get(outcome) {
+            if let Some(r) = record {
                 obj.insert(format!("last_login_{token}"), serde_json::json!({
                     // Same shape as a `last_ended` login, so a caller that can parse one can parse
                     // the other. `outcome` is derived from the slot, not stored in the record, so it
@@ -2725,10 +2734,17 @@ mod tests {
         // #743 review B3: every retained slot the guidance names must be a real field name, and
         // there must be one PER OUTCOME. A string that names a slot the encoder does not emit is the
         // same class of defect as a slot the string does not name.
-        for token in ["succeeded", "failed", "unknown"] {
+        // #743 round-3 review N2: driven by `ConnectOutcome::ALL`, not by a hard-coded list of three
+        // tokens. The wire string is a SECOND enumeration of the outcomes and it cannot follow `ALL`
+        // on its own, so an outcome added to `ALL` would otherwise be emitted on the wire while this
+        // string still promised the old set, with no test noticing.
+        for outcome in eqoxide_ipc::ConnectOutcome::ALL {
+            let token = outcome.as_str();
             assert!(semantics.contains(&format!("last_login_{token}")),
                 "the guidance must name `last_login_{token}` — one slot per outcome is the whole \
                  B3 fix, and guidance that names only some of them re-opens it: {semantics}");
+            assert!(v["login_outcomes"].get(token).is_some(),
+                "…and `login_outcomes` must carry a counter for every outcome in `ALL`: {v}");
             assert!(v.get(format!("last_login_{token}")).is_none(),
                 "no login has ended {token} in this state, so it is ABSENT, not null: {v}");
         }
@@ -2761,14 +2777,15 @@ mod tests {
         assert!(semantics.contains("connecting"), "{semantics}");
         assert_eq!(v["syncs"][0]["phase"], serde_json::json!("connecting"), "{v}");
 
-        // Direction 4: the outcome vocabulary. The guidance promises three tokens; each must be
-        // producible, so a caller branching on them cannot hit a value that was documented but
-        // never emitted (or a value emitted but never documented).
-        for (outcome, tag) in [
-            (eqoxide_ipc::ConnectOutcome::Succeeded, "succeeded"),
-            (eqoxide_ipc::ConnectOutcome::Failed, "failed"),
-            (eqoxide_ipc::ConnectOutcome::Unknown, "unknown"),
-        ] {
+        // Direction 4: the outcome vocabulary. Every outcome must be both documented and producible,
+        // so a caller branching on them cannot hit a value that was documented but never emitted (or
+        // a value emitted but never documented).
+        //
+        // #743 round-3 review N2: iterated from `ConnectOutcome::ALL` rather than from a hard-coded
+        // three-row table, so this is a check on the alphabet and not a restatement of it. The table
+        // could not have caught a fourth outcome; this can.
+        for outcome in eqoxide_ipc::ConnectOutcome::ALL {
+            let tag = outcome.as_str();
             assert!(semantics.contains(tag), "semantics must document outcome `{tag}`: {semantics}");
             let s2 = empty_state();
             begin_login(&s2, "p").finish(outcome);

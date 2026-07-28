@@ -1355,7 +1355,8 @@ The states an agent can distinguish:
 | had *any* login not complete | `login_outcomes.failed + .unknown > 0`; the two records above name both, independently |
 | just ended *something* | `last_ended` names it — and only it. Not a history, not a search |
 
-Those three ⟺ are the contract, and each is *per outcome*: the record beside a counter always
+Those ⟺ rows are the contract — one for **every** key `login_outcomes` carries, which is the list to
+read the outcome set off rather than this table — and each is *per outcome*: the record beside a counter always
 describes a login that ended **that** way. A second failure does replace the first failure's
 `purpose` (these are "most recent per outcome", not a log) — one question, one answer, and both
 still counted.
