@@ -558,8 +558,20 @@ impl ConnectOutcome {
     /// does not, by itself, stop a *different* sentence elsewhere from asserting the same false thing
     /// in its own words; only a grep and a retraction do that, and that fourth copy is now also
     /// retracted (see its own rustdoc). As of this commit a tree-wide grep for the completeness
-    /// claim's phrasings turns up none outside [`LastLoginByOutcome::slots`]'s rustdoc — stated as a
-    /// measured fact about this commit, not a guarantee about the next one.
+    /// claim's phrasings turns up no **un-retracted** copy outside [`LastLoginByOutcome::slots`]'s
+    /// rustdoc — stated as a measured fact about this commit, not a guarantee about the next one.
+    ///
+    /// ⚠️ **[EDIT, round 8 (#755 review, N1): "turns up none" was the wrong word, and the review's
+    /// own re-grep is why.]** Run with the review's wider pattern set (`completeness pin`,
+    /// `compile[- ]time pin`, `before the crate builds`, `does not build if`, `hole is closed`,
+    /// `cannot reach the wire`, `fails to compile here`, `keeps .*ALL.* complete`; `*.rs`/`*.md`,
+    /// `target/` excluded), a grep turns up **four** hits outside `slots()`'s rustdoc: `:541` and
+    /// `:544` — the claim quoted verbatim *inside its own retraction* twelve lines above this one —
+    /// `:1400`, the same thing inside the round-7 retraction, and `observe.rs:314`, which is itself
+    /// a retraction EDIT. (A fifth, `renderer/src/scene.rs:283`, is unrelated prose the pattern
+    /// happens to catch.) Every hit is a retraction or a quotation inside one. What was measured,
+    /// and what is true, is that no *un-retracted* assertion of the claim survives anywhere —
+    /// re-run at round 9 before this correction was written, not carried over from the review.
     ///
     /// **The residual, stated rather than glossed, and measured too.** A variant whose match arms
     /// are pointed at an *existing* slot and counter adds no field, so `slots` is unchanged and
@@ -1456,19 +1468,31 @@ mod tests {
     /// mutation.
     ///
     /// MUTATION-CHECK, run (not reasoned about) at #755 round 6, RE-RUN at round 7 after the review
-    /// found the round-6 claim below wrong: added a fifth `Refused` variant end-to-end — own field on
-    /// `LastLoginByOutcome`, own counter on `LoginOutcomeTally`, its own entry in `slots()`, listed
-    /// **first** in `ALL` (the round-7 review's ordering, chosen as the one most favourable to the
-    /// round-6 claim), all five exhaustive matches wired — with `as_str()` returning `"failed"` for
-    /// it (copy-pasted from `Failed`'s arm) instead of `"refused"`.
+    /// found the round-6 claim below wrong, and RE-RUN AGAIN at round 9: added a fifth `Refused`
+    /// variant end-to-end — own field on `LastLoginByOutcome`, own counter on `LoginOutcomeTally`,
+    /// its own entry in `slots()`, listed **first** in `ALL` (the round-7 review's ordering, chosen
+    /// as the one most favourable to the round-6 claim), all five exhaustive matches wired — with
+    /// `as_str()` returning `"failed"` for it (copy-pasted from `Failed`'s arm) instead of
+    /// `"refused"`, and with [`LoginOutcomeTally::unsuccessful`] **deliberately left unwired**
+    /// (still the hand-written `self.failed + self.unknown`). That last point is not incidental: it
+    /// is the single variable that decides which assertion the second red lands on, so the mutation
+    /// script asserts the two-field body is still present verbatim and aborts if it is not. Call
+    /// this **variant A**; **variant B** is the same mutation with `unsuccessful()` wired
+    /// (`+ self.refused`). Both were run at round 9, at this head and at the round-7 head, so which
+    /// run produced which number below is measured rather than inferred.
     ///
     /// ⚠️ **[EDIT, round 7 (#755 review, B2): "every other test in this module and in `eqoxide-http`
-    /// stayed green; this one alone went RED" was false, and the round-7 review's own re-run
-    /// (`52 passed; 2 failed`) is the proof — re-run again here, independently, before writing this
-    /// correction.]** Real output, `eqoxide-ipc`, `52 passed; 2 failed`:
+    /// stayed green; this one alone went RED" was false.]** ⚠️ **[EDIT, round 9 (#755 review, B1-r8):
+    /// this block used to cite "the round-7 review's own re-run (`52 passed; 2 failed`)" as the proof
+    /// of the two bullets below. That is a collapsed referent. Both runs print `52 passed; 2 failed`
+    /// — 54 tests, two red either way — which hides the seam, but the round-7 review's second red was
+    /// a **different assertion at a different line**; see the adjudication below.]** The two bullets
+    /// are this round's own re-run of **variant A** at this head, `eqoxide-ipc`,
+    /// `test result: FAILED. 52 passed; 2 failed`:
     ///
-    /// - this test, exactly as designed — `left: 3, right: 4` distinct tokens. The claim this test
-    ///   itself makes is correct.
+    /// - this test, exactly as designed — `left: 3, right: 4` distinct tokens
+    ///   (`["failed", "succeeded", "failed", "unknown"]`). The claim this test itself makes is
+    ///   correct.
     /// - [`no_interleaving_can_bury_a_login_failure_where_a_poller_cannot_find_it`] also goes RED, on
     ///   the very first verdict pair it tries (`[Refused, Refused]`): `left: 0, right: 2` at its
     ///   per-iteration [`LoginOutcomeTally::unsuccessful`] check. **This is not a second symptom of
@@ -1478,10 +1502,34 @@ mod tests {
     ///   that property test happens to assert `unsuccessful()` once per verdict pair. It fires before
     ///   the loop ever reaches that test's own `checked == 2520 * ALL.len().pow(2) * 8` assertion —
     ///   which used to be the literal `2520 * 9 * 8`, a same-class alphabet-size restatement, now
-    ///   fixed on its own merits (see the note there) but not what caused this particular red.
-    /// - No `eqoxide-http` test went red in this reproduction.
+    ///   fixed on its own merits (see the note there) but not what caused *this* red.
+    /// - No `eqoxide-http` test went red in this reproduction. Stated as scope, not as coverage:
+    ///   round 9 ran `-p eqoxide-ipc` only, and a round-9 tree-wide grep puts every mention of
+    ///   `unsuccessful` inside `crates/eqoxide-ipc/` — no caller in `eqoxide-http` or anywhere else
+    ///   — so A and B differ there only in a function no other crate invokes.
     ///
-    /// Reverted afterward, `cp`-aside restored and `md5sum`-verified.
+    /// **The adjudication, all four cells measured at round 9** (`-p eqoxide-ipc --locked
+    /// --no-fail-fast`; the round-7 head is reproduced exactly, since `5df7099..55ecbff` changes no
+    /// file but this one, and its only non-comment edits are this test's name and the `checked`
+    /// literal). What varies is *only* whether `unsuccessful()` is wired:
+    ///
+    /// | head | `unsuccessful()` | second red | `test result:` |
+    /// |---|---|---|---|
+    /// | round-7 `5df7099` | A, unwired | per-iteration `unsuccessful()` check, `0` vs `2` | `52 passed; 2 failed` |
+    /// | round-7 `5df7099` | B, wired | the `checked` literal, **`322560` vs `181440`** | `52 passed; 2 failed` |
+    /// | this head `55ecbff` | A, unwired | per-iteration `unsuccessful()` check, `0` vs `2` | `52 passed; 2 failed` |
+    /// | this head `55ecbff` | B, wired | **none — that test is GREEN** | `53 passed; 1 failed` |
+    ///
+    /// So the round-7 review's `322560 vs 181440` was neither a mistake nor a different bug: it is
+    /// row 2, the same mutation plus the one line that lets the loop run to completion. And row 4 is
+    /// the direct measurement that deriving the literal from `ALL.len()` fixed a live defect — the
+    /// only cell that changes across the two heads is the one where the loop actually reaches that
+    /// assertion.
+    ///
+    /// Reverted afterward, `cp`-aside restored and `md5sum`-verified back to
+    /// `13bac5cacbc6ec6b1d9fba8088ade684` — which is `git show 55ecbff:crates/eqoxide-ipc/src/asset_sync.rs`,
+    /// the content the round-9 mutations were applied to, *not* this file at whatever HEAD you are
+    /// reading it from (this very edit changes it).
     #[test]
     fn as_str_is_injective_over_all_so_no_two_outcomes_in_all_collide_on_one_wire_token() {
         let tokens: Vec<&str> = ConnectOutcome::ALL.iter().map(|o| o.as_str()).collect();
@@ -1807,13 +1855,29 @@ mod tests {
         // same test. The review named it as a live bug: add a variant and `ALL.len()` grows from 3
         // to 4, so the *actual* pair count the two nested `for … in ConnectOutcome::ALL` loops walk
         // grows to 16 while the hard-coded `9` stays put, so `checked` (322560) and the literal
-        // (181440) diverge — a real defect on its own terms, independent of whether any one
-        // reproduction happens to reach this line before an earlier assertion panics first (in the
-        // round-7 MX-E2 re-run this line was never reached — an earlier, unrelated, already-disclosed
-        // gap fired first; see the note on
-        // `as_str_is_injective_over_all_so_no_two_outcomes_in_all_collide_on_one_wire_token`).
-        // Derived from `ALL.len()` so the count self-scales with the alphabet the loops actually
-        // walk, regardless of which assertion a given mutation happens to trip first.]
+        // (181440) diverge.
+        //
+        // ⚠️ [EDIT, round 9 (#755 review, B1-r8): the clause that stood here said "in the round-7
+        // MX-E2 re-run this line was never reached — an earlier, unrelated, already-disclosed gap
+        // fired first". That is false about the run it names, and self-contradicting on its face:
+        // the two numbers quoted one line above can only be produced by a run that DID reach this
+        // line. Corrected, and re-measured at round 9 rather than reasoned about — all four cells of
+        // the 2×2 are in the MUTATION-CHECK table on
+        // `as_str_is_injective_over_all_so_no_two_outcomes_in_all_collide_on_one_wire_token`:
+        //
+        //   * the round-7 review's mutation ALSO wired `LoginOutcomeTally::unsuccessful()`, so the
+        //     per-iteration `unsuccessful()` check above passed, the loop ran to completion, and this
+        //     line WAS reached and DID fire `322560 vs 181440` at the round-7 head. That is the
+        //     direct measurement that this literal was a live bug, not merely a derivation from
+        //     `ALL.len()` — which makes the case for the fix stronger, not weaker.
+        //   * the mutation described in that MUTATION-CHECK leaves `unsuccessful()` unwired, so the
+        //     per-iteration check panics on the first verdict pair and this line is not reached.
+        //
+        // Whether it is reached is therefore a property of the mutation, not of this defect: the
+        // divergence is real either way. Derived from `ALL.len()` so the count self-scales with the
+        // alphabet the loops actually walk, regardless of which assertion a given mutation trips
+        // first — and at this head, with `unsuccessful()` wired, that test is GREEN under the same
+        // mutation that reddened it at the round-7 head.]
         assert_eq!(checked, 2520 * ConnectOutcome::ALL.len().pow(2) * 8,
             "2520 orderings × ALL.len()² outcome pairs × 8 steps must each have been asserted; a \
              shrunken enumeration is how this property stops covering the ordering it exists for");
