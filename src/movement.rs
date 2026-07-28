@@ -664,20 +664,31 @@ impl CharacterController {
             let mut ducked = false;
             if (self.on_ground || swimming) && low_hit && low_prog + 0.01 < hlen(wish) {
                 // #661: a blocked SWIMMER first tries to pass UNDER the obstruction — the exact
-                // mirror of the step-up below, pointing down, and the reason the two are ordered:
-                // staying in the water is the reversible move (a swimmer that dives can always
-                // surface again; a haul-out onto dry ground cannot be swum back through, which is
-                // the one-way transition #661 is about). The step-up may only haul a swimmer out
-                // once the water route has been MEASURED shut — `try_duck_under` found no more
-                // lateral progress at diving depth. At a real bank that measurement fails (the
-                // bank face is solid all the way down, so diving gains nothing) and the haul-out
-                // proceeds exactly as before (#191); at qcat's pocket mouth the passage to the
-                // shaft is open water 2 u below the swim plane, so the duck carries the swimmer
-                // through instead of letting the lip strand it.
+                // mirror of the step-up below, pointing down. The ordering rationale, stated as
+                // the property the code actually has (#661 review, B1 — the first version of this
+                // comment claimed "a swimmer that dives can always surface again", and the review
+                // FALSIFIED that on a shallow far shelf; the sentence was not reworded, the
+                // missing condition was built):
+                //
+                //   * a haul-out that lands DRY is irreversible under every driver — `want_swim`
+                //     is inert on dry ground and nothing can sink through a floor — so it must be
+                //     the last resort;
+                //   * a duck is only constructible when its landing column is re-divable
+                //     (`try_duck_under`'s floor bound), so the passage it crosses can be dived
+                //     back through; the duck is therefore the option that KEEPS options.
+                //
+                // The step-up may only haul a swimmer out once the water route has been MEASURED
+                // shut — `try_duck_under` found no more lateral progress at diving depth. At a
+                // real bank that measurement fails (the bank face is solid all the way down, so
+                // diving gains nothing) and the haul-out proceeds exactly as before (#191); at
+                // qcat's pocket mouth the passage to the shaft is open water 2 u below the swim
+                // plane, so the duck carries the swimmer through instead of letting the lip
+                // strand it.
                 //
                 // Gated on `wish_vspeed <= 0`: an explicit upward swim wish is the walker's
                 // haul-out drive (water design §4c) and must never be countermanded by an
-                // autonomous dive.
+                // autonomous dive (`an_upward_haul_out_drive_is_never_countermanded_by_the_duck`
+                // goes RED if this gate is deleted).
                 if swimming && intent.wish_vspeed <= 0.0 {
                     if let Some(duck) = self.try_duck_under(wish, col) {
                         if hlen([duck[0] - self.pos[0], duck[1] - self.pos[1], 0.0]) > low_prog + 0.05 {
@@ -753,11 +764,24 @@ impl CharacterController {
                 // clamped at the water surface — the feet never leave the water column mid-swim;
                 // a haul-out lip is mounted by the swimming step-up above, not by flying out of
                 // the pool.
+                //
+                // The clamp stops `SKIN` UNDER the surface, not exactly ON it (#661 review round,
+                // found by pinning the duck's up-wish gate): `in_water` is a strict inequality, so
+                // feet clamped to exactly `surf` read as DRY for the frame — the body probe sees
+                // feet-at-boundary + chest-in-air and calls the whole body dry — and the DRY
+                // depenetration net then owns a body that is actually swimming at the surface.
+                // Measured: a surfaced swimmer pressed against a face inside footprint radius was
+                // ring-recovered by `nearest_floor` straight to the pool floor 40 u down,
+                // `Grounded`, in one frame — the #649 teleport shape, alive on `main` too
+                // (pre-existing; this fix's door made it SUSTAINED rather than new, because the
+                // up-wish now pins the feet at the clamp indefinitely instead of the net churning
+                // the body). One `SKIN` of depth keeps the clamped swimmer in its own medium, so
+                // the sentence above about the water column stays true in the probe's own terms.
                 let want = intent.wish_vspeed * dt;
                 if want > 0.0 {
                     let mut rise = self.swim_rise(want, col);
                     if let Some(surf) = col.water_surface(water_at) {
-                        rise = rise.min((surf - self.pos[2]).max(0.0));
+                        rise = rise.min((surf - SKIN - self.pos[2]).max(0.0));
                     }
                     self.pos[2] += rise;
                 } else {
@@ -958,11 +982,14 @@ impl CharacterController {
                         // #661 (issue's "second un-`Recovery`'d writer" note): routed through
                         // `recover` so the fall-through guard shares the net's single
                         // position+support writer instead of re-stating the flags inline. Ring
-                        // samples are banked only while grounded and non-embedded, so
-                        // `Recovery::Grounded` holds by construction — the same justification as
-                        // the stuck fallback in `depenetrate`. Behaviour-identical: `recover`
-                        // additionally zeroes `stuck_time`, but this arm only runs on frames
-                        // `depenetrate` returned false, which already reset it.
+                        // samples are banked only while grounded and non-embedded — since #661's
+                        // review (B3) that is enforced by the explicit `!is_embedded` predicate at
+                        // the banking site, not by the control flow's shape (the widened wet door
+                        // briefly made the old shape-argument false, measured) — so
+                        // `Recovery::Grounded` holds by construction, same as the stuck fallback
+                        // in `depenetrate`. Behaviour-identical routing: `recover` additionally
+                        // zeroes `stuck_time`, but this arm only runs on frames `depenetrate`
+                        // returned false, which already reset it.
                         let recovered = match self.good.back().copied() {
                             Some(g) => { self.recover(g[0], g[1], Recovery::Grounded(g[2])); true }
                             None => false, // hold current pos; don't sink below underworld
@@ -1090,9 +1117,40 @@ impl CharacterController {
     /// obstruction by diving? Sink the feet (collided, via [`Self::swim_sink`] — the dive cannot
     /// pass through the pool floor) by up to the same envelope the step-up can climb
     /// (`STEP_UP + GROUND_SNAP_TOL` = 2.5 u, the controller's real step capability), then sweep the
-    /// wish again from the lowered position. `Some(lowered destination)` only when the dive found
-    /// real room below AND both the lowered start and the destination keep the body's feet in
-    /// water — a duck is a SWIM move; it may never exit the medium downward or sideways.
+    /// wish again from the lowered position. Every clause is a refusal condition, each pinned by a
+    /// RED-when-deleted test (named per clause below):
+    ///
+    /// * the dive must find real room below (`sink` actually resolved downward);
+    /// * the lowered start must keep the feet in water — the duck may not dive out the BOTTOM of
+    ///   its own water volume, even when the destination would be wet again
+    ///   (`a_duck_never_dives_out_the_bottom_of_its_own_water_volume`);
+    /// * the destination must keep the feet in water — the duck may not exit the medium SIDEWAYS
+    ///   into dry space, where `want_swim` is inert and gravity owns the body
+    ///   (`a_duck_never_exits_the_water_sideways`);
+    /// * **the destination column must be re-divable (#661 review, B1): its floor must exist and
+    ///   sit at or below the ducked feet.** Without this the duck is itself a one-way transition —
+    ///   the defect class this whole fix exists to remove: over a far shelf shallower than the
+    ///   duck depth, the outbound duck clears the obstruction from deep water while the return
+    ///   duck's sink clamps on the shelf and can never get the chest back under the lip (measured:
+    ///   far floor −3.0 vs duck z −4.5 → crossed once, then converged against the far face for
+    ///   ever, `on_ground=false, in_water=true, hold()=None` — trapped with every observable
+    ///   reading "swimming normally"). Requiring `floor ≤ ducked feet` makes the crossing
+    ///   **reversible by a driven dive, by construction**: the return only needs feet to re-occupy
+    ///   the passage depth, which the floor now provably admits and the destination water check
+    ///   already covers. (Residual, stated exactly: the return's sink stops `SKIN` = 0.05 u above
+    ///   the floor, so a passage whose outbound clearance was under 0.05 u can still shut behind
+    ///   the body; and this is reversibility of the PASSAGE for a driver that dives — a
+    ///   horizontal-only wish still needs the return column deep enough for the autonomous duck,
+    ///   which the same floor bound gives everywhere the two sides' surfaces match.) The probe is
+    ///   the same `ground_below` the step-up's landing check uses, so the two mirrors refuse
+    ///   unoccupiable destinations the same way — the reviewer's structural point, adopted.
+    ///
+    /// The feet-only `in_water` probes here are DELIBERATE, not an oversight of the #649
+    /// feet-probe lesson (#661 review, N3): a duck is a descent into the medium's interior, so
+    /// "the FEET themselves are in water" is the required condition — a chest-based probe would
+    /// accept landings whose lower body is out of the volume. In the one geometry where the feet
+    /// probe lies (a `.wtr` volume that stops short of the pool floor), these clauses can only
+    /// REFUSE a duck, never mount anything — the failure is a missed shortcut, not a wrong state.
     ///
     /// The caller compares the returned progress against the surface slide's and only takes a duck
     /// that measured strictly better — on an ascending bank face (solid to the bottom) the lowered
@@ -1103,7 +1161,13 @@ impl CharacterController {
         let lowered = [self.pos[0], self.pos[1], self.pos[2] + sink];
         if !col.in_water(lowered) { return None; }
         let (lo, _) = self.slide(lowered, wish, col);
-        col.in_water(lo).then_some(lo)
+        if !col.in_water(lo) { return None; }
+        // Re-divability (B1): the landing column's floor must admit re-occupying the passage
+        // depth. `ground_below`'s probe origin is `feet + GROUND_ORIGIN`, so a floor slightly
+        // above the ducked feet would still be FOUND — hence the explicit `<=` bound, not just
+        // `is_some()`: a floor above the ducked feet shallows the return sink and shuts the door.
+        let floor = col.ground_below(lo[0], lo[1], lo[2] + GROUND_ORIGIN, GROUND_DEPTH)?;
+        (floor <= lo[2]).then_some(lo)
     }
 
     /// Is the wedged-against barrier a *hoppable* fence — i.e. is there walkable floor `HOP_REACH`
@@ -1171,7 +1235,17 @@ impl CharacterController {
         if body_in_water(col, p) || !is_embedded(col, p) {
             self.stuck_time = 0.0;
             self.good_timer += dt;
-            if self.on_ground && self.good_timer >= GOOD_SAMPLE_SECS {
+            // The ring's invariant — every banked sample is GROUNDED and NON-EMBEDDED — used to
+            // hold by position in the control flow (this arm was only reachable when
+            // `!is_embedded`). Widening the door for wet bodies broke that silently: a wading
+            // body embedded between rocks reached this arm and banked embedded restore points,
+            // which both ring readers (the stuck fallback and the underworld fall-through guard)
+            // would then restore a body INTO — the #724 stale-ring re-banking shape (#661 review,
+            // B3, measured: `banked=4 any_embedded=TRUE` vs main's `banked=0`). So the invariant
+            // is now enforced where the sample is taken, for every medium; the predicate runs
+            // only on sample frames (every GOOD_SAMPLE_SECS), and for a dry body it is a
+            // re-evaluation of the door's own answer.
+            if self.on_ground && self.good_timer >= GOOD_SAMPLE_SECS && !is_embedded(col, p) {
                 self.good_timer = 0.0;
                 if self.good.len() >= GOOD_RING_LEN { self.good.pop_front(); }
                 self.good.push_back(self.pos);
@@ -1199,9 +1273,12 @@ impl CharacterController {
             match self.good.back().copied() {
                 Some(g) => {
                     tracing::info!("depenetrate: stuck {:.1}s, falling back to last good pos {:?}", self.stuck_time, g);
-                    // The ring buffer only ever samples GROUNDED positions (see the `!embedded` arm
-                    // above), so this fallback is a `Grounded` recovery by construction — routed through
-                    // the same single writer so the net has exactly one place that sets the support flags.
+                    // The ring buffer only ever samples GROUNDED, NON-EMBEDDED positions — enforced
+                    // by the explicit `!is_embedded` predicate at the banking site since #661's
+                    // review (B3; the wet-door widening had silently let an embedded wading body
+                    // bank) — so this fallback is a `Grounded` recovery by construction, routed
+                    // through the same single writer so the net has exactly one place that sets
+                    // the support flags.
                     self.recover(g[0], g[1], Recovery::Grounded(g[2]));
                 }
                 // #724 review B1 — the branch that used not to exist. With an empty ring this arm
@@ -1966,6 +2043,203 @@ mod tests {
              actually gains progress; ended at {:?}", ctrl.pos);
     }
 
+    // ── #661 review: every duck guard is pinned by a RED-when-deleted test ──────────────────────
+    //
+    // The review measured that three of the duck's four refusal clauses were pinned by nothing
+    // (deleting each left the whole tree green), and that the duck itself was a NEW one-way
+    // transition over a shallow far shelf — the defect class this fix exists to remove. The tests
+    // below each pin one clause; each was verified RED with only its clause deleted and GREEN on
+    // the fixed controller. The shared scene is the hanging-face corridor from
+    // `a_swimmer_ducks_under_a_hanging_face_instead_of_stranding_at_it`, varied one element at a
+    // time.
+
+    /// Drive the controller east with a constant intent for `frames` frames.
+    fn drive_east(ctrl: &mut CharacterController, col: &Collision, frames: usize, vspeed: f32) {
+        let intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: vspeed, jump: false,
+                                  want_swim: true, speed: 44.0, climb: 0.0, hop: false };
+        for _ in 0..frames { ctrl.step(intent, 1.0 / 60.0, col); }
+    }
+
+    /// **B1 — the duck must not be a one-way transition: a far side too shallow to dive back out
+    /// of is REFUSED.** The reviewer's falsifying scene, adopted as the pin: same lintel, but the
+    /// far column's floor is at −3.0 — above the −4.5 duck depth — so a body that crossed could
+    /// never re-sink far enough to get its chest back under the lip (measured pre-guard: crossed
+    /// once, then converged against the far face for ever, every observable reading "swimming
+    /// normally"). `try_duck_under`'s floor bound (`floor ≤ ducked feet`, the re-divability
+    /// condition) refuses the crossing instead; the body presses at the lip — wet, at its plane,
+    /// still answering input — which nav sees as a stall and can replan around.
+    #[test]
+    fn a_duck_never_crosses_into_a_column_it_cannot_dive_back_out_of() {
+        let c = flooded_corridor(
+            vec![floor(-40.0, -100.0, 4.0), floor(-3.0, 4.0, 100.0), wall(4.0, -0.2, 20.0)],
+            -40.0, 0.0);
+        // Fixture: the far column must NOT be divable to the passage depth (−4.5): its floor sits
+        // above it, so `ground_below` from the ducked feet finds nothing at or below them.
+        assert!(c.ground_below(8.0, 0.0, -4.5 + 1.0, 200.0).map_or(true, |f| f > -4.5),
+            "fixture: the far shelf must be shallower than the duck depth, or this is the \
+             round-trip scene");
+        let mut ctrl = CharacterController::new([-2.0, 0.0, -2.0]);
+        drive_east(&mut ctrl, &c, 240, 0.0);
+        assert!(ctrl.pos[0] < 4.0,
+            "#661 review B1: the duck must REFUSE a crossing whose far side cannot be dived back \
+             out of — crossing here is a one-way trap (measured); got {:?}", ctrl.pos);
+        assert!(c.in_water(ctrl.pos) && (ctrl.pos[2] - (-2.0)).abs() < 0.3 && !ctrl.on_ground,
+            "…and the refused swimmer stays wet at its plane, still a swimmer: {:?}", ctrl.pos);
+    }
+
+    /// **B1's other half — a divable far side is a ROUND TRIP.** Identical scene with the far
+    /// floor at −4.6, just below the −4.5 duck depth: the crossing is allowed, and driving back
+    /// west re-ducks under the same lintel and returns. This is the reversibility the ordering
+    /// comment claims, held as a measurement — and the over-tightening guard on the B1 fix (a
+    /// refusal keyed on anything stronger than re-divability would turn this red).
+    #[test]
+    fn a_duck_across_a_divable_far_side_is_a_round_trip() {
+        let c = flooded_corridor(
+            vec![floor(-40.0, -100.0, 4.0), floor(-4.6, 4.0, 100.0), wall(4.0, -0.2, 20.0)],
+            -40.0, 0.0);
+        let mut ctrl = CharacterController::new([-2.0, 0.0, -2.0]);
+        drive_east(&mut ctrl, &c, 240, 0.0);
+        assert!(ctrl.pos[0] > 8.0,
+            "fixture/capability: with the far floor below the duck depth the crossing must be \
+             allowed; got {:?}", ctrl.pos);
+        let west = MoveIntent { wish_dir: [-1.0, 0.0], wish_vspeed: 0.0, jump: false,
+                                want_swim: true, speed: 44.0, climb: 0.0, hop: false };
+        for _ in 0..360 { ctrl.step(west, 1.0 / 60.0, &c); }
+        assert!(ctrl.pos[0] < 0.0,
+            "#661 review B1: the crossing must be a round trip — driving back west must re-duck \
+             under the lintel and return; got {:?}", ctrl.pos);
+        assert!(c.in_water(ctrl.pos) && !ctrl.on_ground,
+            "…still a swimmer after the round trip: {:?}", ctrl.pos);
+    }
+
+    /// **The `wish_vspeed <= 0` gate (review M4): an explicit upward drive is never countermanded
+    /// by an autonomous dive.** The walker's haul-out approach (water design §4c) holds an
+    /// up-wish; if the duck could fire during it, a bank with any open water under its face would
+    /// see the controller dive under instead of climbing out. Here the up-wishing swimmer starts
+    /// at the lintel already within duck range: with the gate it presses and RISES (the §4c
+    /// shape); with the gate deleted it ducks under on the first blocked frame and crosses —
+    /// which is this test's failure.
+    #[test]
+    fn an_upward_haul_out_drive_is_never_countermanded_by_the_duck() {
+        let c = flooded_corridor(
+            vec![floor(-40.0, -100.0, 100.0), wall(4.0, -0.2, 20.0)],
+            -40.0, 0.0);
+        let mut ctrl = CharacterController::new([3.0, 0.0, -2.4]);
+        drive_east(&mut ctrl, &c, 120, 5.0); // an explicit, sustained upward swim wish
+        assert!(ctrl.pos[0] < 4.0,
+            "#661 review M4: an up-wishing swimmer must NEVER be taken under the obstruction by \
+             the autonomous duck — the up-wish is the walker's haul-out drive; got {:?}", ctrl.pos);
+        assert!(ctrl.pos[2] > -2.4 + 0.05 && c.in_water(ctrl.pos),
+            "…and the up-wish must actually be rising it toward the surface: {:?}", ctrl.pos);
+    }
+
+    /// **The destination water check (review M5): a duck never exits the water SIDEWAYS.** The
+    /// water region ends exactly at the lintel's plane, so the surface swimmer always stays wet —
+    /// but a duck's landing would be dry. With the check the duck is refused and the body keeps
+    /// pressing, wet, at its plane; with the check deleted the duck lands the body dry at depth
+    /// with `want_swim` inert and gravity in charge — it plummets to the pool floor 38 u below,
+    /// which is this test's failure.
+    #[test]
+    fn a_duck_never_exits_the_water_sideways() {
+        let mut c = col(vec![floor(-40.0, -100.0, 100.0), wall(4.0, -0.2, 20.0)]);
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::box_below(-100.0, 100.0, -100.0, 4.0, 0.0))));
+        assert!(c.in_water([3.5, 0.0, -2.0]) && !c.in_water([4.5, 0.0, -4.5]),
+            "fixture: wet up to the lintel plane, dry beyond it at every depth");
+        let mut ctrl = CharacterController::new([-2.0, 0.0, -2.0]);
+        drive_east(&mut ctrl, &c, 180, 0.0);
+        assert!(ctrl.pos[0] < 4.05 && (ctrl.pos[2] - (-2.0)).abs() < 0.3,
+            "#661 review M5: a duck whose landing is dry must be refused — accepting it exits the \
+             medium sideways at depth and gravity takes the body to the pool floor; got {:?}",
+            ctrl.pos);
+        assert!(c.in_water(ctrl.pos) && !ctrl.on_ground,
+            "…the refused swimmer is still a swimmer: {:?}", ctrl.pos);
+    }
+
+    /// **The lowered-start water check (review M6): a duck never dives out the BOTTOM of its own
+    /// water volume.** The near column's water is only 3.5 u deep over a 40 u-deep passage: the
+    /// 2.5 u sink from the float plane would put the feet below the volume's floor, transiting
+    /// dry space even though the far side would be wet again. With the check the duck is refused;
+    /// with it deleted the body crosses — this test's failure.
+    #[test]
+    fn a_duck_never_dives_out_the_bottom_of_its_own_water_volume() {
+        let mut c = col(vec![floor(-40.0, -100.0, 100.0), wall(4.0, -0.2, 20.0)]);
+        c.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_boxes(&[
+            [-100.0, 100.0, -100.0, 4.0, -3.5, 0.0], // shallow near volume: bottom −3.5
+            [-100.0, 100.0, 4.0, 100.0, -40.0, 0.0], // deep far volume
+        ]))));
+        assert!(c.in_water([2.0, 0.0, -2.0]) && !c.in_water([2.0, 0.0, -4.5])
+                && c.in_water([6.0, 0.0, -4.5]),
+            "fixture: the ducked depth is BELOW the near volume's bottom but wet on the far side — \
+             exactly the case only the lowered-start check refuses");
+        let mut ctrl = CharacterController::new([-2.0, 0.0, -2.0]);
+        drive_east(&mut ctrl, &c, 180, 0.0);
+        assert!(ctrl.pos[0] < 4.05 && ctrl.pos[2] > -3.6,
+            "#661 review M6: the duck must not dive through the floor of the water it is in, even \
+             to a wet landing; got {:?}", ctrl.pos);
+    }
+
+    /// **The 2.5 u envelope (review M7), pinned where CI can see it.** The lintel's underside is
+    /// at −1.0: passing it needs the chest (feet + 4) below −1.0, i.e. a 3.0 u dive from the
+    /// float plane — just past the `STEP_UP + GROUND_SNAP_TOL` = 2.5 envelope. The duck must
+    /// refuse; a widened envelope (the review's 12.0 mutation, previously RED only in
+    /// `#[ignore]`d asset-gated tests) crosses and turns this red. The envelope is the step
+    /// capability's mirror, not a free dive — anything deeper is the planner's business
+    /// (a dive-first route with an explicit down-wish), not the controller's autonomy.
+    #[test]
+    fn the_duck_envelope_is_the_step_envelope_not_a_free_dive() {
+        let c = flooded_corridor(
+            vec![floor(-40.0, -100.0, 100.0), wall(4.0, -1.0, 20.0)],
+            -40.0, 0.0);
+        let mut ctrl = CharacterController::new([-2.0, 0.0, -2.0]);
+        drive_east(&mut ctrl, &c, 240, 0.0);
+        assert!(ctrl.pos[0] < 4.0 && ctrl.pos[2] > -4.6,
+            "#661 review M7: a passage needing a 3.0 u dive is outside the 2.5 u duck envelope and \
+             must be refused — a free-dive duck is a new capability nobody approved; got {:?}",
+            ctrl.pos);
+        assert!(c.in_water(ctrl.pos) && (ctrl.pos[2] - (-2.0)).abs() < 0.3,
+            "…the refused swimmer holds its plane: {:?}", ctrl.pos);
+    }
+
+    /// **The recovery ring never contains an EMBEDDED sample (review B3).** Widening the net's
+    /// door for wet bodies let a wading body embedded between close rocks reach the banking arm —
+    /// silently breaking the ring's "grounded and non-embedded by construction" property that
+    /// both ring readers (the stuck fallback and the underworld guard) rely on for their restore
+    /// points. The banking site now enforces the predicate explicitly. Here: a body wades
+    /// embedded in a flooded 1.6 u slot for two full seconds (four banking windows), is then
+    /// relocated over a floorless dry column, and the stuck fallback must find NOTHING to restore
+    /// — it must hold and disclose, not rubber-band the body back into the embedded slot.
+    #[test]
+    fn an_embedded_wading_sample_never_enters_the_recovery_ring() {
+        let mut c = col(vec![floor(0.0, -100.0, 100.0), wall(0.8, 0.0, 10.0), wall(-0.8, 0.0, 10.0)]);
+        // Water only over the slot's east band, so the relocation target is DRY.
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::box_below(-100.0, 100.0, -1.5, 1.5, 1.0))));
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        assert!(c.in_water([0.0, 0.0, 0.0]) && !c.footprint_clear(0.0, 0.0, 0.0, PLAYER_RADIUS, 8),
+            "fixture: a WET, GROUNDED, EMBEDDED body — the exact combination the widened door let \
+             into the banking arm");
+        for _ in 0..120 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(ctrl.on_ground && ctrl.pos[0].abs() < 0.1,
+            "fixture: it waded in place, grounded, for the whole banking period: {:?}", ctrl.pos);
+
+        // Relocate over a column with NO floor below (the floor at z=0 is far above) — dry, clear
+        // footprint, `ground_below` none → the net's no-floor arm, whose only recovery is the ring.
+        ctrl.pos = [50.0, 0.0, -49.0];
+        assert!(!c.in_water(ctrl.pos)
+                && c.ground_below(50.0, 0.0, -48.0, GROUND_DEPTH).is_none(),
+            "fixture: the relocation target is dry with nothing below in probe range");
+        for _ in 0..90 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!((ctrl.pos[0] - 50.0).abs() < 1.5,
+            "#661 review B3: the ring must hold NO sample from the embedded wade — restoring one \
+             rubber-bands the body back into the slot it was standing embedded in; got {:?}",
+            ctrl.pos);
+        assert!(matches!(ctrl.hold(), Some(h) if h.reason == ControllerHoldReason::EmbeddedNoRecovery),
+            "…and with an empty ring the stuck fallback must HOLD and disclose, not invent a \
+             restore point; got {:?}", ctrl.hold());
+    }
+
     #[test]
     // #730: capitalised on purpose — BODY-not-feet is the exact #649 regression this test pins
     // (a feet-only probe calls a submerged body dry, see the comment below); renaming would blur it.
@@ -1994,15 +2268,17 @@ mod tests {
         ctrl.step(swim_still(), 1.0 / 60.0, &c);
 
         // One frame. Fixed: the door sees a wet BODY, the net stays out, and buoyancy's ordinary
-        // ≤ 0.5 u-per-frame rise begins (the pre-#661 assertion demanded z exactly 0, but that was
-        // the net FREEZING the frame — "not teleported" and "frozen" are different claims, and the
-        // frozen half is gone with the net). Mutated (feet-only door probe): the body walks into
-        // the dry net and is beached on the slab — z = 2.0, `on_ground` — which both halves below
-        // reject.
-        assert!(ctrl.pos[2] < 1.0 && !ctrl.on_ground,
-            "a submerged body whose FEET are outside the water volume is still afloat: a feet-only \
-             probe in the net calls it dry and mounts it on the slab at z=2, grounded — got {:?} \
-             on_ground={}", ctrl.pos, ctrl.on_ground);
+        // rise begins (the pre-#661 assertion demanded z exactly 0, but that was the net FREEZING
+        // the frame — "not teleported" and "frozen" are different claims, and the frozen half is
+        // gone with the net). The bound is buoyancy's own per-frame maximum, `BUOY_RATE * dt`
+        // = 0.5 u — the PHYSICAL claim, not a midpoint to the mutation (#661 review, flip-4 note:
+        // `< 1.0` would let a doubled buoyancy rate ship green under this test's name). Mutated
+        // (feet-only door probe): the body walks into the dry net and is beached on the slab —
+        // z = 2.0, `on_ground` — which both halves below reject.
+        assert!(ctrl.pos[2] <= BUOY_RATE * (1.0 / 60.0) + 1e-3 && !ctrl.on_ground,
+            "a submerged body whose FEET are outside the water volume is still afloat and rises at \
+             most one buoyancy step (0.5 u): a feet-only probe in the net calls it dry and mounts \
+             it on the slab at z=2, grounded — got {:?} on_ground={}", ctrl.pos, ctrl.on_ground);
     }
 
     /// **THE DEPENETRATION CORPUS — the blast-radius harness, committed so its numbers are
@@ -2164,9 +2440,10 @@ mod tests {
         for _ in 0..20 { ctrl.step(walk(0.0, [0.0, 0.0]), 0.05, &bad); }
         assert!((ctrl.pos[0]).abs() < 1e-2 && (ctrl.pos[1]).abs() < 1e-2,
             "should have rubber-banded to the last good grounded position (origin): {:?}", ctrl.pos);
-        // The ring buffer only ever samples GROUNDED positions, so the fallback recovers a body that
-        // IS standing — pinned here because #649 routed this write through the shared `recover`
-        // (`Recovery::Grounded`) and an unpinned refactor is an unnoticed behaviour change.
+        // The ring buffer only ever samples GROUNDED, NON-EMBEDDED positions (the explicit
+        // `!is_embedded` gate at the banking site — #661 review B3), so the fallback recovers a
+        // body that IS standing — pinned here because #649 routed this write through the shared
+        // `recover` (`Recovery::Grounded`) and an unpinned refactor is an unnoticed behaviour change.
         assert!(ctrl.on_ground, "the last-good position is a grounded one: {:?}", ctrl.pos);
     }
 
