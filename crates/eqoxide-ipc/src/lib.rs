@@ -1360,20 +1360,25 @@ pub struct NavStatus {
     /// `nav_state: navigating` needs to know, in the same snapshot, whether the tier that is actually
     /// steering it can see a way through the next 40 u.
     pub local:  Option<NavLocal>,
-    /// **SESSION-scoped, latched: the fine worker thread has died** (#766 review B3). `true` once
-    /// `LocalPlanner::is_dead()` has been observed; never cleared, because the thread never comes
-    /// back — recovering it needs a client restart. Published as the top-level `nav_local_planner_dead`
-    /// on GET /v1/observe/debug, always, in both states: an agent checking its own health needs to be
-    /// able to read "alive", not merely fail to read "dead".
+    /// **The fine worker thread has died — latched, and scoped to that WORKER** (#766 review B3/B9).
+    /// Set `true` the instant `LocalPlanner::is_dead()` is observed, and cleared by **nothing on any
+    /// nav route**: no goal, no zone change, no retirement touches it, because the thread does not
+    /// come back and recovering it needs a client restart. The one writer that clears it is
+    /// `Walker::new` (`eqoxide-nav`), which does so as it spawns a REPLACEMENT worker — so what the
+    /// latch describes is the worker, not the process. Those coincide today, exactly one `Walker`
+    /// being built per process, which is why the agent-facing docs call the field session-scoped; the
+    /// last paragraph here says why the distinction is worth keeping anyway. Published as the
+    /// top-level `nav_local_planner_dead` on GET /v1/observe/debug, always, in both states: an agent
+    /// checking its own health needs to be able to read "alive", not merely fail to read "dead".
     ///
     /// This field exists because `local` could not carry the fact honestly. `NavLocal` is a PER-GOAL
     /// verdict and #766 retires it with the goal, but `planner_dead` was riding in it as one of its
-    /// three publishable `state` values while being a session fact about the *client*, not a
+    /// three publishable `state` values while being a fact about the *client's fine worker*, not a
     /// statement about any goal — and `local` was its only publication surface in the tree (the
     /// `no_path`/`planner_dead` pair on `state`/`reason` comes from the COARSE planner). So
     /// retirement destroyed it, and the review found the consequence: an agent between goals — exactly
     /// when it polls `/v1/observe/debug` to decide what to do next — could not learn that its fine
-    /// planner was dead. Splitting the session fact out of the per-goal row fixes that without a
+    /// planner was dead. Splitting the worker fact out of the per-goal row fixes that without a
     /// carve-out in [`NavStatus::retire_to_idle`], which would have re-opened the very
     /// clear-`local`-on-every-`idle` uniformity #766 exists to create.
     ///
@@ -1381,7 +1386,8 @@ pub struct NavStatus {
     /// through a failed send or a disconnected receive, both of which happen on a tick that has a
     /// committed route. A worker that dies and is never posted to again is not detectable by any
     /// reader, this field included; what the latch guarantees is that once the death HAS been seen it
-    /// stays visible for the rest of the session instead of dying with the next goal.
+    /// stays visible for the rest of that worker's life — which, on today's one-`Walker` process, is
+    /// the rest of the session — instead of dying with the next goal.
     ///
     /// **Latched for the life of a WORKER, and cleared where one is spawned** (rounds 3–5 review).
     /// "Session" means PROCESS today: `LocalPlanner::spawn` is reached only through `Walker::new` →
@@ -1397,6 +1403,18 @@ pub struct NavStatus {
     /// `a_new_walker_does_not_inherit_a_previous_workers_death_766` in `eqoxide-nav`, which
     /// constructs over a dirty row directly — the relogin *scenario* has no route to test through,
     /// but the *clear* does, and the clear is what carries the guarantee.
+    ///
+    /// **That covers the BIRTH end of a worker's life and nothing covers the death end** (#766 review
+    /// B13). There is no `Drop` for `Walker` or for `LocalPlanner` anywhere, so when the net thread
+    /// ends — `run_net_thread` in `src/model.rs` writes a terminal reason on all four of its exit
+    /// arms — the worker is gone while this row, which the HTTP surface holds its own `Arc` to, goes
+    /// on publishing whatever it last held, `false` included. So do NOT read this field as "the flag
+    /// can never outlive the thread it reports on": a stale `false` after teardown is exactly that.
+    /// It is *disclosed* rather than hidden — `net_thread_dead` is non-null on precisely those paths
+    /// and the endpoint marks the whole payload a frozen final snapshot — which is why the review
+    /// asked for the sentence to be corrected and explicitly did **not** ask for a teardown writer:
+    /// adding one would be a new, untested route to fix something an existing signal already tells
+    /// the agent.
     pub local_planner_dead: bool,
 }
 
@@ -1476,11 +1494,13 @@ impl NavStatus {
     /// goal that just ended*, so it is a per-goal fact by the same argument as `tier`.
     ///
     /// **That argument covers two of the three publishable states, not all three** (review B3).
-    /// `planner_dead` was never a verdict about a goal — it is a latched, session-scoped client fault
-    /// that happened to be riding in this field as one of its three publishable `state` values, and
-    /// retiring it with the
+    /// `planner_dead` was never a verdict about a goal — it is a latched client fault, scoped to the
+    /// fine WORKER rather than to any goal (round-6 review B12; the session framing this paragraph
+    /// used to carry is the agent-facing one, and `local_planner_dead`'s own doc says why the two
+    /// coincide today), that happened to be riding in this field as one of its three publishable
+    /// `state` values, and retiring it with the
     /// goal would hide a dead fine worker from an agent between goals. It is not carved out here;
-    /// it now has its own session-scoped field, `local_planner_dead`, which this function KEEPS.
+    /// it now has its own field, `local_planner_dead`, which this function KEEPS.
     ///
     /// Before #766 the routes did not agree with each other. `zoned` — the reported one — and
     /// `zone_cross_dropped_unhandled` left the verdict standing. The rest already cleared it, by two
@@ -1541,10 +1561,13 @@ impl NavStatus {
             // there is no goal, so there is no corridor for it to be an opinion about.
             local,
             // KEPT, deliberately — and this is the field the E0027 net was built for. A dead fine
-            // worker is a SESSION fact about the client, not a fact about the goal that just ended,
-            // and it is latched because the thread does not come back. Clearing it here would tell an
-            // agent between goals that its degraded steering had healed. See the field's own doc for
-            // why it is a separate field rather than a carve-out in the `local` arm above.
+            // worker is a fact about the WORKER, not about the goal that just ended, and it is
+            // latched because that thread does not come back. Retiring a goal is not replacing a
+            // worker, so nothing here has repaired anything; clearing it would tell an agent between
+            // goals that its degraded steering had healed. (Scoped to the worker, not to the session
+            // — round-6 review B12. `Walker::new` is the one writer that clears it. See the field's
+            // own doc, both for that and for why it is a separate field rather than a carve-out in
+            // the `local` arm above.)
             local_planner_dead: _keep_local_planner_dead,
         } = self;
         *state  = "idle".to_string();

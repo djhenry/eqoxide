@@ -529,10 +529,10 @@ impl Walker {
     /// **What is lost by dropping it, precisely** (review B3). For `no_way_through` and `exhausted`,
     /// nothing: they are verdicts about threading toward a goal that no longer exists. The earlier
     /// draft of this doc said that of all of them, and it was false for the third publishable state.
-    /// `planner_dead` is a latched session fault about the *client*, not about any goal, and dropping
-    /// it here would have hidden a dead fine worker from an agent between goals — which is when an
-    /// agent polls `/v1/observe/debug` to decide what to do next. That fact is no longer carried in
-    /// this field alone: [`Walker::latch_local_planner_liveness`] mirrors it into the session-scoped
+    /// `planner_dead` is a latched fault about the *client's fine worker*, not about any goal, and
+    /// dropping it here would have hidden a dead fine worker from an agent between goals — which is
+    /// when an agent polls `/v1/observe/debug` to decide what to do next. That fact is no longer
+    /// carried in this field alone: [`Walker::latch_local_planner_liveness`] mirrors it into
     /// `NavStatus::local_planner_dead`, which retirement keeps and this coercion does not touch. So
     /// the sentence is now true as scoped, because the code makes it true, not because it was
     /// narrowed until it stopped saying anything.
@@ -542,8 +542,11 @@ impl Walker {
         if s.local != local { s.local = local; }
     }
 
-    /// Mirror the fine worker's death into the SESSION-scoped `NavStatus::local_planner_dead` (#766
-    /// review B3). Latched: `LocalPlanner::is_dead()` is itself latched, and this only ever sets.
+    /// Mirror the fine worker's death into `NavStatus::local_planner_dead` (#766 review B3). Latched
+    /// for the life of the WORKER — `LocalPlanner::is_dead()` is itself latched, and this only ever
+    /// sets; the single clear lives in [`Walker::new`], which runs when a REPLACEMENT worker is
+    /// spawned (round-6 review B12: this line used to call the field SESSION-scoped, which is the
+    /// agent-facing name for the same span on today's one-`Walker` process, not the internal rule).
     ///
     /// Called from the `is_dead()` branch in [`Walker::drive_walk`], beside the per-goal
     /// `nav_local` publication it backs up. **That is the DISCOVERY site, and discovery is the
@@ -573,7 +576,8 @@ impl Walker {
     /// Latching at the discovery site therefore records the fault on the very tick it becomes
     /// knowable, and because the record is on the shared row rather than in the per-goal verdict, the
     /// later retirement cannot take it away. What changes is not WHEN the fault is seen but how long
-    /// it stays visible: for the rest of the session, instead of until the next goal ends.
+    /// it stays visible: for the rest of the worker's life — which, one `Walker` being built per
+    /// process today, is the rest of the session — instead of until the next goal ends.
     ///
     /// The residual limit is stated on the field: a worker that dies and is never posted to again is
     /// not discoverable by any reader, this one included.
@@ -1527,7 +1531,8 @@ impl Walker {
                     state: "planner_dead".into(), reason: "local_planner_dead".into(),
                     stuck_ticks: 0, plan_us: 0,
                 }));
-                // #766 B3: and mirror it into the SESSION-scoped row, which retirement keeps. The
+                // #766 B3: and mirror it into the shared row, which retirement keeps (the latch is
+                // scoped to the WORKER, not to the session — round-6 review B12). The
                 // `set_nav_local` above is a PER-GOAL channel that #766 now retires on every route
                 // to `idle` — correct for the two verdict states, wrong for this one. See the
                 // method's doc for why this call sits here and not somewhere more general.
@@ -2907,7 +2912,7 @@ mod tests {
              this test and silently break this design");
     }
 
-    /// **#766 review B3 — a dead fine worker is a SESSION fault and must outlive the goal.**
+    /// **#766 review B3 — a dead fine worker is a WORKER fault and must outlive the goal.**
     ///
     /// `planner_dead` is one of the three publishable `nav_local.state` values, but unlike
     /// `no_way_through` / `exhausted` it is not a verdict about a goal: it is a latched client fault
@@ -2917,8 +2922,11 @@ mod tests {
     /// `nav_local` is its only publication surface in the tree (the `no_path`/`planner_dead` pair on
     /// `nav_state` comes from the COARSE planner, a different object).
     ///
-    /// The fix is a separate session-scoped field, not a carve-out in `retire_to_idle` — that would
-    /// have re-opened the clear-on-every-`idle` uniformity #766 exists to create.
+    /// The fix is a separate field outliving the goal, not a carve-out in `retire_to_idle` — that
+    /// would have re-opened the clear-on-every-`idle` uniformity #766 exists to create. (Its
+    /// lifetime is the fine WORKER's; round-6 review B12 corrected an earlier "session-scoped" here.
+    /// Nothing this test does turns on the difference — it retires a goal, and retiring a goal does
+    /// not replace a worker.)
     ///
     /// **This test is driven end-to-end by production `drive_walk`, and an earlier draft that was not
     /// is why.** My recollection of that draft — pre-forcing `is_dead()` in a loop, calling
@@ -2973,12 +2981,13 @@ mod tests {
 
         assert!(nav.nav_state.lock().unwrap().local_planner_dead,
             "#766 B3: production `drive_walk` discovered the fine worker's death on this tick and \
-             must record it on the SESSION-scoped row, not only in the per-goal verdict — steering \
-             has permanently degraded to the coarse 8u route and the thread does not come back");
+             must record it on the shared row that outlives the goal, not only in the per-goal \
+             verdict — steering has degraded to the coarse 8u route and THIS thread does not come \
+             back");
         assert_eq!(nav.nav_state.lock().unwrap().local.as_ref().map(|l| l.state.clone()),
             Some("planner_dead".into()),
-            "PREMISE: the pre-existing per-goal publication still happens — the session field is an \
-             addition beside it, not a replacement for it");
+            "PREMISE: the pre-existing per-goal publication still happens — the liveness field is \
+             an addition beside it, not a replacement for it");
 
         // …and now the retirement that #766 made uniform. This is the exact interleaving the review
         // found: `nav_local` goes `null` and the agent is between goals, which is when it polls.
@@ -2986,20 +2995,23 @@ mod tests {
         let s = nav.nav_state.lock().unwrap();
         assert_eq!(s.state, "idle");
         assert_eq!(s.local, None,
-            "PREMISE: the per-goal verdict is still retired — the session field is an addition, not \
-             a hole in #766's guarantee");
+            "PREMISE: the per-goal verdict is still retired — the liveness field is an addition, \
+             not a hole in #766's guarantee");
         assert!(s.local_planner_dead,
-            "#766 B3: the thread does not come back, so the fault does not heal. Clearing it here \
-             would tell an agent its degraded steering had recovered when nothing recovered it");
+            "#766 B3: a zone change does not replace the fine worker, so the dead one is still the \
+             live one and the fault has not healed. Clearing it here would tell an agent its \
+             degraded steering had recovered when nothing recovered it");
     }
 
     /// **#766 review B9 — the latch is scoped to the WORKER, and construction is where that is
-    /// enforced.** `local_planner_dead` never clears once set, which is right for a thread that does
-    /// not come back — but "never clears" and "outlives the thread it describes" are different
-    /// claims, and only the first one is wanted. The row is a shared `Arc` the HTTP surface holds; a
-    /// `Walker` is not. So a second `Walker` over the same row would publish a *fresh, healthy*
-    /// worker as permanently dead: #343's shape, and a lie in the honesty-critical direction (the
-    /// client asserting a fault it has just fixed).
+    /// enforced.** Once set, `local_planner_dead` is cleared by nothing on any nav route — no goal,
+    /// no zone change, no retirement — which is right for a thread that does not come back. But
+    /// "no nav route clears it" and "it outlives the thread it describes" are different claims, and
+    /// only the first one is wanted. The row is a shared `Arc` the HTTP surface holds; a `Walker` is
+    /// not. So a second `Walker` over the same row would publish a *fresh, healthy* worker as
+    /// permanently dead: #343's shape, and a lie in the honesty-critical direction (the client
+    /// asserting a fault it has just fixed). `Walker::new` is therefore the one writer that clears
+    /// it, and this test is what pins that — so do not read the opening clause as "never clears".
     ///
     /// Production cannot reach that today — `Walker::new` runs once per process, through
     /// `ActionLoop::new` from `run_login_flow`, which returns when the gameplay phase ends. Round 4

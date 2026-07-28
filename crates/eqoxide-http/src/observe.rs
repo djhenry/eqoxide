@@ -914,7 +914,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // clock" with no way to ask which, and `nav_state` said a confident `navigating` throughout.
         // The clock is gone; the ambiguity went with it.
         "nav_local": nav_local,
-        // SESSION-scoped fine-planner liveness (#766 review B3). `nav_local` above is a PER-GOAL
+        // WORKER-scoped fine-planner liveness (#766 review B3; scope corrected from "session" by
+        // round-6 review B12 — the latch is cleared by `Walker::new` as it spawns a replacement, and
+        // it reads as session-scoped from outside only because exactly one fine worker is built per
+        // process. `docs/http-api.md` keeps the agent-facing "session-scoped" name and says why).
+        // `nav_local` above is a PER-GOAL
         // verdict and #766 retires it with the goal — correct for `no_way_through` / `exhausted`, and
         // wrong for `planner_dead`, which is a latched client fault, not a statement about a goal.
         // Carried here it survives every retirement, so an agent BETWEEN goals — which is when it
@@ -2998,16 +3002,19 @@ mod tests {
              tier's verdict is about threading toward a goal, so it retires with the goal");
     }
 
-    /// **#766 review B3 — the session-scoped fault must NOT retire with the goal.**
+    /// **#766 review B3 — the worker-scoped fault must NOT retire with the goal.**
     ///
     /// The counterweight to the test above, and the reason this PR did not simply narrow a sentence.
     /// `planner_dead` is the third publishable `nav_local.state`, and it is not a verdict about a
     /// goal: it is a latched client fault meaning steering has permanently degraded to the coarse
     /// 8 u route. Retiring `nav_local` on every `idle` — which is #766's whole point — therefore hid
     /// it from an agent BETWEEN goals, which is precisely when an agent polls this endpoint. So the
-    /// fault moved to its own session-scoped field and this measures the split at the JSON surface,
-    /// where an agent actually reads it: after the same retirement, the per-goal verdict is `null`
-    /// and the session fault is still `true`.
+    /// fault moved to its own field and this measures the split at the JSON surface, where an agent
+    /// actually reads it: after the same retirement, the per-goal verdict is `null` and the
+    /// worker-scoped fault is still `true`. (The field's lifetime is the fine WORKER's, not the
+    /// session's — round-6 review B12. Nothing in this test turns on the difference; it retires a
+    /// goal, and retiring a goal does not replace a worker. What it would catch is a clear placed on
+    /// a retirement route, which is the defect it was written for.)
     ///
     /// It also pins the always-present shape. A `null`-when-healthy field would make "alive"
     /// indistinguishable from "this client is too old to have the field", and a health check you
@@ -3048,8 +3055,8 @@ mod tests {
 
         let v = debug_json(state).await;
         assert_eq!(v["nav_local"], serde_json::json!(null),
-            "#766 is unchanged by B3: the per-goal channel still retires with the goal. The session \
-             field is an addition, not a hole in that guarantee");
+            "#766 is unchanged by B3: the per-goal channel still retires with the goal. The \
+             liveness field is an addition, not a hole in that guarantee");
         assert_eq!(v["nav_local_planner_dead"], serde_json::json!(true),
             "#766 B3: the worker thread does not come back — recovering it needs a client restart — \
              so an agent between goals must still be able to read that its steering has degraded. \

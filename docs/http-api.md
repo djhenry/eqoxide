@@ -886,10 +886,26 @@ corridor is not threadable" from "the steering planner hasn't caught up." `nav_l
 
 **Always present, in both states.** `true` once the fine worker thread has been observed dead. It
 stays `true` for the life of that worker, because the thread does not come back — recovering it needs
-a client restart. The one thing that clears it is the construction of a *new* fine worker, which today
-happens exactly once per process, at startup: the flag is scoped to the worker it describes, not to
-the process, so it can never outlive the thread it is reporting on. In practice, over a running
-client, that means it is one-way.
+a client restart.
+
+*Session-scoped* is the agent-facing name for that lifetime, and it is accurate: the latch the client
+keeps internally is scoped to the fine **worker**, and exactly one fine worker is built per client
+process, so from out here the two are the same span. The distinction only matters to the client's own
+code, which is where it is written down.
+
+**Over a running client this field is one-way.** Nothing in the process constructs a second fine
+worker, so nothing clears it. That is a property of the *process*, not of the field, and it was
+equally true before the clear described next existed.
+
+**A `false` reading is only meaningful while `net_thread_dead` is `null`.** The client clears this
+flag in one place — when it constructs a new fine worker — and nothing writes it when a worker *ends*
+without a replacement. Once the network thread has exited, the fine worker is gone and this row, like
+the rest of the payload, is frozen at whatever it last held; `net_thread_dead` is the field that tells
+you so. Check it before you trust a `false` here.
+
+> The clear-on-construction exists so that if anything ever *did* build a second fine worker
+> in-process, the new one would not inherit the old one's latch and report a fault the client had just
+> repaired. On today's single-worker process it is a no-op.
 
 This field exists because the `nav_local`-is-`null`-on-`idle` rule above would otherwise hide a client
 fault. Two of `nav_local`'s three states — `no_way_through`, `exhausted` — are verdicts about
