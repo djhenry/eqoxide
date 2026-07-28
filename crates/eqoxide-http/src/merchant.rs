@@ -72,7 +72,12 @@ async fn post_trade_open(
 
     // Park the open with a result channel and await the TRUE outcome (park → fulfil → timeout).
     let (tx, rx) = oneshot::channel::<CommandResult<OpenOk>>();
-    s.command.request_open_await(id, tx);
+    if !s.command.request_open_await(id, tx) {
+        return json(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "status": "refused", "reason": BUSY_OPEN }),
+        );
+    }
     tracing::info!("trade: awaited open queued — merchant {:?} (spawn_id={})", key, id);
 
     match tokio::time::timeout(Duration::from_secs(4), rx).await {
@@ -107,7 +112,9 @@ async fn post_trade_open(
 /// POST /v1/merchant/close — close the currently open merchant window (OP_ShopRequest command=Close).
 async fn post_trade_close(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    s.command.request_merchant_trade(TradeCmd::Close);
+    if !s.command.request_merchant_trade(TradeCmd::Close) {
+        return (StatusCode::CONFLICT, BUSY_CLOSE.into());
+    }
     (StatusCode::OK, "closing merchant window".into())
 }
 
@@ -132,6 +139,18 @@ struct BuyBody {
     /// Merchant inventory slot of the item to buy (from /v1/merchant/list).
     slot: u32,
 }
+
+// ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ───────────────────────────────
+// Each `/v1/merchant/*` verb queues into a single-slot mailbox the net thread drains once per tick.
+// Before #347 a second request inside that window OVERWROTE the pending one; for `sell`/`close`
+// BOTH callers were told `200`, and for the awaited `buy`/`open` the LOSER's oneshot Sender was
+// dropped so that caller fell into the `_` arm and was told 202 for a request that was never sent.
+// The slot now refuses the second write and keeps the first. A 409 here means the request was NOT
+// queued and definitively did not happen — retrying after the drain is safe.
+const BUSY_OPEN: &str = "a merchant open is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_CLOSE: &str = "a merchant close is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_BUY: &str = "a buy is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_SELL: &str = "a sell is already queued and undrained — retry in a moment (it was NOT queued)";
 
 /// A quick `(StatusCode, String)` plain-text response, so the small error paths stay terse.
 fn text(status: StatusCode, body: impl Into<String>) -> Response {
@@ -185,7 +204,12 @@ async fn post_buy(
 
     // Park the buy with a result channel and await the TRUE outcome (park → fulfil → timeout).
     let (tx, rx) = oneshot::channel::<CommandResult<BuyOk>>();
-    s.command.request_buy_await(id, b.slot, tx);
+    if !s.command.request_buy_await(id, b.slot, tx) {
+        return json(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "status": "refused", "reason": BUSY_BUY }),
+        );
+    }
     tracing::info!("buy: awaited buy queued — merchant {:?} (spawn_id={}) slot={}", key, id, b.slot);
 
     match tokio::time::timeout(Duration::from_secs(4), rx).await {
@@ -255,7 +279,17 @@ async fn post_sell(
         .map(|(k, &id)| (k.clone(), id));
     match found {
         Some((key, id)) => {
-            s.command.request_merchant_sell(id, b.slot, qty);
+            // #347 step 1 (reject at the door): an empty `slot` cannot be sold. The drain would
+            // send OP_ShopPlayerSell for a slot the server sees as empty and the server answers
+            // with nothing at all, yet the caller was told 200 "selling slot N". Checked against
+            // the last published inventory (GET /v1/observe/inventory).
+            let occupied = s.inventory_slots.inventory.lock().unwrap().iter().any(|i| i.slot == b.slot as i32);
+            if !occupied {
+                return (StatusCode::NOT_FOUND, format!("no item in slot {} to sell", b.slot));
+            }
+            if !s.command.request_merchant_sell(id, b.slot, qty) {
+                return (StatusCode::CONFLICT, BUSY_SELL.into());
+            }
             tracing::info!("sell: queued merchant {:?} (spawn_id={}) slot={} qty={}", key, id, b.slot, qty);
             (StatusCode::OK, format!("selling slot {} x{} to {} (spawn_id={})", b.slot, qty, clean_entity_name(&key), id))
         }
@@ -273,6 +307,14 @@ mod tests {
 
     fn seed_merchant(state: &crate::HttpState, key: &str, id: u32) {
         state.world.entity_ids_mut().insert_for_test(key.to_string(), id);
+    }
+
+    /// Publish one item at a wire slot, exactly as `OP_CharInventory` decoding does, so the #347
+    /// step-1 "the slot holds an item" door check sees the same state a live client would.
+    fn seed_item(state: &crate::HttpState, slot: i32, name: &str) {
+        state.inventory_slots.inventory.lock().unwrap().push(eqoxide_core::game_state::InvItem {
+            slot, item_id: 13073, name: name.into(), charges: 1, ..Default::default()
+        });
     }
 
     /// eqoxide#341: a typo'd key ("quantitiy" instead of "quantity") must 400 — not be silently
@@ -293,10 +335,58 @@ mod tests {
             "a typo'd key must not silently fall through to selling with quantity defaulted to 1");
     }
 
+    /// #347 step 1: selling FROM a slot the published inventory says is empty is a request the
+    /// server answers with total silence — it must be refused at the door, not answered
+    /// `200 selling slot N`.
+    #[tokio::test]
+    async fn sell_from_an_empty_slot_is_404_and_queues_nothing() {
+        let state = empty_state();
+        seed_merchant(&state, "Innkeeper_Beek000", 11);
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/sell")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"merchant":"Beek","slot":23,"quantity":1}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(command.take_merchant_sell().is_none(),
+            "a rejected sell must not reach the command slot at all");
+    }
+
+    /// #347 step 2: two sells inside one undrained tick. Before the fix the second OVERWROTE the
+    /// first and BOTH callers were told `200` — one sell silently never happened.
+    #[tokio::test]
+    async fn a_second_sell_before_the_drain_is_409_and_the_first_survives() {
+        let state = empty_state();
+        seed_merchant(&state, "Innkeeper_Beek000", 11);
+        seed_item(&state, 23, "Rat Whiskers");
+        seed_item(&state, 24, "Rat Ears");
+        let command = state.command.clone();
+        let app = router().with_state(state);
+
+        let first = app.clone().oneshot(Request::post("/sell")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"merchant":"Beek","slot":23,"quantity":1}"#)).unwrap()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app.oneshot(Request::post("/sell")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"merchant":"Beek","slot":24,"quantity":1}"#)).unwrap()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT,
+            "the second sell must be refused, not silently swallowed");
+
+        assert_eq!(command.take_merchant_sell(), Some((11, 23, 1)),
+            "the FIRST sell must be the one that survives to the net thread");
+        assert!(command.take_merchant_sell().is_none());
+    }
+
     #[tokio::test]
     async fn sell_valid_body_still_queues() {
         let state = empty_state();
         seed_merchant(&state, "Innkeeper_Beek000", 11);
+        // Slot 23 must actually hold something — #347 step 1 added a "the slot holds an item"
+        // door check, so selling an empty slot is now a 404 rather than a lying 200.
+        seed_item(&state, 23, "Rat Whiskers");
         let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/sell")

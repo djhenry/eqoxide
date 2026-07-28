@@ -22,6 +22,18 @@ use super::*;
 /// silence rides it out. A resolved/refused/unexplained outcome fires far sooner via `fulfill_cast`.
 const CAST_HTTP_TIMEOUT_SECS: u64 = 12;
 
+// ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ───────────────────────────────
+// Each `/v1/combat/*` verb queues into a single-slot mailbox the net thread drains once per tick.
+// Before #347 a second request inside that window OVERWROTE the pending one and BOTH callers were
+// told `200`, so one of the two actions silently never happened. The slot now refuses the second
+// write and keeps the first, and these are what the caller is told instead. A 409 here means the
+// request was NOT queued and definitively did not happen — retrying after the drain is safe.
+const BUSY_TARGET: &str = "a target request is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_ATTACK: &str = "an auto-attack toggle is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_CONSIDER: &str = "a consider request is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_CAST: &str = "a cast is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_MEM_SPELL: &str = "a memorize/scribe request is already queued and undrained — retry in a moment (it was NOT queued)";
+
 /// A `text/plain` response (mirrors `http::merchant`'s local helper — combat's cast handler now
 /// returns a `Response`, not `(StatusCode, String)`).
 fn text(status: StatusCode, body: impl Into<String>) -> Response {
@@ -79,7 +91,9 @@ async fn post_target(
     if !known {
         return (StatusCode::NOT_FOUND, format!("no spawn with id {id} in this zone"));
     }
-    s.command.request_target(id);
+    if !s.command.request_target(id) {
+        return (StatusCode::CONFLICT, BUSY_TARGET.into());
+    }
     tracing::info!("target: queued spawn_id={}", id);
     (StatusCode::OK, format!("targeting spawn {}", id))
 }
@@ -114,7 +128,11 @@ async fn post_target_name(
     let found = crate::name_match::resolve_in_world(&s.world, &name, s.player_pos());
     match found {
         Some(m) => {
-            s.command.request_target(m.id);
+            if !s.command.request_target(m.id) {
+                return json(StatusCode::CONFLICT, serde_json::json!({
+                    "status": "refused", "reason": BUSY_TARGET,
+                }));
+            }
             tracing::info!("target_name: {:?} → {:?} spawn_id={} ({:?})", name, m.name, m.id, m.quality);
             json(StatusCode::OK, serde_json::json!({
                 "status": "targeting",
@@ -131,7 +149,9 @@ async fn post_target_name(
 /// POST /v1/combat/attack — enable auto-attack (sends OP_AUTO_ATTACK 1).
 async fn post_attack_on(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    s.command.request_attack(true);
+    if !s.command.request_attack(true) {
+        return (StatusCode::CONFLICT, BUSY_ATTACK.into());
+    }
     tracing::info!("attack: queued auto-attack ON");
     (StatusCode::OK, "auto-attack ON".into())
 }
@@ -139,7 +159,9 @@ async fn post_attack_on(State(s): State<HttpState>) -> (StatusCode, String) {
 /// DELETE /v1/combat/attack — disable auto-attack (sends OP_AUTO_ATTACK 0).
 async fn post_attack_off(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    s.command.request_attack(false);
+    if !s.command.request_attack(false) {
+        return (StatusCode::CONFLICT, BUSY_ATTACK.into());
+    }
     tracing::info!("attack: queued auto-attack OFF");
     (StatusCode::OK, "auto-attack OFF".into())
 }
@@ -149,11 +171,26 @@ async fn post_attack_off(State(s): State<HttpState>) -> (StatusCode, String) {
 struct ConsiderBody { id: Option<u32> }
 
 /// POST /v1/combat/consider {"id":N?} — consider a spawn (con color/faction), default current target.
+///
+/// #347 step 1 (reject at the door): an id that isn't in this zone is a 404, not a queued no-op.
+/// The con reply arrives asynchronously in the message log, so an unknown id used to produce a `200`
+/// followed by a reply that never came — the agent had no way to tell that from a slow server. This
+/// is the same check `/v1/combat/target` got in #348, and it uses the same two sources of truth
+/// (the entity roster plus the player's own spawn, which `register_spawn` deliberately omits).
 async fn post_consider(State(s): State<HttpState>, OptionalJson(body): OptionalJson<ConsiderBody>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let id = body.and_then(|b| b.id).or(s.player().target_id);
     match id {
-        Some(id) => { s.command.request_consider(id); (StatusCode::OK, format!("consider {id} queued")) }
+        Some(id) => {
+            let is_self = s.player().player_id == id;
+            if !(is_self || s.world.entity_ids().values().any(|&v| v == id)) {
+                return (StatusCode::NOT_FOUND, format!("no spawn with id {id} in this zone"));
+            }
+            if !s.command.request_consider(id) {
+                return (StatusCode::CONFLICT, BUSY_CONSIDER.into());
+            }
+            (StatusCode::OK, format!("consider {id} queued"))
+        }
         None => (StatusCode::BAD_REQUEST, "no target; provide {\"id\":N}".into()),
     }
 }
@@ -217,7 +254,11 @@ async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<
 
     // Park the cast with a result channel and await the TRUE outcome (park → fulfil → timeout).
     let (tx, rx) = oneshot::channel::<CommandResult<CastEnd>>();
-    s.command.request_cast_await(req, tx);
+    if !s.command.request_cast_await(req, tx) {
+        return json(StatusCode::CONFLICT, serde_json::json!({
+            "status": "refused", "landed": false, "reason": BUSY_CAST,
+        }));
+    }
     tracing::info!("cast: awaited cast queued (gem={} item_slot={:?})", req.gem, req.item_slot);
 
     match tokio::time::timeout(Duration::from_secs(CAST_HTTP_TIMEOUT_SECS), rx).await {
@@ -273,7 +314,9 @@ async fn post_memorize(
     if let Err(e) = require_live_session(&s) { return e; }
     let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"gem\":0-8}".into()) };
     if b.gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
-    s.command.request_mem_spell(b.gem, b.spell_id, 1, None);
+    if !s.command.request_mem_spell(b.gem, b.spell_id, 1, None) {
+        return (StatusCode::CONFLICT, BUSY_MEM_SPELL.into());
+    }
     (StatusCode::OK, format!("memorizing spell {} into gem {}", b.spell_id, b.gem))
 }
 
@@ -293,7 +336,19 @@ async fn post_scribe(
     if let Err(e) = require_live_session(&s) { return e; }
     let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"from\":S,\"slot\":B?}".into()) };
     let slot = b.slot.unwrap_or(0);
-    s.command.request_mem_spell(slot, b.spell_id, 0, b.from);
+    // #347 step 1 (reject at the door): the drain's FIRST act is to move `from` → cursor. An empty
+    // `from` makes that move a no-op (`GameState::move_item` returns early on an absent source), so
+    // the scribe went out against whatever was already on the cursor — or nothing — and the caller
+    // was told 200. Checked against the published inventory, exactly as `/v1/interact/read` does.
+    if let Some(from) = b.from {
+        let occupied = s.inventory_slots.inventory.lock().unwrap().iter().any(|i| i.slot == from as i32);
+        if !occupied {
+            return (StatusCode::NOT_FOUND, format!("no item in slot {from} to scribe"));
+        }
+    }
+    if !s.command.request_mem_spell(slot, b.spell_id, 0, b.from) {
+        return (StatusCode::CONFLICT, BUSY_MEM_SPELL.into());
+    }
     (StatusCode::OK, match b.from {
         Some(f) => format!("scribing spell {} into book slot {} (scroll from slot {})", b.spell_id, slot, f),
         None    => format!("scribing spell {} into book slot {} (scroll assumed on cursor)", b.spell_id, slot),
@@ -319,6 +374,9 @@ mod tests {
     async fn consider_no_body_falls_back_to_current_target() {
         let state = empty_state();
         set_gs(&state, |gs| gs.target_id = Some(7));
+        // Spawn 7 must exist in the roster — #347 step 1 added the same spawn-exists door check
+        // /combat/target has had since #348, so a target_id with no live spawn is now a 404.
+        state.world.entity_ids_mut().insert_for_test("a_rat000".into(), 7);
         let command = state.command.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/consider").body(Body::empty()).unwrap()).await.unwrap();
@@ -370,6 +428,72 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let text = body_text(resp).await;
         assert!(text.contains("provide"), "message: {text}");
+    }
+
+    // ── #347: reject at the door, and never silently overwrite a queued command ─────────────────
+
+    /// Publish one item at a wire slot, exactly as `OP_CharInventory` decoding does.
+    fn seed_item(state: &crate::HttpState, slot: i32) {
+        state.inventory_slots.inventory.lock().unwrap().push(eqoxide_core::game_state::InvItem {
+            slot, item_id: 13073, name: "Spell: Minor Healing".into(), charges: 1, ..Default::default()
+        });
+    }
+
+    /// #347 step 1: the scribe drain's FIRST act is to move `from` → cursor, and RoF2 scribes only
+    /// what is on the cursor. An empty `from` makes that move a no-op, so the scribe went out
+    /// against whatever happened to be on the cursor — and the caller was told 200.
+    #[tokio::test]
+    async fn scribe_from_an_empty_slot_is_404_and_queues_nothing() {
+        let state = empty_state();
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/scribe")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"spell_id":202,"from":23}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(command.take_mem_spell().is_none(), "a rejected scribe must not reach the slot");
+    }
+
+    #[tokio::test]
+    async fn scribe_from_an_occupied_slot_is_200_and_queues_it() {
+        let state = empty_state();
+        seed_item(&state, 23);
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/scribe")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"spell_id":202,"from":23}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(command.take_mem_spell(), Some((0, 202, 0, Some(23))));
+    }
+
+    /// #347 step 2: two targets inside one undrained tick. Before the fix the second OVERWROTE the
+    /// first and BOTH callers were told `200` — so an agent that targeted A then B could end up
+    /// with A, having been told both had happened.
+    #[tokio::test]
+    async fn a_second_target_before_the_drain_is_409_and_the_first_survives() {
+        let state = empty_state();
+        state.world.entity_ids_mut().insert_for_test("a_rat000".into(), 7);
+        state.world.entity_ids_mut().insert_for_test("a_rat001".into(), 8);
+        let command = state.command.clone();
+        let app = router().with_state(state);
+
+        let first = app.clone().oneshot(Request::post("/target")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":7}"#)).unwrap()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app.oneshot(Request::post("/target")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":8}"#)).unwrap()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT,
+            "the second target must be refused, not silently swallowed");
+
+        assert_eq!(command.take_target(), Some(7),
+            "the FIRST target must be the one that survives to the net thread");
+        assert_eq!(command.take_target(), None);
     }
 
     // ── #348: /combat/target must not adopt a spawn id the zone doesn't have ────────────────────

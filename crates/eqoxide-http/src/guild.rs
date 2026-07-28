@@ -100,3 +100,226 @@ async fn post_remove(
     let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
     queue(&s, GuildAction::Remove(name))
 }
+
+/// #347 step 2, crate-wide guard. Lives here because `guild.rs` is where the 409-on-occupied
+/// pattern originated — its `queue()` above was the only handler in the crate that checked whether
+/// its command was actually accepted, and #347 generalized it to every other domain.
+#[cfg(test)]
+mod no_silent_overwrite_guard {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    fn crate_src() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src") }
+    fn command_src() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../eqoxide-command/src")
+    }
+
+    fn rs_files(dir: &PathBuf) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir).expect("readable source dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Every `CommandState::request_*` that can REFUSE, i.e. whose signature returns `bool`.
+    ///
+    /// Search key (re-runnable by hand):
+    ///   `grep -rn 'pub fn request_' crates/eqoxide-command/src/*.rs`
+    /// A signature may span several lines, so the whole thing up to the opening `{` is accumulated
+    /// before testing it for `-> bool`.
+    fn refusable_requests() -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for path in rs_files(&command_src()) {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let trimmed = line.trim_start();
+                let Some(rest) = trimmed.strip_prefix("pub fn request_") else { continue };
+                let name = format!("request_{}", rest.split(['(', '<']).next().unwrap_or(""));
+                let mut sig = String::new();
+                for l in &lines[i..] {
+                    sig.push_str(l);
+                    if l.contains('{') { break; }
+                }
+                if sig.contains("-> bool") {
+                    out.insert(name);
+                }
+            }
+        }
+        out
+    }
+
+    /// The universal at the HTTP boundary: a handler that calls a refusable `request_*` and IGNORES
+    /// the returned `bool` has re-created exactly the #347 defect — the command was dropped on the
+    /// floor and the caller was still told `200`. Every such call site must consume the result.
+    ///
+    /// Search key: `grep -rn 's\.command\.request_' crates/eqoxide-http/src/*.rs`. Handlers reach the
+    /// facade through the `HttpState` binding `s`, so this prefix is what distinguishes a real call
+    /// site from the `command.take_*` / `command.request_*` forms used inside test bodies.
+    #[test]
+    fn every_refusable_command_request_is_checked_by_its_http_caller() {
+        let refusable = refusable_requests();
+        let mut checked: Vec<String> = Vec::new();
+        let mut offenders: Vec<String> = Vec::new();
+        let mut ignored_by_design: Vec<String> = Vec::new();
+
+        for path in rs_files(&crate_src()) {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let file = path.file_name().unwrap().to_string_lossy().to_string();
+            for (n, line) in text.lines().enumerate() {
+                let Some(pos) = line.find("s.command.request_") else { continue };
+                let name_start = pos + "s.command.".len();
+                let name: String = line[name_start..]
+                    .chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                if !refusable.contains(&name) {
+                    ignored_by_design.push(format!("{file}:{}: {name}", n + 1));
+                    continue;
+                }
+                let code = line.trim_start();
+                // Accepted shapes: `if !s.command.request_x(..)`, `if s.command.request_x(..)`, and
+                // `let ok = s.command.request_x(..)`. Anything else discards the refusal.
+                let consumed = code.starts_with("if !s.command.request_")
+                    || code.starts_with("if s.command.request_")
+                    || code.starts_with("let ");
+                if consumed {
+                    checked.push(format!("{file}:{}: {name}", n + 1));
+                } else {
+                    offenders.push(format!("{file}:{}: {name} — result discarded", n + 1));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these HTTP handlers call a refusable CommandState::request_* and throw away the \
+             refusal, so a dropped command is still answered 200 (#347 step 2):\n  {}",
+            offenders.join("\n  ")
+        );
+        // Anti-vacuity: the guard must actually be looking at something. Both numbers are lower
+        // bounds measured from this tree at the time of writing, not exact expectations.
+        assert!(refusable.len() >= 30,
+            "expected the command facade to expose >= 30 refusable request_* methods, found {} — \
+             the scanner's parse of `pub fn request_` signatures has probably drifted",
+            refusable.len());
+        assert!(checked.len() >= 25,
+            "expected >= 25 checked refusable call sites in this crate, found {}: {:?}",
+            checked.len(), checked);
+        // `request_goto` / `request_follow` / `request_stop` / `request_zone_cross` / `request_camp`
+        // / `request_respawn` / `request_who` / `request_friends_who` / `request_chat_send` are the
+        // deliberately last-writer-wins or reply-channel commands (see `eqoxide_command::slot`'s
+        // module docs); they do not return `bool` and so land here rather than in `offenders`.
+        assert!(!ignored_by_design.is_empty(),
+            "no non-refusable call sites found at all — the scanner is probably matching nothing");
+    }
+
+    /// The enumeration `docs/http-api.md` makes — "*every* verb under `/v1/combat`, `/v1/interact`,
+    /// `/v1/inventory`, `/v1/merchant`, `/v1/trainer`, `/v1/pet`, `/v1/group`, `/v1/quests` and
+    /// `/v1/guild` can answer `409`" — is itself a claim, so it is checked here rather than trusted.
+    ///
+    /// For each of those modules this reads the `router()` table, collects every handler mounted
+    /// with `post(..)` or `.delete(..)`, and requires that handler's body to mention
+    /// `StatusCode::CONFLICT`. `get(..)` routes are reads and are skipped. If a route is added to one
+    /// of these modules without a busy-slot refusal, this fails with its name.
+    ///
+    /// Search key: `grep -n '\.route(' crates/eqoxide-http/src/{combat,interact,inventory,merchant,trainer,pet,group,quests,guild}.rs`
+    #[test]
+    fn every_mutating_route_in_the_documented_modules_can_answer_409() {
+        const MODULES: [&str; 9] = [
+            "combat", "interact", "inventory", "merchant",
+            "trainer", "pet", "group", "quests", "guild",
+        ];
+        let mut checked: Vec<String> = Vec::new();
+        let mut offenders: Vec<String> = Vec::new();
+
+        for m in MODULES {
+            let path = crate_src().join(format!("{m}.rs"));
+            let text = std::fs::read_to_string(&path).expect("module source");
+
+            // 1. Handler fn names mounted as a mutating verb in `router()`.
+            let mut handlers: Vec<(String, String)> = Vec::new(); // (route, fn)
+            for line in text.lines() {
+                let Some(rest) = line.trim_start().strip_prefix(".route(") else {
+                    // `pet.rs` mounts its single route inline on `Router::new()`.
+                    if !line.contains("Router::new().route(") { continue; }
+                    let rest = line.split("Router::new().route(").nth(1).unwrap();
+                    collect_route(rest, &mut handlers);
+                    continue;
+                };
+                collect_route(rest, &mut handlers);
+            }
+
+            // 2. Module-local helpers that themselves answer CONFLICT — `guild.rs::queue` and
+            //    `interact.rs::queue_loot` hold the refusal for several handlers each, so a
+            //    handler that delegates to one of them is just as capable of a 409.
+            let conflict_helpers: Vec<String> = text.lines()
+                .filter_map(|l| l.trim_start().strip_prefix("fn ").map(|r| {
+                    r.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>()
+                }))
+                .filter(|n| !n.is_empty())
+                .filter(|n| fn_body_named(&text, &format!("fn {n}("))
+                    .is_some_and(|b| b.contains("StatusCode::CONFLICT")))
+                .collect();
+
+            // 3. Each handler's body must be able to produce a CONFLICT, directly or via one of
+            //    those helpers.
+            for (route, func) in handlers {
+                let body = fn_body(&text, &func)
+                    .unwrap_or_else(|| panic!("{m}.rs: no body found for handler `{func}`"));
+                let via_helper = conflict_helpers.iter().any(|h| body.contains(&format!("{h}(")));
+                if body.contains("StatusCode::CONFLICT") || via_helper {
+                    checked.push(format!("/{m}{route} → {func}"));
+                } else {
+                    offenders.push(format!("/{m}{route} → {func} (in {m}.rs)"));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "docs/http-api.md claims every mutating verb in these modules can answer 409 when its \
+             command slot is busy, but these cannot (#347 step 2):\n  {}",
+            offenders.join("\n  ")
+        );
+        // Anti-vacuity: measured at 41 mutating routes across the nine modules when this was
+        // written; asserted as a lower bound so adding routes does not fail the guard spuriously.
+        assert!(checked.len() >= 41,
+            "expected >= 41 mutating routes across {MODULES:?}, found {}: {checked:#?}",
+            checked.len());
+    }
+
+    /// Pull `("/path", "handler_fn")` pairs out of the remainder of a `.route(..)` line, for the
+    /// `post(..)`/`delete(..)` verbs only.
+    fn collect_route(rest: &str, out: &mut Vec<(String, String)>) {
+        let Some(route) = rest.split('"').nth(1) else { return };
+        for verb in ["post(", "delete("] {
+            let mut from = 0;
+            while let Some(i) = rest[from..].find(verb) {
+                let start = from + i + verb.len();
+                let name: String = rest[start..]
+                    .chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                if !name.is_empty() {
+                    out.push((route.to_string(), name));
+                }
+                from = start;
+            }
+        }
+    }
+
+    /// The source text of `async fn <name>`'s body, from its signature to the closing brace in
+    /// column 0. Handlers in this crate are all free functions at module level.
+    fn fn_body(text: &str, name: &str) -> Option<String> {
+        fn_body_named(text, &format!("async fn {name}("))
+    }
+
+    /// As [`fn_body`], but takes the whole leading needle so plain (non-`async`) helpers can be read
+    /// too. Handlers and helpers in this crate are all free functions at module level, so the body
+    /// ends at the first closing brace in column 0.
+    fn fn_body_named(text: &str, needle: &str) -> Option<String> {
+        let start = text.find(needle)?;
+        let rest = &text[start..];
+        let end = rest.find("\n}\n").map(|i| i + 2).unwrap_or(rest.len());
+        Some(rest[..end].to_string())
+    }
+}

@@ -6,6 +6,7 @@
 //! `ActionLoop::drain_trainer`). No behavior change — just one typed surface.
 
 use super::CommandState;
+use crate::slot::Mailbox;
 
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
@@ -13,26 +14,26 @@ impl CommandState {
     /// Open a training session with `npc_id` (POST /v1/trainer/open, resolved by name), or end the
     /// current session using the `npc_id == 0` sentinel (POST /v1/trainer/close — 0 is never a real
     /// spawn id).
-    pub fn request_open_trainer(&self, npc_id: u32) {
-        *self.trainer.trainer_open_req.lock().unwrap() = Some(npc_id);
+    pub fn request_open_trainer(&self, npc_id: u32) -> bool {
+        self.trainer.trainer_open_req.try_put(npc_id)
     }
 
     /// Train one point of `skill_id` at the open trainer (POST /v1/trainer/train, the trainer
     /// window's Train button).
-    pub fn request_train_skill(&self, skill_id: u32) {
-        *self.trainer.trainer_train_req.lock().unwrap() = Some(skill_id);
+    pub fn request_train_skill(&self, skill_id: u32) -> bool {
+        self.trainer.trainer_train_req.try_put(skill_id)
     }
 
     // ── take_* : the MODEL (`ActionLoop::drain_trainer`) drains these once per tick ───────────────
 
     /// Drain a pending open/close request. `Some(0)` means close.
     pub fn take_trainer_open(&self) -> Option<u32> {
-        self.trainer.trainer_open_req.lock().unwrap().take()
+        self.trainer.trainer_open_req.take_msg()
     }
 
     /// Drain a pending train-skill request.
     pub fn take_train_skill(&self) -> Option<u32> {
-        self.trainer.trainer_train_req.lock().unwrap().take()
+        self.trainer.trainer_train_req.take_msg()
     }
 }
 
@@ -65,6 +66,6 @@ mod tests {
     fn take_on_empty_slot_is_none() {
         let cs = CommandState::default();
         assert_eq!(cs.take_trainer_open(), None);
-        assert_eq!(cs.take_train_skill(), None);
+        assert_eq!(cs.take_train_skill(), None)
     }
 }

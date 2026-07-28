@@ -164,6 +164,9 @@ impl CommandState {
     /// `goal_id` (#349): the state is reset to `pending` for this fresh goal, so a caller can never
     /// read the previous goto's terminal outcome as this one's.
     pub fn request_goto(&self, target: (f32, f32, f32)) -> u64 {
+        // LAST-WINS (#347): a goto is a RETARGET, not a queued action — a second goto is MEANT to
+        // supersede the first. It is also not silent: `stamp_new_goal` below publishes a fresh
+        // `goal_id` + `nav_state`, so the superseded goal is observable (#349). See `slot.rs`.
         *self.nav.goto_target.lock().unwrap() = Some(target);
         *self.nav.goto_entity.lock().unwrap() = None;
         self.stamp_new_goal("pending", None, Some(target))
@@ -173,8 +176,9 @@ impl CommandState {
     /// is the `entity_positions` key the walker re-resolves each tick; `pos` seeds the initial goal.
     /// Returns the new `goal_id` (#349); state resets to `pending`.
     pub fn request_follow(&self, key: String, pos: (f32, f32, f32)) -> u64 {
+        // LAST-WINS (#347): same as `request_goto` — a follow retargets and stamps a fresh goal_id.
         *self.nav.goto_target.lock().unwrap() = Some(pos);
-        *self.nav.goto_entity.lock().unwrap() = Some(key);
+        *self.nav.goto_entity.lock().unwrap() = Some(key);  // LAST-WINS (#347), as the line above
         self.stamp_new_goal("pending", None, Some(pos))
     }
 
@@ -228,6 +232,8 @@ impl CommandState {
     /// resolves the concrete zone-line goal (which re-stamps a fresh id via `request_goto`). `goal`
     /// is left `None` until that resolution — the concrete destination isn't known yet.
     pub fn request_zone_cross(&self, zone_id: u16) -> u64 {
+        // LAST-WINS (#347): a re-issued cross replaces the pending one under a fresh goal_id
+        // (stamped below), and `/move/stop` must be able to cancel it — see `request_stop`.
         *self.nav.zone_cross.lock().unwrap() = Some(zone_id);
         self.stamp_new_goal("pending", None, None)
     }

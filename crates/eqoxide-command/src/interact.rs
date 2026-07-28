@@ -12,6 +12,7 @@
 //! exposed here (see `mod.rs`).
 
 use super::CommandState;
+use crate::slot::Mailbox;
 use eqoxide_core::game_state::DialogueChoice;
 use eqoxide_ipc::{CommandResult, GiveOk};
 use tokio::sync::oneshot;
@@ -22,27 +23,27 @@ impl CommandState {
     /// Hail an NPC — "Hail, `<name>`" (POST /v1/interact/hail, the Actions window's Hail button,
     /// the NPC-dialogue window's re-hail). `spawn_id`, when known, is targeted first so the
     /// server's EVENT_SAY fires (#130).
-    pub fn request_hail(&self, name: String, spawn_id: Option<u32>) {
-        *self.interact.hail.lock().unwrap() = Some((name, spawn_id));
+    pub fn request_hail(&self, name: String, spawn_id: Option<u32>) -> bool {
+        self.interact.hail.try_put((name, spawn_id))
     }
 
     /// Say arbitrary Say-channel text (POST /v1/interact/say, the chat window's say box, a
     /// dialogue keyword follow-up click).
-    pub fn request_say(&self, text: String) {
-        *self.interact.say.lock().unwrap() = Some(text);
+    pub fn request_say(&self, text: String) -> bool {
+        self.interact.say.try_put(text)
     }
 
     /// Loot a corpse by spawn id (POST /v1/interact/loot, the Loot window). The drain pushes it
     /// onto the existing auto-loot queue.
-    pub fn request_loot(&self, corpse_id: u32) {
-        *self.interact.loot.lock().unwrap() = Some(corpse_id);
+    pub fn request_loot(&self, corpse_id: u32) -> bool {
+        self.interact.loot.try_put(corpse_id)
     }
 
     /// Give (quest turn-in) inventory slot `from_slot` to NPC `npc_id` — FIRE-AND-FORGET (the UI
     /// turn-in path). The drain runs the multi-tick trade-window state machine. HTTP's POST
     /// /v1/interact/give uses the awaited [`request_give_await`](Self::request_give_await) instead.
-    pub fn request_give(&self, npc_id: u32, from_slot: u32) {
-        *self.interact.give.lock().unwrap() = Some((npc_id, from_slot));
+    pub fn request_give(&self, npc_id: u32, from_slot: u32) -> bool {
+        self.interact.give.try_put((npc_id, from_slot))
     }
 
     /// Command-with-result give (A3 Migration 2, #448): queue the SAME turn-in as `request_give` but
@@ -56,61 +57,68 @@ impl CommandState {
         npc_id: u32,
         from_slot: u32,
         tx: oneshot::Sender<CommandResult<GiveOk>>,
-    ) {
-        *self.interact.give_await.lock().unwrap() = Some((npc_id, from_slot, tx));
+    ) -> bool {
+        self.interact.give_await.try_put((npc_id, from_slot, tx))
+    }
+
+    /// `true` while an awaited give is parked and undrained — a PEEK, not a drain (#347). Lets a
+    /// caller (and the HTTP tests) observe that the mailbox is occupied without consuming the
+    /// message, which `take_give_await` would.
+    pub fn give_await_pending(&self) -> bool {
+        Mailbox::<(u32, u32, oneshot::Sender<CommandResult<GiveOk>>)>::is_occupied(&*self.interact.give_await)
     }
 
     /// Click a door by id (POST /v1/interact/click_door, or a human click in the 3D view). The
     /// drain sends OP_ClickDoor.
-    pub fn request_door_click(&self, door_id: u8) {
-        *self.interact.door_click.lock().unwrap() = Some(door_id);
+    pub fn request_door_click(&self, door_id: u8) -> bool {
+        self.interact.door_click.try_put(door_id)
     }
 
     /// Posture: `Some(true)` = sit, `Some(false)` = stand (POST /v1/interact/{sit,stand}, the
     /// Actions window's sit/stand toggle).
-    pub fn request_sit(&self, sit: bool) {
-        *self.interact.sit.lock().unwrap() = Some(sit);
+    pub fn request_sit(&self, sit: bool) -> bool {
+        self.interact.sit.try_put(sit)
     }
 
     /// Run/walk toggle (#625): `Some(true)` = run, `Some(false)` = walk (POST /v1/interact/{run,walk},
     /// the Actions window's Run/Walk button). The drain sends `OP_SetRunMode` (0x009f) and switches
     /// the local movement speed to match.
-    pub fn request_run_mode(&self, run: bool) {
-        *self.interact.run_mode.lock().unwrap() = Some(run);
+    pub fn request_run_mode(&self, run: bool) -> bool {
+        self.interact.run_mode.try_put(run)
     }
 
     /// Click one of the current NPC-dialogue saylink choices (POST /v1/interact/dialogue, the
     /// NPC-dialogue window). The drain sends OP_ItemLinkClick.
-    pub fn request_dialogue_click(&self, choice: DialogueChoice) {
-        *self.interact.dialogue_click.lock().unwrap() = Some(choice);
+    pub fn request_dialogue_click(&self, choice: DialogueChoice) -> bool {
+        self.interact.dialogue_click.try_put(choice)
     }
 
     /// Read a book/note at inventory wire slot `slot` (POST /v1/interact/read). The drain sends
     /// OP_ReadBook. (#288)
-    pub fn request_read_book(&self, slot: i32) {
-        *self.interact.read_book.lock().unwrap() = Some(slot);
+    pub fn request_read_book(&self, slot: i32) -> bool {
+        self.interact.read_book.try_put(slot)
     }
 
     // ── take_* : the MODEL (`ActionLoop`'s drains) drains these once per tick ─────────────────────
 
     /// Drain a pending hail request as `(display_name, spawn_id)`.
     pub fn take_hail(&self) -> Option<(String, Option<u32>)> {
-        self.interact.hail.lock().unwrap().take()
+        self.interact.hail.take_msg()
     }
 
     /// Drain pending Say-channel text.
     pub fn take_say(&self) -> Option<String> {
-        self.interact.say.lock().unwrap().take()
+        self.interact.say.take_msg()
     }
 
     /// Drain a pending loot request (corpse spawn id).
     pub fn take_loot(&self) -> Option<u32> {
-        self.interact.loot.lock().unwrap().take()
+        self.interact.loot.take_msg()
     }
 
     /// Drain a pending give request as `(npc_id, from_slot)`.
     pub fn take_give(&self) -> Option<(u32, u32)> {
-        self.interact.give.lock().unwrap().take()
+        self.interact.give.take_msg()
     }
 
     /// Drain a pending awaited-give request as `(npc_id, from_slot, Sender)` (A3 Migration 2, #448).
@@ -119,32 +127,32 @@ impl CommandState {
     pub fn take_give_await(
         &self,
     ) -> Option<(u32, u32, oneshot::Sender<CommandResult<GiveOk>>)> {
-        self.interact.give_await.lock().unwrap().take()
+        self.interact.give_await.take_msg()
     }
 
     /// Drain a pending door-click request (door id).
     pub fn take_door_click(&self) -> Option<u8> {
-        self.interact.door_click.lock().unwrap().take()
+        self.interact.door_click.take_msg()
     }
 
     /// Drain a pending sit/stand request.
     pub fn take_sit(&self) -> Option<bool> {
-        self.interact.sit.lock().unwrap().take()
+        self.interact.sit.take_msg()
     }
 
     /// Drain a pending run/walk toggle request (#625).
     pub fn take_run_mode(&self) -> Option<bool> {
-        self.interact.run_mode.lock().unwrap().take()
+        self.interact.run_mode.take_msg()
     }
 
     /// Drain a pending dialogue-click request.
     pub fn take_dialogue_click(&self) -> Option<DialogueChoice> {
-        self.interact.dialogue_click.lock().unwrap().take()
+        self.interact.dialogue_click.take_msg()
     }
 
     /// Drain a pending read-book request (inventory wire slot).
     pub fn take_read_book(&self) -> Option<i32> {
-        self.interact.read_book.lock().unwrap().take()
+        self.interact.read_book.take_msg()
     }
 }
 
@@ -237,6 +245,6 @@ mod tests {
         assert_eq!(
             rx.await.unwrap(),
             CommandResult::Resolved(GiveOk { npc_id: 11, item_name: "Bone Chips".into() }),
-        );
+        )
     }
 }

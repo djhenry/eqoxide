@@ -7,6 +7,7 @@
 //! deliberately NOT exposed here — that's read-path, not a command (see `mod.rs`).
 
 use super::CommandState;
+use crate::slot::Mailbox;
 use eqoxide_ipc::GuildAction;
 
 impl CommandState {
@@ -17,19 +18,14 @@ impl CommandState {
     /// undrained — preserves the original `queue()` helper's atomic check-then-set, which the HTTP
     /// handler surfaces as 409 CONFLICT rather than silently clobbering a pending action.
     pub fn request_guild_action(&self, action: GuildAction) -> bool {
-        let mut slot = self.guild.guild_action.lock().unwrap();
-        if slot.is_some() {
-            return false;
-        }
-        *slot = Some(action);
-        true
+        self.guild.guild_action.try_put(action)
     }
 
     // ── take_* : the MODEL (`ActionLoop::tick`'s `drain_guild`) drains this once per tick ─────────
 
     /// Drain a pending guild action.
     pub fn take_guild_action(&self) -> Option<GuildAction> {
-        self.guild.guild_action.lock().unwrap().take()
+        self.guild.guild_action.take_msg()
     }
 }
 

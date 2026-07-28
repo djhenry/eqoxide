@@ -27,6 +27,15 @@ async fn get_roster(State(s): State<HttpState>) -> Json<serde_json::Value> {
     }))
 }
 
+// ── 409 CONFLICT body for an occupied command slot (#347 step 2) ─────────────────────────────────
+// Every `/v1/group/*` verb queues into its OWN single-slot mailbox the net thread drains once per
+// tick. Before #347 a second request inside that window OVERWROTE the pending one and BOTH callers
+// were told `200`, so one of the two actions silently never happened. The slot now refuses the
+// second write and keeps the first. A 409 here means the request was NOT queued and definitively
+// did not happen — retrying after the drain is safe. The slots are per-verb, so this only ever
+// refuses a repeat of the SAME verb (two invites, two kicks, …), never a different one.
+const BUSY_GROUP: &str = "the same group action is already queued and undrained — retry in a moment (it was NOT queued)";
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NameBody { name: String }
@@ -45,7 +54,9 @@ async fn post_invite(
 ) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
-    s.command.request_group_invite(name.clone());
+    if !s.command.request_group_invite(name.clone()) {
+        return (StatusCode::CONFLICT, BUSY_GROUP.into());
+    }
     tracing::info!("group: queued invite to {name}");
     (StatusCode::OK, format!("inviting {name}"))
 }
@@ -56,7 +67,9 @@ async fn post_accept(State(s): State<HttpState>) -> (StatusCode, String) {
     if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending invite".into());
     }
-    s.command.request_group_accept();
+    if !s.command.request_group_accept() {
+        return (StatusCode::CONFLICT, BUSY_GROUP.into());
+    }
     tracing::info!("group: queued accept");
     (StatusCode::OK, "accepting invite".into())
 }
@@ -68,7 +81,9 @@ async fn post_decline(State(s): State<HttpState>) -> (StatusCode, String) {
     if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending invite".into());
     }
-    s.command.request_group_decline();
+    if !s.command.request_group_decline() {
+        return (StatusCode::CONFLICT, BUSY_GROUP.into());
+    }
     tracing::info!("group: queued decline");
     (StatusCode::OK, "declining invite".into())
 }
@@ -80,7 +95,9 @@ async fn post_leave(State(s): State<HttpState>) -> (StatusCode, String) {
     if s.group_slots.group.lock().unwrap().members.is_empty() {
         return (StatusCode::BAD_REQUEST, "not in a group".into());
     }
-    s.command.request_group_leave();
+    if !s.command.request_group_leave() {
+        return (StatusCode::CONFLICT, BUSY_GROUP.into());
+    }
     tracing::info!("group: queued leave");
     (StatusCode::OK, "leaving group".into())
 }
@@ -101,7 +118,9 @@ async fn post_kick(
         return (StatusCode::BAD_REQUEST, format!("{name} is not a current group member"));
     }
     drop(g);
-    s.command.request_group_kick(name.clone());
+    if !s.command.request_group_kick(name.clone()) {
+        return (StatusCode::CONFLICT, BUSY_GROUP.into());
+    }
     tracing::info!("group: queued kick of {name}");
     (StatusCode::OK, format!("kicking {name}"))
 }
@@ -122,7 +141,9 @@ async fn post_makeleader(
         return (StatusCode::BAD_REQUEST, format!("{name} is not a current group member"));
     }
     drop(g);
-    s.command.request_group_make_leader(name.clone());
+    if !s.command.request_group_make_leader(name.clone()) {
+        return (StatusCode::CONFLICT, BUSY_GROUP.into());
+    }
     tracing::info!("group: queued makeleader {name}");
     (StatusCode::OK, format!("transferring leadership to {name}"))
 }

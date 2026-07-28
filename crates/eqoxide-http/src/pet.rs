@@ -10,6 +10,17 @@ pub fn router() -> Router<HttpState> {
     Router::new().route("/command", post(post_command))
 }
 
+/// 409 CONFLICT body for an occupied command slot (#347 step 2). Before #347 a second pet command
+/// issued inside the same net-thread tick OVERWROTE the pending one and BOTH callers were told
+/// `200`, so one of the two commands silently never happened. A 409 here means the request was NOT
+/// queued and definitively did not happen — retrying after the drain is safe.
+///
+/// Deliberately NOT added here: a "you have a pet" door check. `gs.pet_id` is only ever set from an
+/// OP_PetBuffWindow/spawn packet; a missed or late packet would turn a working `/v1/pet/command`
+/// into a false 409 — a new lie in the opposite direction. Left as-is pending a measurement of how
+/// reliably `pet_id` tracks reality.
+const BUSY_PET: &str = "a pet command is already queued and undrained — retry in a moment (it was NOT queued)";
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandBody {
@@ -44,7 +55,9 @@ async fn post_command(
     });
     match cmd {
         Some(c) => {
-            s.command.request_pet_command(c);
+            if !s.command.request_pet_command(c) {
+                return (StatusCode::CONFLICT, BUSY_PET.into());
+            }
             (StatusCode::OK, format!("pet command {c} queued"))
         }
         None => (StatusCode::BAD_REQUEST, "unknown pet command — use a PET_* number or attack|backoff|follow|guard|sit".into()),

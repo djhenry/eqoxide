@@ -196,12 +196,51 @@ shape.
 ## Notes
 
 - **Most actions are fire-and-forget**: a handler writes a shared request slot that the navigation
-  thread drains each tick. The HTTP 200 means *queued*, not *done* — observe the result via
-  `GET /v1/observe/*` or the `chat/events` feed.
+  thread drains each tick. The HTTP 200 means *queued and not overwritten*, not *done* — observe the
+  result via `GET /v1/observe/*` or the `chat/events` feed. See
+  [What a 200 means, and the two ways an action is refused](#what-a-200-means-and-the-two-ways-an-action-is-refused-347).
 - **Async travel**: `move/goto` / `move/zone_cross` return immediately; poll `GET /v1/observe/debug` (or watch
   for a `zone` event) to know when movement / a zone-in completed.
 - **Coordinates**: server convention is `x=east, y=north, z=up`. Brewall map coords negate x/y.
 - See `docs/autonomous-play.md` for end-to-end play recipes.
+
+### What a 200 means, and the two ways an action is refused (#347)
+
+A `200` from an action endpoint asserts exactly two things, and no more:
+
+1. the request passed the checks the client could make against its own published state, and
+2. it reached the command slot **without displacing an earlier request that had not been sent yet**.
+
+It does **not** assert the packet went out, and it never asserted the server accepted it. Anything
+stronger has its own status code (`/merchant/{buy,open}`, `/interact/give` and `/combat/cast` await
+the real outcome and answer `200` / `409` / `202 unconfirmed`).
+
+**`404` — rejected at the door.** The client refuses a request its own published snapshot already
+contradicts, instead of queueing it and answering `200`. Nothing is queued and nothing is sent:
+
+| Route | Checked against | Refused when |
+|-------|-----------------|--------------|
+| `POST /v1/combat/target`, `POST /v1/combat/consider` | `GET /v1/observe/entities` | no spawn with that id is in the zone |
+| `POST /v1/inventory/move` | `GET /v1/observe/inventory` | `from` holds no item |
+| `POST /v1/interact/give` | `GET /v1/observe/inventory` | `from` holds no item |
+| `POST /v1/merchant/sell` | `GET /v1/observe/inventory` | `slot` holds no item |
+| `POST /v1/combat/scribe` | `GET /v1/observe/inventory` | `from` is supplied and holds no item |
+| `POST /v1/interact/read` | `GET /v1/observe/inventory` | `slot` holds no item (`409` if it holds something unreadable) |
+
+**`409` — the slot is busy.** Each action endpoint queues into a single-slot mailbox the net thread
+drains once per tick (~150 ms). A second request arriving inside that window used to **replace** the
+first, and both callers were told `200` — one of the two actions simply never happened and nothing
+said so. It is now refused: the pending request is kept untouched and the second caller gets `409`
+with a body ending `(it was NOT queued)`. A `409` is definitive — that request did not happen, so
+retrying it after the drain is safe and cannot double-fire.
+
+This applies to every verb under `/v1/combat`, `/v1/interact`, `/v1/inventory`, `/v1/merchant`,
+`/v1/trainer`, `/v1/pet`, `/v1/group`, `/v1/quests` and `/v1/guild`. Three families are deliberately
+exempt because a second request there is a *retarget*, not a lost action, and is already observable:
+`/v1/move/*` (each write stamps a fresh `nav_goal_id` and republishes `nav_state`),
+`/v1/lifecycle/*` (`camp` is a toggle; `exit` must be able to override an in-progress camp), and
+`/v1/social/*` (a superseded reply channel closes and answers `503`). `/v1/chat/*` is an unbounded
+FIFO and never dropped anything.
 
 ---
 

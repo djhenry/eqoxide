@@ -6,6 +6,7 @@
 //! were (the HTTP handler and `ActionLoop::tick`). No behavior change — just one typed surface.
 
 use super::CommandState;
+use crate::slot::Mailbox;
 use eqoxide_ipc::{CastEnd, CastRequest, CommandResult};
 use tokio::sync::oneshot;
 
@@ -14,24 +15,24 @@ impl CommandState {
 
     /// Target a spawn (POST /v1/combat/target{,/name}, the Target/Actions windows). The drain
     /// (`take_target`) auto-considers it. Caller validates the id is in-zone first.
-    pub fn request_target(&self, spawn_id: u32) {
-        *self.combat.target.lock().unwrap() = Some(spawn_id);
+    pub fn request_target(&self, spawn_id: u32) -> bool {
+        self.combat.target.try_put(spawn_id)
     }
 
     /// Toggle auto-attack (POST/DELETE /v1/combat/attack, the Attack button). `on` = engage.
-    pub fn request_attack(&self, on: bool) {
-        *self.combat.attack.lock().unwrap() = Some(on);
+    pub fn request_attack(&self, on: bool) -> bool {
+        self.combat.attack.try_put(on)
     }
 
     /// Consider a spawn (POST /v1/combat/consider, the Consider button) — con color/faction reply.
-    pub fn request_consider(&self, spawn_id: u32) {
-        *self.combat.consider.lock().unwrap() = Some(spawn_id);
+    pub fn request_consider(&self, spawn_id: u32) -> bool {
+        self.combat.consider.try_put(spawn_id)
     }
 
     /// Cast a memorized gem, a spell id, or an item clicky (POST /v1/combat/cast, the spell-gem /
     /// spellbook windows). The handler builds the [`CastRequest`]; the drain resolves the target.
-    pub fn request_cast(&self, req: CastRequest) {
-        *self.combat.cast.lock().unwrap() = Some(req);
+    pub fn request_cast(&self, req: CastRequest) -> bool {
+        self.combat.cast.try_put(req)
     }
 
     /// Command-with-result cast (A3 Migration 3, #448): queue the SAME cast as `request_cast` but hand
@@ -40,43 +41,43 @@ impl CommandState {
     /// (completed / fizzled / interrupted / refused / unconfirmed) instead of a premature queued 200.
     /// Writes the sibling `cast_await` slot — the fire-and-forget `cast` slot (UI path) is left
     /// untouched. See `crate::command_state::result`.
-    pub fn request_cast_await(&self, req: CastRequest, tx: oneshot::Sender<CommandResult<CastEnd>>) {
-        *self.combat.cast_await.lock().unwrap() = Some((req, tx));
+    pub fn request_cast_await(&self, req: CastRequest, tx: oneshot::Sender<CommandResult<CastEnd>>) -> bool {
+        self.combat.cast_await.try_put((req, tx))
     }
 
     /// Memorize a known spell (`scribing = 1`) or scribe a scroll (`scribing = 0`) into a book/gem
     /// `slot` (POST /v1/combat/{memorize,scribe}). `from` is the scroll's inventory wire slot for a
     /// scribe (moved to cursor first by the drain), `None` for a memorize. Tuple shape preserved
     /// verbatim from `ipc::MemSpellReq`.
-    pub fn request_mem_spell(&self, slot: u32, spell_id: u32, scribing: u32, from: Option<u32>) {
-        *self.combat.mem_spell.lock().unwrap() = Some((slot, spell_id, scribing, from));
+    pub fn request_mem_spell(&self, slot: u32, spell_id: u32, scribing: u32, from: Option<u32>) -> bool {
+        self.combat.mem_spell.try_put((slot, spell_id, scribing, from))
     }
 
     /// Queue one OP_PetCommands byte (POST /v1/pet/command, the Pet window). See `PET_*` constants.
-    pub fn request_pet_command(&self, cmd: u8) {
-        *self.combat.pet_cmd.lock().unwrap() = Some(cmd);
+    pub fn request_pet_command(&self, cmd: u8) -> bool {
+        self.combat.pet_cmd.try_put(cmd)
     }
 
     // ── take_* : the MODEL (`ActionLoop::tick`) drains these once per tick ────────────────────────
 
     /// Drain a pending target request. `Some(spawn_id)` if one was queued since the last tick.
     pub fn take_target(&self) -> Option<u32> {
-        self.combat.target.lock().unwrap().take()
+        self.combat.target.take_msg()
     }
 
     /// Drain a pending auto-attack toggle. `Some(true)` = engage, `Some(false)` = disengage.
     pub fn take_attack(&self) -> Option<bool> {
-        self.combat.attack.lock().unwrap().take()
+        self.combat.attack.take_msg()
     }
 
     /// Drain a pending consider request.
     pub fn take_consider(&self) -> Option<u32> {
-        self.combat.consider.lock().unwrap().take()
+        self.combat.consider.take_msg()
     }
 
     /// Drain a pending cast request.
     pub fn take_cast(&self) -> Option<CastRequest> {
-        self.combat.cast.lock().unwrap().take()
+        self.combat.cast.take_msg()
     }
 
     /// Drain a pending awaited-cast request as `(CastRequest, Sender)` (A3 Migration 3, #448).
@@ -84,17 +85,17 @@ impl CommandState {
     /// until the cast's outcome transition lands (or fires `Refused` immediately if it never started).
     /// Sibling of `take_cast`.
     pub fn take_cast_await(&self) -> Option<(CastRequest, oneshot::Sender<CommandResult<CastEnd>>)> {
-        self.combat.cast_await.lock().unwrap().take()
+        self.combat.cast_await.take_msg()
     }
 
     /// Drain a pending memorize/scribe request as `(slot, spell_id, scribing, from)`.
     pub fn take_mem_spell(&self) -> Option<(u32, u32, u32, Option<u32>)> {
-        self.combat.mem_spell.lock().unwrap().take()
+        self.combat.mem_spell.take_msg()
     }
 
     /// Drain a pending pet command byte.
     pub fn take_pet_command(&self) -> Option<u8> {
-        self.combat.pet_cmd.lock().unwrap().take()
+        self.combat.pet_cmd.take_msg()
     }
 }
 
@@ -142,6 +143,6 @@ mod tests {
         let cs = CommandState::default();
         assert_eq!(cs.take_target(), None);
         assert_eq!(cs.take_attack(), None);
-        assert!(cs.take_cast().is_none());
+        assert!(cs.take_cast().is_none())
     }
 }

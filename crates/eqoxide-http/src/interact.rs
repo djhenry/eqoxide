@@ -20,6 +20,22 @@ use super::*;
 /// rather than a vaguer HTTP-elapsed 202 firing first — the two-timeout ordering landmine.
 pub const GIVE_HTTP_TIMEOUT_SECS: u64 = 8;
 
+// ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ───────────────────────────────
+// Each `/v1/interact/*` verb queues into a single-slot mailbox the net thread drains once per tick.
+// Before #347 a second request inside that window OVERWROTE the pending one and BOTH callers were
+// told `200`, so one of the two actions silently never happened. The slot now refuses the second
+// write and keeps the first, and these are what the caller is told instead. A 409 here means the
+// request was NOT queued and definitively did not happen — retrying after the drain is safe.
+const BUSY_HAIL: &str = "a hail is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_SAY: &str = "a say is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_LOOT: &str = "a loot request is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_GIVE: &str = "a give is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_DOOR: &str = "a door click is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_SIT: &str = "a sit/stand is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_RUN_MODE: &str = "a run/walk toggle is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_DIALOGUE: &str = "a dialogue click is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_READ: &str = "a book read is already queued and undrained — retry in a moment (it was NOT queued)";
+
 /// A quick `(StatusCode, String)` plain-text response, so the small error paths stay terse.
 fn text(status: StatusCode, body: impl Into<String>) -> Response {
     Response::builder().status(status)
@@ -75,7 +91,9 @@ async fn post_read(
         .map(|i| !i.filename.is_empty());
     match readable {
         Some(true) => {
-            s.command.request_read_book(b.slot);
+            if !s.command.request_read_book(b.slot) {
+                return (StatusCode::CONFLICT, BUSY_READ.into());
+            }
             tracing::info!("read: queued book slot={}", b.slot);
             (StatusCode::OK, format!("reading item in slot {}", b.slot))
         }
@@ -118,7 +136,9 @@ async fn post_dialogue(
     match chosen {
         Some(c) => {
             let label = c.text.clone();
-            s.command.request_dialogue_click(c);
+            if !s.command.request_dialogue_click(c) {
+                return (StatusCode::CONFLICT, BUSY_DIALOGUE.into());
+            }
             tracing::info!("dialogue: queued click {:?}", label);
             (StatusCode::OK, format!("clicking '{}'", label))
         }
@@ -172,7 +192,9 @@ async fn post_hail(
             // Resolve the NPC's spawn_id so the nav thread can target it before saying — the
             // server only fires EVENT_SAY on the player's current target (#130).
             let spawn_id = s.world.entity_ids().get(&key).copied();
-            s.command.request_hail(display_name.clone(), spawn_id);
+            if !s.command.request_hail(display_name.clone(), spawn_id) {
+                return (StatusCode::CONFLICT, BUSY_HAIL.into());
+            }
             tracing::info!("hail: queued hail to {:?} (spawn_id={:?})", display_name, spawn_id);
             (StatusCode::OK, format!("hailing {}", display_name))
         }
@@ -206,7 +228,9 @@ async fn post_say(
     if text.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "empty text".into());
     }
-    s.command.request_say(text.clone());
+    if !s.command.request_say(text.clone()) {
+        return (StatusCode::CONFLICT, BUSY_SAY.into());
+    }
     tracing::info!("say: queued {:?}", text);
     (StatusCode::OK, format!("saying {}", text))
 }
@@ -227,7 +251,9 @@ fn is_corpse_key(key: &str) -> bool {
 }
 
 fn queue_loot(s: &HttpState, name: String, id: u32) -> (StatusCode, String) {
-    s.command.request_loot(id);
+    if !s.command.request_loot(id) {
+        return (StatusCode::CONFLICT, BUSY_LOOT.into());
+    }
     tracing::info!("loot: queued corpse {:?} (spawn_id={})", name, id);
     (StatusCode::OK, format!("looting {} (spawn_id={})", clean_entity_name(&name), id))
 }
@@ -345,9 +371,27 @@ async fn post_give(
         None => return text(StatusCode::NOT_FOUND, format!("no NPC matching {:?}", b.npc)),
     };
 
+    // #347 step 1 (reject at the door): an empty `from` slot cannot be given away. The net-side
+    // state machine would move nothing to the cursor and then trade whatever was already there —
+    // or open an empty trade — and the caller would be told 202 "unconfirmed" at best. Checked
+    // against the last published inventory (GET /v1/observe/inventory).
+    let occupied = s.inventory_slots.inventory.lock().unwrap().iter().any(|i| i.slot == b.from as i32);
+    if !occupied {
+        return text(StatusCode::NOT_FOUND, format!("no item in slot {} to give", b.from));
+    }
+
     // Park the give with a result channel and await the TRUE outcome (park → fulfil → timeout).
     let (tx, rx) = oneshot::channel::<CommandResult<GiveOk>>();
-    s.command.request_give_await(id, b.from, tx);
+    if !s.command.request_give_await(id, b.from, tx) {
+        // #347 step 2: the give mailbox already holds an undrained give. Before the fix this
+        // OVERWROTE it — the first caller's oneshot Sender was dropped, so THAT caller fell into
+        // the `_` arm and was told 202 for a give that was never sent. Now the second caller is
+        // refused outright and the first give is preserved.
+        return json(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "status": "refused", "reason": BUSY_GIVE }),
+        );
+    }
     tracing::info!("give: awaited give queued — npc {:?} (spawn_id={}) from_slot={}", key, id, b.from);
 
     match tokio::time::timeout(Duration::from_secs(GIVE_HTTP_TIMEOUT_SECS), rx).await {
@@ -406,7 +450,9 @@ async fn post_door_click(
     };
     match id {
         Some(id) => {
-            s.command.request_door_click(id);
+            if !s.command.request_door_click(id) {
+                return (StatusCode::CONFLICT, BUSY_DOOR.into());
+            }
             (StatusCode::OK, format!("clicking door {}", id))
         }
         None => (StatusCode::BAD_REQUEST,
@@ -417,14 +463,18 @@ async fn post_door_click(
 /// POST /v1/interact/sit — sit down (mana/HP regen).
 async fn post_sit(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    s.command.request_sit(true);
+    if !s.command.request_sit(true) {
+        return (StatusCode::CONFLICT, BUSY_SIT.into());
+    }
     (StatusCode::OK, "sit queued".into())
 }
 
 /// POST /v1/interact/stand — stand up.
 async fn post_stand(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    s.command.request_sit(false);
+    if !s.command.request_sit(false) {
+        return (StatusCode::CONFLICT, BUSY_SIT.into());
+    }
     (StatusCode::OK, "stand queued".into())
 }
 
@@ -433,7 +483,9 @@ async fn post_stand(State(s): State<HttpState>) -> (StatusCode, String) {
 /// (a send-time intent — the opcode has no server ack, same epistemic level as sit/auto_attack).
 async fn post_run(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    s.command.request_run_mode(true);
+    if !s.command.request_run_mode(true) {
+        return (StatusCode::CONFLICT, BUSY_RUN_MODE.into());
+    }
     (StatusCode::OK, "run queued".into())
 }
 
@@ -441,7 +493,9 @@ async fn post_run(State(s): State<HttpState>) -> (StatusCode, String) {
 /// nav walker to `WALK_SPEED`.
 async fn post_walk(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    s.command.request_run_mode(false);
+    if !s.command.request_run_mode(false) {
+        return (StatusCode::CONFLICT, BUSY_RUN_MODE.into());
+    }
     (StatusCode::OK, "walk queued".into())
 }
 
@@ -456,6 +510,14 @@ mod tests {
     fn seed_npc(state: &crate::HttpState, key: &str, id: u32, pos: (f32, f32, f32)) {
         state.world.entity_positions_mut().insert_for_test(key.to_string(), pos);
         state.world.entity_ids_mut().insert_for_test(key.to_string(), id);
+    }
+
+    /// Publish one item at a wire slot, exactly as `OP_CharInventory` decoding does, so the #347
+    /// step-1 "the `from` slot holds an item" door check sees the same state a live client would.
+    fn seed_item(state: &crate::HttpState, slot: i32, name: &str) {
+        state.inventory_slots.inventory.lock().unwrap().push(eqoxide_core::game_state::InvItem {
+            slot, item_id: 13073, name: name.into(), charges: 1, ..Default::default()
+        });
     }
 
     // --- run/walk (#625): the toggle queues an intent for action_loop to send OP_SetRunMode ----
@@ -682,12 +744,74 @@ mod tests {
         assert!(command.take_give_await().is_none(), "a 404 must not park a give");
     }
 
+    /// #347 step 1: giving FROM a slot the published inventory says is empty cannot work — the
+    /// net-side state machine has nothing to put on the cursor. Refused at the door with a 404
+    /// rather than parked and answered with a vague 202 eight seconds later.
+    #[tokio::test]
+    async fn give_from_an_empty_slot_is_404_and_parks_nothing() {
+        let state = empty_state();
+        seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/give").header("content-type", "application/json")
+            .body(Body::from(r#"{"npc":"Mischief","from":23}"#)).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(command.take_give_await().is_none(), "a 404 must not park a give");
+    }
+
+    /// #347 step 2 on an AWAITED command. Before the fix the second give overwrote the first, which
+    /// DROPPED the first caller's oneshot Sender — so caller #1 fell into the `_` arm and was told
+    /// `202 unconfirmed` for a give that was never sent at all. Now caller #2 is refused with a 409
+    /// and caller #1's parked Sender is still live.
+    #[tokio::test]
+    async fn a_second_give_before_the_drain_is_409_and_the_first_sender_survives() {
+        let state = empty_state();
+        seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
+        seed_item(&state, 23, "Bone Chips");
+        seed_item(&state, 24, "Rat Ears");
+        let command = state.command.clone();
+        let app = router().with_state(state);
+
+        // Caller #1 parks and then blocks on its 8s await, so run it as a task.
+        let app1 = app.clone();
+        let mut first = tokio::spawn(async move {
+            app1.oneshot(Request::post("/give").header("content-type", "application/json")
+                .body(Body::from(r#"{"npc":"Mischief","from":23}"#)).unwrap()).await.unwrap()
+        });
+
+        // Wait until #1's Sender is actually parked, racing its JoinHandle (#717 pattern) so an
+        // early return fails loudly instead of spinning forever. Peek WITHOUT draining: `take_*`
+        // would empty the slot and destroy the very precondition under test, so poll the slot's
+        // occupancy through the public `*_pending` predicate instead.
+        tokio::select! {
+            _ = async { while !command.give_await_pending() { tokio::task::yield_now().await; } } => {}
+            res = &mut first => panic!(
+                "expected /give to park a Sender, but the handler returned early with status {}",
+                res.expect("handler task panicked").status()),
+        }
+
+        let second = app.oneshot(Request::post("/give").header("content-type", "application/json")
+            .body(Body::from(r#"{"npc":"Mischief","from":24}"#)).unwrap()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT,
+            "the second give must be refused, not overwrite the first");
+
+        // The FIRST give — slot 23, not 24 — is what the net thread drains, and its Sender still
+        // reaches its caller.
+        let (npc_id, from_slot, tx) = command.take_give_await().expect("the first give must survive");
+        assert_eq!((npc_id, from_slot), (11, 23));
+        tx.send(CommandResult::Resolved(GiveOk { npc_id: 11, item_name: "Bone Chips".into() })).unwrap();
+        let resp = first.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK,
+            "caller #1 must get its real receipt, not a 202 for a give that never happened");
+    }
+
     /// SUCCESS: the server confirms the turn-in (OP_FinishTrade, delivered here as `Resolved`) → 200
     /// with the honest receipt body (item/npc_id).
     #[tokio::test]
     async fn give_confirmed_is_200_with_the_receipt() {
         let state = empty_state();
         seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
+        seed_item(&state, 23, "Bone Chips");
         let command = state.command.clone();
         let app = router().with_state(state);
         let mut task = tokio::spawn(async move {
@@ -732,6 +856,7 @@ mod tests {
     async fn give_refused_is_409() {
         let state = empty_state();
         seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
+        seed_item(&state, 23, "Bone Chips");
         let command = state.command.clone();
         let app = router().with_state(state);
         let mut task = tokio::spawn(async move {
@@ -772,6 +897,7 @@ mod tests {
     async fn give_with_no_confirmation_is_202_unknown_never_success() {
         let state = empty_state();
         seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
+        seed_item(&state, 23, "Bone Chips");
         let command = state.command.clone();
         let app = router().with_state(state);
         let mut task = tokio::spawn(async move {

@@ -20,12 +20,16 @@ impl CommandState {
     /// Register a `/who all` request (GET /v1/observe/who). Overwrites (and thereby drops) any
     /// prior undrained sender — a newer request supersedes an in-flight one.
     pub fn request_who(&self, tx: Sender<Vec<WhoEntry>>) {
+        // LAST-WINS (#347): this is a oneshot REPLY channel, not a command. A superseded sender is
+        // dropped, which closes the losing caller's receiver — GET /v1/observe/who then answers 503,
+        // not a false 200. Out of #347's "both callers got 200" class. See `slot.rs`.
         *self.social.who_req.lock().unwrap() = Some(tx);
     }
 
     /// Register a friends-presence poll (GET /v1/social/friends). Overwrites (and thereby drops)
     /// any prior undrained sender.
     pub fn request_friends_who(&self, tx: Sender<Vec<WhoEntry>>) {
+        // LAST-WINS (#347): as `request_who` above — a dropped sender surfaces as 503, not a lie.
         *self.social.friends_req.lock().unwrap() = Some(tx);
     }
 

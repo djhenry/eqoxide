@@ -14,6 +14,16 @@ pub fn router() -> Router<HttpState> {
         .route("/close", post(post_close))
 }
 
+// ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ───────────────────────────────
+// Each `/v1/trainer/*` verb queues into a single-slot mailbox the net thread drains once per tick.
+// Before #347 a second request inside that window OVERWROTE the pending one and BOTH callers were
+// told `200`, so one of the two actions silently never happened. The slot now refuses the second
+// write and keeps the first. A 409 here means the request was NOT queued and definitively did not
+// happen — retrying after the drain is safe. `open` and `close` share one slot (close is `open(0)`),
+// so either can 409 the other.
+const BUSY_TRAINER: &str = "a trainer open/close is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_TRAIN: &str = "a train request is already queued and undrained — retry in a moment (it was NOT queued)";
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OpenBody { name: Option<String>, trainer: Option<String> }
@@ -43,7 +53,9 @@ async fn post_open(
         .map(|(k, &id)| (k.clone(), id));
     match found {
         Some((key, id)) => {
-            s.command.request_open_trainer(id);
+            if !s.command.request_open_trainer(id) {
+                return (StatusCode::CONFLICT, BUSY_TRAINER.into());
+            }
             (StatusCode::OK, format!("opening training with {} (spawn_id={})", clean_entity_name(&key), id))
         }
         None => (StatusCode::NOT_FOUND, format!("no entity matching {:?}", name)),
@@ -89,7 +101,9 @@ async fn post_train(
     if !s.player().trainer_open {
         return (StatusCode::BAD_REQUEST, "no trainer window open — call /v1/trainer/open first".into());
     }
-    s.command.request_train_skill(b.skill_id);
+    if !s.command.request_train_skill(b.skill_id) {
+        return (StatusCode::CONFLICT, BUSY_TRAIN.into());
+    }
     let name = eqoxide_core::skills::skill_name(b.skill_id).unwrap_or("?");
     (StatusCode::OK, format!("training {} (skill_id={})", name, b.skill_id))
 }
@@ -99,6 +113,8 @@ async fn post_train(
 /// request slot needs threading through the nav chain (#162).
 async fn post_close(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    s.command.request_open_trainer(0);
+    if !s.command.request_open_trainer(0) {
+        return (StatusCode::CONFLICT, BUSY_TRAINER.into());
+    }
     (StatusCode::OK, "closing trainer".into())
 }

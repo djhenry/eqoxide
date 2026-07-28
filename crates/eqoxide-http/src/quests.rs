@@ -39,6 +39,16 @@ async fn get_offers(State(s): State<HttpState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "count": offers.len(), "offers": offers }))
 }
 
+// ── 409 CONFLICT bodies for an occupied command slot (#347 step 2) ──────────────────────────
+// Each `/v1/quests/*` verb queues into a single-slot mailbox the net thread drains once per tick.
+// Before #347 a second request inside that window OVERWROTE the pending one and BOTH callers were
+// told `200`, so one of the two actions silently never happened. The slot now refuses the second
+// write and keeps the first. A 409 here means the request was NOT queued and definitively did not
+// happen — retrying after the drain is safe. `accept` and `decline` share a slot (a decline is an
+// accept of task 0), so either can 409 the other.
+const BUSY_TASK: &str = "a task accept/decline is already queued and undrained — retry in a moment (it was NOT queued)";
+const BUSY_CANCEL: &str = "a task cancel is already queued and undrained — retry in a moment (it was NOT queued)";
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaskIdBody { task_id: u32 }
@@ -58,7 +68,9 @@ async fn post_accept(
     if !known {
         return (StatusCode::BAD_REQUEST, format!("no pending task offer with task_id={task_id}"));
     }
-    s.command.request_accept_task(task_id);
+    if !s.command.request_accept_task(task_id) {
+        return (StatusCode::CONFLICT, BUSY_TASK.into());
+    }
     tracing::info!("quests: queued accept task_id={task_id}");
     (StatusCode::OK, format!("accepting task_id={task_id}"))
 }
@@ -69,7 +81,9 @@ async fn post_decline(State(s): State<HttpState>) -> (StatusCode, String) {
     if s.quest.task_offers_shared.lock().unwrap().is_empty() {
         return (StatusCode::OK, "no pending task offers".into());
     }
-    s.command.request_accept_task(0);
+    if !s.command.request_accept_task(0) {
+        return (StatusCode::CONFLICT, BUSY_TASK.into());
+    }
     tracing::info!("quests: queued decline-all");
     (StatusCode::OK, "declining pending task offer(s)".into())
 }
@@ -90,7 +104,9 @@ async fn post_cancel(
     if !known {
         return (StatusCode::BAD_REQUEST, format!("no active task with task_id={task_id}"));
     }
-    s.command.request_cancel_task(task_id);
+    if !s.command.request_cancel_task(task_id) {
+        return (StatusCode::CONFLICT, BUSY_CANCEL.into());
+    }
     tracing::info!("quests: queued cancel task_id={task_id}");
     (StatusCode::OK, format!("cancelling task_id={task_id}"))
 }

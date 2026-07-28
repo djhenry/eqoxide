@@ -8,6 +8,7 @@
 //! wrapped here — see `mod.rs`'s scope note.
 
 use super::CommandState;
+use crate::slot::Mailbox;
 
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
@@ -15,25 +16,25 @@ impl CommandState {
     /// Accept one offered task (POST /v1/quests/accept {"task_id":N}, the quest journal's Accept
     /// button), or decline all pending offers using the `task_id == 0` sentinel (POST
     /// /v1/quests/decline, the journal's Decline button).
-    pub fn request_accept_task(&self, task_id: u32) {
-        *self.quest.accept_task.lock().unwrap() = Some(task_id);
+    pub fn request_accept_task(&self, task_id: u32) -> bool {
+        self.quest.accept_task.try_put(task_id)
     }
 
     /// Abandon an active task (POST /v1/quests/cancel {"task_id":N}, the journal's Abandon button).
-    pub fn request_cancel_task(&self, task_id: u32) {
-        *self.quest.cancel_task.lock().unwrap() = Some(task_id);
+    pub fn request_cancel_task(&self, task_id: u32) -> bool {
+        self.quest.cancel_task.try_put(task_id)
     }
 
     // ── take_* : the MODEL (`ActionLoop::drain_quests`) drains these once per tick ────────────────
 
     /// Drain a pending accept/decline-all request.
     pub fn take_accept_task(&self) -> Option<u32> {
-        self.quest.accept_task.lock().unwrap().take()
+        self.quest.accept_task.take_msg()
     }
 
     /// Drain a pending cancel-task request.
     pub fn take_cancel_task(&self) -> Option<u32> {
-        self.quest.cancel_task.lock().unwrap().take()
+        self.quest.cancel_task.take_msg()
     }
 }
 
@@ -66,6 +67,6 @@ mod tests {
     fn take_on_empty_slot_is_none() {
         let cs = CommandState::default();
         assert_eq!(cs.take_accept_task(), None);
-        assert_eq!(cs.take_cancel_task(), None);
+        assert_eq!(cs.take_cancel_task(), None)
     }
 }

@@ -11,6 +11,7 @@
 //! read-path/published field, not a command — deliberately NOT exposed here (see `mod.rs`).
 
 use super::CommandState;
+use crate::slot::Mailbox;
 use eqoxide_ipc::{BuyOk, CommandResult, OpenOk, TradeCmd};
 use tokio::sync::oneshot;
 
@@ -20,8 +21,8 @@ impl CommandState {
     /// Buy merchant inventory slot `slot` from merchant `merchant_id` (the merchant window's buy
     /// click — FIRE-AND-FORGET). The drain opens the merchant then sends OP_ShopPlayerBuy. HTTP's
     /// POST /v1/merchant/buy uses the awaited [`request_buy_await`](Self::request_buy_await) instead.
-    pub fn request_merchant_buy(&self, merchant_id: u32, slot: u32) {
-        *self.merchant.buy.lock().unwrap() = Some((merchant_id, slot));
+    pub fn request_merchant_buy(&self, merchant_id: u32, slot: u32) -> bool {
+        self.merchant.buy.try_put((merchant_id, slot))
     }
 
     /// Command-with-result buy (A3 Migration 1, #448): queue the SAME buy as `request_merchant_buy`
@@ -34,20 +35,20 @@ impl CommandState {
         merchant_id: u32,
         slot: u32,
         tx: oneshot::Sender<CommandResult<BuyOk>>,
-    ) {
-        *self.merchant.buy_await.lock().unwrap() = Some((merchant_id, slot, tx));
+    ) -> bool {
+        self.merchant.buy_await.try_put((merchant_id, slot, tx))
     }
 
     /// Sell `quantity` of player inventory slot `slot` to merchant `merchant_id` (POST
     /// /v1/merchant/sell, the merchant window's sell click).
-    pub fn request_merchant_sell(&self, merchant_id: u32, slot: u32, quantity: u32) {
-        *self.merchant.sell.lock().unwrap() = Some((merchant_id, slot, quantity));
+    pub fn request_merchant_sell(&self, merchant_id: u32, slot: u32, quantity: u32) -> bool {
+        self.merchant.sell.try_put((merchant_id, slot, quantity))
     }
 
     /// Open or close the merchant window (POST /v1/merchant/{open,close}, the merchant window's
     /// close button, and the transient-window-close handler for `registry::MERCHANT`).
-    pub fn request_merchant_trade(&self, cmd: TradeCmd) {
-        *self.merchant.trade.lock().unwrap() = Some(cmd);
+    pub fn request_merchant_trade(&self, cmd: TradeCmd) -> bool {
+        self.merchant.trade.try_put(cmd)
     }
 
     /// Command-with-result open (eqoxide#479): queue the SAME open as
@@ -60,15 +61,15 @@ impl CommandState {
         &self,
         merchant_id: u32,
         tx: oneshot::Sender<CommandResult<OpenOk>>,
-    ) {
-        *self.merchant.open_await.lock().unwrap() = Some((merchant_id, tx));
+    ) -> bool {
+        self.merchant.open_await.try_put((merchant_id, tx))
     }
 
     // ── take_* : the MODEL (`ActionLoop::drain_merchant`) drains these once per tick ─────────────
 
     /// Drain a pending buy request as `(merchant_id, slot)`.
     pub fn take_merchant_buy(&self) -> Option<(u32, u32)> {
-        self.merchant.buy.lock().unwrap().take()
+        self.merchant.buy.take_msg()
     }
 
     /// Drain a pending awaited-buy request as `(merchant_id, slot, Sender)` (A3 Migration 1, #448).
@@ -77,24 +78,24 @@ impl CommandState {
     pub fn take_buy_await(
         &self,
     ) -> Option<(u32, u32, oneshot::Sender<CommandResult<BuyOk>>)> {
-        self.merchant.buy_await.lock().unwrap().take()
+        self.merchant.buy_await.take_msg()
     }
 
     /// Drain a pending sell request as `(merchant_id, slot, quantity)`.
     pub fn take_merchant_sell(&self) -> Option<(u32, u32, u32)> {
-        self.merchant.sell.lock().unwrap().take()
+        self.merchant.sell.take_msg()
     }
 
     /// Drain a pending open/close request.
     pub fn take_merchant_trade(&self) -> Option<TradeCmd> {
-        self.merchant.trade.lock().unwrap().take()
+        self.merchant.trade.take_msg()
     }
 
     /// Drain a pending awaited-open request as `(merchant_id, Sender)` (eqoxide#479).
     /// `ActionLoop::drain_merchant` takes this, sends the open, and parks the `Sender` in
     /// `pending_open` until the resolving packet lands. Sibling of `take_merchant_trade`.
     pub fn take_open_await(&self) -> Option<(u32, oneshot::Sender<CommandResult<OpenOk>>)> {
-        self.merchant.open_await.lock().unwrap().take()
+        self.merchant.open_await.take_msg()
     }
 }
 
@@ -184,6 +185,6 @@ mod tests {
         assert_eq!(
             rx.await.unwrap(),
             CommandResult::Resolved(BuyOk { item_name: "Rusty Dagger".into(), price: 5, coin_after: [0, 0, 0, 95] }),
-        );
+        )
     }
 }
