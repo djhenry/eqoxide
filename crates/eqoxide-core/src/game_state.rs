@@ -987,6 +987,38 @@ pub struct GameState {
     /// Client-side writers (nav, the HTTP move API) do NOT clear it — they are not evidence about
     /// where the server thinks we are.
     pub position_provisional_since: Option<std::time::Instant>,
+    /// #713 item 1 — auto-cross attempts during the current continuous stand on zone-line geometry
+    /// that did not result in a crossing. `None` = the character is not on (or has just left) a
+    /// region it has tried to cross. See [`crate::zone_cross::CrossAttempts`] for why this counts
+    /// attempts rather than server denials AND why the tally is per stand rather than per region
+    /// index, and [`crate::zone_cross::MAX_CROSS_ATTEMPTS`] for the bound and its reasoning.
+    ///
+    /// **Deliberately NOT a [`WorldState`] field.** It is a record of what THIS CLIENT decided to
+    /// do, not server truth — same reasoning as `position_provisional_since` above. Written only by
+    /// `eqoxide_net::action_loop`'s standing auto-cross; read by it (the gate) and by
+    /// `GET /v1/observe/debug` (the `zone_cross_stopped` disclosure), both through
+    /// `CrossAttempts::blocks`, so the gate and its observable cannot disagree.
+    ///
+    /// Cleared on the FIRST net-thread tick on which the standing probe finds the character off
+    /// every zone-line region, and by [`GameState::begin_zone_in`] (region indices are a per-zone
+    /// namespace).
+    ///
+    /// *(An earlier revision of this doc said the probe only runs once per auto-cross cooldown, so
+    /// the terminal disclosure "can outlive the stand by up to one cooldown". That was true of the
+    /// code and understated it: the attempt that reaches the bound stamps the cooldown itself, so a
+    /// walk-off/walk-on shorter than the cooldown was sampled ON the line at both ends and cleared
+    /// nothing at all — the documented escape hatch did not work. The reset was hoisted out of the
+    /// cooldown guard in the #713 review round 2 (B2); see `ActionLoop::drain_zone_cross`.)*
+    pub zone_cross_attempts: Option<crate::zone_cross::CrossAttempts>,
+    /// #713 item 2 — what the most recently drained `POST /v1/move/zone_cross` decided to do, and
+    /// in particular whether it degraded to the #683 best-effort fallback (walk to a line whose
+    /// destination only the server knows). `None` = no request has been resolved to a zone line in
+    /// this zone. See [`crate::zone_cross::ZoneCrossPlan`].
+    ///
+    /// Also client-side-decision state rather than server truth, so also not in [`WorldState`].
+    /// Cleared at the start of every resolution (a request that located no line leaves no stale
+    /// plan) and by [`GameState::begin_zone_in`].
+    pub zone_cross_plan: Option<crate::zone_cross::ZoneCrossPlan>,
     /// **#724 review B1: the render controller is holding the body still and cannot resume.**
     /// `None` = it is not (which includes "it is simply standing still because nothing asked it to
     /// move"); `Some` = a recovery path has frozen the body and has nothing to restore it onto. See
@@ -1358,6 +1390,14 @@ impl GameState {
         // lie as a missing one — verified live that without this it stayed true in the new zone for
         // 30s+ while `pos` was actually the correct zone-in point).
         self.position_provisional_since = None;
+        // #713: both zone-cross bookkeeping facts are about the zone we are LEAVING. A zone-line
+        // region index is a per-zone namespace (index 0 is the universal unresolvable index), and
+        // an advertised destination zone id is only meaningful against the zone that advertised it
+        // — so carrying either across a crossing would make the client report the previous zone's
+        // attempt history / crossing plan as if it were this zone's. Same reasoning as the #683
+        // round-3 re-arm of the gated-refusal latch in `sync_zone_points`.
+        self.zone_cross_attempts = None;
+        self.zone_cross_plan = None;
         // #724 review B1: a hold describes the body's predicament in geometry that is about to be
         // dropped. The controller stops being stepped while the new zone loads, so without this the
         // last mirrored value would sit here — a confident "you are wedged" about a zone we have
