@@ -223,6 +223,143 @@ pub fn execute_instanced_shadow_plan<C: InstancedShadowCaster, S: InstancedShado
     }
 }
 
+// ── Character shadow sub-pass ROUTING (#739) ─────────────────────────────────────────────────────
+//
+// After the instanced placed objects, `encode_shadow_pass` draws the selected characters in two
+// sub-passes: skinned first, then static. Each sets its pipeline and binds group 0 once, then binds
+// each caster's `shadow_uniform_pool` slot at group 1 — and, for skinned casters ONLY, that caster's
+// `shadow_joint_pool` slot at group 2. Those were two hand-written loops with a `bool` latch each,
+// and nothing in the suite could see them: a flipped pipeline, a dropped sub-pass, or a static
+// caster that bound a joint palette (or a skinned one that did not) was invisible.
+//
+// #739 asked explicitly whether this can share #721's vocabulary. **It cannot, and the planners are
+// deliberately separate.** `ShadowPipelineKind` names the two INSTANCED pipelines and is chosen from
+// a mesh's `RenderMode`; these two are chosen from whether a *model* is skinned. `ShadowTexBind`
+// names a diffuse-texture bind; neither sub-pass here samples a texture, and what they bind instead
+// is a pool slot index. The only shared shape is "one latch per sub-pass", which is three lines.
+
+/// Which of the two character shadow pipelines draws a selected caster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CharacterShadowKind {
+    /// `pipelines.shadow_skinned` — reads a joint palette at group 2.
+    Skinned,
+    /// `pipelines.shadow_static` — no joint palette.
+    Static,
+}
+
+/// The character shadow sub-passes `encode_shadow_pass` issues, **in draw order**. Owning the list
+/// here rather than as two hand-written loops is what makes "the static sub-pass got deleted" a
+/// single testable edit.
+pub const CHARACTER_SHADOW_SUBPASSES: [CharacterShadowKind; 2] =
+    [CharacterShadowKind::Skinned, CharacterShadowKind::Static];
+
+/// What a caster binds before it draws.
+///
+/// **The joint palette is inside the `Skinned` variant, which is the point.** A static caster
+/// cannot carry a `shadow_joint_pool` slot — the bad state is unrepresentable rather than merely
+/// untaken, so no test is needed to keep a joint index out of a static step. What this does NOT
+/// prevent: a [`CharacterShadowCaster`] impl reporting the wrong variant for its model, and a
+/// [`CharacterShadowSink`] impl binding group 2 anyway. The first is graded differentially in
+/// tests/character_shadow_routing.rs; the second is `encode_shadow_pass`'s four-line sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CharacterShadowBind {
+    Skinned { u_slot: usize, j_slot: usize },
+    Static  { u_slot: usize },
+}
+
+impl CharacterShadowBind {
+    pub fn kind(self) -> CharacterShadowKind {
+        match self {
+            Self::Skinned { .. } => CharacterShadowKind::Skinned,
+            Self::Static  { .. } => CharacterShadowKind::Static,
+        }
+    }
+}
+
+/// One planned character shadow draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CharacterShadowStep {
+    /// Index into the caster slice the plan was built from.
+    pub caster:       usize,
+    /// True on the first step of each non-empty sub-pass: set the pipeline and bind group 0.
+    pub set_pipeline: bool,
+    pub bind:         CharacterShadowBind,
+}
+
+/// The device-free slice of a selected shadow caster the ROUTING reads. The real caster owns a
+/// `&GpuSkinnedModel`/`&GpuStaticModel` (both unconstructible in a test — they own `wgpu::Buffer`s);
+/// routing only ever asks which pipeline draws it and which pool slots it binds.
+pub trait CharacterShadowCaster {
+    fn shadow_bind(&self) -> CharacterShadowBind;
+}
+
+/// Plans every character shadow draw for one frame: which sub-passes run, in which order, which
+/// caster is in which, and what each binds.
+///
+/// Returns a **lazy iterator** — no allocation — because `encode_shadow_pass` runs every frame.
+/// Steps come out in exactly the order `encode_shadow_pass` issues them, so the sub-pass split is
+/// observable: a caster's position in this stream is its position in its sub-pass, not its position
+/// in `casters`.
+pub fn plan_character_shadow_draws<C: CharacterShadowCaster>(
+    casters: &[C],
+) -> impl Iterator<Item = CharacterShadowStep> + '_ {
+    CHARACTER_SHADOW_SUBPASSES.into_iter().flat_map(move |kind| {
+        casters
+            .iter()
+            .enumerate()
+            .filter(move |(_, c)| c.shadow_bind().kind() == kind)
+            .scan(false, move |started, (caster, c)| {
+                let set_pipeline = !*started;
+                *started = true;
+                Some(CharacterShadowStep { caster, set_pipeline, bind: c.shadow_bind() })
+            })
+    })
+}
+
+/// The device-bound half of a character shadow draw, expressed entirely in **plan vocabulary** —
+/// a [`CharacterShadowKind`] and pool slot *indices*, never `wgpu` handles.
+///
+/// `encode_shadow_pass` supplies an impl closing over the renderer and the live `wgpu::RenderPass`;
+/// `tests/character_shadow_routing.rs` supplies one that appends to a `Vec`. Both run the *same*
+/// executor.
+pub trait CharacterShadowSink {
+    /// Start a sub-pass: select the pipeline this kind names.
+    fn set_pipeline(&mut self, kind: CharacterShadowKind);
+    /// Bind group 0 (the shadow light's view-projection uniform).
+    fn bind_light_depth(&mut self);
+    /// Bind group 1 to `shadow_uniform_pool[u_slot]` (this caster's model matrix).
+    fn bind_model_uniform(&mut self, u_slot: usize);
+    /// Bind group 2 to `shadow_joint_pool[j_slot]`. Called for skinned casters only.
+    fn bind_joints(&mut self, j_slot: usize);
+    /// Issue the draws for `casters[caster]` (one per mesh of its model).
+    fn draw(&mut self, caster: usize);
+}
+
+/// Turns a [`plan_character_shadow_draws`] plan into sink calls. **This is the real executor** —
+/// `encode_shadow_pass` calls exactly this function, so the command sequence it emits is graded
+/// device-free in `tests/character_shadow_routing.rs` against a transcription of the pre-#739 loops.
+pub fn execute_character_shadow_plan<C: CharacterShadowCaster, S: CharacterShadowSink>(
+    casters: &[C],
+    sink:    &mut S,
+) {
+    for step in plan_character_shadow_draws(casters) {
+        if step.set_pipeline {
+            sink.set_pipeline(step.bind.kind());
+            sink.bind_light_depth();
+        }
+        match step.bind {
+            CharacterShadowBind::Skinned { u_slot, j_slot } => {
+                sink.bind_model_uniform(u_slot);
+                sink.bind_joints(j_slot);
+            }
+            CharacterShadowBind::Static { u_slot } => {
+                sink.bind_model_uniform(u_slot);
+            }
+        }
+        sink.draw(step.caster);
+    }
+}
+
 /// Entity draw distance (EQ units, measured from the player). Beyond this an NPC's 3D
 /// model is not drawn — it's a distant speck. Combined with a frustum test, this caps
 /// the per-frame entity work in densely-populated zones (e.g. gfaydark, ~400 spawns).
@@ -622,6 +759,229 @@ pub fn encode_sky_pass(
     pass.draw(0..6, 0..1);
 }
 
+// ── Zone colour pass ROUTING (#741) ──────────────────────────────────────────────────────────────
+//
+// `encode_zone_pass` issues six sub-passes: {static, instanced} × {opaque+masked, blend, additive}.
+// Which mesh list each reads, which pipeline it selects, which render modes it accepts, the order
+// they run in, and when group 1 is rebound were two hand-written closures called six times, inside a
+// function that takes `&EqRenderer` + `&mut wgpu::CommandEncoder` — arguments no test can build
+// (neither `wgpu::Device` nor `wgpu::Queue` has a non-adapter constructor, and wgpu 22 has no `noop`
+// backend). A flipped source, a dropped sub-pass or a widened mode filter was therefore invisible.
+// The split below is the same shape #721 used for the instanced shadow draws: a pure planner over a
+// device-free trait plus a sink for the `wgpu` handles, graded in tests/zone_pass_routing.rs.
+
+/// Which mesh list a zone sub-pass draws from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ZoneMeshSource {
+    /// `EqRenderer::gpu_meshes` — one draw per mesh, one instance.
+    Static,
+    /// `EqRenderer::gpu_instanced` — one draw per mesh over `instance_count` instances.
+    Instanced,
+}
+
+/// The blend class of a zone sub-pass. **This is the mode filter**: a sub-pass does not carry a
+/// free-form list of [`eqoxide_assets::RenderMode`]s, so "the opaque sub-pass silently started
+/// accepting `Blend`" is not expressible in the table below — only in this one function.
+///
+/// `Opaque` and `Masked` share a class because they share a pipeline: masked discards in-shader with
+/// depth-write still on, so both belong in the depth-writing prepass. `Blend` and `Additive` run
+/// after, each with its own depth-write-off pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ZoneBlendClass {
+    OpaqueMasked,
+    Blend,
+    Additive,
+}
+
+impl ZoneBlendClass {
+    /// Whether a mesh in this render mode is drawn by this class of sub-pass. Every mode is accepted
+    /// by exactly one class — a mesh is drawn once, never twice and never zero times, which is what
+    /// `zone_pass_routing.rs::every_render_mode_is_drawn_exactly_once` grades.
+    pub fn accepts(self, mode: eqoxide_assets::RenderMode) -> bool {
+        use eqoxide_assets::RenderMode;
+        matches!(
+            (self, mode),
+            (Self::OpaqueMasked, RenderMode::Opaque | RenderMode::Masked)
+                | (Self::Blend, RenderMode::Blend)
+                | (Self::Additive, RenderMode::Additive)
+        )
+    }
+}
+
+/// One zone sub-pass: a mesh list and a blend class. The pipeline is a pure function of the pair
+/// (`ZoneDrawSink::set_pipeline`'s six arms), so there is no third field to get wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ZoneSubpass {
+    pub source: ZoneMeshSource,
+    pub class:  ZoneBlendClass,
+}
+
+/// The zone sub-passes, **in draw order**. Owning the order here rather than as six call statements
+/// is what makes "the additive instanced sub-pass got dropped" a single testable edit.
+///
+/// The order matters twice over: all depth-writing geometry must precede all depth-write-off
+/// geometry, and within a class the static terrain is drawn before the placed objects standing on
+/// it.
+pub const ZONE_SUBPASSES: [ZoneSubpass; 6] = [
+    ZoneSubpass { source: ZoneMeshSource::Static,    class: ZoneBlendClass::OpaqueMasked },
+    ZoneSubpass { source: ZoneMeshSource::Instanced, class: ZoneBlendClass::OpaqueMasked },
+    ZoneSubpass { source: ZoneMeshSource::Static,    class: ZoneBlendClass::Blend },
+    ZoneSubpass { source: ZoneMeshSource::Instanced, class: ZoneBlendClass::Blend },
+    ZoneSubpass { source: ZoneMeshSource::Static,    class: ZoneBlendClass::Additive },
+    ZoneSubpass { source: ZoneMeshSource::Instanced, class: ZoneBlendClass::Additive },
+];
+
+/// Group-1 action for a planned zone draw. There is no `NotSampled` arm (unlike
+/// [`ShadowTexBind`]): every zone pipeline has a fragment stage and samples its diffuse texture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneTexBind {
+    /// Bind group 1 to this texture index (`None` → the renderer's fallback texture).
+    Set(Option<usize>),
+    /// Group 1 already holds the right texture from an earlier step **in this sub-pass** — skip the
+    /// redundant `set_bind_group`. The cache does not survive a sub-pass boundary.
+    Keep,
+}
+
+/// One planned zone draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZoneDrawStep {
+    /// Index into [`ZONE_SUBPASSES`].
+    pub subpass:      usize,
+    pub source:       ZoneMeshSource,
+    pub class:        ZoneBlendClass,
+    /// Index into the mesh list named by `source` — NOT a position within the sub-pass.
+    pub mesh:         usize,
+    /// True on the first step of each non-empty sub-pass: set the pipeline and bind groups 0 and 2.
+    pub set_pipeline: bool,
+    pub bind:         ZoneTexBind,
+}
+
+/// The device-free slice of a mesh the zone pass reads.
+///
+/// Structurally identical to [`InstancedShadowCaster`], and deliberately NOT the same trait: that
+/// one names the instanced *shadow* casters and is implemented only for
+/// [`crate::gpu::GpuInstancedMesh`], whereas this is implemented for both zone mesh lists. Unifying
+/// them would rename #721's public trait for no coverage gain, which is out of scope for a coverage
+/// issue.
+pub trait ZoneDrawMesh {
+    fn render_mode(&self) -> eqoxide_assets::RenderMode;
+    fn texture_idx(&self) -> Option<usize>;
+    fn anim(&self) -> Option<&(u32, Vec<usize>)>;
+}
+
+impl ZoneDrawMesh for crate::gpu::GpuMesh {
+    fn render_mode(&self) -> eqoxide_assets::RenderMode { self.render_mode }
+    fn texture_idx(&self) -> Option<usize> { self.texture_idx }
+    fn anim(&self) -> Option<&(u32, Vec<usize>)> { self.anim.as_ref() }
+}
+
+impl ZoneDrawMesh for crate::gpu::GpuInstancedMesh {
+    fn render_mode(&self) -> eqoxide_assets::RenderMode { self.render_mode }
+    fn texture_idx(&self) -> Option<usize> { self.texture_idx }
+    fn anim(&self) -> Option<&(u32, Vec<usize>)> { self.anim.as_ref() }
+}
+
+/// Plans every zone colour draw for one frame: which sub-passes run, in which order, which mesh is
+/// in which, and which texture each step must bind.
+///
+/// Returns a **lazy iterator** — no allocation — because `encode_zone_pass` runs every frame. Steps
+/// come out in exactly the order `encode_zone_pass` issues them.
+pub fn plan_zone_draws<'a, S: ZoneDrawMesh, I: ZoneDrawMesh>(
+    statics:   &'a [S],
+    instanced: &'a [I],
+    now_ms:    u64,
+) -> impl Iterator<Item = ZoneDrawStep> + 'a {
+    let len_of = move |src: ZoneMeshSource| match src {
+        ZoneMeshSource::Static    => statics.len(),
+        ZoneMeshSource::Instanced => instanced.len(),
+    };
+    let mode_of = move |src: ZoneMeshSource, i: usize| match src {
+        ZoneMeshSource::Static    => statics[i].render_mode(),
+        ZoneMeshSource::Instanced => instanced[i].render_mode(),
+    };
+    let tex_of = move |src: ZoneMeshSource, i: usize| match src {
+        ZoneMeshSource::Static =>
+            animated_frame_texture(statics[i].texture_idx(), statics[i].anim(), now_ms),
+        ZoneMeshSource::Instanced =>
+            animated_frame_texture(instanced[i].texture_idx(), instanced[i].anim(), now_ms),
+    };
+
+    ZONE_SUBPASSES.into_iter().enumerate().flat_map(move |(subpass, sp)| {
+        (0..len_of(sp.source))
+            .filter(move |&i| sp.class.accepts(mode_of(sp.source, i)))
+            // The `scan` seed is re-evaluated per sub-pass, so `current_tex` starts as `None` inside
+            // every sub-pass and the first step of each necessarily takes the `Set` arm. The
+            // sub-pass boundary reset is therefore STRUCTURAL, not a condition anyone can flip: an
+            // added `!started` guard here measured green against the whole suite (mutation Z5,
+            // #739/#741 PR body) precisely because it was unreachable.
+            .scan((false, None::<Option<usize>>), move |(started, current_tex), mesh| {
+                let tex  = tex_of(sp.source, mesh);
+                let bind = if *current_tex == Some(tex) {
+                    ZoneTexBind::Keep
+                } else {
+                    *current_tex = Some(tex);
+                    ZoneTexBind::Set(tex)
+                };
+                let set_pipeline = !*started;
+                *started = true;
+                Some(ZoneDrawStep {
+                    subpass, source: sp.source, class: sp.class, mesh, set_pipeline, bind,
+                })
+            })
+    })
+}
+
+/// The device-bound half of a zone draw, expressed entirely in **plan vocabulary** —
+/// [`ZoneMeshSource`]/[`ZoneBlendClass`] and texture *indices*, never `wgpu` handles.
+///
+/// `encode_zone_pass` supplies an impl closing over the renderer and the live `wgpu::RenderPass`;
+/// `tests/zone_pass_routing.rs` supplies one that appends to a `Vec`. Both run the *same* executor,
+/// so a regression in the plan→command translation is a test failure rather than something only a
+/// GPU could notice.
+///
+/// [`Self::bind_texture`] receives an index and has no mesh in scope, so "bind the mesh's base
+/// `texture_idx` instead of the resolved animation frame" — #718's N2 bug, which shipped once
+/// already — is not expressible in the executor at all.
+pub trait ZoneDrawSink {
+    /// Start a sub-pass: select the pipeline for this (source, class) pair.
+    fn set_pipeline(&mut self, source: ZoneMeshSource, class: ZoneBlendClass);
+    /// Bind group 0 (the camera uniform).
+    fn bind_camera(&mut self);
+    /// Bind group 1 to the *already-resolved* texture index (`None` → fallback texture).
+    fn bind_texture(&mut self, idx: Option<usize>);
+    /// Bind group 2 (the sun shadow map, #518).
+    fn bind_shadow_sample(&mut self);
+    /// Issue the draw for mesh `mesh` of the list named by `source`.
+    fn draw(&mut self, source: ZoneMeshSource, mesh: usize);
+}
+
+/// Turns a [`plan_zone_draws`] plan into sink calls. **This is the real executor** —
+/// `encode_zone_pass` calls exactly this function.
+///
+/// The call order within a first step (pipeline, group 0, group 1, group 2) is the pre-#741 order,
+/// preserved because `tests/zone_pass_routing.rs` grades this stream against a verbatim
+/// transcription of the two pre-#741 closures.
+pub fn execute_zone_draw_plan<S: ZoneDrawMesh, I: ZoneDrawMesh, K: ZoneDrawSink>(
+    statics:   &[S],
+    instanced: &[I],
+    now_ms:    u64,
+    sink:      &mut K,
+) {
+    for step in plan_zone_draws(statics, instanced, now_ms) {
+        if step.set_pipeline {
+            sink.set_pipeline(step.source, step.class);
+            sink.bind_camera();
+        }
+        if let ZoneTexBind::Set(tex) = step.bind {
+            sink.bind_texture(tex);
+        }
+        if step.set_pipeline {
+            sink.bind_shadow_sample();
+        }
+        sink.draw(step.source, step.mesh);
+    }
+}
+
 /// Zone geometry pass. Clears depth to 1.0; preserves sky color from sky pass.
 pub fn encode_zone_pass(
     r:       &EqRenderer,
@@ -651,83 +1011,71 @@ pub fn encode_zone_pass(
         occlusion_query_set: None,
     });
 
-    use eqoxide_assets::RenderMode;
-    let tex_bg = |idx: Option<usize>| -> &wgpu::BindGroup {
-        match idx {
-            Some(i) if i < r.texture_bind_groups.len() => &r.texture_bind_groups[i],
-            _ => &r.fallback_texture_bg,
+    // Everything decided for this pass — the six sub-passes and their order, which mesh list and
+    // which render modes each one draws, which animated texture frame a mesh binds, and when a
+    // group-1 rebind is actually needed — comes from `plan_zone_draws` (#741), which is device-free
+    // and unit tested in tests/zone_pass_routing.rs (with a differential pin against the pre-#741
+    // closures in the same file). All that is left here is `ZoneSink`: five bodies that turn plan
+    // vocabulary into `wgpu` handles. Nothing in this impl decides anything — if you find yourself
+    // adding a condition to it, it belongs in the planner.
+    struct ZoneSink<'r, 'p, 'e> {
+        r:    &'r EqRenderer,
+        pass: &'p mut wgpu::RenderPass<'e>,
+    }
+    impl ZoneDrawSink for ZoneSink<'_, '_, '_> {
+        fn set_pipeline(&mut self, source: ZoneMeshSource, class: ZoneBlendClass) {
+            let p = &self.r.pipelines;
+            self.pass.set_pipeline(match (source, class) {
+                (ZoneMeshSource::Static,    ZoneBlendClass::OpaqueMasked) => &p.zone,
+                (ZoneMeshSource::Static,    ZoneBlendClass::Blend)        => &p.zone_blend,
+                (ZoneMeshSource::Static,    ZoneBlendClass::Additive)     => &p.zone_additive,
+                (ZoneMeshSource::Instanced, ZoneBlendClass::OpaqueMasked) => &p.zone_instanced,
+                (ZoneMeshSource::Instanced, ZoneBlendClass::Blend)        => &p.zone_instanced_blend,
+                (ZoneMeshSource::Instanced, ZoneBlendClass::Additive)     => &p.zone_instanced_additive,
+            });
         }
-    };
-    // Wall-clock ms since process start, for cycling animated textures (fire/water/lava).
+        fn bind_camera(&mut self) {
+            let r = self.r;
+            self.pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
+        }
+        fn bind_texture(&mut self, idx: Option<usize>) {
+            let r = self.r;
+            let bg = match idx {
+                Some(i) if i < r.texture_bind_groups.len() => &r.texture_bind_groups[i],
+                _ => &r.fallback_texture_bg,
+            };
+            self.pass.set_bind_group(1, bg, &[]);
+        }
+        fn bind_shadow_sample(&mut self) {
+            let r = self.r;
+            self.pass.set_bind_group(2, &r.shadow_sample_bg, &[]); // sun shadow map (#518)
+        }
+        fn draw(&mut self, source: ZoneMeshSource, mesh: usize) {
+            match source {
+                ZoneMeshSource::Static => {
+                    let m = &self.r.gpu_meshes[mesh];
+                    self.pass.set_vertex_buffer(0, m.vertex_buf.slice(..));
+                    self.pass.set_index_buffer(m.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    self.pass.draw_indexed(0..m.index_count, 0, 0..1);
+                }
+                ZoneMeshSource::Instanced => {
+                    let m = &self.r.gpu_instanced[mesh];
+                    self.pass.set_vertex_buffer(0, m.vertex_buf.slice(..));
+                    self.pass.set_vertex_buffer(1, m.instance_buf.slice(..));
+                    self.pass.set_index_buffer(m.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    self.pass.draw_indexed(0..m.index_count, 0, 0..m.instance_count);
+                }
+            }
+        }
+    }
+
+    // Wall-clock ms since process start, for cycling animated textures (fire/water/lava). The frame
+    // a mesh resolves to is `animated_frame_texture`, the SAME function the masked shadow sub-pass
+    // uses (#721) — the colour and shadow silhouettes must agree on the texel, or #718's N2 mismatch
+    // comes back. The planner calls it; do not re-inline a copy here.
     let now_ms = anim_now_ms();
-    // The texture a mesh should bind this frame: its current animation frame if animated,
-    // else its static texture. The per-loop texture cache naturally rebinds when it advances.
-    // This is the SAME function the masked shadow sub-pass resolves its frame with (#721) — the
-    // color and shadow silhouettes must agree on the texel, or #718's N2 mismatch comes back. It
-    // was a byte-identical copy of `animated_frame_texture` until #721's review round 2; do not
-    // re-inline it.
-    let frame_tex = |tex: Option<usize>, anim: &Option<(u32, Vec<usize>)>| -> Option<usize> {
-        animated_frame_texture(tex, anim.as_ref(), now_ms)
-    };
-
-    // Draw the static terrain meshes whose render_mode is in `modes`, with `pipeline`.
-    // Opaque + masked share the opaque pipeline (masked discards in-shader, depth-write
-    // on); blend/additive run after with their own depth-write-off pipelines.
-    let draw_static = |pass: &mut wgpu::RenderPass<'_>, pipeline, modes: &[RenderMode]| {
-        let mut bound = false;
-        let mut current_tex: Option<usize> = None;
-        for mesh in &r.gpu_meshes {
-            if !modes.contains(&mesh.render_mode) { continue; }
-            let etex = frame_tex(mesh.texture_idx, &mesh.anim);
-            if !bound {
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
-                pass.set_bind_group(1, tex_bg(etex), &[]);
-                pass.set_bind_group(2, &r.shadow_sample_bg, &[]); // sun shadow map (#518)
-                current_tex = etex;
-                bound = true;
-            } else if etex != current_tex {
-                current_tex = etex;
-                pass.set_bind_group(1, tex_bg(current_tex), &[]);
-            }
-            pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-            pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-        }
-    };
-    draw_static(&mut pass, &r.pipelines.zone, &[RenderMode::Opaque, RenderMode::Masked]);
-
-    // ── GPU-instanced placed objects ───────────────────────────────────────
-    let draw_instanced = |pass: &mut wgpu::RenderPass<'_>, pipeline, modes: &[RenderMode]| {
-        let mut bound = false;
-        let mut current_tex: Option<usize> = None;
-        for mesh in &r.gpu_instanced {
-            if !modes.contains(&mesh.render_mode) { continue; }
-            let etex = frame_tex(mesh.texture_idx, &mesh.anim);
-            if !bound {
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
-                pass.set_bind_group(1, tex_bg(etex), &[]);
-                pass.set_bind_group(2, &r.shadow_sample_bg, &[]); // sun shadow map (#518)
-                current_tex = etex;
-                bound = true;
-            } else if etex != current_tex {
-                current_tex = etex;
-                pass.set_bind_group(1, tex_bg(current_tex), &[]);
-            }
-            pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-            pass.set_vertex_buffer(1, mesh.instance_buf.slice(..));
-            pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, 0..mesh.instance_count);
-        }
-    };
-    draw_instanced(&mut pass, &r.pipelines.zone_instanced, &[RenderMode::Opaque, RenderMode::Masked]);
-
-    // ── Transparent passes (after all opaque/masked, depth-write off) ───────
-    draw_static(&mut pass, &r.pipelines.zone_blend, &[RenderMode::Blend]);
-    draw_instanced(&mut pass, &r.pipelines.zone_instanced_blend, &[RenderMode::Blend]);
-    draw_static(&mut pass, &r.pipelines.zone_additive, &[RenderMode::Additive]);
-    draw_instanced(&mut pass, &r.pipelines.zone_instanced_additive, &[RenderMode::Additive]);
+    let mut sink = ZoneSink { r, pass: &mut pass };
+    execute_zone_draw_plan(&r.gpu_meshes, &r.gpu_instanced, now_ms, &mut sink);
 }
 
 /// Draw the zone's doors (closed state). Each door uses its object model if loaded, else a
@@ -1797,41 +2145,69 @@ pub fn encode_shadow_pass(
         execute_instanced_shadow_plan(&r.gpu_instanced, now_ms, &mut sink);
     }
 
-    // Skinned casters.
-    let mut skinned_bound = false;
-    for c in &casters {
-        if let Caster::Skinned { model, u_slot, j_slot } = c {
-            if !skinned_bound {
-                pass.set_pipeline(&r.pipelines.shadow_skinned);
-                pass.set_bind_group(0, &r.light_depth_bg, &[]);
-                skinned_bound = true;
-            }
-            pass.set_bind_group(1, &r.shadow_uniform_pool[*u_slot].1, &[]);
-            pass.set_bind_group(2, &r.shadow_joint_pool[*j_slot].1, &[]);
-            for mesh in &model.meshes {
-                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+    // Character casters, skinned sub-pass then static sub-pass. Which sub-pass a caster lands in,
+    // the one-time pipeline/group-0 bind per sub-pass, and the fact that only skinned casters bind a
+    // joint palette all come from `plan_character_shadow_draws` (#739), device-free and unit tested
+    // in tests/character_shadow_routing.rs (with a differential pin against the pre-#739 loops).
+    // `CharacterSink` below is the `wgpu`-handle translation and decides nothing.
+    impl CharacterShadowCaster for Caster<'_> {
+        fn shadow_bind(&self) -> CharacterShadowBind {
+            match *self {
+                Caster::Skinned { u_slot, j_slot, .. } =>
+                    CharacterShadowBind::Skinned { u_slot, j_slot },
+                Caster::Static { u_slot, .. } => CharacterShadowBind::Static { u_slot },
             }
         }
     }
-
-    // Static casters.
-    let mut static_bound = false;
-    for c in &casters {
-        if let Caster::Static { model, u_slot } = c {
-            if !static_bound {
-                pass.set_pipeline(&r.pipelines.shadow_static);
-                pass.set_bind_group(0, &r.light_depth_bg, &[]);
-                static_bound = true;
-            }
-            pass.set_bind_group(1, &r.shadow_uniform_pool[*u_slot].1, &[]);
-            for mesh in &model.meshes {
-                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+    struct CharacterSink<'r, 'p, 'e, 'c> {
+        r:       &'r EqRenderer,
+        pass:    &'p mut wgpu::RenderPass<'e>,
+        casters: &'c [Caster<'c>],
+    }
+    impl CharacterShadowSink for CharacterSink<'_, '_, '_, '_> {
+        fn set_pipeline(&mut self, kind: CharacterShadowKind) {
+            let r = self.r;
+            self.pass.set_pipeline(match kind {
+                CharacterShadowKind::Skinned => &r.pipelines.shadow_skinned,
+                CharacterShadowKind::Static  => &r.pipelines.shadow_static,
+            });
+        }
+        fn bind_light_depth(&mut self) {
+            let r = self.r;
+            self.pass.set_bind_group(0, &r.light_depth_bg, &[]);
+        }
+        fn bind_model_uniform(&mut self, u_slot: usize) {
+            let r = self.r;
+            self.pass.set_bind_group(1, &r.shadow_uniform_pool[u_slot].1, &[]);
+        }
+        fn bind_joints(&mut self, j_slot: usize) {
+            let r = self.r;
+            self.pass.set_bind_group(2, &r.shadow_joint_pool[j_slot].1, &[]);
+        }
+        fn draw(&mut self, caster: usize) {
+            // One draw per mesh of the caster's model. Mesh count is not a routing decision, so it
+            // is not in the plan.
+            match &self.casters[caster] {
+                Caster::Skinned { model, .. } => {
+                    for mesh in &model.meshes {
+                        self.pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        self.pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                        self.pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    }
+                }
+                Caster::Static { model, .. } => {
+                    for mesh in &model.meshes {
+                        self.pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        self.pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                        self.pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    }
+                }
             }
         }
+    }
+    {
+        let mut sink = CharacterSink { r, pass: &mut pass, casters: &casters };
+        execute_character_shadow_plan(&casters, &mut sink);
     }
 }
 
