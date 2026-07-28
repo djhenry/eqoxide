@@ -2323,8 +2323,14 @@ mod health_clock_tests {
         let frozen = HealthClock::frozen_at(pin);
         assert_eq!(frozen.age_of(frozen.ago(15)), std::time::Duration::from_secs(15),
             "on a pinned clock, ago(15) must read back as exactly 15s");
-        assert_eq!(HealthClock::WALL.age_of(HealthClock::WALL.ago(0)), std::time::Duration::ZERO,
-            "and the wall clock is the same operation, not a special case");
+        // The wall clock's version of the same law, stated as the inequality that is actually true:
+        // `now` advances between the two calls, so the age can only read LONGER than asked, never
+        // shorter. (Writing this as `assert_eq!(…, ZERO)` is what a first draft said; it failed at
+        // `left: 100ns`, which is this PR's own defect class — a wall-clock-dependent assertion —
+        // caught by the suite. Monotonicity gives a bound that needs no tolerance window.)
+        assert!(HealthClock::WALL.age_of(HealthClock::WALL.ago(15)) >= std::time::Duration::from_secs(15),
+            "on the wall clock, ago(15) must read back as AT LEAST 15s — a monotonic clock cannot \
+             make a stamp younger than it was minted");
 
         // The cross-clock error the guard test exists to ban: stamp from the wall clock AFTER the
         // pin, read back against the pin. The gap is real elapsed time, so the age comes back SHORT.
