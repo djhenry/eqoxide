@@ -1475,10 +1475,17 @@ mod cursor_resync_tests {
     /// * for a `::`-qualified path it resolves the **tail only** (`resolution_name`). A citation
     ///   whose module prefix is wrong but whose final identifier exists elsewhere in the workspace
     ///   resolves and is not reported. Prefixes are prose here, not links;
-    /// * lines inside a triple-backtick fence are exempt from the unbalanced-span check, so a
-    ///   citation written inside a fenced example is neither balance-checked nor guarded;
+    /// * lines inside a triple-backtick fence are exempt from the **unbalanced-span check only**;
+    ///   `doc_citations` does not skip fences, so a citation written inside a fenced example is
+    ///   still resolved (rule 2/3) and, if it is a same-file `#[test]`, still required to be in the
+    ///   `_cited`/`_helpers` guard (rule 1) — only the *parity* balance check is fence-exempt;
     /// * the citation corpus is still the four files #727 touches. Nothing here claims anything
-    ///   about the other 151 `.rs` files in the workspace.
+    ///   about the other 154 `.rs` files in the workspace;
+    /// * backtick parity is not span-crossing (round 8): escaping a literal backtick in prose (the
+    ///   standard CommonMark double-backtick escape) both false-fails the balance check on its own
+    ///   line, and — applied the same way on both sides of a genuine wrap — can make both lines land
+    ///   on an even count and hide it entirely. Both demonstrated by execution against this exact
+    ///   corpus; see `unbalanced_doc_spans`'s doc for the counts.
     ///
     /// ⚠️ **Correction (#727 round 7 review, non-blocking 1).** The first two bullets are all round 6
     /// listed, and the round-6 review demonstrated the list was incomplete by finding a live citation
@@ -1486,6 +1493,16 @@ mod cursor_resync_tests {
     /// fix for those two introduced blind spots of its own: widening the charset to `:` buys nothing
     /// about the prefix, and skipping fences to avoid false positives is a real exemption. Both are
     /// stated rather than discovered next round.
+    ///
+    /// ⚠️ **Correction (#727 round 8 review, blocking).** The fourth bullet was wrong: it said a
+    /// fenced citation is "neither balance-checked nor guarded". Only the first half is true.
+    /// Verified by execution on this head: a nonexistent name and an unguarded same-file `#[test]`
+    /// name, both cited from inside a triple-backtick-fenced example, are still reported by rules
+    /// 2/3 and rule 1 respectively — `doc_citations` has no fence check at all, only
+    /// `unbalanced_doc_spans` does. Corrected above, and the sixth bullet (parity ≠ span-crossing)
+    /// is the blind spot this list was actually missing. The fifth bullet's file count was also
+    /// stale (151 → 154, drift from
+    /// unrelated merges, not a mechanism error) and is corrected in the same pass.
     #[test]
     fn every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard() {
         use std::collections::{HashMap, HashSet};
@@ -1690,10 +1707,21 @@ mod cursor_resync_tests {
         citation.rsplit("::").next().unwrap_or(citation)
     }
 
-    /// Every doc-comment line outside a triple-backtick fence whose backtick count is odd — i.e. a
-    /// code span that opens on one line and closes on another. Round 7: this is the shape that hid the
-    /// round-6 review's surviving citation, and no amount of widening the charset would have caught
-    /// it, because the name never appears whole on any line.
+    /// A backtick-PARITY heuristic: every doc-comment line outside a triple-backtick fence whose
+    /// backtick count is odd. Round 7: this is the shape that hid the round-6 review's surviving
+    /// citation, and no amount of widening the charset would have caught it, because the name never
+    /// appears whole on any line.
+    ///
+    /// ⚠️ **Correction (#727 round 8 review, blocking).** This doc used to call the odd-count check
+    /// "i.e. a code span that opens on one line and closes on another" — an equivalence. It is false
+    /// in both directions, demonstrated by execution. Escaping a literal backtick in prose (the
+    /// standard CommonMark double-backtick escape) puts an odd backtick count on one line with
+    /// nothing crossing anything — a FALSE FAILURE, and this check hard-fails it, reporting a defect
+    /// that is not there. And a citation genuinely wrapped across two lines, padded with the same
+    /// escape so each line's count comes out even, passes this check silently — a FALSE PASS, and
+    /// the exact shape it exists to catch. Parity implies a crossing span only when nothing else on
+    /// the line contributes an odd backtick count of its own; it is not equivalent to it. See "What
+    /// it does NOT do" below for the sixth bullet this forces.
     fn unbalanced_doc_spans(src: &str) -> Vec<usize> {
         let mut out = Vec::new();
         let mut in_fence = false;
