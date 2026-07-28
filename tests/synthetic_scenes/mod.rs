@@ -26,16 +26,21 @@
 //! specific argument, and the control scenes (`sealed_pocket_without_lid`, …) that hold everything
 //! else fixed and remove only the feature under test.
 //!
-//! # What this layer does NOT cover — the swimming step-up
+//! # What this layer does NOT cover — the swimming step-up and its #661 duck-under mirror
 //!
-//! **There is zero synthetic coverage of the swimming step-up** (`movement.rs`'s
+//! **There is zero synthetic coverage in THIS layer of the swimming step-up** (`movement.rs`'s
 //! `if (self.on_ground || swimming) && low_hit …` branch, the one that exists so a swimmer can
-//! haul OUT onto a bank, #191). Disabling it leaves every test in this layer green — that is a
-//! deliberately-recorded observation about the LID STRAND's mechanism (it is the depenetration
-//! push-out, not the step-up), and it is NOT a statement that the step-up is untested: the tree's
-//! coverage of it lives in `tests/walker_sim.rs`
-//! (`p1_haul_out_admission_matches_controller_execution`), which does go RED when it is disabled.
-//! A future reader must not infer from "these tests stayed green" that the step-up is unprotected.
+//! haul OUT onto a bank, #191) **or of its #661 downward mirror, `try_duck_under`**. Disabling
+//! either leaves every test in this layer green — that is a deliberately-recorded observation
+//! about the LID STRAND's mechanism (it was the depenetration net, not the step-up), and it is
+//! NOT a statement that either branch is untested: the step-up's coverage lives in
+//! `tests/walker_sim.rs` (`p1_haul_out_admission_matches_controller_execution`) and in
+//! `movement::tests::a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191`,
+//! both RED when it is disabled; the duck-under's lives in
+//! `movement::tests::a_swimmer_ducks_under_a_hanging_face_instead_of_stranding_at_it` and the
+//! asset-gated `qcat_pocket_swim_plane_swimmer_escapes_to_the_shaft`, both RED without it.
+//! A future reader must not infer from "these tests stayed green" that those branches are
+//! unprotected.
 //!
 //! # Coordinates
 //!

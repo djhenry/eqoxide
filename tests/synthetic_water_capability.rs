@@ -8,8 +8,8 @@
 //!
 //! **What is pinned here is the PHYSICAL CLAIM, not a shipped zone's coordinates.** The
 //! asset-gated tests assert things like "the qcat pocket surface is −55.978"; these assert "a
-//! swimmer is lifted to the DESTINATION column's swim plane" and (since #658) "the depenetration
-//! push-out recovers an afloat swimmer AT ITS OWN DEPTH rather than mounting it onto a lid". Both
+//! swimmer is lifted to the DESTINATION column's swim plane" and (since #658/#661) "a swimmer
+//! beside dry geometry is never carried onto it — it stays at its own depth, in the water". Both
 //! are worth having; neither replaces the other.
 
 mod synthetic_scenes;
@@ -71,44 +71,32 @@ fn try_to_sink(col: &Collision, from: [f32; 3], secs: f32) -> [f32; 3] {
 
 // ───────────────────────────── scene 1: the lid mount ─────────────────────────────
 
-/// **#649 FIXED, ON SYNTHETIC GEOMETRY: the push-out holds an afloat swimmer at its own depth
-/// instead of mounting it onto the lid.**
+/// **#649/#661, ON SYNTHETIC GEOMETRY: a swimmer beside the lid is never carried onto it.**
 ///
 /// A sealed flooded chamber whose ceiling quad sits **0.009 u above the waterline**. A swimmer
 /// floating at the chamber's own swim plane swims into the sealed chamber's east wall (there is
-/// nowhere else to go); `footprint_clear` fails there, which the controller's depenetration net
-/// reads as embedded, and its ring push-out runs.
+/// nowhere else to go) and must simply stop there — at its own depth, in the water.
 ///
-/// Before #658, that push-out hunted for the nearest FLOOR within `STEP_UP + GROUND_ORIGIN = 3.0`
-/// u of the body regardless of medium — water-blind — found the lid 2.009 u up, and placed the
-/// swimmer there: `on_ground = true`, DRY, buoyancy never firing again. Since #658 the net measures
-/// the medium once, at the body's own position (`movement::Recovery::at_column`): an afloat body is
-/// recovered **at its own depth** in any ring candidate whose column is still water, never onto a
-/// floor. Here every candidate at the swim plane's height is still water (the lid is 2 u higher),
-/// so the ring finds a nearby clear spot along the same wall and returns `Recovery::Afloat` at the
-/// UNCHANGED z — the swimmer ends up nudged into a corner of the chamber, still floating at its own
-/// swim plane, never touching the lid.
+/// # How the controller has satisfied this claim, across three revisions
+///
+/// Before #658, the depenetration net's push-out hunted for the nearest FLOOR within
+/// `STEP_UP + GROUND_ORIGIN = 3.0` u of an "embedded" body regardless of medium — water-blind —
+/// found the lid 2.009 u up, and placed the swimmer there: `on_ground = true`, DRY, buoyancy never
+/// firing again. #658 kept the net running for swimmers but recovered an afloat body at its own
+/// depth (`Recovery::Afloat`) whenever the ring candidate was still water. #661 then measured, at
+/// the real qcat coordinate, that the half-measure still failed two ways (the dry-candidate beach
+/// and the input-eating ping-pong) and removed the swimmer from the net entirely: a floating body
+/// never enters it, `Recovery::Afloat` no longer exists, and what stops this swimmer at the wall
+/// is the collided slide alone. The assertions below never named the mechanism, only the outcome —
+/// own depth, wet, not the lid — and pin all three revisions' shared claim.
 ///
 /// # How this compares to the baked-`qcat` twin, precisely
 ///
-/// `tests/water_capability.rs`'s `qcat_pocket_swim_plane_strands_the_swimmer_on_the_tile_floor`
-/// (renamed alongside #658) shows the identical push-out fix at the real coordinate — one frame
-/// from the qcat swim plane now holds depth (`the_depenetration_push_out_holds_a_qcat_swimmer_at_
-/// its_own_depth`) instead of mounting the tile floor as it did pre-fix. But driven for the full
-/// 12 s toward the shaft, qcat's swimmer STILL ends up dry at −55.9687 — not through this
-/// mechanism, but through a SECOND, independent one: the swimming step-up (the #191 haul-out
-/// branch) climbs the same 2.009 u once the swimmer has drifted onto the tile floor's own
-/// footprint. That residual live wedge is tracked separately as **#661**.
-///
-/// This synthetic chamber has no bank for that second mechanism to reach — it is sealed on all six
-/// sides with nothing at swim-plane height but water and the wall it presses into (see
-/// `synthetic_scenes`'s module doc for why the swimming step-up has zero coverage in this layer),
-/// so this test is not expected to flip again when #661 is fixed.
-///
-/// The SUB-MECHANISM fixed here was confirmed identical to qcat's by mutation, not by resemblance:
-/// removing only the push-out's UPWARD reach (`nearest_floor(e, n, p[2], 0.0, GROUND_DEPTH)` —
-/// leaving depenetration otherwise intact) used to turn both this test and its qcat twin red for
-/// the same reason; #658's fix is what makes both hold depth instead.
+/// `tests/water_capability.rs`'s pocket test shows the same coordinate live: under #658 the
+/// swimmer still ended dry at −55.9687 (that residual wedge was #661), and since the #661 fix that
+/// test asserts the ESCAPE (`qcat_pocket_swim_plane_swimmer_escapes_to_the_shaft`). This chamber
+/// is sealed on all six sides, so there is no escape to assert here — a swimmer that stays wet at
+/// its own depth beside the wall is the whole correct outcome.
 ///
 /// What this test does NOT pin is qcat's own coordinates — `POCKET_LID_Z` was copied from that file
 /// (see its doc) purely so this chamber's geometry sits in the same band; the near-agreement of the
@@ -141,13 +129,14 @@ fn a_swimmer_at_the_pocket_swim_plane_holds_its_own_depth_not_the_lid() {
 /// This no longer builds on the test above: since #658, ordinary swimming in this chamber never
 /// puts a character on the lid (see `a_swimmer_at_the_pocket_swim_plane_holds_its_own_depth_not_
 /// the_lid`), so the position here is manually authored rather than reached by driving the
-/// controller. What survives is the property that used to make the pre-#658 push-out mount
-/// permanent — and would make any FUTURE dry mount on this lid equally permanent, whether from a
-/// regression in #658, from #661's separate swimming-step-up mechanism reaching this height in some
-/// other geometry, or from a GM teleport: `want_swim` only does anything when `in_water`, so a
-/// downward swim wish from a DRY position moves nothing. The live #649 evidence was
+/// controller. What survives is the property that made every dry mount permanent — and would make
+/// any FUTURE one equally permanent, whether from a regression re-admitting floaters to the net
+/// (#661's measured writer was its dry-candidate beach), from a haul-out onto a floor with no way
+/// back, or from a GM teleport: `want_swim` only does anything when `in_water`, so a downward swim
+/// wish from a DRY position moves nothing. The live #649 evidence was
 /// `POST /v1/move/manual {"up":-1,"duration_ms":3000}` moving the character **0.00 u**; reproduced
-/// here to a tenth of a unit.
+/// here to a tenth of a unit. This irreversibility is exactly why #661's fix is shaped as "never
+/// mount a swimmer unasked" rather than "recover from a wrong mount" — there is no recovering.
 #[test]
 fn a_dry_mount_on_the_lid_is_one_way_a_downward_swim_wish_cannot_recover_it() {
     let col = scenes::sealed_pocket_with_lid();
@@ -175,14 +164,13 @@ fn a_dry_mount_on_the_lid_is_one_way_a_downward_swim_wish_cannot_recover_it() {
 /// 1 u above it every time it pressed the wall again — still submerged, but by the same defective
 /// mechanism in its other direction.
 ///
-/// Since #658 the push-out no longer hunts a floor for an afloat body at all when the ring
-/// candidate is still water — it recovers the body AT ITS OWN DEPTH instead (`movement::Recovery::
-/// Afloat`). So removing the lid no longer changes the outcome: measured here, this scene now ends
-/// at essentially the SAME z as the with-lid scene above (-57.978, its own swim plane), not at the
-/// chamber floor. The control's claim is unchanged in substance — **the character stays submerged
-/// and never ends up above the waterline** — but the reason it holds is no longer "the nearer floor
-/// happens to be below the surface too"; it is that the push-out stopped moving an afloat body
-/// vertically at all.
+/// Since #658 the push-out no longer hunted a floor for an afloat body when the ring candidate was
+/// still water, and since #661 a floating body never enters the net at all. So removing the lid no
+/// longer changes the outcome: this scene ends at essentially the SAME z as the with-lid scene
+/// above (−57.978, its own swim plane), not at the chamber floor. The control's claim is unchanged
+/// in substance — **the character stays submerged and never ends up above the waterline** — but
+/// the reason it holds is no longer "the nearer floor happens to be below the surface too"; it is
+/// that the net stopped touching floating bodies entirely.
 #[test]
 fn without_the_lid_the_same_pocket_never_strands_the_swimmer_above_the_waterline() {
     let col = scenes::sealed_pocket_without_lid();
@@ -272,9 +260,11 @@ fn the_stepped_scene_really_has_two_surfaces_and_no_climbable_geometry() {
 /// that position and picked the next candidate, and so on: the body walked east one ring radius
 /// (1.0 u) per embedded frame — 60 u/s at 60 fps — ignoring wish input entirely, with `in_water`
 /// reporting stale-false the whole time (the net's early-return freezes the rest of `step`, so the
-/// real water probe never runs). `Recovery::at_column`'s `!is_embedded` guard on the afloat arm is
-/// the fix that shipped instead: a recovery must ALSO not be embedded, or by definition it is not a
-/// recovery — it is the next frame's starting point for exactly the same failure.
+/// real water probe never runs). The #649-era fix was a `!is_embedded` guard on the recovery;
+/// since #661 the protection is structural — a floating body never enters the net at all, so
+/// there is no recovery whose iteration could drift. (The `embedded` mirror used by the fixture
+/// checks below restates the net's DRY predicate; production now applies it only behind the
+/// floating-body door, which this scene's body never passes.)
 ///
 /// Driven for two input-free seconds (110 frames to let anything that is going to happen settle,
 /// then 10 more to check it has actually stopped) with a completely idle intent — no wish direction,
