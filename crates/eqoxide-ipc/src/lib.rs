@@ -1360,6 +1360,29 @@ pub struct NavStatus {
     /// `nav_state: navigating` needs to know, in the same snapshot, whether the tier that is actually
     /// steering it can see a way through the next 40 u.
     pub local:  Option<NavLocal>,
+    /// **SESSION-scoped, latched: the fine worker thread has died** (#766 review B3). `true` once
+    /// `LocalPlanner::is_dead()` has been observed; never cleared, because the thread never comes
+    /// back — recovering it needs a client restart. Published as the top-level `nav_local_planner_dead`
+    /// on GET /v1/observe/debug, always, in both states: an agent checking its own health needs to be
+    /// able to read "alive", not merely fail to read "dead".
+    ///
+    /// This field exists because `local` could not carry the fact honestly. `NavLocal` is a PER-GOAL
+    /// verdict and #766 retires it with the goal, but `planner_dead` was riding in it as one of its
+    /// three publishable `state` values while being a session fact about the *client*, not a
+    /// statement about any goal — and `local` was its only publication surface in the tree (the
+    /// `no_path`/`planner_dead` pair on `state`/`reason` comes from the COARSE planner). So
+    /// retirement destroyed it, and the review found the consequence: an agent between goals — exactly
+    /// when it polls `/v1/observe/debug` to decide what to do next — could not learn that its fine
+    /// planner was dead. Splitting the session fact out of the per-goal row fixes that without a
+    /// carve-out in [`NavStatus::retire_to_idle`], which would have re-opened the very
+    /// clear-`local`-on-every-`idle` uniformity #766 exists to create.
+    ///
+    /// **Known limit, stated rather than implied.** `LocalPlanner`'s death is only *discoverable*
+    /// through a failed send or a disconnected receive, both of which happen on a tick that has a
+    /// committed route. A worker that dies and is never posted to again is not detectable by any
+    /// reader, this field included; what the latch guarantees is that once the death HAS been seen it
+    /// stays visible for the rest of the session instead of dying with the next goal.
+    pub local_planner_dead: bool,
 }
 
 /// A named obstruction with a position — the agent-facing form of `traversability::Blockage`
@@ -1433,9 +1456,16 @@ impl NavStatus {
     /// does — this function does not touch `LocalPlanner`, and every NON-`idle` state keeps `local`
     /// exactly as before, which is what preserves #382's deliberate keep-the-fine-verdict-on-`blocked`
     /// design (`Walker::stop_nav_blocked` publishes `blocked`/`no_path`, never `idle`, so it does not
-    /// come through here). It does not hold for the published FIELD on an `idle` row: `NavLocal` is
-    /// the fine planner's verdict on threading toward *the goal that just ended*, so it is a per-goal
-    /// fact by the same argument as `tier`.
+    /// come through here). It does not hold for the published FIELD on an `idle` row: a `NavLocal`
+    /// carrying `no_way_through` or `exhausted` is the fine planner's verdict on threading toward *the
+    /// goal that just ended*, so it is a per-goal fact by the same argument as `tier`.
+    ///
+    /// **That argument covers two of the three publishable states, not all three** (review B3).
+    /// `planner_dead` was never a verdict about a goal — it is a latched, session-scoped client fault
+    /// that happened to be riding in this field as one of its three publishable `state` values, and
+    /// retiring it with the
+    /// goal would hide a dead fine worker from an agent between goals. It is not carved out here;
+    /// it now has its own session-scoped field, `local_planner_dead`, which this function KEEPS.
     ///
     /// Before #766 the routes did not agree with each other. `zoned` — the reported one — and
     /// `zone_cross_dropped_unhandled` left the verdict standing. The rest already cleared it, by two
@@ -1459,8 +1489,20 @@ impl NavStatus {
     /// construction.** Its `state` is a `&str`, so nothing stops a future caller passing `"idle"`
     /// and routing a terminal `blocked` through this retirement after all. Every call site in the
     /// tree today passes a literal — `blocked`, `no_path`, `search_exhausted` — so the design holds
-    /// now; a `debug_assert!(state != "idle", …)` there would make it structural, and is worth
-    /// doing outside this issue's scope. Recorded as a known limit rather than left implied.
+    /// now, but it is grep-checkable, not enforced.
+    ///
+    /// The structural remedy is a typed `state` — an enum whose `idle` variant `stop_nav_blocked`
+    /// cannot name — and that is a workspace-wide change, out of this issue's scope. A
+    /// `debug_assert!(state != "idle", …)` would NOT be that remedy, and the earlier draft of this
+    /// paragraph was wrong to call it structural (review B4): `debug_assert!` compiles out under
+    /// `--release`, so it is a test-time instrument. That is not a new opinion: it is the same
+    /// argument `Walker::set_nav_local`'s doc makes for taking a coercion instead of an assert, and
+    /// the repo already says it out loud about the #725 writer guard — the doc on
+    /// `a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725` in
+    /// `eqoxide-nav` calls that `debug_assert!` "a TEST-TIME instrument, not a runtime one". It would
+    /// raise
+    /// the odds of catching a bad call site in CI; it would not make the invariant hold in the shipped
+    /// binary. Recorded as a known limit rather than left implied.
     pub fn retire_to_idle(&mut self, why: Option<&str>) {
         // The same writer-level guard as `Walker::set_nav_state_because` and
         // `CommandState::stamp_new_goal`: on `idle`, `nav_reason: null` is reserved for boot (#725).
@@ -1483,6 +1525,12 @@ impl NavStatus {
             // Clearing it on `idle` clears that input too, which is what we want: on an `idle` row
             // there is no goal, so there is no corridor for it to be an opinion about.
             local,
+            // KEPT, deliberately — and this is the field the E0027 net was built for. A dead fine
+            // worker is a SESSION fact about the client, not a fact about the goal that just ended,
+            // and it is latched because the thread does not come back. Clearing it here would tell an
+            // agent between goals that its degraded steering had healed. See the field's own doc for
+            // why it is a separate field rather than a carve-out in the `local` arm above.
+            local_planner_dead: _keep_local_planner_dead,
         } = self;
         *state  = "idle".to_string();
         *reason = why.map(str::to_string);
@@ -1498,7 +1546,7 @@ impl Default for NavStatus {
     fn default() -> Self {
         NavStatus { state: "idle".into(), reason: None, local: None,
             blocked_goal: None, blocked_frontier: None, tier: None,
-            goal_id: 0, goal: None }
+            goal_id: 0, goal: None, local_planner_dead: false }
     }
 }
 
@@ -1506,7 +1554,7 @@ impl From<&str> for NavStatus {
     fn from(state: &str) -> Self {
         NavStatus { state: state.to_string(), reason: None, local: None,
             blocked_goal: None, blocked_frontier: None, tier: None,
-            goal_id: 0, goal: None }
+            goal_id: 0, goal: None, local_planner_dead: false }
     }
 }
 

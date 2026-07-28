@@ -513,12 +513,49 @@ impl Walker {
     /// can retire the row from the HTTP thread in between, so a verdict computed while the goal was
     /// live can arrive after it is gone — no call site is wrong. An assert cannot prevent that, and
     /// it is compiled out of `--release` besides, so it would leave the documented universal false
-    /// in the shipped binary. Dropping the value instead makes it true in every profile. Nothing is
-    /// lost: the verdict describes a goal that no longer exists.
+    /// in the shipped binary. Dropping the value instead makes it true in every profile.
+    ///
+    /// **What is lost by dropping it, precisely** (review B3). For `no_way_through` and `exhausted`,
+    /// nothing: they are verdicts about threading toward a goal that no longer exists. The earlier
+    /// draft of this doc said that of all of them, and it was false for the third publishable state.
+    /// `planner_dead` is a latched session fault about the *client*, not about any goal, and dropping
+    /// it here would have hidden a dead fine worker from an agent between goals — which is when an
+    /// agent polls `/v1/observe/debug` to decide what to do next. That fact is no longer carried in
+    /// this field alone: [`Walker::latch_local_planner_liveness`] mirrors it into the session-scoped
+    /// `NavStatus::local_planner_dead`, which retirement keeps and this coercion does not touch. So
+    /// the sentence is now true as scoped, because the code makes it true, not because it was
+    /// narrowed until it stopped saying anything.
     pub fn set_nav_local(&self, local: Option<eqoxide_ipc::NavLocal>) {
         let mut s = self.nav.nav_state.lock().unwrap();
         let local = if s.state == "idle" { None } else { local };
         if s.local != local { s.local = local; }
+    }
+
+    /// Mirror the fine worker's death into the SESSION-scoped `NavStatus::local_planner_dead` (#766
+    /// review B3). Latched: `LocalPlanner::is_dead()` is itself latched, and this only ever sets.
+    ///
+    /// Called from the `is_dead()` branch in [`Walker::drive_walk`], beside the per-goal
+    /// `nav_local` publication it backs up. **That is the DISCOVERY site, and discovery is the
+    /// constraint** — an earlier draft of this method put the call at the top of the walk tick and
+    /// claimed the placement was "unconditional"; the test below failed and was right to. Two things
+    /// falsify that: `drive_walk` returns early in three places above it (`halt_no_world`, the coarse
+    /// `planner.is_dead()` stop, `awaiting_first_plan`), and `ActionLoop::tick` does not call
+    /// `drive_walk` at all once `resolve_goal` returns `None`. There is no "every tick" to hook.
+    ///
+    /// So the latch is placed where the fact first becomes knowable. `LocalPlanner`'s death is only
+    /// discoverable through a failed send or a disconnected receive — `post_if_idle` and `poll`, both
+    /// inside the `have_path` branch, both above this check on the same tick. Latching here therefore
+    /// records it on the very tick it is discovered, and because the record is on the shared row
+    /// rather than in the per-goal verdict, the later retirement cannot take it away. What changes is
+    /// not WHEN the fault is seen but how long it stays visible: for the rest of the session, instead
+    /// of until the next goal ends.
+    ///
+    /// The residual limit is stated on the field: a worker that dies and is never posted to again is
+    /// not discoverable by any reader, this one included.
+    pub fn latch_local_planner_liveness(&self) {
+        if !self.local_planner.is_dead() { return; }
+        let mut s = self.nav.nav_state.lock().unwrap();
+        if !s.local_planner_dead { s.local_planner_dead = true; }
     }
 
     /// The player's position for the snapshot — **`None` until the server has told us where we
@@ -1465,6 +1502,11 @@ impl Walker {
                     state: "planner_dead".into(), reason: "local_planner_dead".into(),
                     stuck_ticks: 0, plan_us: 0,
                 }));
+                // #766 B3: and mirror it into the SESSION-scoped row, which retirement keeps. The
+                // `set_nav_local` above is a PER-GOAL channel that #766 now retires on every route
+                // to `idle` — correct for the two verdict states, wrong for this one. See the
+                // method's doc for why this call sits here and not somewhere more general.
+                self.latch_local_planner_liveness();
             }
 
             // LOS clamp (#685): shorten the carrot at a convex corner so the walker rounds it instead
@@ -2765,12 +2807,22 @@ mod tests {
     /// race, because `set_nav_local` is called from the net thread while `POST /v1/move/stop` retires the
     /// row from the HTTP thread, each taking the `nav_state` lock separately. A verdict computed
     /// while the goal was live can therefore land after it is gone, with no call site at fault.
-    /// `set_nav_local` coerces it away; this measures both directions of that coercion, because a
-    /// guard that swallowed everything would satisfy the negative half on its own.
+    /// `set_nav_local` coerces it away; this measures three directions of that coercion, because a
+    /// guard that swallowed everything would satisfy the negative half on its own — and, per review
+    /// B5, because a guard keyed on the WRONG thing would satisfy the first two.
     ///
-    /// Mutation check: delete `let local = if s.state == "idle" { None } else { local };` from
-    /// `Walker::set_nav_local` → the post-retirement assertion goes RED and the mid-goal one stays
-    /// GREEN. The line can fire, and it fires only where it should.
+    /// **Why three and not two.** The first two directions are `navigating`+`reason: None` and
+    /// `idle`+`reason: Some`, which vary two things at once, so any predicate separating those rows
+    /// passes: the reviewer replaced the guard with `if s.reason.is_some()` and the whole workspace
+    /// stayed green. The third direction is `blocked`+`reason: Some` — non-`idle` *and* carrying a
+    /// reason — which is exactly the row that tells a state-keyed guard apart from a reason-keyed one.
+    ///
+    /// Mutation checks, both RUN on this branch, not reasoned. (a) Delete
+    /// `let local = if s.state == "idle" { None } else { local };` from `Walker::set_nav_local` →
+    /// the post-retirement assertion goes RED, the other directions stay GREEN. (b) Replace it with
+    /// `if s.reason.is_some() { None } else { local }` → `eqoxide-nav` reports
+    /// `FAILED. 214 passed; 1 failed; 16 ignored`, the one failure being the `blocked` assertion in
+    /// this test. So the line can fire, fires only where it should, and keys on the right field.
     #[test]
     fn a_verdict_arriving_after_the_goal_is_retired_is_not_published_766() {
         let (w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
@@ -2802,6 +2854,102 @@ mod tests {
              toward one — publishing it here would tell the agent the fine planner is stuck on a \
              goal it no longer has. `docs/http-api.md` states this as a universal over the row, \
              so the row must hold it for its whole lifetime, not just at the transition");
+
+        // Direction 3 — a TERMINAL `blocked` row, which carries a reason. This is the direction that
+        // makes the test able to see a WRONG predicate (review B5). Directions 1 and 2 vary two
+        // things at once (`navigating`+no reason vs `idle`+reason), so any predicate separating those
+        // two rows passes them both — the reviewer drove `if s.reason.is_some()` through the entire
+        // workspace green. `blocked` is non-`idle` AND carries a reason, so it separates the two.
+        //
+        // It also pins #382's keep-the-verdict-as-EVIDENCE design, which had no test anywhere in the
+        // tree despite being this field's most load-bearing documented behaviour on a non-`idle` row:
+        // on a terminal failure the fine tier's verdict is the evidence BEHIND the failure the agent
+        // is being told about, so suppressing it would delete the explanation and keep the complaint.
+        w.set_nav_state_because("blocked", Some("local_no_way_through"));
+        w.set_nav_local(verdict());
+        assert_eq!(nav.nav_state.lock().unwrap().local, verdict(),
+            "#766 B5 / #382: a terminal `blocked` row MUST keep the fine tier's verdict — it is the \
+             evidence behind the failure being reported, and `Walker::local_says_no_way_through` \
+             reads it back as a steering input. The guard keys on `state == \"idle\"` and nothing \
+             else; a predicate that keyed on `reason` instead would pass every other assertion in \
+             this test and silently break this design");
+    }
+
+    /// **#766 review B3 — a dead fine worker is a SESSION fault and must outlive the goal.**
+    ///
+    /// `planner_dead` is one of the three publishable `nav_local.state` values, but unlike
+    /// `no_way_through` / `exhausted` it is not a verdict about a goal: it is a latched client fault
+    /// meaning steering has permanently degraded to the coarse 8 u route. #766 retires `nav_local` on
+    /// every route to `idle`, and the review found the consequence — an agent BETWEEN goals, which is
+    /// when it polls to decide what to do next, could no longer see that its fine planner was dead.
+    /// `nav_local` is its only publication surface in the tree (the `no_path`/`planner_dead` pair on
+    /// `nav_state` comes from the COARSE planner, a different object).
+    ///
+    /// The fix is a separate session-scoped field, not a carve-out in `retire_to_idle` — that would
+    /// have re-opened the clear-on-every-`idle` uniformity #766 exists to create.
+    ///
+    /// **This test is driven end-to-end by production `drive_walk`, and an earlier draft that was not
+    /// is why.** That draft called `drive_walk` with an EMPTY path, on the theory that a latch placed
+    /// inside the `have_path` branch would be unobservable between goals. It went RED, and it was
+    /// right: three early returns sit above that point (`halt_no_world`, the COARSE `planner.is_dead()`
+    /// stop, `awaiting_first_plan`), and `ActionLoop::tick` does not call `drive_walk` at all once
+    /// `resolve_goal` returns `None` — so there is no "between goals" tick to latch on. The fact is
+    /// only ever knowable inside `have_path`, because that is where the channel is touched. So the
+    /// latch goes at the point of DISCOVERY and the row carries it forward from there. Below, the test
+    /// kills the worker and then hands the whole job to `drive_walk`: it does not call
+    /// `is_dead()` in a loop to force the state, and it does not call the latch itself.
+    ///
+    /// Mutation checks, both RUN. Delete the `latch_local_planner_liveness()` call from `drive_walk`
+    /// → `eqoxide-nav` reports `FAILED. 214 passed; 1 failed; 16 ignored`, the failure being this
+    /// test's discovery assertion. Clear `local_planner_dead` in `retire_to_idle` instead of keeping
+    /// it → `eqoxide-nav` `214 passed; 1 failed` (this test's post-retirement assertion) **and**
+    /// `eqoxide-http` `246 passed; 1 failed` (the endpoint test). Two lines in two crates, an
+    /// assertion each, and the second is visible from the published API as well as from the row.
+    #[test]
+    fn a_dead_fine_planner_stays_visible_after_the_goal_is_retired_766() {
+        let (mut w, nav, _intent, _view) = walker_with(open_plane(400.0));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.world.zone_name = TEST_ZONE.into(); // #600: loaded-zone match, or drive_walk halts early
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
+
+        // A committed route the walker is following — the ONLY situation in which the fine tier is
+        // touched at all, and therefore the only one in which its death is discoverable.
+        let goal = (60.0, 0.0, 0.0);
+        *nav.goto_target.lock().unwrap() = Some(goal);
+        w.set_nav_state("navigating");
+        w.path = vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [40.0, 0.0, 0.0], [60.0, 0.0, 0.0]];
+        w.path_i = 0;
+        w.path_goal = Some(goal); // same goal → no replan, no `awaiting_first_plan`
+
+        // Kill the fine worker the way a panic does: its reply `Sender` drops. Nothing has NOTICED
+        // yet — noticing is a failed send or a disconnected receive, and both live in `drive_walk`.
+        w.local_planner.kill_worker_for_test();
+        assert!(!nav.nav_state.lock().unwrap().local_planner_dead,
+            "PREMISE: nothing has published the fault yet, so the assertion below measures the \
+             latch and not a value that was already there");
+
+        w.drive_walk(&mut gs, goal);
+
+        assert!(nav.nav_state.lock().unwrap().local_planner_dead,
+            "#766 B3: production `drive_walk` discovered the fine worker's death on this tick and \
+             must record it on the SESSION-scoped row, not only in the per-goal verdict — steering \
+             has permanently degraded to the coarse 8u route and the thread does not come back");
+        assert_eq!(nav.nav_state.lock().unwrap().local.as_ref().map(|l| l.state.clone()),
+            Some("planner_dead".into()),
+            "PREMISE: the pre-existing per-goal publication still happens — the session field is an \
+             addition beside it, not a replacement for it");
+
+        // …and now the retirement that #766 made uniform. This is the exact interleaving the review
+        // found: `nav_local` goes `null` and the agent is between goals, which is when it polls.
+        w.reset_for_zone_change();
+        let s = nav.nav_state.lock().unwrap();
+        assert_eq!(s.state, "idle");
+        assert_eq!(s.local, None,
+            "PREMISE: the per-goal verdict is still retired — the session field is an addition, not \
+             a hole in #766's guarantee");
+        assert!(s.local_planner_dead,
+            "#766 B3: the thread does not come back, so the fault does not heal. Clearing it here \
+             would tell an agent its degraded steering had recovered when nothing recovered it");
     }
 
     /// **#766, the OTHER walker route to `idle` — and it is here to MEASURE a claim, not to guard a

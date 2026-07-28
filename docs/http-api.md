@@ -840,7 +840,7 @@ said. It is **`null` while the tier is healthy** (a complete fine route to its c
 |---------|---------|
 | `no_way_through` | The fine planner **closed its entire 40 u window** and found no way along the committed coarse route from here. A falsifiable **local** "no" — the coarse route is being re-planned around it. It says **nothing** about whether your goal is reachable. |
 | `exhausted` | The fine search was **cut short** (node cap) before closing its window: **"I don't know"**, not "no". The walker is steering on the best partial it has. |
-| `planner_dead` | The fine worker thread has **died**. Steering has degraded to the coarse 8 u route for the rest of the session — the character **keeps walking**, but handles thin ramps and narrow openings worse. A client fault; restart to recover it. |
+| `planner_dead` | The fine worker thread has **died**. Steering has degraded to the coarse 8 u route for the rest of the session — the character **keeps walking**, but handles thin ramps and narrow openings worse. A client fault; restart to recover it. **Do not poll for this here** — it is a session fault, not a per-goal verdict, so it disappears from `nav_local` when the goal is retired. Read `nav_local_planner_dead` instead. |
 
 > **`nav_local.state` is never `no_path`, and structurally cannot be.** A 40 u window can never prove a
 > *goal* unreachable, so a tight doorway must never be able to tell an agent its destination does not
@@ -877,6 +877,31 @@ corridor is not threadable" from "the steering planner hasn't caught up." `nav_l
 > the real nav root cause for months and caused several false diagnoses. **A timeout is never
 > reported as "no route"**, and an unreachable goal is now reported before the character takes a
 > single step.
+
+### `nav_local_planner_dead` — fine-planner liveness, session-scoped
+
+```json
+"nav_local_planner_dead": false
+```
+
+**Always present, in both states.** `true` once the fine worker thread has been observed dead; never
+returns to `false`, because the thread does not come back — recovering it needs a client restart.
+
+This field exists because the `nav_local`-is-`null`-on-`idle` rule above would otherwise hide a client
+fault. Two of `nav_local`'s three states — `no_way_through`, `exhausted` — are verdicts about
+threading toward *a goal*, so retiring them with the goal is right. `planner_dead` is not: it is a
+latched fault about the client itself that happened to be riding in the same field. Left there, it
+would vanish on every retirement, so an agent **between goals** — exactly when you poll
+`/v1/observe/debug` to decide what to do next — could not learn that its steering had permanently
+degraded to the coarse 8 u route. It would reappear only after a new goal had committed a route.
+
+So check liveness here, not in `nav_local`. `nav_local` still reports `planner_dead` while a route is
+committed, which is useful in context; this is the channel that does not vanish when the route does.
+
+**One honest limit.** The worker's death is only *discoverable* through a failed send or a
+disconnected receive, and both happen on a tick that has a committed route. A worker that dies and is
+never posted to again is not detectable by any reader, this field included. What is guaranteed is that
+once the death has been seen, it stays visible for the rest of the session.
 
 ---
 

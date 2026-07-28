@@ -914,6 +914,18 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // clock" with no way to ask which, and `nav_state` said a confident `navigating` throughout.
         // The clock is gone; the ambiguity went with it.
         "nav_local": nav_local,
+        // SESSION-scoped fine-planner liveness (#766 review B3). `nav_local` above is a PER-GOAL
+        // verdict and #766 retires it with the goal — correct for `no_way_through` / `exhausted`, and
+        // wrong for `planner_dead`, which is a latched client fault, not a statement about a goal.
+        // Carried here it survives every retirement, so an agent BETWEEN goals — which is when it
+        // polls this endpoint to decide what to do next — can still see that its steering has
+        // permanently degraded to the coarse 8u route. `planner_dead` still appears in `nav_local`
+        // while a route is committed; this is the channel that does not vanish when the route does.
+        //
+        // Always present, in BOTH states, unlike the `null`-when-healthy fields around it: checking
+        // your own health needs a readable "alive", not merely the absence of "dead" — which is
+        // indistinguishable from an older client that never had the field.
+        "nav_local_planner_dead": nav.local_planner_dead,
         // The agent-honesty payload behind a terminal `no_path` (#378 Phase 2). `null` when there is
         // nothing to report. `goal` (if present) is the DEFINITIVE "your goal itself cannot be stood
         // at"; `frontier` is the hazard at the search's CLOSEST APPROACH — one blocking fact, named
@@ -2984,6 +2996,64 @@ mod tests {
             "#766: `no_way_through` beside `idle`/`zoned` describes a corridor in the zone the \
              reader has LEFT, computed against a collision grid that no longer exists — the fine \
              tier's verdict is about threading toward a goal, so it retires with the goal");
+    }
+
+    /// **#766 review B3 — the session-scoped fault must NOT retire with the goal.**
+    ///
+    /// The counterweight to the test above, and the reason this PR did not simply narrow a sentence.
+    /// `planner_dead` is the third publishable `nav_local.state`, and it is not a verdict about a
+    /// goal: it is a latched client fault meaning steering has permanently degraded to the coarse
+    /// 8 u route. Retiring `nav_local` on every `idle` — which is #766's whole point — therefore hid
+    /// it from an agent BETWEEN goals, which is precisely when an agent polls this endpoint. So the
+    /// fault moved to its own session-scoped field and this measures the split at the JSON surface,
+    /// where an agent actually reads it: after the same retirement, the per-goal verdict is `null`
+    /// and the session fault is still `true`.
+    ///
+    /// It also pins the always-present shape. A `null`-when-healthy field would make "alive"
+    /// indistinguishable from "this client is too old to have the field", and a health check you
+    /// cannot distinguish from a missing feature is not a health check.
+    ///
+    /// Mutation check, RUN: clear `local_planner_dead` in `NavStatus::retire_to_idle` instead of
+    /// keeping it → this crate reports `246 passed; 1 failed`, the failure being the final assertion
+    /// here (and `eqoxide-nav` goes red on its own row-level assertion, separately). The
+    /// always-present shape is pinned by the first assertion but NOT mutation-checked — omitting a
+    /// key from a `json!` literal is a shape change, not a behaviour one, and I did not run it.
+    #[tokio::test]
+    async fn debug_keeps_publishing_a_dead_fine_planner_after_the_goal_is_retired_766() {
+        let state = empty_state();
+        let v = debug_json(state.clone()).await;
+        assert_eq!(v["nav_local_planner_dead"], serde_json::json!(false),
+            "PREMISE: liveness is published in BOTH states — a healthy client says so out loud, so \
+             the `true` below is a change this test caused and not a key that only ever appears \
+             when something is wrong");
+
+        {
+            let mut s = state.nav.nav_state.lock().unwrap();
+            s.goal_id = 4;
+            s.state   = "navigating".into();
+            s.local   = Some(eqoxide_ipc::NavLocal {
+                state: "planner_dead".into(), reason: "local_planner_dead".into(),
+                stuck_ticks: 0, plan_us: 0,
+            });
+            s.local_planner_dead = true;   // what `Walker::latch_local_planner_liveness` writes
+        }
+        let v = debug_json(state.clone()).await;
+        assert_eq!(v["nav_local"]["state"], serde_json::json!("planner_dead"),
+            "PREMISE: while a route is committed the fault is visible in BOTH channels, so the \
+             assertions below measure which one survives rather than which one exists");
+        assert_eq!(v["nav_local_planner_dead"], serde_json::json!(true));
+
+        state.nav.nav_state.lock().unwrap().retire_to_idle(Some("zoned"));
+
+        let v = debug_json(state).await;
+        assert_eq!(v["nav_local"], serde_json::json!(null),
+            "#766 is unchanged by B3: the per-goal channel still retires with the goal. The session \
+             field is an addition, not a hole in that guarantee");
+        assert_eq!(v["nav_local_planner_dead"], serde_json::json!(true),
+            "#766 B3: the worker thread does not come back — recovering it needs a client restart — \
+             so an agent between goals must still be able to read that its steering has degraded. \
+             Clearing this on retirement would report a recovery that never happened, which is the \
+             agent-honesty defect class #766 exists to close, not one it may create");
     }
 
     /// #471 (agent-honesty): the server placed two Mobs (consecutive spawn_ids, e.g. 526/527) at a
