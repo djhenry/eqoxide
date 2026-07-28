@@ -22,10 +22,12 @@ use crate::HttpState;
 /// `NetHealth::clock`, which a fixture pins, so a wall-clock stamp read back against it drifts by
 /// however long the test took (#760). Use `h.clock.ago(secs)` there. That ban is **partially**
 /// guarded by `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_
-/// one_that_reads_it` — a source scan over four files that reads one statement at a time, so it does
-/// catch the rustfmt-wrapped and struct-literal spellings but cannot see a stamp aliased through a
-/// local. Read that test's doc for the measured blind spots before relying on it: a wrong spelling
-/// it misses still compiles and still lands.
+/// one_that_reads_it` — a source scan over four files, one statement at a time. It catches the
+/// rustfmt-wrapped and struct-literal spellings. It does **not** catch a stamp aliased through a
+/// local, nor one whose value is produced inside a nested block or a `match` arm (the scan cuts
+/// statements at `{` and `}`, which separates the field from the call), nor anything in a file it
+/// does not scan. Read that test's doc for the full measured list before relying on it: a wrong
+/// spelling it misses still compiles and still lands.
 pub fn ago(secs: u64) -> std::time::Instant {
     std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(secs))
@@ -82,6 +84,16 @@ pub fn empty_state_wall_clock() -> HttpState {
 /// `EqStream` into a REAL send failure and then asserts the failure is visible in THIS crate's
 /// `/v1/observe/debug` JSON, i.e. that the fact reaches something the agent can poll rather than
 /// merely being published into an internal struct.
+///
+/// **This un-pins the health clock (#760/N3).** [`empty_state`] hands out a `NetHealth` frozen at
+/// construction so a handler test cannot race `SESSION_STALE_TICK_MS`; the caller-owned `Arc`
+/// replaces that wholesale, and callers build theirs with `NetHealth::default()`, i.e. the WALL
+/// clock. That is correct for #612's purpose — the subject is a real `EqStream` stamping real
+/// times — but it means a stamp written here is aged against the wall clock, so the two shapes in
+/// [`empty_state_wall_clock`]'s doc apply to this function too, and the `observe` guard does not
+/// scan the caller's crate. `crates/eqoxide-net/src/transport.rs:2679` past-dates
+/// `last_send_pressure_at` through this path today; it is correct precisely because the clock is
+/// the wall clock, which is the fact this paragraph exists to keep true.
 pub fn empty_state_with_net_health(net_health: eqoxide_ipc::NetHealthShared) -> HttpState {
     HttpState { net_health, ..empty_state() }
 }
@@ -207,3 +219,13 @@ pub async fn observe_json(state: HttpState, path: &str) -> serde_json::Value {
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
+
+/// Reach control for `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it` (#760/C1).
+///
+/// That guard scans this file's source text. A scanner that silently stops early — as it did, when
+/// a `/*` inside a route glob in a doc comment latched its block-comment state — reports
+/// a clean scan of a corpus it never read, which is a confident falsehood. The guard asserts it can
+/// SEE this constant; because it is the last item in the file, seeing it proves the scan arrived at
+/// the end. **Keep it last.**
+#[cfg(test)]
+pub(crate) const GUARD_REACH_SENTINEL_TESTKIT: u8 = 0;

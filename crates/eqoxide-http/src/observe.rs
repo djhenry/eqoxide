@@ -3426,34 +3426,81 @@ mod tests {
     /// `debug_reports_world_unresponsive_when_a_probe_goes_unanswered_while_the_link_acks`.
     ///
     /// A prose rule did not prevent it (the rule named only "an age that must move", not "an age
-    /// that must exceed a bound"), so this scans the source instead. `HealthClock::ago` is correct
-    /// for BOTH clocks — on a wall clock it is exactly `Instant::now() - N` — so there is no case
-    /// where the flagged form is the right one, which is why this is a blanket ban and not a
-    /// judgement call. Bare `Instant::now()` is deliberately NOT flagged: it dates a stamp to the
-    /// present, which saturates to age 0 against either clock.
+    /// that must exceed a bound"), so this scans the source instead.
     ///
-    /// # What this actually matches, and what it therefore cannot see
+    /// # What this matches
     ///
-    /// The unit of matching is a **comment-stripped statement**, not a physical line: the source is
-    /// stripped of `//` and `/* */` comments and then cut at `;`, `{` and `}`. A statement offends
-    /// when it mentions one of the eight [`STAMP_FIELDS`] *and* past-dates via a form that is not
-    /// clock-relative. This unit was chosen after review measured the physical-line version catching
-    /// **1 of 6** injected violation shapes; the misses included the shape **rustfmt itself writes**
-    /// (an assignment wrapped so the `=` and the `ago(` land on different lines), which already
-    /// occurs on `NetHealth` stamps in `eqoxide-net` today — benign there only because those
-    /// fixtures read on the wall clock.
+    /// The unit is a **statement**, not a physical line: comments and literals are removed by a
+    /// character scanner, and what is left is cut at `;`, `{` and `}`. A statement offends when it
+    /// mentions one of the eight [`STAMP_FIELDS`] *and* past-dates through a receiver that is not
+    /// the clock reading it back (see `receiver_is_the_reading_clock`). Flagged forms: `ago(`, and
+    /// `now()` followed by `-` or `.checked_sub`.
     ///
-    /// Past-dating forms flagged: any `ago(` whose receiver is not the reading clock (see
-    /// `receiver_is_the_reading_clock` — a bare `ago(` and `WALL.ago(` are both flagged; exempting
-    /// *any* `.ago(` regardless of receiver was review's sharpest miss), plus `now() -` / `now()-`
-    /// and `checked_sub`. Those last two are here because review's own sweep found past-dated sites
-    /// a bare `ago(` grep cannot see: **grep the concept, not the spelling.**
+    /// # Why the `now()` spelling is matched, stated honestly
     ///
-    /// Known blind spot, stated because it is real and not closable by a text scan: **aliasing
-    /// through a local.** `let s = ago(15); h.last_probe_sent = Some(s);` is two statements, neither
-    /// of which contains both halves, so it lands. Closing it needs dataflow, not text. Two lesser
-    /// ones: files outside the four scanned, and a ninth `Instant` field added to `NetHealth` and to
-    /// `health()` but not to [`STAMP_FIELDS`] — there is no cross-check against the struct.
+    /// It was added after a sweep for the CONCEPT rather than the field name found past-dated
+    /// `NetHealth` stamps a bare `ago(` grep does not see. That sweep is worth keeping as a
+    /// methodological result — **grep the concept, not the spelling** — but its sites do NOT
+    /// justify the widening on their own terms, and an earlier version of this comment implied they
+    /// did. Two corrections:
+    ///
+    /// 1. There are **seven**, not the three previously published — re-enumerated by sweeping
+    ///    `eqoxide-net` for all eight [`STAMP_FIELDS`] against all three past-dating spellings:
+    ///    `crates/eqoxide-net/src/gameplay.rs:1569, 1831, 1835, 1839` and
+    ///    `crates/eqoxide-net/src/transport.rs:1885, 1914, 2679`.
+    /// 2. Not one of them is reachable by this test — they are all in `eqoxide-net`, which is not in
+    ///    the scanned set below and cannot be (`include_str!` reaches only this crate's own files).
+    ///    And if the scan were extended to them they would all be **false positives**: each site's
+    ///    `NetHealth` is built by `Default` (checked at every one of the seven), so its stamps are
+    ///    past-dated from the wall clock and read back by the wall clock — the same clock — which is
+    ///    exactly the property this test exists to require.
+    ///
+    /// What the widening actually buys is confined to the four files below: the spelling is now
+    /// caught *there* if it ever appears, where today it does not.
+    ///
+    /// # How to probe this guard, and why it is written down
+    ///
+    /// A source scanner has TWO failure modes, and only one of them is obvious. It can fail to
+    /// recognise a bad *shape* — and it can silently fail to *arrive* at the code in the first
+    /// place. Round 3 of #760 had a twelve-cell shape table that was entirely void, because every
+    /// probe was placed inside this test's own body, which happened to be the only region of
+    /// `observe.rs` the scanner still reached: a `/*` inside a route glob in a doc comment on line 1
+    /// latched the block-comment state and blinded **87% of the corpus**, and the probes were sitting
+    /// in the window that this test's own `/* */`-containing doc had re-opened. The instrument was
+    /// measured only where it worked.
+    ///
+    /// So: **any probe of this guard must be placed at several depths in EVERY scanned file** — near
+    /// the top, mid-file, and near the end — and must be reported with two controls:
+    /// 1. a **positive control**, proving the injected shape is detectable at all, and
+    /// 2. a **reach control**, proving the scanner actually arrives at that location.
+    ///
+    /// Both controls are now permanent rather than ad-hoc: `scan_ended_clean` fails loudly if a file
+    /// ends mid-comment or mid-string (a real source file never does), and every scanned file ends
+    /// with a `GUARD_REACH_SENTINEL_*` const that this test asserts it can see.
+    ///
+    /// # What it still cannot see
+    ///
+    /// **Aliasing through a local.** `let s = ago(15); h.last_probe_sent = Some(s);` is two
+    /// statements, neither carrying both halves, so it lands unflagged. Closing that needs dataflow,
+    /// not text, and no amount of scanner care will do it.
+    ///
+    /// **A value produced inside a nested block or a `match` arm.** The cut at `{` and `}` puts
+    /// `h.last_tick =` and the `ago(30)` in `h.last_tick = { ago(30) };` into different statements,
+    /// so neither carries both halves. Same for a `match` that yields the stamp. Measured, with the
+    /// controls this doc demands: both spellings were injected at three depths in all four scanned
+    /// files (twelve locations) alongside a plain `now() -` positive control in the same function.
+    /// All twelve controls were flagged — so the scanner reached every location and the shape is
+    /// detectable there — and not one of the twenty-four brace/`match` forms was.
+    ///
+    /// Two lesser gaps: files outside the four named below, and a ninth `Instant` field added to
+    /// `NetHealth` and to `health()` but not to [`STAMP_FIELDS`] — that list is hand-maintained with
+    /// no cross-check against the struct.
+    ///
+    /// The rule is a SPELLING rule and errs toward flagging: it recognises the receivers `c.` and
+    /// `….clock.`, so a *correct* stamp taken from a binding named anything else is flagged too, and
+    /// so is a correct `self.now().checked_sub(…)` — which is the body of `HealthClock::ago` itself.
+    /// That method lives in `eqoxide-ipc` and is not scanned, but the point stands: a flagged line is
+    /// not automatically a wrong line.
     #[test]
     fn no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it() {
         /// Exactly the `NetHealth` fields `HttpState::health()` turns into an age. Adding a stamp
@@ -3464,32 +3511,92 @@ mod tests {
             "last_send_pressure_at", "last_send_error_at",
         ];
 
-        /// Comment-stripped statements, each kept as its (1-based line, text) fragments so an
-        /// offender can still be reported at the exact line that names the field.
-        fn statements(src: &str) -> Vec<Vec<(usize, String)>> {
-            let mut out: Vec<Vec<(usize, String)>> = Vec::new();
-            let mut cur: Vec<(usize, String)> = Vec::new();
-            let mut in_block = false;
-            for (i, raw) in src.lines().enumerate() {
-                // Strip `/* … */` (possibly spanning lines), then a trailing `//`.
-                let (mut code, mut rest) = (String::new(), raw);
-                while !rest.is_empty() {
-                    if in_block {
-                        match rest.find("*/") {
-                            Some(k) => { in_block = false; rest = &rest[k + 2..]; }
-                            None => break,
+        /// Code text per source line, with comments and literal contents removed, plus whether the
+        /// scan **ended clean** — i.e. not stranded inside a block comment or a string.
+        ///
+        /// The line-at-a-time version this replaces looked for `/*` before it truncated at `//`, so
+        /// a `/*` occurring *inside* a line or doc comment latched the block state permanently. That
+        /// is not a corner case: two of the four scanned files open with a `//!` doc line containing
+        /// a route glob (`/v1/observe/*`), which blinded the scanner from line 1. Literals are
+        /// skipped for the same family of reason — a `//` or `/*` inside a string is not a comment.
+        fn strip_to_code(src: &str) -> (Vec<String>, bool) {
+            #[derive(PartialEq, Clone, Copy)]
+            enum S { Code, Line, Block(u32), Str, Raw(usize), Chr }
+            let b: Vec<char> = src.chars().collect();
+            let at = |k: usize| -> char { b.get(k).copied().unwrap_or('\0') };
+            let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+            let mut out = vec![String::new()];
+            let (mut st, mut i) = (S::Code, 0usize);
+            while i < b.len() {
+                let c = b[i];
+                if c == '\n' {
+                    if st == S::Line { st = S::Code; }
+                    out.push(String::new());
+                    i += 1;
+                    continue;
+                }
+                match st {
+                    S::Line => i += 1,
+                    S::Block(d) => {
+                        if c == '*' && at(i + 1) == '/' {
+                            st = if d == 1 { S::Code } else { S::Block(d - 1) };
+                            i += 2;
+                        } else if c == '/' && at(i + 1) == '*' {
+                            st = S::Block(d + 1); // Rust block comments nest.
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    S::Str => {
+                        if c == '\\' { i += 2; } else { if c == '"' { st = S::Code; } i += 1; }
+                    }
+                    S::Raw(h) => {
+                        if c == '"' && (1..=h).all(|k| at(i + k) == '#') { st = S::Code; i += h + 1; }
+                        else { i += 1; }
+                    }
+                    S::Chr => {
+                        if c == '\\' { i += 2; } else { if c == '\'' { st = S::Code; } i += 1; }
+                    }
+                    S::Code => {
+                        let prev_is_ident = i > 0 && ident(b[i - 1]);
+                        // NB the branch ORDER here is not what fixes C1 — `//` and `/*` differ in
+                        // their second character, so they can never both match. The fix is that
+                        // `S::Line` skips to end-of-line, so a `/*` sitting inside a line or doc
+                        // comment is never read as an opener at all. The version this replaced
+                        // stripped block comments in a whole-line pass BEFORE truncating at `//`,
+                        // which is exactly how a route glob in a `//!` line latched it forever.
+                        if c == '/' && at(i + 1) == '/' { st = S::Line; i += 2; }
+                        else if c == '/' && at(i + 1) == '*' { st = S::Block(1); i += 2; }
+                        else if c == '"' { st = S::Str; i += 1; }
+                        else if (c == 'r' || (c == 'b' && at(i + 1) == 'r')) && !prev_is_ident && {
+                            let j = i + if c == 'b' { 2 } else { 1 };
+                            let mut h = 0;
+                            while at(j + h) == '#' { h += 1; }
+                            at(j + h) == '"'
+                        } {
+                            let j = i + if c == 'b' { 2 } else { 1 };
+                            let mut h = 0;
+                            while at(j + h) == '#' { h += 1; }
+                            st = S::Raw(h);
+                            i = j + h + 1;
                         }
-                    } else {
-                        match rest.find("/*") {
-                            Some(k) => { code.push_str(&rest[..k]); in_block = true; rest = &rest[k + 2..]; }
-                            None => { code.push_str(rest); break; }
-                        }
+                        // `'` is a char literal only if it closes; otherwise it is a lifetime.
+                        else if c == '\'' && (at(i + 1) == '\\' || at(i + 2) == '\'') { st = S::Chr; i += 1; }
+                        else { out.last_mut().unwrap().push(c); i += 1; }
                     }
                 }
-                if let Some(k) = code.find("//") { code.truncate(k); }
-                // Cut at statement and block boundaries so unrelated code never merges into one
-                // statement (which would invent co-occurrences and fire falsely).
-                for (n, piece) in code.split([';', '{', '}']).enumerate() {
+            }
+            (out, matches!(st, S::Code | S::Line))
+        }
+
+        /// Statements, each kept as its (1-based line, text) fragments so an offender is still
+        /// reported at the exact line that names the field.
+        fn statements(code: &[String]) -> Vec<Vec<(usize, String)>> {
+            let mut out: Vec<Vec<(usize, String)>> = Vec::new();
+            let mut cur: Vec<(usize, String)> = Vec::new();
+            for (i, line) in code.iter().enumerate() {
+                // Cut at statement AND block boundaries, so unrelated code never merges into one
+                // "statement" and invents a co-occurrence that fires falsely.
+                for (n, piece) in line.split([';', '{', '}']).enumerate() {
                     if n > 0 && !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
                     if !piece.trim().is_empty() { cur.push((i + 1, piece.to_string())); }
                 }
@@ -3498,45 +3605,70 @@ mod tests {
             out
         }
 
-        /// Is this `ago(` call's RECEIVER the health clock that will read the stamp back?
+        /// Is this call's RECEIVER the health clock that will read the stamp back?
         ///
-        /// Exempt spellings are `c.ago(` (the convention every call site uses, `let c = h.clock;`)
-        /// and `….clock.ago(`. Everything else is flagged — a free `ago(`, and equally
-        /// `HealthClock::WALL.ago(` or any other receiver. The old rule exempted *any* `.ago(`,
-        /// which review showed lets `wall.ago(30)` into a pinned fixture: that is #760 exactly.
-        ///
-        /// This is a SPELLING rule, so it is deliberately conservative — a correct stamp taken from
-        /// a binding named something other than `c` is flagged too. The fix is to rename it to `c`.
+        /// Exempt spellings are `c.` (the convention every call site uses, `let c = h.clock;`) and
+        /// `….clock.`. Everything else is flagged — a free `ago(`, and equally `HealthClock::WALL`
+        /// or any other receiver. Exempting *any* `.ago(` regardless of receiver was review's
+        /// sharpest miss: `wall.ago(30)` stamped into a pinned fixture is #760 exactly.
         fn receiver_is_the_reading_clock(prefix: &str) -> bool {
             if prefix.ends_with(".clock.") { return true; }
             let Some(rest) = prefix.strip_suffix("c.") else { return false };
             !rest.chars().next_back().is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
         }
 
+        // Naming the sentinels as VALUES, not just as strings to grep for, is what makes deleting
+        // one a compile error rather than a silently weakened reach control.
+        let _sentinels_must_exist = (
+            super::GUARD_REACH_SENTINEL_OBSERVE,
+            crate::GUARD_REACH_SENTINEL_LIB,
+            crate::combat::GUARD_REACH_SENTINEL_COMBAT,
+            crate::testkit::GUARD_REACH_SENTINEL_TESTKIT,
+        );
         let sources = [
-            ("observe.rs", include_str!("observe.rs")),
-            ("lib.rs",     include_str!("lib.rs")),
-            ("combat.rs",  include_str!("combat.rs")),
-            ("testkit.rs", include_str!("testkit.rs")),
+            ("observe.rs",  include_str!("observe.rs"),  "GUARD_REACH_SENTINEL_OBSERVE"),
+            ("lib.rs",      include_str!("lib.rs"),      "GUARD_REACH_SENTINEL_LIB"),
+            ("combat.rs",   include_str!("combat.rs"),   "GUARD_REACH_SENTINEL_COMBAT"),
+            ("testkit.rs",  include_str!("testkit.rs"),  "GUARD_REACH_SENTINEL_TESTKIT"),
         ];
         let mut offenders = Vec::new();
-        for (file, src) in sources {
-            for stmt in statements(src) {
+        for (file, src, sentinel) in sources {
+            let (code, ended_clean) = strip_to_code(src);
+            // REACH CONTROL 1 — loud failure instead of a silent early stop. A real source file
+            // never ends inside a block comment or a string, so this cannot false-positive.
+            assert!(ended_clean,
+                "{file}: the scanner ended stranded inside a comment or string literal, so it stopped \
+                 seeing code partway through and every 'clean' result below is worthless (#760/C1)");
+            let stmts = statements(&code);
+            // REACH CONTROL 2 — the sentinel is the LAST item in each scanned file, so seeing it
+            // proves the scan arrived at the end rather than merely ending without complaint.
+            assert!(stmts.iter().flatten().any(|(_, t)| t.contains(sentinel)),
+                "{file}: the scanner never reached `{sentinel}` at the end of the file, so it covered \
+                 only a prefix of it — a clean scan of a corpus that was never read (#760/C1)");
+            for stmt in stmts {
                 let joined: String = stmt.iter().map(|(_, t)| t.as_str()).collect();
                 let Some((line, _)) = stmt.iter().find(|(_, t)| STAMP_FIELDS.iter().any(|f| t.contains(f)))
                 else { continue };
-                let past_dated = joined.match_indices("ago(")
-                        .any(|(k, _)| !receiver_is_the_reading_clock(&joined[..k]))
-                    || joined.contains("now() -")
-                    || joined.contains("now()-")
-                    || joined.contains("checked_sub");
-                if !past_dated { continue; }
+                let bad_ago = joined.match_indices("ago(")
+                    .any(|(k, _)| !receiver_is_the_reading_clock(&joined[..k]));
+                // `now()` is fine on its own — it dates a stamp to the present, which saturates to
+                // age 0 against either clock. It is past-dating, and so a #760 shape, only when it
+                // is followed by a subtraction. The receiver test applies here too: `c.now() - d` is
+                // the correct clock and must NOT be flagged (review finding C2).
+                let bad_now = joined.match_indices("now()").any(|(k, _)| {
+                    if receiver_is_the_reading_clock(&joined[..k]) { return false; }
+                    let tail = joined[k + "now()".len()..].trim_start();
+                    tail.starts_with('-') || tail.starts_with(".checked_sub")
+                });
+                if !(bad_ago || bad_now) { continue; }
                 offenders.push(format!("{file}:{line}: {}", joined.trim()));
             }
         }
         assert!(offenders.is_empty(),
-            "these past-date a net-health stamp from a clock other than the one `health()` will read \
-             it back against — use `let c = h.clock; … = c.ago(N)` instead (#760):\n{}",
+            "these past-date a net-health stamp through a receiver that is not the clock `health()` \
+             reads it back against — use `let c = h.clock; … = c.ago(N)` (#760). A flagged line is \
+             not automatically wrong: the receiver test is a spelling rule, so a correct stamp under \
+             a binding named other than `c` lands here too.\n{}",
             offenders.join("\n"));
     }
 
@@ -4910,3 +5042,13 @@ mod zone_cross_observables_713 {
             "and it must say what the caller actually risks");
     }
 }
+
+/// Reach control for `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it` (#760/C1).
+///
+/// That guard scans this file's source text. A scanner that silently stops early — as it did, when
+/// a `/*` inside a route glob in a doc comment latched its block-comment state on line 1 — reports
+/// a clean scan of a corpus it never read, which is a confident falsehood. The guard asserts it can
+/// SEE this constant; because it is the last item in the file, seeing it proves the scan arrived at
+/// the end. **Keep it last.**
+#[cfg(test)]
+pub(crate) const GUARD_REACH_SENTINEL_OBSERVE: u8 = 0;
