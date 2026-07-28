@@ -23,28 +23,38 @@
 //! if let Some(busy) = s.command.request_pet_command(c).refused(BUSY_PET) { return busy; }
 //! ```
 //!
-//! There is now no `!` at any call site to drop, and the two obvious inversions do not build:
-//! `if let None = …` leaves `busy` unbound (E0425) and `if let Some(_) = …` has nothing to return.
-//! The polarity decision survives in exactly one place — [`Refusal::refused`] below — where it is
-//! covered by this module's own unit tests *and*, transitively, by every per-route 409 test in the
-//! crate. Inverting it there is not a silent change: swapping the two match arms of
-//! [`Refusal::refused`] was measured at **33 failing tests** in this crate, and the same swap in
-//! [`Refusal::refused_json`] at **20** (mutations M-B1d / M-B1e in the PR's mutation table).
+//! There is now no `!` at any call site to drop, and the polarity decision survives in exactly one
+//! place — [`Refusal::refused`] below — where it is covered by this module's own unit tests *and*,
+//! transitively, by every per-route 409 test in the crate. Inverting it there is not a silent
+//! change: swapping the two match arms of [`Refusal::refused`] was measured at **33 failing tests**
+//! in this crate, and the same swap in [`Refusal::refused_json`] at **20** (mutations M-B1d /
+//! M-B1e in the PR's mutation table).
+//!
+//! # What this does and does not achieve
 //!
 //! This reaches for the "make the bad state unrepresentable rather than guarded" rule from the
-//! repo's verification hierarchy, applied to a defect that a guard had already failed to catch
-//! once. It does not fully get there, and the honest statement of what it achieves is: the polarity
-//! lives at ONE site, and the remaining expressible bad forms are provably RED rather than silent.
+//! repo's verification hierarchy. **It does not get there, and three rounds of review have each
+//! found a further way to spell the bug**, so the claim is worth stating exactly:
 //!
-//! Structure alone is not the whole answer, because at least two edits still compile. One is
-//! `(!s.command.request_x(..)).refused(MSG)`. The other — found only by running it, after this
-//! module's docs had already claimed otherwise — is `if let Some(_) = …refused(MSG) { }`, which
-//! discards the refusal with an empty body and answers `200`; see M-B1f. Both are caught two ways: the
-//! caller guard rejects it (the statement no longer starts with the one accepted shape), and — the
-//! part that does not depend on a guard — the four modules the reviewer measured as having *zero*
-//! `409` assertions (`pet`, `trainer`, `group`, `quests`) now each have a double-fire test that
-//! fires the same well-formed request twice and asserts `200` then `409` *and* that the FIRST
-//! command is the one the net thread drains. Both mutations were run; see M-B1b / M-B1c.
+//! - The polarity decision lives at ONE site (this module) rather than at ~38 call sites.
+//! - Every silent-drop form found so far is RED, by a source guard and — on eight routes — by a
+//!   behavioural double-fire test as well.
+//! - The enumeration of those forms is **not** claimed to be complete. It has been wrong three
+//!   times: round 1 `if s.command.request_x` (no `!`); round 2 `if let Some(_) = …refused(MSG) { }`,
+//!   which compiles and answers `200`; round 2 again, a receiver wrapped across lines, which the
+//!   guard's single-line grep never even enumerated. Each was found by running a mutation, and each
+//!   had already been reasoned away in a comment like this one.
+//!
+//! Because guessing the next form is what keeps failing, the guard no longer depends on guessing
+//! how a call site is *formatted*: it normalises the source (comments stripped, literals blanked,
+//! whitespace collapsed, spaces around `.` removed) before matching, and its acceptance predicate
+//! is extracted and pinned by a table test over literal snippets — including both wrapped forms —
+//! so relaxing the predicate is itself RED. See `guild.rs`'s `no_silent_overwrite_guard`.
+//!
+//! The part that does not depend on any guard: the four modules the round-1 reviewer measured as
+//! having *zero* `409` assertions (`pet`, `trainer`, `group`, `quests`) now each have a double-fire
+//! test that fires the same well-formed request twice and asserts `200` then `409` *and* that the
+//! FIRST command is the one the net thread drains. Mutations M-B1b / M-B1c / M-B1f / M-R2a.
 
 use axum::{http::StatusCode, response::Response, response::IntoResponse, Json};
 

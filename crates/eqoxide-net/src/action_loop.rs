@@ -6271,6 +6271,103 @@ mod tests {
              inbound packet");
     }
 
+    /// Every raw local-mirror edit in `src`, as `(line, enclosing fn)`.
+    ///
+    /// **Round-2 review, R2-1 corollary.** The first cut matched a single PHYSICAL line, so
+    /// `gs\n    .inventory\n    .retain(..)` evaded it — the identical hole the HTTP caller guard
+    /// had, inherited from the same copy-a-grep-into-a-test habit. Continuation lines that begin
+    /// with `.` are joined onto their statement and spaces touching a `.` are dropped, so a wrapped
+    /// method chain is byte-identical to its one-line spelling. (`eqoxide-http`'s
+    /// `no_silent_overwrite_guard` does the full normalising version — comments, string literals,
+    /// the lot; this file only needs the method-chain case, and says so rather than implying it is
+    /// the same strength.)
+    fn raw_mirror_edits(src: &str) -> Vec<(usize, String)> {
+        // Split so this scanner's own source is not itself a match (the first cut of this guard
+        // flagged its own needle line).
+        let move_needle   = concat!("gs.", "move_item(");
+        let retain_needle = concat!("gs.", "inventory.retain(");
+
+        // Blank string literals, then cut a trailing `//` comment, then drop spaces touching a `.`.
+        // Blanking is not decoration: without it this scanner reads its OWN table-test snippets as
+        // code and reports three offenders in the test that exists to pin it — the same
+        // flagged-itself failure the first cut of this guard hit, one level up.
+        let sanitize = |s: &str| -> String {
+            let mut out = String::new();
+            let mut chars = s.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    out.push('"');
+                    while let Some(d) = chars.next() {
+                        if d == '\\' { chars.next(); continue; }
+                        if d == '"' { out.push('"'); break; }
+                    }
+                    continue;
+                }
+                if c == '/' && chars.peek() == Some(&'/') { break; }
+                out.push(c);
+            }
+            let mut squeezed = String::new();
+            let bytes: Vec<char> = out.chars().collect();
+            for (i, &c) in bytes.iter().enumerate() {
+                if c == ' ' {
+                    let prev = squeezed.chars().last();
+                    let next = bytes.get(i + 1).copied();
+                    if prev == Some('.') || next == Some('.') { continue; }
+                }
+                squeezed.push(c);
+            }
+            squeezed
+        };
+
+        // Join `.`-continuations onto the statement they belong to, keeping its FIRST line number.
+        let mut logical: Vec<(usize, String)> = Vec::new();
+        for (n, line) in src.lines().enumerate() {
+            let t = line.trim();
+            if t.starts_with('.') && !t.starts_with("..") {
+                if let Some(last) = logical.last_mut() { last.1.push_str(t); continue; }
+            }
+            logical.push((n + 1, line.to_string()));
+        }
+
+        let mut current_fn = String::new();
+        let mut hits = Vec::new();
+        for (n, line) in logical {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix("fn ").or_else(|| t.strip_prefix("pub fn "))
+                .or_else(|| t.strip_prefix("pub(crate) fn ")) {
+                current_fn = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            }
+            let squeezed = sanitize(&line);
+            if !(squeezed.contains(move_needle) || squeezed.contains(retain_needle)) { continue; }
+            hits.push((n, current_fn.clone()));
+        }
+        hits
+    }
+
+    /// R2-1 corollary, pinned: the wrapped spelling must be found. Without this, the joiner could be
+    /// deleted and every mirror-edit guarantee below would silently weaken back to a line grep.
+    #[test]
+    fn the_mirror_edit_scanner_sees_a_wrapped_method_chain() {
+        let one_line = "fn f() {\n    gs.inventory.retain(|i| i.slot != slot);\n}";
+        let wrapped  = "fn f() {\n    gs\n        .inventory\n        .retain(|i| i.slot != slot);\n}";
+        let spaced   = "fn f() {\n    gs . inventory . retain(|i| i.slot != slot);\n}";
+        let prose    = "fn f() {\n    // gs.inventory.retain(..) is the shape\n}";
+        for (label, src) in [("one line", one_line), ("wrapped", wrapped), ("spaced", spaced)] {
+            let hits = raw_mirror_edits(src);
+            assert_eq!(hits.len(), 1, "{label}: expected one mirror edit, got {hits:?}");
+            assert_eq!(hits[0].1, "f", "{label}: wrong enclosing fn");
+        }
+        assert!(raw_mirror_edits(prose).is_empty(), "a comment is not a mirror edit");
+
+        // The blanking half, pinned for the same reason: these are what this test's own snippets
+        // look like to the scanner, and a regression here makes the guard flag itself rather than
+        // the code it protects.
+        let in_string = "fn f() {\n    let s = \"gs.inventory.retain(x)\";\n}";
+        assert!(raw_mirror_edits(in_string).is_empty(), "a string literal is not a mirror edit");
+        let trailing = "fn f() {\n    let x = 1; // gs.inventory.retain(x)\n}";
+        assert!(raw_mirror_edits(trailing).is_empty(), "a trailing comment is not a mirror edit");
+    }
+
     /// A guard, not a substitute for the two behaviour tests above: it catches the *sixth* mirror
     /// edit someone adds next year, which no existing test would cover. It is deliberately narrow —
     /// it only knows about this one file and these two mutating call shapes.
@@ -6279,24 +6376,12 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/action_loop.rs");
         let text = std::fs::read_to_string(&path).unwrap();
         const ALLOWED: [&str; 2] = ["mirror_move_item", "mirror_remove_item"];
-        // Split so this scanner's own source lines are not themselves matches (the first cut of
-        // this guard flagged itself).
-        let move_needle   = concat!("gs.", "move_item(");
-        let retain_needle = concat!("gs.", "inventory.retain(");
 
-        let mut current_fn = String::new();
         let mut offenders: Vec<String> = Vec::new();
         let mut allowed_hits = 0usize;
-        for (n, line) in text.lines().enumerate() {
-            let t = line.trim_start();
-            if let Some(rest) = t.strip_prefix("fn ").or_else(|| t.strip_prefix("pub fn "))
-                .or_else(|| t.strip_prefix("pub(crate) fn ")) {
-                current_fn = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-            }
-            if t.starts_with("//") { continue; } // prose: these helpers document the old shape
-            if !(line.contains(move_needle) || line.contains(retain_needle)) { continue; }
-            if ALLOWED.contains(&current_fn.as_str()) { allowed_hits += 1; continue; }
-            offenders.push(format!("action_loop.rs:{}: in `{current_fn}`: {}", n + 1, t));
+        for (line, enclosing) in raw_mirror_edits(&text) {
+            if ALLOWED.contains(&enclosing.as_str()) { allowed_hits += 1; continue; }
+            offenders.push(format!("action_loop.rs:{line}: in `{enclosing}`"));
         }
 
         assert!(

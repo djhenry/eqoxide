@@ -112,6 +112,17 @@ mod no_silent_overwrite_guard {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
+    /// Canonical refusal call sites in this crate, measured on this tree. A ratchet, not a target:
+    /// adding a route is free, losing one is RED. See the assertion below for why it is not a loose
+    /// floor any more.
+    ///
+    /// Reconciliation, since the round-2 review counted 39 by grep: the normalised scanner and the
+    /// old line-based one enumerate the SAME 38 sites (verified by diffing both against `3c495c1`
+    /// — no site in one and not the other), so the rewrite lost nothing. A bare
+    /// `grep -c 's\.command\.request_'` runs higher because it also counts prose and, now, the
+    /// snippets inside this module's own table test.
+    const CANONICAL_SITES: usize = 38;
+
     fn crate_src() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src") }
     fn command_src() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../eqoxide-command/src")
@@ -154,6 +165,280 @@ mod no_silent_overwrite_guard {
         out
     }
 
+    /// Normalised source, so that this guard cannot be evaded — or silently switched off — by
+    /// reformatting.
+    ///
+    /// **Round-2 review, R2-1:** the previous version enumerated call sites with
+    /// `line.find("s.command.request_")`, a single-LINE needle, and Rust lets a receiver wrap. So
+    /// `let _busy = s\n.command\n.request_sit(true)\n.refused(BUSY_SIT);` was never enumerated at
+    /// all — the shape check below was never reached — and shipped fully green. Worse, the
+    /// *correctly* written statement disappeared from the guarded set the moment anyone reflowed
+    /// it, with no signal. Coverage must not be a function of source formatting, which nothing
+    /// enforces.
+    ///
+    /// Returns the source with comments removed, string and char literals blanked (so that a `{`,
+    /// `;` or `//` inside `format!("… {c} …")` or `split('"')` cannot be read as punctuation),
+    /// whitespace runs collapsed to a single space, and spaces adjacent to `.` dropped — that last
+    /// step is what makes a wrapped method chain byte-identical to its one-line spelling. The
+    /// second return value maps every BYTE offset of the normalised text to its 1-based source
+    /// line. Non-ASCII characters are replaced by `_` so that byte offsets stay char boundaries.
+    fn normalize(src: &str) -> (String, Vec<usize>) {
+        let chars: Vec<char> = src.chars().collect();
+        let mut kept: Vec<(char, usize)> = Vec::with_capacity(chars.len());
+        let mut line = 1usize;
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\n' { line += 1; i += 1; kept.push((' ', line)); continue; }
+            if c.is_whitespace() { i += 1; kept.push((' ', line)); continue; }
+            if c == '/' && chars.get(i + 1) == Some(&'/') {
+                while i < chars.len() && chars[i] != '\n' { i += 1; }
+                kept.push((' ', line));
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'*') {
+                i += 2;
+                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    if chars[i] == '\n' { line += 1; }
+                    i += 1;
+                }
+                i = (i + 2).min(chars.len());
+                kept.push((' ', line));
+                continue;
+            }
+            // Raw string: r"…", r#"…"#, r##"…"##
+            if c == 'r' && matches!(chars.get(i + 1), Some('"') | Some('#')) {
+                let mut j = i + 1;
+                let mut hashes = 0usize;
+                while chars.get(j) == Some(&'#') { hashes += 1; j += 1; }
+                if chars.get(j) == Some(&'"') {
+                    j += 1;
+                    while j < chars.len() {
+                        if chars[j] == '\n' { line += 1; }
+                        if chars[j] == '"' && (1..=hashes).all(|k| chars.get(j + k) == Some(&'#')) {
+                            j += hashes + 1;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    kept.push(('"', line));
+                    kept.push(('"', line));
+                    continue;
+                }
+            }
+            if c == '"' {
+                let mut j = i + 1;
+                while j < chars.len() {
+                    if chars[j] == '\\' { j += 2; continue; }
+                    if chars[j] == '\n' { line += 1; }
+                    if chars[j] == '"' { j += 1; break; }
+                    j += 1;
+                }
+                i = j;
+                kept.push(('"', line));
+                kept.push(('"', line));
+                continue;
+            }
+            // `'x'` / `'\n'` are literals; `'a` in `&'a str` is a lifetime and must pass through.
+            if c == '\'' {
+                let escaped = chars.get(i + 1) == Some(&'\\');
+                let closes = if escaped { chars.get(i + 3) == Some(&'\'') }
+                             else { chars.get(i + 2) == Some(&'\'') };
+                if closes {
+                    i += if escaped { 4 } else { 3 };
+                    kept.push(('\'', line));
+                    kept.push(('\'', line));
+                    continue;
+                }
+            }
+            kept.push((if c.is_ascii() { c } else { '_' }, line));
+            i += 1;
+        }
+
+        // Pass 1: collapse whitespace runs (and drop any leading space).
+        let mut collapsed: Vec<(char, usize)> = Vec::with_capacity(kept.len());
+        for &(c, l) in &kept {
+            if c == ' ' && (collapsed.is_empty() || collapsed.last().unwrap().0 == ' ') { continue; }
+            collapsed.push((c, l));
+        }
+        // Pass 2: a space touching `.` is formatting, not syntax — this is the whole point.
+        let mut out = String::new();
+        let mut map: Vec<usize> = Vec::new();
+        for (idx, &(c, l)) in collapsed.iter().enumerate() {
+            if c == ' ' {
+                let prev = idx.checked_sub(1).map(|p| collapsed[p].0);
+                let next = collapsed.get(idx + 1).map(|n| n.0);
+                if prev == Some('.') || next == Some('.') { continue; }
+            }
+            out.push(c);
+            while map.len() < out.len() { map.push(l); }
+        }
+        (out, map)
+    }
+
+    /// The ONE accepted spelling of a refusal at an HTTP call site:
+    ///
+    /// ```text
+    /// if let Some(busy) = s.command.request_x(..).refused(MSG) { return busy; }
+    /// ```
+    ///
+    /// **Round-2 review, R2-3.** This predicate is the sole defence for the majority of refusal
+    /// sites (the reviewer counted 15 behavioural 409 tests against 39 sites), and until now
+    /// nothing stopped anyone relaxing it: reverting it to `contains("s.command.request_")` — the
+    /// literal round-1 B1 hole — left the whole suite green, because every site still landed in
+    /// `checked` and the anti-vacuity floors had ~14 sites of slack. A doc comment saying "do not
+    /// weaken this" is not an enforcement mechanism.
+    ///
+    /// So it is extracted here and pinned by [`the_call_site_predicate_accepts_only_the_canonical_shape`],
+    /// a table test over literal source snippets. Relaxing this function fails that test; the table
+    /// includes the wrapped-receiver form, so it would also have caught R2-1 at design time,
+    /// without a build.
+    fn is_canonical_refusal(stmt: &str) -> bool {
+        stmt.starts_with("if let Some(busy) = s.command.request_")
+            && (stmt.contains(".refused(") || stmt.contains(".refused_json("))
+            && stmt.contains("{ return busy;")
+    }
+
+    #[derive(Debug)]
+    struct Site {
+        line: usize,
+        name: String,
+        canonical: bool,
+    }
+
+    /// Every `s.command.request_*` call site in `src`, found on the NORMALISED text so that the
+    /// enumeration is whitespace-insensitive, each classified by [`is_canonical_refusal`].
+    ///
+    /// The statement bounds are the previous `;`/`{`/`}` and — because the canonical shape carries
+    /// its `return busy;` inside a block — the first `;` after the statement's opening brace, when
+    /// a brace comes before the next `;`.
+    fn refusal_sites(src: &str) -> Vec<Site> {
+        const NEEDLE: &str = "s.command.request_";
+        let (text, map) = normalize(src);
+        let mut out = Vec::new();
+        for (pos, _) in text.match_indices(NEEDLE) {
+            let name: String = text[pos + "s.command.".len()..]
+                .chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            let raw_start = text[..pos].rfind([';', '{', '}']).map(|b| b + 1).unwrap_or(0);
+            let start = raw_start + (text[raw_start..].len() - text[raw_start..].trim_start().len());
+            let after = &text[pos..];
+            let end = match (after.find('{'), after.find(';')) {
+                (Some(b), Some(s)) if b < s => {
+                    after[b..].find(';').map(|k| pos + b + k + 1).unwrap_or(text.len())
+                }
+                (_, Some(s)) => pos + s + 1,
+                (_, None) => text.len(),
+            };
+            let stmt = &text[start..end.max(start)];
+            out.push(Site {
+                line: map.get(pos).copied().unwrap_or(0),
+                name,
+                canonical: is_canonical_refusal(stmt),
+            });
+        }
+        out
+    }
+
+    /// R2-1 + R2-3, pinned. Every row is a literal source snippet; the expectation is what
+    /// [`refusal_sites`] must say about it. A relaxation of [`is_canonical_refusal`] flips a
+    /// `false` row; a return to line-oriented detection flips the wrapped rows to "not found".
+    #[test]
+    fn the_call_site_predicate_accepts_only_the_canonical_shape() {
+        // (label, snippet, expected: None = no site enumerated, Some(canonical?))
+        let cases: Vec<(&str, &str, Option<bool>)> = vec![
+            (
+                "canonical, one line",
+                r#"fn h() { if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; } }"#,
+                Some(true),
+            ),
+            (
+                "canonical, receiver wrapped across lines (R2-1: correct code, reflowed)",
+                "fn h() {\n    if let Some(busy) = s\n        .command\n        .request_sit(true)\n        .refused(BUSY_SIT) { return busy; }\n}",
+                Some(true),
+            ),
+            (
+                "M-R2a: the reviewer's wrapped discard — must be FOUND and rejected",
+                "fn h() {\n    let _busy = s\n        .command\n        .request_sit(true)\n        .refused(BUSY_SIT);\n}",
+                Some(false),
+            ),
+            (
+                "round-1 B1: `if !…`",
+                r#"fn h() { if !s.command.request_sit(true) { return (StatusCode::CONFLICT, BUSY_SIT.into()); } }"#,
+                Some(false),
+            ),
+            (
+                "round-1 B1 inverted: `if …`",
+                r#"fn h() { if s.command.request_sit(true) { return (StatusCode::CONFLICT, BUSY_SIT.into()); } }"#,
+                Some(false),
+            ),
+            (
+                "bound and ignored",
+                r#"fn h() { let ok = s.command.request_sit(true); }"#,
+                Some(false),
+            ),
+            (
+                "M-B1f: empty-bodied `if let Some(_)`",
+                r#"fn h() { if let Some(_) = s.command.request_sit(true).refused(BUSY_SIT) { } }"#,
+                Some(false),
+            ),
+            (
+                "canonical via refused_json",
+                r#"fn h() { if let Some(busy) = s.command.request_buy(x).refused_json(json!({"e":1})) { return busy; } }"#,
+                Some(true),
+            ),
+            (
+                "prose in a doc comment is not a call site",
+                "//! use `if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT)`\nfn h() {}",
+                None,
+            ),
+            (
+                "prose in a trailing line comment is not a call site",
+                "fn h() {} // s.command.request_sit(true) is the shape\n",
+                None,
+            ),
+            (
+                "a `{` inside a string literal must not be read as a statement boundary",
+                "fn h() {\n    let _ = format!(\"{x} queued; now\");\n    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; }\n}",
+                Some(true),
+            ),
+            (
+                "a `{` inside a raw string must not be read as a statement boundary",
+                "fn h() {\n    let _ = r#\"{\"a\":1};\"#;\n    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; }\n}",
+                Some(true),
+            ),
+            (
+                "a quote inside a char literal must not open a string",
+                "fn h() {\n    let _ = x.split('\"').next();\n    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; }\n}",
+                Some(true),
+            ),
+        ];
+
+        let mut wrong: Vec<String> = Vec::new();
+        for (label, snippet, expected) in &cases {
+            let sites = refusal_sites(snippet);
+            let got = match sites.len() {
+                0 => None,
+                1 => Some(sites[0].canonical),
+                n => { wrong.push(format!("{label}: expected at most one site, found {n}")); continue; }
+            };
+            if got != *expected {
+                wrong.push(format!("{label}: expected {expected:?}, got {got:?} ({sites:?})"));
+            }
+        }
+        assert!(wrong.is_empty(), "the call-site predicate has drifted:\n  {}", wrong.join("\n  "));
+
+        // Anti-vacuity: the table must contain both verdicts and at least one wrapped snippet,
+        // otherwise a future edit could satisfy it with a predicate that answers a constant.
+        assert!(cases.iter().any(|c| c.2 == Some(true)), "no accepted row");
+        assert!(cases.iter().any(|c| c.2 == Some(false)), "no rejected row");
+        assert!(cases.iter().any(|c| c.2.is_none()), "no not-a-call-site row");
+        assert!(
+            cases.iter().filter(|c| c.1.contains("\n        .command")).count() >= 2,
+            "the table must keep BOTH wrapped-receiver rows — they are what pins R2-1"
+        );
+    }
+
     /// The universal at the HTTP boundary: a handler that calls a refusable `request_*` and IGNORES
     /// the returned `bool` has re-created exactly the #347 defect — the command was dropped on the
     /// floor and the caller was still told `200`. Every such call site must consume the result.
@@ -166,15 +451,19 @@ mod no_silent_overwrite_guard {
     ///
     /// Precisely what that buys, measured rather than reasoned — the compiler rejects the literal
     /// `!`-drop (`if let None = …` binds nothing, so the `return busy;` is `E0425`), but it does
-    /// NOT reject every silent drop: `if let Some(_) = …refused(MSG) { }` compiles cleanly. That
-    /// form is caught here, by the shape match, and — for the four modules that gained tests in
-    /// round 1 — independently by a behavioural double-fire test that sees the `200` where a `409`
-    /// belongs. So: the inverted form is not unrepresentable, it is provably RED. Do not weaken
-    /// this test to a "the bool is read somewhere" check; that is the exact hole B1 found.
+    /// NOT reject every silent drop: `if let Some(_) = …refused(MSG) { }` compiles cleanly, and so
+    /// does a wrapped receiver (R2-1). Both are caught HERE, by [`is_canonical_refusal`], and —
+    /// for the four modules that gained tests in round 1 — independently by a behavioural
+    /// double-fire test that sees the `200` where a `409` belongs. So the inverted form is not
+    /// unrepresentable; every form found SO FAR is provably RED (the enumeration has been wrong
+    /// three times — see `refusal.rs`), and the predicate that makes them RED is itself pinned by
+    /// [`the_call_site_predicate_accepts_only_the_canonical_shape`] rather than by a request in a
+    /// comment.
     ///
-    /// Search key: `grep -rn 's\.command\.request_' crates/eqoxide-http/src/*.rs`. Handlers reach the
-    /// facade through the `HttpState` binding `s`, so this prefix is what distinguishes a real call
-    /// site from the `command.take_*` / `command.request_*` forms used inside test bodies.
+    /// Search key: `grep -rn 's\.command\.request_' crates/eqoxide-http/src/*.rs` — but note that
+    /// grep is exactly the tool this guard stopped using in round 2, so it undercounts wrapped
+    /// sites. Handlers reach the facade through the `HttpState` binding `s`, which is what
+    /// distinguishes a real call site from the `command.take_*` forms used inside test bodies.
     #[test]
     fn every_refusable_command_request_is_checked_by_its_http_caller() {
         let refusable = refusable_requests();
@@ -185,38 +474,14 @@ mod no_silent_overwrite_guard {
         for path in rs_files(&crate_src()) {
             let text = std::fs::read_to_string(&path).unwrap();
             let file = path.file_name().unwrap().to_string_lossy().to_string();
-            for (n, line) in text.lines().enumerate() {
-                let Some(pos) = line.find("s.command.request_") else { continue };
-                // Prose, not code: `refusal.rs`'s module docs quote both the old and the new call
-                // shape, and this guard is exactly the thing they are describing.
-                if line.trim_start().starts_with("//") { continue; }
-                let name_start = pos + "s.command.".len();
-                let name: String = line[name_start..]
-                    .chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            for site in refusal_sites(&text) {
+                let Site { line, name, canonical } = site;
                 if !refusable.contains(&name) {
-                    ignored_by_design.push(format!("{file}:{}: {name}", n + 1));
-                    continue;
-                }
-                let code = line.trim_start();
-                // The ONE accepted shape (B1):
-                //   `if let Some(busy) = s.command.request_x(..).refused(MSG) { return busy; }`
-                // The `.refused(..)` / `.refused_json(..)` call may wrap onto the next line, so the
-                // statement is accumulated up to its opening brace before being matched. Nothing
-                // else is accepted — not `if !…`, not `if …`, not `let ok = …` — because those are
-                // the forms in which a one-character polarity mutation is expressible.
-                let mut stmt = String::new();
-                for l in text.lines().skip(n) {
-                    stmt.push_str(l.trim());
-                    if l.contains('{') { break; }
-                    stmt.push(' ');
-                }
-                let consumed = code.starts_with("if let Some(busy) = s.command.request_")
-                    && (stmt.contains(".refused(") || stmt.contains(".refused_json("))
-                    && stmt.contains("return busy;");
-                if consumed {
-                    checked.push(format!("{file}:{}: {name}", n + 1));
+                    ignored_by_design.push(format!("{file}:{line}: {name}"));
+                } else if canonical {
+                    checked.push(format!("{file}:{line}: {name}"));
                 } else {
-                    offenders.push(format!("{file}:{}: {name} — result discarded", n + 1));
+                    offenders.push(format!("{file}:{line}: {name} — result discarded"));
                 }
             }
         }
@@ -228,13 +493,18 @@ mod no_silent_overwrite_guard {
             offenders.join("\n  ")
         );
         // Anti-vacuity: the guard must actually be looking at something. Both numbers are lower
-        // bounds measured from this tree at the time of writing, not exact expectations.
+        // bounds measured from this tree, not exact expectations.
         assert!(refusable.len() >= 30,
             "expected the command facade to expose >= 30 refusable request_* methods, found {} — \
              the scanner's parse of `pub fn request_` signatures has probably drifted",
             refusable.len());
-        assert!(checked.len() >= 25,
-            "expected >= 25 checked refusable call sites in this crate, found {}: {:?}",
+        // R2-1: the old floor of 25 against 39 actual sites meant 14 could vanish — by a reflow, or
+        // by deletion — before anti-vacuity noticed. The floor is now the measured count, so losing
+        // even one site is RED and has to be an explicit edit to this number.
+        assert!(checked.len() >= CANONICAL_SITES,
+            "expected >= {CANONICAL_SITES} checked refusable call sites in this crate, found {}. \
+             If you deliberately removed a route, lower CANONICAL_SITES in the same commit; if you \
+             did not, a call site has stopped matching the canonical shape: {:?}",
             checked.len(), checked);
         // `request_goto` / `request_follow` / `request_stop` / `request_zone_cross` / `request_camp`
         // / `request_respawn` / `request_who` / `request_friends_who` / `request_chat_send` are the
