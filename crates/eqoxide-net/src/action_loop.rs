@@ -1484,11 +1484,16 @@ impl ActionLoop {
             //
             // This does NOT re-open the refire storm the bound exists to close. Every path that
             // SENDS is still inside the cooldown guard AND still behind `blocks()`; the only thing
-            // hoisted is an observation plus the two resets it licenses, and those fire only when the
-            // character is physically off every zone-line region — which never happens during the
-            // continuous stand the bound is stated over. Cost: one BSP leaf descent per ~1 u of body
-            // height per net tick (~100 Hz), against a `RwLock` read — the same query the block
-            // already made, just no longer rate-limited by an unrelated packet cooldown.
+            // hoisted is an observation plus the two resets it licenses, and those fire whenever the
+            // standing probe finds no zone-line region — which never happens during the continuous
+            // stand the bound is stated over. That is not the same claim as "the character is
+            // physically off every zone line": `zone_line_at_standing` also reads `None` when
+            // `self.collision` is absent (no grid loaded yet) or the zone has no `.wtr` (a v1 map, no
+            // water/region layer) — both indistinguishable from "off the line" to this probe. Benign
+            // here (the hoisted statements only ever CLEAR), but not a physics guarantee. Cost: one
+            // BSP leaf descent per ~1 u of body height per net tick (~100 Hz), against a `RwLock`
+            // read — the same query the block already made, just no longer rate-limited by an
+            // unrelated packet cooldown.
             //
             // The `eqoxide-core` property test (`auto_cross_attempts_are_bounded_per_stand_713`)
             // already modelled it this way — its `Tick::Off` arm clears the tally on EVERY off tick.

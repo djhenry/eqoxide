@@ -428,8 +428,14 @@ mod tests {
                     Tick::Off => None,
                 };
                 match index {
-                    // This IS `drain_zone_cross`'s auto-cross shape: consult `blocks`, and only
-                    // then attempt + `record`.
+                    // This models the SHAPE of `drain_zone_cross`'s gate (consult `blocks`, then
+                    // attempt + `record`) but deliberately NOT its cooldown: this arm attempts on
+                    // every `On` tick, while the real function attempts at most once per
+                    // `ZONE_CROSS_COOLDOWN_MS`. That gap is why this property test, though its model
+                    // is correct as a model, did not catch #713 round 2's B2 defect — the reset below
+                    // is what needed to track the cooldown-gated code, and this arm does not exercise
+                    // that interaction. See the `None` arm's comment for what actually grades the real
+                    // function.
                     Some(i) => {
                         if tally.is_some_and(|t| t.blocks()) {
                             saw_a_blocked_run = true;
@@ -440,8 +446,16 @@ mod tests {
                         regions_this_stand.insert(i);
                         if regions_this_stand.len() > 1 { saw_alternating_stand = true; }
                     }
-                    // Off every zone-line region: the stand ends and the tally is re-armed, exactly
-                    // as `drain_zone_cross`'s `else` branch does.
+                    // Off every zone-line region: the stand ends and the tally is re-armed. In
+                    // `drain_zone_cross` this is a STANDALONE `if index.is_none() { .. }` reset block
+                    // (round 2, B2) — there is no `else` branch any more; the cooldown-gated attempt
+                    // below it is a separate, later `if`. Whether that real block behaves like this
+                    // arm is asserted by this comment, not checked by this test: this property grades
+                    // the MODEL above, and the model has no cooldown (see the `Some` arm). The test
+                    // that actually drives the real `drain_zone_cross` and grades this correspondence
+                    // is `the_escape_hatch_works_on_the_tick_you_step_off_713`
+                    // (crates/eqoxide-net/src/action_loop.rs) — trust that one over this comment if
+                    // they ever disagree.
                     None => {
                         tally = None;
                         attempts_this_stand = 0;

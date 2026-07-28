@@ -576,6 +576,9 @@ received*, and `detail` says so.
   zone-line region, and zoning, clear the tally. An explicit retry on the same line returns `200`,
   walks nowhere (you are already there) and never crosses; `zone_cross_stopped` stays non-null
   throughout, so it is detectable — but it is the first thing to try and it is not a recovery.
+  *(Reasoned from the code path, not measured live: `resolve_zone_cross` has zero occurrences of
+  `zone_cross_attempts` in its body, so it cannot be the tally's fourth writer — but no test drives
+  an explicit retry end-to-end and asserts the HTTP response or the walk outcome.)*
 
 `nav_reason` for `blocked`:
 
