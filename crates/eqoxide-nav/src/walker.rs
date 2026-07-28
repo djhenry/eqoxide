@@ -311,6 +311,17 @@ impl Walker {
         // reason about a different state than the loader writes.
         zone_assets: crate::zone_assets::ZoneAssetStateShared,
     ) -> Self {
+        // #766 review B9: a FRESH fine worker starts alive, so the row it will be published on must
+        // say so. `local_planner_dead` is latched for the life of a worker (see its field doc), and
+        // the row outlives any one `Walker` — it is a shared `Arc` the HTTP surface also holds. Today
+        // exactly one `Walker` is built per process, so this clear is a no-op in production; it is
+        // here so that the flag's lifetime is tied to the WORKER's, structurally, at the one place
+        // that spawns one. Without it, a second `Walker` over the same row — the shape an in-process
+        // relogin would create — would inherit `true` and report a planner it had just replaced as
+        // dead forever — #343's shape, a value that outlives the thing it describes (there,
+        // `connected: true` published by a loop that had stopped running; here, `dead` published for
+        // a thread that had been replaced).
+        nav.nav_state.lock().unwrap().local_planner_dead = false;
         Walker {
             nav, world, collision, nav_intent, nav_debug, zone_assets,
             debug_seq: 0,
@@ -536,9 +547,13 @@ impl Walker {
     ///
     /// Called from the `is_dead()` branch in [`Walker::drive_walk`], beside the per-goal
     /// `nav_local` publication it backs up. **That is the DISCOVERY site, and discovery is the
-    /// constraint.** An earlier draft put the call earlier in the walk tick, on the theory that
-    /// "unconditional" beat "inside `have_path`". Two independent things kill that, and review B7 is
-    /// right that the ORDERING one is decisive while the reachability one is merely additional:
+    /// constraint.** The tempting alternative is to call this earlier in the walk tick,
+    /// "unconditionally", so that it cannot be missed. (An uncommitted draft of mine did; that draft
+    /// is in no commit, ref or reflog, so treat any account of it — including
+    /// [`a_dead_fine_planner_stays_visible_after_the_goal_is_retired_766`]'s — as recollection rather
+    /// than history, review B10. The argument below does not rest on it.) Two independent things kill
+    /// that placement, and review B7 is right that the ORDERING one is decisive while the
+    /// reachability one is merely additional:
     ///
     /// 1. **Ordering — structural, and by itself sufficient.** `LocalPlanner.dead` is written at
     ///    exactly two places, the failed send in `post_if_idle` and the disconnected receive in
@@ -2112,6 +2127,10 @@ mod tests {
             // added in round 6 by `steering`'s mechanical citation scan: cited in a doc comment in
             // this file and named in no guard list.
             cancelling_the_goto_while_loading_returns_to_idle,
+            // #766 round 5: cited by `Walker::latch_local_planner_liveness`'s rustdoc, which points
+            // at this test for the B10 hedge on the uncommitted draft. Caught by `steering`'s scan,
+            // not by me — the citation was added and the guard was not.
+            a_dead_fine_planner_stays_visible_after_the_goal_is_retired_766,
         ];
     }
 
@@ -2902,14 +2921,21 @@ mod tests {
     /// have re-opened the clear-on-every-`idle` uniformity #766 exists to create.
     ///
     /// **This test is driven end-to-end by production `drive_walk`, and an earlier draft that was not
-    /// is why.** That draft pre-forced `is_dead()` in a loop, called `drive_walk` with an EMPTY path,
-    /// and latched from a point above `let have_path`. It went RED, and it was right to: that tick
-    /// took one of the FIVE early returns above `have_path` (it had no committed route, so it posted
-    /// a first plan and returned at `awaiting_first_plan`) and never reached the latch. See
-    /// [`Walker::latch_local_planner_liveness`] for why the deeper defect in that placement is
-    /// ORDERING rather than reachability — `dead` is only ever set inside `have_path`, so any earlier
-    /// latch is a tick late by construction even when it is reached. Below, the test does neither: no
-    /// forcing loop, no direct latch call, and a committed route so production discovers the death
+    /// is why.** My recollection of that draft — pre-forcing `is_dead()` in a loop, calling
+    /// `drive_walk` with an EMPTY path, latching from above `let have_path` — is **recollection, not
+    /// history**: the review established that the draft survives in no commit, ref or reflog entry,
+    /// so nobody can reproduce it and no account of its internals, mine included, is checkable
+    /// (round-5 review B10). Treat it the way this branch treats any un-run claim.
+    ///
+    /// What IS checkable is on the tree in front of you, and it is the part that matters. An empty
+    /// path returns at `awaiting_first_plan`, one of the FIVE early returns above `let have_path`, so
+    /// no latch placed after `advance_cursor` can fire in that fixture at all — reachability. And
+    /// independently of any draft, `dead` is only ever written inside `have_path`, so an earlier latch
+    /// is a tick late by construction even where it IS reached — ordering, which is the decisive
+    /// defect and is argued in full on [`Walker::latch_local_planner_liveness`]. The two are separate
+    /// failures with separate evidence; earlier rounds on both sides collapsed them into one story
+    /// and got the attribution wrong in both directions. Below, the test avoids the whole question:
+    /// no forcing loop, no direct latch call, and a committed route so production discovers the death
     /// itself.
     ///
     /// Mutation checks, both RUN, reported by ASSERTION rather than by line number — a re-measured
@@ -2965,6 +2991,57 @@ mod tests {
         assert!(s.local_planner_dead,
             "#766 B3: the thread does not come back, so the fault does not heal. Clearing it here \
              would tell an agent its degraded steering had recovered when nothing recovered it");
+    }
+
+    /// **#766 review B9 — the latch is scoped to the WORKER, and construction is where that is
+    /// enforced.** `local_planner_dead` never clears once set, which is right for a thread that does
+    /// not come back — but "never clears" and "outlives the thread it describes" are different
+    /// claims, and only the first one is wanted. The row is a shared `Arc` the HTTP surface holds; a
+    /// `Walker` is not. So a second `Walker` over the same row would publish a *fresh, healthy*
+    /// worker as permanently dead: #343's shape, and a lie in the honesty-critical direction (the
+    /// client asserting a fault it has just fixed).
+    ///
+    /// Production cannot reach that today — `Walker::new` runs once per process, through
+    /// `ActionLoop::new` from `run_login_flow`, which returns when the gameplay phase ends. Round 4
+    /// declined the clear on that ground and the round-5 review was right to block it: what the
+    /// missing route makes untestable is the end-to-end relogin *scenario*, not the *clear*, and the
+    /// clear is what carries the guarantee. `Walker::new` takes caller-owned slots and this suite
+    /// already calls it directly, so the property is testable at construction with no relogin route
+    /// in sight — which is what this does. Tier: the flag's lifetime is now pinned to the
+    /// constructor that spawns the worker, so the bad state is created-and-cleared in one place
+    /// rather than argued about in a comment.
+    ///
+    /// Mutation check, RUN, named by assertion rather than by line (review B8): delete the
+    /// `local_planner_dead = false` clear from [`Walker::new`] → this test's B9 assertion goes RED,
+    /// alone. Measured across `eqoxide-nav` / `-http` / `-ipc` / `-net` (this branch's blast radius,
+    /// the last of them because `action_loop.rs` `include_str!`s `docs/http-api.md`): `eqoxide-nav`
+    /// `215 passed; 1 failed; 16 ignored`, and 247 / 37 / 380 unmoved in the other three. Not a
+    /// workspace run — say "these four crates", not "nothing anywhere". That the blast radius is one
+    /// assertion is the honest measure of the fix: on today's single-`Walker` process it is a
+    /// structural guarantee, not a behaviour change to any live path.
+    #[test]
+    fn a_new_walker_does_not_inherit_a_previous_workers_death_766() {
+        // A row that already carries a dead worker's latch — the state an in-process relogin would
+        // hand the next `Walker`, and the only way to reach it from here (nothing in the process
+        // retires a `Walker` today, which is exactly why the scenario is not the thing under test).
+        let nav: eqoxide_ipc::NavSlots = Default::default();
+        nav.nav_state.lock().unwrap().local_planner_dead = true;
+        assert!(nav.nav_state.lock().unwrap().local_planner_dead,
+            "PREMISE: the row starts dirty, so the assertion below measures the constructor and not \
+             a field that was `false` all along");
+
+        let world: eqoxide_ipc::WorldSlots = Default::default();
+        let intent: eqoxide_ipc::NavIntent = Default::default();
+        let view: crate::diagnostics::NavDebugView = Default::default();
+        let collision = open_plane(400.0);
+        let za = zone_assets_for(&collision);
+        let _w = Walker::new(nav.clone(), world, collision, intent, view, za);
+
+        assert!(!nav.nav_state.lock().unwrap().local_planner_dead,
+            "#766 B9: `Walker::new` has just spawned a NEW `LocalPlanner`, which is alive. Leaving \
+             the previous worker's latch standing would publish `nav_local_planner_dead: true` for a \
+             thread that is running fine, and it would never clear — the client asserting a \
+             permanent fault it had itself just repaired");
     }
 
     /// **#766, the OTHER walker route to `idle` — and it is here to MEASURE a claim, not to guard a

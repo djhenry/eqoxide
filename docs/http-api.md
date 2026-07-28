@@ -884,8 +884,12 @@ corridor is not threadable" from "the steering planner hasn't caught up." `nav_l
 "nav_local_planner_dead": false
 ```
 
-**Always present, in both states.** `true` once the fine worker thread has been observed dead; never
-returns to `false`, because the thread does not come back — recovering it needs a client restart.
+**Always present, in both states.** `true` once the fine worker thread has been observed dead. It
+stays `true` for the life of that worker, because the thread does not come back — recovering it needs
+a client restart. The one thing that clears it is the construction of a *new* fine worker, which today
+happens exactly once per process, at startup: the flag is scoped to the worker it describes, not to
+the process, so it can never outlive the thread it is reporting on. In practice, over a running
+client, that means it is one-way.
 
 This field exists because the `nav_local`-is-`null`-on-`idle` rule above would otherwise hide a client
 fault. Two of `nav_local`'s three states — `no_way_through`, `exhausted` — are verdicts about
