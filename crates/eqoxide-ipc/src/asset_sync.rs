@@ -562,16 +562,29 @@ impl ConnectOutcome {
     /// rustdoc — stated as a measured fact about this commit, not a guarantee about the next one.
     ///
     /// ⚠️ **[EDIT answering the round-8 review, N1 (#755): "turns up none" was the wrong word, and
-    /// the review's own re-grep is why.]** Run with the review's wider pattern set (`completeness pin`,
-    /// `compile[- ]time pin`, `before the crate builds`, `does not build if`, `hole is closed`,
-    /// `cannot reach the wire`, `fails to compile here`, `keeps .*ALL.* complete`; `*.rs`/`*.md`,
-    /// `target/` excluded), a grep turns up **four** hits outside `slots()`'s rustdoc: `:541` and
-    /// `:544` — the claim quoted verbatim *inside its own retraction* twelve lines above this one —
-    /// `:1400`, the same thing inside the round-7 retraction, and `observe.rs:314`, which is itself
-    /// a retraction EDIT. (A fifth, `renderer/src/scene.rs:283`, is unrelated prose the pattern
-    /// happens to catch.) Every hit is a retraction or a quotation inside one. What was measured,
-    /// and what is true, is that no *un-retracted* assertion of the claim survives anywhere —
-    /// re-run at round 9 before this correction was written, not carried over from the review.
+    /// the review's own re-grep is why — and #782 found that re-grep's own report was itself
+    /// wrong in three more ways, corrected below rather than re-measured into a fourth stale
+    /// number.]** Run with the review's wider pattern set (`completeness pin`, `compile[- ]time
+    /// pin`, `before the crate builds`, `does not build if`, `hole is closed`, `cannot reach the
+    /// wire`, `fails to compile here`, `keeps .*ALL.* complete`; `*.rs`/`*.md`, `target/`
+    /// excluded), every hit outside `slots()`'s own rustdoc, as of this commit, is a retraction, a
+    /// quotation inside one, or unrelated prose the pattern happens to catch — for example, the
+    /// old claim quoted in this doc's own round-6 retraction, the same claim quoted again in
+    /// the round-7 retraction on
+    /// `the_slot_enumeration_and_all_are_the_same_list_in_the_same_order`'s rustdoc, the
+    /// round-5 retraction in `eqoxide-http`'s login-outcomes encoder, and unrelated prose in
+    /// `eqoxide-renderer`'s pose-matching comment.
+    ///
+    /// **Deliberately not a count.** This sentence's own pattern list is itself a hit — quoting
+    /// the patterns necessarily matches them — and a case-sensitive sweep does not agree with a
+    /// case-insensitive one: the round-6 correction re-quotes one phrase with different
+    /// capitalization, which only `grep -i` catches. This inventory is what a grep against the
+    /// *current* text turns up, not a promise about the next edit — the pattern list will keep
+    /// matching itself, and the last two attempts at a specific state of this grep ("no
+    /// un-retracted copy", then "four hits") were each wrong by the time the following EDIT ran
+    /// it again. What is true, and was measured for this commit, is that no *un-retracted*
+    /// assertion of the completeness claim survives outside that inventory — re-run the grep to
+    /// check; do not trust a cached number, including one that isn't given here.
     ///
     /// **The residual, stated rather than glossed, and measured too.** A variant whose match arms
     /// are pointed at an *existing* slot and counter adds no field, so `slots` is unchanged and
