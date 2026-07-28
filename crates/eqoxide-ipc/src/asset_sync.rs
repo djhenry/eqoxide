@@ -564,27 +564,30 @@ impl ConnectOutcome {
     /// ⚠️ **[EDIT answering the round-8 review, N1 (#755): "turns up none" was the wrong word, and
     /// the review's own re-grep is why — and #782 found that re-grep's own report was itself
     /// wrong in three more ways, corrected below rather than re-measured into a fourth stale
-    /// number.]** Run with the review's wider pattern set (`completeness pin`, `compile[- ]time
-    /// pin`, `before the crate builds`, `does not build if`, `hole is closed`, `cannot reach the
-    /// wire`, `fails to compile here`, `keeps .*ALL.* complete`; `*.rs`/`*.md`, `target/`
-    /// excluded), every hit outside `slots()`'s own rustdoc, as of this commit, is a retraction, a
-    /// quotation inside one, or unrelated prose the pattern happens to catch — for example, the
-    /// old claim quoted in this doc's own round-6 retraction, the same claim quoted again in
-    /// the round-7 retraction on
-    /// `the_slot_enumeration_and_all_are_the_same_list_in_the_same_order`'s rustdoc, the
-    /// round-5 retraction in `eqoxide-http`'s login-outcomes encoder, and unrelated prose in
+    /// number.]** Run with the review's wider pattern set (`completeness pin`,
+    /// `compile[- ]time pin`, `before the crate builds`, `does not build if`, `hole is closed`,
+    /// `cannot reach the wire`, `fails to compile here`, `keeps .*ALL.* complete`; `*.rs`/`*.md`,
+    /// `target/` excluded), every hit outside `slots()`'s own rustdoc, as of this commit, is a
+    /// retraction, a quotation inside one, or unrelated prose the pattern happens to catch — for
+    /// example, the old claim quoted in this doc's own round-6 retraction, the same claim quoted
+    /// again in the round-7 retraction on
+    /// `the_slot_enumeration_and_all_are_the_same_list_in_the_same_order`'s rustdoc, the round-5
+    /// retraction in `eqoxide-http`'s login-outcomes encoder, and unrelated prose in
     /// `eqoxide-renderer`'s pose-matching comment.
     ///
-    /// **Deliberately not a count.** This sentence's own pattern list is itself a hit — quoting
-    /// the patterns necessarily matches them — and a case-sensitive sweep does not agree with a
-    /// case-insensitive one: the round-6 correction re-quotes one phrase with different
+    /// **Deliberately not a count.** The pattern list above is itself a hit for seven of its
+    /// eight patterns — quoting a literal phrase matches it — but not for `compile[- ]time pin`:
+    /// its bracket-and-space character class has no literal match in the text
+    /// `compile[- ]time pin`, which quotes the pattern's own source rather than either
+    /// alternative it matches. A case-sensitive sweep also does not agree with a case-insensitive
+    /// one: the round-6 correction two EDITs up re-quotes one phrase with different
     /// capitalization, which only `grep -i` catches. This inventory is what a grep against the
-    /// *current* text turns up, not a promise about the next edit — the pattern list will keep
-    /// matching itself, and the last two attempts at a specific state of this grep ("no
-    /// un-retracted copy", then "four hits") were each wrong by the time the following EDIT ran
-    /// it again. What is true, and was measured for this commit, is that no *un-retracted*
-    /// assertion of the completeness claim survives outside that inventory — re-run the grep to
-    /// check; do not trust a cached number, including one that isn't given here.
+    /// *current* text turns up, not a promise about the next edit — the pattern list above will
+    /// keep matching itself, and the count this EDIT gave when it first ran ("four hits") was
+    /// wrong by the time #782 re-ran it. What is true, and was measured for this commit, is that
+    /// no *un-retracted* assertion of the completeness claim survives outside `slots()`'s own
+    /// rustdoc and this inventory — re-run the grep to check; do not trust a cached number,
+    /// including one that isn't given here.
     ///
     /// **The residual, stated rather than glossed, and measured too.** A variant whose match arms
     /// are pointed at an *existing* slot and counter adds no field, so `slots` is unchanged and
