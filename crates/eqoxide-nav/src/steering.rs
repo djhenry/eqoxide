@@ -1300,9 +1300,19 @@ mod cursor_resync_tests {
         let span = run.late_x_max - run.late_x_min;
         // Round 7 (non-blocking 4): the doc above quotes these three. Print them, so the quoted
         // figures come from THIS run and not from arithmetic on the band's printed 3 decimals.
+        //
+        // #742: the WHOLE-run extent is printed alongside. `Run`'s doc says the whole-run and
+        // settled extents "measure different things, and both are recorded rather than one standing
+        // in for the other" — but nothing read `x_min`/`x_max`, which is what the `dead_code` warning
+        // on those two fields was reporting: they were computed and then dropped, so the transient
+        // the #727 round-5 correction exists to keep separate was invisible in the output. Printing
+        // them is deliberately NOT an assertion: the transient's width is a diagnostic, and the only
+        // claim this test makes is about the settled band.
         eprintln!(
-            "settled span {span:.4}   east of LANDED {:.4}   west of LANDED {:.4}",
-            run.late_x_max - LANDED[0], LANDED[0] - run.late_x_min);
+            "settled span {span:.4}   east of LANDED {:.4}   west of LANDED {:.4}   \
+             whole-run extent [{:.4}, {:.4}] (transient included)",
+            run.late_x_max - LANDED[0], LANDED[0] - run.late_x_min,
+            run.x_min, run.x_max);
         assert!(span < 5.0 * FRAME,
             "the settled cycle must stay within a few frames of travel — a wider band would be \
              drift, not a limit cycle; it was {span:.3} u");
