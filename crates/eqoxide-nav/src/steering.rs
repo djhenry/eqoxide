@@ -1722,10 +1722,8 @@ mod cursor_resync_tests {
     }
 
     /// A backtick-PARITY heuristic: every doc-comment line outside a triple-backtick fence whose
-    /// backtick count is odd. Round 7: parity is one of two independent checks that caught the
-    /// round-6 review's surviving citation once the wrap made this line's count odd — parity here,
-    /// and charset-based resolution in `doc_citations` above. They catch overlapping but different
-    /// subsets of wrapped citations; neither subsumes the other.
+    /// backtick count is odd. Round 7: this is what caught the round-6 review's surviving
+    /// citation, once the hand-wrap made the opening line's count odd.
     ///
     /// ⚠️ **Correction (#727 round 8 review, blocking).** This doc used to call the odd-count check
     /// "i.e. a code span that opens on one line and closes on another" — an equivalence. It is false
@@ -1748,6 +1746,22 @@ mod cursor_resync_tests {
     /// both fire the citation-half diagnostic in the same run as this check's own, on this head. The
     /// round-6 citation survived because `:` was not yet in the charset, not because a wrapped name
     /// is inherently invisible to citation resolution. No further mechanism claim is made here.
+    ///
+    /// ⚠️ **Correction (#727 round 10 review, blocking).** The paragraph at the top of this doc
+    /// used to close with a comparison between this check and `doc_citations`: "They catch
+    /// overlapping but different subsets of wrapped citations; neither subsumes the other." Found
+    /// false in one direction and deleted, not repaired — this is the third round running in which
+    /// a sentence summarising the relationship between the two checks turned out to be a new
+    /// falsifiable absolute (round 8's `i.e.` equivalence in the paragraph above, round 9's own
+    /// "neither subsumes" replacement for it, now this one). No replacement sentence is written.
+    /// What this check does
+    /// is stated in the paragraph above, on its own terms; what `doc_citations` does is stated in
+    /// its own doc, on its own terms. Nothing here compares them, and nothing should.
+    ///
+    /// ⚠️ **Correction (#727 round 10 review, non-blocking).** The round-9 block above says the
+    /// wrapped fragment "IS visible" to `doc_citations`, unqualified. Left as originally written,
+    /// as history — but for the reader, it holds only when the opening line's own backtick count
+    /// is odd; the sixth bullet below (padding onto an even count) is the case where it does not.
     fn unbalanced_doc_spans(src: &str) -> Vec<usize> {
         let mut out = Vec::new();
         let mut in_fence = false;
