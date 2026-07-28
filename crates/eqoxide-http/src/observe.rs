@@ -917,13 +917,17 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // WORKER-scoped fine-planner liveness (#766 review B3; scope corrected from "session" by
         // round-6 review B12 — the latch is cleared by `Walker::new` as it spawns a replacement, and
         // it reads as session-scoped from outside only because exactly one fine worker is built per
-        // process. `docs/http-api.md` keeps the agent-facing "session-scoped" name and says why).
+        // process — a premise nothing in the tree pins, #787. `docs/http-api.md` keeps the
+        // agent-facing "session-scoped" name and says why).
         // `nav_local` above is a PER-GOAL
         // verdict and #766 retires it with the goal — correct for `no_way_through` / `exhausted`, and
         // wrong for `planner_dead`, which is a latched client fault, not a statement about a goal.
         // Carried here it survives every retirement, so an agent BETWEEN goals — which is when it
         // polls this endpoint to decide what to do next — can still see that its steering has
-        // permanently degraded to the coarse 8u route. `planner_dead` still appears in `nav_local`
+        // degraded to the coarse 8u route and that nothing on any nav route recovers it (a claim
+        // about WRITERS, which is what the tree guarantees; "permanently" was strictly stronger and
+        // false in the same breath as this block's own "the lifetime is the WORKER's" — round-6
+        // review B14). `planner_dead` still appears in `nav_local`
         // while a route is committed; this is the channel that does not vanish when the route does.
         //
         // Always present, in BOTH states, unlike the `null`-when-healthy fields around it: checking
@@ -2962,9 +2966,12 @@ mod tests {
     /// **#766 (agent-honesty) — the OBSERVER half of the fine tier's retirement.**
     ///
     /// The sibling of the test above, for the field #732 left standing. `nav_local` is read off the
-    /// same cloned `NavStatus` and passed through exactly one filter — `.filter(|l| l.state !=
-    /// "threaded")` — so an UNHEALTHY verdict reaches the response body verbatim, and an unhealthy
-    /// verdict is the only kind an agent can ever see. That makes `no_way_through` the right fixture
+    /// same cloned `NavStatus` and passed through exactly one filter —
+    /// `.filter(|l| l.state != "threaded")` — so an UNHEALTHY verdict reaches the response body
+    /// verbatim, and an unhealthy verdict is the only kind an agent can ever see. (Kept whole on one
+    /// line: a code span broken across a `///` wrap renders the break inside the span and is
+    /// un-greppable — #773, round-6 review B15.)
+    /// That makes `no_way_through` the right fixture
     /// and makes the first half of this test a real premise: it asserts that the planted verdict
     /// genuinely publishes, so the `null` below is the retirement's doing and not the filter's.
     ///
@@ -3006,8 +3013,8 @@ mod tests {
     ///
     /// The counterweight to the test above, and the reason this PR did not simply narrow a sentence.
     /// `planner_dead` is the third publishable `nav_local.state`, and it is not a verdict about a
-    /// goal: it is a latched client fault meaning steering has permanently degraded to the coarse
-    /// 8 u route. Retiring `nav_local` on every `idle` — which is #766's whole point — therefore hid
+    /// goal: it is a latched client fault meaning steering has degraded to the coarse 8 u route
+    /// with nothing on any nav route to recover it. Retiring `nav_local` on every `idle` — which is #766's whole point — therefore hid
     /// it from an agent BETWEEN goals, which is precisely when an agent polls this endpoint. So the
     /// fault moved to its own field and this measures the split at the JSON surface, where an agent
     /// actually reads it: after the same retirement, the per-goal verdict is `null` and the

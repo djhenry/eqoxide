@@ -2916,7 +2916,8 @@ mod tests {
     ///
     /// `planner_dead` is one of the three publishable `nav_local.state` values, but unlike
     /// `no_way_through` / `exhausted` it is not a verdict about a goal: it is a latched client fault
-    /// meaning steering has permanently degraded to the coarse 8 u route. #766 retires `nav_local` on
+    /// meaning steering has degraded to the coarse 8 u route with nothing on any nav route to
+    /// recover it. #766 retires `nav_local` on
     /// every route to `idle`, and the review found the consequence — an agent BETWEEN goals, which is
     /// when it polls to decide what to do next, could no longer see that its fine planner was dead.
     /// `nav_local` is its only publication surface in the tree (the `no_path`/`planner_dead` pair on

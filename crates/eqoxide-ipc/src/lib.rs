@@ -1393,7 +1393,9 @@ pub struct NavStatus {
     /// "Session" means PROCESS today: `LocalPlanner::spawn` is reached only through `Walker::new` →
     /// `ActionLoop::new`, and the one production call site of `ActionLoop::new` is in
     /// `run_login_flow`, which returns as soon as the gameplay phase ends — so exactly one fine
-    /// worker exists per process and "latched forever" and "latched for this worker" coincide. They
+    /// worker exists per process and "latched forever" and "latched for this worker" coincide.
+    /// **That premise is pinned by nothing — no guard, no test — and #787 tracks it**; the B9 test
+    /// below cannot be the pin, because building a second `Walker` is its method. They
     /// stop coinciding the moment anything builds a second `Walker` over this row (the shape an
     /// in-process relogin would take): a NEW, healthy `LocalPlanner` would inherit `true` and the
     /// client would report a fault it had just repaired, permanently — #343's shape, and a lie in the

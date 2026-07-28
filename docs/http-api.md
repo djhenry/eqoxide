@@ -891,7 +891,8 @@ a client restart.
 *Session-scoped* is the agent-facing name for that lifetime, and it is accurate: the latch the client
 keeps internally is scoped to the fine **worker**, and exactly one fine worker is built per client
 process, so from out here the two are the same span. The distinction only matters to the client's own
-code, which is where it is written down.
+code, which is where it is written down — as is the fact that nothing currently pins the one-worker
+premise this name rests on (#787).
 
 **Over a running client this field is one-way.** Nothing in the process constructs a second fine
 worker, so nothing clears it. That is a property of the *process*, not of the field, and it was
@@ -912,8 +913,9 @@ fault. Two of `nav_local`'s three states — `no_way_through`, `exhausted` — a
 threading toward *a goal*, so retiring them with the goal is right. `planner_dead` is not: it is a
 latched fault about the client itself that happened to be riding in the same field. Left there, it
 would vanish on every retirement, so an agent **between goals** — exactly when you poll
-`/v1/observe/debug` to decide what to do next — could not learn that its steering had permanently
-degraded to the coarse 8 u route. It would reappear only after a new goal had committed a route.
+`/v1/observe/debug` to decide what to do next — could not learn that its steering had degraded to
+the coarse 8 u route with nothing on any nav route to recover it. It would reappear only after a new
+goal had committed a route.
 
 So check liveness here, not in `nav_local`. `nav_local` still reports `planner_dead` while a route is
 committed, which is useful in context; this is the channel that does not vanish when the route does.
