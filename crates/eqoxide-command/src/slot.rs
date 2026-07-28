@@ -153,15 +153,13 @@ mod tests {
     /// **Why this one stayed line-based when `eqoxide-http`'s guard did not (round 2, N2 / round
     /// 3).** That guard was rewritten to normalise the source because a call site reflowed across
     /// lines silently left its coverage — the guard was the ONLY thing standing behind those call
-    /// sites, so a formatting change could delete a check. That argument does not transfer here,
-    /// and the reason is stronger than "the risk is lower": this crate's real universal is
+    /// sites, so a formatting change could delete a check. This crate's real universal is
     /// [`every_no_overwrite_request_refuses_a_second_write`], which is BEHAVIOURAL — it issues a
     /// second write to a live slot and asserts the first message is the one that drains — and its
     /// case table is completeness-checked against [`declared_no_overwrite_requests`], itself read
-    /// out of the sources. **No reformatting evades a behavioural test.** Wrap a write across five
-    /// lines and the second write still has to be refused, or that test fails. This static rule is
-    /// a redundant early-warning on top of it, catching a *newly added* blind write before anyone
-    /// writes a behaviour test for it.
+    /// out of the sources. That coverage set is exactly the `-> bool` refusing methods; this
+    /// crate's blind writes are not among them, so this static rule is the only defence for a
+    /// blind write, and that is an accepted limit, not a backstopped one.
     #[test]
     fn no_domain_module_blind_writes_a_command_slot() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

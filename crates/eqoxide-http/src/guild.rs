@@ -328,6 +328,13 @@ mod no_silent_overwrite_guard {
         /// Carried rather than collapsed to a `bool` so the table test can pin each conjunct
         /// separately — see R3-1 on [`refusal_shape_faults`].
         faults: Vec<u8>,
+        /// Which terminator conjunct 2 actually found in this site's statement, if either —
+        /// `.refused(` and `.refused_json(` are not interchangeable (one returns
+        /// `(StatusCode, String)`, the other `Response`), so a failure message must echo back
+        /// the one this call site actually uses rather than assume either one (#770 B1: a
+        /// hardcoded `.refused(` suggestion does not compile at a `.refused_json(` site).
+        /// `None` only when conjunct 2 itself is violated (neither string present).
+        terminator: Option<&'static str>,
     }
 
     impl Site {
@@ -358,10 +365,20 @@ mod no_silent_overwrite_guard {
                 (_, None) => text.len(),
             };
             let stmt = &text[start..end.max(start)];
+            // Same two literals conjunct 2 checks; recorded independently so a failure message
+            // can name the one this site actually contains instead of assuming either one.
+            let terminator = if stmt.contains(".refused_json(") {
+                Some(".refused_json(")
+            } else if stmt.contains(".refused(") {
+                Some(".refused(")
+            } else {
+                None
+            };
             out.push(Site {
                 line: map.get(pos).copied().unwrap_or(0),
                 name,
                 faults: refusal_shape_faults(stmt),
+                terminator,
             });
         }
         out
@@ -561,16 +578,34 @@ mod no_silent_overwrite_guard {
             let file = path.file_name().unwrap().to_string_lossy().to_string();
             for site in refusal_sites(&text) {
                 let canonical = site.canonical();
-                let Site { line, name, faults } = site;
+                let Site { line, name, faults, terminator } = site;
                 if !refusable.contains(&name) {
                     ignored_by_design.push(format!("{file}:{line}: {name}"));
                 } else if canonical {
                     checked.push(format!("{file}:{line}: {name}"));
                 } else {
+                    // #770 B1: there are two accepted terminators, not one, and they are not
+                    // interchangeable — `.refused(` returns `(StatusCode, String)`,
+                    // `.refused_json(` returns `Response`. When conjunct 2 already found one of
+                    // them at this site, echo that one back (it is guaranteed to typecheck,
+                    // since it is the terminator the handler already calls); only when neither
+                    // is present (conjunct 2 itself is violated) do we not know which return
+                    // type this handler uses, so both accepted shapes are shown side by side
+                    // instead of guessing.
+                    let shape = match terminator {
+                        Some(t) => format!(
+                            "if let Some(busy) = s.command.{name}(..){t}MSG) {{ return busy; }}"
+                        ),
+                        None => format!(
+                            "if let Some(busy) = s.command.{name}(..).refused(MSG) {{ return busy; }} \
+                             // if the handler returns `(StatusCode, String)`\n    \
+                             if let Some(busy) = s.command.{name}(..).refused_json(MSG) {{ return busy; }} \
+                             // if the handler returns `Response`"
+                        ),
+                    };
                     offenders.push(format!(
                         "{file}:{line}: {name} — not the canonical refusal (violates conjunct(s) \
-                         {faults:?} of refusal_shape_faults). The one accepted spelling is:\n    \
-                         if let Some(busy) = s.command.{name}(..).refused(MSG) {{ return busy; }}"
+                         {faults:?} of refusal_shape_faults). The accepted shape is:\n    {shape}"
                     ));
                 }
             }
