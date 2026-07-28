@@ -561,8 +561,8 @@ impl ConnectOutcome {
     /// claim's phrasings turns up no **un-retracted** copy outside [`LastLoginByOutcome::slots`]'s
     /// rustdoc — stated as a measured fact about this commit, not a guarantee about the next one.
     ///
-    /// ⚠️ **[EDIT, round 8 (#755 review, N1): "turns up none" was the wrong word, and the review's
-    /// own re-grep is why.]** Run with the review's wider pattern set (`completeness pin`,
+    /// ⚠️ **[EDIT answering the round-8 review, N1 (#755): "turns up none" was the wrong word, and
+    /// the review's own re-grep is why.]** Run with the review's wider pattern set (`completeness pin`,
     /// `compile[- ]time pin`, `before the crate builds`, `does not build if`, `hole is closed`,
     /// `cannot reach the wire`, `fails to compile here`, `keeps .*ALL.* complete`; `*.rs`/`*.md`,
     /// `target/` excluded), a grep turns up **four** hits outside `slots()`'s rustdoc: `:541` and
@@ -1483,8 +1483,8 @@ mod tests {
     /// inferred. Commit SHAs, not "this head" — this very edit moves HEAD past `55ecbff`.
     ///
     /// ⚠️ **[EDIT, round 7 (#755 review, B2): "every other test in this module and in `eqoxide-http`
-    /// stayed green; this one alone went RED" was false.]** ⚠️ **[EDIT, round 9 (#755 review, B1-r8):
-    /// this block used to cite "the round-7 review's own re-run (`52 passed; 2 failed`)" as the proof
+    /// stayed green; this one alone went RED" was false.]** ⚠️ **[EDIT answering the round-8 review,
+    /// B1-r8 (#755): this block used to cite "the round-7 review's own re-run (`52 passed; 2 failed`)" as the proof
     /// of the two bullets below. That is a collapsed referent. Both runs print `52 passed; 2 failed`
     /// — 54 tests, two red either way — which hides the seam, but the round-7 review's second red was
     /// a **different assertion at a different line**; see the adjudication below.]** The two bullets
@@ -1858,7 +1858,7 @@ mod tests {
         // grows to 16 while the hard-coded `9` stays put, so `checked` (322560) and the literal
         // (181440) diverge.
         //
-        // ⚠️ [EDIT, round 9 (#755 review, B1-r8): the clause that stood here said "in the round-7
+        // ⚠️ [EDIT answering the round-8 review, B1-r8 (#755): the clause that stood here said "in the round-7
         // MX-E2 re-run this line was never reached — an earlier, unrelated, already-disclosed gap
         // fired first". That is false about the run it names, and self-contradicting on its face:
         // the two numbers quoted one line above can only be produced by a run that DID reach this
