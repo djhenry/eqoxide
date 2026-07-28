@@ -235,6 +235,12 @@ pub struct PlayerState {
     /// `sitting`/`auto_attack`: what we told the server, not what it granted. Defaults `true`
     /// (matching every driver's pre-#625 behavior of always moving at run speed).
     pub run_mode:  bool,
+    /// #724 review B1: **the controller has stopped the body and cannot resume** — see
+    /// [`PlayerHoldView`]. `null` when it has not, which is the overwhelmingly normal case.
+    /// No `skip_serializing_if`: the key is ALWAYS present, so an agent that greps for it and finds
+    /// nothing knows it is talking to a client too old to report the state, rather than concluding
+    /// the character is fine.
+    pub hold: Option<PlayerHoldView>,
 }
 
 impl PlayerState {
@@ -311,6 +317,33 @@ impl PlayerState {
             target_con:      gs.target_id.and(gs.target_con_name.clone()),
             target_attitude: gs.target_id.and(gs.target_attitude.clone()),
             target_level:    gs.target_id.and_then(|id| gs.world.entities.get(&id)).map(|e| e.level),
+            // #724 review B1: the controller's hold, mirrored into `gs` by the same
+            // `ActionLoop::stream_position` tick that mirrors the position, so this is as fresh as
+            // `pos_east/north/up`. `detail` is attached here rather than stored, like every other
+            // agent-facing explanation in this crate.
+            hold: gs.player_hold.map(|h| PlayerHoldView {
+                reason:    h.reason.as_str(),
+                held_secs: h.secs,
+                detail: match h.reason {
+                    eqoxide_core::game_state::ControllerHoldReason::EmbeddedNoRecovery =>
+                        "the character is EMBEDDED in world geometry. The client's push-out search \
+                         found nowhere it can legally stand, and it has no recovery position to fall \
+                         back to (a position discontinuity — a summon, a large server correction — \
+                         supersedes that history, #724). Physics is frozen: every movement command \
+                         will be accepted and produce NO motion, in any direction. This will not \
+                         clear on its own — the client keeps streaming this position and the server \
+                         agrees with it, so no further correction is coming. Ask a GM to move the \
+                         character (#goto/#summon), or zone out.",
+                    eqoxide_core::game_state::ControllerHoldReason::UnderworldNoRecovery =>
+                        "the character fell to the zone's UNDERWORLD floor and the client is holding \
+                         it there rather than let it drop out of the world (#150). It has no \
+                         recovery position to restore (a position discontinuity supersedes that \
+                         history, #724), so it is hanging in place: not falling, not landing, not \
+                         grounded. Horizontal movement still works, but there is probably nothing \
+                         under it. This will not clear on its own — ask a GM to move the character, \
+                         or zone out.",
+                },
+            }),
             // #336: spawn-scoped, unlike target_con*/target_level above — populated for the LAST
             // consider of any spawn, not gated on that spawn being the current target.
             run_mode:      gs.run_mode,
@@ -469,6 +502,73 @@ fn ser_error_kind<S: serde::Serializer>(
     }
 }
 
+/// **The character is physically stuck and the client cannot free it** — `player.hold` (#724).
+/// `null` for a healthy character, including one that is simply standing still.
+///
+/// This exists because "standing still because nothing asked me to move" and "frozen in rock and
+/// unable to move in any direction" were indistinguishable through this API. `pos` is correct in
+/// both, `nav_state` is `idle` in both, and `nav_state.stuck_ticks` is the *walker's* counter, which
+/// only advances while a `/goto` is actively driving — a summoned, stationary character produced no
+/// observable at all. An agent has no independent channel to reality; it would have built every
+/// downstream decision on "everything is fine".
+///
+/// It is emitted only while the hold is IN FORCE; nothing here latches. Three separate things make
+/// that true, and it is worth knowing which one is carrying you (#724 round-3 review, N1 — this
+/// paragraph previously said "recomputes it from scratch on every frame", which is false of the
+/// paths below and contradicted [`PlayerHoldView::held_secs`] twenty lines down):
+///
+/// * **On every RENDERED frame** the controller recomputes it from scratch — the value is taken
+///   before any branch can re-arm it — so it clears the moment the body is freed. `render_frame` is
+///   the only caller of the controller's step.
+/// * **While a zone's assets load** (~10 s, no collision) nothing steps, so an explicit clear runs
+///   instead; likewise a zone-in clears the mirrored copy. Both are pinned by name.
+/// * **While the render loop is idle** it does not render at all, so nothing recomputes — but a
+///   held body cannot be *freed* without a stepped frame either, so idling cannot manufacture a
+///   false hold. What it can do is freeze `held_secs`; see that field, which tells you how to
+///   detect it.
+///
+/// So: a non-`null` `hold` is never stale-because-idle in the sense of describing a predicament the
+/// body has left. It can be stale in *age* (`held_secs`), which is measurable from the caller.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PlayerHoldView {
+    /// `embedded_no_recovery` — embedded in geometry, push-out found nowhere to go, no recovery
+    /// history: **the body cannot move at all**, in any direction, under any driver.
+    /// `underworld_no_recovery` — a descent below the zone's underworld floor was refused with no
+    /// recovery history: the body hangs at the height it reached. Lateral movement still works.
+    ///
+    /// `embedded_no_recovery` LAGS the freeze it reports by up to `STUCK_FALLBACK_SECS` (0.5 s):
+    /// `depenetrate` freezes the whole step from the first embedded frame, but only raises the hold
+    /// once the push-out search has failed continuously for that long. The lag is a genuine "still
+    /// retrying" window — the push-out may succeed inside it — but it means a `None` hold says *no
+    /// hold is in force*, never *the body moved this frame*. `underworld_no_recovery` has no lag.
+    /// (#724 round-2 review, N5.)
+    pub reason: &'static str,
+    /// How long the hold has been continuously in force, in CONTROLLER FRAME TIME as of the last
+    /// stepped frame — deliberately not wall-clock-since-entry. A frozen body's meaningful clock is
+    /// the physics clock, and if the render loop is not stepping then no frames are elapsing, this
+    /// stops advancing, and the `pos` beside it is stale by exactly the same amount.
+    ///
+    /// **The check for that is this field against the caller's own clock** — poll twice, compare the
+    /// delta here with the wall-clock gap between the reads. Do NOT point an agent at [`Health`]:
+    /// every field on it measures the network thread, the link or the world (`snapshot_age_ms` is
+    /// ms since the *network* thread ticked; `connected` is derived at read time and needs no render
+    /// at all), so a stalled render loop with a live network reads as healthy there. Nothing in this
+    /// API tracks the render loop directly.
+    ///
+    /// (#724 round-2 review, N3, which found this doc pointing at [`Health`] — structurally unable
+    /// to answer it — and argued the staleness may be unreachable because both hold shapes leave
+    /// `on_ground == false`, an unconditional render-loop activity signal. That holds for
+    /// `underworld_no_recovery`, whose arm runs only inside `if !self.on_ground`. It does NOT hold
+    /// for `embedded_no_recovery`: `depenetrate` never writes `on_ground`, and while `teleport` does
+    /// clear it, the zone-change ring clear in `app.rs` does not — so a cross-zone arrival inside
+    /// geometry that fires no `teleport` (the #593 gap) can hold with `on_ground` still `true`. That
+    /// path is reasoned from the branch structure, not measured, but it is enough that the caveat
+    /// must stay.)
+    pub held_secs: f32,
+    /// Plain-language statement of what is true and what an agent can do about it.
+    pub detail: &'static str,
+}
+
 /// A cast in flight, for `/v1/observe/debug` → `casting` (#348).
 ///
 /// NOTE the missing `elapsed_ms`: it is derived at **HTTP read time** from `started`, never stored.
@@ -476,6 +576,11 @@ fn ser_error_kind<S: serde::Serializer>(
 /// it is wrong, and nothing in the payload says so. That is #343 in miniature — and it is why the
 /// whole player view is now derived on read rather than published by a loop that sleeps. A duration
 /// must be measured when it is read, or it is just another lie with a timestamp on it.
+//
+// (#724 round-2 review, B1: this comment was orphaned when `PlayerHoldView` was inserted between it
+// and its struct, leaving `PlayerHoldView` documented as "a cast in flight" and `CastingView`
+// documented as nothing at all. Restored verbatim. If you add a type near here, put its doc above
+// its OWN `#[derive]`, not on the end of the previous one.)
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CastingView {
     pub spell_id:   u32,
