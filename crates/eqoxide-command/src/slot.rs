@@ -158,8 +158,12 @@ mod tests {
     /// second write to a live slot and asserts the first message is the one that drains — and its
     /// case table is completeness-checked against [`declared_no_overwrite_requests`], itself read
     /// out of the sources. That coverage set is exactly the `-> bool` refusing methods; this
-    /// crate's blind writes are not among them, so this static rule is the only defence for a
-    /// blind write, and that is an accepted limit, not a backstopped one.
+    /// crate's blind writes are not among them, so for a blind write this static rule is the only
+    /// defence *and a reflow does cost it* — measured, not assumed: an un-annotated blind write
+    /// added to a domain module and wrapped across lines the way rustfmt wraps a long receiver
+    /// chain passes this crate's tests fully green, because the wrap breaks this rule's `*self.`
+    /// anchor and a blind writer was never in the behavioural universal's coverage set to begin
+    /// with. That is an accepted limit, not a backstopped one.
     #[test]
     fn no_domain_module_blind_writes_a_command_slot() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

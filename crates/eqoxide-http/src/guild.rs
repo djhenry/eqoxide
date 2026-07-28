@@ -328,13 +328,6 @@ mod no_silent_overwrite_guard {
         /// Carried rather than collapsed to a `bool` so the table test can pin each conjunct
         /// separately — see R3-1 on [`refusal_shape_faults`].
         faults: Vec<u8>,
-        /// Which terminator conjunct 2 actually found in this site's statement, if either —
-        /// `.refused(` and `.refused_json(` are not interchangeable (one returns
-        /// `(StatusCode, String)`, the other `Response`), so a failure message must echo back
-        /// the one this call site actually uses rather than assume either one (#770 B1: a
-        /// hardcoded `.refused(` suggestion does not compile at a `.refused_json(` site).
-        /// `None` only when conjunct 2 itself is violated (neither string present).
-        terminator: Option<&'static str>,
     }
 
     impl Site {
@@ -347,6 +340,17 @@ mod no_silent_overwrite_guard {
     /// The statement bounds are the previous `;`/`{`/`}` and — because the canonical shape carries
     /// its `return busy;` inside a block — the first `;` after the statement's opening brace, when
     /// a brace comes before the next `;`.
+    ///
+    /// **Do not add a "which terminator did this site use" field here (#770 B1, round 2 attempted
+    /// exactly this and it was reverted).** The span above ends at the first `;` *after* the
+    /// opening brace, so a malformed site missing its `;` inside `{ return busy` — the very thing
+    /// conjunct 3 exists to flag — lets the span run on into the FOLLOWING statement and pick up
+    /// *its* terminator instead. A message that echoes "the terminator this span contains" is then
+    /// not "the terminator this call site uses"; it can name the wrong one, on exactly the
+    /// malformed input the guard is supposed to describe accurately. Fixing the span to stop at
+    /// the offending statement's own closing brace would be a behaviour change, out of place in a
+    /// docs-only fix; until that happens, [`offender_message`] states both accepted shapes rather
+    /// than guessing which one applies.
     fn refusal_sites(src: &str) -> Vec<Site> {
         const NEEDLE: &str = "s.command.request_";
         let (text, map) = normalize(src);
@@ -365,23 +369,35 @@ mod no_silent_overwrite_guard {
                 (_, None) => text.len(),
             };
             let stmt = &text[start..end.max(start)];
-            // Same two literals conjunct 2 checks; recorded independently so a failure message
-            // can name the one this site actually contains instead of assuming either one.
-            let terminator = if stmt.contains(".refused_json(") {
-                Some(".refused_json(")
-            } else if stmt.contains(".refused(") {
-                Some(".refused(")
-            } else {
-                None
-            };
             out.push(Site {
                 line: map.get(pos).copied().unwrap_or(0),
                 name,
                 faults: refusal_shape_faults(stmt),
-                terminator,
             });
         }
         out
+    }
+
+    /// The offender message for a non-canonical [`Site`]. Kept as its own function, rather than
+    /// inlined at the one call site, so a test can pin its exact text without needing the scanner
+    /// to find a real non-canonical site on this (canonical) tree — see
+    /// `offender_message_names_both_accepted_shapes` below.
+    ///
+    /// #770 B1, round 2: this used to echo back "the" terminator found in the site's scanned
+    /// statement, labelled as the one accepted spelling / guaranteed to compile. Both claims were
+    /// false — conjunct 2 accepts two non-interchangeable terminators, and the span that finds one
+    /// of them is not reliably bounded to the flagged call (see the note on [`refusal_sites`]). So
+    /// this states both accepted shapes plainly instead of asserting which one is correct here: a
+    /// message that says less but is never wrong beats one that is usually right.
+    fn offender_message(file: &str, line: usize, name: &str, faults: &[u8]) -> String {
+        format!(
+            "{file}:{line}: {name} — not the canonical refusal (violates conjunct(s) {faults:?} of \
+             refusal_shape_faults). The accepted shape is one of:\n    \
+             if let Some(busy) = s.command.{name}(..).refused(MSG) {{ return busy; }} \
+             // handler returns (StatusCode, String)\n    \
+             if let Some(busy) = s.command.{name}(..).refused_json(json!({{ .. }})) {{ return busy; }} \
+             // handler returns Response"
+        )
     }
 
     /// R2-1 + R2-3 + R3-1, pinned. Every row is a literal source snippet; the expectation is the
@@ -541,6 +557,36 @@ mod no_silent_overwrite_guard {
         );
     }
 
+    /// #770 B1, round 2: [`offender_message`] is built inside `!canonical`, which no site on this
+    /// (canonical) tree ever reaches — a green run of
+    /// [`every_refusable_command_request_is_checked_by_its_http_caller`] exercises it zero times, so
+    /// it was possible to publish a false claim ("guaranteed to compile") about a code path no test
+    /// ever executed. Calling the function directly, on a fabricated non-canonical case, is what
+    /// makes it not-dead: this test fails if the message text drifts from either accepted shape, or
+    /// if it starts claiming to know which one applies to a given site (the thing that was false).
+    #[test]
+    fn offender_message_names_both_accepted_shapes() {
+        let msg = offender_message("combat.rs", 152, "request_attack", &[1, 3]);
+        assert_eq!(
+            msg,
+            "combat.rs:152: request_attack — not the canonical refusal (violates conjunct(s) [1, 3] \
+             of refusal_shape_faults). The accepted shape is one of:\n    \
+             if let Some(busy) = s.command.request_attack(..).refused(MSG) { return busy; } \
+             // handler returns (StatusCode, String)\n    \
+             if let Some(busy) = s.command.request_attack(..).refused_json(json!({ .. })) { return busy; } \
+             // handler returns Response"
+        );
+        // Anti-vacuity against the exact failure mode this replaces: the message must not single
+        // out one shape as "the" accepted one, or name a terminator without the other beside it —
+        // both `.refused(` and `.refused_json(` must be present, uncoupled from which one (if
+        // either) actually appears at the flagged site, because the scanner cannot reliably tell
+        // (see the note on `refusal_sites`).
+        assert!(msg.contains(".refused(MSG)") && msg.contains(".refused_json(json!({ .. }))"),
+            "offender_message must always name BOTH accepted shapes, not the one it guesses: {msg:?}");
+        assert!(!msg.to_lowercase().contains("guarantee"),
+            "offender_message must not claim a compile guarantee it cannot back: {msg:?}");
+    }
+
     /// The universal at the HTTP boundary: a handler that calls a refusable `request_*` and IGNORES
     /// the returned `bool` has re-created exactly the #347 defect — the command was dropped on the
     /// floor and the caller was still told `200`. Every such call site must consume the result.
@@ -578,35 +624,13 @@ mod no_silent_overwrite_guard {
             let file = path.file_name().unwrap().to_string_lossy().to_string();
             for site in refusal_sites(&text) {
                 let canonical = site.canonical();
-                let Site { line, name, faults, terminator } = site;
+                let Site { line, name, faults } = site;
                 if !refusable.contains(&name) {
                     ignored_by_design.push(format!("{file}:{line}: {name}"));
                 } else if canonical {
                     checked.push(format!("{file}:{line}: {name}"));
                 } else {
-                    // #770 B1: there are two accepted terminators, not one, and they are not
-                    // interchangeable — `.refused(` returns `(StatusCode, String)`,
-                    // `.refused_json(` returns `Response`. When conjunct 2 already found one of
-                    // them at this site, echo that one back (it is guaranteed to typecheck,
-                    // since it is the terminator the handler already calls); only when neither
-                    // is present (conjunct 2 itself is violated) do we not know which return
-                    // type this handler uses, so both accepted shapes are shown side by side
-                    // instead of guessing.
-                    let shape = match terminator {
-                        Some(t) => format!(
-                            "if let Some(busy) = s.command.{name}(..){t}MSG) {{ return busy; }}"
-                        ),
-                        None => format!(
-                            "if let Some(busy) = s.command.{name}(..).refused(MSG) {{ return busy; }} \
-                             // if the handler returns `(StatusCode, String)`\n    \
-                             if let Some(busy) = s.command.{name}(..).refused_json(MSG) {{ return busy; }} \
-                             // if the handler returns `Response`"
-                        ),
-                    };
-                    offenders.push(format!(
-                        "{file}:{line}: {name} — not the canonical refusal (violates conjunct(s) \
-                         {faults:?} of refusal_shape_faults). The accepted shape is:\n    {shape}"
-                    ));
+                    offenders.push(offender_message(&file, line, &name, &faults));
                 }
             }
         }
