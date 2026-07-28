@@ -101,6 +101,20 @@ pub struct ControllerView {
     /// #442). `None` except right after a landing; the nav streamer take-and-clears it exactly once.
     /// Respects the init gate — default `None`, only ever set after `initialized`.
     pub landed_fall_height: Option<f32>,
+    /// #724 review B1: the controller is holding the body still and has no way to resume — see
+    /// [`eqoxide_core::game_state::ControllerHold`]. Republished from
+    /// `CharacterController::hold()` on every RENDERED frame (not latched like
+    /// `landed_fall_height`, which is a one-shot the reader must not miss): this is a level signal,
+    /// so a stale `Some` after the condition ends is the failure mode to avoid, and re-publishing
+    /// the current value is what avoids it. `ActionLoop::stream_position` mirrors it into
+    /// `GameState::player_hold`.
+    ///
+    /// "Rendered" is load-bearing (#724 round-3 review, N1 — this said "EVERY frame" flatly).
+    /// `about_to_wait` has an explicit idle branch that renders nothing, and on rendered frames
+    /// where the controller is not stepped (no collision, mid zone-load) the level signal is
+    /// supplied by an explicit `clear_hold`, not by a recompute. Both are pinned by name; see
+    /// `CharacterController::clear_hold`.
+    pub hold: Option<eqoxide_core::game_state::ControllerHold>,
 }
 
 /// Which mode the orbit/follow camera is in. Relocated from `camera_state` (#544 Step 2c).

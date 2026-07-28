@@ -2803,6 +2803,11 @@ impl ActionLoop {
         let view = *self.controller.controller_view.lock().unwrap();
         // Don't stream/mirror until the render controller has spawned (else we'd push origin).
         if !view.initialized { return; }
+        // #724 review B1: mirror the controller's "I have stopped the body and cannot resume" state
+        // alongside its position, on the same tick and under the same init gate, so `player.hold` on
+        // `GET /v1/observe` is exactly as fresh as the `pos` beside it. Level-triggered — the view is
+        // republished every render frame, so this write is also the clear.
+        gs.player_hold = view.hold;
         // Anti-MQGhost keepalive (#105): send a movement-history entry every 30s (< the server's 70s
         // window) whether or not we're moving, so the server's CheatManager never false-flags us.
         if self.last_movement_history_send.elapsed().as_millis() >= MOVEMENT_HISTORY_MS {

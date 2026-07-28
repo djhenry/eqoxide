@@ -824,6 +824,76 @@ pub struct WorldState {
     pub zone_points: Vec<ZonePoint>,
 }
 
+/// Why the render `CharacterController` is holding the body still — a predicament it cannot leave
+/// under its own power, and which no other published field reveals (#724 review, B1).
+///
+/// Both variants are the SAME shape: a recovery path decided it must not let the body go where the
+/// physics was taking it, looked for a banked "last good" position to put it at instead, and found
+/// none. The frame then changes nothing and re-runs identically next frame, so the body is frozen
+/// until something external moves it. Before #724 the ring was almost never empty, so these branches
+/// were rare; #724 clears the ring on every position discontinuity, which makes an empty ring the
+/// NORMAL post-relocation state and these holds an ordinary outcome of a GM summon into rock.
+///
+/// This is deliberately NOT "am I stuck?" in general — a character walking into a wall is blocked
+/// and is not this. It is specifically "the controller has stopped the body and has no way to
+/// resume", which is the state an agent would otherwise read as a perfectly healthy stand-still.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerHoldReason {
+    /// The body is embedded in geometry, the depenetration push-out ring found nowhere it can
+    /// occupy, and there is no banked good position to fall back to. `depenetrate` returns `true`
+    /// every frame, so the whole rest of the step is skipped: the body cannot move at all, in any
+    /// direction, under any driver (WASD, `/goto`, `/move`).
+    EmbeddedNoRecovery,
+    /// The #150 fall-through guard refused a descent to/below the zone's underworld floor and had
+    /// no banked good position to restore. The body hangs at the height it reached, not falling and
+    /// not landing. Lateral movement still works; the body is out of the world vertically.
+    UnderworldNoRecovery,
+}
+
+impl ControllerHoldReason {
+    /// Stable machine token for the API. Never reword these — agents match on them.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ControllerHoldReason::EmbeddedNoRecovery   => "embedded_no_recovery",
+            ControllerHoldReason::UnderworldNoRecovery => "underworld_no_recovery",
+        }
+    }
+}
+
+/// A hold in force RIGHT NOW, with how long it has lasted.
+///
+/// Level-triggered by construction: the controller clears this at the top of every `step` and only
+/// a branch that is actively holding the body *this frame* re-sets it, so it cannot outlive the
+/// condition it describes. That clear-path is the point — an observable that latches on and never
+/// clears is its own honesty bug (#343/#679), not a fix for one.
+///
+/// # `secs` defeats `publish_snapshot`'s dedup for the hold's whole duration — deliberately
+///
+/// This type's `PartialEq` reaches [`GameState`]'s, which `eqoxide_net::gameplay::publish_snapshot`
+/// uses to skip republishing an unchanged snapshot. `secs` advances on every stepped frame, so a
+/// held body compares unequal on every net tick and stores a fresh `Arc` each time, for as long as
+/// the hold lasts (#724 round-2 review, N6).
+///
+/// **Nothing downstream amplifies that, and here is why.** The only consumer of the snapshot `Arc`'s
+/// *identity* is `App::poll_external`, which sets `activity = true` on `!Arc::ptr_eq` to wake the
+/// render loop. That same function already sets `activity = true` unconditionally on `!on_ground`,
+/// which every `underworld_no_recovery` hold guarantees (its arm runs only inside `if
+/// !self.on_ground`) — so on that shape the republish cannot wake a loop that was not already
+/// awake. HTTP reads the snapshot by value (`.load()`), never by identity, and no endpoint or
+/// long-poll waits on a pointer change. The residual cost is one `GameState::clone` per net tick
+/// instead of a pointer compare, bounded per tick and unbounded only in duration.
+///
+/// Excluding `secs` from equality was considered and rejected: it would make two genuinely different
+/// states compare equal, so a hold that changed duration could go unpublished, and the field exists
+/// precisely so an agent can watch it advance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ControllerHold {
+    pub reason: ControllerHoldReason,
+    /// Seconds this hold has been continuously in force (controller frame time, accumulated only
+    /// while the reason is unchanged). A change of reason restarts it at one frame.
+    pub secs: f32,
+}
+
 /// All state the renderer needs for one frame.
 ///
 /// `PartialEq` is load-bearing: `eq_net::gameplay::publish_snapshot` compares the freshly-mutated
@@ -949,6 +1019,21 @@ pub struct GameState {
     /// Cleared at the start of every resolution (a request that located no line leaves no stale
     /// plan) and by [`GameState::begin_zone_in`].
     pub zone_cross_plan: Option<crate::zone_cross::ZoneCrossPlan>,
+    /// **#724 review B1: the render controller is holding the body still and cannot resume.**
+    /// `None` = it is not (which includes "it is simply standing still because nothing asked it to
+    /// move"); `Some` = a recovery path has frozen the body and has nothing to restore it onto. See
+    /// [`ControllerHold`] for the two shapes and for why this cannot latch.
+    ///
+    /// Mirrored here from `ControllerView::hold` by `ActionLoop::stream_position`, exactly like
+    /// `player_x/y/z` and with exactly the same freshness: it is as current as the last render frame
+    /// that stepped the controller. If the render loop is not stepping, the controller is not moving
+    /// the body either and this holds its last computed value — the position beside it is stale in
+    /// the same breath and by the same amount.
+    ///
+    /// This is a CLIENT-SIDE physics fact, not server truth. It deliberately does not live in
+    /// [`WorldState`]: the server has no opinion about it and would happily agree with the position
+    /// we keep streaming from inside the rock.
+    pub player_hold: Option<ControllerHold>,
     pub player_heading: f32,
     pub player_level: u32,
     pub player_race: String,
@@ -1313,6 +1398,11 @@ impl GameState {
         // round-3 re-arm of the gated-refusal latch in `sync_zone_points`.
         self.zone_cross_attempts = None;
         self.zone_cross_plan = None;
+        // #724 review B1: a hold describes the body's predicament in geometry that is about to be
+        // dropped. The controller stops being stepped while the new zone loads, so without this the
+        // last mirrored value would sit here — a confident "you are wedged" about a zone we have
+        // left — until the first frame after the new collision lands. Unknown, not false-positive.
+        self.player_hold = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
         // target_name/target_hp_pct fall back to the stale cached snapshot — /observe/debug then
@@ -1927,7 +2017,8 @@ mod pose_tests_643 {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{Door, GameState, MerchantItem, ZonePoint, make_entity};
+    use super::{ControllerHold, ControllerHoldReason, Door, GameState, MerchantItem, ZonePoint,
+                make_entity};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
     /// including the FULL-SNAPSHOT (`resync_from_snapshot`) path that carries the real mid-zone
@@ -2777,6 +2868,44 @@ pub(crate) mod tests {
             "a zone-in makes the crossing guess moot — the marker must not stick true across it");
         assert!(!gs.player_pos_known,
             "…and the honest post-zone-in position state is UNKNOWN, not a provisional guess");
+    }
+
+    /// #724 round-3 review (B1) — the previous zone's hold must NOT survive a zone-in.
+    ///
+    /// A [`ControllerHold`] describes the body's predicament in specific collision geometry. A
+    /// zone-in drops that geometry, and the controller stops being stepped while the new zone
+    /// loads, so nothing recomputes the value. Left in place, the last mirrored hold sits in
+    /// `player_hold` — and `/v1/observe/debug` reports *"the character is EMBEDDED in world
+    /// geometry … ask a GM to move the character"* about a zone the character has already left —
+    /// until the first frame after the new collision lands. The honest state for that window is
+    /// `None` (no hold in force), not a stale alarm.
+    ///
+    /// This field has exactly two writers — this clear, and `ActionLoop::stream_position`'s mirror
+    /// of `ControllerView::hold` (`git grep player_hold`, verified for this test). So while the
+    /// zone-entry handshake runs, this clear is the only thing that can make the field honest.
+    /// Round-3 review additionally traced that the net tick loop is *suspended* across the
+    /// handshake, so the mirror cannot even race it — that is the REVIEWER'S CODE TRACE of an async
+    /// call graph, recorded here as attribution, not re-derived and not measured at runtime. This
+    /// test does not depend on it: the two-writer fact alone is enough reason for the clear to
+    /// exist, and the test pins the clear directly.
+    ///
+    /// Round-3 review MEASURED this clear unpinned: deleting it (with `app.rs`'s `clear_hold` call)
+    /// left the whole workspace green, 158 passed / 0 failed. Mutation check: drop the
+    /// `player_hold = None` from `begin_zone_in` → RED here.
+    #[test]
+    fn begin_zone_in_clears_the_previous_zones_hold_724() {
+        let mut gs = GameState::new();
+        gs.player_hold = Some(ControllerHold {
+            reason: ControllerHoldReason::EmbeddedNoRecovery,
+            secs: 9.5,
+        });
+
+        gs.begin_zone_in();
+
+        assert!(gs.player_hold.is_none(),
+            "a hold describes geometry the zone-in just dropped, and nothing recomputes it while \
+             the new zone loads — a zone-in must clear it so the load window reads honestly \
+             \"no hold\" instead of a confident wedge alarm about the zone we left");
     }
 
 }

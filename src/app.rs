@@ -1361,6 +1361,7 @@ impl App {
                 v.pos = self.scene.player_pos;
                 v.heading = self.scene.player_heading;
                 v.moving = false;
+                v.hold = None; // just seeded by `teleport`; nothing has stepped yet (#724 review B1)
                 v.initialized = true;
             }
         }
@@ -1614,6 +1615,13 @@ impl App {
                     // and fades; false for a normal grounded character (physics byte-identical).
                     self.controller.set_levitating(self.game_state_view.player_levitating());
                     self.controller.step(intent, dt, c);
+                } else {
+                    // No collision loaded (mid zone-load): the controller is NOT being stepped, so
+                    // whatever hold it last computed describes geometry that has since been dropped
+                    // and nothing will recompute it until the new zone lands. Publishing it would be
+                    // a confident "you are wedged" about a zone we have left, for the whole ~10 s of
+                    // the load. Drop it — unknown, not a stale alarm (#724 review B1).
+                    self.controller.clear_hold();
                 }
             }
             let cpos = self.controller.pos;
@@ -1655,6 +1663,13 @@ impl App {
                     v.pos = cpos;
                     v.heading = self.heading_target;
                     v.moving = intent.wish_dir[0] != 0.0 || intent.wish_dir[1] != 0.0 || !self.on_ground;
+                    // #724 review B1: republish the controller's hold every RENDERED frame — a level
+                    // signal, never latched. `hold()` is `None` unless a recovery branch stopped the
+                    // body on the frame just stepped, so this write is also the clear: the frame the
+                    // body is freed, `None` overwrites the previous `Some` here with no ceremony.
+                    // On frames that render but do NOT step, that `None` comes from the explicit
+                    // `clear_hold()` above, not from a recompute (#724 round-3 review, B1/N1).
+                    v.hold = self.controller.hold();
                     // Latch a fresh landing ONLY into an empty view slot, and only TAKE it from the
                     // controller when the slot is free (§442 #442 DEFECT-3 — never drop a real fall's
                     // damage). If the nav thread has not yet consumed a previous landing's height, we
