@@ -39,17 +39,31 @@
 //! - The polarity decision lives at ONE site (this module) rather than at ~38 call sites.
 //! - Every silent-drop form found so far is RED, by a source guard and — on eight routes — by a
 //!   behavioural double-fire test as well.
-//! - The enumeration of those forms is **not** claimed to be complete. It has been wrong three
+//! - The enumeration of those forms is **not** claimed to be complete. It has been wrong four
 //!   times: round 1 `if s.command.request_x` (no `!`); round 2 `if let Some(_) = …refused(MSG) { }`,
 //!   which compiles and answers `200`; round 2 again, a receiver wrapped across lines, which the
-//!   guard's single-line grep never even enumerated. Each was found by running a mutation, and each
-//!   had already been reasoned away in a comment like this one.
+//!   guard's single-line grep never even enumerated; round 3
+//!   `if let Some(busy) = … .refused(MSG) { tracing::warn!("{busy:?}"); }`, which binds the refusal
+//!   and then answers `200` anyway. Each was found by running a mutation, and each had already been
+//!   reasoned away in a comment like this one.
 //!
 //! Because guessing the next form is what keeps failing, the guard no longer depends on guessing
 //! how a call site is *formatted*: it normalises the source (comments stripped, literals blanked,
 //! whitespace collapsed, spaces around `.` removed) before matching, and its acceptance predicate
-//! is extracted and pinned by a table test over literal snippets — including both wrapped forms —
-//! so relaxing the predicate is itself RED. See `guild.rs`'s `no_silent_overwrite_guard`.
+//! is extracted and pinned by a table test over literal snippets — including both wrapped forms.
+//! See `guild.rs`'s `no_silent_overwrite_guard`.
+//!
+//! **Round-3 correction (R3-1).** This paragraph used to end "so relaxing the predicate is itself
+//! RED". That was false, and it is the same defect as the ones above, written into the text meant
+//! to fix them. The predicate is a three-way conjunction; every negative row in the table failed on
+//! conjunct 1 alone, so deleting conjunct 2 or conjunct 3 shipped with the round-2 suite unchanged
+//! (`240 passed; 0 failed` either way — the round-3 reviewer's figures, on the round-2 tree), and
+//! the composite of the two answered `200` on a refused `POST /v1/interact/sit`. What is true now,
+//! measured on THIS tree rather than reasoned (M-R3a / M-R3c / M-R3b, all `239 passed; 1 failed`):
+//! the predicate reports WHICH conjuncts a snippet violates, the table pins the exact set per row,
+//! and an anti-vacuity assertion requires each conjunct to be the sole fault of some row — so
+//! deleting any one of the three is RED. That is a claim about these three conjuncts, not about the
+//! enumeration above, which remains open.
 //!
 //! The part that does not depend on any guard: the four modules the round-1 reviewer measured as
 //! having *zero* `409` assertions (`pet`, `trainer`, `group`, `quests`) now each have a double-fire

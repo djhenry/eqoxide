@@ -291,24 +291,51 @@ mod no_silent_overwrite_guard {
     /// weaken this" is not an enforcement mechanism.
     ///
     /// So it is extracted here and pinned by [`the_call_site_predicate_accepts_only_the_canonical_shape`],
-    /// a table test over literal source snippets. Relaxing this function fails that test; the table
-    /// includes the wrapped-receiver form, so it would also have caught R2-1 at design time,
-    /// without a build.
-    fn is_canonical_refusal(stmt: &str) -> bool {
-        stmt.starts_with("if let Some(busy) = s.command.request_")
-            && (stmt.contains(".refused(") || stmt.contains(".refused_json("))
-            && stmt.contains("{ return busy;")
+    /// a table test over literal source snippets. The table includes the wrapped-receiver form, so
+    /// it would also have caught R2-1 at design time, without a build.
+    ///
+    /// **Round-3 review, R3-1.** The round-2 version of that sentence read "relaxing this function
+    /// fails that test", and it was FALSE. The predicate is a three-way conjunction, but every
+    /// negative row in the table failed on conjunct 1 (`starts_with`) alone, so no row ever reached
+    /// conjuncts 2 or 3 — deleting either of them left the round-2 suite green at `240 passed;
+    /// 0 failed` (the round-3 reviewer's measurement, mutations M-R3a and M-R3c; not re-run here,
+    /// because the code it applied to no longer exists). With conjunct 3 gone, a handler could bind
+    /// the refusal and then throw it away — `{ tracing::warn!("busy: {busy:?}"); }` — and answer
+    /// `200` to a refused write, which is #347 on the exact route this patch protects (M-R3b).
+    /// A conjunction is only as pinned as its least-covered conjunct.
+    ///
+    /// Hence the fault vector rather than a bare `bool`: each conjunct is numbered, the table
+    /// asserts the exact set of conjuncts a snippet violates, and an anti-vacuity assertion
+    /// requires every conjunct to be the SOLE fault of at least one row. Deleting any single
+    /// conjunct therefore turns that row's expectation from `[n]` into `[]` and fails the test.
+    fn refusal_shape_faults(stmt: &str) -> Vec<u8> {
+        let mut faults = Vec::new();
+        // 1: the statement is the `if let Some(busy) = …` binding, not `if !…`, `let ok = …`,
+        //    `if let Some(_) = …`, or a wrapped discard.
+        if !stmt.starts_with("if let Some(busy) = s.command.request_") { faults.push(1); }
+        // 2: the refusal goes through the one polarity site, `refusal::Refusal`.
+        if !(stmt.contains(".refused(") || stmt.contains(".refused_json(")) { faults.push(2); }
+        // 3: the bound refusal is actually RETURNED, not logged, counted, or dropped.
+        if !stmt.contains("{ return busy;") { faults.push(3); }
+        faults
     }
 
     #[derive(Debug)]
     struct Site {
         line: usize,
         name: String,
-        canonical: bool,
+        /// Which conjuncts of [`refusal_shape_faults`] this site violates; empty = canonical.
+        /// Carried rather than collapsed to a `bool` so the table test can pin each conjunct
+        /// separately — see R3-1 on [`refusal_shape_faults`].
+        faults: Vec<u8>,
+    }
+
+    impl Site {
+        fn canonical(&self) -> bool { self.faults.is_empty() }
     }
 
     /// Every `s.command.request_*` call site in `src`, found on the NORMALISED text so that the
-    /// enumeration is whitespace-insensitive, each classified by [`is_canonical_refusal`].
+    /// enumeration is whitespace-insensitive, each carrying its [`refusal_shape_faults`] verdict.
     ///
     /// The statement bounds are the previous `;`/`{`/`}` and — because the canonical shape carries
     /// its `return busy;` inside a block — the first `;` after the statement's opening brace, when
@@ -334,58 +361,91 @@ mod no_silent_overwrite_guard {
             out.push(Site {
                 line: map.get(pos).copied().unwrap_or(0),
                 name,
-                canonical: is_canonical_refusal(stmt),
+                faults: refusal_shape_faults(stmt),
             });
         }
         out
     }
 
-    /// R2-1 + R2-3, pinned. Every row is a literal source snippet; the expectation is what
-    /// [`refusal_sites`] must say about it. A relaxation of [`is_canonical_refusal`] flips a
-    /// `false` row; a return to line-oriented detection flips the wrapped rows to "not found".
+    /// R2-1 + R2-3 + R3-1, pinned. Every row is a literal source snippet; the expectation is the
+    /// EXACT set of [`refusal_shape_faults`] conjuncts it violates (`None` = no site enumerated at
+    /// all, `Some([])` = canonical). A return to line-oriented detection flips the wrapped rows to
+    /// `None`.
+    ///
+    /// **Why fault sets and not a `bool` (R3-1).** With a `bool` expectation this table was green
+    /// under deletion of conjunct 2 *or* conjunct 3, because every rejected row also failed conjunct
+    /// 1 and `false` is `false` however you reach it. The exact-set form plus the per-conjunct
+    /// anti-vacuity assertion below makes each conjunct independently load-bearing: for each `n`
+    /// there is a row whose only fault is `n`, so deleting conjunct `n` turns that row's answer into
+    /// `[]` and this test goes RED.
     #[test]
     fn the_call_site_predicate_accepts_only_the_canonical_shape() {
-        // (label, snippet, expected: None = no site enumerated, Some(canonical?))
-        let cases: Vec<(&str, &str, Option<bool>)> = vec![
+        // (label, snippet, expected: None = no site enumerated, Some(exact fault set))
+        let cases: Vec<(&str, &str, Option<Vec<u8>>)> = vec![
             (
                 "canonical, one line",
                 r#"fn h() { if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; } }"#,
-                Some(true),
+                Some(vec![]),
             ),
             (
                 "canonical, receiver wrapped across lines (R2-1: correct code, reflowed)",
                 "fn h() {\n    if let Some(busy) = s\n        .command\n        .request_sit(true)\n        .refused(BUSY_SIT) { return busy; }\n}",
-                Some(true),
+                Some(vec![]),
             ),
             (
                 "M-R2a: the reviewer's wrapped discard — must be FOUND and rejected",
                 "fn h() {\n    let _busy = s\n        .command\n        .request_sit(true)\n        .refused(BUSY_SIT);\n}",
-                Some(false),
+                Some(vec![1, 3]),
             ),
             (
                 "round-1 B1: `if !…`",
                 r#"fn h() { if !s.command.request_sit(true) { return (StatusCode::CONFLICT, BUSY_SIT.into()); } }"#,
-                Some(false),
+                Some(vec![1, 2, 3]),
             ),
             (
                 "round-1 B1 inverted: `if …`",
                 r#"fn h() { if s.command.request_sit(true) { return (StatusCode::CONFLICT, BUSY_SIT.into()); } }"#,
-                Some(false),
+                Some(vec![1, 2, 3]),
             ),
             (
                 "bound and ignored",
                 r#"fn h() { let ok = s.command.request_sit(true); }"#,
-                Some(false),
+                Some(vec![1, 2, 3]),
             ),
             (
                 "M-B1f: empty-bodied `if let Some(_)`",
                 r#"fn h() { if let Some(_) = s.command.request_sit(true).refused(BUSY_SIT) { } }"#,
-                Some(false),
+                Some(vec![1, 3]),
             ),
             (
                 "canonical via refused_json",
                 r#"fn h() { if let Some(busy) = s.command.request_buy(x).refused_json(json!({"e":1})) { return busy; } }"#,
-                Some(true),
+                Some(vec![]),
+            ),
+            // R3-1, conjunct 1 alone. This form is BEHAVIOURALLY CORRECT — it returns the refusal —
+            // and the guard rejects it anyway, because #347's whole point is that there is one
+            // spelling to audit. Keeping that as a row makes the cost explicit instead of leaving
+            // it as a surprise, and it is the only row whose sole fault is conjunct 1.
+            (
+                "R3-1: `match` instead of `if let` — correct, but not the canonical spelling",
+                r#"fn h() { match s.command.request_sit(true).refused(BUSY_SIT) { Some(busy) => { return busy; } None => {} } }"#,
+                Some(vec![1]),
+            ),
+            // R3-1, conjunct 2 alone: correct binding, correct return, but the refusal is built by
+            // some other helper instead of the one polarity site. Nothing else in this table can
+            // fail here, so conjunct 2 exists or this row is wrong.
+            (
+                "R3-1: bypasses `Refusal` — fails conjunct 2 and NOTHING else",
+                r#"fn h() { if let Some(busy) = s.command.request_sit(true).busy_response(BUSY_SIT) { return busy; } }"#,
+                Some(vec![2]),
+            ),
+            // R3-1, conjunct 3 alone: this is M-R3b, the composite the reviewer shipped green in
+            // round 2 — it answers 200 on a refused write, i.e. #347 on the very route this patch
+            // is meant to protect.
+            (
+                "M-R3b: binds the refusal, logs it, returns 200 — fails conjunct 3 and NOTHING else",
+                r#"fn h() { if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { tracing::warn!("busy: {busy:?}"); } }"#,
+                Some(vec![3]),
             ),
             (
                 "prose in a doc comment is not a call site",
@@ -400,17 +460,17 @@ mod no_silent_overwrite_guard {
             (
                 "a `{` inside a string literal must not be read as a statement boundary",
                 "fn h() {\n    let _ = format!(\"{x} queued; now\");\n    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; }\n}",
-                Some(true),
+                Some(vec![]),
             ),
             (
                 "a `{` inside a raw string must not be read as a statement boundary",
                 "fn h() {\n    let _ = r#\"{\"a\":1};\"#;\n    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; }\n}",
-                Some(true),
+                Some(vec![]),
             ),
             (
                 "a quote inside a char literal must not open a string",
                 "fn h() {\n    let _ = x.split('\"').next();\n    if let Some(busy) = s.command.request_sit(true).refused(BUSY_SIT) { return busy; }\n}",
-                Some(true),
+                Some(vec![]),
             ),
         ];
 
@@ -419,23 +479,48 @@ mod no_silent_overwrite_guard {
             let sites = refusal_sites(snippet);
             let got = match sites.len() {
                 0 => None,
-                1 => Some(sites[0].canonical),
+                1 => Some(sites[0].faults.clone()),
                 n => { wrong.push(format!("{label}: expected at most one site, found {n}")); continue; }
             };
             if got != *expected {
                 wrong.push(format!("{label}: expected {expected:?}, got {got:?} ({sites:?})"));
             }
+            // `Site::canonical` is the form the scanner's callers read; it must agree with the
+            // fault vector on every row, so a future edit cannot fix one and leave the other behind.
+            if let (Some(g), Some(site)) = (got.as_ref(), sites.first()) {
+                if site.canonical() != g.is_empty() {
+                    wrong.push(format!("{label}: canonical()/faults disagree ({site:?})"));
+                }
+            }
         }
         assert!(wrong.is_empty(), "the call-site predicate has drifted:\n  {}", wrong.join("\n  "));
 
-        // Anti-vacuity: the table must contain both verdicts and at least one wrapped snippet,
-        // otherwise a future edit could satisfy it with a predicate that answers a constant.
-        assert!(cases.iter().any(|c| c.2 == Some(true)), "no accepted row");
-        assert!(cases.iter().any(|c| c.2 == Some(false)), "no rejected row");
+        // Anti-vacuity: the table must contain every verdict shape and at least one wrapped
+        // snippet, otherwise a future edit could satisfy it with a predicate that answers a
+        // constant.
+        assert!(cases.iter().any(|c| c.2.as_deref() == Some(&[][..])), "no accepted row");
+        assert!(cases.iter().any(|c| c.2.as_ref().is_some_and(|f| !f.is_empty())), "no rejected row");
         assert!(cases.iter().any(|c| c.2.is_none()), "no not-a-call-site row");
         assert!(
             cases.iter().filter(|c| c.1.contains("\n        .command")).count() >= 2,
             "the table must keep BOTH wrapped-receiver rows — they are what pins R2-1"
+        );
+
+        // R3-1: every conjunct must be the SOLE fault of some row. Without this, a conjunct can be
+        // deleted with the whole table still green — which is exactly what M-R3a and M-R3c did to
+        // the round-2 version of this test.
+        for n in 1u8..=3 {
+            assert!(
+                cases.iter().any(|c| c.2.as_deref() == Some(&[n][..])),
+                "conjunct {n} of refusal_shape_faults is not independently pinned: no row fails it \
+                 and only it, so deleting it would leave this test green"
+            );
+        }
+        // …and the conjunct numbering must not have silently grown past what the loop above covers.
+        assert!(
+            refusal_shape_faults("").iter().copied().eq(1u8..=3),
+            "refusal_shape_faults gained or lost a conjunct; extend the anti-vacuity loop to match \
+             (an empty statement must fail every conjunct, in order)"
         );
     }
 
@@ -452,7 +537,7 @@ mod no_silent_overwrite_guard {
     /// Precisely what that buys, measured rather than reasoned — the compiler rejects the literal
     /// `!`-drop (`if let None = …` binds nothing, so the `return busy;` is `E0425`), but it does
     /// NOT reject every silent drop: `if let Some(_) = …refused(MSG) { }` compiles cleanly, and so
-    /// does a wrapped receiver (R2-1). Both are caught HERE, by [`is_canonical_refusal`], and —
+    /// does a wrapped receiver (R2-1). Both are caught HERE, by [`refusal_shape_faults`], and —
     /// for the four modules that gained tests in round 1 — independently by a behavioural
     /// double-fire test that sees the `200` where a `409` belongs. So the inverted form is not
     /// unrepresentable; every form found SO FAR is provably RED (the enumeration has been wrong
@@ -475,13 +560,17 @@ mod no_silent_overwrite_guard {
             let text = std::fs::read_to_string(&path).unwrap();
             let file = path.file_name().unwrap().to_string_lossy().to_string();
             for site in refusal_sites(&text) {
-                let Site { line, name, canonical } = site;
+                let canonical = site.canonical();
+                let Site { line, name, faults } = site;
                 if !refusable.contains(&name) {
                     ignored_by_design.push(format!("{file}:{line}: {name}"));
                 } else if canonical {
                     checked.push(format!("{file}:{line}: {name}"));
                 } else {
-                    offenders.push(format!("{file}:{line}: {name} — result discarded"));
+                    offenders.push(format!(
+                        "{file}:{line}: {name} — not the canonical refusal (violates conjunct(s) \
+                         {faults:?} of refusal_shape_faults)"
+                    ));
                 }
             }
         }
