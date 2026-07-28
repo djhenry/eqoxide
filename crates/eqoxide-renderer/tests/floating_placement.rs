@@ -49,15 +49,27 @@
 //! same day counted 130: the model directory is a live sync target, so the *total* moves. The
 //! loadable subset below and the result did not.
 //!
-//! 1. **`boat.glb` is the only model `model_for` can load with `skins == 0`.** The loadable names
-//!    are the 18 distinct archetypes `race_to_archetype` can return (`humanoid`, `elf`, `dwarf`,
-//!    `gnoll`, `skeleton`, `zombie`, `creature`, `rat`, `snake`, `frog`, `wasp`, `wolf`, `bat`,
-//!    `bird`, `worm`, `fish`, `bear`, `boat`) plus the 29 `race_*` player models — 47 names, all 47
-//!    present. Every one reported `skins == 1` except `boat.glb`, at `skins == 0`. The remaining
-//!    files are zone/door/weapon assets `model_for` never names. Also scanned, because the first
-//!    pass missed them: the `<key>_f.glb` female variants `model_for` prefers for `gender == 1`
-//!    (`renderer.rs:610`). Three exist on disk — `humanoid_f`, `elf_f`, `dwarf_f` — and all three
-//!    reported `skins == 1`, so they do not change the conclusion.
+//! 1. **`boat.glb` is the only model `model_for` can load that lands on the STATIC arm.** State the
+//!    gate first, because an earlier version of this note stated the wrong one: `renderer.rs:663-664`
+//!    picks the skinned path when `0 < joint_count <= 128`, so the static arm is
+//!    `!(0 < joint_count <= 128)` — no skin, a skin with zero joints, **or a skin with more than 128
+//!    joints**. `skins == 0` is therefore *sufficient but not necessary*, and a scan that only reads
+//!    `len(skins)` does not establish which arm a model takes.
+//!
+//!    Re-scanned on 2026-07-28 reading `len(skins[0].joints)` as well. Loadable names: the 18
+//!    distinct archetypes `race_to_archetype` can return (`humanoid`, `elf`, `dwarf`, `gnoll`,
+//!    `skeleton`, `zombie`, `creature`, `rat`, `snake`, `frog`, `wasp`, `wolf`, `bat`, `bird`,
+//!    `worm`, `fish`, `bear`, `boat`) plus the 29 `race_*` player models plus the 3 `<key>_f.glb`
+//!    female variants that exist (`humanoid_f`, `elf_f`, `dwarf_f`; `model_for` prefers them for
+//!    `gender == 1`, `renderer.rs:610`) — **50 files, all present**. Exactly one lands on the static
+//!    arm: `boat.glb`, `skins == 0`, 0 joints. Nothing is above the cap. The remaining files on disk
+//!    are zone/door/weapon assets `model_for` never names.
+//!
+//!    **This is a margin of one joint on a directory rebaked outside this repo.**
+//!    `race_pcfroglok.glb` sits at **127** joints against the 128 cap, and 11 rigs are at ≥ 109
+//!    (next highest 110). A two-joint rebake of that file moves a PC race — for which
+//!    `Entity::floating()` is false — onto the grounded arm. The grounded arm being unreached today
+//!    is a fact about the current asset bake, not a property of the code.
 //! 2. **A skinned rig's raw vertex origin is not a stable EQ datum.** `race_hum.glb` reported
 //!    `y_min = -10.430519`; `race_huf.glb` reported `y_min = -3.688780`. Both are nominally
 //!    6.0-foot humans (`race_target_height("HUM") == 6.0`), so their raw origins sit at wildly
@@ -409,10 +421,20 @@ fn all_archetypes_is_every_archetype_race_to_archetype_can_return() {
 /// both halves stay 2, i.e. green with an unreviewed call site. `cargo fmt` would remove that space,
 /// but this repo runs no fmt job in CI, so the assert is the guard.
 ///
-/// Three residual holes are NOT closed, stated rather than papered over:
+/// Four residual holes are NOT closed, stated rather than papered over:
 /// - **A call site in another file.** This test reads only `pass.rs`. A `static_placement` call
 ///   added to a new render module is invisible to it. What still forces a decision there is the
-///   API, not this test: `floating` is a required argument with no default (#756).
+///   API, not this test: `floating` is a required argument with no default (#756). "Four call
+///   sites" is a count of `pass.rs` call sites; it is not a bound on callers elsewhere.
+/// - **A fifth producer of the flag, outside `pass.rs`.** `Billboard.floating` is set in two
+///   places: `Scene::from_game_state` derives it (`src/scene.rs:337`, `e.floating()`), and
+///   `Scene::inject_test_billboards` hardcodes `floating: false` (`src/scene.rs:248`). The
+///   hardcode is not currently reachable by a static-arm model: it is called only when
+///   `self.scene.zone == "testzone"` (`src/app.rs:1267-1269`), and its race table
+///   (`src/scene.rs:189-205`) lists 16 character races with no `SHP` entry, so the one model that
+///   takes the static arm today (`boat.glb`) is never injected. That chain holds by asset and
+///   zone facts, not by construction — adding `SHP` to that table would grade a grounded static
+///   model with a hardcoded flag, and nothing here would go red.
 /// - **A call whose argument list contains `);` before its own close** — the slice would end early
 ///   and the two halves would read a truncated call. No such call exists today (that needs a
 ///   statement inside an argument, e.g. a block or closure body).
@@ -453,29 +475,80 @@ fn every_static_placement_call_site_in_pass_rs_decides_floating_explicitly() {
          found {player} of 2");
 }
 
-/// **The other half of #768, pinned as source text** — because the behavioural tests above cannot
-/// reach it.
+/// **#768's lift, pinned at both source-text channels through which `pass.rs` can re-create it.**
+/// The behavioural tests above cannot reach either one: they call `static_placement` with their own
+/// arguments and build the matrix with a literal `0.0`, so they grade the helper, never the call.
 ///
-/// Dropping `visual_scale` from `StaticPlacement` removes the second lift term from the SHARED
-/// helper. It does not remove it from the four call sites: `model` is in scope at every one of them
-/// and `GpuStaticModel::y_extent` is a public field, so `2.0 * model.y_extent * p.mesh_scale` is one
-/// edit away from being passed as `entity_model_matrix_heading`'s `visual_scale` again — which is
-/// exactly the pre-#768 lift. The placement tests at the top of this file would stay green through
-/// that edit, because they build the matrix themselves and pass the literal `0.0` rather than
-/// reading what `pass.rs` passes. Measured: making that edit at one call site leaves every other
-/// test in this crate green and reddens only this one.
+/// There are exactly two channels, and both were measured green before being closed:
 ///
-/// Source text, not semantics, and with the same caveats as the pin above: it proves the argument
-/// is *written* as `0.0`, not that the call is reached. Whitespace is normalized first so a
-/// re-wrapped argument list does not read as a violation. It cannot see a static placement built in
-/// another file.
+/// 1. **Out of the placement, into the matrix.** `model` is in scope at all four call sites and
+///    `GpuStaticModel::y_extent` is public, so `2.0 * model.y_extent * p.mesh_scale` can be handed
+///    to `entity_model_matrix_heading`'s `visual_scale`. Measured with this test present, that edit
+///    at the entity call site reddens this test and nothing else in the crate:
+///    `--no-fail-fast` over the whole crate gave **214 passed / 1 failed / 11 ignored**, the one
+///    failure being this test. (Without `--no-fail-fast` cargo stops after the failing binary and
+///    only 2 of the 10 binaries report — a run that reddens here is not evidence about the rest.)
+/// 2. **Into the placement.** Nothing about dropping the `visual_scale` FIELD constrains what is
+///    passed as `y_bottom`. `static_placement(archetype, model.y_bottom + model.y_extent, …)`
+///    restores the identical pre-#768 lift `(y_extent + y_bottom) * mesh_scale`. Measured by the
+///    round-1 reviewer of PR #773 and reproduced here before writing anything down: with only the
+///    channel-1 half present, the crate stayed **green at 215 passed / 0 failed / 11 ignored**, this
+///    test included — it read the matrix call, not the placement call. That is the finding this test
+///    was extended for; with the `REVIEWED_ARGS` check below, the same mutation now fails on the
+///    `REVIEWED_ARGS` assert (10 passed / 1 failed in this binary), printing the offending call.
+///
+/// Channel 2 is closed by pinning the whole argument list, not one argument: an expression is not
+/// something source text can bound (`model.y_bottom` vs `model.y_bottom + 0.0` vs a helper call are
+/// all "the second argument"), so the test instead requires each call to be written EXACTLY as one
+/// of two reviewed spellings. **The consequence is deliberate and is the loud direction**: renaming
+/// the `model` binding, or adding a fifth site with any other argument, turns this RED on correct
+/// code and asks for a review. That is the trade this repo's verification hierarchy prefers over a
+/// comment.
+///
+/// **What this still does not do**, stated because the previous version of this doc overstated it:
+/// - It is source text, not semantics. It proves the argument is *written* that way, not that the
+///   call is reached, and not that `model.y_bottom` itself holds what the loader intended.
+/// - It only reads `pass.rs`. A static placement built in another file is invisible to it, and
+///   "four call sites" is a count of `pass.rs` call sites — it is not a bound on callers of
+///   `static_placement` anywhere else in the workspace.
+/// - Whitespace is normalized, so a re-wrapped argument list is not a violation; a renamed
+///   *variable* is.
 #[test]
-fn every_static_entity_matrix_in_pass_rs_passes_a_zero_visual_scale() {
+fn every_static_placement_in_pass_rs_is_written_exactly_as_reviewed() {
     // Anti-escape, same class as #769's: the extractor needs the name and the paren adjacent.
     assert!(!PASS_RS.contains("entity_model_matrix_heading ("),
         "an `entity_model_matrix_heading (…)` call (space before the paren) is invisible to the \
          parser below");
 
+    // ── Channel 2: what goes IN to static_placement ──────────────────────────────────────────
+    // (the sibling test above grades the `floating` argument's provenance and counts the sites;
+    // this grades the exact spelling of all four arguments, which is what bounds the lift.)
+    const REVIEWED_ARGS: [&str; 2] = [
+        "archetype, model.y_bottom, [model.x_center, model.z_center], false",
+        "archetype, model.y_bottom, [model.x_center, model.z_center], b.floating",
+    ];
+    let placements: Vec<String> = PASS_RS
+        .match_indices("static_placement(")
+        .map(|(i, _)| {
+            let rest = &PASS_RS[i..];
+            let call = &rest[..rest.find(");").expect("unterminated static_placement( call")];
+            call.split_whitespace().collect::<Vec<_>>().join(" ")
+        })
+        .collect();
+    assert_eq!(placements.len(), 4,
+        "pass.rs must call static_placement at exactly the 4 known sites; found {}",
+        placements.len());
+    for call in &placements {
+        let args = call.split_once('(').expect("no argument list").1.trim();
+        assert!(REVIEWED_ARGS.contains(&args),
+            "#768: a static model's whole vertical lift is the `y_bottom` argument, so each call \
+             site must pass the model's OWN measured bounds and nothing derived from them — \
+             `model.y_bottom + model.y_extent` here restores the exact pre-#768 over-lift and no \
+             behavioural test in this crate would fail. Expected one of {REVIEWED_ARGS:?}, found: \
+             {args}");
+    }
+
+    // ── Channel 1: what comes OUT of the placement, into the matrix ──────────────────────────
     let statics: Vec<String> = PASS_RS
         .match_indices("entity_model_matrix_heading(")
         .map(|(i, _)| {

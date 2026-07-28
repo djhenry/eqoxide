@@ -919,12 +919,20 @@ pub struct StaticPlacement {
     /// for `visual_scale`, so this field is the only lift a static *placement* can express. #768 was
     /// exactly a second lift term hiding in `visual_scale`.
     ///
-    /// Dropping the field removes that term from this shared helper — it does NOT make it
-    /// unwritable. `model` is in scope at all four `pass.rs` call sites and `GpuStaticModel::y_extent`
-    /// is public, so `2.0 * model.y_extent * p.mesh_scale` can still be handed to
-    /// `entity_model_matrix_heading` there, and no behavioural test would see it. That half is held
-    /// by a source-text pin instead:
-    /// `tests/floating_placement.rs::every_static_entity_matrix_in_pass_rs_passes_a_zero_visual_scale`.
+    /// Dropping the field removes that term from this shared helper. It does NOT make the term
+    /// unwritable, and there are TWO ways back to it, not one — a caller can hand
+    /// `2.0 * model.y_extent * p.mesh_scale` to `entity_model_matrix_heading` (nothing here
+    /// constrains that argument), and a caller can hand `model.y_bottom + model.y_extent` to this
+    /// function's `y_bottom` (nothing here constrains that either — an `f32` is an `f32`). Both were
+    /// measured to leave every behavioural test in this crate green.
+    ///
+    /// What holds them today is a source-text pin over `pass.rs`,
+    /// `tests/floating_placement.rs::every_static_placement_in_pass_rs_is_written_exactly_as_reviewed`,
+    /// which requires each of the four call sites to be spelled exactly as reviewed. That bounds the
+    /// four call sites in that one file. It is NOT a type-level guarantee and it does not reach a
+    /// caller in another file; making the state unrepresentable would mean this function taking the
+    /// model's measured bounds as an opaque value only the loader can mint, which is a wider change
+    /// than #768 and is not done here.
     pub y_bottom: f32,
 }
 
@@ -957,12 +965,23 @@ pub struct StaticPlacement {
 ///   the only unskinned model `model_for` can load and its `y_min` is `-3.982317` — so #768 left the
 ///   clamp alone rather than change a datum the skinned path also reads.
 ///
-///   Nothing rendered wrong because of the over-lift, which follows from two measured facts:
-///   `Entity::floating()` is `skips_wire_z_offset(is_boat, flymode)`
-///   (`eqoxide-core/src/game_state.rs:192`), true for every boat regardless of flymode; and
-///   `boat.glb` is the only model `model_for` can load with no skin. Since the grounded arm is only
-///   reached by a static model, the inference is that it had **no live consumer**. That is also why
-///   a false sentence could sit here undetected, and why #768 has no live before/after to show.
+///   Nothing rendered wrong because of the over-lift — true as measured on 2026-07-28, and stated
+///   with the mechanism that actually decides it, because an earlier version of this paragraph got
+///   that mechanism wrong. A model takes the static arm when
+///   `!(0 < joint_count <= 128)` (`renderer.rs:663-664`): no skin at all, **or** a skin with zero
+///   joints, **or** a skin with MORE than 128 joints. "Unskinned" is sufficient, not necessary.
+///   Scanned every name `model_for` can ask for (18 archetypes + 29 `race_*` + the 3 `_f` variants
+///   that exist = 50 files): exactly one lands on the static arm, `boat.glb`, at `skins == 0`.
+///   Nothing is over the 128 cap. `Entity::floating()` is `skips_wire_z_offset(is_boat, flymode)`
+///   (`eqoxide-core/src/game_state.rs:192`), true for every boat regardless of flymode, so the
+///   grounded arm has no live consumer today.
+///
+///   **The margin is one joint, and it is not ours to hold.** `race_pcfroglok.glb` has 127 joints
+///   against the 128 cap; 11 rigs are at 109 or more. The model directory is an externally rebaked
+///   sync target. A two-joint rebake of that one file would put a PC race on the grounded arm,
+///   where `floating()` is false — which is why this arm has to be correct rather than merely
+///   unreached. The absence of a live consumer is also why a false sentence could sit here
+///   undetected, and why #768 has no live before/after to show.
 /// - **floating** (`true`) — two separate steps, held to different standards:
 ///
 ///   1. *That the current lift is wrong* is certain from the code alone. `wire_z_to_foot`
