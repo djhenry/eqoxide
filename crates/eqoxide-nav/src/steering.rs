@@ -1511,8 +1511,9 @@ mod cursor_resync_tests {
     /// causal-claim fix on `unbalanced_doc_spans` below. First: the fifth bullet's count is deleted,
     /// not re-counted — it went stale within a single round (154 correct at `d01d338`; `origin/main`
     /// moved to 159 tracked files one round later, true figure 155 on landing), which is exactly the
-    /// "measurement with an expiry date" the round-7 correction two bullets up already warns about,
-    /// just not yet applied to this number. The sentence needs no number to make its point. Second:
+    /// "measurement with an expiry date" the round-7 correction below, on a different test's doc,
+    /// already warns about, just not yet applied to this number. The sentence needs no number to
+    /// make its point. Second:
     /// the sixth bullet's closing cross-reference pointed at `unbalanced_doc_spans`'s doc for "the
     /// counts" — that doc states no counts and never did; removed. Its attribution was also
     /// incomplete: the false pass on this exact padded example is not parity alone, `doc_citations`
@@ -1754,11 +1755,12 @@ mod cursor_resync_tests {
     /// a single absolute claim in this doc turned out to be false: round 8's `i.e.` equivalence
     /// above (a claim about this check alone, not a comparison), round 9's causal claim that no
     /// amount of charset widening could have caught the round-6 citation, and now this one. (#764:
-    /// the PR body and the round-10 review comment carry an earlier list with the same intent that
-    /// omits the round-9 item and double-counts this one; left as merged history, not rewritten.)
+    /// #727's PR body, the round-10 edit block on its round-7 reply comment, and its round-10
+    /// response comment carry an earlier list with the same intent that omits the round-9 item and
+    /// double-counts this one; left as merged history, not rewritten.)
     /// No replacement sentence is written. What this check does
     /// is stated in the paragraph above, on its own terms; what `doc_citations` does is stated in
-    /// its own doc, on its own terms. This block adds no claim about how they relate.
+    /// its own doc, on its own terms.
     ///
     /// ⚠️ **Correction (#727 round 10 review, non-blocking).** The round-9 block above says the
     /// wrapped fragment "IS visible" to `doc_citations`, unqualified. Left as originally written,
