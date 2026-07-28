@@ -536,19 +536,29 @@ impl Walker {
     ///
     /// Called from the `is_dead()` branch in [`Walker::drive_walk`], beside the per-goal
     /// `nav_local` publication it backs up. **That is the DISCOVERY site, and discovery is the
-    /// constraint** — an earlier draft of this method put the call at the top of the walk tick and
-    /// claimed the placement was "unconditional"; the test below failed and was right to. Two things
-    /// falsify that: `drive_walk` returns early in three places above it (`halt_no_world`, the coarse
-    /// `planner.is_dead()` stop, `awaiting_first_plan`), and `ActionLoop::tick` does not call
-    /// `drive_walk` at all once `resolve_goal` returns `None`. There is no "every tick" to hook.
+    /// constraint.** An earlier draft put the call earlier in the walk tick, on the theory that
+    /// "unconditional" beat "inside `have_path`". Two independent things kill that, and review B7 is
+    /// right that the ORDERING one is decisive while the reachability one is merely additional:
     ///
-    /// So the latch is placed where the fact first becomes knowable. `LocalPlanner`'s death is only
-    /// discoverable through a failed send or a disconnected receive — `post_if_idle` and `poll`, both
-    /// inside the `have_path` branch, both above this check on the same tick. Latching here therefore
-    /// records it on the very tick it is discovered, and because the record is on the shared row
-    /// rather than in the per-goal verdict, the later retirement cannot take it away. What changes is
-    /// not WHEN the fault is seen but how long it stays visible: for the rest of the session, instead
-    /// of until the next goal ends.
+    /// 1. **Ordering — structural, and by itself sufficient.** `LocalPlanner.dead` is written at
+    ///    exactly two places, the failed send in `post_if_idle` and the disconnected receive in
+    ///    `poll`. Both are called only from inside `drive_walk`'s `have_path` block, and both sit
+    ///    ABOVE this check on the same tick. So at any point earlier in the tick `is_dead()` can only
+    ///    report a death some EARLIER tick already discovered — an earlier latch is always one tick
+    ///    late, and if the goal retires in that gap it never fires at all. That is the same
+    ///    between-goals hole B3 exists to close, just moved one tick over.
+    /// 2. **Reachability — additional, and the reason a "just put it higher" placement is not even
+    ///    reliably one tick late.** `drive_walk` returns early at **five** points above
+    ///    `let have_path`, not the three an earlier draft of this doc claimed (review B7): the
+    ///    zone-usability halt; the mid-tick collision-grid-vanished halt; a coarse reply that
+    ///    `apply_plan` says terminated the goal; the COARSE `planner.is_dead()` stop; and
+    ///    `awaiting_first_plan`. Separately, `ActionLoop::tick` does not call `drive_walk` at all once
+    ///    `resolve_goal` returns `None`, so there is no between-goals tick to hook either.
+    ///
+    /// Latching at the discovery site therefore records the fault on the very tick it becomes
+    /// knowable, and because the record is on the shared row rather than in the per-goal verdict, the
+    /// later retirement cannot take it away. What changes is not WHEN the fault is seen but how long
+    /// it stays visible: for the rest of the session, instead of until the next goal ends.
     ///
     /// The residual limit is stated on the field: a worker that dies and is never posted to again is
     /// not discoverable by any reader, this one included.
@@ -2817,12 +2827,15 @@ mod tests {
     /// stayed green. The third direction is `blocked`+`reason: Some` — non-`idle` *and* carrying a
     /// reason — which is exactly the row that tells a state-keyed guard apart from a reason-keyed one.
     ///
-    /// Mutation checks, both RUN on this branch, not reasoned. (a) Delete
+    /// Mutation checks, both RUN on this branch, not reasoned, and reported by ASSERTION rather than
+    /// by line number (review B8: a line locator drifts on the next edit above it, and a freshly
+    /// re-measured one is trusted more than it deserves). (a) Delete
     /// `let local = if s.state == "idle" { None } else { local };` from `Walker::set_nav_local` →
     /// the post-retirement assertion goes RED, the other directions stay GREEN. (b) Replace it with
-    /// `if s.reason.is_some() { None } else { local }` → `eqoxide-nav` reports
-    /// `FAILED. 214 passed; 1 failed; 16 ignored`, the one failure being the `blocked` assertion in
-    /// this test. So the line can fire, fires only where it should, and keys on the right field.
+    /// `if s.reason.is_some() { None } else { local }` → the `blocked` assertion below is the ONLY
+    /// thing that goes RED anywhere (`eqoxide-nav` `FAILED. 214 passed; 1 failed; 16 ignored`; before
+    /// that assertion existed the same mutation left the whole workspace green). So the line can
+    /// fire, fires only where it should, and keys on the right field.
     #[test]
     fn a_verdict_arriving_after_the_goal_is_retired_is_not_published_766() {
         let (w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
@@ -2889,22 +2902,24 @@ mod tests {
     /// have re-opened the clear-on-every-`idle` uniformity #766 exists to create.
     ///
     /// **This test is driven end-to-end by production `drive_walk`, and an earlier draft that was not
-    /// is why.** That draft called `drive_walk` with an EMPTY path, on the theory that a latch placed
-    /// inside the `have_path` branch would be unobservable between goals. It went RED, and it was
-    /// right: three early returns sit above that point (`halt_no_world`, the COARSE `planner.is_dead()`
-    /// stop, `awaiting_first_plan`), and `ActionLoop::tick` does not call `drive_walk` at all once
-    /// `resolve_goal` returns `None` — so there is no "between goals" tick to latch on. The fact is
-    /// only ever knowable inside `have_path`, because that is where the channel is touched. So the
-    /// latch goes at the point of DISCOVERY and the row carries it forward from there. Below, the test
-    /// kills the worker and then hands the whole job to `drive_walk`: it does not call
-    /// `is_dead()` in a loop to force the state, and it does not call the latch itself.
+    /// is why.** That draft pre-forced `is_dead()` in a loop, called `drive_walk` with an EMPTY path,
+    /// and latched from a point above `let have_path`. It went RED, and it was right to: that tick
+    /// took one of the FIVE early returns above `have_path` (it had no committed route, so it posted
+    /// a first plan and returned at `awaiting_first_plan`) and never reached the latch. See
+    /// [`Walker::latch_local_planner_liveness`] for why the deeper defect in that placement is
+    /// ORDERING rather than reachability — `dead` is only ever set inside `have_path`, so any earlier
+    /// latch is a tick late by construction even when it is reached. Below, the test does neither: no
+    /// forcing loop, no direct latch call, and a committed route so production discovers the death
+    /// itself.
     ///
-    /// Mutation checks, both RUN. Delete the `latch_local_planner_liveness()` call from `drive_walk`
-    /// → `eqoxide-nav` reports `FAILED. 214 passed; 1 failed; 16 ignored`, the failure being this
-    /// test's discovery assertion. Clear `local_planner_dead` in `retire_to_idle` instead of keeping
-    /// it → `eqoxide-nav` `214 passed; 1 failed` (this test's post-retirement assertion) **and**
-    /// `eqoxide-http` `246 passed; 1 failed` (the endpoint test). Two lines in two crates, an
-    /// assertion each, and the second is visible from the published API as well as from the row.
+    /// Mutation checks, both RUN, reported by ASSERTION rather than by line number — a re-measured
+    /// line number is correct only until the next edit above it, and reads more trustworthy than it
+    /// is (review B8). Delete the `latch_local_planner_liveness()` call from `drive_walk` → the
+    /// discovery assertion here goes RED, `eqoxide-nav` `214 passed; 1 failed; 16 ignored`. Clear
+    /// `local_planner_dead` in `retire_to_idle` instead of keeping it → the post-retirement assertion
+    /// here goes RED (`eqoxide-nav` `214 passed; 1 failed`) **and** so does the endpoint test in
+    /// `eqoxide-http` (`246 passed; 1 failed`). Two lines in two crates, one assertion each, and the
+    /// second is visible from the published API as well as from the row.
     #[test]
     fn a_dead_fine_planner_stays_visible_after_the_goal_is_retired_766() {
         let (mut w, nav, _intent, _view) = walker_with(open_plane(400.0));

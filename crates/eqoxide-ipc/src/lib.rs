@@ -1382,6 +1382,18 @@ pub struct NavStatus {
     /// committed route. A worker that dies and is never posted to again is not detectable by any
     /// reader, this field included; what the latch guarantees is that once the death HAS been seen it
     /// stays visible for the rest of the session instead of dying with the next goal.
+    ///
+    /// **"Session" means PROCESS today, and that is load-bearing** (round-3 review, non-blocking).
+    /// `LocalPlanner::spawn` is reached only through `Walker::new` → `ActionLoop::new`, and the one
+    /// production call site of `ActionLoop::new` is in `run_login_flow`, which returns as soon as the
+    /// gameplay phase ends — so exactly one fine worker exists per process and "latched forever" and
+    /// "latched for this worker" are the same statement. If a future change ever re-entered gameplay
+    /// in-process (relogin without restart), a NEW `Walker` with a NEW, healthy `LocalPlanner` would
+    /// be handed this same shared row still reading `true`, and the client would report a dead fine
+    /// planner it had just replaced — the honest-signal failure in the opposite direction. Whoever
+    /// makes relogin in-process owns clearing this at the same point they construct the new worker;
+    /// it is flagged here rather than pre-emptively cleared, because there is no such route today and
+    /// a clear on a route that cannot happen is untestable.
     pub local_planner_dead: bool,
 }
 

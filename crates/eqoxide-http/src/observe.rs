@@ -3014,8 +3014,9 @@ mod tests {
     /// cannot distinguish from a missing feature is not a health check.
     ///
     /// Mutation check, RUN: clear `local_planner_dead` in `NavStatus::retire_to_idle` instead of
-    /// keeping it → this crate reports `246 passed; 1 failed`, the failure being the final assertion
-    /// here (and `eqoxide-nav` goes red on its own row-level assertion, separately). The
+    /// keeping it → the final assertion here goes RED (`246 passed; 1 failed` in this crate), and
+    /// `eqoxide-nav` goes red separately on its own row-level assertion. Named by assertion, not by
+    /// line number, deliberately (review B8): a line locator drifts on the next edit above it. The
     /// always-present shape is pinned by the first assertion but NOT mutation-checked — omitting a
     /// key from a `json!` literal is a shape change, not a behaviour one, and I did not run it.
     #[tokio::test]
