@@ -220,10 +220,21 @@ pub struct App {
     /// `self.acts.command`. The DERIVED heading it implies is computed render-side (`manual_wish`).
     manual_move:        crate::ipc::ManualMoveReq,
     camera_initialized: bool,
-    /// Set on every zone change. While true, the first frame with loaded collision settles the
-    /// player onto the NEAREST floor (above or below), fixing zone-ins where the zone-point z is
-    /// below the actual floor (the per-frame snap only probes downward and can't lift them).
-    needs_reground:     bool,
+    /// Zone-in orchestration: the one-shot reground armed on every zone change, which settles the
+    /// player onto the NEAREST floor (above or below) on the first frame with loaded collision —
+    /// fixing zone-ins where the zone-point z is below the actual floor (the per-frame snap only
+    /// probes downward and can't lift them).
+    ///
+    /// The logic lives in [`crate::zone_in::ZoneIn`] rather than inline here so it can be run
+    /// without a window, a GPU or an event loop: `src/zone_in.rs`'s test module drives a whole
+    /// zone-in — arrival, load window, correction, first grounded frame — against real collision
+    /// (#712, #728, #745). All `App` still owns is a single unconditional `on_frame` call in
+    /// `render_frame` — arming and "the controller has been stepped" are derived inside `ZoneIn`
+    /// from arguments, not signalled by extra calls, because a call site that exists is a call site
+    /// that can be silently disabled (#791 round 2). That one statement is pinned by
+    /// `zone_in::tests::the_app_rs_call_into_this_module_is_an_unconditional_statement`, whose doc
+    /// states exactly what such a pin can and cannot establish.
+    zone_in:            crate::zone_in::ZoneIn,
     last_frame_time:    std::time::Instant,
     fps_frame_count:    u32,
     fps_timer:          std::time::Instant,
@@ -477,7 +488,7 @@ impl App {
             camera: CameraState::new([0.0, 0.0, 0.0], 0.0),
             camera_cmd, camera_snapshot, manual_move,
             camera_initialized: false,
-            needs_reground: false,
+            zone_in: crate::zone_in::ZoneIn::default(),
             last_frame_time: std::time::Instant::now(),
             fps_frame_count: 0,
             fps_timer: std::time::Instant::now(),
@@ -1402,13 +1413,29 @@ impl App {
                 &self.shared_collision, &self.zone_assets,
                 &self.current_zone, "Zone change — starting asset load…");
             // The new zone's floor may sit above the zone-point spawn z; settle onto it once
-            // collision loads (see the reground block in the vertical-physics section below).
-            self.needs_reground = true;
-            // …and drop the controller's last-good recovery ring with the old collision (#712).
+            // collision loads (see `zone_in::ZoneIn::on_frame`, run in the vertical-physics section
+            // below). There is deliberately no `arm()` call here any more: `on_frame` is handed
+            // `current_zone` and arms itself the frame that name changes — i.e. this very frame,
+            // since the line above is what changes it. A call site that does not exist cannot be
+            // written-but-never-reached, which is what #791's round-2 review demonstrated about the
+            // source-text pin that used to guard this line (`if false { … }` around it left every
+            // test green). See `zone_in`'s module doc, and #799 for the residual.
+            //
+            // Drop the controller's last-good recovery ring with the old collision (#712).
             // Those samples are untagged coordinates from the PREVIOUS zone; if the fall-through
             // guard or the depenetration fallback restores one here it lands the character at an
             // arbitrary point in THIS zone — in #712 a point 133u outside steamfont's geometry,
             // where it wedged permanently and the nav graph reported `start_isolated`.
+            //
+            // `ZoneIn::on_frame` clears it again on the first frame it runs. That is a backstop,
+            // not a duplicate: this call is the TIMELY one (the ring stops being consultable the
+            // instant the old collision goes), and #745 measured that deleting it left the whole
+            // suite green, because nothing behavioural reached it. `zone_in::tests::
+            // a_zone_in_never_grounds_the_body_on_a_previous_zones_recovery_coordinate` is the
+            // behavioural pin on the invariant; `movement::tests::
+            // the_zone_change_reload_block_still_forgets_the_recovery_ring` is the textual pin on
+            // this line. Do not delete this call as "redundant with the backstop" — between here
+            // and there sits the whole ~10s asset load.
             self.controller.forget_recovery_history();
             // `door_frac` is already cleared for this zone change above (#326) — that clear has
             // to run before the door-easing loop reads the map, which is earlier in this same
@@ -1582,39 +1609,33 @@ impl App {
 
             // One-shot reground after a zone change: if the controller arrived somewhere it can
             // only fall out of the world from, lift it onto the floor above once the new zone's
-            // collision is loaded. `zone_in_reground` decides; the #712 case is an arrival a little
-            // UNDER the surface whose only ground is below the zone's underworld, which the old
-            // "no floor at all below" test read as perfectly settled.
-            if self.needs_reground && !self.loading {
-                if let Some(c) = self.collision.as_deref() {
-                    let p = self.controller.pos;
-                    // Once the body is standing on something the arrival is over, so retire the
-                    // one-shot rather than leave it armed to fire at some position the character
-                    // has since walked to (#720 review, non-blocking C).
-                    if self.controller.on_ground {
-                        self.needs_reground = false;
-                    } else {
-                        // Underworld comes from the live world state, not `controller.underworld`:
-                        // `set_underworld` is only called from the step below, which does not run
-                        // while collision is None, so on this first post-load frame the controller
-                        // still holds the PREVIOUS zone's threshold.
-                        let uw = self.game_state_view.world.zone_underworld;
-                        match crate::movement::zone_in_reground(c, p, uw) {
-                            crate::movement::Reground::Lift(f) => {
-                                self.controller.teleport([p[0], p[1], f]);
-                                self.controller.on_ground = true;
-                                self.needs_reground = false;
-                                tracing::info!(
-                                    "zone-in: regrounded controller to floor z={:.2} (arrived at \
-                                     z={:.2}; nothing landable below, underworld {:?})",
-                                    f, p[2], uw);
-                            }
-                            crate::movement::Reground::Retire => self.needs_reground = false,
-                            crate::movement::Reground::Wait => {}
-                        }
-                    }
-                }
-            }
+            // collision is loaded. The #712 case is an arrival a little UNDER the surface whose only
+            // ground is below the zone's underworld, which the old "no floor at all below" test read
+            // as perfectly settled.
+            //
+            // The decision — the load throttle, the settled-in-this-zone early return, and the lift
+            // itself — lives in `zone_in::ZoneIn::on_frame`, where it can be driven through a whole
+            // zone-in without a window or a GPU. Underworld comes from the live world state rather
+            // than `controller.underworld` because `set_underworld` is only called from the step
+            // below, which does not run while collision is None, so on this first post-load frame
+            // the controller still holds the PREVIOUS zone's threshold.
+            //
+            // This is the ONLY statement in this file that reaches `zone_in`, and it is
+            // deliberately unconditional: `current_zone` is what arms it (the frame that name
+            // changes), and `camera_initialized` tells it whether the step below will actually run,
+            // so both facts are arguments rather than separate calls that could be dropped without
+            // anything noticing. Pinned by
+            // `zone_in::tests::the_app_rs_call_into_this_module_is_an_unconditional_statement`,
+            // which refuses any conditional nesting around this call — see that test's doc for what
+            // it does and does not prove.
+            self.zone_in.on_frame(
+                &mut self.controller,
+                &self.current_zone,
+                self.loading,
+                self.camera_initialized,
+                self.collision.as_deref(),
+                self.game_state_view.world.zone_underworld,
+            );
 
             // Integrate the controller (sole position authority). Step only once spawned and with
             // collision loaded; otherwise hold position so we don't fall through a loading void.
@@ -1628,6 +1649,16 @@ impl App {
                     // and fades; false for a normal grounded character (physics byte-identical).
                     self.controller.set_levitating(self.game_state_view.player_levitating());
                     self.controller.step(intent, dt, c);
+                    // The controller has now been stepped against THIS zone — the necessary
+                    // condition for the zone-in one-shot to read `on_ground` at all (#728 N1).
+                    // There is no `note_stepped()` call to make here: this arm's two conditions are
+                    // exactly the `camera_initialized` and `collision.is_some()` that `on_frame` is
+                    // handed above, so it derives the fact itself, one frame later, rather than
+                    // trusting a call that could be deleted silently (#791 round 2).
+                    //
+                    // Necessary, not sufficient: `step`'s depenetration early return can leave
+                    // `on_ground` stale even here, which is why `ZoneIn::on_frame`'s settled arm
+                    // also corroborates against this zone's geometry.
                 } else {
                     // No collision loaded (mid zone-load): the controller is NOT being stepped, so
                     // whatever hold it last computed describes geometry that has since been dropped
