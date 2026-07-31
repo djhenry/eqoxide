@@ -256,7 +256,15 @@ impl ZoneWater {
         }
     }
 
-    /// Wrap an already-loaded/hand-authored region map (synthetic scenes, fixtures).
+    /// Wrap an already-loaded/hand-authored region map (synthetic scenes, fixtures). Test-only,
+    /// gated the same way as the `RegionMap` fixture constructors it wraps (`flat_below`,
+    /// `water_slab`, …) — round-2 finding N2: this was the whole escape hatch that let a
+    /// `WaterMeasurement` be fabricated without a real `.wtr` ever loading, which falsified
+    /// [`WaterMeasurement`]'s "no public constructor" doc in exactly the test builds where every
+    /// converted consumer lives. Gating it here closes that in the same way the rest of this
+    /// codebase gates fixture constructors — see `ZoneAssetState::test_ready` and
+    /// `RegionMap::flat_below`.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn from_map(map: eqoxide_core::region_map::RegionMap) -> Self {
         Self::Measured(std::sync::Arc::new(map))
     }
@@ -277,8 +285,15 @@ impl ZoneWater {
     /// Install this zone's region data onto `col`.
     ///
     /// `#[must_use]`: there is nothing to install in the `Unmeasured` case, and a caller that
-    /// ignores that goes on to read fabricated dry answers out of the grid. The compiler makes you
-    /// look at the failure — which is the whole of #762.
+    /// ignores that goes on to read fabricated dry answers out of the grid. **Round-2 correction
+    /// (N3):** this is a warning, not a gate — the compiler warns unless the caller writes
+    /// `let _ = zw.install(&mut col);`, which is the idiomatic Rust spelling of "I see the
+    /// must-use value and am discarding it on purpose" and compiles with ZERO diagnostics
+    /// regardless of lint level (this workspace also doesn't `deny(unused_must_use)` or set a CI
+    /// `RUSTFLAGS` that would). So `#[must_use]` is a speed bump for an attentive reader, not
+    /// something the compiler enforces — the actual enforcement that a zone's water was really
+    /// consulted is `WaterRollup`/the corpus `assert!`s that consume the `Result`, not this
+    /// attribute.
     #[must_use = "an UNMEASURED zone installs no water: every water answer off this grid would be a \
                   fabricated dry (#762). Report it as unmeasured or refuse to score the zone."]
     pub fn install(&self, col: &mut crate::collision::Collision)
@@ -312,9 +327,15 @@ pub const UNMEASURED: &str = "unmeasured";
 /// A water-specific measurement for ONE zone, carrying whether it is a measurement at all.
 ///
 /// The value is private and there is **no public constructor**: the only way to make one is
-/// [`ZoneWater::measure`], which needs a loaded region map. So "a water number for a zone whose
-/// `.wtr` did not load" is not a value this type can hold, and `Display` prints [`UNMEASURED`]
-/// rather than a zero that reads as a perfect score.
+/// [`ZoneWater::measure`], and `measure`'s closure runs only in the `Measured` arm — so a real
+/// `.wtr` load is what puts a value in here in production. **Round-2 correction (N2):** that
+/// guarantee is about *production* code, not about what a test file can construct. In a test
+/// build, [`ZoneWater::from_map`] and the `RegionMap` fixture constructors (`flat_below`,
+/// `water_slab`, …) can put `ZoneWater` into `Measured` without a `.wtr` ever touching disk — on
+/// purpose, so tests can exercise `measure` without real assets — and both are gated behind
+/// `#[cfg(any(test, feature = "test-fixtures"))]` for exactly that reason. So the precise claim is:
+/// outside test code, "a water number for a zone whose `.wtr` did not load" is not a value this
+/// type can hold. `Display` prints [`UNMEASURED`] rather than a zero that reads as a perfect score.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaterMeasurement<T> {
     /// `Some` **iff** the zone's region data loaded.
@@ -343,17 +364,41 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
     }
 }
 
-/// A corpus TOTAL over a per-zone water column that **cannot hide a hole**.
+/// A corpus TOTAL over a per-zone water column, with an honest denominator.
 ///
 /// Summing only the zones that happened to load and printing the sum is the same lie one zone
 /// bigger: `wat-route: 0` over "14 of 15 zones, one of which was never looked at" reads exactly like
 /// `wat-route: 0` over all 15. So the rollup keeps the unmeasured zones by name, refuses to call
 /// itself complete while it has any, and says so in its own `Display`.
+///
+/// # Round-2 correction (#762 B1) — this type's own coverage claim was the same bug one level up
+///
+/// The first version of this type's doc claimed it "cannot hide a hole". That was false: [`add`]
+/// is the ONLY thing that can put a zone in the denominator, and a corpus that drops a zone
+/// *before* calling `add` at all — no baked `.glb` for it, an empty collision grid, no routable
+/// pairs — never calls `add` for that zone, so the zone vanishes from BOTH the numerator and the
+/// denominator. `Display` then prints `(over N/N zones)`, which is true by construction over
+/// whatever subset reached `add` and says nothing about the zones the corpus was actually asked to
+/// cover. Measured on real assets: a 4-zone run with 3 `.glb`s absent printed `0 (over 1/1 zones)`
+/// and passed green — the exact shape #762 exists to kill, reintroduced by this PR's own new code.
+///
+/// The fix: [`skip`](Self::skip) gives a zone dropped upstream of `add` a THIRD outcome — distinct
+/// from both "measured" and "unmeasured" — so it still lands in the denominator via
+/// [`attempted_zones`](Self::attempted_zones), and [`is_complete`](Self::is_complete) is false
+/// whenever anything was skipped, exactly as it already was for anything unmeasured. A caller that
+/// drops a zone without calling either `add` or `skip` is still capable of lying by omission — this
+/// type cannot see a zone it is never told about — but every `continue` in this PR's own corpus
+/// loops now calls one or the other, so within this PR's corpora the denominator is the zones the
+/// loop actually iterated, not just the zones that reached `add`.
 #[derive(Clone, Debug, Default)]
 pub struct WaterRollup {
     total: usize,
     measured_zones: usize,
     unmeasured: Vec<(String, eqoxide_core::region_map::RegionLoadError)>,
+    /// Zones dropped BEFORE the water check ever ran — no `.glb`, an empty collision grid, no
+    /// routable pairs, etc. Distinct from `unmeasured`: an unmeasured zone's water check RAN and
+    /// failed; a skipped zone's water check never ran at all. Both are holes; neither is a zero.
+    skipped: Vec<(String, String)>,
 }
 
 impl WaterRollup {
@@ -371,6 +416,21 @@ impl WaterRollup {
         }
     }
 
+    /// Record a zone that was dropped BEFORE the water check ran at all — the corpus never got as
+    /// far as [`ZoneWater::load`]/`install` for it, so it can't even say "unmeasured, here's why
+    /// the `.wtr` didn't load" (that would be a lie: the `.wtr` may be fine, nobody asked it).
+    /// `reason` is a short, free-text tag ("no glb", "no grid", "no routable pairs") for the
+    /// printed line — this is not a [`RegionLoadError`](eqoxide_core::region_map::RegionLoadError),
+    /// because the failure isn't a region-load failure.
+    ///
+    /// Call this at every `continue` in a corpus loop that fires before `add` would otherwise be
+    /// reached for that zone. A zone the loop never mentions to the rollup via `add` OR `skip` is
+    /// still invisible to it — see the type doc — so a corpus that wants an honest `(over N/N
+    /// zones)` must route every early exit through one of the two.
+    pub fn skip(&mut self, zone: &str, reason: impl Into<String>) {
+        self.skipped.push((zone.to_string(), reason.into()));
+    }
+
     /// Sum over the zones that WERE measured. Meaningless on its own — read it beside
     /// [`Self::is_complete`], or just print the rollup.
     pub fn measured_total(&self) -> usize { self.total }
@@ -379,21 +439,39 @@ impl WaterRollup {
     pub fn unmeasured_zones(&self) -> Vec<&str> {
         self.unmeasured.iter().map(|(z, _)| z.as_str()).collect()
     }
-    /// True only when EVERY zone folded in was measured. A water-inclusive gate must assert this —
-    /// a run with a hole in it has no water result, however green the rest looks.
-    pub fn is_complete(&self) -> bool { self.unmeasured.is_empty() }
+    /// Every zone selected for this run that was dropped before the water check ran at all.
+    pub fn skipped_zones(&self) -> Vec<&str> {
+        self.skipped.iter().map(|(z, _)| z.as_str()).collect()
+    }
+    /// The TRUE denominator: every zone this rollup was told about at all, whether it ended up
+    /// measured, unmeasured, or skipped. This is what `Display`'s "N zones" now means — not "N
+    /// zones that happened to reach `add`" (the round-1 shape).
+    pub fn attempted_zones(&self) -> usize {
+        self.measured_zones + self.unmeasured.len() + self.skipped.len()
+    }
+    /// True only when EVERY zone folded in was measured — none unmeasured AND none skipped. A
+    /// water-inclusive gate must assert this — a run with a hole in it (of either kind) has no
+    /// water result, however green the rest looks.
+    pub fn is_complete(&self) -> bool { self.unmeasured.is_empty() && self.skipped.is_empty() }
 }
 
 impl std::fmt::Display for WaterRollup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let zones = self.measured_zones + self.unmeasured.len();
+        let zones = self.attempted_zones();
         if self.is_complete() {
             return write!(f, "{} (over {}/{} zones)", self.total, self.measured_zones, zones);
         }
-        let holes: Vec<String> = self.unmeasured.iter().map(|(z, e)| format!("{z}: {e}")).collect();
-        write!(f, "{} over {}/{} zones — INCOMPLETE, {} {} [{}]",
-            self.total, self.measured_zones, zones, self.unmeasured.len(),
-            UNMEASURED, holes.join("; "))
+        let mut parts: Vec<String> = Vec::new();
+        if !self.unmeasured.is_empty() {
+            let holes: Vec<String> = self.unmeasured.iter().map(|(z, e)| format!("{z}: {e}")).collect();
+            parts.push(format!("{} {} [{}]", self.unmeasured.len(), UNMEASURED, holes.join("; ")));
+        }
+        if !self.skipped.is_empty() {
+            let names: Vec<String> = self.skipped.iter().map(|(z, r)| format!("{z} ({r})")).collect();
+            parts.push(format!("{} skipped [{}]", self.skipped.len(), names.join("; ")));
+        }
+        write!(f, "{} over {}/{} zones — INCOMPLETE, {}",
+            self.total, self.measured_zones, zones, parts.join("; "))
     }
 }
 
@@ -574,6 +652,61 @@ mod tests {
         assert_eq!(clean.measured_total(), 0);
         assert!(!clean.to_string().contains(UNMEASURED), "{}", clean.to_string());
         assert_ne!(clean.to_string(), line, "clean-zero and holed-zero are different outputs");
+    }
+
+    /// **#762 ROUND 2 (B1, blocking): a zone dropped BEFORE the water check ever ran must still
+    /// land in the denominator.**
+    ///
+    /// The round-1 rollup only knew about zones that reached `add`. A corpus zone dropped upstream
+    /// of `add` — no baked `.glb`, an empty collision grid — was invisible to the rollup entirely,
+    /// so it vanished from BOTH the numerator and the denominator and `(over N/N zones)` came out
+    /// true by construction over a smaller corpus than the one requested. Measured on real assets
+    /// (round-2 review): a 4-zone run with 3 `.glb`s missing printed `0 (over 1/1 zones)` and passed
+    /// green. `skip` is the fix: it gives such a zone a THIRD outcome that still counts toward
+    /// [`WaterRollup::attempted_zones`] and still makes [`WaterRollup::is_complete`] false.
+    ///
+    /// MUTATION CHECK (both directions):
+    /// 1. Delete the `self.skipped.len()` term from `attempted_zones` (denominator reverts to
+    ///    round-1 shape) → `attempted_zones() == 3` and the "must not equal (over 1/1 zones)"
+    ///    assertion below go RED.
+    /// 2. Delete the `|| !self.skipped.is_empty()` term from `is_complete` → `!roll.is_complete()`
+    ///    goes RED.
+    #[test]
+    fn a_corpus_total_cannot_hide_a_zone_that_never_reached_the_water_check_762() {
+        let mut roll = WaterRollup::new();
+        roll.add("qeynos2", &dry_but_loaded().tally()); // 1 zone genuinely measured, water == 0
+        roll.skip("akanon", "no glb");
+        roll.skip("crushbone", "no grid");
+
+        // The skipped zones are not silently absent: they are named and counted.
+        assert_eq!(roll.skipped_zones(), vec!["akanon", "crushbone"]);
+        assert_eq!(roll.measured_zones(), 1);
+        assert_eq!(roll.unmeasured_zones(), Vec::<&str>::new(), "skipped is not the same bucket as unmeasured");
+
+        // THE DENOMINATOR: 3 zones were named to this rollup, not 1. This is the assertion round-1
+        // could not make — `attempted_zones` did not exist, and nothing skipped ever reached `add`.
+        assert_eq!(roll.attempted_zones(), 3, "a skipped zone must still count toward the total asked for");
+
+        // A rollup with a skip can never call itself complete, exactly like an unmeasured zone.
+        assert!(!roll.is_complete(), "a skipped zone must make the rollup incomplete, same as unmeasured");
+
+        let line = roll.to_string();
+        // The round-1 bug's exact printed shape — a clean ratio over only the zones that reached
+        // `add` — must not appear. 1 measured zone over a 3-zone request must never read as 1/1.
+        assert!(!line.contains("(over 1/1 zones)"),
+            "must not read as complete coverage over a corpus smaller than the one requested: {line}");
+        assert!(line.contains("INCOMPLETE"), "a rollup with any skip must not read clean: {line}");
+        assert!(line.contains("akanon") && line.contains("crushbone"),
+            "the TOTAL line must name the skipped zones, not just count them: {line}");
+        assert!(line.contains('3'), "the printed denominator must include the skipped zones: {line}");
+
+        // A rollup with ONLY a skip (no unmeasured zone at all) must still refuse to look complete —
+        // the two holes are independent triggers, not just additive on top of `unmeasured`.
+        let mut only_skip = WaterRollup::new();
+        only_skip.add("qeynos2", &dry_but_loaded().tally());
+        only_skip.skip("akanon", "no glb");
+        assert!(!only_skip.is_complete(), "a skip-only rollup must still be incomplete");
+        assert_eq!(only_skip.attempted_zones(), 2);
     }
 
     /// Installing an unmeasured zone onto a collision grid is an error the caller must handle: the

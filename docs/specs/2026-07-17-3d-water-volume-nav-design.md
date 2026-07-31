@@ -500,7 +500,12 @@ under test** and the walker-sim is effectively opt-out for water (`want_swim: fa
    * P-3D-3 *haul-out contract retained*: every water→land step in any emitted route satisfies
      the E3 predicate — sweep ledge height h as in #359's P1; planner-legal ≡ h ≤ haul_out_up.
    * P-3D-4 *no-regression*: existing water tests (:2734, :4296) green; zones with no `.wtr`
-     plan exactly as today (span grid absent ⇒ no water nodes ⇒ current dry behaviour).
+     plan exactly as today (span grid absent ⇒ no water nodes ⇒ current dry behaviour). **Superseded
+     by #762:** "no `.wtr` ⇒ current dry behaviour" is precisely the confident-absence-from-silence
+     equivalence #762 rejects (a zone whose `.wtr` did not load is UNMEASURED, not dry). When this
+     phase is implemented, plan against `eqoxide_nav::water_grid::ZoneWater` — a zone with no loadable
+     region data must come out `Unmeasured`, not silently plan as if it were genuinely dry — the span
+     grid being absent is only "current dry behaviour" for a zone that is *actually* dry.
    * These prove: **the planner cannot emit** a bottom-crawl, a surface-projection of a mid-water
      goal, a ceiling-clipping tunnel route, or an illegal exit. They prove nothing about
      execution.

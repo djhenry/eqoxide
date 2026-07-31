@@ -549,7 +549,10 @@ use eqoxide_ipc::MoveIntent;
         // files once made every water-inclusive halas/blackburrow run print `0`/`0` here while the
         // `.glb` hashes matched exactly — a perfect score that had never consulted any water data.
         // The rollups carry per-zone provenance, so an unmeasured zone contributes NO number and the
-        // TOTAL line cannot come out looking clean.
+        // TOTAL line cannot come out looking clean. Round 2 (B1): a zone dropped BEFORE the water
+        // check even runs (no glb, no grid) is routed through `WaterRollup::skip` below, not left to
+        // silently vanish from the denominator too — see the type doc for why that was its own #762-
+        // shaped bug.
         let mut roll_wr = WaterRollup::new();
         let mut roll_423 = WaterRollup::new();
         println!("\n=== faithful walker drift: {} mode ===", if include_water { "WATER-INCLUSIVE" } else { "DRY" });
@@ -557,9 +560,22 @@ use eqoxide_ipc::MoveIntent;
             "zone", "walked", "wedged", "height", "overlap", "other", "wat-route", "#423");
         for zone in &zones {
             let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
-            let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
+            // #762 round 2 (B1): these two `continue`s fire BEFORE the water check ever runs, so the
+            // zone is not "unmeasured" (that means the check ran and failed) — it never reached the
+            // check at all. `skip` still puts it in the rollup's denominator, so the printed "(over
+            // N/N zones)" cannot come out looking like complete coverage of a corpus this run barely
+            // touched.
+            let Ok(za) = ZoneAssets::from_glb(&p) else {
+                println!("{zone:<12}  (no glb — skipped)");
+                roll_wr.skip(zone, "no glb"); roll_423.skip(zone, "no glb");
+                continue
+            };
             let mut col = Collision::build(&za, 32.0);
-            if col.cols == 0 { println!("{zone:<12}  (no grid — skipped)"); continue; }
+            if col.cols == 0 {
+                println!("{zone:<12}  (no grid — skipped)");
+                roll_wr.skip(zone, "no grid"); roll_423.skip(zone, "no grid");
+                continue;
+            }
             // Water drives BOTH modes here: in water-inclusive mode it is what the run measures, and
             // in DRY mode it is the filter that keeps wet journeys out (`!include_water && in_water`).
             // Either way a zone with no region map is UNMEASURED, never a zone with no water.

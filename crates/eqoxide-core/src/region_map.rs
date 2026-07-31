@@ -26,21 +26,31 @@ const REGION_ZONE_LINE: i32 = 3;
 /// **Why a zone's `.wtr` region data is NOT available** — the fact [`RegionMap::load`]'s `Option`
 /// throws away (#762).
 ///
-/// A `None` from the old loader collapsed four different facts into one value: *there is no file*,
-/// *the file is not region data*, *this build cannot read that version*, *the file is truncated*.
-/// Worse, every caller then stored that `None` on a collision grid, where it stops being an absence
-/// and becomes an **answer**: the zone reads as having no water anywhere and no zone-line regions
-/// anywhere. A measurement over such a grid reports `0` water events — a confident claim, made
-/// without ever consulting any water data, and indistinguishable from a perfect score.
+/// A `None` from the old loader collapsed five different facts into one value: *there is no file*,
+/// *the file is there but couldn't be read* (permission error, bad mount, a directory in its
+/// place), *the file is not region data*, *this build cannot read that version*, *the file is
+/// truncated*. Worse, every caller then stored that `None` on a collision grid, where it stops
+/// being an absence and becomes an **answer**: the zone reads as having no water anywhere and no
+/// zone-line regions anywhere. A measurement over such a grid reports `0` water events — a
+/// confident claim, made without ever consulting any water data, and indistinguishable from a
+/// perfect score.
 ///
 /// So the load failure is a VALUE now. [`RegionMap::try_load`] returns it; carry it (see
 /// `eqoxide_nav::water_grid::ZoneWater`) rather than discarding it into a `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegionLoadError {
-    /// No readable `.wtr` at `<dir>/<zone>.wtr`. **This is the #762 case** — the one that used to
-    /// read as "this zone has no water".
+    /// No readable `.wtr` at `<dir>/<zone>.wtr` — specifically, `std::fs::read` failed with
+    /// `ErrorKind::NotFound`. **This is the #762 case** — the one that used to read as "this zone
+    /// has no water".
     Missing,
-    /// The file exists but is not region data: shorter than the 14-byte header, or wrong magic.
+    /// `std::fs::read` failed for a reason OTHER than "not found" — a permission error, a corrupt
+    /// mount, a directory sitting where the file should be. Round-2 finding (N1): collapsing this
+    /// into `Missing` reports "this zone has no water data" for a fact that isn't that at all — the
+    /// exact substitution #762 exists to kill, one level up. Carries the raw `io::ErrorKind` so the
+    /// message names what actually happened.
+    Unreadable(std::io::ErrorKind),
+    /// The file exists but is not region data: shorter than the 18-byte header (10-byte magic + u32
+    /// version + u32 node count), or wrong magic.
     NotRegionData,
     /// A `.wtr` format version this build cannot read (only v1 and v2 are supported).
     UnsupportedVersion(u32),
@@ -54,6 +64,7 @@ impl std::fmt::Display for RegionLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Missing => write!(f, "no .wtr file for this zone"),
+            Self::Unreadable(kind) => write!(f, ".wtr present but unreadable ({kind:?}), not confirmed absent"),
             Self::NotRegionData => write!(f, ".wtr present but not region data (bad magic/header)"),
             Self::UnsupportedVersion(v) => write!(f, ".wtr is v{v}; only v1/v2 are supported"),
             Self::Truncated { declared_nodes, bytes } =>
@@ -294,7 +305,11 @@ impl RegionMap {
     /// caller's answer would otherwise depend on data it never read (#762).
     pub fn try_load(dir: &Path, zone: &str) -> Result<RegionMap, RegionLoadError> {
         let path = dir.join(format!("{zone}.wtr"));
-        let d = std::fs::read(&path).map_err(|_| RegionLoadError::Missing)?;
+        let d = std::fs::read(&path).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
+            RegionLoadError::Missing
+        } else {
+            RegionLoadError::Unreadable(e.kind())
+        })?;
         if d.len() < 18 || &d[..10] != b"EQEMUWATER" { return Err(RegionLoadError::NotRegionData); }
         let version = u32::from_le_bytes(d[10..14].try_into().unwrap());
         // v1 = 36-byte nodes (no zone-line index); v2 = 40-byte nodes (trailing index).
@@ -698,6 +713,19 @@ mod tests {
         // 1. No file at all — the #762 case (a build host holding 2 of 497 `.wtr` files).
         assert_eq!(RegionMap::try_load(dir.path(), "absent").unwrap_err(), RegionLoadError::Missing);
 
+        // 1b. Round-2 finding N1: a `.wtr` that exists but can't be READ (permission error,
+        // corrupt mount, a directory sitting where the file should be) is NOT the same fact as
+        // "no file" and must not report "no .wtr file for this zone". Reproduced without touching
+        // real permissions: create a DIRECTORY named `isadir.wtr` — `std::fs::read` on it fails
+        // with an io error whose kind is NOT `NotFound` on every platform this workspace targets.
+        std::fs::create_dir(dir.path().join("isadir.wtr")).unwrap();
+        match RegionMap::try_load(dir.path(), "isadir").unwrap_err() {
+            RegionLoadError::Unreadable(kind) => assert_ne!(kind, std::io::ErrorKind::NotFound,
+                "a directory that exists must not be reported as the NotFound kind"),
+            other => panic!("a directory in place of the file must not read as {other:?} (Missing \
+                would claim the water is confirmed absent, which is false here)"),
+        }
+
         // 2. A file that is not region data.
         std::fs::write(dir.path().join("junk.wtr"), b"not a wtr file at all").unwrap();
         assert_eq!(RegionMap::try_load(dir.path(), "junk").unwrap_err(), RegionLoadError::NotRegionData);
@@ -736,6 +764,7 @@ mod tests {
         // say WHY, and no two reasons read alike.
         let msgs: Vec<String> = [
             RegionLoadError::Missing,
+            RegionLoadError::Unreadable(std::io::ErrorKind::PermissionDenied),
             RegionLoadError::NotRegionData,
             RegionLoadError::UnsupportedVersion(9),
             RegionLoadError::Truncated { declared_nodes: 1, bytes: 40 },
