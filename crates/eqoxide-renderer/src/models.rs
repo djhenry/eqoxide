@@ -164,6 +164,33 @@ pub struct ModelAsset {
     pub feet_offset: f32,
 }
 
+/// Reduce a model's measured Y bounds (over its dominant-scale vertices) to the two quantities
+/// `ModelAsset::load` publishes: `y_bottom` (the static-arm grounding lift, `StaticPlacement`'s
+/// only lift term since #768) and `y_extent` (the plain vertical span, kept for `true_height` and
+/// the standalone model-viewer bin, but explicitly NOT fed into static placement — see
+/// `static_placement`'s doc comment).
+///
+/// This is a NAMED, single-call-site reduction rather than the inline arithmetic it replaces
+/// (eqoxide#779), specifically so a test can call it directly with hand-known bounds — no glTF,
+/// no GPU, no real asset. The formula it must not drift into: `y_bottom = -y_min + y_extent`,
+/// which is `-y_min + (y_max - y_min)` — algebraically `y_bottom_correct + y_extent` — is #768's
+/// exact over-lift reintroduced one file upstream of where #768/#773 fixed it, because a static
+/// model's whole lift is `y_bottom * mesh_scale` and folding `y_extent` into `y_bottom` puts the
+/// extent back into that product by another route.
+///
+/// **Spec, restated as the property that distinguishes this from that corruption:** `y_bottom`
+/// is a function of `y_min` ALONE. It does not read `y_max` (nor, equivalently, `y_extent`) at
+/// all. `tests::y_bottom_and_extent_hold_the_spec_over_many_generated_bounds` asserts exactly
+/// this — that changing `y_max` while holding `y_min` fixed never changes `y_bottom` — over many
+/// generated `(y_min, y_max)` pairs, which is strictly stronger than checking one fixture.
+/// `tests::y_bottom_matches_the_intended_quantity_for_a_known_model` is the specific eqoxide#779
+/// regression case (boat.glb's real measured bounds), mutation-checked both ways.
+fn y_bottom_and_extent(y_min: f32, y_max: f32) -> (f32, f32) {
+    let y_bottom = if y_min < 0.0 { -y_min } else { 0.0 };
+    let y_extent = if y_min < f32::MAX && y_max > f32::MIN { y_max - y_min } else { 0.0 };
+    (y_bottom, y_extent)
+}
+
 impl ModelAsset {
     pub fn load(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)
@@ -484,8 +511,7 @@ impl ModelAsset {
 
         let y_min = dominant_positions.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
         let y_max = dominant_positions.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
-        let y_bottom = if y_min < 0.0 { -y_min } else { 0.0 };
-        let y_extent = if y_min < f32::MAX && y_max > f32::MIN { y_max - y_min } else { 0.0 };
+        let (y_bottom, y_extent) = y_bottom_and_extent(y_min, y_max);
 
         // Horizontal recentre offsets. `x_center`/`z_center` are the two non-height axes
         // in the load-order the render matrix expects (see entity_model_matrix_heading).
@@ -1215,6 +1241,126 @@ pub fn self_held_item_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── eqoxide#779: grade the loader's y_bottom/y_extent reduction ──────────────────────────
+    //
+    // #773's reviewer built the mutation `y_bottom = -y_min -> -y_min + (y_max - y_min)` (the
+    // literal substring "-y_min" is only written once in `y_bottom_and_extent`, in the
+    // `y_min < 0.0` branch) and ran it against the whole crate: 215 passed / 0 failed / 11
+    // ignored, green. `(y_max - y_min)` is `y_extent`, so that mutation folds the model's whole
+    // vertical extent into `y_bottom` — algebraically `y_bottom_correct + y_extent` — which is
+    // exactly #768's over-lift (`StaticPlacement`'s lift is `y_bottom * mesh_scale`; #768 was a
+    // second, separate `y_extent` term added on top of that same product). The two tests below
+    // grade the reduction directly: one is a property over many generated bounds, the other is
+    // the specific regression case with real measured data, both mutation-checked.
+
+    #[test]
+    fn y_bottom_and_extent_hold_the_spec_over_many_generated_bounds() {
+        // A tiny xorshift PRNG so this is a genuine property test over MANY (y_min, y_max) pairs
+        // rather than one hand-picked fixture, without adding a proptest/quickcheck dependency
+        // this crate (and the rest of the workspace) does not otherwise have. Deterministic seed
+        // -> reproducible on failure.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next_u64 = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Map a u64 to a wide, finite f32 range so bounds routinely land off zero and off each
+        // other: roughly [-1000.0, 1000.0] with fractional bits, not just small integers.
+        let mut next_f32 = || {
+            ((next_u64() as f64 / u64::MAX as f64) * 2000.0 - 1000.0) as f32
+        };
+
+        let mut saw_negative_y_min_with_extent = 0usize;
+
+        for _ in 0..2000 {
+            let a = next_f32();
+            let b = next_f32();
+            let (y_min, y_max) = if a <= b { (a, b) } else { (b, a) };
+
+            let (y_bottom, y_extent) = y_bottom_and_extent(y_min, y_max);
+
+            // Spec: y_bottom is -y_min clamped at zero from below.
+            let expected_bottom = if y_min < 0.0 { -y_min } else { 0.0 };
+            assert_eq!(
+                y_bottom, expected_bottom,
+                "y_bottom must be -y_min (clamped at 0), got {y_bottom} for y_min={y_min} y_max={y_max}"
+            );
+
+            // Spec: y_extent is the plain span.
+            let expected_extent = y_max - y_min;
+            assert_eq!(
+                y_extent, expected_extent,
+                "y_extent must be y_max - y_min, got {y_extent} for y_min={y_min} y_max={y_max}"
+            );
+
+            // THE property eqoxide#779 is about: y_bottom must not depend on y_max at all. Hold
+            // y_min fixed, change y_max by an arbitrary nonzero amount, and confirm y_bottom is
+            // unchanged. #779's corruption (and any equivalent mutation that folds y_extent, or
+            // y_max directly, into y_bottom) makes y_bottom move when y_max moves; this is the
+            // assertion that would catch that for every generated y_min, not just one fixture.
+            let alt_y_max = y_max + 137.0;
+            let (y_bottom_alt, _) = y_bottom_and_extent(y_min, alt_y_max);
+            assert_eq!(
+                y_bottom, y_bottom_alt,
+                "y_bottom must be independent of y_max: y_min={y_min} y_max={y_max} vs alt_y_max={alt_y_max} \
+                 gave y_bottom={y_bottom} vs {y_bottom_alt}"
+            );
+
+            if y_min < 0.0 && y_extent != 0.0 {
+                saw_negative_y_min_with_extent += 1;
+            }
+        }
+
+        // Guard against a silently degenerate run (e.g. a broken PRNG that only emits zeros,
+        // or a range bug that never produces y_min < 0): without at least some samples where
+        // y_min < 0.0 and y_extent != 0.0, the assertions above never actually exercise the
+        // branch #779's corruption lives in, and this test would be worthless despite passing.
+        assert!(
+            saw_negative_y_min_with_extent > 100,
+            "generated bounds never exercised the y_min<0 branch with nonzero extent \
+             ({saw_negative_y_min_with_extent} of 2000) — this run could not have caught eqoxide#779's mutation"
+        );
+    }
+
+    #[test]
+    fn y_bottom_matches_the_intended_quantity_for_a_known_model() {
+        // eqoxide#779: hand-known bounds for a real model, not a synthetic one — boat.glb's
+        // measured Y bounds, the same constants `tests/floating_placement.rs` (BOAT_Y_MIN,
+        // BOAT_Y_MAX) and this file's `static_placement` doc comment (`y_extent = 9.9452`) cite
+        // as ground truth. y_min != 0, y_max != y_min (nonzero extent), so this pair cannot
+        // collapse the correct and #779-corrupted formulas onto the same number — they coincide
+        // only when y_extent == 0 (y_min == y_max), asserted explicitly below rather than assumed.
+        let y_min = -3.982317_f32;
+        let y_max = 5.962854_f32;
+
+        let (y_bottom, y_extent) = y_bottom_and_extent(y_min, y_max);
+
+        assert_eq!(y_bottom, 3.982317, "y_bottom must be -y_min, not fold in the model's extent");
+        assert!((y_extent - 9.945171).abs() < 1e-4, "y_extent={y_extent}");
+
+        // Sanity: confirm this fixture is NOT incidentally symmetric before trusting it as a
+        // regression guard (eq-fixture-edits-are-not-local: a corpus edit once collapsed a
+        // file's only mutant while everything stayed green). The correct and #779-corrupted
+        // formulas coincide exactly when y_extent == 0; assert we are measurably off that.
+        assert!(y_extent.abs() > 1.0, "fixture's extent is too close to 0 to distinguish the mutation");
+
+        // eqoxide#779's exact corruption: "-y_min" (this file's `y_bottom_and_extent`, y_min<0.0
+        // branch) becomes "-y_min + (y_max - y_min)". Applying that text substitution to this
+        // fixture's own y_min/y_max must NOT equal the real y_bottom, or this fixture is useless
+        // as a regression guard for it.
+        let corrupted = -y_min + (y_max - y_min);
+        assert_ne!(
+            y_bottom, corrupted,
+            "fixture collapsed: y_min={y_min} y_max={y_max} makes the correct and #779-corrupted \
+             formulas equal, so this pair can't catch that mutation"
+        );
+        // And confirm the corrupted value is exactly #768's shape (y_bottom + y_extent), which is
+        // the whole point of the issue: the same over-lift, reintroduced one file upstream.
+        assert!((corrupted - (y_bottom + y_extent)).abs() < 1e-4);
+    }
 
     #[test]
     fn held_item_keys_map_wire_slots_and_skip_dead() {
