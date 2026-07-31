@@ -1381,8 +1381,8 @@ mod cursor_resync_tests {
     ///
     /// **You do not have to remember to add a line here — for every citation shape that scan can
     /// see.** The list below is the *enforcement*; its *completeness* is checked mechanically by
-    /// `every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard`, which reads the source
-    /// and fails if a doc comment cites a test this array does not name.
+    /// `every_test_citation_in_the_four_citation_files_resolves_and_is_listed_in_a_guard`,
+    /// which reads the source and fails if a doc comment cites a test this array does not name.
     ///
     /// ⚠️ **Correction (#727 round 7 review, non-blocking 1).** Round 6 wrote that first sentence
     /// without the qualifier, and it was **false for two shapes at once**: `::`-qualified paths
@@ -1410,7 +1410,12 @@ mod cursor_resync_tests {
             // in this file and named in no guard list, which is the defect the scan exists to find.
             resync_never_jumps_across_blocked_geometry,
             every_test_name_cited_in_a_doc_comment_still_exists,
-            every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard,
+            // #788 split the doc-span half out of the citation test and renamed the citation test
+            // so neither name reads as workspace-wide. All three are cited in doc comments in this
+            // file, so all three are pinned here.
+            every_test_citation_in_the_four_citation_files_resolves_and_is_listed_in_a_guard,
+            unbalanced_doc_spans_are_rejected_in_the_four_citation_files_only_not_the_workspace,
+            the_doc_span_scan_reaches_all_four_citation_files_at_three_depths_each,
             // …and this one the scan caught on its first run, on a citation added in round 6
             // itself — which is the whole argument for having it.
             the_simulated_stall_is_a_bounded_overshoot_cycle_a_few_frames_wide,
@@ -1530,8 +1535,32 @@ mod cursor_resync_tests {
     /// misses it independently, verified by tracing `skip(1).step_by(2)` against the literal text —
     /// the citation's fragment lands at split index 6 on the 6-backtick line, and only odd indices
     /// (1, 3, 5, …) are ever read.
+    ///
+    /// ⚠️ **Correction (#788).** Two changes, both about what a reader of the RESULT can tell, and
+    /// neither of them changes which files are scanned.
+    ///
+    /// * **This test was renamed.** It used to be
+    ///   `every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard`. "Every doc comment"
+    ///   reads as the workspace; the corpus is the four files in `citation_corpus`. The name now
+    ///   says so, because the name is what a `cargo test` result line shows and the fifth bullet
+    ///   above — which says the same thing correctly — is not.
+    /// * **The unbalanced-code-span half moved out**, into
+    ///   `unbalanced_doc_spans_are_rejected_in_the_four_citation_files_only_not_the_workspace`,
+    ///   with a reach control of its own. It ran inside this test's `cited_in` loop and its green
+    ///   was read as workspace coverage by three independent readers in two days, twice by the same
+    ///   one. Same four files, same check, its own result line.
+    ///
+    /// Consequence for the round-7 paragraph above: its "four problems from two mutations, one run,
+    /// `0 passed; 1 failed`" was measured when both halves were one test. Two of those four problems
+    /// now arrive on the span test's result line instead. Left as written, corrected here.
+    ///
+    /// **What #788 deliberately did NOT do.** The span check was not widened to the resolution
+    /// corpus. It was run over that corpus once, by execution, and the workspace outside these four
+    /// files is not clean by it. The count is recorded in #789 (filed by #788, not fixed by it) and
+    /// deliberately not repeated here — a count in a comment is the "measurement with an expiry
+    /// date" the round-9 block above already had to delete once.
     #[test]
-    fn every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard() {
+    fn every_test_citation_in_the_four_citation_files_resolves_and_is_listed_in_a_guard() {
         use std::collections::{HashMap, HashSet};
         use std::path::PathBuf;
 
@@ -1564,34 +1593,15 @@ mod cursor_resync_tests {
               this fn's rustdoc as the evidence that the check bites. Its whole point is that it \
               resolves to nothing — and the scan caught it here, unprompted, on the run that added \
               that paragraph."),
+            ("every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard",
+             "this test's own name before #788 renamed it, quoted in its rustdoc as the retracted \
+              name rather than deleted. Inherently unresolvable — that is what renamed means."),
         ];
-
-        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let ws = crate_root.parent().and_then(|p| p.parent())
-            .expect("crate is two levels under the workspace root").to_path_buf();
 
         // ── corpus 1: where citations are read from ──────────────────────────────────────────────
-        let cited_in: Vec<PathBuf> = vec![
-            crate_root.join("src/steering.rs"),
-            crate_root.join("src/walker.rs"),
-            crate_root.join("src/collision.rs"),
-            ws.join("tests/walker_sim.rs"),
-        ];
+        let cited_in: Vec<PathBuf> = citation_corpus().to_vec();
         // ── corpus 2: where names are resolved against ───────────────────────────────────────────
-        let mut resolve_in: Vec<PathBuf> = Vec::new();
-        let mut stack = vec![ws.join("crates"), ws.join("tests"), ws.join("src")];
-        while let Some(d) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&d) else { continue };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    // `target/` holds generated sources; resolving against them would let a stale
-                    // build artifact vouch for a citation.
-                    if p.file_name().is_some_and(|n| n == "target") { continue; }
-                    stack.push(p);
-                } else if p.extension().is_some_and(|s| s == "rs") { resolve_in.push(p); }
-            }
-        }
+        let resolve_in: Vec<PathBuf> = workspace_rs_files();
         // A silently empty corpus would make this test vacuously green — the exact failure mode it
         // exists to prevent. Pin both ends.
         for p in &cited_in {
@@ -1650,16 +1660,14 @@ mod cursor_resync_tests {
                     }
                 }
             }
-            // A structural check for a code span wrapped across two lines — independent of the
-            // citation loop above, which reads each line's chunks on its own and so can ALSO fire
-            // on a wrapped citation's truncated fragment (round 9 review: verified by execution,
-            // both halves firing together in the same run). Neither check subsumes the other.
-            for line in unbalanced_doc_spans(&src) {
-                problems.push(format!(
-                    "{}:{line}: a code span opens on this line and closes on another. `cargo doc` \
-                     renders the break inside the span. Keep the span on one line.",
-                    p.file_name().unwrap().to_string_lossy()));
-            }
+            // The structural check for a code span wrapped across two lines used to run here, over
+            // this same loop's four-file corpus. #788 moved it to its own test — same four files,
+            // its own result line — because a green line naming *this* test was read as workspace
+            // coverage. It remains independent of the citation loop above, which reads each line's
+            // chunks on its own and so can ALSO fire on a wrapped citation's truncated fragment
+            // (round 9 review: verified by execution, both halves firing in the same run — after
+            // #788, in the same `cargo test` run but on two result lines). Neither subsumes the
+            // other.
         }
         // Dead exceptions are their own kind of stale claim.
         // Under the RESOLUTION name, not the written one — `NOT_A_FN` is keyed on what a citation
@@ -1677,6 +1685,275 @@ mod cursor_resync_tests {
         }
         assert!(problems.is_empty(), "doc-comment citation scan found {} problem(s):\n  {}",
             problems.len(), problems.join("\n  "));
+    }
+
+    /// The workspace root: two levels above this crate's manifest directory.
+    fn workspace_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().and_then(|p| p.parent())
+            .expect("crate is two levels under the workspace root")
+            .to_path_buf()
+    }
+
+    /// **The citation corpus: the four files, as a value.**
+    ///
+    /// Every scan in this module that READS doc comments reads exactly these four — the citation
+    /// scan, the code-span scan, and the code-span scan's reach control. One definition, so a reach
+    /// control cannot end up measuring a corpus the guard does not use.
+    ///
+    /// The return type is `[PathBuf; 4]`, not a `Vec`, on purpose. Two test names in this module say
+    /// "four_citation_files"; the array length is what makes adding a fifth file a **compile error**
+    /// at every call site rather than a silent drift between what the names claim and what runs.
+    fn citation_corpus() -> [std::path::PathBuf; 4] {
+        let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let ws = workspace_root();
+        [
+            crate_root.join("src/steering.rs"),
+            crate_root.join("src/walker.rs"),
+            crate_root.join("src/collision.rs"),
+            ws.join("tests/walker_sim.rs"),
+        ]
+    }
+
+    /// Every `.rs` file under the workspace's `crates/`, `tests/` and `src/`, minus anything under a
+    /// `target/` directory — generated sources, where a stale build artifact could vouch for a
+    /// citation. Sorted, so a failure message is stable between runs.
+    ///
+    /// This is the RESOLUTION corpus, and only the resolution corpus. Nothing in this module scans
+    /// these files for doc-comment defects; see #788.
+    fn workspace_rs_files() -> Vec<std::path::PathBuf> {
+        let ws = workspace_root();
+        let mut out: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![ws.join("crates"), ws.join("tests"), ws.join("src")];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if p.file_name().is_some_and(|n| n == "target") { continue; }
+                    stack.push(p);
+                } else if p.extension().is_some_and(|s| s == "rs") { out.push(p); }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Read a corpus once, so a guard and its reach control scan byte-identical input rather than
+    /// two reads that could disagree.
+    fn read_corpus(files: &[std::path::PathBuf]) -> Vec<(std::path::PathBuf, String)> {
+        files.iter().map(|p| {
+            let src = std::fs::read_to_string(p)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
+            (p.clone(), src)
+        }).collect()
+    }
+
+    /// What `scan_doc_spans` returns. `files_scanned` and `lines_scanned` are here so that a scan
+    /// which stops part-way through its corpus is a LOUD failure and not a quieter green: #760's
+    /// round-4 finding was a source scanner that silently stopped at roughly an eighth of its
+    /// corpus, and every one of the twelve mutation probes aimed at it happened to sit inside the
+    /// window it could still see, so a twelve-cell mutation table proved nothing.
+    struct DocSpanScan {
+        offenders: Vec<(std::path::PathBuf, usize)>,
+        files_scanned: usize,
+        lines_scanned: usize,
+    }
+
+    /// Run `unbalanced_doc_spans` over a whole corpus, reporting what it found AND how far it got.
+    fn scan_doc_spans(corpus: &[(std::path::PathBuf, String)]) -> DocSpanScan {
+        let mut offenders = Vec::new();
+        let mut files_scanned = 0usize;
+        let mut lines_scanned = 0usize;
+        for (p, src) in corpus {
+            files_scanned += 1;
+            lines_scanned += src.lines().count();
+            for line in unbalanced_doc_spans(src) { offenders.push((p.clone(), line)); }
+        }
+        DocSpanScan { offenders, files_scanned, lines_scanned }
+    }
+
+    /// **A code span must not open on one line and close on the next — IN THE FOUR CITATION FILES.
+    /// Nowhere else. (#788)**
+    ///
+    /// `cargo doc` renders the line break inside the span, so the rendered docs show something the
+    /// source does not say. This is the check; `unbalanced_doc_spans` is the mechanism, and its own
+    /// doc records what backtick parity does and does not imply.
+    ///
+    /// **Why this is a test of its own.** Until #788 this ran inside
+    /// `every_test_citation_in_the_four_citation_files_resolves_and_is_listed_in_a_guard`'s loop —
+    /// the same four files, and honestly described in that test's body. But the corpus was legible
+    /// only to a reader of the *code*. A reader of the *result* saw one passing line whose name
+    /// began "every doc comment", and read it as the workspace. That happened to three independent
+    /// readers within two days, one of them twice, including on two other PRs whose doc edits landed
+    /// outside these four files and were therefore covered by nothing. The corpus is now in the
+    /// name, which is the only part of a green run anybody reads.
+    ///
+    /// **The corpus, stated exactly**, and identical to the citation corpus by construction (both
+    /// call `citation_corpus`): this crate's `src/steering.rs`, `src/walker.rs` and
+    /// `src/collision.rs`, plus the workspace's `tests/walker_sim.rs`. Four files. This test claims
+    /// **nothing** about the other `.rs` files in the workspace, and #788 measured, by running this
+    /// scan over the resolution corpus, that they are not clean by it. The count is filed as #789,
+    /// not repeated here — see the round-9 block above on why a count belongs in a comment's expiry
+    /// date, not its body.
+    ///
+    /// **Reach, not just shape.** That this check *can* detect a wrapped span says nothing about
+    /// whether it *arrives* at file 4, or at line 2000 of file 1.
+    /// `the_doc_span_scan_reaches_all_four_citation_files_at_three_depths_each` is the control for
+    /// that, and it injects its probes into every file of this exact corpus, at three depths each.
+    #[test]
+    fn unbalanced_doc_spans_are_rejected_in_the_four_citation_files_only_not_the_workspace() {
+        let files = citation_corpus();
+        for p in &files {
+            assert!(p.is_file(), "citation corpus file is missing: {}", p.display());
+        }
+        let corpus = read_corpus(&files);
+        let scan = scan_doc_spans(&corpus);
+        assert_eq!(scan.files_scanned, files.len(),
+            "the span scan visited {} of {} corpus files — it stopped early and its result is not \
+             about the corpus it names",
+            scan.files_scanned, files.len());
+        // Visible with `-- --nocapture`; the corpus is in the test NAME for everyone else.
+        println!("doc-span corpus: {} files, {} lines — {}",
+            scan.files_scanned, scan.lines_scanned,
+            files.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>().join(", "));
+        let report: Vec<String> = scan.offenders.iter()
+            .map(|(p, line)| format!(
+                "{}:{line}: a code span opens on this line and closes on another. `cargo doc` \
+                 renders the break inside the span. Keep the span on one line.",
+                p.file_name().unwrap().to_string_lossy()))
+            .collect();
+        assert!(report.is_empty(),
+            "doc-span scan found {} problem(s) in the {} citation files:\n  {}",
+            report.len(), files.len(), report.join("\n  "));
+    }
+
+    /// Which of a file's fence-safe insertion points a reach probe goes at.
+    ///
+    /// Bound **by value** in `PROBE_DEPTHS` and consumed by an exhaustive `match`: deleting a depth
+    /// is a compile error in two places, not a silent loss of a third of the reach evidence. That is
+    /// the remedy shape #760 landed after its round-4 finding, where a mutation table that *looked*
+    /// twelve-wide was in fact one window wide.
+    #[derive(Clone, Copy, Debug)]
+    enum ProbeDepth { Top, Mid, End }
+
+    /// The three depths every scanned file carries a probe at. Top, middle and end — because a
+    /// scanner that stops early stops *inside* a file as readily as *between* files.
+    const PROBE_DEPTHS: [ProbeDepth; 3] = [ProbeDepth::Top, ProbeDepth::Mid, ProbeDepth::End];
+
+    /// 0-based line indices at which an inserted doc-comment line would NOT be inside a
+    /// triple-backtick fence — i.e. positions where `unbalanced_doc_spans` will actually look at it.
+    ///
+    /// This mirrors that fn's own fence state machine, and it has to: a probe dropped inside a fence
+    /// is exempt by design, would go unreported, and would read as "the scan did not reach here"
+    /// when the scan was working correctly. Index 0 is always safe, so this never returns empty for
+    /// a non-empty file.
+    fn fence_safe_insertion_points(src: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut in_fence = false;
+        for (i, line) in src.lines().enumerate() {
+            if !in_fence { out.push(i); }
+            let t = line.trim_start();
+            let Some(body) = t.strip_prefix("///").or_else(|| t.strip_prefix("//!")) else {
+                in_fence = false;
+                continue;
+            };
+            if body.trim_start().starts_with("```") { in_fence = !in_fence; }
+        }
+        out
+    }
+
+    /// **The reach control for the doc-span scan: it must ARRIVE, not merely match (#788).**
+    ///
+    /// A positive control proves the scanner recognises the shape it hunts. It says nothing about
+    /// how far the scanner gets. #760's round-4 review found exactly that gap: a source-scanning
+    /// guard had silently stopped near the start of its corpus, and all twelve cells of the
+    /// mutation table built to prove it worked sat inside the one window still visible — nine of
+    /// the twelve injected violations were invisible and the table still came out clean.
+    ///
+    /// So this control does not put a probe next to the guard. It takes the **real corpus**, reads
+    /// it, and builds a mutated copy in which **every file carries three unbalanced-span probes**,
+    /// one at each `PROBE_DEPTHS` position — the first fence-safe line, the middle one, and the last
+    /// one. `fence_safe_insertion_points` picks positions the scan is not entitled to skip. Then it
+    /// runs the **same** `scan_doc_spans` the guard runs, and requires:
+    ///
+    /// * every one of the 4 × 3 probes is reported, named by file and depth if not; and
+    /// * the total offender count is exactly the unmutated baseline plus twelve, so a scan that
+    ///   reported the probes but dropped real findings on the way cannot pass either; and
+    /// * the scan reports having visited all four files.
+    ///
+    /// A scan that stops after file 1, or after the first 200 lines of a 2600-line file, fails this
+    /// with a list of the probes it never reached. Deleting a depth from `PROBE_DEPTHS` does not
+    /// quietly shrink the evidence — it fails to compile.
+    #[test]
+    fn the_doc_span_scan_reaches_all_four_citation_files_at_three_depths_each() {
+        use std::collections::HashSet;
+        use std::path::PathBuf;
+
+        // One backtick: odd parity on its own line, which is what the scan reports.
+        const PROBE: &str = "    /// #788 reach probe: this code span opens `and never closes";
+
+        let files = citation_corpus();
+        let corpus = read_corpus(&files);
+        let baseline = scan_doc_spans(&corpus);
+
+        let mut mutated: Vec<(PathBuf, String)> = Vec::new();
+        let mut expected: Vec<(PathBuf, ProbeDepth, usize)> = Vec::new();
+        for (p, src) in &corpus {
+            let safe = fence_safe_insertion_points(src);
+            assert!(safe.len() >= 3,
+                "{}: only {} fence-safe insertion point(s) — this file cannot carry a three-depth \
+                 probe and the control would be weaker than it claims",
+                p.display(), safe.len());
+            let at = |d: ProbeDepth| match d {
+                ProbeDepth::Top => safe[0],
+                ProbeDepth::Mid => safe[safe.len() / 2],
+                ProbeDepth::End => safe[safe.len() - 1],
+            };
+            let mut idx: Vec<(ProbeDepth, usize)> =
+                PROBE_DEPTHS.iter().map(|d| (*d, at(*d))).collect();
+            idx.sort_by_key(|(_, i)| *i);
+            assert!(idx[0].1 < idx[1].1 && idx[1].1 < idx[2].1,
+                "{}: two probe depths landed on the same line ({:?}) — the depths would not be \
+                 distinct and the control would prove less than it claims",
+                p.display(), idx);
+            let mut lines: Vec<&str> = src.lines().collect();
+            // Insert from the back so the earlier indices stay valid while inserting.
+            for (_, i) in idx.iter().rev() { lines.insert(*i, PROBE); }
+            mutated.push((p.clone(), lines.join("\n")));
+            // After all three insertions the probe of rank `n` sits at 0-based `i + n`, so its
+            // 1-based line number is `i + 1 + n`.
+            for (n, (d, i)) in idx.iter().enumerate() {
+                expected.push((p.clone(), *d, i + 1 + n));
+            }
+        }
+
+        let scan = scan_doc_spans(&mutated);
+        assert_eq!(scan.files_scanned, corpus.len(),
+            "the scan visited {} of {} files — it stopped between files",
+            scan.files_scanned, corpus.len());
+
+        let found: HashSet<(PathBuf, usize)> = scan.offenders.iter().cloned().collect();
+        let missed: Vec<String> = expected.iter()
+            .filter(|(p, _, line)| !found.contains(&(p.clone(), *line)))
+            .map(|(p, d, line)| format!("{}:{line} ({d:?})", p.display()))
+            .collect();
+        assert!(missed.is_empty(),
+            "the doc-span scan never arrived at {} of {} probes — it matches the shape but does not \
+             reach the whole corpus:\n  {}",
+            missed.len(), expected.len(), missed.join("\n  "));
+
+        assert_eq!(scan.offenders.len(), baseline.offenders.len() + expected.len(),
+            "mutated scan reported {} offender(s); expected the {} baseline offender(s) plus {} \
+             probes. A count that is short means the scan dropped findings it had already made; a \
+             count that is over means the probe insertion perturbed something it should not have",
+            scan.offenders.len(), baseline.offenders.len(), expected.len());
+
+        println!("reach control: {} probes ({} files x {} depths) all reported; \
+                  baseline {} offender(s) over {} files / {} lines",
+            expected.len(), corpus.len(), PROBE_DEPTHS.len(),
+            baseline.offenders.len(), baseline.files_scanned, baseline.lines_scanned);
     }
 
     /// The `NAME` in a `fn NAME` declaration on this line, if any. Deliberately dumb — it is a
