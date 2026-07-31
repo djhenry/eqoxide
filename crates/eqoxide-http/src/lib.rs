@@ -787,15 +787,22 @@ impl HttpState {
     /// renderer, not the network thread — has to be alive for the answer to be honest.
     pub(crate) fn health(&self) -> Health {
         let h = *self.net_health.lock().unwrap();
-        let link_age       = h.last_datagram.elapsed();
-        let last_packet_ago = h.last_packet.elapsed();
+        // #760: EVERY age below is measured back from `h.clock`, never from a bare `Instant::now()`.
+        // In production that clock IS `Instant::now()` (`HealthClock::WALL`, the only clock a
+        // non-test build can construct), so this is the same read-time measurement #343 requires.
+        // In a TEST it is pinned, which is what makes a fixture's liveness verdict a pure function
+        // of the fixture instead of a function of how long the test took to reach this line. If you
+        // add a field here, derive its age from `h.clock` too — a stray `.elapsed()` silently opts
+        // that one field back into wall time and re-arms #760's flake for it.
+        let link_age        = h.clock.age_of(h.last_datagram);
+        let last_packet_ago = h.clock.age_of(h.last_packet);
         // #371: the active-probe verdict, all measured at read time (like every other health field,
         // per #343 — never cached, so no live publisher has to run for the answer to stay honest).
         // NOTE: the timeout check is measured against `first_unanswered_probe_sent`, NOT
         // `last_probe_sent` — the latter is bumped by every 30s resend and would let a permanently
         // wedged zone re-earn the 10s in-flight grace window forever (the #371-followup bug).
-        let probe_sent_ago  = h.first_unanswered_probe_sent.map(|t| t.elapsed());
-        let probe_reply_ago = h.last_probe_reply.map(|t| t.elapsed());
+        let probe_sent_ago  = h.first_unanswered_probe_sent.map(|t| h.clock.age_of(t));
+        let probe_reply_ago = h.last_probe_reply.map(|t| h.clock.age_of(t));
         // #470: `world_responsive` must know the LINK is dead. When a failed world-reconnect kills the
         // net thread the prober dies too, so no probe is ever outstanding — without this, the "no
         // probe" branch reported a zombie session alive forever. `connected` here is the SAME value
@@ -819,12 +826,12 @@ impl HttpState {
         // #656: the io-starvation alert. Measured HERE, at read time (#343's rule for every age in
         // this payload) — `last_send_pressure_at` is a timestamp, never a pre-computed bool, so the
         // alert cannot go stale between the net thread's last write and this HTTP read.
-        let send_pressure_ago = h.last_send_pressure_at.map(|t| t.elapsed());
+        let send_pressure_ago = h.last_send_pressure_at.map(|t| h.clock.age_of(t));
         let send_starved = eqoxide_ipc::send_starved(h.send_pressure_streak, send_pressure_ago);
         Health {
             link_age_ms:        link_age.as_millis() as u64,
             last_packet_age_ms: last_packet_ago.as_millis() as u64,
-            snapshot_age_ms:    h.last_tick.elapsed().as_millis() as u64,
+            snapshot_age_ms:    h.clock.age_of(h.last_tick).as_millis() as u64,
             // Link liveness, NOT world activity — see `NetHealth`. An idle session goes 40+s with
             // no application packet while the session layer keeps ACKing; calling that "disconnected"
             // would be just as much a lie as #343's frozen `connected: true`.
@@ -840,7 +847,7 @@ impl HttpState {
             send_starved,
             send_failures_unretried: h.send_failures_unretried,
             last_send_error:         h.last_send_error_kind,
-            last_send_error_age_ms:  h.last_send_error_at.map(|t| t.elapsed().as_millis() as u64),
+            last_send_error_age_ms:  h.last_send_error_at.map(|t| h.clock.age_of(t).as_millis() as u64),
             reliable_abandoned:      h.reliable_abandoned,
             session_drop:            h.session_drop,
         }
@@ -1118,7 +1125,7 @@ mod player_view_datum_tests {
 #[cfg(test)]
 mod live_session_guard_tests {
     use super::*;
-    use crate::testkit::{ago, empty_state};
+    use crate::testkit::empty_state;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -1126,13 +1133,17 @@ mod live_session_guard_tests {
     /// Overwrite the three net-health clocks (ages in seconds) to model a given liveness state; the
     /// probe clocks are left at their `Default` (`None`), which is what the guard reads through
     /// `health()` but never keys its verdict on.
+    ///
+    /// #760: the clock is PINNED at the same instant the stamps are taken from, so the ages
+    /// `health()` reads back are exactly the numbers passed in. Before, the stamps were wall-clock
+    /// and the read happened later, so the real age was `arg + (however long the test then took)`.
+    /// By construction that put `tick_just_under_bound_passes` (1s, bound 5s) on a 4s margin that
+    /// machine load could eat — the same mechanism as #760, one test over. Not observed failing;
+    /// stated as a derivation from the old code, not as a measurement.
     fn set_clocks(s: &HttpState, datagram_ago: u64, tick_ago: u64, packet_ago: u64) {
-        *s.net_health.lock().unwrap() = NetHealth {
-            last_datagram: ago(datagram_ago),
-            last_packet:   ago(packet_ago),
-            last_tick:     ago(tick_ago),
-            ..NetHealth::default()
-        };
+        *s.net_health.lock().unwrap() = NetHealth::frozen_at(
+            std::time::Instant::now(), datagram_ago, tick_ago, packet_ago,
+        );
     }
 
     /// A freshly-built state (all clocks = now) is LIVE — the guard must pass. This is why every
@@ -1140,6 +1151,50 @@ mod live_session_guard_tests {
     #[test]
     fn fresh_state_is_live() {
         assert!(require_live_session(&empty_state()).is_ok());
+    }
+
+    /// #760: `health()` measures every age against `NetHealth::clock`, not against a fresh
+    /// `Instant::now()`. Proved by pinning the clock 7s AHEAD of the stamps and reading the ages
+    /// back exactly — no sleeping, no tolerance window. Swap any `h.clock.age_of(x)` in `health()`
+    /// back to `x.elapsed()` and the corresponding assertion here reads ~0 instead of 7000.
+    ///
+    /// This is the half that makes the frozen fixture mean anything: a fixture can pin its clock all
+    /// it likes, but only if the projection actually reads that clock does the wall clock stop
+    /// deciding a test's HTTP status.
+    #[test]
+    fn health_ages_are_measured_against_the_injected_clock() {
+        let s = empty_state();
+        let stamped = std::time::Instant::now();
+        *s.net_health.lock().unwrap() = NetHealth {
+            // Clock pinned 7s after the stamps → every age must read exactly 7000ms.
+            clock: HealthClock::frozen_at(stamped + std::time::Duration::from_secs(7)),
+            last_datagram: stamped,
+            last_packet:   stamped,
+            last_tick:     stamped,
+            ..NetHealth::default()
+        };
+        let h = s.health();
+        assert_eq!(h.snapshot_age_ms, 7_000, "snapshot_age_ms must come from the injected clock");
+        assert_eq!(h.link_age_ms, 7_000, "link_age_ms must come from the injected clock");
+        assert_eq!(h.last_packet_age_ms, 7_000, "last_packet_age_ms must come from the injected clock");
+        // And the guard's verdict follows that injected reading, not the wall: 7s > 5s bound.
+        let (code, msg) = require_live_session(&s).unwrap_err();
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(msg.contains("has not ticked in 7000ms"), "message: {msg}");
+    }
+
+    /// #760: the shared handler fixture pins its clock, so no handler test's status can depend on
+    /// how loaded the machine was. Delete the `frozen_at` in `testkit::empty_state` (back to
+    /// `NetHealth::default()`) and this goes RED immediately — `is_frozen()` is false — which is the
+    /// point: the property is structural, not a margin.
+    #[test]
+    fn handler_fixture_pins_its_health_clock() {
+        let s = empty_state();
+        assert!(s.net_health.lock().unwrap().clock.is_frozen(),
+            "empty_state() must pin the health clock so gated handler tests cannot age into a 503");
+        let h = s.health();
+        assert_eq!((h.snapshot_age_ms, h.link_age_ms, h.last_packet_age_ms), (0, 0, 0),
+            "a pinned fixture's ages are exactly zero, not merely small");
     }
 
     /// A healthy but IDLE session — connected + ticking, yet the WORLD has been quiet for a full
@@ -1288,3 +1343,13 @@ mod health_serde_tests {
             "a live session must serialize session_drop as an explicit null (#642)");
     }
 }
+
+/// Reach control for `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it` (#760/C1).
+///
+/// That guard scans this file's source text. A scanner that silently stops early — as it did, when
+/// a `/*` inside a route glob in a doc comment latched its block-comment state — reports
+/// a clean scan of a corpus it never read, which is a confident falsehood. The guard asserts it can
+/// SEE this constant; because it is the last item in the file, seeing it proves the scan arrived at
+/// the end. **Keep it last.**
+#[cfg(test)]
+pub(crate) const GUARD_REACH_SENTINEL_LIB: u8 = 0;
