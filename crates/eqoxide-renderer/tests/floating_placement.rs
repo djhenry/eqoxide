@@ -50,26 +50,35 @@
 //! loadable subset below and the result did not.
 //!
 //! 1. **`boat.glb` is the only model `model_for` can load that lands on the STATIC arm.** State the
-//!    gate first, because an earlier version of this note stated the wrong one: `renderer.rs:663-664`
-//!    picks the skinned path when `0 < joint_count <= 128`, so the static arm is
-//!    `!(0 < joint_count <= 128)` — no skin, a skin with zero joints, **or a skin with more than 128
-//!    joints**. `skins == 0` is therefore *sufficient but not necessary*, and a scan that only reads
-//!    `len(skins)` does not establish which arm a model takes.
+//!    gate first, because an earlier version of this note stated the wrong one. As of eqoxide#780
+//!    the gate is named — `renderer::SkinFit::classify` picks the skinned path for `Fits`, so the
+//!    static arm is everything else: no skin, a skin with zero joints (`EmptySkin`), **or a skin
+//!    with more than `JOINT_CAP` (128) joints (`ExceedsCap`)**. `skins == 0` is therefore
+//!    *sufficient but not necessary*, and a scan that only reads `len(skins)` does not establish
+//!    which arm a model takes. (Before #780 this was the unnamed boolean
+//!    `asset.skin.as_ref().is_some_and(|s| s.joint_count > 0 && s.joint_count <= 128)` at
+//!    `renderer.rs:663-664` of the #773 merge-base — same gate, no line to cite anymore now that
+//!    it has a name.)
 //!
-//!    Re-scanned on 2026-07-28 reading `len(skins[0].joints)` as well. Loadable names: the 18
-//!    distinct archetypes `race_to_archetype` can return (`humanoid`, `elf`, `dwarf`, `gnoll`,
-//!    `skeleton`, `zombie`, `creature`, `rat`, `snake`, `frog`, `wasp`, `wolf`, `bat`, `bird`,
-//!    `worm`, `fish`, `bear`, `boat`) plus the 29 `race_*` player models plus the 3 `<key>_f.glb`
-//!    female variants that exist (`humanoid_f`, `elf_f`, `dwarf_f`; `model_for` prefers them for
-//!    `gender == 1`, `renderer.rs:610`) — **50 files, all present**. Exactly one lands on the static
-//!    arm: `boat.glb`, `skins == 0`, 0 joints. Nothing is above the cap. The remaining files on disk
-//!    are zone/door/weapon assets `model_for` never names.
+//!    Re-scanned on 2026-07-28 reading `len(skins[0].joints)` as well, and again independently for
+//!    #780 (2026-07-31, parsing the GLB JSON chunk directly rather than via this predicate).
+//!    Loadable names: the 18 distinct archetypes `race_to_archetype` can return (`humanoid`, `elf`,
+//!    `dwarf`, `gnoll`, `skeleton`, `zombie`, `creature`, `rat`, `snake`, `frog`, `wasp`, `wolf`,
+//!    `bat`, `bird`, `worm`, `fish`, `bear`, `boat`) plus the 29 `race_*` player models plus the 3
+//!    `<key>_f.glb` female variants that exist (`humanoid_f`, `elf_f`, `dwarf_f`; `model_for`
+//!    prefers them for `gender == 1`, `renderer.rs:610`) — **50 files, all present**. Exactly one
+//!    lands on the static arm: `boat.glb`, `skins == 0`, 0 joints. Nothing is above the cap. The
+//!    remaining files on disk are zone/door/weapon assets `model_for` never names.
 //!
 //!    **This is a margin of one joint on a directory rebaked outside this repo.**
 //!    `race_pcfroglok.glb` sits at **127** joints against the 128 cap, and 11 rigs are at ≥ 109
 //!    (next highest 110). A two-joint rebake of that file moves a PC race — for which
 //!    `Entity::floating()` is false — onto the grounded arm. The grounded arm being unreached today
-//!    is a fact about the current asset bake, not a property of the code.
+//!    is a fact about the current asset bake, not a property of the code. #780 does not change
+//!    that fact; it changes what happens the day it stops being true — see
+//!    `tests/skin_cap_selection.rs` for the classifier this note now describes and
+//!    `EqRenderer::skin_cap_downgrades` / the `error!` log `build_character_model` now emits when
+//!    `ExceedsCap` is reached.
 //! 2. **A skinned rig's raw vertex origin is not a stable EQ datum.** `race_hum.glb` reported
 //!    `y_min = -10.430519`; `race_huf.glb` reported `y_min = -3.688780`. Both are nominally
 //!    6.0-foot humans (`race_target_height("HUM") == 6.0`), so their raw origins sit at wildly

@@ -967,12 +967,16 @@ pub struct StaticPlacement {
 ///
 ///   Nothing rendered wrong because of the over-lift — true as measured on 2026-07-28, and stated
 ///   with the mechanism that actually decides it, because an earlier version of this paragraph got
-///   that mechanism wrong. A model takes the static arm when
-///   `!(0 < joint_count <= 128)` (`renderer.rs:663-664`): no skin at all, **or** a skin with zero
-///   joints, **or** a skin with MORE than 128 joints. "Unskinned" is sufficient, not necessary.
-///   Scanned every name `model_for` can ask for (18 archetypes + 29 `race_*` + the 3 `_f` variants
-///   that exist = 50 files): exactly one lands on the static arm, `boat.glb`, at `skins == 0`.
-///   Nothing is over the 128 cap. `Entity::floating()` is `skips_wire_z_offset(is_boat, flymode)`
+///   that mechanism wrong. A model takes the static arm when `renderer::SkinFit::classify` returns
+///   anything but `Fits` (`renderer.rs`, eqoxide#780 — before #780 this was the unnamed boolean
+///   `!(0 < joint_count <= 128)`): no skin at all, **or** a skin with zero joints, **or** a skin
+///   with MORE than `JOINT_CAP` (128) joints. "Unskinned" is sufficient, not necessary. Scanned
+///   every name `model_for` can ask for (18 archetypes + 29 `race_*` + the 3 `_f` variants that
+///   exist = 50 files): exactly one lands on the static arm, `boat.glb`, at `skins == 0`. Nothing
+///   is over the 128 cap — re-measured independently for #780 by parsing the GLB JSON chunk of
+///   every file in the local model cache directly (136 files, including zone terrain; the 51
+///   character-relevant ones reproduce the same 50-file scan): 0 over cap, `race_pcfroglok.glb`
+///   still the max at 127. `Entity::floating()` is `skips_wire_z_offset(is_boat, flymode)`
 ///   (`eqoxide-core/src/game_state.rs:192`), true for every boat regardless of flymode, so the
 ///   grounded arm has no live consumer today.
 ///
@@ -981,7 +985,10 @@ pub struct StaticPlacement {
 ///   sync target. A two-joint rebake of that one file would put a PC race on the grounded arm,
 ///   where `floating()` is false — which is why this arm has to be correct rather than merely
 ///   unreached. The absence of a live consumer is also why a false sentence could sit here
-///   undetected, and why #768 has no live before/after to show.
+///   undetected, and why #768 has no live before/after to show. eqoxide#780 (this margin, filed by
+///   the #773 reviewer) is fixed by giving that predicate a name (`SkinFit`) instead of a change of
+///   behaviour: a model whose skin EXCEEDS the cap now logs loudly and is recorded in
+///   `EqRenderer::skin_cap_downgrades`, but still renders through this same static arm.
 /// - **floating** (`true`) — two separate steps, held to different standards:
 ///
 ///   1. *That the current lift is wrong* is certain from the code alone. `wire_z_to_foot`
