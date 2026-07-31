@@ -2146,12 +2146,6 @@ mod tests {
     /// What the server ADVERTISES this pad's same-zone arrival to be (a real floor point on slab B).
     const PAD_ADVERTISED_DEST: [f32; 3] = [430.0, 40.0, 0.0];
 
-    /// Two floor slabs 400u apart (no walk and no jump bridges the gap) with a DRNTP teleport-pad
-    /// footprint on the near slab, advertised as landing on the far one. Mirrors `collision.rs`'s
-    /// `pad_scene` (the #403 fixture) — duplicated here rather than shared so this test does not
-    /// have to widen `collision.rs`'s private test module.
-    fn pad_scene() -> crate::collision::Collision { pad_scene_leaves(false) }
-
     /// `two_leaves` bakes the SAME DRNTP index as two horizontally-separated footprint boxes — the
     /// real shape a pad can have, and the case where naming only one leaf sends the agent to a
     /// footprint it may not be able to reach (#660 review NB2).
