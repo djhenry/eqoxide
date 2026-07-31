@@ -1732,13 +1732,28 @@ impl Default for NavStatus {
     }
 }
 
-impl From<&str> for NavStatus {
-    fn from(state: &str) -> Self {
-        NavStatus { state: state.to_string(), reason: None, local: None,
-            blocked_goal: None, blocked_frontier: None, tier: None,
-            goal_id: 0, goal: None, local_planner_dead: false }
-    }
-}
+// `impl From<&str> for NavStatus` was deleted here (#771). It was a fourth, unnamed way to build a
+// `NavStatus` alongside `NavStatus::default()` (the boot row) and the three writers
+// `retire_to_idle` funnels every `idle` transition through — and unlike all three of those, it
+// named no reason: `"idle".into()` minted `state: "idle", reason: None` directly, exactly the
+// combination `CommandState::stamp_new_goal`'s `debug_assert` (`eqoxide-command/src/nav.rs:146`)
+// exists to reject, reached without passing through it.
+//
+// #765's review found this and classed it non-blocking because production never called it. #771
+// first tried `#[cfg(test)]`, but that gates something nothing can reach: its only two callers
+// were `eqoxide-net::action_loop`'s test module, a DIFFERENT crate, and they were migrated to
+// `NavStatus { state: "...".to_string(), ..Default::default() }` (see `action_loop.rs`) once bare
+// `#[cfg(test)]` — which is per-crate — turned out not to reach them (Cargo builds a dependency in
+// its normal mode while compiling the crate under test, not in test mode). Once those were gone, a
+// repo-wide check — including `eqoxide-ipc`'s own test module — found ZERO remaining callers in
+// any crate, in any build configuration. A gate on an unreachable impl is dead weight, not a
+// guarantee. This codebase's actual idiom for a downstream-visible test fixture is
+// `#[cfg(any(test, feature = "test-fixtures"))]`, used throughout this file — but this impl needed
+// neither that nor bare `#[cfg(test)]`, because nothing anywhere used it. Deletion is the maximal
+// form of "make the bad state unrepresentable": there is no longer any code path, gated or not,
+// that can build a `NavStatus` this way. If a genuine downstream test need for this shorthand
+// shows up later, it should be reintroduced under `#[cfg(any(test, feature = "test-fixtures"))]`,
+// not bare `#[cfg(test)]`.
 
 impl PartialEq<&str> for NavStatus {
     fn eq(&self, other: &&str) -> bool { self.state == *other }
