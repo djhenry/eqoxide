@@ -1733,7 +1733,9 @@ impl Default for NavStatus {
 }
 
 /// Test-only shorthand for seeding a `NavStatus` from a bare state string, e.g.
-/// `*nav_state.lock().unwrap() = "navigating".into();`.
+/// `*nav_state.lock().unwrap() = "navigating".into();`. As of #771 this crate has no caller of its
+/// own (see below) — it is kept for other crates' `#[cfg(test)]` code to reach for, not because
+/// anything here still uses it.
 ///
 /// # Why `#[cfg(test)]` (#771)
 ///
@@ -1746,9 +1748,8 @@ impl Default for NavStatus {
 /// reject, reached without passing through it or any other guard.
 ///
 /// #765's review found this and classed it non-blocking because, measured rather than assumed,
-/// production never calls it as of `daab1ef` — re-checked for #771 by reading every assignment
-/// whose target type is `NavStatus` (there are exactly two, both inside
-/// `eqoxide-net::action_loop::tests`, below) plus a repo-wide grep for `NavStatus::from(` and
+/// production never called it as of `daab1ef` — re-checked for #771 by reading every assignment
+/// whose target type is `NavStatus` and by a repo-wide grep for `NavStatus::from(` and
 /// `: NavStatus\b`, both empty. But "nobody happens to call it" is not a fact the type system was
 /// making true; the `debug_assert` at `eqoxide-command/src/nav.rs:146` compiles out under
 /// `--release` (test-time instrument, not a runtime one — same limit `retire_to_idle`'s own doc
@@ -1768,9 +1769,17 @@ impl Default for NavStatus {
 ///     = note: required for `&str` to implement `Into<NavStatus>`
 /// ```
 ///
-/// not merely "would be surprising if someone added one". See the two existing test-only call sites in
-/// `eqoxide-net::action_loop::tests::{dead_player_halts_navigation, zone_change_resets_stale_destination_and_path}`
-/// — both keep compiling because tests build with `cfg(test)` enabled crate-wide.
+/// **`#[cfg(test)]` is per-crate, not per-build — this bit the first draft of this fix.** The two
+/// call sites this impl actually had were in `eqoxide-net::action_loop::tests`, a DIFFERENT crate.
+/// Compiling `eqoxide-net`'s tests does not compile `eqoxide-ipc` in test mode — Cargo only builds
+/// the crate under test with `--cfg test`; its dependencies, `eqoxide-ipc` included, are built
+/// normally. So gating this impl broke those two call sites too: `error[E0277]: the trait bound
+/// \`NavStatus: From<&str>\` is not satisfied` at `action_loop.rs:6444` and `:6532`, running
+/// `cargo test --workspace`. That is exactly the "non-test caller" case #771 asked to be reported
+/// rather than routed around — and per its instruction ("check whether that caller should be using
+/// a real constructor instead") both were migrated to
+/// `NavStatus { state: "...".to_string(), ..Default::default() }`, the same real constructor
+/// [`NavStatus::default`] already uses. Nothing outside this crate calls this impl any more.
 #[cfg(test)]
 impl From<&str> for NavStatus {
     fn from(state: &str) -> Self {

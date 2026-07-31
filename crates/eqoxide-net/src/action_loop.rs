@@ -6441,7 +6441,12 @@ mod tests {
             nav.walker.path_goal = Some((100.0, 200.0, 0.0));
             nav.walker.path_i = 1;
             nav.walker.local_i = 1;
-            *nav.nav.nav_state.lock().unwrap() = "navigating".into();
+            // #771: not `"navigating".into()` — `From<&str> for NavStatus` is `#[cfg(test)]`-gated
+            // to `eqoxide-ipc`'s OWN test build, which does not cover this crate's tests (cfg(test)
+            // is per-crate; a dependency compiled for `eqoxide-net`'s tests still builds
+            // `eqoxide-ipc` in its normal, non-test mode). The real constructor works everywhere.
+            *nav.nav.nav_state.lock().unwrap() =
+                eqoxide_ipc::NavStatus { state: "navigating".to_string(), ..Default::default() };
         };
         let assert_halted = |nav: &ActionLoop| {
             assert!(nav.nav.goto_target.lock().unwrap().is_none(), "goto_target must clear on death");
@@ -6529,7 +6534,9 @@ mod tests {
         nav.walker.nav_repaths = 3;
         nav.walker.backoff_ticks = 2;
         nav.walker.replan_coarse = true;
-        *nav.nav.nav_state.lock().unwrap() = "blocked".into();
+        // #771: real constructor, not `.into()` — see the comment on the same pattern above.
+        *nav.nav.nav_state.lock().unwrap() =
+            eqoxide_ipc::NavStatus { state: "blocked".to_string(), ..Default::default() };
 
         // Cross into a NEW zone.
         let mut gs = GameState::new();
