@@ -1278,7 +1278,12 @@ mod tests {
                          // self.zone_in.on_frame();\n    }\n}\n";
         let in_a_string = "impl App {\n    fn f(&mut self) {\n        \
                            log(\"self.zone_in.on_frame();\");\n    }\n}\n";
-        let branched = "impl App {\n    fn f(&mut self) {\n        \
+        // A runtime `if`, NOT a `#[cfg(...)]` — the #791 round-2 review found that a genuine
+        // compile-time feature flag is a different mechanism this scan cannot see at all (see the
+        // "What this does NOT establish" section on the sibling test below). This case was
+        // previously mislabelled "behind a flag", which is what generalised the false claim in the
+        // first place.
+        let behind_a_runtime_if = "impl App {\n    fn f(&mut self) {\n        \
                         if self.ready { self.zone_in.on_frame(); }\n    }\n}\n";
         let in_a_closure = "impl App {\n    fn f(&mut self) {\n        \
                             self.later(|| { self.zone_in.on_frame(); });\n    }\n}\n";
@@ -1298,7 +1303,8 @@ mod tests {
 
         assert_eq!(verdict(live), Ok(()), "the live call must pass");
         for (name, src) in [("if false", disabled), ("commented out", commented),
-                            ("inside a string", in_a_string), ("behind a flag", branched),
+                            ("inside a string", in_a_string),
+                            ("behind a runtime if", behind_a_runtime_if),
                             ("inside a closure", in_a_closure), ("in a match arm", in_a_match_arm)] {
             assert!(verdict(src).is_err(),
                 "a call that is {name} must NOT satisfy this check — that is the #791 round-1 \
@@ -1315,11 +1321,14 @@ mod tests {
     ///    as code (not in a comment, not inside a string literal).
     /// 2. That statement is **unconditional within its function**: every block enclosing it, up to
     ///    and including `render_frame`'s own body, is introduced by something that cannot skip its
-    ///    body. Wrapping the call in `if false { … }`, in a feature flag, in a closure or in a
-    ///    match arm reds this test. `an_unconditional_statement_check_tells_a_live_call_from_dead_code`
+    ///    body. Wrapping the call in `if false { … }`, in a closure or in a match arm reds this
+    ///    test. `an_unconditional_statement_check_tells_a_live_call_from_dead_code`
     ///    demonstrates that on synthetic sources; `the_app_rs_scan_reads_a_balanced_file` is the
     ///    reach control that stops a mis-parse from making it vacuous.
-    /// 3. The call is handed the four live values it needs, by name.
+    /// 3. The call is handed the five live values it needs, by name. (A round-3 review pass over
+    ///    this doc found the previous version said "four" while checking only four of the five
+    ///    non-`controller` arguments — silently excluding `zone_underworld`. Fixed by adding the
+    ///    fifth check rather than narrowing the sentence to match the gap.)
     ///
     /// # What this does NOT establish — and cannot
     ///
@@ -1328,6 +1337,20 @@ mod tests {
     /// it. That is #728's own premise, and it is why this module exists at all. A source scan can
     /// show a statement is written and un-nested; it cannot show its function is called. #799
     /// tracks that residual and the two pins of this shape still standing in `movement.rs`.
+    ///
+    /// **That the statement survives compilation.** #791 round-2 review MEASURED this, against the
+    /// real `app.rs` call site, copy-aside/restore, md5-verified before and after: prepending
+    /// `#[cfg(any())]` directly above the statement, and separately wrapping it in a
+    /// `macro_rules!` that discards its argument list (`never!(self.zone_in.on_frame(…))`), both
+    /// leave this test `1 passed, 0 failed` — while in both cases rustc's own dead-code lint fired
+    /// `warning: field \`zone_in\` is never read`, independently proving the call had been excluded
+    /// from the compiled binary. Neither mutation is caught, and neither can be, by the mechanism
+    /// above: `is_conditional` only rejects a block introduced by
+    /// `if`/`else`/`while`/`for`/`loop`/`match`/a match arm/a closure, and `#[cfg]` introduces no
+    /// block at all — it is resolved by rustc before this scan ever walks the text — while a macro
+    /// invocation's discarded arguments live inside `(`/`)`, which `open_braces` does not track.
+    /// A text scan cannot see whether the compiler kept a statement; only the compiler's own
+    /// warnings can.
     ///
     /// This paragraph replaces a sentence in the previous version of this test that said nothing in
     /// the harness "can see whether `app.rs` still calls it" — which reads as an execution claim,
@@ -1384,6 +1407,10 @@ mod tests {
             ("self.loading",           "the asset-load throttle"),
             ("self.camera_initialized","whether this frame will step the controller at all"),
             ("self.collision",         "this zone's geometry, `None` for the whole load window"),
+            ("self.game_state_view.world.zone_underworld",
+             "this zone's baked underworld — `zone_in_reground` uses it to tell a genuine void \
+              arrival from a landable floor; a stale value here silently answers for the WRONG \
+              zone's underworld"),
         ] {
             assert!(args.contains(arg),
                 "app.rs must still pass `{arg}` to `ZoneIn::on_frame` — {why}. Call was:\n{args}");
