@@ -857,6 +857,26 @@ mod tests {
         assert!(line.contains("INCOMPLETE"), "{line}");
         assert!(line.contains("tinyzone") && line.contains("lastzone"),
             "the TOTAL line must name the zones it lost: {line}");
+
+        // An UNACCOUNTED hole ALONE — no skip, no unmeasured zone anywhere in the run — must be
+        // enough on its own. This case is not decoration: with only the mixed rollup above, the
+        // `skipped` bucket masks mutation 4 (measured — deleting the `unaccounted_zones().is_empty()`
+        // term from `is_complete` left every other assertion in this test green, 15 passed / 0
+        // failed). The three holes must be independent triggers, not additive on top of each other.
+        let mut only_unaccounted = WaterRollup::new();
+        only_unaccounted.begin_zone("qeynos2");
+        only_unaccounted.add("qeynos2", &dry_but_loaded().tally());
+        only_unaccounted.begin_zone("tinyzone"); // dropped, and nothing opens after it
+        assert_eq!(only_unaccounted.unaccounted_zones(), vec!["tinyzone"]);
+        assert_eq!(only_unaccounted.skipped_zones(), Vec::<&str>::new());
+        assert_eq!(only_unaccounted.unmeasured_zones(), Vec::<&str>::new());
+        assert_eq!(only_unaccounted.attempted_zones(), 2);
+        assert!(!only_unaccounted.is_complete(),
+            "an unaccounted zone with no other hole must still make the run incomplete");
+        let solo = only_unaccounted.to_string();
+        assert!(solo.contains("INCOMPLETE") && solo.contains("tinyzone"), "{solo}");
+        assert!(!solo.contains("(over 1/1 zones)"),
+            "the defect string must not be producible from an unaccounted-only run: {solo}");
     }
 
     /// The wiring is fail-CLOSED: a corpus loop that forgets `begin_zone` cannot silently revert to
