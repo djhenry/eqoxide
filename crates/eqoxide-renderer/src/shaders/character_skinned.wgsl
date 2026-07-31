@@ -15,7 +15,12 @@ struct EntityUniform {
 };
 @group(2) @binding(0) var<uniform> entity: EntityUniform;
 
-struct JointMatrices { mats: array<mat4x4<f32>, 128> };
+// `JOINT_CAP` is NOT a WGSL constant: `pipeline::wgsl()` substitutes the Rust
+// `renderer::JOINT_CAP` into this text before `create_shader_module` sees it, so the palette
+// length exists as a number in exactly one place in the tree (eqoxide#798). Do not write a
+// numeric length here — an un-substituted source is not valid WGSL and naga rejects it, which
+// is the point: forgetting the substitution is a hard failure, never a silent wrong cap.
+struct JointMatrices { mats: array<mat4x4<f32>, JOINT_CAP> };
 @group(3) @binding(0) var<uniform> joints: JointMatrices;
 
 struct SkinnedVertexInput {

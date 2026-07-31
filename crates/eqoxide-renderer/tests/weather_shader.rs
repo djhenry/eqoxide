@@ -21,7 +21,11 @@ const WEATHER_WGSL: &str = include_str!("../src/shaders/weather.wgsl");
 const PIPELINE_RS: &str = include_str!("../src/pipeline.rs");
 
 fn parse_and_validate(source: &str, label: &str) -> naga::Module {
-    let module = naga::front::wgsl::parse_str(source)
+    // The `.wgsl` files are not standalone WGSL: they carry the `JOINT_CAP` placeholder that
+    // `pipeline::wgsl` substitutes on the way into `create_shader_module` (eqoxide#798). Parse the
+    // SAME text the GPU is handed, not the raw file, or a joint-palette shader won't even parse.
+    let source = eqoxide_renderer::pipeline::wgsl(source);
+    let module = naga::front::wgsl::parse_str(&source)
         .unwrap_or_else(|e| panic!("{label}: WGSL failed to parse: {e}"));
     naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
         .validate(&module)
