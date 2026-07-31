@@ -89,6 +89,25 @@ const GOOD_RING_LEN: usize = 8;
 /// starts. The throttle is re-armed whenever the hold's REASON changes, so a transition from one
 /// hold to the other is never swallowed by the previous one's cooldown.
 const HOLD_LOG_SECS: f32 = 5.0;
+/// #776: seconds of sustained no-horizontal-progress, against a NONZERO horizontal wish, while the
+/// body is afloat, before the controller discloses an [`AfloatStall`].
+///
+/// Sized to be far longer than any legitimate transient a floating body has: buoyancy settles to the
+/// float plane at `BUOY_RATE` = 30 u/s (a full `float_depth` = 2 u of settle is 0.07 s), a swimming
+/// step-up / duck-under either resolves on the frame it is tried or never, and a slide along a wall
+/// makes real tangential progress. Three seconds of a driver asking for motion and getting under
+/// `AFLOAT_PROGRESS` of it is not any of those.
+const AFLOAT_STALL_SECS: f32 = 3.0;
+/// #776: net horizontal displacement from the window's anchor (units) that counts as PROGRESS and
+/// re-arms the window from the new position.
+///
+/// Measured as NET displacement from an anchor, not per-frame delta, on purpose: a per-frame epsilon
+/// would be re-armed for ever by float noise or by a body oscillating between two contacts, which is
+/// the same "not going anywhere" the signal exists to disclose. 0.5 u is ~0.011 s of travel at the
+/// 44 u/s the nav swim drive uses, so a body that is genuinely swimming clears it on the first frame
+/// and never opens a window at all.
+const AFLOAT_PROGRESS: f32 = 0.5;
+
 /// Ring push-out search radii (units).
 const PUSHOUT_RADII: [f32; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 /// Directions sampled per push-out ring.
@@ -118,6 +137,155 @@ pub fn manual_wish(dir: [f32; 2]) -> ([f32; 2], Option<f32>) {
 }
 
 // `ControllerView` moved to `eqoxide-ipc` (#544 Step 2c) — re-exported at the top of this module.
+
+// ── #776: the trapped-swimmer disclosure ─────────────────────────────────────────────────────────
+//
+// Since #661 a body afloat in water never enters the depenetration net (see `depenetrate`'s door,
+// and the reasons there — every question the net asks about a floating body is mis-posed). That
+// removed a LOUD failure mode: the review that produced #767 measured `main` walking a swimmer
+// ~140 u OUT of a sealed box through the walls, one ring radius at a time. What it left behind is a
+// QUIET one. A swimmer sealed in a pocket, or pressing at a passage `try_duck_under` refuses,
+// simply stops: `on_ground = false`, `in_water = true`, `hold() = None`, and `stuck_time` never
+// accrues because the net's clock is the only one and the net no longer runs for floaters. Every
+// observable reads "swimming normally". That is the project's top-ranked defect class — a missing
+// disclosure an agent cannot detect, cannot retry around, and builds every later decision on.
+//
+// # Why this is NOT a `ControllerHoldReason`, and why it needs its own signal
+//
+// The state is **not locally distinguishable from correct behaviour**. A swimmer resting at its
+// float plane beside a wall is also stationary, also unsupported, also wet — that is what a swimmer
+// DOES. Publishing the shape naively would raise an alarm on every ordinary floating character, and
+// **a false alarm in an honesty observable is the same defect as a silence** (the argument is
+// recorded verbatim at the neutral-buoyancy branch in `step`, which declines to report itself for
+// exactly this reason).
+//
+// So the signal is not the shape, it is **sustained zero progress against a nonzero wish**:
+//
+//   * **nonzero horizontal wish** — the driver is actively asking for lateral motion. An idle
+//     floater has no wish, so it can never open a window. This is the whole resting-vs-trapped
+//     distinction, and it is enforced by TYPE below ([`AfloatFrame::Resting`] has no path to the
+//     advancing arm), not by a guard a later edit can invert;
+//   * **horizontal** on both sides, deliberately: a pure UP-wish that goes nowhere is what a
+//     swimmer at the surface gets from the surface clamp in `step`, and is what the walker's own
+//     haul-out steering sends. Counting it would false-alarm on the single most common wish in the
+//     whole water system;
+//   * **sustained** — `AFLOAT_STALL_SECS` against net displacement from an anchor, so no transient
+//     (buoyancy settling, a refused step-up, a grazing slide) can trip it.
+//
+// # What this deliberately does NOT claim
+//
+// An `AfloatStall` is weaker than a [`ControllerHold`] and must never be conflated with one. A hold
+// says *the body cannot move at all, under any driver*. A stall says only *this wish has produced
+// no motion for this long*. The trapped swimmer at qcat's pocket mouth is escapable — by a DRIVEN
+// dive, which `qcat_pocket_swimmer_escapes_to_the_shaft_under_a_driven_dive` pins — while the
+// horizontal-only drive that stalls there cannot get out on its own. Reporting "you are not moving"
+// is true of both; reporting "you are frozen" would be false of the first. That is why this is a
+// separate type with its own vocabulary rather than a third `ControllerHoldReason` variant.
+//
+// Scope, stated plainly: this covers the AFLOAT case only (`in_water && !on_ground`). A DRY body
+// pressed against a wall is equally silent and equally uncovered — but that is pre-existing and not
+// what #661 changed, and widening this to dry bodies would collide with the depenetration net's own
+// `stuck_time`/`EmbeddedNoRecovery` accounting. A wading body standing on the bottom is likewise
+// out (it is `on_ground`, so the dry-net vocabulary applies to it).
+
+/// #776: the body is afloat and a horizontal wish has produced no net progress for a sustained
+/// window. Level-triggered — recomputed from scratch every stepped frame, exactly like
+/// [`ControllerHold`] — so it cannot outlive its cause.
+///
+/// The fields are private and there is no public constructor **on purpose**: the only code that can
+/// build one is [`AfloatStallClock::stall`], and only once the window has actually reached
+/// `AFLOAT_STALL_SECS`. A premature or fabricated `AfloatStall` is therefore not representable,
+/// which is the point — this is an honesty observable, and the failure that matters most for it is
+/// the FALSE one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AfloatStall {
+    secs:   f32,
+    anchor: [f32; 3],
+}
+
+impl AfloatStall {
+    /// Seconds the body has been afloat, wished at, and within [`AFLOAT_PROGRESS`] of `anchor`.
+    /// Always `>= AFLOAT_STALL_SECS` — see the type doc. Counts the WHOLE window, including the
+    /// pre-threshold part, so an agent watching it advance sees the true age of the stall.
+    pub fn secs(self) -> f32 { self.secs }
+    /// The position the window opened at — the point the body has failed to get more than
+    /// [`AFLOAT_PROGRESS`] away from.
+    pub fn anchor(self) -> [f32; 3] { self.anchor }
+}
+
+/// One frame's answer to "is this body being asked to swim somewhere, and failing to?".
+///
+/// A total function of the frame's own facts, computed in ONE place ([`AfloatFrame::classify`]), so
+/// the clock below cannot advance on a frame that was never classified [`Self::Wished`]. This is
+/// the resting-vs-trapped distinction made unrepresentable-in-the-wrong-direction rather than
+/// guarded: there is no arm of [`AfloatStallClock::observe`] that both accepts a non-`Wished` frame
+/// and advances the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfloatFrame {
+    /// Not afloat: dry, or standing/wading on the bottom (`on_ground`). The depenetration net's
+    /// vocabulary (`stuck_time`, `ControllerHoldReason::EmbeddedNoRecovery`) owns these bodies.
+    NotAfloat,
+    /// Afloat with NO horizontal wish — an ordinary floating character, holding at its plane.
+    /// **This variant is the false-alarm guard.** It resets the window like `NotAfloat` does.
+    Resting,
+    /// Afloat AND asked to move horizontally. Only this variant can advance the clock.
+    Wished,
+}
+
+impl AfloatFrame {
+    /// `afloat` = the body is in water and unsupported; `throttle` = the frame's horizontal wish
+    /// magnitude, the same value `step` computes for its collide-and-slide (so the classification
+    /// and the motion can never disagree about whether a wish was made).
+    fn classify(afloat: bool, throttle: f32) -> Self {
+        if !afloat { Self::NotAfloat } else if throttle > 1e-4 { Self::Wished } else { Self::Resting }
+    }
+}
+
+/// The window state behind [`AfloatStall`]. `None` = no window open.
+///
+/// A window carries the position it opened at and how long it has been open. Progress is measured
+/// as NET horizontal displacement from that anchor rather than per-frame delta — see
+/// [`AFLOAT_PROGRESS`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct AfloatStallClock {
+    window: Option<([f32; 3], f32)>,
+}
+
+impl AfloatStallClock {
+    /// Fold one resolved frame in. `pos` is the body's position AFTER the frame resolved, `dt` the
+    /// frame time.
+    fn observe(&mut self, frame: AfloatFrame, pos: [f32; 3], dt: f32) {
+        match frame {
+            // Not afloat, or afloat with nothing asked of it: no window, nothing to disclose. Both
+            // arms are unconditional — a resting floater cannot carry a window across an idle frame
+            // and resume it later, so an alarm can never be assembled out of scattered frames.
+            AfloatFrame::NotAfloat | AfloatFrame::Resting => self.window = None,
+            AfloatFrame::Wished => match self.window {
+                None => self.window = Some((pos, 0.0)),
+                Some((anchor, secs)) => {
+                    let moved = hlen([pos[0] - anchor[0], pos[1] - anchor[1], 0.0]);
+                    // Progress: re-anchor HERE and restart the clock. A body creeping forward
+                    // 0.5 u at a time is making progress and must never accumulate a stall.
+                    if moved > AFLOAT_PROGRESS { self.window = Some((pos, 0.0)); }
+                    else { self.window = Some((anchor, secs + dt)); }
+                }
+            },
+        }
+    }
+
+    /// The stall in force right now, or `None`. The ONLY constructor of [`AfloatStall`].
+    fn stall(self) -> Option<AfloatStall> {
+        match self.window {
+            Some((anchor, secs)) if secs >= AFLOAT_STALL_SECS => Some(AfloatStall { secs, anchor }),
+            _ => None,
+        }
+    }
+}
+
+/// Minimum spacing (seconds) between afloat-stall log lines. Its own throttle rather than a share of
+/// `hold_log_cooldown`: the two disclosures are independent, and one silently swallowing the other's
+/// first line is exactly the drift a shared clock invites.
+const AFLOAT_STALL_LOG_SECS: f32 = 5.0;
 
 /// Sole owner of the local player's physical state. Position is `[east, north, z]` (server coords,
 /// `z` = feet).
@@ -174,6 +342,14 @@ pub struct CharacterController {
     /// breaks a fall") must still hold for every other water-exit path. Keying this off actual
     /// descent (not `wish_vspeed`'s sign) is what keeps a sideways exit from false-arming a fall.
     swim_sinking: bool,
+    /// #776: the afloat no-progress window. See the block comment above [`AfloatStall`] for why the
+    /// trapped swimmer needs its own signal instead of a `ControllerHoldReason`. Recomputed every
+    /// stepped frame from that frame's own facts; reset by [`Self::teleport`] and
+    /// [`Self::clear_hold`] for the same reasons those reset the hold.
+    afloat: AfloatStallClock,
+    /// Seconds until the afloat-stall log line may be emitted again (see `AFLOAT_STALL_LOG_SECS`).
+    /// Diagnostics only — no physics reads this.
+    afloat_log_cooldown: f32,
 }
 
 #[inline]
@@ -360,7 +536,8 @@ impl CharacterController {
                stuck_time: 0.0,
                hop_cooldown: 0.0, underworld: f32::NEG_INFINITY,
                airborne_start_z: None, landed_fall_height: None, levitating: false,
-               swim_sinking: false }
+               swim_sinking: false,
+               afloat: AfloatStallClock::default(), afloat_log_cooldown: 0.0 }
     }
 
     /// Take-and-clear the one-shot fall height (feet dropped during the airborne stretch just
@@ -488,6 +665,25 @@ impl CharacterController {
     /// (#724 round-3 review, N1 — this used to say "every frame" flatly.)
     pub fn hold(&self) -> Option<ControllerHold> { self.hold }
 
+    /// #776: the afloat stall in force, or `None` — see [`AfloatStall`] and the block comment above
+    /// it. `None` includes every ordinary floating character: a body with no horizontal wish never
+    /// opens a window at all, so a resting floater is `None` for as long as it floats.
+    ///
+    /// Level-triggered exactly like [`Self::hold`]: recomputed at the end of every stepped frame
+    /// from that frame's own classification, so it clears the frame the body makes progress or the
+    /// driver stops asking.
+    ///
+    /// # ⚠️ NOT YET ON THE HTTP OBSERVABLE — deliberately, and this is the whole residual of #776
+    ///
+    /// This is the controller half. Publishing it to agents means a new `player.*` field (or a third
+    /// `ControllerHoldReason`), which lands in `eqoxide-core`'s `game_state.rs`, `eqoxide-http`'s
+    /// `lib.rs` and `docs/http-api.md` — files held by other in-flight work when this landed, so the
+    /// plumbing is sequenced separately. Until that lands the disclosure reaches the LOG only (the
+    /// throttled `controller AFLOAT STALL` line in `step`), which serves a human or log-reading
+    /// operator and does NOT serve an HTTP-driving agent. Said plainly rather than left implicit,
+    /// because "there is a signal now" would otherwise read as "agents can see it".
+    pub fn afloat_stall(&self) -> Option<AfloatStall> { self.afloat.stall() }
+
     /// Drop any hold WITHOUT stepping (`app.rs` calls this on the frames it does not step the
     /// controller — no collision loaded, i.e. mid zone-load). The last hold described geometry that
     /// has been dropped, and nothing is going to recompute it until the new zone lands, so the
@@ -500,7 +696,13 @@ impl CharacterController {
     /// pinned now: `the_frames_that_do_not_step_still_clear_the_hold` (a source scan of `app.rs`'s
     /// not-stepped arm) and `clear_hold_drops_a_hold_without_stepping` in this module's tests, and
     /// `begin_zone_in_clears_the_previous_zones_hold_724` in `eqoxide-core`.
-    pub fn clear_hold(&mut self) { self.hold = None; }
+    ///
+    /// #776: this drops the afloat no-progress window too, for the identical reason — the window
+    /// describes a body failing to cross specific geometry, and on a frame with no collision loaded
+    /// there is no such geometry. Doing it here rather than at a new call site is what keeps the
+    /// future publication of [`Self::afloat_stall`] correct with NO change to `app.rs`'s
+    /// not-stepped arm.
+    pub fn clear_hold(&mut self) { self.hold = None; self.afloat = AfloatStallClock::default(); }
 
     /// Record — and, throttled, log — that a recovery branch has stopped the body this frame with
     /// nothing to restore it onto.
@@ -591,6 +793,11 @@ impl CharacterController {
         self.airborne_start_z = None;
         self.landed_fall_height = None;
         self.swim_sinking = false; // #444: a teleport isn't a swim-down exit either
+        // #776: a position discontinuity supersedes the afloat window as well. The anchor describes
+        // a point THIS body failed to get away from; after a relocation it is a point the body is no
+        // longer at, and carrying the accumulated seconds across would make the first frames at the
+        // new position inherit an alarm they did not earn.
+        self.afloat = AfloatStallClock::default();
     }
 
     /// Advance one frame. Returns the new authoritative position.
@@ -607,7 +814,14 @@ impl CharacterController {
         let prev_hold = self.hold.take();
         // Depenetration / unstuck net runs first (§3.3). If it handled an embedded frame, freeze
         // the rest of the step so we neither slide deeper nor fall through void.
+        self.afloat_log_cooldown = (self.afloat_log_cooldown - dt).max(0.0);
         if self.depenetrate(dt, col, prev_hold) {
+            // #776: reaching here means the net HANDLED the frame, and the net's door (see
+            // `depenetrate`) hands every wet body straight back to physics — so a frame the net
+            // handled is a frame with a DRY body, by construction, not by coincidence. `NotAfloat`
+            // is therefore the true classification, not a convenient default, and this closes the
+            // window rather than leaving it to drift across the frames the net owns.
+            self.afloat.observe(AfloatFrame::NotAfloat, self.pos, dt);
             return self.pos;
         }
         // §444: remember whether we were in water AND actively swim-sinking LAST frame, before
@@ -1017,6 +1231,28 @@ impl CharacterController {
                 }
             }
         }
+        // ── #776: the afloat no-progress window ──────────────────────────────────────────────────
+        //
+        // Folded in at the END of the frame, from the frame's own resolved facts: `in_water` and
+        // `on_ground` as every branch above left them, `throttle` as the collide-and-slide itself
+        // used it (so the classification cannot disagree with the motion about whether a wish was
+        // made), and `self.pos` as the frame resolved it. See the block comment above `AfloatStall`
+        // for why this is a separate signal from `ControllerHold` and why both halves of the
+        // predicate are horizontal.
+        self.afloat.observe(
+            AfloatFrame::classify(self.in_water && !self.on_ground, throttle), self.pos, dt);
+        if let Some(stall) = self.afloat.stall() {
+            if self.afloat_log_cooldown <= 0.0 {
+                self.afloat_log_cooldown = AFLOAT_STALL_LOG_SECS;
+                tracing::info!(
+                    "controller AFLOAT STALL: afloat at {:?} with a horizontal wish for {:.1}s and \
+                     still within {:.2}u of {:?} — the drive is being honoured and producing no \
+                     progress (a sealed pocket, or a passage the duck-under refuses). This is NOT a \
+                     freeze: a different wish — notably an explicit down-wish dive — may still \
+                     cross. This line is throttled to one per {:.0}s while it lasts.",
+                    self.pos, stall.secs(), AFLOAT_PROGRESS, stall.anchor(), AFLOAT_STALL_LOG_SECS);
+            }
+        }
         self.pos
     }
 
@@ -1140,8 +1376,10 @@ impl CharacterController {
     ///   reading "swimming normally"). Requiring `floor ≤ ducked feet` makes the crossing
     ///   **reversible by a driven dive, by construction**: the return only needs feet to re-occupy
     ///   the passage depth, which the floor now provably admits and the destination water check
-    ///   already covers. (Residual, stated exactly: the return's sink stops `SKIN` = 0.05 u above
-    ///   the floor, so a passage whose outbound clearance was under 0.05 u can still shut behind
+    ///   already covers. (Residual, **REASONED from the two clamps, not measured** — the label is
+    ///   review N1's own, on this very sentence: *"'stated exactly' is a reasoned figure, not a
+    ///   measured one."* The return's sink stops `SKIN` = 0.05 u above the floor, so a passage
+    ///   whose outbound clearance was under 0.05 u can still shut behind
     ///   the body; and this is reversibility of the PASSAGE for a driver that dives — a
     ///   horizontal-only wish still needs the return column deep enough for the autonomous duck,
     ///   which the same floor bound gives everywhere the two sides' surfaces match.) The probe is
@@ -1182,7 +1420,22 @@ impl CharacterController {
         // bounds an admitted duck's crossing is autonomously round-trip-capable: the return sink
         // can reach the passage depth (this bound), the floor provably admits it (the floor
         // bound), and the passage is wet at both ends (the water checks) — up to the SKIN-sized
-        // clearance residual, which review N1 measured unreachable in practice.
+        // clearance residual, which review N1 SWEPT FOR AND COULD NOT CONSTRUCT.
+        //
+        // ⚠️ CORRECTED (#794). This clause used to read "which review N1 measured unreachable in
+        // practice", and that overstated what N1 did. N1 swept the lintel underside across the
+        // band — −0.20 / −0.40 / −0.46 / −0.49 all crossed AND returned, −0.52 refused outbound —
+        // and concluded it could not build the case; it then labelled its own mechanism
+        // **REASONED**, in as many words ("'stated exactly' is a reasoned figure, not a measured
+        // one"). A failed attempt to construct a counter-example is evidence, but it is not a
+        // measurement of unreachability: the sweep can only report what it visited. So the honest
+        // statement is the one above — searched, not found, mechanism reasoned — and NOT the
+        // reciprocal overclaim either: nothing here says the residual IS reachable, only that this
+        // file does not know that it is not. The distinction is load-bearing in this specific
+        // comment because the same PR's history is two universals that survived several rewrites
+        // and were then falsified by measurement (see the ordering comment in `step` and the two
+        // re-divability bounds below), i.e. exactly the shape "swept and did not find" cannot rule
+        // out.
         //
         // Cost, stated plainly: this also refuses the qcat pocket-mouth duck for a HORIZONTAL-only
         // wish (the shaft's surface is ~13 u above the pocket's, so that crossing is genuinely
@@ -3450,5 +3703,435 @@ mod tests {
         assert!(c.hold().is_none(),
             "#724 B1: clear_hold must drop the hold WITHOUT a step — it is the only thing making \
              \"nothing here latches\" true on the frames app.rs does not step the controller");
+    }
+
+    // ── #794: the SKIN-residual claim in `try_duck_under` ────────────────────────────────────────
+
+    /// **The retired overclaim must stay retired.**
+    ///
+    /// `try_duck_under`'s doc used to say review N1 had *measured* the SKIN-sized clearance
+    /// residual to be unreachable in practice. N1 did no such measurement: it swept the lintel band
+    /// (−0.20 / −0.40 / −0.46 / −0.49 crossed and returned, −0.52 refused outbound), reported that
+    /// it could not CONSTRUCT the case, and labelled its own mechanism REASONED in as many words.
+    ///
+    /// A comment cannot be pinned by behaviour, so it is pinned by text. This is not
+    /// ceremony — [[eq-docs-are-the-honesty-surface]]: in the five-round review this file came
+    /// through, every blocking finding was a false claim in a tracked file and none was in the code.
+    /// The banned strings below are the exact ones the issue quotes; if a future edit reintroduces
+    /// either, this fails by name.
+    ///
+    /// (The scan deliberately starts at the top of the file and stops at this function, so the
+    /// assertions cannot match their own text. The doc block you are reading is inside that window,
+    /// which is why it paraphrases the retired claim instead of quoting it.)
+    #[test]
+    // Capitalised on purpose: MEASURED is the word this test exists to keep out of the file.
+    #[allow(non_snake_case)]
+    fn the_duck_never_again_claims_the_skin_residual_was_MEASURED_unreachable() {
+        const THIS_FILE: &str = include_str!("movement.rs");
+        // Skip this test's own body, or the quoted phrase below would match itself.
+        let src = &THIS_FILE[..THIS_FILE
+            .find("fn the_duck_never_again_claims_the_skin_residual_was_MEASURED_unreachable")
+            .expect("this test's own name must appear in this file")];
+        assert!(!src.contains("measured it unreachable"),
+            "#794: the overclaim is back in movement.rs, reworded. Review N1 SWEPT the lintel band \
+             and could not construct the case, and labelled its mechanism REASONED — a failed \
+             construction is evidence, not a measurement of unreachability.");
+        // The retired wording is allowed to survive EXACTLY ONCE, inside the retraction that
+        // quotes it — this repo retracts in place rather than deleting, so the quote is the record.
+        // Anywhere else it is an assertion again.
+        let hits: Vec<usize> = src.match_indices("measured unreachable").map(|(i, _)| i).collect();
+        assert_eq!(hits.len(), 1,
+            "#794: expected the retired claim to appear exactly once (quoted inside its own \
+             retraction); found {} occurrence(s). A second one is the overclaim restated.",
+            hits.len());
+        let at = hits[0];
+        assert!(src[..at].rfind("⚠️ CORRECTED (#794)").is_some_and(|j| at - j < 400),
+            "#794: the surviving `measured unreachable` is no longer inside its `⚠️ CORRECTED \
+             (#794)` retraction block — it has drifted back into an assertion. Say \"swept for and \
+             could not construct\" (and do not overclaim the other way either: nothing has shown \
+             the residual IS reachable).");
+        assert!(src.contains("SWEPT FOR AND COULD NOT CONSTRUCT"),
+            "#794: the corrected clause is gone from try_duck_under's doc. If the residual is ever \
+             genuinely measured, replace this assertion with the measurement — do not just delete \
+             the label.");
+    }
+
+    // ── #776: the trapped-swimmer disclosure ────────────────────────────────────────────────────
+    //
+    // Two directions, and the SECOND is the one that matters more. A genuinely trapped swimmer must
+    // raise the signal — and every ordinary floating character must NOT, because a false alarm in
+    // an honesty observable is the same defect as a silence (the argument #661 recorded at the
+    // neutral-buoyancy branch, and the reason #776 could not simply be bolted onto `ControllerHold`).
+    // The false-alarm pins below outnumber the positive one deliberately.
+
+    /// Deep water to z = 0 over a pool floor 40 u down, with a SOLID wall at east = 4 running from
+    /// the floor to 20 u above the surface. A swimmer pressing east into it can neither duck under
+    /// it (solid to the bottom, so the lowered slide gains nothing) nor step up it (20 u tall, and
+    /// no floor anywhere in the step band): the qcat pocket mouth at bench scale, and the exact
+    /// #776 shape — `on_ground = false`, `in_water = true`, `hold() = None`, `stuck_time` never
+    /// accruing because the net's door hands every wet body back to physics.
+    fn sealed_east_face() -> Collision {
+        flooded_corridor(vec![floor(-40.0, -100.0, 100.0), wall(4.0, -40.0, 20.0)], -40.0, 0.0)
+    }
+    /// Open deep water — no wall at all, otherwise the same scene.
+    fn open_water() -> Collision {
+        flooded_corridor(vec![floor(-40.0, -100.0, 100.0)], -40.0, 0.0)
+    }
+    fn swim_toward(dir: [f32; 2], speed: f32) -> MoveIntent {
+        MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: true, speed,
+                     climb: 0.0, hop: false }
+    }
+    /// The swim plane of the scenes above: `surface (0) − float_depth`.
+    fn plane() -> f32 { -crate::traversability::PLAYER_BODY.float_depth }
+
+    #[test]
+    fn a_swimmer_pressing_at_a_face_it_cannot_pass_raises_the_afloat_stall() {
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        // Fixture: the state really is the "reads as swimming normally" one this issue is about.
+        for _ in 0..30 { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        assert!(!ctrl.on_ground && ctrl.in_water && ctrl.hold().is_none(),
+            "fixture: the trapped swimmer must be afloat, wet and NOT held — if any of those is \
+             false this test is measuring some other bug; got pos={:?} on_ground={} in_water={} \
+             hold={:?}", ctrl.pos, ctrl.on_ground, ctrl.in_water, ctrl.hold());
+        assert!(ctrl.afloat_stall().is_none(),
+            "half a second of pressing is not a stall — the window must not have fired yet");
+
+        let pinned_at = ctrl.pos;
+        for _ in 0..(5 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+
+        let s = ctrl.afloat_stall().expect(
+            "#776: a swimmer given five seconds of honoured horizontal drive that produces NO \
+             progress against a face it can neither duck under nor climb must SAY SO. Before this \
+             fix the state was completely silent: on_ground=false, in_water=true, hold()=None, \
+             stuck_time never accruing (the depenetration net stopped running for floaters in \
+             #661), i.e. every observable read \"swimming normally\" for ever.");
+        assert!(s.secs() >= AFLOAT_STALL_SECS,
+            "the disclosed duration must have actually reached the threshold; got {:.2}s", s.secs());
+        assert!(hlen([pinned_at[0] - s.anchor()[0], pinned_at[1] - s.anchor()[1], 0.0])
+                    <= AFLOAT_PROGRESS,
+            "the anchor must be the point the body failed to leave; body pinned near {pinned_at:?}, \
+             anchor {:?}", s.anchor());
+        assert!(ctrl.hold().is_none(),
+            "#776: and this is NOT a ControllerHold — the body is not frozen, a driven dive may \
+             still cross. Conflating the two would be a different lie; got {:?}", ctrl.hold());
+    }
+
+    #[test]
+    fn an_ordinary_floater_never_raises_the_afloat_stall_however_long_it_floats() {
+        // THE FALSE-ALARM PIN, and the reason #776 needed its own signal rather than a naive report
+        // of the shape. This body is stationary, unsupported and wet — bit-for-bit the trapped
+        // swimmer's observable state, right up against the very same face. The ONLY difference is
+        // that nobody is asking it to go anywhere. Raising here would light `hold`-class alarms on
+        // every idle swimmer in the world.
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([3.0, 0.0, plane()]);
+        for i in 0..(60 * 60) {
+            ctrl.step(swim_still(), 1.0 / 60.0, &c);
+            assert!(ctrl.afloat_stall().is_none(),
+                "#776 FALSE ALARM at frame {i}: an idle floater beside a wall is a swimmer doing \
+                 what swimmers do, not a trapped one. A false alarm in an honesty observable is the \
+                 same defect as a silence. pos={:?}", ctrl.pos);
+        }
+        assert!(!ctrl.on_ground && ctrl.in_water,
+            "fixture: …and it really was afloat the whole minute, i.e. this test was not vacuous; \
+             got pos={:?} on_ground={} in_water={}", ctrl.pos, ctrl.on_ground, ctrl.in_water);
+    }
+
+    #[test]
+    fn a_sustained_up_wish_at_the_surface_never_raises_the_afloat_stall() {
+        // The single most common wish in the whole water system: the walker's haul-out drive sends
+        // an UP-wish, and `step`'s surface clamp pins the feet SKIN under the surface, so the body
+        // asks to rise and does not rise, indefinitely. That is correct behaviour at a surface, and
+        // it is why both halves of the stall predicate are HORIZONTAL.
+        let c = open_water();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        let up = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 20.0, jump: false, want_swim: true,
+                              speed: 0.0, climb: 0.0, hop: false };
+        for i in 0..(30 * 60) {
+            ctrl.step(up, 1.0 / 60.0, &c);
+            assert!(ctrl.afloat_stall().is_none(),
+                "#776 FALSE ALARM at frame {i}: a swimmer holding an up-wish at the surface is not \
+                 trapped — it is at the top of the water. pos={:?}", ctrl.pos);
+        }
+        assert!(ctrl.in_water && !ctrl.on_ground && ctrl.pos[2] > plane(),
+            "fixture: the up-wish must really have carried it to the clamped surface and held it \
+             there (else the frames above were not the case this pins); got {:?}", ctrl.pos);
+    }
+
+    #[test]
+    fn a_swimmer_crossing_open_water_never_raises_the_afloat_stall() {
+        for speed in [44.0f32, 10.0, 1.0] {
+            // 1.0 u/s is the tightest legitimate case in the sweep: it needs half a second to clear
+            // AFLOAT_PROGRESS, so the window opens and re-arms repeatedly without ever maturing.
+            let c = open_water();
+            let mut ctrl = CharacterController::new([-60.0, 0.0, plane()]);
+            for i in 0..(30 * 60) {
+                ctrl.step(swim_toward([1.0, 0.0], speed), 1.0 / 60.0, &c);
+                assert!(ctrl.afloat_stall().is_none(),
+                    "#776 FALSE ALARM at frame {i} (speed {speed}): a body that is actually getting \
+                     somewhere must never accumulate a stall. pos={:?}", ctrl.pos);
+            }
+            assert!(ctrl.pos[0] > -60.0 + AFLOAT_PROGRESS,
+                "fixture: speed {speed} must actually have moved the body, else this is vacuous; \
+                 got {:?}", ctrl.pos);
+        }
+    }
+
+    #[test]
+    fn a_swimmer_hauling_out_at_a_legitimate_bank_never_raises_the_afloat_stall() {
+        // The #191 bank from `a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191`:
+        // a lip 2.1 u above the swim plane, inside the swimming step-up's reach. The body presses,
+        // mounts, and walks out — never stalling, because the approach makes progress and the
+        // haul-out ends the afloat state entirely.
+        let c = flooded_corridor(
+            vec![floor(-40.0, -100.0, 4.0), floor(0.1, 4.0, 100.0), wall(4.0, -40.0, 0.1)],
+            -40.0, 0.0);
+        let mut ctrl = CharacterController::new([-20.0, 0.0, plane()]);
+        for i in 0..(30 * 60) {
+            ctrl.step(swim_toward([1.0, 0.0], 35.0), 1.0 / 60.0, &c);
+            assert!(ctrl.afloat_stall().is_none(),
+                "#776 FALSE ALARM at frame {i}: swimming to a bank and hauling out of it is the \
+                 water system working. pos={:?} on_ground={}", ctrl.pos, ctrl.on_ground);
+        }
+        assert!(ctrl.on_ground && ctrl.pos[0] > 4.0,
+            "fixture: the body must genuinely have hauled out (#191), else this test never visited \
+             the transition it claims to cover; got {:?} on_ground={}", ctrl.pos, ctrl.on_ground);
+    }
+
+    #[test]
+    fn a_wading_body_blocked_by_a_wall_never_raises_the_afloat_stall() {
+        // Wet but SUPPORTED. Scope pin: the afloat signal must not annex the grounded vocabulary
+        // (`stuck_time` / `EmbeddedNoRecovery`), which is what owns bodies standing on something.
+        // The water starts at east 0 and is 1 u deep over the floor, so the body grounds on DRY
+        // land first and wades in — the only way a wet grounded body actually arises (a body that
+        // is already unsupported when it meets water is taken by the buoyancy branch and stays
+        // afloat).
+        let mut c = col(vec![floor(0.0, -100.0, 100.0), wall(4.0, 0.0, 20.0)]);
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::box_below(-100.0, 100.0, 0.0, 100.0, 1.0))));
+        let mut ctrl = CharacterController::new([-20.0, 0.0, 0.0]);
+        for _ in 0..(20 * 60) { ctrl.step(walk(44.0, [1.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(ctrl.on_ground && ctrl.in_water,
+            "fixture: the body must be wading — wet AND grounded; got {:?} on_ground={} in_water={}",
+            ctrl.pos, ctrl.on_ground, ctrl.in_water);
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776: a body standing on the bottom is not AFLOAT, whatever else is true of it — the \
+             afloat window must stay shut; got {:?}", ctrl.afloat_stall());
+    }
+
+    #[test]
+    fn a_dry_body_pressed_against_a_wall_never_raises_the_afloat_stall() {
+        // The other scope pin, and an explicitly UNCOVERED case: a dry body walking into a wall for
+        // ever is equally silent, and this fix does not change that. It is pre-existing, it is not
+        // what #661 altered, and reporting it here would put an "afloat" word on a body that is not.
+        let c = col(vec![floor(0.0, -100.0, 100.0), wall(4.0, 0.0, 20.0)]);
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        for _ in 0..(20 * 60) { ctrl.step(walk(44.0, [1.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(!ctrl.in_water && ctrl.on_ground, "fixture: dry and grounded; got {:?}", ctrl.pos);
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776 scope: the dry wall-press is NOT covered by this signal; got {:?}",
+            ctrl.afloat_stall());
+    }
+
+    #[test]
+    fn the_afloat_stall_clears_the_frame_the_body_makes_progress_again() {
+        // Level-triggered, like `hold`. An observable that latches on and never clears is its own
+        // honesty bug (#343/#679), not a fix for one.
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        for _ in 0..(6 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        assert!(ctrl.afloat_stall().is_some(), "fixture: the body must be stalled before we clear it");
+
+        // One frame of swimming AWAY covers 0.73 u > AFLOAT_PROGRESS, so the window re-anchors.
+        ctrl.step(swim_toward([-1.0, 0.0], 44.0), 1.0 / 60.0, &c);
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776: the stall must clear the FIRST frame the body gets somewhere, not decay; got {:?}",
+            ctrl.afloat_stall());
+    }
+
+    #[test]
+    fn the_afloat_stall_clears_the_frame_the_driver_stops_asking() {
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        for _ in 0..(6 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        assert!(ctrl.afloat_stall().is_some(), "fixture: stalled before we drop the wish");
+
+        ctrl.step(swim_still(), 1.0 / 60.0, &c);
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776: with the wish withdrawn the body is a resting floater again — the same physical \
+             state, and no longer a report. The stall says \"this drive is not working\", never \
+             \"this body is trapped\"; got {:?}", ctrl.afloat_stall());
+    }
+
+    #[test]
+    fn a_position_discontinuity_supersedes_the_afloat_stall() {
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        for _ in 0..(6 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        assert!(ctrl.afloat_stall().is_some(), "fixture: stalled before the teleport");
+
+        ctrl.teleport([-50.0, 0.0, plane()]);
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776: a summon / large server correction relocates the body, so the anchor describes a \
+             point it is no longer at. Carrying the seconds across would hand the new position an \
+             alarm it did not earn — the same shape #724 removed from the recovery ring");
+    }
+
+    #[test]
+    fn a_frame_the_depenetration_net_handles_closes_the_afloat_window() {
+        // `step` early-returns on any frame the net handled, BEFORE the fold at the bottom — so
+        // without an explicit close on that path a mature stall would freeze in place and be
+        // published, unchanged, about a body that is now dry and embedded (whose real disclosure is
+        // `EmbeddedNoRecovery`). The net's door only ever hands it DRY bodies, so `NotAfloat` there
+        // is the true classification, not a convenient default.
+        //
+        // Constructed by stepping the same body against a second, DRY collision in which its
+        // position is embedded — the shape a water region vanishing under a swimmer produces.
+        let wet = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        for _ in 0..(6 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &wet); }
+        assert!(ctrl.afloat_stall().is_some(), "fixture: stalled before the medium changes");
+        let pinned = ctrl.pos;
+
+        let dry = col(vec![floor(-12.0, -100.0, 100.0),
+                           wall(pinned[0] + 0.8, -12.0, 10.0), wall(pinned[0] - 0.8, -12.0, 10.0)]);
+        assert!(!dry.footprint_clear(pinned[0], pinned[1], pinned[2], PLAYER_RADIUS, 8),
+            "fixture: the body must be EMBEDDED in the dry scene, or the net never runs and this \
+             test proves nothing");
+        ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &dry);
+
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776: a frame the depenetration net handled is a frame with a DRY body — the afloat \
+             window must close there, not freeze at its last value and go on reporting a swimmer \
+             that no longer exists; got {:?}", ctrl.afloat_stall());
+    }
+
+    #[test]
+    fn clear_hold_drops_the_afloat_window_too() {
+        // `app.rs` calls `clear_hold` on frames it renders but does not step (no collision loaded,
+        // i.e. the whole ~10 s zone-asset load). Nothing recomputes the window on those frames, so
+        // without this the last stall — computed against geometry that has since been dropped —
+        // would survive the load. Folding it into `clear_hold` is what makes the eventual
+        // publication correct with no change to `app.rs`.
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+        for _ in 0..(6 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        assert!(ctrl.afloat_stall().is_some(), "fixture: stalled before the clear");
+
+        ctrl.clear_hold();
+        assert!(ctrl.afloat_stall().is_none(),
+            "#776: clear_hold must drop the afloat window as well as the hold — the frames it \
+             covers have no geometry for either claim to be about");
+    }
+
+    // ── #776: the universals, on the pure clock ─────────────────────────────────────────────────
+    //
+    // The example tests above are existence proofs over particular trajectories. "A resting floater
+    // can NEVER stall" is a universal, and no finite number of scenes discharges one
+    // ([[eq-verification-hierarchy]]). These drive `AfloatStallClock` directly, which is pure, and
+    // sweep it far outside anything a scene reaches.
+
+    /// A tiny deterministic LCG — no dev-dependency, and a fixed seed so a failure is reproducible.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 { self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); self.0 >> 33 }
+        fn f32(&mut self, lo: f32, hi: f32) -> f32 { lo + (self.next() % 100_000) as f32 / 100_000.0 * (hi - lo) }
+    }
+
+    #[test]
+    fn no_run_of_frames_without_a_wish_can_ever_stall() {
+        // THE false-alarm universal. Any sequence at all of NotAfloat / Resting frames — any
+        // durations, any positions, any length — must leave the clock silent.
+        let mut rng = Lcg(0x776_0001);
+        let mut clock = AfloatStallClock::default();
+        for i in 0..500_000u32 {
+            let frame = if rng.next() % 2 == 0 { AfloatFrame::Resting } else { AfloatFrame::NotAfloat };
+            let pos = [rng.f32(-1000.0, 1000.0), rng.f32(-1000.0, 1000.0), rng.f32(-200.0, 200.0)];
+            clock.observe(frame, pos, rng.f32(0.0, 0.5));
+            assert!(clock.stall().is_none(),
+                "#776: a stall was assembled out of frames that contained NO horizontal wish \
+                 (iteration {i}, {frame:?}). The wish is the ENTIRE resting-vs-trapped distinction; \
+                 without it every idle swimmer in the world reports trapped.");
+        }
+    }
+
+    #[test]
+    fn one_wishless_frame_always_ends_the_window_immediately() {
+        // Stronger than "a resting run never stalls": a single non-`Wished` frame must close a
+        // MATURE window at once, so an alarm can never be reassembled out of scattered frames with
+        // ordinary swimming in between.
+        let mut rng = Lcg(0x776_0002);
+        for i in 0..20_000u32 {
+            let mut clock = AfloatStallClock::default();
+            // Mature a stall in place.
+            for _ in 0..200 { clock.observe(AfloatFrame::Wished, [0.0, 0.0, 0.0], 0.1); }
+            assert!(clock.stall().is_some(), "fixture (iteration {i}): the window must be mature");
+            let frame = if rng.next() % 2 == 0 { AfloatFrame::Resting } else { AfloatFrame::NotAfloat };
+            clock.observe(frame, [rng.f32(-9.0, 9.0), rng.f32(-9.0, 9.0), 0.0], rng.f32(0.0, 0.5));
+            assert!(clock.stall().is_none(),
+                "#776: one {frame:?} frame must clear a mature stall outright (iteration {i})");
+        }
+    }
+
+    #[test]
+    fn a_stall_always_implies_an_unbroken_wished_run_that_went_nowhere() {
+        // The positive universal, checked against an independent shadow model: whenever the clock
+        // reports a stall, (a) every frame since the anchor was `Wished`, (b) the body never got
+        // more than AFLOAT_PROGRESS from that anchor, and (c) the reported duration is the real
+        // elapsed time of that run. Any one of those failing is a stall that overstates.
+        let mut rng = Lcg(0x776_0003);
+        let mut clock = AfloatStallClock::default();
+        // Shadow: (anchor, secs since anchor) for the current unbroken Wished run.
+        let mut shadow: Option<([f32; 3], f32)> = None;
+        let mut stalls = 0u32;
+        for i in 0..500_000u32 {
+            // Biased toward Wished, toward SMALL steps and toward long frames, so mature windows
+            // actually occur — an unbiased sweep reaches a stall essentially never (measured: 0
+            // stalls in 500k iterations), and a universal test that never visits the state it is
+            // about is the "passes both ways" failure this project keeps catching. The `stalls`
+            // floor at the bottom is what makes that non-vacuity checkable rather than assumed.
+            let roll = rng.next() % 20;
+            let frame = match roll {
+                0 => AfloatFrame::Resting,
+                1 => AfloatFrame::NotAfloat,
+                _ => AfloatFrame::Wished,
+            };
+            let step = if rng.next() % 8 == 0 { rng.f32(0.0, 1.2) } else { rng.f32(0.0, 0.45) };
+            let dt = rng.f32(0.05, 0.25);
+            let prev = clock;
+            let base = match shadow { Some((a, _)) => a, None => [0.0, 0.0, 0.0] };
+            let pos = [base[0] + step, base[1], 0.0];
+            clock.observe(frame, pos, dt);
+            match frame {
+                AfloatFrame::Resting | AfloatFrame::NotAfloat => shadow = None,
+                AfloatFrame::Wished => shadow = Some(match shadow {
+                    None => (pos, 0.0),
+                    Some((a, s)) => {
+                        if hlen([pos[0] - a[0], pos[1] - a[1], 0.0]) > AFLOAT_PROGRESS { (pos, 0.0) }
+                        else { (a, s + dt) }
+                    }
+                }),
+            }
+            if let Some(st) = clock.stall() {
+                stalls += 1;
+                let (a, s) = shadow.expect(
+                    "#776: the clock reported a stall on a frame the shadow model closed the window \
+                     on — i.e. a stall survived a wishless frame");
+                assert_eq!(frame, AfloatFrame::Wished,
+                    "#776: a stall was in force on a {frame:?} frame (iteration {i}, prev {prev:?})");
+                assert!((st.secs() - s).abs() < 1e-3,
+                    "#776: reported {:.4}s, real run {s:.4}s (iteration {i})", st.secs());
+                assert!(st.secs() >= AFLOAT_STALL_SECS,
+                    "#776: an AfloatStall below the threshold is not constructible by contract; got \
+                     {:.4}s (iteration {i})", st.secs());
+                assert!(hlen([pos[0] - a[0], pos[1] - a[1], 0.0]) <= AFLOAT_PROGRESS,
+                    "#776: stalled while more than {AFLOAT_PROGRESS}u from the anchor (iteration {i})");
+                assert_eq!(st.anchor(), a, "#776: anchor drifted from the run's start (iteration {i})");
+            }
+        }
+        assert!(stalls > 1000,
+            "the sweep must actually REACH the stalled state often enough to mean something — a \
+             green run that never stalled would prove nothing; got {stalls}");
     }
 }
