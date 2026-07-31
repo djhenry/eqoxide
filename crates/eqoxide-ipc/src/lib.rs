@@ -94,6 +94,28 @@ pub struct MoveIntent {
 pub struct ControllerView {
     pub pos:     [f32; 3],
     pub heading: f32,
+    /// `wish_dir != 0 || !on_ground`, written by the render thread on every frame it publishes this
+    /// view. **DEAD — and NOT safe to publish as-is. Do not wire a reader to it (#746).**
+    ///
+    /// It has no reader anywhere in the workspace: written, consumed by nothing. It is NOT the
+    /// level signal [`ControllerView::hold`] beside it is, despite looking like one. `hold`'s
+    /// producer has an explicit `clear_hold()` on the branch that does not step the controller
+    /// (no collision, mid zone-load), so `hold` stays honest for that whole window. This field has
+    /// no such clear: its `!on_ground` half is recomputed unconditionally from a value only the
+    /// controller step writes, so on a frame that publishes without stepping it republishes the
+    /// PREVIOUS zone's answer as if it were current. PR #792's independent review reproduced that
+    /// at the `eqoxide-net` boundary: a character that crossed a zone line airborne reports a
+    /// confident `true` for the whole multi-second zone load.
+    ///
+    /// So wiring it up gives the `connected: true` (#343) shape — a well-formed, changing `bool`
+    /// that lies in exactly the window that matters. #792 tried that and was reverted for it.
+    ///
+    /// #746's preferred close is DELETION, which is why nothing here tries to launder it into an
+    /// observable. Deleting it means deleting this field plus its two write sites in the render
+    /// thread's frame loop; #792 could not do that because that file was held by another change in
+    /// flight, so the field is documented rather than gone. If you need a movement observable,
+    /// #746 is explicit: add one with a defined writer and a defined clear-on-stop — do not reach
+    /// for this.
     pub moving:  bool,
     /// False until the render thread has spawned and seeded the controller. The nav streamer must
     /// not mirror/stream a default (origin) position before this is set.
