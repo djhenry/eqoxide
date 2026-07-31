@@ -1732,62 +1732,28 @@ impl Default for NavStatus {
     }
 }
 
-/// Test-only shorthand for seeding a `NavStatus` from a bare state string, e.g.
-/// `*nav_state.lock().unwrap() = "navigating".into();`. As of #771 this crate has no caller of its
-/// own (see below) — it is kept for other crates' `#[cfg(test)]` code to reach for, not because
-/// anything here still uses it.
-///
-/// # Why `#[cfg(test)]` (#771)
-///
-/// This is a FOURTH way to build a `NavStatus`, alongside [`NavStatus::default`] (the boot row)
-/// and the three writers `retire_to_idle` funnels every `idle` transition through
-/// (`Walker::set_nav_state_because`, `CommandState::stamp_new_goal`, `ZoneCrossTicket::drop`) — and
-/// unlike all three of those, it does not name a reason at all: `"idle".into()` mints
-/// `state: "idle", reason: None` directly, which is exactly the combination
-/// `CommandState::stamp_new_goal`'s `debug_assert` (`eqoxide-command/src/nav.rs:146`) exists to
-/// reject, reached without passing through it or any other guard.
-///
-/// #765's review found this and classed it non-blocking because, measured rather than assumed,
-/// production never called it as of `daab1ef` — re-checked for #771 by reading every assignment
-/// whose target type is `NavStatus` and by a repo-wide grep for `NavStatus::from(` and
-/// `: NavStatus\b`, both empty. But "nobody happens to call it" is not a fact the type system was
-/// making true; the `debug_assert` at `eqoxide-command/src/nav.rs:146` compiles out under
-/// `--release` (test-time instrument, not a runtime one — same limit `retire_to_idle`'s own doc
-/// records), so a future production call passing `"idle"` would ship a released binary that
-/// publishes the untraceable idle silently.
-///
-/// `#[cfg(test)]` makes that call **unrepresentable** outside a test build rather than merely
-/// unused: a production call site fails to compile. Verified directly (#771) with a throwaway
-/// non-test `fn probe() -> NavStatus { "idle".into() }` placed right after this impl:
-///
-/// ```text
-/// error[E0277]: the trait bound `NavStatus: From<&str>` is not satisfied
-///    --> crates/eqoxide-ipc/src/lib.rs:1780:57
-///     |
-/// 1780 | fn probe() -> NavStatus { "idle".into() }
-///      |                                 ^^^^ unsatisfied trait bound
-///     = note: required for `&str` to implement `Into<NavStatus>`
-/// ```
-///
-/// **`#[cfg(test)]` is per-crate, not per-build — this bit the first draft of this fix.** The two
-/// call sites this impl actually had were in `eqoxide-net::action_loop::tests`, a DIFFERENT crate.
-/// Compiling `eqoxide-net`'s tests does not compile `eqoxide-ipc` in test mode — Cargo only builds
-/// the crate under test with `--cfg test`; its dependencies, `eqoxide-ipc` included, are built
-/// normally. So gating this impl broke those two call sites too: `error[E0277]: the trait bound
-/// \`NavStatus: From<&str>\` is not satisfied` at `action_loop.rs:6444` and `:6532`, running
-/// `cargo test --workspace`. That is exactly the "non-test caller" case #771 asked to be reported
-/// rather than routed around — and per its instruction ("check whether that caller should be using
-/// a real constructor instead") both were migrated to
-/// `NavStatus { state: "...".to_string(), ..Default::default() }`, the same real constructor
-/// [`NavStatus::default`] already uses. Nothing outside this crate calls this impl any more.
-#[cfg(test)]
-impl From<&str> for NavStatus {
-    fn from(state: &str) -> Self {
-        NavStatus { state: state.to_string(), reason: None, local: None,
-            blocked_goal: None, blocked_frontier: None, tier: None,
-            goal_id: 0, goal: None, local_planner_dead: false }
-    }
-}
+// `impl From<&str> for NavStatus` was deleted here (#771). It was a fourth, unnamed way to build a
+// `NavStatus` alongside `NavStatus::default()` (the boot row) and the three writers
+// `retire_to_idle` funnels every `idle` transition through — and unlike all three of those, it
+// named no reason: `"idle".into()` minted `state: "idle", reason: None` directly, exactly the
+// combination `CommandState::stamp_new_goal`'s `debug_assert` (`eqoxide-command/src/nav.rs:146`)
+// exists to reject, reached without passing through it.
+//
+// #765's review found this and classed it non-blocking because production never called it. #771
+// first tried `#[cfg(test)]`, but that gates something nothing can reach: its only two callers
+// were `eqoxide-net::action_loop`'s test module, a DIFFERENT crate, and they were migrated to
+// `NavStatus { state: "...".to_string(), ..Default::default() }` (see `action_loop.rs`) once bare
+// `#[cfg(test)]` — which is per-crate — turned out not to reach them (Cargo builds a dependency in
+// its normal mode while compiling the crate under test, not in test mode). Once those were gone, a
+// repo-wide check — including `eqoxide-ipc`'s own test module — found ZERO remaining callers in
+// any crate, in any build configuration. A gate on an unreachable impl is dead weight, not a
+// guarantee. This codebase's actual idiom for a downstream-visible test fixture is
+// `#[cfg(any(test, feature = "test-fixtures"))]`, used throughout this file — but this impl needed
+// neither that nor bare `#[cfg(test)]`, because nothing anywhere used it. Deletion is the maximal
+// form of "make the bad state unrepresentable": there is no longer any code path, gated or not,
+// that can build a `NavStatus` this way. If a genuine downstream test need for this shorthand
+// shows up later, it should be reintroduced under `#[cfg(any(test, feature = "test-fixtures"))]`,
+// not bare `#[cfg(test)]`.
 
 impl PartialEq<&str> for NavStatus {
     fn eq(&self, other: &&str) -> bool { self.state == *other }

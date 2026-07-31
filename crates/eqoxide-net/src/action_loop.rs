@@ -6441,10 +6441,10 @@ mod tests {
             nav.walker.path_goal = Some((100.0, 200.0, 0.0));
             nav.walker.path_i = 1;
             nav.walker.local_i = 1;
-            // #771: not `"navigating".into()` — `From<&str> for NavStatus` is `#[cfg(test)]`-gated
-            // to `eqoxide-ipc`'s OWN test build, which does not cover this crate's tests (cfg(test)
-            // is per-crate; a dependency compiled for `eqoxide-net`'s tests still builds
-            // `eqoxide-ipc` in its normal, non-test mode). The real constructor works everywhere.
+            // #771: not `"navigating".into()` — `impl From<&str> for NavStatus` was deleted (it
+            // was an unnamed fourth construction path bypassing every idle-row assert; see the
+            // comment in `eqoxide-ipc/src/lib.rs` where the impl used to be). The real constructor
+            // works everywhere, including across the crate boundary.
             *nav.nav.nav_state.lock().unwrap() =
                 eqoxide_ipc::NavStatus { state: "navigating".to_string(), ..Default::default() };
         };
