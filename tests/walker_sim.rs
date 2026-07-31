@@ -16,6 +16,9 @@ use eqoxide::nav::steering::{carrot_along, carrot_along_los, fast_steer_aim, swi
 use eqoxide::traversability::{Point, Traversability, PLAYER_BODY};
 use eqoxide::assets::{MeshData, RenderMode, ZoneAssets};
 use eqoxide::region_map::RegionMap;
+// #762: water/region data is carried as a MEASURED-or-UNMEASURED value, never as an `Option` a
+// corpus can silently read as "this zone has no water".
+use eqoxide::nav::water_grid::{WaterRollup, ZoneWater, UNMEASURED};
 use eqoxide_core::physics::PLAYER_RADIUS;
 use eqoxide_ipc::MoveIntent;
 
@@ -541,7 +544,14 @@ use eqoxide_ipc::MoveIntent;
         // later increments; `#423` = the route was DRY near the wedge but the character ended up
         // wet/wedged — the pre-existing walk-THROUGH-a-wall-into-water collision bug (#423), NOT a
         // routing failure. They are never lumped.
-        let (mut tot_wr, mut tot_423) = (0usize, 0usize);
+        // #762: `wat-route` and `#423` are TOTALS OVER A CORPUS, and a corpus with a hole in it
+        // reports the hole's zeros as if they were results. A build host holding 2 of 497 `.wtr`
+        // files once made every water-inclusive halas/blackburrow run print `0`/`0` here while the
+        // `.glb` hashes matched exactly — a perfect score that had never consulted any water data.
+        // The rollups carry per-zone provenance, so an unmeasured zone contributes NO number and the
+        // TOTAL line cannot come out looking clean.
+        let mut roll_wr = WaterRollup::new();
+        let mut roll_423 = WaterRollup::new();
         println!("\n=== faithful walker drift: {} mode ===", if include_water { "WATER-INCLUSIVE" } else { "DRY" });
         println!("{:<12} {:>6} {:>7} {:>8} {:>8} {:>6} {:>9} {:>6}",
             "zone", "walked", "wedged", "height", "overlap", "other", "wat-route", "#423");
@@ -550,7 +560,17 @@ use eqoxide_ipc::MoveIntent;
             let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
             let mut col = Collision::build(&za, 32.0);
             if col.cols == 0 { println!("{zone:<12}  (no grid — skipped)"); continue; }
-            col.set_water(RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
+            // Water drives BOTH modes here: in water-inclusive mode it is what the run measures, and
+            // in DRY mode it is the filter that keeps wet journeys out (`!include_water && in_water`).
+            // Either way a zone with no region map is UNMEASURED, never a zone with no water.
+            let zw = ZoneWater::load(&std::path::Path::new(&dir).join("maps/water"), zone);
+            if let Err(e) = zw.install(&mut col) {
+                println!("{zone:<12} {:>6} {:>7} {:>8} {:>8} {:>6} {:>9} {:>6}   ({UNMEASURED}: {e})",
+                    "-", "-", "-", "-", "-", UNMEASURED, UNMEASURED);
+                roll_wr.add(zone, &zw.tally());
+                roll_423.add(zone, &zw.tally());
+                continue;
+            }
 
             // Sample full (start, goal) pairs: a random floor point and a goal 120-400u away that a
             // coarse route actually reaches (so we simulate real journeys, not un-routable noise).
@@ -697,12 +717,16 @@ use eqoxide_ipc::MoveIntent;
             }
             println!("{zone:<12} {walked:>6} {wedged:>7} {n_h:>8} {n_o:>8} {n_x:>6} {n_wr:>9} {n_423:>6}   ({n_forced} forced)");
             tot_pairs += pairs.len(); tot_walked += walked; tot_wedged += wedged;
-            tot_height += n_h; tot_overlap += n_o; tot_other += n_x; tot_wr += n_wr; tot_423 += n_423;
+            tot_height += n_h; tot_overlap += n_o; tot_other += n_x;
+            // `measure` runs its closure only when the region map is really there, so these two
+            // numbers cannot exist for a zone whose `.wtr` did not load (#762).
+            roll_wr.add(zone, &zw.measure(|_| n_wr));
+            roll_423.add(zone, &zw.measure(|_| n_423));
         }
         let rate = if tot_walked > 0 { 100.0 * tot_wedged as f32 / tot_walked as f32 } else { 0.0 };
         println!("\n=== FAITHFUL WALKER DRIFT [{}]: {tot_walked} full journeys walked, {tot_wedged} terminal wedges \
             ({rate:.2}%) — height #386: {tot_height}, overlap #381: {tot_overlap}, other: {tot_other}, \
-            wat-route: {tot_wr}, #423: {tot_423} ===",
+            wat-route: {roll_wr}, #423: {roll_423} ===",
             if include_water { "WATER-INCLUSIVE" } else { "DRY" });
         if include_water {
             println!("(wat-route = wedge whose COMMITTED coarse route carried water waypoints near the wedge = a \
@@ -712,6 +736,14 @@ use eqoxide_ipc::MoveIntent;
         }
         let _ = tot_pairs;
         assert!(tot_walked > 0, "no journeys walked — check $ZONE_DIR");
+        // #762: a water column of `0` is only a result if every zone in the run was actually
+        // measured. Fail LOUDLY here rather than letting the reader infer a clean water score from a
+        // corpus that never opened those zones' region data.
+        assert!(roll_wr.is_complete() && roll_423.is_complete(),
+            "#762: {:?} had no loadable .wtr, so this run measured NOTHING about water there — the \
+             wat-route/#423 columns above are not a score for them. Bake or fetch their region \
+             files and re-run. (wat-route {roll_wr}; #423 {roll_423})",
+            roll_wr.unmeasured_zones());
     }
 
 
@@ -1031,12 +1063,22 @@ fn goal_append_blast_radius() {
     let (mut g_pairs, mut g_routed, mut g_lost, mut g_drove, mut g_over) = (0usize, 0usize, 0usize, 0usize, 0usize);
     println!("\n=== #639 goal-append blast radius (LOST = goal_not_walkable WITH a column floor) ===");
     println!("{:<12} {:>6} {:>7} {:>6} {:>7} {:>9}", "zone", "pairs", "routed", "lost", "drove", "over_tight");
+    let mut unmeasured: Vec<String> = Vec::new();
     for zone in &zones {
         let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
         let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12} (no glb — skipped)"); continue };
         let mut col = Collision::build(&za, 32.0);
         if col.cols == 0 { println!("{zone:<12} (no grid — skipped)"); continue; }
-        col.set_water(RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
+        // #762: the water map is this corpus' PAIR FILTER (`in_water(s) || in_water(g) → skip`).
+        // With no region map the filter silently passes everything, so wet pairs are scored as dry
+        // land and the table below describes a different corpus than the one it names. A zone whose
+        // `.wtr` did not load is UNMEASURED — dropped here and reported at the end, never scored.
+        if let Err(e) = ZoneWater::load(&std::path::Path::new(&dir).join("maps/water"), zone)
+            .install(&mut col) {
+            println!("{zone:<12} ({UNMEASURED} — {e})");
+            unmeasured.push(zone.clone());
+            continue;
+        }
 
         let (mut z_pairs, mut z_routed, mut z_lost, mut z_drove, mut z_over) = (0usize, 0usize, 0usize, 0usize, 0usize);
         let mut tries = 0;
@@ -1088,6 +1130,10 @@ fn goal_append_blast_radius() {
     println!("(gained = 0 by construction: #639 only ADDS refusals. OVER-TIGHTENED must be 0 — any LOST \
              pair where the REAL controller reached the goal's own tier is a regression.)");
     assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
+    assert!(unmeasured.is_empty(),
+        "#762: {} zone(s) were dropped because their .wtr did not load — the totals above cover a \
+         smaller corpus than the one named and are not comparable to a run that had them: {:?}",
+        unmeasured.len(), unmeasured);
     assert_eq!(g_over, 0,
         "#639 over-tightening: {g_over} LOST pair(s) were reachable by the REAL controller — the goal-\
          append check refused a goal the walker can actually stand on. Investigate the printed pairs.");
@@ -1196,12 +1242,22 @@ fn corner_buffer_blast_radius() {
     let (mut g_turn_inf, mut g_turn_plain) = (0.0f64, 0.0f64);
     println!("\n=== #685 corner-buffer inflation blast radius (A/B: inflated route vs plain, LOS clamp on both) ===");
     println!("{:<12} {:>6} {:>5} {:>6} {:>6} {:>8} {:>9}", "zone", "pairs", "both", "broken", "gained", "smoothed", "slowdown");
+    let mut unmeasured: Vec<String> = Vec::new();
     for zone in &zones {
         let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
         let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12} (no glb — skipped)"); continue };
         let mut col = Collision::build(&za, 32.0);
         if col.cols == 0 { println!("{zone:<12} (no grid — skipped)"); continue; }
-        col.set_water(RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
+        // #762: the water map is this corpus' PAIR FILTER (`in_water(s) || in_water(g) → skip`).
+        // With no region map the filter silently passes everything, so wet pairs are scored as dry
+        // land and the table below describes a different corpus than the one it names. A zone whose
+        // `.wtr` did not load is UNMEASURED — dropped here and reported at the end, never scored.
+        if let Err(e) = ZoneWater::load(&std::path::Path::new(&dir).join("maps/water"), zone)
+            .install(&mut col) {
+            println!("{zone:<12} ({UNMEASURED} — {e})");
+            unmeasured.push(zone.clone());
+            continue;
+        }
 
         let (mut z_pairs, mut z_both, mut z_broken, mut z_gained, mut z_smoothed) = (0usize, 0usize, 0usize, 0usize, 0usize);
         let (mut z_ti, mut z_tp) = (0u64, 0u64);
@@ -1254,6 +1310,10 @@ fn corner_buffer_blast_radius() {
     println!("(BROKEN must be 0 — a route the plain coarse route completed that inflation broke is a narrow-corridor \
              over-tightening. SLOWDOWN must be ~1.0. turning<1.0 and SMOOTHED>0 is the anti-wiggle win.)");
     assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
+    assert!(unmeasured.is_empty(),
+        "#762: {} zone(s) were dropped because their .wtr did not load — the totals above cover a \
+         smaller corpus than the one named and are not comparable to a run that had them: {:?}",
+        unmeasured.len(), unmeasured);
     assert_eq!(g_broken, 0,
         "#685 over-tightening: {g_broken} route(s) the plain coarse route completed FAILED after inflation — \
          the corner-buffer offset broke a passable route (likely a narrow corridor). Investigate the printed pairs.");
@@ -1346,12 +1406,22 @@ fn descent_guard_blast_radius() {
     let (mut g_pairs, mut g_routed, mut g_complete, mut g_refused, mut g_descent_routes) = (0usize, 0usize, 0usize, 0usize, 0usize);
     println!("\n=== #693 descent-guard blast radius (one build; diff the PAIR lines across builds) ===");
     println!("{:<12} {:>6} {:>7} {:>9} {:>8} {:>13}", "zone", "pairs", "routed", "complete", "refused", "descent_routes");
+    let mut unmeasured: Vec<String> = Vec::new();
     for zone in &zones {
         let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
         let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12} (no glb — skipped)"); continue };
         let mut col = Collision::build(&za, 32.0);
         if col.cols == 0 { println!("{zone:<12} (no grid — skipped)"); continue; }
-        col.set_water(RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
+        // #762: the water map is this corpus' PAIR FILTER (`in_water(s) || in_water(g) → skip`).
+        // With no region map the filter silently passes everything, so wet pairs are scored as dry
+        // land and the table below describes a different corpus than the one it names. A zone whose
+        // `.wtr` did not load is UNMEASURED — dropped here and reported at the end, never scored.
+        if let Err(e) = ZoneWater::load(&std::path::Path::new(&dir).join("maps/water"), zone)
+            .install(&mut col) {
+            println!("{zone:<12} ({UNMEASURED} — {e})");
+            unmeasured.push(zone.clone());
+            continue;
+        }
 
         let (mut z_pairs, mut z_routed, mut z_complete, mut z_refused, mut z_desc) = (0usize, 0usize, 0usize, 0usize, 0usize);
         let mut tries = 0;
@@ -1395,6 +1465,10 @@ fn descent_guard_blast_radius() {
     }
     println!("\nTOTAL pairs {g_pairs}  routed {g_routed}  complete {g_complete}  refused {g_refused}  descent_routes {g_descent_routes}");
     assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
+    assert!(unmeasured.is_empty(),
+        "#762: {} zone(s) were dropped because their .wtr did not load — the totals above cover a \
+         smaller corpus than the one named and are not comparable to a run that had them: {:?}",
+        unmeasured.len(), unmeasured);
 }
 
 /// **#381 parallel-wall clearance blast radius over baked zones — REAL `CharacterController`, cross-
@@ -1476,12 +1550,22 @@ fn parallel_wall_clearance_blast_radius() {
     let (mut g_pairs, mut g_routed, mut g_complete, mut g_refused) = (0usize, 0usize, 0usize, 0usize);
     println!("\n=== #381 parallel-wall blast radius (one build; diff PAIR lines across builds; route+complete->refused MUST be 0) ===");
     println!("{:<12} {:>6} {:>7} {:>9} {:>8}", "zone", "pairs", "routed", "complete", "refused");
+    let mut unmeasured: Vec<String> = Vec::new();
     for zone in &zones {
         let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
         let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12} (no glb — skipped)"); continue };
         let mut col = Collision::build(&za, 32.0);
         if col.cols == 0 { println!("{zone:<12} (no grid — skipped)"); continue; }
-        col.set_water(RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
+        // #762: the water map is this corpus' PAIR FILTER (`in_water(s) || in_water(g) → skip`).
+        // With no region map the filter silently passes everything, so wet pairs are scored as dry
+        // land and the table below describes a different corpus than the one it names. A zone whose
+        // `.wtr` did not load is UNMEASURED — dropped here and reported at the end, never scored.
+        if let Err(e) = ZoneWater::load(&std::path::Path::new(&dir).join("maps/water"), zone)
+            .install(&mut col) {
+            println!("{zone:<12} ({UNMEASURED} — {e})");
+            unmeasured.push(zone.clone());
+            continue;
+        }
 
         let (mut z_pairs, mut z_routed, mut z_complete, mut z_refused) = (0usize, 0usize, 0usize, 0usize);
         let mut tries = 0;
@@ -1522,4 +1606,8 @@ fn parallel_wall_clearance_blast_radius() {
     }
     println!("\nTOTAL pairs {g_pairs}  routed {g_routed}  complete {g_complete}  refused {g_refused}");
     assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
+    assert!(unmeasured.is_empty(),
+        "#762: {} zone(s) were dropped because their .wtr did not load — the totals above cover a \
+         smaller corpus than the one named and are not comparable to a run that had them: {:?}",
+        unmeasured.len(), unmeasured);
 }

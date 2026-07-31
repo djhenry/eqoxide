@@ -23,6 +23,45 @@ use std::path::Path;
 /// EQEmu region type for a zone-line region.
 const REGION_ZONE_LINE: i32 = 3;
 
+/// **Why a zone's `.wtr` region data is NOT available** — the fact [`RegionMap::load`]'s `Option`
+/// throws away (#762).
+///
+/// A `None` from the old loader collapsed four different facts into one value: *there is no file*,
+/// *the file is not region data*, *this build cannot read that version*, *the file is truncated*.
+/// Worse, every caller then stored that `None` on a collision grid, where it stops being an absence
+/// and becomes an **answer**: the zone reads as having no water anywhere and no zone-line regions
+/// anywhere. A measurement over such a grid reports `0` water events — a confident claim, made
+/// without ever consulting any water data, and indistinguishable from a perfect score.
+///
+/// So the load failure is a VALUE now. [`RegionMap::try_load`] returns it; carry it (see
+/// `eqoxide_nav::water_grid::ZoneWater`) rather than discarding it into a `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegionLoadError {
+    /// No readable `.wtr` at `<dir>/<zone>.wtr`. **This is the #762 case** — the one that used to
+    /// read as "this zone has no water".
+    Missing,
+    /// The file exists but is not region data: shorter than the 14-byte header, or wrong magic.
+    NotRegionData,
+    /// A `.wtr` format version this build cannot read (only v1 and v2 are supported).
+    UnsupportedVersion(u32),
+    /// The header declares more BSP nodes than the file actually carries.
+    Truncated { declared_nodes: usize, bytes: usize },
+}
+
+impl std::fmt::Display for RegionLoadError {
+    // Deliberately names no path: these strings land in logs, corpus tables and PR bodies, and the
+    // repo is public (the zone + the failure kind are the whole diagnostic anyway).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(f, "no .wtr file for this zone"),
+            Self::NotRegionData => write!(f, ".wtr present but not region data (bad magic/header)"),
+            Self::UnsupportedVersion(v) => write!(f, ".wtr is v{v}; only v1/v2 are supported"),
+            Self::Truncated { declared_nodes, bytes } =>
+                write!(f, ".wtr is truncated: header declares {declared_nodes} BSP nodes, file is {bytes} bytes"),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BspNode {
     normal: [f32; 3],
@@ -36,6 +75,14 @@ struct BspNode {
 
 pub struct RegionMap {
     nodes: Vec<BspNode>,
+}
+
+// Concise on purpose: a `{:?}` on a real zone map would dump tens of thousands of BSP nodes. What a
+// reader actually needs is "there IS a map, and it read this much" — the thing #762's `None` hid.
+impl std::fmt::Debug for RegionMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RegionMap({} BSP nodes)", self.nodes.len())
+    }
 }
 
 impl RegionMap {
@@ -242,22 +289,28 @@ impl RegionMap {
         ]}
     }
 
-    /// Load `<dir>/<zone>.wtr` (v1 or v2 BSP). Returns None if missing or unparseable (nav then just
-    /// behaves as before — no water descents, no region-based zone crossing).
-    pub fn load(dir: &Path, zone: &str) -> Option<RegionMap> {
+    /// Load `<dir>/<zone>.wtr` (v1 or v2 BSP), **keeping the failure** ([`RegionLoadError`]) instead
+    /// of collapsing it to a bare absence. Prefer this over [`RegionMap::load`] everywhere the
+    /// caller's answer would otherwise depend on data it never read (#762).
+    pub fn try_load(dir: &Path, zone: &str) -> Result<RegionMap, RegionLoadError> {
         let path = dir.join(format!("{zone}.wtr"));
-        let d = std::fs::read(&path).ok()?;
-        if d.len() < 14 || &d[..10] != b"EQEMUWATER" { return None; }
-        let version = u32::from_le_bytes(d[10..14].try_into().ok()?);
+        let d = std::fs::read(&path).map_err(|_| RegionLoadError::Missing)?;
+        if d.len() < 18 || &d[..10] != b"EQEMUWATER" { return Err(RegionLoadError::NotRegionData); }
+        let version = u32::from_le_bytes(d[10..14].try_into().unwrap());
         // v1 = 36-byte nodes (no zone-line index); v2 = 40-byte nodes (trailing index).
         let stride = match version {
             1 => 36,
             2 => 40,
-            _ => { tracing::warn!("region_map: {} is v{version}, only v1/v2 supported", path.display()); return None; }
+            _ => {
+                tracing::warn!("region_map: {} is v{version}, only v1/v2 supported", path.display());
+                return Err(RegionLoadError::UnsupportedVersion(version));
+            }
         };
         let mut off = 14;
-        let count = u32::from_le_bytes(d[off..off + 4].try_into().ok()?) as usize; off += 4;
-        if d.len() < off + count * stride { return None; }
+        let count = u32::from_le_bytes(d[off..off + 4].try_into().unwrap()) as usize; off += 4;
+        if d.len() < off + count * stride {
+            return Err(RegionLoadError::Truncated { declared_nodes: count, bytes: d.len() });
+        }
         let mut nodes = Vec::with_capacity(count);
         for _ in 0..count {
             // ZBSP_Node: i32 node_number, f32 normal[3], f32 split, i32 region, i32 special, i32 left, i32 right [, i32 zone_line_index]
@@ -274,7 +327,19 @@ impl RegionMap {
             off += stride;
         }
         tracing::info!("region_map: loaded {} (v{version}, {} BSP nodes)", path.display(), nodes.len());
-        Some(RegionMap { nodes })
+        Ok(RegionMap { nodes })
+    }
+
+    /// [`RegionMap::try_load`] with the failure discarded.
+    ///
+    /// ⚠️ **LOSSY, and lossy in the direction that lies (#762).** A `None` here is
+    /// indistinguishable from "loaded, and this zone simply has no water and no zone lines", and
+    /// callers that store it as `set_water(None)` publish exactly that reading. Only use it where a
+    /// caller genuinely does not care WHY there is no region data; anything that will report a
+    /// number, a count, or an emptiness derived from water/zone-line state must use `try_load` (or
+    /// `eqoxide_nav::water_grid::ZoneWater`, which carries the failure for you).
+    pub fn load(dir: &Path, zone: &str) -> Option<RegionMap> {
+        Self::try_load(dir, zone).ok()
     }
 
     /// Walk the BSP from node 1 to the leaf containing the server-coord point. The swap to (y,x,z)
@@ -304,6 +369,10 @@ impl RegionMap {
     pub fn is_water(&self, sx: f32, sy: f32, sz: f32) -> bool {
         matches!(self.region_type(sx, sy, sz), 1 | 7)
     }
+
+    /// How many BSP nodes this map carries. Reported in diagnostics so "loaded" is visibly
+    /// different from "there is no map here" (#762) — a map that loaded says how much it read.
+    pub fn node_count(&self) -> usize { self.nodes.len() }
 
     /// If the point is inside a zone-line (`DRNTP`) region, the zone-point index it carries — the
     /// same value as the `OP_SendZonepoints` `iterator` for that line, used to resolve the
@@ -609,6 +678,84 @@ mod tests {
                     && p[1] >= n[0] && p[1] <= n[1] && p[2] >= z[0] && p[2] <= z[1]),
                 "wet point {p:?} must be covered by some reported AABB: {aabbs:?}");
         }
+    }
+
+    /// **#762: every way region data can fail to load is a DISTINCT value, and none of them is
+    /// "loaded with nothing in it".**
+    ///
+    /// The bug this pins: `load` answered `None` for all four, and a caller storing that `None`
+    /// published "this zone has no water and no zone lines" — a claim about the world, derived from
+    /// data it never read. `try_load` names the failure instead, so a measurement can say
+    /// *unmeasured*.
+    ///
+    /// Mutation check: make `try_load` return `Ok(RegionMap { nodes: vec![] })` on any of these
+    /// (the moral equivalent of the old silent `None` reaching a collision grid) and the matching
+    /// arm goes RED.
+    #[test]
+    fn every_wtr_load_failure_is_a_distinct_named_value_762() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. No file at all — the #762 case (a build host holding 2 of 497 `.wtr` files).
+        assert_eq!(RegionMap::try_load(dir.path(), "absent").unwrap_err(), RegionLoadError::Missing);
+
+        // 2. A file that is not region data.
+        std::fs::write(dir.path().join("junk.wtr"), b"not a wtr file at all").unwrap();
+        assert_eq!(RegionMap::try_load(dir.path(), "junk").unwrap_err(), RegionLoadError::NotRegionData);
+
+        // 2b. Right magic, but too short to even carry the node count. (The old loader INDEXED
+        // `d[14..18]` here after a `len < 14` check — a panic, not a `None`.)
+        let mut stub = b"EQEMUWATER".to_vec();
+        stub.extend_from_slice(&2u32.to_le_bytes());
+        std::fs::write(dir.path().join("stub.wtr"), &stub).unwrap();
+        assert_eq!(RegionMap::try_load(dir.path(), "stub").unwrap_err(), RegionLoadError::NotRegionData);
+
+        // 3. A version this build cannot read.
+        let mut v9 = b"EQEMUWATER".to_vec();
+        v9.extend_from_slice(&9u32.to_le_bytes());
+        v9.extend_from_slice(&1u32.to_le_bytes());
+        v9.extend_from_slice(&[0u8; 40]);
+        std::fs::write(dir.path().join("v9.wtr"), &v9).unwrap();
+        assert_eq!(RegionMap::try_load(dir.path(), "v9").unwrap_err(), RegionLoadError::UnsupportedVersion(9));
+
+        // 4. Header promises more nodes than the file holds.
+        let mut cut = wtr_v2(&[([0.0, 0.0, 1.0], -2.0, 0, 2, 3, 0)]);
+        cut.truncate(cut.len() - 8);
+        std::fs::write(dir.path().join("cut.wtr"), &cut).unwrap();
+        assert!(matches!(RegionMap::try_load(dir.path(), "cut").unwrap_err(),
+            RegionLoadError::Truncated { declared_nodes: 1, .. }));
+
+        // …and a GOOD file loads, so the taxonomy is not just "everything fails".
+        std::fs::write(dir.path().join("ok.wtr"), wtr_v2(&[
+            ([0.0, 0.0, 1.0], -2.0, 0, 2, 3, 0),
+            ([0.0; 3], 0.0, 0, 0, 0, 0),
+            ([0.0; 3], 0.0, 1, 0, 0, 0),
+        ])).unwrap();
+        assert!(RegionMap::try_load(dir.path(), "ok").is_ok());
+
+        // Every failure prints its own sentence — a corpus row that says "unmeasured" can always
+        // say WHY, and no two reasons read alike.
+        let msgs: Vec<String> = [
+            RegionLoadError::Missing,
+            RegionLoadError::NotRegionData,
+            RegionLoadError::UnsupportedVersion(9),
+            RegionLoadError::Truncated { declared_nodes: 1, bytes: 40 },
+        ].iter().map(|e| e.to_string()).collect();
+        let unique: std::collections::HashSet<&String> = msgs.iter().collect();
+        assert_eq!(unique.len(), msgs.len(), "reasons must be distinguishable: {msgs:?}");
+    }
+
+    /// The lossy `load` is exactly `try_load(..).ok()` — one loader, so the two can never drift into
+    /// disagreeing about what a valid `.wtr` is.
+    #[test]
+    fn load_is_try_load_with_the_reason_thrown_away() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(RegionMap::load(dir.path(), "absent").is_none());
+        std::fs::write(dir.path().join("ok.wtr"), wtr_v2(&[
+            ([0.0, 0.0, 1.0], -2.0, 0, 2, 3, 0),
+            ([0.0; 3], 0.0, 0, 0, 0, 0),
+            ([0.0; 3], 0.0, 1, 0, 0, 0),
+        ])).unwrap();
+        assert!(RegionMap::load(dir.path(), "ok").is_some());
     }
 
     #[test]
