@@ -48,13 +48,30 @@
 //!      out-of-range slot panics rather than falling back.
 //!   4. `bind_joints` — `shadow_joint_pool[j_slot].1` at group 2. Same.
 //!   5. `draw` — re-matches the caster's own variant to reach `model.meshes`. A branch, but not a
-//!      decision: the two arms differ only in the concrete model type and are otherwise the same
-//!      loop, so swapping them does not compile.
+//!      decision: each arm binds `model` out of its own variant, so neither arm can be made to draw
+//!      the other's model. (An earlier draft of this item said "swapping them does not compile".
+//!      Not so — the two arm *bodies* are identical text, so exchanging them compiles and is a
+//!      no-op. The conclusion was right for the wrong reason; the #784 reviewer caught it.)
 //!
 //!   None of the five decides anything a mutation could silently flip. That is **not** true of the
-//!   sibling `ZoneSink` in `encode_zone_pass`, where two bodies do decide and are ungraded — see
+//!   sibling `ZoneSink` in `encode_zone_pass`, where a body does decide and is ungraded — see
 //!   `zone_pass_routing.rs`'s list. The distinction is stated because an earlier draft of both files
 //!   used one blanket sentence for both sinks, and for the zone one it was measurably false.
+//! - **That the plan is executed, *semantically*.** Nothing in the sink-driven tests below would
+//!   fail if the `execute_character_shadow_plan` call in `encode_shadow_pass` were deleted or
+//!   wrapped in `if false` — the same gap `shadow_routing.rs` records for its own call site, in its
+//!   wording.
+//!
+//!   That call takes one caster list, so unlike the sibling `execute_zone_draw_plan` call there is
+//!   no second argument to swap it with (`zone_pass_routing.rs` grades that one; the swap was
+//!   measured green as #784's mutation S3 before it was pinned). The failure available here is a
+//!   deletion, which renders no character shadows at all — loud rather than silent, which is why
+//!   this one is the weaker of the two.
+//!
+//!   `encode_shadow_pass_executes_the_character_plan` at the end of this file pins the call as
+//!   **source text**, the same technique and caveat as `shadow_caster_selection.rs`'s call-site pin:
+//!   it proves the call is *written*, not that it is *reached*, and cannot see a second inlined
+//!   caster loop added beside it.
 //! - **wgpu semantics**, and **whether a flip is visible in play** — #739 listed the second as not
 //!   established, and this PR does not settle it. No client was run.
 //! - **Which entities are selected at all** — that is `plan_shadow_casters` (#740), graded in
@@ -282,4 +299,49 @@ fn a_step_carries_the_casters_index_in_the_selection_list() {
     assert_eq!(steps[0].bind, CharacterShadowBind::Skinned { u_slot: 0, j_slot: 0 });
     assert_eq!(steps[3].bind, CharacterShadowBind::Static { u_slot: 1 },
         "the first static step must carry caster 1's uniform slot, not the 4th caster's");
+}
+
+// ── Call-site pin (source text, not semantics) ──────────────────────────────────────────────────
+
+const PASS_RS: &str = include_str!("../src/pass.rs");
+
+/// Nothing else in this file would fail if `encode_shadow_pass` stopped calling
+/// `execute_character_shadow_plan` and went back to the inline loops #739 replaced — this file
+/// drives the executor through its own sink, which the production call site cannot affect.
+///
+/// This is a **source-text** assert, not a semantic one: it proves the call is written, not that it
+/// is reached, and it cannot see a *second*, inlined caster loop added alongside the call. Same
+/// technique and same caveat as `shadow_caster_selection.rs`'s
+/// `encode_shadow_pass_calls_the_planner_this_file_grades`, which pins the sibling planner call in
+/// the same function.
+///
+/// Unlike the zone pin in `zone_pass_routing.rs`, there is no argument order to defend here: this
+/// executor takes one caster list, so the only mutation available is deletion, and deletion renders
+/// no character shadows at all.
+///
+/// **Measured both ways** in #784 round 3: deleting the call in `encode_shadow_pass` compiles (two
+/// `unused` warnings, no error) and turns this test — and, in the same run, only this test and the
+/// zone pin under its own mutation — RED. Restoring returns the crate to green. Totals are in that
+/// review comment rather than here, so this doc cannot go stale against a growing suite.
+#[test]
+fn encode_shadow_pass_executes_the_character_plan() {
+    let pass = PASS_RS
+        .split_once("pub fn encode_shadow_pass(")
+        .expect("encode_shadow_pass not found in pass.rs")
+        .1;
+    let body = pass.split_once("\npub fn ").map(|(b, _)| b).unwrap_or(pass);
+    let code: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        flat.contains("execute_character_shadow_plan(&casters, &mut sink)"),
+        "encode_shadow_pass must draw its character casters via execute_character_shadow_plan — \
+         that call is the only thing making this file's coverage real. If it was legitimately \
+         reformatted, update this pin AND confirm the sub-passes are still ordered skinned-then-\
+         static; if the call was dropped, no character casts a shadow.",
+    );
 }

@@ -7,6 +7,14 @@
 //! so an integration test cannot build the arguments at all. A flipped mesh list, a dropped
 //! sub-pass, a widened mode filter or a lost texture rebind was invisible to the whole suite.
 //!
+//! Do not read that sentence as a list of what this file fixed, and read the four items at
+//! different strengths. A dropped sub-pass, a widened mode filter and a lost texture rebind are
+//! graded **semantically**, by driving the real executor (mutations Z3, Z2 and Z4 of the #784
+//! table). A flipped mesh list is graded only as **source text**: the two lists are interchangeable
+//! to the type system at the call site, so no semantic test in this crate can tell them apart, and
+//! the only thing that catches the swap is the call-site pin at the end of this file. See the
+//! call-site bullet under "What this file does NOT cover" for what that pin does and does not buy.
+//!
 //! What is graded here is the **command sequence** `encode_zone_pass` emits, produced by the real
 //! executor (`pass::execute_zone_draw_plan` — the exact function the pass calls) driven into a
 //! recording sink. Two kinds of assertion:
@@ -25,25 +33,69 @@
 //!   1. `set_pipeline` — the six-arm `(ZoneMeshSource, ZoneBlendClass)` → `&wgpu::RenderPipeline`
 //!      match. Swapping two arms there is invisible here, because this file's sink maps the same
 //!      pair to a `&'static str`.
-//!   2. `bind_texture` — `texture_bind_groups[i]` vs `fallback_texture_bg`. **This one decides.**
-//!      Ignoring the index and always binding the fallback untextures the whole zone (mutation S2).
+//!   2. `bind_texture` — `texture_bind_groups[i]` vs `fallback_texture_bg`. The in-range
+//!      **decision** here was pure, so it is no longer in the sink: it is
+//!      `pass::zone_texture_slot`, graded by
+//!      `a_texture_index_falls_back_exactly_when_it_is_out_of_range` below. What is left in the sink
+//!      is the handle lookup, and *that* is still ungraded — a sink body that discarded the slot and
+//!      always bound the fallback would untexture the whole zone silently (mutation S2b).
 //!   3. `draw` — `gpu_meshes` vs `gpu_instanced`, and the static vs instanced buffer/draw form.
-//!      **This one decides too.** Pointing the `Static` arm at `gpu_instanced` draws the wrong
-//!      geometry for every static zone mesh (mutation S1).
+//!      **This one decides.** Pointing the `Static` arm at `gpu_instanced` draws the wrong geometry
+//!      for every static zone mesh (mutation S1).
 //!   4. `bind_camera` — `camera_uniform.bind_group` at group 0. A straight lookup.
 //!   5. `bind_shadow_sample` — `shadow_sample_bg` at group 2. A straight lookup.
 //!
 //!   **An earlier draft of this paragraph claimed "everything which *decides* is graded and the
 //!   handle lookup is not". That was false**, and items 2 and 3 are why: the #784 reviewer mutated
-//!   both in the production sink and both left the crate green at 226 passed / 0 failed. Neither is
-//!   a regression — both survive identically on the base file — but the description was wrong about
-//!   where the hole is and how wide it is. **They remain ungraded after this PR.** Closing them
-//!   needs a live device or a further indirection between the plan and the mesh list, which is a
-//!   refactor rather than the coverage this issue asked for.
+//!   both in the production sink and both left the crate green. Neither is a regression — both
+//!   survive identically on the base file — but the description was wrong about where the hole is
+//!   and how wide it is.
+//!
+//!   A second draft then justified leaving *both* alone as "a refactor rather than the coverage this
+//!   issue asked for". That was right for item 3 and wrong for item 2, whose predicate depends on
+//!   nothing but an index and a length: extracting it cost six lines, which is the same shape this
+//!   file already applies everywhere else, and this impl's own rule at `pass.rs` says a condition in
+//!   the sink belongs somewhere testable. So item 2's decision is now graded and item 3 is not.
+//!   Item 3 genuinely does need an indirection between the plan and the handles — its two arms reach
+//!   `wgpu::RenderPass` differently over two different concrete mesh types — and S1 **remains
+//!   ungraded after this PR**, as does the residual lookup in item 2 (S2b).
+//!
+//!   "Left the crate green" is the claim; the pass/fail *totals* for every mutation named in this
+//!   file are in the #784 PR body, against the head they were measured at. An earlier draft of this
+//!   paragraph carried a bare "226 passed" here, and it was already stale by one commit — a count in
+//!   a tracked file goes wrong the moment anyone adds a test, which is exactly what this PR does.
 //!
 //!   Item 1 is additionally left open *deliberately* rather than for cost: pinning it would mean
 //!   asserting on the source text of `pass.rs`, and a source-text pin has now been measured on this
 //!   crate to be evadable by shadowing a local (#773 review, evasions E1b/E2).
+//! - **That the plan is executed, *semantically*.** Nothing in the sink-driven tests below would
+//!   fail if the `execute_zone_draw_plan` call in `encode_zone_pass` were deleted or wrapped in
+//!   `if false` — the same gap `shadow_routing.rs` records for its own call site, and the reason
+//!   this bullet exists in that file's wording.
+//!
+//!   The zone call site is **worse than the one that bullet covers**, because the executor is
+//!   generic in *both* list parameters and `GpuMesh` and `GpuInstancedMesh` both implement
+//!   `ZoneDrawMesh`: the two arguments are interchangeable to the type system. Swapping them
+//!   compiles with no error, and every static mesh is then planned from the instanced list's modes
+//!   and textures and drawn out of the other list. Deleting the call renders nothing, which is loud;
+//!   swapping its arguments renders the whole zone wrongly, which is silent — and by this project's
+//!   ordering the silent one is the worse failure, which is why it is pinned rather than only
+//!   disclosed. Measured: before that pin existed the swap left the whole crate green (#784 round 2,
+//!   mutation S3).
+//!
+//!   `encode_zone_pass_executes_the_plan_on_the_lists_in_this_order`, at the end of this file,
+//!   closes the swap and *only* the swap. It is a **source-text** assert — same technique and same
+//!   caveat as `shadow_caster_selection.rs`'s call-site pin and `shadow_routing.rs`'s pipeline pin —
+//!   so it proves the call is *written* with `gpu_meshes` first, not that it is *reached*: an
+//!   `if false` around it, or a second inlined draw loop added beside it, still passes. Treat it as
+//!   a backstop over the one call this crate cannot make device-free, not as a semantic grader.
+//!
+//!   `now_ms` is only weakly covered by the same pin: it pins the *spelling* `now_ms` at the call,
+//!   so a different clock behind that name would pass. Every test below passes `now_ms` explicitly.
+//!
+//!   This bullet is here because round 2 of the #784 review enumerated the sink and stopped at its
+//!   boundary. The question this heading answers is "what can still break silently", not "what is in
+//!   that struct", and the answer did not stop where the struct did.
 //! - **wgpu semantics.** Nothing here creates a `wgpu::RenderPass`, so a command sequence that is
 //!   correct as a sequence but invalid as wgpu (wrong group index for a layout, say) still passes.
 //! - **Whether a flip is visible in play.** #741 asked; it is still not established. A wrong
@@ -52,8 +104,8 @@
 
 use eqoxide_assets::RenderMode;
 use eqoxide_renderer::pass::{
-    execute_zone_draw_plan, plan_zone_draws, ZoneBlendClass, ZoneDrawMesh, ZoneDrawSink,
-    ZoneMeshSource, ZoneTexBind, ZONE_SUBPASSES,
+    execute_zone_draw_plan, plan_zone_draws, zone_texture_slot, ZoneBlendClass, ZoneDrawMesh,
+    ZoneDrawSink, ZoneMeshSource, ZoneTexBind, ZONE_SUBPASSES,
 };
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -374,6 +426,33 @@ fn an_empty_subpass_emits_nothing_and_a_nonempty_one_sets_its_pipeline_once() {
     assert!(steps[0].set_pipeline, "the first step of a sub-pass sets the pipeline");
 }
 
+/// The one **decision** `ZoneSink::bind_texture` used to make inline: an index the renderer has a
+/// bind group for binds that group, anything else binds the fallback. A mesh whose `texture_idx` is
+/// stale or out of range must not index past `texture_bind_groups` (that panics) and must not
+/// silently bind a *different* mesh's texture either.
+///
+/// This is graded only because the predicate is pure — it depends on the index and a length and
+/// nothing else — so #741 lifted it to `pass::zone_texture_slot`. What stayed in the sink is the
+/// handle lookup, which still needs a device; see the call-site bullet at the top of this file.
+#[test]
+fn a_texture_index_falls_back_exactly_when_it_is_out_of_range() {
+    assert_eq!(zone_texture_slot(None, 4), None, "an untextured mesh binds the fallback");
+    assert_eq!(zone_texture_slot(Some(0), 4), Some(0));
+    assert_eq!(zone_texture_slot(Some(3), 4), Some(3), "the last valid index is in range");
+    assert_eq!(zone_texture_slot(Some(4), 4), None, "one past the end is out of range");
+    assert_eq!(zone_texture_slot(Some(9), 4), None);
+    assert_eq!(zone_texture_slot(Some(0), 0), None, "no bind groups at all: everything falls back");
+
+    // The property behind the cases: in-range indices are passed through UNCHANGED (binding a
+    // neighbour's texture would be silent), and nothing else resolves to a slot.
+    for n in 0..6usize {
+        for i in 0..8usize {
+            assert_eq!(zone_texture_slot(Some(i), n), (i < n).then_some(i),
+                "idx {i} against {n} bind groups");
+        }
+    }
+}
+
 /// **A mesh's index is its index in its own list**, not its position within the sub-pass — the sink
 /// uses it to index `gpu_meshes`/`gpu_instanced` directly, so an off-by-one here draws the wrong
 /// geometry.
@@ -385,4 +464,82 @@ fn a_step_carries_the_meshs_index_in_its_own_list() {
         .filter(|s| s.class == ZoneBlendClass::Blend).map(|s| s.mesh).collect();
     assert_eq!(blend, vec![0, 2],
         "the blend sub-pass skips mesh 1, but its steps must still name meshes 0 and 2");
+}
+
+// ── Call-site pin (source text, not semantics) ──────────────────────────────────────────────────
+
+const PASS_RS: &str = include_str!("../src/pass.rs");
+
+/// **The one thing in this file's subject that no semantic test in this crate can grade.**
+///
+/// `encode_zone_pass` ends with
+///
+/// ```text
+/// execute_zone_draw_plan(&r.gpu_meshes, &r.gpu_instanced, now_ms, &mut sink);
+/// ```
+///
+/// and `execute_zone_draw_plan<S: ZoneDrawMesh, I: ZoneDrawMesh, K: ZoneDrawSink>` is generic in
+/// **both** list parameters, with `GpuMesh` and `GpuInstancedMesh` both implementing `ZoneDrawMesh`.
+/// The two arguments are therefore interchangeable to the type system: swapping them compiles with
+/// no error, plans every static mesh from the instanced list's modes and textures, draws it out of
+/// the wrong list, and — measured by the #784 round-2 reviewer as mutation S3 — left the whole
+/// crate green. Everything else this file grades is reached through its own sink, which the
+/// production call site cannot affect.
+///
+/// It cannot be graded semantically here: `EqRenderer` owns `wgpu` handles and no test can build
+/// one, which is the whole premise of this file. So it is pinned as **source text**, the same
+/// technique (and the same caveat) as `shadow_caster_selection.rs`'s
+/// `encode_shadow_pass_calls_the_planner_this_file_grades` and `shadow_routing.rs`'s
+/// `executor_binds_each_kind_to_the_pipeline_this_file_grades`.
+///
+/// **What this pin does not prove**, stated so nobody upgrades it by reading:
+///
+/// * That the call is *reached*. Wrapping it in `if false`, or returning early above it, passes.
+/// * That it is the *only* draw path. A second inlined loop added beside it passes.
+/// * That `now_ms` is the right clock. Only the identifier is pinned, not what it holds.
+/// * It is a guard over text, and guards over text are evadable. Whole-line `//` comments are
+///   stripped so a decoy comment cannot satisfy it, but per #721's measured evasion A2b a
+///   *trailing* comment on a code line still can, and per #773's E1b/E2 shadowing a local can defeat
+///   a pin of this shape. It is a backstop, not the mechanism.
+///
+/// **Measured, both ways** (totals in the #784 round-3 comment, against the head they were measured
+/// at — a count written *here* goes stale the moment anyone adds a test, which is R4 of that same
+/// review). Re-applying S3 turns this test RED — it is the *first* assert below that fires — and,
+/// paired with a deletion mutation on the sibling call that `character_shadow_routing.rs` pins,
+/// exactly those two tests move from `ok` to `FAILED` and **no other test in the crate changes
+/// state**. So this pin has teeth and is not over-broad.
+///
+/// The second assert below adds the one thing the first cannot: the first is satisfied by a correct
+/// line even if a swapped one sits beside it, and the second fails on the swapped spelling
+/// **anywhere** in the function. It is not what caught S3; it is what stops S3 being reintroduced
+/// alongside a surviving correct call.
+#[test]
+fn encode_zone_pass_executes_the_plan_on_the_lists_in_this_order() {
+    let pass = PASS_RS
+        .split_once("pub fn encode_zone_pass(")
+        .expect("encode_zone_pass not found in pass.rs")
+        .1;
+    let body = pass.split_once("\npub fn ").map(|(b, _)| b).unwrap_or(pass);
+    // Whole-line comments are stripped: this function's own ⚠ note spells out the swapped order on
+    // purpose, and must not be able to satisfy or trip either assert.
+    let code: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        flat.contains("execute_zone_draw_plan(&r.gpu_meshes, &r.gpu_instanced, now_ms, &mut sink)"),
+        "encode_zone_pass must execute the plan with the STATIC list first and the INSTANCED list \
+         second. Both implement ZoneDrawMesh, so the wrong order compiles and renders the whole \
+         zone out of the wrong lists in silence. If this line was legitimately reformatted, update \
+         this pin AND re-check the order — do not make the pin pass by moving text.",
+    );
+    assert!(
+        !flat.contains("execute_zone_draw_plan(&r.gpu_instanced, &r.gpu_meshes"),
+        "encode_zone_pass draws the static sub-passes out of gpu_instanced and vice versa \
+         (mutation S3). Every static zone mesh is planned from the wrong list's render modes and \
+         texture indices and then drawn from the wrong buffers.",
+    );
 }

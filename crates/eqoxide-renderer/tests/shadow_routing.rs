@@ -41,15 +41,23 @@
 //! - **The depth-attachment clear** in `encode_shadow_pass`. That is the last of the three items
 //!   this bullet originally listed and the only one still uncovered here.
 //!
-//!   This bullet is a **recurring maintenance point** — it has now been discharged twice, and the
-//!   count has been wrong after each discharge, so check it rather than trusting it. It read "the
-//!   other three sub-passes (skinned casters, static casters, the depth-attachment clear) … remain
-//!   as untested as they were before #721", plus a *fourth* item for the caster selection that
-//!   fills `casters`. #740 extracted that fourth to `pass::plan_shadow_casters` and graded it in
-//!   `shadow_caster_selection.rs` (leaving the count reading "four" — an off-by-one this file
-//!   introduced). #739 then extracted the **skinned and static** sub-passes to
-//!   `pass::plan_character_shadow_draws` and graded them in `character_shadow_routing.rs`, which
-//!   falsified two more of the three without touching this sentence.
+//!   This bullet is a **recurring maintenance point** — it has now been discharged twice, and each
+//!   discharge *drafted* the wrong residue, so check it rather than trusting it. It read "the other
+//!   three sub-passes (skinned casters, static casters, the depth-attachment clear) … remain as
+//!   untested as they were before #721", plus a *fourth* item for the caster selection that fills
+//!   `casters`. #740 extracted that fourth to `pass::plan_shadow_casters` and graded it in
+//!   `shadow_caster_selection.rs`; its **first draft** dropped the item but left the count reading
+//!   "four". #739 then extracted the **skinned and static** sub-passes to
+//!   `pass::plan_character_shadow_draws` and graded them in `character_shadow_routing.rs`, and *its*
+//!   first draft left this sentence untouched, still claiming all three were untested when two of
+//!   them had just been covered.
+//!
+//!   **Both drafts were caught in review and corrected before merge** — #740's by PR #747's review
+//!   (its finding N1), #739's by PR #784's round 1 — so no wrong count has ever reached `main`.
+//!   That is the accurate history and it is a better one: the sentence is fragile, and so far the
+//!   process has held. (A round-2 draft of *this* paragraph dropped the "first draft" and
+//!   "**Corrected:**" markers the base text carried, which made #740 read as having merged a wrong
+//!   count. #784's round 3, finding R3.)
 //!
 //!   What is *still* uncovered from those discharges, and is not restated by the files that took
 //!   them over: what caster selection turns into (matrices, buffer writes), and — exactly as in the

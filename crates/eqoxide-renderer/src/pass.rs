@@ -983,6 +983,28 @@ pub fn execute_zone_draw_plan<S: ZoneDrawMesh, I: ZoneDrawMesh, K: ZoneDrawSink>
     }
 }
 
+/// Which entry of `EqRenderer::texture_bind_groups` a planned `ZoneTexBind::Set(idx)` resolves to;
+/// `None` means "bind the fallback".
+///
+/// This is the one *decision* `ZoneSink::bind_texture` makes, lifted out of the sink so a test can
+/// reach it — the sink body itself needs a live device and no test can call it. It is a free
+/// function rather than part of the plan because the planner does not know how many bind groups the
+/// renderer holds: `n_bind_groups` is renderer state, not mesh state. What is left behind in the
+/// sink after this extraction is a pure lookup with no condition in it.
+///
+/// Graded by `a_texture_index_falls_back_exactly_when_it_is_out_of_range` in
+/// tests/zone_pass_routing.rs.
+///
+/// The masked instanced *shadow* sub-pass (#721) still has this expression inline, and is
+/// deliberately not routed through here: changing that sub-pass is outside #741, and
+/// tests/shadow_routing.rs already discloses its copy as uncovered.
+pub fn zone_texture_slot(idx: Option<usize>, n_bind_groups: usize) -> Option<usize> {
+    match idx {
+        Some(i) if i < n_bind_groups => Some(i),
+        _ => None,
+    }
+}
+
 /// Zone geometry pass. Clears depth to 1.0; preserves sky color from sky pass.
 pub fn encode_zone_pass(
     r:       &EqRenderer,
@@ -1018,22 +1040,28 @@ pub fn encode_zone_pass(
     // tests/zone_pass_routing.rs (with a differential pin against the pre-#741 closures there).
     //
     // `ZoneSink` below is the rest: five bodies that turn plan vocabulary into `wgpu` handles, ALL
-    // of which need a live device and NONE of which any test can reach. Two of the five make real
-    // decisions, so "nothing here decides anything" would be false — measured, by the #784 reviewer,
-    // with two mutations that both left the crate green at 226 passed / 0 failed:
+    // of which need a live device and NONE of which any test can reach. "Nothing here decides
+    // anything" would be false — measured, by the #784 reviewer, with mutations that left the crate
+    // green (totals in the #784 body, against the head they were measured at):
     //
     //   * `draw` picks `gpu_meshes` vs `gpu_instanced` from the `ZoneMeshSource`. Pointing the
     //     `Static` arm at `gpu_instanced` draws the wrong geometry for every static zone mesh, and
-    //     no test notices (mutation S1).
-    //   * `bind_texture` picks `texture_bind_groups[i]` vs `fallback_texture_bg`. Ignoring the index
-    //     and always binding the fallback untextures the whole zone, and no test notices (S2).
+    //     no test notices (mutation S1). This one is still open: grading it needs an indirection
+    //     between the plan and the mesh handles, since the two arms reach `wgpu::RenderPass`
+    //     differently over two different concrete types.
+    //   * `bind_texture` used to decide in-range-vs-fallback inline. That predicate was pure, so it
+    //     is now `zone_texture_slot` above, which is tested; what is left here is the lookup. A body
+    //     that discarded the slot and always bound the fallback would still untexture the whole zone
+    //     unnoticed (S2b).
     //
-    // Both predate #741 (they survive identically on the base file) and are recorded rather than
-    // fixed here; closing them needs a device or a further indirection, not another planner test.
-    // The other three bodies — the six-arm pipeline lookup, `camera_uniform.bind_group`,
+    // Both predate #741 (they survive identically on the base file) and S1 is recorded rather than
+    // fixed. The other three bodies — the six-arm pipeline lookup, `camera_uniform.bind_group`,
     // `shadow_sample_bg` — are straight lookups with no condition in them.
     //
-    // If you add a condition to this impl, it belongs in the planner, where it is testable.
+    // If you add a condition to this impl, it belongs somewhere testable — the planner if it is a
+    // function of the meshes, a pure helper like `zone_texture_slot` if it is a function of renderer
+    // state. That rule was stated here for a round while this impl violated it; do not restate it
+    // without checking the impl still obeys it.
     struct ZoneSink<'r, 'p, 'e> {
         r:    &'r EqRenderer,
         pass: &'p mut wgpu::RenderPass<'e>,
@@ -1056,9 +1084,11 @@ pub fn encode_zone_pass(
         }
         fn bind_texture(&mut self, idx: Option<usize>) {
             let r = self.r;
-            let bg = match idx {
-                Some(i) if i < r.texture_bind_groups.len() => &r.texture_bind_groups[i],
-                _ => &r.fallback_texture_bg,
+            // The in-range DECISION is `zone_texture_slot`, which is pure and tested; what is left
+            // here is the handle lookup, which is not reachable without a device.
+            let bg = match zone_texture_slot(idx, r.texture_bind_groups.len()) {
+                Some(i) => &r.texture_bind_groups[i],
+                None    => &r.fallback_texture_bg,
             };
             self.pass.set_bind_group(1, bg, &[]);
         }
@@ -1091,6 +1121,20 @@ pub fn encode_zone_pass(
     // comes back. The planner calls it; do not re-inline a copy here.
     let now_ms = anim_now_ms();
     let mut sink = ZoneSink { r, pass: &mut pass };
+    // ⚠ THE ARGUMENT ORDER BELOW IS LOAD-BEARING AND THE TYPE SYSTEM WILL NOT DEFEND IT.
+    // `execute_zone_draw_plan` is generic in both list parameters and `GpuMesh`/`GpuInstancedMesh`
+    // both implement `ZoneDrawMesh`, so `(&r.gpu_instanced, &r.gpu_meshes, …)` compiles with no
+    // error, while the entire colour pass renders the wrong geometry with the wrong textures in the
+    // wrong sub-passes. Deleting the call is loud; swapping it is silent — measured: before #784
+    // round 3, the swap left the whole crate green (mutation S3).
+    //
+    // The only thing that catches the swap is a SOURCE-TEXT pin,
+    // `encode_zone_pass_executes_the_plan_on_the_lists_in_this_order` in tests/zone_pass_routing.rs,
+    // which asserts this line's spelling because no test can build an `EqRenderer` to reach it
+    // semantically. It therefore proves the call is *written* this way, not that it is *reached*:
+    // wrapping it in `if false`, or adding a second draw loop beside it, still passes. If you
+    // reformat this line, update that pin AND check the order is still right — do not make the pin
+    // pass by moving text.
     execute_zone_draw_plan(&r.gpu_meshes, &r.gpu_instanced, now_ms, &mut sink);
 }
 
@@ -2169,9 +2213,13 @@ pub fn encode_shadow_pass(
     // `CharacterSink` below is the `wgpu`-handle translation: five bodies, none reachable by a test.
     // Four are straight lookups (`shadow_skinned`/`shadow_static`, `light_depth_bg`,
     // `shadow_uniform_pool[u_slot]`, `shadow_joint_pool[j_slot]`). `draw` re-matches the caster's own
-    // variant, which is a branch but not a decision: the two arms differ only in the concrete model
-    // type and are otherwise the same loop, so they cannot be swapped — the compiler rejects it.
-    // Contrast `encode_zone_pass`'s `ZoneSink`, where two bodies DO decide and are ungraded; see the
+    // variant, which is a branch but not a decision: each arm binds `model` from its own variant, so
+    // neither can be made to draw the other's model. (An earlier draft said the arms "cannot be
+    // swapped — the compiler rejects it". That was wrong: the two arm BODIES are identical text, so
+    // exchanging them compiles and changes nothing. What the type prevents is an arm reaching the
+    // other variant's model, which is the property that matters — the conclusion held, the reason
+    // did not. Caught by the #784 reviewer.)
+    // Contrast `encode_zone_pass`'s `ZoneSink`, where a body DOES decide and is ungraded; see the
     // note there. Do not paraphrase this as "decides nothing" — an earlier draft did, and the
     // equivalent sentence in the zone pass was measurably false.
     impl CharacterShadowCaster for Caster<'_> {
@@ -2230,6 +2278,11 @@ pub fn encode_shadow_pass(
         }
     }
     {
+        // This call takes one list, so there is no sibling argument to swap it with the way
+        // `encode_zone_pass`'s `execute_zone_draw_plan` call has (see the ⚠ note there). The failure
+        // available here is deletion, which renders no character shadows at all — loud, not silent.
+        // Pinned as source text by `encode_shadow_pass_executes_the_character_plan` in
+        // tests/character_shadow_routing.rs, with the same "written, not reached" caveat.
         let mut sink = CharacterSink { r, pass: &mut pass, casters: &casters };
         execute_character_shadow_plan(&casters, &mut sink);
     }
