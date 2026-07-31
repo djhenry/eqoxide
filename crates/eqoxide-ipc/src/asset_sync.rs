@@ -584,10 +584,11 @@ impl ConnectOutcome {
     /// capitalization, which only `grep -i` catches. This inventory is what a grep against the
     /// *current* text turns up, not a promise about the next edit — the pattern list above will
     /// keep matching itself, and the count this EDIT gave when it first ran ("four hits") was
-    /// wrong by the time #782 re-ran it. What is true, and was measured for this commit, is that
-    /// no *un-retracted* assertion of the completeness claim survives outside `slots()`'s own
-    /// rustdoc and this inventory — re-run the grep to check; do not trust a cached number,
-    /// including one that isn't given here.
+    /// wrong when it was written: the same sweep at the commit that wrote it already returned
+    /// twelve hits, eight of them outside `slots()`'s own rustdoc. What is true, and was
+    /// measured for this commit, is that no *un-retracted* assertion of the completeness claim
+    /// survives outside `slots()`'s own rustdoc and this inventory — re-run the grep to check;
+    /// do not trust a cached number, including one that isn't given here.
     ///
     /// **The residual, stated rather than glossed, and measured too.** A variant whose match arms
     /// are pointed at an *existing* slot and counter adds no field, so `slots` is unchanged and
