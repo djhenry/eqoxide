@@ -1034,18 +1034,6 @@ pub struct GameState {
     /// [`WorldState`]: the server has no opinion about it and would happily agree with the position
     /// we keep streaming from inside the rock.
     pub player_hold: Option<ControllerHold>,
-    /// **#746: whether the render controller is currently intending horizontal motion or is
-    /// airborne** — `wish_dir != 0 || !on_ground`, recomputed by the controller every rendered
-    /// frame it steps. Mirrored here from `ControllerView::moving` by `ActionLoop::stream_position`,
-    /// with exactly the same freshness contract as `player_hold` beside it: current as of the last
-    /// render frame that stepped the controller, and — like `player_hold` — a level signal
-    /// (republished, never latched), so it clears to `false` the same tick `wish_dir` zeroes and
-    /// `on_ground` goes true, with no separate clear path to fall out of sync with.
-    ///
-    /// Before #746 this was written by the render controller and read by nothing: a field that
-    /// would have become a false "still moving" the instant something wired it up without also
-    /// wiring the clear. Give it the one reader here instead of leaving it a trap.
-    pub player_moving: bool,
     pub player_heading: f32,
     pub player_level: u32,
     pub player_race: String,
@@ -1415,11 +1403,6 @@ impl GameState {
         // last mirrored value would sit here — a confident "you are wedged" about a zone we have
         // left — until the first frame after the new collision lands. Unknown, not false-positive.
         self.player_hold = None;
-        // #746: same reasoning as `player_hold` just above — the controller stops being stepped
-        // while the new zone loads, so the last mirrored `moving` would otherwise sit here as a
-        // stale "still moving" about a zone we have left. It is also the true answer: a controller
-        // that is not being stepped is not moving the body, so `false` here is measured, not guessed.
-        self.player_moving = false;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
         // target_name/target_hp_pct fall back to the stale cached snapshot — /observe/debug then
@@ -2932,27 +2915,6 @@ pub(crate) mod tests {
             "a hold describes geometry the zone-in just dropped, and nothing recomputes it while \
              the new zone loads — a zone-in must clear it so the load window reads honestly \
              \"no hold\" instead of a confident wedge alarm about the zone we left");
-    }
-
-    /// #746 — the previous zone's `moving` must NOT survive a zone-in, same reasoning as the
-    /// `hold` clear directly above: the controller stops being stepped while the new zone loads, so
-    /// without this clear the last mirrored `true` sits in `player_moving` — a confident "still
-    /// moving" about a zone the character has already left — until the first frame after the new
-    /// collision lands. `false` is also the true answer for that window: a controller that is not
-    /// stepping is not moving the body.
-    ///
-    /// MUTATION CHECK: drop the `player_moving = false` line from `begin_zone_in` → RED here.
-    #[test]
-    fn begin_zone_in_clears_the_previous_zones_moving_flag_746() {
-        let mut gs = GameState::new();
-        gs.player_moving = true;
-
-        gs.begin_zone_in();
-
-        assert!(!gs.player_moving,
-            "a controller that is not being stepped while the new zone loads is not moving the \
-             body — begin_zone_in must clear the stale mirrored `true` so the load window reads \
-             honestly rather than reporting motion from the zone we left");
     }
 
     /// #757 — `zone_cross_attempts` and `zone_cross_plan` must NOT survive a zone-in.

@@ -2841,12 +2841,6 @@ impl ActionLoop {
         // `GET /v1/observe` is exactly as fresh as the `pos` beside it. Level-triggered — the view is
         // republished every render frame, so this write is also the clear.
         gs.player_hold = view.hold;
-        // #746: `ControllerView::moving` had no reader anywhere in the workspace — written every
-        // rendered frame by `app.rs`, consumed by nothing, so it would have become a false "still
-        // moving" the moment anyone wired it up (the exact #343/#679 shape). Give it the same
-        // mirror `hold` gets, on the same tick and under the same init gate: level-triggered, so
-        // this write is also the clear the instant `wish_dir` zeroes and `on_ground` goes true.
-        gs.player_moving = view.moving;
         // Anti-MQGhost keepalive (#105): send a movement-history entry every 30s (< the server's 70s
         // window) whether or not we're moving, so the server's CheatManager never false-flags us.
         if self.last_movement_history_send.elapsed().as_millis() >= MOVEMENT_HISTORY_MS {
@@ -3499,55 +3493,6 @@ mod tests {
         // a hypothetical negative speed must clamp to -512 — never overflow the field or wrap.
         assert_eq!(speed_to_wire_animation(100_000.0), 511);
         assert_eq!(speed_to_wire_animation(-100_000.0), -512);
-    }
-
-    /// #746: `ControllerView::moving` used to have no reader anywhere in the workspace — written
-    /// every rendered frame by `app.rs`, consumed by nothing, which made it a trap: the moment
-    /// something wired it up as an observable it would have looked live (a well-formed, changing
-    /// `bool`) while actually tracking nothing downstream — the same false-observable shape as
-    /// `connected: true` (#343). `stream_position` now mirrors it into `gs.player_moving` on the
-    /// same tick, same init gate, as `hold`. This pins the mirror runs in BOTH directions: a mirror
-    /// that only ever fired the `true` edge would still look wired while lying about the clear.
-    ///
-    /// `bool` has exactly two values, so exercising both transitions (false→true, true→false) is
-    /// exhaustive over the field's whole state space — there is no third value a property test
-    /// would catch that these two examples do not.
-    ///
-    /// MUTATION CHECK: delete `gs.player_moving = view.moving;` from `stream_position` → both the
-    /// second and third assertions below go RED (the field sticks at its `Default` `false`
-    /// regardless of `view.moving`, so the `true` case never asserts true and the "clears back"
-    /// assertion passes for the wrong reason — run it once with the mutation applied and both
-    /// non-init assertions fail, not just the clear).
-    #[tokio::test]
-    async fn stream_position_mirrors_the_controllers_moving_flag_and_its_clear_746() {
-        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
-        let mut nav = new_loop();
-        let mut gs = GameState::new();
-
-        // Not initialized yet: stream_position must no-op (same init gate as `hold`/`pos`), so
-        // `player_moving` stays at its `Default` `false` — not evidence either way, just the
-        // pre-spawn baseline this test starts from.
-        nav.stream_position(&mut stream, &mut gs);
-        assert!(!gs.player_moving, "must not publish before the controller has spawned");
-
-        {
-            let mut view = nav.controller.controller_view.lock().unwrap();
-            view.initialized = true;
-            view.moving = true;
-        }
-        nav.stream_position(&mut stream, &mut gs);
-        assert!(gs.player_moving,
-            "the mirror must carry a live `true` from `ControllerView::moving` through to \
-             `GameState::player_moving`");
-
-        {
-            let mut view = nav.controller.controller_view.lock().unwrap();
-            view.moving = false;
-        }
-        nav.stream_position(&mut stream, &mut gs);
-        assert!(!gs.player_moving,
-            "the mirror is a level signal republished every tick, not a latch — it must clear the \
-             same tick the controller's own `moving` clears, not stay stuck at the last `true`");
     }
 
     /// #624 REVIEW FOLLOW-UP: exercises the REAL send cadence — `stream_position`/
