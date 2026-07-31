@@ -139,6 +139,25 @@ pub struct ControllerView {
     /// supplied by an explicit `clear_hold`, not by a recompute. Both are pinned by name; see
     /// `CharacterController::clear_hold`.
     pub hold: Option<eqoxide_core::game_state::ControllerHold>,
+    /// #776/#801: the controller is afloat, being wished at, and going nowhere — see
+    /// [`eqoxide_core::afloat::AfloatStall`]. **Not a weaker `hold`, and not a stronger one
+    /// either: a different claim.** `hold` says the body cannot move at all under any driver;
+    /// this says only that *this wish* has produced no motion for this long, which is why they are
+    /// two fields and not one enum. A swimmer at the qcat pocket mouth stalls a horizontal wish
+    /// forever and still escapes under a driven dive.
+    ///
+    /// Published on exactly the same terms as [`ControllerView::hold`], by the same statement:
+    /// `app.rs` destructures `CharacterController::disclosures()` into both fields at once, so this
+    /// is a level signal republished every RENDERED frame, and the republish is also the clear. On
+    /// rendered frames that do not step the controller (no collision, mid zone-load) the value comes
+    /// from `CharacterController::clear_hold`, which drops the stall window as well as the hold —
+    /// not from a recompute. `ActionLoop::stream_position` mirrors it into
+    /// `GameState::player_afloat_stall`, which `GameState::begin_zone_in` clears so a departed
+    /// zone's claim cannot survive a zone load during which the render loop published nothing.
+    ///
+    /// Deliberately NOT the `moving` field's shape (see its doc above): that one has no clear on the
+    /// not-stepped path and republishes a stale answer as if it were current. This one does.
+    pub afloat_stall: Option<eqoxide_core::afloat::AfloatStall>,
 }
 
 /// Which mode the orbit/follow camera is in. Relocated from `camera_state` (#544 Step 2c).

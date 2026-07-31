@@ -393,6 +393,76 @@ false hold; what it freezes is `held_secs`, and the paragraph above tells you ho
 (#724 round-3 review, N1 — this used to say "recomputes it from scratch every frame", which is not
 true of the load, zone-in or idle paths.)
 
+### `afloat_stall` — this swimmer is being asked to swim and is going nowhere (#776/#801)
+
+`player.afloat_stall` is `null` for every ordinary character, **including every ordinary swimmer**,
+and non-null only while the body is *afloat*, *being wished at horizontally*, and *not getting
+anywhere*.
+
+It exists because a genuinely trapped swimmer had **no observable at all**. A body afloat in water
+never enters the client's depenetration net, so a swimmer sealed in a pocket or pressing at a
+passage it cannot pass reads `on_ground: false`, `in_water: true`, `hold: null`, and a walker
+`stuck_ticks` that only advances while a `/goto` is driving. Every field said "swimming normally",
+which is the silent-wrong-answer class this project ranks above crashes.
+
+```jsonc
+"afloat_stall": {
+  "secs":                 4.8,        // controller frame time, this unbroken stall
+  "anchor_east":         -161.2,      // the point it has failed to get away from…
+  "anchor_north":         842.7,      // …same frame and datum as pos_east/north/up
+  "anchor_up":            -18.0,
+  "stall_threshold_secs": 3.0,        // engineering choices, NOT measurements
+  "progress_threshold":   0.5,
+  "detail":               "…what is true and what you can do about it…"
+}
+```
+
+**This is not a `hold`, and the difference is actionable.** A [`hold`](#hold--the-character-is-physically-stuck-and-the-client-cannot-free-it-724)
+claims *the body cannot move at all, under any driver* — the only ways out are a GM or a zone. An
+`afloat_stall` claims only that *the wish currently being made is producing no motion*. The worked
+case is a submerged pocket mouth: it stalls a horizontal swim wish indefinitely and is still
+escapable by a **driven dive**. So when you see one, try a vertical wish, try backing out the way you
+came, try a different heading — and only then treat it as a genuine trap.
+
+| Field | What it is |
+|---|---|
+| `secs` | How long the stall has been continuously in force, in **controller frame time** as of the last stepped frame — the same clock and the same caveat as `hold.held_secs`. It counts the whole window including the part before the threshold, so it is the true age of the stall and is always at least `stall_threshold_secs`. |
+| `anchor_*` | The position the window opened at: the point the body has failed to get more than `progress_threshold` away from, in any direction. Same coordinate frame and FOOT datum as `pos_east`/`pos_north`/`pos_up`, so you can difference them directly. |
+| `stall_threshold_secs`, `progress_threshold` | The two thresholds this report was produced against, published so you do not have to guess them. |
+
+**`null` does NOT mean "not stuck".** The predicate is deliberately narrow, because a false alarm in
+an honesty observable is the same defect as a silence — and the naive "stationary and wet" test
+fires on every floating character alive. These bodies are genuinely trapped and are reported `null`:
+
+* a swimmer **slowly losing ground**, or drifting — if it stays inside `progress_threshold` the
+  window matures normally, but a body that creeps *outside* it re-anchors and the clock restarts;
+* a swimmer **circling a pocket wider than `progress_threshold`** — it re-anchors every lap. Progress
+  is measured in 3-D, so a body oscillating vertically through more than the threshold re-anchors
+  too;
+* a swimmer lidded under a **purely vertical wish** with no horizontal component — no window ever
+  opens. The wish half of the predicate is horizontal-only on purpose: a sustained up-wish at the
+  surface is exactly what a legitimate haul-out does, and it is the single most common wish in the
+  water system, so counting it would false-alarm constantly;
+* any **dry** body pressed against a wall, and any body **wading on the bottom** — both out of scope;
+  the depenetration net's `hold` vocabulary owns them.
+
+**The thresholds are engineering choices, not measurements.** `3.0 s` is sized to be far longer than
+any legitimate transient a floating body has (buoyancy settles in ~0.07 s; a swimming step-up or
+duck-under resolves on the frame it is tried or never). `0.5 u` is ~0.011 s of travel at the speed
+the nav swim drive uses, so a body genuinely swimming clears it on its first frame. Neither number
+was tuned against measured data, and this document does not claim otherwise.
+
+**The key is always present** (never omitted), so an agent that greps for `afloat_stall` and finds
+nothing knows it is talking to a client too old to report the state, rather than concluding the
+swimmer is fine. It does not latch: the controller recomputes it on every stepped frame, the render
+thread republishes it on every rendered frame in the same statement that republishes `hold`, the
+frames that render without stepping clear it explicitly, and a zone-in clears the mirrored copy — so
+a stall can never survive into a zone the character has left, which matters more here than for
+`hold` because a stall names an *anchor position* in the departed zone's coordinates. If the render
+loop goes idle it stops recomputing, but a stalled body cannot be *freed* without a stepped frame
+either, so idling cannot manufacture a stall; what it freezes is `secs`, detectable exactly the way
+`held_secs` is (poll twice, compare the delta against your own clock).
+
 ### `zone_assets` — is the world this response describes actually loaded? (#579)
 
 A zone's terrain arrives from the asset server as one large GLB (freportw: ~30 MB) and is decoded,

@@ -1034,6 +1034,25 @@ pub struct GameState {
     /// [`WorldState`]: the server has no opinion about it and would happily agree with the position
     /// we keep streaming from inside the rock.
     pub player_hold: Option<ControllerHold>,
+    /// **#776/#801 (agent-honesty): the body is afloat, a driver is asking it to swim somewhere, and
+    /// it is not getting there.** `None` = it is not in that state, which includes every ordinary
+    /// floating character — a body nobody is wishing at never opens a window at all. See
+    /// [`crate::afloat::AfloatStall`].
+    ///
+    /// **This is NOT a [`ControllerHold`] and must never be folded into one.** A hold asserts the
+    /// body cannot move at all, under any driver. This asserts only that *this wish* has produced no
+    /// motion for this long: the body may well be escapable by a different drive (a driven dive out
+    /// of a pocket mouth is the worked case). Publishing it as a hold would be a new false claim,
+    /// not a fix for the old silence — which is why it is a separate field with a separate type and
+    /// a separate key on the API.
+    ///
+    /// Mirrored here from `ControllerView::afloat_stall` by `ActionLoop::stream_position`, on the
+    /// same tick and with the same freshness as `player_hold` and `player_x/y/z` beside it.
+    /// Cleared by [`GameState::begin_zone_in`] for the same reason `player_hold` is: the render loop
+    /// may publish nothing at all across a ~10 s zone load, and a stall describes a body failing to
+    /// cross *specific geometry* that no longer exists. Also a CLIENT-SIDE physics fact, so also
+    /// deliberately not in [`WorldState`].
+    pub player_afloat_stall: Option<crate::afloat::AfloatStall>,
     pub player_heading: f32,
     pub player_level: u32,
     pub player_race: String,
@@ -1403,6 +1422,13 @@ impl GameState {
         // last mirrored value would sit here — a confident "you are wedged" about a zone we have
         // left — until the first frame after the new collision lands. Unknown, not false-positive.
         self.player_hold = None;
+        // #776/#801: and the afloat stall, for the identical reason and with a sharper edge — a
+        // stall names an ANCHOR, a specific position in the departed zone's coordinate frame that
+        // the body failed to get away from. Carried across a crossing it would report a trapped
+        // swimmer at a point in a zone we are no longer in. `clear_hold` on `app.rs`'s not-stepped
+        // frames covers the case where the render loop keeps rendering through the load; this covers
+        // the case where it does not publish at all. Neither alone is sufficient.
+        self.player_afloat_stall = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
         // target_name/target_hp_pct fall back to the stale cached snapshot — /observe/debug then
@@ -2915,6 +2941,53 @@ pub(crate) mod tests {
             "a hold describes geometry the zone-in just dropped, and nothing recomputes it while \
              the new zone loads — a zone-in must clear it so the load window reads honestly \
              \"no hold\" instead of a confident wedge alarm about the zone we left");
+    }
+
+    /// #801 — the previous zone's afloat stall must NOT survive a zone-in either.
+    ///
+    /// The sibling of `..._hold_724` above, and the case for it is *sharper*. A `ControllerHold`
+    /// names a predicament; an [`AfloatStall`](crate::afloat::AfloatStall) names an **anchor** — a
+    /// specific `[east, north, up]` in the departed zone's coordinate frame. Carried across a
+    /// crossing, `/v1/observe/state` would answer an agent with "you have been unable to swim away
+    /// from (-812.5, 43.0, -119.75) for 7.5 seconds" about a point in a zone the character is no
+    /// longer in, and about water that may not exist here. That is not a stale number, it is a
+    /// confident falsehood with coordinates attached, and the agent's reasonable response — dive,
+    /// or route around — would be aimed at nothing.
+    ///
+    /// This field has exactly the same two writers as `player_hold`: this clear, and
+    /// `ActionLoop::stream_position`'s mirror of `ControllerView::afloat_stall`. `app.rs`'s
+    /// `clear_hold()` on frames that render without stepping drops the window on the render side and
+    /// covers the case where the loop keeps rendering through the load; this covers the case where it
+    /// does not publish at all. Neither alone is sufficient, which is why both exist.
+    ///
+    /// The fixture uses a REAL matured stall from the real clock, not a hand-built value — the type
+    /// has no public constructor, by design (see `crates/eqoxide-core/tests/afloat_unconstructible.rs`),
+    /// so this is the only way to obtain one and the test could not fake it if it wanted to.
+    ///
+    /// Mutation check (#801, run independently): drop `self.player_afloat_stall = None;` from
+    /// `begin_zone_in` → RED here.
+    #[test]
+    fn begin_zone_in_clears_the_previous_zones_afloat_stall_801() {
+        use crate::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
+
+        let mut gs = GameState::new();
+
+        // Mature a genuine stall: a body held at one point under a sustained horizontal wish.
+        let anchor = [-812.5_f32, 43.0, -119.75];
+        let mut clock = AfloatStallClock::default();
+        for _ in 0..((AFLOAT_STALL_SECS / 0.05).ceil() as usize + 3) {
+            clock.observe(AfloatFrame::Wished, anchor, 0.05);
+        }
+        let stall = clock.stall().expect("fixture must actually reach the disclosure threshold");
+        assert_eq!(stall.anchor(), anchor, "fixture sanity: the anchor is the departed zone's");
+        gs.player_afloat_stall = Some(stall);
+
+        gs.begin_zone_in();
+
+        assert!(gs.player_afloat_stall.is_none(),
+            "an afloat stall names an anchor in the zone we just left; nothing recomputes it while \
+             the new zone loads, so a zone-in must clear it — otherwise the API keeps reporting a \
+             trapped swimmer at coordinates that belong to a different zone");
     }
 
     /// #757 — `zone_cross_attempts` and `zone_cross_plan` must NOT survive a zone-in.

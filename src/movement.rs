@@ -120,251 +120,27 @@ pub fn manual_wish(dir: [f32; 2]) -> ([f32; 2], Option<f32>) {
 
 // `ControllerView` moved to `eqoxide-ipc` (#544 Step 2c) — re-exported at the top of this module.
 
-// ── #776: the trapped-swimmer disclosure ─────────────────────────────────────────────────────────
+// ── #776: the trapped-swimmer disclosure — DEFINED IN `eqoxide_core::afloat` ────────────────────
 //
-// Since #661 a body afloat in water never enters the depenetration net (see `depenetrate`'s door,
-// and the reasons there — every question the net asks about a floating body is mis-posed). That
-// removed a LOUD failure mode: the review that produced #767 measured `main` walking a swimmer
-// ~140 u OUT of a sealed box through the walls, one ring radius at a time. What it left behind is a
-// QUIET one. A swimmer sealed in a pocket, or pressing at a passage `try_duck_under` refuses,
-// simply stops: `on_ground = false`, `in_water = true`, `hold() = None`, and `stuck_time` never
-// accrues because the net's clock is the only one and the net no longer runs for floaters. Every
-// observable reads "swimming normally". That is the project's top-ranked defect class — a missing
-// disclosure an agent cannot detect, cannot retry around, and builds every later decision on.
+// The signal, its two thresholds, the frame classification and the window clock all live in
+// `crates/eqoxide-core/src/afloat.rs`, together with the whole design record that used to sit here:
+// why it is a module and not just private fields, why the WISH half is horizontal while the
+// PROGRESS half is 3-D, and the false-negative classes it does not cover. It moved DOWN in #801
+// because publishing it over HTTP means `eqoxide_ipc::ControllerView` and `GameState` have to name
+// the type, and neither can depend on this crate. That module also records what the move widened.
 //
-// # Why this is NOT a `ControllerHoldReason`, and why it needs its own signal
-//
-// The state is **not locally distinguishable from correct behaviour**. A swimmer resting at its
-// float plane beside a wall is also stationary, also unsupported, also wet — that is what a swimmer
-// DOES. Publishing the shape naively would raise an alarm on every ordinary floating character, and
-// **a false alarm in an honesty observable is the same defect as a silence** (the argument is
-// recorded verbatim at the neutral-buoyancy branch in `step`, which declines to report itself for
-// exactly this reason).
-//
-// So the signal is not the shape, it is **sustained zero progress against a nonzero wish**:
-//
-//   * **nonzero horizontal wish** — the driver is actively asking for lateral motion, and asking
-//     with a speed behind it. An idle floater has no wish, so it can never open a window. This is
-//     the whole resting-vs-trapped distinction, and it is enforced by TYPE below
-//     ([`AfloatFrame::Resting`] has no path to the advancing arm), not by a guard a later edit can
-//     invert;
-//   * the WISH half is **horizontal only**, deliberately: a pure UP-wish that goes nowhere is what
-//     a swimmer at the surface gets from the surface clamp in `step`, and is what the walker's own
-//     haul-out steering sends. Opening a window on it would false-alarm on the single most common
-//     wish in the whole water system;
-//   * the PROGRESS half is **three-dimensional**, and the asymmetry is the point. The reason above
-//     is a reason about WISHES and does not carry over: the surface up-wish case has a ZERO
-//     horizontal wish, so it is already `Resting` and no window is open for a vertical progress
-//     term to keep alive. Meanwhile the production intent shape sets a unit horizontal `wish_dir`
-//     and a `swim_vspeed` in the same `MoveIntent` (the walker's Slice-3 depth control, and the
-//     manual path), so a swimmer descending a shaft with its lateral wish pressed into the shaft
-//     wall is ordinary — and a horizontal-only progress term disclosed exactly that body as going
-//     nowhere. **Measured**, round-2 review B1 and
-//     `a_driven_dive_or_rise_along_a_blocked_face_never_raises_the_afloat_stall`: 120 u of vertical
-//     travel in 6 s reported as `AfloatStall { secs: 5.92 }`, with a log line offering "a down-wish
-//     dive may still cross" to a body already performing one. Counting z can only ever RE-ANCHOR
-//     the window, never advance it, so widening it here is strictly a false-alarm reduction;
-//   * **sustained** — `AFLOAT_STALL_SECS` against net displacement from an anchor, so no transient
-//     (buoyancy settling, a refused step-up, a grazing slide) can trip it.
-//
-// # What this deliberately does NOT claim
-//
-// An `AfloatStall` is weaker than a [`ControllerHold`] and must never be conflated with one. A hold
-// says *the body cannot move at all, under any driver*. A stall says only *this wish has produced
-// no motion for this long*. The trapped swimmer at qcat's pocket mouth is escapable — by a DRIVEN
-// dive, which `qcat_pocket_swimmer_escapes_to_the_shaft_under_a_driven_dive` pins — while the
-// horizontal-only drive that stalls there cannot get out on its own. Reporting "you are not moving"
-// is true of both; reporting "you are frozen" would be false of the first. That is why this is a
-// separate type with its own vocabulary rather than a third `ControllerHoldReason` variant.
-//
-// Scope, stated plainly: this covers the AFLOAT case only (`in_water && !on_ground`). A DRY body
-// pressed against a wall is equally silent and equally uncovered — but that is pre-existing and not
-// what #661 changed, and widening this to dry bodies would collide with the depenetration net's own
-// `stuck_time`/`EmbeddedNoRecovery` accounting. A wading body standing on the bottom is likewise
-// out (it is `on_ground`, so the dry-net vocabulary applies to it).
-//
-// # The FALSE-NEGATIVE classes this signal does not cover — named, not implied
-//
-// The predicate is deliberately narrow, and narrowness has a cost. These bodies are genuinely stuck
-// and this signal stays silent about every one of them. That is the correct behaviour for the
-// predicate as defined, not a bug to be "fixed" by loosening it — but leaving them unnamed would be
-// the same defect in prose that a silent observable is in code:
-//
-//   * **a swimmer lidded under a PURE vertical wish** (`wish_dir = [0, 0]`, `wish_vspeed > 0`) —
-//     `hold() = None`, `afloat_stall() = None`, measured. There is no horizontal wish, so no window
-//     ever opens. This is the **#783** shape: at the qcat pocket the walker's steering turns a
-//     rise-at-destination `swim_surface` edge into an immediate up-wish, the body clamps under the
-//     pocket lid, and it stays there for the whole 20 s of the offline repro. Widening the WISH
-//     half to vertical is NOT the answer — it would false-alarm on every surface hold, which is the
-//     single most common wish in the water system (see the bullet above). #783 fixes it where it
-//     belongs, in the steering that produces the wrong wish;
-//   * **a swimmer slowly losing ground** — retreating, or drifting, at under `AFLOAT_PROGRESS` per
-//     window is not "no progress" by this definition;
-//   * **a swimmer circling a pocket wider than `AFLOAT_PROGRESS`** — it keeps re-anchoring, so the
-//     window never matures. Widening the progress term to 3D (above) extends this same residual to
-//     the vertical axis: a body oscillating vertically through more than `AFLOAT_PROGRESS` about a
-//     fixed point re-anchors too. Both are the known cost of a NET-displacement-from-anchor test,
-//     which is itself chosen over a per-frame epsilon for a stronger reason (see `AFLOAT_PROGRESS`).
+// This file now holds only the CALL SITES: `step` folds one classified frame in, `clear_hold` and
+// `teleport` drop the window, `afloat_stall()` reports it, and `app.rs` publishes what it reports.
 
-/// #776's afloat-stall signal, in a module of its own **so its "not constructible" guarantee is
-/// enforced by the compiler rather than asserted by a comment**.
-///
-/// Round-2 review N3 measured the reason this is a module: Rust's private fields are MODULE-private,
-/// not type-private, so while `AfloatStall`'s fields kept every caller in the workspace out, any
-/// line of `movement.rs` — 4,100 of them — could still write `AfloatStall { secs: 0.0, anchor: … }`
-/// and fabricate a sub-threshold instance. The doc claimed otherwise. Rather than weaken the claim
-/// to "outside this module", the boundary was moved to where the claim already was: nothing outside
-/// `afloat` can name those fields, `stall()` is the sole construction site, and a future edit
-/// anywhere else in `movement.rs` — including its test module, which is a SIBLING of this one —
-/// fails to compile rather than producing a premature alarm.
-mod afloat {
-    /// #776: seconds of sustained no-progress, against a NONZERO horizontal wish, while the body is
-    /// afloat, before the controller discloses an [`AfloatStall`].
-    ///
-    /// Sized to be far longer than any legitimate transient a floating body has: buoyancy settles to
-    /// the float plane at `BUOY_RATE` = 30 u/s (a full `float_depth` = 2 u of settle is 0.07 s), a
-    /// swimming step-up / duck-under either resolves on the frame it is tried or never, and a slide
-    /// along a wall makes real tangential progress. Three seconds of a driver asking for motion and
-    /// getting under [`AFLOAT_PROGRESS`] of it is not any of those.
-    pub(super) const AFLOAT_STALL_SECS: f32 = 3.0;
-    /// #776: net displacement from the window's anchor (units) that counts as PROGRESS and re-arms
-    /// the window from the new position.
-    ///
-    /// Measured as NET displacement from an anchor, not per-frame delta, on purpose: a per-frame
-    /// epsilon would be re-armed for ever by float noise or by a body oscillating between two
-    /// contacts, which is the same "not going anywhere" the signal exists to disclose. 0.5 u is
-    /// ~0.011 s of travel at the 44 u/s the nav swim drive uses, so a body that is genuinely
-    /// swimming clears it on the first frame and never opens a window at all.
-    ///
-    /// Measured in **three dimensions** (round-2 review B1): see the `PROGRESS half` bullet in the
-    /// block comment above this module for why the wish half's horizontal-only reason does not carry
-    /// over to this half, and for the 120 u false alarm it produced when it did.
-    pub(super) const AFLOAT_PROGRESS: f32 = 0.5;
-
-    /// Euclidean length of a 3-vector. The progress term, and the ONE place the signal's notion of
-    /// "got somewhere" is defined.
-    #[inline]
-    fn len3(d: [f32; 3]) -> f32 { (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() }
-
-    /// #776: the body is afloat and a horizontal wish has produced no net progress for a sustained
-    /// window. Level-triggered — recomputed from scratch every stepped frame, exactly like
-    /// `ControllerHold` — so it cannot outlive its cause.
-    ///
-    /// The fields are private and there is no public constructor **on purpose**: the only code that
-    /// can build one is [`AfloatStallClock::stall`], and only once the window has actually reached
-    /// [`AFLOAT_STALL_SECS`]. A premature or fabricated `AfloatStall` is therefore not
-    /// representable — see this module's own doc for why that is a module boundary and not just a
-    /// field one — which is the point: this is an honesty observable, and the failure that matters
-    /// most for it is the FALSE one.
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct AfloatStall {
-        secs:   f32,
-        anchor: [f32; 3],
-    }
-
-    impl AfloatStall {
-        /// Seconds the body has been afloat, wished at, and within [`AFLOAT_PROGRESS`] of `anchor`.
-        /// Always `>= AFLOAT_STALL_SECS` — see the type doc. Counts the WHOLE window, including the
-        /// pre-threshold part, so an agent watching it advance sees the true age of the stall.
-        pub fn secs(self) -> f32 { self.secs }
-        /// The position the window opened at — the point the body has failed to get more than
-        /// [`AFLOAT_PROGRESS`] away from, in any direction.
-        pub fn anchor(self) -> [f32; 3] { self.anchor }
-    }
-
-    /// One frame's answer to "is this body being asked to swim somewhere, and failing to?".
-    ///
-    /// A total function of the frame's own facts, computed in ONE place ([`AfloatFrame::classify`]),
-    /// so the clock below cannot advance on a frame that was never classified [`Self::Wished`]. This
-    /// is the resting-vs-trapped distinction made unrepresentable-in-the-wrong-direction rather than
-    /// guarded: there is no arm of [`AfloatStallClock::observe`] that both accepts a non-`Wished`
-    /// frame and advances the clock.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) enum AfloatFrame {
-        /// Not afloat: dry, or standing/wading on the bottom (`on_ground`). The depenetration net's
-        /// vocabulary (`stuck_time`, `ControllerHoldReason::EmbeddedNoRecovery`) owns these bodies.
-        NotAfloat,
-        /// Afloat with NO horizontal wish — an ordinary floating character, holding at its plane.
-        /// **This variant is the false-alarm guard.** It resets the window like `NotAfloat` does.
-        Resting,
-        /// Afloat AND asked to move horizontally. Only this variant can advance the clock.
-        Wished,
-    }
-
-    impl AfloatFrame {
-        /// `afloat` = the body is in water and unsupported. `throttle` = the frame's horizontal wish
-        /// magnitude and `speed` its requested speed — the same two values `step` multiplies
-        /// together for its collide-and-slide, so the classification and the motion can never
-        /// disagree about whether a wish was made.
-        ///
-        /// **BOTH are required** (round-2 review N5). `throttle` alone is `|wish_dir|`, so
-        /// `wish_dir = [1, 0], speed = 0.0` used to classify `Wished` and mature a stall in EMPTY
-        /// OPEN WATER with no geometry at all — measured, and pinned by
-        /// `a_unit_wish_at_zero_speed_never_raises_the_afloat_stall`. A frame whose requested
-        /// displacement is identically zero is not a drive that is failing; nobody asked for
-        /// anything, which is precisely `Resting`.
-        pub(super) fn classify(afloat: bool, throttle: f32, speed: f32) -> Self {
-            if !afloat { Self::NotAfloat }
-            else if throttle > 1e-4 && speed > 0.0 { Self::Wished }
-            else { Self::Resting }
-        }
-    }
-
-    /// The window state behind [`AfloatStall`]. `None` = no window open.
-    ///
-    /// A window carries the position it opened at and how long it has been open. Progress is
-    /// measured as NET 3-D displacement from that anchor rather than per-frame delta — see
-    /// [`AFLOAT_PROGRESS`].
-    #[derive(Debug, Clone, Copy, Default, PartialEq)]
-    pub(super) struct AfloatStallClock {
-        window: Option<([f32; 3], f32)>,
-    }
-
-    impl AfloatStallClock {
-        /// Fold one resolved frame in. `pos` is the body's position AFTER the frame resolved, `dt`
-        /// the frame time.
-        pub(super) fn observe(&mut self, frame: AfloatFrame, pos: [f32; 3], dt: f32) {
-            match frame {
-                // Not afloat, or afloat with nothing asked of it: no window, nothing to disclose.
-                // Both arms are unconditional — a resting floater cannot carry a window across an
-                // idle frame and resume it later, so an alarm can never be assembled out of
-                // scattered frames.
-                AfloatFrame::NotAfloat | AfloatFrame::Resting => self.window = None,
-                AfloatFrame::Wished => match self.window {
-                    None => self.window = Some((pos, 0.0)),
-                    Some((anchor, secs)) => {
-                        // THREE-dimensional (round-2 review B1). A swimmer that descended 120 u of
-                        // water column while its blocked lateral wish went nowhere is not trapped,
-                        // and a horizontal-only term said it was. `hlen` is still the right measure
-                        // for the WISH; it is the wrong one for "did the body get anywhere".
-                        let moved = len3([pos[0] - anchor[0], pos[1] - anchor[1], pos[2] - anchor[2]]);
-                        // Progress: re-anchor HERE and restart the clock. A body creeping forward
-                        // 0.5 u at a time is making progress and must never accumulate a stall.
-                        if moved > AFLOAT_PROGRESS { self.window = Some((pos, 0.0)); }
-                        else { self.window = Some((anchor, secs + dt)); }
-                    }
-                },
-            }
-        }
-
-        /// The stall in force right now, or `None`. The ONLY constructor of [`AfloatStall`].
-        pub(super) fn stall(self) -> Option<AfloatStall> {
-            match self.window {
-                Some((anchor, secs)) if secs >= AFLOAT_STALL_SECS =>
-                    Some(AfloatStall { secs, anchor }),
-                _ => None,
-            }
-        }
-    }
-}
-
-pub use afloat::AfloatStall;
-use afloat::{AfloatFrame, AfloatStallClock, AFLOAT_PROGRESS};
-/// Only the tests outside `mod afloat` read the maturity threshold — the runtime path asks
+// Re-exported so every existing `crate::movement::AfloatStall` path keeps resolving — the same
+// treatment `ControllerHold` gets above, and for the same reason.
+pub use eqoxide_core::afloat::AfloatStall;
+use eqoxide_core::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_PROGRESS};
+/// Only the tests in this file read the maturity threshold — the runtime path asks
 /// `AfloatStallClock::stall()` rather than re-deriving the comparison, which is the whole point of
 /// keeping the clock's state private. A plain `use` here is an unused import in a non-test build.
 #[cfg(test)]
-use afloat::AFLOAT_STALL_SECS;
+use eqoxide_core::afloat::AFLOAT_STALL_SECS;
 
 /// Minimum spacing (seconds) between afloat-stall log lines. Its own throttle rather than a share of
 /// `hold_log_cooldown`: the two disclosures are independent, and one silently swallowing the other's
@@ -426,7 +202,7 @@ pub struct CharacterController {
     /// breaks a fall") must still hold for every other water-exit path. Keying this off actual
     /// descent (not `wish_vspeed`'s sign) is what keeps a sideways exit from false-arming a fall.
     swim_sinking: bool,
-    /// #776: the afloat no-progress window. See the block comment above [`AfloatStall`] for why the
+    /// #776: the afloat no-progress window. See `eqoxide_core::afloat`'s module docs for why the
     /// trapped swimmer needs its own signal instead of a `ControllerHoldReason`. Recomputed every
     /// stepped frame from that frame's own facts; reset by [`Self::teleport`] and
     /// [`Self::clear_hold`] for the same reasons those reset the hold.
@@ -749,46 +525,61 @@ impl CharacterController {
     /// (#724 round-3 review, N1 — this used to say "every frame" flatly.)
     pub fn hold(&self) -> Option<ControllerHold> { self.hold }
 
-    /// #776: the afloat stall in force, or `None` — see [`AfloatStall`] and the block comment above
-    /// it. `None` includes every ordinary floating character: a body with no horizontal wish never
-    /// opens a window at all, so a resting floater is `None` for as long as it floats.
+    /// #776: the afloat stall in force, or `None` — see [`AfloatStall`] and `eqoxide_core::afloat`'s
+    /// module docs. `None` includes every ordinary floating character: a body with no horizontal
+    /// wish never opens a window at all, so a resting floater is `None` for as long as it floats.
     ///
     /// Level-triggered exactly like [`Self::hold`]: recomputed at the end of every stepped frame
     /// from that frame's own classification, so it clears the frame the body makes progress or the
     /// driver stops asking.
     ///
-    /// # ⚠️ NOT YET ON THE HTTP OBSERVABLE — deliberately, and this is the whole residual of #776
+    /// # Published (#801) — but read [`Self::disclosures`], not this, if you are a publisher
     ///
-    /// This is the controller half. Until the publication lands the disclosure reaches the LOG only
-    /// (the throttled `controller AFLOAT STALL` line in `step`), which serves a human or log-reading
-    /// operator and does NOT serve an HTTP-driving agent. Said plainly rather than left implicit,
-    /// because "there is a signal now" would otherwise read as "agents can see it".
+    /// #800 shipped this as a controller-only signal reaching a throttled `tracing::info!` and
+    /// nothing else, which served a log-reading operator and not the HTTP-driving agent the
+    /// honesty invariant is about. #801 wired it through to `GET /v1/observe` as
+    /// `player.afloat_stall`, on the same six-file path [`Self::hold`] travels:
     ///
-    /// **The publication work is tracked by #801** — that issue, not this comment, is the current
-    /// state of it. (Round-2 review N4: this used to record *which files were held by other agents
-    /// on the day it landed*, a transient fleet fact baked into tracked source that nobody reading
-    /// it later could check.)
-    ///
-    /// The path a new observable has to travel is [`Self::hold`]'s, TRACED here rather than reasoned
-    /// — `git grep player_hold ControllerView` over the workspace, which is how the two files the
-    /// first version of this list omitted were found. Six files, in order:
-    ///
-    /// 1. `src/app.rs` — the render thread's `v.hold = self.controller.hold()` writer, and the
-    ///    `clear_hold()` beside it on frames that render without stepping;
-    /// 2. `crates/eqoxide-ipc/src/lib.rs` — the `ControllerView` field the render thread publishes;
+    /// 1. `src/app.rs` — the render thread's publisher, which takes BOTH disclosures in one call
+    ///    ([`Self::disclosures`]) so neither can be written without the other, plus the
+    ///    [`Self::clear_hold`] beside it on frames that render without stepping;
+    /// 2. `crates/eqoxide-ipc/src/lib.rs` — `ControllerView::afloat_stall`;
     /// 3. `crates/eqoxide-net/src/action_loop.rs` — `ActionLoop::stream_position`, which mirrors the
     ///    view into `GameState` on the same tick as the position;
-    /// 4. `crates/eqoxide-core/src/game_state.rs` — `GameState::player_hold`, plus the
+    /// 4. `crates/eqoxide-core/src/game_state.rs` — `GameState::player_afloat_stall`, plus the
     ///    `begin_zone_in` clear that stops a departed zone's claim surviving a zone load;
-    /// 5. `crates/eqoxide-http/src/lib.rs` — the `player.*` view. Its `detail` match is
-    ///    **exhaustive**, so a new variant forces the edit rather than falling through silently;
+    /// 5. `crates/eqoxide-http/src/lib.rs` — `player.afloat_stall`, a view of its OWN, deliberately
+    ///    not folded into `player.hold`;
     /// 6. `docs/http-api.md`.
     ///
-    /// Whatever shape #801 chooses, two constraints carry over from here: an `AfloatStall` is not a
-    /// `ControllerHold` (see the block comment above [`AfloatStall`]), and the false-alarm direction
-    /// is the one that matters — the pins in this module's tests exist for that and must not be
-    /// weakened by the surface built on top of them.
+    /// Two constraints carried over from #800 and still hold: an `AfloatStall` is not a
+    /// `ControllerHold` — a hold says the body cannot move at all, this says only that *this wish*
+    /// produced no motion — and the false-alarm direction is the one that matters. The seven
+    /// false-alarm tests in this module's test block are unchanged by #801 and must not be weakened
+    /// by the surface built on top of them.
     pub fn afloat_stall(&self) -> Option<AfloatStall> { self.afloat.stall() }
+
+    /// Both level-triggered controller disclosures, in ONE call — the publisher's entry point.
+    ///
+    /// # Why this exists rather than two separate reads (#801)
+    ///
+    /// `app.rs`'s render-thread publisher needs to write both into `ControllerView` every rendered
+    /// frame. Written as two independent statements, dropping one of them is a *silent* edit: the
+    /// remaining field keeps its previous value, `stream_position` keeps mirroring it, and the API
+    /// keeps answering — with a stale, confident value that nothing recomputes. That is the #343 /
+    /// #792 shape, and it is exactly what a reviewer reading a diff is least likely to notice.
+    ///
+    /// Returning them as a tuple the publisher destructures into place makes the omission
+    /// unrepresentable rather than merely discouraged: a publisher that stops writing one half no
+    /// longer type-checks. It can still be discarded, but only by writing `_` — a deliberate act
+    /// that shows up in a diff, not an absence that does not.
+    ///
+    /// **What this does NOT do:** it does not prove the publisher is *called*. Nothing here reaches
+    /// into `app.rs`'s event loop. It removes one specific failure — publishing one disclosure and
+    /// silently forgetting the other — and no other.
+    pub fn disclosures(&self) -> (Option<ControllerHold>, Option<AfloatStall>) {
+        (self.hold(), self.afloat_stall())
+    }
 
     /// Drop any hold WITHOUT stepping (`app.rs` calls this on the frames it does not step the
     /// controller — no collision loaded, i.e. mid zone-load). The last hold described geometry that
@@ -805,9 +596,10 @@ impl CharacterController {
     ///
     /// #776: this drops the afloat no-progress window too, for the identical reason — the window
     /// describes a body failing to cross specific geometry, and on a frame with no collision loaded
-    /// there is no such geometry. Doing it here rather than at a new call site is what keeps the
-    /// future publication of [`Self::afloat_stall`] correct with NO change to `app.rs`'s
-    /// not-stepped arm.
+    /// there is no such geometry. Doing it here rather than at a new call site is what keeps #801's
+    /// publication of [`Self::afloat_stall`] correct with NO change to `app.rs`'s not-stepped arm —
+    /// and it means `the_frames_that_do_not_step_still_clear_the_hold`, which scans that arm for
+    /// this exact call, pins BOTH disclosures against the stale-across-a-zone-load failure.
     pub fn clear_hold(&mut self) { self.hold = None; self.afloat = AfloatStallClock::default(); }
 
     /// Record — and, throttled, log — that a recovery branch has stopped the body this frame with
@@ -3965,6 +3757,53 @@ mod tests {
         assert!(ctrl.hold().is_none(),
             "#776: and this is NOT a ControllerHold — the body is not frozen, a driven dive may \
              still cross. Conflating the two would be a different lie; got {:?}", ctrl.hold());
+    }
+
+    /// #801 — `disclosures()` reports what `hold()` and `afloat_stall()` report, not a constant.
+    ///
+    /// `app.rs` publishes both halves through this one call, so a `disclosures()` that quietly
+    /// hard-coded one half (`(self.hold(), None)`) would compile, pass every existing test in this
+    /// file — they all read `afloat_stall()` directly — and silence the entire HTTP observable #801
+    /// exists to add. That is the shape this test exists for.
+    ///
+    /// The tuple's ORDER is not tested because it is not testable: the two halves have different
+    /// types, so a swapped return does not compile. Making a hazard unrepresentable is preferable to
+    /// pinning it, and this records which of the two treatments each half got.
+    ///
+    /// **Axes deliberately varied:** all three reachable combinations of the two disclosures that
+    /// this fixture can produce — neither, then stall-without-hold. **Axis NOT varied, and stated
+    /// rather than hidden:** hold-without-stall and both-at-once are not exercised here; a
+    /// `ControllerHold` needs an embedded/underworld body, which this flooded-corridor fixture
+    /// cannot make. `hold()`'s own publication is pinned separately by
+    /// `the_frames_that_do_not_step_still_clear_the_hold`.
+    ///
+    /// MUTATION CHECK (#801): change `disclosures` to return `(self.hold(), None)` → RED here.
+    #[test]
+    fn disclosures_reports_both_halves_and_not_a_hardcoded_one_801() {
+        let c = sealed_east_face();
+        let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
+
+        // State 1: nothing wrong yet — both halves None, and both must AGREE with the singles.
+        for _ in 0..30 { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        let (h, s) = ctrl.disclosures();
+        assert_eq!(h, ctrl.hold(), "the hold half must be `hold()`, whatever it says");
+        assert_eq!(s, ctrl.afloat_stall(), "the stall half must be `afloat_stall()`");
+        assert!(h.is_none() && s.is_none(), "fixture: half a second of pressing discloses nothing");
+
+        // State 2: a matured stall with NO hold — the case a hard-coded `None` would erase.
+        for _ in 0..(5 * 60) { ctrl.step(swim_toward([1.0, 0.0], 44.0), 1.0 / 60.0, &c); }
+        let (h, s) = ctrl.disclosures();
+        assert_eq!(h, ctrl.hold());
+        assert_eq!(s, ctrl.afloat_stall());
+        assert!(h.is_none(),
+            "fixture: a trapped swimmer is not HELD — if this fires the fixture drifted into the \
+             depenetration net's territory and the assertion below proves nothing");
+        let s = s.expect(
+            "#801: the publisher reads BOTH halves through this one call. A `disclosures()` that \
+             returned a constant `None` here would compile, keep every test in this file green — \
+             they all read `afloat_stall()` directly — and publish \"swimming normally\" over HTTP \
+             about a swimmer that has gone nowhere for five seconds.");
+        assert!(s.secs() >= AFLOAT_STALL_SECS, "disclosed {:.2}s", s.secs());
     }
 
     #[test]

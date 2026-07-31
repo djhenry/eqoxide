@@ -243,6 +243,16 @@ pub struct PlayerState {
     /// nothing knows it is talking to a client too old to report the state, rather than concluding
     /// the character is fine.
     pub hold: Option<PlayerHoldView>,
+    /// #776/#801 (agent-honesty): **the character is afloat, is being wished at, and is going
+    /// nowhere** — see [`PlayerAfloatStallView`], which also states plainly which real traps this
+    /// stays silent about. `null` when no stall is in force, which is the case for every ordinary
+    /// swimmer. Distinct from [`Self::hold`] on purpose: a hold claims the body cannot move at all,
+    /// this claims only that the current wish is producing no motion.
+    ///
+    /// No `skip_serializing_if`, for the same reason as [`Self::hold`]: the key is ALWAYS present,
+    /// so an agent that greps for it and finds nothing knows it is talking to a client too old to
+    /// report the state, rather than concluding the swimmer is fine.
+    pub afloat_stall: Option<PlayerAfloatStallView>,
 }
 
 impl PlayerState {
@@ -345,6 +355,33 @@ impl PlayerState {
                          under it. This will not clear on its own — ask a GM to move the character, \
                          or zone out.",
                 },
+            }),
+            // #776/#801: the afloat stall, mirrored into `gs` by the same `stream_position` tick as
+            // the hold above and the position above that. A view of its own — folding it into `hold`
+            // would publish "this body cannot move at all" about a body a driven dive can free.
+            afloat_stall: gs.player_afloat_stall.map(|s| {
+                let a = s.anchor();
+                PlayerAfloatStallView {
+                    secs:         s.secs(),
+                    anchor_east:  a[0],
+                    anchor_north: a[1],
+                    anchor_up:    a[2],
+                    stall_threshold_secs: eqoxide_core::afloat::AFLOAT_STALL_SECS,
+                    progress_threshold:   eqoxide_core::afloat::AFLOAT_PROGRESS,
+                    detail: "the character is AFLOAT in water, a driver is asking it to swim \
+                             horizontally, and it has not moved more than the reported \
+                             progress_threshold from `anchor` for the reported time. Movement \
+                             commands are being accepted and are producing no net motion. This is \
+                             NOT the same claim as `hold`: the body is not necessarily frozen, only \
+                             this wish is failing. Things that often work: a DRIVEN DIVE or rise \
+                             (a vertical wish — the classic submerged-pocket mouth is escapable \
+                             downward but not sideways), backing out the way you came, or a \
+                             different horizontal heading. If none of those move it, treat it as a \
+                             genuine trap and zone out or ask a GM. A `null` here does not mean \
+                             \"not stuck\" — a swimmer losing ground slowly, or circling a pocket \
+                             wider than progress_threshold, makes progress by this definition and \
+                             is reported as null.",
+                }
             }),
             // #336: spawn-scoped, unlike target_con*/target_level above — populated for the LAST
             // consider of any spawn, not gated on that spawn being the current target.
@@ -567,6 +604,77 @@ pub struct PlayerHoldView {
     /// path is reasoned from the branch structure, not measured, but it is enough that the caveat
     /// must stay.)
     pub held_secs: f32,
+    /// Plain-language statement of what is true and what an agent can do about it.
+    pub detail: &'static str,
+}
+
+/// **#776/#801 (agent-honesty): this character is afloat, is being asked to swim somewhere, and is
+/// not getting there.** `player.afloat_stall` on `GET /v1/observe`.
+///
+/// # This is NOT a [`PlayerHoldView`], and the difference is the whole point
+///
+/// A `hold` says *the body cannot move at all, under any driver* — the honest response is to get a
+/// GM to move it or to zone out. This says only *the wish currently being made has produced no
+/// motion for this long*. Those are different claims and the weaker one is often actionable: the
+/// worked case is a swimmer at a submerged pocket mouth, which stalls a horizontal swim wish
+/// indefinitely and still escapes under a **driven dive**. Reporting that body as "frozen" would be
+/// a new false claim, so it gets its own key rather than a third `hold.reason`.
+///
+/// Before #801 this state had no observable at all: a trapped swimmer reads `on_ground = false`,
+/// `in_water = true`, `hold = null`, and the walker's own `stuck_ticks` only advances while a
+/// `/goto` is driving. Every field said "swimming normally". The signal existed inside the
+/// controller from #800 and reached a log line, which serves an operator reading logs and not an
+/// agent polling this API.
+///
+/// # What a `null` here does and does not mean
+///
+/// `null` means *no stall is in force by this definition*. It does **not** mean "not stuck". The
+/// definition is deliberately narrow and these bodies are genuinely trapped and silent here:
+///
+/// * a swimmer **slowly losing ground** — retreating or drifting at under the 0.5 u progress
+///   threshold per window counts as no progress only if it stays inside the threshold; a body that
+///   creeps outside it re-anchors and the window restarts;
+/// * a swimmer **circling a pocket wider than 0.5 u** — it keeps re-anchoring, so the window never
+///   matures. The same residual applies on the vertical axis, since progress is measured in 3-D;
+/// * a swimmer lidded under a **pure vertical wish** (no horizontal component at all) — no window
+///   ever opens, because the wish half of the predicate is horizontal-only on purpose: a sustained
+///   up-wish at the surface is what every legitimate haul-out does, and counting it would false-alarm
+///   on the most common wish in the water system;
+/// * any **dry** body pressed against a wall, and any body **wading on the bottom**. Both are out of
+///   scope — the depenetration net's `stuck_time` / `hold` vocabulary owns them.
+///
+/// The 3.0 s and 0.5 u thresholds behind all of this are **engineering choices** sized against the
+/// buoyancy settle rate and the nav swim drive, documented at their definitions in
+/// `eqoxide_core::afloat`. They are not measurements of anything, and this doc does not claim they
+/// are tuned.
+///
+/// # Freshness
+///
+/// Exactly that of `pos_east/north/up` and [`PlayerState::hold`] beside it: the render controller
+/// recomputes it on every stepped frame, `app.rs` republishes it on every rendered frame in the same
+/// statement that republishes the hold, and `ActionLoop::stream_position` mirrors it on the same
+/// tick as the position. On rendered frames that do not step (mid zone-load) an explicit clear runs;
+/// on a zone-in the mirrored copy is cleared too. A stalled body cannot be *freed* without a stepped
+/// frame, so an idle render loop cannot manufacture a stall — what it can do is freeze `secs`, which
+/// is detectable the same way `held_secs` is (poll twice, compare the delta against your own clock).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PlayerAfloatStallView {
+    /// Seconds the body has been afloat, wished at, and stuck within `progress_threshold` of the
+    /// anchor. Controller frame time, like [`PlayerHoldView::held_secs`], and for the same reason.
+    /// Counts the WHOLE window including the pre-threshold part, so it is the true age of the stall
+    /// and always `>= stall_threshold_secs`.
+    pub secs: f32,
+    /// The position the window opened at — the point the body has failed to get more than
+    /// `progress_threshold` away from, in any direction. Same frame and datum as
+    /// `player.pos_east/north/up` (FOOT height), so it can be differenced against them directly.
+    pub anchor_east:  f32,
+    pub anchor_north: f32,
+    pub anchor_up:    f32,
+    /// The two thresholds behind this report, published rather than left for the agent to guess.
+    /// Engineering choices, not measurements — see the type doc.
+    pub stall_threshold_secs: f32,
+    /// Net 3-D displacement from the anchor that counts as progress and re-arms the window (units).
+    pub progress_threshold: f32,
     /// Plain-language statement of what is true and what an agent can do about it.
     pub detail: &'static str,
 }
@@ -1116,6 +1224,104 @@ mod player_view_datum_tests {
         let view = PlayerState::from_game_state(&gs);
         assert_eq!(view.pos_up, 73.875,
             "pos_up must report the internal FOOT datum, not foot + WIRE_Z_OFFSET");
+    }
+}
+
+/// #776/#801: the trapped-swimmer disclosure has to survive the LAST hop — the JSON.
+///
+/// Everything upstream of here (the clock, the view, the mirror) is pinned by its own tests. This
+/// module pins the projection an agent actually reads: that a real stall reaches the serialised
+/// body with its anchor and seconds intact, that the absence of one serialises as an explicit
+/// `null` rather than a missing key, and — the part that would otherwise be a silent design
+/// regression — that it is published as a field of its own and NOT folded into `hold`.
+#[cfg(test)]
+mod afloat_stall_view_tests {
+    use super::PlayerState;
+    use eqoxide_core::afloat::{AfloatFrame, AfloatStall, AfloatStallClock, AFLOAT_STALL_SECS};
+
+    /// The only way to obtain one: drive the real clock. `AfloatStall` has no public constructor
+    /// (five fabrication forms are compile errors — see
+    /// `crates/eqoxide-core/tests/afloat_unconstructible.rs`), so this fixture cannot lie about
+    /// what the runtime would produce.
+    fn matured(anchor: [f32; 3]) -> AfloatStall {
+        let mut clock = AfloatStallClock::default();
+        for _ in 0..((AFLOAT_STALL_SECS / 0.05).ceil() as usize + 3) {
+            clock.observe(AfloatFrame::Wished, anchor, 0.05);
+        }
+        clock.stall().expect("fixture must actually reach the disclosure threshold")
+    }
+
+    /// A stall in `GameState` reaches the JSON with both of its facts intact.
+    ///
+    /// **Axes varied:** the anchor on all three components, including a negative `up` (a submerged
+    /// pocket is below the waterline, and #800's live false alarm was a z-axis bug — a fixture that
+    /// pinned `anchor_up` at 0.0 would be repeating exactly that mistake). **Axis not varied:**
+    /// `secs` is whatever the clock produced; the test asserts the published threshold rather than
+    /// a hard-coded duration, so retuning `AFLOAT_STALL_SECS` cannot silently invalidate it.
+    #[test]
+    fn a_real_stall_reaches_the_json_with_its_anchor_and_seconds_801() {
+        let anchor = [-812.5_f32, 43.0, -119.75];
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.player_afloat_stall = Some(matured(anchor));
+
+        let view = PlayerState::from_game_state(&gs);
+        let s = view.afloat_stall.as_ref().expect("a stall in gs must be published, not dropped");
+
+        assert_eq!(s.anchor_east, anchor[0], "anchor_east");
+        assert_eq!(s.anchor_north, anchor[1], "anchor_north");
+        assert_eq!(s.anchor_up, anchor[2],
+            "anchor_up — a submerged pocket is BELOW the waterline; a projection that flattened \
+             this to 0.0 would publish an anchor the agent cannot navigate to");
+        assert!(s.secs >= AFLOAT_STALL_SECS,
+            "secs {} must never be published below the threshold that earned it", s.secs);
+        assert_eq!(s.stall_threshold_secs, AFLOAT_STALL_SECS,
+            "the threshold is published so the agent can calibrate rather than guess");
+
+        // And it survives serde with the same values — the agent reads bytes, not a Rust struct.
+        let json = serde_json::to_value(&view).expect("PlayerState must serialise");
+        assert_eq!(json["afloat_stall"]["anchor_up"], serde_json::json!(anchor[2]));
+        assert!(json["afloat_stall"]["secs"].as_f64().unwrap() >= AFLOAT_STALL_SECS as f64);
+    }
+
+    /// No stall serialises as an explicit `null`, not a missing key.
+    ///
+    /// A missing key forces every reader to distinguish "the field is absent because this client is
+    /// older" from "the field is absent because there is no stall". An explicit `null` is a positive
+    /// answer. MUTATION CHECK: add `#[serde(skip_serializing_if = "Option::is_none")]` to
+    /// `PlayerState::afloat_stall` → RED here.
+    #[test]
+    fn no_stall_publishes_an_explicit_null_key_801() {
+        let gs = eqoxide_core::game_state::GameState::new();
+        let view = PlayerState::from_game_state(&gs);
+        assert!(view.afloat_stall.is_none());
+
+        let json = serde_json::to_value(&view).expect("PlayerState must serialise");
+        let obj = json.as_object().expect("player state is a JSON object");
+        assert!(obj.contains_key("afloat_stall"),
+            "the key must always be present — an absent key is indistinguishable from an old \
+             client, while an explicit null is a real answer");
+        assert!(obj["afloat_stall"].is_null());
+    }
+
+    /// The stall is its OWN field and does not touch `hold`.
+    ///
+    /// #801's second constraint, made a test rather than a comment: a `hold` asserts the body cannot
+    /// move at all and warrants "ask a GM"; an afloat stall asserts only that THIS horizontal wish
+    /// produced no motion, and is routinely escapable by a driven dive. An agent that saw a `hold`
+    /// here would give up on a body it could have freed itself. This pins the two apart in both
+    /// directions.
+    #[test]
+    fn an_afloat_stall_is_not_published_as_a_hold_801() {
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.player_afloat_stall = Some(matured([1.0, 2.0, -30.0]));
+        // Deliberately NO player_hold — the body is not held.
+
+        let view = PlayerState::from_game_state(&gs);
+        assert!(view.afloat_stall.is_some(), "the stall is published…");
+        assert!(view.hold.is_none(),
+            "…and must NOT also raise `hold`. A hold means the body cannot move at all and the \
+             agent should stop trying; an afloat stall is escapable by a driven dive. Collapsing \
+             them would tell an agent to give up on a body it could free itself.");
     }
 }
 
