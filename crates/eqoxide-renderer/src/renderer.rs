@@ -50,8 +50,107 @@ pub const WEAPON_UNIFORM_SLOTS: usize = 512;
 /// Dedicated uniform slot count for doors (one slot per door mesh draw this frame).
 /// Sized generously; far more than any zone's door count × meshes-per-door.
 pub const DOOR_UNIFORM_SLOTS: usize = 512;
-/// Size of one joint buffer: 128 joints × mat4(64 bytes).
-pub const JOINT_BUF_BYTES: u64 = 128 * 64;
+/// Max joints a skinned model may have: the fixed-size joint uniform buffer holds exactly this
+/// many mat4s (see [`JOINT_BUF_BYTES`]). A skin over this count cannot be uploaded and the model
+/// takes the STATIC (unskinned) render arm instead — see [`SkinFit`].
+pub const JOINT_CAP: usize = 128;
+/// Size of one joint buffer: [`JOINT_CAP`] joints × mat4(64 bytes).
+pub const JOINT_BUF_BYTES: u64 = JOINT_CAP as u64 * 64;
+
+/// Which render arm a model's skin data selects, and — when the STATIC arm is taken despite the
+/// model having skin data — *why*. Before eqoxide#780 `build_character_model` folded three
+/// different situations into one `bool`:
+///
+/// ```text
+/// let use_skinned = asset.skin.as_ref().is_some_and(|s| s.joint_count > 0 && s.joint_count <= 128);
+/// ```
+///
+/// `!use_skinned` is true for "no skin at all" (an unremarkable static model, e.g. `boat.glb`),
+/// "a skin with zero joints" (malformed/degenerate skin data), AND "a skin with MORE than
+/// [`JOINT_CAP`] joints" (a model that DOES have real joint data, silently downgraded because it
+/// doesn't fit the uniform buffer). Only the third is a genuine downgrade worth reporting, and the
+/// single boolean could not tell it apart from the other two — nothing did, or could.
+///
+/// Naming the outcomes forces every call site to decide what to do with each one explicitly,
+/// rather than discarding the distinction on the way into a `bool`. `classify` is the only place
+/// the three-way split happens, and it needs no `wgpu` device — see
+/// `tests/skin_cap_selection.rs` for coverage that does not touch the GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkinFit {
+    /// No skin data at all.
+    NoSkin,
+    /// A skin is present but carries zero joints — degenerate, not a cap downgrade.
+    EmptySkin,
+    /// A skin is present and its joint count is over [`JOINT_CAP`]. The model has real joint data
+    /// and is downgraded to the static arm anyway — this is the case eqoxide#780 is about.
+    ExceedsCap { joint_count: usize },
+    /// A skin is present and fits within [`JOINT_CAP`]: the model renders skinned.
+    Fits { joint_count: usize },
+}
+
+impl SkinFit {
+    /// Classify a model's joint count (`None` = no skin at all). Pure — the whole three-way
+    /// split lives here and nowhere else, so a call site cannot re-derive its own (possibly
+    /// diverging) version of the boolean this replaces.
+    pub fn classify(joint_count: Option<usize>) -> SkinFit {
+        match joint_count {
+            None       => SkinFit::NoSkin,
+            Some(0)    => SkinFit::EmptySkin,
+            Some(n) if n > JOINT_CAP => SkinFit::ExceedsCap { joint_count: n },
+            Some(n)    => SkinFit::Fits { joint_count: n },
+        }
+    }
+
+    /// Whether this fit takes the SKINNED render arm (`GpuModel::Skinned`). Every other variant
+    /// takes the static arm — see [`SkinFit::static_reason`] for why, spelled out per variant.
+    pub fn is_skinned(self) -> bool {
+        matches!(self, SkinFit::Fits { .. })
+    }
+
+    /// Why this fit takes the STATIC arm, or `None` if it doesn't (i.e. it's `Fits`). A
+    /// `GpuStaticModel` is never built for a `Fits` skin, so there is deliberately no
+    /// `StaticReason` for that case — see `build_character_model`.
+    pub fn static_reason(self) -> Option<StaticReason> {
+        match self {
+            SkinFit::NoSkin                       => Some(StaticReason::NoSkin),
+            SkinFit::EmptySkin                     => Some(StaticReason::EmptySkin),
+            SkinFit::ExceedsCap { joint_count }    => Some(StaticReason::ExceedsCap { joint_count }),
+            SkinFit::Fits { .. }                   => None,
+        }
+    }
+}
+
+/// Why a model landed on the STATIC render arm. A subset of [`SkinFit`] excluding `Fits`, which
+/// never reaches this arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticReason {
+    NoSkin,
+    EmptySkin,
+    ExceedsCap { joint_count: usize },
+}
+
+impl StaticReason {
+    /// The one case eqoxide#780 requires to stop being silent: the model had real skin data that
+    /// simply did not fit the uniform buffer, and got rendered as if it were never skinned at all.
+    pub fn is_downgrade(self) -> bool {
+        matches!(self, StaticReason::ExceedsCap { .. })
+    }
+}
+
+/// Record `label`'s joint count into `downgrades` iff `reason` is a genuine cap downgrade
+/// (`StaticReason::ExceedsCap`) — the one outcome eqoxide#780 requires to stop being silent. Pure
+/// so the recording decision is unit-testable without a `wgpu::Device`; `EqRenderer` cannot be
+/// constructed at all in a test (no `wgpu` backend has a non-adapter constructor), which is why
+/// this book-keeping is kept out of `build_character_model`'s body and callable on its own.
+pub fn record_skin_cap_downgrade(
+    downgrades: &mut std::collections::BTreeMap<String, usize>,
+    label: &str,
+    reason: StaticReason,
+) {
+    if let StaticReason::ExceedsCap { joint_count } = reason {
+        downgrades.insert(label.to_string(), joint_count);
+    }
+}
 
 /// Build a unit cube GpuMesh (~2 units per side, centered at origin), used as the door
 /// fallback marker. Positions are already in render space; the door pass translates it to
@@ -134,6 +233,14 @@ pub struct EqRenderer {
     /// The common set is fully synced before render begins, so a missing file here is a genuinely
     /// absent race, not one still downloading. (eqoxide#224)
     model_load_tried:        std::collections::HashSet<(&'static str, u8)>,
+    /// Character models whose skin EXCEEDED [`JOINT_CAP`] and were therefore downgraded to the
+    /// static (unskinned) render arm, keyed by model label with the joint count that caused it —
+    /// the observable eqoxide#780 exists to add. `None`/absent = no downgrade has happened; a
+    /// missing model or a genuinely unskinned one (e.g. `boat.glb`) is never inserted here, only a
+    /// model that HAD real skin data and didn't fit. Not yet wired to the HTTP API (that crosses
+    /// into `src/app.rs`, out of scope for this fix — see the #780 PR body) but is public and
+    /// queryable in-process, and every downgrade is also logged at `error!`.
+    pub skin_cap_downgrades: std::collections::BTreeMap<String, usize>,
     /// Channel to the background model-sync worker: send a race model KEY (e.g. "race_hum") to
     /// fetch its `charmodel/<key>` set on demand the first time a spawn of that race is seen, so
     /// the client never downloads the ~450 MB of race models it doesn't need. None until wired in
@@ -385,6 +492,7 @@ impl EqRenderer {
             fallback_texture_bg,
             gpu_character_models: std::collections::HashMap::new(),
             model_load_tried:     std::collections::HashSet::new(),
+            skin_cap_downgrades:  std::collections::BTreeMap::new(),
             model_sync_tx:        None,
             model_sync_requested: std::collections::HashSet::new(),
             anim_states:     std::collections::HashMap::new(),
@@ -631,7 +739,10 @@ impl EqRenderer {
         }
         match crate::models::ModelAsset::load(&path) {
             Ok(asset) => {
-                let model = self.build_character_model(key, asset);
+                let (model, skin_fit) = self.build_character_model(key, asset);
+                if let Some(reason) = skin_fit.static_reason() {
+                    record_skin_cap_downgrade(&mut self.skin_cap_downgrades, key, reason);
+                }
                 self.gpu_character_models.insert((key, gender), model);
                 tracing::debug!("renderer: lazily loaded character model '{key}' (gender {gender})");
             }
@@ -648,7 +759,13 @@ impl EqRenderer {
     /// Upload one `ModelAsset` to the GPU as a `GpuModel` (skinned when it has a
     /// usable skin, else static). `label` is only used for log lines. Shared by the
     /// archetype loader and the per-race (`race_<code>.glb`) loader.
-    fn build_character_model(&self, label: &str, asset: crate::models::ModelAsset) -> crate::gpu::GpuModel {
+    ///
+    /// Returns the [`SkinFit`] alongside the model so the caller can record a cap downgrade
+    /// (eqoxide#780) — this method takes `&self`, not `&mut self`, so it cannot update
+    /// `self.skin_cap_downgrades` itself; see `ensure_character_model`.
+    fn build_character_model(&self, label: &str, asset: crate::models::ModelAsset)
+        -> (crate::gpu::GpuModel, SkinFit)
+    {
         use wgpu::util::DeviceExt;
         use crate::models::SkinnedMeshData;
         tracing::info!("renderer: loaded '{}' — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
@@ -660,10 +777,18 @@ impl EqRenderer {
         let tex_names: Vec<String> =
             asset.textures.iter().map(|t| t.name.clone()).collect();
 
-        let use_skinned = asset.skin.as_ref()
-            .is_some_and(|s| s.joint_count > 0 && s.joint_count <= 128);
+        let skin_fit = SkinFit::classify(asset.skin.as_ref().map(|s| s.joint_count));
+        if let Some(reason) = skin_fit.static_reason() {
+            if reason.is_downgrade() {
+                tracing::error!(
+                    "renderer: character model '{label}' has a skin that EXCEEDS the \
+                     {JOINT_CAP}-joint cap ({skin_fit:?}) — falling back to the STATIC \
+                     (unskinned) render arm; this model will not animate (eqoxide#780)"
+                );
+            }
+        }
 
-        if use_skinned {
+        if skin_fit.is_skinned() {
             let skin = asset.skin.unwrap();
             let mut meshes: Vec<GpuSkinnedMesh>                       = Vec::new();
             let mut skinned_slots: Vec<Option<crate::models::EquipSlot>> = Vec::new();
@@ -711,7 +836,7 @@ impl EqRenderer {
             }
             tracing::info!("renderer: loaded skinned model '{}' ({} joints, {} clips)",
                       label, skin.joint_count, skin.clips.len());
-            GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: skinned_slots, head_parts: skinned_head_parts, head_default_hidden: skinned_head_hidden, true_height: asset.true_height, clip_bounds: asset.clip_bounds.clone(), feet_offset: asset.feet_offset })
+            (GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: skinned_slots, head_parts: skinned_head_parts, head_default_hidden: skinned_head_hidden, true_height: asset.true_height, clip_bounds: asset.clip_bounds.clone(), feet_offset: asset.feet_offset }), skin_fit)
         } else {
             let mut meshes: Vec<GpuMesh>                              = Vec::new();
             let mut static_slots: Vec<Option<crate::models::EquipSlot>> = Vec::new();
@@ -748,7 +873,7 @@ impl EqRenderer {
                 static_head_hidden.push(dh);
             }
             tracing::info!("renderer: loaded static model '{}'", label);
-            GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: static_slots, head_parts: static_head_parts, head_default_hidden: static_head_hidden, true_height: asset.true_height, clip_bounds: vec![], feet_offset: 0.0 })
+            (GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: static_slots, head_parts: static_head_parts, head_default_hidden: static_head_hidden, true_height: asset.true_height, clip_bounds: vec![], feet_offset: 0.0 }), skin_fit)
         }
     }
 
