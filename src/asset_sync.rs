@@ -196,14 +196,49 @@ fn artifacts_intact(cache: &CacheDirs, files: &[FileEntry]) -> bool {
     })
 }
 
+/// Where `fetch_and_reassemble`'s download-phase `elapsed` reads "now" from (#796).
+///
+/// Production always uses [`DownloadClock::WALL`] — the real monotonic clock — and behaviour is
+/// byte-for-byte unchanged from before this type existed: `WALL.now()` is `Instant::now()`. The
+/// pinned variant exists only so a test can assert the "elapsed is scoped to THIS phase, not
+/// carried over from a prior one" property (#708) EXACTLY, instead of proving it by sleeping real
+/// wall time and asserting a soft upper bound on how long the actual download loop's own work took
+/// — which is what made `elapsed_does_not_carry_over_from_a_slow_prior_download` fail under
+/// remote-builder contention: the assertion raced the machine's load, not the code path it names.
+/// `frozen_at` is `#[cfg(test)]`-gated and the inner field is private to this module, so a pinned
+/// clock cannot reach a real sync: `fetch_and_reassemble`/`sync_set` are private to this file, and
+/// their only externally-reachable entry point, [`sync_set_observed`], always passes `WALL`.
+#[derive(Clone, Copy)]
+struct DownloadClock(Option<std::time::Instant>);
+
+impl DownloadClock {
+    const WALL: DownloadClock = DownloadClock(None);
+
+    /// A clock pinned at `t` — test fixtures only. See the type doc for why this is gated.
+    #[cfg(test)]
+    fn frozen_at(t: std::time::Instant) -> Self {
+        DownloadClock(Some(t))
+    }
+
+    fn now(self) -> std::time::Instant {
+        self.0.unwrap_or_else(std::time::Instant::now)
+    }
+}
+
 /// Downloads whatever chunks in `files` aren't already in the CAS, then reassembles every file.
 /// Shared by both the normal (server digest Changed) sync path and the repair path taken when an
 /// unchanged digest's own artifacts turn out to be missing/corrupt (#601).
-fn fetch_and_reassemble(
+///
+/// Takes an explicit [`DownloadClock`] (#796) rather than reading `Instant::now()` directly, so a
+/// test can pin what `elapsed` reads "now" as instead of racing the real clock against machine
+/// load. Every production call site (both inside this file) passes [`DownloadClock::WALL`], which
+/// is exactly `Instant::now()` — behaviour there is unchanged.
+fn fetch_and_reassemble_with_clock(
     t: &dyn Transport,
     cache: &CacheDirs,
     files: &[FileEntry],
     progress: &mut dyn FnMut(SyncProgress),
+    clock: DownloadClock,
 ) -> anyhow::Result<()> {
     let missing = missing_chunks(files, cache);
     let total = missing.len();
@@ -214,7 +249,7 @@ fn fetch_and_reassemble(
     // is empty (every chunk already cached) this loop body never runs at all, so `progress` is never
     // called with `Downloading` — the caller sees no download tick, not a misleading "0 B/s" one
     // (#708 requirement 2: "nothing to download" must not render like a stall).
-    let start = std::time::Instant::now();
+    let start = clock.now();
     for (i, hash) in missing.iter().enumerate() {
         let data = t.get_chunk(hash)?;
         // The server is content-addressed: a chunk's bytes must hash to its id.
@@ -224,7 +259,12 @@ fn fetch_and_reassemble(
         }
         cache.cas_put(&data)?;
         bytes += data.len() as u64;
-        progress(SyncProgress::Downloading { done: i + 1, total, bytes, elapsed: start.elapsed() });
+        progress(SyncProgress::Downloading {
+            done: i + 1,
+            total,
+            bytes,
+            elapsed: clock.now().saturating_duration_since(start),
+        });
     }
     for entry in files {
         reassemble(cache, entry)?;
@@ -407,6 +447,19 @@ fn sync_set(
     cache: &CacheDirs,
     progress: &mut dyn FnMut(SyncProgress),
 ) -> anyhow::Result<()> {
+    sync_set_with_clock(t, set, cache, progress, DownloadClock::WALL)
+}
+
+/// The real body of `sync_set` — separated out so a test can supply a pinned [`DownloadClock`]
+/// instead of racing the real one (#796). `sync_set` is the only production entry point (via
+/// [`sync_set_observed`]) and always passes [`DownloadClock::WALL`].
+fn sync_set_with_clock(
+    t: &dyn Transport,
+    set: &str,
+    cache: &CacheDirs,
+    progress: &mut dyn FnMut(SyncProgress),
+    clock: DownloadClock,
+) -> anyhow::Result<()> {
     let prev = cache.synced(set);
     // Only offer the server our digest when we also still have the file list it refers to — that
     // list is what lets an "Unchanged" reply be checked locally. (In practice the two are always
@@ -447,7 +500,7 @@ fn sync_set(
                 return Ok(()); // content AND local artifacts both unchanged — genuine no-op
             }
             progress(SyncProgress::Verifying);
-            if let Err(repair_err) = fetch_and_reassemble(t, cache, &files, progress) {
+            if let Err(repair_err) = fetch_and_reassemble_with_clock(t, cache, &files, progress, clock) {
                 // The recorded chunk list can itself be stale even though the digest is not: the
                 // digest (`set_digest`) hashes only `path\0<file-blake3>`, never chunk ids, so a
                 // server that re-chunks a file (different FastCDC params, a re-bake, ...) while
@@ -458,7 +511,8 @@ fn sync_set(
                 // than keep repairing with data the server can no longer serve.
                 cache.clear_synced(set);
                 return match t.get_manifest(set, None)? {
-                    ManifestFetch::Changed(m) => sync_changed_manifest(t, set, cache, m, progress),
+                    ManifestFetch::Changed(m) =>
+                        sync_changed_manifest_with_clock(t, set, cache, m, progress, clock),
                     ManifestFetch::Unchanged => Err(repair_err.context(format!(
                         "repair of set {set} failed, and a fresh (unconditional) manifest fetch \
                          still reports Unchanged — server cannot supply working chunk data"
@@ -467,7 +521,7 @@ fn sync_set(
             }
             Ok(()) // digest/file-list unchanged from what's already recorded — nothing new to persist
         }
-        ManifestFetch::Changed(m) => sync_changed_manifest(t, set, cache, m, progress),
+        ManifestFetch::Changed(m) => sync_changed_manifest_with_clock(t, set, cache, m, progress, clock),
     }
 }
 
@@ -558,12 +612,17 @@ pub fn login_observed(
 /// files, and records the new synced state. Shared by the normal (digest Changed) path and the
 /// repair-failure fallback above (#601 D-2), both of which end up with a manifest they need to
 /// fully (re)apply.
-fn sync_changed_manifest(
+///
+/// Takes an explicit [`DownloadClock`] (#796), forwarded to `fetch_and_reassemble_with_clock`; see
+/// that function's doc. Both call sites (inside `sync_set_with_clock`) pass through whatever clock
+/// they themselves were given, so a pinned test clock reaches all the way down.
+fn sync_changed_manifest_with_clock(
     t: &dyn Transport,
     set: &str,
     cache: &CacheDirs,
     manifest: Manifest,
     progress: &mut dyn FnMut(SyncProgress),
+    clock: DownloadClock,
 ) -> anyhow::Result<()> {
     // Defense against a lying/corrupt server: the manifest must hash to its claimed digest.
     let recomputed = set_digest(&manifest.files);
@@ -572,7 +631,7 @@ fn sync_changed_manifest(
     }
     progress(SyncProgress::Verifying);
 
-    fetch_and_reassemble(t, cache, &manifest.files, progress)?;
+    fetch_and_reassemble_with_clock(t, cache, &manifest.files, progress, clock)?;
 
     // Record the synced identity so a future unchanged fetch (304) can skip the whole set.
     cache.set_synced(set, &manifest.digest, &manifest.files);
@@ -1226,9 +1285,21 @@ mod download_rate_tests {
         // instead of from the start of THIS call, a slow first sync would make a fast SECOND sync's
         // very first tick already look like it had been running for a long time — a stale-rate bug
         // by another name (the rate would be computed against the wrong clock, not just the wrong
-        // phase). Reproduce with two back-to-back sync_set calls against two different manifests
-        // (so the second one also has real work to do), inserting a real sleep before the first
-        // call begins so any global/leaked clock would show up as inflated elapsed on the second.
+        // phase). Reproduce with two back-to-back sync_set_with_clock calls against two different
+        // manifests (so the second one also has real work to do).
+        //
+        // #796: this used to reproduce "slow prior work" with a real `std::thread::sleep`, which
+        // meant the assertion afterward ("elapsed stays under a soft bound") was really a bet on how
+        // long the download loop's OWN real wall-clock work took on this run — and that bet lost
+        // under remote-builder contention with nothing wrong in the code under test. There is no
+        // sleep anywhere in this test now: "slow prior work" is simulated by pinning the FIRST
+        // sync's `DownloadClock` far ahead of an arbitrary reference instant, and "more time passing
+        // between syncs" by pinning the SECOND sync's clock further ahead still. Because each pinned
+        // clock's `now()` always returns the SAME instant, a correctly phase-scoped
+        // `start = clock.now()` makes every `elapsed` in that call EXACTLY `Duration::ZERO` —
+        // deterministically, independent of how fast or slow the machine actually runs the loop
+        // body. The property under test (fresh `start` per call) is what the assertion measures now,
+        // not machine speed.
         let dir = tempfile::tempdir().unwrap();
         let cache = CacheDirs::with_root(dir.path());
 
@@ -1245,23 +1316,28 @@ mod download_rate_tests {
             chunks: chunks1,
         };
 
-        std::thread::sleep(Duration::from_millis(150)); // simulate time passing before ANY sync runs
+        // Simulated: "10 seconds had already passed" before this sync starts — no real sleep, just
+        // a clock pinned 10s ahead of an arbitrary reference instant.
+        let reference = std::time::Instant::now();
+        let slow_prior_pin = reference + Duration::from_secs(10);
 
-        let mut first_elapsed = Duration::ZERO;
-        sync_set(&t1, "s1", &cache, &mut |p| {
+        let mut first_elapsed = Duration::MAX; // deliberately not ZERO, so a missed tick still fails
+        sync_set_with_clock(&t1, "s1", &cache, &mut |p| {
             if let SyncProgress::Downloading { elapsed, .. } = p {
                 first_elapsed = elapsed;
             }
-        }).unwrap();
-        assert!(first_elapsed < Duration::from_millis(100),
-            "first sync's own elapsed should be small (just its own download loop), got {first_elapsed:?}");
+        }, DownloadClock::frozen_at(slow_prior_pin)).unwrap();
+        assert_eq!(first_elapsed, Duration::ZERO,
+            "first sync's own elapsed must be EXACTLY zero against a clock pinned at a single \
+             instant — got {first_elapsed:?}, which can only happen if `start` was read from a \
+             DIFFERENT clock reading than the tick that reported it");
 
-        // A SECOND sleep, between the two syncs, is the actual discriminator: if `start` were ever
-        // hoisted to something that persists across calls (a `static`/`OnceLock`, a field on some
-        // long-lived context) instead of being captured fresh inside THIS call to
-        // `fetch_and_reassemble`, this sleep would show up added into the second sync's `elapsed`
-        // even though the second sync's own download loop never ran during it.
-        std::thread::sleep(Duration::from_millis(150));
+        // Simulated: 5 MORE seconds pass between the two syncs. If `start` were ever hoisted to
+        // something that persists across calls (a `static`/`OnceLock`, a field on some long-lived
+        // context) instead of being captured fresh inside THIS call to `fetch_and_reassemble_with_clock`,
+        // the leaked `start` would still be `slow_prior_pin` while `clock.now()` on the second call's
+        // ticks reads `second_pin` — a `elapsed` of 5s, not zero.
+        let second_pin = slow_prior_pin + Duration::from_secs(5);
 
         // Second, independent manifest/content — its phase starts fresh.
         let b = vec![2u8; 5];
@@ -1276,15 +1352,16 @@ mod download_rate_tests {
             chunks: chunks2,
         };
 
-        let mut second_elapsed = Duration::ZERO;
-        sync_set(&t2, "s2", &cache, &mut |p| {
+        let mut second_elapsed = Duration::MAX;
+        sync_set_with_clock(&t2, "s2", &cache, &mut |p| {
             if let SyncProgress::Downloading { elapsed, .. } = p {
                 second_elapsed = elapsed;
             }
-        }).unwrap();
-        assert!(second_elapsed < Duration::from_millis(100),
-            "second sync's elapsed must NOT carry over the 300ms slept before/between syncs — got \
-             {second_elapsed:?}, which would mean the clock is global/shared, not phase-scoped");
+        }, DownloadClock::frozen_at(second_pin)).unwrap();
+        assert_eq!(second_elapsed, Duration::ZERO,
+            "second sync's elapsed must be EXACTLY zero — a nonzero value would mean `start` was \
+             NOT captured fresh from THIS call's own clock reading (the #708 carry-over bug this \
+             test is named for), got {second_elapsed:?}");
     }
 }
 
