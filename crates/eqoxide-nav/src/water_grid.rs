@@ -382,14 +382,38 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// cover. Measured on real assets: a 4-zone run with 3 `.glb`s absent printed `0 (over 1/1 zones)`
 /// and passed green — the exact shape #762 exists to kill, reintroduced by this PR's own new code.
 ///
-/// The fix: [`skip`](Self::skip) gives a zone dropped upstream of `add` a THIRD outcome — distinct
-/// from both "measured" and "unmeasured" — so it still lands in the denominator via
+/// The round-2 fix: [`skip`](Self::skip) gives a zone dropped upstream of `add` a THIRD outcome —
+/// distinct from both "measured" and "unmeasured" — so it still lands in the denominator via
 /// [`attempted_zones`](Self::attempted_zones), and [`is_complete`](Self::is_complete) is false
-/// whenever anything was skipped, exactly as it already was for anything unmeasured. A caller that
-/// drops a zone without calling either `add` or `skip` is still capable of lying by omission — this
-/// type cannot see a zone it is never told about — but every `continue` in this PR's own corpus
-/// loops now calls one or the other, so within this PR's corpora the denominator is the zones the
-/// loop actually iterated, not just the zones that reached `add`.
+/// whenever anything was skipped, exactly as it already was for anything unmeasured.
+///
+/// # Round-3 correction (#762 B1 again) — "every `continue` calls one or the other" was ALSO false
+///
+/// Round 2's doc closed with the sentence *"every `continue` in this PR's own corpus loops now
+/// calls one or the other"*. That was written, not measured. `faithful_walker_drift_corpus`'s zone
+/// loop has **four** `continue`s that abandon a zone; round 2 wired two of them. The third —
+/// `if pairs.is_empty() { … continue; }` — printed the word "skipped" without ever calling `skip`,
+/// so it looked accounted for and was not, and an independent reviewer reproduced the round-1 output
+/// (`wat-route: 0 (over 1/1 zones)`, green, over a two-zone corpus) straight through it.
+///
+/// The lesson is that per-call-site wiring is the wrong mechanism: it is a promise a reader has to
+/// re-verify by enumeration every time the loop changes, and nothing goes red when it lapses. So the
+/// denominator no longer depends on the caller having wired anything:
+///
+/// **[`begin_zone`](Self::begin_zone) opens a zone; `add` or `skip` closes it. A zone that is opened
+/// and never closed — by ANY control flow: an existing `continue`, a `continue` added next year, a
+/// `break`, a `?`, an early `return` — is recorded as `unaccounted` the moment the next zone opens
+/// (or, for the last zone, is still open when the rollup is read).** `unaccounted` counts toward
+/// `attempted_zones` and makes `is_complete` false, exactly like the other two holes, and `Display`
+/// names the zones. `add`/`skip` **panic** if no matching zone is open, so a loop that forgets
+/// `begin_zone` fails loudly instead of silently reverting to the round-1 shape.
+///
+/// What this still does NOT cover, stated so nobody re-derives the round-2 sentence: a corpus loop
+/// that uses no `WaterRollup` at all is invisible to this type. The four `*_blast_radius` corpora
+/// and `water_grid_budget_measurement` in `tests/walker_sim.rs`, and the zone loop in
+/// `collision.rs`, accumulate into a plain `Vec<String>` and still drop zones without accounting.
+/// They print no ratio, so they lie by omission rather than by assertion, but they are NOT covered
+/// by anything in this file.
 #[derive(Clone, Debug, Default)]
 pub struct WaterRollup {
     total: usize,
@@ -399,14 +423,51 @@ pub struct WaterRollup {
     /// routable pairs, etc. Distinct from `unmeasured`: an unmeasured zone's water check RAN and
     /// failed; a skipped zone's water check never ran at all. Both are holes; neither is a zero.
     skipped: Vec<(String, String)>,
+    /// The zone [`begin_zone`](Self::begin_zone) opened that `add`/`skip` has not closed yet.
+    open: Option<String>,
+    /// Zones that were opened and then abandoned without ever reaching `add` or `skip`. This is the
+    /// bucket that catches a drop path nobody wired — the round-3 B1 defect — without the caller
+    /// having to enumerate its own `continue`s correctly.
+    unaccounted: Vec<String>,
 }
 
 impl WaterRollup {
     pub fn new() -> Self { Self::default() }
 
-    /// Fold one zone's column in. An unmeasured zone contributes NO number — it is recorded as a
-    /// hole in the corpus instead.
+    /// Open a zone. Call this as the FIRST statement of a corpus loop's body, before anything that
+    /// could `continue`.
+    ///
+    /// The previously-open zone, if any, is closed here: if it was never settled by `add` or `skip`
+    /// it becomes an `unaccounted` hole. That is the whole point — the rollup finds the drop itself
+    /// rather than trusting the loop to have declared it.
+    pub fn begin_zone(&mut self, zone: &str) {
+        if let Some(prev) = self.open.take() {
+            self.unaccounted.push(prev);
+        }
+        self.open = Some(zone.to_string());
+    }
+
+    /// Close the open zone, or panic. `add`/`skip` are the only two ways to close one.
+    fn settle(&mut self, zone: &str) {
+        match self.open.take() {
+            Some(z) if z == zone => {}
+            Some(z) => {
+                // The loop settled a different zone than the one it opened: the opened one is a
+                // hole, and the mismatch itself is a bug worth being loud about.
+                self.unaccounted.push(z.clone());
+                panic!("#762: WaterRollup was given a measurement for zone {zone:?} while zone \
+                        {z:?} was the one open — begin_zone/add must name the same zone");
+            }
+            None => panic!("#762: WaterRollup::add/skip called for zone {zone:?} with no zone open \
+                            — every corpus loop iteration must start with begin_zone(zone), or the \
+                            rollup cannot tell a dropped zone from a zone that was never asked for"),
+        }
+    }
+
+    /// Fold one zone's column in, closing the zone [`Self::begin_zone`] opened. An unmeasured zone
+    /// contributes NO number — it is recorded as a hole in the corpus instead.
     pub fn add(&mut self, zone: &str, m: &WaterMeasurement<usize>) {
+        self.settle(zone);
         match (m.value(), m.reason()) {
             (Some(v), _) => { self.total += *v; self.measured_zones += 1; }
             (None, Some(e)) => self.unmeasured.push((zone.to_string(), e.clone())),
@@ -423,11 +484,10 @@ impl WaterRollup {
     /// printed line — this is not a [`RegionLoadError`](eqoxide_core::region_map::RegionLoadError),
     /// because the failure isn't a region-load failure.
     ///
-    /// Call this at every `continue` in a corpus loop that fires before `add` would otherwise be
-    /// reached for that zone. A zone the loop never mentions to the rollup via `add` OR `skip` is
-    /// still invisible to it — see the type doc — so a corpus that wants an honest `(over N/N
-    /// zones)` must route every early exit through one of the two.
+    /// Closes the open zone, like `add`. Forgetting it at some `continue` no longer erases the zone:
+    /// it lands in `unaccounted` instead, which is louder but still honest — see the type doc.
     pub fn skip(&mut self, zone: &str, reason: impl Into<String>) {
+        self.settle(zone);
         self.skipped.push((zone.to_string(), reason.into()));
     }
 
@@ -443,16 +503,36 @@ impl WaterRollup {
     pub fn skipped_zones(&self) -> Vec<&str> {
         self.skipped.iter().map(|(z, _)| z.as_str()).collect()
     }
+    /// Every zone that was opened and then left the loop without `add` or `skip` — including one
+    /// that is STILL open when the rollup is read (the last iteration abandoning its zone looks
+    /// exactly like the loop not having finished, and both are holes).
+    pub fn unaccounted_zones(&self) -> Vec<&str> {
+        self.unaccounted.iter().map(String::as_str)
+            .chain(self.open.as_deref())
+            .collect()
+    }
     /// The TRUE denominator: every zone this rollup was told about at all, whether it ended up
-    /// measured, unmeasured, or skipped. This is what `Display`'s "N zones" now means — not "N
-    /// zones that happened to reach `add`" (the round-1 shape).
+    /// measured, unmeasured, skipped, or unaccounted. This is what `Display`'s "N zones" now means —
+    /// not "N zones that happened to reach `add`" (the round-1 shape).
     pub fn attempted_zones(&self) -> usize {
         self.measured_zones + self.unmeasured.len() + self.skipped.len()
+            + self.unaccounted_zones().len()
     }
-    /// True only when EVERY zone folded in was measured — none unmeasured AND none skipped. A
-    /// water-inclusive gate must assert this — a run with a hole in it (of either kind) has no
-    /// water result, however green the rest looks.
-    pub fn is_complete(&self) -> bool { self.unmeasured.is_empty() && self.skipped.is_empty() }
+    /// True only when EVERY zone folded in was measured — none unmeasured, none skipped, none
+    /// unaccounted — AND at least one zone was folded in at all. A water-inclusive gate must assert
+    /// this — a run with a hole in it (of any of the three kinds) has no water result, however green
+    /// the rest looks.
+    ///
+    /// The `attempted_zones() > 0` term is round 3 (review N-R2c): a `Default`-constructed rollup
+    /// used to answer "complete" and print `0 (over 0/0 zones)`, i.e. a type whose entire job is
+    /// refusing to look clean shipped a value that looks clean over nothing. In the flagship corpus
+    /// `assert!(tot_walked > 0)` fires first so it was not reachable there, but it was a live trap
+    /// for any future consumer without that guard.
+    pub fn is_complete(&self) -> bool {
+        self.attempted_zones() > 0
+            && self.unmeasured.is_empty() && self.skipped.is_empty()
+            && self.unaccounted_zones().is_empty()
+    }
 }
 
 impl std::fmt::Display for WaterRollup {
@@ -460,6 +540,10 @@ impl std::fmt::Display for WaterRollup {
         let zones = self.attempted_zones();
         if self.is_complete() {
             return write!(f, "{} (over {}/{} zones)", self.total, self.measured_zones, zones);
+        }
+        if zones == 0 {
+            return write!(f, "{} over 0/0 zones — INCOMPLETE, no zone ever reached this rollup",
+                self.total);
         }
         let mut parts: Vec<String> = Vec::new();
         if !self.unmeasured.is_empty() {
@@ -469,6 +553,11 @@ impl std::fmt::Display for WaterRollup {
         if !self.skipped.is_empty() {
             let names: Vec<String> = self.skipped.iter().map(|(z, r)| format!("{z} ({r})")).collect();
             parts.push(format!("{} skipped [{}]", self.skipped.len(), names.join("; ")));
+        }
+        let unacc = self.unaccounted_zones();
+        if !unacc.is_empty() {
+            parts.push(format!("{} unaccounted [{}] (opened by begin_zone, never reached add/skip)",
+                unacc.len(), unacc.join("; ")));
         }
         write!(f, "{} over {}/{} zones — INCOMPLETE, {}",
             self.total, self.measured_zones, zones, parts.join("; "))
@@ -634,6 +723,7 @@ mod tests {
         let zones: Vec<(&str, ZoneWater)> = vec![("qeynos2", dry_but_loaded()), ("halas", absent())];
         let mut roll = WaterRollup::new();
         for (name, zw) in &zones {
+            roll.begin_zone(name);
             let mut t = zw.tally();
             if let Some(v) = t.value_mut() { *v += 0; } // the corpus' per-zone water counter
             roll.add(name, &t);
@@ -647,6 +737,7 @@ mod tests {
 
         // The all-measured run is allowed to print a plain, trustworthy zero.
         let mut clean = WaterRollup::new();
+        clean.begin_zone("qeynos2");
         clean.add("qeynos2", &dry_but_loaded().tally());
         assert!(clean.is_complete());
         assert_eq!(clean.measured_total(), 0);
@@ -674,8 +765,11 @@ mod tests {
     #[test]
     fn a_corpus_total_cannot_hide_a_zone_that_never_reached_the_water_check_762() {
         let mut roll = WaterRollup::new();
+        roll.begin_zone("qeynos2");
         roll.add("qeynos2", &dry_but_loaded().tally()); // 1 zone genuinely measured, water == 0
+        roll.begin_zone("akanon");
         roll.skip("akanon", "no glb");
+        roll.begin_zone("crushbone");
         roll.skip("crushbone", "no grid");
 
         // The skipped zones are not silently absent: they are named and counted.
@@ -703,10 +797,96 @@ mod tests {
         // A rollup with ONLY a skip (no unmeasured zone at all) must still refuse to look complete —
         // the two holes are independent triggers, not just additive on top of `unmeasured`.
         let mut only_skip = WaterRollup::new();
+        only_skip.begin_zone("qeynos2");
         only_skip.add("qeynos2", &dry_but_loaded().tally());
+        only_skip.begin_zone("akanon");
         only_skip.skip("akanon", "no glb");
         assert!(!only_skip.is_complete(), "a skip-only rollup must still be incomplete");
         assert_eq!(only_skip.attempted_zones(), 2);
+    }
+
+    /// **#762 ROUND 3 (B1 again, blocking): a zone the loop drops WITHOUT calling `skip` must not
+    /// vanish either.**
+    ///
+    /// Round 2 fixed the denominator by wiring `skip` into the two `continue`s it knew about, and
+    /// documented that as "every `continue` … now calls one or the other". It was three, not two.
+    /// The unwired one printed the word "skipped" and called nothing, and a reviewer reproduced the
+    /// original defect string (`0 (over 1/1 zones)`, green) through it on real assets.
+    ///
+    /// So the denominator no longer trusts the loop's wiring at all. `begin_zone` opens a zone;
+    /// `add`/`skip` close it; **anything that leaves the body without closing it lands in
+    /// `unaccounted`.** This test drives that shape directly: zone 2 is opened and abandoned exactly
+    /// as an unwired `continue` would abandon it, and zone 4 is abandoned as the LAST iteration
+    /// (never followed by another `begin_zone`), which is the case a "close the previous one on the
+    /// next open" scheme alone would miss.
+    ///
+    /// MUTATION CHECKS (each independently turns this RED):
+    /// 1. Delete `self.unaccounted.push(prev)` from `begin_zone` → the abandoned zones disappear.
+    /// 2. Delete `.chain(self.open.as_deref())` from `unaccounted_zones` → the last, still-open zone
+    ///    disappears (the `attempted_zones() == 4` and `is_complete()` assertions).
+    /// 3. Delete `+ self.unaccounted_zones().len()` from `attempted_zones` → the denominator reverts.
+    /// 4. Delete `&& self.unaccounted_zones().is_empty()` from `is_complete` → the run reads clean.
+    #[test]
+    fn a_zone_the_loop_drops_without_calling_skip_still_counts_762() {
+        let mut roll = WaterRollup::new();
+
+        roll.begin_zone("qeynos2");
+        roll.add("qeynos2", &dry_but_loaded().tally()); // measured
+        roll.begin_zone("tinyzone");
+        /* the unwired `continue`: no add, no skip */
+        roll.begin_zone("akanon");
+        roll.skip("akanon", "no glb"); // correctly wired
+        roll.begin_zone("lastzone");
+        /* unwired AND last — nothing ever opens after it */
+
+        assert_eq!(roll.unaccounted_zones(), vec!["tinyzone", "lastzone"],
+            "a zone opened and abandoned is a named hole, not an absence");
+        assert_eq!(roll.measured_zones(), 1);
+        assert_eq!(roll.skipped_zones(), vec!["akanon"]);
+        assert_eq!(roll.unmeasured_zones(), Vec::<&str>::new(),
+            "unaccounted is its own bucket: nothing failed to LOAD here");
+
+        // The denominator is the four zones the loop actually iterated.
+        assert_eq!(roll.attempted_zones(), 4,
+            "a dropped-without-accounting zone must still count toward the total asked for");
+        assert!(!roll.is_complete(), "a run that lost two zones has no water result");
+
+        let line = roll.to_string();
+        assert!(!line.contains("(over 1/1 zones)"),
+            "the round-1/round-3 defect string must not be producible: {line}");
+        assert!(line.contains("INCOMPLETE"), "{line}");
+        assert!(line.contains("tinyzone") && line.contains("lastzone"),
+            "the TOTAL line must name the zones it lost: {line}");
+    }
+
+    /// The wiring is fail-CLOSED: a corpus loop that forgets `begin_zone` cannot silently revert to
+    /// the round-1 shape, because there is then no open zone for `add` to close.
+    #[test]
+    #[should_panic(expected = "with no zone open")]
+    fn add_without_begin_zone_panics_rather_than_silently_reverting_762() {
+        let mut roll = WaterRollup::new();
+        roll.add("qeynos2", &dry_but_loaded().tally());
+    }
+
+    /// Same for `skip` — both closers enforce the protocol, not just one.
+    #[test]
+    #[should_panic(expected = "with no zone open")]
+    fn skip_without_begin_zone_panics_too_762() {
+        let mut roll = WaterRollup::new();
+        roll.skip("qeynos2", "no glb");
+    }
+
+    /// Review N-R2c: a rollup that was never told about any zone must not answer "complete". A type
+    /// whose job is refusing to look clean must not have a `Default` value that looks clean.
+    #[test]
+    fn an_empty_rollup_is_not_a_complete_result_762() {
+        let empty = WaterRollup::new();
+        assert_eq!(empty.attempted_zones(), 0);
+        assert!(!empty.is_complete(), "zero zones is not a water result");
+        let line = empty.to_string();
+        assert!(line.contains("INCOMPLETE"), "an empty rollup must not print a clean total: {line}");
+        assert!(!line.contains("(over 0/0 zones)"),
+            "the round-2 clean-looking empty string must not be producible: {line}");
     }
 
     /// Installing an unmeasured zone onto a collision grid is an error the caller must handle: the

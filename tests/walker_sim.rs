@@ -552,15 +552,24 @@ use eqoxide_ipc::MoveIntent;
         // TOTAL line cannot come out looking clean. Round 2 (B1): a zone dropped BEFORE the water
         // check even runs (no glb, no grid) is routed through `WaterRollup::skip` below, not left to
         // silently vanish from the denominator too — see the type doc for why that was its own #762-
-        // shaped bug.
+        // shaped bug. Round 3 (B1 again): round 2 wired two of this loop's FOUR zone-abandoning
+        // `continue`s and its doc claimed all of them, so `if pairs.is_empty()` printed the word
+        // "skipped" while calling nothing and the original defect string came straight back. The
+        // wiring is no longer what makes the denominator honest: `begin_zone` opens each zone and
+        // `add`/`skip` close it, so ANY exit that doesn't close it is recorded as `unaccounted` by
+        // the rollup itself, including exits nobody has written yet.
         let mut roll_wr = WaterRollup::new();
         let mut roll_423 = WaterRollup::new();
         println!("\n=== faithful walker drift: {} mode ===", if include_water { "WATER-INCLUSIVE" } else { "DRY" });
         println!("{:<12} {:>6} {:>7} {:>8} {:>8} {:>6} {:>9} {:>6}",
             "zone", "walked", "wedged", "height", "overlap", "other", "wat-route", "#423");
         for zone in &zones {
+            // #762: OPEN the zone before anything that can abandon it. Every exit from this body
+            // must reach `add` or `skip`; one that doesn't is recorded as `unaccounted` and the
+            // terminal completeness assert below fails. Do not move this line down.
+            roll_wr.begin_zone(zone); roll_423.begin_zone(zone);
             let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
-            // #762 round 2 (B1): these two `continue`s fire BEFORE the water check ever runs, so the
+            // #762 round 2 (B1): these `continue`s fire BEFORE the water check ever runs, so the
             // zone is not "unmeasured" (that means the check ran and failed) — it never reached the
             // check at all. `skip` still puts it in the rollup's denominator, so the printed "(over
             // N/N zones)" cannot come out looking like complete coverage of a corpus this run barely
@@ -673,7 +682,16 @@ use eqoxide_ipc::MoveIntent;
                 }
             }
             let n_forced = pairs.len() - forced_start;
-            if pairs.is_empty() { println!("{zone:<12}  (no routable pairs — skipped)"); continue; }
+            // #762 round 3 (B1): the third zone-abandoning `continue`. Round 2 left it unwired while
+            // printing the same word ("skipped") as the two wired ones, so the zone dropped out of
+            // both the numerator and the denominator and the corpus printed a clean
+            // `wat-route: 0 (over 1/1 zones)` over a two-zone run. Its `.wtr` loaded fine here, so it
+            // is NOT "unmeasured" — the water check ran, there was simply nothing to walk.
+            if pairs.is_empty() {
+                println!("{zone:<12}  (no routable pairs — skipped)");
+                roll_wr.skip(zone, "no routable pairs"); roll_423.skip(zone, "no routable pairs");
+                continue;
+            }
 
             let (mut walked, mut wedged, mut n_h, mut n_o, mut n_x) = (0usize, 0usize, 0usize, 0usize, 0usize);
             let (mut n_wr, mut n_423) = (0usize, 0usize);
@@ -755,11 +773,25 @@ use eqoxide_ipc::MoveIntent;
         // #762: a water column of `0` is only a result if every zone in the run was actually
         // measured. Fail LOUDLY here rather than letting the reader infer a clean water score from a
         // corpus that never opened those zones' region data.
+        //
+        // Round 3 (review N-R2b): this message used to name only `unmeasured_zones()` and assert
+        // "had no loadable .wtr" as the cause, so a run whose only hole was a SKIP printed an empty
+        // subject list attached to a false cause (`[] had no loadable .wtr`). `is_complete` now has
+        // three independent triggers, so the message names all three buckets and lets the reader see
+        // which one is non-empty instead of asserting a cause this assert never established.
         assert!(roll_wr.is_complete() && roll_423.is_complete(),
-            "#762: {:?} had no loadable .wtr, so this run measured NOTHING about water there — the \
-             wat-route/#423 columns above are not a score for them. Bake or fetch their region \
-             files and re-run. (wat-route {roll_wr}; #423 {roll_423})",
-            roll_wr.unmeasured_zones());
+            "#762: this run has a hole in its water coverage, so the wat-route/#423 columns above \
+             are NOT a score for this corpus. Holes, by kind (an empty list means that kind did not \
+             occur):\n  \
+             wat-route — unmeasured (.wtr failed to load, so nothing was measured): {:?}; \
+             skipped (dropped before the water check ran, e.g. no glb/no grid/no routable pairs): {:?}; \
+             unaccounted (left the loop without reaching add or skip — a corpus wiring bug, not an \
+             asset problem): {:?}\n  \
+             #423     — unmeasured: {:?}; skipped: {:?}; unaccounted: {:?}\n  \
+             Bake or fetch the missing region files / zone glbs and re-run. \
+             (wat-route {roll_wr}; #423 {roll_423})",
+            roll_wr.unmeasured_zones(), roll_wr.skipped_zones(), roll_wr.unaccounted_zones(),
+            roll_423.unmeasured_zones(), roll_423.skipped_zones(), roll_423.unaccounted_zones());
     }
 
 
