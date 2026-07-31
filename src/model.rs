@@ -319,8 +319,13 @@ impl Model for ServerModel {
 // published snapshot as the sole Model output, so when `WorldState` is split out, the mock's
 // `publish_snapshot` body is the natural place that constructs it — the scripting surface
 // (`self_at`/`zone`/`spawn`/`map`) becomes a `WorldState` builder unchanged.
+// #742: this re-export used to also name `MockProbe`, which nothing imported — the `unused_imports`
+// warning. `MockProbe` is still reachable in practice: every consumer obtains one from
+// `MockModel::probe()` and binds it by inference, which is how all four tests below already use it.
+// Re-add the name here if a consumer ever needs to write the type out (a helper signature, a struct
+// field); it is not re-exported speculatively.
 #[cfg(test)]
-pub(crate) use mock::{MockModel, MockProbe};
+pub(crate) use mock::MockModel;
 
 #[cfg(test)]
 mod mock {
@@ -450,11 +455,10 @@ mod mock {
             self
         }
 
-        /// Override the planning radius (avatar half-width) `find_path_ex` uses. Default 1.0.
-        pub(crate) fn plan_radius(mut self, r: f32) -> Self {
-            self.plan_radius = r;
-            self
-        }
+        // #742: a `plan_radius(r)` builder setter lived here and no test ever called it — the
+        // `dead_code` warning. The FIELD is live (`run` hands it to `find_path_ex`) and keeps its
+        // documented 1.0 default; only the never-used override is gone. Restoring it is three lines
+        // if a test needs to vary the avatar half-width.
 
         /// Clone out the observation handles BEFORE `run` (which consumes `self`).
         pub(crate) fn probe(&self) -> MockProbe {

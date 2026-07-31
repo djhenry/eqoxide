@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state) and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. Optional `preset`/`pitch`/`yaw`/`distance` params request a one-off diagnostic camera angle for just this capture — see [Camera override for `/frame`](#camera-override-for-observeframe-422). |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses, snapshot_age_ms}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. The default bare-map shape carries the same freshness value in the `X-Snapshot-Age-Ms` header instead — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646). |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -840,11 +840,25 @@ said. It is **`null` while the tier is healthy** (a complete fine route to its c
 |---------|---------|
 | `no_way_through` | The fine planner **closed its entire 40 u window** and found no way along the committed coarse route from here. A falsifiable **local** "no" — the coarse route is being re-planned around it. It says **nothing** about whether your goal is reachable. |
 | `exhausted` | The fine search was **cut short** (node cap) before closing its window: **"I don't know"**, not "no". The walker is steering on the best partial it has. |
-| `planner_dead` | The fine worker thread has **died**. Steering has degraded to the coarse 8 u route for the rest of the session — the character **keeps walking**, but handles thin ramps and narrow openings worse. A client fault; restart to recover it. |
+| `planner_dead` | The fine worker thread has **died**. Steering has degraded to the coarse 8 u route for the rest of the session — the character **keeps walking**, but handles thin ramps and narrow openings worse. A client fault; restart to recover it. **Do not poll for this here** — it is a session fault, not a per-goal verdict, so it disappears from `nav_local` when the goal is retired. Read `nav_local_planner_dead` instead. |
 
 > **`nav_local.state` is never `no_path`, and structurally cannot be.** A 40 u window can never prove a
 > *goal* unreachable, so a tight doorway must never be able to tell an agent its destination does not
 > exist. Only the coarse planner, which closes the whole zone's frontier, may say `no_path`.
+
+**`nav_local` is `null` on every `idle`, whichever `nav_reason` got you there** (#766) — `zoned`,
+`goal_dropped`, `respawned`, `stopped`, `goto_superseded`, `zone_cross_dropped_unhandled`. The fine
+tier's verdict is about threading toward *a goal*, so when the goal is retired the verdict goes with
+it, exactly like `nav_goal` and `nav_tier` (#732). The `zoned` case is the sharp one: a `no_way_through`
+left standing across a crossing describes a corridor in the zone you just left, computed against a
+collision grid that no longer exists — and it is the only kind that publishes, because a healthy
+`threaded` verdict is filtered out anyway. It **does** survive a terminal `blocked` / `no_path`, on
+purpose: there it is the *evidence* behind the failure you are being told about.
+
+This holds for the whole `idle` row, not just the moment it becomes `idle`, and it takes two writers to
+say so. `NavStatus::retire_to_idle` clears the field on the transition; `Walker::set_nav_local` then
+refuses to store a verdict onto a row that is already `idle`, which is what covers a fine-tier reply
+that was still in flight on another thread when the goal was retired.
 
 **Why this field exists.** The fine tier is bounded *spatially* (a 40 u window) plus a deterministic
 node cap (#394 removed its old 150 ms wall clock, so its answer no longer depends on machine load), and
@@ -863,6 +877,53 @@ corridor is not threadable" from "the steering planner hasn't caught up." `nav_l
 > the real nav root cause for months and caused several false diagnoses. **A timeout is never
 > reported as "no route"**, and an unreachable goal is now reported before the character takes a
 > single step.
+
+### `nav_local_planner_dead` — fine-planner liveness, session-scoped
+
+```json
+"nav_local_planner_dead": false
+```
+
+**Always present, in both states.** `true` once the fine worker thread has been observed dead. It
+stays `true` for the life of that worker, because the thread does not come back — recovering it needs
+a client restart.
+
+*Session-scoped* is the agent-facing name for that lifetime, and it is accurate: the latch the client
+keeps internally is scoped to the fine **worker**, and exactly one fine worker is built per client
+process, so from out here the two are the same span. The distinction only matters to the client's own
+code, which is where it is written down — as is the fact that nothing currently pins the one-worker
+premise this name rests on (#787).
+
+**Over a running client this field is one-way.** Nothing in the process constructs a second fine
+worker, so nothing clears it. That is a property of the *process*, not of the field, and it was
+equally true before the clear described next existed.
+
+**A `false` reading is only meaningful while `net_thread_dead` is `null`.** The client clears this
+flag in one place — when it constructs a new fine worker — and nothing writes it when a worker *ends*
+without a replacement. Once the network thread has exited, the fine worker is gone and this row, like
+the rest of the payload, is frozen at whatever it last held; `net_thread_dead` is the field that tells
+you so. Check it before you trust a `false` here.
+
+> The clear-on-construction exists so that if anything ever *did* build a second fine worker
+> in-process, the new one would not inherit the old one's latch and report a fault the client had just
+> repaired. On today's single-worker process it is a no-op.
+
+This field exists because the `nav_local`-is-`null`-on-`idle` rule above would otherwise hide a client
+fault. Two of `nav_local`'s three states — `no_way_through`, `exhausted` — are verdicts about
+threading toward *a goal*, so retiring them with the goal is right. `planner_dead` is not: it is a
+latched fault about the client itself that happened to be riding in the same field. Left there, it
+would vanish on every retirement, so an agent **between goals** — exactly when you poll
+`/v1/observe/debug` to decide what to do next — could not learn that its steering had degraded to
+the coarse 8 u route with nothing on any nav route to recover it. It would reappear only after a new
+goal had committed a route.
+
+So check liveness here, not in `nav_local`. `nav_local` still reports `planner_dead` while a route is
+committed, which is useful in context; this is the channel that does not vanish when the route does.
+
+**One honest limit.** The worker's death is only *discoverable* through a failed send or a
+disconnected receive, and both happen on a tick that has a committed route. A worker that dies and is
+never posted to again is not detectable by any reader, this field included. What is guaranteed is that
+once the death has been seen, it stays visible for the rest of the session.
 
 ---
 

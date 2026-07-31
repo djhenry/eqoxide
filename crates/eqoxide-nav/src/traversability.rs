@@ -673,26 +673,17 @@ mod tests {
         Collision::build(&ZoneAssets { terrain: meshes, objects: vec![], textures: vec![] }, 32.0)
     }
 
-    /// A corridor (floor + side walls, east-going) with a LINTEL: an overhead barrier spanning the
-    /// full corridor cross-section from 3.5 u to 6.5 u above the floor. The #386 drift band made
-    /// exactly this shape a trap: the old planner probes (2.5, 3.0) pass UNDER it, the controller's
-    /// chest contact ray (4.0) hits it, and its step-up re-probe (4.0 + 2.0) hits it too — clear to
-    /// A*, solid to the walker.
-    fn lintel_corridor() -> Collision {
-        col(vec![
-            floor_at(0.0, -40.0, 40.0, -8.0, 8.0),
-            panel(0.0, -8.0, 8.0, 3.5, 6.5), // the lintel, sealing the corridor at chest height
-            // side walls so no detour exists — the ONLY way east is under the lintel
-            mesh(vec![[-8.0, 0.0, -40.0], [-8.0, 10.0, -40.0], [-8.0, 10.0, 40.0], [-8.0, 0.0, 40.0]]),
-            mesh(vec![[8.0, 0.0, -40.0], [8.0, 10.0, -40.0], [8.0, 10.0, 40.0], [8.0, 0.0, 40.0]]),
-        ])
-    }
-
-
     /// The planner's probe heights and the controller's contact heights come from ONE body, and the
     /// planner's top probe is the controller's chest ray. This is the drift-direction invariant in
-    /// its cheapest form: if someone re-declares either height locally, the lintel fixture above
-    /// catches the behaviour; this catches the structure.
+    /// its cheapest form: if someone re-declares either height locally, the lintel fixture catches
+    /// the behaviour; this catches the structure.
+    ///
+    /// #742: "the lintel fixture" used to mean a `lintel_corridor()` defined immediately above here.
+    /// #567 moved the tests that consume it to the app crate (they step the real
+    /// `movement::CharacterController`, which this crate cannot depend on) but left a copy of the
+    /// fixture behind, unused — that copy is what the `dead_code` warning reported, and it is now
+    /// deleted. The behaviour pin is alive and unchanged in
+    /// `tests/walker_sim.rs::planner_never_routes_under_a_lintel_the_walker_collides_with`.
     #[test]
     fn planner_probes_are_derived_from_the_controllers_body_on_both_axes() {
         let planner = PLAYER_BODY.planner_probes();
@@ -703,7 +694,10 @@ mod tests {
         // the controller's own step-up reach — DERIVED, not a coincident literal. This is the exact
         // height of the controller's raised step-slide contact ray, so a low obstacle taller than it
         // blocks BOTH and a shorter one passes BOTH. Re-declaring either as a bare constant re-opens
-        // the #420 drift; this pins the derivation, and `..._low_wall_...` below pins the behaviour.
+        // the #420 drift; this pins the derivation. The behaviour is pinned by
+        // `tests/walker_sim.rs::planner_never_routes_over_a_low_wall_the_walker_cant_step` — NOT by
+        // anything below in this file (#742: that read "`..._low_wall_...` below", which #567 made
+        // false when it moved the test out; the fixture it left behind here was dead and is gone).
         assert_eq!(PLAYER_BODY.step_up, eqoxide_core::physics::STEP_UP,
             "the body's step-up must be the controller's real step-up capability");
         assert_eq!(planner[0], contact[0] + PLAYER_BODY.step_up,
@@ -714,22 +708,6 @@ mod tests {
         assert!(planner[0] > eqoxide_core::physics::STEP_UP,
             "the planner's low probe must clear the step-up band, or every stair reads as a wall");
         assert!(PLAYER_BODY.radius >= eqoxide_core::physics::PLAYER_RADIUS);
-    }
-
-    /// A corridor sealed by a thin LOW WALL 3.0 u tall — taller than the controller's step reach
-    /// (`foot + step_up` = 2.5 u) and with NO walkable top, but shorter than the 4.0 u chest ray.
-    /// The #420 foot-axis twin of [`lintel_corridor`]: the controller's step-up cannot mount it (its
-    /// raised contact ray at 2.5 u hits the wall), and the planner's LOW probe (`feet_clr` = 2.5 u)
-    /// also hits it — so A* refuses the corridor. Drop the low probe (leave only the 4.0 u chest)
-    /// and the wall passes UNDER it: the planner would then route through a wall the walker cannot
-    /// step. That is the mutation this fixture pins.
-    fn low_wall_corridor() -> Collision {
-        col(vec![
-            floor_at(0.0, -40.0, 40.0, -8.0, 8.0),
-            panel(0.0, -8.0, 8.0, 0.0, 3.0), // 3u wall: above the 2.5u step reach, below the 4.0u chest
-            mesh(vec![[-8.0, 0.0, -40.0], [-8.0, 10.0, -40.0], [-8.0, 10.0, 40.0], [-8.0, 0.0, 40.0]]),
-            mesh(vec![[8.0, 0.0, -40.0], [8.0, 10.0, -40.0], [8.0, 10.0, 40.0], [8.0, 0.0, 40.0]]),
-        ])
     }
 
 

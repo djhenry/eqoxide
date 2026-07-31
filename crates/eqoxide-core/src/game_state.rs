@@ -2044,7 +2044,7 @@ pub(crate) mod tests {
         let alphabet = [
             Ev::Fly(true), Ev::Fly(false),
             Ev::BuffOn(1), Ev::BuffOff(1), Ev::BuffKnownOther(1), Ev::BuffUnknown(1),
-            Ev::BuffOn(2), Ev::BuffOff(2),
+            Ev::BuffOn(2), Ev::BuffOff(2), Ev::BuffUnknown(2),
             Ev::ZoneIn(true), Ev::ZoneIn(false),
             Ev::SnapLev, Ev::SnapOther, Ev::SnapUnknown,
         ];
@@ -2060,7 +2060,7 @@ pub(crate) mod tests {
             }
             (ns, nu)
         };
-        // Every sequence of length 3 over the 13-symbol alphabet (2197 orderings).
+        // Every sequence of length 3 over the 14-symbol alphabet (2744 orderings).
         for a in alphabet { for b in alphabet { for c in alphabet {
             let seq = [a, b, c];
             let mut st = LevitateState::default();
@@ -2075,9 +2075,18 @@ pub(crate) mod tests {
                     Ev::BuffKnownOther(s) => { st.buff_slot_changed(s, Some(false), false); ref_slots.remove(&s); ref_unresolved.remove(&s); }
                     Ev::BuffOff(s) => { st.buff_slot_changed(s, None, true); ref_slots.remove(&s); ref_unresolved.remove(&s); }
                     // An UNKNOWN spell id never flips the levitate belief, but IS recorded so the
-                    // answer can honestly say Unknown (slot 1, matching the wire event modeled).
-                    Ev::BuffUnknown(_) => { st.buff_slot_changed(1, None, false);
-                                            if !ref_slots.contains(&1) { ref_unresolved.insert(1); } }
+                    // answer can honestly say Unknown.
+                    //
+                    // #742: both sides of this arm used to hardcode slot 1 and DISCARD the variant's
+                    // payload, which is what the `dead_code` warning on `BuffUnknown`'s field was
+                    // pointing at. The alphabet therefore could not express "an unresolvable buff in
+                    // a slot OTHER than the one the rest of the sequence acts on": adding
+                    // `BuffUnknown(2)` produced a symbol byte-identical in effect to
+                    // `BuffUnknown(1)`, silently, while reading as extra coverage. The slot now comes
+                    // from the event on BOTH the state under test and the reference model, so the
+                    // symbol means what it says.
+                    Ev::BuffUnknown(s) => { st.buff_slot_changed(s, None, false);
+                                            if !ref_slots.contains(&s) { ref_unresolved.insert(s); } }
                     Ev::SnapLev    => { st.resync_from_snapshot(&[(1, Some(true))]);
                                         let (ns, nu) = ref_snapshot(&ref_slots, &[(1, Some(true))]); ref_slots = ns; ref_unresolved = nu; }
                     Ev::SnapOther  => { st.resync_from_snapshot(&[(1, Some(false))]);

@@ -357,6 +357,89 @@ impl SessionDropCause {
     }
 }
 
+/// Where a health projection reads **"now"** from when it turns [`NetHealth`]'s stamps into ages.
+///
+/// #760. Every age in the projection is `now - stamp`. In production `now` is the real monotonic
+/// clock, which is correct and must stay that way — silence *is* the signal (#343). But a TEST
+/// fixture stamps its clocks at construction and is then read some unbounded time later, so its
+/// ages are a function of **how long the test took**, i.e. of machine load. That made
+/// `combat::tests::cast_empty_gem_is_409_and_queues_nothing` answer `503 stale session` instead of
+/// the `409` it asserts whenever the box was busy enough to put >5s (`SESSION_STALE_TICK_MS`)
+/// between `empty_state()` and the request being served — measured, not theorised: sleeping 5.1s
+/// between the fixture and that request reproduces the 503 exactly.
+///
+/// Freezing the clock removes the wall clock from the test's answer entirely, rather than moving
+/// the threshold it races against. A fixture built with [`NetHealth::frozen_at`] has
+/// `now == stamp`, so every age it projects is **exactly** zero however long the test takes.
+///
+/// **A release build cannot construct a frozen clock.** The inner field is private *to this crate*
+/// — production code inside `eqoxide-ipc`'s own `src/` could still write `HealthClock(Some(t))`
+/// directly, which is the normal Rust module boundary; the guarantee is against every OTHER crate,
+/// and it is measured, not reasoned (a `compile_error!` probe on the `test-fixtures` feature does
+/// not fire in `cargo build --release --bin eqoxide`, and does fire under `cargo test`). The only
+/// constructor that can set it from outside, [`HealthClock::frozen_at`], is behind the
+/// `test-fixtures` feature —
+/// so the frozen variant is *unrepresentable* outside a test build. That matters for the honesty
+/// invariant in the other direction: a frozen health clock would pin `snapshot_age_ms` at 0 and
+/// report a dead net thread as live forever, which is exactly the #343 lie this projection exists
+/// to prevent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HealthClock(Option<std::time::Instant>);
+
+impl HealthClock {
+    /// The real monotonic clock — the only clock a non-test build can have, and the `Default`.
+    pub const WALL: HealthClock = HealthClock(None);
+
+    /// A clock PINNED at `t`. Test fixtures only (see the type doc for why this is gated).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn frozen_at(t: std::time::Instant) -> Self {
+        HealthClock(Some(t))
+    }
+
+    /// The instant every age in the projection is measured back from.
+    pub fn now(self) -> std::time::Instant {
+        self.0.unwrap_or_else(std::time::Instant::now)
+    }
+
+    /// True for a pinned clock. Lets a test assert its fixture really is load-independent instead
+    /// of inferring it from a reading that happened to be 0.
+    pub fn is_frozen(self) -> bool {
+        self.0.is_some()
+    }
+
+    /// The age of `stamp` against this clock, saturating at zero for a stamp in the future (which a
+    /// pinned clock makes reachable: a test may re-stamp a field after freezing).
+    pub fn age_of(self, stamp: std::time::Instant) -> std::time::Duration {
+        self.now().saturating_duration_since(stamp)
+    }
+
+    /// A stamp `secs` behind this clock's own reading of now — the inverse of [`age_of`].
+    ///
+    /// On a **pinned** clock the round trip is exact: `age_of(ago(n)) == n`. On the **wall** clock it
+    /// is not, and cannot be — `now` advances between minting and reading, so `age_of(ago(n)) >= n`
+    /// is the strongest true statement. Both are asserted in
+    /// `ago_is_the_inverse_of_age_of_on_the_same_clock_and_drifts_across_clocks`.
+    ///
+    /// Every past-dated net-health stamp in a test must come from here rather than from a bare
+    /// `Instant::now() - secs`. On a wall clock the two are the same expression; on a PINNED clock
+    /// they are not, and the difference is a silent, drifting error:
+    /// `now() - secs` read back against a clock pinned at fixture construction ages to
+    /// `secs − (time since construction)`, so any assertion that needs the stamp to stay ABOVE a
+    /// bound has a margin that machine load eats. That is #760's own failure mode, re-armed one
+    /// level down — it happened, in review, to `debug_reports_world_unresponsive_when_a_probe_goes_
+    /// unanswered_while_the_link_acks` (a 15s stamp that had to clear a 10s bound: a 5s margin).
+    /// Deriving the stamp from the clock that will read it removes that drift, so the correct call
+    /// has no wrong variant to choose between.
+    ///
+    /// [`age_of`]: HealthClock::age_of
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn ago(self, secs: u64) -> std::time::Instant {
+        self.now()
+            .checked_sub(std::time::Duration::from_secs(secs))
+            .expect("monotonic clock younger than the requested stamp age")
+    }
+}
+
 /// The three clocks that answer "can I trust anything else in this payload?", owned and stamped by
 /// the network thread and turned into `Health` **at HTTP read time** (`HttpState::health`), never
 /// cached (#8, #343). They are deliberately separate signals, because they fail independently:
@@ -390,6 +473,9 @@ impl SessionDropCause {
 /// still-ACKing reader thread; this server does not work that way — do not reason from that model.)
 #[derive(Debug, Clone, Copy)]
 pub struct NetHealth {
+    /// Where the health projection reads "now" from (#760). `HealthClock::WALL` in every build that
+    /// is not a test; see [`HealthClock`].
+    pub clock: HealthClock,
     /// Last inbound datagram of ANY kind, session-layer ACKs/keepalives included → link liveness.
     pub last_datagram: std::time::Instant,
     /// Last inbound APPLICATION packet (a decoded opcode that mutated `GameState`) → world activity.
@@ -641,6 +727,7 @@ impl Default for NetHealth {
     fn default() -> Self {
         let now = std::time::Instant::now();
         NetHealth {
+            clock: HealthClock::WALL,
             last_datagram: now, last_packet: now, last_tick: now,
             last_probe_sent: None, last_probe_reply: None,
             first_unanswered_probe_sent: None,
@@ -655,6 +742,37 @@ impl Default for NetHealth {
 }
 
 impl NetHealth {
+    /// #760: a fixture whose clock is PINNED at `now`, with `last_datagram`/`last_packet`/`last_tick`
+    /// stamped at that same instant *minus* the ages the caller asks for (in seconds). Every age the
+    /// health projection derives from it is then **exactly** the number passed in — not "that number
+    /// plus however long the test has been running so far" — so a test's liveness verdict cannot
+    /// depend on machine load. `(0, 0, 0)` is a perfectly live session, permanently.
+    ///
+    /// Test fixtures only; see [`HealthClock`] for why a release build cannot reach this.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn frozen_at(
+        now: std::time::Instant,
+        datagram_ago_secs: u64,
+        tick_ago_secs: u64,
+        packet_ago_secs: u64,
+    ) -> Self {
+        // `checked_sub` + `expect` (the same shape as `eqoxide_http::testkit::ago`): on a host whose
+        // monotonic epoch is younger than the age asked for there is no instant to name, and a loud
+        // panic naming the cause beats silently clamping to the epoch and reporting a smaller age
+        // than the fixture asked for.
+        let back = |secs: u64| {
+            now.checked_sub(std::time::Duration::from_secs(secs))
+                .expect("monotonic clock younger than the requested fixture age")
+        };
+        NetHealth {
+            clock: HealthClock::frozen_at(now),
+            last_datagram: back(datagram_ago_secs),
+            last_tick: back(tick_ago_secs),
+            last_packet: back(packet_ago_secs),
+            ..NetHealth::default()
+        }
+    }
+
     /// #656: stamp a `send_wouldblock_rescued`/`send_deferred` event and update the consecutive-
     /// burst streak that `send_starved` reads. Call this from BOTH increment sites (never bump
     /// `send_pressure_streak`/`last_send_pressure_at` any other way, or the two would drift from the
@@ -1362,6 +1480,64 @@ pub struct NavStatus {
     /// `nav_state: navigating` needs to know, in the same snapshot, whether the tier that is actually
     /// steering it can see a way through the next 40 u.
     pub local:  Option<NavLocal>,
+    /// **The fine worker thread has died — latched, and scoped to that WORKER** (#766 review B3/B9).
+    /// Set `true` the instant `LocalPlanner::is_dead()` is observed, and cleared by **nothing on any
+    /// nav route**: no goal, no zone change, no retirement touches it, because the thread does not
+    /// come back and recovering it needs a client restart. The one writer that clears it is
+    /// `Walker::new` (`eqoxide-nav`), which does so as it spawns a REPLACEMENT worker — so what the
+    /// latch describes is the worker, not the process. Those coincide today, exactly one `Walker`
+    /// being built per process, which is why the agent-facing docs call the field session-scoped; the
+    /// last paragraph here says why the distinction is worth keeping anyway. Published as the
+    /// top-level `nav_local_planner_dead` on GET /v1/observe/debug, always, in both states: an agent
+    /// checking its own health needs to be able to read "alive", not merely fail to read "dead".
+    ///
+    /// This field exists because `local` could not carry the fact honestly. `NavLocal` is a PER-GOAL
+    /// verdict and #766 retires it with the goal, but `planner_dead` was riding in it as one of its
+    /// three publishable `state` values while being a fact about the *client's fine worker*, not a
+    /// statement about any goal — and `local` was its only publication surface in the tree (the
+    /// `no_path`/`planner_dead` pair on `state`/`reason` comes from the COARSE planner). So
+    /// retirement destroyed it, and the review found the consequence: an agent between goals — exactly
+    /// when it polls `/v1/observe/debug` to decide what to do next — could not learn that its fine
+    /// planner was dead. Splitting the worker fact out of the per-goal row fixes that without a
+    /// carve-out in [`NavStatus::retire_to_idle`], which would have re-opened the very
+    /// clear-`local`-on-every-`idle` uniformity #766 exists to create.
+    ///
+    /// **Known limit, stated rather than implied.** `LocalPlanner`'s death is only *discoverable*
+    /// through a failed send or a disconnected receive, both of which happen on a tick that has a
+    /// committed route. A worker that dies and is never posted to again is not detectable by any
+    /// reader, this field included; what the latch guarantees is that once the death HAS been seen it
+    /// stays visible for the rest of that worker's life — which, on today's one-`Walker` process, is
+    /// the rest of the session — instead of dying with the next goal.
+    ///
+    /// **Latched for the life of a WORKER, and cleared where one is spawned** (rounds 3–5 review).
+    /// "Session" means PROCESS today: `LocalPlanner::spawn` is reached only through `Walker::new` →
+    /// `ActionLoop::new`, and the one production call site of `ActionLoop::new` is in
+    /// `run_login_flow`, which returns as soon as the gameplay phase ends — so exactly one fine
+    /// worker exists per process and "latched forever" and "latched for this worker" coincide.
+    /// **That premise is pinned by nothing — no guard, no test — and #787 tracks it**; the B9 test
+    /// below cannot be the pin, because building a second `Walker` is its method. They
+    /// stop coinciding the moment anything builds a second `Walker` over this row (the shape an
+    /// in-process relogin would take): a NEW, healthy `LocalPlanner` would inherit `true` and the
+    /// client would report a fault it had just repaired, permanently — #343's shape, and a lie in the
+    /// honesty-critical direction. So `Walker::new` clears this flag as it spawns the worker, tying
+    /// the latch's lifetime to the worker's rather than to the row's. That is a no-op on today's
+    /// single-`Walker` process and is guarded by
+    /// `a_new_walker_does_not_inherit_a_previous_workers_death_766` in `eqoxide-nav`, which
+    /// constructs over a dirty row directly — the relogin *scenario* has no route to test through,
+    /// but the *clear* does, and the clear is what carries the guarantee.
+    ///
+    /// **That covers the BIRTH end of a worker's life and nothing covers the death end** (#766 review
+    /// B13). There is no `Drop` for `Walker` or for `LocalPlanner` anywhere, so when the net thread
+    /// ends — `run_net_thread` in `src/model.rs` writes a terminal reason on all four of its exit
+    /// arms — the worker is gone while this row, which the HTTP surface holds its own `Arc` to, goes
+    /// on publishing whatever it last held, `false` included. So do NOT read this field as "the flag
+    /// can never outlive the thread it reports on": a stale `false` after teardown is exactly that.
+    /// It is *disclosed* rather than hidden — `net_thread_dead` is non-null on precisely those paths
+    /// and the endpoint marks the whole payload a frozen final snapshot — which is why the review
+    /// asked for the sentence to be corrected and explicitly did **not** ask for a teardown writer:
+    /// adding one would be a new, untested route to fix something an existing signal already tells
+    /// the agent.
+    pub local_planner_dead: bool,
 }
 
 /// A named obstruction with a position — the agent-facing form of `traversability::Blockage`
@@ -1428,6 +1604,62 @@ impl NavStatus {
     /// the same construction `AssetSyncState::slots()` uses in `eqoxide-ipc::asset_sync`. Note the
     /// weaker precondition: `NavStatus`'s fields are `pub` and read directly by several crates, so
     /// this pins the *retirement path* only. It does not stop other code writing the fields.
+    ///
+    /// **#766 moved `local` from KEPT to retired.** #732 left it standing with a `_keep_local`
+    /// binding on the grounds that the FINE tier is "a different tier" whose clearing
+    /// `Walker::clear_local_plan` owns. That reasoning holds for the tier's *machinery* and it still
+    /// does — this function does not touch `LocalPlanner`, and every NON-`idle` state keeps `local`
+    /// exactly as before, which is what preserves #382's deliberate keep-the-fine-verdict-on-`blocked`
+    /// design (`Walker::stop_nav_blocked` publishes `blocked`/`no_path`, never `idle`, so it does not
+    /// come through here). It does not hold for the published FIELD on an `idle` row: a `NavLocal`
+    /// carrying `no_way_through` or `exhausted` is the fine planner's verdict on threading toward *the
+    /// goal that just ended*, so it is a per-goal fact by the same argument as `tier`.
+    ///
+    /// **That argument covers two of the three publishable states, not all three** (review B3).
+    /// `planner_dead` was never a verdict about a goal — it is a latched client fault, scoped to the
+    /// fine WORKER rather than to any goal (round-6 review B12; the session framing this paragraph
+    /// used to carry is the agent-facing one, and `local_planner_dead`'s own doc says why the two
+    /// coincide today), that happened to be riding in this field as one of its three publishable
+    /// `state` values, and retiring it with the
+    /// goal would hide a dead fine worker from an agent between goals. It is not carved out here;
+    /// it now has its own field, `local_planner_dead`, which this function KEEPS.
+    ///
+    /// Before #766 the routes did not agree with each other. `zoned` — the reported one — and
+    /// `zone_cross_dropped_unhandled` left the verdict standing. The rest already cleared it, by two
+    /// different mechanisms that are RUN here rather than read off the source: `goal_dropped` (and
+    /// `respawned`, which shares its branch) because `Walker::resolve_goal`'s no-goto branch calls
+    /// `clear_local_plan()` on the same tick before it retires — `eqoxide-nav`'s
+    /// `the_goal_dropped_route_already_cleared_the_fine_verdict_before_766`; and the command-side
+    /// ones through an explicit `s.local = None;` in `CommandState::stamp_new_goal`, now deleted as
+    /// redundant — `eqoxide-command`'s
+    /// `every_command_side_retirement_retires_the_fine_tiers_verdict_766`. Routing them all through
+    /// here replaces that agreement-by-coincidence with one writer. (`respawned` is covered by
+    /// reading the shared branch, not by its own test.)
+    ///
+    /// **This covers the transition only.** `docs/http-api.md` states `nav_local: null` as a
+    /// universal over every `idle` row, and a retirement writer cannot deliver that on its own — the
+    /// fine tier publishes from another thread and can land a verdict after the row went `idle`.
+    /// The other half of the guarantee is the coercion in `Walker::set_nav_local`; see its doc
+    /// comment for why that one is a coercion and not an assert.
+    ///
+    /// **The `stop_nav_blocked` half of the #382 argument is true by convention, not by
+    /// construction.** Its `state` is a `&str`, so nothing stops a future caller passing `"idle"`
+    /// and routing a terminal `blocked` through this retirement after all. Every call site in the
+    /// tree today passes a literal — `blocked`, `no_path`, `search_exhausted` — so the design holds
+    /// now, but it is grep-checkable, not enforced.
+    ///
+    /// The structural remedy is a typed `state` — an enum whose `idle` variant `stop_nav_blocked`
+    /// cannot name — and that is a workspace-wide change, out of this issue's scope. A
+    /// `debug_assert!(state != "idle", …)` would NOT be that remedy, and the earlier draft of this
+    /// paragraph was wrong to call it structural (review B4): `debug_assert!` compiles out under
+    /// `--release`, so it is a test-time instrument. That is not a new opinion: it is the same
+    /// argument `Walker::set_nav_local`'s doc makes for taking a coercion instead of an assert, and
+    /// the repo already says it out loud about the #725 writer guard — the doc on
+    /// `a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725` in
+    /// `eqoxide-nav` calls that `debug_assert!` "a TEST-TIME instrument, not a runtime one". It would
+    /// raise
+    /// the odds of catching a bad call site in CI; it would not make the invariant hold in the shipped
+    /// binary. Recorded as a known limit rather than left implied.
     pub fn retire_to_idle(&mut self, why: Option<&str>) {
         // The same writer-level guard as `Walker::set_nav_state_because` and
         // `CommandState::stamp_new_goal`: on `idle`, `nav_reason: null` is reserved for boot (#725).
@@ -1440,10 +1672,25 @@ impl NavStatus {
             // Zeroing or bumping it here would break that correlation.
             goal_id: _keep_goal_id,
             goal, blocked_goal, blocked_frontier, tier,
-            // KEPT, deliberately — `local` is the FINE tier's own last word, an independent fact
-            // about a different tier (#382), and `Walker::clear_local_plan` owns clearing it. Wiring
-            // it in here would silently take that ownership away from #382's design.
-            local: _keep_local,
+            // #766: RETIRED, not kept. The fine tier's verdict is about threading toward the goal
+            // that is now over — a `no_way_through` published beside `idle`/`zoned` asserts something
+            // about a corridor in a zone we have left, computed against a collision grid that no
+            // longer exists. See the "#766 moved `local`" paragraph above for why this does not
+            // undo #382's ownership: only the `idle` row is affected, and this function does not
+            // touch `LocalPlanner` — but note the effect is not merely cosmetic, because
+            // `Walker::local_says_no_way_through` reads this same field back as a steering input.
+            // Clearing it on `idle` clears that input too, which is what we want: on an `idle` row
+            // there is no goal, so there is no corridor for it to be an opinion about.
+            local,
+            // KEPT, deliberately — and this is the field the E0027 net was built for. A dead fine
+            // worker is a fact about the WORKER, not about the goal that just ended, and it is
+            // latched because that thread does not come back. Retiring a goal is not replacing a
+            // worker, so nothing here has repaired anything; clearing it would tell an agent between
+            // goals that its degraded steering had healed. (Scoped to the worker, not to the session
+            // — round-6 review B12. `Walker::new` is the one writer that clears it. See the field's
+            // own doc, both for that and for why it is a separate field rather than a carve-out in
+            // the `local` arm above.)
+            local_planner_dead: _keep_local_planner_dead,
         } = self;
         *state  = "idle".to_string();
         *reason = why.map(str::to_string);
@@ -1451,6 +1698,7 @@ impl NavStatus {
         *blocked_goal     = None;
         *blocked_frontier = None;
         *tier             = None;
+        *local            = None;
     }
 }
 
@@ -1458,7 +1706,7 @@ impl Default for NavStatus {
     fn default() -> Self {
         NavStatus { state: "idle".into(), reason: None, local: None,
             blocked_goal: None, blocked_frontier: None, tier: None,
-            goal_id: 0, goal: None }
+            goal_id: 0, goal: None, local_planner_dead: false }
     }
 }
 
@@ -1466,7 +1714,7 @@ impl From<&str> for NavStatus {
     fn from(state: &str) -> Self {
         NavStatus { state: state.to_string(), reason: None, local: None,
             blocked_goal: None, blocked_frontier: None, tier: None,
-            goal_id: 0, goal: None }
+            goal_id: 0, goal: None, local_planner_dead: false }
     }
 }
 
@@ -2155,6 +2403,107 @@ mod world_responsive_tests {
         // gone (#470) → condemn.
         assert!(!world_responsive(true, None, None, STALE, TIMEOUT, STALE),
             "at/after the passive bound with no probe ever, the prober is dead → zombie (#470)");
+    }
+}
+
+/// #760: `HealthClock` — where a health projection reads "now" when it turns [`NetHealth`]'s
+/// stamps into ages. These pin the two properties the fix rests on: the production/`Default` clock
+/// is the real wall clock (anything else would freeze every published age at process start — the
+/// #343 lie), and a pinned clock yields ages that are a pure function of the stamps, so a fixture
+/// built from it cannot drift with machine load.
+#[cfg(test)]
+mod health_clock_tests {
+    use super::{HealthClock, NetHealth};
+
+    // ── `HealthClock` — where a health projection reads "now" (#760) ────────────────────────────
+
+    /// The production clock is the wall clock, and `Default` is the production clock. If this ever
+    /// flipped, every age the client publishes would freeze at process start and `connected` would
+    /// latch true forever — the exact #343 lie.
+    #[test]
+    fn the_default_health_clock_is_the_wall_clock() {
+        assert!(!HealthClock::default().is_frozen(), "the default clock must be the real wall clock");
+        assert!(!HealthClock::WALL.is_frozen());
+        assert!(!NetHealth::default().clock.is_frozen(),
+            "a NetHealth built the production way must carry the wall clock");
+        let before = std::time::Instant::now();
+        let a = HealthClock::WALL.now();
+        assert!(a >= before, "the wall clock must actually read the wall clock");
+    }
+
+    /// A pinned clock reads back the SAME instant every time, so an age against it is a pure
+    /// function of the two values and cannot move with machine load. This is the whole of #760.
+    #[test]
+    fn a_frozen_clock_does_not_advance_and_ages_exactly() {
+        let t = std::time::Instant::now();
+        let c = HealthClock::frozen_at(t);
+        assert!(c.is_frozen());
+        assert_eq!(c.now(), t);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(c.now(), t, "a pinned clock must not advance with wall time");
+        assert_eq!(c.age_of(t), std::time::Duration::ZERO,
+            "a stamp taken at the pin reads exactly zero, however long ago that was");
+        assert_eq!(
+            c.age_of(t - std::time::Duration::from_secs(4)),
+            std::time::Duration::from_secs(4),
+            "and an older stamp reads exactly its own age, with no wall-clock drift added");
+    }
+
+    /// `ago` inverts `age_of` **on the same clock**: exactly, on a pinned clock; up to the elapsed
+    /// gap between the two calls, on the wall clock — where an exact round trip is impossible, which
+    /// is why the wall-clock arm below is an inequality and the pinned arm is not. Either way the
+    /// call is the right one, so a test never has to choose between two spellings.
+    /// The cross-clock half is the one that matters: a stamp taken from the WALL clock and read back
+    /// against a PINNED one drifts by the gap between them, which is #760's failure mode one level
+    /// down (review finding B1). Asserted here as a strict inequality, not a tolerance window.
+    #[test]
+    fn ago_is_the_inverse_of_age_of_on_the_same_clock_and_drifts_across_clocks() {
+        let pin = std::time::Instant::now();
+        let frozen = HealthClock::frozen_at(pin);
+        assert_eq!(frozen.age_of(frozen.ago(15)), std::time::Duration::from_secs(15),
+            "on a pinned clock, ago(15) must read back as exactly 15s");
+        // The wall clock's version of the same law, stated as the inequality that is actually true:
+        // `now` advances between the two calls, so the age can only read LONGER than asked, never
+        // shorter. (Writing this as `assert_eq!(…, ZERO)` is what a first draft said; it failed at
+        // `left: 100ns`, which is this PR's own defect class — a wall-clock-dependent assertion —
+        // caught by the suite. Monotonicity gives a bound that needs no tolerance window.)
+        assert!(HealthClock::WALL.age_of(HealthClock::WALL.ago(15)) >= std::time::Duration::from_secs(15),
+            "on the wall clock, ago(15) must read back as AT LEAST 15s — a monotonic clock cannot \
+             make a stamp younger than it was minted");
+
+        // The cross-clock error the guard test exists to ban: stamp from the wall clock AFTER the
+        // pin, read back against the pin. The gap is real elapsed time, so the age comes back SHORT.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let wall_stamp = HealthClock::WALL.ago(15);
+        assert!(frozen.age_of(wall_stamp) < std::time::Duration::from_secs(15),
+            "a wall-clock stamp read against a pinned clock must age SHORT — this is the drift that \
+             eats a threshold test's margin (#760/B1)");
+    }
+
+    /// A stamp AHEAD of the clock saturates to zero rather than panicking — reachable once the clock
+    /// is pinnable, because a fixture may re-stamp a field after freezing.
+    #[test]
+    fn a_stamp_ahead_of_the_clock_saturates_to_zero() {
+        let t = std::time::Instant::now();
+        let c = HealthClock::frozen_at(t);
+        assert_eq!(c.age_of(t + std::time::Duration::from_secs(9)), std::time::Duration::ZERO);
+    }
+
+    /// `NetHealth::frozen_at` stamps the three liveness clocks at exactly the ages asked for,
+    /// measured against its own pin — so a fixture's `(0,0,0)` is a permanently live session and its
+    /// `(20,0,20)` is a permanently disconnected one, with no margin for load to eat.
+    #[test]
+    fn net_health_frozen_at_yields_exact_ages() {
+        let now = std::time::Instant::now();
+        let h = NetHealth::frozen_at(now, 20, 6, 41);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(h.clock.age_of(h.last_datagram), std::time::Duration::from_secs(20));
+        assert_eq!(h.clock.age_of(h.last_tick), std::time::Duration::from_secs(6));
+        assert_eq!(h.clock.age_of(h.last_packet), std::time::Duration::from_secs(41));
+        let live = NetHealth::frozen_at(std::time::Instant::now(), 0, 0, 0);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(live.clock.age_of(live.last_tick), std::time::Duration::ZERO,
+            "a (0,0,0) fixture stays exactly fresh no matter how long the test runs");
     }
 }
 

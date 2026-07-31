@@ -15,7 +15,19 @@ use std::sync::{Arc, Mutex};
 
 use crate::HttpState;
 
-/// An `Instant` `secs` in the past (saturating — a just-booted host can't go below its epoch).
+/// An `Instant` `secs` in the past, on the WALL clock.
+///
+/// Fine for stamps that are aged against `Instant::now()` at read time — the asset-sync publisher's
+/// `tick_stamped`, for instance. **Not** for a `NetHealth` stamp: `health()` ages those against
+/// `NetHealth::clock`, which a fixture pins, so a wall-clock stamp read back against it drifts by
+/// however long the test took (#760). Use `h.clock.ago(secs)` there. That ban is **partially**
+/// guarded by `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_
+/// one_that_reads_it` — a source scan over four files, one statement at a time. It catches the
+/// rustfmt-wrapped and struct-literal spellings. It does **not** catch a stamp aliased through a
+/// local, nor one whose value is produced inside a nested block or a `match` arm (the scan cuts
+/// statements at `{` and `}`, which separates the field from the call), nor anything in a file it
+/// does not scan. Read that test's doc for the full measured list before relying on it: a wrong
+/// spelling it misses still compiles and still lands.
 pub fn ago(secs: u64) -> std::time::Instant {
     std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(secs))
@@ -31,11 +43,57 @@ pub fn set_gs(state: &HttpState, f: impl FnOnce(&mut eqoxide_core::game_state::G
     state.game_state.store(Arc::new(gs));
 }
 
+/// As [`empty_state`], but with the health clock left on the REAL WALL CLOCK (#760).
+///
+/// For the small, deliberate set of tests whose SUBJECT is the clock: the #343 read-time-derivation
+/// guards, which stamp a stale source and then assert the projected age is genuinely `>= N` seconds,
+/// or that it CLIMBS between two reads with no publisher running. Those properties are meaningless
+/// against a pinned clock — an age that cannot move cannot be shown to move — so they opt out here,
+/// explicitly and visibly, rather than the whole fixture staying wall-driven for their sake.
+///
+/// **Everything else must use [`empty_state`].** A handler test on a wall clock is racing
+/// `SESSION_STALE_TICK_MS`: if the machine puts 5s between this call and the request, the handler
+/// answers `503 stale session` instead of whatever the test asserted (#760). There are exactly seven
+/// call sites of this function, all in `observe`'s clock tests.
+///
+/// If you are adding an eighth, there are **two** shapes to tell apart, and the earlier version of
+/// this rule named only the first — which is precisely how a load-fragile test got past review:
+///
+/// 1. **An age that must MOVE** (`assert!(second > first)` across two reads). Genuinely needs the
+///    wall clock: an age that cannot move cannot be shown to move. This function is for these.
+/// 2. **An age that must EXCEED A BOUND** (`assert!(age >= N)`, or a stamp placed past a timeout so
+///    a verdict fires). These do **not** need the wall clock, and must not use it — stay on
+///    [`empty_state`] and derive the stamp from the fixture's own clock (`let c = h.clock;
+///    h.last_probe_sent = Some(c.ago(15));`). A wall-clock `ago(15)` read back against a pinned
+///    clock ages to `15s − (time since the fixture was built)`, so the margin over the bound is
+///    eaten by machine load — #760's failure mode, one level down.
+///
+/// Shape 2 is documented here and **partially** guarded by
+/// `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it`,
+/// which names its own measured blind spots. Do not read it as making the mistake unlandable.
+pub fn empty_state_wall_clock() -> HttpState {
+    let state = empty_state();
+    // `NetHealth::default()` is the production constructor: `HealthClock::WALL`, all three stamps at
+    // `Instant::now()`. This is exactly what `empty_state` used to hand every test.
+    *state.net_health.lock().unwrap() = crate::NetHealth::default();
+    state
+}
+
 /// As [`empty_state`], but wired to a CALLER-OWNED `NetHealthShared` — the same `Arc` the network
 /// thread's `EqStream` stamps. Exposed for #612's cross-crate test: eqoxide-net drives a REAL
 /// `EqStream` into a REAL send failure and then asserts the failure is visible in THIS crate's
 /// `/v1/observe/debug` JSON, i.e. that the fact reaches something the agent can poll rather than
 /// merely being published into an internal struct.
+///
+/// **This un-pins the health clock (#760/N3).** [`empty_state`] hands out a `NetHealth` frozen at
+/// construction so a handler test cannot race `SESSION_STALE_TICK_MS`; the caller-owned `Arc`
+/// replaces that wholesale, and callers build theirs with `NetHealth::default()`, i.e. the WALL
+/// clock. That is correct for #612's purpose — the subject is a real `EqStream` stamping real
+/// times — but it means a stamp written here is aged against the wall clock, so the two shapes in
+/// [`empty_state_wall_clock`]'s doc apply to this function too, and the `observe` guard does not
+/// scan the caller's crate. `crates/eqoxide-net/src/transport.rs:2679` past-dates
+/// `last_send_pressure_at` through this path today; it is correct precisely because the clock is
+/// the wall clock, which is the fact this paragraph exists to keep true.
 pub fn empty_state_with_net_health(net_health: eqoxide_ipc::NetHealthShared) -> HttpState {
     HttpState { net_health, ..empty_state() }
 }
@@ -121,7 +179,16 @@ pub fn empty_state() -> HttpState {
         chat: Default::default(),
         spells: std::sync::Arc::new(eqoxide_core::spells::SpellDb::default()),
         game_state: Arc::new(arc_swap::ArcSwap::from_pointee(eqoxide_core::game_state::GameState::new())),
-        net_health: Arc::new(Mutex::new(crate::NetHealth::default())),
+        // #760: a FROZEN health clock, stamped at the same instant it is pinned to, so every age
+        // `HttpState::health()` projects for this fixture is exactly 0 — permanently, and whatever
+        // the machine is doing. With `NetHealth::default()` (the real wall clock) the ages were
+        // "however long this test has been running", so a handler test that took >5s to reach its
+        // request got `503 stale session` from `require_live_session` instead of the status it
+        // asserted. That is #760, and it fired on a diff that had nothing to do with it.
+        // Tests that WANT a stale session build their own `NetHealth::frozen_at(now, …)`.
+        net_health: Arc::new(Mutex::new(crate::NetHealth::frozen_at(
+            std::time::Instant::now(), 0, 0, 0,
+        ))),
         frame_profile: Arc::new(Mutex::new(eqoxide_ipc::FrameProfile::default())),
         quest: Default::default(),
         group_slots: Default::default(),
@@ -152,3 +219,13 @@ pub async fn observe_json(state: HttpState, path: &str) -> serde_json::Value {
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
+
+/// Reach control for `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it` (#760/C1).
+///
+/// That guard scans this file's source text. A scanner that silently stops early — as it did, when
+/// a `/*` inside a route glob in a doc comment latched its block-comment state — reports
+/// a clean scan of a corpus it never read, which is a confident falsehood. The guard asserts it can
+/// SEE this constant; because it is the last item in the file, seeing it proves the scan arrived at
+/// the end. **Keep it last.**
+#[cfg(test)]
+pub(crate) const GUARD_REACH_SENTINEL_TESTKIT: u8 = 0;

@@ -558,6 +558,90 @@ mod tests {
         assert!(command.take_cast().is_none(), "an empty gem must not be queued as a cast");
     }
 
+    /// #760: the request above must answer 409 for reasons that have nothing to do with how long the
+    /// test took to get there. `empty_state()` used to stamp its net-health clocks with
+    /// `Instant::now()` and `HttpState::health()` used to read them against `Instant::now()` again,
+    /// so `snapshot_age_ms` was "however long this test has been running" — and on a loaded box that
+    /// crossed `SESSION_STALE_TICK_MS` (5s) and `require_live_session` answered `503` from the very
+    /// first line of `post_cast`, before any gem was ever looked at.
+    ///
+    /// MEASURED, on this code, before the fix: the same request with a 5.1s sleep in front of it
+    /// returned `503 … the network thread has not ticked in 5100ms`. So the reported mechanism is
+    /// the real one and the 503 really does come from this guard on this route.
+    ///
+    /// This asserts the FIXTURE property that removes it, not a timing: real wall time passes here
+    /// (the sleep is deliberate and observable via `Instant::elapsed`) and the fixture's projected
+    /// ages stay exactly 0, because they are measured against a clock pinned at the fixture's own
+    /// construction instant. A 50ms sleep and a 5s one are the same assertion — `now - stamp` where
+    /// `now == stamp` is 0 for every duration — so this does not need to cost the suite 5 seconds
+    /// to prove the 5-second case.
+    #[tokio::test]
+    async fn handler_fixture_ages_do_not_track_the_wall_clock() {
+        let state = empty_state();
+        assert!(state.net_health.lock().unwrap().clock.is_frozen(),
+            "the handler fixture must pin its health clock, or every gated handler test races \
+             SESSION_STALE_TICK_MS (#760)");
+        let started = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50),
+            "precondition: real wall time really did pass");
+        let h = state.health();
+        assert_eq!(h.snapshot_age_ms, 0,
+            "the fixture's tick age must be pinned at 0, not the {}ms of wall clock that just \
+             elapsed — this is the age require_live_session 503s on (#760)", started.elapsed().as_millis());
+        assert_eq!(h.link_age_ms, 0, "the fixture's link age must be pinned too — it feeds `connected`");
+        assert_eq!(h.last_packet_age_ms, 0, "the fixture's packet age must be pinned too");
+        assert!(crate::require_live_session(&state).is_ok(),
+            "and the verdict the pinned ages produce is a live session");
+    }
+
+    /// #760, end to end and DETERMINISTIC: the exact request
+    /// `cast_empty_gem_is_409_and_queues_nothing` drives, served after more than
+    /// `SESSION_STALE_TICK_MS` (5s) of real wall time has passed since the fixture was built.
+    ///
+    /// This is the load condition the flake needs, forced rather than waited for — and forced in the
+    /// only direction that matters: a busy machine makes the sleep LONGER, never shorter, so this
+    /// test cannot become less severe under load. On the pre-fix code the measured answer here was
+    /// `503 … the network thread has not ticked in 5100ms`; the whole 409 body was never reached.
+    ///
+    /// It costs the suite ~5s. That is the price of turning "fails sometimes, on someone else's PR"
+    /// into a check that fails every time if the fix is undone.
+    #[tokio::test]
+    async fn cast_empty_gem_is_still_409_after_the_stale_session_bound_has_elapsed() {
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.mem_spells = [eqoxide_core::game_state::EMPTY_GEM; 9];
+            gs.mem_spells[0] = 202;
+        });
+        let net_health = state.net_health.clone();
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        // > SESSION_STALE_TICK_MS. `std::thread::sleep`, not `tokio::time::sleep`: the clock under
+        // test is `std::time::Instant`, which tokio's virtual time does not move.
+        std::thread::sleep(std::time::Duration::from_millis(5_100));
+        let req = Request::post("/cast")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"gem":7}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let text = body_text(resp).await;
+        assert_eq!(status, StatusCode::CONFLICT,
+            "5.1s of wall time must not change this request's answer — it is an empty gem either \
+             way (#760). Body was: {text}");
+        assert!(text.contains("empty"), "and for the real reason, not a stale-session one: {text}");
+        // ONE lock, both reads. Two `net_health.lock()` calls in a single `assert_eq!` self-deadlock:
+        // the left guard is a temporary that lives to the end of the statement, and `std::sync::Mutex`
+        // is not reentrant — the second lock blocks forever. Measured: this test hung a whole
+        // `eqoxide-http` test binary until it was written this way.
+        let (clock_now, tick_stamp) = {
+            let h = net_health.lock().unwrap();
+            (h.clock.now(), h.last_tick)
+        };
+        assert_eq!(clock_now, tick_stamp,
+                   "the fixture's clock is still pinned to its own tick stamp after 5.1s");
+        assert!(command.take_cast().is_none(), "and still nothing was queued");
+    }
+
     // ── A3 Migration 3 (#448): POST /v1/combat/cast reports the TRUE outcome, not a queued 200 ──
 
     use eqoxide_command::{CastEnd, CommandResult};
@@ -767,3 +851,13 @@ mod tests {
             "message should name the real cause, not the unrelated \"provide gem/spell_id\" default-validation text: {text}");
     }
 }
+
+/// Reach control for `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it` (#760/C1).
+///
+/// That guard scans this file's source text. A scanner that silently stops early — as it did, when
+/// a `/*` inside a route glob in a doc comment latched its block-comment state — reports
+/// a clean scan of a corpus it never read, which is a confident falsehood. The guard asserts it can
+/// SEE this constant; because it is the last item in the file, seeing it proves the scan arrived at
+/// the end. **Keep it last.**
+#[cfg(test)]
+pub(crate) const GUARD_REACH_SENTINEL_COMBAT: u8 = 0;

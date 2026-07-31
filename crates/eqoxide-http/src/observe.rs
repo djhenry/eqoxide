@@ -87,7 +87,8 @@ fn zone_assets_not_ready(s: &HttpState) -> Option<Response> {
 /// frozen map and no marker of any kind.
 ///
 /// **This is the SAME clock as `/debug`'s `snapshot_age_ms`, not a second one** — both are
-/// `HttpState::health().snapshot_age_ms`, i.e. `NetHealth::last_tick.elapsed()` measured fresh on
+/// `HttpState::health().snapshot_age_ms`, i.e. `NetHealth::last_tick`'s age against the health clock
+/// (`Instant::now()` in every non-test build — see `HealthClock`, #760) measured fresh on
 /// every request (#343: an age is only true at the instant it's read, so nothing here is cached).
 /// `last_tick` is bumped, unconditionally, once per gameplay tick by the SAME `eq-net` thread loop
 /// iteration that publishes `GameState` and drains `ActionLoop::tick` — the single writer of every
@@ -1050,6 +1051,26 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // clock" with no way to ask which, and `nav_state` said a confident `navigating` throughout.
         // The clock is gone; the ambiguity went with it.
         "nav_local": nav_local,
+        // WORKER-scoped fine-planner liveness (#766 review B3; scope corrected from "session" by
+        // round-6 review B12 — the latch is cleared by `Walker::new` as it spawns a replacement, and
+        // it reads as session-scoped from outside only because exactly one fine worker is built per
+        // process — a premise nothing in the tree pins, #787. `docs/http-api.md` keeps the
+        // agent-facing "session-scoped" name and says why).
+        // `nav_local` above is a PER-GOAL
+        // verdict and #766 retires it with the goal — correct for `no_way_through` / `exhausted`, and
+        // wrong for `planner_dead`, which is a latched client fault, not a statement about a goal.
+        // Carried here it survives every retirement, so an agent BETWEEN goals — which is when it
+        // polls this endpoint to decide what to do next — can still see that its steering has
+        // degraded to the coarse 8u route and that nothing on any nav route recovers it (a claim
+        // about WRITERS, which is what the tree guarantees; "permanently" was strictly stronger and
+        // false in the same breath as this block's own "the lifetime is the WORKER's" — round-6
+        // review B14). `planner_dead` still appears in `nav_local`
+        // while a route is committed; this is the channel that does not vanish when the route does.
+        //
+        // Always present, in BOTH states, unlike the `null`-when-healthy fields around it: checking
+        // your own health needs a readable "alive", not merely the absence of "dead" — which is
+        // indistinguishable from an older client that never had the field.
+        "nav_local_planner_dead": nav.local_planner_dead,
         // The agent-honesty payload behind a terminal `no_path` (#378 Phase 2). `null` when there is
         // nothing to report. `goal` (if present) is the DEFINITIVE "your goal itself cannot be stood
         // at"; `frontier` is the hazard at the search's CLOSEST APPROACH — one blocking fact, named
@@ -1952,7 +1973,7 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{ago, empty_state, set_gs};
+    use crate::testkit::{ago, empty_state, empty_state_wall_clock, set_gs};
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -3235,7 +3256,7 @@ mod tests {
     /// publisher has to be alive for the answer to be honest.
     #[tokio::test]
     async fn debug_reports_disconnected_when_the_world_froze_and_nothing_republished() {
-        let state = empty_state();
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         // The world as it was when the link was still up — a sitting character, full HP.
         set_gs(&state, |gs| {
             gs.player_name = "Gmkblr".into();
@@ -3247,9 +3268,10 @@ mod tests {
         // genuinely gone), and no publish of any kind.
         {
             let mut h = state.net_health.lock().unwrap();
-            h.last_datagram = ago(60);
-            h.last_packet   = ago(60);
-            h.last_tick     = ago(60);
+            let c = h.clock;
+            h.last_datagram = c.ago(60);
+            h.last_packet   = c.ago(60);
+            h.last_tick     = c.ago(60);
         }
 
         let v = debug_json(state).await;
@@ -3327,8 +3349,8 @@ mod tests {
     /// same number across consecutive polls whenever the render loop slept.
     #[tokio::test]
     async fn last_packet_age_advances_between_reads_with_no_publisher_running() {
-        let state = empty_state();
-        state.net_health.lock().unwrap().last_packet = ago(5);
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
+        { let mut h = state.net_health.lock().unwrap(); let c = h.clock; h.last_packet = c.ago(5); }
         let first = debug_json(state.clone()).await["player"]["last_packet_age_ms"].as_u64().unwrap();
         // Nothing renders, nothing publishes, no packet arrives — just time passing.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3341,12 +3363,13 @@ mod tests {
     /// SERVER went quiet is not the same failure as a client whose own network thread wedged.
     #[tokio::test]
     async fn server_silence_and_publisher_stall_are_distinguishable() {
-        let state = empty_state();
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         // The link is dead (no datagrams at all), but our network thread is fine and still ticking.
         {
             let mut h = state.net_health.lock().unwrap();
-            h.last_datagram = ago(30);
-            h.last_packet   = ago(30);
+            let c = h.clock;
+            h.last_datagram = c.ago(30);
+            h.last_packet   = c.ago(30);
         }
         let p = debug_json(state).await["player"].clone();
         assert_eq!(p["connected"], serde_json::json!(false));
@@ -3363,11 +3386,12 @@ mod tests {
     /// the LINK clock, and `last_packet_age_ms` is left free to say "the world is quiet".
     #[tokio::test]
     async fn a_quiet_world_on_a_live_link_is_still_connected() {
-        let state = empty_state();
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         {
             let mut h = state.net_health.lock().unwrap();
-            h.last_packet   = ago(45);                    // the world has nothing to say...
-            h.last_datagram = std::time::Instant::now();  // ...but the link is demonstrably alive.
+            let c = h.clock;
+            h.last_packet   = c.ago(45);                  // the world has nothing to say...
+            h.last_datagram = c.now();                    // ...but the link is demonstrably alive.
         }
         let p = debug_json(state).await["player"].clone();
         assert_eq!(p["connected"], serde_json::json!(true),
@@ -3388,15 +3412,22 @@ mod tests {
         let state = empty_state();
         {
             let mut h = state.net_health.lock().unwrap();
-            h.last_datagram = std::time::Instant::now(); // link is demonstrably alive (ACKing)...
-            h.last_packet   = ago(30);                    // ...but the world has produced nothing...
-            h.last_probe_sent = Some(ago(15));            // ...and our probe (15s ago) went...
+            // #760/B1: every stamp below is derived from the fixture's OWN health clock (`c`), which
+            // is what `health()` will read them back against. Written as `ago(15)` — the wall clock —
+            // this test's probe age became `15s − (time since empty_state())` and the assertion below
+            // needed it to clear a 10s bound: a 5s margin that machine load ate. Measured, with a
+            // 5.1s sleep injected after `empty_state()`: `ago(15)` → world_responsive `true`
+            // (assertion FAILS), `c.ago(15)` → `false` (passes). Same sleep, opposite outcome.
+            let c = h.clock;
+            h.last_datagram = c.now();                    // link is demonstrably alive (ACKing)...
+            h.last_packet   = c.ago(30);                  // ...but the world has produced nothing...
+            h.last_probe_sent = Some(c.ago(15));          // ...and our probe (15s ago) went...
             h.last_probe_reply = None;                    // ...unanswered, past the 10s bound.
             // #371 wedge-flicker fix: `health()` reads the wedge-timeout clock off
             // `first_unanswered_probe_sent`, not `last_probe_sent` — this is the first (and, in this
             // scenario, only) unanswered send of the streak, so in production `record_probe_sent`
             // would have stamped both together. Mirror that here.
-            h.first_unanswered_probe_sent = Some(ago(15));
+            h.first_unanswered_probe_sent = Some(c.ago(15));
         }
         let p = debug_json(state).await["player"].clone();
         assert_eq!(p["connected"], serde_json::json!(true),
@@ -3405,19 +3436,276 @@ mod tests {
             "an unanswered probe on a live link is a WEDGED world — the #371 signal must fire");
     }
 
+    /// #760/B1 — the rule about past-dated net-health stamps, as a TEST rather than as a doc comment.
+    ///
+    /// A stamp written `ago(N)` comes from the wall clock; `health()` reads it back against
+    /// `NetHealth::clock`. On a frozen fixture those are different clocks, so the age is
+    /// `N − (time since the fixture was built)` — it SHRINKS with machine load, silently, and any
+    /// assertion needing it to stay above a bound has a margin that load eats. That is #760's own
+    /// failure mode one level down, and it is what review found in
+    /// `debug_reports_world_unresponsive_when_a_probe_goes_unanswered_while_the_link_acks`.
+    ///
+    /// A prose rule did not prevent it (the rule named only "an age that must move", not "an age
+    /// that must exceed a bound"), so this scans the source instead.
+    ///
+    /// # What this matches
+    ///
+    /// The unit is a **statement**, not a physical line: comments and literals are removed by a
+    /// character scanner, and what is left is cut at `;`, `{` and `}`. A statement offends when it
+    /// mentions one of the eight [`STAMP_FIELDS`] *and* past-dates through a receiver that is not
+    /// the clock reading it back (see `receiver_is_the_reading_clock`). Flagged forms: `ago(`, and
+    /// `now()` followed by `-` or `.checked_sub`.
+    ///
+    /// # Why the `now()` spelling is matched, stated honestly
+    ///
+    /// It was added after a sweep for the CONCEPT rather than the field name found past-dated
+    /// `NetHealth` stamps a bare `ago(` grep does not see. That sweep is worth keeping as a
+    /// methodological result — **grep the concept, not the spelling** — but its sites do NOT
+    /// justify the widening on their own terms, and an earlier version of this comment implied they
+    /// did. Two corrections:
+    ///
+    /// 1. There are **seven**, not the three previously published — re-enumerated by sweeping
+    ///    `eqoxide-net` for all eight [`STAMP_FIELDS`] against all three past-dating spellings:
+    ///    `crates/eqoxide-net/src/gameplay.rs:1569, 1831, 1835, 1839` and
+    ///    `crates/eqoxide-net/src/transport.rs:1885, 1914, 2679`.
+    /// 2. Not one of them is reachable by this test — they are all in `eqoxide-net`, which is not in
+    ///    the scanned set below and cannot be (`include_str!` reaches only this crate's own files).
+    ///    And if the scan were extended to them they would all be **false positives**: each site's
+    ///    `NetHealth` is built by `Default` (checked at every one of the seven), so its stamps are
+    ///    past-dated from the wall clock and read back by the wall clock — the same clock — which is
+    ///    exactly the property this test exists to require.
+    ///
+    /// What the widening actually buys is confined to the four files below: the spelling is now
+    /// caught *there* if it ever appears, where today it does not.
+    ///
+    /// # How to probe this guard, and why it is written down
+    ///
+    /// A source scanner has TWO failure modes, and only one of them is obvious. It can fail to
+    /// recognise a bad *shape* — and it can silently fail to *arrive* at the code in the first
+    /// place. Round 3 of #760 had a twelve-cell shape table that was entirely void, because every
+    /// probe was placed inside this test's own body, which happened to be the only region of
+    /// `observe.rs` the scanner still reached: a `/*` inside a route glob in a doc comment on line 1
+    /// latched the block-comment state and blinded **87% of the corpus**, and the probes were sitting
+    /// in the window that this test's own `/* */`-containing doc had re-opened. The instrument was
+    /// measured only where it worked.
+    ///
+    /// So: **any probe of this guard must be placed at several depths in EVERY scanned file** — near
+    /// the top, mid-file, and near the end — and must be reported with two controls:
+    /// 1. a **positive control**, proving the injected shape is detectable at all, and
+    /// 2. a **reach control**, proving the scanner actually arrives at that location.
+    ///
+    /// Both controls are now permanent rather than ad-hoc: `scan_ended_clean` fails loudly if a file
+    /// ends mid-comment or mid-string (a real source file never does), and every scanned file ends
+    /// with a `GUARD_REACH_SENTINEL_*` const that this test asserts it can see.
+    ///
+    /// # What it still cannot see
+    ///
+    /// **Aliasing through a local.** `let s = ago(15); h.last_probe_sent = Some(s);` is two
+    /// statements, neither carrying both halves, so it lands unflagged. Closing that needs dataflow,
+    /// not text, and no amount of scanner care will do it.
+    ///
+    /// **A value produced inside a nested block or a `match` arm.** The cut at `{` and `}` puts
+    /// `h.last_tick =` and the `ago(30)` in `h.last_tick = { ago(30) };` into different statements,
+    /// so neither carries both halves. Same for a `match` that yields the stamp. Measured, with the
+    /// controls this doc demands: both spellings were injected at three depths in all four scanned
+    /// files (twelve locations) alongside a plain `now() -` positive control in the same function.
+    /// All twelve controls were flagged — so the scanner reached every location and the shape is
+    /// detectable there — and not one of the twenty-four brace/`match` forms was.
+    ///
+    /// Two lesser gaps: files outside the four named below, and a ninth `Instant` field added to
+    /// `NetHealth` and to `health()` but not to [`STAMP_FIELDS`] — that list is hand-maintained with
+    /// no cross-check against the struct.
+    ///
+    /// The rule is a SPELLING rule and errs toward flagging: it recognises the receivers `c.` and
+    /// `….clock.`, so a *correct* stamp taken from a binding named anything else is flagged too, and
+    /// so is a correct `self.now().checked_sub(…)` — which is the body of `HealthClock::ago` itself.
+    /// That method lives in `eqoxide-ipc` and is not scanned, but the point stands: a flagged line is
+    /// not automatically a wrong line.
+    #[test]
+    fn no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it() {
+        /// Exactly the `NetHealth` fields `HttpState::health()` turns into an age. Adding a stamp
+        /// field to that projection without adding it here leaves the new field unguarded.
+        const STAMP_FIELDS: [&str; 8] = [
+            "last_datagram", "last_packet", "last_tick",
+            "last_probe_sent", "last_probe_reply", "first_unanswered_probe_sent",
+            "last_send_pressure_at", "last_send_error_at",
+        ];
+
+        /// Code text per source line, with comments and literal contents removed, plus whether the
+        /// scan **ended clean** — i.e. not stranded inside a block comment or a string.
+        ///
+        /// The line-at-a-time version this replaces looked for `/*` before it truncated at `//`, so
+        /// a `/*` occurring *inside* a line or doc comment latched the block state permanently. That
+        /// is not a corner case: two of the four scanned files open with a `//!` doc line containing
+        /// a route glob (`/v1/observe/*`), which blinded the scanner from line 1. Literals are
+        /// skipped for the same family of reason — a `//` or `/*` inside a string is not a comment.
+        fn strip_to_code(src: &str) -> (Vec<String>, bool) {
+            #[derive(PartialEq, Clone, Copy)]
+            enum S { Code, Line, Block(u32), Str, Raw(usize), Chr }
+            let b: Vec<char> = src.chars().collect();
+            let at = |k: usize| -> char { b.get(k).copied().unwrap_or('\0') };
+            let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+            let mut out = vec![String::new()];
+            let (mut st, mut i) = (S::Code, 0usize);
+            while i < b.len() {
+                let c = b[i];
+                if c == '\n' {
+                    if st == S::Line { st = S::Code; }
+                    out.push(String::new());
+                    i += 1;
+                    continue;
+                }
+                match st {
+                    S::Line => i += 1,
+                    S::Block(d) => {
+                        if c == '*' && at(i + 1) == '/' {
+                            st = if d == 1 { S::Code } else { S::Block(d - 1) };
+                            i += 2;
+                        } else if c == '/' && at(i + 1) == '*' {
+                            st = S::Block(d + 1); // Rust block comments nest.
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    S::Str => {
+                        if c == '\\' { i += 2; } else { if c == '"' { st = S::Code; } i += 1; }
+                    }
+                    S::Raw(h) => {
+                        if c == '"' && (1..=h).all(|k| at(i + k) == '#') { st = S::Code; i += h + 1; }
+                        else { i += 1; }
+                    }
+                    S::Chr => {
+                        if c == '\\' { i += 2; } else { if c == '\'' { st = S::Code; } i += 1; }
+                    }
+                    S::Code => {
+                        let prev_is_ident = i > 0 && ident(b[i - 1]);
+                        // NB the branch ORDER here is not what fixes C1 — `//` and `/*` differ in
+                        // their second character, so they can never both match. The fix is that
+                        // `S::Line` skips to end-of-line, so a `/*` sitting inside a line or doc
+                        // comment is never read as an opener at all. The version this replaced
+                        // stripped block comments in a whole-line pass BEFORE truncating at `//`,
+                        // which is exactly how a route glob in a `//!` line latched it forever.
+                        if c == '/' && at(i + 1) == '/' { st = S::Line; i += 2; }
+                        else if c == '/' && at(i + 1) == '*' { st = S::Block(1); i += 2; }
+                        else if c == '"' { st = S::Str; i += 1; }
+                        else if (c == 'r' || (c == 'b' && at(i + 1) == 'r')) && !prev_is_ident && {
+                            let j = i + if c == 'b' { 2 } else { 1 };
+                            let mut h = 0;
+                            while at(j + h) == '#' { h += 1; }
+                            at(j + h) == '"'
+                        } {
+                            let j = i + if c == 'b' { 2 } else { 1 };
+                            let mut h = 0;
+                            while at(j + h) == '#' { h += 1; }
+                            st = S::Raw(h);
+                            i = j + h + 1;
+                        }
+                        // `'` is a char literal only if it closes; otherwise it is a lifetime.
+                        else if c == '\'' && (at(i + 1) == '\\' || at(i + 2) == '\'') { st = S::Chr; i += 1; }
+                        else { out.last_mut().unwrap().push(c); i += 1; }
+                    }
+                }
+            }
+            (out, matches!(st, S::Code | S::Line))
+        }
+
+        /// Statements, each kept as its (1-based line, text) fragments so an offender is still
+        /// reported at the exact line that names the field.
+        fn statements(code: &[String]) -> Vec<Vec<(usize, String)>> {
+            let mut out: Vec<Vec<(usize, String)>> = Vec::new();
+            let mut cur: Vec<(usize, String)> = Vec::new();
+            for (i, line) in code.iter().enumerate() {
+                // Cut at statement AND block boundaries, so unrelated code never merges into one
+                // "statement" and invents a co-occurrence that fires falsely.
+                for (n, piece) in line.split([';', '{', '}']).enumerate() {
+                    if n > 0 && !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
+                    if !piece.trim().is_empty() { cur.push((i + 1, piece.to_string())); }
+                }
+            }
+            if !cur.is_empty() { out.push(cur); }
+            out
+        }
+
+        /// Is this call's RECEIVER the health clock that will read the stamp back?
+        ///
+        /// Exempt spellings are `c.` (the convention every call site uses, `let c = h.clock;`) and
+        /// `….clock.`. Everything else is flagged — a free `ago(`, and equally `HealthClock::WALL`
+        /// or any other receiver. Exempting *any* `.ago(` regardless of receiver was review's
+        /// sharpest miss: `wall.ago(30)` stamped into a pinned fixture is #760 exactly.
+        fn receiver_is_the_reading_clock(prefix: &str) -> bool {
+            if prefix.ends_with(".clock.") { return true; }
+            let Some(rest) = prefix.strip_suffix("c.") else { return false };
+            !rest.chars().next_back().is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+        }
+
+        // Naming the sentinels as VALUES, not just as strings to grep for, is what makes deleting
+        // one a compile error rather than a silently weakened reach control.
+        let _sentinels_must_exist = (
+            super::GUARD_REACH_SENTINEL_OBSERVE,
+            crate::GUARD_REACH_SENTINEL_LIB,
+            crate::combat::GUARD_REACH_SENTINEL_COMBAT,
+            crate::testkit::GUARD_REACH_SENTINEL_TESTKIT,
+        );
+        let sources = [
+            ("observe.rs",  include_str!("observe.rs"),  "GUARD_REACH_SENTINEL_OBSERVE"),
+            ("lib.rs",      include_str!("lib.rs"),      "GUARD_REACH_SENTINEL_LIB"),
+            ("combat.rs",   include_str!("combat.rs"),   "GUARD_REACH_SENTINEL_COMBAT"),
+            ("testkit.rs",  include_str!("testkit.rs"),  "GUARD_REACH_SENTINEL_TESTKIT"),
+        ];
+        let mut offenders = Vec::new();
+        for (file, src, sentinel) in sources {
+            let (code, ended_clean) = strip_to_code(src);
+            // REACH CONTROL 1 — loud failure instead of a silent early stop. A real source file
+            // never ends inside a block comment or a string, so this cannot false-positive.
+            assert!(ended_clean,
+                "{file}: the scanner ended stranded inside a comment or string literal, so it stopped \
+                 seeing code partway through and every 'clean' result below is worthless (#760/C1)");
+            let stmts = statements(&code);
+            // REACH CONTROL 2 — the sentinel is the LAST item in each scanned file, so seeing it
+            // proves the scan arrived at the end rather than merely ending without complaint.
+            assert!(stmts.iter().flatten().any(|(_, t)| t.contains(sentinel)),
+                "{file}: the scanner never reached `{sentinel}` at the end of the file, so it covered \
+                 only a prefix of it — a clean scan of a corpus that was never read (#760/C1)");
+            for stmt in stmts {
+                let joined: String = stmt.iter().map(|(_, t)| t.as_str()).collect();
+                let Some((line, _)) = stmt.iter().find(|(_, t)| STAMP_FIELDS.iter().any(|f| t.contains(f)))
+                else { continue };
+                let bad_ago = joined.match_indices("ago(")
+                    .any(|(k, _)| !receiver_is_the_reading_clock(&joined[..k]));
+                // `now()` is fine on its own — it dates a stamp to the present, which saturates to
+                // age 0 against either clock. It is past-dating, and so a #760 shape, only when it
+                // is followed by a subtraction. The receiver test applies here too: `c.now() - d` is
+                // the correct clock and must NOT be flagged (review finding C2).
+                let bad_now = joined.match_indices("now()").any(|(k, _)| {
+                    if receiver_is_the_reading_clock(&joined[..k]) { return false; }
+                    let tail = joined[k + "now()".len()..].trim_start();
+                    tail.starts_with('-') || tail.starts_with(".checked_sub")
+                });
+                if !(bad_ago || bad_now) { continue; }
+                offenders.push(format!("{file}:{line}: {}", joined.trim()));
+            }
+        }
+        assert!(offenders.is_empty(),
+            "these past-date a net-health stamp through a receiver that is not the clock `health()` \
+             reads it back against — use `let c = h.clock; … = c.ago(N)` (#760). A flagged line is \
+             not automatically wrong: the receiver test is a spelling rule, so a correct stamp under \
+             a binding named other than `c` lands here too.\n{}",
+            offenders.join("\n"));
+    }
+
     /// #371, the false-alarm we must NOT raise (the #343 trap in reverse): a legitimately idle world
     /// — 45s with no spontaneous packet — whose probe IS answered stays `world_responsive: true`,
     /// while `last_packet_age_ms` still honestly reports the 45s of app-silence (the probe reply does
     /// NOT reset it).
     #[tokio::test]
     async fn debug_reports_idle_but_answered_world_as_responsive() {
-        let state = empty_state();
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
         {
             let mut h = state.net_health.lock().unwrap();
-            h.last_datagram    = std::time::Instant::now();
-            h.last_packet      = ago(45);          // no spontaneous world output for 45s (normal idle)
-            h.last_probe_sent  = Some(ago(20));
-            h.last_probe_reply = Some(ago(2));     // ...but the probe was answered 2s ago → alive
+            let c = h.clock;
+            h.last_datagram    = c.now();
+            h.last_packet      = c.ago(45);        // no spontaneous world output for 45s (normal idle)
+            h.last_probe_sent  = Some(c.ago(20));
+            h.last_probe_reply = Some(c.ago(2));   // ...but the probe was answered 2s ago → alive
             // `first_unanswered_probe_sent` deliberately left `None` (the `empty_state()` default): in
             // production `record_probe_reply` clears it the instant a genuine reply lands, so an
             // ANSWERED probe's real state has no outstanding streak at all — this is what makes
@@ -3440,7 +3728,7 @@ mod tests {
     #[tokio::test]
     async fn debug_defaults_world_responsive_true_before_the_first_probe() {
         let state = empty_state();
-        state.net_health.lock().unwrap().last_packet = ago(20);
+        { let mut h = state.net_health.lock().unwrap(); let c = h.clock; h.last_packet = c.ago(20); }
         let p = debug_json(state).await["player"].clone();
         assert_eq!(p["world_responsive"], serde_json::json!(true),
             "no probe sent yet → no verdict → true (read connected/last_packet_age_ms instead)");
@@ -3538,6 +3826,114 @@ mod tests {
         assert_eq!(v["nav_goal_id"], serde_json::json!(4),
             "the IDENTITY stamp survives on purpose (#349) — it is what lets a caller match this \
              `idle` to the goal it asked for; only the per-goal FACTS are retired");
+    }
+
+    /// **#766 (agent-honesty) — the OBSERVER half of the fine tier's retirement.**
+    ///
+    /// The sibling of the test above, for the field #732 left standing. `nav_local` is read off the
+    /// same cloned `NavStatus` and passed through exactly one filter —
+    /// `.filter(|l| l.state != "threaded")` — so an UNHEALTHY verdict reaches the response body
+    /// verbatim, and an unhealthy verdict is the only kind an agent can ever see. (Kept whole on one
+    /// line: a code span broken across a `///` wrap renders the break inside the span and is
+    /// un-greppable — #773, round-6 review B15.)
+    /// That makes `no_way_through` the right fixture
+    /// and makes the first half of this test a real premise: it asserts that the planted verdict
+    /// genuinely publishes, so the `null` below is the retirement's doing and not the filter's.
+    ///
+    /// Mutation check: delete `*local = None;` from `NavStatus::retire_to_idle`
+    /// (`crates/eqoxide-ipc/src/lib.rs`) → the `nav_local` assertion goes RED with the previous
+    /// zone's `no_way_through` object in the diff.
+    #[tokio::test]
+    async fn debug_publishes_no_nav_local_once_the_goal_is_retired_to_idle_766() {
+        let state = empty_state();
+        {
+            let mut s = state.nav.nav_state.lock().unwrap();
+            s.goal_id = 4;
+            s.state   = "navigating".into();
+            s.local   = Some(eqoxide_ipc::NavLocal {
+                state: "no_way_through".into(), reason: "search_closed".into(),
+                stuck_ticks: 7, plan_us: 1234,
+            });
+        }
+        let v = debug_json(state.clone()).await;
+        assert_eq!(v["nav_local"]["state"], serde_json::json!("no_way_through"),
+            "PREMISE: an un-retired UNHEALTHY fine verdict is published — the harm is reachable by a \
+             reader of GET /v1/observe/debug, not merely resident in memory");
+        assert_eq!(v["nav_local"]["stuck_ticks"], serde_json::json!(7),
+            "PREMISE: and the whole object comes through, not just a state string");
+
+        // The zone-change retirement, which is where #766 was reported.
+        state.nav.nav_state.lock().unwrap().retire_to_idle(Some("zoned"));
+
+        let v = debug_json(state).await;
+        assert_eq!(v["player"]["nav_state"], serde_json::json!("idle"));
+        assert_eq!(v["player"]["nav_reason"], serde_json::json!("zoned"));
+        assert_eq!(v["nav_local"], serde_json::json!(null),
+            "#766: `no_way_through` beside `idle`/`zoned` describes a corridor in the zone the \
+             reader has LEFT, computed against a collision grid that no longer exists — the fine \
+             tier's verdict is about threading toward a goal, so it retires with the goal");
+    }
+
+    /// **#766 review B3 — the worker-scoped fault must NOT retire with the goal.**
+    ///
+    /// The counterweight to the test above, and the reason this PR did not simply narrow a sentence.
+    /// `planner_dead` is the third publishable `nav_local.state`, and it is not a verdict about a
+    /// goal: it is a latched client fault meaning steering has degraded to the coarse 8 u route
+    /// with nothing on any nav route to recover it. Retiring `nav_local` on every `idle` — which is #766's whole point — therefore hid
+    /// it from an agent BETWEEN goals, which is precisely when an agent polls this endpoint. So the
+    /// fault moved to its own field and this measures the split at the JSON surface, where an agent
+    /// actually reads it: after the same retirement, the per-goal verdict is `null` and the
+    /// worker-scoped fault is still `true`. (The field's lifetime is the fine WORKER's, not the
+    /// session's — round-6 review B12. Nothing in this test turns on the difference; it retires a
+    /// goal, and retiring a goal does not replace a worker. What it would catch is a clear placed on
+    /// a retirement route, which is the defect it was written for.)
+    ///
+    /// It also pins the always-present shape. A `null`-when-healthy field would make "alive"
+    /// indistinguishable from "this client is too old to have the field", and a health check you
+    /// cannot distinguish from a missing feature is not a health check.
+    ///
+    /// Mutation check, RUN: clear `local_planner_dead` in `NavStatus::retire_to_idle` instead of
+    /// keeping it → the final assertion here goes RED (`246 passed; 1 failed` in this crate), and
+    /// `eqoxide-nav` goes red separately on its own row-level assertion. Named by assertion, not by
+    /// line number, deliberately (review B8): a line locator drifts on the next edit above it. The
+    /// always-present shape is pinned by the first assertion but NOT mutation-checked — omitting a
+    /// key from a `json!` literal is a shape change, not a behaviour one, and I did not run it.
+    #[tokio::test]
+    async fn debug_keeps_publishing_a_dead_fine_planner_after_the_goal_is_retired_766() {
+        let state = empty_state();
+        let v = debug_json(state.clone()).await;
+        assert_eq!(v["nav_local_planner_dead"], serde_json::json!(false),
+            "PREMISE: liveness is published in BOTH states — a healthy client says so out loud, so \
+             the `true` below is a change this test caused and not a key that only ever appears \
+             when something is wrong");
+
+        {
+            let mut s = state.nav.nav_state.lock().unwrap();
+            s.goal_id = 4;
+            s.state   = "navigating".into();
+            s.local   = Some(eqoxide_ipc::NavLocal {
+                state: "planner_dead".into(), reason: "local_planner_dead".into(),
+                stuck_ticks: 0, plan_us: 0,
+            });
+            s.local_planner_dead = true;   // what `Walker::latch_local_planner_liveness` writes
+        }
+        let v = debug_json(state.clone()).await;
+        assert_eq!(v["nav_local"]["state"], serde_json::json!("planner_dead"),
+            "PREMISE: while a route is committed the fault is visible in BOTH channels, so the \
+             assertions below measure which one survives rather than which one exists");
+        assert_eq!(v["nav_local_planner_dead"], serde_json::json!(true));
+
+        state.nav.nav_state.lock().unwrap().retire_to_idle(Some("zoned"));
+
+        let v = debug_json(state).await;
+        assert_eq!(v["nav_local"], serde_json::json!(null),
+            "#766 is unchanged by B3: the per-goal channel still retires with the goal. The \
+             liveness field is an addition, not a hole in that guarantee");
+        assert_eq!(v["nav_local_planner_dead"], serde_json::json!(true),
+            "#766 B3: the worker thread does not come back — recovering it needs a client restart — \
+             so an agent between goals must still be able to read that its steering has degraded. \
+             Clearing this on retirement would report a recovery that never happened, which is the \
+             agent-honesty defect class #766 exists to close, not one it may create");
     }
 
     /// #471 (agent-honesty): the server placed two Mobs (consecutive spawn_ids, e.g. 526/527) at a
@@ -4291,8 +4687,8 @@ mod tests {
     /// one.
     #[tokio::test]
     async fn snapshot_age_ms_climbs_across_reads_of_a_frozen_source() {
-        let state = empty_state();
-        state.net_health.lock().unwrap().last_tick = ago(5);
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
+        { let mut h = state.net_health.lock().unwrap(); let c = h.clock; h.last_tick = c.ago(5); }
         let first = body_json(get(state.clone(), "/messages").await).await["snapshot_age_ms"].as_u64().unwrap();
         // Nothing ticks, nothing republishes — just time passing, exactly like a wedged net thread.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -4305,8 +4701,8 @@ mod tests {
     /// Same climb, over the header channel this time (`/doors`, a bare-array endpoint).
     #[tokio::test]
     async fn snapshot_age_header_climbs_across_reads_of_a_frozen_source() {
-        let state = empty_state();
-        state.net_health.lock().unwrap().last_tick = ago(5);
+        let state = empty_state_wall_clock(); // #760: this test's subject IS the wall clock
+        { let mut h = state.net_health.lock().unwrap(); let c = h.clock; h.last_tick = c.ago(5); }
         let first = header_age_ms(&get(state.clone(), "/doors").await);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let second = header_age_ms(&get(state, "/doors").await);
@@ -4774,3 +5170,13 @@ mod zone_cross_observables_713 {
             "and it must say what the caller actually risks");
     }
 }
+
+/// Reach control for `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_one_that_reads_it` (#760/C1).
+///
+/// That guard scans this file's source text. A scanner that silently stops early — as it did, when
+/// a `/*` inside a route glob in a doc comment latched its block-comment state on line 1 — reports
+/// a clean scan of a corpus it never read, which is a confident falsehood. The guard asserts it can
+/// SEE this constant; because it is the last item in the file, seeing it proves the scan arrived at
+/// the end. **Keep it last.**
+#[cfg(test)]
+pub(crate) const GUARD_REACH_SENTINEL_OBSERVE: u8 = 0;
