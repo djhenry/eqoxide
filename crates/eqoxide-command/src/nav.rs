@@ -161,11 +161,12 @@ impl CommandState {
         // throwaway `probe_route_len` field: E0027 in `eqoxide-ipc`, `eqoxide-command` compiled
         // clean, and `request_stop` published the field beside `state: "idle"`.
         //
-        // Behaviour-identical: `retire_to_idle` writes a strict subset of what this list writes for
-        // `idle` (it deliberately keeps `local`, which is cleared just below), and both `idle` call
-        // sites already pass `goal: None`.
+        // Behaviour-identical: `retire_to_idle` writes exactly what this list writes for `idle`, and
+        // both `idle` call sites already pass `goal: None`. (#766 removed the last difference — the
+        // explicit `s.local = None;` that used to sit here because `retire_to_idle` kept `local`.
+        // `retire_to_idle` now retires `local` itself, so keeping the line would only mean two
+        // writers for one field and a comment that has to explain the overlap.)
         if new_state == "idle" {
-            s.local = None;
             s.retire_to_idle(reason);
             return s.goal_id;
         }
@@ -686,5 +687,76 @@ mod tests {
         assert_eq!(s.goal, Some([5.0, 6.0, 7.0]),
             "the newer goal's coordinates must not be cleared by the older request's backstop");
         assert_eq!(s.reason, None);
+    }
+
+    /// **#766 (agent-honesty): the FINE tier's verdict is a per-goal fact, so every command-side
+    /// route to `idle` must retire it too.**
+    ///
+    /// #766 was reported against the zone change, but as with #732 the defect was one writer up:
+    /// `NavStatus::retire_to_idle` deliberately KEPT `local`, so of the six documented routes to
+    /// `idle` the two that reached it without a `Walker::clear_local_plan` on the same tick leaked
+    /// it — the zone change (pinned in `eqoxide-nav`/`eqoxide-net`) and this crate's
+    /// `zone_cross_dropped_unhandled` backstop. `stopped` and `goto_cancelled` did NOT leak it,
+    /// because `stamp_new_goal` carried its own explicit `s.local = None;` line; this PR deleted
+    /// that line as redundant once `retire_to_idle` owns the field, so those two routes now depend
+    /// on the shared writer and are pinned here for that reason.
+    ///
+    /// `no_way_through` is the fixture verdict because `eqoxide_http::observe` filters `threaded`
+    /// out — an unhealthy verdict is the only kind that reaches an agent at all.
+    ///
+    /// **Mutation check:** delete `*local = None;` from `NavStatus::retire_to_idle`
+    /// (`crates/eqoxide-ipc/src/lib.rs`) → all three cases go RED. Restore the deleted
+    /// `s.local = None;` in `stamp_new_goal` on top of that mutation and the first two go green
+    /// again while `zone_cross_unhandled` stays RED — which is the split this test exists to show.
+    #[test]
+    fn every_command_side_retirement_retires_the_fine_tiers_verdict_766() {
+        let stale = || eqoxide_ipc::NavLocal {
+            state: "no_way_through".into(), reason: "search_closed".into(),
+            stuck_ticks: 7, plan_us: 1234,
+        };
+        // The two `stamp_new_goal` routes. NOTE the ordering: `request_goto` itself goes through
+        // `stamp_new_goal`'s NON-idle branch, which clears `local` — so the verdict is planted
+        // AFTER it, or the post-condition would be met before the code under test ever runs.
+        for (label, act) in [
+            ("stop",        Box::new(|cs: &CommandState| { cs.request_stop(); })        as Box<dyn Fn(&CommandState)>),
+            ("cancel_goto", Box::new(|cs: &CommandState| { cs.request_cancel_goto(); }) as Box<dyn Fn(&CommandState)>),
+        ] {
+            let cs = CommandState::default();
+            cs.request_goto((2216.0, 579.0, -113.0));
+            cs.nav.nav_state.lock().unwrap().local = Some(stale());
+            assert_eq!(cs.nav.nav_state.lock().unwrap().local, Some(stale()),
+                "{label}: PREMISE — the fine tier's verdict really is loaded, so the assertion \
+                 below cannot pass on `NavStatus::default()`");
+
+            act(&cs);
+
+            let s = cs.nav.nav_state.lock().unwrap();
+            assert_eq!(s.state, "idle", "{label}: the route ends at idle");
+            assert_eq!(s.local, None,
+                "{label}: #766 — the fine tier's last word is its verdict on threading toward the \
+                 goal that just ended. Beside `idle` it is a live-looking answer about work that is \
+                 over, and after a zone change it describes a corridor in a world we have left.");
+        }
+
+        // The #725 backstop: a one-shot cross drained and never answered. Same ordering hazard —
+        // `request_zone_cross` also stamps through the non-idle branch — so the verdict is planted
+        // while the ticket is HELD, which is also exactly when the fine tier would have produced
+        // one (the walker keeps ticking while the drain runs). Planting it does not touch
+        // `state`/`reason`/`goal_id`, so the ticket's `moved` guard still sees an unanswered request.
+        let cs = CommandState::default();
+        cs.request_zone_cross(30);
+        let ticket = cs.take_zone_cross().expect("the request was queued");
+        cs.nav.nav_state.lock().unwrap().local = Some(stale());
+        assert_eq!(cs.nav.nav_state.lock().unwrap().local, Some(stale()),
+            "zone_cross_unhandled: PREMISE — the verdict is loaded before the backstop fires");
+        drop(ticket);
+
+        let s = cs.nav.nav_state.lock().unwrap();
+        assert_eq!(s.state, "idle");
+        assert_eq!(s.reason.as_deref(), Some(NAV_REASON_ZONE_CROSS_UNHANDLED),
+            "PREMISE: the backstop really did fire — otherwise the `local` assertion below would be \
+             about a row nothing retired");
+        assert_eq!(s.local, None,
+            "#766: the sixth route to `idle` retires the fine verdict like the other five");
     }
 }
