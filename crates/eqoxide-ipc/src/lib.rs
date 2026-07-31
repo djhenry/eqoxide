@@ -1732,6 +1732,46 @@ impl Default for NavStatus {
     }
 }
 
+/// Test-only shorthand for seeding a `NavStatus` from a bare state string, e.g.
+/// `*nav_state.lock().unwrap() = "navigating".into();`.
+///
+/// # Why `#[cfg(test)]` (#771)
+///
+/// This is a FOURTH way to build a `NavStatus`, alongside [`NavStatus::default`] (the boot row)
+/// and the three writers `retire_to_idle` funnels every `idle` transition through
+/// (`Walker::set_nav_state_because`, `CommandState::stamp_new_goal`, `ZoneCrossTicket::drop`) — and
+/// unlike all three of those, it does not name a reason at all: `"idle".into()` mints
+/// `state: "idle", reason: None` directly, which is exactly the combination
+/// `CommandState::stamp_new_goal`'s `debug_assert` (`eqoxide-command/src/nav.rs:146`) exists to
+/// reject, reached without passing through it or any other guard.
+///
+/// #765's review found this and classed it non-blocking because, measured rather than assumed,
+/// production never calls it as of `daab1ef` — re-checked for #771 by reading every assignment
+/// whose target type is `NavStatus` (there are exactly two, both inside
+/// `eqoxide-net::action_loop::tests`, below) plus a repo-wide grep for `NavStatus::from(` and
+/// `: NavStatus\b`, both empty. But "nobody happens to call it" is not a fact the type system was
+/// making true; the `debug_assert` at `eqoxide-command/src/nav.rs:146` compiles out under
+/// `--release` (test-time instrument, not a runtime one — same limit `retire_to_idle`'s own doc
+/// records), so a future production call passing `"idle"` would ship a released binary that
+/// publishes the untraceable idle silently.
+///
+/// `#[cfg(test)]` makes that call **unrepresentable** outside a test build rather than merely
+/// unused: a production call site fails to compile. Verified directly (#771) with a throwaway
+/// non-test `fn probe() -> NavStatus { "idle".into() }` placed right after this impl:
+///
+/// ```text
+/// error[E0277]: the trait bound `NavStatus: From<&str>` is not satisfied
+///    --> crates/eqoxide-ipc/src/lib.rs:1780:57
+///     |
+/// 1780 | fn probe() -> NavStatus { "idle".into() }
+///      |                                 ^^^^ unsatisfied trait bound
+///     = note: required for `&str` to implement `Into<NavStatus>`
+/// ```
+///
+/// not merely "would be surprising if someone added one". See the two existing test-only call sites in
+/// `eqoxide-net::action_loop::tests::{dead_player_halts_navigation, zone_change_resets_stale_destination_and_path}`
+/// — both keep compiling because tests build with `cfg(test)` enabled crate-wide.
+#[cfg(test)]
 impl From<&str> for NavStatus {
     fn from(state: &str) -> Self {
         NavStatus { state: state.to_string(), reason: None, local: None,
