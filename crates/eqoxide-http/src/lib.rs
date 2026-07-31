@@ -243,6 +243,14 @@ pub struct PlayerState {
     /// nothing knows it is talking to a client too old to report the state, rather than concluding
     /// the character is fine.
     pub hold: Option<PlayerHoldView>,
+    /// #746: whether the render controller currently has horizontal wish-motion or is airborne
+    /// (`wish_dir != 0 || !on_ground`). Mirrored from `ControllerView::moving`, exactly as fresh as
+    /// `pos_east/north/up` beside it (same `ActionLoop::stream_position` tick, same init gate), and
+    /// — like `hold` — a level signal that clears to `false` the render frame it stops being true,
+    /// never a latch. `false` while the controller is not being stepped (e.g. mid zone-load): a
+    /// controller that is not stepping is not moving the body, so that is the measured answer, not
+    /// a guess plugged in for an unstepped frame.
+    pub moving: bool,
 }
 
 impl PlayerState {
@@ -380,6 +388,10 @@ impl PlayerState {
                                  text:       o.text.clone(),
                                  at:         o.at,
                              }),
+            // #746: mirrored from `ControllerView::moving` via `gs.player_moving` by
+            // `ActionLoop::stream_position` — see that field's doc comment and this struct's `moving`
+            // field doc for the freshness/clear contract (same tick and gate as `hold` above it).
+            moving:          gs.player_moving,
         }
     }
 }

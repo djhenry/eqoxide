@@ -94,6 +94,16 @@ pub struct MoveIntent {
 pub struct ControllerView {
     pub pos:     [f32; 3],
     pub heading: f32,
+    /// Whether the controller currently has horizontal wish-motion or is airborne
+    /// (`wish_dir != 0 || !on_ground`), republished by the render thread every frame it steps the
+    /// controller — a level signal, not a latch, exactly like [`ControllerView::hold`] beside it.
+    ///
+    /// #746: this field used to have no reader anywhere in the workspace — written every rendered
+    /// frame, consumed by nothing — which made it a trap: the moment something wired it up as an
+    /// observable, it would have looked live (a well-formed, changing `bool`) while actually
+    /// tracking nothing downstream, the same false-observable shape as `connected: true` (#343).
+    /// `ActionLoop::stream_position` now mirrors it into `GameState::player_moving` on the same
+    /// tick, same init gate, as `hold`, and it is surfaced as `GET /v1/observe` `player.moving`.
     pub moving:  bool,
     /// False until the render thread has spawned and seeded the controller. The nav streamer must
     /// not mirror/stream a default (origin) position before this is set.

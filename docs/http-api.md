@@ -393,6 +393,22 @@ false hold; what it freezes is `held_secs`, and the paragraph above tells you ho
 (#724 round-3 review, N1 — this used to say "recomputes it from scratch every frame", which is not
 true of the load, zone-in or idle paths.)
 
+### `moving` — horizontal wish-motion or airborne, as of the last stepped frame (#746)
+
+`player.moving` is `true` while the render controller has horizontal wish-direction (WASD or a
+`/goto` in progress) **or** is airborne (`!on_ground`) — `false` otherwise, including "standing
+still on the ground" and "falling with no horizontal input" is still `true` (airborne counts as
+moving even with zero `wish_dir`).
+
+It carries exactly the same freshness contract as [`hold`](#hold--the-character-is-physically-stuck-and-the-client-cannot-free-it-724):
+mirrored into `player.moving` on the same `ActionLoop::stream_position` tick, so it is as current as
+`pos_east/north/up` beside it — and it is a **level signal, never a latch**, republished every
+rendered frame the controller steps, so it clears to `false` the same frame `wish_dir` zeroes and
+`on_ground` goes true, with no separate clear path to fall out of sync with the fact it describes.
+`false` while the controller is not being stepped (mid zone-load, before the first spawn) — a
+controller that is not stepping is not moving the body, so that is the measured answer, not a
+default standing in for "unknown".
+
 ### `zone_assets` — is the world this response describes actually loaded? (#579)
 
 A zone's terrain arrives from the asset server as one large GLB (freportw: ~30 MB) and is decoded,
