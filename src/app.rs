@@ -1393,7 +1393,7 @@ impl App {
                 // complete with an anchor in coordinates that no longer mean anything. Reading the
                 // controller cannot drift from what the controller actually holds, and it makes
                 // "seed one, forget the other" fail to compile. See `movement::disclosures`.
-                (v.hold, v.afloat_stall) = self.controller.disclosures();
+                v.publish_disclosures(self.controller.disclosures());
                 v.initialized = true;
             }
         }
@@ -1728,7 +1728,7 @@ impl App {
                     // stale confident value that `stream_position` keeps mirroring and the API keeps
                     // answering. Written this way, dropping a half does not compile. See
                     // `CharacterController::disclosures`.
-                    (v.hold, v.afloat_stall) = self.controller.disclosures();
+                    v.publish_disclosures(self.controller.disclosures());
                     // Latch a fresh landing ONLY into an empty view slot, and only TAKE it from the
                     // controller when the slot is free (§442 #442 DEFECT-3 — never drop a real fall's
                     // damage). If the nav thread has not yet consumed a previous landing's height, we

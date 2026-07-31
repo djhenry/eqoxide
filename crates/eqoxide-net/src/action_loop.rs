@@ -2840,11 +2840,11 @@ impl ActionLoop {
         // alongside its position, on the same tick and under the same init gate, so `player.hold` on
         // `GET /v1/observe` is exactly as fresh as the `pos` beside it. Level-triggered — the view is
         // republished every render frame, so this write is also the clear.
-        gs.player_hold = view.hold;
-        // #776/#801: and the afloat stall beside it, on the same tick, under the same init gate and
-        // with the same level-triggered clear. Two fields rather than one, because they are two
-        // different claims — see `ControllerView::afloat_stall`.
-        gs.player_afloat_stall = view.afloat_stall;
+        // #776/#801: and the afloat stall beside it, in the SAME statement — `ControllerView` keeps
+        // both disclosures private behind `disclosures()` precisely so this mirror cannot update one
+        // and leave the other holding the previous frame's answer. Two GameState fields rather than
+        // one, because they are two different claims — see `ControllerView::publish_disclosures`.
+        (gs.player_hold, gs.player_afloat_stall) = view.disclosures();
         // Anti-MQGhost keepalive (#105): send a movement-history entry every 30s (< the server's 70s
         // window) whether or not we're moving, so the server's CheatManager never false-flags us.
         if self.last_movement_history_send.elapsed().as_millis() >= MOVEMENT_HISTORY_MS {
@@ -3510,7 +3510,7 @@ mod tests {
     /// The second half matters at least as much: the mirror must also be the CLEAR. A stall that is
     /// written once and never withdrawn is a false alarm from the moment the body swims free, and
     /// this signal's false-alarm direction is the one #800 actually shipped a live bug in. Because
-    /// the assignment is unconditional (`gs.player_afloat_stall = view.afloat_stall;`, not an
+    /// the assignment is unconditional (a plain destructuring of `view.disclosures()`, not an
     /// `if let Some(..)`), a `None` view withdraws it on the very next tick.
     ///
     /// **Axes deliberately varied:** presence/absence of the stall, and the transition in BOTH
@@ -3518,8 +3518,10 @@ mod tests {
     /// is not driven here — whether the CLOCK is right is `afloat_unconstructible.rs`'s and
     /// `movement.rs`'s job; this test only pins the wire between the view and the game state.
     ///
-    /// MUTATION CHECK (#801): delete `gs.player_afloat_stall = view.afloat_stall;` from
-    /// `stream_position` → RED at the first assertion.
+    /// MUTATION CHECKS (#801, each run independently and recorded in the PR body): drop the stall
+    /// half of the mirror in `stream_position` → RED at the first assertion; change the mirror to
+    /// `if let Some(s) = .. { gs.player_afloat_stall = Some(s); }` so it writes but never withdraws
+    /// → RED at the last assertion.
     #[tokio::test]
     async fn stream_position_mirrors_and_withdraws_the_afloat_stall_801() {
         use eqoxide_core::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
@@ -3540,7 +3542,7 @@ mod tests {
             let mut view = nav.controller.controller_view.lock().unwrap();
             view.initialized = true;
             view.pos = anchor;
-            view.afloat_stall = Some(stall);
+            view.publish_disclosures((None, Some(stall)));
         }
         nav.stream_position(&mut stream, &mut gs);
         assert_eq!(gs.player_afloat_stall, Some(stall),
@@ -3550,7 +3552,7 @@ mod tests {
             "and it must carry the anchor intact — an agent routes off those coordinates");
 
         // The body swims free: the view republishes None, and the mirror must WITHDRAW it.
-        nav.controller.controller_view.lock().unwrap().afloat_stall = None;
+        nav.controller.controller_view.lock().unwrap().publish_disclosures((None, None));
         nav.stream_position(&mut stream, &mut gs);
         assert!(gs.player_afloat_stall.is_none(),
             "the mirror is level-triggered and must also be the clear — a stall that is written \

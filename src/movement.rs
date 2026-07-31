@@ -569,14 +569,18 @@ impl CharacterController {
     /// keeps answering — with a stale, confident value that nothing recomputes. That is the #343 /
     /// #792 shape, and it is exactly what a reviewer reading a diff is least likely to notice.
     ///
-    /// Returning them as a tuple the publisher destructures into place makes the omission
-    /// unrepresentable rather than merely discouraged: a publisher that stops writing one half no
-    /// longer type-checks. It can still be discarded, but only by writing `_` — a deliberate act
-    /// that shows up in a diff, not an absence that does not.
+    /// Returning them as a tuple makes the omission awkward at this end; the other end is what makes
+    /// it impossible. `eqoxide_ipc::ControllerView` keeps both fields PRIVATE and takes them only
+    /// through `publish_disclosures((hold, stall))`, so a publisher in this crate cannot write one
+    /// without naming the other — it is a compile error, not a code-review catch. That was measured
+    /// on #801: with the fields public, replacing the paired write with a lone `v.hold = …` left the
+    /// whole workspace green, because `app.rs`'s frame loop needs a GPU and a window and no unit test
+    /// can reach that statement. See `ControllerView::publish_disclosures` for the transcript.
     ///
-    /// **What this does NOT do:** it does not prove the publisher is *called*. Nothing here reaches
-    /// into `app.rs`'s event loop. It removes one specific failure — publishing one disclosure and
-    /// silently forgetting the other — and no other.
+    /// **What this does NOT do:** it does not prove the publisher is *called*, and it does not stop
+    /// a caller passing a deliberate `None`. Nothing here reaches into `app.rs`'s event loop. It
+    /// removes one specific failure — publishing one disclosure and silently forgetting the other —
+    /// and no other.
     pub fn disclosures(&self) -> (Option<ControllerHold>, Option<AfloatStall>) {
         (self.hold(), self.afloat_stall())
     }

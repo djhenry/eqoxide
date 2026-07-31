@@ -434,8 +434,9 @@ came, try a different heading — and only then treat it as a genuine trap.
 an honesty observable is the same defect as a silence — and the naive "stationary and wet" test
 fires on every floating character alive. These bodies are genuinely trapped and are reported `null`:
 
-* a swimmer **slowly losing ground**, or drifting — if it stays inside `progress_threshold` the
-  window matures normally, but a body that creeps *outside* it re-anchors and the clock restarts;
+* a swimmer **slowly losing ground**, or drifting — progress is measured as net displacement from
+  the anchor, not as progress toward any goal, so a body that creeps more than `progress_threshold`
+  in *any* direction re-anchors and the clock restarts. Backwards counts as progress here;
 * a swimmer **circling a pocket wider than `progress_threshold`** — it re-anchors every lap. Progress
   is measured in 3-D, so a body oscillating vertically through more than the threshold re-anchors
   too;
