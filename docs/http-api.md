@@ -1044,11 +1044,20 @@ corridor is not threadable" from "the steering planner hasn't caught up." `nav_l
 stays `true` for the life of that worker, because the thread does not come back — recovering it needs
 a client restart.
 
-*Session-scoped* is the agent-facing name for that lifetime, and it is accurate: the latch the client
-keeps internally is scoped to the fine **worker**, and exactly one fine worker is built per client
-process, so from out here the two are the same span. The distinction only matters to the client's own
-code, which is where it is written down — as is the fact that nothing currently pins the one-worker
-premise this name rests on (#787).
+*Session-scoped* is the agent-facing name for that lifetime, and it is accurate today: the latch the
+client keeps internally is scoped to the fine **worker**, and exactly one fine worker is built per
+client process, so from out here the two are the same span. The distinction only matters to the
+client's own code, which is where it is written down — together with a **tripwire, not a proof**,
+under the one-worker premise this name rests on: a scan of the tracked tree that fails, naming this
+paragraph, when a second fine-worker construction *site* is added in the ordinary way (#787). It
+counts construction sites in source text, so it does **not** catch a second worker reached by a
+function-pointer binding, an angle-bracket qualified path, a construction inside a `macro_rules!`
+body that carries the guard's non-production marker, a site anyone marked as non-production
+regardless of which file it is in, or — the one that matters most — **the same single site executed
+twice**, which is exactly the in-process relogin shape. Every one of those gaps was measured, not
+inferred. The scan's own reach is also weaker in environments without a git checkout, which the
+guard now states on every run; the merge gate has one. Read "session-scoped" as accurate today and
+cheaply checked, not as guaranteed.
 
 **Over a running client this field is one-way.** Nothing in the process constructs a second fine
 worker, so nothing clears it. That is a property of the *process*, not of the field, and it was

@@ -1126,7 +1126,13 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // WORKER-scoped fine-planner liveness (#766 review B3; scope corrected from "session" by
         // round-6 review B12 — the latch is cleared by `Walker::new` as it spawns a replacement, and
         // it reads as session-scoped from outside only because exactly one fine worker is built per
-        // process — a premise nothing in the tree pins, #787. `docs/http-api.md` keeps the
+        // process — a premise with a TRIPWIRE under it rather than a pin: `eqoxide-nav`'s
+        // `walker::tests::exactly_one_production_fine_worker_is_built_in_the_tree_787` (#787) scans
+        // the tracked tree and names THIS comment among the four sentences that go false when a
+        // second construction SITE is added unmarked. It counts sites, not workers. It stays green
+        // for one site executed twice — the relogin shape — which was measured, not assumed, and it
+        // is evadable by a handful of documented spellings listed on the test. Read it as a cheap
+        // alarm on the likely edit, not as proof. `docs/http-api.md` keeps the
         // agent-facing "session-scoped" name and says why).
         // `nav_local` above is a PER-GOAL
         // verdict and #766 retires it with the goal — correct for `no_way_through` / `exhausted`, and
