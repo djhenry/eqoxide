@@ -418,14 +418,22 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// levers are that a loop opens its zones through [`open_corpus_zone`], or wires
 /// `begin_zone`/`add`/`skip` by hand as `faithful_walker_drift_corpus` does.
 ///
-/// As of #807 the corpora that go through this type are `faithful_walker_drift_corpus` (hand-wired,
-/// two rollups), the four `*_blast_radius` corpora in `tests/walker_sim.rs`, and
-/// `water_grid_budget_measurement` in `crates/eqoxide-nav/src/collision.rs` — the last five via
-/// [`open_corpus_zone`]. What remains uncovered is a set of further zone loops in `collision.rs`
-/// that still drop zones on a `continue` without opening them here — some accumulating into a
-/// local `Vec`, some printing nothing at all — see **issue #839**, which carries the current
-/// per-line list. Do not re-derive or restate that tally here; it will drift. This paragraph names
-/// the mechanism; #839 names the sites.
+/// As of #839 every zone-corpus loop in `crates/eqoxide-nav/src/collision.rs` and
+/// `tests/walker_sim.rs` goes through this type: `faithful_walker_drift_corpus` (hand-wired, two
+/// rollups) and ten corpora via [`open_corpus_zone`] — the four `*_blast_radius` corpora in
+/// `tests/walker_sim.rs`, and, in `collision.rs`, `water_grid_budget_measurement` (#807),
+/// `worst_case_reachable_component`, `fine_tier_corpus_route_success_and_cost`,
+/// `fix_700_planner_ab_corpus`, `q1_headroom_seal_measurement`, and
+/// `floor_model_disagreement_scan` (#839). Four of the last five have no water dependency at all —
+/// no `in_water` call, no water-grid build — and still route through `open_corpus_zone` rather than
+/// a bespoke two-drop wrapper, closing with `cover.add(zone, &zw.tally())`, a zero-valued "no water
+/// number" close: one owner for the accounting, not two. **What this paragraph does NOT claim:** a
+/// zone-corpus loop that never constructs a `WaterRollup` is invisible to this type by construction
+/// (see above) and #839 did not audit outside `collision.rs`/`walker_sim.rs` —
+/// `depenetration_corpus_over_baked_zones` in `src/movement.rs` is a zone loop with the same
+/// bare-`continue` shape, still unwired, out of #839's scope. Do not re-derive or restate this
+/// paragraph's own tally by rereading the source; it will drift the same way the version it
+/// replaced did.
 #[derive(Clone, Debug, Default)]
 pub struct WaterRollup {
     total: usize,

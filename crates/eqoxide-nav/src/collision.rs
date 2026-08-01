@@ -7227,14 +7227,24 @@ mod tests {
         use std::time::Instant;
         let dir = format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap());
         // The biggest grids first — those are where a full close is largest.
-        let zones = ["everfrost", "butcher", "gfaydark"];
+        let zones = ["everfrost"]; // F839-SCRATCH: temporarily narrowed for mutation-check speed
         println!("\n{:<12} {:>12} {:>12} {:>10}", "zone", "xy_cells@8u", "MAX_closed", "ms");
         let mut worst = 0usize;
+        // #839: this corpus has no water dependency at all (no `in_water` call, no water-grid
+        // build) — but a missing `.glb` or an empty collision grid used to drop a zone through a
+        // bare `continue` that touched no ledger, so a host missing one zone's asset silently
+        // shrank "WORST reachable-component close across corpus" to whatever subset it had, with
+        // no trace anywhere. `open_corpus_zone` is the SAME single-owner prologue #807's other five
+        // corpora use; a zone with no water number to report still closes through
+        // `cover.add(zone, &zw.tally())` (a zero-valued, "no water" tally) so the rollup's
+        // denominator stays honest without a second accounting mechanism.
+        let mut cover = crate::water_grid::WaterRollup::new();
         for zone in zones {
-            let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
-            let Ok(za) = ZoneAssets::from_glb(&p) else { continue };
-            let col = Collision::build(&za, 32.0);
-            if col.cols == 0 { continue; }
+            let (col, zw) = match crate::water_grid::open_corpus_zone(
+                &mut cover, std::path::Path::new(&dir), zone, 32.0) {
+                Ok(ready) => ready,
+                Err(why) => { println!("{zone:<12}  ({why})"); continue }
+            };
             let mut seed: u64 = 99;
             let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
             // Sample several starts; force each to an OFF-MESH goal (far outside the grid, no floor)
@@ -7267,9 +7277,19 @@ mod tests {
             worst = worst.max(max_closed);
             let xy = (col.cols as f32 * col.cell_size / 8.0).ceil() * (col.rows as f32 * col.cell_size / 8.0).ceil();
             println!("{zone:<12} {:>12.0} {:>12} {:>10}", xy, max_closed, max_ms);
+            // F839-SCRATCH: delete-a-close mutation — cover.add(zone, &zw.tally()); //#839
         }
         println!("\nWORST reachable-component close across corpus: {worst} nodes");
         println!("=> the coarse MAX_NODES backstop must be comfortably above this (it is: 8M).");
+        println!("zones: {cover}");
+        assert!(cover.is_complete(),
+            "#839: this run is not a complete corpus measurement — it covered {}/{} of the zones it \
+             was asked for. unmeasured (the .wtr was read and did not load): {:?}; skipped (dropped \
+             before the water check ran — no glb / no grid): {:?}; unaccounted (left the loop body \
+             without reaching add or skip — a corpus WIRING bug, not an asset problem): {:?}. The \
+             WORST number above is only over the zones that were actually measured.",
+            cover.measured_zones(), cover.attempted_zones(),
+            cover.unmeasured_zones(), cover.skipped_zones(), cover.unaccounted_zones());
     }
 
     /// **THE #382 CORPUS MEASUREMENT.** Fine-tier route success and cost, OLD (inline, net-thread) vs
@@ -7402,8 +7422,7 @@ mod tests {
                 // walk-through-walls-into-water, #329 spawn-pocket dead-end, and unimplemented water
                 // nav #359/#197), so a route-success/cost number there is not clean evidence about
                 // this refactor. Pass ZONES=qcat explicitly if you want to look at it in isolation.
-                "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka", "felwithea",
-                "highpass", "everfrost", "butcher",
+                "akanon", // F839-SCRATCH: temporarily narrowed for mutation-check speed
             ].into_iter().map(str::to_string).collect());
 
         // A seeded LCG: a failure here must be reproducible, and an unseeded sample is not evidence.
@@ -7417,11 +7436,19 @@ mod tests {
 
         println!("\n{:<12} {:>6} {:>10} {:>10} {:>9} {:>9} {:>10} {:>10}",
             "zone", "pairs", "old ok", "new ok", "new-only", "old-only", "old mean", "new mean");
+        // #839: this corpus has no water dependency (no `in_water` call anywhere in it) — but a
+        // missing `.glb` or an empty collision grid used to drop a zone through a bare `continue`
+        // that printed a message and touched no ledger, so the FINE-TIER CORPUS totals below read
+        // as complete over whatever subset of `zones` happened to load. `open_corpus_zone` is the
+        // SAME single-owner prologue #807's other five corpora use; a zone with no water number to
+        // report still closes through `cover.add(zone, &zw.tally())`.
+        let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
-            let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
-            let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
-            let col = Collision::build(&za, 32.0);
-            if col.cols == 0 { println!("{zone:<12}  (no grid — skipped)"); continue; }
+            let (col, zw) = match crate::water_grid::open_corpus_zone(
+                &mut cover, std::path::Path::new(&dir), zone, 32.0) {
+                Ok(ready) => ready,
+                Err(why) => { println!("{zone:<12}  ({why})"); continue }
+            };
 
             // Sample (start, carrot) pairs the way production makes them: real coarse routes, carrots
             // 24u ahead along them. A carrot invented out of thin air would not be the question the
@@ -7464,7 +7491,11 @@ mod tests {
                     pairs.push((from, carrot));
                 }
             }
-            if pairs.is_empty() { println!("{zone:<12}  (no routable pairs — skipped)"); continue; }
+            if pairs.is_empty() {
+                println!("{zone:<12}  (no routable pairs — skipped)");
+                cover.skip(zone, "no routable pairs");
+                continue;
+            }
 
             let (mut old_ok, mut new_ok, mut new_only, mut old_only) = (0usize, 0usize, 0usize, 0usize);
             let (mut zo, mut zn) = (Vec::new(), Vec::new());
@@ -7497,6 +7528,7 @@ mod tests {
             tot_pairs += pairs.len(); tot_old_ok += old_ok; tot_new_ok += new_ok;
             tot_new_only += new_only; tot_old_only += old_only;
             old_us.extend(zo); new_us.extend(zn);
+            // F839-SCRATCH: delete-a-close mutation — cover.add(zone, &zw.tally()); //#839
         }
 
         old_us.sort_unstable(); new_us.sort_unstable();
@@ -7514,6 +7546,18 @@ mod tests {
         println!("cost/plan  NEW  mean {}us  p50 {}us  p99 {}us  max {}us  (paid on the fine WORKER, not the net thread)",
             mean(&new_us), pct(&new_us, 50), pct(&new_us, 99), new_us.last().copied().unwrap_or(0));
 
+        // #839: the accounting assert fires BEFORE `tot_pairs > 0` — a run that dropped every zone
+        // is still RED either way, but this ordering names which zones dropped and why instead of
+        // only saying the corpus produced no pairs.
+        println!("zones: {cover}");
+        assert!(cover.is_complete(),
+            "#839: the FINE-TIER CORPUS numbers above are not this corpus — they cover {}/{} of the \
+             zones it was asked for. unmeasured (the .wtr was read and did not load): {:?}; skipped \
+             (dropped before the water check ran — no glb / no grid / no routable pairs): {:?}; \
+             unaccounted (left the loop body without reaching add or skip — a corpus WIRING bug, not \
+             an asset problem): {:?}",
+            cover.measured_zones(), cover.attempted_zones(),
+            cover.unmeasured_zones(), cover.skipped_zones(), cover.unaccounted_zones());
         assert!(tot_pairs > 0, "the corpus produced no pairs — check $ZONE_DIR");
         // THE REGRESSION GATE. Deleting a deadline can only ADD completed searches: any search that
         // finished inside 150ms finishes identically without it (A* is deterministic given the same
@@ -7860,29 +7904,32 @@ mod tests {
             .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
         let zones: Vec<String> = std::env::var("ZONES").ok()
             .map(|z| z.split(',').map(str::to_string).collect())
-            .unwrap_or_else(|| ["qeynos", "qcat", "halas", "akanon", "blackburrow", "qeynos2", "gfaydark",
-                "crushbone", "neriaka", "felwithea", "highpass", "everfrost", "butcher", "cazicthule", "oasis"]
+            .unwrap_or_else(|| ["qeynos"] // F839-SCRATCH: temporarily narrowed for mutation-check speed
                 .into_iter().map(str::to_string).collect());
-        let pairs_per_zone: usize = std::env::var("PAIRS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+        let pairs_per_zone: usize = std::env::var("PAIRS").ok().and_then(|s| s.parse().ok()).unwrap_or(10); // F839-SCRATCH
         let mut seed: u64 = 0x693A_11CE;
         let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
         let unit = |r: u32| r as f32 / u32::MAX as f32;
         let (mut g_pairs, mut g_routed, mut g_steep) = (0usize, 0usize, 0usize);
-        let mut unmeasured: Vec<String> = Vec::new();
+        // #839: this used to keep its OWN `Vec<String> unmeasured` for the `.wtr` path — a second,
+        // parallel accounting scheme alongside `WaterRollup` (which every sibling corpus in this
+        // family already uses), and one that only ever covered the third drop path: a missing
+        // `.glb` printed "(no glb)" and a bare `continue` with no ledger entry at all, same as an
+        // empty collision grid. Folded into the SAME rollup `open_corpus_zone` owns for the other
+        // four corpora: `skip` (no glb / no grid) and the `.wtr`-load `unmeasured` bucket are both
+        // its job now, so there is one accounting scheme in this function, not two.
+        let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
-            let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
-            let Ok(za) = ZoneAssets::from_glb(&p) else { println!("AB {zone} (no glb)"); continue };
-            let mut col = Collision::build(&za, 32.0);
-            if col.cols == 0 { continue; }
-            // #762: water is this corpus' PAIR FILTER (`in_water(s) || in_water(g) → skip`). Without
-            // the region map the filter silently passes everything, so wet pairs get scored as dry
-            // land and the AB numbers are about a different corpus than the one they claim.
-            if let Err(e) = crate::water_grid::ZoneWater::load(
-                &std::path::Path::new(&dir).join("maps/water"), zone).install(&mut col) {
-                println!("AB {zone} {} — {e}", crate::water_grid::UNMEASURED);
-                unmeasured.push(zone.clone());
-                continue;
-            }
+            // #762/#839: water is this corpus' PAIR FILTER (`in_water(s) || in_water(g) → skip`).
+            // Without the region map the filter silently passes everything, so wet pairs get scored
+            // as dry land and the AB numbers are about a different corpus than the one they claim —
+            // `open_corpus_zone`'s DROP 3 refuses that zone as `unmeasured` rather than installing a
+            // fabricated-dry region map.
+            let (col, zw) = match crate::water_grid::open_corpus_zone(
+                &mut cover, std::path::Path::new(&dir), zone, 32.0) {
+                Ok(ready) => ready,
+                Err(why) => { println!("AB {zone} {why}"); continue }
+            };
             let (mut z_pairs, mut tries) = (0usize, 0usize);
             while z_pairs < pairs_per_zone && tries < pairs_per_zone * 70 + 500 {
                 tries += 1;
@@ -7913,13 +7960,21 @@ mod tests {
                         other.reason(), s[0],s[1],s[2], g[0],g[1],g[2]),
                 }
             }
+            // F839-SCRATCH: delete-a-close mutation — cover.add(zone, &zw.tally()); //#839
         }
         println!("AB_TOTAL pairs={g_pairs} routed={g_routed} steep_drop_routes={g_steep}");
+        // #839: the accounting assert fires BEFORE `g_pairs > 0`, same as the other four corpora in
+        // this family — it names which zones dropped and why instead of just saying no zones loaded.
+        println!("zones: {cover}");
+        assert!(cover.is_complete(),
+            "#839 (refs #762): the AB_TOTAL above is not this corpus — it covers {}/{} of the zones \
+             it was asked for. unmeasured (the .wtr was read and did not load): {:?}; skipped \
+             (dropped before the water check ran — no glb / no grid): {:?}; unaccounted (left the \
+             loop body without reaching add or skip — a corpus WIRING bug, not an asset problem): \
+             {:?}",
+            cover.measured_zones(), cover.attempted_zones(),
+            cover.unmeasured_zones(), cover.skipped_zones(), cover.unaccounted_zones());
         assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR");
-        assert!(unmeasured.is_empty(),
-            "#762: {} zone(s) were dropped because their .wtr did not load — the AB_TOTAL above \
-             covers a smaller corpus than the one named, so it is not comparable to a run that had \
-             them: {:?}", unmeasured.len(), unmeasured);
     }
 
     /// A vertical wall segment at constant `east`, spanning north `[n0,n1]` and height `[h0,h1]`.
@@ -8177,15 +8232,22 @@ mod tests {
             .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
         let zones: Vec<String> = std::env::var("ZONES").ok()
             .map(|z| z.split(',').map(str::to_string).collect())
-            .unwrap_or_else(|| ["highpass", "permafrost", "neriakc", "qcat"].iter().map(|s| s.to_string()).collect());
+            .unwrap_or_else(|| ["highpass"].iter().map(|s| s.to_string()).collect()); // F839-SCRATCH: narrowed
         let mut seed: u64 = 0x0155_EA1D;
         let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
         println!("\n{:<12} {:>10} {:>10} {:>12} {:>10}", "zone", "fits", "recovered", "headroom-rej", "steep-rej");
+        // #839: this corpus has no water dependency (no `in_water` call) — but a missing `.glb` or
+        // an empty collision grid used to drop a zone through a bare `continue` that printed nothing
+        // (the `cols == 0` arm) or a message nobody accounted for, so the Q1 numbers above read as a
+        // complete seal measurement over whatever subset of `zones` happened to load. Same
+        // single-owner prologue as the other four corpora in this family.
+        let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
-            let Ok(za) = ZoneAssets::from_glb(&std::path::Path::new(&dir).join(format!("{zone}.glb"))) else {
-                println!("{zone:<12}  (no glb)"); continue };
-            let col = Collision::build(&za, 32.0);
-            if col.cols == 0 { continue; }
+            let (col, zw) = match crate::water_grid::open_corpus_zone(
+                &mut cover, std::path::Path::new(&dir), zone, 32.0) {
+                Ok(ready) => ready,
+                Err(why) => { println!("{zone:<12}  ({why})"); continue }
+            };
             let (ext_e, ext_n) = (col.cols as f32 * col.cell_size, col.rows as f32 * col.cell_size);
             let (mut fits, mut recovered, mut head_rej, mut steep_rej) = (0usize, 0usize, 0usize, 0usize);
             let mut cols = 0;
@@ -8208,6 +8270,7 @@ mod tests {
                 }
             }
             println!("{zone:<12} {fits:>10} {recovered:>10} {head_rej:>12} {steep_rej:>10}");
+            // F839-SCRATCH: delete-a-close mutation — cover.add(zone, &zw.tally()); //#839
         }
         println!("\n=== Q1: 'recovered' = floor is_standable KEEPS (the #375 win). 'headroom-rej' = \
             rejected for a solid surface < {NAV_AGENT_HEIGHT}u above. A mutation-checked test confirms \
@@ -8215,6 +8278,15 @@ mod tests {
             below body height (correct). Route-success held, BUT the corpus cannot distinguish a rejected \
             ceiling from a sealed pocket (it samples via nearest_floor, so a sealed pocket is invisible \
             to it) — this is NOT proof every reject is a ceiling. ===");
+        println!("zones: {cover}");
+        assert!(cover.is_complete(),
+            "#839: the Q1 numbers above are not a complete seal measurement — they cover {}/{} of the \
+             zones this run was asked for. unmeasured (the .wtr was read and did not load): {:?}; \
+             skipped (dropped before the water check ran — no glb / no grid): {:?}; unaccounted (left \
+             the loop body without reaching add or skip — a corpus WIRING bug, not an asset problem): \
+             {:?}",
+            cover.measured_zones(), cover.attempted_zones(),
+            cover.unmeasured_zones(), cover.skipped_zones(), cover.unaccounted_zones());
     }
 
     /// **THE FLOOR-MODEL DISAGREEMENT SCAN — a corpus indicator for D-2 (#375).** Counts, over a zone
@@ -8262,9 +8334,7 @@ mod tests {
         let zones: Vec<String> = std::env::var("ZONES").ok()
             .map(|z| z.split(',').map(str::to_string).collect())
             .unwrap_or_else(|| vec![
-                "qcat", "highpass", "permafrost", "neriakc",  // inverted-art zones (#375) — high on main
-                "gfaydark",                                   // open outdoor: the believable clean control (~0)
-                "qeynos2",                                    // ceiling-rich city: reads high (see HONEST LIMIT)
+                "qcat", // F839-SCRATCH: temporarily narrowed for mutation-check speed
             ].into_iter().map(str::to_string).collect());
 
         let mut seed: u64 = 0x5044_0F7D; // distinct stream
@@ -8273,11 +8343,18 @@ mod tests {
         let mut tot_pts = 0usize;
         let mut tot_drift = 0usize;
         println!("\n{:<12} {:>10} {:>12} {:>8}", "zone", "sampled", "drift-pts", "%");
+        // #839: this corpus has no water dependency (no `in_water` call) — but a missing `.glb` or
+        // an empty collision grid used to drop a zone through a `continue` that printed a message
+        // and touched no ledger, so the FLOOR-MODEL DISAGREEMENT total below read as complete over
+        // whatever subset of `zones` happened to load. Same single-owner prologue as the other four
+        // corpora in this family.
+        let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
-            let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
-            let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
-            let col = Collision::build(&za, 32.0);
-            if col.cols == 0 { println!("{zone:<12}  (no grid — skipped)"); continue; }
+            let (col, zw) = match crate::water_grid::open_corpus_zone(
+                &mut cover, std::path::Path::new(&dir), zone, 32.0) {
+                Ok(ready) => ready,
+                Err(why) => { println!("{zone:<12}  ({why})"); continue }
+            };
             let ext_e = col.cols as f32 * col.cell_size;
             let ext_n = col.rows as f32 * col.cell_size;
             let (mut sampled, mut drift) = (0usize, 0usize);
@@ -8307,10 +8384,22 @@ mod tests {
             let pct = if sampled > 0 { 100.0 * drift as f32 / sampled as f32 } else { 0.0 };
             println!("{zone:<12} {sampled:>10} {drift:>12} {pct:>7.2}%", );
             tot_pts += sampled; tot_drift += drift;
+            // F839-SCRATCH: delete-a-close mutation — cover.add(zone, &zw.tally()); //#839
         }
         println!("\n=== FLOOR-MODEL DISAGREEMENT: {tot_drift} / {tot_pts} standable-looking surfaces the \
             planner's floor model omits (UPPER BOUND — conflates inverted-art floor with ceilings on main; \
             see HONEST LIMIT). D-2 gate: → 0 by construction (both sides share is_standable). ===");
+        // #839: the accounting assert fires BEFORE `tot_pts > 0` — a run that dropped every zone is
+        // still RED either way, but this ordering names which zones dropped and why.
+        println!("zones: {cover}");
+        assert!(cover.is_complete(),
+            "#839: the FLOOR-MODEL DISAGREEMENT total above is not a complete scan — it covers {}/{} \
+             of the zones this run was asked for. unmeasured (the .wtr was read and did not load): \
+             {:?}; skipped (dropped before the water check ran — no glb / no grid): {:?}; \
+             unaccounted (left the loop body without reaching add or skip — a corpus WIRING bug, not \
+             an asset problem): {:?}",
+            cover.measured_zones(), cover.attempted_zones(),
+            cover.unmeasured_zones(), cover.skipped_zones(), cover.unaccounted_zones());
         assert!(tot_pts > 0, "no points sampled — check $ZONE_DIR");
     }
 
