@@ -595,12 +595,16 @@ use eqoxide_ipc::MoveIntent;
             // must reach `add` or `skip`; one that doesn't is recorded as `unaccounted`.
             //
             // #805: opening goes through `open_zone_checked`, NOT a bare `begin_zone` pair, because
-            // it re-checks the `unaccounted` bucket for the zones already opened before it opens
-            // this one. #762 left that check to this function's LAST statement and #763 says this
-            // corpus never terminates on blackburrow, so on the one run where a zone is known to
-            // misbehave the check was never reached at all. Per zone, a run that hangs / returns /
-            // dies at zone K has already checked zones 1..K-1. Do not move this line down, and do
-            // not replace it with `begin_zone`.
+            // it re-checks the `unaccounted` AND `unmeasured` buckets for the zones already opened
+            // before it opens this one. #762 left those checks to this function's LAST statement and
+            // #763 says this corpus never terminates on blackburrow, so on the one run where a zone
+            // is known to misbehave they were never reached at all. Per zone, a run that hangs /
+            // returns / dies at zone K has already checked zones 1..K-1 for both. Do not move this
+            // line down, and do not replace it with `begin_zone`.
+            //
+            // Nothing CI runs would notice if you did: this corpus is `#[ignore]`d and CI passes no
+            // `--ignored` (#799 / #777). Reverting this one line to `begin_zone` was measured to
+            // leave the whole workspace suite byte-identically green.
             open_zone_checked(&mut roll_wr, &mut roll_423, zone);
             let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
             // #762 round 2 (B1): these `continue`s fire BEFORE the water check ever runs, so the
@@ -815,11 +819,12 @@ use eqoxide_ipc::MoveIntent;
         // which one is non-empty instead of asserting a cause this assert never established.
         //
         // #805: this assert is still TERMINAL and still unreachable on a run that does not finish
-        // the loop above (#763: blackburrow). What changed is that its `unaccounted` third is now
-        // ALSO decided per zone by `open_zone_checked`, so the only zone whose accounting depends on
-        // reaching this line is the LAST one opened. The other two thirds (`unmeasured`, `skipped`)
-        // stay here on purpose: "does this corpus have a hole in it" is a question about the whole
-        // denominator and is not answerable at zone 3 of 11 — see `open_zone_checked`'s doc.
+        // the loop above (#763: blackburrow). What changed is that TWO of its three buckets —
+        // `unaccounted` and `unmeasured` — are ALSO decided per zone by `open_zone_checked` as each
+        // zone closes. This line remains the ONLY check for the `skipped` bucket, for every zone,
+        // and the only check of any kind for the last zone opened (nothing closes it, so no later
+        // `begin_zone` observes it). It is still load-bearing; it is not a backstop. Why `skipped`
+        // is exempt — a diagnostics trade, not a decidability one — is in `open_zone_checked`'s doc.
         assert!(roll_wr.is_complete() && roll_423.is_complete(),
             "#762: this run has a hole in its water coverage, so the wat-route/#423 columns above \
              are NOT a score for this corpus. Holes, by kind (an empty list means that kind did not \
@@ -837,8 +842,8 @@ use eqoxide_ipc::MoveIntent;
 
 // ── #805: the corpus's zone accounting, enforced per zone instead of only at the end ──
 
-    /// Open `zone` on both of `faithful_walker_drift_corpus`'s rollups — but first re-check that
-    /// every zone opened before it was CLOSED by `add` or `skip`.
+    /// Open `zone` on both of `faithful_walker_drift_corpus`'s rollups — but first refuse the run if
+    /// any zone already closed is `unaccounted` or `unmeasured`.
     ///
     /// **Why this exists (#805).** #762 gave the corpus a completeness refusal, and put it in the
     /// corpus's last statement. #763 says the corpus never terminates on blackburrow. So on the one
@@ -847,35 +852,70 @@ use eqoxide_ipc::MoveIntent;
     /// the top of every iteration means a run that hangs, returns early, or dies at zone K has
     /// already checked zones 1..K-1 by the time it gets there.
     ///
-    /// **Why only the `unaccounted` bucket.** Of `is_complete`'s three triggers, exactly one is
-    /// decidable per zone: `unaccounted` means "a zone left the loop body without reaching `add` or
-    /// `skip`", which is a corpus WIRING bug and never an asset problem, and it is already known the
-    /// instant the next zone opens. `unmeasured` and `skipped` are asset-coverage holes, and whether
-    /// the corpus HAS a hole is a statement about the whole denominator — not answerable at zone 3
-    /// of 11. Checking those per zone would abort the run on the first missing `.glb` instead of
-    /// printing the table and reconciling at the end, so they stay in the terminal assert.
+    /// **Which buckets, and why `skipped` is not one of them.**
     ///
-    /// **What this does NOT buy, stated so nobody re-derives it.** A hang produces no new output:
-    /// after this change an operator watching a wedged blackburrow run still sees nothing extra, and
-    /// there is no timeout here that would turn the hang into a red run (#763 is untouched by
-    /// design). The gain is only that zones 1..K-1 are individually verified as they complete rather
-    /// than all of them resting on a statement the run never reaches. The zone that is OPEN when the
-    /// run stops is not covered by this — nothing closes it and no later `begin_zone` runs — so it
-    /// is still the terminal assert's job. And the corpus's total line (`wat-route: {roll_wr}`)
-    /// sits after the same loop, so an unterminated run prints no water total either — that is a
-    /// claim about statement order in THIS file, checked by reading it, not an observation of a
-    /// hung run: no blackburrow run was executed for this change.
+    /// * `unaccounted` — "a zone left the loop body without reaching `add` or `skip`". A corpus
+    ///   WIRING bug, never an asset problem.
+    /// * `unmeasured` — "the zone was walked and its `.wtr` did not load". **This is #762's
+    ///   motivating exhibit** (a build host holding 2 of 497 `.wtr` files scoring `0`/`0` on a
+    ///   water-inclusive run), so it is the bucket #805 is actually about, and leaving it terminal
+    ///   left the exhibit uncovered on exactly the hanging run.
+    /// * `skipped` — "the zone was dropped before the water check ran at all: no `.glb`, no grid, no
+    ///   routable pairs". **Deliberately NOT checked here, and the reason is DIAGNOSTICS, not
+    ///   decidability.** All three buckets are decidable the instant a zone closes and all three are
+    ///   monotone (they are push-only `Vec`s), so a per-zone refusal on any of them could never fire
+    ///   where the terminal one would not — an earlier revision of this comment claimed the opposite
+    ///   for `unmeasured`/`skipped` and the PR's reviewer measured it false. What is true is that
+    ///   `skipped` is the COMMON state of a partial `$ZONE_DIR`, which is the normal state of a dev
+    ///   box: measured on a two-zone run (`ZONES=akanon,crushbone`) against real baked GLBs, akanon
+    ///   skipped for "no routable pairs" at zone 1 of 2, so gating `skipped` here would have killed
+    ///   the run before crushbone's 60 journeys ever ran. That cost is paid for a bucket the table
+    ///   already prints per zone (`(no glb — skipped)`), so it buys little. It stays in the terminal
+    ///   assert. That is a judgement call, not a wall.
+    ///
+    /// **What an abort here costs (N4).** This panics mid-loop, so the zones AFTER `zone` are never
+    /// opened and their holes are never seen: the message is a partial picture and names only the
+    /// first offending rollup. The per-zone table rows already printed stay; the corpus's own total
+    /// line does not run, so this function prints a partial rollup line of its own before panicking.
+    ///
+    /// **What this does NOT buy, stated so nobody re-derives it.**
+    ///
+    /// * A hang produces no new output. An operator watching a wedged blackburrow run still sees
+    ///   nothing extra; there is no timeout here and #763 is untouched by design.
+    /// * The zone that is OPEN when the run stops is not covered — nothing closes it and no later
+    ///   `begin_zone` runs — so it is still the terminal assert's job, as is `skipped` for every
+    ///   zone. The terminal assert is therefore still load-bearing and still unreachable on a
+    ///   non-terminating run.
+    /// * **This call site is not covered by any always-run test (#799).** Delete the
+    ///   `open_zone_checked(…)` call from the corpus loop, restore the bare `begin_zone` pair, and
+    ///   the whole workspace suite stays byte-identically green: `faithful_walker_drift_corpus` is
+    ///   `#[ignore]`d and `.github/workflows/test.yml` runs `cargo test --workspace --locked` with
+    ///   no `--ignored`. The tests below pin this HELPER's behaviour; nothing that CI runs pins that
+    ///   the corpus calls it. That was measured (by running the deletion and comparing figures), not
+    ///   assumed, and it is not fixed here — whether `#[ignore]`d tests should run in CI is
+    ///   #777/#654/#659, an owner decision.
+    /// * The corpus's total line (`wat-route: {roll_wr}`) sits after the same loop, so an
+    ///   unterminated run prints no water total — a claim about statement order in THIS file,
+    ///   checked by reading it, not an observation of a hung run. No blackburrow run was executed.
     fn open_zone_checked(wr: &mut WaterRollup, r423: &mut WaterRollup, zone: &str) {
         for (label, roll) in [("wat-route", &*wr), ("#423", &*r423)] {
             let orphans = roll.unaccounted_zones();
-            assert!(orphans.is_empty(),
-                "#805/#762: opening zone {zone:?}, but the {label} rollup already has {} zone(s) \
-                 that left the corpus loop without reaching add or skip: {orphans:?}. That is a \
-                 corpus WIRING bug (an exit path from the loop body that closes neither), not a \
-                 missing asset, and the water columns from this run are not a score. Caught HERE, \
-                 at the next zone, rather than at the terminal assert — which a run that never \
-                 finishes the loop (#763) does not reach.",
-                orphans.len());
+            let unmeasured = roll.unmeasured_zones();
+            if orphans.is_empty() && unmeasured.is_empty() { continue; }
+            // N4: the corpus's own total line runs after the loop and this panic is inside it, so
+            // print what the run DID establish before dying. PARTIAL by construction — the zones
+            // after this one are never opened.
+            println!("\n=== FAITHFUL WALKER DRIFT [ABORTED while opening {zone}] — PARTIAL rollups; \
+                      the zones after {zone} were never opened, so this is not a corpus score: \
+                      wat-route: {}, #423: {} ===", &*wr, &*r423);
+            panic!("#805/#762: opening zone {zone:?}, but the {label} rollup already holds a hole \
+                    that the terminal assert would only have reported at the END of a run that may \
+                    never get there (#763). unaccounted (left the loop body without reaching add or \
+                    skip — a corpus WIRING bug, not an asset problem): {orphans:?}; unmeasured (the \
+                    zone was walked and its .wtr did not load — #762's exhibit): {unmeasured:?}. \
+                    The water columns from this run are not a score. Only the FIRST offending \
+                    rollup is named and the zones after {zone:?} were never opened, so treat this \
+                    as a partial picture. `skipped` is not checked here — see this fn's doc.");
         }
         wr.begin_zone(zone);
         r423.begin_zone(zone);
@@ -886,12 +926,13 @@ use eqoxide_ipc::MoveIntent;
     /// THIRD stands in for #763's blackburrow: a zone the run never gets past, so nothing after the
     /// loop ever executes. The corpus itself needs baked GLBs and hangs; this needs neither.
     ///
-    /// This is a reach control, not just a condition check: if `open_zone_checked`'s assert is
-    /// disabled (or the call is removed from a loop), control reaches the `UNREACHED` panics below
-    /// and `should_panic`'s expected substring no longer matches, so the test goes RED. Measured
-    /// both ways — see the PR body for raw output.
+    /// This is a reach control for the HELPER, not for the fix: if `open_zone_checked`'s refusal is
+    /// disabled, or its call is removed from THIS loop, control reaches the `UNREACHED` panics below
+    /// and `should_panic`'s expected substring no longer matches, so the test goes RED. It says
+    /// nothing about whether `faithful_walker_drift_corpus` still calls it — see that function's
+    /// `#799` paragraph.
     #[test]
-    #[should_panic(expected = "left the corpus loop without reaching add or skip")]
+    #[should_panic(expected = "unaccounted (left the loop body without reaching add or skip")]
     fn zone_accounting_fires_before_the_corpus_loop_ends() {
         let mut wr = WaterRollup::new();
         let mut r423 = WaterRollup::new();
@@ -909,10 +950,13 @@ use eqoxide_ipc::MoveIntent;
                 caught the abandoned zone — which is exactly the #805 defect");
     }
 
-    /// **#805 — GREEN direction, and the reason the gate checks only `unaccounted`.** Every zone
-    /// here is CLOSED, some by `skip` (a partial `$ZONE_DIR`, the normal case on a dev box) and one
-    /// by `add`. The per-zone gate must stay silent through all of them so the corpus still prints
-    /// its whole table, while the TERMINAL reconciliation still refuses to call the run complete.
+    /// **#805 — GREEN direction, and the pin on `skipped` being exempt.** Every zone here is CLOSED,
+    /// three by `skip` (a partial `$ZONE_DIR`, the normal state of a dev box) and one by a MEASURED
+    /// `add`. The per-zone refusal must stay silent through all of them — otherwise the corpus would
+    /// abort on the first missing `.glb` and never print the rest of its table — while the TERMINAL
+    /// reconciliation still refuses to call the run complete. If `skipped` is ever added to
+    /// `open_zone_checked`, this test goes RED, which is the intended alarm: that is a real change
+    /// in what an operator with a partial asset dir gets to see, not a tidy-up.
     #[test]
     fn zone_accounting_stays_silent_while_every_zone_is_closed() {
         let mut wr = WaterRollup::new();
@@ -935,19 +979,45 @@ use eqoxide_ipc::MoveIntent;
             "three skipped zones is a hole; the terminal reconciliation must still refuse it");
     }
 
-    /// **#805 — the limit, pinned rather than described.** The gate checks zones 1..K-1. A zone that
-    /// is still OPEN when the run stops is caught only by the terminal assert, because nothing
-    /// closes it and no later `begin_zone` runs. If a future change makes the gate cover the open
-    /// zone too, this test goes RED and the doc above must be rewritten — that is the point of it.
+    /// **#805 — the `#423` arm, which is otherwise entirely unpinned (review N1/M_E).** The two
+    /// rollups can DIVERGE: a corpus edit that settles `roll_wr` and forgets `roll_423` is exactly
+    /// the wiring bug this refusal exists for, and a gate that only consulted the first rollup would
+    /// pass every other test in this file. Here `wat-route` is clean and only `#423` is abandoned,
+    /// so the refusal must fire on the SECOND arm — and the expected substring includes the `{label}`
+    /// interpolation, so a mutation that hard-codes `"wat-route"` also goes RED.
     #[test]
-    fn zone_accounting_does_not_cover_the_zone_that_is_still_open() {
+    #[should_panic(expected = "the #423 rollup already holds a hole")]
+    fn zone_accounting_covers_the_423_rollup_not_just_wat_route() {
         let mut wr = WaterRollup::new();
         let mut r423 = WaterRollup::new();
-        open_zone_checked(&mut wr, &mut r423, "the_zone_that_hangs");
-        // The run stops here. The gate never runs again, so it never sees this zone…
-        assert_eq!(wr.unaccounted_zones(), ["the_zone_that_hangs"],
-            "an unclosed zone is `unaccounted` the moment the rollup is READ…");
-        assert!(!wr.is_complete(), "…so only whoever reads the rollup — the terminal assert — refuses it");
+        open_zone_checked(&mut wr, &mut r423, "zone_a");
+        wr.skip("zone_a", "no glb"); // wat-route closed — and `#423` deliberately is NOT.
+        open_zone_checked(&mut wr, &mut r423, "zone_b");
+        panic!("UNREACHED: zone_b opened with `#423` still holding an abandoned zone_a — the gate \
+                only consults the wat-route rollup");
+    }
+
+    /// **#805 — `unmeasured` is refused per zone too (round-2 B1/B3).** Round 1 checked only
+    /// `unaccounted` on the reasoning that an asset hole "is not answerable at zone 3 of 11". The
+    /// reviewer measured that false: the buckets are push-only, so `unmeasured` is settled the
+    /// instant a zone closes and can never un-fire. `unmeasured` is #762's motivating exhibit (a
+    /// `.wtr` that did not load scoring as zero water), so leaving it terminal left the exhibit
+    /// uncovered on precisely the non-terminating run #805 is about. This drives the real
+    /// `ZoneWater::load` failure path — no fixture constructor, no `.wtr` on disk.
+    #[test]
+    #[should_panic(expected = "unmeasured (the zone was walked and its .wtr did not load")]
+    fn zone_accounting_refuses_an_unmeasured_zone_before_the_corpus_ends() {
+        let mut wr = WaterRollup::new();
+        let mut r423 = WaterRollup::new();
+        // A directory that does not exist, so `load` really fails and `tally()` is `Unmeasured`.
+        let nowhere = std::env::temp_dir().join("f805-no-such-water-dir");
+        let zw = ZoneWater::load(&nowhere, "zone_a");
+        assert!(!zw.is_measured(), "fixture precondition: this .wtr must NOT load");
+        open_zone_checked(&mut wr, &mut r423, "zone_a");
+        wr.add("zone_a", &zw.tally()); r423.add("zone_a", &zw.tally()); // closed, but with no data
+        open_zone_checked(&mut wr, &mut r423, "zone_b");
+        panic!("UNREACHED: zone_b opened after zone_a closed UNMEASURED — the run would have gone \
+                on to report a water column with a hole in it, which is #762's exhibit");
     }
 
     /// **Rename guard for this file's doc-comment citations.** `open_zone_checked`'s rustdoc names
