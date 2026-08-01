@@ -579,9 +579,11 @@ Now:
 
 * **`200` with `[]`** means, and only means, *this zone's region map loaded and contains no
   zone-line regions.* It is a real reading of the world.
-* **`503 {"error": "zone_region_data_unavailable", "reason": …, "detail": …}`** means the question
-  could not be answered. Unlike `zone_assets_not_ready`, **this does not clear by polling** — the
-  asset is missing or unusable, not loading. Re-sync or re-bake the zone's assets.
+* **`503 {"error": "zone_region_data_unavailable", "reason": …, "detail": …, "message": …}`** means
+  the question could not be answered. Unlike `zone_assets_not_ready`, **this does not clear by
+  polling** — the asset is missing or unusable, not loading. Re-sync or re-bake the zone's assets.
+  `reason` is the machine-readable cause below, `detail` is that cause rendered with its specifics
+  (e.g. the declared node count), and `message` is prose for a human reading the log.
 
 | `reason` | What happened |
 |---|---|
@@ -590,7 +592,18 @@ Now:
 | `region_data_not_region_data` | Present, but not a region map (wrong magic, or shorter than the header). |
 | `region_data_unsupported_version` | A `.wtr` format version this build cannot read. |
 | `region_data_truncated` | The header declares more BSP nodes than the file carries. |
-| `region_data_not_attached` | No region data was ever handed to this zone's collision grid. |
+
+**A sixth `reason` exists in the code and is NOT in that table on purpose: `region_data_not_attached`**
+(#821 review round 2, B3 — a previous revision listed it as an outcome you might receive). It is the
+state a freshly built collision grid is in before any region data is handed to it. **No release
+build can serve it**: the client has exactly one production construction of a collision grid
+(`build_zone_collision` in `src/app.rs`), which builds and attaches in a single call, and the only
+reason-free way to write the slot (`Collision::set_water`) is `#[cfg(any(test, feature =
+"test-fixtures"))]` and so does not exist in a release binary. It is listed here only so that an
+agent that somehow *does* receive it knows what it means: **a client bug, not an asset problem** —
+re-syncing assets will not help; file it. (This is an argument from enumerating every construction
+site, not a type-level guarantee — nothing stops a future non-test grid from reaching a reader
+un-attached.)
 
 **Not covered by this:** `POST /v1/move/zone_cross` still reports `zone_line_not_in_map` (documented
 as a map-data *gap*) when the region map failed to load rather than merely lacking the region — the

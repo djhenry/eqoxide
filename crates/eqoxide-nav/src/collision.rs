@@ -1185,8 +1185,14 @@ impl Collision {
     /// Each links to an entrance via the `OP_SendZonepoints` `iterator`.
     ///
     /// `Ok(vec![])` is a real reading: this zone's region map loaded and contains no zone-line
-    /// regions (or is a v1 map, which carries no indices). `Err` means the question could not be
-    /// answered at all, and names why.
+    /// regions. `Err` means the question could not be answered at all, and names why.
+    ///
+    /// **A v1 map is NOT an exception to that** (#821 review round 2, B1 — an earlier revision of
+    /// this sentence said it was). v1 records carry no `zone_line_index` field, so every v1 zone
+    /// line reads as index **0**, and index 0 is *included*: this returns `[0]`, not `[]`. That is
+    /// the whole point of #683 — gating recognition on a nonzero index locked a character in qrg
+    /// forever. See `RegionMap::zone_line_indices` and
+    /// `a_zero_index_zone_line_region_is_still_recognized_683`.
     ///
     /// **The `Result` is the fix for #803, and it is here rather than in a caller-side guard because
     /// the guard is what kept failing.** This used to be `Vec<i32>` with `.unwrap_or_default()`, so a
