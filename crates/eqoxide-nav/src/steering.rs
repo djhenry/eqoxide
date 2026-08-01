@@ -249,17 +249,25 @@ pub fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
 /// fires and the carrot never leads again — measured 1 of 8 swept starts still CARROT-PINNED after
 /// 400 ticks, and 33 of 288 on the wider 8 u-separation sweep. With `<` it is outside, and both go
 /// to zero (`the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced`,
-/// `the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it`).
+/// `the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured`).
 ///
 /// **What this constant does NOT do — the residual class, stated so nobody re-derives it as a
-/// surprise.** Below the guard the resync is inert by construction, so a route whose legs are
-/// closer together than `CURSOR_STALE_DIST` can still form the #673 cycle. Measured on the same
-/// hairpin sweep (carrot-pinned starts / total): 8 u and above → 0 pinned; 7 u → 252/252;
-/// 6 u → 216/216; 4 u → 144/144, i.e. below the guard the fix is not partial, it is absent. The
-/// real deadlock invariant is CARROT COLLAPSE (the `LOCAL_REACH` carrot landing within ~the body
-/// offset of the body while `path_i` is pinned), and a distance guard is only a proxy for it —
-/// wrong on exactly the routes whose legs are closer together than the guard. Tracked as its own
-/// issue; do not read this constant as pinning a value, it is unpinned over at least [2, 16].
+/// surprise.** Below the guard this trigger is inert by construction, so a route whose legs are
+/// closer together than `CURSOR_STALE_DIST` was still able to form the #673 cycle. Measured on the
+/// hairpin sweep with this as the SOLE trigger (carrot-pinned starts / total): 8 u and above →
+/// 0 pinned; 7 u → 252/252; 6 u → 216/216; 4 u → 144/144, i.e. below the guard this trigger is not
+/// partial, it is absent. The real deadlock invariant is CARROT COLLAPSE, and a distance guard is
+/// only a proxy for it — wrong on exactly the routes whose legs are closer together than the guard.
+/// Do not read this constant as pinning a value, it is unpinned over at least [2, 16].
+///
+/// **#733 did not widen this constant; it added a second, threshold-free trigger beside it.**
+/// [`resync_cursor`] now also fires when [`carrot_leads`] is false — the collapse measured directly
+/// as an arclength comparison rather than inferred from a distance. Widening `CURSOR_STALE_DIST`
+/// could not have worked: the sub-guard cycle is a body 4–7 u from its own segment, so any constant
+/// small enough to catch it also snaps a walker legitimately cutting a tight switchback
+/// (`a_walker_cutting_a_tight_switchback_keeps_its_cursor`, a body 1.5 u from its segment and 0.5 u
+/// from a later one, whose carrot still leads and whose cursor must not move). The two triggers
+/// answer different questions and the sweep counts above are what this one, alone, is worth.
 ///
 /// > ## ⚠️ Corrections
 /// >
@@ -273,14 +281,16 @@ pub fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
 /// >   memory instead of by grepping the concept.
 /// > * *"…and is inert below it" cited as
 /// >   `the_resync_clears_the_deadlock_above_the_guard_and_is_inert_below_it`* — **that test no
-/// >   longer exists.** Round 3 renamed it to
-/// >   `the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it` *precisely
-/// >   because* the old name asserted the retracted "deadlock" reading of these counts. So this doc
-/// >   was citing the retracted claim by its retracted name, as evidence for itself.
+/// >   longer exists.** Round 3 renamed it *precisely because* the old name asserted the retracted
+/// >   "deadlock" reading of these counts. So this doc was citing the retracted claim by its
+/// >   retracted name, as evidence for itself. **#733 renamed it a second time**, for the second
+/// >   time because the name asserted something the code had stopped doing — "inert below the
+/// >   guard" — and it is now
+/// >   `the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured`.
 /// > * *"The round-1 review measured 133/1649 at 8 u…"* — **removed.** The round-2 reviewer retracted
 /// >   that figure on the same grounds (it was the same 24 u-step model on a denser grid), and it is
 /// >   preserved with its retraction on
-/// >   `the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it` rather than
+/// >   `the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured` rather than
 /// >   repeated here.
 /// >
 /// > None of this weakens the `<` finding, which is about the fixed point sitting on the boundary
@@ -302,6 +312,16 @@ pub const CURSOR_STALE_DIST: f32 = 8.0;
 ///   them at ~12 per candidate instead of running the length of a 141-waypoint route.
 pub const CURSOR_RESYNC_MAX_HOP: f32 = 24.0;
 
+/// The reach `drive_walk` builds its `local_goal` with — the point on the coarse route it hands the
+/// FINE planner as a destination — and therefore the reach whose collapse [`carrot_leads`] measures.
+///
+/// It lives here, `pub`, for one reason: `drive_walk` and [`resync_cursor`] must be talking about
+/// **the same carrot**. A private copy in each would agree today by coincidence and drift silently,
+/// and a drifted copy makes the collapse check answer a question about a carrot production never
+/// builds — the guard would still pass, on the wrong carrot. `walker::Walker::drive_walk` and the
+/// offline `fixture_run` harness both read this constant rather than restating 24.0.
+pub const LOCAL_REACH: f32 = 24.0;
+
 /// Squared 3-D distance from `p` to segment `a`→`b`, plus the closest point on it.
 fn seg_closest(a: [f32; 3], b: [f32; 3], p: [f32; 3]) -> ([f32; 3], f32) {
     let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
@@ -314,6 +334,92 @@ fn seg_closest(a: [f32; 3], b: [f32; 3], p: [f32; 3]) -> ([f32; 3], f32) {
     let c = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
     let d = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
     (c, d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+}
+
+/// The three arclengths carrot collapse is a comparison between, all measured along `path` from
+/// `path[start_i]` (#733). Returns `None` when `start_i` names no segment, so there is nothing to
+/// measure.
+///
+/// * `.0` — **the carrot's ORIGIN**: the arclength of the projection of `from` onto segment
+///   `start_i`. This is exactly where [`carrot_along`] starts spending its `reach` budget, and the
+///   whole defect is that it is a point on the segment the cursor NAMES, not a point near the body.
+/// * `.1` — **the BODY**: the arclength of the point on `path[start_i..]` genuinely nearest `from`.
+///   Ties resolve to the EARLIER segment (`<`, not `<=`), which is the conservative half of the tie:
+///   an earlier reading of where the body is makes a collapse HARDER to declare, never easier.
+/// * `.2` — the total length of `path[start_i..]`, which is the cap [`carrot_along`] clamps the
+///   carrot at once the route runs out before the budget does.
+///
+/// The forward-only scan (`start_i..`) is deliberate and matches [`resync_cursor`]'s guard 1: a body
+/// nearest to a part of the route BEHIND the cursor has not collapsed anything — its carrot still
+/// leads — and rewinding the cursor is a thing this module never does.
+fn cursor_arclengths(path: &[[f32; 3]], start_i: usize, from: [f32; 3]) -> Option<(f32, f32, f32)> {
+    if start_i + 1 >= path.len() {
+        return None;
+    }
+    let (mut s, mut s_proj, mut s_near, mut near_sq) = (0.0f32, 0.0f32, 0.0f32, f32::INFINITY);
+    for i in start_i..(path.len() - 1) {
+        let (a, b) = (path[i], path[i + 1]);
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let seg_len = (ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2]).sqrt();
+        let (c, d_sq) = seg_closest(a, b, from);
+        let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let along = (ac[0] * ac[0] + ac[1] * ac[1] + ac[2] * ac[2]).sqrt();
+        if i == start_i {
+            s_proj = along;
+        }
+        if d_sq < near_sq {
+            near_sq = d_sq;
+            s_near = s + along;
+        }
+        s += seg_len;
+    }
+    Some((s_proj, s_near, s))
+}
+
+/// **Does the pure-pursuit carrot off `start_i` actually LEAD the body? (#733)**
+///
+/// This is the deadlock invariant of #673 measured DIRECTLY, rather than through the distance proxy
+/// [`CURSOR_STALE_DIST`]. [`carrot_along`] spends its `reach` budget from the projection of the body
+/// onto segment `start_i`. When the cursor is honest that projection IS the body's own place on the
+/// route, so the carrot lands `reach` further along and leads by construction. When the cursor names
+/// a segment the body is merely BESIDE, the budget is spent on a phantom leg the body has already
+/// left — and if that phantom leg is longer than the whole budget, the carrot lands **at or behind
+/// the body's own point on the route**. There is then no aim that leaves the spot.
+///
+/// So the predicate is one comparison of arclengths, with **no threshold of its own**:
+///
+/// ```text
+/// min(s_projection + reach, total) > s_body
+/// ```
+///
+/// `reach` is not a tuning knob — it is the budget of the very carrot being judged, and passing
+/// anything other than the reach the caller will really use measures a different carrot. Production
+/// passes [`LOCAL_REACH`], the reach `drive_walk` builds `local_goal` with, because `local_goal` is
+/// the carrot #727 measured collapsing (0.21 u ahead on the captured #673 fixture).
+///
+/// **What it does NOT measure**, so nobody over-quotes it:
+///
+/// * It judges the UNCLAMPED carrot. [`carrot_along_los`] can only ever SHORTEN the carrot, so a
+///   carrot that leads here may still fail to lead once a corner clamps it. This predicate therefore
+///   under-detects in the presence of geometry; it never over-detects.
+/// * It says nothing about walkability. A body 0.1 u from a later leg with a wall between is
+///   "nearest" to that leg here. Acting on the answer is [`resync_cursor`]'s job, and it is that
+///   function's `reachable` predicate — not this one — that refuses to cross geometry.
+/// * A body whose nearest point is the path's FINAL vertex reports "does not lead" (the carrot is
+///   clamped to that same vertex). That is a body at the goal, which is arrival's business, not
+///   steering's.
+///
+/// The three arclengths are checked against their definitions by
+/// `the_three_arclengths_are_the_points_they_claim_to_be`, and the claim that
+/// `min(s_projection + reach, total)` really is where [`carrot_along`] lands — the drift that would
+/// leave this guard passing on a carrot production never builds — by
+/// `carrot_leads_judges_the_carrot_the_production_code_actually_builds`.
+pub fn carrot_leads(path: &[[f32; 3]], start_i: usize, from: [f32; 3], reach: f32) -> bool {
+    match cursor_arclengths(path, start_i, from) {
+        // Nothing to measure is not evidence of a collapse. Never claim one we cannot see.
+        None => true,
+        Some((s_proj, s_near, total)) => (s_proj + reach).min(total) > s_near,
+    }
 }
 
 /// **Resync a stale coarse-route cursor (#673).**
@@ -408,8 +514,34 @@ fn seg_closest(a: [f32; 3], b: [f32; 3], p: [f32; 3]) -> ([f32; 3], f32) {
 /// **not** "the character walked this leg". Which is why the walker deliberately does not report a
 /// resync jump as PROGRESS: see `Walker::advance_cursor`.
 ///
-/// A character within [`CURSOR_STALE_DIST`] of its current segment is left alone entirely, so the
-/// normal case is untouched (and `reachable` is not even called).
+/// ## When it fires — two triggers, not one (#733)
+///
+/// The cursor is left alone only when **neither** trigger fires:
+///
+/// * **DISTANCE** (#727) — the body is at least [`CURSOR_STALE_DIST`] from the segment `path_i`
+///   names. This is a *proxy*: "far from its own segment" correlates with the deadlock and is not
+///   it, and the correlation breaks down entirely below one coarse cell.
+/// * **CARROT COLLAPSE** (#733) — [`carrot_leads`] is false, i.e. the carrot built off `path_i` at
+///   [`LOCAL_REACH`] lands at or behind the body's own point on the route. This is the invariant
+///   itself. It is what catches the class the distance trigger is structurally blind to, a cycle
+///   whose whole geometry fits inside 8 u; measured, the hairpin sweep's 4/6/7 u columns go from
+///   144/144, 216/216, 252/252 carrot-pinned to 0
+///   (`the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured`).
+///
+/// Neither trigger has any say in *where* the cursor goes — that is the candidate loop and its three
+/// guards above, unchanged. A trigger only decides whether the loop is allowed to run at all, so a
+/// spurious trigger costs a scan and cannot move the cursor anywhere the guards would refuse.
+///
+/// **The normal case is still untouched and still pays no geometry.** [`carrot_leads`] is pure
+/// arithmetic over the route; an on-route walker fails both triggers and returns before `reachable`
+/// is ever consulted (`an_on_route_walker_is_left_alone_without_consulting_geometry`).
+///
+/// **What the second trigger buys, as a universal rather than an example.** With a clear predicate,
+/// a body whose nearest point is inside [`CURSOR_RESYNC_MAX_HOP`] and has route left beyond it comes
+/// out of this function with a leading carrot — swept over seven route shapes, every cursor and a
+/// body grid by `after_a_resync_with_clear_geometry_the_carrot_always_leads`, which also asserts the
+/// sweep actually contains collapsed inputs. The #673 cycle itself is pinned as one arithmetic
+/// example by `the_sub_guard_hairpin_fixed_point_resyncs_though_the_distance_trigger_cannot_see_it`.
 pub fn resync_cursor(
     path: &[[f32; 3]],
     start_i: usize,
@@ -422,8 +554,19 @@ pub fn resync_cursor(
         return start_i;
     }
     let (_, d0_sq) = seg_closest(path[start_i], path[start_i + 1], from);
-    // `<`, not `<=`: the deadlock's fixed point sits exactly ON the boundary — see CURSOR_STALE_DIST.
-    if d0_sq < CURSOR_STALE_DIST * CURSOR_STALE_DIST {
+    // TWO independent triggers; the cursor is left alone only when NEITHER fires.
+    //
+    //  * DISTANCE (#727) — the body is further than one coarse cell from the segment `path_i` names.
+    //    `<`, not `<=`: the cycle's fixed point sits exactly ON the boundary, see CURSOR_STALE_DIST.
+    //  * CARROT COLLAPSE (#733) — the carrot measured off `path_i` lands at or behind the body's own
+    //    point on the route. This is the deadlock invariant itself rather than a correlate of it,
+    //    and it is what catches the class the distance trigger is structurally blind to: a cycle
+    //    whose whole geometry fits INSIDE the guard. It costs the normal case nothing extra in
+    //    geometry queries — `carrot_leads` is pure arithmetic and `reachable` is still consulted
+    //    only from the candidate loop below.
+    if d0_sq < CURSOR_STALE_DIST * CURSOR_STALE_DIST
+        && carrot_leads(path, start_i, from, LOCAL_REACH)
+    {
         return start_i;
     }
     let hop_sq = CURSOR_RESYNC_MAX_HOP * CURSOR_RESYNC_MAX_HOP;
@@ -904,7 +1047,9 @@ mod cursor_resync_tests {
         const FRAMES: u32 = 14;        // 150 ms nav tick = 1 steer_target + 14 fast_steer_aim frames
         const TICKS: u32 = 200;
         const LOOK_AHEAD: f32 = 5.0;   // walker.rs `drive_walk`
-        const LOCAL_REACH: f32 = 24.0; // walker.rs `drive_walk`
+        // `drive_walk`'s `local_goal` reach, READ from the module rather than restated, so this
+        // harness cannot drift onto a different carrot than production and the collapse check.
+        const LOCAL_REACH: f32 = super::LOCAL_REACH;
         const LOCAL_BOUND: f32 = 40.0; // walker.rs `drive_walk`
         // The walker's own clearance, referenced rather than re-derived: it is defined as
         // `PLAYER_RADIUS` today, so a copy would agree by coincidence and drift silently.
@@ -1399,7 +1544,7 @@ mod cursor_resync_tests {
         let _cited: &[fn()] = &[
             // cited by `CURSOR_STALE_DIST`
             the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced,
-            the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it,
+            the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured,
             // cited by `resync_cursor` and by `Walker::advance_cursor`
             the_stale_cursor_reaches_the_steering_aim_through_the_fine_plan_not_the_coarse_carrot,
             the_stale_cursor_leaves_the_steering_loop_no_escaping_trajectory_and_the_resync_clears_it,
@@ -1427,10 +1572,15 @@ mod cursor_resync_tests {
             resync_is_inert_on_degenerate_paths,
             an_on_route_walker_is_left_alone_without_consulting_geometry,
             a_walker_cutting_a_tight_switchback_keeps_its_cursor,
+            // #733: cited by `carrot_leads` and by `resync_cursor`'s two-trigger section.
+            the_three_arclengths_are_the_points_they_claim_to_be,
+            carrot_leads_judges_the_carrot_the_production_code_actually_builds,
+            after_a_resync_with_clear_geometry_the_carrot_always_leads,
+            the_sub_guard_hairpin_fixed_point_resyncs_though_the_distance_trigger_cannot_see_it,
         ];
         // Helpers cited by name in the same docs.
         let _helpers: (fn(&crate::collision::Collision, usize, bool, bool) -> Run,
-                       fn(f32, [f32; 3], usize) -> bool) = (fixture_run, hairpin_carrot_stops_leading);
+                       fn(f32, [f32; 3], usize) -> HairpinRun) = (fixture_run, hairpin_carrot_stops_leading);
     }
 
     /// **The citation guard's ALPHABET is now mechanical, not remembered (#727 round 6 review,
@@ -1596,6 +1746,10 @@ mod cursor_resync_tests {
             ("every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard",
              "this test's own name before #788 renamed it, quoted in its rustdoc as the retracted \
               name rather than deleted. Inherently unresolvable — that is what renamed means."),
+            ("the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it",
+             "the hairpin sweep's name between round 3 of #727 and #733, quoted verbatim inside a \
+              ⚠️ Correction block because the name asserted 'inert below the guard' — which #733 \
+              made false. Retired, so inherently unresolvable."),
         ];
 
         // ── corpus 1: where citations are read from ──────────────────────────────────────────────
@@ -2311,13 +2465,29 @@ mod cursor_resync_tests {
     ///
     /// Deliberately NOT a physics sim: no collision, no controller, so the reachability predicate is
     /// vacuously clear. That isolates the one thing under test.
-    fn hairpin_carrot_stops_leading(sep: f32, start: [f32; 3], mut cursor: usize) -> bool {
+    ///
+    /// **#733: it also reports its own REACH.** `collapse_only_ticks` counts nav ticks on which the
+    /// carrot-collapse trigger fired *while the body was inside* [`CURSOR_STALE_DIST`] of the segment
+    /// the cursor names — i.e. ticks the #727 distance trigger is structurally incapable of catching.
+    /// Without that counter a green sweep cannot distinguish "the new trigger cleared the cycle" from
+    /// "the old trigger did, and the new one never fired", which is exactly how a guard ships dead.
+    struct HairpinRun {
+        /// The carrot never led the body out: 400 nav ticks without reaching the goal.
+        pinned: bool,
+        /// Ticks where `carrot_leads` was false AND the body was within `CURSOR_STALE_DIST` of the
+        /// segment `cursor` names — work only the #733 trigger can do.
+        collapse_only_ticks: u32,
+    }
+
+    fn hairpin_carrot_stops_leading(sep: f32, start: [f32; 3], mut cursor: usize) -> HairpinRun {
         const DT: f32 = 0.15;          // the nav tick
         // `drive_walk`'s `local_goal` reach — the fine planner's destination, NOT a steering carrot.
-        const LOCAL_REACH: f32 = 24.0;
+        // Read from the module so this sweep and the collapse check judge the same carrot.
+        const LOCAL_REACH: f32 = super::LOCAL_REACH;
         let route = hairpin_route(sep);
         let goal = *route.last().unwrap();
         let mut p = start;
+        let mut collapse_only_ticks = 0u32;
         for _ in 0..400 {
             while cursor + 2 < route.len() {
                 let (a, b) = (route[cursor], route[cursor + 1]);
@@ -2328,6 +2498,15 @@ mod cursor_resync_tests {
                 };
                 if t >= 1.0 { cursor += 1; } else { break; }
             }
+            // Observe, before the resync, whether this tick is one only #733's trigger can see.
+            if cursor + 1 < route.len() {
+                let (_, d0_sq) = seg_closest(route[cursor], route[cursor + 1], p);
+                if d0_sq < CURSOR_STALE_DIST * CURSOR_STALE_DIST
+                    && !carrot_leads(&route, cursor, p, LOCAL_REACH)
+                {
+                    collapse_only_ticks += 1;
+                }
+            }
             cursor = resync_cursor(&route, cursor, p, always_clear);
             let carrot = carrot_along(&route, cursor, p, LOCAL_REACH).unwrap_or(goal);
             let d = [carrot[0] - p[0], carrot[1] - p[1]];
@@ -2337,9 +2516,11 @@ mod cursor_resync_tests {
                 p[0] += d[0] / len * step;
                 p[1] += d[1] / len * step;
             }
-            if (p[0] - goal[0]).hypot(p[1] - goal[1]) <= 4.0 { return false; }
+            if (p[0] - goal[0]).hypot(p[1] - goal[1]) <= 4.0 {
+                return HairpinRun { pinned: false, collapse_only_ticks };
+            }
         }
-        true
+        HairpinRun { pinned: true, collapse_only_ticks }
     }
 
     /// **MEASURED (#727 round 2): the deadlock's attracting fixed point sits exactly ON the
@@ -2355,7 +2536,7 @@ mod cursor_resync_tests {
     ///
     /// Both numbers were measured on this branch by flipping that single token and re-running; the
     /// same flip takes the 8 u column of
-    /// [`the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it`] from 0/288 to
+    /// [`the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured`] from 0/288 to
     /// 33/288. Mutation check: flip it back to `<=` and this test goes RED.
     ///
     /// ⚠️ **Correction (round 3).** These counts are of *carrot pinning*, not of a walker failing to
@@ -2365,68 +2546,336 @@ mod cursor_resync_tests {
         let mut pinned = Vec::new();
         for k in 0..8 {
             let y = 6.25 + 0.25 * k as f32;
-            if hairpin_carrot_stops_leading(8.0, [40.0, y, 0.0], 5) { pinned.push(y); }
+            if hairpin_carrot_stops_leading(8.0, [40.0, y, 0.0], 5).pinned { pinned.push(y); }
         }
         assert!(pinned.is_empty(),
             "the guard-boundary band still deadlocks at offsets {pinned:?} — the fixed point at \
              exactly CURSOR_STALE_DIST must be OUTSIDE the guard");
     }
 
-    /// **MEASURED (#727 round 2, re-labelled round 3): where the fix stops.** The resync is inert
-    /// below [`CURSOR_STALE_DIST`] by construction, so a hairpin whose legs are closer together than
-    /// the guard still forms the #673 cycle. This pins both halves of that honestly: **zero** pinned
-    /// starts from 8 u separation (the guard itself) up, and a **total** wipe-out below it.
+    /// **MEASURED (#733): carrot pinning is cleared at EVERY leg separation this sweep measures,
+    /// including the ones below [`CURSOR_STALE_DIST`] where the distance trigger is inert.**
     ///
-    /// Measured on this branch (`--nocapture` prints the table):
+    /// Same sweep, same fixture, same counts as #727's — only the code under it changed. The `before`
+    /// column is this branch with the `carrot_leads` conjunct deleted from [`resync_cursor`]'s gate
+    /// (executed, not reasoned: that is mutation M1 in the PR body):
     ///
     /// ```text
-    /// sep  4 u: 144/144 pinned     sep  9 u: 0/324
-    /// sep  6 u: 216/216 pinned     sep 10 u: 0/360
-    /// sep  7 u: 252/252 pinned     sep 12 u: 0/432
-    /// sep  8 u:   0/288
+    /// sep    before (#727: distance trigger only)   after (#733: + carrot collapse)
+    ///  4 u   144/144 carrot-pinned                  0/144
+    ///  6 u   216/216 carrot-pinned                  0/216
+    ///  7 u   252/252 carrot-pinned                  0/252
+    ///  8 u     0/288                                0/288
+    ///  9 u     0/324                                0/324
+    /// 10 u     0/360                                0/360
+    /// 12 u     0/432                                0/432
     /// ```
     ///
-    /// ⚠️ **Correction (round 3).** The column above counted *carrot pinning* all along, but round 2
-    /// labelled it "wedged" and read it as walker arrival. It is not a walker outcome — the loop it
-    /// comes from steps straight at `local_goal`, which is not how `drive_walk` moves. Retracted
-    /// wording: "**zero** wedged starts … a **total** wipe-out". The counts themselves are unchanged
-    /// and were re-run at round 3; only the claim they support is narrower. The round-1 review's own
-    /// 133/1649 figure was measured on a comparable 24 u-step model and the reviewer has since
-    /// retracted it on the same grounds.
+    /// ⚠️ **Correction (#733).** This test was called
+    /// `the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it` and its doc said
+    /// *"the resync is inert below `CURSOR_STALE_DIST` by construction … the residual `<= 7 u` class
+    /// is a real, open defect"*. Both were true of the distance trigger alone and are now false of
+    /// the function: #733 added a second trigger that fires on the collapse itself. The old name is
+    /// retired rather than left asserting a claim the code no longer makes — the same reason round 3
+    /// renamed it off "deadlock".
     ///
-    /// So the honest claim is *carrot pinning is cleared completely at and above the guard, and the
-    /// fix is inert below it* — NOT "fixes the #673 deadlock". The residual `<= 7 u` class is a real,
-    /// open defect (a distance guard cannot see a cycle whose whole geometry fits inside the guard);
-    /// it is filed as its own issue and described in the PR body, not tolerated here by accident.
+    /// **What these counts are, unchanged from round 3.** They count *carrot pinning*, not walker
+    /// outcomes: [`hairpin_carrot_stops_leading`] steps the body straight at `local_goal`, which is
+    /// not how `drive_walk` moves, so the loop measures whether the cursor/carrot arithmetic reaches
+    /// a fixed point (pure function composition) and nothing about stall detection, backoff or
+    /// re-planning. #733's own statement of the cost stands: at least a wasted backoff-and-re-plan
+    /// lap, at worst terminal — not "always wedges".
+    ///
+    /// **The premise counter is the reach control.** A sweep that goes green because the OLD trigger
+    /// did all the work would be indistinguishable from a fix, so each sub-guard separation must also
+    /// record at least one tick on which the collapse trigger fired *while the body was inside*
+    /// `CURSOR_STALE_DIST` — a tick #727's trigger structurally cannot see.
     #[test]
-    fn the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it() {
+    fn the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured() {
         let count = |sep: f32| {
-            let (mut pinned, mut total) = (0usize, 0usize);
+            let (mut pinned, mut total, mut collapse_only) = (0usize, 0usize, 0u32);
             let mut yi = 1;
             while yi as f32 * 0.25 <= sep {
                 let y = yi as f32 * 0.25;
                 for xi in 1..10 {
                     let x = xi as f32 * 8.0;
                     total += 1;
-                    if hairpin_carrot_stops_leading(sep, [x, y, 0.0], xi) { pinned += 1; }
+                    let run = hairpin_carrot_stops_leading(sep, [x, y, 0.0], xi);
+                    if run.pinned { pinned += 1; }
+                    collapse_only += run.collapse_only_ticks;
                 }
                 yi += 1;
             }
-            (pinned, total)
+            (pinned, total, collapse_only)
         };
         for sep in [4.0f32, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0] {
-            let (w, t) = count(sep);
-            println!("hairpin leg separation {sep:>4} u: carrot pinned {w}/{t}");
-            if sep >= 8.0 {
-                // "carrot-pinned", NOT "wedged" — see this test's round-3 correction block.
-                assert_eq!(w, 0,
-                    "the fix must be complete at {sep} u separation, got {w}/{t} carrot-pinned");
+            let (w, t, c) = count(sep);
+            println!(
+                "hairpin leg separation {sep:>4} u: carrot pinned {w}/{t}  \
+                 (collapse-only trigger ticks: {c})");
+            // "carrot-pinned", NOT "wedged" — see the correction block on this test.
+            assert_eq!(w, 0,
+                "carrot pinning must be cleared at {sep} u separation, got {w}/{t} carrot-pinned");
+            if sep < CURSOR_STALE_DIST {
+                assert!(c > 0,
+                    "premise: at {sep} u separation the #733 trigger never fired inside the distance \
+                     guard, so this row says nothing about it — the sweep is not reaching the defect");
             }
         }
-        let (below, _) = count(7.0);
-        assert!(below > 0,
-            "premise: the sub-guard residual must still reproduce, or this test is not measuring \
-             the boundary it claims to");
+    }
+
+    // ──────────────── #733: the collapse measurement itself ────────────────
+
+    /// A test-local, deliberately independent walk of the polyline: the point `s` units of 3-D
+    /// arclength along `path[start_i..]`, clamped to the final vertex. Written out longhand here
+    /// rather than shared with the code under test — a helper both sides call cannot disagree with
+    /// itself, and disagreement is the entire point of the three tests below.
+    fn point_at_arclength(path: &[[f32; 3]], start_i: usize, s: f32) -> [f32; 3] {
+        let mut left = s.max(0.0);
+        for i in start_i..path.len().saturating_sub(1) {
+            let (a, b) = (path[i], path[i + 1]);
+            let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if left <= l || i + 2 >= path.len() {
+                let t = if l < 1e-9 { 0.0 } else { (left / l).clamp(0.0, 1.0) };
+                return [a[0] + d[0] * t, a[1] + d[1] * t, a[2] + d[2] * t];
+            }
+            left -= l;
+        }
+        *path.last().unwrap()
+    }
+
+    /// The corpus the three #733 tests below sweep: the #673 hairpin at a sub-guard and an
+    /// on-guard separation, the deliberate-conservatism switchback, a straight run, a 3-D ramp
+    /// (the water-nav shape `carrot_along` is 3-D for), a zigzag, and a path with a **repeated
+    /// vertex** so the zero-length-segment branch is exercised rather than argued about.
+    fn arclength_fixtures() -> Vec<(&'static str, Vec<[f32; 3]>)> {
+        vec![
+            ("hairpin 4u", hairpin_route(4.0)),
+            ("hairpin 8u", hairpin_route(8.0)),
+            ("switchback", vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 2.0, 0.0], [0.0, 2.0, 0.0]]),
+            ("straight",   vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [40.0, 0.0, 0.0], [60.0, 0.0, 0.0]]),
+            ("3-D ramp",   vec![[0.0, 0.0, 0.0], [10.0, 0.0, 10.0], [20.0, 0.0, 0.0],
+                                [30.0, 0.0, -10.0], [40.0, 0.0, 0.0]]),
+            ("zigzag",     vec![[0.0, 0.0, 0.0], [10.0, 10.0, 0.0], [20.0, 0.0, 0.0],
+                                [30.0, 10.0, 0.0], [40.0, 0.0, 0.0]]),
+            ("dup vertex", vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 0.0],
+                                [10.0, 10.0, 0.0], [0.0, 10.0, 0.0]]),
+        ]
+    }
+
+    /// A coarse body grid over and around each fixture, plus two z levels so the 3-D ramp is not
+    /// swept only in its own plane.
+    fn arclength_bodies() -> Vec<[f32; 3]> {
+        let mut v = Vec::new();
+        let mut x = -6.0f32;
+        while x <= 88.0 {
+            let mut y = -6.0f32;
+            while y <= 12.0 {
+                for z in [0.0f32, 6.0] { v.push([x, y, z]); }
+                y += 3.0;
+            }
+            x += 6.0;
+        }
+        v
+    }
+
+    /// **The three arclengths [`cursor_arclengths`] returns are the points it says they are (#733).**
+    ///
+    /// The collapse check is one comparison between three numbers, so the numbers themselves are
+    /// where a silent error would live. This checks each against its *definition*, using a test-local
+    /// [`point_at_arclength`] and a resampling of the route, never against a restatement of the
+    /// implementation:
+    ///
+    /// * `s_projection` — the point that far along must be the point [`seg_closest`] projects onto
+    ///   segment `start_i`. That is exactly where [`carrot_along`] starts spending its budget.
+    /// * `s_body` — the point that far along must be **at least as close** to the body as every
+    ///   point sampled along the whole of `path[start_i..]` at 0.1 u spacing. Note the direction:
+    ///   a sparse resampling can only ever fail to find something closer, so a wrong `s_body` is
+    ///   caught while a coarse sample is never a false failure. Density buys strength, not validity.
+    /// * `total` — the point that far along must be the route's final vertex.
+    ///
+    /// Plus the ordering the comparison relies on: `0 <= s_body <= total`.
+    #[test]
+    fn the_three_arclengths_are_the_points_they_claim_to_be() {
+        let mut checked = 0usize;
+        for (name, path) in arclength_fixtures() {
+            for start_i in 0..path.len().saturating_sub(1) {
+                for from in arclength_bodies() {
+                    let Some((s_proj, s_near, total)) = cursor_arclengths(&path, start_i, from) else {
+                        continue;
+                    };
+                    checked += 1;
+                    let d = |a: [f32; 3], b: [f32; 3]| {
+                        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+                    };
+                    // s_projection is the projection onto segment `start_i`.
+                    let (proj, _) = seg_closest(path[start_i], path[start_i + 1], from);
+                    assert!(d(point_at_arclength(&path, start_i, s_proj), proj) < 1e-2,
+                        "{name} start {start_i} body {from:?}: s_projection {s_proj} is not the \
+                         projection onto the cursor's own segment");
+                    // total ends at the last vertex.
+                    assert!(d(point_at_arclength(&path, start_i, total), *path.last().unwrap()) < 1e-2,
+                        "{name} start {start_i}: total {total} does not reach the final vertex");
+                    assert!(s_near >= -1e-4 && s_near <= total + 1e-3,
+                        "{name} start {start_i} body {from:?}: s_body {s_near} outside [0, {total}]");
+                    // s_body beats every resampled point on the route ahead.
+                    let claimed = d(point_at_arclength(&path, start_i, s_near), from);
+                    let mut s = 0.0f32;
+                    while s <= total {
+                        let sampled = d(point_at_arclength(&path, start_i, s), from);
+                        assert!(claimed <= sampled + 1e-3,
+                            "{name} start {start_i} body {from:?}: s_body {s_near} is {claimed} away \
+                             but arclength {s} is nearer at {sampled} — s_body is not the body's \
+                             point on the route");
+                        s += 0.1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 5_000, "premise: the sweep only measured {checked} cases");
+    }
+
+    /// **[`carrot_leads`] judges the carrot production actually builds (#733).**
+    ///
+    /// The collapse check is only meaningful if `min(s_projection + reach, total)` is *the arclength
+    /// [`carrot_along`] lands at*. If the two ever drift the guard still passes — on the wrong
+    /// carrot — which is the failure mode the shared [`LOCAL_REACH`] constant exists to prevent on
+    /// the value side and this test pins on the arithmetic side. Swept at three reaches, including
+    /// production's, and at reaches longer than some fixtures so the clamp-to-`total` branch is run.
+    ///
+    /// This is a **model-agreement** test, not a claim about [`carrot_along_los`]: the LOS clamp can
+    /// only shorten the carrot, so under geometry the real carrot may sit *behind* the point checked
+    /// here. `carrot_leads` therefore under-detects collapse in the presence of walls and never
+    /// over-detects — stated on `carrot_leads` itself and not measured anywhere.
+    #[test]
+    fn carrot_leads_judges_the_carrot_the_production_code_actually_builds() {
+        let mut checked = 0usize;
+        for (name, path) in arclength_fixtures() {
+            for start_i in 0..path.len().saturating_sub(1) {
+                for from in arclength_bodies() {
+                    let Some((s_proj, _, total)) = cursor_arclengths(&path, start_i, from) else {
+                        continue;
+                    };
+                    for reach in [5.0f32, LOCAL_REACH, 400.0] {
+                        let built = carrot_along(&path, start_i, from, reach)
+                            .expect("carrot_along must produce a carrot wherever start_i names a segment");
+                        let modelled = point_at_arclength(&path, start_i, (s_proj + reach).min(total));
+                        let sep = ((built[0] - modelled[0]).powi(2) + (built[1] - modelled[1]).powi(2)
+                                 + (built[2] - modelled[2]).powi(2)).sqrt();
+                        assert!(sep < 1e-2,
+                            "{name} start {start_i} body {from:?} reach {reach}: the carrot \
+                             production builds is {built:?} but the collapse check models it at \
+                             {modelled:?} ({sep} u apart) — the two have drifted");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 5_000, "premise: the sweep only measured {checked} cases");
+    }
+
+    /// **PROPERTY (#733): after a resync with clear geometry the carrot leads the body — always,
+    /// not on the hairpin.**
+    ///
+    /// "The carrot never lands on or behind the body" is a universal, so examples cannot discharge
+    /// it. This sweeps every fixture × every cursor × a body grid on and around each route and
+    /// asserts the property of the cursor [`resync_cursor`] RETURNS, not of the one it was given.
+    ///
+    /// **The two honest preconditions**, which are capability boundaries and not conveniences:
+    ///
+    /// * the body's nearest point on `path[start_i..]` is inside [`CURSOR_RESYNC_MAX_HOP`] — a
+    ///   resync refuses to adopt a segment further than that however clear the line, so a body 60 u
+    ///   off its route is a case this function deliberately declines to fix (see that constant's own
+    ///   doc for both reasons);
+    /// * there is more than 1 u of route left beyond that nearest point — a body at the goal has no
+    ///   carrot ahead of it by construction, which is arrival's business, not steering's.
+    ///
+    /// The predicate is always-clear, which is the honest scope: with real geometry a candidate can
+    /// be refused as unreachable and the cursor left stale on purpose. That is `reachable` doing its
+    /// job, and this property makes no claim there.
+    ///
+    /// **Non-vacuity is asserted, not assumed.** The sweep counts inputs that were genuinely
+    /// collapsed before the resync, and separately those collapsed *while inside* the distance guard
+    /// — the class #727's trigger structurally cannot see. Both must be non-zero or the property
+    /// proves nothing about the fix.
+    #[test]
+    fn after_a_resync_with_clear_geometry_the_carrot_always_leads() {
+        let (mut checked, mut collapsed_in, mut collapsed_inside_guard) = (0usize, 0usize, 0usize);
+        for (name, path) in arclength_fixtures() {
+            for start_i in 0..path.len() {
+                for from in arclength_bodies() {
+                    if path.len() < 3 || start_i + 2 >= path.len() { continue; }
+                    // Nearest forward segment, by the same primitive `resync_cursor` scans with.
+                    let mut near_sq = f32::INFINITY;
+                    for i in start_i..(path.len() - 1) {
+                        let (_, d_sq) = seg_closest(path[i], path[i + 1], from);
+                        if d_sq < near_sq { near_sq = d_sq; }
+                    }
+                    if near_sq.sqrt() >= CURSOR_RESYNC_MAX_HOP - 0.01 { continue; }
+                    let (_, s_near, total) = cursor_arclengths(&path, start_i, from).unwrap();
+                    if total - s_near <= 1.0 { continue; }
+
+                    checked += 1;
+                    if !carrot_leads(&path, start_i, from, LOCAL_REACH) {
+                        collapsed_in += 1;
+                        let (_, d0_sq) = seg_closest(path[start_i], path[start_i + 1], from);
+                        if d0_sq < CURSOR_STALE_DIST * CURSOR_STALE_DIST { collapsed_inside_guard += 1; }
+                    }
+                    let out = resync_cursor(&path, start_i, from, always_clear);
+                    assert!(carrot_leads(&path, out, from, LOCAL_REACH),
+                        "{name}: cursor {start_i} → {out} for a body at {from:?} still leaves the \
+                         carrot at or behind the body");
+                }
+            }
+        }
+        assert!(checked > 2_000, "premise: the sweep only measured {checked} cases");
+        assert!(collapsed_in > 100,
+            "premise: only {collapsed_in} swept inputs were collapsed at all — the property is \
+             passing on cases that were never broken");
+        assert!(collapsed_inside_guard > 20,
+            "premise: only {collapsed_inside_guard} swept inputs were collapsed while INSIDE the \
+             distance guard, so this sweep is not reaching the class #733 adds");
+    }
+
+    /// **REGRESSION (#733): the sub-guard hairpin's fixed point, as one arithmetic example.**
+    ///
+    /// The 4 u hairpin's limit cycle parks the body at `(56 + sep, sep)` with the cursor still on the
+    /// outbound leg. Every number below is checked, so the example documents *why* the distance
+    /// trigger is blind here rather than just asserting an index:
+    ///
+    /// * the body is 4 u from the segment the cursor names — half the [`CURSOR_STALE_DIST`] guard, so
+    ///   #727's trigger is silent and cannot be made to fire by any constant that also leaves
+    ///   `a_walker_cutting_a_tight_switchback_keeps_its_cursor` alone;
+    /// * the carrot is spent from arclength 4 on the outbound leg and lands at 28, while the body's
+    ///   own point on the route — on the return leg — is at 48. The carrot is **20 u behind the
+    ///   body**, and no aim at it leaves the spot;
+    /// * the resync moves the cursor onto the return-leg segment the body is actually on, after which
+    ///   the carrot leads again.
+    #[test]
+    fn the_sub_guard_hairpin_fixed_point_resyncs_though_the_distance_trigger_cannot_see_it() {
+        let route = hairpin_route(4.0);
+        let body = [60.0f32, 4.0, 0.0];
+        let (cursor, on_return_leg) = (7usize, 13usize);
+        assert_eq!(route[cursor], [56.0, 0.0, 0.0], "premise: the cursor names the outbound leg");
+        assert_eq!(route[on_return_leg], [64.0, 4.0, 0.0], "premise: segment 13 is the return leg");
+
+        let (_, d0_sq) = seg_closest(route[cursor], route[cursor + 1], body);
+        assert!(d0_sq < CURSOR_STALE_DIST * CURSOR_STALE_DIST,
+            "premise: the whole cycle fits INSIDE the distance guard ({} u), which is why #727's \
+             trigger is structurally blind to it", d0_sq.sqrt());
+
+        let (s_proj, s_near, total) = cursor_arclengths(&route, cursor, body).unwrap();
+        assert!((s_proj - 4.0).abs() < 1e-3 && (s_near - 48.0).abs() < 1e-3 && (total - 108.0).abs() < 1e-3,
+            "premise: expected the fixed point's arclengths (4, 48, 108), got ({s_proj}, {s_near}, {total})");
+        assert!(!carrot_leads(&route, cursor, body, LOCAL_REACH),
+            "the carrot lands at {} and the body is at {s_near} — that is the collapse",
+            (s_proj + LOCAL_REACH).min(total));
+
+        assert_eq!(resync_cursor(&route, cursor, body, always_clear), on_return_leg,
+            "the resync must move the cursor onto the leg the body is really on");
+        assert!(carrot_leads(&route, on_return_leg, body, LOCAL_REACH),
+            "and the carrot must lead again once it does");
     }
 }
 

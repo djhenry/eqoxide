@@ -1500,7 +1500,10 @@ impl Walker {
         self.advance_cursor([px, py, pz]);
         let have_path = !self.path.is_empty();
         let target: (f32, f32, f32) = if have_path {
-            const LOCAL_REACH: f32 = 24.0;   // how far ahead on the coarse route the fine plan aims
+            // How far ahead on the coarse route the fine plan aims. Read from `steering` rather than
+            // restated here so `resync_cursor`'s carrot-collapse check (#733) and this call site can
+            // never end up judging two different carrots.
+            use crate::steering::LOCAL_REACH;
             const LOCAL_BOUND: f32 = 40.0;   // the fine search window (keeps it bounded → it terminates)
             let coarse = carrot_along(&self.path, self.path_i, [px, py, pz], LOOK_AHEAD)
                 .unwrap_or([goal.0, goal.1, gs.player_z]);
