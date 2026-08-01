@@ -524,16 +524,25 @@ fn every_static_placement_call_site_in_pass_rs_decides_floating_explicitly() {
 ///    12 ignored**, the one failure being this test. Since #781 the static sites call
 ///    `camera::entity_model_matrix_static`, which has **no `visual_scale` parameter**, so that exact
 ///    edit no longer compiles (measured: `error[E0061]: this function takes 4 arguments but 5
-///    arguments were supplied`). What is left open is calling `entity_model_matrix_heading`
-///    directly instead — a different function NAME, which the `heading` guard at the bottom of this
-///    test catches.
+///    arguments were supplied`). What is left open at the type level is calling
+///    `entity_model_matrix_heading` directly instead — a different function NAME. What bounds THAT
+///    is the whitelist at the bottom of this test, and only for `pass.rs`. #781 round 1 wrote it as
+///    a blacklist of the field names `.y_bottom` / `.center_xz`, and #828's reviewer measured the
+///    over-lift written through `model.bounds.y_extent` / `.x_center` / `.z_center` as **fully
+///    green** against it (262 passed / 0 failed / 12 ignored); it is a whitelist of the six
+///    reviewed argument lists since.
 /// 2. **Into the placement.** Before #781 `static_placement` took a bare `y_bottom: f32`, so
 ///    `static_placement(archetype, model.y_bottom + model.y_extent, …)` restored the identical
 ///    pre-#768 lift. Measured on `41cca4e`: **261 passed / 1 failed / 12 ignored**, the failure
 ///    being this test's `REVIEWED_ARGS` assert. (Before #773 extended this pin it was measured
 ///    GREEN at 215 / 0 by PR #773's round-1 reviewer — that is why the pin exists at all.) Since
-///    #781 `static_placement` takes `&ModelBounds`, so that edit no longer compiles either
-///    (measured: `error[E0308]: mismatched types`, expected `&ModelBounds`, found `f32`).
+///    #781 `static_placement` takes `&ModelBounds`, so that edit no longer compiles either. WHICH
+///    error depends on how it is transcribed, and both were measured on this branch, because round
+///    1 reported only the second: transcribed literally, the pre-#781 spelling also still passes a
+///    separate `center_xz` argument, so it is `error[E0061]: this function takes 3 arguments but 4
+///    arguments were supplied`, with `expected &ModelBounds, found f32` as a sub-note rather than a
+///    standalone error; transcribed minimally onto the 3-argument signature it is `error[E0308]:
+///    mismatched types`, expected `&ModelBounds`, found `f32`. Neither compiles.
 ///
 /// **What #781 leaves possible, measured, not reasoned.** `ModelBounds` has public fields, so the
 /// same over-lift can be written as a struct literal at the call site —
@@ -556,7 +565,10 @@ fn every_static_placement_call_site_in_pass_rs_decides_floating_explicitly() {
 ///   call is reached, and not that `model.bounds` itself holds what the loader intended. PR #773's
 ///   reviewer measured two instances of exactly this and both are still green today: rebinding
 ///   `model` to a local with the same field names (E1b), and corrupting the loader's reduction that
-///   produces `y_bottom` (E2). #781 does not address either.
+///   produces `y_bottom` (E2). #828's reviewer measured a third, on this branch: shadowing `p`
+///   between the two reviewed calls with a hand-built `StaticPlacement` carrying
+///   `p.y_bottom + model.bounds.y_extent`, which leaves all four argument texts byte-identical —
+///   **262 passed / 0 failed / 12 ignored**. #781 addresses none of the three.
 /// - It only reads `pass.rs`. A static placement built in another file is invisible to it, and
 ///   "four call sites" is a count of `pass.rs` call sites — it is not a bound on callers of
 ///   `static_placement` anywhere else in the workspace.
@@ -572,13 +584,31 @@ fn every_static_placement_in_pass_rs_is_written_exactly_as_reviewed() {
         PASS_RS
             .match_indices(&format!("{name}("))
             .map(|(i, _)| {
-                let rest = &PASS_RS[i..];
-                let call = &rest[..rest.find(");").unwrap_or_else(|| {
-                    panic!("unterminated {name}( call in pass.rs")
-                })];
-                let norm = call.split_whitespace().collect::<Vec<_>>().join(" ");
-                norm.split_once('(').expect("no argument list").1.trim()
-                    .trim_end_matches(',').trim().to_string()
+                // Depth-count to the paren that closes THIS call. The `rest.find(");")` this used
+                // before #828 round 2 stops at the first `);` anywhere after the call, so a call
+                // NESTED in another — `from_cols_array_2d(&entity_model_matrix_heading(…))` at
+                // `pass.rs:1447` and `:1850` — captured one `)` too many. That was harmless while
+                // the only consumer was a `contains` check; it is not harmless for the exact-match
+                // whitelists below, which would otherwise need two entries per spelling differing
+                // only by a trailing paren. Assumes parens inside an argument list are balanced —
+                // an unbalanced one in a string literal would over-capture, which fails these
+                // whitelists loudly rather than silently.
+                let open = i + name.len();
+                let mut depth = 0usize;
+                let mut end = None;
+                for (k, c) in PASS_RS.as_bytes().iter().enumerate().skip(open) {
+                    match c {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 { end = Some(k); break; }
+                        }
+                        _ => {}
+                    }
+                }
+                let end = end.unwrap_or_else(|| panic!("unterminated {name}( call in pass.rs"));
+                let norm = PASS_RS[open + 1..end].split_whitespace().collect::<Vec<_>>().join(" ");
+                norm.trim().trim_end_matches(',').trim().to_string()
             })
             .collect()
     }
@@ -630,26 +660,82 @@ fn every_static_placement_in_pass_rs_is_written_exactly_as_reviewed() {
         assert!(REVIEWED_MATRIX_ARGS.contains(&args.as_str()),
             "#768/#781: a static model's whole vertical lift comes from the placement's `y_bottom`, \
              and `entity_model_matrix_static` binds `visual_scale = 0.0` internally so there is no \
-             lift argument here. Passing anything but the placement built one line above \
-             re-opens that. Expected one of {REVIEWED_MATRIX_ARGS:?}, found: {args}");
+             lift argument here. This pins the argument TEXT: the matrix must be built from `&p`, \
+             the placement spelled one line above. It does NOT bind what `p` denotes — shadowing it \
+             with a hand-built `StaticPlacement` carrying `p.y_bottom + model.bounds.y_extent` \
+             leaves this text unchanged and was measured fully green by #828's reviewer, and \
+             `camera::entity_model_matrix_static`'s doc discloses the same capability. Expected one \
+             of {REVIEWED_MATRIX_ARGS:?}, found: {args}");
     }
 
     // The escape #781 leaves open at the type level: call the GENERAL matrix function, which still
-    // takes a `visual_scale`, and hand it a static placement. `y_bottom` and `center_xz` are
-    // `StaticPlacement`'s two fields that `HumanoidPlacement` does not have, so a `.y_bottom` or
-    // `.center_xz` in a `entity_model_matrix_heading` argument list identifies a static placement.
+    // takes a `visual_scale`, and hand it a static model's numbers.
     //
-    // Matched on the FIELD, not on `p.` — pinning the binding name would miss
-    // `let q = static_placement(…); entity_model_matrix_heading(…, q.y_bottom, …)`, which is #773's
-    // E1b class (rename the binding, keep the text). Measured: the six `entity_model_matrix_heading`
-    // calls that legitimately remain in `pass.rs` (all skinned, plus the two non-entity ones) pass
-    // `[0.0, 0.0]` and `0.0` in those positions, so not one of them mentions either field today.
-    for args in arg_lists("entity_model_matrix_heading") {
-        assert!(!args.contains(".y_bottom") && !args.contains(".center_xz"),
-            "#781: a static placement must go through `camera::entity_model_matrix_static`, which \
-             has no `visual_scale` parameter. `entity_model_matrix_heading` still has one, and \
-             `visual_scale * 0.5` is added on top of `y_bottom * mesh_scale` — which is exactly the \
-             #768 over-lift. Renaming the placement binding does not evade this: the match is on the \
-             FIELD name. Offending call arguments: {args}");
+    // #781 round 1 wrote this as a BLACKLIST — no `entity_model_matrix_heading` argument list may
+    // contain `.y_bottom` or `.center_xz` — reasoning that those are `StaticPlacement`'s two fields
+    // `HumanoidPlacement` does not have, so their presence "identifies a static placement". That
+    // reasoning was wrong in both directions, and #828's reviewer MEASURED the load-bearing one:
+    //
+    // - **False negative, measured, fully green.** `GpuStaticModel::bounds` is in scope at all four
+    //   static sites and carries the same numbers under other names. Adding, at `pass.rs:1672`, a
+    //   direct `entity_model_matrix_heading(b.pos, b.heading, 2.0 * model.bounds.y_extent *
+    //   p.mesh_scale, p.mesh_scale, [model.bounds.x_center, model.bounds.z_center], true, 0.0, …)`
+    //   restores the whole #768 over-lift without spelling either blacklisted field: **262 passed /
+    //   0 failed / 12 ignored**, byte-identical to the green baseline. That spelling is not exotic —
+    //   `[model.x_center, model.z_center]` is literally what all four of these sites passed to
+    //   `static_placement` on `41cca4e`, before #781 folded the fields into `&model.bounds`. And a
+    //   field name need not appear at all: binding the numbers to plain locals first
+    //   (`let lift = 2.0 * model.bounds.y_extent * p.mesh_scale; let ctr = p.center_xz;`) leaves an
+    //   argument list of `b.pos, b.heading, lift, p.mesh_scale, ctr, true, 0.0, …`, which was ALSO
+    //   measured green against the blacklist — 262 passed / 0 failed / 12 ignored — and which no
+    //   list of field names can catch.
+    // - **False positive.** `GpuSkinnedModel` has `y_bottom` / `x_center` / `z_center` too
+    //   (`gpu.rs`), so `.y_bottom` in an argument list never did identify a *static* placement; a
+    //   future skinned site passing `model.y_bottom` would have tripped an assert naming a bug it
+    //   did not have.
+    //
+    // A blacklist has to enumerate the aliases of four numbers, and they are not enumerable. A
+    // whitelist has to enumerate the legitimate calls, and there are six, in one file: four
+    // per-model matrices (player `:1356`, skinned entity `:1818`, and the two shadow-pass arms
+    // `:2070`/`:2103`) and two held-item matrices (the player's `:1447` in `encode_player_pass` and
+    // a spawn's `:1850` in `encode_skinned_entity_pass` — all six are on skinned paths, and the
+    // second held-item one IS an entity site; round 1 called the pair "the two non-entity ones").
+    // So this is the same trade the two asserts above already make.
+    //
+    // **What this bounds, and what it does not.** It bounds the argument TEXT of every
+    // `entity_model_matrix_heading` call in `pass.rs`, and their count. It does not bound what the
+    // names in a reviewed text denote, which is the hole the `&p` assert above also has and
+    // discloses; and it reads no other file.
+    const REVIEWED_HEADING_ARGS: [&str; 4] = [
+        "scene.player_pos, scene.player_heading, visual_scale, dominant_mesh_scale, [0.0, 0.0], \
+         true, 0.0, crate::models::archetype_correction(archetype)",
+        "b.pos, b.heading, visual_scale, dominant_scale, [0.0, 0.0], true, 0.0, \
+         crate::models::archetype_correction(archetype)",
+        "scene.player_pos, scene.player_heading, p.visual_scale, p.mesh_scale, [0.0, 0.0], true, \
+         0.0, archetype_correction(archetype)",
+        "b.pos, b.heading, visual_scale, dominant_scale, [0.0, 0.0], true, 0.0, \
+         archetype_correction(archetype)",
+    ];
+    let headings = arg_lists("entity_model_matrix_heading");
+    // The per-call whitelist runs BEFORE the count assert deliberately: an ADDED call with a novel
+    // argument list must fail here, naming the offending arguments, rather than fail on a count
+    // that says only "six became seven". The count then catches the one shape the whitelist cannot
+    // — an added call whose argument list is byte-identical to a reviewed one, whose names denote
+    // something else at the new site. Both orders are measured; see the PR's mutation table.
+    for args in &headings {
+        assert!(REVIEWED_HEADING_ARGS.contains(&args.as_str()),
+            "#768/#781: `entity_model_matrix_heading` adds `visual_scale * 0.5` ON TOP of \
+             `y_bottom * mesh_scale`, which is exactly the #768 over-lift, and a static model's \
+             numbers are reachable at every static call site under several names \
+             (`model.bounds.y_extent`, a local bound from it, …). Enumerating those names is not \
+             possible, so this enumerates the legitimate CALLS instead: every \
+             `entity_model_matrix_heading` in pass.rs must be spelled as reviewed. A new one is not \
+             necessarily wrong — it has to be reviewed for the #768 lift, which is why the list is \
+             pinned. Expected one of {REVIEWED_HEADING_ARGS:?}, found: {args}");
     }
+    assert_eq!(headings.len(), 6,
+        "pass.rs must call entity_model_matrix_heading at exactly the 6 known skinned sites (four \
+         per-model matrices, two held-item matrices); found {}. This catches the one addition the \
+         whitelist above cannot: a call copied verbatim from a reviewed site into a static one, \
+         where the same argument names denote a static model's numbers.", headings.len());
 }

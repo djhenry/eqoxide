@@ -129,9 +129,18 @@ pub fn entity_model_matrix_heading(
 ///
 /// **What that does NOT mean**, stated because overstating exactly this boundary is what two of
 /// #773's commit messages had to retract: it is not a guarantee. A call site can still call
-/// `entity_model_matrix_heading` directly — that is a different function name, which is loud and is
-/// what `tests/floating_placement.rs::every_static_placement_in_pass_rs_is_written_exactly_as_reviewed`
-/// pins — and it can still hand this function a `StaticPlacement` built from wrong bounds.
+/// `entity_model_matrix_heading` directly — a different function name — and what bounds that is one
+/// source-text test over one file:
+/// `tests/floating_placement.rs::every_static_placement_in_pass_rs_is_written_exactly_as_reviewed`
+/// requires every `entity_model_matrix_heading` argument list in `pass.rs` to be one of six
+/// reviewed spellings, and pins their count. #781 round 1 asserted something weaker — that no such
+/// argument list names `.y_bottom` or `.center_xz` — and #828's reviewer measured the same over-lift
+/// written as `model.bounds.y_extent` / `.x_center` / `.z_center` **fully green** against it
+/// (262 passed / 0 failed / 12 ignored), so it is a whitelist now. Two limits survive that change:
+/// the test reads `pass.rs` and no other file, and it bounds the argument TEXT, not what the names
+/// in it denote — this function can still be handed a `StaticPlacement` built from wrong bounds, or
+/// one shadowing the reviewed `p`, and `StaticPlacement` is a plain struct with public fields that
+/// any caller can construct.
 pub fn entity_model_matrix_static(
     pos: [f32; 3], heading_deg: f32, p: &crate::models::StaticPlacement, correction: glam::Mat4,
 ) -> [[f32; 4]; 4] {

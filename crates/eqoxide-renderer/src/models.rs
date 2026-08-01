@@ -940,6 +940,12 @@ pub fn skinned_target_height(race: &str, archetype: &str, true_height: f32) -> f
 /// tree. Two of them were wrong before #781 and are corrected rather than shifted: `:1101` was
 /// written `:1097` and `:1102` was written `:1098`, and on 41cca4e those two lines are a `};` and a
 /// blank line — the true lines there were 1099 and 1100.
+///
+/// Like [`ModelBounds`], this is a plain struct with public fields and is **freely constructible**
+/// — a caller can hand `camera::entity_model_matrix_static` a `StaticPlacement` this function never
+/// produced, including one shadowing the binding the `pass.rs` pin reviewed. #828's reviewer
+/// measured that: 262 passed / 0 failed / 12 ignored, the over-lift restored, every reviewed
+/// argument text unchanged. Round 1 disclosed the capability for `ModelBounds` only.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StaticPlacement {
     /// Uniform mesh scale fed to `entity_model_matrix_heading`'s `mesh_scale`.
@@ -961,20 +967,30 @@ pub struct StaticPlacement {
     /// - Handing `2.0 * model.y_extent * p.mesh_scale` to `entity_model_matrix_heading`'s
     ///   `visual_scale`. The four static sites now call `camera::entity_model_matrix_static`, which
     ///   has no `visual_scale` parameter, so that edit is `error[E0061]` (measured). Still open:
-    ///   calling `entity_model_matrix_heading` directly — a different function name.
+    ///   calling `entity_model_matrix_heading` directly — a different function name, bounded only by
+    ///   the source-text whitelist over `pass.rs` described below. #781 round 1 bounded it with a
+    ///   blacklist of the field names `.y_bottom` / `.center_xz` instead, and #828's reviewer
+    ///   measured the identical over-lift spelled `model.bounds.y_extent` / `.x_center` /
+    ///   `.z_center` fully green against that (262 passed / 0 failed / 12 ignored).
     /// - Handing `model.y_bottom + model.y_extent` to this function's `y_bottom`. The parameter is
-    ///   now `&ModelBounds`, so that edit is `error[E0308]` (measured). Still open: a `ModelBounds`
-    ///   struct literal at the call site, which compiles and restores the identical over-lift —
-    ///   measured, and caught by the source-text pin alone.
+    ///   now `&ModelBounds`, so that edit does not compile — `error[E0061]` if the pre-#781 call is
+    ///   transcribed literally (it also still passes a `center_xz` argument), `error[E0308]:
+    ///   mismatched types` on a minimal transcription onto the 3-argument signature. Both measured;
+    ///   round 1 reported only the second. Still open: a `ModelBounds` struct literal at the call
+    ///   site, which compiles and restores the identical over-lift — measured, and caught by the
+    ///   source-text pin alone.
     ///
     /// So the bad state is still REPRESENTABLE and this doc does not claim otherwise. What bounds
     /// the remaining routes is the source-text pin over `pass.rs`,
     /// `tests/floating_placement.rs::every_static_placement_in_pass_rs_is_written_exactly_as_reviewed`,
-    /// which requires each of the four call sites to be spelled exactly as reviewed. That bounds the
-    /// four call sites in that one file. It is NOT a type-level guarantee and it does not reach a
-    /// caller in another file; making the state unrepresentable would mean this function taking the
-    /// model's bounds as an opaque value only the loader can mint, which `ModelBounds`'s doc records
-    /// as declined and why.
+    /// which requires the four `static_placement` calls, the four `entity_model_matrix_static` calls
+    /// and — since #828 round 2 — all six `entity_model_matrix_heading` calls in that file to be
+    /// spelled exactly as reviewed. That bounds those calls as TEXT, in that one file. It is NOT a
+    /// type-level guarantee, it does not bound what the names in a reviewed spelling denote at the
+    /// site (measured green: shadowing the reviewed `p` with a hand-built `StaticPlacement` carrying
+    /// the over-lift), and it does not reach a caller in another file; making the state
+    /// unrepresentable would mean this function taking the model's bounds as an opaque value only
+    /// the loader can mint, which `ModelBounds`'s doc records as declined and why.
     pub y_bottom: f32,
 }
 
