@@ -13,28 +13,40 @@
 //! ## What replaced it
 //!
 //! - The `.wgsl` files contain **no palette length at all**. They write the placeholder
-//!   `JOINT_CAP`, and `pipeline::wgsl` — the single preprocessing step every `create_shader_module`
-//!   in the tree goes through — substitutes `renderer::JOINT_CAP` into the text before naga (and
-//!   therefore the driver) ever sees it. A GPU-side copy that could drift no longer exists.
+//!   `pipeline::JOINT_CAP_TOKEN`, and `pipeline::wgsl` — the single preprocessing step every
+//!   `create_shader_module` in the tree goes through — substitutes `renderer::JOINT_CAP` into the
+//!   text before naga (and therefore the driver) ever sees it. A GPU-side copy that could drift no
+//!   longer exists.
 //! - The five Rust palette-building copies collapsed into `renderer::pad_joint_palette`, which
 //!   returns the named type `renderer::JointPalette = [[[f32;4];4]; JOINT_CAP]`. A draw site cannot
 //!   choose a different length because it no longer states one.
 //!
-//! ## What this test adds on top, and why it is not a source-text pin
+//! ## Detection is structural, over the WHOLE corpus (eqoxide#811)
 //!
-//! The checks below read the **parsed and validated naga IR**, not the shader source text.
-//! `uniform_struct_array_lengths` resolves each shader's uniform-address-space struct members
-//! through naga's type arena and reads the array size out of the IR — the same representation the
-//! backend lowers to SPIR-V/MSL/HLSL. That is immune to the whole `include_str!`-plus-`contains`
-//! evasion family this repo has measured six times over (trailing comment, shadowing, `if false
-//! {}`, `#[cfg(any())]`, macro-elided argument, satisfying the guard from an unrelated comment):
-//! you cannot comment or `cfg` your way to a different validated array size — for a shader this
-//! test already knows to look at. Two other checks here ARE source-text scans, not IR reads:
-//! `no_shader_writes_a_numeric_palette_length`, a belt-and-braces sweep across shaders the IR
-//! checks do not know about (scope stated at that test); and
-//! `joint_palette_shaders_are_exactly_the_expected_three`'s struct-name match, which decides which
-//! shaders the IR check above even looks at in the first place (scope, and its measured gap,
-//! stated at that test).
+//! The first version of this file decided *which* shaders carry a joint palette by matching the
+//! struct name `JointMatrices` in the source text, and ran the IR check only on that name-derived
+//! subset. A shader declaring a fixed-length uniform `mat4x4` palette under any other name — or
+//! through a type alias — was invisible to it, and shipped unguarded; that was measured on
+//! eqoxide#809 and filed as eqoxide#811.
+//!
+//! The name match is gone. [`uniform_mat4_palette_lengths`] resolves every uniform-address-space
+//! struct member through naga's **validated type arena** and reports the length of any fixed-size
+//! `mat4x4<f32>` array it finds, and every check below runs it over **every** `.wgsl` in the
+//! discovered corpus rather than over a list. A palette is detected by being one, so a struct name,
+//! a type alias (naga resolves aliases before the arena exists) and whitespace inside the
+//! declaration are all irrelevant by construction.
+//!
+//! ## What is a source-text scan here, and what that is worth
+//!
+//! Everything above reads the IR — the representation the backend lowers to SPIR-V/MSL/HLSL — so it
+//! is immune to the `include_str!`-plus-`contains` evasion family this repo has measured seven times
+//! over (trailing comment, shadowing, `if false {}`, `#[cfg(any())]`, macro-elided argument,
+//! satisfying the guard from an unrelated comment, `if false`-wrapping a written call): you cannot
+//! comment or `cfg` your way to a different validated array size.
+//!
+//! Two checks in this file ARE text scans, and each states its own scope at its docstring:
+//! `no_shader_writes_a_numeric_palette_length` (a *negative* sweep, and a deliberately partial one)
+//! and `no_draw_site_states_a_joint_palette_length` (likewise, over two Rust files).
 //!
 //! ## Reach control (the eqoxide#778 lesson)
 //!
@@ -42,37 +54,30 @@
 //!
 //! - The corpus is **discovered from disk** (`src/shaders/*.wgsl` under `CARGO_MANIFEST_DIR`), not
 //!   listed in this file. A shader added tomorrow is scanned tomorrow.
-//! - `discovered_corpus_is_not_silently_truncated` asserts the walk found a plausible corpus AND
-//!   that every file named by the IR checks is inside it — so "the scanner couldn't see that file"
-//!   fails loudly instead of passing quietly.
-//! - `joint_palette_shaders_are_exactly_the_expected_three` asserts the set of shaders whose
-//!   source contains the struct name `JointMatrices` equals the expected three. That is a **name
-//!   match on source text, not a structural check** for "declares a fixed-length uniform
-//!   `mat4x4` palette." A new shader that declares exactly such a palette under any other struct
-//!   name — including through a type alias, which also defeats the numeric sweep above — is
-//!   invisible to it: measured by planting a fourth shader (`alias JMat = mat4x4<f32>; struct
-//!   DecoyPalette { mats: array<JMat, 99> }; @group(0) @binding(0) var<uniform> decoy:
-//!   DecoyPalette;`) into the corpus and observing the suite stay 9 passed / 0 failed. Making
-//!   this structural — reading the IR instead of matching a name — is tracked as a separate
-//!   follow-up, not done here.
+//! - `discovered_corpus_is_not_silently_truncated` asserts the walk found a plausible corpus, that
+//!   every file the palette checks name is inside it, and that **every discovered file was actually
+//!   parsed** — so "the scanner couldn't see that file" fails loudly instead of passing quietly.
+//! - `palette_bearing_shaders_are_exactly_the_expected_three` asserts the structurally-detected
+//!   palette set equals the expected three. Both directions of that assertion were planted and run
+//!   for eqoxide#811 (a fourth palette shader added; a known palette removed) — see the PR body's
+//!   mutation table.
 //!
-//! The `JOINT_CAP`-value claims above — the three shaders and the five collapsed Rust sites —
-//! were each demonstrated by planting a mismatch in the corresponding file and running this test;
-//! see the PR body's per-file mutation table. The two reach-control bullets above this paragraph
-//! were **not** exercised by that table: no mutation there truncates the corpus walk or renames a
-//! struct, so those bullets' own "goes red" claims rest on reading the assertion, not on a
-//! planted-and-observed failure — except for the fourth-shader gap just measured above, which
-//! goes the other way (it stays green when the doc used to claim red).
+//! Nothing in this header claims a mutation went red that was not planted and observed. The claims
+//! whose mutations are in the eqoxide#798 PR body: the three shaders' palette lengths and the five
+//! collapsed Rust sites. The claims whose mutations are in the eqoxide#811/812/813/814 PR body: the
+//! structural detection set (both directions), the whole-corpus length check via a decoy shader, the
+//! token-tracking check, the delimited-token identifier property, and the comment-preservation
+//! property.
 
 use eqoxide_renderer::pipeline::{wgsl, JOINT_CAP_TOKEN};
 use eqoxide_renderer::renderer::{pad_joint_palette, JointPalette, JOINT_BUF_BYTES, JOINT_CAP};
 use std::collections::BTreeMap;
 
-/// The shaders whose source is expected to contain the struct name `JointMatrices`. Asserted to
-/// be EXACTLY the corpus's `JointMatrices`-matching set (not merely a subset) by
-/// `joint_palette_shaders_are_exactly_the_expected_three` — a source-text name match, not a
-/// structural one. A shader that adds a fixed-length uniform `mat4x4` palette under a different
-/// struct name falls behind this list unnoticed; see that test's docstring for the measured gap.
+/// The shaders expected to declare a joint palette. Asserted to be EXACTLY the corpus's
+/// **structurally detected** palette set by `palette_bearing_shaders_are_exactly_the_expected_three`
+/// — detection is "the validated IR contains a fixed-length `mat4x4<f32>` array in a uniform-space
+/// struct", not a name or spelling. A fourth shader that adds such a palette under any struct name
+/// fails that assertion instead of slipping past it (eqoxide#811).
 const EXPECTED_JOINT_SHADERS: [&str; 3] =
     ["character_skinned.wgsl", "shadow.wgsl", "skin_probe.wgsl"];
 
@@ -110,12 +115,30 @@ fn parse_and_validate(source: &str, label: &str) -> naga::Module {
     module
 }
 
-/// Every fixed array length that appears as a member of a struct bound in the **uniform** address
-/// space, read out of the validated IR's type arena.
+/// Is this IR type `mat4x4<f32>`?
+fn is_mat4x4_f32(inner: &naga::TypeInner) -> bool {
+    matches!(
+        inner,
+        naga::TypeInner::Matrix {
+            columns: naga::VectorSize::Quad,
+            rows: naga::VectorSize::Quad,
+            scalar: naga::Scalar { kind: naga::ScalarKind::Float, width: 4 },
+        }
+    )
+}
+
+/// Every fixed-length `mat4x4<f32>` array that appears as a member of a struct bound in the
+/// **uniform** address space, read out of the validated IR's type arena. That *is* a joint palette:
+/// it is the declaration the driver bounds indexing against.
 ///
-/// This is the value the backend lowers into the shader the driver compiles — not a substring of a
-/// file. `JointMatrices { mats: array<mat4x4<f32>, N> }` bound as `var<uniform>` yields `[N]`.
-fn uniform_struct_array_lengths(module: &naga::Module) -> Vec<u32> {
+/// This is a structural property, not a spelling. `JointMatrices { mats: array<mat4x4<f32>, N> }`,
+/// `Decoy { m: array<JMat, N> }` with `alias JMat = mat4x4<f32>`, and
+/// `X { m : array < mat4x4<f32> , N > }` all yield `[N]` — naga has already resolved aliases and
+/// discarded whitespace by the time the arena exists.
+///
+/// Deliberately narrower than "any fixed-length uniform array": a `array<vec4<f32>, 4>` in a uniform
+/// struct is not a joint palette and must not be forced to equal `JOINT_CAP`.
+fn uniform_mat4_palette_lengths(module: &naga::Module) -> Vec<u32> {
     let mut lengths = Vec::new();
     for (_, global) in module.global_variables.iter() {
         if global.space != naga::AddressSpace::Uniform {
@@ -125,24 +148,44 @@ fn uniform_struct_array_lengths(module: &naga::Module) -> Vec<u32> {
             continue;
         };
         for member in members {
-            if let naga::TypeInner::Array { size, .. } = &module.types[member.ty].inner {
-                if let naga::ArraySize::Constant(n) = size {
-                    lengths.push(n.get());
-                }
+            let naga::TypeInner::Array { base, size, .. } = &module.types[member.ty].inner else {
+                continue;
+            };
+            if !is_mat4x4_f32(&module.types[*base].inner) {
+                continue;
+            }
+            if let naga::ArraySize::Constant(n) = size {
+                lengths.push(n.get());
             }
         }
     }
     lengths
 }
 
+/// The whole corpus, substituted through `pipeline::wgsl` and parsed: filename → palette lengths.
+///
+/// Every file is parsed. A shader that fails to parse or validate panics here rather than being
+/// skipped, because a skipped file is a hole in the corpus that would report clean.
+fn corpus_palette_lengths() -> BTreeMap<String, Vec<u32>> {
+    shader_corpus()
+        .iter()
+        .map(|(name, raw)| {
+            let module = parse_and_validate(&wgsl(raw), name);
+            (name.clone(), uniform_mat4_palette_lengths(&module))
+        })
+        .collect()
+}
+
 // ── Reach control ───────────────────────────────────────────────────────────────────────────────
 
-/// The disk walk found a real corpus, and everything the IR checks below name is inside it.
+/// The disk walk found a real corpus, everything the palette checks name is inside it, and every
+/// discovered file was parsed.
 ///
 /// This is the eqoxide#778 guard-reach control expressed as an assertion rather than as a belief:
 /// on that issue a scanner silently stopped at ~12% of its corpus and reported clean, and every
-/// mutation probe happened to land in the window it could still see. A truncated walk here fails
-/// on the count, and a covered file that fell out of the walk fails on the membership check.
+/// mutation probe happened to land in the window it could still see. A truncated walk fails on the
+/// count, a covered file that fell out of the walk fails on the membership check, and a file the
+/// parse pass dropped fails on the third.
 #[test]
 fn discovered_corpus_is_not_silently_truncated() {
     let corpus = shader_corpus();
@@ -161,88 +204,140 @@ fn discovered_corpus_is_not_silently_truncated() {
             corpus.keys().collect::<Vec<_>>()
         );
     }
+    let parsed = corpus_palette_lengths();
+    let seen: Vec<&String> = parsed.keys().collect();
+    let walked: Vec<&String> = corpus.keys().collect();
+    assert_eq!(
+        seen, walked,
+        "the palette scan parsed a different set of files than the walk discovered — a file that \
+         is walked but never parsed is a hole that reports clean"
+    );
 }
 
-/// The set of shaders whose source contains the struct name `JointMatrices` is EXACTLY
-/// `EXPECTED_JOINT_SHADERS`.
+/// The set of shaders that **structurally** declare a fixed-length uniform `mat4x4<f32>` palette is
+/// EXACTLY `EXPECTED_JOINT_SHADERS`.
 ///
-/// This is a **name match on source text**, not a structural check for "declares a fixed-length
-/// uniform `mat4x4` palette." If one of the three known shaders' source stops containing
-/// `JointMatrices` (loses the palette, or renames the struct), the detected set no longer equals
-/// `EXPECTED_JOINT_SHADERS` and this assertion fails — but that specific mutation was not planted
-/// in this PR, so treat it as read from the code, not measured. What WAS measured: a *new*
-/// shader that declares such a palette under a different struct name — including via a type
-/// alias, which also defeats `no_shader_writes_a_numeric_palette_length`'s text sweep — is
-/// invisible to this check. Planting exactly that fourth shader left the suite at 9 passed / 0
-/// failed. Making detection structural (read the IR instead of matching a name) is tracked as a
-/// separate follow-up.
+/// eqoxide#811: this used to be `src.contains("JointMatrices")` — a struct name. A new shader
+/// declaring the same palette under a different name, or through a type alias, was invisible to it
+/// (measured on eqoxide#809: the suite stayed 9 passed / 0 failed with exactly such a shader in the
+/// corpus). Detection now reads the validated IR, so the name a shader gives its struct is not
+/// something this guard depends on being guessed correctly.
+///
+/// This assertion is two-sided on purpose: a *new* palette shader makes `actual` longer, and a known
+/// shader losing its palette makes it shorter. Both were planted and run — see the PR body.
 #[test]
-fn joint_palette_shaders_are_exactly_the_expected_three() {
-    let corpus = shader_corpus();
-    let mut actual: Vec<&str> = corpus
+fn palette_bearing_shaders_are_exactly_the_expected_three() {
+    let lengths = corpus_palette_lengths();
+    let actual: Vec<&str> = lengths
         .iter()
-        .filter(|(_, src)| src.contains("JointMatrices"))
+        .filter(|(_, l)| !l.is_empty())
         .map(|(name, _)| name.as_str())
         .collect();
-    actual.sort_unstable();
     let mut expected = EXPECTED_JOINT_SHADERS.to_vec();
     expected.sort_unstable();
     assert_eq!(
         actual, expected,
-        "the set of shaders declaring a joint palette changed; update EXPECTED_JOINT_SHADERS (and \
-         confirm the new one is covered) rather than letting an unguarded palette ship"
+        "the set of shaders declaring a fixed-length uniform mat4x4 palette changed. If a shader \
+         gained one, it is now covered by every_uniform_mat4_palette_in_the_corpus_is_exactly_\
+         joint_cap and belongs in EXPECTED_JOINT_SHADERS; if one lost its palette, the cap it used \
+         to enforce went with it."
     );
 }
 
-// ── The IR check: the GPU-side palette length IS `JOINT_CAP` ────────────────────────────────────
+// ── The IR check: EVERY uniform mat4 palette in the corpus IS `JOINT_CAP` ───────────────────────
 
-/// For each joint shader, the palette length in the **validated IR** equals `JOINT_CAP`.
+/// For **every** shader in the discovered corpus, every fixed-length uniform `mat4x4<f32>` array in
+/// the validated IR has length `JOINT_CAP`.
 ///
-/// Not a text search: `uniform_struct_array_lengths` reads naga's type arena after validation.
+/// Not a text search, and not restricted to a list: `uniform_mat4_palette_lengths` reads naga's type
+/// arena after validation, and this runs over the whole corpus. That is the eqoxide#811 fix — the
+/// machinery was already alias-immune, but it was only pointed at a name-derived subset.
 #[test]
-fn every_joint_shader_compiles_to_a_palette_of_exactly_joint_cap() {
-    let corpus = shader_corpus();
-    for name in EXPECTED_JOINT_SHADERS {
-        let raw = corpus
-            .get(name)
-            .unwrap_or_else(|| panic!("{name} missing from the shader corpus"));
-        let module = parse_and_validate(&wgsl(raw), name);
-        let lengths = uniform_struct_array_lengths(&module);
-        assert!(
-            !lengths.is_empty(),
-            "{name}: no fixed-length array in any uniform struct — the palette this test exists to \
-             pin is not there, so a passing result would mean nothing"
-        );
-        for len in lengths {
-            assert_eq!(
-                len as usize, JOINT_CAP,
-                "{name}: the GPU-side uniform palette length is {len}, but renderer::JOINT_CAP is \
-                 {JOINT_CAP}. The shader is the real enforcement — do not write a number in the \
-                 .wgsl; write {JOINT_CAP_TOKEN} and let pipeline::wgsl substitute it."
-            );
+fn every_uniform_mat4_palette_in_the_corpus_is_exactly_joint_cap() {
+    let lengths = corpus_palette_lengths();
+    let mut offenders = Vec::new();
+    for (name, lens) in &lengths {
+        for len in lens {
+            if *len as usize != JOINT_CAP {
+                offenders.push(format!("{name}: palette length {len}"));
+            }
         }
     }
+    assert!(
+        offenders.is_empty(),
+        "a GPU-side uniform mat4 palette does not equal renderer::JOINT_CAP ({JOINT_CAP}). The \
+         shader is the real enforcement — do not write a number in the .wgsl; write the \
+         {JOINT_CAP_TOKEN} placeholder and let pipeline::wgsl substitute it. Offenders: \
+         {offenders:#?}"
+    );
+    // Positive control: a corpus with no palette at all would satisfy the loop above vacuously.
+    assert!(
+        lengths.values().any(|l| !l.is_empty()),
+        "no shader in the corpus declares a uniform mat4 palette — the thing this test pins is not \
+         there, so a passing result would mean nothing"
+    );
+}
+
+/// Every palette length in a palette-bearing shader **tracks the substituted token**, whatever value
+/// is substituted.
+///
+/// This is the check that makes a hardcoded-but-currently-correct length impossible. `array<JMat,
+/// 128>` written literally compiles to the same IR as the placeholder does today, so
+/// `every_uniform_mat4_palette_in_the_corpus_is_exactly_joint_cap` cannot tell them apart. Here the
+/// token is substituted with a SENTINEL that is deliberately not `JOINT_CAP`: a length derived from
+/// the token moves to the sentinel, a length written as a literal does not, and the mismatch is the
+/// failure. Spelling-, alias- and whitespace-independent, because the comparison is against the IR.
+#[test]
+fn every_palette_length_tracks_the_substituted_token() {
+    const SENTINEL: u32 = 77;
+    assert_ne!(SENTINEL as usize, JOINT_CAP, "the sentinel must differ from the real cap");
+    let corpus = shader_corpus();
+    let mut checked = 0usize;
+    for name in EXPECTED_JOINT_SHADERS {
+        let raw = corpus.get(name).unwrap_or_else(|| panic!("{name} missing from the corpus"));
+        let substituted = raw.replace(JOINT_CAP_TOKEN, &SENTINEL.to_string());
+        let module = parse_and_validate(&substituted, name);
+        let lens = uniform_mat4_palette_lengths(&module);
+        assert!(!lens.is_empty(), "{name}: no palette found under sentinel substitution");
+        for len in lens {
+            assert_eq!(
+                len, SENTINEL,
+                "{name}: a uniform mat4 palette is {len} when the token is substituted with \
+                 {SENTINEL} — that length is written into the shader, not derived from \
+                 renderer::JOINT_CAP"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= EXPECTED_JOINT_SHADERS.len(), "checked only {checked} palettes");
 }
 
 /// A shader source that skips `pipeline::wgsl` is **invalid WGSL**, so a missed substitution cannot
 /// ship a silently wrong cap.
 ///
-/// This is what lets `pipeline::wgsl` be a preprocessing step rather than a discipline: the bare
-/// identifier `JOINT_CAP` has no declaration in any of these files, and naga rejects an undeclared
-/// identifier used as an array length. Note what this does and does not prove — it proves the raw
-/// sources do not compile, i.e. that forgetting the substitution FAILS LOUDLY at
-/// `create_shader_module`. It does not prove any particular call site currently calls `wgsl()`;
-/// that is proven by the whole render path failing to produce a pipeline, which no test in this
-/// crate can observe without a GPU adapter.
+/// This is what lets `pipeline::wgsl` be a preprocessing step rather than a discipline: the raw text
+/// carries `${JOINT_CAP}`, and `$` is not a WGSL token character at all, so naga rejects the
+/// unsubstituted source outright. Note what this does and does not prove — it proves the raw sources
+/// do not compile, i.e. that forgetting the substitution FAILS LOUDLY at `create_shader_module`. It
+/// does not prove any particular call site currently calls `wgsl()`; that is proven by the whole
+/// render path failing to produce a pipeline, which no test in this crate can observe without a GPU
+/// adapter. (Measured end-to-end on eqoxide#809: removing the wrapper from one call site killed the
+/// release binary at startup with a naga error.)
+///
+/// Runs over the **structurally detected** palette set, not a name-matched one (eqoxide#811).
 #[test]
-fn raw_joint_shader_sources_do_not_parse_without_substitution() {
+fn raw_palette_shader_sources_do_not_parse_without_substitution() {
     let corpus = shader_corpus();
-    for name in EXPECTED_JOINT_SHADERS {
+    let lengths = corpus_palette_lengths();
+    let detected: Vec<&String> =
+        lengths.iter().filter(|(_, l)| !l.is_empty()).map(|(n, _)| n).collect();
+    assert!(!detected.is_empty(), "no palette shader detected — nothing would be checked");
+    for name in detected {
         let raw = corpus.get(name).unwrap();
         assert!(
             raw.contains(JOINT_CAP_TOKEN),
-            "{name} no longer carries the {JOINT_CAP_TOKEN} placeholder — if it now carries a \
-             number instead, the GPU-side copy of the cap is back"
+            "{name} declares a uniform mat4 palette but does not carry the {JOINT_CAP_TOKEN} \
+             placeholder — its length is a second copy of the cap"
         );
         assert!(
             naga::front::wgsl::parse_str(raw).is_err(),
@@ -252,13 +347,21 @@ fn raw_joint_shader_sources_do_not_parse_without_substitution() {
     }
 }
 
-/// Belt-and-braces source sweep over the WHOLE corpus, including shaders with no joint palette
-/// today: no `.wgsl` may write a numeric `array<mat4x4<f32>, N>` length.
+/// Backstop source sweep over the whole corpus: no `.wgsl` may write a numeric
+/// `array<mat4x4<f32>, N>` length, in any address space.
 ///
-/// Scope, stated plainly: this is a text scan, and a text scan proves only that this spelling is
-/// absent. It is not what enforces the cap — `every_joint_shader_compiles_to_a_palette_of_exactly_
-/// joint_cap` is. It exists to catch a *new* shader introducing a hardcoded palette before anyone
-/// remembers to add it to `EXPECTED_JOINT_SHADERS`.
+/// **Scope, stated plainly, because this one is weak and it matters that nobody mistakes it for the
+/// enforcement.** It is a substring scan for one spelling. It does **not** catch a palette written
+/// through a type alias (`alias JMat = mat4x4<f32>; array<JMat, 99>`), nor the whitespace form
+/// `array < mat4x4<f32> , 99 >`, nor `array<mat4x4 <f32>, 99>` — both measured limitations, and the
+/// alias case is exactly what made eqoxide#811 possible when this test was one of only two things
+/// looking at the wider corpus.
+///
+/// It is kept for the one thing the IR checks structurally cannot cover: a fixed-length mat4 array
+/// in a **non-uniform** address space (`var<private>`, `var<storage>`), which is still a copy of the
+/// cap but is not a uniform palette, so `uniform_mat4_palette_lengths` correctly ignores it. Every
+/// uniform-space palette, in any spelling, is covered by
+/// `every_palette_length_tracks_the_substituted_token` instead.
 #[test]
 fn no_shader_writes_a_numeric_palette_length() {
     let corpus = shader_corpus();
@@ -277,6 +380,105 @@ fn no_shader_writes_a_numeric_palette_length() {
         offenders.is_empty(),
         "shader(s) hardcode a numeric mat4 array length instead of the {JOINT_CAP_TOKEN} \
          placeholder — that is a second copy of the cap: {offenders:#?}"
+    );
+}
+
+// ── eqoxide#812: the token is delimited, so substitution touches nothing else ────────────────────
+
+/// The token cannot be a substring of a WGSL identifier, **by the characters it is made of**.
+///
+/// WGSL identifiers are XID_Start/XID_Continue plus `_`. `$`, `{` and `}` are none of those, so no
+/// identifier can contain the token — which is why `pipeline::wgsl` can stay a plain `replace`
+/// instead of growing a word-boundary rule that a future edit could get wrong.
+#[test]
+fn the_joint_cap_token_cannot_occur_inside_an_identifier() {
+    let non_ident: Vec<char> = JOINT_CAP_TOKEN
+        .chars()
+        .filter(|c| !(c.is_alphanumeric() || *c == '_'))
+        .collect();
+    assert!(
+        !non_ident.is_empty(),
+        "JOINT_CAP_TOKEN is {JOINT_CAP_TOKEN:?} — every character of it is identifier-legal, so it \
+         is a prefix/infix of longer identifiers and pipeline::wgsl will rewrite them mid-name. \
+         That is eqoxide#812: the bare token turned `JOINT_CAP_SCALE` into `128_SCALE`."
+    );
+}
+
+/// Substitution leaves identifiers that merely *contain* the words alone.
+///
+/// eqoxide#812, measured on the pre-fix tree: with the bare token, adding
+/// `const JOINT_CAP_SCALE: f32 = 1.0;` to a joint shader produced `character_skinned.wgsl: WGSL
+/// failed to parse: expected identifier, found '128'`. Exhaustive over the shapes an identifier can
+/// take around the word: prefix, suffix, infix, doubled, and the bare word alone.
+#[test]
+fn substitution_cannot_alter_an_identifier_that_contains_the_word_joint_cap() {
+    let cases = [
+        "JOINT_CAP",
+        "JOINT_CAP_SCALE",
+        "MAX_JOINT_CAP",
+        "MAX_JOINT_CAP_BYTES",
+        "aJOINT_CAPb",
+        "JOINT_CAPJOINT_CAP",
+        "_JOINT_CAP_",
+    ];
+    for ident in cases {
+        let src = format!("const {ident}: u32 = 1u;\nlet x = {ident};\n");
+        assert_eq!(
+            wgsl(&src),
+            src,
+            "substitution rewrote the identifier `{ident}` — a token that is a substring of an \
+             identifier mangles it (eqoxide#812)"
+        );
+    }
+    // And the delimited token itself IS substituted, or the whole scheme does nothing.
+    assert_eq!(wgsl(JOINT_CAP_TOKEN), JOINT_CAP.to_string());
+    assert_eq!(
+        wgsl(&format!("array<mat4x4<f32>, {JOINT_CAP_TOKEN}>")),
+        format!("array<mat4x4<f32>, {JOINT_CAP}>")
+    );
+}
+
+/// Substitution leaves every shader **comment** byte-identical.
+///
+/// eqoxide#812's second half: with the bare token, `pipeline::wgsl` rewrote the shaders' own prose,
+/// so the text naga received read "`128` is NOT a WGSL constant … substitutes the Rust
+/// `renderer::128` into this text". Self-falsifying documentation shipped to the compiler. This
+/// compares the comment portion of every line of every corpus shader before and after substitution.
+///
+/// Scope: this is a line-comment comparison (`//` onwards), which is the only comment form these
+/// shaders use — it does not model WGSL block comments or `//` inside a string literal, neither of
+/// which occurs in the corpus.
+#[test]
+fn substitution_leaves_every_shader_comment_byte_identical() {
+    let corpus = shader_corpus();
+    let mut compared = 0usize;
+    for (name, raw) in &corpus {
+        let sub = wgsl(raw);
+        let raw_lines: Vec<&str> = raw.lines().collect();
+        let sub_lines: Vec<&str> = sub.lines().collect();
+        assert_eq!(raw_lines.len(), sub_lines.len(), "{name}: substitution changed the line count");
+        for (i, (r, s)) in raw_lines.iter().zip(sub_lines.iter()).enumerate() {
+            let (Some(rc), Some(sc)) = (r.find("//"), s.find("//")) else { continue };
+            compared += 1;
+            assert_eq!(
+                &r[rc..],
+                &s[sc..],
+                "{name}:{}: pipeline::wgsl rewrote a comment (eqoxide#812)",
+                i + 1
+            );
+        }
+    }
+    assert!(
+        compared > 0,
+        "no comment lines were compared across {} shader(s) — this test would pass vacuously",
+        corpus.len()
+    );
+    // Positive control for the comparison itself: a comment that DOES carry the token is caught.
+    let doctored = format!("// the {JOINT_CAP_TOKEN} placeholder\n");
+    assert_ne!(
+        wgsl(&doctored),
+        doctored,
+        "the comparison above can only detect a rewritten comment if wgsl() rewrites this one"
     );
 }
 

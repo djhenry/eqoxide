@@ -14,23 +14,42 @@ pub const SKIN_PROBE_WGSL: &str = include_str!("shaders/skin_probe.wgsl");
 /// The placeholder the joint-palette shaders write where the palette length goes.
 ///
 /// It is **not** a WGSL construct — the `.wgsl` files are deliberately not standalone-compilable.
-/// [`wgsl`] is the one and only place this identifier is bound to a number, and the number it binds
+/// [`wgsl`] is the one and only place this placeholder is bound to a number, and the number it binds
 /// is [`crate::renderer::JOINT_CAP`]. Consequently there is no GPU-side copy of the cap that could
 /// drift from the Rust one: the shader text contains no palette length at all. (eqoxide#798 — before
 /// this, three `.wgsl` files each hardcoded `array<mat4x4<f32>, 128>` and nothing went red if the
 /// Rust constant and any one of them disagreed.)
-pub const JOINT_CAP_TOKEN: &str = "JOINT_CAP";
+///
+/// ## Why it is delimited (eqoxide#812)
+///
+/// The placeholder was originally the bare word `JOINT_CAP`, and [`wgsl`] is a plain substring
+/// `replace`. A bare word is a *prefix and infix* of longer identifiers, so `MAX_JOINT_CAP` or
+/// `JOINT_CAP_SCALE` anywhere in a preprocessed shader was rewritten mid-identifier into
+/// `MAX_128` / `128_SCALE`. Measured on the pre-fix tree: adding `const JOINT_CAP_SCALE: f32 = 1.0;`
+/// to a joint shader produced `character_skinned.wgsl: WGSL failed to parse: expected identifier,
+/// found '128'`. It also rewrote the shaders' own **comments**, so the text naga received described
+/// itself as substituting "`renderer::128`".
+///
+/// `${` and `}` cannot appear in a WGSL identifier (WGSL identifiers are XID_Start/XID_Continue
+/// plus `_`), so the delimited form **cannot be a substring of any identifier**. That is a
+/// structural property of the token's characters, not a discipline the substitution has to apply
+/// correctly — which is why the fix is a token change and not a smarter `replace`.
+pub const JOINT_CAP_TOKEN: &str = "${JOINT_CAP}";
 
 /// Preprocess WGSL source before handing it to `create_shader_module`: substitute
 /// [`JOINT_CAP_TOKEN`] with [`crate::renderer::JOINT_CAP`].
 ///
 /// Every `create_shader_module` in the tree goes through this, including the shaders that carry no
 /// joint palette — so "which shaders get preprocessed" is not a judgement call a future author has
-/// to make correctly. A source that skips it keeps the bare identifier `JOINT_CAP`, which has no
-/// declaration and is therefore **invalid WGSL**: naga rejects it at module creation. That is
-/// deliberate — a missed substitution fails loudly instead of shipping a wrong cap silently. Pinned
-/// by `tests/joint_cap_single_source.rs`, which parses the un-substituted sources and asserts naga
-/// refuses them.
+/// to make correctly. A source that skips it keeps the literal text `${JOINT_CAP}`, which is not
+/// valid WGSL at all (`$` is not a WGSL token character): naga rejects it at module creation. That
+/// is deliberate — a missed substitution fails loudly instead of shipping a wrong cap silently.
+/// Pinned by `tests/joint_cap_single_source.rs`, which parses the un-substituted sources and
+/// asserts naga refuses them.
+///
+/// Since the token is delimited, this substitution touches no identifier and no prose: see
+/// `substitution_cannot_alter_an_identifier_that_contains_the_word_joint_cap` and
+/// `substitution_leaves_every_shader_comment_byte_identical` in that test file (eqoxide#812).
 pub fn wgsl(src: &str) -> String {
     src.replace(JOINT_CAP_TOKEN, &crate::renderer::JOINT_CAP.to_string())
 }
