@@ -211,12 +211,13 @@ pub enum StaticReason {
 
 impl StaticReason {
     /// The joint count that caused a genuine cap downgrade, or `None` when the static arm was taken
-    /// for an unremarkable reason. This is the **single predicate both eqoxide#780 channels use** —
-    /// the `error!` log in [`crate::skin_observation::observe_skin_fit`] and the
-    /// `skin_cap_downgrades` entry [`record_skin_cap_downgrade`] writes.
+    /// for an unremarkable reason. This is the **single predicate both eqoxide#780 channels use**:
+    /// [`crate::skin_observation::observe_skin_fit`] evaluates it once, in one `if let`, and inside
+    /// that arm both fires the `error!` and calls [`record_skin_cap_downgrade`].
     ///
     /// It returns the count rather than a `bool` so the two channels cannot be gated by two
-    /// separately-mutable expressions. They were, before: the log tested [`is_downgrade`] while the
+    /// separately-mutable expressions — and so the log message can interpolate the bound count,
+    /// which makes forcing that gate open a compile error rather than a survivable mutation. They were, before: the log tested [`is_downgrade`] while the
     /// report re-matched `ExceedsCap` itself, so a mutation that made `is_downgrade` return `true`
     /// for every variant changed which models got logged without changing which got reported. That
     /// was measured on the intermediate commit that had both gates, and is the reason this method
@@ -235,6 +236,11 @@ impl StaticReason {
     /// simply did not fit the uniform buffer, and got rendered as if it were never skinned at all.
     /// Delegates to [`StaticReason::downgrade_joint_count`] rather than re-matching, so it cannot
     /// disagree with what actually gets reported.
+    ///
+    /// It has **no production caller**: the report and the log are both gated on
+    /// `downgrade_joint_count` directly. It is kept because it is `pub` and reads better at a call
+    /// site that only wants the yes/no; `is_downgrade_agrees_with_the_report_gate` pins the
+    /// delegation. Do not describe it as "the gate" — an earlier test message did, and it was false.
     pub fn is_downgrade(self) -> bool {
         self.downgrade_joint_count().is_some()
     }
@@ -425,8 +431,15 @@ pub struct EqRenderer {
     ///
     /// Written in exactly one place, [`crate::skin_observation::observe_skin_fit`], which is also
     /// the only producer of the [`crate::skin_observation::ObservedSkinFit`] that
-    /// `build_character_model` requires — so the report and the render arm are decided by the same
-    /// call and cannot drift apart.
+    /// `build_character_model` requires. Two things follow, and neither is more than what it says:
+    ///
+    /// - An arm cannot be chosen without an observation having run (omitting it is a compile error).
+    /// - That observation cannot have been written anywhere else, because
+    ///   [`crate::skin_observation::DowngradeSink`] borrows *this* field and, outside `cfg(test)`,
+    ///   has no other constructor. An earlier version of this comment claimed the two "cannot drift
+    ///   apart" while the destination was a caller-supplied `&mut BTreeMap`; a reviewer substituted
+    ///   a throwaway map, the crate compiled clean and stayed green, and this field stayed empty for
+    ///   a 129-joint rig. That route is closed; see the module's "Does not" list for what is not.
     pub skin_cap_downgrades: std::collections::BTreeMap<String, usize>,
     /// Channel to the background model-sync worker: send a race model KEY (e.g. "race_hum") to
     /// fetch its `charmodel/<key>` set on demand the first time a spawn of that race is seen, so
@@ -928,7 +941,7 @@ impl EqRenderer {
                 // gender 1 falls back to the male GLB when there is no `_f` variant and the joint
                 // count belongs to the file (eqoxide#813).
                 let observed = crate::skin_observation::observe_skin_fit(
-                    &mut self.skin_cap_downgrades,
+                    crate::skin_observation::DowngradeSink::of(self),
                     &path,
                     key,
                     asset.skin.as_ref().map(|s| s.joint_count),

@@ -3,8 +3,10 @@
 //!
 //! ## The bug
 //!
-//! `build_character_model` (`renderer.rs`) decides whether a loaded model uses the skinned
-//! (GPU-animated) render arm or the static one. Before #780 that decision was one `bool`:
+//! Whether a loaded model uses the skinned (GPU-animated) render arm or the static one is decided
+//! by `skin_observation::observe_skin_fit`, which classifies the skin; `build_character_model`
+//! applies that decision and builds the GPU model. Before #780 the decision was one `bool`, made
+//! inside `build_character_model` itself:
 //!
 //! ```text
 //! let use_skinned = asset.skin.as_ref().is_some_and(|s| s.joint_count > 0 && s.joint_count <= 128);
@@ -24,10 +26,12 @@
 //! `renderer::SkinFit::classify` names the three-way split explicitly (`NoSkin` / `EmptySkin` /
 //! `ExceedsCap` / `Fits`) so a call site can no longer discard the distinction on the way into a
 //! `bool`. `StaticReason` (the subset that actually reaches the static arm) exposes
-//! `is_downgrade()` — true only for `ExceedsCap` — and `skin_observation::observe_skin_fit` logs at
-//! `error!` and records into `EqRenderer::skin_cap_downgrades` exactly when that's true. (Both of
-//! those lived in `build_character_model` / `ensure_character_model` until eqoxide#780 moved them
-//! into one function a test can call.)
+//! `is_downgrade()`, true only for `ExceedsCap`. `skin_observation::observe_skin_fit` logs at
+//! `error!` and records into `EqRenderer::skin_cap_downgrades` under one `if let` on
+//! `StaticReason::downgrade_joint_count` — the actual gate; `is_downgrade` is a convenience with no
+//! production caller, and the test below that relates the two says only that, having once said
+//! more. (Both channels lived in `build_character_model` / `ensure_character_model` until
+//! eqoxide#780 moved them into one function a test can call.)
 //!
 //! ## What this file does NOT cover
 //!
@@ -36,10 +40,10 @@
 //!   construct (see `shadow_routing.rs`'s header for the established precedent). **The wiring
 //!   between them is no longer in that blind spot**, though, and that is the change eqoxide#797
 //!   asked for: the classify → log → record sequence is now one device-free function,
-//!   `skin_observation::observe_skin_fit`, exercised directly by the `observing_*` tests below.
-//!   What remains uncovered is only the two device-dependent methods' own bodies — and a render arm
-//!   cannot be chosen in either without an `ObservedSkinFit`, which only `observe_skin_fit`
-//!   produces.
+//!   `skin_observation::observe_skin_fit`, exercised directly by that module's own `mod tests`
+//!   (they cannot live here — see the WIRING note further down). What remains uncovered is only the
+//!   two device-dependent methods' own bodies — and a render arm cannot be chosen in either without
+//!   an `ObservedSkinFit`, which only `observe_skin_fit` produces.
 //! - That the `error!` log line is emitted with any particular text — this project's own
 //!   `AGENT-HONESTY` guidance is that a log line is a weak signal anyway (the driving agent does
 //!   not read logs), so this file grades the *structured* observable
@@ -59,7 +63,6 @@ use eqoxide_renderer::renderer::{
     downgrade_key, record_skin_cap_downgrade, resolve_character_model_path, SkinFit, StaticReason,
     JOINT_CAP, MAX_MEASURED_CHARACTER_RIG_JOINTS,
 };
-use eqoxide_renderer::skin_observation::observe_skin_fit;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -206,16 +209,20 @@ fn record_skin_cap_downgrade_only_inserts_for_exceeds_cap() {
     assert_eq!(map.len(), 1);
 }
 
-/// The `error!` channel and the `skin_cap_downgrades` channel must be gated by the SAME predicate.
+/// `StaticReason::is_downgrade` agrees with the predicate that actually gates the report.
 ///
-/// They were not: the log tested `StaticReason::is_downgrade` while `record_skin_cap_downgrade`
-/// re-matched `ExceedsCap` itself. Mutating `is_downgrade` to return `true` for every variant
-/// therefore changed which models got logged without changing which got reported — measured, and
-/// exactly the drift the eqoxide#780 PR claims to have removed. `downgrade_joint_count` is now the
-/// one source; this asserts the equivalence over every `StaticReason` shape rather than trusting
-/// the delegation to stay in place.
+/// Scope, stated because an earlier version of this test overstated it: `is_downgrade` has **no
+/// production caller**. It does not gate the log — `skin_observation::observe_skin_fit` gates on
+/// `downgrade_joint_count()` directly, and `the_log_and_the_report_come_from_one_gate_evaluation`
+/// (a unit test in that module) is what pins the real gate. This test only keeps the public
+/// convenience method from diverging from the method it delegates to, which is worth having because
+/// `is_downgrade` is `pub` and a reader will believe it.
+///
+/// The delegation is not decorative. On an intermediate commit of this branch the log tested
+/// `is_downgrade` while `record_skin_cap_downgrade` re-matched `ExceedsCap` itself, and mutating
+/// `is_downgrade` to `true` changed which models got logged without changing which got reported.
 #[test]
-fn the_log_gate_and_the_report_gate_are_the_same_predicate() {
+fn is_downgrade_agrees_with_the_report_gate() {
     for reason in [
         StaticReason::NoSkin,
         StaticReason::EmptySkin,
@@ -225,112 +232,24 @@ fn the_log_gate_and_the_report_gate_are_the_same_predicate() {
         record_skin_cap_downgrade(&mut map, Path::new("/models/x.glb"), reason);
 
         assert_eq!(map.contains_key("x.glb"), reason.is_downgrade(),
-            "{reason:?}: `is_downgrade` (which gates the log) disagrees with whether a report \
-             entry was written");
+            "{reason:?}: `is_downgrade` disagrees with whether a report entry was written");
         assert_eq!(map.get("x.glb").copied(), reason.downgrade_joint_count(),
             "{reason:?}: the recorded count must be exactly what the shared predicate yields");
     }
 }
 
-// ── The WIRING: classify → log → record, as one reachable function (eqoxide#780 / eqoxide#797) ──
+// ── The WIRING: classify -> log -> record, as one reachable function (eqoxide#780 / eqoxide#797) ──
 //
-// The tests above grade the pure pieces. These grade the sequence the renderer actually executes.
-// eqoxide#797 measured that the previous arrangement — `build_character_model` classifying and
-// logging, `ensure_character_model` recording — was invisible to this suite: wrapping both calls in
-// `if false {}` left `-p eqoxide-renderer` byte-identically green. `observe_skin_fit` is that whole
-// sequence in one device-free function, so the same wrap is now a compile error at the call site
-// (there is no `ObservedSkinFit` to hand `build_character_model`) and a RED test here.
-
-/// eqoxide#780's acceptance bar, applied to the function the renderer really calls rather than to
-/// the classifier alone: a synthetic model with `joint_count = 129` takes the static arm **and** is
-/// reported as a downgrade.
-///
-/// 129 is the issue's own number, written literally rather than as `JOINT_CAP + 1`, so this test
-/// keeps asserting the case the issue names even if the cap moves. `the_cap_is_inclusive` and
-/// `observation_and_arm_agree_over_the_whole_range` cover the boundary relative to `JOINT_CAP`.
-#[test]
-fn observing_a_cap_exceeding_skin_takes_the_static_arm_and_reports_it() {
-    let mut downgrades: BTreeMap<String, usize> = BTreeMap::new();
-    let observed = observe_skin_fit(
-        &mut downgrades, Path::new("/models/race_over.glb"), "race_over", Some(129),
-    );
-
-    assert!(!observed.is_skinned(), "a 129-joint skin must take the STATIC arm");
-    assert_eq!(observed.fit(), SkinFit::ExceedsCap { joint_count: 129 });
-    assert_eq!(downgrades.get("race_over.glb"), Some(&129),
-        "a 129-joint skin must be REPORTED as a downgrade, keyed by the loaded file");
-    assert_eq!(downgrades.len(), 1);
-}
-
-/// The other half of the acceptance bar: the two static arms that are NOT downgrades take the same
-/// arm and produce no report. Before eqoxide#780 all three of these were one `bool` and nothing
-/// distinguished them; the point is that the arm is the same and the report is not.
-#[test]
-fn observing_an_unremarkable_static_model_takes_the_static_arm_and_reports_nothing() {
-    let mut downgrades: BTreeMap<String, usize> = BTreeMap::new();
-
-    let empty = observe_skin_fit(
-        &mut downgrades, Path::new("/models/race_empty.glb"), "race_empty", Some(0),
-    );
-    assert!(!empty.is_skinned());
-    assert_eq!(empty.fit(), SkinFit::EmptySkin);
-    assert!(downgrades.is_empty(),
-        "a zero-joint skin is degenerate data, not a cap downgrade — it must not be reported");
-
-    let none = observe_skin_fit(&mut downgrades, Path::new("/models/boat.glb"), "boat", None);
-    assert!(!none.is_skinned());
-    assert_eq!(none.fit(), SkinFit::NoSkin);
-    assert!(downgrades.is_empty(),
-        "an unskinned model (e.g. boat.glb) must not be reported as a downgrade");
-}
-
-/// A fitting skin takes the skinned arm and is not reported. Stated separately because a report
-/// that fired on every load would also be a falsehood, just a noisier one.
-#[test]
-fn observing_a_fitting_skin_takes_the_skinned_arm_and_reports_nothing() {
-    let mut downgrades: BTreeMap<String, usize> = BTreeMap::new();
-    let observed = observe_skin_fit(
-        &mut downgrades, Path::new("/models/race_pcfroglok.glb"), "race_pcfroglok",
-        Some(MAX_MEASURED_CHARACTER_RIG_JOINTS),
-    );
-
-    assert!(observed.is_skinned(),
-        "the widest rig that ships is under the cap and must render SKINNED");
-    assert_eq!(observed.fit(), SkinFit::Fits { joint_count: MAX_MEASURED_CHARACTER_RIG_JOINTS });
-    assert!(downgrades.is_empty());
-}
-
-/// The universal the two examples above are instances of, and the one that makes the two channels
-/// unable to drift apart: over every joint count from "no skin" through well past the cap, a model
-/// is reported as a downgrade **iff** it has a skin that exceeds the cap, and it takes the skinned
-/// arm **iff** it is not reported and has a non-empty skin.
-///
-/// Both sides are also checked against `old_use_skinned`, the verbatim pre-eqoxide#780 boolean, so
-/// this simultaneously re-pins "eqoxide#780 is not a placement change" across the whole range for
-/// the function the renderer calls — not just for `SkinFit::classify`.
-#[test]
-fn observation_and_arm_agree_over_the_whole_range() {
-    for n in 0..=(JOINT_CAP + 8) {
-        let mut downgrades: BTreeMap<String, usize> = BTreeMap::new();
-        let observed = observe_skin_fit(
-            &mut downgrades, Path::new("/models/x.glb"), "x", Some(n),
-        );
-
-        let reported = downgrades.get("x.glb").copied();
-        assert_eq!(reported, (n > JOINT_CAP).then_some(n),
-            "joint_count {n}: reported-as-downgrade must hold exactly when the cap is exceeded");
-        assert_eq!(observed.is_skinned(), old_use_skinned(Some(n)),
-            "joint_count {n}: the render arm must match the pre-#780 boolean");
-        assert!(!(observed.is_skinned() && reported.is_some()),
-            "joint_count {n}: a model cannot both render skinned and be a cap downgrade");
-    }
-
-    // The `None` (no skin at all) case, which the numeric loop cannot express.
-    let mut downgrades: BTreeMap<String, usize> = BTreeMap::new();
-    let observed = observe_skin_fit(&mut downgrades, Path::new("/models/x.glb"), "x", None);
-    assert!(downgrades.is_empty());
-    assert_eq!(observed.is_skinned(), old_use_skinned(None));
-}
+// Those tests are NOT here. They are unit tests in `src/skin_observation.rs`, because the sink that
+// names the report's destination has no constructor outside `cfg(test)` — an integration test is a
+// separate crate and links the library built without it. Moving them was the point: giving this
+// file a way to build a sink would have handed the same escape hatch to the renderer.
+//
+// What lives there: `observing_a_cap_exceeding_skin_takes_the_static_arm_and_reports_it`,
+// `observing_an_unremarkable_static_model_takes_the_static_arm_and_reports_nothing`,
+// `observing_a_fitting_skin_takes_the_skinned_arm_and_reports_nothing`,
+// `the_log_and_the_report_come_from_one_gate_evaluation`, and
+// `observation_and_arm_agree_over_the_whole_range`.
 
 /// The documented limit of the file-name key: two files with the same base name under two different
 /// asset roots collapse into ONE entry.
