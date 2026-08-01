@@ -22,15 +22,19 @@
 //!
 //! ## What this test adds on top, and why it is not a source-text pin
 //!
-//! The checks below read the **parsed and validated naga IR**, not the shader source text. `array_
-//! length_of_uniform_palettes` resolves each shader's uniform-address-space struct members through
-//! naga's type arena and reads the array size out of the IR — the same representation the backend
-//! lowers to SPIR-V/MSL/HLSL. That is immune to the whole `include_str!`-plus-`contains` evasion
-//! family this repo has measured six times over (trailing comment, shadowing, `if false {}`,
-//! `#[cfg(any())]`, macro-elided argument, satisfying the guard from an unrelated comment): you
-//! cannot comment or `cfg` your way to a different validated array size. The only source-text scan
-//! here is `no_shader_writes_a_numeric_palette_length`, which is a belt-and-braces sweep across
-//! shaders the IR checks do not know about; its scope is stated at the test.
+//! The checks below read the **parsed and validated naga IR**, not the shader source text.
+//! `uniform_struct_array_lengths` resolves each shader's uniform-address-space struct members
+//! through naga's type arena and reads the array size out of the IR — the same representation the
+//! backend lowers to SPIR-V/MSL/HLSL. That is immune to the whole `include_str!`-plus-`contains`
+//! evasion family this repo has measured six times over (trailing comment, shadowing, `if false
+//! {}`, `#[cfg(any())]`, macro-elided argument, satisfying the guard from an unrelated comment):
+//! you cannot comment or `cfg` your way to a different validated array size — for a shader this
+//! test already knows to look at. Two other checks here ARE source-text scans, not IR reads:
+//! `no_shader_writes_a_numeric_palette_length`, a belt-and-braces sweep across shaders the IR
+//! checks do not know about (scope stated at that test); and
+//! `joint_palette_shaders_are_exactly_the_expected_three`'s struct-name match, which decides which
+//! shaders the IR check above even looks at in the first place (scope, and its measured gap,
+//! stated at that test).
 //!
 //! ## Reach control (the eqoxide#778 lesson)
 //!
@@ -41,19 +45,34 @@
 //! - `discovered_corpus_is_not_silently_truncated` asserts the walk found a plausible corpus AND
 //!   that every file named by the IR checks is inside it — so "the scanner couldn't see that file"
 //!   fails loudly instead of passing quietly.
-//! - The set of shaders declaring a joint palette is asserted to be **exactly** the expected three.
-//!   A fourth one appearing unguarded, or one of the three losing its palette, goes red.
+//! - `joint_palette_shaders_are_exactly_the_expected_three` asserts the set of shaders whose
+//!   source contains the struct name `JointMatrices` equals the expected three. That is a **name
+//!   match on source text, not a structural check** for "declares a fixed-length uniform
+//!   `mat4x4` palette." A new shader that declares exactly such a palette under any other struct
+//!   name — including through a type alias, which also defeats the numeric sweep above — is
+//!   invisible to it: measured by planting a fourth shader (`alias JMat = mat4x4<f32>; struct
+//!   DecoyPalette { mats: array<JMat, 99> }; @group(0) @binding(0) var<uniform> decoy:
+//!   DecoyPalette;`) into the corpus and observing the suite stay 9 passed / 0 failed. Making
+//!   this structural — reading the IR instead of matching a name — is tracked as a separate
+//!   follow-up, not done here.
 //!
-//! Every claim above about what goes red was demonstrated by planting a mismatch in each covered
-//! file and running this test — see the PR body's per-file mutation table.
+//! The `JOINT_CAP`-value claims above — the three shaders and the five collapsed Rust sites —
+//! were each demonstrated by planting a mismatch in the corresponding file and running this test;
+//! see the PR body's per-file mutation table. The two reach-control bullets above this paragraph
+//! were **not** exercised by that table: no mutation there truncates the corpus walk or renames a
+//! struct, so those bullets' own "goes red" claims rest on reading the assertion, not on a
+//! planted-and-observed failure — except for the fourth-shader gap just measured above, which
+//! goes the other way (it stays green when the doc used to claim red).
 
 use eqoxide_renderer::pipeline::{wgsl, JOINT_CAP_TOKEN};
 use eqoxide_renderer::renderer::{pad_joint_palette, JointPalette, JOINT_BUF_BYTES, JOINT_CAP};
 use std::collections::BTreeMap;
 
-/// The shaders that declare a `JointMatrices`-style uniform palette. Asserted to be EXACTLY this
-/// set (not merely a subset) by `joint_palette_shaders_are_exactly_the_expected_three`, so this
-/// list cannot quietly fall behind the corpus in either direction.
+/// The shaders whose source is expected to contain the struct name `JointMatrices`. Asserted to
+/// be EXACTLY the corpus's `JointMatrices`-matching set (not merely a subset) by
+/// `joint_palette_shaders_are_exactly_the_expected_three` — a source-text name match, not a
+/// structural one. A shader that adds a fixed-length uniform `mat4x4` palette under a different
+/// struct name falls behind this list unnoticed; see that test's docstring for the measured gap.
 const EXPECTED_JOINT_SHADERS: [&str; 3] =
     ["character_skinned.wgsl", "shadow.wgsl", "skin_probe.wgsl"];
 
@@ -144,10 +163,19 @@ fn discovered_corpus_is_not_silently_truncated() {
     }
 }
 
-/// The set of shaders carrying a joint palette is EXACTLY `EXPECTED_JOINT_SHADERS`.
+/// The set of shaders whose source contains the struct name `JointMatrices` is EXACTLY
+/// `EXPECTED_JOINT_SHADERS`.
 ///
-/// Both directions matter. A fourth shader growing a palette would otherwise be enforced by nothing;
-/// one of the three losing its palette would make the IR check below vacuously pass on it.
+/// This is a **name match on source text**, not a structural check for "declares a fixed-length
+/// uniform `mat4x4` palette." If one of the three known shaders' source stops containing
+/// `JointMatrices` (loses the palette, or renames the struct), the detected set no longer equals
+/// `EXPECTED_JOINT_SHADERS` and this assertion fails — but that specific mutation was not planted
+/// in this PR, so treat it as read from the code, not measured. What WAS measured: a *new*
+/// shader that declares such a palette under a different struct name — including via a type
+/// alias, which also defeats `no_shader_writes_a_numeric_palette_length`'s text sweep — is
+/// invisible to this check. Planting exactly that fourth shader left the suite at 9 passed / 0
+/// failed. Making detection structural (read the IR instead of matching a name) is tracked as a
+/// separate follow-up.
 #[test]
 fn joint_palette_shaders_are_exactly_the_expected_three() {
     let corpus = shader_corpus();
