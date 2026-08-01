@@ -1176,8 +1176,10 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         player.insert("run_mode".into(),               serde_json::json!(player_run_mode));
         // #776/#801 — AFLOAT STALL. The character is in water, a driver is asking it to swim
         // horizontally, and it has not moved. Before this the state had NO observable at all: a
-        // floating body never enters the depenetration net, so a swimmer sealed in a pocket read
-        // `on_ground: false`, `in_water: true`, `hold: null` — every field said "swimming normally"
+        // floating body never enters the depenetration net, so a swimmer sealed in a pocket was
+        // indistinguishable, in THIS response, from one crossing a lake: barely-moving `pos` and
+        // nothing else. (`in_water`/`on_ground` are controller state and are not keys here, so they
+        // could not be consulted either.) Every field an agent could GET said "swimming normally"
         // for ever, which is the silent-wrong-answer class this project ranks above crashes.
         //
         // ALWAYS PRESENT, `null` when there is no stall (`serde_json::json!(None::<T>)` renders an
@@ -2986,9 +2988,16 @@ mod tests {
     ///   1 failed**, at the `contains_key` assertion. The failure message printed the 55 keys that
     ///   remain, which is exactly the key set the round-1 reviewer observed live;
     /// * wrap that same insert in `if player_afloat_stall.is_some()`, i.e. omit the key instead of
-    ///   serving `null` → **262 passed, 1 failed**, at the null assertion. This is the mutation
+    ///   serving `null` → **262 passed, 1 failed**, at the SAME `contains_key` assertion, not at the
+    ///   null one. (This line first said "at the null assertion", which is where it would fail if
+    ///   `contains_key` were not checked first; the transcript says `contains_key`. Corrected from
+    ///   the observed panic location rather than re-reasoned — #810 round-2 review, N2, in a repo
+    ///   where reasoned-not-transcribed is the dominant defect class.) This is still the mutation
     ///   worth having: it leaves the stall case fully working and breaks only the
     ///   always-present contract, which is the half a hand-written happy-path test would miss.
+    ///
+    /// The `hold` assertion at the tail is NOT part of either mutation's coverage; see the comment
+    /// on it for why it was rewritten.
     ///
     /// NOT a useful mutation here, contrary to the obvious guess: adding `skip_serializing_if` to
     /// `PlayerState::afloat_stall` changes nothing this test can see, because `get_debug` never
@@ -3037,11 +3046,28 @@ mod tests {
              has no reason to try a vertical wish: {}", a["detail"]);
 
         // ── And it is NOT published as a `hold`. Two different claims (#801). ────────────────────
-        assert!(v["player"]["hold"].is_null(),
-            "an afloat stall must NOT also raise `hold`. A hold means the body cannot move at all \
-             and the agent should stop trying; a stall is escapable by a driven dive. Collapsing \
-             them would tell an agent to give up on a body it could free itself. Got {}",
-            v["player"]["hold"]);
+        //
+        // This was written as `assert!(v["player"]["hold"].is_null())` and #810's round-2 review
+        // measured it VACUOUS: `hold` is not a key in this body at all (#817), and `serde_json`
+        // returns `Value::Null` for a key that is absent, so the assertion could not fail and could
+        // not catch the mutation it named — and had it ever fired, its message would have printed
+        // `Got null` about a key that was missing. A test that names a thing it cannot detect reads
+        // live and never fires, which is the observable-with-no-writer shape this whole issue is
+        // about, turned on the test suite.
+        //
+        // Replaced with a check that CAN fail, and that fails on the event that makes the original
+        // claim testable: `hold` becoming a served key. Today that is absence. When #817 lands this
+        // goes red on purpose — read the message, then assert the real disjointness here.
+        let player = v["player"].as_object().expect("player object");
+        assert!(!player.contains_key("hold"),
+            "`hold` is now served in the debug body. That is #817 landing, not a bug in it — but \
+             this test deliberately trips on it, because the claim it exists to pin only becomes \
+             checkable now. Replace this assertion with the real one: with a stall in force and no \
+             hold in force, `player.hold` must be null. A hold says the body cannot move at all and \
+             the agent should stop trying; a stall says only that THIS wish is producing no motion \
+             and is escapable by a driven dive. Collapsing them tells an agent to give up on a body \
+             it could free itself. Keys now served: {:?}",
+            player.keys().collect::<Vec<_>>());
     }
 
     /// #598 finding 1, at the API BOUNDARY — the honesty contract must hold in the SERIALIZED body,

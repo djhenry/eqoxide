@@ -631,9 +631,11 @@ pub struct PlayerHoldView {
 /// indefinitely and still escapes under a **driven dive**. Reporting that body as "frozen" would be
 /// a new false claim, so it gets its own key rather than a third `hold.reason`.
 ///
-/// Before #801 this state had no observable at all: a trapped swimmer reads `on_ground = false`,
-/// `in_water = true`, `hold = null`, and the walker's own `stuck_ticks` only advances while a
-/// `/goto` is driving. Every field said "swimming normally". The signal existed inside the
+/// Before #801 this state had no observable at all. The controller knew — internally its
+/// `in_water` is true and its `on_ground` false — but **neither is a key in any served body**, so
+/// an agent could not read either; the nearest served stall counter is `nav_local.stuck_ticks`,
+/// which is a top-level sibling of `player` rather than a field on it and advances only while a
+/// `/goto` is driving. Every field an agent could actually GET said "swimming normally". The signal existed inside the
 /// controller from #800 and reached a log line, which serves an operator reading logs and not an
 /// agent polling this API.
 ///
@@ -661,13 +663,18 @@ pub struct PlayerHoldView {
 ///
 /// # Freshness
 ///
-/// Exactly that of `pos_east/north/up` and [`PlayerState::hold`] beside it: the render controller
+/// Exactly that of the [`PlayerState`] position fields beside it — served as the single `pos`
+/// array, `[east, north, up]`, NOT as `pos_east`/`pos_north`/`pos_up` keys — and of
+/// [`PlayerState::hold`]: the render controller
 /// recomputes it on every stepped frame, `app.rs` republishes it on every rendered frame in the same
 /// statement that republishes the hold, and `ActionLoop::stream_position` mirrors it on the same
 /// tick as the position. On rendered frames that do not step (mid zone-load) an explicit clear runs;
 /// on a zone-in the mirrored copy is cleared too. A stalled body cannot be *freed* without a stepped
-/// frame, so an idle render loop cannot manufacture a stall — what it can do is freeze `secs`, which
-/// is detectable the same way `held_secs` is (poll twice, compare the delta against your own clock).
+/// frame, so an idle render loop cannot manufacture a stall — what it can do is freeze `secs`.
+/// Detect that by polling `afloat_stall.secs` twice and comparing the delta against your own wall
+/// clock. This used to read "detectable the same way `held_secs` is"; that was a procedure the agent
+/// cannot run, because [`PlayerState::hold`] is not serialised by any handler today (#817), so
+/// `held_secs` is not a pollable field. Out of scope to fix here, in scope not to point at.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlayerAfloatStallView {
     /// Seconds the body has been afloat, wished at, and stuck within `progress_threshold` of the
@@ -676,8 +683,10 @@ pub struct PlayerAfloatStallView {
     /// and always `>= stall_threshold_secs`.
     pub secs: f32,
     /// The position the window opened at — the point the body has failed to get more than
-    /// `progress_threshold` away from, in any direction. Same frame and datum as
-    /// `player.pos_east/north/up` (FOOT height), so it can be differenced against them directly.
+    /// `progress_threshold` away from, in any direction. Same frame and FOOT datum as the served
+    /// `player.pos` array (`[east, north, up]`), so it can be differenced against it directly.
+    /// Named for the struct fields it is built from, NOT for response keys: there are no
+    /// `pos_east`/`pos_north`/`pos_up` keys in any body this API serves (#810 round-2 review, B1).
     pub anchor_east:  f32,
     pub anchor_north: f32,
     pub anchor_up:    f32,

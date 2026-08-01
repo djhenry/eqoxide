@@ -400,16 +400,21 @@ ordinary character, **including every ordinary swimmer**, and non-null only whil
 *afloat*, *being wished at horizontally*, and *not getting anywhere*.
 
 It exists because a genuinely trapped swimmer had **no observable at all**. A body afloat in water
-never enters the client's depenetration net, so a swimmer sealed in a pocket or pressing at a
-passage it cannot pass reads `on_ground: false`, `in_water: true`, `hold: null`, and a walker
-`stuck_ticks` that only advances while a `/goto` is driving. Every field said "swimming normally",
-which is the silent-wrong-answer class this project ranks above crashes.
+never enters the client's depenetration net, so nothing the API served distinguished it from a
+swimmer making perfect progress: `pos` barely moved, `nav_state` read whatever the driver had last
+set, and the one nearby stall counter — `nav_local.stuck_ticks`, a top-level sibling of `player`,
+not a key inside it — advances only while a `/goto` is driving, so a manually-driven or
+directly-wished swimmer never touched it. Every served field said "swimming normally", which is the
+silent-wrong-answer class this project ranks above crashes. (The controller's own internal state did
+know — `in_water` true, `on_ground` false — but neither of those is a key in any response body, then
+or now, so an agent could not read them. Naming them as if an agent could is the mistake #810's
+round-2 review caught one paragraph further down.)
 
 ```jsonc
 "afloat_stall": {
   "secs":                 4.8,        // controller frame time, this unbroken stall
   "anchor_east":         -161.2,      // the point it has failed to get away from…
-  "anchor_north":         842.7,      // …same frame and datum as pos_east/north/up
+  "anchor_north":         842.7,      // …same frame and datum as this object's own `pos`
   "anchor_up":            -18.0,
   "stall_threshold_secs": 3.0,        // engineering choices, NOT measurements
   "progress_threshold":   0.5,
@@ -426,8 +431,8 @@ came, try a different heading — and only then treat it as a genuine trap.
 
 | Field | What it is |
 |---|---|
-| `secs` | How long the stall has been continuously in force, in **controller frame time** as of the last stepped frame — the same clock and the same caveat as `hold.held_secs`. It counts the whole window including the part before the threshold, so it is the true age of the stall and is always at least `stall_threshold_secs`. |
-| `anchor_*` | The position the window opened at: the point the body has failed to get more than `progress_threshold` away from, in any direction. Same coordinate frame and FOOT datum as `pos_east`/`pos_north`/`pos_up`, so you can difference them directly. |
+| `secs` | How long the stall has been continuously in force, in **controller frame time** as of the last stepped frame — the same clock and the same caveat as `hold.held_secs` (that field is documented above but is **not currently served by any handler** — #817 — so treat the comparison as describing the clock, not as pointing you at something to read). It counts the whole window including the part before the threshold, so it is the true age of the stall and is always at least `stall_threshold_secs`. |
+| `anchor_*` | The position the window opened at: the point the body has failed to get more than `progress_threshold` away from, in any direction. Same coordinate frame and FOOT datum as **`player.pos`** in this same response, which is the array `[east, north, up]` — so `anchor_east - pos[0]`, `anchor_north - pos[1]`, `anchor_up - pos[2]` are the drift on each axis, differenceable directly. (Position is served as that one array; there are no `pos_east`/`pos_north`/`pos_up` keys — those are internal field names, not part of this contract.) |
 | `stall_threshold_secs`, `progress_threshold` | The two thresholds this report was produced against, published so you do not have to guess them. |
 
 **`null` does NOT mean "not stuck".** The predicate is deliberately narrow, because a false alarm in
@@ -470,8 +475,12 @@ frames that render without stepping clear it explicitly, and a zone-in clears th
 a stall can never survive into a zone the character has left, which matters more here than for
 `hold` because a stall names an *anchor position* in the departed zone's coordinates. If the render
 loop goes idle it stops recomputing, but a stalled body cannot be *freed* without a stepped frame
-either, so idling cannot manufacture a stall; what it freezes is `secs`, detectable exactly the way
-`held_secs` is (poll twice, compare the delta against your own clock).
+either, so idling cannot manufacture a stall; what it freezes is `secs`. Detect that directly: poll
+`afloat_stall.secs` twice and compare the delta against your own wall clock — a `secs` that advances
+by much less than the elapsed time is a render loop that has gone idle, not a stall that is being
+re-earned. (This paragraph used to say "detectable exactly the way `held_secs` is". It is not:
+`hold` is not served by any handler today — #817 — so `held_secs` is not a field you can poll, and
+that phrasing handed you a procedure that does not run.)
 
 ### `zone_assets` — is the world this response describes actually loaded? (#579)
 
