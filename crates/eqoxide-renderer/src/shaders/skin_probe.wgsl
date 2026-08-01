@@ -3,12 +3,14 @@
 // an output buffer. Used by render_model to read back the GPU's actual skinning result
 // and compare it against the CPU (skin_point) — to isolate GPU-vs-CPU divergence.
 
-// `JOINT_CAP` is NOT a WGSL constant: `pipeline::wgsl()` substitutes the Rust
-// `renderer::JOINT_CAP` into this text before `create_shader_module` sees it, so the palette
-// length exists as a number in exactly one place in the tree (eqoxide#798). Do not write a
+// The palette length below is a PLACEHOLDER, not a WGSL constant: `pipeline::wgsl()` substitutes
+// the Rust `renderer::JOINT_CAP` into this text before `create_shader_module` sees it, so the
+// palette length exists as a number in exactly one place in the tree (eqoxide#798). Do not write a
 // numeric length here — an un-substituted source is not valid WGSL and naga rejects it, which
 // is the point: forgetting the substitution is a hard failure, never a silent wrong cap.
-struct JointMatrices { mats: array<mat4x4<f32>, JOINT_CAP> };
+// The placeholder is delimited so it can never be a substring of an identifier, and so that
+// substitution rewrites no comment on this page (eqoxide#812).
+struct JointMatrices { mats: array<mat4x4<f32>, ${JOINT_CAP}> };
 @group(0) @binding(0) var<uniform> joints: JointMatrices;
 
 struct Vtx {

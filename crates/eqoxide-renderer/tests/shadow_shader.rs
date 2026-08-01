@@ -46,9 +46,10 @@ const EXPECTED_AMBIENT_FLOOR: f32 = 0.25;
 const EXPECTED_ALPHA_CUTOUT: f32 = 0.5;
 
 fn parse_and_validate(source: &str, label: &str) -> naga::Module {
-    // The `.wgsl` files are not standalone WGSL: they carry the `JOINT_CAP` placeholder that
-    // `pipeline::wgsl` substitutes on the way into `create_shader_module` (eqoxide#798). Parse the
-    // SAME text the GPU is handed, not the raw file, or a joint-palette shader won't even parse.
+    // The `.wgsl` files are not standalone WGSL: they carry the `pipeline::JOINT_CAP_TOKEN`
+    // placeholder that `pipeline::wgsl` substitutes on the way into `create_shader_module`
+    // (eqoxide#798). Parse the SAME text the GPU is handed, not the raw file, or a joint-palette
+    // shader won't even parse.
     let source = eqoxide_renderer::pipeline::wgsl(source);
     let module = naga::front::wgsl::parse_str(&source)
         .unwrap_or_else(|e| panic!("{label}: WGSL failed to parse: {e}"));
