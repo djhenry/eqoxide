@@ -217,9 +217,11 @@ impl StaticReason {
     ///
     /// It returns the count rather than a `bool` so the two channels cannot be gated by two
     /// separately-mutable expressions. They were, before: the log tested [`is_downgrade`] while the
-    /// report re-matched `ExceedsCap` itself, and a mutation that made `is_downgrade` return `true`
-    /// for every variant changed the log without changing the report — measured, and the reason this
-    /// method exists (see the eqoxide#780 PR's mutation M5).
+    /// report re-matched `ExceedsCap` itself, so a mutation that made `is_downgrade` return `true`
+    /// for every variant changed which models got logged without changing which got reported. That
+    /// was measured on the intermediate commit that had both gates, and is the reason this method
+    /// exists; the same mutation against this shape is row M5 of the eqoxide#780 PR's mutation
+    /// table.
     ///
     /// [`is_downgrade`]: StaticReason::is_downgrade
     pub fn downgrade_joint_count(self) -> Option<usize> {
