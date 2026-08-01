@@ -625,7 +625,37 @@ fn dist2_to(p: [f32; 3], c: [f32; 3]) -> f32 {
     (p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2)
 }
 
-/// Deterministic LCG — a fixed corpus, so a failure is reproducible from the seed alone.
+/// SplitMix64 finalizer (Steele, Lea & Flood), used only to scramble a per-scene LCG seed before
+/// it is used — **not** as the corpus's own generator.
+///
+/// **Measured (eqoxide#751, second pass) — why this exists.** `Rng(0x5EED_740 ^ scene as u64)`
+/// (the original per-scene reseed) fixed the cross-scene coupling but introduced a narrower,
+/// measured defect: an LCG's *n*-th output is affine in its seed, so running the same small number
+/// of steps from 400 seeds that differ only in their low bits (`scene` is 0..400, XORed into a
+/// constant) does not sample the state space — it walks an arithmetic-ish progression through it.
+/// At the LCG-step offset that produces each scene's first candidate's model-kind selector
+/// (`rng.range(10)` — one `n` draw plus three `coord` draws in), this file's own values were
+/// `Absent=39 Static=1 Skinned=360` against a ~40/80/280 expectation, chi²(9 df) = **399.90** — not
+/// an XOR artefact (`scene` bare or `scene.wrapping_add(…)` reproduce it) but a property of taking
+/// an affine function of a near-arithmetic sequence of seeds. Confirmed independently outside the
+/// crate (a standalone replica of this exact `next`/`range` arithmetic, not a guess): folding the
+/// seed through `splitmix64` before construction drops the worst offset found by scanning the first
+/// 25 draws from chi² 399.90 to **~20.9** (still not perfectly uniform — 400 samples over 10 bins is
+/// a coarse test — but two orders of magnitude closer, and every coverage floor in this file
+/// (§`extracted_planner_matches_the_pre_740_loops_over_a_random_corpus`) stays clear under it; see
+/// that test's doc comment for the re-measured corpus figures). `splitmix64` is applied once, to the
+/// seed only — the LCG below is unchanged and is still what actually drives the corpus.
+fn splitmix64(x: u64) -> u64 {
+    let x = x.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Deterministic LCG — a fixed corpus, so a failure is reproducible from the seed alone. Seeds fed
+/// to this generator should go through `splitmix64` first (see its doc comment) — the LCG's own
+/// step function does not decorrelate a near-arithmetic sequence of seeds on its own.
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -646,14 +676,33 @@ impl Rng {
 /// this file's later doc comments on `saw_ties` / round 2 of #747 — and is recorded in the repo memory
 /// note `eq-fixture-edits-are-not-local`.
 ///
-/// Pulling scene construction out to a free function that takes only `scene` makes the coupling
-/// structurally impossible rather than merely absent by inspection: there is no variable anywhere in
-/// this file that holds an `Rng` (or anything derived from one) across a call boundary, so there is
-/// nothing through which one call's draws COULD reach another call.
-/// `scene_fixtures_are_independent_of_call_order_and_neighboring_scenes` below exercises that claim
-/// rather than asserting it by construction alone.
+/// Pulling scene construction out to a free function that takes only `scene` guarantees one
+/// specific thing, precisely: there is no variable anywhere in this file that holds an `Rng` (or
+/// anything derived from one) across a call boundary, so no call's draws can depend on **when** it
+/// was made or **which other calls** happened around it.
+/// `scene_fixtures_are_independent_of_call_order_and_neighboring_scenes` below exercises exactly
+/// that — call-order and neighboring-call independence — and only that.
+///
+/// **Retracted (eqoxide#751, second pass): this file previously called that coupling "structurally
+/// impossible".** It is not — the property test above pins order-independence, not
+/// edit-locality, and those are different claims. An independent reviewer's **MUT-6** makes the
+/// difference concrete: mutate `build_scene` so that scene `k`'s seed is folded together with a
+/// fresh, independent call to `build_scene(k - 1)` (no `Rng`, or anything derived from one, is
+/// threaded across a call boundary — `build_scene(k - 1)` is recomputed from scratch, not read from
+/// stored state). `build_scene(k)` is still a pure function of `k` alone under MUT-6, so it still
+/// gives the same answer regardless of call order or what else was built around it — the property
+/// test above cannot see the difference and stays green. But editing scene `k − 1`'s generation
+/// logic now silently changes scene `k`'s fixture, which is exactly the failure mode this fix set
+/// out to make impossible. Measured on the real build: MUT-6 leaves all 19 tests in this file green
+/// (**SURVIVED**). A source-text scan
+/// (`build_scenes_dependency_is_its_own_index_and_nothing_else`, below) closes this specific shape —
+/// it greps this function's own body for a nested call to `build_scene` and fails if one is
+/// present — but it is a syntactic pin with the same caveat as this file's other source-text asserts
+/// (see "What this file does NOT cover" at the top): it cannot see a mutation that reaches the same
+/// coupling through an intermediate helper rather than a direct recursive call. No test in this file
+/// rules that out; disclosed here rather than re-asserted as impossible.
 fn build_scene(scene: usize) -> (Vec<Cand>, Option<Cand>, [f32; 3], [f32; 3]) {
-    let mut rng = Rng(0x5EED_740 ^ scene as u64);
+    let mut rng = Rng(splitmix64(0x5EED_740 ^ scene as u64));
 
     // Every 5th scene is DENSE: a crowded zone where every candidate is comfortably inside the
     // cull, so the slot bound is actually reached. Left to chance, a uniformly-scattered corpus
@@ -774,25 +823,32 @@ fn build_scene(scene: usize) -> (Vec<Cand>, Option<Cand>, [f32; 3], [f32; 3]) {
 /// in this table are still the right definitions after #751; only the corpus (and so the counts)
 /// changed — see below.
 ///
-/// **Fixed (eqoxide#751): each scene now draws from its own `Rng(0x5EED_740 ^ scene as u64)`**,
-/// built by `build_scene(scene)` and never threaded across scenes (see that function's doc comment).
-/// Editing what an earlier scene generates can no longer move what a later scene generates — the
-/// exact failure mode that silently dropped mutant M14 (`sort_by` → `sort_unstable_by`) from killed
-/// to surviving while fixing #747's B1. Re-measured post-#751 (`eprintln!` added temporarily to read
-/// the counters, then removed — not left as test output): truncation 80, cull 315, clip guard 387,
-/// ties (selected-equidistant) 366, and the matrix cells 93/56/100/151 (player, in
-/// None/Absent/Static/Skinned order) and 337/367/389 (nearby, in Absent/Static/Skinned order). All
-/// comfortably clear the floors below. The `saw_ties` floor of 150 was NOT retuned to this new value
-/// — see that assert's own message for why the floor is a smoke alarm, not a target, and is
-/// deliberately left far under whatever the corpus happens to produce.
+/// **Fixed (eqoxide#751): each scene now draws from its own `Rng(splitmix64(0x5EED_740 ^ scene as
+/// u64))`**, built by `build_scene(scene)` and never threaded across scenes (see that function's
+/// doc comment). Editing what an earlier scene generates can no longer move what a later scene
+/// generates — the exact failure mode that silently dropped mutant M14 (`sort_by` →
+/// `sort_unstable_by`) from killed to surviving while fixing #747's B1.
+///
+/// **Re-measured a second time (eqoxide#751 round 2), because the seed formula changed again.** An
+/// independent review found the first `0x5EED_740 ^ scene as u64` seed, though no longer shared
+/// across scenes, was measurably non-uniform *within* a scene: an LCG's output is affine in its
+/// seed, and 400 seeds differing only in their low bits do not decorrelate in a handful of steps —
+/// see `splitmix64`'s doc comment above for the chi² figures. Every number below was re-measured
+/// against the `splitmix64`-scrambled seed (`eprintln!` added temporarily, then removed — not left
+/// as test output): truncation 80, cull 317, clip guard 390, ties (selected-equidistant) 363, and
+/// the matrix cells 103/42/100/155 (player, in None/Absent/Static/Skinned order) and 343/362/392
+/// (nearby, in Absent/Static/Skinned order). All comfortably clear the floors below — the floors
+/// were not retuned to these new values, for the same reason given at `saw_ties`'s own assert.
 ///
 /// The reason a per-scene stream matters at all: a pseudo-random corpus only covers what it happens
 /// to generate, and — before this fix — an unrelated edit to the generator could silently move the
 /// whole stream. Not hypothetical: it happened while fixing #747's B1 (adding the absent-player arm
 /// shifted the stream and the incidental tie that was killing that mutant vanished). Per-scene
-/// seeding does not make the corpus exhaustive — it is still sampled — it makes a *specific* class of
-/// silent regression (an edit to scene `k`'s fixture moving scene `k′≠k`'s draws) structurally
-/// impossible instead of merely usually-not-happening.
+/// seeding does not make the corpus exhaustive — it is still sampled. **What it actually rules out**
+/// is one specific coupling: an edit to scene `k`'s fixture moving scene `k′ ≠ k`'s draws *by being
+/// called before or after it*. It does not rule out a fixture generator that deliberately derives
+/// scene `k`'s inputs from scene `k − 1`'s recomputed output — see `build_scene`'s doc comment for
+/// that distinction and the mutant (MUT-6) that draws it.
 #[test]
 fn extracted_planner_matches_the_pre_740_loops_over_a_random_corpus() {
     let mut saw_truncation = 0usize;
@@ -1017,6 +1073,72 @@ fn scene_fixtures_are_independent_of_call_order_and_neighboring_scenes() {
             "scene {}'s fixture changed when the probes were built in a different overall order", s,
         );
     }
+}
+
+// ── 5c. Source-text pin against a hidden edit-locality coupling (eqoxide#751 round 2, MUT-6) ─────
+
+const THIS_FILE: &str = include_str!("shadow_caster_selection.rs");
+
+/// **Why this exists, and why it is not stronger.** An independent reviewer's `MUT-6` mutates
+/// `build_scene(scene)` so that, when `scene > 0`, it folds in a value taken from a **freshly
+/// recomputed** call to `build_scene(scene - 1)` (recomputed from scratch — no `Rng`, or anything
+/// derived from one, is threaded across a call boundary; see `build_scene`'s doc comment). Under
+/// that mutation `build_scene(k)` is still a pure function of `k` alone, so
+/// `scene_fixtures_are_independent_of_call_order_and_neighboring_scenes` — which pins call-order and
+/// neighboring-call independence — cannot see any difference and stays green, and so does every
+/// coverage floor in the differential test. Measured on the real build: **19/19 green, SURVIVED**.
+///
+/// What actually changes under MUT-6 is not runtime behavior for the *current* source — it is what
+/// happens when scene `k − 1`'s generation logic is later edited: scene `k`'s fixture moves too, the
+/// exact silent-coupling failure mode eqoxide#751 exists to close, just introduced by construction
+/// this time instead of by a shared stream. No blackbox input/output test can distinguish "a pure
+/// function of `scene`" from "a pure function of `scene` that happens to be defined by recomputing
+/// its predecessor", because both give identical answers for any fixed version of the source. The
+/// only test genuinely proving that a coupling is closed here is a mutation test on that exact
+/// source, which is a project-process check, not something this file can assert every time it runs.
+///
+/// This test is the file's disclosed, partial answer: a **source-text** scan (same technique and
+/// caveat as `encode_shadow_pass_calls_the_planner_this_file_grades` below) over `build_scene`'s own
+/// body, failing if it contains a nested call back into `build_scene`. It kills MUT-6 exactly as
+/// described above — confirmed by applying that literal mutation and observing this test go red
+/// while the rest of the file stays green. It would **not** catch the same coupling reached through
+/// an intermediate helper function (e.g. `fn prior_signal(scene: usize) -> u64 { let (c, ..) =
+/// build_scene(scene - 1); c.len() as u64 }` called from inside `build_scene`), or through anything
+/// that recomputes an earlier scene's data without the literal token `build_scene(` appearing inside
+/// this function's body. That gap is real and is not claimed to be closed anywhere in this file.
+#[test]
+fn build_scenes_dependency_is_its_own_index_and_nothing_else() {
+    // Isolate exactly `build_scene`'s own `{ … }` by brace-depth counting from its signature's
+    // opening brace to the matching close — NOT by splitting on the next `\nfn `, which swallows
+    // every doc comment between this function and the next one (several of which quote
+    // `build_scene(scene)` in prose) and made this test fail on the unmutated file the first time
+    // it was written.
+    let after_sig = THIS_FILE
+        .split_once("fn build_scene(scene: usize)")
+        .expect("build_scene not found in this file")
+        .1;
+    let open = after_sig.find('{').expect("build_scene has no opening brace");
+    let bytes = after_sig.as_bytes();
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 { close = Some(i); break; }
+            }
+            _ => {}
+        }
+    }
+    let close = close.expect("build_scene's closing brace not found");
+    let body = &after_sig[open + 1..close];
+    assert!(
+        !body.contains("build_scene("),
+        "build_scene now calls itself (directly) — scene k's fixture can depend on another scene's \
+         recomputed fixture, the coupling MUT-6 draws out (see this test's doc comment); no other \
+         test in this file would catch that",
+    );
 }
 
 // ── 6. Call-site pin (source text, not semantics) ───────────────────────────────────────────────
