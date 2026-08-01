@@ -120,8 +120,31 @@ impl ZoneAssetState {
     }
 
     /// The collision grid — `Some` only in `Ready`.
+    ///
+    /// **Matched EXHAUSTIVELY, with no `_` wildcard, on purpose (#826).** This function and
+    /// [`usability`] must react to a NEW state variant the same way, because
+    /// [`usable_collision`] pairs them: `usability` decides whether to bless the state and then
+    /// this decides what grid to hand over. A wildcard here breaks that pairing silently — the
+    /// author of a sixth variant that carries a usable grid would be forced by the compiler to
+    /// classify it in `usability` (which has no wildcard), while this function kept answering
+    /// `None`, and `usable_collision`'s documented-unreachable `ok_or(NotUsable::Idle)` fallback
+    /// would start firing. That converts a usable grid into a REFUSAL with no diagnostic — the
+    /// exact confusion between an answer and a refusal that #803 existed to remove.
+    ///
+    /// Measured, not reasoned: with a wildcard here and a sixth `ProbeRefreshing { zone,
+    /// collision }` variant added, the crate compiled once every arm the compiler ASKED for was
+    /// filled in, and `usability` then said `None` (usable) while `usable_collision` returned
+    /// `Err(Idle)` over a live grid. `usable_collision_agrees_with_usability_for_every_state`
+    /// stayed green throughout, because its `states` vec did not know about the new variant.
+    /// Spelling the arms out makes that state unrepresentable: the two functions now fail to
+    /// compile TOGETHER, which is the only place this can be caught before it ships.
     pub fn collision(&self) -> Option<&Arc<Collision>> {
-        match self { Self::Ready { collision, .. } => Some(collision), _ => None }
+        match self {
+            Self::Ready { collision, .. } => Some(collision),
+            Self::Idle       => None,
+            Self::Pending {..} => None,
+            Self::Failed {..}  => None,
+        }
     }
 
     /// A human/agent-readable sentence explaining what this state means for anything the client
@@ -327,6 +350,13 @@ pub fn usability(state: &ZoneAssetState, player_zone: &str) -> Option<NotUsable>
     if player_zone.is_empty() { return Some(NotUsable::PlayerZoneUnknown); }
     // Zone short-names are ASCII and case-insensitive on the wire; compare accordingly rather than
     // letting a case difference read as "a different zone".
+    //
+    // This is LOOSER than `app::zone_needs_reload`, which decides when to start a reload and
+    // compares the same two names EXACTLY. That direction is the safe one and is deliberate: the
+    // reload trigger being at least as eager as this bless test is what makes "not reloading"
+    // imply "the loaded grid is the zone the character is in". Do not equalise the two by making
+    // the reload trigger case-insensitive — see the reasoning written up at `zone_needs_reload`
+    // (#826).
     if !loaded.eq_ignore_ascii_case(player_zone) { return Some(NotUsable::StaleForPreviousZone); }
     None
 }
@@ -617,6 +647,13 @@ mod tests {
     /// unrepresentable rather than merely documented (#821 review round 2, B4): "the verdict says
     /// yes" and "here is a grid" are now the same value, so there is no `None` branch left for a
     /// caller to answer `[]` from.
+    ///
+    /// **Still load-bearing after #826, and not redundant with it.** #826 removed the `_` wildcard
+    /// from `ZoneAssetState::collision`, so a new state variant now reds `collision` and `usability`
+    /// *together* — that stops one function from silently ignoring a variant the other classified.
+    /// It does not stop the two from being filled in INCONSISTENTLY (`None` here, "usable" there),
+    /// which compiles fine and re-opens the same hole. This test is what rejects that, for the
+    /// combinations it enumerates.
     #[test]
     fn usable_collision_agrees_with_usability_for_every_state() {
         let zones = ["qeynos", "freporte", "FREPORTE", "gfaydark", ""];
@@ -627,6 +664,23 @@ mod tests {
             ("readyA", ZoneAssetState::ready("qeynos", 3, floor_collision())),
             ("readyB", ZoneAssetState::ready("freporte", 3, floor_collision())),
         ];
+        // Compile-time roll call. `states` above is written by HAND, so this test can silently
+        // under-cover: measured on the #826 probe branch, a sixth variant that turned a live grid
+        // into `Err(Idle)` left this test GREEN, because the vec did not know the variant existed.
+        // The match below has no wildcard, so adding a variant to `ZoneAssetState` now reds THIS
+        // FILE too, next to the arms in `collision`/`usability`.
+        //
+        // What it proves: nobody can add a state variant without the compiler pointing at this
+        // test. What it does NOT prove: that `states` actually contains one of every variant — the
+        // author still has to add the row. It is a forced read, not a coverage proof.
+        for (_, st) in &states {
+            match st {
+                ZoneAssetState::Idle
+                | ZoneAssetState::Pending {..}
+                | ZoneAssetState::Ready {..}
+                | ZoneAssetState::Failed {..} => {}
+            }
+        }
         for (name, st) in &states {
             for pz in zones {
                 match (usability(st, pz), usable_collision(st, pz)) {
