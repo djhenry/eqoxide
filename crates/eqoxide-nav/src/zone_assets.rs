@@ -146,8 +146,8 @@ impl ZoneAssetState {
     /// Measured on this tree by the #837 reviewer: the whole crate suite stayed green with that
     /// pair in place. The second line of defence for it is the roll call in
     /// `usable_collision_agrees_with_usability_for_every_state`, which reds when a variant is added
-    /// — and it is a forced read, not a proof either. Nor is compiling the only catch point: a new
-    /// variant also reds `tag`, `zone`, `detail` and the hand-written `Debug` impl.
+    /// — and it is a forced read, not a proof either. Nor is `collision` the only compile catch
+    /// point: a new variant also reds `tag`, `zone`, `detail` and the hand-written `Debug` impl.
     pub fn collision(&self) -> Option<&Arc<Collision>> {
         match self {
             Self::Ready { collision, .. } => Some(collision),
@@ -392,13 +392,16 @@ pub fn usable_collision<'a>(state: &'a ZoneAssetState, player_zone: &str)
     // `usability` returns `None` for `Ready` and for nothing else, and `Ready`'s `collision` field is
     // NOT an `Option` — so this fallback is unreachable. It is spelled as a REFUSAL rather than an
     // `unwrap`/`expect` because the honest answer to "we cannot find the grid" is never an empty
-    // world; `usable_collision_agrees_with_usability_for_every_state` asserts it never fires.
+    // world; `usable_collision_agrees_with_usability_for_every_state` asserts it does not fire for
+    // the five states that test enumerates by hand — not for all states, which no runtime test can
+    // reach.
     //
     // THIS is the sentence a new state variant falsifies, which is why `ZoneAssetState::collision`
     // is matched exhaustively (#826): the wildcard it used to have let a variant be blessed by
     // `usability` and answered `None` here, firing this "unreachable" arm over a live grid. The
-    // exhaustive arms keep the claim honest by forcing both functions to be edited together — they
-    // do not force them to be edited CONSISTENTLY; see the note on `collision`.
+    // exhaustive arms do NOT keep the sentence true — `Self::New {..} => None` alongside a `usability`
+    // that blesses `New` compiles, and falsifies it again. What they buy is that the author of a new
+    // variant is made to read this, in `collision`, because the compiler will not let them skip it.
     state.collision().ok_or(NotUsable::Idle)
 }
 
@@ -720,82 +723,428 @@ mod tests {
         }
     }
 
-    /// A **purely lexical** pin on one function body: every arm of `ZoneAssetState::collision`'s
-    /// `match` must be a `Self::…` pattern, i.e. no `_ =>`, no bare binding.
-    ///
-    /// **Why a source-text scan is legitimate here, when this repo has seven measured ways one can
-    /// prove a call is *written* rather than *reached* (#799).** Those seven all separate the text
-    /// from the execution — a trailing comment, `if false`, `#[cfg(any())]`, a macro wrapper, a
-    /// stray brace. This property has no execution to diverge from: "the body contains no wildcard
-    /// arm" **is** a statement about the text, and the thing it protects (E0004 firing when a
-    /// variant is added) is decided by the compiler from that same text. The #837 reviewer measured
-    /// the point directly on the roll call above — wrapping it in `if false { … }` still produced
-    /// E0004. So there is no gap between written and reached to exploit.
-    ///
-    /// **What it proves:** the wildcard cannot come back to `collision` without something going
-    /// red, which is otherwise true of nothing in the merged tree — the E0004 evidence in #837 is
-    /// not a test and CI cannot re-run it.
-    ///
-    /// **What it does NOT prove**, stated so nobody reads it as more: (a) it covers exactly ONE
-    /// function body and says nothing about the other wildcards on this enum (`status` here,
-    /// `terrain_meshes` in `eqoxide-http`, `lost_load_zone` in the binary crate — see #838);
-    /// (b) it is a lexical guard, so it cannot tell a correct arm from an incorrect one — an author
-    /// who writes `Self::New {..} => None` for a variant carrying a live grid passes this test and
-    /// re-opens #826; and (c) it depends on the arms being formatted with their pattern on the same
-    /// line as their `=>`, which is how rustfmt leaves them today.
-    ///
-    /// The reach controls are inside the test, not asserted in prose: the anchor must be found
-    /// EXACTLY once, and the extracted body must contain all four variant names — so a brace-walk
-    /// that truncates (the #799 stray-`}` failure) fails loudly instead of scanning a short prefix
-    /// and passing.
-    #[test]
-    fn collision_matches_only_named_variants_no_wildcard_arm() {
-        const SRC: &str = include_str!("zone_assets.rs");
-        // Assembled at compile time from two pieces so THIS literal does not itself appear in the
-        // source text — which lets the count below be an exact-uniqueness reach control.
-        const SIG: &str = concat!("pub fn ", "collision(&self) -> Option<&Arc<Collision>> {");
+    // ─────────── the #826 lexical guard on `collision`'s arms ───────────
 
-        assert_eq!(SRC.matches(SIG).count(), 1,
-            "reach control: expected exactly one `{SIG}` in this file. 0 means the scan below \
-             would have found NOTHING (the signature was reformatted or renamed) — fix the anchor, \
-             do not delete this test. >1 means the anchor is ambiguous.");
-        let start = SRC.find(SIG).unwrap() + SIG.len();
+    /// The anchor, assembled at COMPILE time from two pieces so the assembled literal does not
+    /// itself appear anywhere in this file's text — which is what lets the uniqueness check below
+    /// be a real reach control rather than a self-match.
+    const COLLISION_SIG: &str =
+        concat!("pub fn ", "collision(&self) -> Option<&Arc<Collision>> {");
+    /// The variants `collision` must name. Adding a variant to `ZoneAssetState` must red this list
+    /// too — that is deliberate, and it is the same forced read as the roll call above.
+    const COLLISION_VARIANTS: [&str; 4] =
+        ["Self::Idle", "Self::Pending", "Self::Ready", "Self::Failed"];
+
+    /// Remove `//` line comments and `/* … */` block comments **without touching either sequence
+    /// when it appears inside a string or char literal**.
+    ///
+    /// The naive `line.split("//").next()` is unsound in this file: a string containing `//` (a URL,
+    /// say) would be cut mid-literal, the closing quote would vanish, and every later quote in the
+    /// file would be mis-paired — which silently moves the anchor and the walk. So this tracks
+    /// literal state:
+    ///
+    /// * strings, with `\` escapes (including the `\`-at-end-of-line continuations this module's
+    ///   long `detail()` strings use, and `\"`);
+    /// * char literals, which must be distinguished from LIFETIMES — `'a` is not an opener, while
+    ///   `'"'` and `'\\'` are exactly the two shapes that would otherwise invert string state. Both
+    ///   occur in this very module, in [`audit_collision_arms`]. A `'` is treated as a literal only
+    ///   when it is followed by an escape, or by one character and then a closing `'`;
+    /// * block comments, which nest in Rust, so a depth counter rather than a flag.
+    ///
+    /// Newlines are preserved so line structure survives.
+    ///
+    /// It does NOT understand raw strings (`r"…"`), byte strings, or an unterminated block comment.
+    /// A raw string is a REFUSAL in [`audit_collision_arms`]; an unterminated block comment eats the
+    /// rest of the file, which trips that function's anchor reach control. Neither is guessed at.
+    fn strip_comments(src: &str) -> String {
+        let b: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        let mut depth = 0usize; // block-comment nesting
+        while i < b.len() {
+            let c = b[i];
+            if depth > 0 {
+                if c == '/' && b.get(i + 1) == Some(&'*') { depth += 1; i += 2; continue; }
+                if c == '*' && b.get(i + 1) == Some(&'/') { depth -= 1; i += 2; continue; }
+                if c == '\n' { out.push('\n'); }
+                i += 1;
+                continue;
+            }
+            match c {
+                '/' if b.get(i + 1) == Some(&'/') => {
+                    while i < b.len() && b[i] != '\n' { i += 1; }
+                }
+                '/' if b.get(i + 1) == Some(&'*') => { depth = 1; i += 2; }
+                '"' => {
+                    out.push(c);
+                    i += 1;
+                    while i < b.len() {
+                        out.push(b[i]);
+                        if b[i] == '\\' {
+                            if let Some(&e) = b.get(i + 1) { out.push(e); }
+                            i += 2;
+                            continue;
+                        }
+                        if b[i] == '"' { i += 1; break; }
+                        i += 1;
+                    }
+                }
+                '\'' if b.get(i + 1) == Some(&'\\') => {
+                    // Escaped char literal. The escaped character is copied BEFORE the search for
+                    // the terminator starts, so `'\''` closes on its fourth character and not on
+                    // its escaped third one. `'\u{41}'` then closes on the following `'`.
+                    out.push(c);
+                    i += 1;
+                    out.push(b[i]);
+                    i += 1;
+                    if i < b.len() { out.push(b[i]); i += 1; }
+                    while i < b.len() {
+                        let ch = b[i];
+                        out.push(ch);
+                        i += 1;
+                        if ch == '\'' { break; }
+                    }
+                }
+                '\'' if b.get(i + 2) == Some(&'\'') => {
+                    // Simple char literal `'x'`. Anything else starting with `'` is a lifetime.
+                    out.push(c);
+                    out.push(b[i + 1]);
+                    out.push('\'');
+                    i += 3;
+                }
+                _ => { out.push(c); i += 1; }
+            }
+        }
+        out
+    }
+
+    /// True if `src` contains a raw-string opener (`r`, `#`s, `"`) not preceded by an identifier
+    /// character.
+    ///
+    /// Deliberately CONSERVATIVE: it does not track string state, so an ordinary string literal
+    /// whose last character is a standalone `r` (the text `"r"`) also reports true. That direction
+    /// of error is a refusal, which is loud; the other direction would be a silent mis-scan.
+    fn has_raw_string(src: &str) -> bool {
+        let b = src.as_bytes();
+        for (i, w) in b.iter().enumerate() {
+            if *w != b'r' { continue; }
+            if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') { continue; }
+            let mut j = i + 1;
+            while j < b.len() && b[j] == b'#' { j += 1; }
+            if j < b.len() && b[j] == b'"' && j > i { return true; }
+        }
+        false
+    }
+
+    /// **The whole #826 guard, as a pure function over source text, so its evasions are ordinary
+    /// test data instead of one-off source mutations** (see
+    /// `collision_arm_audit_rejects_the_evasions_measured_against_it`).
+    ///
+    /// `Ok(())` means: in `src`, every arm of `ZoneAssetState::collision`'s `match` is a `Self::…`
+    /// pattern. `Err` carries the reason, and the reasons are deliberately split so a failure names
+    /// the cause that actually occurred.
+    fn audit_collision_arms(src: &str) -> Result<(), String> {
+        // Comments are removed FIRST, and everything below runs on the stripped text. Round 2 of the
+        // #837 review defeated the previous version of this guard twice by putting text in comments:
+        // `_ => None,  // Self::Failed` satisfied the arm check, and a `}}` in a trailing comment
+        // truncated the brace walk past the reach control. Both were GREEN with a live wildcard.
+        let src = strip_comments(src);
+
+        // The one construct this scan cannot lex is a REFUSAL, not a guess: the guarantee this
+        // function offers is "either the text was something it can lex, or you got an Err" — never
+        // "it looked fine". A raw string can hold an unescaped quote, which would invert the
+        // stripper's string state and move both the anchor and the walk.
+        if has_raw_string(&src) {
+            return Err("this guard does not lex raw strings, and one is present. Extend \
+                        `strip_comments` or move it (#826/#837).".to_string());
+        }
+
+        // Anchor. REACH CONTROL: exactly one occurrence. 0 means the scan would examine NOTHING —
+        // the #778 failure mode, where a guard silently covers none of what it claims.
+        let hits = src.matches(COLLISION_SIG).count();
+        if hits != 1 {
+            return Err(format!(
+                "reach control: expected exactly ONE `{COLLISION_SIG}`, found {hits}. 0 means this \
+                 scan would have examined nothing (the signature was reformatted or renamed) — fix \
+                 the anchor, do not delete this test. >1 means the anchor is ambiguous."));
+        }
+        let start = src.find(COLLISION_SIG).unwrap() + COLLISION_SIG.len();
 
         // Brace walk from just inside the body.
         let mut depth = 1usize;
         let mut end = None;
-        for (i, c) in SRC[start..].char_indices() {
+        for (i, c) in src[start..].char_indices() {
             match c {
                 '{' => depth += 1,
                 '}' => { depth -= 1; if depth == 0 { end = Some(start + i); break; } }
                 _ => {}
             }
         }
-        let body = &SRC[start..end.expect("reach control: `collision`'s body has no closing brace")];
+        let body = match end {
+            Some(e) => &src[start..e],
+            None => return Err("`collision`'s body has no closing brace after comment \
+                                stripping".to_string()),
+        };
 
-        // REACH CONTROL. A brace walk can be truncated by a `}` inside a comment or string literal
-        // (#799). If that happened, `body` is a short prefix and the wildcard scan below would pass
-        // over almost nothing. Requiring every variant name proves the walk covered the whole match.
-        for variant in ["Self::Idle", "Self::Pending", "Self::Ready", "Self::Failed"] {
-            assert!(body.contains(variant),
-                "reach control: `collision`'s extracted body is missing `{variant}` — the brace \
-                 walk truncated, or a variant was renamed. Body was:\n{body}");
+        // The one remaining way to truncate the walk is a `{`/`}` inside a string or char literal in
+        // the BODY. `collision` has neither, so refuse rather than mis-scan.
+        if body.contains('"') || body.contains('\'') {
+            return Err(format!(
+                "this guard cannot walk a `collision` body containing string or char literals — a \
+                 brace inside one would truncate the scan. Body was:\n{body}"));
         }
 
+        // Arm check FIRST, so the message names the cause that actually occurred. (Round 2 of the
+        // #837 review, N1: with the variant check first, the two realistic regression shapes — a
+        // wildcard REPLACING named arms — reported "the brace walk truncated, or a variant was
+        // renamed", which is not what happened.)
         let arm_lines: Vec<&str> = body.lines().filter(|l| l.contains("=>")).collect();
-        assert!(arm_lines.len() >= 4,
-            "reach control: found only {} arm line(s) in `collision`; the enum has four variants",
-            arm_lines.len());
         for line in &arm_lines {
-            assert!(line.contains("Self::"),
-                "`ZoneAssetState::collision` must match every variant BY NAME (#826). This arm does \
-                 not:\n    {}\nA `_ =>` (or a bare binding) here silently answers `None` for any \
-                 state added later, while `usability` — which has no wildcard — is forced by the \
-                 compiler to classify it. That is how a blessed, live collision grid turns into \
-                 `Err(NotUsable::Idle)`. If this fired on a legitimate multi-line or-pattern, put \
-                 the pattern on the same line as its `=>` or update this pin deliberately.",
-                line.trim());
+            if !line.contains("Self::") {
+                return Err(format!(
+                    "`ZoneAssetState::collision` must match every variant BY NAME (#826). This arm \
+                     does not:\n    {}\nA `_ =>` (or a bare binding) here silently answers `None` \
+                     for any state added later, while `usability` — which has no wildcard — is \
+                     forced by the compiler to classify it. That is how a blessed, live collision \
+                     grid turns into `Err(NotUsable::Idle)`. If this fired on a legitimate \
+                     multi-line or-pattern, put the pattern on the same line as its `=>` or update \
+                     this guard deliberately.", line.trim()));
+            }
         }
+
+        // CONSISTENCY CHECK — deliberately NOT called a reach control. It is an equality, so unlike
+        // the `>= 4` floor it replaced (#837 review round 2, N2) it does detect a walk that reached
+        // four arms and stopped; but it is still a count over already-scanned text, which is not the
+        // same thing as proving the scan reached the end of the match.
+        if arm_lines.len() != COLLISION_VARIANTS.len() {
+            return Err(format!(
+                "`collision` has {} arm line(s) but `ZoneAssetState` has {} variants. Either an arm \
+                 is missing/duplicated, or the walk stopped early. Body was:\n{body}",
+                arm_lines.len(), COLLISION_VARIANTS.len()));
+        }
+
+        // Every variant named. After the equality above this mostly catches a RENAME; it also
+        // catches a walk truncated before a variant's arm.
+        for variant in COLLISION_VARIANTS {
+            if !body.contains(variant) {
+                return Err(format!(
+                    "`collision`'s scanned body is missing `{variant}` — a variant was renamed, or \
+                     the walk truncated. Body was:\n{body}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// A **lexical** pin on one function body: every arm of `ZoneAssetState::collision`'s `match`
+    /// must be a `Self::…` pattern — no `_ =>`, no bare binding.
+    ///
+    /// **Why a source-text scan at all, when this repo has seven measured ways one proves a call is
+    /// *written* rather than *reached* (#799).** Those seven separate the text from the execution.
+    /// This property has no execution to diverge from: "the body contains no wildcard arm" **is** a
+    /// statement about text, and what it protects — E0004 firing when a variant is added — is
+    /// decided by rustc from that same text. The #837 reviewer measured the point on the roll call
+    /// above: wrapping it in `if false { … }` still produced E0004.
+    ///
+    /// **The gap that DOES exist here is not written-vs-reached but scanned-vs-compiled**, and it
+    /// was exploited twice against the first version of this guard (#837 review round 2, probes
+    /// M3/M5): `_ => None,  // Self::Failed` satisfied the arm check from inside a comment, and a
+    /// `}}` in a trailing comment placed after the last variant name truncated the walk past the
+    /// reach control. Both left a live wildcard with the pin GREEN and no compiler warning. The
+    /// answer is [`audit_collision_arms`]: comments — line AND block — are stripped before anything
+    /// is scanned, and the one construct the stripper cannot lex is a REFUSAL rather than a guess.
+    ///
+    /// **String literals ARE handled, not scoped around.** A `//`-strip that splits lines is itself
+    /// unsound — `//` occurs inside string literals (a URL), and cutting there deletes the closing
+    /// quote, inverts string state for everything after it, and silently moves both the anchor and
+    /// the brace walk. So [`strip_comments`] is a literal-aware state machine covering strings with
+    /// `\` escapes, char literals (distinguished from lifetimes: `'"'` and `'\\'` are the two shapes
+    /// that would otherwise invert string state, and both occur a few lines above), and nested block
+    /// comments. `collision_arm_audit_rejects_the_evasions_measured_against_it` asserts the URL case
+    /// passes, which is what shows this is not a `split("//")`.
+    ///
+    /// **What it proves:** a wildcard arm in `collision`'s match is caught, including one hidden in
+    /// a trailing line comment or behind a block comment — and if the text ever contains something
+    /// this scan cannot lex (a raw string; a string or char literal inside `collision`'s own body,
+    /// whose braces would truncate the walk), the test FAILS instead of passing over it. That is
+    /// otherwise true of nothing in the merged tree: the E0004 evidence in #837 is not a test and CI
+    /// cannot re-run it.
+    ///
+    /// **What it does NOT prove**, stated so nobody reads it as more: (a) it covers exactly ONE
+    /// function body and says nothing about the other wildcards on this enum (`status` here,
+    /// `terrain_meshes` in `eqoxide-http`, `lost_load_zone` in the binary crate — see #838);
+    /// (b) it is lexical, so it cannot tell a correct arm from an incorrect one — an author who
+    /// writes `Self::New {..} => None` for a variant carrying a live grid passes this test and
+    /// re-opens #826; (c) it counts LINES containing `=>`, so it depends on the arms being one per
+    /// line with each pattern on the same line as its `=>` — which is how rustfmt leaves them, and
+    /// a collapsed match is rejected by the arm-count equality rather than mis-scanned; and (d) it
+    /// is a scan, not a parse. (d) is bounded by refusal rather
+    /// than by understanding: the unlexable constructs are enumerated and rejected, so the honest
+    /// form of the guarantee is *"either the text was something this scan can lex, or the test
+    /// failed"* — never *"it looked fine"*.
+    #[test]
+    fn collision_matches_only_named_variants_no_wildcard_arm() {
+        const SRC: &str = include_str!("zone_assets.rs");
+        // Each canary is assembled from two pieces, so the joined literal occurs in this file
+        // exactly once — in its own comment below — and never in code. That is what makes the
+        // `!stripped.contains(..)` assertions below evidence rather than tautology.
+        // STRIPPER-REACH-LINE
+        /* STRIPPER-REACH-BLOCK */
+        const CANARY_LINE: &str = concat!("STRIPPER-REACH", "-LINE");
+        const CANARY_BLOCK: &str = concat!("STRIPPER-REACH", "-BLOCK");
+
+        // REACH CONTROL ON THE STRIPPER ITSELF. A stripper that silently no-ops would return this
+        // guard to exactly the behaviour probes M3/M5 defeated, with more confident prose on top —
+        // so prove it ran AND removed something known to be present, rather than assuming it did.
+        // One canary per comment syntax, because M3 evaded a line comment and a block comment is
+        // the other way to hide a brace.
+        for canary in [CANARY_LINE, CANARY_BLOCK] {
+            assert!(SRC.contains(canary),
+                "reach control: the `{canary}` canary comment is gone, so the check below cannot \
+                 prove the comment stripper ran. Restore it — it is a comment containing that \
+                 marker and nothing else depends on it.");
+        }
+        let stripped = strip_comments(SRC);
+        for canary in [CANARY_LINE, CANARY_BLOCK] {
+            assert!(!stripped.contains(canary),
+                "reach control: the comment stripper did NOT remove the `{canary}` comment, which \
+                 is definitely present. It is no-opping for that comment syntax, and every claim \
+                 this test makes about comments of that kind is void.");
+        }
+        assert!(stripped.len() < SRC.len(), "reach control: the stripper removed nothing at all");
+
+        if let Err(why) = audit_collision_arms(SRC) { panic!("{why}"); }
+    }
+
+    /// The evasions that were measured against the FIRST version of the guard above, plus the ones
+    /// its rewrite could plausibly introduce — as data, so they are re-run on every build instead of
+    /// living in a review comment.
+    ///
+    /// Each case is a synthetic source built around the same `COLLISION_SIG` the real pin uses (via
+    /// the constant, never a copy of the literal — a copy would break the pin's uniqueness reach
+    /// control). `M3` and `M5` are the two probes from #837 review round 2 that were GREEN with a
+    /// live wildcard; both must now be `Err`. They were ALSO re-run as real source mutations against
+    /// the real file, which is the check this test cannot make.
+    #[test]
+    fn collision_arm_audit_rejects_the_evasions_measured_against_it() {
+        let four_arms = "\
+        match self {
+            Self::Ready { collision, .. } => Some(collision),
+            Self::Idle       => None,
+            Self::Pending {..} => None,
+            Self::Failed {..}  => None,
+        }
+    }";
+        let src = |body: &str| format!("impl X {{\n    {COLLISION_SIG}\n{body}\n}}\n");
+
+        // The real shape must PASS, or every Err below proves nothing.
+        assert!(audit_collision_arms(&src(four_arms)).is_ok(),
+            "the real body shape must pass: {:?}", audit_collision_arms(&src(four_arms)));
+
+        // A `//` inside a STRING must not be treated as a comment. If the stripper cut this line at
+        // the `//`, the closing quote would vanish, string state would invert for the rest of the
+        // file, and the anchor would be swallowed — so this case passing is what shows the stripper
+        // is literal-aware rather than a `split("//")`.
+        let with_url = format!("impl X {{\n    let _s = \"https://example.invalid/a\"; // trailing\n    {COLLISION_SIG}\n{four_arms}\n}}\n");
+        assert!(audit_collision_arms(&with_url).is_ok(),
+            "a `//` inside a string literal must not be stripped: {:?}",
+            audit_collision_arms(&with_url));
+
+        let cases: [(&str, &str); 8] = [
+            // M1 — the literal pre-#826 one-liner.
+            ("M1 pre-#826 one-liner",
+             "        match self { Self::Ready { collision, .. } => Some(collision), _ => None }\n    }"),
+            // M2 — wildcard replacing a named arm.
+            ("M2 wildcard replaces a named arm", "\
+        match self {
+            Self::Ready { collision, .. } => Some(collision),
+            Self::Idle       => None,
+            Self::Pending {..} => None,
+            _ => None,
+        }
+    }"),
+            // M3 — GREEN against the old guard: `Self::` supplied from inside a comment.
+            ("M3 Self:: hidden in a trailing comment", "\
+        match self {
+            Self::Ready { collision, .. } => Some(collision),
+            Self::Idle       => None,
+            Self::Pending {..} => None,
+            _ => None,  // Self::Failed
+        }
+    }"),
+            // M5 — GREEN against the old guard: a comment brace truncating the walk after the last
+            // variant name, leaving the wildcard outside the scanned region.
+            ("M5 comment brace truncates the walk", "\
+        match self {
+            Self::Ready { collision, .. } => Some(collision),
+            Self::Idle       => None,
+            Self::Pending {..} => None,
+            Self::Failed {..}  => None, // end of match and fn: }}
+            #[allow(unreachable_patterns)] _ => None,
+        }
+    }"),
+            // M6 — wildcard ADDED alongside all four named arms.
+            ("M6 wildcard added alongside the named arms", "\
+        match self {
+            Self::Ready { collision, .. } => Some(collision),
+            Self::Idle       => None,
+            Self::Pending {..} => None,
+            Self::Failed {..}  => None,
+            _ => None,
+        }
+    }"),
+            // M7 — M5's shape moved into a BLOCK comment, which the first stripper rewrite would
+            // still have been blind to.
+            ("M7 block-comment brace truncates the walk", "\
+        match self {
+            Self::Ready { collision, .. } => Some(collision),
+            Self::Idle       => None,
+            Self::Pending {..} => None,
+            Self::Failed {..}  => None, /* end of match and fn: }} */
+            #[allow(unreachable_patterns)] _ => None,
+        }
+    }"),
+            // M8 — M3's shape in a block comment: `Self::` supplied from inside one.
+            ("M8 Self:: hidden in a block comment", "\
+        match self {
+            Self::Ready { collision, .. } => Some(collision),
+            Self::Idle       => None,
+            Self::Pending {..} => None,
+            _ => None,  /* Self::Failed */
+        }
+    }"),
+            // The equality that replaced the `>= 4` floor: a fifth arm line, every variant still
+            // named, no wildcard anywhere. Only the count catches this one.
+            ("fifth arm line, no wildcard", "\
+        match self {
+            Self::Idle if false => None,
+            Self::Ready { collision, .. } => Some(collision),
+            Self::Idle       => None,
+            Self::Pending {..} => None,
+            Self::Failed {..}  => None,
+        }
+    }"),
+        ];
+        for (name, body) in cases {
+            assert!(audit_collision_arms(&src(body)).is_err(),
+                "{name}: this must be REJECTED, and it was accepted");
+        }
+
+        // A raw string is REFUSED, not guessed at — the one construct the stripper cannot lex. The
+        // opener is assembled at run time rather than written, because writing it would put a real
+        // raw string in this file and the pin above would then refuse to scan it. (That is the guard
+        // behaving correctly, but it would be a confusing way to find out.)
+        // Assembled from CHAR literals, not from `"r"`: the text `"r"` is itself an `r` bracketed by
+        // quotes, which `has_raw_string` — deliberately conservative, see its doc — reports as an
+        // opener. Measured: writing it that way made the pin above refuse to scan this file.
+        let raw_open = format!("{}{}{}", 'r', '"', "a raw string\"");
+        let with_raw = format!("impl X {{\n    let _s = {raw_open};\n    {COLLISION_SIG}\n{four_arms}\n}}\n");
+        let err = audit_collision_arms(&with_raw).unwrap_err();
+        assert!(err.contains("raw strings"), "a raw string must be REFUSED by name: {err}");
+
+        // …and the anchor's own reach control: no anchor at all must be an Err naming that, not a
+        // vacuous pass over an empty body.
+        let err = audit_collision_arms("fn unrelated() {}\n").unwrap_err();
+        assert!(err.contains("reach control"), "a missing anchor must be a reach-control Err: {err}");
     }
 
     /// The specific F1 capture, as an assertion: standing in qeynos while the previous zone's
