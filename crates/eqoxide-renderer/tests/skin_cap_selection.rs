@@ -204,6 +204,32 @@ fn record_skin_cap_downgrade_only_inserts_for_exceeds_cap() {
     assert_eq!(map.len(), 1);
 }
 
+/// The `error!` channel and the `skin_cap_downgrades` channel must be gated by the SAME predicate.
+///
+/// They were not: the log tested `StaticReason::is_downgrade` while `record_skin_cap_downgrade`
+/// re-matched `ExceedsCap` itself. Mutating `is_downgrade` to return `true` for every variant
+/// therefore changed which models got logged without changing which got reported — measured, and
+/// exactly the drift the eqoxide#780 PR claims to have removed. `downgrade_joint_count` is now the
+/// one source; this asserts the equivalence over every `StaticReason` shape rather than trusting
+/// the delegation to stay in place.
+#[test]
+fn the_log_gate_and_the_report_gate_are_the_same_predicate() {
+    for reason in [
+        StaticReason::NoSkin,
+        StaticReason::EmptySkin,
+        StaticReason::ExceedsCap { joint_count: 129 },
+    ] {
+        let mut map: BTreeMap<String, usize> = BTreeMap::new();
+        record_skin_cap_downgrade(&mut map, Path::new("/models/x.glb"), reason);
+
+        assert_eq!(map.contains_key("x.glb"), reason.is_downgrade(),
+            "{reason:?}: `is_downgrade` (which gates the log) disagrees with whether a report \
+             entry was written");
+        assert_eq!(map.get("x.glb").copied(), reason.downgrade_joint_count(),
+            "{reason:?}: the recorded count must be exactly what the shared predicate yields");
+    }
+}
+
 // ── The WIRING: classify → log → record, as one reachable function (eqoxide#780 / eqoxide#797) ──
 //
 // The tests above grade the pure pieces. These grade the sequence the renderer actually executes.

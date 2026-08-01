@@ -210,10 +210,31 @@ pub enum StaticReason {
 }
 
 impl StaticReason {
+    /// The joint count that caused a genuine cap downgrade, or `None` when the static arm was taken
+    /// for an unremarkable reason. This is the **single predicate both eqoxide#780 channels use** —
+    /// the `error!` log in [`crate::skin_observation::observe_skin_fit`] and the
+    /// `skin_cap_downgrades` entry [`record_skin_cap_downgrade`] writes.
+    ///
+    /// It returns the count rather than a `bool` so the two channels cannot be gated by two
+    /// separately-mutable expressions. They were, before: the log tested [`is_downgrade`] while the
+    /// report re-matched `ExceedsCap` itself, and a mutation that made `is_downgrade` return `true`
+    /// for every variant changed the log without changing the report — measured, and the reason this
+    /// method exists (see the eqoxide#780 PR's mutation M5).
+    ///
+    /// [`is_downgrade`]: StaticReason::is_downgrade
+    pub fn downgrade_joint_count(self) -> Option<usize> {
+        match self {
+            StaticReason::ExceedsCap { joint_count } => Some(joint_count),
+            StaticReason::NoSkin | StaticReason::EmptySkin => None,
+        }
+    }
+
     /// The one case eqoxide#780 requires to stop being silent: the model had real skin data that
     /// simply did not fit the uniform buffer, and got rendered as if it were never skinned at all.
+    /// Delegates to [`StaticReason::downgrade_joint_count`] rather than re-matching, so it cannot
+    /// disagree with what actually gets reported.
     pub fn is_downgrade(self) -> bool {
-        matches!(self, StaticReason::ExceedsCap { .. })
+        self.downgrade_joint_count().is_some()
     }
 }
 
@@ -266,7 +287,7 @@ pub fn record_skin_cap_downgrade(
     model_path: &std::path::Path,
     reason: StaticReason,
 ) {
-    if let StaticReason::ExceedsCap { joint_count } = reason {
+    if let Some(joint_count) = reason.downgrade_joint_count() {
         downgrades.insert(downgrade_key(model_path), joint_count);
     }
 }

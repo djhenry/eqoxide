@@ -88,7 +88,10 @@ pub fn observe_skin_fit(
 ) -> ObservedSkinFit {
     let fit = SkinFit::classify(joint_count);
     if let Some(reason) = fit.static_reason() {
-        if reason.is_downgrade() {
+        // Both channels are gated by the SAME expression — `downgrade_joint_count`, which
+        // `record_skin_cap_downgrade` also uses. Gating them separately let a mutation change one
+        // without the other; see that method's doc and the eqoxide#780 PR's mutation M5.
+        if reason.downgrade_joint_count().is_some() {
             tracing::error!(
                 "renderer: character model '{label}' ({}) has a skin that EXCEEDS the \
                  {JOINT_CAP}-joint cap ({fit:?}) — falling back to the STATIC (unskinned) render \
