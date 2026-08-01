@@ -216,8 +216,17 @@ impl StaticReason {
     /// that arm both fires the `error!` and calls [`record_skin_cap_downgrade`].
     ///
     /// It returns the count rather than a `bool` so the two channels cannot be gated by two
-    /// separately-mutable expressions — and so the log message can interpolate the bound count,
-    /// which makes forcing that gate open a compile error rather than a survivable mutation. They were, before: the log tested [`is_downgrade`] while the
+    /// separately-mutable expressions, and so the log message can interpolate the bound count.
+    /// Three measured rows of the eqoxide#780 PR's mutation table say exactly how far that goes,
+    /// and no further. C4: replacing the `if let` with `if true` is `E0425`, because the binding
+    /// disappears out from under the log message. C3: keeping the binding but widening the gate
+    /// (`.or(Some(0))`) compiles and goes RED, because the gate's value leaves the function as
+    /// `ObservedSkinFit::reported_downgrade` and the tests pin it against the recorded entry.
+    /// C6: what still survives is a *deliberate* re-split — widen the gate, then reassign
+    /// `reported` back to the honest value — which logs `boat.glb` and stays green. That is a
+    /// two-line edit, not an omission.
+    ///
+    /// The two channels *were* separately gated, before: the log tested [`is_downgrade`] while the
     /// report re-matched `ExceedsCap` itself, so a mutation that made `is_downgrade` return `true`
     /// for every variant changed which models got logged without changing which got reported. That
     /// was measured on the intermediate commit that had both gates, and is the reason this method
@@ -286,10 +295,12 @@ impl StaticReason {
 /// set by `load_character_models` and there is one per renderer, so it does not happen in the
 /// shipped flow, but nothing here *prevents* it.
 ///
-/// The base name is still the right key, for a reason unrelated to collisions: this map is read by
-/// an AI agent over HTTP, and an absolute local path is both unstable across machines and local
-/// detail this project does not publish. `race_pcfroglok.glb` identifies the rig; the absolute path
-/// in front of it identifies the machine.
+/// The base name is still the right key, for a reason unrelated to collisions: this map is *meant*
+/// to be read by an AI agent over HTTP (eqoxide#797 — nothing publishes it yet; grep for
+/// `skin_cap_downgrades` outside this crate and the only hit is a comment in
+/// `src/bin/render_model.rs`), and an absolute local path is both unstable across machines and
+/// local detail this project does not publish. `race_pcfroglok.glb` identifies the rig; the
+/// absolute path in front of it identifies the machine.
 pub fn record_skin_cap_downgrade(
     downgrades: &mut std::collections::BTreeMap<String, usize>,
     model_path: &std::path::Path,

@@ -43,9 +43,12 @@
 //!   omission. Deleting the observation from `ensure_character_model` does not produce a silent
 //!   regression; it produces a compile error, because there is then no `ObservedSkinFit` to pass.
 //!   Measured, not reasoned — see the PR's mutation table.
-//! - **Does:** in a non-`cfg(test)` build, the report cannot be aimed at a map other than the
-//!   renderer's own field, because no other `DowngradeSink` can be constructed. Also measured: the
-//!   throwaway-map substitution above is now `E0308`.
+//! - **Does:** the report cannot be aimed at a map other than the renderer's own field. Measured
+//!   twice at the call site in `ensure_character_model`: handing `observe_skin_fit` a scratch
+//!   `BTreeMap` — the exact round-1 substitution — is `E0308`, and reaching for
+//!   `DowngradeSink::detached` instead is `E0599` in the plain lib build (the item is
+//!   `cfg(test)`-gated) and `E0624` in the lib-test build (it is private to this module, so even a
+//!   `cfg(test)` build of the renderer cannot call it).
 //! - **Does not:** stop a future edit from *adding* a constructor here, or from calling
 //!   `SkinFit::classify` directly and routing around this module. Nothing in Rust prevents a
 //!   deliberate edit to the module that holds the invariant. The claim is about omission, not
@@ -55,10 +58,15 @@
 //!   the downgrade instead. That is a present fact about the workspace, not a hypothetical future
 //!   edit.
 //! - **Does not:** grade the log line. No test here asserts on log text (the driving agent does not
-//!   read logs, and the project's guidance is to grade structured observables). What keeps the log
-//!   honest is structural rather than tested: the message interpolates the joint count bound by the
-//!   *same* `if let` that records the entry, so there is one gate, not two that agree. Forcing that
-//!   gate open does not compile.
+//!   read logs, and the project's guidance is to grade structured observables). What constrains the
+//!   log is structural, and only as far as this: the `error!` and the `record_skin_cap_downgrade`
+//!   call sit inside one `if let`, the message interpolates that binding, and the binding's value
+//!   leaves the function as [`ObservedSkinFit::reported_downgrade`], where the tests pin it against
+//!   the recorded entry. Measured: `if true` is `E0425` (C4) and `.or(Some(0))` is RED (C3). What
+//!   still survives is a deliberate re-split — widen the gate, then reassign `reported` back to
+//!   `reason.downgrade_joint_count()` — which makes the `error!` fire for `boat.glb` and leaves
+//!   `-p eqoxide-renderer` green (C6, measured, 14/14 targets). The set of models that get *logged*
+//!   is therefore pinned against single-expression edits and not against a two-line one.
 
 use std::collections::BTreeMap;
 use std::path::Path;
