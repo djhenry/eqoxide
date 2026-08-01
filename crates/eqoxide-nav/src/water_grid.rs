@@ -422,7 +422,7 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// two rollups), the four `*_blast_radius` corpora in `tests/walker_sim.rs`, and
 /// `water_grid_budget_measurement` in `crates/eqoxide-nav/src/collision.rs` — the last five via
 /// [`open_corpus_zone`]. What remains uncovered is a set of further zone loops in `collision.rs`
-/// that still drop zones on a bare `continue` without opening them here — some accumulating into a
+/// that still drop zones on a `continue` without opening them here — some accumulating into a
 /// local `Vec`, some printing nothing at all — see **issue #839**, which carries the current
 /// per-line list. Do not re-derive or restate that tally here; it will drift. This paragraph names
 /// the mechanism; #839 names the sites.
