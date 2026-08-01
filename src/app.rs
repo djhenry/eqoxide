@@ -2693,18 +2693,23 @@ fn smooth_entity_motion(
         // server pos only changes on a sparse update), so only re-raycast on movement (#152).
         //
         // #753: the `collision` match runs UNCONDITIONALLY — including while `b.floating` — so
-        // the `None` arm's cache invalidation can never be bypassed by the floating exemption.
-        // The original shape nested this whole match inside `if !b.floating`, so a zone reload
-        // that happened to land while an entity was floating (levitate toggle mid-flight, a boat
-        // ride — `floating()` is re-derived from the LIVE flymode every frame, #578, not a
-        // one-time spawn classification) drove `collision` through `None` and back to `Some(new)`
-        // without the invalidation ever running, because `if b.floating` short-circuited past it
-        // entirely. A later grounded frame landing at a bit-identical `b.pos` then trusted
-        // `m.floor_z`, computed against the OLD zone's collision. Restructuring so there is a
-        // single match with no floating-gated branch around it makes that bypass structurally
-        // impossible rather than relying on a second place remembering to invalidate too:
-        // `b.floating` now only gates whether the snap is *applied* (the boat/#194 behavior —
-        // keep the server-sent z), never whether the cache stays honest.
+        // the `None` arm's cache invalidation can never be skipped by the floating exemption. The
+        // original shape nested the whole match inside `if !b.floating`, so while an entity was
+        // floating (a levitate toggle, a boat ride — `floating()` is re-derived from the LIVE
+        // flymode every frame, #578, not a one-time spawn flag) the `None` arm was unreachable no
+        // matter what `collision` did. Confirmed: `[f32::NAN; 3]` — the invalidation — appears
+        // nowhere else in this file, and `self.collision` has exactly two production writers
+        // (`Some` on load completion, `None` on reload start), so every real collision swap
+        // passes through `None`. `b.floating` now only gates whether the snap is *applied* (the
+        // boat/#194 behavior — keep the server-sent z), never whether the `None` arm is reachable.
+        //
+        // NOT measured: whether a floating entity's cache entry can actually survive a live
+        // `Some(A) -> None -> Some(B)` zone swap end to end — `motion.retain` (below) drops an
+        // absent entity's entry the first frame it's missing from the billboard list, and
+        // `begin_zone_in` clears `world.entities` before `self.collision` goes `None`
+        // (`crates/eqoxide-core/src/game_state.rs`). This restructure closes the code-shape hazard
+        // (a floating exemption able to bypass an invalidation) regardless of whether that live
+        // sequence is reachable today.
         match collision {
             Some(col) => {
                 if !b.floating {
@@ -2718,9 +2723,11 @@ fn smooth_entity_motion(
                 // the floor. The server skips FixZ for boats too (Mob::FixZ: `if (GetIsBoat())
                 // return;`) because they're GravityBehavior::Floating; floor_z would find the
                 // seabed/dock a few units down in shallow harbor water and yank the ship underwater
-                // (#194). Deliberately don't write `floor_at`/`floor_z` here either: memoizing a
-                // floor the entity was never actually snapped against would just be a subtler
-                // version of the same stale-but-plausible hazard this fix closes.
+                // (#194). Left write-free (not memoizing `floor_at`/`floor_z` here) to keep this
+                // fix's diff minimal and preserve pre-#753 behavior exactly — memoizing while
+                // floating is a plausible alternate design (mutation-checked as M7 in the #753 PR
+                // review: the suite stays green under it), but changing it is unrelated to this
+                // fix's scope.
             }
             // No collision loaded (zone (re)loading): invalidate the cache so the snap is
             // recomputed against the NEW zone geometry once it arrives, not served stale. Runs
@@ -3156,28 +3163,38 @@ mod tests {
     ///
     /// Sequence, `b.pos` held bit-identical throughout so the ONLY things that change are
     /// `b.floating` and `collision` — exactly the call-site shape the bug needs:
-    ///   1. Grounded on `col_a` (floor z=0): caches the snap.
+    ///   1. Grounded on `col_a` (floor z=-3): caches the snap.
     ///   2. Entity starts floating (levitate toggle / boat) at the SAME instant a zone reload
     ///      drops `collision` to `None` — the real-world trigger (`self.collision = None` always
     ///      precedes a zone swap, `src/app.rs` zone-reload path).
     ///   3. Still floating, the new zone's collision (`col_b`, floor z=5) arrives.
     ///   4. Entity lands (floating clears) at the SAME position. A correct memo must re-raycast
-    ///      against `col_b` and report z=5 — NOT the pre-reload col_a value of z=0.
+    ///      against `col_b` and report z=5 — NOT the pre-reload col_a value of z=-3.
+    ///
+    /// `col_a`'s height is deliberately non-zero (review finding 3, PR #834): `EntityMotion`'s
+    /// own zero-init for `floor_z` is also 0.0, so a `col_a` at z=0 couldn't tell "served the
+    /// stale col_a raycast" apart from "served the never-initialised default" from the failure
+    /// value alone. -3 makes the two cases distinguishable by the number in the panic message.
     #[test]
     fn floating_across_a_zone_reload_does_not_resurrect_the_old_zones_floor() {
-        let col_a = flat_collision_at(0.0);
+        let col_a = flat_collision_at(-3.0);
         let col_b = flat_collision_at(5.0); // different height — any stale serve is detectable
         let now = std::time::Instant::now();
-        // z=10 sits ABOVE both floors (0 and 5) so the downward raycast can find either one;
+        // z=10 sits ABOVE both floors (-3 and 5) so the downward raycast can find either one;
         // x/y/z is bit-identical across every frame below.
         let p = [10.0, 0.0, 10.0];
 
         let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
 
-        // 1. Grounded on the OLD zone's collision — caches floor_at=p, floor_z=0.
+        // 1. Grounded on the OLD zone's collision — caches floor_at=p, floor_z=-3.
         let mut bbs = vec![bb(9, p)];
         smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col_a), now, 1.0 / 60.0);
-        assert!(bbs[0].pos[2].abs() < 1e-3, "precondition: grounded on col_a at z=0");
+        assert!((bbs[0].pos[2] + 3.0).abs() < 1e-3, "precondition: grounded on col_a at z=-3");
+        // Pin the bit-identity the rest of this test depends on (review finding 4, PR #834): the
+        // memo really did cache the raycast at exactly `p`. Steps 2-4 reuse `p` unchanged, so if
+        // `m.display`/`m.floor_at` ever drifted by an epsilon, step 4 would re-raycast for the
+        // wrong reason and this test would stop pinning #753 while still passing.
+        assert_eq!(motion[&9].floor_at, p, "memo must key on the exact position it raycast at");
 
         // 2. Floating starts exactly as the zone reload drops collision to None (the real
         // trigger path: `self.collision = None` always precedes a zone swap).
@@ -3193,13 +3210,13 @@ mod tests {
         smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col_b), now, 1.0 / 60.0);
 
         // 4. Lands at the SAME position. Must re-raycast against col_b (z=5), not resurrect the
-        // pre-reload col_a value (z=0) from a memo that was never invalidated across the change.
+        // pre-reload col_a value (z=-3) from a memo that was never invalidated across the change.
         let mut bbs = vec![bb(9, p)];
         smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col_b), now, 1.0 / 60.0);
         assert!((bbs[0].pos[2] - 5.0).abs() < 1e-3,
             "grounded frame after a floating zone-reload transition must re-raycast against the \
              CURRENT collision (col_b, z=5), got z={} — a stale memo would report the pre-reload \
-             col_a value of z=0",
+             col_a value of z=-3",
             bbs[0].pos[2]);
     }
 
