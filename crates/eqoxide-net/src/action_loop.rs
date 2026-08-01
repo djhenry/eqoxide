@@ -1730,7 +1730,16 @@ impl ActionLoop {
                 // zone-point index that matches — a zone with several lines to the same target, or an
                 // in-zone translocator with multiple advertised points, would otherwise pick one with
                 // no nearby region and no-op, #266). want_index==None → any nearest line.
-                let located = self.collision.read().unwrap().as_ref().and_then(|c| {
+                //
+                // #815: the lookup and "could this grid read region data AT ALL?" are taken from
+                // ONE read guard over the shared slot. Two separate `.read()` calls could straddle
+                // a zone change and pair one zone's lookup with another zone's verdict — the
+                // failure `usable_collision` was introduced to kill one caller over (#803/#821).
+                // The verdict is only CONSULTED in the `None` arm, but it is SAMPLED here, beside
+                // the lookup it describes.
+                let guard = self.collision.read().unwrap();
+                let region_absent = guard.as_ref().and_then(|c| c.region_data_absent().cloned());
+                let located = guard.as_ref().and_then(|c| {
                     let pos = [gs.player_x, gs.player_y, gs.player_z];
                     match (want_zone, want_index) {
                         (0, _) => c.find_zone_line_near(None, pos),
@@ -1769,19 +1778,17 @@ impl ActionLoop {
                                             .map(|zp| zp.iterator as i32).collect())
                                     };
                                     if !allowed { return None; }
-                                    // #803: `zone_line_indices` is now a `Result`. This fallback
-                                    // only ever ASKS for candidates, so an `Err` (no region data)
-                                    // yields none to offer, exactly as the old empty vec did —
-                                    // BEHAVIOUR HERE IS UNCHANGED, deliberately, because this file
-                                    // belongs to another change in flight.
-                                    //
-                                    // What is NOT fixed here: the `None` arm below then reports
-                                    // `zone_line_not_in_map`, whose documented meaning is "a
-                                    // client-side `.wtr` map-data GAP". When the `.wtr` did not
-                                    // load at all that reason names the wrong cause — the same
-                                    // substitution #803 kills on `/observe/zone_exits`, one caller
-                                    // over. Filed as #815 rather than fixed in this PR.
-                                    c.zone_line_indices().unwrap_or_default().into_iter()
+                                    // #803/#815: `zone_line_indices` is a `Result`. This fallback
+                                    // only ever ASKS for candidates, so a grid with no region data
+                                    // has none to offer and this returns `None` — the same outcome
+                                    // the old `unwrap_or_default()` produced. The discard is spelled
+                                    // out as a `let … else` rather than laundered through
+                                    // `unwrap_or_default()`, which turns a failed read into an empty
+                                    // success and is exactly what made the reason below wrong. The
+                                    // reason itself is NOT dropped: it is sampled as `region_absent`
+                                    // beside this lookup, and the `None` arm reports it.
+                                    let Ok(indices) = c.zone_line_indices() else { return None; };
+                                    indices.into_iter()
                                         .filter(|idx| !resolvable.contains(idx))
                                         .filter_map(|idx| c.find_zone_line_near(Some(idx), pos))
                                         .min_by(|a, b| {
@@ -1793,8 +1800,15 @@ impl ActionLoop {
                         }
                     }
                 });
-                match located {
-                    Some((index, [tx, ty, tz])) => {
+                // Both values are now owned; the guard has no reason to outlive the lookup, and
+                // holding a lock across the walk/publish below would be a new contention path.
+                drop(guard);
+                // #815: matched as a PAIR, so every combination of "did we find a region" and
+                // "could this grid have had one" has its own arm and the compiler checks the
+                // enumeration. The alternative — a guard arm plus an `unwrap` — would put a panic
+                // path in the net thread's drain loop to re-establish something already known.
+                match (located, region_absent) {
+                    (Some((index, [tx, ty, tz])), _) => {
                         // Destination zone for logging — resolve the located region's index
                         // against the advertised list. `None` = an UNADVERTISED index (the #683
                         // fallback): the destination is genuinely unknown until the server
@@ -1862,12 +1876,57 @@ impl ActionLoop {
                         }
                         self.command.request_goto((tx, ty, tz));
                     }
-                    None => {
+                    // #815: WHY there is no located region decides what we may say. The gate above
+                    // establishes only that the grid is THIS zone's — not that the grid has any
+                    // region data to have looked in. Both cases used to answer
+                    // `zone_line_not_in_map`, documented verbatim as "the locally loaded zone
+                    // geometry has no matching WLD zone-line (DRNTP) trigger region" — a claim
+                    // about the CONTENTS of a file that, in the second case, was never read.
+                    //
+                    // They call for opposite operator action: a genuine gap means route another
+                    // way / re-bake this exit, while an unread region map means every exit in this
+                    // zone is unknown and the assets need re-syncing. One string could not carry
+                    // both, and no other field recovered the difference.
+                    (None, Some(absent)) => {
+                        tracing::info!(
+                            "zone_cross: region map unavailable ({absent}) — whether zone_id={want_zone} \
+                             has a zone-line region in this zone is UNKNOWN, not absent");
+                        gs.log_msg("zone", &format!(
+                            "Cannot read this zone's region map ({absent}) — whether a zone line to cross is here is UNKNOWN"));
+                        // The SAME machine-readable cause `/v1/observe/zone_exits` refuses with
+                        // (`RegionDataAbsent::as_str`), so one question has one answer across the
+                        // two surfaces, and "the pack never delivered this file" stays distinct
+                        // from "the file is truncated". Same shape as the `zone_loading` refusal
+                        // above, which publishes `NotUsable::as_str()`.
+                        //
+                        // `no_path` is kept as the STATE: a region map that failed to load does
+                        // not resolve itself by polling (#803's refusal says so explicitly), so
+                        // this is terminal for this zone, not the transient `zone_loading`. What
+                        // changes is the reason, which no longer names a cause the client did not
+                        // observe.
+                        self.walker.set_nav_state_because("no_path", Some(absent.as_str()));
+                    }
+                    (None, None) => {
                         tracing::info!("zone_cross: no zone-line region found for zone_id={want_zone}");
                         gs.log_msg("zone", "No zone line found to cross");
                         // Advertised in OP_SendZonepoints but no DRNTP region in the loaded map (a .wtr
                         // gap): report it so the caller isn't left thinking the 200 meant success (#267).
-                        // Gated above, so the grid IS this zone's — a truthful definitive no.
+                        // Gated above, so the grid IS this zone's.
+                        //
+                        // `region_absent == None` is TWO states, and only the first is what this
+                        // reason claims: (a) the grid's region map LOADED and genuinely has no
+                        // matching region — a truthful definitive no about data actually read; or
+                        // (b) the shared collision slot held no grid at all, so nothing was read
+                        // and this reason names a cause the client did not observe.
+                        //
+                        // (b) is NOT fixed here. It is a different absence with a different cure —
+                        // the #821 two-slot straddle, one caller over: the gate above locks the
+                        // zone-ASSET state, this reads the separate collision slot, and
+                        // `begin_zone_load` clears that slot BEFORE it publishes `Pending`, so a
+                        // zone change landing between the two calls pairs a usable verdict with an
+                        // emptied slot. NOT MEASURED — reasoned from those two writes, not
+                        // observed, and the window is one call wide. Filed as #827 rather than
+                        // widened into this fix, which is about region DATA.
                         self.walker.set_nav_state_because("no_path", Some("zone_line_not_in_map"));
                     }
                 }
@@ -3886,9 +3945,18 @@ mod tests {
         use eqoxide_nav::zone_assets::{self, ZoneAssetState};
         let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         const WANT: u16 = 30;
-        // A real flat-floor `Ready` grid (no zone-line regions) via the test fixture — used for the
-        // stale and usable cases where a grid must be present.
-        let grid = ZoneAssetState::test_ready().collision().unwrap().clone();
+        // A real flat-floor `Ready` grid via the test fixture — used for the stale and usable cases
+        // where a grid must be present.
+        //
+        // #815: the region map is an all-dry `flat_below(-1000.0)` — one that genuinely LOADED and
+        // carries no zone-line region — NOT the reason-free `test_ready()` this used to call. That
+        // fixture leaves the grid at `RegionDataAbsent::NotAttached`, so the `usable_no_region` case
+        // below was asserting `zone_line_not_in_map` over a grid whose region map was never read:
+        // it pinned the very substitution #815 is about. The case is meant to be "the map loaded
+        // and the region isn't in it", and now is.
+        let grid = ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::flat_below(-1000.0),
+        ))).collision().unwrap().clone();
 
         // (label, player_zone, expect_zone_loading). Collision + zone_assets are set per label below.
         for &(label, player_zone, want_loading) in &[
@@ -3926,12 +3994,119 @@ mod tests {
                 assert!(requeued,
                     "{label}: the one-shot request must be re-queued so it resolves once assets land");
             } else {
-                // Usable + no matching region in the (flat) grid ⇒ a TRUTHFUL definitive no.
+                // Usable + a LOADED region map with no matching region ⇒ a TRUTHFUL definitive no.
                 assert_eq!(s.state, "no_path",
                     "{label}: once the zone IS usable, a genuine no-region result is a truthful no_path — \
                      the gate must suppress the load-window LIE, not legitimate refusals");
                 assert_eq!(s.reason.as_deref(), Some("zone_line_not_in_map"));
                 assert!(!requeued, "{label}: a usable, resolved attempt consumes the request");
+            }
+        }
+    }
+
+    /// **#815: `zone_line_not_in_map` is a claim about the CONTENTS of a file, so it may only be
+    /// said about a file that was read.**
+    ///
+    /// `docs/http-api.md` documents that reason as "the locally **loaded** zone geometry has no
+    /// matching WLD zone-line (DRNTP) trigger region for it — a client-side `.wtr` map-data gap".
+    /// `POST /v1/move/zone_cross` also emitted it when the region map did not load AT ALL, where the
+    /// client has read nothing and knows nothing about whether such a region exists. The two states
+    /// call for opposite operator action — "this exit isn't baked, route around it" versus "every
+    /// exit in this zone is unknown, re-sync the assets" — and no other field recovered the
+    /// difference. Same substitution #803 killed on `/v1/observe/zone_exits`, one caller over.
+    ///
+    /// **Both directions, and the pair is the point.** A fix that made *everything* report the new
+    /// reason would just move the lie, so the loaded-and-genuinely-absent row asserts the old reason
+    /// is still emitted, and the final assertion pins that no two of the three reasons collide. The
+    /// per-cause strings are `RegionDataAbsent::as_str()` — the same vocabulary `/zone_exits`
+    /// refuses with, and the same shape as this function's own `zone_loading` refusal
+    /// (`NotUsable::as_str()`), so one question has one answer across the surfaces.
+    ///
+    /// Every row is `Ready` for the player's own zone, so the #600 usability gate passes and the
+    /// resolution really does reach the region lookup — otherwise this would be testing the gate.
+    ///
+    /// **Mutation checks, all at the call site rather than inside a callee's body** (a body-wrap
+    /// cannot tell "this branch is dead" from "the condition is false"). Results in the PR:
+    ///   * M1 — the emit arm publishes `Some("zone_line_not_in_map")` instead of
+    ///     `Some(absent.as_str())`: the two failed-load rows go RED on their reason assertion.
+    ///   * M2 — the whole pre-fix shape restored (`match located`, one `None` arm, the
+    ///     `unwrap_or_default()` back): the same two rows go RED.
+    ///   * M3 — the FIXTURE, not the production code: `loaded_lacks_region` is switched to a grid
+    ///     with no region data attached. It goes RED, which is what proves that row is passing
+    ///     because its region map genuinely loaded and not merely because nothing was found.
+    ///     Without M3 the pair could both be satisfied by a test that never had a loaded map.
+    ///
+    /// **NOT verified by a live run**, and not claimed: constructing a truncated `.wtr` against a
+    /// live server is not practical, so the failed-load rows are fixture-driven only.
+    #[tokio::test]
+    async fn zone_cross_reports_an_unread_region_map_as_such_never_as_a_map_data_gap() {
+        use eqoxide_core::region_map::{RegionLoadError, RegionMap};
+        use eqoxide_nav::zone_assets::{self, ZoneAssetState};
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        const WANT: u16 = 30;
+        const ZONE: &str = "freporte";
+
+        // (label, the grid's region-data state, the ONLY reason that is true of it)
+        let cases: Vec<(&str, ZoneAssetState, &str)> = vec![
+            // The map LOADED (an all-dry BSP, no zone-line leaves) and has no region for WANT.
+            // This is the one state `zone_line_not_in_map` describes, and it must keep saying so.
+            ("loaded_lacks_region",
+             ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+                 RegionMap::flat_below(-1000.0)))),
+             "zone_line_not_in_map"),
+            // The `.wtr` was consulted and did not load. The client has NOT looked at any region
+            // list, so it may not report the absence of a region.
+            ("truncated",
+             ZoneAssetState::test_ready_with_region_data(
+                 Err(RegionLoadError::Truncated { declared_nodes: 4096, bytes: 40 })),
+             "region_data_truncated"),
+            // A second failed-load cause, to pin that the reason is per-CAUSE and not one
+            // collapsed "something went wrong" string: re-syncing an asset pack and re-baking a
+            // corrupt one are different operator actions.
+            ("missing",
+             ZoneAssetState::test_ready_with_region_data(Err(RegionLoadError::Missing)),
+             "region_data_missing"),
+        ];
+
+        let mut seen: Vec<(&str, String)> = Vec::new();
+        for (label, state, want_reason) in &cases {
+            let mut al = test_action_loop(Default::default());
+            // Advertise a zone line for WANT so resolution reaches the COLLISION-derived decision
+            // (the region lookup) instead of short-circuiting on "no zone point advertised".
+            *al.world.zone_points.lock().unwrap() = vec![zp_at(7, WANT, [10.0, 10.0, 0.0])];
+            // `Ready` for the player's zone ⇒ the #600 gate passes. The grid is present in BOTH
+            // slots, exactly as `finish_zone_load` writes them in production.
+            zone_assets::finish_zone_load(
+                &al.collision, &al.zone_assets, ZONE,
+                Some(state.collision().expect("every row is a Ready fixture").clone()), 1, None);
+
+            let mut gs = eqoxide_core::game_state::GameState::new();
+            gs.world.zone_name = ZONE.into();
+            gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
+
+            al.command.request_zone_cross(WANT);
+            al.drain_zone_cross(&mut stream, &mut gs);
+
+            let s = al.nav.nav_state.lock().unwrap().clone();
+            assert_eq!(s.state, "no_path",
+                "{label}: the zone is usable and the request is resolved, so this is terminal for \
+                 this zone either way — #815 changes the REASON, not the state");
+            assert_eq!(s.reason.as_deref(), Some(*want_reason),
+                "{label}: the reason must name the cause the client actually observed. \
+                 `zone_line_not_in_map` is documented as a map-data GAP in a map that LOADED, so a \
+                 failed load may not borrow it (#815).");
+            seen.push((*label, s.reason.clone().expect("a terminal no_path always carries a reason")));
+        }
+
+        // The whole point of the fix: these are not the same string. Asserted over the observed
+        // values rather than the expectations above, so a fix that collapsed two causes at the emit
+        // site cannot pass by having also collapsed them in this table.
+        for i in 0..seen.len() {
+            for j in (i + 1)..seen.len() {
+                assert_ne!(seen[i].1, seen[j].1,
+                    "{} and {} must be distinguishable from `nav_reason` alone — an agent has no \
+                     second channel to tell a map-data gap from an unread map (#815)",
+                    seen[i].0, seen[j].0);
             }
         }
     }
