@@ -47,9 +47,16 @@ pub const JOINT_CAP_TOKEN: &str = "${JOINT_CAP}";
 /// Pinned by `tests/joint_cap_single_source.rs`, which parses the un-substituted sources and
 /// asserts naga refuses them.
 ///
-/// Since the token is delimited, this substitution touches no identifier and no prose: see
-/// `substitution_cannot_alter_an_identifier_that_contains_the_word_joint_cap` and
-/// `substitution_leaves_every_shader_comment_byte_identical` in that test file (eqoxide#812).
+/// **Identifiers are safe structurally; prose is safe by a guard, and the difference matters.**
+/// No WGSL identifier can contain `${JOINT_CAP}`, so no identifier can be rewritten — that follows
+/// from the token's characters and holds for text nobody has looked at
+/// (`substitution_cannot_alter_an_identifier_that_contains_the_word_joint_cap`, a 7-case table).
+/// Prose is different: a comment that spells the token **is** rewritten, exactly as the bare token
+/// rewrote comments before eqoxide#812. Delimiting did not fix that and was never going to. What
+/// keeps it from shipping is `substitution_leaves_every_shader_comment_byte_identical`, which
+/// compares every line and block comment in every corpus shader across the substitution. An earlier
+/// version of this sentence claimed the delimiters covered prose too; a reviewer measured
+/// `"// the ${JOINT_CAP} placeholder"` → `"// the 128 placeholder"` and it does not.
 pub fn wgsl(src: &str) -> String {
     src.replace(JOINT_CAP_TOKEN, &crate::renderer::JOINT_CAP.to_string())
 }

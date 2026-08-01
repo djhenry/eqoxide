@@ -200,6 +200,37 @@ fn record_skin_cap_downgrade_only_inserts_for_exceeds_cap() {
     assert_eq!(map.len(), 1);
 }
 
+/// The documented limit of the file-name key: two files with the same base name under two different
+/// asset roots collapse into ONE entry.
+///
+/// This is here because `record_skin_cap_downgrade`'s doc used to say the opposite — that two loads
+/// of two files "cannot produce one, because the key IS the file" — and a reviewer pointed out the
+/// key is the *base name*. Rather than restate the limit in prose and leave it unmeasured, this
+/// pins it: the second load overwrites the first, and the report says 190 for a name that also
+/// belonged to a 140-joint rig.
+///
+/// It is not reachable in the shipped flow (`EqRenderer` has one `assets_path`, set by
+/// `load_character_models`) and the base name is deliberate — the map is agent-facing over HTTP and
+/// an absolute path is machine-specific noise. If a second root is ever introduced, this test is
+/// where the consequence is already written down.
+#[test]
+fn two_roots_with_the_same_basename_collide_into_one_entry() {
+    let mut map: BTreeMap<String, usize> = BTreeMap::new();
+    let a = Path::new("/root_a").join("race_hum.glb");
+    let b = Path::new("/root_b").join("race_hum.glb");
+    assert_ne!(a, b, "precondition: two genuinely different files");
+
+    record_skin_cap_downgrade(&mut map, &a, StaticReason::ExceedsCap { joint_count: 140 });
+    record_skin_cap_downgrade(&mut map, &b, StaticReason::ExceedsCap { joint_count: 190 });
+
+    assert_eq!(map.len(), 1, "same base name under two roots keys the same entry");
+    assert_eq!(
+        map.get("race_hum.glb"),
+        Some(&190),
+        "the later load wins — the 140-joint rig under the other root is not reported at all"
+    );
+}
+
 /// The key is the loaded file name, not the directory-qualified path: two clients with different
 /// asset roots must produce the same report for the same rig.
 #[test]
@@ -262,6 +293,11 @@ fn two_genders_that_load_the_same_file_are_reported_once() {
 /// `_f`-variant presence, the number of entries equals the number of DISTINCT files loaded — never
 /// more, never fewer. #798 (two files, one entry) and #813 (one file, two entries) are the two ways
 /// this can break, and this is the single statement that excludes both.
+///
+/// Quantified over one asset root, which is what a renderer has. `distinct` counts distinct *paths*,
+/// and every path here shares a root, so distinct path and distinct base name coincide. They do not
+/// coincide in general — see `two_roots_with_the_same_basename_collide_into_one_entry`, which pins
+/// the one case where this equality does not hold.
 #[test]
 fn entry_count_always_equals_distinct_file_count() {
     let labels = ["race_a", "race_b"];
@@ -289,7 +325,7 @@ fn entry_count_always_equals_distinct_file_count() {
             }
         }
         assert_eq!(map.len(), distinct.len(),
-            "f_variants={f_variants:04b} files={files:?}: {} entries for {} distinct files loaded",
+            "f_variants={f_variants:02b} files={files:?}: {} entries for {} distinct files loaded",
             map.len(), distinct.len());
     }
 }

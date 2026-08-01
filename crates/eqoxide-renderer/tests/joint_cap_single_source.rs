@@ -31,10 +31,20 @@
 //!
 //! The name match is gone. [`uniform_mat4_palette_lengths`] resolves every uniform-address-space
 //! struct member through naga's **validated type arena** and reports the length of any fixed-size
-//! `mat4x4<f32>` array it finds, and every check below runs it over **every** `.wgsl` in the
-//! discovered corpus rather than over a list. A palette is detected by being one, so a struct name,
-//! a type alias (naga resolves aliases before the arena exists) and whitespace inside the
-//! declaration are all irrelevant by construction.
+//! `mat4x4<f32>` array it finds. A palette is detected by being one, so a struct name, a type alias
+//! (naga resolves aliases before the arena exists) and whitespace inside the declaration are all
+//! irrelevant by construction.
+//!
+//! Which checks run over the **whole discovered corpus**, precisely — an earlier draft of this
+//! header said "every check below" and a reviewer measured that to be false:
+//! `every_uniform_mat4_palette_in_the_corpus_is_exactly_joint_cap`,
+//! `every_palette_length_tracks_the_substituted_token`,
+//! `palette_bearing_shaders_are_exactly_the_expected_three`,
+//! `raw_palette_shader_sources_do_not_parse_without_substitution` (over the set the first three
+//! detect), `no_shader_writes_a_numeric_palette_length`, and
+//! `substitution_leaves_every_shader_comment_byte_identical`. The two `${JOINT_CAP}` token checks
+//! are properties of the token's characters and read no shader at all;
+//! `no_draw_site_states_a_joint_palette_length` scans two named Rust files and says so.
 //!
 //! ## What is a source-text scan here, and what that is worth
 //!
@@ -52,11 +62,16 @@
 //!
 //! A scanner that silently stops short of its corpus is indistinguishable from a passing one. So:
 //!
-//! - The corpus is **discovered from disk** (`src/shaders/*.wgsl` under `CARGO_MANIFEST_DIR`), not
-//!   listed in this file. A shader added tomorrow is scanned tomorrow.
-//! - `discovered_corpus_is_not_silently_truncated` asserts the walk found a plausible corpus, that
-//!   every file the palette checks name is inside it, and that **every discovered file was actually
-//!   parsed** — so "the scanner couldn't see that file" fails loudly instead of passing quietly.
+//! - The corpus is **discovered from disk** (every `.wgsl` under `src/shaders/`, recursively, from
+//!   `CARGO_MANIFEST_DIR`), not listed in this file. A shader added tomorrow is scanned tomorrow.
+//! - `discovered_corpus_is_not_silently_truncated` compares that walk against an oracle it does not
+//!   produce — the shader names `pipeline.rs` compiles in via `include_str!`, which are literals and
+//!   provably name files that exist. A walk that stops short of any shipped shader fails on
+//!   membership; a file the parse pass dropped fails on walk-vs-parse divergence.
+//!   **This control's earlier form did not have that property, and its docstring said it did**: a
+//!   reviewer truncated the walk to three files with a 99-length decoy palette on disk and the file
+//!   stayed 13 passed / 0 failed. That test's own docstring carries the measurement and the hole
+//!   that remains.
 //! - `palette_bearing_shaders_are_exactly_the_expected_three` asserts the structurally-detected
 //!   palette set equals the expected three. Both directions of that assertion were planted and run
 //!   for eqoxide#811 (a fourth palette shader added; a known palette removed) — see the PR body's
@@ -66,12 +81,13 @@
 //! whose mutations are in the eqoxide#798 PR body: the three shaders' palette lengths and the five
 //! collapsed Rust sites. The claims whose mutations are in the eqoxide#811/812/813/814 PR body: the
 //! structural detection set (both directions), the whole-corpus length check via a decoy shader, the
-//! token-tracking check, the delimited-token identifier property, and the comment-preservation
-//! property.
+//! token-tracking check, the delimited-token identifier property, the comment-preservation property
+//! (line and block), the recursive walk via a nested decoy, and the `pipeline.rs` superset oracle —
+//! that last one planted in both directions, a truncated walk (red) and an untouched walk (green).
 
 use eqoxide_renderer::pipeline::{wgsl, JOINT_CAP_TOKEN};
 use eqoxide_renderer::renderer::{pad_joint_palette, JointPalette, JOINT_BUF_BYTES, JOINT_CAP};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The shaders expected to declare a joint palette. Asserted to be EXACTLY the corpus's
 /// **structurally detected** palette set by `palette_bearing_shaders_are_exactly_the_expected_three`
@@ -81,27 +97,93 @@ use std::collections::BTreeMap;
 const EXPECTED_JOINT_SHADERS: [&str; 3] =
     ["character_skinned.wgsl", "shadow.wgsl", "skin_probe.wgsl"];
 
-/// Every `.wgsl` under `src/shaders/`, read from DISK at test time (filename → raw source).
+/// Every `.wgsl` anywhere under `src/shaders/`, read from DISK at test time. Keyed by the path
+/// relative to `src/shaders/`, `/`-separated — a bare file name for everything that ships today,
+/// because no subdirectory exists.
 ///
 /// Deliberately not a hardcoded list of `include_str!`s: the corpus this test claims to cover has
 /// to be the corpus that actually exists, or the reach claim is a guess.
+///
+/// **The walk recurses (eqoxide#811 review, finding 2).** It was a single non-recursive `read_dir`
+/// while this docstring already said "under `src/shaders/`", and the gap was measured, not spotted
+/// by reading: a reviewer planted a palette-bearing decoy one directory deep and *nothing named it*
+/// in the same run that caught a top-level one. Recursing is what makes the sentence true rather
+/// than true by the accident of a flat directory.
 fn shader_corpus() -> BTreeMap<String, String> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders");
-    let entries = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("cannot read shader dir {}: {e}", dir.display()));
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders");
     let mut out = BTreeMap::new();
-    for entry in entries {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("wgsl") {
-            continue;
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("cannot read shader dir {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("wgsl") {
+                continue;
+            }
+            let rel = path.strip_prefix(&root).expect("walked path is under the shader root");
+            let key = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            out.insert(key, src);
         }
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        out.insert(name, src);
     }
     out
 }
+
+/// The shader files `pipeline.rs` compiles into the binary, extracted from **its source text**
+/// (`include_str!("shaders/<name>")`), keyed the way [`shader_corpus`] keys its walk.
+///
+/// This is the only corpus oracle in this file that the shader walk does not itself produce, which
+/// is exactly what makes it usable as the walk's reach control. It rests on two structural
+/// properties, neither of which is a convention someone has to keep:
+///
+/// - `include_str!` takes a **literal** path. It cannot be handed a value computed at runtime, so
+///   this list is fixed in the source text and cannot shrink when the walk shrinks.
+/// - Every name it yields provably **exists on disk**, because the crate under test would not
+///   compile if it did not. "The walk did not return this file" can therefore only mean the walk
+///   missed it.
+///
+/// Names that do not end in `.wgsl` are ignored, so a doc comment that happens to spell the macro
+/// cannot inject a phantom file name.
+fn shaders_pipeline_includes() -> BTreeSet<String> {
+    const NEEDLE: &str = "include_str!(\"shaders/";
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pipeline.rs");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let mut out = BTreeSet::new();
+    let mut rest = src.as_str();
+    while let Some(i) = rest.find(NEEDLE) {
+        rest = &rest[i + NEEDLE.len()..];
+        let end = rest
+            .find('"')
+            .unwrap_or_else(|| panic!("unterminated include_str! path literal in {}", path.display()));
+        let name = &rest[..end];
+        if name.ends_with(".wgsl") {
+            out.insert(name.to_string());
+        }
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// Floor on how many distinct shader files [`shaders_pipeline_includes`] must find, so a bug in that
+/// scan cannot quietly shrink the oracle and make the superset check below vacuous — the oracle needs
+/// a reach control of its own, or it is just a second scanner nobody is watching.
+///
+/// Measured 2026-08-01 on this tree with a tool that is *not* that scanner:
+/// `grep -o 'include_str!("shaders/[^"]*"' crates/eqoxide-renderer/src/pipeline.rs | sort -u | wc -l`
+/// → **11** distinct files (12 occurrences; `character.wgsl` is included twice). If a shader is
+/// deliberately deleted this assertion is where that gets acknowledged rather than absorbed.
+const MIN_PIPELINE_INCLUDED_SHADERS: usize = 11;
 
 fn parse_and_validate(source: &str, label: &str) -> naga::Module {
     let module = naga::front::wgsl::parse_str(source)
@@ -178,25 +260,65 @@ fn corpus_palette_lengths() -> BTreeMap<String, Vec<u32>> {
 
 // ── Reach control ───────────────────────────────────────────────────────────────────────────────
 
-/// The disk walk found a real corpus, everything the palette checks name is inside it, and every
-/// discovered file was parsed.
+/// The disk walk reached its corpus: it returned every shader `pipeline.rs` compiles in, it contains
+/// everything the palette checks name, and every file it returned was parsed.
 ///
-/// This is the eqoxide#778 guard-reach control expressed as an assertion rather than as a belief:
-/// on that issue a scanner silently stopped at ~12% of its corpus and reported clean, and every
-/// mutation probe happened to land in the window it could still see. A truncated walk fails on the
-/// count, a covered file that fell out of the walk fails on the membership check, and a file the
-/// parse pass dropped fails on the third.
+/// This is the eqoxide#778 guard-reach control: on that issue a scanner silently stopped at ~12% of
+/// its corpus and reported clean, and every mutation probe happened to land in the window it could
+/// still see.
+///
+/// ## The first version of this control did not have the property its name claims
+///
+/// Measured by a reviewer, not argued: with a 99-length uniform `mat4x4` palette planted in the
+/// corpus directory **and** `shader_corpus()` truncated to three files, this test file stayed
+/// **13 passed / 0 failed** — indistinguishable from clean. Both sides of the walk-vs-parse
+/// assertion came from the same walk (`corpus_palette_lengths()` is a total map over
+/// `shader_corpus()`, so a short walk shrinks both sides together), and the only other defence was a
+/// count floor of `EXPECTED_JOINT_SHADERS.len()` = 3 against a real corpus of 11. A walk cut to a
+/// quarter of its corpus cleared it. That is the eqoxide#778 shape reproduced *inside the control
+/// written to prevent eqoxide#778*.
+///
+/// ## What replaced it
+///
+/// The walk is now compared against [`shaders_pipeline_includes`] — an enumeration that lives in
+/// `pipeline.rs`'s source text, that this file does not produce, and that cannot shrink when the
+/// walk does. Every name in it provably exists on disk (the crate would not compile otherwise), so a
+/// missing name means the walk missed a file that is definitely there.
+///
+/// ## Scope, both directions measured (see the PR body)
+///
+/// A walk that drops any shader `pipeline.rs` includes fails here. A walk that drops **only** files
+/// no `include_str!` names — a planted decoy, or a `.wgsl` used solely by a dev bin — is still
+/// invisible to this control: nothing outside the disk knows such a file exists, so no oracle in
+/// this file can miss it loudly. That is a real remaining hole and it is stated rather than covered
+/// by a sentence.
 #[test]
 fn discovered_corpus_is_not_silently_truncated() {
     let corpus = shader_corpus();
+
+    // The oracle's own reach control. A scan bug that returned an empty (or nearly empty) set would
+    // make the superset assertion below pass vacuously — an unwatched second scanner.
+    let included = shaders_pipeline_includes();
     assert!(
-        corpus.len() >= EXPECTED_JOINT_SHADERS.len(),
-        "shader corpus walk returned {} file(s) — fewer than the {} this test claims to cover; a \
-         truncated walk must not look like a clean one. Found: {:?}",
-        corpus.len(),
-        EXPECTED_JOINT_SHADERS.len(),
+        included.len() >= MIN_PIPELINE_INCLUDED_SHADERS,
+        "the pipeline.rs include_str! scan found {} shader file name(s), fewer than the {} measured \
+         to be there — the corpus ORACLE is truncated, so the superset check below would pass \
+         vacuously. Found: {:?}",
+        included.len(),
+        MIN_PIPELINE_INCLUDED_SHADERS,
+        included
+    );
+
+    // The superset check: the walk must have reached every shader the crate compiles in.
+    let missing: Vec<&String> = included.iter().filter(|n| !corpus.contains_key(*n)).collect();
+    assert!(
+        missing.is_empty(),
+        "the shader walk never returned {missing:?}, which pipeline.rs compiles in via include_str! \
+         — those files provably exist (the crate would not build otherwise), so the walk stopped \
+         short of its corpus and every scan built on it is measuring a hole. Walked: {:?}",
         corpus.keys().collect::<Vec<_>>()
     );
+
     for name in EXPECTED_JOINT_SHADERS {
         assert!(
             corpus.contains_key(name),
@@ -278,7 +400,7 @@ fn every_uniform_mat4_palette_in_the_corpus_is_exactly_joint_cap() {
     );
 }
 
-/// Every palette length in a palette-bearing shader **tracks the substituted token**, whatever value
+/// Every uniform mat4 palette **in the whole corpus** tracks the substituted token, whatever value
 /// is substituted.
 ///
 /// This is the check that makes a hardcoded-but-currently-correct length impossible. `array<JMat,
@@ -287,18 +409,29 @@ fn every_uniform_mat4_palette_in_the_corpus_is_exactly_joint_cap() {
 /// token is substituted with a SENTINEL that is deliberately not `JOINT_CAP`: a length derived from
 /// the token moves to the sentinel, a length written as a literal does not, and the mismatch is the
 /// failure. Spelling-, alias- and whitespace-independent, because the comparison is against the IR.
+///
+/// It iterates the **discovered corpus**, not `EXPECTED_JOINT_SHADERS` (eqoxide#811 review,
+/// finding 3): it used to walk the 3-name list while two sentences elsewhere described it as
+/// whole-corpus, so a hardcoded palette in a *fourth* shader was outside it. Detection of that
+/// fourth shader was never lost — `palette_bearing_shaders_are_exactly_the_expected_three` and
+/// `raw_palette_shader_sources_do_not_parse_without_substitution` both fire on one, which the
+/// reviewer measured — but the sentences were false, and the cheaper repair was to make them true.
+/// The list is still used, at the end, as the positive control: the three known palette shaders must
+/// each have yielded a palette, or a corpus that lost them all would satisfy the loop vacuously.
 #[test]
 fn every_palette_length_tracks_the_substituted_token() {
     const SENTINEL: u32 = 77;
     assert_ne!(SENTINEL as usize, JOINT_CAP, "the sentinel must differ from the real cap");
     let corpus = shader_corpus();
+    let mut with_palette: Vec<&str> = Vec::new();
     let mut checked = 0usize;
-    for name in EXPECTED_JOINT_SHADERS {
-        let raw = corpus.get(name).unwrap_or_else(|| panic!("{name} missing from the corpus"));
+    for (name, raw) in &corpus {
         let substituted = raw.replace(JOINT_CAP_TOKEN, &SENTINEL.to_string());
         let module = parse_and_validate(&substituted, name);
         let lens = uniform_mat4_palette_lengths(&module);
-        assert!(!lens.is_empty(), "{name}: no palette found under sentinel substitution");
+        if !lens.is_empty() {
+            with_palette.push(name.as_str());
+        }
         for len in lens {
             assert_eq!(
                 len, SENTINEL,
@@ -308,6 +441,13 @@ fn every_palette_length_tracks_the_substituted_token() {
             );
             checked += 1;
         }
+    }
+    for name in EXPECTED_JOINT_SHADERS {
+        assert!(
+            with_palette.contains(&name),
+            "{name}: no palette found under sentinel substitution. Shaders that did yield one: \
+             {with_palette:?}"
+        );
     }
     assert!(checked >= EXPECTED_JOINT_SHADERS.len(), "checked only {checked} palettes");
 }
@@ -438,48 +578,147 @@ fn substitution_cannot_alter_an_identifier_that_contains_the_word_joint_cap() {
     );
 }
 
+/// Every comment in `src`, in source order, as `(1-based line of its opener, text including the
+/// opener)`.
+///
+/// Both WGSL comment forms. `//` runs to end of line. `/* … */` **nests** — WGSL permits
+/// `/* /* */ */`, and a scanner that ended the outer comment at the first `*/` would then compare
+/// the remaining *code* as if it were prose, which is the quiet direction of wrong.
+///
+/// WGSL has no string literals, so "a comment opener inside a string" is not a case that exists in
+/// this grammar. `substitution_leaves_every_shader_comment_byte_identical` does not take that on
+/// trust: it asserts every quote character in every corpus shader falls inside an extracted comment,
+/// so if that assumption is ever wrong the test says so instead of silently mis-parsing.
+fn comments(src: &str) -> Vec<(usize, String)> {
+    let b: Vec<char> = src.chars().collect();
+    let mut out = Vec::new();
+    let mut line = 1usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == '\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+        if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '/' {
+            let start = i;
+            while i < b.len() && b[i] != '\n' {
+                i += 1;
+            }
+            out.push((line, b[start..i].iter().collect()));
+            continue;
+        }
+        if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '*' {
+            let start = i;
+            let start_line = line;
+            let mut depth = 0usize;
+            while i < b.len() {
+                if b[i] == '\n' {
+                    line += 1;
+                    i += 1;
+                    continue;
+                }
+                if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '*' {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if b[i] == '*' && i + 1 < b.len() && b[i + 1] == '/' {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            out.push((start_line, b[start..i].iter().collect()));
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Self-check for [`comments`], both directions. A comment scanner that is wrong about what a
+/// comment is makes the byte-identity test below pass for the wrong reason.
+#[test]
+fn comment_extractor_finds_both_forms_including_nesting() {
+    let src = "let a = 1; // line\n/* block\n   spans */ let b = 2;\n/* /* nested */ still */ let c = 3;\nlet d = 4;\n";
+    let got = comments(src);
+    assert_eq!(got.len(), 3, "expected three comments, got {got:?}");
+    assert_eq!(got[0], (1, "// line".to_string()));
+    assert_eq!(got[1].0, 2, "a block comment is reported at its OPENING line");
+    assert_eq!(got[1].1, "/* block\n   spans */");
+    // Nesting: the outer comment must not end at the inner `*/`.
+    assert_eq!(got[2], (4, "/* /* nested */ still */".to_string()));
+    // Must NOT mistake code for a comment: division and multiplication are not openers.
+    assert!(comments("let x = a / b;\nlet y = c * d;\n").is_empty());
+    // An unterminated block comment is still reported (as running to EOF) rather than dropped.
+    assert_eq!(comments("/* oops").len(), 1);
+}
+
 /// Substitution leaves every shader **comment** byte-identical.
 ///
 /// eqoxide#812's second half: with the bare token, `pipeline::wgsl` rewrote the shaders' own prose,
 /// so the text naga received read "`128` is NOT a WGSL constant … substitutes the Rust
 /// `renderer::128` into this text". Self-falsifying documentation shipped to the compiler. This
-/// compares the comment portion of every line of every corpus shader before and after substitution.
+/// compares every comment of every corpus shader, before and after substitution.
 ///
-/// Scope: this is a line-comment comparison (`//` onwards), which is the only comment form these
-/// shaders use — it does not model WGSL block comments or `//` inside a string literal, neither of
-/// which occurs in the corpus.
+/// Scope: line **and** block comments, via [`comments`]. The line-only version this replaces was
+/// honest about not modelling blocks, but a reviewer measured the consequence — a block comment
+/// spelling the token is rewritten *silently*, where a line comment is caught loudly — so the gap is
+/// closed rather than disclosed. Both forms have a positive control below; no block comment exists
+/// in the corpus today, so that control is the only thing proving the block half works.
 #[test]
 fn substitution_leaves_every_shader_comment_byte_identical() {
     let corpus = shader_corpus();
     let mut compared = 0usize;
     for (name, raw) in &corpus {
         let sub = wgsl(raw);
-        let raw_lines: Vec<&str> = raw.lines().collect();
-        let sub_lines: Vec<&str> = sub.lines().collect();
-        assert_eq!(raw_lines.len(), sub_lines.len(), "{name}: substitution changed the line count");
-        for (i, (r, s)) in raw_lines.iter().zip(sub_lines.iter()).enumerate() {
-            let (Some(rc), Some(sc)) = (r.find("//"), s.find("//")) else { continue };
+        let raw_c = comments(raw);
+        let sub_c = comments(&sub);
+
+        // The extractor's no-string-literal premise, asserted rather than assumed.
+        let quotes_in_src = raw.matches('"').count();
+        let quotes_in_comments: usize = raw_c.iter().map(|(_, t)| t.matches('"').count()).sum();
+        assert_eq!(
+            quotes_in_src, quotes_in_comments,
+            "{name}: a quote character occurs OUTSIDE a comment. WGSL has no string literals, which \
+             is why `comments` does not model one — if that stopped being true, this comparison can \
+             mis-parse and must be revisited"
+        );
+
+        assert_eq!(
+            raw_c.len(),
+            sub_c.len(),
+            "{name}: substitution changed how many comments the shader has"
+        );
+        for ((rl, r), (_, s)) in raw_c.iter().zip(sub_c.iter()) {
             compared += 1;
-            assert_eq!(
-                &r[rc..],
-                &s[sc..],
-                "{name}:{}: pipeline::wgsl rewrote a comment (eqoxide#812)",
-                i + 1
-            );
+            assert_eq!(r, s, "{name}:{rl}: pipeline::wgsl rewrote a comment (eqoxide#812)");
         }
     }
     assert!(
         compared > 0,
-        "no comment lines were compared across {} shader(s) — this test would pass vacuously",
+        "no comments were compared across {} shader(s) — this test would pass vacuously",
         corpus.len()
     );
-    // Positive control for the comparison itself: a comment that DOES carry the token is caught.
-    let doctored = format!("// the {JOINT_CAP_TOKEN} placeholder\n");
-    assert_ne!(
-        wgsl(&doctored),
-        doctored,
-        "the comparison above can only detect a rewritten comment if wgsl() rewrites this one"
-    );
+    // Positive controls for the comparison itself, one per comment form: a comment that DOES carry
+    // the token must be both rewritten by wgsl() and visible as a difference to `comments`.
+    for (form, doctored) in [
+        ("line", format!("// the {JOINT_CAP_TOKEN} placeholder\n")),
+        ("block", format!("/* the {JOINT_CAP_TOKEN} placeholder */\n")),
+    ] {
+        let sub = wgsl(&doctored);
+        assert_ne!(sub, doctored, "wgsl() must rewrite a {form} comment that spells the token");
+        assert_ne!(
+            comments(&doctored),
+            comments(&sub),
+            "the comparison above can only detect a rewritten {form} comment if it sees this one"
+        );
+    }
 }
 
 // ── The Rust side: one palette builder, one length ──────────────────────────────────────────────

@@ -240,8 +240,27 @@ impl StaticReason {
 ///
 /// Both errors are the same mistake: a key that is a *proxy* for the file instead of the file. This
 /// function therefore takes the `&Path` that was actually handed to `ModelAsset::load` and derives
-/// the key from it. Neither failure is expressible: two loads of one file cannot produce two
-/// entries, and two loads of two files cannot produce one, because the key IS the file.
+/// the key from it.
+///
+/// ## Exactly how far that goes
+///
+/// One direction is structural: **two loads of one file cannot produce two entries**, because
+/// [`downgrade_key`] is a pure function of the path — same path in, same key out, and a `BTreeMap`
+/// does the rest.
+///
+/// The other direction is not. The key is the path's **file name**, not the whole path, so two
+/// files with the same base name under two different asset roots collapse into one entry. That is
+/// measured, not reasoned: `two_roots_with_the_same_basename_collide_into_one_entry` in
+/// `tests/skin_cap_selection.rs` plants it. An earlier version of this doc claimed the collision was
+/// inexpressible "because the key IS the file"; it is not, and a reviewer said so. Reaching it needs
+/// one renderer to load character models from two roots that share a file name — `assets_path` is
+/// set by `load_character_models` and there is one per renderer, so it does not happen in the
+/// shipped flow, but nothing here *prevents* it.
+///
+/// The base name is still the right key, for a reason unrelated to collisions: this map is read by
+/// an AI agent over HTTP, and an absolute local path is both unstable across machines and local
+/// detail this project does not publish. `race_pcfroglok.glb` identifies the rig; the absolute path
+/// in front of it identifies the machine.
 pub fn record_skin_cap_downgrade(
     downgrades: &mut std::collections::BTreeMap<String, usize>,
     model_path: &std::path::Path,
