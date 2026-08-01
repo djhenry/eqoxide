@@ -52,6 +52,41 @@ fn publish_load(slot: &Arc<Mutex<Option<PendingLoad>>>, gen: u64, load: PendingL
     }
 }
 
+/// **The client's ONE production construction of a zone's collision grid**: build it from the
+/// terrain, then attach the zone's region map (`<maps_dir>/water/<zone>.wtr`) — water volumes for
+/// swim/descend routing, AND the DRNTP zone-line regions that ARE this zone's exits.
+///
+/// #803: the loader's `Err` is kept and installed on the grid. A discarded failure used to read as
+/// "this zone has no water and no exits", which `/v1/observe/zone_exits` published as `[]` with 200
+/// OK — a confident "there is no way out of here" that the agent had no way to doubt.
+///
+/// **Why this is a named function and not four lines inside the loader closure** (#821 review round
+/// 2, N2): while it lived inline in a thread closure it could not be called from a test, and the
+/// reviewer proved the consequence by deleting the `set_region_data` line — the whole root crate
+/// stayed green, though every zone's grid would then carry `Err(NotAttached)` and `zone_exits` would
+/// 503 in **every zone in the game**. The type change in #803 forced all the *library* call sites to
+/// speak up; the line that actually feeds them in the shipped client was pinned by nothing. It is
+/// pinned by `zone_load_wiring_803` below.
+///
+/// One deliberate behaviour change from the inline version: the `.wtr` load (and its `warn!`) now
+/// happens only when the terrain assets loaded. When they did not, no grid is built at all and the
+/// zone publishes `Failed` — a warning about the region data of a world that does not exist was
+/// noise, and there is no grid for it to be about.
+pub(crate) fn build_zone_collision(
+    za: &assets::ZoneAssets,
+    maps_dir: &std::path::Path,
+    zone_name: &str,
+) -> collision::Collision {
+    let water = crate::region_map::RegionMap::try_load(&maps_dir.join("water"), zone_name)
+        .map(Arc::new);
+    if let Err(e) = &water {
+        tracing::warn!("region_map: zone '{}' has no usable region data: {}", zone_name, e);
+    }
+    let mut c = collision::Collision::build(za, 32.0);
+    c.set_region_data(water);
+    c
+}
+
 /// The `watch_for_lost_load` decision, pure so it can be tested (#595 review F3). `Some(zone)` means
 /// the state is stuck `Pending` for `zone` and no loader is left that could ever report it — a
 /// panic, or a reply clobbered in the handoff slot. `None` means leave it alone: either a loader is
@@ -786,14 +821,8 @@ impl App {
             };
 
             set_status("Building collision grid…");
-            // Load the zone's water regions (maps/water/<zone>.wtr) so find_path can swim/descend
-            // through water where there's no walkable connection. None if the zone has no .wtr.
-            let water = crate::region_map::RegionMap::load(&maps_dir.join("water"), &zone_name).map(Arc::new);
-            let collision = opt_assets.as_ref().map(|za| {
-                let mut c = collision::Collision::build(za, 32.0);
-                c.set_water(water);
-                Arc::new(c)
-            });
+            let collision = opt_assets.as_ref()
+                .map(|za| Arc::new(build_zone_collision(za, &maps_dir, &zone_name)));
 
             set_status("Loading minimap…");
             let zone_map = zone_map::ZoneMap::load(&maps_dir, &zone_name);
@@ -3336,5 +3365,104 @@ mod worker_panic_protection_tests {
             &dead,
         );
         assert_eq!(dead.lock().unwrap().as_deref(), Some("login failed: boom"));
+    }
+}
+
+/// **#821 review round 2, N2 — the production zone-load wiring, pinned.**
+///
+/// #803 made "no exits" and "could not read the exits" different TYPES, and the compiler forced
+/// every library call site to say which it meant. But the one line in the shipped client that
+/// actually feeds region data onto the grid — [`build_zone_collision`]'s `set_region_data` — lived
+/// inside a spawned thread closure, so no test could reach it. The reviewer deleted it: the whole
+/// root crate stayed green, while a real client would have carried `Err(NotAttached)` on every
+/// zone's grid and answered `503` from `/v1/observe/zone_exits` in **every zone in the game**.
+///
+/// These tests call the production function directly, against a real `.wtr` on disk, and assert the
+/// grid can answer the exits question afterwards. They cover the whole wiring, not just the write:
+/// the `maps/water/<zone>.wtr` path convention, the loader's `Ok`/`Err`, and the attach.
+#[cfg(test)]
+mod zone_load_wiring_803 {
+    use super::build_zone_collision;
+    use crate::assets::{MeshData, RenderMode, ZoneAssets};
+
+    /// A minimal but non-degenerate zone: one floor quad. `Collision::build` needs real triangles
+    /// (an empty grid takes a different constructor branch), and `ZoneAssetState::ready` refuses a
+    /// grid with none — so this is the shape a production `Ready` zone actually has.
+    fn one_floor() -> ZoneAssets {
+        let floor = MeshData {
+            positions: vec![[-100.0, -20.0, -100.0], [100.0, -20.0, -100.0],
+                            [100.0, -20.0, 100.0], [-100.0, -20.0, 100.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        };
+        ZoneAssets { terrain: vec![floor], objects: vec![], textures: vec![] }
+    }
+
+    /// A v2 `.wtr` byte blob whose whole lower half is one zone-line region carrying `index`.
+    ///
+    /// Written as BYTES on purpose: the point of this test is the production path from a FILE at
+    /// `<maps_dir>/water/<zone>.wtr` to an answerable grid. Handing `build_zone_collision` an
+    /// already-parsed `RegionMap` would skip `try_load`, the directory join and the filename
+    /// convention — three of the four things that have to be right. Layout is the one documented at
+    /// the top of `eqoxide_core::region_map`: magic, u32 version, u32 node count, then per node
+    /// `i32 index, 3×f32 normal, f32 split, i32 region, i32 special, i32 left, i32 right,
+    /// i32 zone_line_index`.
+    fn wtr_with_one_zone_line(index: i32) -> Vec<u8> {
+        // (normal, split, special, left, right, zone_line_index). `leaf_at` walks LEFT when
+        // `dot(normal, p) + split > 0`, so z > 0 lands on the dry leaf and z < 0 on the zone line.
+        // `special == 3` is `REGION_ZONE_LINE` (private to region_map, hence the literal).
+        let nodes: &[([f32; 3], f32, i32, i32, i32, i32)] = &[
+            ([0.0, 0.0, 1.0], 0.0, 0, 2, 3, 0), // split at z == 0
+            ([0.0; 3], 0.0, 0, 0, 0, 0),        // 2: dry leaf (above)
+            ([0.0; 3], 0.0, 3, 0, 0, index),    // 3: ZONE LINE leaf (below)
+        ];
+        let mut out = b"EQEMUWATER".to_vec();
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
+        for (i, (normal, split, special, left, right, zli)) in nodes.iter().enumerate() {
+            out.extend_from_slice(&(i as i32).to_le_bytes());
+            for c in normal { out.extend_from_slice(&c.to_le_bytes()); }
+            out.extend_from_slice(&split.to_le_bytes());
+            out.extend_from_slice(&0i32.to_le_bytes()); // region ordinal, unused by the reader
+            out.extend_from_slice(&special.to_le_bytes());
+            out.extend_from_slice(&left.to_le_bytes());
+            out.extend_from_slice(&right.to_le_bytes());
+            out.extend_from_slice(&zli.to_le_bytes());
+        }
+        out
+    }
+
+    /// **The healthy path.** A zone whose `.wtr` is where production looks for it must produce a
+    /// grid that ENUMERATES its exits. Delete the `set_region_data` call and this reads
+    /// `Err(NotAttached)` instead of `Ok([7])`.
+    #[test]
+    fn a_zone_with_a_wtr_gets_a_grid_that_can_answer_its_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("water")).unwrap();
+        std::fs::write(dir.path().join("water/testzone.wtr"), wtr_with_one_zone_line(7)).unwrap();
+
+        let col = build_zone_collision(&one_floor(), dir.path(), "testzone");
+        assert_eq!(col.zone_line_indices().as_deref(), Ok(&[7][..]),
+            "the loaded region map's zone line must reach the grid — this is what \
+             /v1/observe/zone_exits reports and the ONLY production write that puts it there");
+        assert_eq!(col.region_data_absent(), None, "the region data IS attached");
+    }
+
+    /// **The failure path.** A zone with no `.wtr` must leave the grid able to say WHY — not
+    /// `Ok([])` ("this zone has no way out", the #803 falsehood) and not `NotAttached` ("nobody
+    /// ever asked", which is a client bug, not a missing asset).
+    #[test]
+    fn a_zone_with_no_wtr_gets_a_grid_that_refuses_with_the_real_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let col = build_zone_collision(&one_floor(), dir.path(), "testzone");
+
+        let absent = col.region_data_absent().expect("a missing .wtr is an absence, not an answer");
+        assert_eq!(absent.as_str(), "region_data_missing",
+            "the grid must name the LOAD failure. `region_data_not_attached` here would mean the \
+             production write was skipped entirely (N2), which reads to an operator as a client \
+             bug rather than a missing asset");
+        assert!(col.zone_line_indices().is_err(),
+            "and the exits question refuses rather than answering the empty list");
     }
 }

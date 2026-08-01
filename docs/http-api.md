@@ -545,6 +545,9 @@ which a later load on the same code refuted.
 | `GET /v1/observe/zone_exits` | Exits come out of the collision grid; before it exists this returned a confident `[]` — "this zone has no exits at all" — and during `stale` it returned the *previous* zone's exits. |
 | `GET /v1/observe/frame` | A PNG of the placeholder ground plane is indistinguishable from a genuinely empty zone, and a `stale` frame shows the zone you left. Pass **`?allow_pending=1`** if the loading screen is what you actually want. |
 
+`zone_exits` has a **second, unrelated 503** that this readiness verdict does not cover — see
+[Zone exits: `[]` means exactly one thing (#803)](#zone-exits--means-exactly-one-thing-803).
+
 Every `200` from `/v1/observe/frame` also carries **`X-Zone-Assets-State:`** with the same word as
 `zone_assets.state`, so a PNG fetched with `?allow_pending=1` cannot be mistaken downstream for one
 of the real zone. Only `ready` means the image shows the zone the character is in. It also carries
@@ -561,6 +564,50 @@ character is moving through a world the client has not built, so prefer waiting 
 `POST /v1/move/goto` still accepts the goal, but its response carries a non-null
 **`zone_assets_pending`** note while the assets are missing, and `nav_state` reads `zone_loading`
 until they land.
+
+### Zone exits: `[]` means exactly one thing (#803)
+
+`GET /v1/observe/zone_exits` answers out of the zone's **region map** (`maps/water/<zone>.wtr`),
+whose baked zone-line regions *are* the exits. That file is separate from the terrain the
+[`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579) verdict
+tracks, and it can fail on its own: absent, unreadable, not region data, a format version this build
+cannot read, or truncated. Until #803 all of those were discarded and the endpoint served **`[]` with
+`200 OK`** — the same bytes as the true, common answer "this zone has no zone lines". Exits are the
+only way out of a zone, so a failed *file read* read as a fact about the world: sealed in.
+
+Now:
+
+* **`200` with `[]`** means, and only means, *this zone's region map loaded and contains no
+  zone-line regions.* It is a real reading of the world.
+* **`503 {"error": "zone_region_data_unavailable", "reason": …, "detail": …, "message": …}`** means
+  the question could not be answered. Unlike `zone_assets_not_ready`, **this does not clear by
+  polling** — the asset is missing or unusable, not loading. Re-sync or re-bake the zone's assets.
+  `reason` is the machine-readable cause below, `detail` is that cause rendered with its specifics
+  (e.g. the declared node count), and `message` is prose for a human reading the log.
+
+| `reason` | What happened |
+|---|---|
+| `region_data_missing` | No `.wtr` for this zone. |
+| `region_data_unreadable` | The file exists but could not be read (permissions, a bad mount, a directory in its place). |
+| `region_data_not_region_data` | Present, but not a region map (wrong magic, or shorter than the header). |
+| `region_data_unsupported_version` | A `.wtr` format version this build cannot read. |
+| `region_data_truncated` | The header declares more BSP nodes than the file carries. |
+
+**A sixth `reason` exists in the code and is NOT in that table on purpose: `region_data_not_attached`**
+(#821 review round 2, B3 — a previous revision listed it as an outcome you might receive). It is the
+state a freshly built collision grid is in before any region data is handed to it. **No release
+build can serve it**: the client has exactly one production construction of a collision grid
+(`build_zone_collision` in `src/app.rs`), which builds and attaches in a single call, and the only
+reason-free way to write the slot (`Collision::set_water`) is `#[cfg(any(test, feature =
+"test-fixtures"))]` and so does not exist in a release binary. It is listed here only so that an
+agent that somehow *does* receive it knows what it means: **a client bug, not an asset problem** —
+re-syncing assets will not help; file it. (This is an argument from enumerating every construction
+site, not a type-level guarantee — nothing stops a future non-test grid from reaching a reader
+un-attached.)
+
+**Not covered by this:** `POST /v1/move/zone_cross` still reports `zone_line_not_in_map` (documented
+as a map-data *gap*) when the region map failed to load rather than merely lacking the region — the
+same substitution, one caller over, tracked as #815.
 
 ### Camera override for `/observe/frame` (#422)
 
