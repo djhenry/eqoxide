@@ -24,8 +24,10 @@
 //! `renderer::SkinFit::classify` names the three-way split explicitly (`NoSkin` / `EmptySkin` /
 //! `ExceedsCap` / `Fits`) so a call site can no longer discard the distinction on the way into a
 //! `bool`. `StaticReason` (the subset that actually reaches the static arm) exposes
-//! `is_downgrade()` — true only for `ExceedsCap` — and `build_character_model` logs at `error!`
-//! and records into `EqRenderer::skin_cap_downgrades` exactly when that's true.
+//! `is_downgrade()` — true only for `ExceedsCap` — and `skin_observation::observe_skin_fit` logs at
+//! `error!` and records into `EqRenderer::skin_cap_downgrades` exactly when that's true. (Both of
+//! those lived in `build_character_model` / `ensure_character_model` until eqoxide#780 moved them
+//! into one function a test can call.)
 //!
 //! ## What this file does NOT cover
 //!
