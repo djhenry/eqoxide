@@ -2697,11 +2697,13 @@ fn smooth_entity_motion(
         // original shape nested the whole match inside `if !b.floating`, so while an entity was
         // floating (a levitate toggle, a boat ride — `floating()` is re-derived from the LIVE
         // flymode every frame, #578, not a one-time spawn flag) the `None` arm was unreachable no
-        // matter what `collision` did. Confirmed: `[f32::NAN; 3]` — the invalidation — appears
-        // nowhere else in this file, and `self.collision` has exactly two production writers
-        // (`Some` on load completion, `None` on reload start), so every real collision swap
-        // passes through `None`. `b.floating` now only gates whether the snap is *applied* (the
-        // boat/#194 behavior — keep the server-sent z), never whether the `None` arm is reachable.
+        // matter what `collision` did. Confirmed: the only other `[f32::NAN; 3]` in this file is
+        // the `motion.entry(..).or_insert_with(..)` initialiser (~2592), which invalidates only
+        // on entry *creation*; nothing else invalidates a live entry. And `self.collision` has
+        // exactly two production writers (`Some` on load completion, `None` on reload start), so
+        // every real collision swap passes through `None`. `b.floating` now only gates whether
+        // the snap is *applied* (the boat/#194 behavior — keep the server-sent z), never whether
+        // the `None` arm is reachable.
         //
         // NOT measured: whether a floating entity's cache entry can actually survive a live
         // `Some(A) -> None -> Some(B)` zone swap end to end — `motion.retain` (below) drops an
