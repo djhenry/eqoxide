@@ -29,12 +29,15 @@
 //!
 //! ## What this file does NOT cover
 //!
-//! - That `build_character_model` actually calls `SkinFit::classify` and wires its result to
-//!   `error!`/`skin_cap_downgrades` — that needs a `wgpu::Device`, which nothing in this crate's
-//!   test harness can construct (see `shadow_routing.rs`'s header for the established precedent).
-//!   What's covered here is the decision itself: `SkinFit::classify`, `SkinFit::is_skinned`,
-//!   `SkinFit::static_reason`, `StaticReason::is_downgrade`, and `record_skin_cap_downgrade` are
-//!   all pure and reached directly.
+//! - That `EqRenderer::ensure_character_model` and `EqRenderer::build_character_model` behave as
+//!   described — both need a `wgpu::Device`, which nothing in this crate's test harness can
+//!   construct (see `shadow_routing.rs`'s header for the established precedent). **The wiring
+//!   between them is no longer in that blind spot**, though, and that is the change eqoxide#797
+//!   asked for: the classify → log → record sequence is now one device-free function,
+//!   `skin_observation::observe_skin_fit`, exercised directly by the `observing_*` tests below.
+//!   What remains uncovered is only the two device-dependent methods' own bodies — and a render arm
+//!   cannot be chosen in either without an `ObservedSkinFit`, which only `observe_skin_fit`
+//!   produces.
 //! - That the `error!` log line is emitted with any particular text — this project's own
 //!   `AGENT-HONESTY` guidance is that a log line is a weak signal anyway (the driving agent does
 //!   not read logs), so this file grades the *structured* observable
@@ -54,6 +57,7 @@ use eqoxide_renderer::renderer::{
     downgrade_key, record_skin_cap_downgrade, resolve_character_model_path, SkinFit, StaticReason,
     JOINT_CAP, MAX_MEASURED_CHARACTER_RIG_JOINTS,
 };
+use eqoxide_renderer::skin_observation::observe_skin_fit;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -198,6 +202,106 @@ fn record_skin_cap_downgrade_only_inserts_for_exceeds_cap() {
     assert_eq!(map.get("race_pcfroglok.glb"), Some(&129),
         "an ExceedsCap reason must be recorded under the loaded FILE with its joint count");
     assert_eq!(map.len(), 1);
+}
+
+// ── The WIRING: classify → log → record, as one reachable function (eqoxide#780 / eqoxide#797) ──
+//
+// The tests above grade the pure pieces. These grade the sequence the renderer actually executes.
+// eqoxide#797 measured that the previous arrangement — `build_character_model` classifying and
+// logging, `ensure_character_model` recording — was invisible to this suite: wrapping both calls in
+// `if false {}` left `-p eqoxide-renderer` byte-identically green. `observe_skin_fit` is that whole
+// sequence in one device-free function, so the same wrap is now a compile error at the call site
+// (there is no `ObservedSkinFit` to hand `build_character_model`) and a RED test here.
+
+/// eqoxide#780's acceptance bar, applied to the function the renderer really calls rather than to
+/// the classifier alone: a synthetic model with `joint_count = 129` takes the static arm **and** is
+/// reported as a downgrade.
+///
+/// 129 is the issue's own number, written literally rather than as `JOINT_CAP + 1`, so this test
+/// keeps asserting the case the issue names even if the cap moves. `the_cap_is_inclusive` and
+/// `observation_and_arm_agree_over_the_whole_range` cover the boundary relative to `JOINT_CAP`.
+#[test]
+fn observing_a_cap_exceeding_skin_takes_the_static_arm_and_reports_it() {
+    let mut downgrades: BTreeMap<String, usize> = BTreeMap::new();
+    let observed = observe_skin_fit(
+        &mut downgrades, Path::new("/models/race_over.glb"), "race_over", Some(129),
+    );
+
+    assert!(!observed.is_skinned(), "a 129-joint skin must take the STATIC arm");
+    assert_eq!(observed.fit(), SkinFit::ExceedsCap { joint_count: 129 });
+    assert_eq!(downgrades.get("race_over.glb"), Some(&129),
+        "a 129-joint skin must be REPORTED as a downgrade, keyed by the loaded file");
+    assert_eq!(downgrades.len(), 1);
+}
+
+/// The other half of the acceptance bar: the two static arms that are NOT downgrades take the same
+/// arm and produce no report. Before eqoxide#780 all three of these were one `bool` and nothing
+/// distinguished them; the point is that the arm is the same and the report is not.
+#[test]
+fn observing_an_unremarkable_static_model_takes_the_static_arm_and_reports_nothing() {
+    let mut downgrades: BTreeMap<String, usize> = BTreeMap::new();
+
+    let empty = observe_skin_fit(
+        &mut downgrades, Path::new("/models/race_empty.glb"), "race_empty", Some(0),
+    );
+    assert!(!empty.is_skinned());
+    assert_eq!(empty.fit(), SkinFit::EmptySkin);
+    assert!(downgrades.is_empty(),
+        "a zero-joint skin is degenerate data, not a cap downgrade — it must not be reported");
+
+    let none = observe_skin_fit(&mut downgrades, Path::new("/models/boat.glb"), "boat", None);
+    assert!(!none.is_skinned());
+    assert_eq!(none.fit(), SkinFit::NoSkin);
+    assert!(downgrades.is_empty(),
+        "an unskinned model (e.g. boat.glb) must not be reported as a downgrade");
+}
+
+/// A fitting skin takes the skinned arm and is not reported. Stated separately because a report
+/// that fired on every load would also be a falsehood, just a noisier one.
+#[test]
+fn observing_a_fitting_skin_takes_the_skinned_arm_and_reports_nothing() {
+    let mut downgrades: BTreeMap<String, usize> = BTreeMap::new();
+    let observed = observe_skin_fit(
+        &mut downgrades, Path::new("/models/race_pcfroglok.glb"), "race_pcfroglok",
+        Some(MAX_MEASURED_CHARACTER_RIG_JOINTS),
+    );
+
+    assert!(observed.is_skinned(),
+        "the widest rig that ships is under the cap and must render SKINNED");
+    assert_eq!(observed.fit(), SkinFit::Fits { joint_count: MAX_MEASURED_CHARACTER_RIG_JOINTS });
+    assert!(downgrades.is_empty());
+}
+
+/// The universal the two examples above are instances of, and the one that makes the two channels
+/// unable to drift apart: over every joint count from "no skin" through well past the cap, a model
+/// is reported as a downgrade **iff** it has a skin that exceeds the cap, and it takes the skinned
+/// arm **iff** it is not reported and has a non-empty skin.
+///
+/// Both sides are also checked against `old_use_skinned`, the verbatim pre-eqoxide#780 boolean, so
+/// this simultaneously re-pins "eqoxide#780 is not a placement change" across the whole range for
+/// the function the renderer calls — not just for `SkinFit::classify`.
+#[test]
+fn observation_and_arm_agree_over_the_whole_range() {
+    for n in 0..=(JOINT_CAP + 8) {
+        let mut downgrades: BTreeMap<String, usize> = BTreeMap::new();
+        let observed = observe_skin_fit(
+            &mut downgrades, Path::new("/models/x.glb"), "x", Some(n),
+        );
+
+        let reported = downgrades.get("x.glb").copied();
+        assert_eq!(reported, (n > JOINT_CAP).then_some(n),
+            "joint_count {n}: reported-as-downgrade must hold exactly when the cap is exceeded");
+        assert_eq!(observed.is_skinned(), old_use_skinned(Some(n)),
+            "joint_count {n}: the render arm must match the pre-#780 boolean");
+        assert!(!(observed.is_skinned() && reported.is_some()),
+            "joint_count {n}: a model cannot both render skinned and be a cap downgrade");
+    }
+
+    // The `None` (no skin at all) case, which the numeric loop cannot express.
+    let mut downgrades: BTreeMap<String, usize> = BTreeMap::new();
+    let observed = observe_skin_fit(&mut downgrades, Path::new("/models/x.glb"), "x", None);
+    assert!(downgrades.is_empty());
+    assert_eq!(observed.is_skinned(), old_use_skinned(None));
 }
 
 /// The documented limit of the file-name key: two files with the same base name under two different

@@ -16,6 +16,7 @@ pub mod pass;
 pub mod pipeline;
 pub mod renderer;
 pub mod scene;
+pub mod skin_observation;
 pub mod models;
 pub mod anim;
 pub mod billboard;

@@ -399,6 +399,11 @@ pub struct EqRenderer {
     /// The key is the file rather than `(label, gender)` because the file is what the joint count
     /// describes; see [`record_skin_cap_downgrade`] for why that distinction is load-bearing
     /// (eqoxide#813).
+    ///
+    /// Written in exactly one place, [`crate::skin_observation::observe_skin_fit`], which is also
+    /// the only producer of the [`crate::skin_observation::ObservedSkinFit`] that
+    /// `build_character_model` requires — so the report and the render arm are decided by the same
+    /// call and cannot drift apart.
     pub skin_cap_downgrades: std::collections::BTreeMap<String, usize>,
     /// Channel to the background model-sync worker: send a race model KEY (e.g. "race_hum") to
     /// fetch its `charmodel/<key>` set on demand the first time a spawn of that race is seen, so
@@ -892,13 +897,20 @@ impl EqRenderer {
         }
         match crate::models::ModelAsset::load(&path) {
             Ok(asset) => {
-                let (model, skin_fit) = self.build_character_model(key, asset);
-                if let Some(reason) = skin_fit.static_reason() {
-                    // Keyed by the file that was just loaded — `path`, not `key`/`gender`, because
-                    // gender 1 falls back to the male GLB when there is no `_f` variant and the
-                    // joint count belongs to the file (eqoxide#813).
-                    record_skin_cap_downgrade(&mut self.skin_cap_downgrades, &path, reason);
-                }
+                // Classify + log + record in ONE call, before the model is built, because
+                // `build_character_model` cannot choose a render arm without the `ObservedSkinFit`
+                // this returns. Skipping the report is therefore a compile error rather than a
+                // silent regression (eqoxide#780; the reachability hole is eqoxide#797/#799).
+                // Keyed by the file that was just loaded — `path`, not `key`/`gender`, because
+                // gender 1 falls back to the male GLB when there is no `_f` variant and the joint
+                // count belongs to the file (eqoxide#813).
+                let observed = crate::skin_observation::observe_skin_fit(
+                    &mut self.skin_cap_downgrades,
+                    &path,
+                    key,
+                    asset.skin.as_ref().map(|s| s.joint_count),
+                );
+                let model = self.build_character_model(key, asset, observed);
                 self.gpu_character_models.insert((key, gender), model);
                 tracing::debug!("renderer: lazily loaded character model '{key}' (gender {gender})");
             }
@@ -916,12 +928,18 @@ impl EqRenderer {
     /// usable skin, else static). `label` is only used for log lines. Shared by the
     /// archetype loader and the per-race (`race_<code>.glb`) loader.
     ///
-    /// Returns the [`SkinFit`] alongside the model so the caller can record a cap downgrade
-    /// (eqoxide#780) — this method takes `&self`, not `&mut self`, so it cannot update
-    /// `self.skin_cap_downgrades` itself; see `ensure_character_model`.
-    fn build_character_model(&self, label: &str, asset: crate::models::ModelAsset)
-        -> (crate::gpu::GpuModel, SkinFit)
-    {
+    /// Takes the render-arm choice as an [`ObservedSkinFit`], which only
+    /// [`crate::skin_observation::observe_skin_fit`] can produce. This method takes `&self`, not
+    /// `&mut self`, so it cannot record into `self.skin_cap_downgrades` itself; rather than return
+    /// a bare [`SkinFit`] and *hope* the caller reports it (which is what eqoxide#795 did, and what
+    /// eqoxide#797 measured to be unreachable from any test), it demands the witness that the
+    /// reporting already happened. See `ensure_character_model`.
+    fn build_character_model(
+        &self,
+        label: &str,
+        asset: crate::models::ModelAsset,
+        observed: crate::skin_observation::ObservedSkinFit,
+    ) -> crate::gpu::GpuModel {
         use wgpu::util::DeviceExt;
         use crate::models::SkinnedMeshData;
         tracing::info!("renderer: loaded '{}' — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
@@ -933,18 +951,7 @@ impl EqRenderer {
         let tex_names: Vec<String> =
             asset.textures.iter().map(|t| t.name.clone()).collect();
 
-        let skin_fit = SkinFit::classify(asset.skin.as_ref().map(|s| s.joint_count));
-        if let Some(reason) = skin_fit.static_reason() {
-            if reason.is_downgrade() {
-                tracing::error!(
-                    "renderer: character model '{label}' has a skin that EXCEEDS the \
-                     {JOINT_CAP}-joint cap ({skin_fit:?}) — falling back to the STATIC \
-                     (unskinned) render arm; this model will not animate (eqoxide#780)"
-                );
-            }
-        }
-
-        if skin_fit.is_skinned() {
+        if observed.is_skinned() {
             let skin = asset.skin.unwrap();
             let mut meshes: Vec<GpuSkinnedMesh>                       = Vec::new();
             let mut skinned_slots: Vec<Option<crate::models::EquipSlot>> = Vec::new();
@@ -992,7 +999,7 @@ impl EqRenderer {
             }
             tracing::info!("renderer: loaded skinned model '{}' ({} joints, {} clips)",
                       label, skin.joint_count, skin.clips.len());
-            (GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: skinned_slots, head_parts: skinned_head_parts, head_default_hidden: skinned_head_hidden, true_height: asset.true_height, clip_bounds: asset.clip_bounds.clone(), feet_offset: asset.feet_offset }), skin_fit)
+            GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: skinned_slots, head_parts: skinned_head_parts, head_default_hidden: skinned_head_hidden, true_height: asset.true_height, clip_bounds: asset.clip_bounds.clone(), feet_offset: asset.feet_offset })
         } else {
             let mut meshes: Vec<GpuMesh>                              = Vec::new();
             let mut static_slots: Vec<Option<crate::models::EquipSlot>> = Vec::new();
@@ -1029,7 +1036,7 @@ impl EqRenderer {
                 static_head_hidden.push(dh);
             }
             tracing::info!("renderer: loaded static model '{}'", label);
-            (GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, bounds: crate::models::ModelBounds { y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center }, prefix: asset.prefix.clone(), equip_slots: static_slots, head_parts: static_head_parts, head_default_hidden: static_head_hidden, true_height: asset.true_height, clip_bounds: vec![], feet_offset: 0.0 }), skin_fit)
+            GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, bounds: crate::models::ModelBounds { y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center }, prefix: asset.prefix.clone(), equip_slots: static_slots, head_parts: static_head_parts, head_default_hidden: static_head_hidden, true_height: asset.true_height, clip_bounds: vec![], feet_offset: 0.0 })
         }
     }
 
