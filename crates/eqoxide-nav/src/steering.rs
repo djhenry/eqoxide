@@ -245,11 +245,16 @@ pub fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
 /// **The comparison is `<`, not `<=`, and that is measured, not cosmetic (#727 round 2).** The
 /// cycle #673 describes has an ATTRACTING FIXED POINT sitting exactly ON this boundary: on a
 /// hairpin whose legs are one coarse cell apart the cursor/carrot loop converges to a body offset of
-/// exactly 8.0 u and parks there. With `<=` that state is *inside* the guard, so the resync never
-/// fires and the carrot never leads again — measured 1 of 8 swept starts still CARROT-PINNED after
-/// 400 ticks, and 33 of 288 on the wider 8 u-separation sweep. With `<` it is outside, and both go
-/// to zero (`the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced`,
-/// `the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured`).
+/// exactly 8.0 u and parks there. With `<=` that state is *inside* the guard, so the DISTANCE
+/// trigger never fires there — measured in round 2 as 1 of 8 swept starts still CARROT-PINNED after
+/// 400 ticks, and 33 of 288 on the wider 8 u-separation sweep. With `<` it is outside, and both went
+/// to zero.
+///
+/// **Since #733 that flip is no longer observable, and no test enforces the token** — see the
+/// ⚠️ Correction on `the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced`, which
+/// records the re-run. The second trigger catches the same fixed point, so `<` survives on the
+/// round-2 reasoning alone. Read the counts above as a measurement of this constant's trigger in
+/// isolation, not as a live mutation check.
 ///
 /// **What this constant does NOT do — the residual class, stated so nobody re-derives it as a
 /// surprise.** Below the guard this trigger is inert by construction, so a route whose legs are
@@ -2536,13 +2541,29 @@ mod cursor_resync_tests {
     ///   which converges onto the boundary and is then held there by the `<=`)
     /// * with `d0_sq <  CURSOR_STALE_DIST²` (this branch): **0 of 8**
     ///
-    /// Both numbers were measured on this branch by flipping that single token and re-running; the
-    /// same flip takes the 8 u column of
+    /// Both numbers were measured in round 2 by flipping that single token and re-running; the same
+    /// flip took the 8 u column of
     /// [`the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured`] from 0/288 to
-    /// 33/288. Mutation check: flip it back to `<=` and this test goes RED.
+    /// 33/288.
     ///
     /// ⚠️ **Correction (round 3).** These counts are of *carrot pinning*, not of a walker failing to
     /// arrive — see [`hairpin_carrot_stops_leading`]. Round 2 reported them as wedged walkers.
+    ///
+    /// ⚠️ **Correction (#733) — the mutation check this doc claimed is DEAD, measured.** The line
+    /// *"Mutation check: flip it back to `<=` and this test goes RED"* was true while the distance
+    /// trigger was the only trigger. It is now false, and the mutation was run rather than reasoned
+    /// about: with `d0_sq <= CURSOR_STALE_DIST²` on this branch the whole crate is still green
+    /// (`223 passed; 0 failed`) and every row of the sweep still reads 0 pinned, 8 u included. The
+    /// reason is not that the `<` finding was wrong — it was a real round-2 measurement, and the
+    /// counts above stand as a measurement OF THE DISTANCE TRIGGER ALONE. It is that #733's second
+    /// trigger catches that same fixed point: the carrot at the 8 u attractor is collapsed, so the
+    /// resync now fires on the collapse whichever way the distance comparison rounds.
+    ///
+    /// **Consequence, stated rather than hidden: `<` is now a surviving mutant.** No test in this
+    /// crate distinguishes `<` from `<=` any more. The token is kept because the round-2 reasoning
+    /// for it is unchanged — a fixed point exactly ON the boundary should be outside a guard that
+    /// means "close enough to leave alone" — but this doc no longer claims a test enforces it, and
+    /// a future reader must not infer one from the counts above.
     #[test]
     fn the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced() {
         let mut pinned = Vec::new();
