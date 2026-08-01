@@ -3195,6 +3195,52 @@ mod tests {
                    "a fully-known non-levitating state → an honest false (not null)");
     }
 
+    /// **#822 — position is served as ONE `pos` array, and there is no `pos_up` key to read.**
+    ///
+    /// Three tracked files told an API reader to read a key called `pos_up`: the `levitating` table
+    /// in `docs/http-api.md`, the rustdoc on `PlayerState::levitating`, and the datum-discipline
+    /// paragraph on `eqoxide_core::coord::WIRE_Z_OFFSET` (which also named a `/player` endpoint that
+    /// does not exist). `pos_east`/`pos_north`/`pos_up` are `PlayerState` field names; `get_debug`
+    /// hand-builds its `player` object and emits them as the single `"pos": [east, north, up]`.
+    ///
+    /// **What this test does and does not cover.** It pins the WIRE FACT the corrected sentences now
+    /// assert — `pos` present as a 3-array, no `pos_*` key beside it — so a future change that adds
+    /// such a key, or renames `pos`, goes red and the prose stops being silently true-by-luck. It
+    /// does NOT check the prose: the wording edits in those three files have no test behind them,
+    /// and reverting any of them leaves this test and the suite green. Said plainly rather than
+    /// implied, because the acceptance bar on #822 asks for exactly that distinction.
+    ///
+    /// `up` is deliberately negative and distinct from `east`/`north`: a fixture that flattens the
+    /// third component, or repeats one value, cannot detect a transposed or dropped axis (#800).
+    ///
+    /// MUTATION CHECK (run on the remote builder, `-p eqoxide-http --lib`, file restored from an
+    /// `md5sum`-verified copy afterwards): rename the `"pos"` key in `get_debug` to `"pos_up"` →
+    /// RED here. Result recorded in the PR body.
+    #[tokio::test]
+    async fn position_is_served_as_one_pos_array_with_no_pos_up_key_822() {
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.player_x = 812.5;
+            gs.player_y = 43.0;
+            gs.player_z = -119.75;
+        });
+        let v = debug_json(state).await;
+        let player = v["player"].as_object().expect("player object");
+
+        assert_eq!(player.get("pos"), Some(&serde_json::json!([812.5, 43.0, -119.75])),
+            "position must be served as the one array [east, north, up]. Keys served: {:?}",
+            player.keys().collect::<Vec<_>>());
+
+        for absent in ["pos_east", "pos_north", "pos_up"] {
+            assert!(!player.contains_key(absent),
+                "`{absent}` is now a served key. That is not automatically wrong, but the docs and \
+                 rustdoc corrected by #822 currently tell agents this key does NOT exist and to read \
+                 the `pos` array instead — update them in the same change, then update this test. \
+                 Keys served: {:?}",
+                player.keys().collect::<Vec<_>>());
+        }
+    }
+
     /// **#608, the no-second-derivation pin for the AGENT consumer.** `/nav_debug` is a structural
     /// serde projection of whatever nav PUBLISHED — verbatim. The fabricated snapshot below is
     /// deliberately inconsistent with any geometry (the state holds NO collision at all, and the
