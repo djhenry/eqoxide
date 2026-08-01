@@ -72,6 +72,14 @@
 //!   reviewer truncated the walk to three files with a 99-length decoy palette on disk and the file
 //!   stayed 13 passed / 0 failed. That test's own docstring carries the measurement and the hole
 //!   that remains.
+//! - **The oracle then had the same disease one level down, and again the docstring was the thing
+//!   that was wrong.** Its scan took `include_str!` hits from `pipeline.rs` *including ones inside
+//!   comments*, while claiming an extension filter prevented that. Measured, not argued: a phantom
+//!   name in a comment padded `MIN_PIPELINE_INCLUDED_SHADERS`, and a scan that silently dropped a
+//!   genuinely-included shader still measured **14 passed / 0 failed**. The scan now skips comments
+//!   via [`comment_spans`] — the same scanner the comment-identity test uses, not a second one — and
+//!   `the_include_scan_ignores_comments_but_not_code` pins both directions against a synthetic
+//!   source, so it keeps testing the rule after `pipeline.rs` changes.
 //! - `palette_bearing_shaders_are_exactly_the_expected_three` asserts the structurally-detected
 //!   palette set equals the expected three. Both directions of that assertion were planted and run
 //!   for eqoxide#811 (a fourth palette shader added; a known palette removed) — see the PR body's
@@ -84,6 +92,10 @@
 //! token-tracking check, the delimited-token identifier property, the comment-preservation property
 //! (line and block), the recursive walk via a nested decoy, and the `pipeline.rs` superset oracle —
 //! that last one planted in both directions, a truncated walk (red) and an untouched walk (green).
+//! Added in the third review round: the oracle's comment filter, planted four ways — a phantom in a
+//! line comment (was a false red, now green), the phantom-pads-the-floor composite (was a false
+//! **green**, now red), the filter neutered (red), and the comment scanner made to swallow the whole
+//! file (red, via the floor at zero). Nothing here is claimed from reading the code.
 
 use eqoxide_renderer::pipeline::{wgsl, JOINT_CAP_TOKEN};
 use eqoxide_renderer::renderer::{pad_joint_palette, JointPalette, JOINT_BUF_BYTES, JOINT_CAP};
@@ -152,25 +164,74 @@ fn shader_corpus() -> BTreeMap<String, String> {
 ///   compile if it did not. "The walk did not return this file" can therefore only mean the walk
 ///   missed it.
 ///
-/// Names that do not end in `.wgsl` are ignored, so a doc comment that happens to spell the macro
-/// cannot inject a phantom file name.
+/// ## Comments in `pipeline.rs` are excluded, and the `.wgsl` filter is not what does it
+///
+/// An earlier version of this docstring said "names that do not end in `.wgsl` are ignored, so a doc
+/// comment that happens to spell the macro cannot inject a phantom file name". The *so* did not
+/// follow: the extension filter rejects a comment naming a non-`.wgsl` path and does nothing about a
+/// comment naming a `.wgsl` one. A reviewer reasoned that out; both consequences were then measured
+/// here, and the second is worse than either of us expected:
+///
+/// - **False RED.** `// include_str!("shaders/ghost.wgsl")` planted as a comment made
+///   `discovered_corpus_is_not_silently_truncated` fail with `the shader walk never returned
+///   ["ghost.wgsl"]` — the honest direction, but an alarm about a file that never existed.
+/// - **False GREEN, and this one is a real hole.** A phantom *inflates* `included.len()`, which is
+///   what `MIN_PIPELINE_INCLUDED_SHADERS` counts. Composite RC-M9 — an orphan `.wgsl` on disk, a
+///   comment naming it, and the scan silently dropping one genuinely-included shader — measured
+///   **14 passed / 0 failed**. The floor was padded by the phantom and the superset check never
+///   looked at the dropped name, because a name the scan loses is a name the scan cannot check.
+///   The oracle's own reach control was defeated by prose.
+///
+/// So the scan now skips any hit inside a comment, using [`comment_spans`] — the same scanner the
+/// comment-identity test uses, not a second one. `parse_and_validate` never sees this file, so a
+/// deliberately partial comment scanner is the honest tool here; what makes that safe is that both
+/// ways it can be wrong are **loud**, and both were measured (RC-M10, RC-M11 in the PR body):
+/// swallowing real code drops names below the floor, and exposing extra text yields a name that is
+/// not on disk and fails the superset check.
+///
+/// `comment_spans` was written for WGSL, which has no string literals; Rust does. A Rust string
+/// containing a comment opener would mis-parse — into one of the two loud directions above, not into
+/// silence — and `the_include_scan_ignores_comments_but_not_code` pins the behaviour this relies on.
 fn shaders_pipeline_includes() -> BTreeSet<String> {
-    const NEEDLE: &str = "include_str!(\"shaders/";
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pipeline.rs");
     let src = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let out = scan_include_str_shaders(&src, &path.display().to_string());
+
+    // The comment filter must be doing something, or a future refactor could silently make it a
+    // no-op and nobody would notice until a phantom padded the floor again.
+    assert!(
+        !comment_spans(&src).is_empty(),
+        "{} has no comments at all, so the comment filter below is untested at its own call site",
+        path.display()
+    );
+    out
+}
+
+/// The scan itself, over an arbitrary source string so it can be driven by a test rather than only
+/// by the real `pipeline.rs`. Hits inside comments are skipped; names not ending in `.wgsl` are
+/// ignored (that filter is still worth having — it just is not the thing that stops phantoms).
+fn scan_include_str_shaders(src: &str, label: &str) -> BTreeSet<String> {
+    const NEEDLE: &str = "include_str!(\"shaders/";
+    let spans = comment_spans(src);
+    let in_comment = |off: usize| spans.iter().any(|&(_, s, e)| off >= s && off < e);
+
     let mut out = BTreeSet::new();
-    let mut rest = src.as_str();
-    while let Some(i) = rest.find(NEEDLE) {
-        rest = &rest[i + NEEDLE.len()..];
-        let end = rest
-            .find('"')
-            .unwrap_or_else(|| panic!("unterminated include_str! path literal in {}", path.display()));
-        let name = &rest[..end];
-        if name.ends_with(".wgsl") {
-            out.insert(name.to_string());
+    let mut at = 0usize;
+    while let Some(i) = src[at..].find(NEEDLE) {
+        let hit = at + i;
+        let after = hit + NEEDLE.len();
+        let end = after
+            + src[after..]
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated include_str! path literal in {label}"));
+        if !in_comment(hit) {
+            let name = &src[after..end];
+            if name.ends_with(".wgsl") {
+                out.insert(name.to_string());
+            }
         }
-        rest = &rest[end..];
+        at = end;
     }
     out
 }
@@ -602,40 +663,56 @@ fn substitution_cannot_alter_an_identifier_that_contains_the_word_joint_cap() {
 /// trust: it asserts every quote character in every corpus shader falls inside an extracted comment,
 /// so if that assumption is ever wrong the test says so instead of silently mis-parsing.
 fn comments(src: &str) -> Vec<(usize, String)> {
-    let b: Vec<char> = src.chars().collect();
+    comment_spans(src)
+        .into_iter()
+        .map(|(line, start, end)| (line, src[start..end].to_string()))
+        .collect()
+}
+
+/// The one comment scanner in this file: `(line, byte_start, byte_end)` for every comment.
+///
+/// Byte-oriented on purpose. `/`, `*` and `\n` are ASCII, and a UTF-8 continuation byte can never
+/// equal an ASCII byte, so scanning bytes cannot land inside a multi-byte character and every offset
+/// it reports is a valid `str` boundary.
+///
+/// [`comments`] and [`shaders_pipeline_includes`] both go through this, deliberately: a second
+/// comment scanner written for the second caller is exactly the "two scanners, one of them watched"
+/// shape this file exists to prevent.
+fn comment_spans(src: &str) -> Vec<(usize, usize, usize)> {
+    let b = src.as_bytes();
     let mut out = Vec::new();
     let mut line = 1usize;
     let mut i = 0usize;
     while i < b.len() {
-        if b[i] == '\n' {
+        if b[i] == b'\n' {
             line += 1;
             i += 1;
             continue;
         }
-        if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '/' {
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
             let start = i;
-            while i < b.len() && b[i] != '\n' {
+            while i < b.len() && b[i] != b'\n' {
                 i += 1;
             }
-            out.push((line, b[start..i].iter().collect()));
+            out.push((line, start, i));
             continue;
         }
-        if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '*' {
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
             let start = i;
             let start_line = line;
             let mut depth = 0usize;
             while i < b.len() {
-                if b[i] == '\n' {
+                if b[i] == b'\n' {
                     line += 1;
                     i += 1;
                     continue;
                 }
-                if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '*' {
+                if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
                     depth += 1;
                     i += 2;
                     continue;
                 }
-                if b[i] == '*' && i + 1 < b.len() && b[i + 1] == '/' {
+                if b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b'/' {
                     depth -= 1;
                     i += 2;
                     if depth == 0 {
@@ -645,7 +722,7 @@ fn comments(src: &str) -> Vec<(usize, String)> {
                 }
                 i += 1;
             }
-            out.push((start_line, b[start..i].iter().collect()));
+            out.push((start_line, start, i));
             continue;
         }
         i += 1;
@@ -669,6 +746,62 @@ fn comment_extractor_finds_both_forms_including_nesting() {
     assert!(comments("let x = a / b;\nlet y = c * d;\n").is_empty());
     // An unterminated block comment is still reported (as running to EOF) rather than dropped.
     assert_eq!(comments("/* oops").len(), 1);
+}
+
+/// The corpus oracle's scan ingests `include_str!` paths from **code** and ignores them in **prose**.
+///
+/// This exists because the previous docstring asserted the property and the code did not have it: a
+/// comment spelling `include_str!("shaders/ghost.wgsl")` was ingested as a real shader name. That
+/// was not merely a false alarm — the phantom padded `MIN_PIPELINE_INCLUDED_SHADERS`, so a scan that
+/// silently dropped a genuinely-included shader still measured 14 passed / 0 failed (RC-M9). Both
+/// halves are asserted here so the fix cannot regress into either direction.
+///
+/// Driven against a synthetic source rather than the real `pipeline.rs`, so it keeps testing the
+/// rule after the real file changes.
+#[test]
+fn the_include_scan_ignores_comments_but_not_code() {
+    let src = concat!(
+        "pub const A: &str = include_str!(\"shaders/real_one.wgsl\");\n",
+        "// include_str!(\"shaders/line_ghost.wgsl\")\n",
+        "/* include_str!(\"shaders/block_ghost.wgsl\") */\n",
+        "/* /* include_str!(\"shaders/nested_ghost.wgsl\") */ */\n",
+        "pub const B: &str = include_str!(\"shaders/real_two.wgsl\");\n",
+        "pub const C: &str = include_str!(\"shaders/not_a_shader.txt\");\n",
+    );
+    let got = scan_include_str_shaders(src, "<synthetic>");
+
+    let want: BTreeSet<String> = ["real_one.wgsl", "real_two.wgsl"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(got, want, "the scan must take code hits and only code hits");
+
+    // Said again as the two failure directions, so a regression names which way it broke.
+    for ghost in ["line_ghost.wgsl", "block_ghost.wgsl", "nested_ghost.wgsl"] {
+        assert!(
+            !got.contains(ghost),
+            "{ghost} came from a COMMENT — a phantom name inflates the oracle's floor and can mask a \
+             real name the scan lost (measured: RC-M9 stayed 14 passed / 0 failed)"
+        );
+    }
+    for real in ["real_one.wgsl", "real_two.wgsl"] {
+        assert!(
+            got.contains(real),
+            "{real} is a genuine include_str! in code and the comment filter swallowed it — the \
+             oracle is now smaller than the truth, which is the direction that under-reports a \
+             truncated walk"
+        );
+    }
+
+    // A comment that is not adjacent to any hit must not shift the offsets of the hits around it.
+    let shifted = scan_include_str_shaders(
+        concat!(
+            "/* leading prose */\n",
+            "pub const A: &str = include_str!(\"shaders/real_one.wgsl\");\n",
+        ),
+        "<synthetic>",
+    );
+    assert_eq!(shifted.len(), 1, "a leading comment must not desynchronise the scan: {shifted:?}");
 }
 
 /// Substitution leaves every shader **comment** byte-identical.
