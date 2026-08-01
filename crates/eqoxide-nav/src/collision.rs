@@ -7365,9 +7365,21 @@ mod tests {
     #[ignore = "requires baked zone glbs at $ZONE_DIR"]
     fn fine_tier_corpus_route_success_and_cost() {
         use std::time::Instant;
-        const LOCAL_REACH: f32 = 24.0;
-        const LOCAL_BOUND: f32 = 40.0;
-        const LOCAL_CELL:  f32 = 2.0;
+        // #819: LOCAL_REACH and LOCAL_CELL used to be private copies of the literals below. Both
+        // names are `pub const` in `steering` (LOCAL_REACH promoted by #818/#733; LOCAL_CELL was
+        // already pub), so a change to either shared constant would have silently left this corpus
+        // sampling the OLD number instead of the one production now uses. IMPORTED rather than
+        // copied so the two cannot drift apart.
+        //
+        // LOCAL_BOUND is NOT imported here: unlike LOCAL_REACH/LOCAL_CELL, it has no promoted `pub`
+        // home — `walker::Walker::drive_walk` still declares it as a private `const` local to that
+        // function (walker.rs:1507), the same way every other site that needs it (steering.rs's own
+        // `fixture_run` corpus, `tests/walker_sim.rs`) restates the literal with a comment pointing
+        // back to walker.rs. So this is a private-copy-of-a-private-value, not the shape #819 is
+        // about; there is nothing shared to import it from without a design decision this issue does
+        // not make.
+        use crate::steering::{LOCAL_CELL, LOCAL_REACH};
+        const LOCAL_BOUND: f32 = 40.0; // walker.rs `drive_walk` (private there — see note above)
 
         let dir = std::env::var("ZONE_DIR")
             .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
