@@ -125,19 +125,29 @@ impl ZoneAssetState {
     /// [`usability`] must react to a NEW state variant the same way, because
     /// [`usable_collision`] pairs them: `usability` decides whether to bless the state and then
     /// this decides what grid to hand over. A wildcard here breaks that pairing silently — the
-    /// author of a sixth variant that carries a usable grid would be forced by the compiler to
+    /// author of a FIFTH variant that carries a usable grid would be forced by the compiler to
     /// classify it in `usability` (which has no wildcard), while this function kept answering
     /// `None`, and `usable_collision`'s documented-unreachable `ok_or(NotUsable::Idle)` fallback
     /// would start firing. That converts a usable grid into a REFUSAL with no diagnostic — the
     /// exact confusion between an answer and a refusal that #803 existed to remove.
     ///
-    /// Measured, not reasoned: with a wildcard here and a sixth `ProbeRefreshing { zone,
-    /// collision }` variant added, the crate compiled once every arm the compiler ASKED for was
-    /// filled in, and `usability` then said `None` (usable) while `usable_collision` returned
-    /// `Err(Idle)` over a live grid. `usable_collision_agrees_with_usability_for_every_state`
-    /// stayed green throughout, because its `states` vec did not know about the new variant.
-    /// Spelling the arms out makes that state unrepresentable: the two functions now fail to
-    /// compile TOGETHER, which is the only place this can be caught before it ships.
+    /// Measured, not reasoned: with a wildcard here and a fifth `ProbeRefreshing { zone,
+    /// collision }` variant added (the enum has FOUR — `Idle`, `Pending`, `Ready`, `Failed`), the
+    /// crate compiled once every arm the compiler ASKED for was filled in, and `usability` then
+    /// said `None` (usable) while `usable_collision` returned `Err(Idle)` over a live grid.
+    /// `usable_collision_agrees_with_usability_for_every_state` stayed green throughout, because
+    /// its `states` vec did not know about the new variant.
+    ///
+    /// **What spelling the arms out achieves, precisely.** It makes the OMISSION unrepresentable:
+    /// this function and `usability` now fail to compile together, so no variant can be classified
+    /// in one and silently defaulted in the other. It does NOT make an *inconsistent* pair
+    /// unrepresentable — an author who writes `Self::New {..} => None` here and classifies the same
+    /// variant as usable in `usability` still compiles, and that re-opens exactly the hole above.
+    /// Measured on this tree by the #837 reviewer: the whole crate suite stayed green with that
+    /// pair in place. The second line of defence for it is the roll call in
+    /// `usable_collision_agrees_with_usability_for_every_state`, which reds when a variant is added
+    /// — and it is a forced read, not a proof either. Nor is compiling the only catch point: a new
+    /// variant also reds `tag`, `zone`, `detail` and the hand-written `Debug` impl.
     pub fn collision(&self) -> Option<&Arc<Collision>> {
         match self {
             Self::Ready { collision, .. } => Some(collision),
@@ -383,6 +393,12 @@ pub fn usable_collision<'a>(state: &'a ZoneAssetState, player_zone: &str)
     // NOT an `Option` — so this fallback is unreachable. It is spelled as a REFUSAL rather than an
     // `unwrap`/`expect` because the honest answer to "we cannot find the grid" is never an empty
     // world; `usable_collision_agrees_with_usability_for_every_state` asserts it never fires.
+    //
+    // THIS is the sentence a new state variant falsifies, which is why `ZoneAssetState::collision`
+    // is matched exhaustively (#826): the wildcard it used to have let a variant be blessed by
+    // `usability` and answered `None` here, firing this "unreachable" arm over a live grid. The
+    // exhaustive arms keep the claim honest by forcing both functions to be edited together — they
+    // do not force them to be edited CONSISTENTLY; see the note on `collision`.
     state.collision().ok_or(NotUsable::Idle)
 }
 
@@ -665,8 +681,9 @@ mod tests {
             ("readyB", ZoneAssetState::ready("freporte", 3, floor_collision())),
         ];
         // Compile-time roll call. `states` above is written by HAND, so this test can silently
-        // under-cover: measured on the #826 probe branch, a sixth variant that turned a live grid
-        // into `Err(Idle)` left this test GREEN, because the vec did not know the variant existed.
+        // under-cover: measured on the #826 probe branch, a FIFTH variant (the enum has four) that
+        // turned a live grid into `Err(Idle)` left this test GREEN, because the vec did not know
+        // the variant existed.
         // The match below has no wildcard, so adding a variant to `ZoneAssetState` now reds THIS
         // FILE too, next to the arms in `collision`/`usability`.
         //
@@ -700,6 +717,84 @@ mod tests {
                         "{name}/{pz:?}: `Idle` came from the unreachable fallback, not the verdict");
                 }
             }
+        }
+    }
+
+    /// A **purely lexical** pin on one function body: every arm of `ZoneAssetState::collision`'s
+    /// `match` must be a `Self::…` pattern, i.e. no `_ =>`, no bare binding.
+    ///
+    /// **Why a source-text scan is legitimate here, when this repo has seven measured ways one can
+    /// prove a call is *written* rather than *reached* (#799).** Those seven all separate the text
+    /// from the execution — a trailing comment, `if false`, `#[cfg(any())]`, a macro wrapper, a
+    /// stray brace. This property has no execution to diverge from: "the body contains no wildcard
+    /// arm" **is** a statement about the text, and the thing it protects (E0004 firing when a
+    /// variant is added) is decided by the compiler from that same text. The #837 reviewer measured
+    /// the point directly on the roll call above — wrapping it in `if false { … }` still produced
+    /// E0004. So there is no gap between written and reached to exploit.
+    ///
+    /// **What it proves:** the wildcard cannot come back to `collision` without something going
+    /// red, which is otherwise true of nothing in the merged tree — the E0004 evidence in #837 is
+    /// not a test and CI cannot re-run it.
+    ///
+    /// **What it does NOT prove**, stated so nobody reads it as more: (a) it covers exactly ONE
+    /// function body and says nothing about the other wildcards on this enum (`status` here,
+    /// `terrain_meshes` in `eqoxide-http`, `lost_load_zone` in the binary crate — see #838);
+    /// (b) it is a lexical guard, so it cannot tell a correct arm from an incorrect one — an author
+    /// who writes `Self::New {..} => None` for a variant carrying a live grid passes this test and
+    /// re-opens #826; and (c) it depends on the arms being formatted with their pattern on the same
+    /// line as their `=>`, which is how rustfmt leaves them today.
+    ///
+    /// The reach controls are inside the test, not asserted in prose: the anchor must be found
+    /// EXACTLY once, and the extracted body must contain all four variant names — so a brace-walk
+    /// that truncates (the #799 stray-`}` failure) fails loudly instead of scanning a short prefix
+    /// and passing.
+    #[test]
+    fn collision_matches_only_named_variants_no_wildcard_arm() {
+        const SRC: &str = include_str!("zone_assets.rs");
+        // Assembled at compile time from two pieces so THIS literal does not itself appear in the
+        // source text — which lets the count below be an exact-uniqueness reach control.
+        const SIG: &str = concat!("pub fn ", "collision(&self) -> Option<&Arc<Collision>> {");
+
+        assert_eq!(SRC.matches(SIG).count(), 1,
+            "reach control: expected exactly one `{SIG}` in this file. 0 means the scan below \
+             would have found NOTHING (the signature was reformatted or renamed) — fix the anchor, \
+             do not delete this test. >1 means the anchor is ambiguous.");
+        let start = SRC.find(SIG).unwrap() + SIG.len();
+
+        // Brace walk from just inside the body.
+        let mut depth = 1usize;
+        let mut end = None;
+        for (i, c) in SRC[start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => { depth -= 1; if depth == 0 { end = Some(start + i); break; } }
+                _ => {}
+            }
+        }
+        let body = &SRC[start..end.expect("reach control: `collision`'s body has no closing brace")];
+
+        // REACH CONTROL. A brace walk can be truncated by a `}` inside a comment or string literal
+        // (#799). If that happened, `body` is a short prefix and the wildcard scan below would pass
+        // over almost nothing. Requiring every variant name proves the walk covered the whole match.
+        for variant in ["Self::Idle", "Self::Pending", "Self::Ready", "Self::Failed"] {
+            assert!(body.contains(variant),
+                "reach control: `collision`'s extracted body is missing `{variant}` — the brace \
+                 walk truncated, or a variant was renamed. Body was:\n{body}");
+        }
+
+        let arm_lines: Vec<&str> = body.lines().filter(|l| l.contains("=>")).collect();
+        assert!(arm_lines.len() >= 4,
+            "reach control: found only {} arm line(s) in `collision`; the enum has four variants",
+            arm_lines.len());
+        for line in &arm_lines {
+            assert!(line.contains("Self::"),
+                "`ZoneAssetState::collision` must match every variant BY NAME (#826). This arm does \
+                 not:\n    {}\nA `_ =>` (or a bare binding) here silently answers `None` for any \
+                 state added later, while `usability` — which has no wildcard — is forced by the \
+                 compiler to classify it. That is how a blessed, live collision grid turns into \
+                 `Err(NotUsable::Idle)`. If this fired on a legitimate multi-line or-pattern, put \
+                 the pattern on the same line as its `=>` or update this pin deliberately.",
+                line.trim());
         }
     }
 

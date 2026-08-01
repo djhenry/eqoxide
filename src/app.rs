@@ -2482,9 +2482,21 @@ fn winit_to_egui_key(code: KeyCode) -> Option<egui::Key> {
 /// The safety rule the pair has to satisfy is one-directional: *the reload trigger must be at least
 /// as eager as the bless test.* If it is, then "no reload is pending" implies "the names match by
 /// the bless test too", so a blessed grid is always the zone the character is in. Exact comparison
-/// is the most eager comparison there is, so it satisfies that rule unconditionally, and the cost of
-/// the extra eagerness is bounded: a case-only difference can only cause a *spurious* reload —
-/// `Pending`, then an honest 503 — never a stale-but-blessed grid (#821 review round 2).
+/// is the most eager comparison there is, so it satisfies that rule **for every non-empty
+/// `scene_zone`** — and the cost of the extra eagerness is bounded: a case-only difference can only
+/// cause a *spurious* reload — `Pending`, then an honest 503 — never a stale-but-blessed grid
+/// (#821 review round 2).
+///
+/// The empty `scene_zone` case is carried by a different mechanism, not by this comparison: the
+/// `is_empty()` short-circuit means an empty `scene_zone` against a loaded `current_zone` starts no
+/// reload at all. `usability` is what stays honest there — it reads `player_zone`, not `scene_zone`,
+/// and refuses an empty one outright with `PlayerZoneUnknown` (#837 review, N1).
+///
+/// A case-only divergence between the two sides also cannot arise from the current data flow at
+/// all: `scene.zone` and the `player_zone` handed to `usability` are both copies of the single
+/// `gs.world.zone_name`, and `current_zone` is itself a copy of `scene.zone`. That makes the
+/// eagerness a margin against a scenario one source already excludes — cheap insurance, which is
+/// why keeping it costs nothing (#837 review, attack 5).
 ///
 /// So do NOT "fix" the inconsistency by making this comparison case-insensitive as well. That does
 /// not tighten anything; it drops the pair to exact parity and makes the safety argument depend on
