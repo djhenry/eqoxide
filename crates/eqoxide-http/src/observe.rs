@@ -1259,7 +1259,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // a `/goto` is actively driving, so a summoned-into-rock character produced no observable at
         // all through this API before this insert existed (#724).
         //
-        // `PlayerState::hold` (see its doc) was computed, mirrored into `GameState` every tick, and
+        // `PlayerState::hold` (see its doc) was computed, mirrored into `GameState` every NET tick
+        // (from a view the render thread republishes per rendered frame — see its doc), and
         // covered by tests since #724 landed — and reached NO response body, because `PlayerState` is
         // an internal projection `get_debug` never serialises whole. That is #817: the type existed,
         // the value was correct, and an agent grepping this response for `hold` found nothing and
@@ -1268,8 +1269,15 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         //
         // ALWAYS PRESENT, `null` when there is no hold (`PlayerState::hold` carries no
         // `skip_serializing_if`, and `serde_json::json!(None::<T>)` renders an explicit null) — same
-        // contract as `levitating`/`afloat_stall`: an omitted key would read as "this client is too
-        // old to report the state", not "no hold in force".
+        // contract as `levitating`/`afloat_stall`. Be precise about what that buys, because this
+        // PR's own measurement bounds it: an omitted key reads as "this client is too old to report
+        // the state" ONLY to a reader that checks key PRESENCE or greps the raw body. It does not
+        // read that way through `v["player"]["hold"]`, the obvious access path — `serde_json`
+        // returns `Value::Null` for an absent key just as it does for an explicit one, which is
+        // exactly what made the original `is_null()` assertion in
+        // `afloat_stall_reaches_the_debug_json_801` VACUOUS (#810 round 2) and why the test below
+        // has to use `contains_key`. So the guarantee this insert provides is to a grepping or
+        // presence-checking agent; `docs/http-api.md` states it that way too.
         player.insert("hold".into(),                   serde_json::json!(player_hold));
         // #776/#801 — AFLOAT STALL. The character is in water, a driver is asking it to swim
         // horizontally, and it has not moved. Before this the state had NO observable at all: a
@@ -1400,7 +1408,10 @@ struct FrameQuery {
     /// value. Mutually exclusive with `preset`.
     pitch: Option<String>,
     /// #422: explicit yaw override in degrees, EQ heading convention (0=north, increasing CCW) — the
-    /// SAME convention as `heading_ccw` on `GET /v1/observe/state`, and applied ABSOLUTELY (not
+    /// SAME convention as `heading_ccw` on `GET /v1/observe/debug` (there is no `/v1/observe/state`
+    /// route — `heading_ccw` is emitted by `get_debug` at the `"heading_ccw": player.heading_ccw`
+    /// line above, and `docs/http-api.md`'s `yaw` row already cites `/v1/observe/debug`), and
+    /// applied ABSOLUTELY (not
     /// relative to the character's current facing, unlike the presets below), so a fixed `yaw` value
     /// always frames the same world direction regardless of which way the character happens to be
     /// facing at capture time. Range -360.0..=360.0. Mutually exclusive with `preset`.
@@ -3197,8 +3208,11 @@ mod tests {
 
     /// #724/#817 — the stuck-and-cannot-free disclosure must reach a RESPONSE BODY, not just a
     /// struct. Same failure shape as `afloat_stall_reaches_the_debug_json_801` just above:
-    /// `PlayerState::hold` was computed, mirrored into `GameState` every controller-stepped frame
-    /// (`ActionLoop::stream_position`), and covered by tests since #724 landed — and reached NO
+    /// `PlayerState::hold` was computed, mirrored into `GameState` on every **net tick** by
+    /// `ActionLoop::stream_position` (that function's own rustdoc: "Runs every tick"), from a
+    /// `ControllerView` snapshot the **render** thread republishes on every rendered frame — so
+    /// the mirror is as fresh as the last *published* frame, not as fresh as the last *net* tick —
+    /// and covered by tests since #724 landed, and reached NO
     /// response body, because `get_debug` hand-builds its `player` object and never serialises
     /// `PlayerState` whole. This goes through `debug_json`, which drives the REAL router with a
     /// REAL request and parses the REAL bytes, for the same reason the afloat_stall test does.

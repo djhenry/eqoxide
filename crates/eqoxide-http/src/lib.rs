@@ -245,8 +245,13 @@ pub struct PlayerState {
     ///
     /// No `skip_serializing_if`: the key is always present in a serialisation of *this struct*.
     /// **That is a different and weaker claim than being present in any response body** — #817
-    /// found this field computed, mirrored into [`eqoxide_core::game_state::GameState`] every
-    /// controller-stepped frame, and covered by tests, and STILL absent from `GET
+    /// found this field computed, mirrored into [`eqoxide_core::game_state::GameState`] on every
+    /// **net tick** by `ActionLoop::stream_position` (whose own rustdoc says "Runs every tick"),
+    /// from a `ControllerView` snapshot the **render** thread republishes on every rendered frame
+    /// — so the mirror is as fresh as the last *published* frame, not as fresh as the last *net*
+    /// tick, and an idle render loop leaves the net thread faithfully re-copying a stale view. See
+    /// the staleness bullet on [`PlayerHoldView`] below, which this sentence must not be read as
+    /// softening. And covered by tests, and STILL absent from `GET
     /// /v1/observe/debug`, because nothing serialises `PlayerState` whole: `observe::get_debug`
     /// hand-builds its `player` object and patches extras in with `player.insert`. What makes the
     /// key reachable is the `player.insert("hold", …)` there, alongside `levitating`/`run_mode`/
