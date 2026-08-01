@@ -57,6 +57,39 @@ pub const JOINT_CAP: usize = 128;
 /// Size of one joint buffer: [`JOINT_CAP`] joints × mat4(64 bytes).
 pub const JOINT_BUF_BYTES: u64 = JOINT_CAP as u64 * 64;
 
+/// One frame's joint palette for one skinned draw: exactly [`JOINT_CAP`] mat4s, which is the exact
+/// layout of a `joint_buf_pool` / `shadow_joint_pool` buffer and of the shaders' `JointMatrices`
+/// uniform. Named as a type so the length is not something a draw site restates.
+pub type JointPalette = [[[f32; 4]; 4]; JOINT_CAP];
+
+/// The joint palette and its uniform buffer are the same size, by construction. Both derive from
+/// [`JOINT_CAP`], so this cannot fail today — it exists to catch a future edit that gives one of
+/// them an independent size.
+const _: () = assert!(std::mem::size_of::<JointPalette>() as u64 == JOINT_BUF_BYTES);
+
+/// Pad an evaluated joint-matrix list out to a full [`JointPalette`], filling unused slots with the
+/// identity and dropping anything past [`JOINT_CAP`].
+///
+/// **This is the only place in the tree that builds a joint palette.** Before eqoxide#798 the same
+/// four lines were written out five times (three in `pass.rs`, two in the `render_model` dev bin),
+/// each with its own bare `128` in both the array length and the `.take(..)` — five copies of a cap
+/// that the named constant did not reach. Collapsing them means a draw site cannot pick a different
+/// length, because it no longer states one.
+///
+/// Truncation past the cap is not expected to be reachable in the render path: a model over the cap
+/// is classified [`SkinFit::ExceedsCap`] and takes the STATIC arm, so it never reaches a skinned
+/// draw. The `.take` is the same defensive bound the five copies carried, kept so a caller that
+/// bypasses `SkinFit` still cannot write past the uniform buffer.
+pub fn pad_joint_palette(mats: &[[[f32; 4]; 4]]) -> JointPalette {
+    const ID4: [[f32; 4]; 4] =
+        [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]];
+    let mut palette: JointPalette = [ID4; JOINT_CAP];
+    for (slot, m) in palette.iter_mut().zip(mats.iter()) {
+        *slot = *m;
+    }
+    palette
+}
+
 /// Which render arm a model's skin data selects, and — when the STATIC arm is taken despite the
 /// model having skin data — *why*. Before eqoxide#780 `build_character_model` folded three
 /// different situations into one `bool`:
@@ -137,18 +170,30 @@ impl StaticReason {
     }
 }
 
-/// Record `label`'s joint count into `downgrades` iff `reason` is a genuine cap downgrade
+/// Record `(label, gender)`'s joint count into `downgrades` iff `reason` is a genuine cap downgrade
 /// (`StaticReason::ExceedsCap`) — the one outcome eqoxide#780 requires to stop being silent. Pure
 /// so the recording decision is unit-testable without a `wgpu::Device`; `EqRenderer` cannot be
 /// constructed at all in a test (no `wgpu` backend has a non-adapter constructor), which is why
 /// this book-keeping is kept out of `build_character_model`'s body and callable on its own.
+///
+/// The key carries `gender` because the thing being reported is a **loaded GLB**, and one label
+/// resolves to two different files: `ensure_character_model` prefers `<label>_f.glb` for gender 1
+/// and falls back to `<label>.glb`. Those two files have independent joint counts, so keying by
+/// label alone let the second load overwrite the first — a male rig over the cap could be erased
+/// from the report by a later female load that fit, or vice versa, and the surviving entry would
+/// name a joint count belonging to a file the reader could not identify. That is exactly the
+/// silent-wrong-answer shape this observable exists to remove, so the key now matches the
+/// `(key, gender)` keying `gpu_character_models` and `model_load_tried` already use. Only the 3
+/// archetypes with `_f` variants can actually collide today; the fix is to the key, not the odds.
+/// (eqoxide#798)
 pub fn record_skin_cap_downgrade(
-    downgrades: &mut std::collections::BTreeMap<String, usize>,
+    downgrades: &mut std::collections::BTreeMap<(String, u8), usize>,
     label: &str,
+    gender: u8,
     reason: StaticReason,
 ) {
     if let StaticReason::ExceedsCap { joint_count } = reason {
-        downgrades.insert(label.to_string(), joint_count);
+        downgrades.insert((label.to_string(), gender), joint_count);
     }
 }
 
@@ -234,13 +279,15 @@ pub struct EqRenderer {
     /// absent race, not one still downloading. (eqoxide#224)
     model_load_tried:        std::collections::HashSet<(&'static str, u8)>,
     /// Character models whose skin EXCEEDED [`JOINT_CAP`] and were therefore downgraded to the
-    /// static (unskinned) render arm, keyed by model label with the joint count that caused it —
-    /// the observable eqoxide#780 exists to add. `None`/absent = no downgrade has happened; a
+    /// static (unskinned) render arm, keyed by `(model label, gender)` — the same key
+    /// `gpu_character_models` uses, because gender selects a different GLB file with its own joint
+    /// count (see [`record_skin_cap_downgrade`]) — with the joint count that caused it. This is
+    /// the observable eqoxide#780 exists to add. Absent = no downgrade has happened; a
     /// missing model or a genuinely unskinned one (e.g. `boat.glb`) is never inserted here, only a
     /// model that HAD real skin data and didn't fit. Not yet wired to the HTTP API (that crosses
     /// into `src/app.rs`, out of scope for this fix — see the #780 PR body) but is public and
     /// queryable in-process, and every downgrade is also logged at `error!`.
-    pub skin_cap_downgrades: std::collections::BTreeMap<String, usize>,
+    pub skin_cap_downgrades: std::collections::BTreeMap<(String, u8), usize>,
     /// Channel to the background model-sync worker: send a race model KEY (e.g. "race_hum") to
     /// fetch its `charmodel/<key>` set on demand the first time a spawn of that race is seen, so
     /// the client never downloads the ~450 MB of race models it doesn't need. None until wired in
@@ -367,7 +414,7 @@ impl EqRenderer {
                 (buf, bg)
             }).collect();
 
-        // Pre-allocate joint matrix buffer pool (128 joints × mat4 each).
+        // Pre-allocate joint matrix buffer pool (JOINT_CAP joints × mat4 each = JOINT_BUF_BYTES).
         let joint_buf_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)> =
             (0..JOINT_BUF_SLOTS).map(|_| {
                 let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -681,7 +728,7 @@ impl EqRenderer {
     /// Load all archetype character models and upload to GPU.
     /// Tries glTF files from `models_dir` (the asset-server cache) first; falls back to EQ `_chr.s3d`
     /// archives ALSO from the cache (the "gameequip" set), never from ~/eq_assets.
-    /// Models with valid skins (joint_count ≤ 128) are loaded as Skinned; others as Static.
+    /// Models with valid skins (joint_count ≤ [`JOINT_CAP`]) are loaded as Skinned; others as Static.
     /// Missing models fall back to billboard rendering.
     /// `_assets_path` is unused (everything now comes from the cache); kept for call-site stability.
     /// Point the renderer at the model cache and load the small always-needed assets (weapons).
@@ -741,7 +788,7 @@ impl EqRenderer {
             Ok(asset) => {
                 let (model, skin_fit) = self.build_character_model(key, asset);
                 if let Some(reason) = skin_fit.static_reason() {
-                    record_skin_cap_downgrade(&mut self.skin_cap_downgrades, key, reason);
+                    record_skin_cap_downgrade(&mut self.skin_cap_downgrades, key, gender, reason);
                 }
                 self.gpu_character_models.insert((key, gender), model);
                 tracing::debug!("renderer: lazily loaded character model '{key}' (gender {gender})");

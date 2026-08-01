@@ -1332,9 +1332,7 @@ pub fn encode_player_pass(
                         model.skin.evaluate(state.clip_idx, state.time),
                     _ => model.skin.bind_pose(),
                 };
-                let id4 = [[1f32,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]];
-                let mut joint_array = [id4; 128];
-                for (i, m) in matrices.iter().enumerate().take(128) { joint_array[i] = *m; }
+                let joint_array = crate::renderer::pad_joint_palette(&matrices);
                 // Write to pool slot 0 (reserved for player).
                 r.queue.write_buffer(&r.joint_buf_pool[0].0, 0, bytemuck::cast_slice(&joint_array));
 
@@ -1771,8 +1769,6 @@ pub fn encode_skinned_entity_pass(
     let mut u_slot   = uniform_base;
     let mut j_slot   = 1usize; // slot 0 reserved for player
 
-    let id4 = [[1f32,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]];
-
     // Each humanoid model is ~27 meshes, so the uniform/joint pools can't hold every
     // spawn in a crowded zone. Render NEAREST-first so the NPCs around the player always
     // draw, and only draw a model that fits ENTIRELY in the remaining pool (no partial,
@@ -1807,8 +1803,7 @@ pub fn encode_skinned_entity_pass(
                 model.skin.evaluate(state.clip_idx, state.time),
             _ => model.skin.bind_pose(),
         };
-        let mut joint_array = [id4; 128];
-        for (i, m) in matrices.iter().enumerate().take(128) { joint_array[i] = *m; }
+        let joint_array = crate::renderer::pad_joint_palette(&matrices);
         r.queue.write_buffer(&r.joint_buf_pool[j_slot].0, 0, bytemuck::cast_slice(&joint_array));
 
         let target = crate::models::skinned_target_height(&b.race, archetype, model.true_height);
@@ -1987,14 +1982,12 @@ pub fn encode_shadow_pass(
         Skinned { model: &'a crate::gpu::GpuSkinnedModel, u_slot: usize, j_slot: usize },
         Static  { model: &'a crate::gpu::GpuStaticModel,  u_slot: usize },
     }
-    let id4 = [[1f32,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]];
 
     let mut casters: Vec<Caster> = Vec::new();
 
-    // Write a padded 128-joint palette to shadow_joint_pool[slot], returning nothing.
+    // Write a full JOINT_CAP-sized palette to shadow_joint_pool[slot], returning nothing.
     let write_joints = |slot: usize, mats: &[[[f32;4];4]]| {
-        let mut joint_array = [id4; 128];
-        for (i, m) in mats.iter().enumerate().take(128) { joint_array[i] = *m; }
+        let joint_array = crate::renderer::pad_joint_palette(mats);
         r.queue.write_buffer(&r.shadow_joint_pool[slot].0, 0, bytemuck::cast_slice(&joint_array));
     };
     let write_model = |slot: usize, mat: [[f32;4];4]| {
