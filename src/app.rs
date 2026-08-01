@@ -91,11 +91,38 @@ pub(crate) fn build_zone_collision(
 /// the state is stuck `Pending` for `zone` and no loader is left that could ever report it — a
 /// panic, or a reply clobbered in the handoff slot. `None` means leave it alone: either a loader is
 /// still working (however slow) or the state is already terminal.
+///
+/// **Why the arms are written out instead of `_ => None`** (#838). This is the decision function for
+/// [`App::watch_for_lost_load`], which is the only detector for a loader that died without
+/// reporting; when it says `None` the watchdog returns early and nothing else re-examines the state.
+/// A wildcard is *correct* for every state that exists today — `Idle`, `Ready` and `Failed` should
+/// all be left alone — and that is exactly what made it dangerous: it reads as deliberate, and it
+/// would go on silently answering `None` for a **fifth, in-flight** variant added later. That
+/// variant would then never be declared lost, and an agent polling a frozen in-flight state cannot
+/// tell "still loading, be patient" from "nothing is coming, ever" — the same lie the module header
+/// of `zone_assets` says `Failed` exists to prevent.
+///
+/// What the explicit arms buy, stated no wider than it is: adding a variant to
+/// [`crate::nav::zone_assets::ZoneAssetState`] makes **this file fail to compile** with `E0004`,
+/// which forces whoever adds it to classify it as in-flight or terminal here. It does not stop
+/// someone from later re-introducing a wildcard, and no runtime test can establish the property —
+/// a test can only construct variants that already exist, which is why the tests below stay green
+/// under a probe variant. Do not collapse these arms back into `_`.
+///
+/// Same class of fix as #826/#837 on `ZoneAssetState::collision()`; that one is in
+/// `crates/eqoxide-nav/` and its E0004 probe did not name this site, because the wildcard absorbed
+/// the new variant instead of erroring.
 fn lost_load_zone(any_loader_alive: bool, st: &crate::nav::zone_assets::ZoneAssetState) -> Option<String> {
+    use crate::nav::zone_assets::ZoneAssetState as S;
     if any_loader_alive { return None; }
     match st {
-        crate::nav::zone_assets::ZoneAssetState::Pending { zone, .. } => Some(zone.clone()),
-        _ => None,
+        // In flight, with nothing left that could ever report it — declare it lost.
+        S::Pending { zone, .. } => Some(zone.clone()),
+        // Nothing is on its way, so there is no load to declare lost.
+        S::Idle => None,
+        // Terminal states: already answered, never re-declared lost.
+        S::Ready { .. } => None,
+        S::Failed { .. } => None,
     }
 }
 
@@ -2780,6 +2807,12 @@ mod tests {
     /// #595 review F3 — the "stuck in `pending` forever" backstop. `Failed` exists so an agent is
     /// never left waiting for a `ready` that is not coming; a loader that panicked (or whose reply
     /// was clobbered) published nothing at all, which used to leave `Pending` frozen forever.
+    ///
+    /// **What this test cannot do** (#838): it enumerates the states that exist today, so it stays
+    /// green when a new `ZoneAssetState` variant is added — it can only construct variants that
+    /// already exist. That gap is covered by the compiler, not here: `lost_load_zone`'s arms are
+    /// written out, so a new variant reds `src/app.rs` with `E0004` instead of being classified
+    /// silently. Do not add a case here that claims to cover it.
     #[test]
     fn a_pending_load_with_no_live_loader_is_declared_lost() {
         use crate::nav::zone_assets::ZoneAssetState;
