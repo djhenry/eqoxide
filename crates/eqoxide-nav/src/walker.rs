@@ -3178,43 +3178,133 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// no hard-coded count to drift. It is strictly weaker than the index equality check — it cannot
     /// see a single missing FILE, only a missing member — and the failure text below says so rather
     /// than letting a builder-only run look as strong as a developer one.
+    /// It has now been wrong twice in opposite directions, and both were measured:
+    ///
+    ///   * `p.contains('/')` dropped `tools`, a member with no slash in its path — 12 of 13, round-2
+    ///     review;
+    ///   * arming on `buf.ends_with("members")` armed on **`default-members`** as well, so adding
+    ///     `default-members = ["tools"]` to the manifest collapsed the check to a single member while
+    ///     the guard reported success. Round-3 review measured 29 `.rs` files going dark that way,
+    ///     with an unmarked production construction planted among them, and the guard GREEN.
+    ///
+    /// The key is therefore ANCHORED (a line whose own key is exactly `members`), the manifest has its
+    /// comments STRIPPED first (a `#` comment containing a quoted string was swept in as a fourteenth
+    /// member and turned an intact tree red — the opposite failure, same root: reasoning about raw
+    /// text while claiming a property of effective text), and — the part that actually makes this a
+    /// control rather than a number nobody checks — the result is ASSERTED against the directories
+    /// that contain a `Cargo.toml`. A count that is printed and never compared is not a control.
     fn workspace_members_787(root: &std::path::Path) -> Vec<String> {
-        let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
+        let raw = std::fs::read_to_string(root.join("Cargo.toml"))
             .expect("#787 guard reach: the workspace manifest must be readable — it is the corpus \
                      definition when there is no git index");
-        // Take every QUOTED string between the `members` key's brackets. The first draft of this
-        // filtered on `p.contains('/')`, which silently dropped the manifest's first member — `tools`,
-        // a top-level crate with no slash in its path — and checked 12 of 13 while claiming "every
-        // workspace member". Round-2 review measured that. There is no path-shape filter here now:
-        // whatever the manifest lists is what must be covered.
+
+        // REACH CONTROL ON THE STRIPPER ITSELF. It is a scanner, so it needs evidence that it ran and
+        // did something, not just that it returned. A silent no-op would restore the exact behaviour
+        // this fix exists to remove, with more confident prose sitting on top of it.
+        {
+            let probe = "a = \"x # not-a-comment\" # yes-a-comment\nb = 'y # also-not'\n";
+            let got = strip_toml_comments_787(probe);
+            assert!(got.contains("x # not-a-comment"),
+                "#787 guard: the TOML comment stripper corrupted a quoted value — a stripper that \
+                 eats string contents swaps one silent evasion for another. Got: {got:?}");
+            assert!(got.contains("y # also-not"),
+                "#787 guard: the TOML comment stripper corrupted a literal-string value. Got: {got:?}");
+            assert!(!got.contains("yes-a-comment"),
+                "#787 guard: the TOML comment stripper removed NOTHING from a probe that contains a \
+                 real comment — it is a no-op, and every claim below about comment-free text is \
+                 false. Got: {got:?}");
+            assert_eq!(got.lines().count(), probe.lines().count(),
+                "#787 guard: the TOML comment stripper changed the line structure of its input");
+        }
+
+        let manifest = strip_toml_comments_787(&raw);
+
+        // ANCHORED key: the line's own key must be exactly `members`, so `default-members`,
+        // `exclude-members` and anything else ending in those seven letters cannot arm it.
         let mut members = Vec::new();
-        let mut in_members = false;
-        let mut buf = String::new();
-        let mut in_str = false;
-        for ch in manifest.chars() {
-            if !in_members {
-                buf.push(ch);
-                if buf.ends_with("members") { in_members = true; buf.clear(); }
-                if buf.len() > 32 { buf.remove(0); }
-                continue;
+        let mut collecting = false;
+        for line in manifest.lines() {
+            if !collecting {
+                let t = line.trim_start();
+                let Some(rest) = t.strip_prefix("members") else { continue };
+                if !rest.trim_start().starts_with('=') { continue }
+                collecting = true;
             }
-            match ch {
-                '"' if in_str => {
-                    in_str = false;
-                    let p = buf.trim().trim_end_matches('/');
-                    if !p.is_empty() { members.push(p.to_string()); }
-                    buf.clear();
+            let mut in_str = false;
+            let mut delim = '"';
+            let mut buf = String::new();
+            for ch in line.chars() {
+                match ch {
+                    c if in_str && c == delim => {
+                        in_str = false;
+                        let p = buf.trim().trim_end_matches('/');
+                        if !p.is_empty() { members.push(p.to_string()); }
+                        buf.clear();
+                    }
+                    '"' | '\'' if !in_str => { in_str = true; delim = ch; buf.clear(); }
+                    ']' if !in_str => { collecting = false; break }
+                    _ if in_str => buf.push(ch),
+                    _ => {}
                 }
-                '"' => { in_str = true; buf.clear(); }
-                ']' if !in_str => break,
-                _ if in_str => buf.push(ch),
-                _ => {}
             }
+            if !collecting { break }
         }
         assert!(!members.is_empty(),
             "#787 guard reach: parsed zero workspace members out of the root `Cargo.toml` — the \
              corpus definition is unreadable, so this guard cannot claim to have covered the tree");
         members
+    }
+
+    /// Directories under `root` that contain a `Cargo.toml` — the filesystem's own answer to "what
+    /// crates are in this workspace", independent of how the manifest spells its member list.
+    ///
+    /// This exists so [`workspace_members_787`] has something to be checked AGAINST. A crate here
+    /// that the manifest does not list is a false RED; that is the safe direction and it forces a
+    /// decision rather than silently shrinking the corpus.
+    fn crate_dirs_787(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            if p.is_dir() {
+                if name == "target" || name.starts_with('.') { continue }
+                if p.join("Cargo.toml").is_file() {
+                    out.push(p.strip_prefix(root).unwrap_or(&p).to_string_lossy().replace('\\', "/"));
+                }
+                crate_dirs_787(&p, root, out);
+            }
+        }
+    }
+
+    /// `text` with every TOML `#` comment removed, newlines preserved.
+    ///
+    /// String-aware on purpose: `#` is legal inside a quoted value, and a naive strip that cut at the
+    /// first `#` would corrupt member paths — replacing one silent evasion with another. Basic (`"`)
+    /// and literal (`'`) strings are both tracked, and a backslash escape inside a basic string is
+    /// honoured. It is exercised by a probe in [`workspace_members_787`] before it is trusted.
+    fn strip_toml_comments_787(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        for line in text.split_inclusive('\n') {
+            let (mut in_str, mut delim, mut esc) = (false, '"', false);
+            for ch in line.chars() {
+                if in_str {
+                    out.push(ch);
+                    if esc { esc = false; continue }
+                    match ch {
+                        '\\' if delim == '"' => esc = true,
+                        c if c == delim => in_str = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' | '\'' => { in_str = true; delim = ch; out.push(ch); }
+                    '#' => { if line.ends_with('\n') { out.push('\n') } break }
+                    _ => out.push(ch),
+                }
+            }
+        }
+        out
     }
 
     /// `text` with every comment blanked to spaces, newlines preserved so line numbers still map.
@@ -3347,8 +3437,15 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// **MEASURED evasions. This list is the honest description of the instrument** — round-1 review
     /// of #836 planted eight production fine-worker constructions simultaneously and this test
     /// reported `ok`. Two of the eight are now closed; the rest are not closable by a text scan
-    /// without turning it into a Rust parser (#799 catalogues the family). Every row below was RUN
-    /// against the code as shipped, not reasoned about — including the rows that say "NOT caught".
+    /// without turning it into a Rust parser (#799 catalogues the family).
+    ///
+    /// A round-3 draft of this comment said "**every** row below was RUN … not reasoned about".
+    /// Round-3 review found that false for two rows and it was: the `LocalPlanner::spawn` fn-pointer
+    /// row and the `Default`/`Clone` row were written by analogy with rows next to them. Both have
+    /// since been run (the spawn fn-pointer row survived exactly as claimed; the `Default` row did
+    /// **not** and has been rewritten to what the run showed). Every row now carries the plant that
+    /// produced its verdict, so the claim is checkable per row rather than as a blanket assurance —
+    /// which is the form the false one took.
     ///
     /// A round-2 draft of this comment claimed the marker hole was *narrower* than review recorded —
     /// that the opt-out could only relocate the production site within its own file. **That was
@@ -3361,15 +3458,15 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// |---|---|
     /// | plainly-written second site, any file, any whitespace reflow | **caught** |
     /// | `use …::Walker as W;` — plain `as`-rename | **caught** (alias check below) |
-    /// | `pub use …::Walker as W;` — re-export rename | **caught since round 2**; the round-1 check tested `starts_with("use ")`, and a re-export can only be spelled `pub use`, so it was GREEN |
+    /// | `pub use …::Walker as W;` — re-export rename | **caught since round 2**; the round-1 check tested `starts_with("use ")`, which no re-export can satisfy — every one of them leads with a visibility (`pub`, `pub(crate)`, `pub(super)`, `pub(in …)`) — so `pub use … as W;` was GREEN. The check now strips the visibility, parenthesised form included, before matching |
     /// | `Walker /* x */ ::new(` — comment interposed in the path | **caught since round 2**, via [`blank_comments_787`]; whitespace-only flattening never formed the needle |
     /// | `let ctor = …::Walker::new;` then `ctor(..)` — fn-pointer binding | **NOT caught.** The name is followed by `;`, never `(`, and it is not an `as`-rename. The cheapest invisible second worker there is; a measured survivor against a different pin in this repo already (#828 round 3) |
-    /// | same, for `LocalPlanner::spawn` | **NOT caught** |
+    /// | same, for `LocalPlanner::spawn` | **NOT caught** — run, not reasoned, since round 4: an unmarked production `fn second_fine_worker_787() { let ctor = …::LocalPlanner::spawn; ctor() }` added to this very file left the guard GREEN (`walked 172`, one site found) |
     /// | `<…::Walker>::new(..)` — qualified path | **NOT caught** |
     /// | a `macro_rules!` body carrying the marker, invoked from production | **NOT caught** |
     /// | a `// #787-NOT-PRODUCTION` marker on a second PRODUCTION construction, original untouched, ANY file | **NOT caught.** The marker is an unpinned opt-out: nothing asserts where a marker may appear, so a marked line is invisible wherever it is. Measured in `observe.rs` — guard green with two production constructions in two files; removing the marker went RED naming the file |
     /// | one textual site executed twice (the relogin shape) | **NOT caught** — see the subject mismatch above |
-    /// | a `Default`/`Clone` impl for `Walker` | **NOT caught.** `Walker` derives neither today, and the private `planner`/`local_planner` fields keep a bare struct literal inside this crate |
+    /// | a `Default`/`Clone` impl for `Walker` | **CAUGHT in the direct form — the round-3 "NOT caught" here was reasoned and it was wrong.** Run in round 4: an `impl Default for Walker` whose body is a struct literal went **RED** (`found 2 site(s)`), because to be a fine worker at all the literal has to fill `local_planner`, and the only plain spelling of that is `LocalPlanner::spawn(` — which is the second needle. The same impl reaching the worker through a fn-pointer binding went GREEN, so this evades only *via* the fn-pointer row above, not on its own. Both plants were text-level: the guard is a text scan, and a full `Walker` literal does not compile outside this module |
     /// | the needle inside a `/* … */` block comment, or inside a string literal | **false RED** (measured). The two passes are combined by MAX per line so that two constructions on one line still count as two; the cost is that the raw pass's hit survives even where the blanked pass correctly sees none. Harmless direction, disclosed rather than left to be tripped over |
     ///
     /// **The balance, corrected.** An earlier draft of this comment argued that the residual holes
@@ -3404,17 +3501,34 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     ///     actually measured, because that failure was a whole crate directory dropping out of the
     ///     walk; it cannot catch one missing file.
     ///
+    /// **And the member LIST is itself asserted, because round-3 review broke it.** That list used to
+    /// be parsed and printed and never compared to anything. A `default-members` key in the manifest
+    /// armed the old suffix match, the list collapsed to ONE member, 29 `.rs` files went dark with a
+    /// planted production construction among them, and the guard passed while printing
+    /// `workspace members checked = 1`. **A number that is printed and never checked is not a
+    /// control** — it is the #778 shape one level up, in the reach control's own input. So the parsed
+    /// list is now asserted EQUAL to the set of directories that actually contain a `Cargo.toml`
+    /// ([`crate_dirs_787`]), which needs no git and does not depend on this parser being right. Both
+    /// halves were measured in round 4: with the anchor deliberately removed the parser still
+    /// collapses to `{"tools"}`, and the tree is **RED anyway** — `Parsed 1 … on disk 13`.
+    ///
     /// **How weak the degraded control is, in numbers.** A corpus satisfying every git-absent check
-    /// needs 13 member representatives plus the two anchors that live outside any member
-    /// (`src/app.rs`, `tests/walker_sim.rs`): **15 of 172 files. Up to 157 — 91% — could be dark and
-    /// every control would still pass.** That is far worse than the 11.6% tolerance band round-1
-    /// review made me delete, and it is the honest ceiling on what a builder-only run proves.
+    /// needs 13 member representatives, plus a 14th file because `eqoxide-nav` carries TWO named
+    /// anchors (`walker.rs` and `planner.rs`) and one representative cannot be both, plus the two
+    /// anchors that live outside any member (`src/app.rs`, `tests/walker_sim.rs`): **16 of 172
+    /// files. Up to 156 — 90.7% — could be dark and every control would still pass.** (A round-3
+    /// draft said 15 / 157 / 91%; it counted `eqoxide-nav` once.) That is far worse than the 11.6%
+    /// tolerance band round-1 review made me delete, and it is the honest ceiling on what a
+    /// builder-only run proves.
     ///
     /// Two things bound it in practice, and neither is a fix. The merge gate has git, so nothing
     /// reaches `main` on the weak path — it is every pre-merge run a developer or agent sees that
     /// takes it. And the guard now prints its mode and its file count **unconditionally, before any
-    /// finding** (`cargo test -- --nocapture`), so a degraded run states its own coverage rather than
-    /// looking identical to a strong one. Round-2 review found that disclosure on the failure path
+    /// finding**, to the process's real stderr handle — so it appears in a plain `cargo test` log of
+    /// a PASSING run, with no `--nocapture` (that flag would be needed only for the `println!` form,
+    /// which is exactly the form this deliberately does not use; see the comment at the write site).
+    /// A degraded run therefore states its own coverage rather than looking identical to a strong
+    /// one. Round-2 review found that disclosure on the failure path
     /// only, which is the #778 property reproduced inside this guard's own reporting: it told the
     /// truth exactly when it was already failing.
     ///
@@ -3445,6 +3559,23 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
             .collect();
 
         let members = workspace_members_787(&root);
+
+        // THE MEMBER LIST IS ASSERTED, NOT JUST PRINTED. Round-3 review: the count was reported and
+        // never compared, so `default-members = ["tools"]` in the manifest collapsed the per-member
+        // control to ONE member — 29 `.rs` files dark with a planted production construction among
+        // them — and the guard still passed while printing `members checked = 1`. A number nothing
+        // checks is not a control. The filesystem's own answer is the independent oracle here, and it
+        // needs no git, which is the whole point of this branch.
+        let mut crate_dirs = Vec::new();
+        crate_dirs_787(&root, &root, &mut crate_dirs);
+        let dirs: std::collections::BTreeSet<String> = crate_dirs.into_iter().collect();
+        let listed: std::collections::BTreeSet<String> = members.iter().cloned().collect();
+        assert_eq!(listed, dirs,
+            "#787 guard reach: the workspace members parsed out of `Cargo.toml` do not match the \
+             directories that actually contain a `Cargo.toml`. Whichever side is short, the \
+             per-member reach control below is covering less of the tree than it reports. Parsed {} \
+             ({:?}); on disk {} ({:?})",
+            listed.len(), listed, dirs.len(), dirs);
 
         // MODE DISCLOSURE, UNCONDITIONAL AND BEFORE ANY FINDING. Round-2 review: the mode was printed
         // only when the guard was already failing, so a PASSING degraded run was byte-identical to a
@@ -3544,8 +3675,10 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
 
             // The `as`-rename hole. A renamed import defeats the needle below, so it is a failure in
             // its own right. The leading visibility MUST be stripped first: round-1 review measured
-            // `use … as X;` going RED and `pub use … as X;` going GREEN off the same tree, and a
-            // re-export — the form that actually matters — can only be spelled `pub use`.
+            // `use … as X;` going RED and `pub use … as X;` going GREEN off the same tree. A
+            // re-export — the form that actually matters — always leads with a visibility, and `pub`
+            // is only the shortest of them, which is why the parenthesised forms (`pub(crate)`,
+            // `pub(super)`, `pub(in path)`) are stripped below rather than assumed away.
             for (n, line) in raw.iter().enumerate() {
                 let mut code = line.trim_start();
                 if let Some(rest) = code.strip_prefix("pub") {
