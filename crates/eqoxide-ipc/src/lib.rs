@@ -186,7 +186,12 @@ impl ControllerView {
     ///
     /// This was MEASURED on #801 rather than assumed. With the fields public, replacing `app.rs`'s
     /// paired write with a `v.hold = self.controller.hold();` that never touches `afloat_stall`
-    /// compiled and left the entire workspace green — 54 targets, 1772 passed, 0 failed. `app.rs`'s
+    /// compiled and left the entire workspace green — 54 targets, 1772 passed, 0 failed. **That
+    /// figure is anchored to commit `efed5e2`, the change that made these fields private, and it
+    /// cannot be re-run at any later head**: the mutation requires the fields to be public, which is
+    /// precisely what that commit removed. Do not read it as a claim about this head's suite. (#810
+    /// round-2 review, N3 — a number in a tracked file with no provenance reads as authority.)
+    /// `app.rs`'s
     /// frame loop needs a GPU and a window, so no unit test can reach that statement, and this
     /// repo's `include_str!` source pins have six separately measured evasions. Privacy is the one
     /// mechanism here that a diff cannot slip past: that mutation is now
@@ -199,8 +204,12 @@ impl ControllerView {
     ///
     /// **Say the residual out loud rather than let the paragraph above imply it away (#801 round-2
     /// review, N1): deleting the whole `v.publish_disclosures(self.controller.disclosures());` call
-    /// in `app.rs`'s stepped arm leaves the workspace fully green** — measured, 54/54 targets, 1774
-    /// passed. Severing only the mirror one layer down IS caught (`stream_position`'s test goes
+    /// in `app.rs`'s stepped arm leaves the workspace fully green** — **re-measured at this head**
+    /// (`ae49d2b`), not carried forward: 54 target headers, 54 `test result:` lines, **1772 passed,
+    /// 0 failed, 47 ignored, 0 filtered out**, identical in every figure to the unmutated run. This
+    /// paragraph previously quoted 1774, which was round 1's total and was stale by two tests; the
+    /// mutation was re-run rather than the number patched, because patching it would have been the
+    /// reasoned-not-measured move (#810 round-2 review, N3). Severing only the mirror one layer down IS caught (`stream_position`'s test goes
     /// red), and severing one field of two is now a compile error, but *removing the call site* is
     /// caught by nothing in CI. `app.rs`'s frame loop needs a GPU, a window and a live session, so
     /// no unit test in this workspace can reach that statement, and this repo has six separately
