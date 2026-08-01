@@ -904,15 +904,17 @@ mod cursor_resync_tests {
     #[test]
     fn a_stale_cursor_collapses_the_fine_planners_goal_onto_the_character() {
         // Not a steering carrot: this is `drive_walk`'s `local_goal`, the point handed to
-        // `find_path_local` as the fine plan's destination.
-        const REACH: f32 = 24.0;
-        let stale = carrot_along(&HAIRPIN, STALE_I, LANDED, REACH).unwrap();
+        // `find_path_local` as the fine plan's destination — so it reads the shared
+        // [`LOCAL_REACH`] rather than restating 24.0. It was a private `const REACH: f32 = 24.0;`
+        // until the #733 review found it: a copy of the reach in the very file that now defines
+        // the shared one, and spelled differently enough that an identifier grep missed it.
+        let stale = carrot_along(&HAIRPIN, STALE_I, LANDED, LOCAL_REACH).unwrap();
         let d_stale = (stale[0] - LANDED[0]).hypot(stale[1] - LANDED[1]);
         assert!(d_stale < 1.0,
             "fixture no longer reproduces the collapse (carrot was {d_stale:.2} u ahead)");
 
         let i = resync_cursor(&HAIRPIN, STALE_I, LANDED, always_clear);
-        let fixed = carrot_along(&HAIRPIN, i, LANDED, REACH).unwrap();
+        let fixed = carrot_along(&HAIRPIN, i, LANDED, LOCAL_REACH).unwrap();
         let d_fixed = (fixed[0] - LANDED[0]).hypot(fixed[1] - LANDED[1]);
         assert!(d_fixed > 8.0,
             "after resync the carrot must actually lead the character; it was {d_fixed:.2} u ahead");
@@ -1053,9 +1055,11 @@ mod cursor_resync_tests {
         const FRAMES: u32 = 14;        // 150 ms nav tick = 1 steer_target + 14 fast_steer_aim frames
         const TICKS: u32 = 200;
         const LOOK_AHEAD: f32 = 5.0;   // walker.rs `drive_walk`
-        // `drive_walk`'s `local_goal` reach, READ from the module rather than restated, so this
-        // harness cannot drift onto a different carrot than production and the collapse check.
-        const LOCAL_REACH: f32 = super::LOCAL_REACH;
+        // `drive_walk`'s `local_goal` reach is NOT restated here: [`LOCAL_REACH`] is in scope from
+        // `use super::*`, so this harness cannot drift onto a different carrot than production and
+        // the collapse check. (A `const LOCAL_REACH: f32 = super::LOCAL_REACH;` alias stood here
+        // briefly; it could not drift either, but it reads exactly like the copies the #733 review
+        // was hunting, so it is gone.)
         const LOCAL_BOUND: f32 = 40.0; // walker.rs `drive_walk`
         // The walker's own clearance, referenced rather than re-derived: it is defined as
         // `PLAYER_RADIUS` today, so a copy would agree by coincidence and drift silently.
@@ -1214,7 +1218,9 @@ mod cursor_resync_tests {
             "the COARSE carrot at LOOK_AHEAD is not the collapsed one — if this ever fails, the \
              round-3 account of #673 is wrong and the round-2 one may be right (was {:.2} u)", d(coarse));
 
-        let local_goal = carrot_along(&HAIRPIN, STALE_I, LANDED, 24.0).unwrap();
+        // `LOCAL_REACH`, not a literal 24.0: this IS `drive_walk`'s `local_goal`, and a bare literal
+        // here was a fourth copy of the reach that the #733 review's identifier grep could not see.
+        let local_goal = carrot_along(&HAIRPIN, STALE_I, LANDED, LOCAL_REACH).unwrap();
         assert!(d(local_goal) < 1.0, "local_goal must be the collapsed one (was {:.2} u)", d(local_goal));
 
         let steer = match col.find_path_local(LANDED, local_goal, LOCAL_CELL, 40.0, LOCAL_CELL * 2.0) {
@@ -2473,24 +2479,51 @@ mod cursor_resync_tests {
     /// Deliberately NOT a physics sim: no collision, no controller, so the reachability predicate is
     /// vacuously clear. That isolates the one thing under test.
     ///
-    /// **#733: it also reports its own REACH.** `collapse_only_ticks` counts nav ticks on which the
-    /// carrot-collapse trigger fired *while the body was inside* [`CURSOR_STALE_DIST`] of the segment
-    /// the cursor names — i.e. ticks the #727 distance trigger is structurally incapable of catching.
-    /// Without that counter a green sweep cannot distinguish "the new trigger cleared the cycle" from
-    /// "the old trigger did, and the new one never fired", which is exactly how a guard ships dead.
+    /// **#733: it also reports a PREMISE counter.** `collapse_only_ticks` counts nav ticks on which
+    /// the carrot was collapsed *while the body was inside* [`CURSOR_STALE_DIST`] of the segment the
+    /// cursor names — i.e. ticks in the region the #727 distance trigger is structurally incapable of
+    /// catching. A zero there means the sweep never reached the defect and its green rows are
+    /// vacuous, so the sub-guard rows assert it is non-zero.
+    ///
+    /// ⚠️ **Correction (#733 review) — what this counter does NOT prove, measured.** It used to be
+    /// documented as a reach control: *"without that counter a green sweep cannot distinguish 'the
+    /// new trigger cleared the cycle' from 'the old trigger did, and the new one never fired', which
+    /// is exactly how a guard ships dead."* **That claim is false and was falsified by running it.**
+    /// The counter calls [`carrot_leads`] itself, so it observes the PREDICATE, never whether
+    /// [`resync_cursor`]'s gate consults it. Wrapping the gate's *call site* — leaving `carrot_leads`
+    /// intact, so the guard is genuinely dead while the counter still reads a live predicate — does
+    /// not zero this counter. It drives it **up by two to three orders of magnitude** (4 u: 144 →
+    /// 41141), because a dead guard leaves the body parked in the collapsed state for all 400 ticks
+    /// and the counter faithfully counts every one of them. A reader who took a non-zero value as
+    /// evidence the guard is live would be reading a confident falsehood; the run tables are in
+    /// #818. The original PR's own mutation wrapped the *body* of `carrot_leads`, which does zero it
+    /// — but tautologically, since predicate and counter are the same call.
+    ///
+    /// **The generalizable rule, written down because this cost a round: mutate at the CALL SITE,
+    /// not inside the function body.** A body-wrap cannot tell "the guard is dead" from "the
+    /// predicate is false" — it forces both at once, so whatever it shows is unattributable. And
+    /// more generally: *any instrument that shares a code path with the thing it certifies is
+    /// measuring itself.* Backing the retracted sentence would need a counter incremented from
+    /// inside `resync_cursor` on the branch actually taken, not recomputed out here.
+    ///
+    /// What DOES catch a dead guard is the three tests that go red under the call-site wrap:
+    /// [`after_a_resync_with_clear_geometry_the_carrot_always_leads`],
+    /// [`the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured`] and
+    /// [`the_sub_guard_hairpin_fixed_point_resyncs_though_the_distance_trigger_cannot_see_it`].
     struct HairpinRun {
         /// The carrot never led the body out: 400 nav ticks without reaching the goal.
         pinned: bool,
         /// Ticks where `carrot_leads` was false AND the body was within `CURSOR_STALE_DIST` of the
-        /// segment `cursor` names — work only the #733 trigger can do.
+        /// segment `cursor` names — the region only the #733 trigger can act in. A NON-VACUITY
+        /// measure of the fixture, not a liveness measure of the guard: see the ⚠️ Correction above.
         collapse_only_ticks: u32,
     }
 
     fn hairpin_carrot_stops_leading(sep: f32, start: [f32; 3], mut cursor: usize) -> HairpinRun {
         const DT: f32 = 0.15;          // the nav tick
-        // `drive_walk`'s `local_goal` reach — the fine planner's destination, NOT a steering carrot.
-        // Read from the module so this sweep and the collapse check judge the same carrot.
-        const LOCAL_REACH: f32 = super::LOCAL_REACH;
+        // `LOCAL_REACH` below is the module constant via `use super::*` — `drive_walk`'s
+        // `local_goal` reach, the fine planner's destination, NOT a steering carrot. Not restated,
+        // not aliased, so this sweep and the collapse check judge the same carrot by construction.
         let route = hairpin_route(sep);
         let goal = *route.last().unwrap();
         let mut p = start;
@@ -2813,8 +2846,15 @@ mod cursor_resync_tests {
     /// it. This sweeps every fixture × every cursor × a body grid on and around each route and
     /// asserts the property of the cursor [`resync_cursor`] RETURNS, not of the one it was given.
     ///
-    /// **The two honest preconditions**, which are capability boundaries and not conveniences:
+    /// **The three honest preconditions**, which are capability boundaries and not conveniences.
+    /// (It said "two" until the #733 review counted them; the last one was in the code and not in
+    /// the prose.)
     ///
+    /// * there are at least two segments left from `start_i` — `resync_cursor`'s own first line
+    ///   returns `start_i` untouched when `path.len() < 3 || start_i + 2 >= path.len()`, so on those
+    ///   inputs the property would be asserting something about a function that declined to run.
+    ///   [`carrot_leads_is_honest_at_the_route_end_and_where_it_can_measure_nothing`] covers that
+    ///   edge directly instead;
     /// * the body's nearest point on `path[start_i..]` is inside [`CURSOR_RESYNC_MAX_HOP`] — a
     ///   resync refuses to adopt a segment further than that however clear the line, so a body 60 u
     ///   off its route is a case this function deliberately declines to fix (see that constant's own
