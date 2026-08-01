@@ -695,12 +695,12 @@ impl Rng {
 /// logic now silently changes scene `k`'s fixture, which is exactly the failure mode this fix set
 /// out to make impossible. Measured on the real build: MUT-6 leaves all 19 tests in this file green
 /// (**SURVIVED**). A source-text scan
-/// (`build_scenes_dependency_is_its_own_index_and_nothing_else`, below) closes this specific shape —
-/// it greps this function's own body for a nested call to `build_scene` and fails if one is
-/// present — but it is a syntactic pin with the same caveat as this file's other source-text asserts
-/// (see "What this file does NOT cover" at the top): it cannot see a mutation that reaches the same
-/// coupling through an intermediate helper rather than a direct recursive call. No test in this file
-/// rules that out; disclosed here rather than re-asserted as impossible.
+/// (`build_scenes_source_text_contains_no_literal_call_to_itself`, below) closes this specific
+/// shape — it isolates this function's own body and fails if it contains a nested call to
+/// `build_scene` — but it is a syntactic pin, narrower than this paragraph's framing: it proves
+/// there is no *literal* `build_scene(` substring in the body, not that there is no dependency of
+/// any kind on another scene. See that test's own doc comment for what it does and does not catch,
+/// including a round-2 fix for a truncation gap in the scan itself.
 fn build_scene(scene: usize) -> (Vec<Cand>, Option<Cand>, [f32; 3], [f32; 3]) {
     let mut rng = Rng(splitmix64(0x5EED_740 ^ scene as u64));
 
@@ -1097,22 +1097,56 @@ const THIS_FILE: &str = include_str!("shadow_caster_selection.rs");
 /// only test genuinely proving that a coupling is closed here is a mutation test on that exact
 /// source, which is a project-process check, not something this file can assert every time it runs.
 ///
-/// This test is the file's disclosed, partial answer: a **source-text** scan (same technique and
-/// caveat as `encode_shadow_pass_calls_the_planner_this_file_grades` below) over `build_scene`'s own
-/// body, failing if it contains a nested call back into `build_scene`. It kills MUT-6 exactly as
-/// described above — confirmed by applying that literal mutation and observing this test go red
-/// while the rest of the file stays green. It would **not** catch the same coupling reached through
-/// an intermediate helper function (e.g. `fn prior_signal(scene: usize) -> u64 { let (c, ..) =
-/// build_scene(scene - 1); c.len() as u64 }` called from inside `build_scene`), or through anything
-/// that recomputes an earlier scene's data without the literal token `build_scene(` appearing inside
-/// this function's body. That gap is real and is not claimed to be closed anywhere in this file.
+/// This test is the file's disclosed, partial answer: a **source-text** scan over `build_scene`'s
+/// own body, failing if it contains a nested call back into `build_scene`. It does **not** use the
+/// same technique as `encode_shadow_pass_calls_the_planner_this_file_grades` below — that one splits
+/// on the next `\npub fn `, which has no brace-balance dependency, because it only needs "everything
+/// up to the next public item" and `encode_shadow_pass` is `pub`. `build_scene` is private and is
+/// followed immediately by another function's doc comment (which itself quotes `build_scene(scene)`
+/// in prose), so the equivalent `\nfn ` split swallows that prose and false-fails on the unmutated
+/// file (this was tried first, and did exactly that, before this scan was written) — isolating
+/// `build_scene`'s own body precisely requires walking its actual brace structure, not a text split.
+///
+/// It kills MUT-6 exactly as described above — confirmed by applying that literal mutation and
+/// observing this test go red while the rest of the file stays green.
+///
+/// **Second round, per independent review: brace-depth counting has no lexer**, so it does not know
+/// a `}` inside a `//` comment, a string literal (e.g. `write!(f, "}}")`), or a char literal (`'}'`)
+/// is not a real closing brace. Measured: MUT-6's recursive call *plus* a single such comment placed
+/// early in the body made the naive scan return to depth 0 after only ~58 bytes — long before
+/// `build_scene`'s real end — so the truncated `body` never contained the recursive call at all and
+/// this test stayed green (**SURVIVED**, 20/0), silently, with the recursive call sitting in plain
+/// sight just outside the scanned window. That is strictly worse than the gaps disclosed below: those
+/// are honestly out of scope; this one was in scope and the scan still missed it.
+///
+/// **Fix, not a full lexer**: after finding a candidate close brace, assert the scan actually reached
+/// `build_scene`'s real tail — its literal final expression, `(cands, player, light, player_pos)`,
+/// which is the last text in the function before its true closing brace. Any brace that closes the
+/// scan early leaves that tail *outside* `body`, so a truncation is caught by its absence rather than
+/// trusted by the depth counter's say-so; there is no room left in the real function, after that tail
+/// expression, for a stray `}` to hide beyond it. Measured, both directions: on the unmutated file
+/// this adds nothing observable (**20/0**, `body` already reaches the tail). Under MUT-6 plus the
+/// stray-`}`-comment mutation, the terminator assert now fires (**19/1**) instead of the scan silently
+/// returning a truncated, all-clear `body`.
+///
+/// This scan is still not a lexer, and the terminator check only proves the scan reached *at least*
+/// as far as the known tail text — not that every byte in between was interpreted correctly. It would
+/// **not** catch the same coupling reached through an intermediate helper function (e.g. `fn
+/// prior_signal(scene: usize) -> u64 { let (c, ..) = build_scene(scene - 1); c.len() as u64 }` called
+/// from inside `build_scene`), through `build_scene (scene - 1)` with inserted whitespace, through a
+/// function-pointer alias, or through anything that recomputes an earlier scene's data without the
+/// literal token `build_scene(` appearing inside this function's body. Those gaps are real and are
+/// not claimed to be closed anywhere in this file. **What this test actually proves, precisely: no
+/// literal, whitespace-exact `build_scene(` substring appears in `build_scene`'s own scanned source
+/// text** — a narrower claim than "no dependency on another scene" (see the name below, chosen to
+/// match).
 #[test]
-fn build_scenes_dependency_is_its_own_index_and_nothing_else() {
+fn build_scenes_source_text_contains_no_literal_call_to_itself() {
     // Isolate exactly `build_scene`'s own `{ … }` by brace-depth counting from its signature's
     // opening brace to the matching close — NOT by splitting on the next `\nfn `, which swallows
     // every doc comment between this function and the next one (several of which quote
     // `build_scene(scene)` in prose) and made this test fail on the unmutated file the first time
-    // it was written.
+    // it was written (see this test's doc comment).
     let after_sig = THIS_FILE
         .split_once("fn build_scene(scene: usize)")
         .expect("build_scene not found in this file")
@@ -1133,6 +1167,18 @@ fn build_scenes_dependency_is_its_own_index_and_nothing_else() {
     }
     let close = close.expect("build_scene's closing brace not found");
     let body = &after_sig[open + 1..close];
+    // This scan has no lexer: a `}` inside a comment or string/char literal in the real body would
+    // close it early, and the truncated `body` below would then silently omit whatever comes after —
+    // including a recursive call the assert below exists to catch. Guard against that by requiring
+    // the scan to have reached `build_scene`'s actual last line of code, which sits immediately before
+    // its true closing brace and leaves nothing between it and the end for a stray `}` to hide behind.
+    assert!(
+        body.contains("(cands, player, light, player_pos)"),
+        "the brace-depth scan did not reach build_scene's real end (only {} bytes scanned) — a `}}` \
+         inside a comment, string, or char literal earlier in the body most likely closed it early; \
+         this scan cannot tell a real closing brace from one of those, so a truncated scan must fail \
+         loudly here instead of silently reporting no self-call", body.len(),
+    );
     assert!(
         !body.contains("build_scene("),
         "build_scene now calls itself (directly) — scene k's fixture can depend on another scene's \
