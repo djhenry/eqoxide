@@ -57,6 +57,53 @@ pub const JOINT_CAP: usize = 128;
 /// Size of one joint buffer: [`JOINT_CAP`] joints × mat4(64 bytes).
 pub const JOINT_BUF_BYTES: u64 = JOINT_CAP as u64 * 64;
 
+/// The widest character rig that actually ships, **measured** — the floor [`JOINT_CAP`] has to
+/// clear for the models in the tree today to render skinned at all.
+///
+/// ## Where this number came from
+///
+/// Measured on 2026-07-31 by parsing the GLB JSON chunk of every `.glb` in the local model cache
+/// (`$XDG_DATA_HOME/eqoxide/assets/models`) that `build_character_model` can be handed — the
+/// `race_*` files plus the named archetype files, excluding zone terrain and `*_doors.glb`, which
+/// never go through skin selection. 136 `.glb` files present; 49 character-relevant files carry a
+/// skin. Largest `max(skins[].joints.len())` per file, top of the distribution:
+///
+/// ```text
+/// 127  race_pcfroglok.glb   <- the maximum
+/// 110  race_huf.glb, humanoid_f.glb
+/// 109  race_hif/haf/gnf/erf/elf/daf.glb, elf_f.glb, elf.glb
+/// 108  race_kem.glb
+/// ...
+///   8  fish.glb             <- the minimum
+/// ```
+///
+/// The same scan is re-run against the live cache by
+/// `skin_cap_selection.rs::no_shipped_local_model_exceeds_the_cap_today`, which is `#[ignore]`d
+/// because the cache is a dev-machine artifact.
+///
+/// ## Why the constant exists (eqoxide#814)
+///
+/// Before eqoxide#798 the cap was spelled independently on the WGSL side and the Rust side, so a
+/// mistyped cap produced a wgpu binding-size error — loud, if ugly. Unifying it removed that
+/// accident: the system is now self-consistent for *any* value of [`JOINT_CAP`], including one too
+/// small to hold the rigs that ship. Such a cap does not error. It reclassifies real rigs as
+/// [`SkinFit::ExceedsCap`] and renders them unskinned — a silent wrong answer about the world,
+/// which this project ranks above a crash.
+pub const MAX_MEASURED_CHARACTER_RIG_JOINTS: usize = 127;
+
+/// A [`JOINT_CAP`] below the widest rig that ships is a **compile error**, not a silent downgrade.
+///
+/// Deliberately a `const` assertion rather than a `#[test]`: the bad state is then not merely
+/// detected, it is unbuildable — nothing can run against a cap that cannot carry the shipped rigs.
+/// `skin_cap_selection.rs::joint_cap_clears_the_widest_shipped_rig` asserts the same floor at
+/// runtime and names the numbers, for a reader who hits the failure and needs the provenance.
+const _: () = assert!(
+    JOINT_CAP >= MAX_MEASURED_CHARACTER_RIG_JOINTS,
+    "JOINT_CAP is below the widest character rig that ships (see \
+     MAX_MEASURED_CHARACTER_RIG_JOINTS). A cap this small does not error at runtime — it silently \
+     reclassifies real rigs as SkinFit::ExceedsCap and renders them unskinned. eqoxide#814."
+);
+
 /// One frame's joint palette for one skinned draw: exactly [`JOINT_CAP`] mat4s, which is the exact
 /// layout of a `joint_buf_pool` / `shadow_joint_pool` buffer and of the shaders' `JointMatrices`
 /// uniform. Named as a type so the length is not something a draw site restates.
@@ -176,25 +223,87 @@ impl StaticReason {
 /// constructed at all in a test (no `wgpu` backend has a non-adapter constructor), which is why
 /// this book-keeping is kept out of `build_character_model`'s body and callable on its own.
 ///
-/// The key carries `gender` because the thing being reported is a **loaded GLB**, and one label
-/// resolves to two different files: `ensure_character_model` prefers `<label>_f.glb` for gender 1
-/// and falls back to `<label>.glb`. Those two files have independent joint counts, so keying by
-/// label alone let the second load overwrite the first — a male rig over the cap could be erased
-/// from the report by a later female load that fit, or vice versa, and the surviving entry would
-/// name a joint count belonging to a file the reader could not identify. That is exactly the
-/// silent-wrong-answer shape this observable exists to remove, so the key now matches the
-/// `(key, gender)` keying `gpu_character_models` and `model_load_tried` already use. Only the 3
-/// archetypes with `_f` variants can actually collide today; the fix is to the key, not the odds.
-/// (eqoxide#798)
+/// ## Why the key is the loaded PATH, and nothing else (eqoxide#798, eqoxide#813)
+///
+/// The thing being reported is a joint count, and a joint count belongs to a **file**. One label
+/// does not identify one file: `ensure_character_model` prefers `<label>_f.glb` for gender 1 and
+/// falls back to `<label>.glb`. So:
+///
+/// - Keyed by `label` alone (pre-#798), two genders that resolve to two *different* files collided
+///   and the second load overwrote the first — a rig over the cap could be erased from the report
+///   by a later load of the other gender, and the surviving number named a file the reader could
+///   not identify.
+/// - Keyed by `(label, gender)` (#798), the opposite error appeared: for the archetypes with no
+///   `_f` variant — every one but the 3 that have one — both genders resolve to the *same* file, so
+///   a single downgraded GLB was reported twice under two keys (eqoxide#813). A duplicate entry in
+///   an agent-facing report is a small falsehood of the kind this observable exists to remove.
+///
+/// Both errors are the same mistake: a key that is a *proxy* for the file instead of the file. This
+/// function therefore takes the `&Path` that was actually handed to `ModelAsset::load` and derives
+/// the key from it.
+///
+/// ## Exactly how far that goes
+///
+/// One direction is structural: **two loads of one file cannot produce two entries**, because
+/// [`downgrade_key`] is a pure function of the path — same path in, same key out, and a `BTreeMap`
+/// does the rest.
+///
+/// The other direction is not. The key is the path's **file name**, not the whole path, so two
+/// files with the same base name under two different asset roots collapse into one entry. That is
+/// measured, not reasoned: `two_roots_with_the_same_basename_collide_into_one_entry` in
+/// `tests/skin_cap_selection.rs` plants it. An earlier version of this doc claimed the collision was
+/// inexpressible "because the key IS the file"; it is not, and a reviewer said so. Reaching it needs
+/// one renderer to load character models from two roots that share a file name — `assets_path` is
+/// set by `load_character_models` and there is one per renderer, so it does not happen in the
+/// shipped flow, but nothing here *prevents* it.
+///
+/// The base name is still the right key, for a reason unrelated to collisions: this map is read by
+/// an AI agent over HTTP, and an absolute local path is both unstable across machines and local
+/// detail this project does not publish. `race_pcfroglok.glb` identifies the rig; the absolute path
+/// in front of it identifies the machine.
 pub fn record_skin_cap_downgrade(
-    downgrades: &mut std::collections::BTreeMap<(String, u8), usize>,
-    label: &str,
-    gender: u8,
+    downgrades: &mut std::collections::BTreeMap<String, usize>,
+    model_path: &std::path::Path,
     reason: StaticReason,
 ) {
     if let StaticReason::ExceedsCap { joint_count } = reason {
-        downgrades.insert((label.to_string(), gender), joint_count);
+        downgrades.insert(downgrade_key(model_path), joint_count);
     }
+}
+
+/// The reporting key for a loaded model file: its file name (`race_hum_f.glb`), or the whole path
+/// if it somehow has none — never silently empty, because an unlabelled entry in a report the agent
+/// reads is worse than an ugly one.
+pub fn downgrade_key(model_path: &std::path::Path) -> String {
+    model_path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| model_path.to_string_lossy().into_owned())
+}
+
+/// Which GLB an `(archetype key, gender)` pair actually loads.
+///
+/// Gender 1 prefers `<key>_f.glb` **if that file exists** and otherwise falls back to `<key>.glb`;
+/// gender 0 is always `<key>.glb`. Only 3 archetypes in the shipped model cache have an `_f`
+/// variant (measured 2026-07-31: `dwarf_f.glb`, `elf_f.glb`, `humanoid_f.glb`, out of 136 `.glb`
+/// files), so for almost every archetype the two genders resolve to the *same file*.
+///
+/// Pulled out of [`EqRenderer::ensure_character_model`] as a free function so that relationship is
+/// reachable from a test — `ensure_character_model` needs a `wgpu::Device` and cannot be called at
+/// all in this crate's test harness. It is the premise eqoxide#813 turns on: a report keyed by
+/// `(label, gender)` counts one file twice whenever this returns the same path for both genders.
+pub fn resolve_character_model_path(
+    assets_path: &std::path::Path,
+    key: &str,
+    gender: u8,
+) -> std::path::PathBuf {
+    if gender == 1 {
+        let female = assets_path.join(format!("{key}_f.glb"));
+        if female.exists() {
+            return female;
+        }
+    }
+    assets_path.join(format!("{key}.glb"))
 }
 
 /// Build a unit cube GpuMesh (~2 units per side, centered at origin), used as the door
@@ -279,15 +388,18 @@ pub struct EqRenderer {
     /// absent race, not one still downloading. (eqoxide#224)
     model_load_tried:        std::collections::HashSet<(&'static str, u8)>,
     /// Character models whose skin EXCEEDED [`JOINT_CAP`] and were therefore downgraded to the
-    /// static (unskinned) render arm, keyed by `(model label, gender)` — the same key
-    /// `gpu_character_models` uses, because gender selects a different GLB file with its own joint
-    /// count (see [`record_skin_cap_downgrade`]) — with the joint count that caused it. This is
-    /// the observable eqoxide#780 exists to add. Absent = no downgrade has happened; a
-    /// missing model or a genuinely unskinned one (e.g. `boat.glb`) is never inserted here, only a
-    /// model that HAD real skin data and didn't fit. Not yet wired to the HTTP API (that crosses
-    /// into `src/app.rs`, out of scope for this fix — see the #780 PR body) but is public and
-    /// queryable in-process, and every downgrade is also logged at `error!`.
-    pub skin_cap_downgrades: std::collections::BTreeMap<(String, u8), usize>,
+    /// static (unskinned) render arm, keyed by the **GLB file name that was loaded** (e.g.
+    /// `race_hum_f.glb`), with the joint count that caused it. This is the observable eqoxide#780
+    /// exists to add. Absent = no downgrade has happened; a missing model or a genuinely unskinned
+    /// one (e.g. `boat.glb`) is never inserted here, only a model that HAD real skin data and
+    /// didn't fit. Not yet wired to the HTTP API (that crosses into `src/app.rs`, out of scope —
+    /// see the #780 PR body) but is public and queryable in-process, and every downgrade is also
+    /// logged at `error!`.
+    ///
+    /// The key is the file rather than `(label, gender)` because the file is what the joint count
+    /// describes; see [`record_skin_cap_downgrade`] for why that distinction is load-bearing
+    /// (eqoxide#813).
+    pub skin_cap_downgrades: std::collections::BTreeMap<String, usize>,
     /// Channel to the background model-sync worker: send a race model KEY (e.g. "race_hum") to
     /// fetch its `charmodel/<key>` set on demand the first time a spawn of that race is seen, so
     /// the client never downloads the ~450 MB of race models it doesn't need. None until wired in
@@ -760,13 +872,7 @@ impl EqRenderer {
     pub fn ensure_character_model(&mut self, key: &'static str, gender: u8) {
         if self.gpu_character_models.contains_key(&(key, gender)) { return; }
         if !self.model_load_tried.insert((key, gender)) { return; } // already attempted
-        let base = self.assets_path.join(format!("{key}.glb"));
-        let path = if gender == 1 {
-            let f = self.assets_path.join(format!("{key}_f.glb"));
-            if f.exists() { f } else { base }
-        } else {
-            base
-        };
+        let path = resolve_character_model_path(&self.assets_path, key, gender);
         if !path.exists() {
             // Race models are fetched ON DEMAND: request the `charmodel/<key>` sync once and retry
             // loading on a later frame (do NOT mark tried, so it isn't given up on). Archetypes ship
@@ -788,7 +894,10 @@ impl EqRenderer {
             Ok(asset) => {
                 let (model, skin_fit) = self.build_character_model(key, asset);
                 if let Some(reason) = skin_fit.static_reason() {
-                    record_skin_cap_downgrade(&mut self.skin_cap_downgrades, key, gender, reason);
+                    // Keyed by the file that was just loaded — `path`, not `key`/`gender`, because
+                    // gender 1 falls back to the male GLB when there is no `_f` variant and the
+                    // joint count belongs to the file (eqoxide#813).
+                    record_skin_cap_downgrade(&mut self.skin_cap_downgrades, &path, reason);
                 }
                 self.gpu_character_models.insert((key, gender), model);
                 tracing::debug!("renderer: lazily loaded character model '{key}' (gender {gender})");
