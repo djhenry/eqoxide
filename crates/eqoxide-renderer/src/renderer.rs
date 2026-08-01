@@ -238,7 +238,7 @@ impl StaticReason {
     }
 }
 
-/// Record `(label, gender)`'s joint count into `downgrades` iff `reason` is a genuine cap downgrade
+/// Record `model_path`'s joint count into `downgrades` iff `reason` is a genuine cap downgrade
 /// (`StaticReason::ExceedsCap`) — the one outcome eqoxide#780 requires to stop being silent. Pure
 /// so the recording decision is unit-testable without a `wgpu::Device`; `EqRenderer` cannot be
 /// constructed at all in a test (no `wgpu` backend has a non-adapter constructor), which is why
@@ -946,8 +946,9 @@ impl EqRenderer {
     }
 
     /// Upload one `ModelAsset` to the GPU as a `GpuModel` (skinned when it has a
-    /// usable skin, else static). `label` is only used for log lines. Shared by the
-    /// archetype loader and the per-race (`race_<code>.glb`) loader.
+    /// usable skin, else static). `label` is only used for log lines. Its one caller is
+    /// `ensure_character_model`, which serves both archetype keys and per-race (`race_<code>.glb`)
+    /// keys through the same path.
     ///
     /// Takes the render-arm choice as an [`ObservedSkinFit`], which only
     /// [`crate::skin_observation::observe_skin_fit`] can produce. This method takes `&self`, not
