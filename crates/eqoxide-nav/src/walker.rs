@@ -314,7 +314,10 @@ impl Walker {
         // #766 review B9: a FRESH fine worker starts alive, so the row it will be published on must
         // say so. `local_planner_dead` is latched for the life of a worker (see its field doc), and
         // the row outlives any one `Walker` — it is a shared `Arc` the HTTP surface also holds. Today
-        // exactly one `Walker` is built per process, so this clear is a no-op in production; it is
+        // exactly one `Walker` is built per process — pinned, since #787, by
+        // `tests::exactly_one_production_fine_worker_is_built_in_the_tree_787`, which fails and names
+        // the four "session-scoped" sentences the day that stops being true — so this clear is a
+        // no-op in production; it is
         // here so that the flag's lifetime is tied to the WORKER's, structurally, at the one place
         // that spawns one. Without it, a second `Walker` over the same row — the shape an in-process
         // relogin would create — would inherit `true` and report a planner it had just replaced as
@@ -1875,7 +1878,7 @@ mod tests {
         let intent: eqoxide_ipc::NavIntent = Default::default();
         let view: crate::diagnostics::NavDebugView = Default::default();
         let za = zone_assets_for(&collision);
-        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone(), za);
+        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone(), za); // #787-NOT-PRODUCTION
         (w, nav, intent, view)
     }
 
@@ -1890,7 +1893,7 @@ mod tests {
         let world: eqoxide_ipc::WorldSlots = Default::default();
         let intent: eqoxide_ipc::NavIntent = Default::default();
         let view: crate::diagnostics::NavDebugView = Default::default();
-        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone(), zone_assets);
+        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone(), zone_assets); // #787-NOT-PRODUCTION
         (w, nav, intent, view)
     }
 
@@ -2139,6 +2142,9 @@ mod tests {
             // at this test for the B10 hedge on the uncommitted draft. Caught by `steering`'s scan,
             // not by me — the citation was added and the guard was not.
             a_dead_fine_planner_stays_visible_after_the_goal_is_retired_766,
+            // #787: cited by `NOT_PRODUCTION`'s rustdoc, which points at the guard that decides what
+            // the marker means. Caught by `steering`'s scan when the citation was written.
+            exactly_one_production_fine_worker_is_built_in_the_tree_787,
         ];
     }
 
@@ -2190,7 +2196,7 @@ mod tests {
         let view: crate::diagnostics::NavDebugView = Default::default();
         let col = Arc::new(std::sync::RwLock::new(Some(Arc::new(pad_scene_leaves(two_leaves)))));
         let za = zone_assets_for(&col); // pad tests don't drive `drive_walk`; a consistent handle regardless
-        let w = Walker::new(nav, world.clone(), col, intent, view, za);
+        let w = Walker::new(nav, world.clone(), col, intent, view, za); // #787-NOT-PRODUCTION
         *world.zone_points.lock().unwrap() = vec![eqoxide_core::game_state::ZonePoint {
             iterator:  PAD_INDEX as u32,
             server_x:  dest[0], server_y: dest[1], server_z: dest[2],
@@ -3045,13 +3051,273 @@ mod tests {
         let view: crate::diagnostics::NavDebugView = Default::default();
         let collision = open_plane(400.0);
         let za = zone_assets_for(&collision);
-        let _w = Walker::new(nav.clone(), world, collision, intent, view, za);
+        let _w = Walker::new(nav.clone(), world, collision, intent, view, za); // #787-NOT-PRODUCTION
 
         assert!(!nav.nav_state.lock().unwrap().local_planner_dead,
             "#766 B9: `Walker::new` has just spawned a NEW `LocalPlanner`, which is alive. Leaving \
              the previous worker's latch standing would publish `nav_local_planner_dead: true` for a \
              thread that is running fine, and it would never clear — the client asserting a \
              permanent fault it had itself just repaired");
+    }
+
+    /// The literal token a fine-worker construction site must carry to declare itself **not a
+    /// production fine worker** — see [`exactly_one_production_fine_worker_is_built_in_the_tree_787`],
+    /// which treats every unmarked, non-prose site as production. Grep it to enumerate the opt-outs.
+    const NOT_PRODUCTION: &str = "#787-NOT-PRODUCTION";
+
+    /// The message the #787 guard fails with. Its whole job: tell whoever tripped it *which four
+    /// sentences have just become false*, so the decay is not silent.
+    fn four_sentences(what: &str) -> String {
+        format!(
+"{what}
+
+`NavStatus::local_planner_dead` is LATCHED and scoped to the fine WORKER. The agent-facing name for
+it — `nav_local_planner_dead`, documented as SESSION-scoped — is accurate only because worker span
+and process span coincide, and they coincide only while exactly one fine steering worker is built per
+client process. A second production fine worker makes the session-scoped name WRONG, and makes these
+four sentences false. Revisit all four before you land this:
+
+  1. crates/eqoxide-ipc/src/lib.rs, `NavStatus::local_planner_dead` field doc —
+     \"…exactly one fine worker exists per process and 'latched forever' and 'latched for this
+      worker' coincide.\"
+  2. crates/eqoxide-ipc/src/lib.rs, same field doc —
+     \"…which is why the agent-facing docs call the field session-scoped.\"
+  3. crates/eqoxide-http/src/observe.rs, the `nav_local_planner_dead` publication comment —
+     \"…it reads as session-scoped from outside only because exactly one fine worker is built per
+      process.\"
+  4. docs/http-api.md, `### nav_local_planner_dead — fine-planner liveness, session-scoped` —
+     \"…exactly one fine worker is built per client process, so from out here the two are the same
+      span.\"
+
+Weaker dependents to re-read while you are there: the \"this clear is a no-op in production\" comment
+in `Walker::new`, and `a_new_walker_does_not_inherit_a_previous_workers_death_766` below (which
+constructs a second `Walker` deliberately and therefore can never be the thing that catches this).
+
+If the new site is genuinely NOT a production worker (a test, a bench, a fixture), append a trailing
+`// {NOT_PRODUCTION}` comment to its line and this guard will accept it.")
+    }
+
+    /// Repo root, from this crate's manifest dir. Anchored below, so a workspace re-layout fails the
+    /// guard loudly instead of quietly scanning an empty tree.
+    fn repo_root_787() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+    }
+
+    /// Every `.rs` file under `root`, recursively.
+    ///
+    /// `target/` and every DOT-directory are skipped. `.claude/worktrees/` in particular holds other
+    /// agents' complete checkouts of this same tree; walking into one would count their construction
+    /// sites as this working tree's and fail the guard for reasons that have nothing to do with the
+    /// code under test.
+    fn rs_files_787(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(dir) = std::fs::read_dir(root) else { return };
+        for entry in dir {
+            let p = entry.expect("readable dir entry").path();
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            if p.is_dir() {
+                if name == "target" || name.starts_with('.') {
+                    continue;
+                }
+                rs_files_787(&p, out);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// Whitespace-stripped file text, plus the source line each retained BYTE came from.
+    ///
+    /// Stripping first is what makes the scan survive a reflow: `eqoxide-http`'s sibling guard was
+    /// rewritten for exactly this reason (see `slot.rs`) after a call site wrapped across lines and
+    /// silently left a line-based guard's coverage. Here the needle is found in the flattened text
+    /// and the byte offset is mapped back to the line the match STARTS on, which is the line whose
+    /// raw text is then classified.
+    fn flatten_787(text: &str) -> (String, Vec<usize>) {
+        let mut flat = String::with_capacity(text.len());
+        let mut line_of = Vec::with_capacity(text.len());
+        let mut line = 1usize;
+        for c in text.chars() {
+            if c == '\n' {
+                line += 1;
+            }
+            if c.is_whitespace() {
+                continue;
+            }
+            flat.push(c);
+            for _ in 0..c.len_utf8() {
+                line_of.push(line);
+            }
+        }
+        (flat, line_of)
+    }
+
+    /// **#787 — the one-fine-worker premise, pinned.**
+    ///
+    /// `local_planner_dead` is latched for the life of a fine WORKER; the agent is told it is
+    /// SESSION-scoped. Those are the same span only while exactly one fine worker is constructed per
+    /// client process, and until this guard existed that premise was prose with nothing under it: the
+    /// day an in-process relogin lands, four sentences (enumerated in [`four_sentences`], which is
+    /// what this fails with) become false and nothing goes red.
+    ///
+    /// **What it grades.** Two links of the premise chain, over the WHOLE repository, not this crate:
+    ///
+    ///   * exactly one production `Walker::new(` call site — in `crates/eqoxide-net/src/action_loop.rs`;
+    ///   * exactly one production `LocalPlanner::spawn(` call site — in this file, inside `Walker::new`.
+    ///
+    /// The second link matters on its own: the field doc's claim is "`LocalPlanner::spawn` is reached
+    /// only through `Walker::new`", so a fine worker spawned OUTSIDE a `Walker` would break the
+    /// premise without adding a `Walker`.
+    ///
+    /// **Why a source scan and not a runtime counter.** A process-global `AtomicUsize` in
+    /// `Walker::new` grades the property rather than the text and would be the stronger instrument —
+    /// except that there is no `cfg` that separates "the production process" from "a downstream
+    /// crate's test binary". `cfg(test)` is per-compilation: when `eqoxide-nav` is built as a
+    /// dependency of `eqoxide-net`, `cfg(test)` is FALSE for this crate, so a `#[cfg(not(test))]`
+    /// trip fires inside `eqoxide-net`'s own suite, which builds two `ActionLoop`s (and therefore two
+    /// `Walker`s) in one process. That was measured, not reasoned — see the PR body. A release-only
+    /// trip avoids the false fire but is never exercised in CI and turns a prose-decay problem into a
+    /// new field failure mode. So the instrument that can fail at AUTHORING time wins here.
+    ///
+    /// **Known evasions, stated rather than implied** (cf. #799, which catalogues seven ways a
+    /// source-text pin proves a call is *written* rather than *reached*):
+    ///
+    ///   * An `as`-renamed import (`use …::Walker as W; W::new(..)`) hides the needle. Flagged
+    ///     separately below, on the `use` line, which closes the plain form of it but not a
+    ///     re-export chain that renames in an intermediate module.
+    ///   * A `macro_rules!` body containing a MARKED construction, invoked from production, spawns a
+    ///     worker this guard has been told to ignore. Not covered. There is no such macro today.
+    ///   * A `Default`/`Clone` impl for `Walker` would construct one without the needle. Not covered;
+    ///     `Walker` derives neither today, and the private `planner`/`local_planner` fields keep a
+    ///     bare struct literal inside this crate.
+    ///   * The `NOT_PRODUCTION` marker is itself a trailing-comment opt-out — #799's evasion #1, here
+    ///     on purpose and by design. It is greppable and it is the documented escape hatch.
+    ///
+    /// Every one of those makes the guard MISS a second worker. The #799 evasions that make a written
+    /// call unreachable (`if false`, `#[cfg(any())]`, shadowing) push this guard the other way — into
+    /// a false RED — which is the safe direction for an at-most-one claim: a human looks.
+    ///
+    /// **Reach.** #778 found an existing source-scanning guard silently covering a fraction of its
+    /// corpus, which is indistinguishable from a passing one. Three controls, all of which fail loudly
+    /// rather than vacuously: the file count floor; the named-anchor set (five files at four different
+    /// depths, in three different roots, that MUST have been visited); and the marked-site count,
+    /// which goes to zero the moment the needle drifts from the source. The guard was also RUN against
+    /// planted second call sites in four separate locations — see the PR body's reach-control table.
+    #[test]
+    fn exactly_one_production_fine_worker_is_built_in_the_tree_787() {
+        let root = repo_root_787();
+        assert!(root.join("Cargo.toml").is_file(),
+            "layout anchor: expected the workspace manifest at the repo root this guard walks from");
+        assert!(root.join("crates/eqoxide-net/src/action_loop.rs").is_file(),
+            "layout anchor: the known production construction site has moved — re-point this guard");
+
+        let mut files = Vec::new();
+        rs_files_787(&root, &mut files);
+        files.sort(); // `read_dir` order is unspecified; the findings below are reported verbatim
+        let visited: std::collections::BTreeSet<String> = files.iter()
+            .map(|p| p.strip_prefix(&root).unwrap_or(p).to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        // REACH CONTROL 1 — the corpus was actually walked. A recursive walk that stops short looks
+        // exactly like a clean pass, so the size is asserted rather than assumed.
+        assert!(files.len() >= 150,
+            "#787 guard reach: expected to scan the whole tree's Rust sources, scanned only {} \
+             file(s) under {:?} — the walk stopped short and a clean pass here would be meaningless",
+            files.len(), root);
+
+        // REACH CONTROL 2 — named anchors, chosen to sit in three different roots (`crates/`, `src/`,
+        // `tests/`) at four different depths. If any is missing the walk skipped a whole subtree.
+        for anchor in [
+            "crates/eqoxide-net/src/action_loop.rs",
+            "crates/eqoxide-nav/src/walker.rs",
+            "crates/eqoxide-nav/src/planner.rs",
+            "src/app.rs",
+            "tests/walker_sim.rs",
+        ] {
+            assert!(visited.contains(anchor),
+                "#787 guard reach: the scan never visited `{anchor}` — it skipped a subtree, so its \
+                 'exactly one' finding covers less of the tree than it claims. Scanned {} files.",
+                files.len());
+        }
+
+        // Needles assembled at run time so this guard's own source does not contain the text it
+        // searches for (`slot.rs` names the same self-match hazard).
+        let walker_new = format!("Walker::{}(", "new");
+        let fine_spawn = format!("LocalPlanner::{}(", "spawn");
+
+        let mut prod_walker: Vec<String> = Vec::new(); // "path:line: code"
+        let mut prod_spawn:  Vec<String> = Vec::new();
+        let mut marked = 0usize;
+        let mut prose = 0usize;
+        let mut aliases: Vec<String> = Vec::new();
+
+        for path in &files {
+            let rel = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+            let text = std::fs::read_to_string(path).expect("readable source file");
+            let raw: Vec<&str> = text.lines().collect();
+
+            // The `as`-rename hole, closed in its plain form: a `use` that renames either type
+            // defeats the needle below, so it is a failure in its own right.
+            for (n, line) in raw.iter().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("use ")
+                    && (code.contains("Walker as ") || code.contains("LocalPlanner as "))
+                {
+                    aliases.push(format!("{rel}:{}: {}", n + 1, code.trim()));
+                }
+            }
+
+            let (flat, line_of) = flatten_787(&text);
+            for (needle, bucket) in [(&walker_new, &mut prod_walker), (&fine_spawn, &mut prod_spawn)] {
+                for (off, _) in flat.match_indices(needle.as_str()) {
+                    let ln = line_of[off];
+                    let line = raw[ln - 1];
+                    let code = line.trim_start();
+                    if code.starts_with("//") {
+                        prose += 1; // a doc/comment mention, not a construction
+                    } else if line.contains(NOT_PRODUCTION) {
+                        marked += 1;
+                    } else {
+                        bucket.push(format!("{rel}:{ln}: {}", code.trim_end()));
+                    }
+                }
+            }
+        }
+
+        assert!(aliases.is_empty(),
+            "{}",
+            four_sentences(&format!(
+                "#787: a `use` statement RENAMES `Walker` or `LocalPlanner`, which hides fine-worker \
+                 construction from the guard that pins the one-worker premise:\n  {}\n\nImport the \
+                 type under its own name, or teach this guard the alias.",
+                aliases.join("\n  "))));
+
+        // POSITIVE CONTROL — if the marker path ever counts zero, the needle has drifted from the
+        // source and the "exactly one" finding below is vacuous rather than true.
+        assert!(marked >= 6,
+            "#787 guard: matched only {marked} marked construction site(s) (expected the 4 `Walker` \
+             fixtures in this file and the 3 `LocalPlanner` fixtures in planner.rs) — the search \
+             pattern has drifted from the source and this guard has stopped measuring anything. \
+             (prose mentions seen: {prose})");
+
+        for (what, where_, found) in [
+            ("`Walker` construction, expected only in `ActionLoop::new`",
+             "crates/eqoxide-net/src/action_loop.rs:", &prod_walker),
+            ("fine-worker `LocalPlanner::spawn`, expected only inside `Walker::new`",
+             "crates/eqoxide-nav/src/walker.rs:", &prod_spawn),
+        ] {
+            assert_eq!(found.len(), 1,
+                "{}",
+                four_sentences(&format!(
+                    "#787: expected exactly ONE production {what}; found {} site(s):\n  {}",
+                    found.len(), found.join("\n  "))));
+            assert!(found[0].starts_with(where_),
+                "{}",
+                four_sentences(&format!(
+                    "#787: the sole production {what} has MOVED — it is now `{}`, not in `{}`. That \
+                     is not by itself a second worker, but the premise chain the four sentences \
+                     below rest on is written in terms of the old location.",
+                    found[0], where_.trim_end_matches(':'))));
+        }
     }
 
     /// **#766, the OTHER walker route to `idle` — and it is here to MEASURE a claim, not to guard a

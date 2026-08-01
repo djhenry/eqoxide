@@ -1027,8 +1027,9 @@ a client restart.
 *Session-scoped* is the agent-facing name for that lifetime, and it is accurate: the latch the client
 keeps internally is scoped to the fine **worker**, and exactly one fine worker is built per client
 process, so from out here the two are the same span. The distinction only matters to the client's own
-code, which is where it is written down — as is the fact that nothing currently pins the one-worker
-premise this name rests on (#787).
+code, which is where it is written down — together with the guard that pins the one-worker premise
+this name rests on: a whole-tree source scan that fails, naming this paragraph, if a second
+fine-worker construction site is ever added (#787).
 
 **Over a running client this field is one-way.** Nothing in the process constructs a second fine
 worker, so nothing clears it. That is a property of the *process*, not of the field, and it was
