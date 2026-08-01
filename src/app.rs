@@ -1384,7 +1384,6 @@ impl App {
             if let Ok(mut v) = self.controller_view.lock() {
                 v.pos = self.scene.player_pos;
                 v.heading = self.scene.player_heading;
-                v.moving = false;
                 // Just seeded by `teleport`, which drops BOTH the hold and the afloat window, and
                 // nothing has stepped yet (#724 review B1). #801 reads them back rather than
                 // writing two literal `None`s: this arm flips `initialized = true`, so whatever is
@@ -1714,7 +1713,6 @@ impl App {
                 if let Ok(mut v) = self.controller_view.lock() {
                     v.pos = cpos;
                     v.heading = self.heading_target;
-                    v.moving = intent.wish_dir[0] != 0.0 || intent.wish_dir[1] != 0.0 || !self.on_ground;
                     // #724 review B1 / #801: republish BOTH controller disclosures every RENDERED
                     // frame — level signals, never latched. Each is `None` unless the frame just
                     // stepped re-established it, so this write is also the clear: the frame the body
