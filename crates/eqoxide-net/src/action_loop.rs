@@ -1769,7 +1769,19 @@ impl ActionLoop {
                                             .map(|zp| zp.iterator as i32).collect())
                                     };
                                     if !allowed { return None; }
-                                    c.zone_line_indices().into_iter()
+                                    // #803: `zone_line_indices` is now a `Result`. This fallback
+                                    // only ever ASKS for candidates, so an `Err` (no region data)
+                                    // yields none to offer, exactly as the old empty vec did —
+                                    // BEHAVIOUR HERE IS UNCHANGED, deliberately, because this file
+                                    // belongs to another change in flight.
+                                    //
+                                    // What is NOT fixed here: the `None` arm below then reports
+                                    // `zone_line_not_in_map`, whose documented meaning is "a
+                                    // client-side `.wtr` map-data GAP". When the `.wtr` did not
+                                    // load at all that reason names the wrong cause — the same
+                                    // substitution #803 kills on `/observe/zone_exits`, one caller
+                                    // over. Filed as #815 rather than fixed in this PR.
+                                    c.zone_line_indices().unwrap_or_default().into_iter()
                                         .filter(|idx| !resolvable.contains(idx))
                                         .filter_map(|idx| c.find_zone_line_near(Some(idx), pos))
                                         .min_by(|a, b| {

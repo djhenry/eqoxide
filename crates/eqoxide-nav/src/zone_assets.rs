@@ -154,9 +154,35 @@ impl ZoneAssetState {
 
     /// [`Self::test_ready`], with an optional region map (`.wtr` BSP) installed on the grid — for
     /// tests in crates that cannot build a zone but need zone-line-region behaviour (e.g. the #683
-    /// unresolved-index auto-cross in `eqoxide-net`). Test-only.
+    /// unresolved-index auto-cross in `eqoxide-net`). `None` leaves the grid with NO region data
+    /// (the honest "nobody attached any", not a load failure). Test-only.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn test_ready_with_water(water: Option<Arc<eqoxide_core::region_map::RegionMap>>) -> Self {
+        let mut col = Self::fixture_grid();
+        col.set_water(water);
+        Self::ready("testfixture", 1, Arc::new(col))
+    }
+
+    /// [`Self::test_ready`], with the zone's region data **or the reason it failed to load**
+    /// installed on the grid (#803). The case this adds over `test_ready_with_water` is
+    /// `Err(RegionLoadError::…)`: a zone whose terrain GLB loaded fine — so the state genuinely IS
+    /// `Ready` — and whose `.wtr` did not. That combination is exactly the one the
+    /// `zone_assets_not_ready` gate does not cover, and the one `/v1/observe/zone_exits` used to
+    /// answer `[]` with 200 OK for. Test-only.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn test_ready_with_region_data(
+        data: Result<Arc<eqoxide_core::region_map::RegionMap>,
+                     eqoxide_core::region_map::RegionLoadError>,
+    ) -> Self {
+        let mut col = Self::fixture_grid();
+        col.set_region_data(data);
+        Self::ready("testfixture", 1, Arc::new(col))
+    }
+
+    /// The trivial 200×200 flat floor both `test_ready_*` fixtures build on — a grid that really
+    /// does have geometry, so `ready()` will not downgrade it.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fn fixture_grid() -> Collision {
         use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
         let mesh = MeshData {
             positions: vec![
@@ -167,10 +193,7 @@ impl ZoneAssetState {
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
         };
-        let mut col = Collision::build(
-            &ZoneAssets { terrain: vec![mesh], objects: vec![], textures: vec![] }, 32.0);
-        if water.is_some() { col.set_water(water); }
-        Self::ready("testfixture", 1, Arc::new(col))
+        Collision::build(&ZoneAssets { terrain: vec![mesh], objects: vec![], textures: vec![] }, 32.0)
     }
 
     /// The live progress line while `Pending`, or the failure reason while `Failed`.
@@ -268,18 +291,23 @@ impl NotUsable {
 /// forgotten by a caller that only had the state handy — and so the universal claim ("a `ready`
 /// observation is never about a zone you are not in") is a property test, not a live run.
 ///
-/// **Which consumers actually go through it (verified by grep, not asserted — #600).** Three, and
-/// they are the three that make a world-answering claim (a route/geometry answer or an
-/// agent-observable `nav_state`) off the shared collision grid:
+/// **Which consumers actually go through it (verified by grep, not asserted — #600; recounted in
+/// the #821 review round 2, B2, which found this list one short).** **FOUR**, and they are the four
+/// that make a world-answering claim (a route/geometry answer or an agent-observable `nav_state`)
+/// off the shared collision grid:
 ///   * the HTTP world-observation endpoints — `/observe/frame`, `/observe/zone_exits`,
 ///     `/observe/zone_entrances`, `/observe/debug`'s zone block, etc. — via `zone_assets_not_ready`
 ///     (`crates/eqoxide-http/src/observe.rs`), which early-returns a 503 before any collision read;
+///   * `POST /v1/move/goto` (`crates/eqoxide-http/src/move_api.rs`, #579), which accepts the goal
+///     but reports `zone_assets_pending` so `"status": "navigating"` is not read as "a walkable
+///     route was found". **This one is NOT an `/observe/*` route**, which is exactly how it went
+///     uncounted here for four issues;
 ///   * the nav path-walker's `drive_walk` gate (`crate::walker`, #600), which refuses to route in the
 ///     stale/loading window instead of steering on the previous zone's grid; and
 ///   * `ActionLoop::drain_zone_cross` (`crates/eqoxide-net/src/action_loop.rs`, #600 review round 2),
 ///     which resolves `/v1/move/zone_cross` off the grid and publishes `nav_state` — it answers the
 ///     honest transient `zone_loading` while not usable instead of a definitive `no_path`.
-/// A `None` here therefore guarantees, for ALL THREE, that the collision grid they go on to read is
+/// A `None` here therefore guarantees, for ALL FOUR, that the collision grid they go on to read is
 /// the current zone's. What does NOT go through it, deliberately (each verified to make no
 /// route/geometry claim about the current zone):
 ///   * the two per-zone DIAGNOSTIC COUNTERS `nav_support` and `nav_tight` read `shared_collision`
@@ -301,6 +329,31 @@ pub fn usability(state: &ZoneAssetState, player_zone: &str) -> Option<NotUsable>
     // letting a case difference read as "a different zone".
     if !loaded.eq_ignore_ascii_case(player_zone) { return Some(NotUsable::StaleForPreviousZone); }
     None
+}
+
+/// [`usability`] **and the grid it blesses, in one call** — the verdict and the collision it vouches
+/// for can never come from two different places (#821 review round 2, B4).
+///
+/// The bug this closes: a reader used to ask `usability` (or `zone_assets_not_ready`) for permission
+/// and then fetch the grid from [`crate::collision::SharedCollision`], a *separate* slot. Nothing —
+/// not a type, not a test — coupled them. `/v1/observe/zone_exits` guarded that slot with a bare
+/// `if let Some(col)` and no `else`, so a `None` there produced `200 []`, i.e. "this zone has no way
+/// out", **having consulted no region map at all**. Production writes both slots together
+/// ([`finish_zone_load`] literally stores `verdict.collision().cloned()`, the same `Arc`), but that
+/// is a convention, and the HTTP testkit already violated it. With this, the `None` case is not
+/// reachable to write: `Ready` OWNS its `Arc<Collision>`, so a blessed verdict comes with a grid.
+///
+/// Delegates to [`usability`] rather than re-deriving the rule, so the two can never disagree about
+/// staleness, zone-name case, or an empty `player_zone`.
+pub fn usable_collision<'a>(state: &'a ZoneAssetState, player_zone: &str)
+    -> Result<&'a Arc<Collision>, NotUsable>
+{
+    if let Some(why) = usability(state, player_zone) { return Err(why); }
+    // `usability` returns `None` for `Ready` and for nothing else, and `Ready`'s `collision` field is
+    // NOT an `Option` — so this fallback is unreachable. It is spelled as a REFUSAL rather than an
+    // `unwrap`/`expect` because the honest answer to "we cannot find the grid" is never an empty
+    // world; `usable_collision_agrees_with_usability_for_every_state` asserts it never fires.
+    state.collision().ok_or(NotUsable::Idle)
 }
 
 /// Lock a [`ZoneAssetStateShared`], **recovering from poisoning**.
@@ -553,6 +606,45 @@ mod tests {
                     if !pz.is_empty() && zone.eq_ignore_ascii_case(pz));
                 assert_eq!(usable, expected,
                     "state {name} with player_zone {pz:?}: usable={usable}, expected={expected}");
+            }
+        }
+    }
+
+    /// [`usable_collision`] must agree with [`usability`] on EVERY state × zone combination, and
+    /// must hand back a grid whenever it agrees — never the unreachable `Idle` fallback.
+    ///
+    /// This is what makes the `if let Some(col)` fall-through in `/v1/observe/zone_exits`
+    /// unrepresentable rather than merely documented (#821 review round 2, B4): "the verdict says
+    /// yes" and "here is a grid" are now the same value, so there is no `None` branch left for a
+    /// caller to answer `[]` from.
+    #[test]
+    fn usable_collision_agrees_with_usability_for_every_state() {
+        let zones = ["qeynos", "freporte", "FREPORTE", "gfaydark", ""];
+        let states: Vec<(&str, ZoneAssetState)> = vec![
+            ("idle",   ZoneAssetState::Idle),
+            ("pendA",  ZoneAssetState::pending("qeynos", "loading…")),
+            ("failA",  ZoneAssetState::failed("qeynos", "boom")),
+            ("readyA", ZoneAssetState::ready("qeynos", 3, floor_collision())),
+            ("readyB", ZoneAssetState::ready("freporte", 3, floor_collision())),
+        ];
+        for (name, st) in &states {
+            for pz in zones {
+                match (usability(st, pz), usable_collision(st, pz)) {
+                    (Some(why), Err(e)) => assert_eq!(
+                        why, e, "{name}/{pz:?}: the two must give the SAME refusal"),
+                    (None, Ok(col)) => assert!(
+                        std::sync::Arc::ptr_eq(col, st.collision().unwrap()),
+                        "{name}/{pz:?}: must hand back the state's OWN grid, not a copy"),
+                    (u, c) => panic!(
+                        "{name}/{pz:?}: disagreement — usability={u:?}, usable_collision ok={}",
+                        c.is_ok()),
+                }
+                // …and the unreachable fallback never fires: a refusal is never `Idle` unless
+                // `usability` genuinely said `Idle`.
+                if let Err(NotUsable::Idle) = usable_collision(st, pz) {
+                    assert_eq!(usability(st, pz), Some(NotUsable::Idle),
+                        "{name}/{pz:?}: `Idle` came from the unreachable fallback, not the verdict");
+                }
             }
         }
     }

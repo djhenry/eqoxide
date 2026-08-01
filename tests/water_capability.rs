@@ -44,8 +44,8 @@ fn zone(name: &str) -> Collision {
     let za = ZoneAssets::from_glb(&dir.join(format!("{name}.glb")))
         .unwrap_or_else(|e| panic!("baked {name}.glb required at $EQZONES: {e:?}"));
     let mut c = Collision::build(&za, 32.0);
-    c.set_water(Some(std::sync::Arc::new(
-        RegionMap::load(&dir.join("maps/water"), name).expect("baked .wtr required"))));
+    c.set_region_data(Ok(std::sync::Arc::new(
+        RegionMap::try_load(&dir.join("maps/water"), name).expect("baked .wtr required"))));
     c
 }
 
