@@ -22,8 +22,17 @@
 //!
 //! The failure is a numeric offset, so it is pinned numerically rather than by screenshot: these
 //! tests build the SAME model matrix the render passes build (`models::static_placement` fed into
-//! `camera::entity_model_matrix_heading` — the exact production calls, per the `#357` rule that a
+//! `camera::entity_model_matrix_static` — the exact production calls, per the `#357` rule that a
 //! hand-copied formula is not a test) and assert where the model's authored origin lands.
+//!
+//! Since #781 that is a *stronger* statement than it was. Before #781 the `visual_scale = 0.0` that
+//! the static arm depends on was spelled at each of the four `pass.rs` call sites, and these tests
+//! could not reach it — they built the matrix with their own literal `0.0`, so only the source-text
+//! pin at the bottom of this file graded the shipped one. #781 moved that `0.0` into
+//! `camera::entity_model_matrix_static`, which these tests DO call, so it is now graded
+//! behaviourally: measured by replacing it with `2.0 * p.y_bottom * p.mesh_scale`, which turns
+//! `a_grounded_static_model_is_drawn_with_its_lowest_vertex_on_the_stored_z` RED (crate
+//! `--no-fail-fast`: 261 passed / 1 failed / 12 ignored).
 //!
 //! ## The fixture is measured, not invented
 //!
@@ -85,10 +94,10 @@
 //!    different heights within the same body. This is why #756's zero-lift rule was NOT extended to
 //!    the skinned path: "put the origin at the stored z" has no defined meaning there.
 
-use eqoxide_renderer::camera::entity_model_matrix_heading;
+use eqoxide_renderer::camera::entity_model_matrix_static;
 use eqoxide_renderer::models::{
     archetype_correction, archetype_native_units, archetype_scale, humanoid_placement,
-    skinned_target_height, static_placement, target_height_for,
+    skinned_target_height, static_placement, target_height_for, ModelBounds,
 };
 
 // ── Measured `boat.glb` constants (see the module doc) ───────────────────────────────────────
@@ -105,17 +114,33 @@ fn boat_center_xz() -> [f32; 2] {
     [(BOAT_X_MIN + BOAT_X_MAX) * 0.5, (BOAT_Z_MIN + BOAT_Z_MAX) * 0.5]
 }
 
+/// `boat.glb`'s measured bounds as the ONE value `static_placement` takes since #781.
+///
+/// Note what this being writable at all means, and it is the point rather than an oversight:
+/// `ModelBounds` is a plain public-field struct, so this test crate can build one without a
+/// `wgpu::Device` — which is exactly why the unforgeable-newtype form was declined (this is an
+/// *integration* test and cannot see a `#[cfg(test)]` mint). The same freedom is available to
+/// `pass.rs`; see `every_static_placement_in_pass_rs_is_written_exactly_as_reviewed`.
+fn boat_bounds() -> ModelBounds {
+    ModelBounds {
+        y_bottom: boat_y_bottom(),
+        y_extent: boat_y_extent(),
+        x_center: boat_center_xz()[0],
+        z_center: boat_center_xz()[1],
+    }
+}
+
 /// Build the production model matrix for a static `boat.glb` entity — the exact calls the render
-/// passes make (`models::static_placement` fed into `camera::entity_model_matrix_heading`), with the
-/// literal `0.0` the static call sites pass for `visual_scale` since #768.
+/// passes make (`models::static_placement` fed into `camera::entity_model_matrix_static`).
+///
+/// Since #781 the `visual_scale = 0.0` and `y_up = true` that used to be spelled here are inside
+/// `entity_model_matrix_static`, so this helper no longer *chooses* them; that is why the pin below
+/// still has to grade the call sites' function NAME.
 ///
 /// Column-major (`glam`'s `to_cols_array_2d`), so `m[col][row]`.
 fn boat_matrix(pos: [f32; 3], heading: f32, floating: bool) -> [[f32; 4]; 4] {
-    let p = static_placement("boat", boat_y_bottom(), boat_center_xz(), floating);
-    entity_model_matrix_heading(
-        pos, heading, 0.0, p.mesh_scale, p.center_xz, true, p.y_bottom,
-        archetype_correction("boat"),
-    )
+    let p = static_placement("boat", &boat_bounds(), floating);
+    entity_model_matrix_static(pos, heading, &p, archetype_correction("boat"))
 }
 
 /// Where the model's local origin (0,0,0) is drawn in world space — the matrix's translation column.
@@ -214,7 +239,7 @@ fn a_grounded_static_model_is_drawn_with_its_lowest_vertex_on_the_stored_z() {
 /// it is a statement about `boat.glb`'s measured bounds, which is why the constants are named here.
 #[test]
 fn the_grounded_arm_lifts_a_boat_by_its_y_bottom_not_by_its_whole_height() {
-    let grounded = static_placement("boat", boat_y_bottom(), boat_center_xz(), false);
+    let grounded = static_placement("boat", &boat_bounds(), false);
     let arch = archetype_scale("boat");
 
     // `entity_model_matrix_heading` lifts by `visual_scale * 0.5 + y_bottom * mesh_scale`, and the
@@ -230,7 +255,7 @@ fn the_grounded_arm_lifts_a_boat_by_its_y_bottom_not_by_its_whole_height() {
     // recentre is passed through untouched, because #756 established the z datum and not the xy
     // one; pinning that here keeps a later change from quietly widening the exemption into an axis
     // nobody measured.
-    let floating = static_placement("boat", boat_y_bottom(), boat_center_xz(), true);
+    let floating = static_placement("boat", &boat_bounds(), true);
     assert_eq!(floating.y_bottom, 0.0, "floating placement must carry no lift");
     assert_eq!(floating.center_xz, grounded.center_xz,
         "the floating arm must not change the horizontal recentre — that datum is unestablished");
@@ -255,7 +280,7 @@ fn a_grounded_spawn_with_the_same_bounds_is_still_lifted() {
 #[test]
 fn the_floating_exemption_changes_placement_only_not_scale() {
     for floating in [false, true] {
-        let p = static_placement("boat", boat_y_bottom(), boat_center_xz(), floating);
+        let p = static_placement("boat", &boat_bounds(), floating);
         assert_eq!(p.mesh_scale, archetype_scale("boat"),
             "mesh_scale must stay archetype_scale for floating={floating}");
     }
@@ -486,100 +511,138 @@ fn every_static_placement_call_site_in_pass_rs_decides_floating_explicitly() {
 
 /// **#768's lift, pinned at both source-text channels through which `pass.rs` can re-create it.**
 /// The behavioural tests above cannot reach either one: they call `static_placement` with their own
-/// arguments and build the matrix with a literal `0.0`, so they grade the helper, never the call.
+/// arguments, so they grade the helpers, never the calls.
 ///
-/// There are exactly two channels, and both were measured green before being closed:
+/// There are exactly two channels. Both were measured green on `41cca4e` before #781, and both are
+/// now **compile errors in the spelling that was measured** — but neither is unrepresentable, and
+/// this doc does not say it is.
 ///
-/// 1. **Out of the placement, into the matrix.** `model` is in scope at all four call sites and
-///    `GpuStaticModel::y_extent` is public, so `2.0 * model.y_extent * p.mesh_scale` can be handed
-///    to `entity_model_matrix_heading`'s `visual_scale`. Measured with this test present, that edit
-///    at the entity call site reddens this test and nothing else in the crate:
-///    `--no-fail-fast` over the whole crate gave **214 passed / 1 failed / 11 ignored**, the one
-///    failure being this test. (Without `--no-fail-fast` cargo stops after the failing binary and
-///    only 2 of the 10 binaries report — a run that reddens here is not evidence about the rest.)
-/// 2. **Into the placement.** Nothing about dropping the `visual_scale` FIELD constrains what is
-///    passed as `y_bottom`. `static_placement(archetype, model.y_bottom + model.y_extent, …)`
-///    restores the identical pre-#768 lift `(y_extent + y_bottom) * mesh_scale`. Measured by the
-///    round-1 reviewer of PR #773 and reproduced here before writing anything down: with only the
-///    channel-1 half present, the crate stayed **green at 215 passed / 0 failed / 11 ignored**, this
-///    test included — it read the matrix call, not the placement call. That is the finding this test
-///    was extended for; with the `REVIEWED_ARGS` check below, the same mutation now fails on the
-///    `REVIEWED_ARGS` assert (10 passed / 1 failed in this binary), printing the offending call.
+/// 1. **Out of the placement, into the matrix.** Before #781 the four call sites passed a literal
+///    `0.0` for `entity_model_matrix_heading`'s `visual_scale`, so handing it
+///    `2.0 * model.y_extent * p.mesh_scale` restored the pre-#768 over-lift. Measured on `41cca4e`
+///    with that edit at the entity call site: crate `--no-fail-fast` **261 passed / 1 failed /
+///    12 ignored**, the one failure being this test. Since #781 the static sites call
+///    `camera::entity_model_matrix_static`, which has **no `visual_scale` parameter**, so that exact
+///    edit no longer compiles (measured: `error[E0061]: this function takes 4 arguments but 5
+///    arguments were supplied`). What is left open is calling `entity_model_matrix_heading`
+///    directly instead — a different function NAME, which the `heading` guard at the bottom of this
+///    test catches.
+/// 2. **Into the placement.** Before #781 `static_placement` took a bare `y_bottom: f32`, so
+///    `static_placement(archetype, model.y_bottom + model.y_extent, …)` restored the identical
+///    pre-#768 lift. Measured on `41cca4e`: **261 passed / 1 failed / 12 ignored**, the failure
+///    being this test's `REVIEWED_ARGS` assert. (Before #773 extended this pin it was measured
+///    GREEN at 215 / 0 by PR #773's round-1 reviewer — that is why the pin exists at all.) Since
+///    #781 `static_placement` takes `&ModelBounds`, so that edit no longer compiles either
+///    (measured: `error[E0308]: mismatched types`, expected `&ModelBounds`, found `f32`).
 ///
-/// Channel 2 is closed by pinning the whole argument list, not one argument: an expression is not
-/// something source text can bound (`model.y_bottom` vs `model.y_bottom + 0.0` vs a helper call are
-/// all "the second argument"), so the test instead requires each call to be written EXACTLY as one
-/// of two reviewed spellings. **The consequence is deliberate and is the loud direction**: renaming
-/// the `model` binding, or adding a fifth site with any other argument, turns this RED on correct
-/// code and asks for a review. That is the trade this repo's verification hierarchy prefers over a
-/// comment.
+/// **What #781 leaves possible, measured, not reasoned.** `ModelBounds` has public fields, so the
+/// same over-lift can be written as a struct literal at the call site —
+/// `&ModelBounds { y_bottom: model.bounds.y_bottom + model.bounds.y_extent, ..model.bounds }` —
+/// and that compiles. It is caught by `REVIEWED_ARGS` below and by nothing else in this crate
+/// (measured: **261 passed / 1 failed**, this test). So #781 changed the two measured evasions from
+/// *type-checks-and-only-a-text-pin-catches-it* to *does-not-type-check*, and left a third,
+/// louder-to-write shape in the first category. It did **not** make the bad state unrepresentable;
+/// the newtype that would is declined for the reason on `models::ModelBounds`.
 ///
-/// **What this still does not do**, stated because the previous version of this doc overstated it:
+/// Both halves are closed by pinning the whole argument list, not one argument: an expression is not
+/// something source text can bound (`model.bounds` vs a helper call returning the same value are
+/// both "the second argument"), so the test requires each call to be written EXACTLY as one of the
+/// reviewed spellings. **The consequence is deliberate and is the loud direction**: renaming the
+/// `model` binding, or adding a fifth site with any other argument, turns this RED on correct code
+/// and asks for a review.
+///
+/// **What this still does not do:**
 /// - It is source text, not semantics. It proves the argument is *written* that way, not that the
-///   call is reached, and not that `model.y_bottom` itself holds what the loader intended.
+///   call is reached, and not that `model.bounds` itself holds what the loader intended. PR #773's
+///   reviewer measured two instances of exactly this and both are still green today: rebinding
+///   `model` to a local with the same field names (E1b), and corrupting the loader's reduction that
+///   produces `y_bottom` (E2). #781 does not address either.
 /// - It only reads `pass.rs`. A static placement built in another file is invisible to it, and
 ///   "four call sites" is a count of `pass.rs` call sites — it is not a bound on callers of
 ///   `static_placement` anywhere else in the workspace.
-/// - Whitespace is normalized, so a re-wrapped argument list is not a violation; a renamed
-///   *variable* is.
+/// - Whitespace is normalized and one trailing comma is stripped, so a re-wrapped argument list is
+///   not a violation; a renamed *variable* is.
 #[test]
 fn every_static_placement_in_pass_rs_is_written_exactly_as_reviewed() {
-    // Anti-escape, same class as #769's: the extractor needs the name and the paren adjacent.
-    assert!(!PASS_RS.contains("entity_model_matrix_heading ("),
-        "an `entity_model_matrix_heading (…)` call (space before the paren) is invisible to the \
-         parser below");
+    /// Extract every call to `name(` in `pass.rs`, whitespace-normalized, argument list only.
+    ///
+    /// The extractor needs the name and the paren adjacent, so the caller asserts the
+    /// `name (` spelling is absent first (#769's escape class).
+    fn arg_lists(name: &str) -> Vec<String> {
+        PASS_RS
+            .match_indices(&format!("{name}("))
+            .map(|(i, _)| {
+                let rest = &PASS_RS[i..];
+                let call = &rest[..rest.find(");").unwrap_or_else(|| {
+                    panic!("unterminated {name}( call in pass.rs")
+                })];
+                let norm = call.split_whitespace().collect::<Vec<_>>().join(" ");
+                norm.split_once('(').expect("no argument list").1.trim()
+                    .trim_end_matches(',').trim().to_string()
+            })
+            .collect()
+    }
+
+    for name in ["static_placement", "entity_model_matrix_static", "entity_model_matrix_heading"] {
+        assert!(!PASS_RS.contains(&format!("{name} (")),
+            "a `{name} (…)` call (space before the paren) is invisible to the parser in this \
+             test, which would leave the pin green with an unreviewed call site");
+    }
 
     // ── Channel 2: what goes IN to static_placement ──────────────────────────────────────────
     // (the sibling test above grades the `floating` argument's provenance and counts the sites;
-    // this grades the exact spelling of all four arguments, which is what bounds the lift.)
+    // this grades the exact spelling of all arguments, which is what bounds the lift.)
     const REVIEWED_ARGS: [&str; 2] = [
-        "archetype, model.y_bottom, [model.x_center, model.z_center], false",
-        "archetype, model.y_bottom, [model.x_center, model.z_center], b.floating",
+        "archetype, &model.bounds, false",
+        "archetype, &model.bounds, b.floating",
     ];
-    let placements: Vec<String> = PASS_RS
-        .match_indices("static_placement(")
-        .map(|(i, _)| {
-            let rest = &PASS_RS[i..];
-            let call = &rest[..rest.find(");").expect("unterminated static_placement( call")];
-            call.split_whitespace().collect::<Vec<_>>().join(" ")
-        })
-        .collect();
+    let placements = arg_lists("static_placement");
     assert_eq!(placements.len(), 4,
         "pass.rs must call static_placement at exactly the 4 known sites; found {}",
         placements.len());
-    for call in &placements {
-        let args = call.split_once('(').expect("no argument list").1.trim();
-        assert!(REVIEWED_ARGS.contains(&args),
-            "#768: a static model's whole vertical lift is the `y_bottom` argument, so each call \
-             site must pass the model's OWN measured bounds and nothing derived from them — \
-             `model.y_bottom + model.y_extent` here restores the exact pre-#768 over-lift and no \
-             behavioural test in this crate would fail. Expected one of {REVIEWED_ARGS:?}, found: \
-             {args}");
+    for args in &placements {
+        assert!(REVIEWED_ARGS.contains(&args.as_str()),
+            "#768/#781: a static model's whole vertical lift is its `y_bottom`, so each call \
+             site must pass the model's OWN measured bounds and nothing derived from them. \
+             Since #781 the parameter is `&ModelBounds`, so the measured \
+             `model.y_bottom + model.y_extent` evasion no longer compiles — but a struct \
+             literal such as `&ModelBounds {{ y_bottom: model.bounds.y_bottom + \
+             model.bounds.y_extent, ..model.bounds }}` still does, and restores the exact \
+             pre-#768 over-lift with no behavioural test in this crate failing. This assert \
+             is what catches it. Expected one of {REVIEWED_ARGS:?}, found: {args}");
     }
 
     // ── Channel 1: what comes OUT of the placement, into the matrix ──────────────────────────
-    let statics: Vec<String> = PASS_RS
-        .match_indices("entity_model_matrix_heading(")
-        .map(|(i, _)| {
-            let rest = &PASS_RS[i..];
-            let call = &rest[..rest.find(");").expect("unterminated matrix call in pass.rs")];
-            call.split_whitespace().collect::<Vec<_>>().join(" ")
-        })
-        // A static placement is the only thing that feeds `p.y_bottom` into this call; the skinned
-        // and non-entity sites do not.
-        .filter(|c| c.contains("p.y_bottom"))
-        .collect();
-
+    // Since #781 the static sites call `entity_model_matrix_static`, which has no `visual_scale`
+    // parameter. Two things are graded: that the four calls are spelled as reviewed, and that no
+    // static placement reaches the general `entity_model_matrix_heading` (which does have one).
+    const REVIEWED_MATRIX_ARGS: [&str; 4] = [
+        "scene.player_pos, scene.player_heading, &p, crate::models::archetype_correction(archetype)",
+        "b.pos, b.heading, &p, crate::models::archetype_correction(archetype)",
+        "scene.player_pos, scene.player_heading, &p, archetype_correction(archetype)",
+        "b.pos, b.heading, &p, archetype_correction(archetype)",
+    ];
+    let statics = arg_lists("entity_model_matrix_static");
     assert_eq!(statics.len(), 4,
         "pass.rs must build exactly the 4 known static-model matrices (entity, player, and both \
          static shadow-caster arms); found {}", statics.len());
+    for args in &statics {
+        assert!(REVIEWED_MATRIX_ARGS.contains(&args.as_str()),
+            "#768/#781: a static model's whole vertical lift comes from the placement's `y_bottom`, \
+             and `entity_model_matrix_static` binds `visual_scale = 0.0` internally so there is no \
+             lift argument here. Passing anything but the placement built one line above \
+             re-opens that. Expected one of {REVIEWED_MATRIX_ARGS:?}, found: {args}");
+    }
 
-    for call in &statics {
-        assert!(call.contains(", 0.0, p.mesh_scale"),
-            "#768: a static model's whole vertical lift comes from `p.y_bottom`, so every static \
-             call site must pass the literal `0.0` for `visual_scale` (the argument immediately \
-             before `mesh_scale`). `entity_model_matrix_heading` adds `visual_scale * 0.5` on top \
-             of `y_bottom * mesh_scale`, so anything else here re-creates the over-lift that put \
-             the model a full rendered height above its stored z. Offending call: {call}");
+    // The escape #781 leaves open at the type level: call the GENERAL matrix function, which still
+    // takes a `visual_scale`, and hand it the static placement. `y_bottom` and `center_xz` are
+    // `StaticPlacement`'s two fields that `HumanoidPlacement` does not have, so they identify a
+    // static placement at a call site without matching the skinned sites.
+    for args in arg_lists("entity_model_matrix_heading") {
+        assert!(!args.contains("p.y_bottom") && !args.contains("p.center_xz"),
+            "#781: a static placement must go through `camera::entity_model_matrix_static`, which \
+             has no `visual_scale` parameter. `entity_model_matrix_heading` still has one, and \
+             `visual_scale * 0.5` is added on top of `y_bottom * mesh_scale` — which is exactly the \
+             #768 over-lift. Offending call arguments: {args}");
     }
 }

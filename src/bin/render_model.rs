@@ -850,8 +850,10 @@ impl ApplicationHandler for ModelViewerApp {
 
         let model = GpuStaticModel {
             meshes, texture_bind_groups: tex_bgs,
-            y_bottom: asset.y_bottom, y_extent: asset.y_extent,
-            x_center: asset.x_center, z_center: asset.z_center,
+            bounds: eqoxide::models::ModelBounds {
+                y_bottom: asset.y_bottom, y_extent: asset.y_extent,
+                x_center: asset.x_center, z_center: asset.z_center,
+            },
             prefix: asset.prefix.clone(), equip_slots: static_slots,
             head_parts: static_head_parts,
             head_default_hidden: static_head_hidden,
@@ -1263,12 +1265,13 @@ fn render_frame(s: &mut ViewerState) {
         }
         (vscale, m, target * 0.5)
     } else {
-        let vscale = 2.0 * s.model.y_extent * s.arch_scale;
+        let vscale = 2.0 * s.model.bounds.y_extent * s.arch_scale;
         let m = camera::entity_model_matrix_heading(
             [0.0, 0.0, 0.0], 0.0, vscale, s.arch_scale,
-            [s.model.x_center, s.model.z_center], true, s.model.y_bottom, glam::Mat4::IDENTITY,
+            [s.model.bounds.x_center, s.model.bounds.z_center], true, s.model.bounds.y_bottom,
+            glam::Mat4::IDENTITY,
         );
-        let lift = vscale * 0.5 + s.model.y_bottom * s.arch_scale;
+        let lift = vscale * 0.5 + s.model.bounds.y_bottom * s.arch_scale;
         (vscale, m, lift)
     };
 
@@ -1315,7 +1318,7 @@ fn render_frame(s: &mut ViewerState) {
     } else {
         // In parts mode, offset each mesh along X so they render side-by-side.
         let n_meshes = s.model.meshes.len() as f32;
-        let parts_spacing = if s.parts_mode { 2.0 * s.model.y_extent } else { 0.0 };
+        let parts_spacing = if s.parts_mode { 2.0 * s.model.bounds.y_extent } else { 0.0 };
         for (i, (mesh, (buf, _))) in s.model.meshes.iter().zip(s.uniform_pool.iter()).enumerate() {
             let mesh_mat = if s.parts_mode {
                 let offset_x = (i as f32 - n_meshes * 0.5) * parts_spacing;
@@ -1469,7 +1472,8 @@ fn render_frame(s: &mut ViewerState) {
                 // visual_scale as the model so markers align with the mesh.
                 let marker_mat = camera::entity_model_matrix_heading(
                     marker.pos, 0.0, visual_scale, s.arch_scale,
-                    [s.model.x_center, s.model.z_center], true, s.model.y_bottom, glam::Mat4::IDENTITY,
+                    [s.model.bounds.x_center, s.model.bounds.z_center], true,
+                    s.model.bounds.y_bottom, glam::Mat4::IDENTITY,
                 );
                 s.queue.write_buffer(&s.marker_uniforms[i].0, 0, bytemuck::bytes_of(&EntityUniform {
                     model: marker_mat, tint: marker.color,

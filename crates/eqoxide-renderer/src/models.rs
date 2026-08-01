@@ -132,7 +132,8 @@ pub struct ModelAsset {
     /// Read here as the `true_height` fallback when the glTF carries no `eq_height` extra. It is
     /// NOT part of static placement: since #768 `static_placement` takes the whole lift from
     /// `y_bottom`. `visual_scale = 2 × y_extent × arch_scale` survives only in the standalone
-    /// `render_model` viewer bin (`src/bin/render_model.rs:1097`).
+    /// `render_model` viewer bin (`src/bin/render_model.rs:1101`, re-verified for #781 — the
+    /// `:1097` previously written here pointed at a `};` on 41cca4e and was already two off).
     pub y_extent:          f32,
     /// Center of the model in the X and Z axes (raw pre-node-scale space, dominant meshes only).
     /// Used as a centering correction so models are rendered at their entity position rather than
@@ -921,16 +922,24 @@ pub fn skinned_target_height(race: &str, archetype: &str, true_height: f32) -> f
 ///
 /// It is NOT the only copy in the repository, and saying otherwise would be false: the standalone
 /// model-viewer binary (`src/bin/render_model.rs`, in the root `eqoxide` crate — it cannot depend on
-/// this crate's pass module) still writes `2.0 * y_extent * arch_scale` (`render_model.rs:1097`
-/// and `:1266`) and `vscale * 0.5 + y_bottom * arch_scale` (`:1271`) by hand. Consequence, stated
+/// this crate's pass module) still writes `2.0 * y_extent * arch_scale` (`render_model.rs:1101`
+/// and `:1268`) and `vscale * 0.5 + y_bottom * arch_scale` (`:1274`) by hand. Consequence, stated
 /// because it is real: the viewer has no `floating` concept at all and did not take #768's
 /// correction either, so its static arm still lifts a model by `(y_extent + y_bottom) * arch_scale`
 /// — the formula #768 replaced here. How far off that puts a given model on the turntable is not
 /// stated, because the viewer's `arch_scale` comes from a CLI-supplied archetype name
-/// (`render_model.rs:814`) and no run of the viewer was made for this change. Neither #756 nor #768
-/// changed the viewer; converging it is its own change, and it is not a pure deletion there — the
-/// viewer also feeds `visual_scale` to its camera distance (`:1098`), its camera focus height
-/// (`:1291`) and its marker placement (`:1471`), so removing the term reframes the turntable.
+/// (`render_model.rs:814`) and no run of the viewer was made for this change. Neither #756, #768
+/// nor #781 changed the viewer's formula; converging it is its own change, and it is not a pure
+/// deletion there — the viewer also feeds `visual_scale` to its camera distance (`:1102`), its
+/// camera focus height (`:1294`) and its marker placement (`:1473`), so removing the term reframes
+/// the turntable.
+///
+/// #781 DID touch that file, but only to re-spell the field reads (`s.model.y_extent` →
+/// `s.model.bounds.y_extent`) after `GpuStaticModel`'s four bounds fields became one `ModelBounds`;
+/// the arithmetic is unchanged. Every line number in this paragraph was re-measured on the #781
+/// tree. Two of them were wrong before #781 and are corrected rather than shifted: `:1101` was
+/// written `:1097` and `:1102` was written `:1098`, and on 41cca4e those two lines are a `};` and a
+/// blank line — the true lines there were 1099 and 1100.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StaticPlacement {
     /// Uniform mesh scale fed to `entity_model_matrix_heading`'s `mesh_scale`.
@@ -946,20 +955,55 @@ pub struct StaticPlacement {
     /// exactly a second lift term hiding in `visual_scale`.
     ///
     /// Dropping the field removes that term from this shared helper. It does NOT make the term
-    /// unwritable, and there are TWO ways back to it, not one — a caller can hand
-    /// `2.0 * model.y_extent * p.mesh_scale` to `entity_model_matrix_heading` (nothing here
-    /// constrains that argument), and a caller can hand `model.y_bottom + model.y_extent` to this
-    /// function's `y_bottom` (nothing here constrains that either — an `f32` is an `f32`). Both were
-    /// measured to leave every behavioural test in this crate green.
+    /// unwritable. Two routes back to it were measured green in #773 and both were closed at the
+    /// TYPE level by #781, in the spellings that were measured — not in general:
     ///
-    /// What holds them today is a source-text pin over `pass.rs`,
+    /// - Handing `2.0 * model.y_extent * p.mesh_scale` to `entity_model_matrix_heading`'s
+    ///   `visual_scale`. The four static sites now call `camera::entity_model_matrix_static`, which
+    ///   has no `visual_scale` parameter, so that edit is `error[E0061]` (measured). Still open:
+    ///   calling `entity_model_matrix_heading` directly — a different function name.
+    /// - Handing `model.y_bottom + model.y_extent` to this function's `y_bottom`. The parameter is
+    ///   now `&ModelBounds`, so that edit is `error[E0308]` (measured). Still open: a `ModelBounds`
+    ///   struct literal at the call site, which compiles and restores the identical over-lift —
+    ///   measured, and caught by the source-text pin alone.
+    ///
+    /// So the bad state is still REPRESENTABLE and this doc does not claim otherwise. What bounds
+    /// the remaining routes is the source-text pin over `pass.rs`,
     /// `tests/floating_placement.rs::every_static_placement_in_pass_rs_is_written_exactly_as_reviewed`,
     /// which requires each of the four call sites to be spelled exactly as reviewed. That bounds the
     /// four call sites in that one file. It is NOT a type-level guarantee and it does not reach a
     /// caller in another file; making the state unrepresentable would mean this function taking the
-    /// model's measured bounds as an opaque value only the loader can mint, which is a wider change
-    /// than #768 and is not done here.
+    /// model's bounds as an opaque value only the loader can mint, which `ModelBounds`'s doc records
+    /// as declined and why.
     pub y_bottom: f32,
+}
+
+/// The four numbers the GLB loader measures off a model's vertex positions, carried as one value.
+///
+/// This exists so `static_placement` takes *the model's bounds* rather than four loose `f32`s
+/// (#781). It is a plain struct with public fields: it is **freely constructible**, so it does NOT
+/// make a wrong lift unrepresentable, and this doc does not claim it does. What it removes is a
+/// specific *shape* — see `static_placement`'s doc for the measured before/after.
+///
+/// The reason it is not an unforgeable newtype is recorded rather than re-litigated:
+/// `tests/floating_placement.rs` is an **integration** test, so it links `eqoxide-renderer` as an
+/// external crate and cannot see a `#[cfg(test)]` mint; an "only the loader can mint it" type would
+/// force either a `pub` mint that `pass.rs` can call too — a naming convention, not a guarantee — or
+/// a feature flag. Declined on that ground in #773's review and again in #781.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelBounds {
+    /// Distance from local Y=0 down to the model's lowest vertex, `-y_min` clamped at `0.0`.
+    /// This is the WHOLE grounding lift a static placement applies (scaled by `mesh_scale`).
+    pub y_bottom: f32,
+    /// `y_max - y_min`. **Not read by this crate's static placement path** — it is carried here
+    /// because it is one of the loader's four measurements and `render_model.rs` reads it. It is
+    /// deliberately still reachable from a `pass.rs` call site (`model.bounds.y_extent`); see
+    /// `static_placement`'s doc for what that leaves open.
+    pub y_extent: f32,
+    /// Horizontal centroid on the model's first horizontal axis.
+    pub x_center: f32,
+    /// Horizontal centroid on the model's second horizontal axis.
+    pub z_center: f32,
 }
 
 /// Compute the static-model placement from the model's measured bounds and the archetype scale.
@@ -1057,14 +1101,21 @@ pub struct StaticPlacement {
 ///
 /// `y_extent` is no longer a parameter. It was only ever read to build the `visual_scale` term #768
 /// removed, so keeping it would have left the over-lift one edit away from returning.
+///
+/// Since #781 the bounds arrive as ONE `&ModelBounds` rather than as a loose `y_bottom: f32` plus a
+/// `center_xz: [f32; 2]`, so there is no scalar lift argument at a call site to do arithmetic in.
+/// `y_extent` is still a public field of that struct (`render_model.rs` reads it), so this is a
+/// change of shape, not a guarantee — see `StaticPlacement::y_bottom` for the measured list of what
+/// it closed and what it left open.
 pub fn static_placement(
-    archetype: &str, y_bottom: f32, center_xz: [f32; 2], floating: bool,
+    archetype: &str, bounds: &ModelBounds, floating: bool,
 ) -> StaticPlacement {
     let mesh_scale = archetype_scale(archetype);
+    let center_xz = [bounds.x_center, bounds.z_center];
     if floating {
         StaticPlacement { mesh_scale, center_xz, y_bottom: 0.0 }
     } else {
-        StaticPlacement { mesh_scale, center_xz, y_bottom }
+        StaticPlacement { mesh_scale, center_xz, y_bottom: bounds.y_bottom }
     }
 }
 
