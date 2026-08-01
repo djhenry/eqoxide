@@ -415,16 +415,17 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 ///
 /// What this still does NOT cover, stated so nobody re-derives it: a corpus loop that uses no
 /// `WaterRollup` at all is invisible to this type. Nothing here can reach into such a loop; the
-/// only lever is that a loop chooses to open its zones through [`open_corpus_zone`].
+/// levers are that a loop opens its zones through [`open_corpus_zone`], or wires
+/// `begin_zone`/`add`/`skip` by hand as `faithful_walker_drift_corpus` does.
 ///
 /// As of #807 the corpora that go through this type are `faithful_walker_drift_corpus` (hand-wired,
 /// two rollups), the four `*_blast_radius` corpora in `tests/walker_sim.rs`, and
 /// `water_grid_budget_measurement` in `crates/eqoxide-nav/src/collision.rs` — the last five via
 /// [`open_corpus_zone`]. What remains uncovered is a set of further zone loops in `collision.rs`
-/// that still accumulate nothing and drop zones on a bare `continue`, several of them without even
-/// printing a line — see **issue #839**, which carries the current per-line list. Do not re-derive
-/// or restate that tally here; it will drift. This paragraph names the mechanism; #839 names the
-/// sites.
+/// that still drop zones on a bare `continue` without opening them here — some accumulating into a
+/// local `Vec`, some printing nothing at all — see **issue #839**, which carries the current
+/// per-line list. Do not re-derive or restate that tally here; it will drift. This paragraph names
+/// the mechanism; #839 names the sites.
 #[derive(Clone, Debug, Default)]
 pub struct WaterRollup {
     total: usize,
@@ -609,7 +610,7 @@ impl std::fmt::Display for ZoneDropped {
 /// are the same statements. They do NOT exist only once in the tree.
 /// `faithful_walker_drift_corpus` (`tests/walker_sim.rs`) still carries its own inline copy with
 /// hand-wired `skip`s, deliberately: it drives TWO rollups (`roll_wr`, `roll_423`) and cannot use
-/// this single-rollup signature unchanged. That copy is wired and correct; it is simply not this
+/// this single-rollup signature unchanged. That copy is wired and accounted; it is simply not this
 /// one, so "one owner" describes five corpora, not six.
 ///
 /// # What this guarantees, and what it does not
