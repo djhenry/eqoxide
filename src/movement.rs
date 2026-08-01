@@ -2807,7 +2807,7 @@ mod tests {
             let Ok(za) = crate::assets::ZoneAssets::from_glb(&dir.join(format!("{name}.glb"))) else { continue };
             let mut col = Collision::build(&za, 32.0);
             if col.cols == 0 { continue; }
-            col.set_water(crate::region_map::RegionMap::load(&dir.join("maps/water"), name)
+            col.set_region_data(crate::region_map::RegionMap::try_load(&dir.join("maps/water"), name)
                 .map(std::sync::Arc::new));
             t_zones += 1;
             let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;

@@ -79,6 +79,42 @@ fn zone_assets_not_ready(s: &HttpState) -> Option<Response> {
     ).into_response())
 }
 
+/// **503 for a question that can only be answered from the zone's `.wtr` region map when that map
+/// is not there (#803).**
+///
+/// The `zone_assets_not_ready` gate above covers the terrain GLB and the collision grid built from
+/// it. It does **not** cover the `.wtr`: a zone whose GLB loaded fine and whose region map did not
+/// is fully `ready`, and used to answer `/v1/observe/zone_exits` with a bare `[]` and 200 OK. That
+/// is indistinguishable from the true, common reading "this zone has no zone lines" — and since
+/// exits are the only way out of a zone, an agent reads it as *sealed in*, off a success response.
+///
+/// Deliberately NOT folded into `NotUsable`/`zone_assets_not_ready`: that verdict is consumed by the
+/// nav walker's `drive_walk` gate and by `ActionLoop::drain_zone_cross` as well as by every
+/// `/observe/*` endpoint, so a new variant there would stop routing and stop rendering frames in any
+/// zone with a missing `.wtr` — far past what a region-map failure actually invalidates. The refusal
+/// belongs to the questions whose answer really does come out of that file.
+///
+/// `reason` is [`eqoxide_core::region_map::RegionDataAbsent::as_str`] — distinct per cause, so an
+/// agent (or an operator reading its log) can tell "the asset pack never delivered this file" from
+/// "the file is truncated" from "this build cannot read that version".
+fn region_data_unavailable(absent: &eqoxide_core::region_map::RegionDataAbsent) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error":   "zone_region_data_unavailable",
+            "reason":  absent.as_str(),
+            "detail":  absent.to_string(),
+            "message": "this zone's region map (its `.wtr`) is not loaded, and the answer to this \
+                        question comes out of that file. An empty list here would say \"this zone \
+                        has no exits\" — a claim this client cannot make, and one you could not \
+                        tell apart from the truth. This does NOT resolve itself by polling: it is a \
+                        missing/unusable asset, not a load in progress. Re-sync the zone's asset \
+                        pack, or use `/v1/observe/zone_entrances` (server-advertised, independent of \
+                        the `.wtr`) to reason about where this zone connects.",
+        })),
+    ).into_response()
+}
+
 /// #646 (split out of #634/#647): the read-time freshness age every `/v1/observe/*` endpoint now
 /// carries, in one form or another. Only `/debug` (`snapshot_age_ms`) and `/nav_debug`
 /// (`published_age_ms`) had ANY such field before this — the other 13 routes served last-known
@@ -1884,8 +1920,16 @@ async fn get_zone_entrances(State(s): State<HttpState>) -> Response {
 /// `/v1/move/zone_cross` walks to. Per exit: `location` `[x,y,z]` (a point inside the region nearest
 /// the player — position-relative), `zone_id` (destination, or `null` if the WLD region's index
 /// isn't advertised in the entrance list), and `index` (the link to the matching entrance's
-/// `iterator`). Advertised entrances with no WLD region are omitted. Empty when the zone has no
-/// region map (no `.wtr` / v1 map).
+/// `iterator`). Advertised entrances with no WLD region are omitted.
+///
+/// **`[]` means exactly one thing: this zone's region map loaded and contains no zone-line regions
+/// (#803).** It never means "the file that would list them did not load" — that is a
+/// **503 `zone_region_data_unavailable`** with a machine-readable `reason`
+/// (`region_data_missing` / `_unreadable` / `_not_region_data` / `_unsupported_version` /
+/// `_truncated` / `_not_attached`). Before #803 both produced `[]` with 200 OK, and because exits
+/// are the only way out of a zone, an agent read a failed read as "sealed in". Unlike the
+/// `zone_assets_not_ready` 503 below, this one does **not** clear by polling — the asset is missing
+/// or unusable, not loading.
 ///
 /// `gated` (#713 item 3) is `true` when this exit's destination is unadvertised **and** this ZONE's
 /// #679/#683 unresolved-cross gate refuses server-resolved crossings. It is a **zone-level** verdict:
@@ -1952,7 +1996,15 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Response {
     ) == eqoxide_core::zone_cross::UnresolvedCross::Ignore;
     let mut exits = Vec::new();
     if let Some(col) = s.shared_collision.read().unwrap().as_ref() {
-        for index in col.zone_line_indices() {
+        // #803: `[]` here must only ever mean "this zone's region map loaded and has no zone-line
+        // regions". When the `.wtr` did NOT load, the exits are UNKNOWN, and publishing the empty
+        // list would be a confident falsehood the agent cannot detect — and the falsehood is
+        // specifically "there is no way out of this zone". Refuse, and name the cause.
+        let indices = match col.zone_line_indices() {
+            Ok(ix) => ix,
+            Err(absent) => return region_data_unavailable(&absent),
+        };
+        for index in indices {
             let location = col
                 .find_zone_line_near(Some(index), pos)
                 .map(|(_, p)| serde_json::json!([p[0], p[1], p[2]]));
@@ -5168,6 +5220,120 @@ mod zone_cross_observables_713 {
         assert_eq!(be["region_index"], IDX);
         assert!(be["detail"].as_str().unwrap().contains("may land you somewhere other than"),
             "and it must say what the caller actually risks");
+    }
+}
+/// **#803 — `/v1/observe/zone_exits` must not publish a failed file read as "this zone has no way
+/// out".**
+///
+/// The endpoint answers out of the zone's region map (`maps/water/<zone>.wtr`), whose DRNTP
+/// zone-line regions ARE the exits. When that file was missing, truncated, of an unsupported
+/// version, or simply never attached, the loader's failure was discarded into a `None`,
+/// `Collision::zone_line_indices()` `.unwrap_or_default()`-ed it to an empty vec, and this endpoint
+/// served `[]` with **200 OK** — byte-identical to the true, common answer for a zone that
+/// genuinely has no zone lines. Exits are the only way out of a zone, so the agent concluded it was
+/// sealed in, from a success response it had no way to doubt.
+///
+/// The two halves below are deliberately separate tests with different names: one pins that the
+/// honest `[]` is STILL served (so the fix cannot degenerate into "refuse whenever the list is
+/// empty"), the other that a load failure is a 503 naming its cause. Neither alone is the property.
+#[cfg(test)]
+mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
+    use super::*;
+    use crate::testkit::{empty_state, set_gs};
+    use axum::body::Body;
+    use axum::http::Request;
+    use eqoxide_core::region_map::{RegionLoadError, RegionMap};
+    use eqoxide_nav::zone_assets::ZoneAssetState;
+    use tower::ServiceExt;
+
+    async fn get(state: HttpState, uri: &str) -> (StatusCode, serde_json::Value) {
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let code = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (code, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// A `Ready` zone — terrain loaded, so the #579 gate is open and cannot be what refuses — whose
+    /// grid carries the given region-data outcome. This is the combination the bug lives in: the
+    /// zone is genuinely usable, and only the `.wtr` is not.
+    fn state_with_region_data(
+        data: Result<std::sync::Arc<RegionMap>, RegionLoadError>,
+    ) -> HttpState {
+        let s = empty_state();
+        set_gs(&s, |gs| gs.world.zone_name = "testfixture".to_string());
+        let ready = ZoneAssetState::test_ready_with_region_data(data);
+        *s.shared_collision.write().unwrap() = ready.collision().cloned();
+        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) = ready;
+        s
+    }
+
+    /// **Half one: the honest empty stays green.** A zone whose region map LOADED and contains no
+    /// zone-line regions still gets `[]` with 200 — that is a real reading of the world and the
+    /// overwhelmingly common one. A "fix" that refused on an empty list would break every zone.
+    #[tokio::test]
+    async fn a_zone_that_genuinely_has_no_zone_lines_still_answers_the_empty_list() {
+        let (code, j) = get(
+            state_with_region_data(Ok(std::sync::Arc::new(RegionMap::flat_below(-10.0)))),
+            "/zone_exits",
+        ).await;
+        assert_eq!(code, StatusCode::OK,
+            "a loaded map with no zone-line regions is an ANSWER; refusing here would break the \
+             common case the empty list legitimately describes");
+        assert_eq!(j, serde_json::json!([]));
+    }
+
+    /// …and a loaded map WITH an exit still lists it, so half one is not passing because the
+    /// endpoint stopped reporting exits altogether.
+    #[tokio::test]
+    async fn a_zone_with_a_zone_line_still_lists_it() {
+        let (code, j) = get(
+            state_with_region_data(Ok(std::sync::Arc::new(
+                RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, 7)))),
+            "/zone_exits",
+        ).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(j.as_array().map(|a| a.len()), Some(1), "the fixture bakes exactly one exit: {j}");
+        assert_eq!(j[0]["index"], 7);
+    }
+
+    /// **Half two: THE #803 FALSEHOOD.** Every way the `.wtr` can fail to load, plus the
+    /// never-attached case, must come back as an explicit refusal naming its cause — never `[]`,
+    /// never 200. All five are looped because the old code collapsed them into one `None`; a fix
+    /// that only handled the failure in the issue title would rebuild the same lie for the rest.
+    #[tokio::test]
+    async fn a_region_map_that_did_not_load_refuses_instead_of_reporting_no_exits() {
+        let cases: Vec<(Result<std::sync::Arc<RegionMap>, RegionLoadError>, &str)> = vec![
+            (Err(RegionLoadError::Missing), "region_data_missing"),
+            (Err(RegionLoadError::Unreadable(std::io::ErrorKind::PermissionDenied)),
+                "region_data_unreadable"),
+            (Err(RegionLoadError::NotRegionData), "region_data_not_region_data"),
+            (Err(RegionLoadError::UnsupportedVersion(99)), "region_data_unsupported_version"),
+            (Err(RegionLoadError::Truncated { declared_nodes: 400, bytes: 12 }),
+                "region_data_truncated"),
+        ];
+        for (data, want_reason) in cases {
+            let (code, j) = get(state_with_region_data(data), "/zone_exits").await;
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE,
+                "{want_reason}: a failed read served as `[]`/200 tells the agent this zone has no \
+                 way out — a confident falsehood it cannot detect (#803). Got {code}: {j}");
+            assert_eq!(j["error"], "zone_region_data_unavailable", "body: {j}");
+            assert_eq!(j["reason"], want_reason,
+                "the reason must name the ACTUAL failure — 'the file is absent' and 'the file is \
+                 truncated' call for different operator action");
+            assert!(!j["detail"].as_str().unwrap_or("").is_empty(), "body: {j}");
+        }
+    }
+
+    /// The refusal is deliberately NOT the `zone_assets_not_ready` verdict: that one is also read by
+    /// the nav walker's drive gate and the net thread's zone-cross drain, and a missing `.wtr` does
+    /// not invalidate the terrain those consume. Pinned so a later "simplification" that folds the
+    /// two together has to change this line and say why.
+    #[tokio::test]
+    async fn the_refusal_is_distinct_from_the_zone_assets_gate() {
+        let (_, j) = get(state_with_region_data(Err(RegionLoadError::Missing)), "/zone_exits").await;
+        assert_ne!(j["error"], "zone_assets_not_ready",
+            "region data is a separate readiness question from the zone's terrain assets: {j}");
     }
 }
 

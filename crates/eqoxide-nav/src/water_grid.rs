@@ -298,9 +298,14 @@ impl ZoneWater {
                   fabricated dry (#762). Report it as unmeasured or refuse to score the zone."]
     pub fn install(&self, col: &mut crate::collision::Collision)
         -> Result<(), &eqoxide_core::region_map::RegionLoadError> {
+        // #803: BOTH arms now write the grid. An `Unmeasured` zone used to leave the grid's region
+        // slot untouched, so the grid could not tell "nobody asked" from "we asked and the `.wtr`
+        // did not load" — and `zone_line_indices` answered `[]` for both. Recording the reason keeps
+        // the `Err` return (the corpus's must-use contract is unchanged) AND makes the grid itself
+        // able to refuse honestly if some later reader asks it about exits.
         match self {
-            Self::Measured(m) => { col.set_water(Some(m.clone())); Ok(()) }
-            Self::Unmeasured(e) => Err(e),
+            Self::Measured(m) => { col.set_region_data(Ok(m.clone())); Ok(()) }
+            Self::Unmeasured(e) => { col.set_region_data(Err(e.clone())); Err(e) }
         }
     }
 

@@ -786,12 +786,18 @@ impl App {
             };
 
             set_status("Building collision grid…");
-            // Load the zone's water regions (maps/water/<zone>.wtr) so find_path can swim/descend
-            // through water where there's no walkable connection. None if the zone has no .wtr.
-            let water = crate::region_map::RegionMap::load(&maps_dir.join("water"), &zone_name).map(Arc::new);
+            // Load the zone's region map (maps/water/<zone>.wtr): water volumes for swim/descend
+            // routing, AND the DRNTP zone-line regions that ARE this zone's exits. #803: keep the
+            // loader's `Err` and install it on the grid — a discarded failure used to read as "this
+            // zone has no water and no exits", which `/v1/observe/zone_exits` published as `[]`/200.
+            let water = crate::region_map::RegionMap::try_load(&maps_dir.join("water"), &zone_name)
+                .map(Arc::new);
+            if let Err(e) = &water {
+                tracing::warn!("region_map: zone '{}' has no usable region data: {}", zone_name, e);
+            }
             let collision = opt_assets.as_ref().map(|za| {
                 let mut c = collision::Collision::build(za, 32.0);
-                c.set_water(water);
+                c.set_region_data(water);
                 Arc::new(c)
             });
 

@@ -23,8 +23,8 @@ use std::path::Path;
 /// EQEmu region type for a zone-line region.
 const REGION_ZONE_LINE: i32 = 3;
 
-/// **Why a zone's `.wtr` region data is NOT available** — the fact [`RegionMap::load`]'s `Option`
-/// throws away (#762).
+/// **Why a zone's `.wtr` region data is NOT available** — the fact the old lossy
+/// `RegionMap::load`'s `Option` threw away (#762; that function is now deleted, #803).
 ///
 /// A `None` from the old loader collapsed five different facts into one value: *there is no file*,
 /// *the file is there but couldn't be read* (permission error, bad mount, a directory in its
@@ -69,6 +69,59 @@ impl std::fmt::Display for RegionLoadError {
             Self::UnsupportedVersion(v) => write!(f, ".wtr is v{v}; only v1/v2 are supported"),
             Self::Truncated { declared_nodes, bytes } =>
                 write!(f, ".wtr is truncated: header declares {declared_nodes} BSP nodes, file is {bytes} bytes"),
+        }
+    }
+}
+
+/// **Why a collision grid has no region data to answer from** — the fact a `None` water slot used
+/// to throw away (#803).
+///
+/// [`RegionLoadError`] says why a `.wtr` *load* failed. This says why a grid cannot answer a
+/// water/zone-line question at all, which is strictly larger: it also covers the grid that was
+/// never handed any region data in the first place (a synthetic test scene, or a grid read before
+/// the zone's `.wtr` was consulted). Both are **absences**, and neither is a fact about the world —
+/// but the code they feed used to turn them into one, because
+/// `Collision::zone_line_indices()` answered an empty `Vec` in every case and
+/// `/v1/observe/zone_exits` published that as `[]` with 200 OK.
+///
+/// `[]` is also the true, common answer for a zone that genuinely has no zone lines, so the agent
+/// could not tell the two apart — and exits are the only way out of a zone. Carrying the reason
+/// here is what lets the endpoint refuse instead of inventing an answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegionDataAbsent {
+    /// No region data was ever attached to this collision grid — nothing was loaded and nothing
+    /// failed. A grid in this state has not been *asked* about the zone's `.wtr`, so any water or
+    /// zone-line answer off it is about nothing.
+    NotAttached,
+    /// The zone's `.wtr` was consulted and did not load. Carries the loader's own verdict.
+    LoadFailed(RegionLoadError),
+}
+
+impl RegionDataAbsent {
+    /// The machine-readable `reason` an agent reads off a refusal. Distinct per cause on purpose:
+    /// "the file isn't there" and "the file is truncated" call for different operator action
+    /// (re-sync the asset pack vs. re-bake it), and collapsing them would repeat the substitution
+    /// this type exists to kill one level up.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotAttached => "region_data_not_attached",
+            Self::LoadFailed(e) => match e {
+                RegionLoadError::Missing            => "region_data_missing",
+                RegionLoadError::Unreadable(_)      => "region_data_unreadable",
+                RegionLoadError::NotRegionData      => "region_data_not_region_data",
+                RegionLoadError::UnsupportedVersion(_) => "region_data_unsupported_version",
+                RegionLoadError::Truncated { .. }   => "region_data_truncated",
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for RegionDataAbsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAttached =>
+                write!(f, "no region data has been attached to this collision grid"),
+            Self::LoadFailed(e) => write!(f, "{e}"),
         }
     }
 }
@@ -301,8 +354,9 @@ impl RegionMap {
     }
 
     /// Load `<dir>/<zone>.wtr` (v1 or v2 BSP), **keeping the failure** ([`RegionLoadError`]) instead
-    /// of collapsing it to a bare absence. Prefer this over [`RegionMap::load`] everywhere the
-    /// caller's answer would otherwise depend on data it never read (#762).
+    /// of collapsing it to a bare absence (#762). This is the ONLY loader — the lossy
+    /// `Option`-returning wrapper it used to share this impl with was deleted in #803, so a caller
+    /// can no longer answer off data it never read without first writing the discard by hand.
     pub fn try_load(dir: &Path, zone: &str) -> Result<RegionMap, RegionLoadError> {
         let path = dir.join(format!("{zone}.wtr"));
         let d = std::fs::read(&path).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
@@ -345,17 +399,15 @@ impl RegionMap {
         Ok(RegionMap { nodes })
     }
 
-    /// [`RegionMap::try_load`] with the failure discarded.
-    ///
-    /// ⚠️ **LOSSY, and lossy in the direction that lies (#762).** A `None` here is
-    /// indistinguishable from "loaded, and this zone simply has no water and no zone lines", and
-    /// callers that store it as `set_water(None)` publish exactly that reading. Only use it where a
-    /// caller genuinely does not care WHY there is no region data; anything that will report a
-    /// number, a count, or an emptiness derived from water/zone-line state must use `try_load` (or
-    /// `eqoxide_nav::water_grid::ZoneWater`, which carries the failure for you).
-    pub fn load(dir: &Path, zone: &str) -> Option<RegionMap> {
-        Self::try_load(dir, zone).ok()
-    }
+    // `RegionMap::load` — `try_load` with the failure discarded — WAS here. It is gone (#803), not
+    // merely unused: while it existed, `load(..).map(Arc::new)` remained the shortest way to get a
+    // region map onto a collision grid, and it is lossy in the direction that lies. Its `None` was
+    // indistinguishable from "loaded, and this zone simply has no water and no zone lines", and
+    // every caller stored it where that absence stops being an absence and becomes an ANSWER — the
+    // zone reads as having no water anywhere and, worse, **no zone-line regions anywhere**, which
+    // `/v1/observe/zone_exits` published as a bare `[]` with 200 OK. Exits are the only way out of a
+    // zone, so an agent read that as "sealed in" (#803). Use `try_load` and keep the
+    // [`RegionLoadError`]; `Collision::set_region_data` takes exactly that `Result`.
 
     /// Walk the BSP from node 1 to the leaf containing the server-coord point. The swap to (y,x,z)
     /// matches EQEmu's WaterMapV1::ReturnRegionType. Returns `None` if the tree is empty or the walk
@@ -773,18 +825,27 @@ mod tests {
         assert_eq!(unique.len(), msgs.len(), "reasons must be distinguishable: {msgs:?}");
     }
 
-    /// The lossy `load` is exactly `try_load(..).ok()` — one loader, so the two can never drift into
-    /// disagreeing about what a valid `.wtr` is.
+    /// Every absence an agent can be shown must be a DIFFERENT machine-readable `reason` — the same
+    /// rule `region_load_error_messages_are_distinguishable` applies to the loader verdicts, carried
+    /// one level up to the value `/v1/observe/zone_exits` refuses with (#803). If two collapsed, an
+    /// agent handed one could not tell "re-sync the asset pack" from "re-bake it".
     #[test]
-    fn load_is_try_load_with_the_reason_thrown_away() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(RegionMap::load(dir.path(), "absent").is_none());
-        std::fs::write(dir.path().join("ok.wtr"), wtr_v2(&[
-            ([0.0, 0.0, 1.0], -2.0, 0, 2, 3, 0),
-            ([0.0; 3], 0.0, 0, 0, 0, 0),
-            ([0.0; 3], 0.0, 1, 0, 0, 0),
-        ])).unwrap();
-        assert!(RegionMap::load(dir.path(), "ok").is_some());
+    fn region_data_absent_reasons_are_distinguishable() {
+        let all = [
+            RegionDataAbsent::NotAttached,
+            RegionDataAbsent::LoadFailed(RegionLoadError::Missing),
+            RegionDataAbsent::LoadFailed(RegionLoadError::Unreadable(std::io::ErrorKind::PermissionDenied)),
+            RegionDataAbsent::LoadFailed(RegionLoadError::NotRegionData),
+            RegionDataAbsent::LoadFailed(RegionLoadError::UnsupportedVersion(9)),
+            RegionDataAbsent::LoadFailed(RegionLoadError::Truncated { declared_nodes: 1, bytes: 40 }),
+        ];
+        let reasons: std::collections::HashSet<&str> = all.iter().map(|a| a.as_str()).collect();
+        assert_eq!(reasons.len(), all.len(), "reasons must be distinguishable: {reasons:?}");
+        // And none of them may read as an empty answer: the whole point is that they are NOT `[]`.
+        for a in &all { assert!(!a.as_str().is_empty() && !a.to_string().is_empty()); }
+        // The load failures must carry the loader's own sentence through, not a flattened summary.
+        assert_eq!(RegionDataAbsent::LoadFailed(RegionLoadError::Missing).to_string(),
+                   RegionLoadError::Missing.to_string());
     }
 
     #[test]
@@ -797,7 +858,7 @@ mod tests {
         ]);
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("z.wtr"), &blob).unwrap();
-        let rm = RegionMap::load(dir.path(), "z").expect("v2 loads");
+        let rm = RegionMap::try_load(dir.path(), "z").expect("v2 loads");
         // A point below the split is in the zone-line region carrying index 1.
         assert_eq!(rm.zone_line_at(10.0, 20.0, -5.0), Some(1));
         // A point above is not a zone line.
@@ -829,7 +890,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("z.wtr"), &out).unwrap();
-        let rm = RegionMap::load(dir.path(), "z").expect("v1 still loads");
+        let rm = RegionMap::try_load(dir.path(), "z").expect("v1 still loads");
         assert!(rm.is_water(10.0, 20.0, -5.0));
         assert_eq!(rm.zone_line_at(10.0, 20.0, -5.0), None); // v1 carries no index
     }
@@ -873,7 +934,7 @@ mod tests {
         ]);
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("z.wtr"), &blob).unwrap();
-        let loaded = RegionMap::load(dir.path(), "z").expect("v2 loads");
+        let loaded = RegionMap::try_load(dir.path(), "z").expect("v2 loads");
         assert_eq!(loaded.zone_line_at(10.0, 20.0, -5.0), Some(0),
             "a loaded special=3/index=0 leaf must classify as a zone line");
         assert_eq!(loaded.zone_line_indices(), vec![0]);

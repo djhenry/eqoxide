@@ -507,9 +507,19 @@ pub struct Collision {
     /// narrow door or a tight bridge with no margin to spare. Surfaced as `nav_tight` so an agent is
     /// never silently handed a riskier path than it thinks (`search_tiered`).
     tight_plans: std::sync::atomic::AtomicU64,
-    /// Optional water-region map (from the zone's `.wtr`). When present, find_path may DESCEND
-    /// through water (swim down a canal/shaft) to a lower floor that has no walkable connection.
-    water:     Option<std::sync::Arc<eqoxide_core::region_map::RegionMap>>,
+    /// The zone's region map (from its `.wtr`) — **or the reason there isn't one** (#803).
+    ///
+    /// `Ok`: find_path may DESCEND through water (swim down a canal/shaft) to a lower floor that has
+    /// no walkable connection, and [`Collision::zone_line_indices`] enumerates the zone's real exits.
+    ///
+    /// `Err`: this grid has NO region data, and here is why. It is a `Result` rather than an
+    /// `Option` because the absence used to be laundered into an answer: `zone_line_indices` handed
+    /// back an empty `Vec` and `/v1/observe/zone_exits` published it as `[]` with 200 OK, which is
+    /// also the true reading for a zone that genuinely has no zone lines. Exits are the only way out
+    /// of a zone, so an agent read a failed READ as "sealed in". Written only by
+    /// [`Collision::set_region_data`]; read through [`Collision::region_map`].
+    water: Result<std::sync::Arc<eqoxide_core::region_map::RegionMap>,
+                  eqoxide_core::region_map::RegionDataAbsent>,
     /// True when the terrain triangles came from a dedicated `__collision__` mesh (SOLID +
     /// INVIS faces, PASSABLE excluded). False for legacy zones with no baked collision mesh,
     /// where the rendered terrain is used as a fallback. Diagnostic/provenance only.
@@ -757,7 +767,8 @@ impl Collision {
                 z_min: 0.0,
                 z_max: 0.0, facing_blind_hits: Default::default(), tight_plans: Default::default(),
                 clearance: Default::default(), water_grid: None,
-                water: None, from_collision_mesh, zone_line_regions: Vec::new() };
+                water: Err(eqoxide_core::region_map::RegionDataAbsent::NotAttached),
+                from_collision_mesh, zone_line_regions: Vec::new() };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
         let rows = (((max[1] - min[1]) / cell_size).ceil() as usize + 1).max(1);
@@ -782,7 +793,9 @@ impl Collision {
             #[cfg(test)]
             z_min,
             z_max,
-            facing_blind_hits: Default::default(), tight_plans: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new(),
+            facing_blind_hits: Default::default(), tight_plans: Default::default(),
+            water: Err(eqoxide_core::region_map::RegionDataAbsent::NotAttached),
+            from_collision_mesh, zone_line_regions: Vec::new(),
             clearance: Default::default(), water_grid: None }
     }
 
@@ -803,19 +816,60 @@ impl Collision {
         self.facing_blind_hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Attach a zone water map so find_path can route swim descents. Call after `build`.
-    pub fn set_water(&mut self, water: Option<std::sync::Arc<eqoxide_core::region_map::RegionMap>>) {
-        self.water = water;
+    /// **The one writer of this grid's region data**: attach the zone's `.wtr` map, or record WHY
+    /// there is none. Call after `build`.
+    ///
+    /// Takes the loader's own `Result` (`RegionMap::try_load`) rather than an `Option` on purpose
+    /// (#803). The production caller no longer *has* a way to drop the reason on the floor without
+    /// writing the discard out by hand — `RegionMap::load`, the wrapper that used to do it for you,
+    /// is deleted.
+    pub fn set_region_data(
+        &mut self,
+        data: Result<std::sync::Arc<eqoxide_core::region_map::RegionMap>,
+                     eqoxide_core::region_map::RegionLoadError>,
+    ) {
+        self.water = data.map_err(eqoxide_core::region_map::RegionDataAbsent::LoadFailed);
         // Precompute zone-line region points now (zone load, off the net thread) so the runtime
         // find_zone_line_near is an O(1) cache read (#204).
         self.zone_line_regions = self.precompute_zone_line_regions();
+    }
+
+    /// Fixture shorthand for synthetic scenes: attach a hand-authored region map, or (with `None`)
+    /// leave the grid with no region data at all.
+    ///
+    /// **Test-only, and gated so on purpose.** For a synthetic scene there is no `.wtr` and so no
+    /// load that could have failed — `None` genuinely means [`RegionDataAbsent::NotAttached`], which
+    /// is still an explicit absence, not an empty answer. Because this is
+    /// `#[cfg(any(test, feature = "test-fixtures"))]` it does not exist in a release build, so no
+    /// production path can reach the reason-free spelling. Same gating as the `RegionMap::flat_below`
+    /// / `water_slab` constructors it exists to accept.
+    ///
+    /// [`RegionDataAbsent::NotAttached`]: eqoxide_core::region_map::RegionDataAbsent::NotAttached
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn set_water(&mut self, water: Option<std::sync::Arc<eqoxide_core::region_map::RegionMap>>) {
+        self.water = water.ok_or(eqoxide_core::region_map::RegionDataAbsent::NotAttached);
+        self.zone_line_regions = self.precompute_zone_line_regions();
+    }
+
+    /// This grid's region map when it has one — the read path for every water/zone-line query below.
+    /// `None` here is only ever consumed by a query whose "no data ⇒ no water here" answer is
+    /// *physically* the safe one; anything an agent reads back as a fact must go through
+    /// [`Collision::zone_line_indices`] (or `region_data_absent`) and surface the reason instead.
+    fn region_map(&self) -> Option<&std::sync::Arc<eqoxide_core::region_map::RegionMap>> {
+        self.water.as_ref().ok()
+    }
+
+    /// Why this grid has no region data — `None` when it has some. The value an agent-facing
+    /// endpoint refuses with instead of publishing an empty answer (#803).
+    pub fn region_data_absent(&self) -> Option<&eqoxide_core::region_map::RegionDataAbsent> {
+        self.water.as_ref().err()
     }
 
     /// Build the zone-line region cache from the water map. Bounded + timed; warns if it runs long
     /// (nav prep should never be slow enough to matter next to keepalive). Empty when there's no
     /// water map / no zone-line regions.
     fn precompute_zone_line_regions(&self) -> Vec<(i32, [f32; 3])> {
-        let Some(water) = self.water.as_ref() else { return Vec::new(); };
+        let Some(water) = self.region_map() else { return Vec::new(); };
         if self.cols == 0 || self.tris.is_empty() { return Vec::new(); }
         let (mut zmin, mut zmax) = (f32::MAX, f32::MIN);
         for t in &self.tris { for v in t { zmin = zmin.min(v[2]); zmax = zmax.max(v[2]); } }
@@ -854,11 +908,11 @@ impl Collision {
     /// The first call in a water zone runs [`Self::build_water_grid`] (the measured 357 ms – 1 s
     /// cost) on whatever thread the plan runs on — which is off the network thread for both the
     /// coarse (#377) and fine (#382) tiers — and caches it; every later call is a pointer read. The
-    /// build is gated on `self.water.is_some()` *before* `get_or_init`, so a grid is never cached for
+    /// build is gated on `self.region_map().is_some()` *before* `get_or_init`, so a grid is never cached for
     /// a zone whose water map has not been attached yet.
     fn water_grid_active(&self) -> Option<&crate::water_grid::WaterGrid> {
         if let Some(g) = self.water_grid.as_ref() { return Some(g); }
-        self.water.as_ref()?;
+        self.region_map()?;
         Some(self.water_grid_lazy.get_or_init(|| {
             let t0 = std::time::Instant::now();
             let g = self.build_water_grid(&crate::traversability::PLAYER_BODY);
@@ -901,7 +955,7 @@ impl Collision {
     pub fn build_water_grid(&self, body: &crate::traversability::Body) -> crate::water_grid::WaterGrid {
         const COL: f32 = 4.0; // 4u XY water columns (design §5.1 / owner decision #2, locked)
         let mut grid = crate::water_grid::WaterGrid::new(self.origin, COL);
-        let Some(water) = self.water.as_ref() else { return grid; };
+        let Some(water) = self.region_map() else { return grid; };
         if self.cols == 0 || self.tris.is_empty() { return grid; }
 
         // Zone z-extent — same source as the zone-line precompute (`precompute_zone_line_regions`).
@@ -1070,13 +1124,13 @@ impl Collision {
     /// True if `pos` = [east, north, z] (server coords) lies in a water region.
     /// False when the zone has no water map. Used to gate swim (vertical) movement.
     pub fn in_water(&self, pos: [f32; 3]) -> bool {
-        self.water.as_ref().is_some_and(|w| w.is_water(pos[0], pos[1], pos[2]))
+        self.region_map().is_some_and(|w| w.is_water(pos[0], pos[1], pos[2]))
     }
 
     /// Water-surface height above a submerged `pos`, or `None` if not in water / no bounded surface.
     /// Used by the controller's buoyancy to float toward the surface (#172).
     pub fn water_surface(&self, pos: [f32; 3]) -> Option<f32> {
-        self.water.as_ref().and_then(|w| w.surface_z(pos[0], pos[1], pos[2]))
+        self.region_map().and_then(|w| w.surface_z(pos[0], pos[1], pos[2]))
     }
 
     /// If `pos` = [east, north, z] (server coords) lies in a zone-line (`DRNTP`) region, the
@@ -1085,7 +1139,7 @@ impl Collision {
     /// This is how the native client triggers a crossing: it detects the region from zone geometry
     /// rather than a coordinate list.
     pub fn zone_line_at(&self, pos: [f32; 3]) -> Option<i32> {
-        self.water.as_ref().and_then(|w| w.zone_line_at(pos[0], pos[1], pos[2]))
+        self.region_map().and_then(|w| w.zone_line_at(pos[0], pos[1], pos[2]))
     }
 
     /// The zone-line index a **standing** character occupies at `(east, north, feet_z)`, probing the
@@ -1114,7 +1168,7 @@ impl Collision {
     /// zone-line slab thinner than the vertical sample step is the only miss, far below any shipped
     /// DRNTP thickness.
     pub fn zone_line_at_standing(&self, pos: [f32; 3]) -> Option<i32> {
-        let w = self.water.as_ref()?;
+        let w = self.region_map()?;
         const STEP: f32 = 1.0;
         let feet = pos[2];
         let head = feet + crate::traversability::PLAYER_BODY.height;
@@ -1127,11 +1181,27 @@ impl Collision {
         w.zone_line_at(pos[0], pos[1], head)
     }
 
-    /// Distinct zone-point indices of every zone-line region in this zone — the set of exits. Each
-    /// links to an entrance via the `OP_SendZonepoints` `iterator`. Empty when the zone has no
-    /// region map (or a v1 map with no indices).
-    pub fn zone_line_indices(&self) -> Vec<i32> {
-        self.water.as_ref().map(|w| w.zone_line_indices()).unwrap_or_default()
+    /// Distinct zone-point indices of every zone-line region in this zone — **the set of exits**.
+    /// Each links to an entrance via the `OP_SendZonepoints` `iterator`.
+    ///
+    /// `Ok(vec![])` is a real reading: this zone's region map loaded and contains no zone-line
+    /// regions (or is a v1 map, which carries no indices). `Err` means the question could not be
+    /// answered at all, and names why.
+    ///
+    /// **The `Result` is the fix for #803, and it is here rather than in a caller-side guard because
+    /// the guard is what kept failing.** This used to be `Vec<i32>` with `.unwrap_or_default()`, so a
+    /// `.wtr` that did not load produced an empty vec that `/v1/observe/zone_exits` published as `[]`
+    /// with 200 OK — byte-identical to the true, common answer for a zone with no zone lines. Exits
+    /// are the only way out of a zone, so the agent concluded it was sealed in, from a success
+    /// response it had no way to doubt. Now the two cases have different TYPES, and every caller has
+    /// to say out loud what it does with the second.
+    pub fn zone_line_indices(&self)
+        -> Result<Vec<i32>, eqoxide_core::region_map::RegionDataAbsent>
+    {
+        match self.water.as_ref() {
+            Ok(w) => Ok(w.zone_line_indices()),
+            Err(absent) => Err(absent.clone()),
+        }
     }
 
     /// Find a point inside a zone-line region nearest to `near` (= [east, north, z]), returning
@@ -1186,7 +1256,7 @@ impl Collision {
         let fz = self.floor_beneath(p[0], p[1], p[2], 2.0, REGION_DROP)?;
         // Standing on that floor must still be INSIDE the region — else we'd walk the char to a spot
         // that never fires the auto-cross.
-        let inside = self.water.as_ref()
+        let inside = self.region_map()
             .and_then(|w| w.zone_line_at(p[0], p[1], fz + 1.0)) == Some(index);
         inside.then_some([p[0], p[1], fz])
     }
@@ -1304,7 +1374,7 @@ impl Collision {
         const STEP_H: f32 = 20.0;
         const REGION_DROP: f32 = 400.0;
         self.column_floors(p[0], p[1], p[2], STEP_H, REGION_DROP).into_iter()
-            .find(|&fz| self.water.as_ref()
+            .find(|&fz| self.region_map()
                 .and_then(|w| w.zone_line_at(p[0], p[1], fz + 1.0)) == Some(index))
             .map(|fz| [p[0], p[1], fz])
     }
@@ -2345,7 +2415,7 @@ impl Collision {
     /// is UNBOUNDED (water 200u+ up, `surface_z` = `None`): there is no surface to anchor to, and
     /// the caller must fall through to the ordinary dry resolution, never unwrap.
     pub fn floating_goal_surface(&self, goal: [f32; 3]) -> Option<f32> {
-        let w = self.water.as_ref()?;
+        let w = self.region_map()?;
         let (x, y, z) = (goal[0], goal[1], goal[2]);
         // A point IN water (checked at z and a hair under, for a goal exactly at the waterline) —
         // or ABOVE water found by a short downward probe, the same shape as the WATER SURFACE
@@ -2382,7 +2452,7 @@ impl Collision {
         //    (`surface_z` is `None` unless `f + 1` is actually in water, and `None` for an
         //    unbounded column — both read as "nothing to report" here.)
         if let Some(f) = self.nearest_floor(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_TIER_TOL) {
-            if let Some(s) = self.water.as_ref().and_then(|w| w.surface_z(goal[0], goal[1], f + 1.0)) {
+            if let Some(s) = self.region_map().and_then(|w| w.surface_z(goal[0], goal[1], f + 1.0)) {
                 if s - f > GOAL_TIER_TOL {
                     return Some(GoalSnap::ToWaterSurface { surface_z: s });
                 }
@@ -2433,7 +2503,7 @@ impl Collision {
         //    is one the walker floats above, so arrival is at the SURFACE (mirrors clause 1 of
         //    `goal_z_was_snapped`). `surface_z` is `None` for a dry tier or an unbounded column.
         if let Some(f) = self.nearest_floor(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_TIER_TOL) {
-            if let Some(s) = self.water.as_ref().and_then(|w| w.surface_z(goal[0], goal[1], f + 1.0)) {
+            if let Some(s) = self.region_map().and_then(|w| w.surface_z(goal[0], goal[1], f + 1.0)) {
                 if s - f > GOAL_TIER_TOL { return Some(s); }
             }
             return Some(f);
@@ -2992,7 +3062,7 @@ impl Collision {
         // actually floating on — which is exactly the tier the WATER SURFACE TRAVERSAL edges connect.
         // `FOOTING` (module const): a floor this close under the feet = standing (wading), not
         // floating — shared with the floating GOAL anchor (`floating_goal_surface`, design §4d).
-        let floating_surface = self.water.as_ref().and_then(|w| {
+        let floating_surface = self.region_map().and_then(|w| {
             let (x, y, z) = (start[0], start[1], start[2]);
             let wet = w.is_water(x, y, z) || w.is_water(x, y, z - 1.0);
             let footed = self.nearest_floor(x, y, z, 2.0, FOOTING).is_some();
@@ -3066,7 +3136,7 @@ impl Collision {
         let cell_has_start_floor = |c: i32, r: i32| -> bool {
             let ctr = center(c, r);
             if floating_surface.is_some() {
-                return self.water.as_ref().is_some_and(|w| w.is_water(ctr[0], ctr[1], start_floor - 1.0));
+                return self.region_map().is_some_and(|w| w.is_water(ctr[0], ctr[1], start_floor - 1.0));
             }
             self.column_floors(ctr[0], ctr[1], start_floor, STEP_H, MAX_STEP_DOWN)
                 .into_iter().any(|z| (z - start_floor).abs() <= GOAL_TIER_TOL)
@@ -3227,7 +3297,7 @@ impl Collision {
             // to ask of it. Ask the right one instead: am I STANDING INSIDE the region? That is
             // exactly the predicate the native auto-cross fires on. Only tested near the goal cell,
             // so it costs a handful of BSP walks per plan, not one per node.
-            if let (Some(want), Some(water)) = (ctx.goal_region, self.water.as_ref()) {
+            if let (Some(want), Some(water)) = (ctx.goal_region, self.region_map()) {
                 if h(c, r) <= 2.0 * cell {
                     let p = center(c, r);
                     if water.zone_line_at(p[0], p[1], fz + 1.0) == Some(want) {
@@ -3418,7 +3488,7 @@ impl Collision {
                     // controller can execute. (The legacy WATER ASCENT family still serves land-
                     // anchored floaters; it is unreachable from a water node, which `continue`s below.)
                     if cur_col.top_node_z().is_some_and(|t| (t - cz).abs() < 0.5) {
-                        if let Some(water) = &self.water {
+                        if let Some(water) = self.region_map() {
                             if let Some(surface) = water.surface_z(a[0], a[1], cz).map(|s| s.max(cz)) {
                                 let haul_out_up = crate::traversability::PLAYER_BODY.haul_out_up;
                                 for nf in self.column_floors(b[0], b[1], surface, STEP_H, surface - cz) {
@@ -3635,7 +3705,7 @@ impl Collision {
                 // dropping/swimming down to the floor beneath it even past MAX_STEP_DOWN and without
                 // a clear chest-height walking segment — you fall into the water and sink/swim. This
                 // connects an upper walkway to a flooded lower level (e.g. qcat's canal → sewer).
-                if let Some(water) = &self.water {
+                if let Some(water) = self.region_map() {
                     // Is there water somewhere in the column between here and far below?
                     let has_water = (1..=12).any(|k| water.is_water(b[0], b[1], cz - k as f32 * 8.0));
                     if has_water {
@@ -3694,7 +3764,7 @@ impl Collision {
                 // and haul out onto a neighbor floor at or below surface + STEP_H. Without
                 // this, flooded pits (qeynos2's moat) are one-way traps: descent gets you in,
                 // and the normal climb's chest ray hits the pit wall on the way out.
-                if let Some(water) = &self.water {
+                if let Some(water) = self.region_map() {
                     // Submerged (water ABOVE us), or floating AT the surface — a start anchored to
                     // the water surface (#329/#197p2) has air above it, so the old submerged-only
                     // test never fired for it and a floating swimmer had no way OUT of the water.
@@ -3772,7 +3842,7 @@ impl Collision {
                 // back (which fights the controller's buoyancy toward the surface). This makes a
                 // surface pool (e.g. the Halas central pool on the way to the Everfrost line) a
                 // crossable swim rather than a drop to the pool floor the fall-guard refuses.
-                if let Some(water) = &self.water {
+                if let Some(water) = self.region_map() {
                     // Probe downward for the first swimmable water within a step of the current
                     // floor — a pool's surface often sits a little BELOW the shore you wade in from
                     // (Halas's central pool surface is ~5u under the ice), so a 1u probe would miss
@@ -7657,7 +7727,7 @@ mod tests {
         crate::water_grid::ZoneWater::load(&std::path::Path::new(&dir).join("maps/water"), &zone)
             .install(&mut col)
             .unwrap_or_else(|e| panic!("{zone}: {e} — every water answer below would be fabricated (#762)"));
-        println!("zone={zone} water loaded: {}", col.water.is_some());
+        println!("zone={zone} water loaded: {}", col.region_map().is_some());
         println!("grid: origin={:?} cols={} rows={} cell={} z=[{:.1},{:.1}] extent e=[{:.0},{:.0}] n=[{:.0},{:.0}]",
             col.origin, col.cols, col.rows, col.cell_size, col.z_min, col.z_max,
             col.origin[0], col.origin[0] + col.cols as f32 * col.cell_size,
@@ -8281,13 +8351,13 @@ mod tests {
             eprintln!("  moat → street x={gx}: {}",
                 r.map(|p| format!("{} waypoints", p.len())).unwrap_or_else(|| "NONE".into()));
         }
-        eprintln!("  zone has a water volume: {}", col.water.is_some());
+        eprintln!("  zone has a water volume: {}", col.region_map().is_some());
 
         // Moat exit scan: walk the whole moat water region and report every column where a
         // haul-out is geometrically possible (a neighbor floor within STEP_H of the water
         // surface and a clear chest ray from swim height). If this prints nothing, the
         // collision genuinely has no exit and the swim-up nav edge can't help.
-        if let Some(w) = col.water.clone() {
+        if let Some(w) = col.region_map().cloned() {
             let mut found = 0;
             let mut y = -260.0f32;
             while y < -20.0 {
@@ -8414,5 +8484,96 @@ mod tests {
             &ZoneAssets { terrain: vec![floor_band(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 8.0);
         assert!(open.footprint_clear(0.0, 0.0, 0.0, 1.0, 8),
             "footprint on open floor should be clear");
+    }
+}
+
+/// **#803 — "this zone has no exits" and "I could not read this zone's exits" must not be the same
+/// value.**
+///
+/// `zone_line_indices` used to return `Vec<i32>` and reached for `.unwrap_or_default()` when there
+/// was no region map, so a `.wtr` that was missing, truncated, of an unsupported version, or simply
+/// never attached produced the byte-identical empty vec that a healthy zone with no zone-line
+/// regions produces. `/v1/observe/zone_exits` published that as `[]` with 200 OK. Exits are the only
+/// way out of a zone, so an agent read a failed FILE READ as a fact about the world: sealed in.
+///
+/// These four cases are one table on purpose. The pairing is the property — an assertion that a
+/// failure is `Err` is worth nothing unless the true empty answer is, at the same time, still `Ok`.
+#[cfg(test)]
+mod zone_line_indices_is_not_lossy_803 {
+    use super::*;
+    use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
+    use eqoxide_core::region_map::{RegionDataAbsent, RegionLoadError, RegionMap};
+
+    fn grid() -> Collision {
+        let floor = MeshData {
+            positions: vec![[-100.0, 0.0, -100.0], [100.0, 0.0, -100.0],
+                            [100.0, 0.0, 100.0],   [-100.0, 0.0, 100.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        };
+        Collision::build(&ZoneAssets { terrain: vec![floor], objects: vec![], textures: vec![] }, 8.0)
+    }
+
+    /// **The honest empty, which must stay green.** A region map that LOADED and genuinely contains
+    /// no zone-line regions still answers `Ok(vec![])` — `/zone_exits` must keep serving `[]`/200
+    /// for the common real zone that has no exits baked. If the fix had been "refuse whenever the
+    /// list is empty", this is the test that would have caught it.
+    #[test]
+    fn a_loaded_map_with_no_zone_lines_still_answers_the_empty_list() {
+        let mut c = grid();
+        c.set_region_data(Ok(std::sync::Arc::new(RegionMap::flat_below(-10.0))));
+        assert_eq!(c.zone_line_indices(), Ok(vec![]),
+            "a map that loaded and has no zone-line regions is an ANSWER, not a refusal");
+    }
+
+    /// A loaded map WITH a zone line still enumerates it — the `Ok` arm is not a stub.
+    #[test]
+    fn a_loaded_map_with_a_zone_line_enumerates_it() {
+        let mut c = grid();
+        c.set_region_data(Ok(std::sync::Arc::new(
+            RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, 7))));
+        assert_eq!(c.zone_line_indices(), Ok(vec![7]));
+    }
+
+    /// **The falsehood, as a test.** Every way the `.wtr` can fail to load must come back as `Err`
+    /// carrying WHICH way — never as the empty list. The four `RegionLoadError`s are looped rather
+    /// than represented by one, because the old code collapsed all of them into a single `None` and
+    /// a fix that only handled the one in the issue title would rebuild the same lie for the others.
+    #[test]
+    fn every_load_failure_is_an_error_not_an_empty_list() {
+        for e in [
+            RegionLoadError::Missing,
+            RegionLoadError::NotRegionData,
+            RegionLoadError::UnsupportedVersion(99),
+            RegionLoadError::Truncated { declared_nodes: 400, bytes: 12 },
+        ] {
+            let mut c = grid();
+            c.set_region_data(Err(e.clone()));
+            assert_eq!(c.zone_line_indices(), Err(RegionDataAbsent::LoadFailed(e.clone())),
+                "{e:?}: a failed READ published as an empty exit list tells the agent it is sealed \
+                 in a zone, from a response it has no way to doubt (#803)");
+        }
+    }
+
+    /// The fourth case, distinct from all of the above: nothing was ever attached to this grid (a
+    /// synthetic scene, or a zone loaded before the region map). Also not an empty exit list.
+    #[test]
+    fn a_grid_with_no_region_data_attached_is_an_error_too() {
+        assert_eq!(grid().zone_line_indices(), Err(RegionDataAbsent::NotAttached));
+        assert_eq!(grid().region_data_absent(), Some(&RegionDataAbsent::NotAttached));
+    }
+
+    /// The reason has to survive the trip to the caller INTACT: `/zone_exits` reports
+    /// `absent.as_str()`, so a `set_region_data` that stored one canned failure for all of them
+    /// would leave the endpoint naming the wrong cause while still looking "explicit".
+    #[test]
+    fn the_reported_reason_names_the_actual_failure() {
+        let mut c = grid();
+        c.set_region_data(Err(RegionLoadError::Truncated { declared_nodes: 400, bytes: 12 }));
+        assert_eq!(c.region_data_absent().unwrap().as_str(), "region_data_truncated");
+        let mut c = grid();
+        c.set_region_data(Err(RegionLoadError::Missing));
+        assert_eq!(c.region_data_absent().unwrap().as_str(), "region_data_missing");
     }
 }

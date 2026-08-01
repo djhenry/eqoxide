@@ -154,9 +154,35 @@ impl ZoneAssetState {
 
     /// [`Self::test_ready`], with an optional region map (`.wtr` BSP) installed on the grid — for
     /// tests in crates that cannot build a zone but need zone-line-region behaviour (e.g. the #683
-    /// unresolved-index auto-cross in `eqoxide-net`). Test-only.
+    /// unresolved-index auto-cross in `eqoxide-net`). `None` leaves the grid with NO region data
+    /// (the honest "nobody attached any", not a load failure). Test-only.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn test_ready_with_water(water: Option<Arc<eqoxide_core::region_map::RegionMap>>) -> Self {
+        let mut col = Self::fixture_grid();
+        col.set_water(water);
+        Self::ready("testfixture", 1, Arc::new(col))
+    }
+
+    /// [`Self::test_ready`], with the zone's region data **or the reason it failed to load**
+    /// installed on the grid (#803). The case this adds over `test_ready_with_water` is
+    /// `Err(RegionLoadError::…)`: a zone whose terrain GLB loaded fine — so the state genuinely IS
+    /// `Ready` — and whose `.wtr` did not. That combination is exactly the one the
+    /// `zone_assets_not_ready` gate does not cover, and the one `/v1/observe/zone_exits` used to
+    /// answer `[]` with 200 OK for. Test-only.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn test_ready_with_region_data(
+        data: Result<Arc<eqoxide_core::region_map::RegionMap>,
+                     eqoxide_core::region_map::RegionLoadError>,
+    ) -> Self {
+        let mut col = Self::fixture_grid();
+        col.set_region_data(data);
+        Self::ready("testfixture", 1, Arc::new(col))
+    }
+
+    /// The trivial 200×200 flat floor both `test_ready_*` fixtures build on — a grid that really
+    /// does have geometry, so `ready()` will not downgrade it.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fn fixture_grid() -> Collision {
         use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
         let mesh = MeshData {
             positions: vec![
@@ -167,10 +193,7 @@ impl ZoneAssetState {
             texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
         };
-        let mut col = Collision::build(
-            &ZoneAssets { terrain: vec![mesh], objects: vec![], textures: vec![] }, 32.0);
-        if water.is_some() { col.set_water(water); }
-        Self::ready("testfixture", 1, Arc::new(col))
+        Collision::build(&ZoneAssets { terrain: vec![mesh], objects: vec![], textures: vec![] }, 32.0)
     }
 
     /// The live progress line while `Pending`, or the failure reason while `Failed`.
