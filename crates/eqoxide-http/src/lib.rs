@@ -195,8 +195,11 @@ pub struct PlayerState {
     /// list cross-referenced to SPA 57. This is the Levitate *buff* state ONLY — it is deliberately
     /// NOT a general "am I subject to gravity?" reading: GM `#flymode 1` (Flying) genuinely turns
     /// gravity off yet reports `false`, because #529 scoped this to Levitating(2)/LevitateWhileRunning(5).
-    /// Exposed because it changes what movement commands do: an agent that reads `pos_up` while
-    /// levitating is reading a height it will NOT fall from. No `skip_serializing_if`: the key is
+    /// Exposed because it changes what movement commands do: an agent that reads the up component of
+    /// the served position array (`player.pos[2]` on `GET /v1/observe/debug`) while levitating is
+    /// reading a height it will NOT fall from. The `pos_up` field beside this one is the internal
+    /// name that value is built from, not a response key — position is served as the one `pos` array
+    /// (#822). No `skip_serializing_if`: the key is
     /// ALWAYS present so an absent-key can never be misread as "known false".
     pub levitating:    Option<bool>,
     /// Current target's display name and HP percent (0–100), or None when nothing is targeted.

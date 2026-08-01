@@ -313,7 +313,7 @@ off, the character free-floats instead of falling and holds altitude with no inp
 
 | Value | Meaning |
 |-------|---------|
-| `true`  | Levitating. `pos_up` is a height the character will **not** fall from, and the controller applies no gravity. |
+| `true`  | Levitating. `player.pos[2]` — the up component of the served position array `[east, north, up]` — is a height the character will **not** fall from, and the controller applies no gravity. |
 | `false` | A **trustworthy** negative — the client has complete buff information and none of it is levitate. |
 | `null`  | **UNKNOWN.** The client received a buff it could not resolve (its spell table — `spells_us.txt` — is missing or truncated) and no channel positively asserts levitate, so it genuinely cannot say. This is **never** silently reported as `false`. |
 
