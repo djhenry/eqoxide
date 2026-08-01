@@ -614,10 +614,22 @@ fn every_static_placement_in_pass_rs_is_written_exactly_as_reviewed() {
             .collect()
     }
 
+    // The parser above finds calls by the literal text `name(`, so any spelling that reaches one of
+    // these functions under a DIFFERENT token escapes every whitelist below without failing one.
+    // Two such spellings are asserted away here. They are not the whole class — see "What this
+    // bounds" above the heading whitelist for the ones that are measured open.
+    let pass_ws = PASS_RS.split_whitespace().collect::<Vec<_>>().join(" ");
     for name in ["static_placement", "entity_model_matrix_static", "entity_model_matrix_heading"] {
         assert!(!PASS_RS.contains(&format!("{name} (")),
             "a `{name} (…)` call (space before the paren) is invisible to the parser in this \
              test, which would leave the pin green with an unreviewed call site");
+        assert!(!pass_ws.contains(&format!("{name} as ")),
+            "an `as`-renamed import — `use …::{name} as f;` — makes every call to it spell `f(`, \
+             which is invisible to the parser in this test. #828's reviewer MEASURED that: a \
+             renamed import of `entity_model_matrix_heading` plus an over-lifting call at the \
+             entity static site passed 264 / 0 / 12 against round 2's guard. The haystack is \
+             whitespace-normalized, so a line-wrapped rename (name, newline, `as f;`) is caught \
+             too. Import the name unrenamed, or add the new spelling to the whitelists below");
     }
 
     // ── Channel 2: what goes IN to static_placement ──────────────────────────────────────────
@@ -696,17 +708,39 @@ fn every_static_placement_in_pass_rs_is_written_exactly_as_reviewed() {
     //   did not have.
     //
     // A blacklist has to enumerate the aliases of four numbers, and they are not enumerable. A
-    // whitelist has to enumerate the legitimate calls, and there are six, in one file: four
+    // whitelist has to enumerate the legitimate calls, and in `pass.rs` there are six: four
     // per-model matrices (player `:1356`, skinned entity `:1818`, and the two shadow-pass arms
     // `:2070`/`:2103`) and two held-item matrices (the player's `:1447` in `encode_player_pass` and
     // a spawn's `:1850` in `encode_skinned_entity_pass` — all six are on skinned paths, and the
     // second held-item one IS an entity site; round 1 called the pair "the two non-entity ones").
     // So this is the same trade the two asserts above already make.
     //
-    // **What this bounds, and what it does not.** It bounds the argument TEXT of every
-    // `entity_model_matrix_heading` call in `pass.rs`, and their count. It does not bound what the
-    // names in a reviewed text denote, which is the hole the `&p` assert above also has and
-    // discloses; and it reads no other file.
+    // **What this bounds, and what it does not.** It bounds the argument TEXT of the
+    // `entity_model_matrix_heading` calls this test's parser can SEE in `pass.rs`, and how many
+    // there are. Round 2 wrote "every … call in `pass.rs`, and their count", and that was false;
+    // what follows is the honest boundary. Every entry is MEASURED unless it says otherwise, and
+    // the list is not claimed complete — #799 tracks this whole "written ≠ reached" class.
+    //
+    // - **Not every spelling reaches the parser.** It matches the literal text
+    //   `entity_model_matrix_heading(`. A space before the paren and an `as`-renamed import are
+    //   asserted away at the top of this test (the rename was green at 264 / 0 / 12 before that
+    //   assert existed, RED after). Binding the function to a local first — `let emh =
+    //   crate::camera::entity_model_matrix_heading;` and then calling `emh(…)` — is still
+    //   invisible, and an over-lift written that way at `pass.rs:1672` was measured green:
+    //   264 passed / 0 failed / 12 ignored. A `macro_rules!` wrapper is the same class and was
+    //   NOT measured.
+    // - **Text, not denotation.** It does not bound what the names in a reviewed argument list
+    //   denote — the same hole the `&p` assert above has and discloses.
+    // - **Arguments, not the result.** Nothing here looks at what a call site does with the matrix
+    //   it gets back. `mat[3][2] += model.bounds.y_extent * p.mesh_scale;` after an UNTOUCHED,
+    //   fully reviewed static call restores the whole #768 over-lift, and #828's reviewer measured
+    //   it green at 264 / 0 / 12. No pin over argument text can bound return-value arithmetic.
+    // - **Spellings, not sites.** The whitelist is a set and the count is a total; neither binds a
+    //   spelling to the site it was reviewed at. See the count assert below, which measures this.
+    // - **One file.** It reads `pass.rs` and nothing else. That is not hypothetical: the viewer at
+    //   `src/bin/render_model.rs:1268` is a complete `entity_model_matrix_heading` call carrying
+    //   the pre-#768 lift, and it is outside this test's reach by construction (`models.rs`'s
+    //   `static_placement` doc states its consequence).
     const REVIEWED_HEADING_ARGS: [&str; 4] = [
         "scene.player_pos, scene.player_heading, visual_scale, dominant_mesh_scale, [0.0, 0.0], \
          true, 0.0, crate::models::archetype_correction(archetype)",
@@ -720,9 +754,10 @@ fn every_static_placement_in_pass_rs_is_written_exactly_as_reviewed() {
     let headings = arg_lists("entity_model_matrix_heading");
     // The per-call whitelist runs BEFORE the count assert deliberately: an ADDED call with a novel
     // argument list must fail here, naming the offending arguments, rather than fail on a count
-    // that says only "six became seven". The count then catches the one shape the whitelist cannot
-    // — an added call whose argument list is byte-identical to a reviewed one, whose names denote
-    // something else at the new site. Both orders are measured; see the PR's mutation table.
+    // that says only "six became seven". The count then catches an addition the whitelist passes —
+    // one whose argument list is byte-identical to a reviewed spelling — and it catches it because
+    // the TOTAL changed, not because it recognised the site. Both asserts have their own reach
+    // control; see the PR's mutation table.
     for args in &headings {
         assert!(REVIEWED_HEADING_ARGS.contains(&args.as_str()),
             "#768/#781: `entity_model_matrix_heading` adds `visual_scale * 0.5` ON TOP of \
@@ -730,13 +765,22 @@ fn every_static_placement_in_pass_rs_is_written_exactly_as_reviewed() {
              numbers are reachable at every static call site under several names \
              (`model.bounds.y_extent`, a local bound from it, …). Enumerating those names is not \
              possible, so this enumerates the legitimate CALLS instead: every \
-             `entity_model_matrix_heading` in pass.rs must be spelled as reviewed. A new one is not \
+             `entity_model_matrix_heading(` this test can find in pass.rs must be spelled as \
+             reviewed (what `can find` excludes is listed above). A new one is not \
              necessarily wrong — it has to be reviewed for the #768 lift, which is why the list is \
              pinned. Expected one of {REVIEWED_HEADING_ARGS:?}, found: {args}");
     }
     assert_eq!(headings.len(), 6,
         "pass.rs must call entity_model_matrix_heading at exactly the 6 known skinned sites (four \
-         per-model matrices, two held-item matrices); found {}. This catches the one addition the \
-         whitelist above cannot: a call copied verbatim from a reviewed site into a static one, \
-         where the same argument names denote a static model's numbers.", headings.len());
+         per-model matrices, two held-item matrices); found {}. What this catches, exactly: an \
+         addition the whitelist above passes because its argument list is byte-identical to a \
+         reviewed spelling — caught because the total moved off 6. What it does NOT catch, \
+         measured by #828's reviewer at 264 passed / 0 failed / 12 ignored: the same thing with \
+         the total held. The heading call at `:1818` is loop-invariant, so hoisting it and reusing \
+         the result at `:1850` deletes a CALL without deleting a draw, and a verbatim reviewed \
+         spelling can then be added at a static site with this count still 6 and every spelling \
+         still on the whitelist. Counting harder does not close that — the per-spelling multiset \
+         is unchanged too — because neither assert binds a spelling to the site it was reviewed \
+         at. Round 2 claimed this assert catches 'a call copied verbatim from a reviewed site into \
+         a static one'; that claim is retracted.", headings.len());
 }

@@ -132,15 +132,25 @@ pub fn entity_model_matrix_heading(
 /// `entity_model_matrix_heading` directly — a different function name — and what bounds that is one
 /// source-text test over one file:
 /// `tests/floating_placement.rs::every_static_placement_in_pass_rs_is_written_exactly_as_reviewed`
-/// requires every `entity_model_matrix_heading` argument list in `pass.rs` to be one of six
-/// reviewed spellings, and pins their count. #781 round 1 asserted something weaker — that no such
-/// argument list names `.y_bottom` or `.center_xz` — and #828's reviewer measured the same over-lift
-/// written as `model.bounds.y_extent` / `.x_center` / `.z_center` **fully green** against it
-/// (262 passed / 0 failed / 12 ignored), so it is a whitelist now. Two limits survive that change:
-/// the test reads `pass.rs` and no other file, and it bounds the argument TEXT, not what the names
-/// in it denote — this function can still be handed a `StaticPlacement` built from wrong bounds, or
-/// one shadowing the reviewed `p`, and `StaticPlacement` is a plain struct with public fields that
-/// any caller can construct.
+/// requires each `entity_model_matrix_heading` argument list it finds in `pass.rs` to be one of
+/// four reviewed spellings — six calls, two spellings shared by two sites each — and pins the count
+/// at six. #781 round 1 asserted something weaker — that no such argument list names `.y_bottom` or
+/// `.center_xz` — and #828's reviewer measured the same over-lift written as
+/// `model.bounds.y_extent` / `.x_center` / `.z_center` **fully green** against it (262 passed /
+/// 0 failed / 12 ignored), so it is a whitelist now.
+///
+/// Round 2 wrote "every … argument list" and "Two limits survive that change" here. Both were
+/// false. The test's own "What this bounds, and what it does not" note is the enumerated,
+/// individually measured list; it is longer than two and is not claimed complete. The ones that
+/// matter at THIS function: it reads `pass.rs` and no other file (`src/bin/render_model.rs:1268` is
+/// a whole `entity_model_matrix_heading` call outside its reach); it sees only calls spelled
+/// literally `entity_model_matrix_heading(`, so a space before the paren and an `as`-renamed import
+/// are asserted away separately while a local bound to the function and called is still invisible
+/// (measured green); it bounds argument TEXT, not what the names in it denote — this function can
+/// still be handed a `StaticPlacement` built from wrong bounds, or one shadowing the reviewed `p`,
+/// and `StaticPlacement` is a plain struct with public fields that any caller can construct; and it
+/// bounds arguments only, not the matrix that comes back, which a site can still add a lift to
+/// (measured green).
 pub fn entity_model_matrix_static(
     pos: [f32; 3], heading_deg: f32, p: &crate::models::StaticPlacement, correction: glam::Mat4,
 ) -> [[f32; 4]; 4] {

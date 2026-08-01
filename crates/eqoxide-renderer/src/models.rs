@@ -925,7 +925,11 @@ pub fn skinned_target_height(race: &str, archetype: &str, true_height: f32) -> f
 /// It is NOT the only copy in the repository, and saying otherwise would be false: the standalone
 /// model-viewer binary (`src/bin/render_model.rs`, in the root `eqoxide` crate — it cannot depend on
 /// this crate's pass module) still writes `2.0 * y_extent * arch_scale` (`render_model.rs:1101`
-/// and `:1268`) and `vscale * 0.5 + y_bottom * arch_scale` (`:1274`) by hand. Consequence, stated
+/// and `:1268`) and `vscale * 0.5 + y_bottom * arch_scale` (`:1274`) by hand. The second of those
+/// is not a loose expression: `render_model.rs:1268-1272` is a complete
+/// `camera::entity_model_matrix_heading(…, vscale, …, [x_center, z_center], true, y_bottom, …)`
+/// call — an instance of exactly the call family the source-text pin whitelists — living in a file
+/// that pin does not read. Consequence, stated
 /// because it is real: the viewer has no `floating` concept at all and did not take #768's
 /// correction either, so its static arm still lifts a model by `(y_extent + y_bottom) * arch_scale`
 /// — the formula #768 replaced here. How far off that puts a given model on the turntable is not
@@ -986,11 +990,16 @@ pub struct StaticPlacement {
     /// the remaining routes is the source-text pin over `pass.rs`,
     /// `tests/floating_placement.rs::every_static_placement_in_pass_rs_is_written_exactly_as_reviewed`,
     /// which requires the four `static_placement` calls, the four `entity_model_matrix_static` calls
-    /// and — since #828 round 2 — all six `entity_model_matrix_heading` calls in that file to be
-    /// spelled exactly as reviewed. That bounds those calls as TEXT, in that one file. It is NOT a
-    /// type-level guarantee, it does not bound what the names in a reviewed spelling denote at the
-    /// site (measured green: shadowing the reviewed `p` with a hand-built `StaticPlacement` carrying
-    /// the over-lift), and it does not reach a caller in another file; making the state
+    /// and — since #828 round 2 — the six `entity_model_matrix_heading` calls in that file to be
+    /// spelled exactly as reviewed. That bounds those calls as TEXT, in that one file, and only the
+    /// spellings its parser can see: it matches the literal text `name(`, so a space before the
+    /// paren and an `as`-renamed import are asserted away separately, while binding the function to
+    /// a local and calling THAT was measured green (the test's own "What this bounds" note lists the
+    /// class). It is NOT a type-level guarantee, it does not bound what the names in a reviewed
+    /// spelling denote at the site (measured green: shadowing the reviewed `p` with a hand-built
+    /// `StaticPlacement` carrying the over-lift), it does not bound what a site does with the matrix
+    /// it gets back (measured green: adding the lift to the returned `mat[3][2]`), and it does not
+    /// reach a caller in another file; making the state
     /// unrepresentable would mean this function taking the model's bounds as an opaque value only
     /// the loader can mint, which `ModelBounds`'s doc records as declined and why.
     pub y_bottom: f32,
