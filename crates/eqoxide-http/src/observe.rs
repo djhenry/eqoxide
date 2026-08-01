@@ -99,18 +99,28 @@ fn zone_assets_refusal(
 /// is indistinguishable from the true, common reading "this zone has no zone lines" — and since
 /// exits are the only way out of a zone, an agent reads it as *sealed in*, off a success response.
 ///
-/// Deliberately NOT folded into `NotUsable`/`zone_assets_not_ready`. **`usability()` has FOUR
-/// non-test consumers** (#821 review round 2, B2 — an earlier revision of this comment said three
-/// and omitted the fourth, which made this argument *understate* the blast radius). By call site:
-///   * `observe.rs:38` / `:67` / `:1554` — every `/observe/*` endpoint, plus `/debug`'s zone block;
-///   * `move_api.rs` — `POST /v1/move/goto`, which turns the verdict into its `zone_assets_pending`
-///     note (**not** an `/observe/*` route, which is why it was missed);
-///   * `walker.rs` — the nav path-walker's `drive_walk` gate; and
-///   * `action_loop.rs` — `ActionLoop::drain_zone_cross`.
+/// Deliberately NOT folded into `NotUsable`/`zone_assets_not_ready`. **`usability()` has THREE
+/// direct non-test consumers, plus one that reaches it one call indirect.** By call site:
+///   * `observe.rs:38` / `:67` / `:1574` — every `/observe/*` endpoint, plus `/debug`'s zone block;
+///   * `move_api.rs:260` — `POST /v1/move/goto`, which turns the verdict into its
+///     `zone_assets_pending` note (**not** an `/observe/*` route, which is why it was missed);
+///   * `walker.rs:1400` — the nav path-walker's `drive_walk` gate; and, indirectly,
+///   * `action_loop.rs` — `ActionLoop::resolve_zone_cross`, which since #827 gates on
+///     [`eqoxide_nav::zone_assets::usable_collision`]; that function's first statement calls
+///     `usability` and returns its verdict as `Err`, so a new variant still reaches zone-crossing.
 ///
-/// So a new `NotUsable` variant would stop routing, stop `/v1/move/goto`, stop zone-crossing AND
-/// stop rendering frames in any zone with a missing `.wtr` — far past what a region-map failure
-/// actually invalidates. The refusal belongs to the questions whose answer really does come out of
+/// **On the count, because the history is easy to misread** (#821 review round 2, B2; #840): an
+/// early revision of this comment said three and omitted `move_api.rs`, which made this argument
+/// *understate* the blast radius, and it was corrected to four. The direct count is three again for
+/// an unrelated reason — #827 turned `action_loop.rs` from a direct caller into an indirect one —
+/// **not** because that omission returned; `move_api.rs` is the bullet that was once missing.
+/// Re-deriving this list by grep needs care in both directions: `usability(` still matches in
+/// `action_loop.rs`, but the only hit there is #827's test asserting its own premise, not a call
+/// site; and no grep for `usability(` alone will find the `resolve_zone_cross` consumer at all.
+///
+/// So a new `NotUsable` variant would stop routing, stop `/v1/move/goto`, stop zone-crossing
+/// (through `usable_collision`, per the bullet above) AND stop rendering frames in any zone with a
+/// missing `.wtr` — far past what a region-map failure actually invalidates. The refusal belongs to the questions whose answer really does come out of
 /// that file. (Confirmed live in the PR's forced-failure run: with the `.wtr` broken and the zone
 /// otherwise `ready`, `/frame`, `/zone_entrances` and `/debug` all still answered `200`.)
 ///
@@ -3193,6 +3203,52 @@ mod tests {
         let v = debug_json(empty_state()).await;
         assert_eq!(v["player"]["levitating"], serde_json::json!(false),
                    "a fully-known non-levitating state → an honest false (not null)");
+    }
+
+    /// **#822 — position is served as ONE `pos` array, and there is no `pos_up` key to read.**
+    ///
+    /// Three tracked files told an API reader to read a key called `pos_up`: the `levitating` table
+    /// in `docs/http-api.md`, the rustdoc on `PlayerState::levitating`, and the datum-discipline
+    /// paragraph on `eqoxide_core::coord::WIRE_Z_OFFSET` (which also named a `/player` endpoint that
+    /// does not exist). `pos_east`/`pos_north`/`pos_up` are `PlayerState` field names; `get_debug`
+    /// hand-builds its `player` object and emits them as the single `"pos": [east, north, up]`.
+    ///
+    /// **What this test does and does not cover.** It pins the WIRE FACT the corrected sentences now
+    /// assert — `pos` present as a 3-array, no `pos_*` key beside it — so a future change that adds
+    /// such a key, or renames `pos`, goes red and the prose stops being silently true-by-luck. It
+    /// does NOT check the prose: the wording edits in those three files have no test behind them,
+    /// and reverting any of them leaves this test and the suite green. Said plainly rather than
+    /// implied, because the acceptance bar on #822 asks for exactly that distinction.
+    ///
+    /// `up` is deliberately negative and distinct from `east`/`north`: a fixture that flattens the
+    /// third component, or repeats one value, cannot detect a transposed or dropped axis (#800).
+    ///
+    /// MUTATION CHECK (run on the remote builder, `-p eqoxide-http --lib`, file restored from an
+    /// `md5sum`-verified copy afterwards): rename the `"pos"` key in `get_debug` to `"pos_up"` →
+    /// RED here. Result recorded in the PR body.
+    #[tokio::test]
+    async fn position_is_served_as_one_pos_array_with_no_pos_up_key_822() {
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.player_x = 812.5;
+            gs.player_y = 43.0;
+            gs.player_z = -119.75;
+        });
+        let v = debug_json(state).await;
+        let player = v["player"].as_object().expect("player object");
+
+        assert_eq!(player.get("pos"), Some(&serde_json::json!([812.5, 43.0, -119.75])),
+            "position must be served as the one array [east, north, up]. Keys served: {:?}",
+            player.keys().collect::<Vec<_>>());
+
+        for absent in ["pos_east", "pos_north", "pos_up"] {
+            assert!(!player.contains_key(absent),
+                "`{absent}` is now a served key. That is not automatically wrong, but the docs and \
+                 rustdoc corrected by #822 currently tell agents this key does NOT exist and to read \
+                 the `pos` array instead — update them in the same change, then update this test. \
+                 Keys served: {:?}",
+                player.keys().collect::<Vec<_>>());
+        }
     }
 
     /// **#608, the no-second-derivation pin for the AGENT consumer.** `/nav_debug` is a structural
