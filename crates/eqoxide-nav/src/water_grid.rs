@@ -413,12 +413,18 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// names the zones. `add`/`skip` **panic** if no matching zone is open, so a loop that forgets
 /// `begin_zone` fails loudly instead of silently reverting to the round-1 shape.
 ///
-/// What this still does NOT cover, stated so nobody re-derives the round-2 sentence: a corpus loop
-/// that uses no `WaterRollup` at all is invisible to this type. The four `*_blast_radius` corpora
-/// and `water_grid_budget_measurement` in `tests/walker_sim.rs`, and the zone loop in
-/// `collision.rs`, accumulate into a plain `Vec<String>` and still drop zones without accounting.
-/// They print no ratio, so they lie by omission rather than by assertion, but they are NOT covered
-/// by anything in this file.
+/// What this still does NOT cover, stated so nobody re-derives it: a corpus loop that uses no
+/// `WaterRollup` at all is invisible to this type. Nothing here can reach into such a loop; the
+/// only lever is that a loop chooses to open its zones through [`open_corpus_zone`].
+///
+/// As of #807 the corpora that go through this type are `faithful_walker_drift_corpus` (hand-wired,
+/// two rollups), the four `*_blast_radius` corpora in `tests/walker_sim.rs`, and
+/// `water_grid_budget_measurement` in `crates/eqoxide-nav/src/collision.rs` — the last five via
+/// [`open_corpus_zone`]. What remains uncovered is a set of further zone loops in `collision.rs`
+/// that still accumulate nothing and drop zones on a bare `continue`, several of them without even
+/// printing a line — see **issue #839**, which carries the current per-line list. Do not re-derive
+/// or restate that tally here; it will drift. This paragraph names the mechanism; #839 names the
+/// sites.
 #[derive(Clone, Debug, Default)]
 pub struct WaterRollup {
     total: usize,
@@ -598,15 +604,21 @@ impl std::fmt::Display for ZoneDropped {
 ///
 /// Copy-per-corpus wiring is the mechanism that failed, twice, in #762's own review (rounds 2 and
 /// 3: a `continue` was left unwired both times, and the second one printed the word "skipped" while
-/// calling nothing). So the drop paths are not per-corpus text any more: they exist **once**, here,
-/// where they cannot be written without their accounting because they are the same statements.
+/// calling nothing). So the drop paths stopped being per-corpus text in five of the six corpora:
+/// there they exist here, once, where they cannot be written without their accounting because they
+/// are the same statements. They do NOT exist only once in the tree.
+/// `faithful_walker_drift_corpus` (`tests/walker_sim.rs`) still carries its own inline copy with
+/// hand-wired `skip`s, deliberately: it drives TWO rollups (`roll_wr`, `roll_423`) and cannot use
+/// this single-rollup signature unchanged. That copy is wired and correct; it is simply not this
+/// one, so "one owner" describes five corpora, not six.
 ///
 /// # What this guarantees, and what it does not
 ///
-/// * **Guaranteed:** every `return` out of this function is preceded by a `skip`/`add` that closes
-///   the zone this function's own `begin_zone` opened. There is no path through it that leaves a
-///   zone unaccounted. The three drop paths are covered by named tests in this file that need no
-///   baked assets, so CI runs them.
+/// * **Guaranteed:** every `Err` return out of this function is preceded by a `skip`/`add` that
+///   closes the zone this function's own `begin_zone` opened. The three drop paths are covered by
+///   named tests in this file that need no baked assets, so CI runs them. The `Ok` tail return is
+///   deliberately NOT closed here — see the next bullet; that is the caller's obligation, and
+///   `open_corpus_zone_leaves_a_ready_zone_open_for_the_caller_to_close_807` pins it.
 /// * **Guaranteed by [`WaterRollup`], not by this function:** the caller must close a zone this
 ///   returns `Ok` for, by calling `add` when it finishes scoring it. If it forgets — or `continue`s
 ///   past it for some later reason — the zone lands in `unaccounted` and
@@ -617,6 +629,13 @@ impl std::fmt::Display for ZoneDropped {
 ///   silently, and nothing in CI would notice, because every corpus that uses this is `#[ignore]`d
 ///   and CI passes no `--ignored` (#777 / #799). What this changes is that there is now one obvious
 ///   thing to call and no per-site wiring left to forget — not that the call is enforced.
+/// * **NOT covered by CI, specifically:** this function body. Every test that pins the three drop
+///   paths calls [`open_corpus_zone_with`] with injected closures; nothing CI runs calls
+///   `open_corpus_zone` itself. What is tested is the accounting, not this wrapper's IO wiring, so a
+///   mutation of `format!("{zone}.glb")`, of `"maps/water"`, or of the `cell` pass-through below
+///   would survive the entire CI suite. A #835 reviewer checked by hand that this wrapper builds the
+///   same paths the deleted inline code did and exercised it end-to-end on baked assets, but that is
+///   a one-time check, not a standing pin. Closing it needs an asset fixture CI does not have.
 ///
 /// `cell` is the collision grid cell size (every current caller passes the production zone-load
 /// value, 32.0).
