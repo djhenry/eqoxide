@@ -635,14 +635,21 @@ fn every_static_placement_in_pass_rs_is_written_exactly_as_reviewed() {
     }
 
     // The escape #781 leaves open at the type level: call the GENERAL matrix function, which still
-    // takes a `visual_scale`, and hand it the static placement. `y_bottom` and `center_xz` are
-    // `StaticPlacement`'s two fields that `HumanoidPlacement` does not have, so they identify a
-    // static placement at a call site without matching the skinned sites.
+    // takes a `visual_scale`, and hand it a static placement. `y_bottom` and `center_xz` are
+    // `StaticPlacement`'s two fields that `HumanoidPlacement` does not have, so a `.y_bottom` or
+    // `.center_xz` in a `entity_model_matrix_heading` argument list identifies a static placement.
+    //
+    // Matched on the FIELD, not on `p.` — pinning the binding name would miss
+    // `let q = static_placement(…); entity_model_matrix_heading(…, q.y_bottom, …)`, which is #773's
+    // E1b class (rename the binding, keep the text). Measured: the six `entity_model_matrix_heading`
+    // calls that legitimately remain in `pass.rs` (all skinned, plus the two non-entity ones) pass
+    // `[0.0, 0.0]` and `0.0` in those positions, so not one of them mentions either field today.
     for args in arg_lists("entity_model_matrix_heading") {
-        assert!(!args.contains("p.y_bottom") && !args.contains("p.center_xz"),
+        assert!(!args.contains(".y_bottom") && !args.contains(".center_xz"),
             "#781: a static placement must go through `camera::entity_model_matrix_static`, which \
              has no `visual_scale` parameter. `entity_model_matrix_heading` still has one, and \
              `visual_scale * 0.5` is added on top of `y_bottom * mesh_scale` — which is exactly the \
-             #768 over-lift. Offending call arguments: {args}");
+             #768 over-lift. Renaming the placement binding does not evade this: the match is on the \
+             FIELD name. Offending call arguments: {args}");
     }
 }
