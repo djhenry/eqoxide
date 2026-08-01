@@ -407,7 +407,8 @@ fn cursor_arclengths(path: &[[f32; 3]], start_i: usize, from: [f32; 3]) -> Optio
 ///   function's `reachable` predicate — not this one — that refuses to cross geometry.
 /// * A body whose nearest point is the path's FINAL vertex reports "does not lead" (the carrot is
 ///   clamped to that same vertex). That is a body at the goal, which is arrival's business, not
-///   steering's.
+///   steering's. That edge, and the rule that an unmeasurable cursor is not evidence of a collapse,
+///   are pinned by `carrot_leads_is_honest_at_the_route_end_and_where_it_can_measure_nothing`.
 ///
 /// The three arclengths are checked against their definitions by
 /// `the_three_arclengths_are_the_points_they_claim_to_be`, and the claim that
@@ -1577,6 +1578,7 @@ mod cursor_resync_tests {
             carrot_leads_judges_the_carrot_the_production_code_actually_builds,
             after_a_resync_with_clear_geometry_the_carrot_always_leads,
             the_sub_guard_hairpin_fixed_point_resyncs_though_the_distance_trigger_cannot_see_it,
+            carrot_leads_is_honest_at_the_route_end_and_where_it_can_measure_nothing,
         ];
         // Helpers cited by name in the same docs.
         let _helpers: (fn(&crate::collision::Collision, usize, bool, bool) -> Run,
@@ -2608,16 +2610,24 @@ mod cursor_resync_tests {
             }
             (pinned, total, collapse_only)
         };
-        for sep in [4.0f32, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0] {
-            let (w, t, c) = count(sep);
+        // EVERY row is measured and printed BEFORE anything is asserted. A per-row `assert` aborts
+        // the sweep at the first failure and prints a one-row table, which is useless as the
+        // `before` column of a comparison — the mutation run has to publish the same seven rows the
+        // fixed run does or the table is not a comparison at all.
+        let rows: Vec<(f32, usize, usize, u32)> =
+            [4.0f32, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0].into_iter()
+                .map(|sep| { let (w, t, c) = count(sep); (sep, w, t, c) }).collect();
+        for (sep, w, t, c) in &rows {
             println!(
                 "hairpin leg separation {sep:>4} u: carrot pinned {w}/{t}  \
                  (collapse-only trigger ticks: {c})");
+        }
+        for (sep, w, t, c) in &rows {
             // "carrot-pinned", NOT "wedged" — see the correction block on this test.
-            assert_eq!(w, 0,
+            assert_eq!(*w, 0,
                 "carrot pinning must be cleared at {sep} u separation, got {w}/{t} carrot-pinned");
-            if sep < CURSOR_STALE_DIST {
-                assert!(c > 0,
+            if *sep < CURSOR_STALE_DIST {
+                assert!(*c > 0,
                     "premise: at {sep} u separation the #733 trigger never fired inside the distance \
                      guard, so this row says nothing about it — the sweep is not reaching the defect");
             }
@@ -2836,6 +2846,40 @@ mod cursor_resync_tests {
         assert!(collapsed_inside_guard > 20,
             "premise: only {collapsed_inside_guard} swept inputs were collapsed while INSIDE the \
              distance guard, so this sweep is not reaching the class #733 adds");
+    }
+
+    /// **The two edges [`carrot_leads`]'s own doc claims, pinned so the claims are not free (#733).**
+    ///
+    /// Both were surviving mutants before this test existed, found by running the mutations rather
+    /// than by reading the function:
+    ///
+    /// * **`>` is not `>=`.** A body sitting on the route's final vertex has `s_body == total`, and
+    ///   the carrot is clamped to that same vertex, so the two arclengths are EQUAL. `>` calls that
+    ///   "does not lead", which is the honest answer — there is no route ahead to lead onto — and it
+    ///   is what the doc says. Relaxing to `>=` would have it report a carrot that leads a body it is
+    ///   standing on, and nothing else in the suite noticed.
+    /// * **an unmeasurable cursor is not a collapse.** `start_i` naming no segment yields `None`, and
+    ///   `None` must read as "leads": declaring a collapse we cannot see would let the resync fire on
+    ///   the strength of missing evidence. (`resync_cursor` never reaches that branch — it rejects
+    ///   short paths first — so this is a claim about the predicate, for its other callers.)
+    #[test]
+    fn carrot_leads_is_honest_at_the_route_end_and_where_it_can_measure_nothing() {
+        let route = hairpin_route(8.0);
+        let end = *route.last().unwrap();
+        assert!(!carrot_leads(&route, route.len() - 2, end, LOCAL_REACH),
+            "a body ON the final vertex has no route ahead of it, so no carrot can lead it");
+        // …and one step back from the end it does lead again, so the assert above is about the end
+        // and not about the last segment being special.
+        let stepped_back = [end[0] + 3.0, end[1], end[2]];
+        assert!(carrot_leads(&route, route.len() - 2, stepped_back, LOCAL_REACH),
+            "premise: a body short of the final vertex must still have a leading carrot");
+
+        assert!(carrot_leads(&[], 0, end, LOCAL_REACH),
+            "an empty path measures nothing; that is not evidence of a collapse");
+        assert!(carrot_leads(&route, route.len() - 1, end, LOCAL_REACH),
+            "a cursor past the last segment measures nothing; that is not evidence of a collapse");
+        assert!(carrot_leads(&route, 999, end, LOCAL_REACH),
+            "an out-of-range cursor measures nothing; that is not evidence of a collapse");
     }
 
     /// **REGRESSION (#733): the sub-guard hairpin's fixed point, as one arithmetic example.**
