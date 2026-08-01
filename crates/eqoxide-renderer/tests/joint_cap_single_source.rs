@@ -418,28 +418,40 @@ fn every_uniform_mat4_palette_in_the_corpus_is_exactly_joint_cap() {
 /// reviewer measured — but the sentences were false, and the cheaper repair was to make them true.
 /// The list is still used, at the end, as the positive control: the three known palette shaders must
 /// each have yielded a palette, or a corpus that lost them all would satisfy the loop vacuously.
+///
+/// **Two sentinels, not one, and that is not belt-and-braces.** With a single sentinel, a shader
+/// that hardcodes exactly the sentinel value is indistinguishable from one that tracks the token.
+/// That is not hypothetical: it was measured here — a planted decoy declaring `array < JMat2 , 77 >`
+/// slipped past this test while the single sentinel was 77, and only the other palette checks caught
+/// it. A length that comes from the token equals *both* sentinels; a length written into the shader
+/// can equal at most one, so no single literal survives.
 #[test]
 fn every_palette_length_tracks_the_substituted_token() {
-    const SENTINEL: u32 = 77;
-    assert_ne!(SENTINEL as usize, JOINT_CAP, "the sentinel must differ from the real cap");
+    const SENTINELS: [u32; 2] = [77, 91];
+    for s in SENTINELS {
+        assert_ne!(s as usize, JOINT_CAP, "a sentinel must differ from the real cap");
+    }
+    assert_ne!(SENTINELS[0], SENTINELS[1], "the sentinels must differ from each other");
     let corpus = shader_corpus();
     let mut with_palette: Vec<&str> = Vec::new();
     let mut checked = 0usize;
     for (name, raw) in &corpus {
-        let substituted = raw.replace(JOINT_CAP_TOKEN, &SENTINEL.to_string());
-        let module = parse_and_validate(&substituted, name);
-        let lens = uniform_mat4_palette_lengths(&module);
-        if !lens.is_empty() {
-            with_palette.push(name.as_str());
-        }
-        for len in lens {
-            assert_eq!(
-                len, SENTINEL,
-                "{name}: a uniform mat4 palette is {len} when the token is substituted with \
-                 {SENTINEL} — that length is written into the shader, not derived from \
-                 renderer::JOINT_CAP"
-            );
-            checked += 1;
+        for sentinel in SENTINELS {
+            let substituted = raw.replace(JOINT_CAP_TOKEN, &sentinel.to_string());
+            let module = parse_and_validate(&substituted, name);
+            let lens = uniform_mat4_palette_lengths(&module);
+            if !lens.is_empty() && !with_palette.contains(&name.as_str()) {
+                with_palette.push(name.as_str());
+            }
+            for len in lens {
+                assert_eq!(
+                    len, sentinel,
+                    "{name}: a uniform mat4 palette is {len} when the token is substituted with \
+                     {sentinel} — that length is written into the shader, not derived from \
+                     renderer::JOINT_CAP"
+                );
+                checked += 1;
+            }
         }
     }
     for name in EXPECTED_JOINT_SHADERS {
