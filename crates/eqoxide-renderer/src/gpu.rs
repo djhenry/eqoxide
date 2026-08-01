@@ -138,19 +138,19 @@ pub struct WeatherUniformData {
 pub struct GpuStaticModel {
     pub meshes:              Vec<GpuMesh>,
     pub texture_bind_groups: Vec<wgpu::BindGroup>,
-    /// Distance from Y=0 to the bottom of the model in buffer vertex space.
-    /// Used to compute the ground lift so models stand at Z=0 instead of floating or sinking.
-    pub y_bottom:            f32,
-    /// Vertical extent of the model (max_y - min_y) in buffer vertex space.
-    /// NOT read by this crate's render path: since #768 a static placement takes its whole vertical
-    /// lift from `y_bottom` (see `models::static_placement`). `visual_scale = 2 * y_extent *
-    /// arch_scale` survives only in the standalone `render_model` viewer bin, which reads this
-    /// field at `src/bin/render_model.rs:1266`.
-    /// Separate from y_bottom because chr.s3d models may have vertices far above Y=0
-    /// (e.g. feet at Y=20), making y_bottom unreliable as a height proxy.
-    pub y_extent:            f32,
-    pub x_center:            f32,
-    pub z_center:            f32,
+    /// The loader's four measured bounds, carried as ONE value so a placement call site passes the
+    /// model's bounds rather than four loose `f32`s (#781). Was four separate fields
+    /// (`y_bottom`/`y_extent`/`x_center`/`z_center`) until then.
+    ///
+    /// - `y_bottom` — distance from Y=0 to the bottom of the model in buffer vertex space. Used to
+    ///   compute the ground lift so models stand at Z=0 instead of floating or sinking.
+    /// - `y_extent` — vertical extent (`max_y - min_y`). NOT read by this crate's render path: since
+    ///   #768 a static placement takes its whole vertical lift from `y_bottom` (see
+    ///   `models::static_placement`). `visual_scale = 2 * y_extent * arch_scale` survives only in
+    ///   the standalone `render_model` viewer bin. Separate from `y_bottom` because chr.s3d models
+    ///   may have vertices far above Y=0 (e.g. feet at Y=20), making `y_bottom` unreliable as a
+    ///   height proxy.
+    pub bounds:              crate::models::ModelBounds,
     /// Lowercase race+gender prefix from material names; empty if unknown.
     pub prefix: String,
     /// Per-mesh equipment slot binding, parallel to `meshes`. `None` = not an armor slot.

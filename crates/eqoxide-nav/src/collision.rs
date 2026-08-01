@@ -7320,23 +7320,25 @@ mod tests {
         let body = crate::traversability::PLAYER_BODY;
 
         // #762: a zone whose `.wtr` did not load is not "0 wet columns" — it is UNMEASURED, and this
-        // whole table is a water measurement. Collect the holes and fail the run at the end rather
-        // than printing a skip line into a log nobody reads back.
-        let mut unmeasured: Vec<String> = Vec::new();
+        // whole table is a water measurement.
+        //
+        // #807: the `.wtr` hole was the only one this run refused. A zone with no baked `.glb`, or
+        // one whose glb built an empty grid, was dropped by a bare `continue` that touched no
+        // ledger, so it left the denominator as well as the numerator and the table below read as a
+        // completed budget measurement of whatever subset happened to be on the host. Opening the
+        // zone now goes through `open_corpus_zone`, which owns all three drop paths and accounts for
+        // each of them; closing it is the `cover.add` at the bottom of the loop, and a zone this
+        // body abandons without reaching that line is recorded as `unaccounted` by the rollup
+        // itself — no per-`continue` wiring to forget.
+        let mut cover = crate::water_grid::WaterRollup::new();
         println!("\n{:<12} {:>10} {:>8} {:>12} {:>10} {:>11}",
             "zone", "wet cols", "spans", "est bytes", "build ms", "unbounded↓");
         for zone in &zones {
-            let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
-            let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
-            let mut col = Collision::build(&za, 32.0);
-            if col.cols == 0 { println!("{zone:<12}  (no grid — skipped)"); continue; }
-            let zw = crate::water_grid::ZoneWater::load(
-                &std::path::Path::new(&dir).join("maps/water"), zone);
-            if let Err(e) = zw.install(&mut col) {
-                println!("{zone:<12} {:>10} — {e}", crate::water_grid::UNMEASURED);
-                unmeasured.push(zone.clone());
-                continue;
-            }
+            let (col, zw) = match crate::water_grid::open_corpus_zone(
+                &mut cover, std::path::Path::new(&dir), zone, 32.0) {
+                Ok(ready) => ready,
+                Err(why) => { println!("{zone:<12}  ({why})"); continue }
+            };
 
             // BUILD COST: median of 5 timed builds (a warm-up build precedes them). The grid is
             // deterministic, so all builds are identical — we time the same work the net thread would.
@@ -7352,13 +7354,20 @@ mod tests {
             println!("{zone:<12} {:>10} {:>8} {:>12} {:>10.1} {:>11}",
                 grid.wet_column_count(), grid.span_count(), grid.estimated_bytes(),
                 median_ms, grid.unbounded_below_count());
+            cover.add(zone, &zw.measure(|_| grid.wet_column_count()));
         }
-        // #762: this table is only a budget measurement for the zones it actually measured. A run
-        // with a hole in it must not read as a completed measurement, however clean the rows look.
-        assert!(unmeasured.is_empty(),
-            "{} zone(s) had no loadable .wtr — this run measured NOTHING for them and is not a \
-             water budget result: {:?}. Bake or fetch their region files and re-run.",
-            unmeasured.len(), unmeasured);
+        // #762/#807: this table is only a budget measurement for the zones it actually measured. A
+        // run with a hole in it — of ANY of the three kinds — must not read as a completed
+        // measurement, however clean the rows look.
+        println!("\nwet columns: {cover}");
+        assert!(cover.is_complete(),
+            "#807: this run is not a water budget result — it measured {}/{} of the zones it was \
+             asked for. unmeasured (the .wtr was read and did not load): {:?}; skipped (dropped \
+             before the water check ran — no glb / no grid): {:?}; unaccounted (left the loop body \
+             without reaching add or skip — a corpus WIRING bug, not an asset problem): {:?}. \
+             Bake or fetch the missing assets and re-run.",
+            cover.measured_zones(), cover.attempted_zones(),
+            cover.unmeasured_zones(), cover.skipped_zones(), cover.unaccounted_zones());
     }
 
     #[test]

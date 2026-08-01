@@ -1029,7 +1029,7 @@ impl EqRenderer {
                 static_head_hidden.push(dh);
             }
             tracing::info!("renderer: loaded static model '{}'", label);
-            (GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: static_slots, head_parts: static_head_parts, head_default_hidden: static_head_hidden, true_height: asset.true_height, clip_bounds: vec![], feet_offset: 0.0 }), skin_fit)
+            (GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, bounds: crate::models::ModelBounds { y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center }, prefix: asset.prefix.clone(), equip_slots: static_slots, head_parts: static_head_parts, head_default_hidden: static_head_hidden, true_height: asset.true_height, clip_bounds: vec![], feet_offset: 0.0 }), skin_fit)
         }
     }
 
