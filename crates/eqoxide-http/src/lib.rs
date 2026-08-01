@@ -242,9 +242,17 @@ pub struct PlayerState {
     pub run_mode:  bool,
     /// #724 review B1: **the controller has stopped the body and cannot resume** — see
     /// [`PlayerHoldView`]. `null` when it has not, which is the overwhelmingly normal case.
-    /// No `skip_serializing_if`: the key is ALWAYS present, so an agent that greps for it and finds
-    /// nothing knows it is talking to a client too old to report the state, rather than concluding
-    /// the character is fine.
+    ///
+    /// No `skip_serializing_if`: the key is always present in a serialisation of *this struct*.
+    /// **That is a different and weaker claim than being present in any response body** — #817
+    /// found this field computed, mirrored into [`eqoxide_core::game_state::GameState`] every
+    /// controller-stepped frame, and covered by tests, and STILL absent from `GET
+    /// /v1/observe/debug`, because nothing serialises `PlayerState` whole: `observe::get_debug`
+    /// hand-builds its `player` object and patches extras in with `player.insert`. What makes the
+    /// key reachable is the `player.insert("hold", …)` there, alongside `levitating`/`run_mode`/
+    /// `afloat_stall` — see that call site and `hold_reaches_the_debug_json_817`, which asserts
+    /// `contains_key` on bytes returned by the real router, not on this attribute or on any test
+    /// that serialises `PlayerState` directly.
     pub hold: Option<PlayerHoldView>,
     /// #776/#801 (agent-honesty): **the character is afloat, is being wished at, and is going
     /// nowhere** — see [`PlayerAfloatStallView`], which also states plainly which real traps this
@@ -550,6 +558,9 @@ fn ser_error_kind<S: serde::Serializer>(
 }
 
 /// **The character is physically stuck and the client cannot free it** — `player.hold` (#724).
+/// Served as `player.hold` by `GET /v1/observe/debug`, and by no other route (#817 — this type
+/// existed, was populated, and reached no response body until the `player.insert("hold", …)` in
+/// `observe::get_debug` was added; see that call site).
 /// `null` for a healthy character, including one that is simply standing still.
 ///
 /// This exists because "standing still because nothing asked me to move" and "frozen in rock and
