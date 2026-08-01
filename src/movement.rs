@@ -537,8 +537,9 @@ impl CharacterController {
     ///
     /// #800 shipped this as a controller-only signal reaching a throttled `tracing::info!` and
     /// nothing else, which served a log-reading operator and not the HTTP-driving agent the
-    /// honesty invariant is about. #801 wired it through to `GET /v1/observe` as
-    /// `player.afloat_stall`, on the same six-file path [`Self::hold`] travels:
+    /// honesty invariant is about. #801 wired it through to `GET /v1/observe/debug` as
+    /// `player.afloat_stall`, on a **seven**-file path — six of which [`Self::hold`] also travels,
+    /// and one which #801's round-1 review had to find the hard way:
     ///
     /// 1. `src/app.rs` — the render thread's publisher, which takes BOTH disclosures in one call
     ///    ([`Self::disclosures`]) so neither can be written without the other, plus the
@@ -550,7 +551,13 @@ impl CharacterController {
     ///    `begin_zone_in` clear that stops a departed zone's claim surviving a zone load;
     /// 5. `crates/eqoxide-http/src/lib.rs` — `player.afloat_stall`, a view of its OWN, deliberately
     ///    not folded into `player.hold`;
-    /// 6. `docs/http-api.md`.
+    /// 6. `crates/eqoxide-http/src/observe.rs` — the `player.insert("afloat_stall", …)` in
+    ///    `get_debug`. **This is the hop that actually reaches an agent, and the one #801 shipped
+    ///    for review without.** `PlayerState` is an internal projection; no handler serialises it
+    ///    whole, so a field can be correct in all five files above and still appear in no response
+    ///    body anywhere. It did: the reviewer ran the release build against a live character and
+    ///    found `player` carrying 55 keys, none of them this one;
+    /// 7. `docs/http-api.md`.
     ///
     /// Two constraints carried over from #800 and still hold: an `AfloatStall` is not a
     /// `ControllerHold` — a hold says the body cannot move at all, this says only that *this wish*

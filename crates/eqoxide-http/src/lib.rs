@@ -249,9 +249,14 @@ pub struct PlayerState {
     /// swimmer. Distinct from [`Self::hold`] on purpose: a hold claims the body cannot move at all,
     /// this claims only that the current wish is producing no motion.
     ///
-    /// No `skip_serializing_if`, for the same reason as [`Self::hold`]: the key is ALWAYS present,
-    /// so an agent that greps for it and finds nothing knows it is talking to a client too old to
-    /// report the state, rather than concluding the swimmer is fine.
+    /// No `skip_serializing_if`, for the same reason as [`Self::hold`] — but be precise about what
+    /// that buys, because #801's round-1 review found this comment overclaiming. Dropping
+    /// `skip_serializing_if` guarantees the key survives *serialisation of this struct*. It does not
+    /// put the key in any response body, because nothing serialises this struct: `observe::get_debug`
+    /// builds its `player` object by hand. The always-present promise in `docs/http-api.md` is
+    /// discharged by the `player.insert("afloat_stall", …)` there and by
+    /// `afloat_stall_reaches_the_debug_json_801`, which asserts `contains_key` on bytes returned by
+    /// the real router — not by this attribute and not by any test that serialises `PlayerState`.
     pub afloat_stall: Option<PlayerAfloatStallView>,
 }
 
@@ -609,7 +614,13 @@ pub struct PlayerHoldView {
 }
 
 /// **#776/#801 (agent-honesty): this character is afloat, is being asked to swim somewhere, and is
-/// not getting there.** `player.afloat_stall` on `GET /v1/observe`.
+/// not getting there.** Served as `player.afloat_stall` by `GET /v1/observe/debug`, and by no other
+/// route. Note the direction of that dependency: this type existing and being populated by
+/// [`PlayerState::from_game_state`] does NOT put it in any response body. `PlayerState` is an
+/// internal projection that no handler serialises whole — `observe::get_debug` hand-builds its
+/// `player` object and patches extras in with `player.insert` — so the field reaches an agent only
+/// because of an explicit insert there. #801's round-1 review found it populated here and absent
+/// from every served body, with the docs already claiming otherwise.
 ///
 /// # This is NOT a [`PlayerHoldView`], and the difference is the whole point
 ///
@@ -1224,104 +1235,6 @@ mod player_view_datum_tests {
         let view = PlayerState::from_game_state(&gs);
         assert_eq!(view.pos_up, 73.875,
             "pos_up must report the internal FOOT datum, not foot + WIRE_Z_OFFSET");
-    }
-}
-
-/// #776/#801: the trapped-swimmer disclosure has to survive the LAST hop — the JSON.
-///
-/// Everything upstream of here (the clock, the view, the mirror) is pinned by its own tests. This
-/// module pins the projection an agent actually reads: that a real stall reaches the serialised
-/// body with its anchor and seconds intact, that the absence of one serialises as an explicit
-/// `null` rather than a missing key, and — the part that would otherwise be a silent design
-/// regression — that it is published as a field of its own and NOT folded into `hold`.
-#[cfg(test)]
-mod afloat_stall_view_tests {
-    use super::PlayerState;
-    use eqoxide_core::afloat::{AfloatFrame, AfloatStall, AfloatStallClock, AFLOAT_STALL_SECS};
-
-    /// The only way to obtain one: drive the real clock. `AfloatStall` has no public constructor
-    /// (five fabrication forms are compile errors — see
-    /// `crates/eqoxide-core/tests/afloat_unconstructible.rs`), so this fixture cannot lie about
-    /// what the runtime would produce.
-    fn matured(anchor: [f32; 3]) -> AfloatStall {
-        let mut clock = AfloatStallClock::default();
-        for _ in 0..((AFLOAT_STALL_SECS / 0.05).ceil() as usize + 3) {
-            clock.observe(AfloatFrame::Wished, anchor, 0.05);
-        }
-        clock.stall().expect("fixture must actually reach the disclosure threshold")
-    }
-
-    /// A stall in `GameState` reaches the JSON with both of its facts intact.
-    ///
-    /// **Axes varied:** the anchor on all three components, including a negative `up` (a submerged
-    /// pocket is below the waterline, and #800's live false alarm was a z-axis bug — a fixture that
-    /// pinned `anchor_up` at 0.0 would be repeating exactly that mistake). **Axis not varied:**
-    /// `secs` is whatever the clock produced; the test asserts the published threshold rather than
-    /// a hard-coded duration, so retuning `AFLOAT_STALL_SECS` cannot silently invalidate it.
-    #[test]
-    fn a_real_stall_reaches_the_json_with_its_anchor_and_seconds_801() {
-        let anchor = [-812.5_f32, 43.0, -119.75];
-        let mut gs = eqoxide_core::game_state::GameState::new();
-        gs.player_afloat_stall = Some(matured(anchor));
-
-        let view = PlayerState::from_game_state(&gs);
-        let s = view.afloat_stall.as_ref().expect("a stall in gs must be published, not dropped");
-
-        assert_eq!(s.anchor_east, anchor[0], "anchor_east");
-        assert_eq!(s.anchor_north, anchor[1], "anchor_north");
-        assert_eq!(s.anchor_up, anchor[2],
-            "anchor_up — a submerged pocket is BELOW the waterline; a projection that flattened \
-             this to 0.0 would publish an anchor the agent cannot navigate to");
-        assert!(s.secs >= AFLOAT_STALL_SECS,
-            "secs {} must never be published below the threshold that earned it", s.secs);
-        assert_eq!(s.stall_threshold_secs, AFLOAT_STALL_SECS,
-            "the threshold is published so the agent can calibrate rather than guess");
-
-        // And it survives serde with the same values — the agent reads bytes, not a Rust struct.
-        let json = serde_json::to_value(&view).expect("PlayerState must serialise");
-        assert_eq!(json["afloat_stall"]["anchor_up"], serde_json::json!(anchor[2]));
-        assert!(json["afloat_stall"]["secs"].as_f64().unwrap() >= AFLOAT_STALL_SECS as f64);
-    }
-
-    /// No stall serialises as an explicit `null`, not a missing key.
-    ///
-    /// A missing key forces every reader to distinguish "the field is absent because this client is
-    /// older" from "the field is absent because there is no stall". An explicit `null` is a positive
-    /// answer. MUTATION CHECK: add `#[serde(skip_serializing_if = "Option::is_none")]` to
-    /// `PlayerState::afloat_stall` → RED here.
-    #[test]
-    fn no_stall_publishes_an_explicit_null_key_801() {
-        let gs = eqoxide_core::game_state::GameState::new();
-        let view = PlayerState::from_game_state(&gs);
-        assert!(view.afloat_stall.is_none());
-
-        let json = serde_json::to_value(&view).expect("PlayerState must serialise");
-        let obj = json.as_object().expect("player state is a JSON object");
-        assert!(obj.contains_key("afloat_stall"),
-            "the key must always be present — an absent key is indistinguishable from an old \
-             client, while an explicit null is a real answer");
-        assert!(obj["afloat_stall"].is_null());
-    }
-
-    /// The stall is its OWN field and does not touch `hold`.
-    ///
-    /// #801's second constraint, made a test rather than a comment: a `hold` asserts the body cannot
-    /// move at all and warrants "ask a GM"; an afloat stall asserts only that THIS horizontal wish
-    /// produced no motion, and is routinely escapable by a driven dive. An agent that saw a `hold`
-    /// here would give up on a body it could have freed itself. This pins the two apart in both
-    /// directions.
-    #[test]
-    fn an_afloat_stall_is_not_published_as_a_hold_801() {
-        let mut gs = eqoxide_core::game_state::GameState::new();
-        gs.player_afloat_stall = Some(matured([1.0, 2.0, -30.0]));
-        // Deliberately NO player_hold — the body is not held.
-
-        let view = PlayerState::from_game_state(&gs);
-        assert!(view.afloat_stall.is_some(), "the stall is published…");
-        assert!(view.hold.is_none(),
-            "…and must NOT also raise `hold`. A hold means the body cannot move at all and the \
-             agent should stop trying; an afloat stall is escapable by a driven dive. Collapsing \
-             them would tell an agent to give up on a body it could free itself.");
     }
 }
 

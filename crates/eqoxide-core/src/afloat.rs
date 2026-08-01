@@ -4,8 +4,11 @@
 //!
 //! #800 built this as a private `mod afloat` inside the app crate's `movement.rs`, because that was
 //! the only place that needed it. #801 publishes the signal over HTTP, and the path a controller
-//! observable travels to `GET /v1/observe` runs `movement.rs` → `eqoxide_ipc::ControllerView` →
-//! `GameState` → `eqoxide-http`. `eqoxide-ipc` cannot depend on the app crate (that is a cycle —
+//! observable travels to `GET /v1/observe/debug` runs `movement.rs` → `eqoxide_ipc::ControllerView`
+//! → `GameState` → `eqoxide-http`'s `PlayerState` → `observe::get_debug`'s hand-built `player`
+//! object (that last hop is easy to forget and #801's round-1 review found it missing: the first
+//! six were all correct and the value still reached no response body).
+//! `eqoxide-ipc` cannot depend on the app crate (that is a cycle —
 //! the app crate depends on it), so the published type has to be nameable from below all of them.
 //! `eqoxide-core` is that place; it is where `ControllerHold` already lives, for exactly this
 //! reason.
@@ -25,6 +28,21 @@
 //! `crates/eqoxide-core/tests/afloat_unconstructible.rs`, and each one also lives as a
 //! `compile_fail` doctest on the type it attacks, so the suite fails the day one of them starts
 //! compiling. Measured, not asserted in prose.
+//!
+//! **What `compile_fail` does not give you, since it is easy to assume it does (#801 round-2
+//! review).** It pins that the snippet does not compile — nothing about *why*. It cannot be made to
+//! pin an error code: the reviewer measured that annotating a fence `compile_fail,E0451` and then
+//! introducing a deliberate typo still reported `5 passed` on stable rustc 1.97.1, so the code
+//! suffix is not enforced there and must not be read as a guarantee. Concretely: rename
+//! `AfloatStall`, or move it out of `pub mod afloat`, and every one of these doctests keeps
+//! "passing" — on a path error instead of a privacy error, which is the vacuous-pass failure mode.
+//! What rules that out is the `use` list at the top of
+//! `crates/eqoxide-core/tests/afloat_unconstructible.rs`, which imports each of these items by its
+//! public path in ordinary (non-`compile_fail`) code and therefore goes red if any of them stops
+//! being publicly nameable. That coupling was accidental when written; it is documented at that
+//! `use` now so it is not "cleaned up" by someone inlining the paths. The reviewer's positive
+//! control for the pair — making the fields `pub` turns 3 of the 5 doctests RED — is what
+//! establishes they bind anything at all.
 //!
 //! **Widened, and this is the honest cost.** [`AfloatStallClock`], [`AfloatFrame`] and the two
 //! thresholds were `pub(super)` — reachable only from `movement.rs`. They are `pub` now, because

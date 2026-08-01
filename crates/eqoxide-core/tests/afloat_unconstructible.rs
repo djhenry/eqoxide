@@ -18,9 +18,11 @@
 //!
 //! # Half one: the fabrication forms are compile errors (measured, not reasoned)
 //!
-//! The three forms below live as `compile_fail` doctests on [`AfloatStall`] and on
-//! [`AfloatStallClock`], so `cargo test` fails the suite the day any of them starts compiling. That
-//! is the live gate. The transcript below is a *record of one measured run* — it was produced by
+//! The five forms below live as `compile_fail` doctests on [`AfloatStall`] (forms 1–4) and on
+//! [`AfloatStallClock`] (form 5), so `cargo test` fails the suite the day any of them starts
+//! compiling. That is the live gate — but only in one direction, and read the note on this file's
+//! `use` list before relying on it: `compile_fail` pins that a snippet does not compile, never why,
+//! and its error-code suffix is not enforced on stable. The transcript below is a *record of one measured run* — it was produced by
 //! putting all five forms in a temporary integration test in this same directory and running
 //! `cargo test -p eqoxide-core --locked --test <probe>` under `rustc 1.97.0 (2d8144b78 2026-07-07)`.
 //! Being a comment it can go stale; the doctests cannot, which is why both exist.
@@ -90,6 +92,22 @@
 //! residual by construction rather than by assertion in prose: they drive the clock adversarially
 //! from outside and check that every stall it will ever hand out is honest about its own two fields.
 
+/// **Do not inline these paths at their use sites, and do not trim this list to what the bodies
+/// below happen to need.** It is load-bearing for the `compile_fail` doctests in
+/// `eqoxide_core::afloat`, which are the actual gate on the fabrication forms (#801 round-2 review).
+///
+/// A `compile_fail` doctest passes on *any* compile error, and its error-code suffix is not
+/// enforced on stable — measured: `compile_fail,E0451` plus a deliberate typo still reported
+/// `5 passed` under rustc 1.97.1. So a doctest that names `eqoxide_core::afloat::AfloatStall` keeps
+/// passing after the type is renamed, moved, or made private: it fails on an unresolved path
+/// instead of on privacy, and reports the same green. Every one of those doctests would go vacuous
+/// at once and nothing would say so.
+///
+/// This `use` is what makes that loud. It names each attacked item by exactly the public path the
+/// doctests use, in ordinary code that must compile, so any of them ceasing to be publicly nameable
+/// turns this integration test RED. The positive control for the pair, from the same review:
+/// making [`AfloatStall`]'s fields `pub` turns 3 of the 5 doctests red — which is what establishes
+/// they bind anything at all, rather than passing for a reason nobody checked.
 use eqoxide_core::afloat::{
     AfloatFrame, AfloatStall, AfloatStallClock, AFLOAT_PROGRESS, AFLOAT_STALL_SECS,
 };

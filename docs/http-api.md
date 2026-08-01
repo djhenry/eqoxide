@@ -395,9 +395,9 @@ true of the load, zone-in or idle paths.)
 
 ### `afloat_stall` — this swimmer is being asked to swim and is going nowhere (#776/#801)
 
-`player.afloat_stall` is `null` for every ordinary character, **including every ordinary swimmer**,
-and non-null only while the body is *afloat*, *being wished at horizontally*, and *not getting
-anywhere*.
+`player.afloat_stall`, in the `player` object of **`GET /v1/observe/debug`**, is `null` for every
+ordinary character, **including every ordinary swimmer**, and non-null only while the body is
+*afloat*, *being wished at horizontally*, and *not getting anywhere*.
 
 It exists because a genuinely trapped swimmer had **no observable at all**. A body afloat in water
 never enters the client's depenetration net, so a swimmer sealed in a pocket or pressing at a
@@ -453,9 +453,18 @@ duck-under resolves on the frame it is tried or never). `0.5 u` is ~0.011 s of t
 the nav swim drive uses, so a body genuinely swimming clears it on its first frame. Neither number
 was tuned against measured data, and this document does not claim otherwise.
 
-**The key is always present** (never omitted), so an agent that greps for `afloat_stall` and finds
-nothing knows it is talking to a client too old to report the state, rather than concluding the
-swimmer is fine. It does not latch: the controller recomputes it on every stepped frame, the render
+**The key is always present in `GET /v1/observe/debug`'s `player` object** (never omitted), so an
+agent that greps that response for `afloat_stall` and finds nothing knows it is talking to a client
+too old to report the state, rather than concluding the swimmer is fine. Two things that sentence
+does **not** say, because #801's round-1 review caught it saying them: it is a claim about *that one
+route*, not about the API in general — no other endpoint carries the field, and there is no bare
+`GET /v1/observe` or `/v1/observe/state` route to carry it; and it is a claim about a served response
+body, which is a different and stronger thing than the field existing on an internal struct. It was
+false when first written for exactly that reason: six files of the publication path were correct, the
+Rust type was populated, and no handler ever serialised it, so the key was present in nothing. What
+makes it true is one `player.insert("afloat_stall", …)` in `crates/eqoxide-http/src/observe.rs`'s
+`get_debug`, and one test that reads it back out of a real response through the real router. It does
+not latch: the controller recomputes it on every stepped frame, the render
 thread republishes it on every rendered frame in the same statement that republishes `hold`, the
 frames that render without stepping clear it explicitly, and a zone-in clears the mirrored copy — so
 a stall can never survive into a zone the character has left, which matters more here than for

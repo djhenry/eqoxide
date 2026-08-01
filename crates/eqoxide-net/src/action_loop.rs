@@ -3503,7 +3503,7 @@ mod tests {
     ///
     /// This is the one runtime writer that carries the signal from the render thread's
     /// `ControllerView` into the network `GameState` the HTTP API serialises. Without it the field
-    /// added to `GameState` in #801 would be permanently `None` and `/v1/observe/state` would report
+    /// added to `GameState` in #801 would be permanently `None` and `/v1/observe/debug` would report
     /// "not stalled" about every genuinely trapped swimmer — an observable with no live writer,
     /// which is the #343 `connected: true` shape in the silent direction.
     ///

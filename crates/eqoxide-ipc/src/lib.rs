@@ -180,7 +180,7 @@ impl ControllerView {
     /// Because forgetting one of them is *silent*. Both are level signals: the render thread
     /// republishes them every rendered frame, and the republish IS the clear. A publisher that
     /// updates one and not the other leaves the other holding its previous value, which
-    /// `ActionLoop::stream_position` keeps mirroring and `GET /v1/observe` keeps confidently
+    /// `ActionLoop::stream_position` keeps mirroring and `GET /v1/observe/debug` keeps confidently
     /// answering — the #343 `connected: true` shape, where a well-formed field lies in exactly the
     /// window that matters. Nothing recomputes it and nothing looks wrong.
     ///
@@ -196,6 +196,18 @@ impl ControllerView {
     /// publisher runs, and it does not stop a caller passing a deliberate `None`. It removes
     /// exactly one failure — updating one disclosure while silently leaving the other stale — and
     /// makes writing only one a compile error rather than an omission a reviewer has to notice.
+    ///
+    /// **Say the residual out loud rather than let the paragraph above imply it away (#801 round-2
+    /// review, N1): deleting the whole `v.publish_disclosures(self.controller.disclosures());` call
+    /// in `app.rs`'s stepped arm leaves the workspace fully green** — measured, 54/54 targets, 1774
+    /// passed. Severing only the mirror one layer down IS caught (`stream_position`'s test goes
+    /// red), and severing one field of two is now a compile error, but *removing the call site* is
+    /// caught by nothing in CI. `app.rs`'s frame loop needs a GPU, a window and a live session, so
+    /// no unit test in this workspace can reach that statement, and this repo has six separately
+    /// measured evasions of `include_str!` source pins — a pin here would assert the line is
+    /// *written*, which is not the property at issue. The honest guard for "the publisher actually
+    /// executes" is the live observation on a running client, and it is a check a human runs, not
+    /// one the suite runs. Treat that call site as unguarded.
     ///
     /// ```compile_fail
     /// // The measured mutation, denied. A single-field write no longer type-checks.

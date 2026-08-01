@@ -903,6 +903,12 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     }));
     let player_levitating = player.levitating;
     let player_run_mode = player.run_mode;
+    // #776/#801 — the trapped-swimmer disclosure. Bound here rather than inlined below for
+    // the same reason `levitating`/`run_mode` are: the `json!` literal is at its recursion
+    // limit. Serialised through its own `PlayerAfloatStallView` so the field names, the two
+    // published thresholds and the `detail` string are defined in ONE place (that type), not
+    // re-spelled here where they could drift from it.
+    let player_afloat_stall = player.afloat_stall.clone();
     let mut out = serde_json::json!({
         "player": {
             "name":       player.name,
@@ -1168,6 +1174,24 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // granted — exactly the same epistemic level as `sitting`/`auto_attack` elsewhere in this
         // payload. Attached here (not in the literal above, which is at the recursion limit).
         player.insert("run_mode".into(),               serde_json::json!(player_run_mode));
+        // #776/#801 — AFLOAT STALL. The character is in water, a driver is asking it to swim
+        // horizontally, and it has not moved. Before this the state had NO observable at all: a
+        // floating body never enters the depenetration net, so a swimmer sealed in a pocket read
+        // `on_ground: false`, `in_water: true`, `hold: null` — every field said "swimming normally"
+        // for ever, which is the silent-wrong-answer class this project ranks above crashes.
+        //
+        // ALWAYS PRESENT, `null` when there is no stall (`serde_json::json!(None::<T>)` renders an
+        // explicit null, and `PlayerState::afloat_stall` carries no `skip_serializing_if`). An
+        // omitted key is a lie too — the agent cannot tell "no stall" from "client too old to
+        // know" — which is exactly the `levitating` contract three lines up.
+        //
+        // This insert is the SEVENTH file on the path, and #810's round-1 review is the reason it
+        // exists: the other six were all correct and the value still reached no response body,
+        // because `PlayerState` is an internal projection that no handler serialises whole. A
+        // projection field that never reaches the JSON is the #409 failure mode, and a test that
+        // serialises `PlayerState` directly cannot see it. `afloat_stall_reaches_the_debug_json_801`
+        // goes through this handler for that reason.
+        player.insert("afloat_stall".into(),           serde_json::json!(player_afloat_stall));
         // #612 — OUTBOUND honesty. Everything else in this payload is about what the server told us;
         // these four are about what WE failed to say. Every send error used to be discarded
         // (`let _ = self.socket.try_send(..)`), so a datagram that never left the machine was
@@ -2932,6 +2956,80 @@ mod tests {
             assert_eq!(b["last_ended"]["connecting"]["outcome"], serde_json::json!(tag),
                 "the documented token `{tag}` must be the one actually served: {b}");
         }
+    }
+
+    /// #776/#801 — the trapped-swimmer disclosure must reach a RESPONSE BODY, not just a struct.
+    ///
+    /// **This test exists because #810's round-1 review found the value unreachable.** Six files of
+    /// the publication path were correct — controller, `ControllerView`, `stream_position`,
+    /// `GameState`, `PlayerState`, docs — and `GET /v1/observe/debug` still had no `afloat_stall`
+    /// key, because `PlayerState` is an internal projection that no handler serialises whole:
+    /// `get_debug` hand-builds its `player` object and patches extras in with `player.insert`. The
+    /// three tests originally shipped for this called `serde_json::to_value(&player_state)`
+    /// directly — a body no client ever emits — so all three were green against a dead end.
+    ///
+    /// So this one goes through `debug_json`, which drives the REAL router with a REAL request and
+    /// parses the REAL bytes. The lesson is worth stating in the file rather than the PR: a test
+    /// that constructs the value it asserts on cannot tell you the value is reachable.
+    ///
+    /// **Axes deliberately varied:** stall present vs absent, and the anchor on all three
+    /// components including a negative `up` — #800's live false alarm was a z-axis bug that seven
+    /// tests missed because every one pinned `z = 0.0`, and a fixture flattening `anchor_up` here
+    /// would be repeating it. **Axis NOT varied:** `secs` is whatever the real clock produced; the
+    /// assertion is against the published threshold, not a hard-coded duration.
+    ///
+    /// MUTATION CHECKS (#801 round 2, each run independently): delete the
+    /// `player.insert("afloat_stall".into(), ..)` from `get_debug` → RED at the `contains_key`
+    /// assertion; add `skip_serializing_if` to `PlayerState::afloat_stall` → RED at the null
+    /// assertion.
+    #[tokio::test]
+    async fn afloat_stall_reaches_the_debug_json_801() {
+        use eqoxide_core::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
+
+        // ── Absent: an explicit `null` that IS in the object, never an omitted key. ──────────────
+        let v = debug_json(empty_state()).await;
+        let player = v["player"].as_object().expect("player object");
+        assert!(player.contains_key("afloat_stall"),
+            "the afloat_stall key must be PRESENT in the served body — an agent that greps for it \
+             and finds nothing cannot tell \"no stall\" from \"this client cannot report one\", and \
+             the docs promise the key is always there. Keys served: {:?}",
+            player.keys().collect::<Vec<_>>());
+        assert!(player["afloat_stall"].is_null(),
+            "no stall must serialise as an explicit null, got {}", player["afloat_stall"]);
+
+        // ── Present: a REAL matured stall — `AfloatStall` has no public constructor, so this
+        // fixture cannot lie about what the runtime would produce. ───────────────────────────────
+        let anchor = [-812.5_f32, 43.0, -119.75];
+        let mut clock = AfloatStallClock::default();
+        for _ in 0..((AFLOAT_STALL_SECS / 0.05).ceil() as usize + 3) {
+            clock.observe(AfloatFrame::Wished, anchor, 0.05);
+        }
+        let stall = clock.stall().expect("fixture must actually reach the disclosure threshold");
+
+        let state = empty_state();
+        set_gs(&state, |gs| gs.player_afloat_stall = Some(stall));
+        let v = debug_json(state).await;
+        let a = &v["player"]["afloat_stall"];
+        assert!(a.is_object(), "a stall in the GameState must reach the body, got {a}");
+        assert_eq!(a["anchor_east"],  serde_json::json!(anchor[0]));
+        assert_eq!(a["anchor_north"], serde_json::json!(anchor[1]));
+        assert_eq!(a["anchor_up"],    serde_json::json!(anchor[2]),
+            "a submerged pocket is BELOW the waterline — an anchor flattened to 0.0 would publish \
+             a point the agent cannot navigate to");
+        assert!(a["secs"].as_f64().expect("secs is a number") >= AFLOAT_STALL_SECS as f64,
+            "secs must never be served below the threshold that earned it, got {}", a["secs"]);
+        assert_eq!(a["stall_threshold_secs"], serde_json::json!(AFLOAT_STALL_SECS),
+            "the threshold is published so the agent can calibrate rather than guess");
+        assert!(a["detail"].as_str().expect("detail is a string").contains("dive"),
+            "the detail must name the escape that usually works — an agent told only \"stalled\" \
+             has no reason to try a vertical wish: {}", a["detail"]);
+
+        // ── And it is NOT published as a `hold`. Two different claims (#801). ────────────────────
+        assert!(v["player"]["hold"].is_null(),
+            "an afloat stall must NOT also raise `hold`. A hold means the body cannot move at all \
+             and the agent should stop trying; a stall is escapable by a driven dive. Collapsing \
+             them would tell an agent to give up on a body it could free itself. Got {}",
+            v["player"]["hold"]);
     }
 
     /// #598 finding 1, at the API BOUNDARY — the honesty contract must hold in the SERIALIZED body,

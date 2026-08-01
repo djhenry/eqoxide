@@ -2948,7 +2948,7 @@ pub(crate) mod tests {
     /// The sibling of `..._hold_724` above, and the case for it is *sharper*. A `ControllerHold`
     /// names a predicament; an [`AfloatStall`](crate::afloat::AfloatStall) names an **anchor** — a
     /// specific `[east, north, up]` in the departed zone's coordinate frame. Carried across a
-    /// crossing, `/v1/observe/state` would answer an agent with "you have been unable to swim away
+    /// crossing, `/v1/observe/debug` would answer an agent with "you have been unable to swim away
     /// from (-812.5, 43.0, -119.75) for 7.5 seconds" about a point in a zone the character is no
     /// longer in, and about water that may not exist here. That is not a stale number, it is a
     /// confident falsehood with coordinates attached, and the agent's reasonable response — dive,
