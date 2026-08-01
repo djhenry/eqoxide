@@ -26,8 +26,13 @@
 ///
 /// **The datum discipline: FOOT everywhere except the wire.** Everything eqoxide holds and reports —
 /// `gs.player_z`, the controller, nav, collision, every stored ENTITY z (converted wire→foot on
-/// ingest in `packet_handler`), and every agent-facing field (`/player` `pos_up`, `/observe`,
-/// `/observe/entities`) — is FOOT. The `± WIRE_Z_OFFSET` conversion happens ONLY at the packet edge.
+/// ingest in `packet_handler`), and the agent-facing position readings (`player.pos` on
+/// `GET /v1/observe/debug`, the positions in `GET /v1/observe/entities`) — is FOOT. Those two are
+/// named because they are the position readings this datum rule was written for, not as a claim
+/// that they are the only agent-facing values it covers. (There is no `/player` endpoint and no
+/// `pos_up` response key — `pos_up` is the internal `PlayerState` field the served `pos` array's
+/// third element is built from, #822.) The `± WIRE_Z_OFFSET` conversion happens ONLY at the packet
+/// edge.
 /// One datum end to end means a position the agent READS can be fed straight back into `goto`/coords
 /// with no 3u skew, self reads at the same height as another player on the same plank, and a
 /// goto-by-name goal lands on the floor instead of 3u above it (a goal-z/floor-tier mismatch wedges

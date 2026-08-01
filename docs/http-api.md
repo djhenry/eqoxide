@@ -269,7 +269,7 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `navigating_partial` | Walking a **partial** route: the search was cut short, so this is *not* a route to your goal — it's progress toward a frontier, and it will re-plan from the far end. Usually resolves to `navigating` or `arrived`. | `search_node_cap` |
 | `following` | A `/follow` chase has caught up; holding near the leader, still latched. | — |
 | `arrived` | Reached the goal. | `goal_z_snapped` (see below) or — |
-| `no_path` | **DEFINITIVE: no route exists.** The planner searched to completion. Do not retry the same goal — pick another. | see below |
+| `no_path` | **No route was published for this goal — read `nav_reason` before concluding one cannot exist.** For most reasons it is definitive: the planner searched to completion, so do not retry the same goal, pick another. **Not all of them are.** `planner_dead` means the pathfinding worker died, and on `/move/zone_cross` the `region_data_*` reasons (#815) mean the zone's region map could not be read — neither is a completed search, and both are **"I don't know", not "no"** — the same reading `search_exhausted` carries, but reported under this state rather than that one. The state itself is still terminal — nothing will retire it for you — so the retry decision is `nav_reason`'s to make, not this row's. | see below |
 | `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_node_cap` |
 | `blocked` | A route exists, but the walker **could not follow it** (wedged after 8 recovery attempts). Not a routing failure. | `walker_stalled`, `local_no_way_through`, `fall_would_be_lethal` |
 | `zone_loading` | **This client has no *usable* model of the zone the character is in yet** — its terrain/collision are still loading, their load failed, or the loaded grid still belongs to the zone the character just LEFT (the stale window, #600). No search was run and no route exists to report; the goal is kept and planned for real once the correct zone's assets land. Since #600 the walker refuses through the SAME `zone_assets::usability` predicate the HTTP world endpoints use, so the reason is that predicate's own verdict — read `zone_assets` (below) for the matching detail. | `zone_assets_pending`, `zone_assets_failed`, `zone_assets_idle`, `zone_assets_stale_for_previous_zone`, `player_zone_unknown` |
@@ -313,7 +313,7 @@ off, the character free-floats instead of falling and holds altitude with no inp
 
 | Value | Meaning |
 |-------|---------|
-| `true`  | Levitating. `pos_up` is a height the character will **not** fall from, and the controller applies no gravity. |
+| `true`  | Levitating. `player.pos[2]` — the up component of the served position array `[east, north, up]` — is a height the character will **not** fall from, and the controller applies no gravity. |
 | `false` | A **trustworthy** negative — the client has complete buff information and none of it is levitate. |
 | `null`  | **UNKNOWN.** The client received a buff it could not resolve (its spell table — `spells_us.txt` — is missing or truncated) and no channel positively asserts levitate, so it genuinely cannot say. This is **never** silently reported as `false`. |
 
@@ -605,9 +605,28 @@ re-syncing assets will not help; file it. (This is an argument from enumerating 
 site, not a type-level guarantee — nothing stops a future non-test grid from reaching a reader
 un-attached.)
 
-**Not covered by this:** `POST /v1/move/zone_cross` still reports `zone_line_not_in_map` (documented
-as a map-data *gap*) when the region map failed to load rather than merely lacking the region — the
-same substitution, one caller over, tracked as #815.
+**The same reasons now reach `POST /v1/move/zone_cross` (#815).** That endpoint used to report
+`zone_line_not_in_map` — documented as a map-data *gap* — when the region map had failed to load
+rather than merely lacking the region, which is a claim about the contents of a file the client
+never read. It now publishes the `region_data_*` reason above as its `nav_reason` instead, so the
+two surfaces answer the same question with the same vocabulary. See the `zone_cross` reason table
+under [Navigation state](#navigation-state).
+
+**Now closed on `zone_cross` too (#827).** Until #827, a `zone_cross` reporting
+`zone_line_not_in_map` could not be told apart from a collision slot that held **no grid at all** —
+`zone_cross` asked the zone-asset state for permission and then read the collision slot under a
+*second*, separate lock, and `begin_zone_load` empties that slot **before** it publishes `pending`,
+so a zone change landing between the two reads paired a usable verdict with an emptied slot and the
+lookup returned nothing for want of a grid. #829's reviewer constructed that end state directly and
+got `no_path` / `zone_line_not_in_map` out of it. `zone_cross` now takes the verdict **and** the
+grid from the one `usable_collision` call #821 introduced for `/v1/observe/zone_exits`: that call
+hands back the `Arc<Collision>` the `ready` state owns, so the region lookup cannot be reached
+without the grid the gate just vouched for and there is no longer an optional grid to be absent.
+`zone_line_not_in_map` on `zone_cross` therefore means a region map that was read. (The third case,
+a grid that is present but whose region data failed to load, is what #815 split out to
+`region_data_*`.) Two limits, stated rather than implied: whether a real zone change actually
+interleaves that way was never measured — the fix removes the pairing, so the question is moot
+rather than answered; and this constrains `zone_cross`, not the other readers of the collision slot.
 
 ### Camera override for `/observe/frame` (#422)
 
@@ -757,12 +776,13 @@ is not snapped: it fails as `no_path` / `goal_not_walkable`.)
 | `no_geometry` | No collision mesh loaded yet (still zoning). |
 | `planner_dead` | The pathfinding worker thread has **died**. No route can be planned for the rest of the session — a **client fault**, not an unreachable goal. Movement must be driven manually, or the client restarted. This is reported loudly and terminally rather than leaving `nav_state` stuck at `planning` forever. |
 
-`POST /v1/move/zone_cross` reports two further `no_path` reasons, both specific to zone-line crossing (#267):
+`POST /v1/move/zone_cross` reports further `no_path` reasons, all specific to zone-line crossing (#267):
 
 | Reason | Meaning |
 |--------|---------|
 | `no_zone_line_to_zone` | The server never advertised (`OP_SendZonepoints`) any zone line from here to the requested `zone_id` — it will not appear in `/v1/observe/zone_exits` either. A genuinely invalid request: pick a `zone_id` that's actually one of this zone's exits. |
-| `zone_line_not_in_map` | The requested `zone_id` **is** advertised by the server as a real exit, but the locally loaded zone geometry has no matching WLD zone-line (DRNTP) trigger region for it — a client-side `.wtr` map-data gap, not proof the exit doesn't exist in the real game. Before reporting this, the client tries one fallback (#683): if the map has a zone-line region under some OTHER (unadvertised) index — e.g. an exit baked with index 0 — and this zone advertises no same-zone teleport pad and server zone points are available, it walks there instead and lets the server resolve the destination, so this reason now means no usable zone-line region exists at all (or the fallback is gated: a same-zone pad is advertised, or no server zone points are available). When the fallback **is** taken you do not have to infer it from the message log: `zone_cross_best_effort` on `/v1/observe/debug` says so structurally (#713, [below](#zone-cross-degradations-you-can-detect-713)). It is also omitted from `/v1/observe/zone_exits` (which only lists regions actually found in the loaded map), so "absent from `zone_exits`" does not by itself distinguish this from `no_zone_line_to_zone` — only `nav_reason` does. |
+| `zone_line_not_in_map` | The requested `zone_id` **is** advertised by the server as a real exit, but the zone's region map **loaded** and has no matching WLD zone-line (DRNTP) trigger region for it — a client-side `.wtr` map-data gap, not proof the exit doesn't exist in the real game. Before reporting this, the client tries one fallback (#683): if the map has a zone-line region under some OTHER (unadvertised) index — e.g. an exit baked with index 0 — and this zone advertises no same-zone teleport pad and server zone points are available, it walks there instead and lets the server resolve the destination, so this reason now means no usable zone-line region exists at all (or the fallback is gated: a same-zone pad is advertised, or no server zone points are available). When the fallback **is** taken you do not have to infer it from the message log: `zone_cross_best_effort` on `/v1/observe/debug` says so structurally (#713, [below](#zone-cross-degradations-you-can-detect-713)). It is also omitted from `/v1/observe/zone_exits` (which only lists regions actually found in the loaded map), so "absent from `zone_exits`" does not by itself distinguish this from `no_zone_line_to_zone` — only `nav_reason` does. **"loaded" is now literal (#827):** this reason used to also be what you got when the client held **no collision grid at all**, because the permission check and the grid read came from two separate slots. `zone_cross` now takes both from one `usable_collision` call, so the grid it looks in is the grid the check blessed and there is no gridless path to this reason. Together with #815 (a present grid whose region data failed to load reports `region_data_*` instead, next row), this reason means: a region map was read, and it has no matching zone-line region. |
+| `region_data_missing`, `region_data_unreadable`, `region_data_not_region_data`, `region_data_unsupported_version`, `region_data_truncated` | **The zone's region map (its `.wtr`) did not load, so the client does not know whether a zone line to `zone_id` exists** (#815). This is NOT `zone_line_not_in_map`: that reason is the *map-data gap* answer — "the map was read and the region is not in it" (previous row) — and publishing it for a file the client never read would be a definitive claim about contents it does not have. The cause strings are the same ones `/v1/observe/zone_exits` refuses with — [same table, same meanings](#zone-exits--means-exactly-one-thing-803). **This does not resolve itself by polling**, which is why the state is `no_path` rather than `zone_loading`: it is a missing/unusable asset, not a load in progress, and it applies to *every* exit in this zone, not just the one you asked for. Re-sync the zone's asset pack; `/v1/observe/zone_entrances` (server-advertised, independent of the `.wtr`) still works meanwhile. The sixth cause, `region_data_not_attached`, can reach this field by the same path and carries the same "a client bug, not an asset problem" reading given [above](#zone-exits--means-exactly-one-thing-803) — with the same caveat that no release build is believed to construct such a grid. |
 
 **Distance no longer decides *whether* the client acts (#725).** It still decides how long the
 crossing takes — you are walked to the line, so a line 30 u away takes longer than one 3 u away —

@@ -111,6 +111,53 @@ pub fn entity_model_matrix_heading(
     .to_cols_array_2d()
 }
 
+/// Model matrix for a **static** model, taking the whole placement as one value (#781).
+///
+/// This is `entity_model_matrix_heading` with the three arguments a static placement must not vary
+/// bound here instead of at the call site: `visual_scale = 0.0`, `y_up = true`, and the placement's
+/// own `mesh_scale`/`center_xz`/`y_bottom` read off the `StaticPlacement` rather than re-spelled.
+///
+/// **Why the `visual_scale = 0.0` moved in here.** #768 was a second lift term: the grounded arm
+/// passed `visual_scale = 2 * y_extent * mesh_scale`, and this crate's matrix adds
+/// `visual_scale * 0.5` **on top of** `y_bottom * mesh_scale` (see the `lifted` line above), so the
+/// model's bottom landed a full model height above its stored z. #773 fixed it by making the four
+/// `pass.rs` static sites pass a literal `0.0` — which left `visual_scale` as an `f32` argument at
+/// those sites, and re-creating the over-lift there was **measured green** against every behavioural
+/// test in this crate (only a source-text pin caught it). With this wrapper there is no
+/// `visual_scale` parameter at a static call site to write into, so that spelling is a *compile
+/// error* rather than a pinned one.
+///
+/// **What that does NOT mean**, stated because overstating exactly this boundary is what two of
+/// #773's commit messages had to retract: it is not a guarantee. A call site can still call
+/// `entity_model_matrix_heading` directly — a different function name — and what bounds that is one
+/// source-text test over one file:
+/// `tests/floating_placement.rs::every_static_placement_in_pass_rs_is_written_exactly_as_reviewed`
+/// requires each `entity_model_matrix_heading` argument list it finds in `pass.rs` to be one of
+/// four reviewed spellings — six calls, two spellings shared by two sites each — and pins the count
+/// at six. #781 round 1 asserted something weaker — that no such argument list names `.y_bottom` or
+/// `.center_xz` — and #828's reviewer measured the same over-lift written as
+/// `model.bounds.y_extent` / `.x_center` / `.z_center` **fully green** against it (262 passed /
+/// 0 failed / 12 ignored), so it is a whitelist now.
+///
+/// Round 2 wrote "every … argument list" and "Two limits survive that change" here. Both were
+/// false. The test's own "What this bounds, and what it does not" note is the enumerated,
+/// individually measured list; it is longer than two and is not claimed complete. The ones that
+/// matter at THIS function: it reads `pass.rs` and no other file (`src/bin/render_model.rs:1268` is
+/// a whole `entity_model_matrix_heading` call outside its reach); it sees only calls spelled
+/// literally `entity_model_matrix_heading(`, so a space before the paren and an `as`-renamed import
+/// are asserted away separately while a local bound to the function and called is still invisible
+/// (measured green); it bounds argument TEXT, not what the names in it denote — this function can
+/// still be handed a `StaticPlacement` built from wrong bounds, or one shadowing the reviewed `p`,
+/// and `StaticPlacement` is a plain struct with public fields that any caller can construct; and it
+/// bounds arguments only, not the matrix that comes back, which a site can still add a lift to
+/// (measured green).
+pub fn entity_model_matrix_static(
+    pos: [f32; 3], heading_deg: f32, p: &crate::models::StaticPlacement, correction: glam::Mat4,
+) -> [[f32; 4]; 4] {
+    entity_model_matrix_heading(pos, heading_deg, 0.0, p.mesh_scale, p.center_xz, true, p.y_bottom,
+                                correction)
+}
+
 /// Directional (sun) light view-projection for shadow mapping (#518).
 ///
 /// Builds an orthographic light camera that looks at `center` (typically the player position, in
