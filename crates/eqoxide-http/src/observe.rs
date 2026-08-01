@@ -65,18 +65,29 @@ fn zone_assets_not_ready(s: &HttpState) -> Option<Response> {
     let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
     let player_zone = s.player().zone;
     let verdict = eqoxide_nav::zone_assets::usability(&st, &player_zone)?;
-    Some((
+    Some(zone_assets_refusal(verdict, &st, &player_zone))
+}
+
+/// The body of that refusal, split out so a caller that obtained its verdict from
+/// [`eqoxide_nav::zone_assets::usable_collision`] (which hands back the grid as well) serves the
+/// byte-identical 503 rather than a second, drifting spelling of it (#821 review round 2, B4).
+fn zone_assets_refusal(
+    verdict: eqoxide_nav::zone_assets::NotUsable,
+    st: &eqoxide_nav::zone_assets::ZoneAssetState,
+    player_zone: &str,
+) -> Response {
+    (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({
             "error":        "zone_assets_not_ready",
             "reason":       verdict.as_str(),
-            "zone_assets":  zone_assets_json_of(&st, &player_zone),
+            "zone_assets":  zone_assets_json_of(st, player_zone),
             "message":      "the loaded zone assets cannot describe the zone this character is in, \
                              so this endpoint cannot answer without inventing a world. Poll GET \
                              /v1/observe/debug until `zone_assets.state` is \"ready\" (or handle \
                              \"failed\", which will never become ready).",
         })),
-    ).into_response())
+    ).into_response()
 }
 
 /// **503 for a question that can only be answered from the zone's `.wtr` region map when that map
@@ -88,11 +99,20 @@ fn zone_assets_not_ready(s: &HttpState) -> Option<Response> {
 /// is indistinguishable from the true, common reading "this zone has no zone lines" — and since
 /// exits are the only way out of a zone, an agent reads it as *sealed in*, off a success response.
 ///
-/// Deliberately NOT folded into `NotUsable`/`zone_assets_not_ready`: that verdict is consumed by the
-/// nav walker's `drive_walk` gate and by `ActionLoop::drain_zone_cross` as well as by every
-/// `/observe/*` endpoint, so a new variant there would stop routing and stop rendering frames in any
-/// zone with a missing `.wtr` — far past what a region-map failure actually invalidates. The refusal
-/// belongs to the questions whose answer really does come out of that file.
+/// Deliberately NOT folded into `NotUsable`/`zone_assets_not_ready`. **`usability()` has FOUR
+/// non-test consumers** (#821 review round 2, B2 — an earlier revision of this comment said three
+/// and omitted the fourth, which made this argument *understate* the blast radius). By call site:
+///   * `observe.rs:38` / `:67` / `:1554` — every `/observe/*` endpoint, plus `/debug`'s zone block;
+///   * `move_api.rs` — `POST /v1/move/goto`, which turns the verdict into its `zone_assets_pending`
+///     note (**not** an `/observe/*` route, which is why it was missed);
+///   * `walker.rs` — the nav path-walker's `drive_walk` gate; and
+///   * `action_loop.rs` — `ActionLoop::drain_zone_cross`.
+///
+/// So a new `NotUsable` variant would stop routing, stop `/v1/move/goto`, stop zone-crossing AND
+/// stop rendering frames in any zone with a missing `.wtr` — far past what a region-map failure
+/// actually invalidates. The refusal belongs to the questions whose answer really does come out of
+/// that file. (Confirmed live in the PR's forced-failure run: with the `.wtr` broken and the zone
+/// otherwise `ready`, `/frame`, `/zone_entrances` and `/debug` all still answered `200`.)
 ///
 /// `reason` is [`eqoxide_core::region_map::RegionDataAbsent::as_str`] — distinct per cause, so an
 /// agent (or an operator reading its log) can tell "the asset pack never delivered this file" from
@@ -1952,10 +1972,19 @@ async fn get_zone_entrances(State(s): State<HttpState>) -> Response {
 /// (#803).** It never means "the file that would list them did not load" — that is a
 /// **503 `zone_region_data_unavailable`** with a machine-readable `reason`
 /// (`region_data_missing` / `_unreadable` / `_not_region_data` / `_unsupported_version` /
-/// `_truncated` / `_not_attached`). Before #803 both produced `[]` with 200 OK, and because exits
+/// `_truncated`). Before #803 both produced `[]` with 200 OK, and because exits
 /// are the only way out of a zone, an agent read a failed read as "sealed in". Unlike the
 /// `zone_assets_not_ready` 503 below, this one does **not** clear by polling — the asset is missing
 /// or unusable, not loading.
+///
+/// **What makes that "never" true is the shape of the code, not this sentence** (#821 review round
+/// 2, B4). This handler used to take permission from the zone-assets verdict and then read the grid
+/// out of the separate `shared_collision` slot behind an `if let Some(col)` with **no `else`** — so
+/// a `None` there returned `200 []` having consulted no region map at all, and nothing coupled the
+/// two slots. It now gets verdict AND grid from one call
+/// ([`eqoxide_nav::zone_assets::usable_collision`]), whose `Ok` arm carries the `Arc<Collision>` the
+/// `Ready` state owns. There is no longer a branch that can reach the response builder without a
+/// grid, so every `[]` this endpoint emits has been through `Collision::zone_line_indices()`.
 ///
 /// `gated` (#713 item 3) is `true` when this exit's destination is unadvertised **and** this ZONE's
 /// #679/#683 unresolved-cross gate refuses server-resolved crossings. It is a **zone-level** verdict:
@@ -1973,7 +2002,16 @@ async fn get_zone_entrances(State(s): State<HttpState>) -> Response {
 /// has no exits at all". That is a falsehood an agent cannot detect; an explicit refusal is the
 /// honest answer. Poll `/v1/observe/debug` → `zone_assets` until it reads `ready`.
 async fn get_zone_exits(State(s): State<HttpState>) -> Response {
-    if let Some(refusal) = zone_assets_not_ready(&s) { return refusal; }
+    // The #579 gate AND the grid it vouches for, from ONE read of ONE slot (#821 review round 2,
+    // B4). Deliberately not `zone_assets_not_ready(&s)` followed by `s.shared_collision`: those are
+    // two slots, and the fall-through when the second was `None` answered `[]` — see this
+    // function's doc comment.
+    let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
+    let player_zone = s.player().zone;
+    let col = match eqoxide_nav::zone_assets::usable_collision(&st, &player_zone) {
+        Ok(col) => col.clone(),
+        Err(verdict) => return zone_assets_refusal(verdict, &st, &player_zone),
+    };
     // #646: bare array body (backward-compatible shape) — freshness rides `SNAPSHOT_AGE_HEADER`
     // instead of a JSON key. See that const's doc for the clock this reuses.
     let snapshot_age_ms = s.health().snapshot_age_ms;
@@ -2020,30 +2058,28 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Response {
     let unresolved_gated = eqoxide_core::zone_cross::classify_unresolved_cross(
         &zone_points, s.game_state.load().world.zone_id,
     ) == eqoxide_core::zone_cross::UnresolvedCross::Ignore;
+    // #803: `[]` here must only ever mean "this zone's region map loaded and has no zone-line
+    // regions". When the `.wtr` did NOT load, the exits are UNKNOWN, and publishing the empty
+    // list would be a confident falsehood the agent cannot detect — and the falsehood is
+    // specifically "there is no way out of this zone". Refuse, and name the cause.
+    let indices = match col.zone_line_indices() {
+        Ok(ix) => ix,
+        Err(absent) => return region_data_unavailable(&absent),
+    };
     let mut exits = Vec::new();
-    if let Some(col) = s.shared_collision.read().unwrap().as_ref() {
-        // #803: `[]` here must only ever mean "this zone's region map loaded and has no zone-line
-        // regions". When the `.wtr` did NOT load, the exits are UNKNOWN, and publishing the empty
-        // list would be a confident falsehood the agent cannot detect — and the falsehood is
-        // specifically "there is no way out of this zone". Refuse, and name the cause.
-        let indices = match col.zone_line_indices() {
-            Ok(ix) => ix,
-            Err(absent) => return region_data_unavailable(&absent),
-        };
-        for index in indices {
-            let location = col
-                .find_zone_line_near(Some(index), pos)
-                .map(|(_, p)| serde_json::json!([p[0], p[1], p[2]]));
-            // An exit with a known destination is crossed by `perform_cross`, which never consults
-            // the unresolved gate — so the gate can only ever close a `zone_id: null` exit.
-            let gated = dest_of.get(&index).is_none() && unresolved_gated;
-            exits.push(serde_json::json!({
-                "index": index,
-                "zone_id": dest_of.get(&index),
-                "location": location,
-                "gated": gated,
-            }));
-        }
+    for index in indices {
+        let location = col
+            .find_zone_line_near(Some(index), pos)
+            .map(|(_, p)| serde_json::json!([p[0], p[1], p[2]]));
+        // An exit with a known destination is crossed by `perform_cross`, which never consults
+        // the unresolved gate — so the gate can only ever close a `zone_id: null` exit.
+        let gated = dest_of.get(&index).is_none() && unresolved_gated;
+        exits.push(serde_json::json!({
+            "index": index,
+            "zone_id": dest_of.get(&index),
+            "location": location,
+            "gated": gated,
+        }));
     }
     with_snapshot_age(Json(serde_json::json!(exits)).into_response(), snapshot_age_ms)
 }
@@ -4372,6 +4408,16 @@ mod tests {
         // `test_ready()`'s `"testfixture"` so this loop exercises the header on a genuinely-served
         // 200, the same way `zone_asset_gate_tests` does.
         set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
+        // …and give that grid a region map that LOADED and simply has no zone-line regions, so
+        // `/zone_exits` serves an honest `[]`/200 (#821 review round 2, B4). `empty_state()`'s
+        // `test_ready()` grid has no region data attached at all, which since B4 is a
+        // `503 zone_region_data_unavailable` — correctly, because the endpoint now reads the grid
+        // the `Ready` state OWNS instead of falling through an unset `shared_collision` slot and
+        // answering `[]` off nothing. This test is about the freshness header on a 200, so it needs
+        // a state that genuinely earns one.
+        *eqoxide_nav::zone_assets::lock_state(&state.zone_assets) =
+            eqoxide_nav::zone_assets::ZoneAssetState::test_ready_with_water(Some(
+                std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(-10.0))));
 
         for uri in ["/entities", "/doors", "/zone_entrances", "/zone_points", "/zone_exits"] {
             let resp = get(state.clone(), uri).await;
@@ -4917,10 +4963,19 @@ mod zone_asset_gate_tests {
     const FIXTURE_ZONE: &str = "testfixture";
 
     /// A state whose assets are loaded AND belong to the zone the character is standing in.
+    ///
+    /// The region map is `Ok` (a loaded map with no zone-line regions) rather than
+    /// `test_ready()`'s never-attached grid, because a `ready` zone in production has ALWAYS had
+    /// `set_region_data` called on it — with an `Ok` or with the loader's `Err`, never with nothing
+    /// (#821 review round 2, B4). Before that round `/zone_exits` read the *other* slot,
+    /// `shared_collision`, which `empty_state()` leaves `None`, so this fixture's grid was never
+    /// consulted at all and the endpoint answered `[]` off a fall-through. It is consulted now.
     fn ready_state() -> HttpState {
         let s = empty_state();
         set_gs(&s, |gs| gs.world.zone_name = FIXTURE_ZONE.to_string());
-        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) = ZoneAssetState::test_ready();
+        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) =
+            ZoneAssetState::test_ready_with_water(Some(std::sync::Arc::new(
+                eqoxide_core::region_map::RegionMap::flat_below(-10.0))));
         s
     }
 
@@ -5461,15 +5516,58 @@ mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
         }
     }
 
+    /// **#821 review round 2, B4: the `shared_collision` slot is no longer an input, so an unset one
+    /// cannot produce `[]`.**
+    ///
+    /// The handler used to take permission from the zone-assets verdict and then read the grid from
+    /// the separate `shared_collision` slot behind `if let Some(col)` with no `else`. A `None` there
+    /// returned `200 []` — "this zone has no way out" — having consulted no region map at all. That
+    /// path was live in-tree and green: the HTTP testkit builds exactly that combination.
+    ///
+    /// Both directions are asserted from ONE fixture, so this cannot pass by the endpoint having
+    /// stopped reading exits: with the slot empty and the region map holding an exit, the exit is
+    /// still listed; with the slot empty and the region map failed, it is still a 503.
+    #[tokio::test]
+    async fn an_unset_shared_collision_slot_can_no_longer_produce_an_empty_exit_list() {
+        for (label, data, want) in [
+            ("a loaded map WITH an exit",
+             Ok(std::sync::Arc::new(RegionMap::zone_line_box(-4.0, 4.0, -4.0, 4.0, -2.0, 2.0, 7))),
+             StatusCode::OK),
+            ("a map that did not load",
+             Err(RegionLoadError::Missing),
+             StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let s = state_with_region_data(data);
+            // The exact fixture shape the old fall-through fired on: `Ready` for this zone, and
+            // NOTHING in the shared slot.
+            *s.shared_collision.write().unwrap() = None;
+            let (code, j) = get(s, "/zone_exits").await;
+            assert_eq!(code, want,
+                "{label}: with the shared slot empty the endpoint must still answer out of the \
+                 grid the `Ready` state OWNS, never out of a fall-through. Got {code}: {j}");
+            assert_ne!(j, serde_json::json!([]),
+                "{label}: `[]` off an unread region map is the #803 falsehood with a new cause");
+        }
+    }
+
     /// The refusal is deliberately NOT the `zone_assets_not_ready` verdict: that one is also read by
     /// the nav walker's drive gate and the net thread's zone-cross drain, and a missing `.wtr` does
     /// not invalidate the terrain those consume. Pinned so a later "simplification" that folds the
     /// two together has to change this line and say why.
+    ///
+    /// **Asserted positively** (#821 review round 2, minor M1). This used to be only
+    /// `assert_ne!(j["error"], "zone_assets_not_ready")`, which is vacuously true whenever the body
+    /// is an ARRAY — `j["error"]` is then `Value::Null` — so the endpoint restored to `200 []` (the
+    /// exact regression this test is named after) passed it. Measured, not reasoned: the reviewer
+    /// ran that mutation and this test survived it.
     #[tokio::test]
     async fn the_refusal_is_distinct_from_the_zone_assets_gate() {
-        let (_, j) = get(state_with_region_data(Err(RegionLoadError::Missing)), "/zone_exits").await;
-        assert_ne!(j["error"], "zone_assets_not_ready",
-            "region data is a separate readiness question from the zone's terrain assets: {j}");
+        let (code, j) = get(state_with_region_data(Err(RegionLoadError::Missing)), "/zone_exits").await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "body: {j}");
+        assert_eq!(j["error"], "zone_region_data_unavailable",
+            "region data is a separate readiness question from the zone's terrain assets, and the \
+             refusal has to SAY so — an array body would make a bare `assert_ne!` pass: {j}");
+        assert_ne!(j["error"], "zone_assets_not_ready", "body: {j}");
     }
 }
 
