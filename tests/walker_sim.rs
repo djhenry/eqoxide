@@ -856,10 +856,15 @@ use eqoxide_ipc::MoveIntent;
     ///
     /// * `unaccounted` — "a zone left the loop body without reaching `add` or `skip`". A corpus
     ///   WIRING bug, never an asset problem.
-    /// * `unmeasured` — "the zone was walked and its `.wtr` did not load". **This is #762's
-    ///   motivating exhibit** (a build host holding 2 of 497 `.wtr` files scoring `0`/`0` on a
-    ///   water-inclusive run), so it is the bucket #805 is actually about, and leaving it terminal
-    ///   left the exhibit uncovered on exactly the hanging run.
+    /// * `unmeasured` — "the zone's `.glb` and grid loaded, so the water check RAN, and the `.wtr`
+    ///   did not load". The zone is then abandoned UNWALKED (`walker_sim.rs`'s `install` arm prints
+    ///   a row of dashes and `continue`s), so do not read this bucket as "walked but unscored" — an
+    ///   earlier revision of this comment and of the panic below said "the zone was walked", and a
+    ///   real two-zone run (`ZONES=crushbone,felwithea` with `crushbone.wtr` moved aside) printed
+    ///   `crushbone  -  -  -  -  -  unmeasured unmeasured` and finished in 0.53s, i.e. zero
+    ///   journeys. **This is #762's motivating exhibit** (a build host holding 2 of 497 `.wtr`
+    ///   files scoring `0`/`0` on a water-inclusive run), so it is the bucket #805 is actually
+    ///   about, and leaving it terminal left the exhibit uncovered on exactly the hanging run.
     /// * `skipped` — "the zone was dropped before the water check ran at all: no `.glb`, no grid, no
     ///   routable pairs". **Deliberately NOT checked here, and the reason is DIAGNOSTICS, not
     ///   decidability.** All three buckets are decidable the instant a zone closes and all three are
@@ -912,7 +917,8 @@ use eqoxide_ipc::MoveIntent;
                     that the terminal assert would only have reported at the END of a run that may \
                     never get there (#763). unaccounted (left the loop body without reaching add or \
                     skip — a corpus WIRING bug, not an asset problem): {orphans:?}; unmeasured (the \
-                    zone was walked and its .wtr did not load — #762's exhibit): {unmeasured:?}. \
+                    water check ran and the .wtr did not load, so the zone was abandoned unwalked \
+                    with no number — #762's exhibit): {unmeasured:?}. \
                     The water columns from this run are not a score. Only the FIRST offending \
                     rollup is named and the zones after {zone:?} were never opened, so treat this \
                     as a partial picture. `skipped` is not checked here — see this fn's doc.");
@@ -1005,7 +1011,7 @@ use eqoxide_ipc::MoveIntent;
     /// uncovered on precisely the non-terminating run #805 is about. This drives the real
     /// `ZoneWater::load` failure path — no fixture constructor, no `.wtr` on disk.
     #[test]
-    #[should_panic(expected = "unmeasured (the zone was walked and its .wtr did not load")]
+    #[should_panic(expected = "unmeasured (the water check ran and the .wtr did not load")]
     fn zone_accounting_refuses_an_unmeasured_zone_before_the_corpus_ends() {
         let mut wr = WaterRollup::new();
         let mut r423 = WaterRollup::new();
