@@ -605,9 +605,19 @@ re-syncing assets will not help; file it. (This is an argument from enumerating 
 site, not a type-level guarantee — nothing stops a future non-test grid from reaching a reader
 un-attached.)
 
-**Not covered by this:** `POST /v1/move/zone_cross` still reports `zone_line_not_in_map` (documented
-as a map-data *gap*) when the region map failed to load rather than merely lacking the region — the
-same substitution, one caller over, tracked as #815.
+**The same reasons now reach `POST /v1/move/zone_cross` (#815).** That endpoint used to report
+`zone_line_not_in_map` — documented as a map-data *gap* — when the region map had failed to load
+rather than merely lacking the region, which is a claim about the contents of a file the client
+never read. It now publishes the `region_data_*` reason above as its `nav_reason` instead, so the
+two surfaces answer the same question with the same vocabulary. See the `zone_cross` reason table
+under [Navigation state](#navigation-state).
+
+**Still not covered, on `zone_cross` only:** that endpoint does not distinguish a region map that
+failed to load from a collision grid that is missing altogether. Unlike `/v1/observe/zone_exits`
+(which takes verdict and grid from the single `usable_collision` call #821 introduced), it reads the
+zone-asset verdict and the collision slot as two separate locks, so a zone change landing between
+them can pair a usable verdict with an emptied slot and still report `zone_line_not_in_map`.
+Reasoned from the write order, **not measured**; tracked as #827.
 
 ### Camera override for `/observe/frame` (#422)
 
@@ -757,12 +767,13 @@ is not snapped: it fails as `no_path` / `goal_not_walkable`.)
 | `no_geometry` | No collision mesh loaded yet (still zoning). |
 | `planner_dead` | The pathfinding worker thread has **died**. No route can be planned for the rest of the session — a **client fault**, not an unreachable goal. Movement must be driven manually, or the client restarted. This is reported loudly and terminally rather than leaving `nav_state` stuck at `planning` forever. |
 
-`POST /v1/move/zone_cross` reports two further `no_path` reasons, both specific to zone-line crossing (#267):
+`POST /v1/move/zone_cross` reports further `no_path` reasons, all specific to zone-line crossing (#267):
 
 | Reason | Meaning |
 |--------|---------|
 | `no_zone_line_to_zone` | The server never advertised (`OP_SendZonepoints`) any zone line from here to the requested `zone_id` — it will not appear in `/v1/observe/zone_exits` either. A genuinely invalid request: pick a `zone_id` that's actually one of this zone's exits. |
-| `zone_line_not_in_map` | The requested `zone_id` **is** advertised by the server as a real exit, but the locally loaded zone geometry has no matching WLD zone-line (DRNTP) trigger region for it — a client-side `.wtr` map-data gap, not proof the exit doesn't exist in the real game. Before reporting this, the client tries one fallback (#683): if the map has a zone-line region under some OTHER (unadvertised) index — e.g. an exit baked with index 0 — and this zone advertises no same-zone teleport pad and server zone points are available, it walks there instead and lets the server resolve the destination, so this reason now means no usable zone-line region exists at all (or the fallback is gated: a same-zone pad is advertised, or no server zone points are available). When the fallback **is** taken you do not have to infer it from the message log: `zone_cross_best_effort` on `/v1/observe/debug` says so structurally (#713, [below](#zone-cross-degradations-you-can-detect-713)). It is also omitted from `/v1/observe/zone_exits` (which only lists regions actually found in the loaded map), so "absent from `zone_exits`" does not by itself distinguish this from `no_zone_line_to_zone` — only `nav_reason` does. |
+| `zone_line_not_in_map` | The requested `zone_id` **is** advertised by the server as a real exit, but the zone's region map **loaded** and has no matching WLD zone-line (DRNTP) trigger region for it — a client-side `.wtr` map-data gap, not proof the exit doesn't exist in the real game. Before reporting this, the client tries one fallback (#683): if the map has a zone-line region under some OTHER (unadvertised) index — e.g. an exit baked with index 0 — and this zone advertises no same-zone teleport pad and server zone points are available, it walks there instead and lets the server resolve the destination, so this reason now means no usable zone-line region exists at all (or the fallback is gated: a same-zone pad is advertised, or no server zone points are available). When the fallback **is** taken you do not have to infer it from the message log: `zone_cross_best_effort` on `/v1/observe/debug` says so structurally (#713, [below](#zone-cross-degradations-you-can-detect-713)). It is also omitted from `/v1/observe/zone_exits` (which only lists regions actually found in the loaded map), so "absent from `zone_exits`" does not by itself distinguish this from `no_zone_line_to_zone` — only `nav_reason` does. |
+| `region_data_missing`, `region_data_unreadable`, `region_data_not_region_data`, `region_data_unsupported_version`, `region_data_truncated` | **The zone's region map (its `.wtr`) did not load, so the client does not know whether a zone line to `zone_id` exists** (#815). This is NOT `zone_line_not_in_map`: that reason says the map was read and the region is not in it, and saying it here would be a definitive claim about a file the client never read. The cause strings are the same ones `/v1/observe/zone_exits` refuses with — [same table, same meanings](#zone-exits--means-exactly-one-thing-803). **This does not resolve itself by polling**, which is why the state is `no_path` rather than `zone_loading`: it is a missing/unusable asset, not a load in progress, and it applies to *every* exit in this zone, not just the one you asked for. Re-sync the zone's asset pack; `/v1/observe/zone_entrances` (server-advertised, independent of the `.wtr`) still works meanwhile. The sixth cause, `region_data_not_attached`, can reach this field by the same path and carries the same "a client bug, not an asset problem" reading given [above](#zone-exits--means-exactly-one-thing-803) — with the same caveat that no release build is believed to construct such a grid. |
 
 **Distance no longer decides *whether* the client acts (#725).** It still decides how long the
 crossing takes — you are walked to the line, so a line 30 u away takes longer than one 3 u away —
