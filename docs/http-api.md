@@ -619,9 +619,11 @@ third case, a grid that is present but whose region data failed to load: that no
 `region_data_*`.) `/v1/observe/zone_exits` does not have this gap (it takes verdict and grid from
 the single `usable_collision` call #821 introduced);
 `zone_cross` reads the zone-asset verdict and the collision slot under two separate locks, so a zone
-change landing between them can pair a usable verdict with an emptied slot. That pairing has since
-been **constructed and observed** returning `no_path` / `zone_line_not_in_map` — it is no longer an
-inference from the write order. Tracked as #827.
+change landing between them can pair a usable verdict with an emptied slot. The **end state** has
+been constructed directly — a usable verdict over an emptied slot does return `no_path` /
+`zone_line_not_in_map` — so no type or invariant rules that pairing out. Whether a real zone change
+actually interleaves that way is a separate question, still **reasoned from the write order, not
+measured**. Tracked as #827.
 
 ### Camera override for `/observe/frame` (#422)
 
