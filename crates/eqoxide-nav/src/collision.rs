@@ -7243,6 +7243,10 @@ mod tests {
             .unwrap_or_else(|| vec!["halas".into(), "blackburrow".into(), "qcat".into()]);
         let body = crate::traversability::PLAYER_BODY;
 
+        // #762: a zone whose `.wtr` did not load is not "0 wet columns" — it is UNMEASURED, and this
+        // whole table is a water measurement. Collect the holes and fail the run at the end rather
+        // than printing a skip line into a log nobody reads back.
+        let mut unmeasured: Vec<String> = Vec::new();
         println!("\n{:<12} {:>10} {:>8} {:>12} {:>10} {:>11}",
             "zone", "wet cols", "spans", "est bytes", "build ms", "unbounded↓");
         for zone in &zones {
@@ -7250,9 +7254,13 @@ mod tests {
             let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
             let mut col = Collision::build(&za, 32.0);
             if col.cols == 0 { println!("{zone:<12}  (no grid — skipped)"); continue; }
-            col.set_water(eqoxide_core::region_map::RegionMap::load(
-                &std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
-            if col.water.is_none() { println!("{zone:<12}  (no .wtr — skipped)"); continue; }
+            let zw = crate::water_grid::ZoneWater::load(
+                &std::path::Path::new(&dir).join("maps/water"), zone);
+            if let Err(e) = zw.install(&mut col) {
+                println!("{zone:<12} {:>10} — {e}", crate::water_grid::UNMEASURED);
+                unmeasured.push(zone.clone());
+                continue;
+            }
 
             // BUILD COST: median of 5 timed builds (a warm-up build precedes them). The grid is
             // deterministic, so all builds are identical — we time the same work the net thread would.
@@ -7269,6 +7277,12 @@ mod tests {
                 grid.wet_column_count(), grid.span_count(), grid.estimated_bytes(),
                 median_ms, grid.unbounded_below_count());
         }
+        // #762: this table is only a budget measurement for the zones it actually measured. A run
+        // with a hole in it must not read as a completed measurement, however clean the rows look.
+        assert!(unmeasured.is_empty(),
+            "{} zone(s) had no loadable .wtr — this run measured NOTHING for them and is not a \
+             water budget result: {:?}. Bake or fetch their region files and re-run.",
+            unmeasured.len(), unmeasured);
     }
 
     #[test]
@@ -7434,7 +7448,10 @@ mod tests {
             .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
         let za = ZoneAssets::from_glb(&std::path::Path::new(&dir).join("qcat.glb")).unwrap();
         let mut col = Collision::build(&za, 32.0);
-        col.set_water(eqoxide_core::region_map::RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), "qcat").map(std::sync::Arc::new));
+        // #762: this probe reports water-adjacent column shape; without the region map it would
+        // print confident dry answers, so refuse to run rather than measure nothing.
+        crate::water_grid::ZoneWater::load(&std::path::Path::new(&dir).join("maps/water"), "qcat")
+            .install(&mut col).expect("qcat .wtr must load — a dry qcat probe measures nothing (#762)");
         let (x, y) = (4.0f32, 809.8);
         println!("qcat column at ({x},{y}):  z_min={:.1} z_max={:.1}", col.z_min, col.z_max);
         // Enumerate surfaces facing-blind, top→down, via ground_below stepping.
@@ -7635,8 +7652,11 @@ mod tests {
         let zone = std::env::var("PROBE_ZONE").unwrap_or_else(|_| "qeynos".into());
         let za = ZoneAssets::from_glb(&std::path::Path::new(&dir).join(format!("{zone}.glb"))).unwrap();
         let mut col = Collision::build(&za, 32.0);
-        col.set_water(eqoxide_core::region_map::RegionMap::load(
-            &std::path::Path::new(&dir).join("maps/water"), &zone).map(std::sync::Arc::new));
+        // #762: `water loaded: false` used to be a printed aside; the probe then went on to report
+        // in_water=false for every column as if it had checked. Refuse instead.
+        crate::water_grid::ZoneWater::load(&std::path::Path::new(&dir).join("maps/water"), &zone)
+            .install(&mut col)
+            .unwrap_or_else(|e| panic!("{zone}: {e} — every water answer below would be fabricated (#762)"));
         println!("zone={zone} water loaded: {}", col.water.is_some());
         println!("grid: origin={:?} cols={} rows={} cell={} z=[{:.1},{:.1}] extent e=[{:.0},{:.0}] n=[{:.0},{:.0}]",
             col.origin, col.cols, col.rows, col.cell_size, col.z_min, col.z_max,
@@ -7716,8 +7736,8 @@ mod tests {
             .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
         let za = ZoneAssets::from_glb(&std::path::Path::new(&dir).join("qeynos.glb")).unwrap();
         let mut col = Collision::build(&za, 32.0);
-        col.set_water(eqoxide_core::region_map::RegionMap::load(
-            &std::path::Path::new(&dir).join("maps/water"), "qeynos").map(std::sync::Arc::new));
+        crate::water_grid::ZoneWater::load(&std::path::Path::new(&dir).join("maps/water"), "qeynos")
+            .install(&mut col).expect("qeynos .wtr must load — the canal drop is a water feature (#762)");
         // columns across the drop
         for (x, y) in [(-582.0f32, 133.0f32), (-575.7, 144.4), (-570.0, 140.0), (-566.7, 136.4), (-566.0, 130.0), (-560.0, 130.0)] {
             println!("col ({x:6.1},{y:6.1}) floors={:?} surfaces={:?}",
@@ -7751,13 +7771,21 @@ mod tests {
         let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
         let unit = |r: u32| r as f32 / u32::MAX as f32;
         let (mut g_pairs, mut g_routed, mut g_steep) = (0usize, 0usize, 0usize);
+        let mut unmeasured: Vec<String> = Vec::new();
         for zone in &zones {
             let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
             let Ok(za) = ZoneAssets::from_glb(&p) else { println!("AB {zone} (no glb)"); continue };
             let mut col = Collision::build(&za, 32.0);
             if col.cols == 0 { continue; }
-            col.set_water(eqoxide_core::region_map::RegionMap::load(
-                &std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
+            // #762: water is this corpus' PAIR FILTER (`in_water(s) || in_water(g) → skip`). Without
+            // the region map the filter silently passes everything, so wet pairs get scored as dry
+            // land and the AB numbers are about a different corpus than the one they claim.
+            if let Err(e) = crate::water_grid::ZoneWater::load(
+                &std::path::Path::new(&dir).join("maps/water"), zone).install(&mut col) {
+                println!("AB {zone} {} — {e}", crate::water_grid::UNMEASURED);
+                unmeasured.push(zone.clone());
+                continue;
+            }
             let (mut z_pairs, mut tries) = (0usize, 0usize);
             while z_pairs < pairs_per_zone && tries < pairs_per_zone * 70 + 500 {
                 tries += 1;
@@ -7791,6 +7819,10 @@ mod tests {
         }
         println!("AB_TOTAL pairs={g_pairs} routed={g_routed} steep_drop_routes={g_steep}");
         assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR");
+        assert!(unmeasured.is_empty(),
+            "#762: {} zone(s) were dropped because their .wtr did not load — the AB_TOTAL above \
+             covers a smaller corpus than the one named, so it is not comparable to a run that had \
+             them: {:?}", unmeasured.len(), unmeasured);
     }
 
     /// A vertical wall segment at constant `east`, spanning north `[n0,n1]` and height `[h0,h1]`.
@@ -7887,8 +7919,8 @@ mod tests {
             .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
         let za = ZoneAssets::from_glb(&std::path::Path::new(&dir).join("qeynos.glb")).unwrap();
         let mut col = Collision::build(&za, 32.0);
-        col.set_water(eqoxide_core::region_map::RegionMap::load(
-            &std::path::Path::new(&dir).join("maps/water"), "qeynos").map(std::sync::Arc::new));
+        crate::water_grid::ZoneWater::load(&std::path::Path::new(&dir).join("maps/water"), "qeynos")
+            .install(&mut col).expect("qeynos .wtr must load — this pin is about a canal lip (#762)");
         let r = eqoxide_core::physics::PLAYER_RADIUS;
         // From the lip top just above the covered aqueduct, to the tier below it.
         let route = col.find_path([-574.0, 140.0, 0.0], [-566.0, 140.0, -14.0], r, &[], false)
@@ -8197,7 +8229,9 @@ mod tests {
         // Attach the zone's water map like production does (app.rs) — the earlier run of
         // this diagnostic skipped it and mis-reported the moat as having no water volume.
         let wtr_dir = std::path::Path::new(&p).parent().unwrap().join("maps/water");
-        col.set_water(eqoxide_core::region_map::RegionMap::load(&wtr_dir, "qeynos2").map(std::sync::Arc::new));
+        crate::water_grid::ZoneWater::load(&wtr_dir, "qeynos2").install(&mut col)
+            .expect("qeynos2 .wtr must load — an earlier run of this diagnostic skipped it and \
+                     mis-reported the moat as having no water volume, which is exactly #762");
         eprintln!("collision: from_collision_mesh={} grid {}x{} cell={} origin={:?}",
             col.from_collision_mesh, col.cols, col.rows, col.cell_size, col.origin);
 

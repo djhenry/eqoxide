@@ -144,28 +144,44 @@ fn a_fitting_skin_has_no_static_reason() {
 
 #[test]
 fn record_skin_cap_downgrade_only_inserts_for_exceeds_cap() {
-    let mut map: BTreeMap<String, usize> = BTreeMap::new();
+    let mut map: BTreeMap<(String, u8), usize> = BTreeMap::new();
 
-    record_skin_cap_downgrade(&mut map, "race_ok", StaticReason::NoSkin);
+    record_skin_cap_downgrade(&mut map, "race_ok", 0, StaticReason::NoSkin);
     assert!(map.is_empty(), "NoSkin must not be recorded as a downgrade");
 
-    record_skin_cap_downgrade(&mut map, "race_empty", StaticReason::EmptySkin);
+    record_skin_cap_downgrade(&mut map, "race_empty", 0, StaticReason::EmptySkin);
     assert!(map.is_empty(), "EmptySkin must not be recorded as a downgrade");
 
-    record_skin_cap_downgrade(&mut map, "race_pcfroglok", StaticReason::ExceedsCap { joint_count: 129 });
-    assert_eq!(map.get("race_pcfroglok"), Some(&129),
+    record_skin_cap_downgrade(&mut map, "race_pcfroglok", 0, StaticReason::ExceedsCap { joint_count: 129 });
+    assert_eq!(map.get(&("race_pcfroglok".to_string(), 0)), Some(&129),
         "an ExceedsCap reason must be recorded under the model's own label with its joint count");
     assert_eq!(map.len(), 1);
+}
+
+/// eqoxide#798: the key is `(label, gender)`, not `label`. `ensure_character_model` loads a
+/// DIFFERENT FILE per gender (`<label>_f.glb` for gender 1, falling back to `<label>.glb`), and the
+/// two files have independent joint counts. Keyed by label alone, whichever gender loaded second
+/// silently overwrote the first — so a report could name one joint count while a second, differently
+/// sized rig was also downgraded and went unmentioned, and the reader could not tell which file the
+/// surviving number belonged to. Both must survive, each with its own count.
+#[test]
+fn the_two_genders_of_one_label_are_recorded_separately() {
+    let mut map: BTreeMap<(String, u8), usize> = BTreeMap::new();
+    record_skin_cap_downgrade(&mut map, "race_hum", 0, StaticReason::ExceedsCap { joint_count: 140 });
+    record_skin_cap_downgrade(&mut map, "race_hum", 1, StaticReason::ExceedsCap { joint_count: 190 });
+    assert_eq!(map.len(), 2, "male and female rigs of one label must not collide");
+    assert_eq!(map.get(&("race_hum".to_string(), 0)), Some(&140));
+    assert_eq!(map.get(&("race_hum".to_string(), 1)), Some(&190));
 }
 
 /// A later re-classification of the same model updates its recorded joint count rather than
 /// leaving a stale one behind (relevant if a model is ever reloaded after a rebake).
 #[test]
 fn re_recording_the_same_label_updates_the_joint_count() {
-    let mut map: BTreeMap<String, usize> = BTreeMap::new();
-    record_skin_cap_downgrade(&mut map, "race_x", StaticReason::ExceedsCap { joint_count: 130 });
-    record_skin_cap_downgrade(&mut map, "race_x", StaticReason::ExceedsCap { joint_count: 200 });
-    assert_eq!(map.get("race_x"), Some(&200));
+    let mut map: BTreeMap<(String, u8), usize> = BTreeMap::new();
+    record_skin_cap_downgrade(&mut map, "race_x", 0, StaticReason::ExceedsCap { joint_count: 130 });
+    record_skin_cap_downgrade(&mut map, "race_x", 0, StaticReason::ExceedsCap { joint_count: 200 });
+    assert_eq!(map.get(&("race_x".to_string(), 0)), Some(&200));
     assert_eq!(map.len(), 1);
 }
 
@@ -174,10 +190,11 @@ fn re_recording_the_same_label_updates_the_joint_count() {
 /// re-derives `NoSkin`/`EmptySkin` for an already-downgraded label can't accidentally un-report it.
 #[test]
 fn a_non_downgrade_call_never_removes_an_existing_entry() {
-    let mut map: BTreeMap<String, usize> = BTreeMap::new();
-    record_skin_cap_downgrade(&mut map, "race_x", StaticReason::ExceedsCap { joint_count: 130 });
-    record_skin_cap_downgrade(&mut map, "race_x", StaticReason::NoSkin);
-    assert_eq!(map.get("race_x"), Some(&130), "a non-downgrade call must not clear a prior record");
+    let mut map: BTreeMap<(String, u8), usize> = BTreeMap::new();
+    record_skin_cap_downgrade(&mut map, "race_x", 0, StaticReason::ExceedsCap { joint_count: 130 });
+    record_skin_cap_downgrade(&mut map, "race_x", 0, StaticReason::NoSkin);
+    assert_eq!(map.get(&("race_x".to_string(), 0)), Some(&130),
+        "a non-downgrade call must not clear a prior record");
 }
 
 // ── Measured, not inferred: does any shipped model actually exceed the cap today? ───────────────

@@ -1500,7 +1500,8 @@ mod tests {
         let asset = ModelAsset::load(&path).expect("load failed");
         let skin = asset.skin.expect("creature.glb must have a skin");
         assert!(skin.joint_count > 0, "expected joints");
-        assert!(skin.joint_count <= 128, "too many joints for uniform buffer");
+        assert!(skin.joint_count <= crate::renderer::JOINT_CAP,
+            "too many joints for uniform buffer");
         assert!(!skin.clips.is_empty(), "expected animation clips");
         assert!(skin.clip_for_action("walking").is_some(), "no walking clip found");
     }
@@ -1517,7 +1518,8 @@ mod tests {
         assert!(asset.skinned_node_scale > 0.0 && asset.skinned_node_scale.is_finite(),
             "node_scale should be positive+finite, got {}", asset.skinned_node_scale);
         let skin = asset.skin.expect("humanoid must have a skin");
-        assert!(skin.joint_count <= 128, "joint count {} exceeds shader limit", skin.joint_count);
+        assert!(skin.joint_count <= crate::renderer::JOINT_CAP,
+            "joint count {} exceeds shader limit", skin.joint_count);
         let idx = skin.clip_for_action("walking")
             .expect("no walk clip found; clip names may not contain 'walk'");
         let clip = &skin.clips[idx];
