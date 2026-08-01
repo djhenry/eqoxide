@@ -3140,21 +3140,67 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// case was 22 files / 12.8% with every control green. A floor 13% below the true value is a
     /// tolerance band, not a reach control, so there is no longer a floor: the index IS the corpus,
     /// and the filesystem walk is checked against it for equality below.
-    fn git_tracked_rs_787(root: &std::path::Path) -> Vec<String> {
+    ///
+    /// Returns `None` when the tree is not a git checkout — **which is a real environment here, not a
+    /// hypothetical**: this workspace's tests are compiled and run on a remote builder that receives
+    /// an rsync'd copy of the worktree with no `.git`, and the first version of this helper turned
+    /// that into a hard failure of the whole suite. A missing index is not evidence of a second
+    /// worker, so it must not be reported as one. The caller falls back to the git-free per-member
+    /// reach control and **says out loud in its failure text which control was in force**; see
+    /// [`workspace_members_787`].
+    fn git_tracked_rs_787(root: &std::path::Path) -> Option<Vec<String>> {
         let out = std::process::Command::new("git")
             .arg("-C").arg(root)
             .args(["ls-files", "-z", "*.rs"])
             .output()
-            .expect("#787 guard: `git ls-files` must run — the git index is this guard's corpus, and \
-                     a guard that cannot enumerate its corpus must fail, not pass");
-        assert!(out.status.success(),
-            "#787 guard: `git ls-files` failed ({:?}) — corpus unknown, so this guard cannot make \
-             any claim about the tree", out.status);
-        String::from_utf8_lossy(&out.stdout)
+            .ok()?;
+        if !out.status.success() {
+            return None; // not a git checkout (the remote builder), or git is absent
+        }
+        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
             .split('\0')
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
-            .collect()
+            .collect();
+        // An index that exists but lists nothing is NOT the no-git case — it is a broken corpus, and
+        // silently accepting it would be the tolerance band all over again.
+        assert!(!files.is_empty(),
+            "#787 guard reach: `git ls-files '*.rs'` succeeded but listed nothing — the corpus is \
+             empty, so a pass here would assert nothing at all");
+        Some(files)
+    }
+
+    /// The workspace's member crate directories, read out of the root `Cargo.toml`.
+    ///
+    /// This is the corpus check that survives where git does not. The defect round-1 review measured
+    /// was a whole crate directory vanishing from the walk under a tolerance floor; a member list read
+    /// from a file that must exist in *any* copy of this tree catches exactly that, with no index and
+    /// no hard-coded count to drift. It is strictly weaker than the index equality check — it cannot
+    /// see a single missing FILE, only a missing member — and the failure text below says so rather
+    /// than letting a builder-only run look as strong as a developer one.
+    fn workspace_members_787(root: &std::path::Path) -> Vec<String> {
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
+            .expect("#787 guard reach: the workspace manifest must be readable — it is the corpus \
+                     definition when there is no git index");
+        let mut members = Vec::new();
+        let mut in_members = false;
+        for line in manifest.lines() {
+            let t = line.trim();
+            if t.starts_with("members") && t.contains('[') { in_members = true; }
+            if in_members {
+                for piece in t.split(['[', ']', ',']) {
+                    let p = piece.trim().trim_matches('"');
+                    if !p.is_empty() && p.contains('/') && !p.starts_with('#') {
+                        members.push(p.trim_end_matches('/').to_string());
+                    }
+                }
+                if t.contains(']') { break; }
+            }
+        }
+        assert!(!members.is_empty(),
+            "#787 guard reach: parsed zero workspace members out of the root `Cargo.toml` — the \
+             corpus definition is unreadable, so this guard cannot claim to have covered the tree");
+        members
     }
 
     /// `text` with every comment blanked to spaces, newlines preserved so line numbers still map.
@@ -3326,6 +3372,21 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// EQUAL to it rather than merely large. Untracked `.rs` files are scanned too (the corpus is the
     /// union), so a stray scratch file is a false RED — the safe direction, disclosed here rather
     /// than left to be discovered.
+    ///
+    /// **The reach control is not the same strength everywhere, and this guard says which one ran.**
+    /// The index equality check needs a git checkout. The remote builder that compiles and runs this
+    /// workspace receives an rsync'd copy with no `.git`, and the first version of this fix turned
+    /// that into a hard failure of the entire suite — a missing index reported as if it were evidence
+    /// about workers, which is the same class of dishonesty #787 is about. So:
+    ///
+    ///   * git present (any developer or agent worktree) — index equality, per FILE;
+    ///   * git absent (the builder) — every workspace member read from the root `Cargo.toml` must
+    ///     contribute at least one walked file, per MEMBER. This still catches the failure that was
+    ///     actually measured, because that failure was a whole crate directory dropping out of the
+    ///     walk; it cannot catch one missing file.
+    ///
+    /// The per-member assert prints `git index available: false` when it fires, so a builder-only run
+    /// is never mistaken for the stronger check having passed.
     #[test]
     fn exactly_one_production_fine_worker_is_built_in_the_tree_787() {
         let root = repo_root_787();
@@ -3337,11 +3398,8 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
         // The corpus is the GIT INDEX unioned with a filesystem walk. Neither alone is right: the
         // index cannot see an untracked file, and a hand-rolled walk can silently skip a subtree —
         // which is precisely what round-1 review measured against this guard's first draft.
-        let tracked: std::collections::BTreeSet<String> =
-            git_tracked_rs_787(&root).into_iter().collect();
-        assert!(!tracked.is_empty(),
-            "#787 guard reach: `git ls-files '*.rs'` returned nothing — the corpus is empty, so a \
-             pass here would assert nothing at all");
+        let tracked: Option<std::collections::BTreeSet<String>> =
+            git_tracked_rs_787(&root).map(|v| v.into_iter().collect());
 
         let mut walked_paths = Vec::new();
         rs_files_787(&root, &mut walked_paths);
@@ -3349,21 +3407,44 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
             .map(|p| p.strip_prefix(&root).unwrap_or(p).to_string_lossy().replace('\\', "/"))
             .collect();
 
-        // REACH CONTROL 1 — EQUALITY, not a tolerance. Every tracked `.rs` file must have been
-        // reached by the walk. The old form was `files.len() >= 150`, and review measured a 20-file
-        // crate (11.6% of the tree, worst case 22 / 12.8%) vanishing under that band with every other
-        // control green and a planted production site inside it invisible. A floor 13% below the true
-        // value is not a reach control.
-        let unwalked: Vec<&String> = tracked.difference(&walked).collect();
-        assert!(unwalked.is_empty(),
-            "#787 guard reach: the filesystem walk missed {} tracked file(s) the git index lists — \
-             it skipped a subtree, so any 'exactly one' finding covers less of the tree than it \
-             claims. Walked {} of {} tracked:\n  {:?}",
-            unwalked.len(), walked.len(), tracked.len(), unwalked);
+        // REACH CONTROL 1 — EQUALITY against the git index, not a tolerance. Every tracked `.rs` file
+        // must have been reached by the walk. The old form was `files.len() >= 150`, and review
+        // measured a 20-file crate (11.6% of the tree, worst case 22 / 12.8%) vanishing under that
+        // band with every other control green and a planted production site inside it invisible. A
+        // floor 13% below the true value is not a reach control.
+        //
+        // This control is UNAVAILABLE where there is no git checkout — the remote builder runs the
+        // suite from an rsync'd copy. Control 1b below is what runs there, and it is weaker.
+        if let Some(tracked) = tracked.as_ref() {
+            let unwalked: Vec<&String> = tracked.difference(&walked).collect();
+            assert!(unwalked.is_empty(),
+                "#787 guard reach: the filesystem walk missed {} tracked file(s) the git index lists \
+                 — it skipped a subtree, so any 'exactly one' finding covers less of the tree than \
+                 it claims. Walked {} of {} tracked:\n  {:?}",
+                unwalked.len(), walked.len(), tracked.len(), unwalked);
+        }
 
-        // Scan the UNION. Untracked strays are included deliberately: an unmarked construction in one
-        // is a false RED, which is the safe direction and is disclosed in this test's rustdoc.
-        let files: Vec<String> = tracked.union(&walked).cloned().collect(); // BTreeSet → sorted
+        // REACH CONTROL 1b — git-free, and the only reach control in force on the remote builder.
+        // Every workspace member must contribute at least one walked `.rs` file. It cannot see a
+        // single missing file the way control 1 can; it CAN see the failure that was actually
+        // measured (a whole crate directory dropping out of the walk), and it needs no index.
+        for member in workspace_members_787(&root) {
+            let prefix = format!("{member}/");
+            let n = walked.iter().filter(|f| f.starts_with(&prefix)).count();
+            assert!(n > 0,
+                "#787 guard reach: workspace member `{member}` contributed ZERO files to the walk — \
+                 a whole crate is dark, so 'exactly one production construction' is a claim about \
+                 less of the tree than it sounds like. git index available: {}. Walked {} file(s).",
+                tracked.is_some(), walked.len());
+        }
+
+        // Scan the UNION where the index is available. Untracked strays are included deliberately: an
+        // unmarked construction in one is a false RED, which is the safe direction and is disclosed
+        // in this test's rustdoc.
+        let files: Vec<String> = match tracked.as_ref() {
+            Some(t) => t.union(&walked).cloned().collect(), // BTreeSet → sorted
+            None => walked.iter().cloned().collect(),
+        };
 
         // REACH CONTROL 2 — named anchors. Redundant against control 1 for the walk, but it is what
         // catches "this guard is running against the wrong tree entirely" (a re-layout, a vendored
