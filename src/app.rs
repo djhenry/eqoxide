@@ -2500,6 +2500,40 @@ fn winit_to_egui_key(code: KeyCode) -> Option<egui::Key> {
 ///
 /// An empty `scene_zone` (no zone yet, or a transient reset) never triggers a load: there is no
 /// `<empty>.glb` to fetch, and loading it would only blow away real terrain for a fallback plane.
+///
+/// **The `!=` below is an EXACT, case-SENSITIVE comparison, while `zone_assets::usability` — the
+/// function that decides whether the loaded grid may be used to answer about the world — compares
+/// the same two zone names with `eq_ignore_ascii_case`. That asymmetry is deliberate, not an
+/// oversight (#826).**
+///
+/// The safety rule the pair has to satisfy is one-directional: *the reload trigger must be at least
+/// as eager as the bless test.* If it is, then "no reload is pending" implies "the names match by
+/// the bless test too", so a blessed grid is always the zone the character is in. Exact comparison
+/// is the most eager comparison there is, so it satisfies that rule **for every non-empty
+/// `scene_zone`** — and the cost of the extra eagerness is bounded: a case-only difference can only
+/// cause a *spurious* reload — `Pending`, then an honest 503 — never a stale-but-blessed grid
+/// (#821 review round 2).
+///
+/// The empty `scene_zone` case is carried by a different mechanism, not by this comparison: the
+/// `is_empty()` short-circuit means an empty `scene_zone` against a loaded `current_zone` starts no
+/// reload at all. `usability` is what stays honest there — it reads `player_zone`, not `scene_zone`,
+/// and refuses an empty one outright with `PlayerZoneUnknown` (#837 review, N1).
+///
+/// A case-only divergence between the two sides also cannot arise from the current data flow at
+/// all: `scene.zone` and the `player_zone` handed to `usability` are both copies of the single
+/// `gs.world.zone_name`, and `current_zone` is itself a copy of `scene.zone`. That makes the
+/// eagerness a margin against a scenario one source already excludes — cheap insurance, which is
+/// why keeping it costs nothing (#837 review, attack 5).
+///
+/// So do NOT "fix" the inconsistency by making this comparison case-insensitive as well. That does
+/// not tighten anything; it drops the pair to exact parity and makes the safety argument depend on
+/// the extra assumption that two zone shortnames differing only in ASCII case are always the same
+/// zone. Today they are, which is why this is a margin and not a live bug — but the margin is free
+/// and the assumption is not enforced anywhere. More seriously, the same edit taken one step
+/// further — any comparison here that is *more lenient* than `usability`'s — silently breaks the
+/// rule: a real zone change would fail to start a reload while `usability` went on blessing the
+/// previous zone's collision grid, which is precisely the stale-ready lie `NotUsable::
+/// StaleForPreviousZone` exists to report.
 fn zone_needs_reload(scene_zone: &str, current_zone: &str) -> bool {
     !scene_zone.is_empty() && scene_zone != current_zone
 }

@@ -314,7 +314,12 @@ impl Walker {
         // #766 review B9: a FRESH fine worker starts alive, so the row it will be published on must
         // say so. `local_planner_dead` is latched for the life of a worker (see its field doc), and
         // the row outlives any one `Walker` — it is a shared `Arc` the HTTP surface also holds. Today
-        // exactly one `Walker` is built per process, so this clear is a no-op in production; it is
+        // exactly one `Walker` is built per process — watched, since #787, by
+        // `tests::exactly_one_production_fine_worker_is_built_in_the_tree_787`, which fails and names
+        // the four "session-scoped" sentences when a second construction SITE is written, and which
+        // stays green if this one site is simply called twice (the relogin shape — measured; see its
+        // rustdoc) — so this clear is a
+        // no-op in production; it is
         // here so that the flag's lifetime is tied to the WORKER's, structurally, at the one place
         // that spawns one. Without it, a second `Walker` over the same row — the shape an in-process
         // relogin would create — would inherit `true` and report a planner it had just replaced as
@@ -1875,7 +1880,7 @@ mod tests {
         let intent: eqoxide_ipc::NavIntent = Default::default();
         let view: crate::diagnostics::NavDebugView = Default::default();
         let za = zone_assets_for(&collision);
-        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone(), za);
+        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone(), za); // #787-NOT-PRODUCTION
         (w, nav, intent, view)
     }
 
@@ -1890,7 +1895,7 @@ mod tests {
         let world: eqoxide_ipc::WorldSlots = Default::default();
         let intent: eqoxide_ipc::NavIntent = Default::default();
         let view: crate::diagnostics::NavDebugView = Default::default();
-        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone(), zone_assets);
+        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone(), zone_assets); // #787-NOT-PRODUCTION
         (w, nav, intent, view)
     }
 
@@ -2139,6 +2144,9 @@ mod tests {
             // at this test for the B10 hedge on the uncommitted draft. Caught by `steering`'s scan,
             // not by me — the citation was added and the guard was not.
             a_dead_fine_planner_stays_visible_after_the_goal_is_retired_766,
+            // #787: cited by `NOT_PRODUCTION`'s rustdoc, which points at the guard that decides what
+            // the marker means. Caught by `steering`'s scan when the citation was written.
+            exactly_one_production_fine_worker_is_built_in_the_tree_787,
         ];
     }
 
@@ -2190,7 +2198,7 @@ mod tests {
         let view: crate::diagnostics::NavDebugView = Default::default();
         let col = Arc::new(std::sync::RwLock::new(Some(Arc::new(pad_scene_leaves(two_leaves)))));
         let za = zone_assets_for(&col); // pad tests don't drive `drive_walk`; a consistent handle regardless
-        let w = Walker::new(nav, world.clone(), col, intent, view, za);
+        let w = Walker::new(nav, world.clone(), col, intent, view, za); // #787-NOT-PRODUCTION
         *world.zone_points.lock().unwrap() = vec![eqoxide_core::game_state::ZonePoint {
             iterator:  PAD_INDEX as u32,
             server_x:  dest[0], server_y: dest[1], server_z: dest[2],
@@ -3045,13 +3053,724 @@ mod tests {
         let view: crate::diagnostics::NavDebugView = Default::default();
         let collision = open_plane(400.0);
         let za = zone_assets_for(&collision);
-        let _w = Walker::new(nav.clone(), world, collision, intent, view, za);
+        let _w = Walker::new(nav.clone(), world, collision, intent, view, za); // #787-NOT-PRODUCTION
 
         assert!(!nav.nav_state.lock().unwrap().local_planner_dead,
             "#766 B9: `Walker::new` has just spawned a NEW `LocalPlanner`, which is alive. Leaving \
              the previous worker's latch standing would publish `nav_local_planner_dead: true` for a \
              thread that is running fine, and it would never clear — the client asserting a \
              permanent fault it had itself just repaired");
+    }
+
+    /// The literal token a fine-worker construction site must carry to declare itself **not a
+    /// production fine worker** — see [`exactly_one_production_fine_worker_is_built_in_the_tree_787`],
+    /// which treats every unmarked, non-prose site as production. Grep it to enumerate the opt-outs.
+    const NOT_PRODUCTION: &str = "#787-NOT-PRODUCTION";
+
+    /// The message the #787 guard fails with. Its whole job: tell whoever tripped it *which four
+    /// sentences have just become false*, so the decay is not silent.
+    fn four_sentences(what: &str) -> String {
+        format!(
+"{what}
+
+`NavStatus::local_planner_dead` is LATCHED and scoped to the fine WORKER. The agent-facing name for
+it — `nav_local_planner_dead`, documented as SESSION-scoped — is accurate only because worker span
+and process span coincide, and they coincide only while exactly one fine steering worker is built per
+client process. A second production fine worker makes the session-scoped name WRONG, and makes these
+four sentences false. Revisit all four before you land this:
+
+  1. crates/eqoxide-ipc/src/lib.rs, `NavStatus::local_planner_dead` field doc —
+     \"…exactly one fine worker exists per process and 'latched forever' and 'latched for this
+      worker' coincide.\"
+  2. crates/eqoxide-ipc/src/lib.rs, same field doc —
+     \"…which is why the agent-facing docs call the field session-scoped.\"
+  3. crates/eqoxide-http/src/observe.rs, the `nav_local_planner_dead` publication comment —
+     \"…it reads as session-scoped from outside only because exactly one fine worker is built per
+      process.\"
+  4. docs/http-api.md — the section headed (backticks included, so this is grep-able verbatim):
+     ### `nav_local_planner_dead` — fine-planner liveness, session-scoped
+     \"…exactly one fine worker is built per client process, so from out here the two are the same
+      span.\"
+
+Weaker dependents to re-read while you are there: the \"this clear is a no-op in production\" comment
+in `Walker::new`, and `a_new_walker_does_not_inherit_a_previous_workers_death_766` below (which
+constructs a second `Walker` deliberately and therefore can never be the thing that catches this).
+
+If the new site is genuinely NOT a production worker (a test, a bench, a fixture), append a trailing
+`// {NOT_PRODUCTION}` comment to its line and this guard will accept it. NOTE: nothing checks WHERE a
+marker may appear, so a marker on a production line disarms this guard for that site silently. It is
+an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
+    }
+
+    /// Repo root, from this crate's manifest dir. Anchored below, so a workspace re-layout fails the
+    /// guard loudly instead of quietly scanning an empty tree.
+    fn repo_root_787() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+    }
+
+    /// Every `.rs` file under `root`, recursively.
+    ///
+    /// `target/` and every DOT-directory are skipped. `.claude/worktrees/` in particular holds other
+    /// agents' complete checkouts of this same tree; walking into one would count their construction
+    /// sites as this working tree's and fail the guard for reasons that have nothing to do with the
+    /// code under test.
+    fn rs_files_787(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(dir) = std::fs::read_dir(root) else { return };
+        for entry in dir {
+            let p = entry.expect("readable dir entry").path();
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            if p.is_dir() {
+                if name == "target" || name.starts_with('.') {
+                    continue;
+                }
+                rs_files_787(&p, out);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// The tree's TRACKED `.rs` files, straight out of the git index.
+    ///
+    /// The corpus is taken from the index rather than measured against a tolerance because round-1
+    /// review measured the tolerance failing: with `crates/eqoxide-http/` skipped the walk returned
+    /// 152 files, which cleared the old `>= 150` floor with all five named anchors still present,
+    /// leaving 20 files (11.6% of the tree) dark and a planted production site inside them invisible
+    /// — the #778 failure reproduced inside this guard. Four crates fit under that band; the worst
+    /// case was 22 files / 12.8% with every control green. A floor 13% below the true value is a
+    /// tolerance band, not a reach control, so there is no longer a floor: the index IS the corpus,
+    /// and the filesystem walk is checked against it for equality below.
+    ///
+    /// Returns `None` when the tree is not a git checkout — **which is a real environment here, not a
+    /// hypothetical**: this workspace's tests are compiled and run on a remote builder that receives
+    /// an rsync'd copy of the worktree with no `.git`, and the first version of this helper turned
+    /// that into a hard failure of the whole suite. A missing index is not evidence of a second
+    /// worker, so it must not be reported as one. The caller falls back to the git-free per-member
+    /// reach control and **says out loud in its failure text which control was in force**; see
+    /// [`workspace_members_787`].
+    fn git_tracked_rs_787(root: &std::path::Path) -> Option<Vec<String>> {
+        let out = std::process::Command::new("git")
+            .arg("-C").arg(root)
+            .args(["ls-files", "-z", "*.rs"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None; // not a git checkout (the remote builder), or git is absent
+        }
+        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        // An index that exists but lists nothing is NOT the no-git case — it is a broken corpus, and
+        // silently accepting it would be the tolerance band all over again.
+        assert!(!files.is_empty(),
+            "#787 guard reach: `git ls-files '*.rs'` succeeded but listed nothing — the corpus is \
+             empty, so a pass here would assert nothing at all");
+        Some(files)
+    }
+
+    /// The workspace's member crate directories, read out of the root `Cargo.toml`.
+    ///
+    /// This is the corpus check that survives where git does not. The defect round-1 review measured
+    /// was a whole crate directory vanishing from the walk under a tolerance floor; a member list read
+    /// from a file that must exist in *any* copy of this tree catches exactly that, with no index and
+    /// no hard-coded count to drift. It is strictly weaker than the index equality check — it cannot
+    /// see a single missing FILE, only a missing member — and the failure text below says so rather
+    /// than letting a builder-only run look as strong as a developer one.
+    /// It has now been wrong twice in opposite directions, and both were measured:
+    ///
+    ///   * `p.contains('/')` dropped `tools`, a member with no slash in its path — 12 of 13, round-2
+    ///     review;
+    ///   * arming on `buf.ends_with("members")` armed on **`default-members`** as well, so adding
+    ///     `default-members = ["tools"]` to the manifest collapsed the check to a single member while
+    ///     the guard reported success. Round-3 review measured 29 `.rs` files going dark that way,
+    ///     with an unmarked production construction planted among them, and the guard GREEN.
+    ///
+    /// The key is therefore ANCHORED (a line whose own key is exactly `members`), the manifest has its
+    /// comments STRIPPED first (a `#` comment containing a quoted string was swept in as a fourteenth
+    /// member and turned an intact tree red — the opposite failure, same root: reasoning about raw
+    /// text while claiming a property of effective text), and — the part that actually makes this a
+    /// control rather than a number nobody checks — the result is ASSERTED against the directories
+    /// that contain a `Cargo.toml`. A count that is printed and never compared is not a control.
+    fn workspace_members_787(root: &std::path::Path) -> Vec<String> {
+        let raw = std::fs::read_to_string(root.join("Cargo.toml"))
+            .expect("#787 guard reach: the workspace manifest must be readable — it is the corpus \
+                     definition when there is no git index");
+
+        // REACH CONTROL ON THE STRIPPER ITSELF. It is a scanner, so it needs evidence that it ran and
+        // did something, not just that it returned. A silent no-op would restore the exact behaviour
+        // this fix exists to remove, with more confident prose sitting on top of it.
+        {
+            let probe = "a = \"x # not-a-comment\" # yes-a-comment\nb = 'y # also-not'\n";
+            let got = strip_toml_comments_787(probe);
+            assert!(got.contains("x # not-a-comment"),
+                "#787 guard: the TOML comment stripper corrupted a quoted value — a stripper that \
+                 eats string contents swaps one silent evasion for another. Got: {got:?}");
+            assert!(got.contains("y # also-not"),
+                "#787 guard: the TOML comment stripper corrupted a literal-string value. Got: {got:?}");
+            assert!(!got.contains("yes-a-comment"),
+                "#787 guard: the TOML comment stripper removed NOTHING from a probe that contains a \
+                 real comment — it is a no-op, and every claim below about comment-free text is \
+                 false. Got: {got:?}");
+            assert_eq!(got.lines().count(), probe.lines().count(),
+                "#787 guard: the TOML comment stripper changed the line structure of its input");
+        }
+
+        let manifest = strip_toml_comments_787(&raw);
+
+        // ANCHORED key: the line's own key must be exactly `members`, so `default-members`,
+        // `exclude-members` and anything else ending in those seven letters cannot arm it.
+        let mut members = Vec::new();
+        let mut collecting = false;
+        for line in manifest.lines() {
+            if !collecting {
+                let t = line.trim_start();
+                let Some(rest) = t.strip_prefix("members") else { continue };
+                if !rest.trim_start().starts_with('=') { continue }
+                collecting = true;
+            }
+            let mut in_str = false;
+            let mut delim = '"';
+            let mut buf = String::new();
+            for ch in line.chars() {
+                match ch {
+                    c if in_str && c == delim => {
+                        in_str = false;
+                        let p = buf.trim().trim_end_matches('/');
+                        if !p.is_empty() { members.push(p.to_string()); }
+                        buf.clear();
+                    }
+                    '"' | '\'' if !in_str => { in_str = true; delim = ch; buf.clear(); }
+                    ']' if !in_str => { collecting = false; break }
+                    _ if in_str => buf.push(ch),
+                    _ => {}
+                }
+            }
+            if !collecting { break }
+        }
+        assert!(!members.is_empty(),
+            "#787 guard reach: parsed zero workspace members out of the root `Cargo.toml` — the \
+             corpus definition is unreadable, so this guard cannot claim to have covered the tree");
+        members
+    }
+
+    /// Directories under `root` that contain a `Cargo.toml` — the filesystem's own answer to "what
+    /// crates are in this workspace", independent of how the manifest spells its member list.
+    ///
+    /// This exists so [`workspace_members_787`] has something to be checked AGAINST. A crate here
+    /// that the manifest does not list is a false RED; that is the safe direction and it forces a
+    /// decision rather than silently shrinking the corpus.
+    fn crate_dirs_787(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            if p.is_dir() {
+                if name == "target" || name.starts_with('.') { continue }
+                if p.join("Cargo.toml").is_file() {
+                    out.push(p.strip_prefix(root).unwrap_or(&p).to_string_lossy().replace('\\', "/"));
+                }
+                crate_dirs_787(&p, root, out);
+            }
+        }
+    }
+
+    /// `text` with every TOML `#` comment removed, newlines preserved.
+    ///
+    /// String-aware on purpose: `#` is legal inside a quoted value, and a naive strip that cut at the
+    /// first `#` would corrupt member paths — replacing one silent evasion with another. Basic (`"`)
+    /// and literal (`'`) strings are both tracked, and a backslash escape inside a basic string is
+    /// honoured. It is exercised by a probe in [`workspace_members_787`] before it is trusted.
+    fn strip_toml_comments_787(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        for line in text.split_inclusive('\n') {
+            let (mut in_str, mut delim, mut esc) = (false, '"', false);
+            for ch in line.chars() {
+                if in_str {
+                    out.push(ch);
+                    if esc { esc = false; continue }
+                    match ch {
+                        '\\' if delim == '"' => esc = true,
+                        c if c == delim => in_str = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' | '\'' => { in_str = true; delim = ch; out.push(ch); }
+                    '#' => { if line.ends_with('\n') { out.push('\n') } break }
+                    _ => out.push(ch),
+                }
+            }
+        }
+        out
+    }
+
+    /// `text` with every comment blanked to spaces, newlines preserved so line numbers still map.
+    ///
+    /// This exists to close A5 (round-1 review): `Walker /* … */ ::new(` is valid Rust and, since
+    /// [`flatten_787`] strips whitespace but not comments, the needle never formed — which falsified
+    /// the very reflow-resistance this guard advertised. The scan now runs over BOTH the raw text and
+    /// this blanked copy and unions the findings, so an interposed comment cannot hide a call.
+    ///
+    /// The blanking is deliberately naive (it tracks `"` strings and nested `/* */`, and will be
+    /// confused by a `'"'` char literal). That is acceptable *in this direction*: a confused blanker
+    /// stops blanking, which can only make this pass find FEWER candidates than the raw pass, and the
+    /// raw pass is unioned in. It cannot silently remove a finding the raw scan already has.
+    fn blank_comments_787(text: &str) -> String {
+        let b: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let (mut i, mut state, mut depth) = (0usize, 0u8, 0usize);
+        while i < b.len() {
+            let c = b[i];
+            let n = if i + 1 < b.len() { b[i + 1] } else { '\0' };
+            match state {
+                // 0 = code
+                0 => {
+                    if c == '/' && n == '/' { state = 1; out.push_str("  "); i += 2; continue; }
+                    if c == '/' && n == '*' { state = 2; depth = 1; out.push_str("  "); i += 2; continue; }
+                    if c == '"' { state = 3; }
+                    out.push(c);
+                    i += 1;
+                }
+                // 1 = line comment, to end of line
+                1 => {
+                    if c == '\n' { state = 0; out.push(c); } else { out.push(' '); }
+                    i += 1;
+                }
+                // 2 = block comment (Rust nests them)
+                2 => {
+                    if c == '/' && n == '*' { depth += 1; out.push_str("  "); i += 2; continue; }
+                    if c == '*' && n == '/' {
+                        depth -= 1; out.push_str("  "); i += 2;
+                        if depth == 0 { state = 0; }
+                        continue;
+                    }
+                    out.push(if c == '\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+                // 3 = inside a string literal
+                _ => {
+                    if c == '\\' {
+                        out.push(c);
+                        if i + 1 < b.len() { out.push(n); }
+                        i += 2;
+                        continue;
+                    }
+                    if c == '"' { state = 0; }
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Whitespace-stripped file text, plus the source line each retained BYTE came from.
+    ///
+    /// Stripping first is what makes the scan survive a WHITESPACE reflow: `eqoxide-http`'s sibling
+    /// guard was rewritten for exactly this reason (see `slot.rs`) after a call site wrapped across
+    /// lines and silently left a line-based guard's coverage. Here the needle is found in the
+    /// flattened text and the byte offset is mapped back to the line the match STARTS on, which is
+    /// the line whose raw text is then classified. Whitespace alone was NOT enough — see
+    /// [`blank_comments_787`], added after review measured `Walker /* x */ ::new(` slipping through.
+    fn flatten_787(text: &str) -> (String, Vec<usize>) {
+        let mut flat = String::with_capacity(text.len());
+        let mut line_of = Vec::with_capacity(text.len());
+        let mut line = 1usize;
+        for c in text.chars() {
+            if c == '\n' {
+                line += 1;
+            }
+            if c.is_whitespace() {
+                continue;
+            }
+            flat.push(c);
+            for _ in 0..c.len_utf8() {
+                line_of.push(line);
+            }
+        }
+        (flat, line_of)
+    }
+
+    /// **#787 — a TRIPWIRE under the one-fine-worker premise. Read the limits before you trust it.**
+    ///
+    /// `local_planner_dead` is latched for the life of a fine WORKER; the agent is told it is
+    /// SESSION-scoped. Those are the same span only while exactly one fine worker is constructed per
+    /// client process, and that premise used to be prose with nothing under it at all.
+    ///
+    /// **What it grades — and the subject mismatch that is its deepest limit.** The premise is a
+    /// RUNTIME count: *exactly one fine worker is CONSTRUCTED per process*. This test is a TEXT
+    /// count: *exactly one construction SITE is written*. Those are different claims and they come
+    /// apart on exactly the scenario #787 was filed about.
+    ///
+    /// > **An in-process relogin re-enters an existing construction path. It adds ZERO new textual
+    /// > sites.** Round-1 review of #836 measured it: move the production construction into a helper
+    /// > in `action_loop.rs` and call that helper twice — one unmarked site in the whole tree, in the
+    /// > expected file, both asserts below satisfied, **two fine workers per process, guard green.**
+    ///
+    /// So do not read a pass here as "one worker exists". Read it as "nobody has written a second,
+    /// plainly-spelled construction site". That is a real and useful thing to know — it is the shape
+    /// most second workers would actually arrive in — but it is a proxy, and it is the weaker of the
+    /// two claims. [`eqoxide_ipc::NavStatus::local_planner_dead`]'s field doc says the same thing.
+    ///
+    /// Two links of the premise chain are checked, over the WHOLE repository, not this crate:
+    ///
+    ///   * exactly one production `Walker::new(` call site — in `crates/eqoxide-net/src/action_loop.rs`;
+    ///   * exactly one production `LocalPlanner::spawn(` call site — in this file, inside `Walker::new`.
+    ///
+    /// The second link matters on its own: the field doc's claim is "`LocalPlanner::spawn` is reached
+    /// only through `Walker::new`", so a fine worker spawned OUTSIDE a `Walker` would break the
+    /// premise without adding a `Walker`.
+    ///
+    /// **Why a source scan and not a runtime counter.** A process-global `AtomicUsize` in
+    /// `Walker::new` grades the property rather than the text and would be the stronger instrument —
+    /// except that there is no `cfg` that separates "the production process" from "a downstream
+    /// crate's test binary". `cfg(test)` is per-compilation: when `eqoxide-nav` is built as a
+    /// dependency of `eqoxide-net`, `cfg(test)` is FALSE for this crate, so a `#[cfg(not(test))]`
+    /// trip fires inside `eqoxide-net`'s own suite, which builds two `ActionLoop`s (and therefore two
+    /// `Walker`s) in one process. That was measured, not reasoned — see the PR body. A release-only
+    /// trip avoids the false fire but is never exercised in CI and turns a prose-decay problem into a
+    /// new field failure mode. So the instrument that can fail at AUTHORING time wins here.
+    ///
+    /// **MEASURED evasions. This list is the honest description of the instrument** — round-1 review
+    /// of #836 planted eight production fine-worker constructions simultaneously and this test
+    /// reported `ok`. Two of the eight are now closed; the rest are not closable by a text scan
+    /// without turning it into a Rust parser (#799 catalogues the family).
+    ///
+    /// A round-3 draft of this comment said "**every** row below was RUN … not reasoned about".
+    /// Round-3 review found that false for two rows and it was: the `LocalPlanner::spawn` fn-pointer
+    /// row and the `Default`/`Clone` row were written by analogy with rows next to them. Both have
+    /// since been run (the spawn fn-pointer row survived exactly as claimed; the `Default` row did
+    /// **not** and has been rewritten to what the run showed). Every row now carries the plant that
+    /// produced its verdict, so the claim is checkable per row rather than as a blanket assurance —
+    /// which is the form the false one took.
+    ///
+    /// A round-2 draft of this comment claimed the marker hole was *narrower* than review recorded —
+    /// that the opt-out could only relocate the production site within its own file. **That was
+    /// wrong and round-2 review refuted it by construction**: a marked second construction in a
+    /// different file, original untouched, leaves the guard green. Two rows in this very table (the
+    /// marker row and the macro row) are instances of the form that claim said could not exist. The
+    /// narrowing is withdrawn; what follows is what was measured, nothing inferred from it.
+    ///
+    /// | form | status |
+    /// |---|---|
+    /// | plainly-written second site, any file, any whitespace reflow | **caught** |
+    /// | `use …::Walker as W;` — plain `as`-rename | **caught** (alias check below) |
+    /// | `pub use …::Walker as W;` — re-export rename | **caught since round 2**; the round-1 check tested `starts_with("use ")`, which no re-export can satisfy — every one of them leads with a visibility (`pub`, `pub(crate)`, `pub(super)`, `pub(in …)`) — so `pub use … as W;` was GREEN. The check now strips the visibility, parenthesised form included, before matching |
+    /// | `Walker /* x */ ::new(` — comment interposed in the path | **caught since round 2**, via [`blank_comments_787`]; whitespace-only flattening never formed the needle |
+    /// | `let ctor = …::Walker::new;` then `ctor(..)` — fn-pointer binding | **NOT caught.** The name is followed by `;`, never `(`, and it is not an `as`-rename. The cheapest invisible second worker there is; a measured survivor against a different pin in this repo already (#828 round 3) |
+    /// | same, for `LocalPlanner::spawn` | **NOT caught** — run, not reasoned, since round 4: an unmarked production `fn second_fine_worker_787() { let ctor = …::LocalPlanner::spawn; ctor() }` added to this very file left the guard GREEN (`walked 172`, one site found) |
+    /// | `<…::Walker>::new(..)` — qualified path | **NOT caught** |
+    /// | a `macro_rules!` body carrying the marker, invoked from production | **NOT caught** |
+    /// | a `// #787-NOT-PRODUCTION` marker on a second PRODUCTION construction, original untouched, ANY file | **NOT caught.** The marker is an unpinned opt-out: nothing asserts where a marker may appear, so a marked line is invisible wherever it is. Measured in `observe.rs` — guard green with two production constructions in two files; removing the marker went RED naming the file |
+    /// | one textual site executed twice (the relogin shape) | **NOT caught** — see the subject mismatch above |
+    /// | a `Default`/`Clone` impl for `Walker` | **CAUGHT in the direct form — the round-3 "NOT caught" here was reasoned and it was wrong.** Run in round 4: an `impl Default for Walker` whose body is a struct literal went **RED** (`found 2 site(s)`), because to be a fine worker at all the literal has to fill `local_planner`, and the only plain spelling of that is `LocalPlanner::spawn(` — which is the second needle. The same impl reaching the worker through a fn-pointer binding went GREEN, so this evades only *via* the fn-pointer row above, not on its own. Both plants were text-level: the guard is a text scan, and a full `Walker` literal does not compile outside this module |
+    /// | the needle inside a `/* … */` block comment, or inside a string literal | **false RED** (measured). The two passes are combined by MAX per line so that two constructions on one line still count as two; the cost is that the raw pass's hit survives even where the blanked pass correctly sees none. Harmless direction, disclosed rather than left to be tripped over |
+    ///
+    /// **The balance, corrected.** An earlier draft of this comment argued that the residual holes
+    /// push into a false RED — the safe direction — because #799's `if false` / `#[cfg(any())]` /
+    /// shadowing evasions make a *written* call *unreached*. That argument was **falsified by
+    /// measurement**: the residual is dominated by invisible-to-the-scan misses (the table above),
+    /// not by false REDs. Those false-RED forms are real and they are the harmless direction, but
+    /// they are not the balance. **This is a tripwire for the common case, not a pin**, and the
+    /// argument that a source scan was the right mechanism here is correspondingly weaker than it
+    /// was written to be. What survives of it is narrower and still true: the instrument fails at
+    /// AUTHORING time, which is when this premise decays, and a runtime counter cannot be built here
+    /// at all (next paragraph).
+    ///
+    /// **Reach.** #778 found an existing source-scanning guard silently covering a fraction of its
+    /// corpus, which is indistinguishable from a passing one — and round-1 review reproduced exactly
+    /// that inside THIS guard's first draft (see [`git_tracked_rs_787`] for the measurement). The
+    /// corpus is therefore the git index, not a tolerance band, and the filesystem walk is asserted
+    /// EQUAL to it rather than merely large. Untracked `.rs` files are scanned too (the corpus is the
+    /// union), so a stray scratch file is a false RED — the safe direction, disclosed here rather
+    /// than left to be discovered.
+    ///
+    /// **The reach control is not the same strength everywhere, and this guard says which one ran.**
+    /// The index equality check needs a git checkout. The remote builder that compiles and runs this
+    /// workspace receives an rsync'd copy with no `.git`, and the first version of this fix turned
+    /// that into a hard failure of the entire suite — a missing index reported as if it were evidence
+    /// about workers, which is the same class of dishonesty #787 is about. So:
+    ///
+    ///   * git present (any developer or agent worktree, and CI — the workflow uses
+    ///     `actions/checkout@v4`, so **the merge gate runs index equality**) — per FILE;
+    ///   * git absent (the remote builder) — every workspace member read from the root `Cargo.toml`
+    ///     must contribute at least one walked file, per MEMBER. It catches the failure that was
+    ///     actually measured, because that failure was a whole crate directory dropping out of the
+    ///     walk; it cannot catch one missing file.
+    ///
+    /// **And the member LIST is itself asserted, because round-3 review broke it.** That list used to
+    /// be parsed and printed and never compared to anything. A `default-members` key in the manifest
+    /// armed the old suffix match, the list collapsed to ONE member, 29 `.rs` files went dark with a
+    /// planted production construction among them, and the guard passed while printing
+    /// `workspace members checked = 1`. **A number that is printed and never checked is not a
+    /// control** — it is the #778 shape one level up, in the reach control's own input. So the parsed
+    /// list is now asserted EQUAL to the set of directories that actually contain a `Cargo.toml`
+    /// ([`crate_dirs_787`]), which needs no git and does not depend on this parser being right. Both
+    /// halves were measured in round 4: with the anchor deliberately removed the parser still
+    /// collapses to `{"tools"}`, and the tree is **RED anyway** — `Parsed 1 … on disk 13`.
+    ///
+    /// **How weak the degraded control is, in numbers.** A corpus satisfying every git-absent check
+    /// needs 13 member representatives, plus a 14th file because `eqoxide-nav` carries TWO named
+    /// anchors (`walker.rs` and `planner.rs`) and one representative cannot be both, plus the two
+    /// anchors that live outside any member (`src/app.rs`, `tests/walker_sim.rs`): **16 of 172
+    /// files. Up to 156 — 90.7% — could be dark and every control would still pass.** (A round-3
+    /// draft said 15 / 157 / 91%; it counted `eqoxide-nav` once.) That is far worse than the 11.6%
+    /// tolerance band round-1 review made me delete, and it is the honest ceiling on what a
+    /// builder-only run proves.
+    ///
+    /// Two things bound it in practice, and neither is a fix. The merge gate has git, so nothing
+    /// reaches `main` on the weak path — it is every pre-merge run a developer or agent sees that
+    /// takes it. And the guard now prints its mode and its file count **unconditionally, before any
+    /// finding**, to the process's real stderr handle — so it appears in a plain `cargo test` log of
+    /// a PASSING run, with no `--nocapture` (that flag would be needed only for the `println!` form,
+    /// which is exactly the form this deliberately does not use; see the comment at the write site).
+    /// A degraded run therefore states its own coverage rather than looking identical to a strong
+    /// one. Round-2 review found that disclosure on the failure path
+    /// only, which is the #778 property reproduced inside this guard's own reporting: it told the
+    /// truth exactly when it was already failing.
+    ///
+    /// **Why the corpus is still cross-checked against git rather than being the walk alone.**
+    /// Measured on two trees that have both: `git ls-files '*.rs'` and the walk produce the **same
+    /// 172 files, identical by name**, not merely the same count. So the corpus is already the walk
+    /// either way — the union adds nothing — and dropping the index would not simplify the corpus,
+    /// it would only delete the one per-FILE reach control the merge gate actually runs. The two
+    /// modes are a difference in CHECKING, not in what gets scanned.
+    #[test]
+    fn exactly_one_production_fine_worker_is_built_in_the_tree_787() {
+        let root = repo_root_787();
+        assert!(root.join("Cargo.toml").is_file(),
+            "layout anchor: expected the workspace manifest at the repo root this guard walks from");
+        assert!(root.join("crates/eqoxide-net/src/action_loop.rs").is_file(),
+            "layout anchor: the known production construction site has moved — re-point this guard");
+
+        // The corpus is the GIT INDEX unioned with a filesystem walk. Neither alone is right: the
+        // index cannot see an untracked file, and a hand-rolled walk can silently skip a subtree —
+        // which is precisely what round-1 review measured against this guard's first draft.
+        let tracked: Option<std::collections::BTreeSet<String>> =
+            git_tracked_rs_787(&root).map(|v| v.into_iter().collect());
+
+        let mut walked_paths = Vec::new();
+        rs_files_787(&root, &mut walked_paths);
+        let walked: std::collections::BTreeSet<String> = walked_paths.iter()
+            .map(|p| p.strip_prefix(&root).unwrap_or(p).to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        let members = workspace_members_787(&root);
+
+        // THE MEMBER LIST IS ASSERTED, NOT JUST PRINTED. Round-3 review: the count was reported and
+        // never compared, so `default-members = ["tools"]` in the manifest collapsed the per-member
+        // control to ONE member — 29 `.rs` files dark with a planted production construction among
+        // them — and the guard still passed while printing `members checked = 1`. A number nothing
+        // checks is not a control. The filesystem's own answer is the independent oracle here, and it
+        // needs no git, which is the whole point of this branch.
+        let mut crate_dirs = Vec::new();
+        crate_dirs_787(&root, &root, &mut crate_dirs);
+        let dirs: std::collections::BTreeSet<String> = crate_dirs.into_iter().collect();
+        let listed: std::collections::BTreeSet<String> = members.iter().cloned().collect();
+        assert_eq!(listed, dirs,
+            "#787 guard reach: the workspace members parsed out of `Cargo.toml` do not match the \
+             directories that actually contain a `Cargo.toml`. Whichever side is short, the \
+             per-member reach control below is covering less of the tree than it reports. Parsed {} \
+             ({:?}); on disk {} ({:?})",
+            listed.len(), listed, dirs.len(), dirs);
+
+        // MODE DISCLOSURE, UNCONDITIONAL AND BEFORE ANY FINDING. Round-2 review: the mode was printed
+        // only when the guard was already failing, so a PASSING degraded run was byte-identical to a
+        // passing strong one — the #778 property reproduced inside this guard's own reporting. It is
+        // printed here, ahead of every assert, so it survives a failure too.
+        //
+        // It goes to the process's REAL stderr handle rather than through `println!`, because libtest
+        // captures the macros and shows their output only for tests that FAIL — which would have left
+        // the disclosure on the failure path again, in a different disguise. A direct handle write is
+        // not captured, so this line is in the default suite log of a PASSING run, which is the run
+        // whose strength was previously unknowable. Measured, not assumed.
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(),
+            "#787 guard: reach control = {}; walked {} .rs file(s); git index available = {} \
+             ({} tracked); workspace members checked = {}",
+            if tracked.is_some() { "INDEX EQUALITY, per FILE" } else { "PER WORKSPACE MEMBER only (weaker)" },
+            walked.len(),
+            tracked.is_some(),
+            tracked.as_ref().map(|t| t.len()).unwrap_or(0),
+            members.len(),
+            );
+        }
+
+        // REACH CONTROL 1 — EQUALITY against the git index, not a tolerance. Every tracked `.rs` file
+        // must have been reached by the walk. The old form was `files.len() >= 150`, and review
+        // measured a 20-file crate (11.6% of the tree, worst case 22 / 12.8%) vanishing under that
+        // band with every other control green and a planted production site inside it invisible. A
+        // floor 13% below the true value is not a reach control.
+        //
+        // This control is UNAVAILABLE where there is no git checkout — the remote builder runs the
+        // suite from an rsync'd copy. Control 1b below is what runs there, and it is weaker.
+        if let Some(tracked) = tracked.as_ref() {
+            let unwalked: Vec<&String> = tracked.difference(&walked).collect();
+            assert!(unwalked.is_empty(),
+                "#787 guard reach: the filesystem walk missed {} tracked file(s) the git index lists \
+                 — it skipped a subtree, so any 'exactly one' finding covers less of the tree than \
+                 it claims. Walked {} of {} tracked:\n  {:?}",
+                unwalked.len(), walked.len(), tracked.len(), unwalked);
+        }
+
+        // REACH CONTROL 1b — git-free, and the only reach control in force on the remote builder.
+        // Every workspace member must contribute at least one walked `.rs` file. It cannot see a
+        // single missing file the way control 1 can; it CAN see the failure that was actually
+        // measured (a whole crate directory dropping out of the walk), and it needs no index.
+        for member in &members {
+            let prefix = format!("{member}/");
+            let n = walked.iter().filter(|f| f.starts_with(&prefix)).count();
+            assert!(n > 0,
+                "#787 guard reach: workspace member `{member}` contributed ZERO files to the walk — \
+                 a whole crate is dark, so 'exactly one production construction' is a claim about \
+                 less of the tree than it sounds like. git index available: {}. Walked {} file(s). \
+                 Members checked: {}.",
+                tracked.is_some(), walked.len(), members.len());
+        }
+
+        // Scan the UNION where the index is available. Untracked strays are included deliberately: an
+        // unmarked construction in one is a false RED, which is the safe direction and is disclosed
+        // in this test's rustdoc.
+        let files: Vec<String> = match tracked.as_ref() {
+            Some(t) => t.union(&walked).cloned().collect(), // BTreeSet → sorted
+            None => walked.iter().cloned().collect(),
+        };
+
+        // REACH CONTROL 2 — named anchors. Redundant against control 1 for the walk, but it is what
+        // catches "this guard is running against the wrong tree entirely" (a re-layout, a vendored
+        // copy). All four files carrying the four dependent sentences are in the list.
+        for anchor in [
+            "crates/eqoxide-net/src/action_loop.rs",
+            "crates/eqoxide-nav/src/walker.rs",
+            "crates/eqoxide-nav/src/planner.rs",
+            "crates/eqoxide-ipc/src/lib.rs",
+            "crates/eqoxide-http/src/observe.rs",
+            "src/app.rs",
+            "tests/walker_sim.rs",
+        ] {
+            assert!(files.iter().any(|f| f == anchor),
+                "#787 guard reach: `{anchor}` is not in the corpus — this guard is looking at the \
+                 wrong tree. Corpus: {} file(s).", files.len());
+        }
+
+        // Needles assembled at run time so this guard's own source does not contain the text it
+        // searches for (`slot.rs` names the same self-match hazard).
+        let walker_new = format!("Walker::{}(", "new");
+        let fine_spawn = format!("LocalPlanner::{}(", "spawn");
+
+        let mut prod_walker: Vec<String> = Vec::new(); // "path:line: code"
+        let mut prod_spawn:  Vec<String> = Vec::new();
+        let mut marked = 0usize;
+        let mut prose = 0usize;
+        let mut aliases: Vec<String> = Vec::new();
+
+        for rel in &files {
+            let path = root.join(rel);
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let raw: Vec<&str> = text.lines().collect();
+
+            // The `as`-rename hole. A renamed import defeats the needle below, so it is a failure in
+            // its own right. The leading visibility MUST be stripped first: round-1 review measured
+            // `use … as X;` going RED and `pub use … as X;` going GREEN off the same tree. A
+            // re-export — the form that actually matters — always leads with a visibility, and `pub`
+            // is only the shortest of them, which is why the parenthesised forms (`pub(crate)`,
+            // `pub(super)`, `pub(in path)`) are stripped below rather than assumed away.
+            for (n, line) in raw.iter().enumerate() {
+                let mut code = line.trim_start();
+                if let Some(rest) = code.strip_prefix("pub") {
+                    let rest = rest.trim_start();
+                    // `pub(crate)` / `pub(super)` / `pub(in path)` — drop the parenthesised part.
+                    code = if rest.starts_with('(') {
+                        rest.split_once(')').map(|(_, r)| r.trim_start()).unwrap_or(rest)
+                    } else {
+                        rest
+                    };
+                }
+                if code.starts_with("use ")
+                    && (code.contains("Walker as ") || code.contains("LocalPlanner as "))
+                {
+                    aliases.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                }
+            }
+
+            // TWO passes over every file: the raw text, and the same text with comments blanked.
+            // The second is what sees `Walker /* x */ ::new(` — valid Rust that whitespace-only
+            // flattening never forms the needle from (A5, measured). Findings are de-duplicated by
+            // `path:line`, so a call visible to both passes is reported once. Classification always
+            // reads the RAW line, so a `// #787-NOT-PRODUCTION` marker still marks its site even in
+            // the pass where comments are gone.
+            let blanked = blank_comments_787(&text);
+            // (is_spawn, line) → how many matches that line carries. The two passes are combined by
+            // MAX per line, not by set-union, so two constructions on ONE line still count as two.
+            let mut hits: std::collections::BTreeMap<(bool, usize), usize> = Default::default();
+            for source in [&text, &blanked] {
+                let (flat, line_of) = flatten_787(source);
+                let mut pass: std::collections::BTreeMap<(bool, usize), usize> = Default::default();
+                for (is_spawn, needle) in [(false, &walker_new), (true, &fine_spawn)] {
+                    for (off, _) in flat.match_indices(needle.as_str()) {
+                        *pass.entry((is_spawn, line_of[off])).or_default() += 1;
+                    }
+                }
+                for (k, v) in pass {
+                    let e = hits.entry(k).or_default();
+                    *e = (*e).max(v);
+                }
+            }
+            for ((is_spawn, ln), n) in hits {
+                let line = raw[ln - 1];
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    prose += n; // doc/comment mentions, not constructions
+                } else if line.contains(NOT_PRODUCTION) {
+                    marked += n;
+                } else {
+                    let entry = format!("{rel}:{ln}: {}", code.trim_end());
+                    for _ in 0..n {
+                        if is_spawn { prod_spawn.push(entry.clone()) } else { prod_walker.push(entry.clone()) }
+                    }
+                }
+            }
+        }
+
+        assert!(aliases.is_empty(),
+            "{}",
+            four_sentences(&format!(
+                "#787: a `use` statement RENAMES `Walker` or `LocalPlanner`, which hides fine-worker \
+                 construction from the guard that pins the one-worker premise:\n  {}\n\nImport the \
+                 type under its own name, or teach this guard the alias.",
+                aliases.join("\n  "))));
+
+        // POSITIVE CONTROL — if the marker path ever counts zero, the needle has drifted from the
+        // source and the "exactly one" finding below is vacuous rather than true.
+        assert!(marked >= 7,
+            "#787 guard: matched only {marked} marked construction site(s); at least 7 are expected \
+             (the 4 `Walker` fixtures in this file and the 3 `LocalPlanner` fixtures in planner.rs). \
+             The search pattern has drifted from the source and this guard has stopped measuring \
+             anything. (prose mentions seen: {prose})");
+
+        for (what, where_, found) in [
+            ("`Walker` construction, expected only in `ActionLoop::new`",
+             "crates/eqoxide-net/src/action_loop.rs:", &prod_walker),
+            ("fine-worker `LocalPlanner::spawn`, expected only inside `Walker::new`",
+             "crates/eqoxide-nav/src/walker.rs:", &prod_spawn),
+        ] {
+            assert_eq!(found.len(), 1,
+                "{}",
+                four_sentences(&format!(
+                    "#787: expected exactly ONE production {what}; found {} site(s):\n  {}",
+                    found.len(), found.join("\n  "))));
+            assert!(found[0].starts_with(where_),
+                "{}",
+                four_sentences(&format!(
+                    "#787: the sole production {what} has MOVED — it is now `{}`, not in `{}`. That \
+                     is not by itself a second worker, but the premise chain the four sentences \
+                     below rest on is written in terms of the old location.",
+                    found[0], where_.trim_end_matches(':'))));
+        }
     }
 
     /// **#766, the OTHER walker route to `idle` — and it is here to MEASURE a claim, not to guard a
