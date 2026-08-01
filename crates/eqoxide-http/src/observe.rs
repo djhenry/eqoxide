@@ -2978,10 +2978,22 @@ mod tests {
     /// would be repeating it. **Axis NOT varied:** `secs` is whatever the real clock produced; the
     /// assertion is against the published threshold, not a hard-coded duration.
     ///
-    /// MUTATION CHECKS (#801 round 2, each run independently): delete the
-    /// `player.insert("afloat_stall".into(), ..)` from `get_debug` → RED at the `contains_key`
-    /// assertion; add `skip_serializing_if` to `PlayerState::afloat_stall` → RED at the null
-    /// assertion.
+    /// MUTATION CHECKS (#801 round 2, each run independently on the remote builder, restored from
+    /// an `md5sum`-verified copy between runs, `-p eqoxide-http --lib`; both were RED against a
+    /// 263-passed/0-failed control):
+    ///
+    /// * delete the `player.insert("afloat_stall".into(), ..)` from `get_debug` → **262 passed,
+    ///   1 failed**, at the `contains_key` assertion. The failure message printed the 55 keys that
+    ///   remain, which is exactly the key set the round-1 reviewer observed live;
+    /// * wrap that same insert in `if player_afloat_stall.is_some()`, i.e. omit the key instead of
+    ///   serving `null` → **262 passed, 1 failed**, at the null assertion. This is the mutation
+    ///   worth having: it leaves the stall case fully working and breaks only the
+    ///   always-present contract, which is the half a hand-written happy-path test would miss.
+    ///
+    /// NOT a useful mutation here, contrary to the obvious guess: adding `skip_serializing_if` to
+    /// `PlayerState::afloat_stall` changes nothing this test can see, because `get_debug` never
+    /// serialises `PlayerState` — it reads the field and inserts it. Recorded so the next person
+    /// does not run it and conclude the test is weak.
     #[tokio::test]
     async fn afloat_stall_reaches_the_debug_json_801() {
         use eqoxide_core::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
@@ -3020,7 +3032,7 @@ mod tests {
             "secs must never be served below the threshold that earned it, got {}", a["secs"]);
         assert_eq!(a["stall_threshold_secs"], serde_json::json!(AFLOAT_STALL_SECS),
             "the threshold is published so the agent can calibrate rather than guess");
-        assert!(a["detail"].as_str().expect("detail is a string").contains("dive"),
+        assert!(a["detail"].as_str().expect("detail is a string").to_ascii_lowercase().contains("dive"),
             "the detail must name the escape that usually works — an agent told only \"stalled\" \
              has no reason to try a vertical wish: {}", a["detail"]);
 
