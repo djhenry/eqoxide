@@ -246,7 +246,7 @@ use eqoxide_ipc::MoveIntent;
             let d = (dx * dx + dy * dy).sqrt();
             let wish_dir = if d > 1e-3 { [dx / d, dy / d] } else { [0.0, 0.0] };
             ctrl.step(MoveIntent { wish_dir, wish_vspeed, jump: false, want_swim,
-                speed: 44.0, climb: 0.0, hop: false }, DT, &col);
+                speed: RUN_SPEED, climb: 0.0, hop: false }, DT, &col);
 
             let at_goal = (ctrl.pos[0] - goal[0]).hypot(ctrl.pos[1] - goal[1]) < 3.0
                 && (ctrl.pos[2] - (-24.0)).abs() < 2.0;
@@ -321,14 +321,32 @@ use eqoxide_ipc::MoveIntent;
         // module IS reachable; and `LOCAL_REACH` sat three lines under that sentence as a literal
         // `24.0` while `steering::LOCAL_REACH` existed. So did seven more.
         //
-        // The rule now holds because it is enforced by construction: everything with a public home
-        // is imported at the top of the file, and only the three below are still literals. They are
-        // literals because they have NO public home — they are private `const`s inside
-        // `walker.rs::drive_walk`, and the fix for that is to promote them there, not to copy them
-        // better here. If you give one a public home, delete it from this block in the same change.
-        const LOOK_AHEAD: f32 = 5.0;   // walker.rs `drive_walk`, private
-        const LOCAL_BOUND: f32 = 40.0; // walker.rs `drive_walk`, private
-        const MAX_REPATHS: u32 = 8;    // walker.rs `drive_walk`, private
+        // ⚠️ **Correction, round 2 of the same review — the repair above was itself wrong twice.**
+        // It went on to claim "everything with a public home is imported at the top of the file, and
+        // only the three below are still literals", and that all three are "private `const`s inside
+        // `walker.rs::drive_walk`". Both were falsified by grep:
+        //
+        //   * `RUN_SPEED` is imported and used by NAME at seven sites, and was ALSO still spelled as
+        //     a bare `speed: 44.0` at five others. Fixed — they now read `speed: RUN_SPEED`. The
+        //     reason the previous round missed them is worth keeping: the value was grepped in
+        //     `steering.rs` and the identifier in this file, so a value-shaped survivor here was
+        //     invisible to both. Grep the value AND the identifier AND the concept, in every file.
+        //     Then READ each hit: four of this file's nine `44.0`s (lines ~199, 200, 205, 921) are
+        //     coordinates and polygon vertices that merely happen to equal the run speed, and
+        //     promoting one would assert a relationship that does not exist — a later change to
+        //     `RUN_SPEED` would move a wall. `speed: 35.0` at ~160 is likewise a deliberately
+        //     different speed, not a stale copy.
+        //   * `MAX_REPATHS` does not exist in `walker.rs`. `grep -rn MAX_REPATHS` hits this file and
+        //     nothing else; production spells the cap as a bare `if self.nav_repaths < 8` at
+        //     `walker.rs:1768`. So it is not a copy of a private const — it MIRRORS AN UNNAMED
+        //     LITERAL, which is strictly worse, and the fix is to name it there first.
+        //
+        // So, precisely: everything that HAS a public home is imported at the top of this file and
+        // is not restated anywhere in it. The three below have no public home, for two different
+        // reasons, and each says which.
+        const LOOK_AHEAD: f32 = 5.0;   // private `const` in walker.rs `drive_walk` (walker.rs:1496)
+        const LOCAL_BOUND: f32 = 40.0; // private `const` in walker.rs `drive_walk` (walker.rs:1507)
+        const MAX_REPATHS: u32 = 8;    // NOT a const anywhere: mirrors the bare `8` at walker.rs:1768
         const DT: f32 = 1.0 / 100.0;          // ~100 Hz controller, per navigation.rs's fast-steer note
         const FRAMES_PER_TICK: u32 = 15;      // 150 ms / 10 ms
         // The swim-up vertical wish is `drift_swim_up_wish` (module fn below), mirroring the walker
@@ -824,7 +842,7 @@ use eqoxide_ipc::MoveIntent;
         let mut ctrl = CharacterController::new(start);
         ctrl.on_ground = true;
         for _ in 0..600 {
-            ctrl.step(MoveIntent { wish_dir: [1.0, 0.0], speed: 44.0, ..Default::default() },
+            ctrl.step(MoveIntent { wish_dir: [1.0, 0.0], speed: RUN_SPEED, ..Default::default() },
                       1.0 / 60.0, &c);
         }
         assert!(ctrl.pos[0] < 0.0,
@@ -861,7 +879,7 @@ use eqoxide_ipc::MoveIntent;
         let mut ctrl = CharacterController::new(start);
         ctrl.on_ground = true;
         for _ in 0..600 {
-            ctrl.step(MoveIntent { wish_dir: [1.0, 0.0], speed: 44.0, ..Default::default() },
+            ctrl.step(MoveIntent { wish_dir: [1.0, 0.0], speed: RUN_SPEED, ..Default::default() },
                       1.0 / 60.0, &c);
         }
         assert!(ctrl.pos[0] < 0.0,
@@ -951,7 +969,7 @@ use eqoxide_ipc::MoveIntent;
         let mut ctrl = CharacterController::new([36.0, 36.0, 0.0]);
         ctrl.on_ground = true;
         for _ in 0..600 {
-            ctrl.step(MoveIntent { wish_dir: [0.7071, 0.7071], speed: 44.0, ..Default::default() },
+            ctrl.step(MoveIntent { wish_dir: [0.7071, 0.7071], speed: RUN_SPEED, ..Default::default() },
                       1.0 / 60.0, &c);
         }
         assert!(ctrl.pos[2] < 6.0,
@@ -1006,7 +1024,7 @@ use eqoxide_ipc::MoveIntent;
         ctrl.on_ground = true;
         let mut topped = false;
         for _ in 0..900 {
-            ctrl.step(MoveIntent { wish_dir: [0.7071, 0.7071], speed: 44.0, ..Default::default() },
+            ctrl.step(MoveIntent { wish_dir: [0.7071, 0.7071], speed: RUN_SPEED, ..Default::default() },
                       1.0 / 60.0, &c);
             if ctrl.on_ground && ctrl.pos[2] > 12.0 {
                 topped = true;

@@ -2492,9 +2492,13 @@ mod cursor_resync_tests {
     /// The counter calls [`carrot_leads`] itself, so it observes the PREDICATE, never whether
     /// [`resync_cursor`]'s gate consults it. Wrapping the gate's *call site* — leaving `carrot_leads`
     /// intact, so the guard is genuinely dead while the counter still reads a live predicate — does
-    /// not zero this counter. It drives it **up by two to three orders of magnitude** (4 u: 144 →
-    /// 41141), because a dead guard leaves the body parked in the collapsed state for all 400 ticks
-    /// and the counter faithfully counts every one of them. A reader who took a non-zero value as
+    /// not zero this counter. **It raises it, on every row, 7 of 7.** The magnitude splits with the
+    /// row, and only the first claim below is load-bearing: on the three sub-guard rows the body
+    /// stays parked in the collapsed state for all 400 ticks, so the count goes up ~286×/351×/395×
+    /// (4 u: 144 → 41141; 6 u: 216 → 75818; 7 u: 252 → 99469); on the four rows at or above the
+    /// guard the body is not pinned and the rise is small — 1.8×/1.7×/1.5×/1.2×. An earlier draft of
+    /// this correction said "two to three orders of magnitude" without qualification, which is true
+    /// of 3 rows and false of 4. A reader who took a non-zero value as
     /// evidence the guard is live would be reading a confident falsehood; the run tables are in
     /// #818. The original PR's own mutation wrapped the *body* of `carrot_leads`, which does zero it
     /// — but tautologically, since predicate and counter are the same call.
