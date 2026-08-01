@@ -914,9 +914,17 @@ mod tests {
             "the round-2 clean-looking empty string must not be producible: {line}");
     }
 
-    /// Installing an unmeasured zone onto a collision grid is an error the caller must handle: the
-    /// grid keeps `water: None`, and a scorer that ignored the `Result` would read fabricated dry
-    /// answers out of it. `#[must_use]` makes ignoring it a compiler warning.
+    /// Installing an unmeasured zone onto a collision grid is an error the caller must handle: a
+    /// scorer that ignored the `Result` would read fabricated dry answers out of it.
+    /// `#[must_use]` makes ignoring it a compiler warning.
+    ///
+    /// **#821 review round 2, N1.** Since #803 `install` also RECORDS the reason on the grid, so the
+    /// grid itself can refuse instead of answering `[]`. That behaviour change was stated in
+    /// `install`'s comment ("BOTH arms now write the grid") and pinned by nothing: the reviewer
+    /// severed the `Unmeasured` arm's `col.set_region_data(Err(e.clone()))` and three crates stayed
+    /// green. The before/after assertions below are the missing pin — before the install the grid is
+    /// `NotAttached` (nobody asked), after it is `LoadFailed(Missing)` (we asked and the file was
+    /// not there), and those are DIFFERENT states with different `reason` strings on the wire.
     #[test]
     fn installing_an_unmeasured_zone_is_a_handled_failure_762() {
         use crate::collision::Collision;
@@ -930,13 +938,30 @@ mod tests {
         let mut col = Collision::build(
             &ZoneAssets { terrain: vec![floor], objects: vec![], textures: vec![] }, 32.0);
 
+        // Nobody has installed anything yet, so the grid says exactly that — NOT "the file failed".
+        assert_eq!(col.region_data_absent().map(|a| a.as_str()), Some("region_data_not_attached"),
+            "a freshly built grid has had no region data handed to it");
+
         let err = absent().install(&mut col).unwrap_err().clone();
         assert_eq!(err, RegionLoadError::Missing);
         assert!(!col.in_water([0.0, 0.0, 1.0]),
             "the grid is dry — but that dry is FABRICATED, which is why install() reported Err");
+        // …and the GRID now carries the reason too (#803), so a later reader that never sees this
+        // `Result` still cannot mistake the failure for an answer. N1: severing the `Unmeasured`
+        // arm's `set_region_data` leaves the grid on `region_data_not_attached` and both of these
+        // go RED.
+        assert_eq!(col.region_data_absent().map(|a| a.as_str()), Some("region_data_missing"),
+            "the Unmeasured arm must RECORD why, not leave the grid looking un-asked");
+        assert!(matches!(col.zone_line_indices(), Err(ref a) if a.as_str() == "region_data_missing"),
+            "…so the exits question refuses with the real cause instead of answering `[]`: {:?}",
+            col.zone_line_indices());
 
         dry_but_loaded().install(&mut col).expect("a loaded map installs");
         assert!(!col.in_water([0.0, 0.0, 1.0]), "loaded and genuinely dry");
+        // The Measured arm's write clears the recorded failure rather than leaving it latched.
+        assert_eq!(col.region_data_absent().map(|a| a.as_str()), None, "a loaded map is present");
+        assert_eq!(col.zone_line_indices().as_deref(), Ok(&[7][..]),
+            "and the loaded map's zone line is enumerable");
         ZoneWater::from_map(RegionMap::water_slab(-40.0, 0.0)).install(&mut col).expect("installs");
         assert!(col.in_water([0.0, 0.0, -10.0]), "a real water map really answers wet");
     }
