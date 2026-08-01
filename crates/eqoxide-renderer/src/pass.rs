@@ -1513,11 +1513,9 @@ pub fn encode_player_pass(
                 // `floating: false` — the player's z is the CharacterController's FOOT datum, not
                 // a wire passthrough, so the player is never a model-origin placement (#756).
                 let p = crate::models::static_placement(
-                    archetype, model.y_bottom,
-                    [model.x_center, model.z_center], false);
-                let mat = crate::camera::entity_model_matrix_heading(
-                    scene.player_pos, scene.player_heading, 0.0, p.mesh_scale,
-                    p.center_xz, true, p.y_bottom,
+                    archetype, &model.bounds, false);
+                let mat = crate::camera::entity_model_matrix_static(
+                    scene.player_pos, scene.player_heading, &p,
                     crate::models::archetype_correction(archetype),
                 );
                 for (i, mesh) in model.meshes.iter().enumerate() {
@@ -1672,9 +1670,9 @@ pub fn encode_entity_pass(
         // so `static_placement` drops the grounding lift for it (#756). The horizontal
         // recentre is unchanged — that datum was not established; see the fn's doc.
         let p = crate::models::static_placement(
-            archetype, model.y_bottom, [model.x_center, model.z_center], b.floating);
-        let mat = crate::camera::entity_model_matrix_heading(b.pos, b.heading, 0.0, p.mesh_scale,
-            p.center_xz, true, p.y_bottom, crate::models::archetype_correction(archetype));
+            archetype, &model.bounds, b.floating);
+        let mat = crate::camera::entity_model_matrix_static(b.pos, b.heading, &p,
+            crate::models::archetype_correction(archetype));
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
             if slot >= slot_end { break; }
             let slot_meta = model.equip_slots[mesh_idx];
@@ -2078,11 +2076,9 @@ pub fn encode_shadow_pass(
                     (Some(GpuModel::Static(model)), ShadowCasterDraw::Static) => {
                         // Same placement call as the color pass, so the shadow tracks the body
                         // (see this fn's doc). `floating: false` — the player is never one (#756).
-                        let p = static_placement(archetype, model.y_bottom,
-                            [model.x_center, model.z_center], false);
-                        let mat = crate::camera::entity_model_matrix_heading(
-                            scene.player_pos, scene.player_heading, 0.0, p.mesh_scale,
-                            p.center_xz, true, p.y_bottom,
+                        let p = static_placement(archetype, &model.bounds, false);
+                        let mat = crate::camera::entity_model_matrix_static(
+                            scene.player_pos, scene.player_heading, &p,
                             archetype_correction(archetype));
                         write_model(step.u_slot, mat);
                         casters.push(Caster::Static { model, u_slot: step.u_slot });
@@ -2114,11 +2110,9 @@ pub fn encode_shadow_pass(
                         // Same placement call as the color pass, so a floating hull's shadow
                         // tracks the hull instead of staying above it (#756; the gap between the two
                         // arms is 3.9823u for `boat.glb` since #768 corrected the grounded lift).
-                        let p = static_placement(archetype, model.y_bottom,
-                            [model.x_center, model.z_center], b.floating);
-                        let mat = crate::camera::entity_model_matrix_heading(
-                            b.pos, b.heading, 0.0, p.mesh_scale,
-                            p.center_xz, true, p.y_bottom,
+                        let p = static_placement(archetype, &model.bounds, b.floating);
+                        let mat = crate::camera::entity_model_matrix_static(
+                            b.pos, b.heading, &p,
                             archetype_correction(archetype));
                         write_model(step.u_slot, mat);
                         casters.push(Caster::Static { model, u_slot: step.u_slot });

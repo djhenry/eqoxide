@@ -413,12 +413,19 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// names the zones. `add`/`skip` **panic** if no matching zone is open, so a loop that forgets
 /// `begin_zone` fails loudly instead of silently reverting to the round-1 shape.
 ///
-/// What this still does NOT cover, stated so nobody re-derives the round-2 sentence: a corpus loop
-/// that uses no `WaterRollup` at all is invisible to this type. The four `*_blast_radius` corpora
-/// and `water_grid_budget_measurement` in `tests/walker_sim.rs`, and the zone loop in
-/// `collision.rs`, accumulate into a plain `Vec<String>` and still drop zones without accounting.
-/// They print no ratio, so they lie by omission rather than by assertion, but they are NOT covered
-/// by anything in this file.
+/// What this still does NOT cover, stated so nobody re-derives it: a corpus loop that uses no
+/// `WaterRollup` at all is invisible to this type. Nothing here can reach into such a loop; the
+/// levers are that a loop opens its zones through [`open_corpus_zone`], or wires
+/// `begin_zone`/`add`/`skip` by hand as `faithful_walker_drift_corpus` does.
+///
+/// As of #807 the corpora that go through this type are `faithful_walker_drift_corpus` (hand-wired,
+/// two rollups), the four `*_blast_radius` corpora in `tests/walker_sim.rs`, and
+/// `water_grid_budget_measurement` in `crates/eqoxide-nav/src/collision.rs` — the last five via
+/// [`open_corpus_zone`]. What remains uncovered is a set of further zone loops in `collision.rs`
+/// that still drop zones on a `continue` without opening them here — some accumulating into a
+/// local `Vec`, some printing nothing at all — see **issue #839**, which carries the current
+/// per-line list. Do not re-derive or restate that tally here; it will drift. This paragraph names
+/// the mechanism; #839 names the sites.
 #[derive(Clone, Debug, Default)]
 pub struct WaterRollup {
     total: usize,
@@ -567,6 +574,130 @@ impl std::fmt::Display for WaterRollup {
         write!(f, "{} over {}/{} zones — INCOMPLETE, {}",
             self.total, self.measured_zones, zones, parts.join("; "))
     }
+}
+
+// ───────── #807: the corpus PROLOGUE, so its drop paths are not each corpus' own to wire ─────────
+
+/// Why [`open_corpus_zone`] handed a zone back unscored.
+///
+/// It carries only display text for the caller's per-zone table row. **The accounting has already
+/// happened** by the time this value exists — the rollup passed to `open_corpus_zone` has the zone
+/// closed in its `skipped` or `unmeasured` bucket — so a caller that ignores this value entirely
+/// still cannot lose the zone. Printing it is diagnostics, not bookkeeping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZoneDropped(String);
+
+impl std::fmt::Display for ZoneDropped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+
+/// Open one corpus zone against a rollup and hand back a grid that is ready to score — or the
+/// reason it was dropped, already recorded.
+///
+/// # The defect this exists to remove (#807, refs #762)
+///
+/// Six per-zone corpora in this tree opened a zone with the SAME six lines: load `<zone>.glb`,
+/// build a `Collision`, load `<zone>.wtr`, install it. Each of those lines can fail, and each
+/// failure was written out separately in each corpus as `else { println!("… skipped"); continue }`.
+/// #762 wired the rollup into ONE of those six copies. In the other five the dropped zone left both
+/// the numerator and the denominator, so the corpus went on to print a `TOTAL …` line over a
+/// silently smaller corpus than the one it names — measured-looking, unmeasured, and green.
+///
+/// Copy-per-corpus wiring is the mechanism that failed, twice, in #762's own review (rounds 2 and
+/// 3: a `continue` was left unwired both times, and the second one printed the word "skipped" while
+/// calling nothing). So the drop paths stopped being per-corpus text in five of the six corpora:
+/// there they exist here, once, where they cannot be written without their accounting because they
+/// are the same statements. They do NOT exist only once in the tree.
+/// `faithful_walker_drift_corpus` (`tests/walker_sim.rs`) still carries its own inline copy with
+/// hand-wired `skip`s, deliberately: it drives TWO rollups (`roll_wr`, `roll_423`) and cannot use
+/// this single-rollup signature unchanged. That copy is wired and accounted; it is simply not this
+/// one, so "one owner" describes five corpora, not six.
+///
+/// # What this guarantees, and what it does not
+///
+/// * **Guaranteed:** every `Err` return out of this function is preceded by a `skip`/`add` that
+///   closes the zone this function's own `begin_zone` opened. The three drop paths are covered by
+///   named tests in this file that need no baked assets, so CI runs them. The `Ok` tail return is
+///   deliberately NOT closed here — see the next bullet; that is the caller's obligation, and
+///   `open_corpus_zone_leaves_a_ready_zone_open_for_the_caller_to_close_807` pins it.
+/// * **Guaranteed by [`WaterRollup`], not by this function:** the caller must close a zone this
+///   returns `Ok` for, by calling `add` when it finishes scoring it. If it forgets — or `continue`s
+///   past it for some later reason — the zone lands in `unaccounted` and
+///   [`WaterRollup::is_complete`] is false. The caller cannot lose it silently; it can only make
+///   the run fail louder.
+/// * **NOT guaranteed:** that a corpus calls this at all. A future corpus (or this one, reverted)
+///   can still open a zone with its own inline `let Ok(za) = … else { continue }` and drop it
+///   silently, and nothing in CI would notice, because every corpus that uses this is `#[ignore]`d
+///   and CI passes no `--ignored` (#777 / #799). What this changes is that there is now one obvious
+///   thing to call and no per-site wiring left to forget — not that the call is enforced.
+/// * **NOT covered by CI, specifically:** this function body. Every test that pins the three drop
+///   paths calls [`open_corpus_zone_with`] with injected closures; nothing CI runs calls
+///   `open_corpus_zone` itself. What is tested is the accounting, not this wrapper's IO wiring, so a
+///   mutation of `format!("{zone}.glb")`, of `"maps/water"`, or of the `cell` pass-through below
+///   would survive the entire CI suite. A #835 reviewer checked by hand that this wrapper builds the
+///   same paths the deleted inline code did and exercised it end-to-end on baked assets, but that is
+///   a one-time check, not a standing pin. Closing it needs an asset fixture CI does not have.
+///
+/// `cell` is the collision grid cell size (every current caller passes the production zone-load
+/// value, 32.0).
+pub fn open_corpus_zone(
+    cover: &mut WaterRollup,
+    dir: &std::path::Path,
+    zone: &str,
+    cell: f32,
+) -> Result<(crate::collision::Collision, ZoneWater), ZoneDropped> {
+    let glb = dir.join(format!("{zone}.glb"));
+    let water_dir = dir.join("maps/water");
+    open_corpus_zone_with(
+        cover,
+        zone,
+        || eqoxide_assets::ZoneAssets::from_glb(&glb).ok(),
+        |za| crate::collision::Collision::build(za, cell),
+        || ZoneWater::load(&water_dir, zone),
+    )
+}
+
+/// [`open_corpus_zone`] with its three IO steps injected.
+///
+/// This split is not decoration: it is what lets the three drop paths be exercised by ordinary unit
+/// tests with **no baked `.glb` and no `.wtr` on disk**, so they are pinned by tests CI actually
+/// runs. `open_corpus_zone` is the thin wrapper that supplies the real loaders and contains no
+/// accounting of its own.
+pub fn open_corpus_zone_with(
+    cover: &mut WaterRollup,
+    zone: &str,
+    load_glb: impl FnOnce() -> Option<eqoxide_assets::ZoneAssets>,
+    build: impl FnOnce(&eqoxide_assets::ZoneAssets) -> crate::collision::Collision,
+    load_water: impl FnOnce() -> ZoneWater,
+) -> Result<(crate::collision::Collision, ZoneWater), ZoneDropped> {
+    cover.begin_zone(zone);
+
+    // DROP 1 — no baked `.glb`. The water check never ran, so this is `skip`, not `unmeasured`:
+    // claiming the `.wtr` failed would be a second falsehood (nobody asked it).
+    let Some(za) = load_glb() else {
+        cover.skip(zone, "no glb");
+        return Err(ZoneDropped("no glb — skipped".into()));
+    };
+
+    // DROP 2 — the glb loaded but carries no collision geometry, so there is nothing to sample.
+    let mut col = build(&za);
+    if col.cols == 0 {
+        cover.skip(zone, "no grid");
+        return Err(ZoneDropped("no grid — skipped".into()));
+    }
+
+    // DROP 3 — the region data did not load. Now the water check DID run and failed, so this is
+    // `unmeasured` (it carries the load error), not `skip`. Every current caller uses water at
+    // minimum as its wet-pair filter, and a filter fed a fabricated dry silently scores wet pairs
+    // as dry land — #762's exhibit.
+    let zw = load_water();
+    if let Err(e) = zw.install(&mut col) {
+        let why = ZoneDropped(format!("{UNMEASURED} — {e}"));
+        cover.add(zone, &zw.tally());
+        return Err(why);
+    }
+
+    Ok((col, zw))
 }
 
 #[cfg(test)]
@@ -964,5 +1095,149 @@ mod tests {
             "and the loaded map's zone line is enumerable");
         ZoneWater::from_map(RegionMap::water_slab(-40.0, 0.0)).install(&mut col).expect("installs");
         assert!(col.in_water([0.0, 0.0, -10.0]), "a real water map really answers wet");
+    }
+
+    // ───────── #807: the corpus prologue's three drop paths, pinned WITHOUT baked assets ─────────
+
+    /// A zone whose glb carries one big floor plate — enough that `Collision::build` produces a
+    /// non-empty grid, so `open_corpus_zone_with` gets past DROP 2 and reaches the water check.
+    fn floor_assets() -> eqoxide_assets::ZoneAssets {
+        use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
+        ZoneAssets {
+            terrain: vec![MeshData {
+                positions: vec![[-60.0, 0.0, -60.0], [60.0, 0.0, -60.0], [60.0, 0.0, 60.0], [-60.0, 0.0, 60.0]],
+                normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+                indices: vec![0, 2, 1, 0, 3, 2], texture_name: None, base_color: [1.0; 4],
+                center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+            }],
+            objects: vec![], textures: vec![],
+        }
+    }
+
+    /// A glb that parses but has no geometry at all — the DROP 2 condition, reproduced without a
+    /// file. Pinned here rather than assumed: `Collision::build` on empty terrain must really give
+    /// `cols == 0`, or the "no grid" arm below would be testing nothing.
+    fn empty_assets() -> eqoxide_assets::ZoneAssets {
+        eqoxide_assets::ZoneAssets { terrain: vec![], objects: vec![], textures: vec![] }
+    }
+
+    fn build32(za: &eqoxide_assets::ZoneAssets) -> crate::collision::Collision {
+        crate::collision::Collision::build(za, 32.0)
+    }
+
+    /// **DROP 1 (#807).** A corpus zone with no baked `.glb` must land in the rollup's `skipped`
+    /// bucket and make the run incomplete — not vanish from the denominator, which is what the
+    /// five unconverted corpora did (their `else { println!("(no glb — skipped)"); continue }`
+    /// touched no ledger at all, so their `TOTAL …` line covered a smaller corpus than it named).
+    ///
+    /// MUTATION CHECK: delete `cover.skip(zone, "no glb")` from `open_corpus_zone_with`'s DROP 1
+    /// arm → the zone becomes `unaccounted` instead of `skipped` and the `skipped_zones` assertion
+    /// goes RED. (It stays incomplete either way — `unaccounted` is the fail-closed backstop — so
+    /// the bucket assertion, not `is_complete`, is what discriminates.)
+    #[test]
+    fn open_corpus_zone_records_a_missing_glb_as_skipped_807() {
+        let mut cover = WaterRollup::new();
+        let out = open_corpus_zone_with(&mut cover, "halas",
+            || None, build32, dry_but_loaded);
+        assert_eq!(out.err(), Some(ZoneDropped("no glb — skipped".into())));
+        assert_eq!(cover.skipped_zones(), vec!["halas"]);
+        assert_eq!(cover.unaccounted_zones(), Vec::<&str>::new(),
+            "the drop path accounted for itself; nothing should have been left open");
+        assert_eq!(cover.attempted_zones(), 1, "the zone is still in the denominator");
+        assert!(!cover.is_complete());
+    }
+
+    /// **DROP 2 (#807).** A glb that loads but yields an empty collision grid is the same shape:
+    /// the water check never runs, so the honest outcome is `skipped`, not a measured zero.
+    ///
+    /// MUTATION CHECK: delete `cover.skip(zone, "no grid")` from DROP 2 → `skipped_zones` goes RED
+    /// (the zone shows up as `unaccounted`).
+    #[test]
+    fn open_corpus_zone_records_an_empty_collision_grid_as_skipped_807() {
+        // The premise this arm rests on, asserted rather than assumed.
+        assert_eq!(build32(&empty_assets()).cols, 0, "empty terrain must really build an empty grid");
+        assert!(build32(&floor_assets()).cols > 0, "…and a floor plate must really build a non-empty one");
+
+        let mut cover = WaterRollup::new();
+        let out = open_corpus_zone_with(&mut cover, "halas",
+            || Some(empty_assets()), build32, dry_but_loaded);
+        assert_eq!(out.err(), Some(ZoneDropped("no grid — skipped".into())));
+        assert_eq!(cover.skipped_zones(), vec!["halas"]);
+        assert_eq!(cover.unaccounted_zones(), Vec::<&str>::new());
+        assert!(!cover.is_complete());
+    }
+
+    /// **DROP 3 (#807 / #762).** A zone whose `.wtr` did not load is `unmeasured` — a DIFFERENT
+    /// bucket from `skipped`, because here the water check really did run and really did fail. The
+    /// distinction is the whole of #762: `skipped` says "nobody asked this zone's water"; a
+    /// measured `0` says "we asked and there is none".
+    ///
+    /// MUTATION CHECK: delete `cover.add(zone, &zw.tally())` from DROP 3 → `unmeasured_zones` goes
+    /// RED (the zone shows up as `unaccounted`). Replace it with `cover.skip(zone, "no wtr")` →
+    /// `unmeasured_zones` goes RED too, and the two failure kinds are conflated again.
+    #[test]
+    fn open_corpus_zone_records_an_unloadable_wtr_as_unmeasured_807() {
+        let mut cover = WaterRollup::new();
+        let out = open_corpus_zone_with(&mut cover, "halas",
+            || Some(floor_assets()), build32, absent);
+        let why = out.err().expect("an unloadable .wtr must drop the zone");
+        assert!(why.to_string().starts_with(UNMEASURED), "{why}");
+        assert_eq!(cover.unmeasured_zones(), vec!["halas"]);
+        assert_eq!(cover.skipped_zones(), Vec::<&str>::new(),
+            "a .wtr that was read and failed is not the same outcome as one nobody read");
+        assert_eq!(cover.unaccounted_zones(), Vec::<&str>::new());
+        assert!(!cover.is_complete());
+    }
+
+    /// The success path leaves the zone **open**, so closing it is the caller's job and forgetting
+    /// is loud. This is the property that makes the corpus body's own later `continue`s — including
+    /// ones nobody has written yet — fail the run instead of shrinking it silently.
+    #[test]
+    fn open_corpus_zone_leaves_a_ready_zone_open_for_the_caller_to_close_807() {
+        let mut cover = WaterRollup::new();
+        let (col, zw) = open_corpus_zone_with(&mut cover, "gfaydark",
+            || Some(floor_assets()), build32, dry_but_loaded)
+            .expect("a zone with a grid and loadable region data is ready to score");
+        assert!(col.cols > 0);
+        assert!(zw.is_measured(), "the caller gets the region data back so it can fold a real number");
+
+        // Still open: the run is NOT complete until the caller closes it.
+        assert_eq!(cover.unaccounted_zones(), vec!["gfaydark"]);
+        assert!(!cover.is_complete(), "an opened-but-unclosed zone is a hole, not a pass");
+
+        cover.add("gfaydark", &zw.measure(|_| 3usize));
+        assert!(cover.is_complete(), "…and closing it is what makes the run a result");
+        assert_eq!(cover.measured_total(), 3);
+        assert_eq!(cover.unaccounted_zones(), Vec::<&str>::new());
+    }
+
+    /// The corpus-shaped end-to-end: a mixed run over four zones, one per outcome, driven through
+    /// the real prologue. The two things a corpus publishes — its denominator and its refusal —
+    /// must both survive a run in which three of four zones fell down a different drop path.
+    #[test]
+    fn a_corpus_using_the_prologue_cannot_publish_a_total_over_a_shrunken_zone_list_807() {
+        let mut cover = WaterRollup::new();
+        for (zone, glb, water) in [
+            ("crushbone", Some(floor_assets()), true),  // measured
+            ("akanon",    None,                 true),  // no glb        → skipped
+            ("qeynos2",   Some(empty_assets()), true),  // no grid       → skipped
+            ("halas",     Some(floor_assets()), false), // .wtr missing  → unmeasured
+        ] {
+            let loader = || if water { dry_but_loaded() } else { absent() };
+            let Ok((_col, zw)) = open_corpus_zone_with(&mut cover, zone, || glb, build32, loader)
+                else { continue };
+            cover.add(zone, &zw.measure(|_| 1usize));
+        }
+        assert_eq!(cover.measured_zones(), 1);
+        assert_eq!(cover.attempted_zones(), 4, "all four zones asked for are in the denominator");
+        assert_eq!(cover.skipped_zones(), vec!["akanon", "qeynos2"]);
+        assert_eq!(cover.unmeasured_zones(), vec!["halas"]);
+        assert_eq!(cover.unaccounted_zones(), Vec::<&str>::new(),
+            "no drop path left a zone open — that is what the prologue is for");
+        assert!(!cover.is_complete(), "3 of 4 zones were never scored: this run has no total");
+        let line = cover.to_string();
+        assert!(!line.contains("(over 1/1 zones)"),
+            "the #762/#807 defect string — a clean ratio over the zones that happened to survive: {line}");
+        assert!(line.contains("INCOMPLETE") && line.contains("akanon") && line.contains("halas"), "{line}");
     }
 }
