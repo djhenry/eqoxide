@@ -132,8 +132,10 @@ pub struct ModelAsset {
     /// Read here as the `true_height` fallback when the glTF carries no `eq_height` extra. It is
     /// NOT part of static placement: since #768 `static_placement` takes the whole lift from
     /// `y_bottom`. `visual_scale = 2 × y_extent × arch_scale` survives only in the standalone
-    /// `render_model` viewer bin (`src/bin/render_model.rs:1101`, re-verified for #781 — the
-    /// `:1097` previously written here pointed at a `};` on 41cca4e and was already two off).
+    /// `render_model` viewer bin, where it is written TWICE (`src/bin/render_model.rs:1101` and
+    /// `:1268`, both re-verified for #781 — round 1 cited only the first here, while the sibling
+    /// block on `StaticPlacement` cited both; the `:1097` written here before #781 pointed at a
+    /// `};` on 41cca4e and was already two off).
     pub y_extent:          f32,
     /// Center of the model in the X and Z axes (raw pre-node-scale space, dominant meshes only).
     /// Used as a centering correction so models are rendered at their entity position rather than
@@ -1016,9 +1018,15 @@ pub struct ModelBounds {
     /// deliberately still reachable from a `pass.rs` call site (`model.bounds.y_extent`); see
     /// `static_placement`'s doc for what that leaves open.
     pub y_extent: f32,
-    /// Horizontal centroid on the model's first horizontal axis.
+    /// Midpoint of the model's horizontal bounding box on the X axis: `(x_min + x_max) * 0.5` over
+    /// the dominant-scale vertices, or over skinned-posed ones on the skinned branch — both
+    /// spellings are in `ModelAsset::load`, this file. NOT the centroid of the vertex set: #781
+    /// round 1 wrote "centroid", and the two differ for any model not symmetric about this
+    /// midpoint. Which of the two the horizontal recentre datum *should* be is the question #756
+    /// explicitly left unestablished, so the word is load-bearing rather than cosmetic.
     pub x_center: f32,
-    /// Horizontal centroid on the model's second horizontal axis.
+    /// Midpoint of the model's horizontal bounding box on the Z axis, `(z_min + z_max) * 0.5`. Same
+    /// caveat as `x_center`: a bounding-box midpoint, not a centroid.
     pub z_center: f32,
 }
 

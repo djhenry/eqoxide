@@ -572,8 +572,9 @@ fn every_static_placement_call_site_in_pass_rs_decides_floating_explicitly() {
 /// - It only reads `pass.rs`. A static placement built in another file is invisible to it, and
 ///   "four call sites" is a count of `pass.rs` call sites — it is not a bound on callers of
 ///   `static_placement` anywhere else in the workspace.
-/// - Whitespace is normalized and one trailing comma is stripped, so a re-wrapped argument list is
-///   not a violation; a renamed *variable* is.
+/// - Whitespace is normalized and trailing commas are stripped — `trim_end_matches(',')` removes
+///   every one of them, not one — so a re-wrapped argument list is not a violation; a renamed
+///   *variable* is.
 #[test]
 fn every_static_placement_in_pass_rs_is_written_exactly_as_reviewed() {
     /// Extract every call to `name(` in `pass.rs`, whitespace-normalized, argument list only.
