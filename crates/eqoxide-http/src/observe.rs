@@ -99,18 +99,28 @@ fn zone_assets_refusal(
 /// is indistinguishable from the true, common reading "this zone has no zone lines" — and since
 /// exits are the only way out of a zone, an agent reads it as *sealed in*, off a success response.
 ///
-/// Deliberately NOT folded into `NotUsable`/`zone_assets_not_ready`. **`usability()` has FOUR
-/// non-test consumers** (#821 review round 2, B2 — an earlier revision of this comment said three
-/// and omitted the fourth, which made this argument *understate* the blast radius). By call site:
-///   * `observe.rs:38` / `:67` / `:1554` — every `/observe/*` endpoint, plus `/debug`'s zone block;
-///   * `move_api.rs` — `POST /v1/move/goto`, which turns the verdict into its `zone_assets_pending`
-///     note (**not** an `/observe/*` route, which is why it was missed);
-///   * `walker.rs` — the nav path-walker's `drive_walk` gate; and
-///   * `action_loop.rs` — `ActionLoop::drain_zone_cross`.
+/// Deliberately NOT folded into `NotUsable`/`zone_assets_not_ready`. **`usability()` has THREE
+/// direct non-test consumers, plus one that reaches it one call indirect.** By call site:
+///   * `observe.rs:38` / `:67` / `:1574` — every `/observe/*` endpoint, plus `/debug`'s zone block;
+///   * `move_api.rs:260` — `POST /v1/move/goto`, which turns the verdict into its
+///     `zone_assets_pending` note (**not** an `/observe/*` route, which is why it was missed);
+///   * `walker.rs:1400` — the nav path-walker's `drive_walk` gate; and, indirectly,
+///   * `action_loop.rs` — `ActionLoop::resolve_zone_cross`, which since #827 gates on
+///     [`eqoxide_nav::zone_assets::usable_collision`]; that function's first statement calls
+///     `usability` and returns its verdict as `Err`, so a new variant still reaches zone-crossing.
 ///
-/// So a new `NotUsable` variant would stop routing, stop `/v1/move/goto`, stop zone-crossing AND
-/// stop rendering frames in any zone with a missing `.wtr` — far past what a region-map failure
-/// actually invalidates. The refusal belongs to the questions whose answer really does come out of
+/// **On the count, because the history is easy to misread** (#821 review round 2, B2; #840): an
+/// early revision of this comment said three and omitted `move_api.rs`, which made this argument
+/// *understate* the blast radius, and it was corrected to four. The direct count is three again for
+/// an unrelated reason — #827 turned `action_loop.rs` from a direct caller into an indirect one —
+/// **not** because that omission returned; `move_api.rs` is the bullet that was once missing.
+/// Re-deriving this list by grep needs care in both directions: `usability(` still matches in
+/// `action_loop.rs`, but the only hit there is #827's test asserting its own premise, not a call
+/// site; and no grep for `usability(` alone will find the `resolve_zone_cross` consumer at all.
+///
+/// So a new `NotUsable` variant would stop routing, stop `/v1/move/goto`, stop zone-crossing
+/// (through `usable_collision`, per the bullet above) AND stop rendering frames in any zone with a
+/// missing `.wtr` — far past what a region-map failure actually invalidates. The refusal belongs to the questions whose answer really does come out of
 /// that file. (Confirmed live in the PR's forced-failure run: with the `.wtr` broken and the zone
 /// otherwise `ready`, `/frame`, `/zone_entrances` and `/debug` all still answered `200`.)
 ///

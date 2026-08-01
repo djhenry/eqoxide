@@ -4148,9 +4148,22 @@ mod tests {
     /// **Both halves of the acceptance bar, and the second is the one that keeps the fix honest:**
     /// an emptied slot must NOT produce `zone_line_not_in_map` (rows 1–2), *and* a genuinely loaded
     /// region map that really lacks the region must still produce it (rows 3–4) — otherwise a fix
-    /// that simply stopped ever emitting the string would pass. Row 4 is the sharpest of the four:
-    /// the slot is emptied AND the answer is still `zone_line_not_in_map`, because it now comes from
-    /// a map that was read. The fix removes the falsehood, not the reason.
+    /// that simply stopped ever emitting the string would pass.
+    ///
+    /// **Which rows discriminate #827, and which deliberately do not.** Rows 1–2 are the
+    /// discriminators, measured: under the M1 mutation below (grid re-read from `self.collision`
+    /// while the verdict still comes from `usable_collision`) row 1 fails, and with row 1 removed
+    /// row 2 fails with the acceptance sentence verbatim. Row 4 looks like the sharpest of the four
+    /// — emptied slot, and still `zone_line_not_in_map` — but it is **blind to #827**, and saying so
+    /// here is the point: the #840 review measured row 4 GREEN on its own under M1
+    /// (`1 passed; 0 failed; 382 filtered out`). The pre-fix bug produced this row's expected answer
+    /// too, because an emptied slot left `located` and `region_absent` both `None` and the
+    /// `(None, None)` arm published that same string from no map at all. Row 4 therefore cannot
+    /// attribute its outcome to the grid it was answered from, and no sentence here should.
+    /// What rows 3–4 do pin is the opposite failure: they assert the reason is still *produced*, so
+    /// a "fix" that suppressed `zone_line_not_in_map` rather than re-sourcing it fails here. (That
+    /// is what the rows assert, read directly; no suppression mutation was run.) The fix removes
+    /// the falsehood, not the reason.
     ///
     /// **Mutation checks — all at the CALL SITE in `resolve_zone_cross`, never inside a callee**
     /// (a body-wrap cannot tell "this branch is dead" from "the predicate is false"). Results are
