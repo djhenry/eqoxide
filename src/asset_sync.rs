@@ -205,25 +205,42 @@ fn artifacts_intact(cache: &CacheDirs, files: &[FileEntry]) -> bool {
 /// wall time and asserting a soft upper bound on how long the actual download loop's own work took
 /// — which is what made `elapsed_does_not_carry_over_from_a_slow_prior_download` fail under
 /// remote-builder contention: the assertion raced the machine's load, not the code path it names.
-/// `frozen_at` is `#[cfg(test)]`-gated and the inner field is private to this module, so a pinned
-/// clock cannot reach a real sync: `fetch_and_reassemble`/`sync_set` are private to this file, and
-/// their only externally-reachable entry point, [`sync_set_observed`], always passes `WALL`.
-#[derive(Clone, Copy)]
-struct DownloadClock(Option<std::time::Instant>);
+///
+/// `DownloadClock` lives in its own private submodule (`download_clock`) rather than merely being
+/// a private-field struct in this file. A private tuple field is visible everywhere IN THE MODULE
+/// that declares it — and that module used to be all ~1300 lines of `asset_sync.rs`, including
+/// every production function here, so nothing actually stopped `sync_set` (or any future call
+/// site added to this file) from writing `DownloadClock(Some(t))` directly and silently zeroing
+/// every real download's `elapsed`/rate. That was checked directly: pointing `sync_set` at a
+/// pinned clock instead of `WALL` compiled clean and the whole `--lib` suite still passed. Scoping
+/// the field to `download_clock` instead makes that unreachable rather than merely undone: outside
+/// this submodule the only ways to name a `DownloadClock` are `WALL` and the `#[cfg(test)]`-gated
+/// `frozen_at`, so in a non-test build `WALL` is the *only* constructible value — the compiler
+/// rejects the mutation above (verified: `sync_set` calling `DownloadClock(Some(Instant::now()))`
+/// fails with `E0423: cannot initialize a tuple struct which contains private fields`) instead of
+/// accepting it.
+mod download_clock {
+    /// `None` is the real wall clock ([`DownloadClock::WALL`]); `Some` is a pinned instant, only
+    /// ever constructible via the `#[cfg(test)]` [`DownloadClock::frozen_at`]. See the module doc
+    /// for why the field stays private to this submodule rather than to all of `asset_sync.rs`.
+    #[derive(Clone, Copy)]
+    pub(super) struct DownloadClock(Option<std::time::Instant>);
 
-impl DownloadClock {
-    const WALL: DownloadClock = DownloadClock(None);
+    impl DownloadClock {
+        pub(super) const WALL: DownloadClock = DownloadClock(None);
 
-    /// A clock pinned at `t` — test fixtures only. See the type doc for why this is gated.
-    #[cfg(test)]
-    fn frozen_at(t: std::time::Instant) -> Self {
-        DownloadClock(Some(t))
-    }
+        /// A clock pinned at `t` — test fixtures only. See the module doc for why this is gated.
+        #[cfg(test)]
+        pub(super) fn frozen_at(t: std::time::Instant) -> Self {
+            DownloadClock(Some(t))
+        }
 
-    fn now(self) -> std::time::Instant {
-        self.0.unwrap_or_else(std::time::Instant::now)
+        pub(super) fn now(self) -> std::time::Instant {
+            self.0.unwrap_or_else(std::time::Instant::now)
+        }
     }
 }
+use download_clock::DownloadClock;
 
 /// Downloads whatever chunks in `files` aren't already in the CAS, then reassembles every file.
 /// Shared by both the normal (server digest Changed) sync path and the repair path taken when an
