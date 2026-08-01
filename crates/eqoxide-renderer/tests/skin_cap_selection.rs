@@ -39,9 +39,23 @@
 //!   `AGENT-HONESTY` guidance is that a log line is a weak signal anyway (the driving agent does
 //!   not read logs), so this file grades the *structured* observable
 //!   (`record_skin_cap_downgrade` / `skin_cap_downgrades`), not the log text.
+//!
+//! ## Later additions
+//!
+//! - **eqoxide#813** — the downgrade report is keyed by the **loaded GLB file**, not by
+//!   `(label, gender)`. Those tests drive the real `renderer::resolve_character_model_path` (the
+//!   function `ensure_character_model` calls) against a scratch asset dir, so the `(label, gender)`
+//!   → file relationship they depend on is exercised rather than restated.
+//! - **eqoxide#814** — a floor on `JOINT_CAP`'s VALUE, with the measured corpus figures it comes
+//!   from. See `joint_cap_clears_the_widest_shipped_rig`; the primary enforcement is the `const`
+//!   assertion in `renderer.rs`, which makes a too-small cap a compile error.
 
-use eqoxide_renderer::renderer::{record_skin_cap_downgrade, SkinFit, StaticReason, JOINT_CAP};
+use eqoxide_renderer::renderer::{
+    downgrade_key, record_skin_cap_downgrade, resolve_character_model_path, SkinFit, StaticReason,
+    JOINT_CAP, MAX_MEASURED_CHARACTER_RIG_JOINTS,
+};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 // ── Differential pin: #780 changes NO rendering behaviour ──────────────────────────────────────
 
@@ -142,42 +156,272 @@ fn a_fitting_skin_has_no_static_reason() {
 
 // ── The recording side-effect (what `EqRenderer::skin_cap_downgrades` is built from) ───────────
 
+/// A scratch asset dir containing the given GLB file names (empty files — only their *existence*
+/// matters to `resolve_character_model_path`). Removed on drop.
+///
+/// The downgrade-key tests below run the **real** `renderer::resolve_character_model_path`, the
+/// same function `ensure_character_model` calls, rather than a transcription of it: eqoxide#813 is
+/// about the relationship between `(label, gender)` and the file that ends up loaded, so a test
+/// that restates that relationship would grade its own restatement.
+struct ScratchAssets(std::path::PathBuf);
+
+impl ScratchAssets {
+    fn with(tag: &str, files: &[&str]) -> Self {
+        let dir = std::env::temp_dir().join(format!("eqoxide-skin-cap-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch asset dir");
+        for f in files {
+            std::fs::write(dir.join(f), b"").expect("create scratch glb");
+        }
+        ScratchAssets(dir)
+    }
+    fn path(&self) -> &Path { &self.0 }
+}
+
+impl Drop for ScratchAssets {
+    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+}
+
 #[test]
 fn record_skin_cap_downgrade_only_inserts_for_exceeds_cap() {
     let mut map: BTreeMap<String, usize> = BTreeMap::new();
+    let dir = Path::new("/models");
 
-    record_skin_cap_downgrade(&mut map, "race_ok", StaticReason::NoSkin);
+    record_skin_cap_downgrade(&mut map, &dir.join("race_ok.glb"), StaticReason::NoSkin);
     assert!(map.is_empty(), "NoSkin must not be recorded as a downgrade");
 
-    record_skin_cap_downgrade(&mut map, "race_empty", StaticReason::EmptySkin);
+    record_skin_cap_downgrade(&mut map, &dir.join("race_empty.glb"), StaticReason::EmptySkin);
     assert!(map.is_empty(), "EmptySkin must not be recorded as a downgrade");
 
-    record_skin_cap_downgrade(&mut map, "race_pcfroglok", StaticReason::ExceedsCap { joint_count: 129 });
-    assert_eq!(map.get("race_pcfroglok"), Some(&129),
-        "an ExceedsCap reason must be recorded under the model's own label with its joint count");
+    record_skin_cap_downgrade(&mut map, &dir.join("race_pcfroglok.glb"),
+        StaticReason::ExceedsCap { joint_count: 129 });
+    assert_eq!(map.get("race_pcfroglok.glb"), Some(&129),
+        "an ExceedsCap reason must be recorded under the loaded FILE with its joint count");
     assert_eq!(map.len(), 1);
 }
 
-/// A later re-classification of the same model updates its recorded joint count rather than
+/// The documented limit of the file-name key: two files with the same base name under two different
+/// asset roots collapse into ONE entry.
+///
+/// This is here because `record_skin_cap_downgrade`'s doc used to say the opposite — that two loads
+/// of two files "cannot produce one, because the key IS the file" — and a reviewer pointed out the
+/// key is the *base name*. Rather than restate the limit in prose and leave it unmeasured, this
+/// pins it: the second load overwrites the first, and the report says 190 for a name that also
+/// belonged to a 140-joint rig.
+///
+/// It is not reachable in the shipped flow (`EqRenderer` has one `assets_path`, set by
+/// `load_character_models`) and the base name is deliberate — the map is agent-facing over HTTP and
+/// an absolute path is machine-specific noise. If a second root is ever introduced, this test is
+/// where the consequence is already written down.
+#[test]
+fn two_roots_with_the_same_basename_collide_into_one_entry() {
+    let mut map: BTreeMap<String, usize> = BTreeMap::new();
+    let a = Path::new("/root_a").join("race_hum.glb");
+    let b = Path::new("/root_b").join("race_hum.glb");
+    assert_ne!(a, b, "precondition: two genuinely different files");
+
+    record_skin_cap_downgrade(&mut map, &a, StaticReason::ExceedsCap { joint_count: 140 });
+    record_skin_cap_downgrade(&mut map, &b, StaticReason::ExceedsCap { joint_count: 190 });
+
+    assert_eq!(map.len(), 1, "same base name under two roots keys the same entry");
+    assert_eq!(
+        map.get("race_hum.glb"),
+        Some(&190),
+        "the later load wins — the 140-joint rig under the other root is not reported at all"
+    );
+}
+
+/// The key is the loaded file name, not the directory-qualified path: two clients with different
+/// asset roots must produce the same report for the same rig.
+#[test]
+fn the_downgrade_key_is_the_file_name() {
+    assert_eq!(downgrade_key(Path::new("/a/b/race_hum_f.glb")), "race_hum_f.glb");
+    assert_eq!(downgrade_key(Path::new("race_hum.glb")), "race_hum.glb");
+    // Never empty: a path with no file-name component still names something.
+    assert!(!downgrade_key(Path::new("/a/b/..")).is_empty());
+}
+
+/// eqoxide#798's half: two genders that resolve to two DIFFERENT files must produce two entries.
+///
+/// `ensure_character_model` prefers `<label>_f.glb` for gender 1, and the two files have
+/// independent joint counts. Keyed by label alone (the pre-#798 key) the second load overwrote the
+/// first, so a report could name one joint count while a second, differently sized rig was also
+/// downgraded and went unmentioned.
+#[test]
+fn two_genders_that_load_two_different_files_are_reported_separately() {
+    let assets = ScratchAssets::with("two-files", &["race_hum.glb", "race_hum_f.glb"]);
+    let mut map: BTreeMap<String, usize> = BTreeMap::new();
+    let male   = resolve_character_model_path(assets.path(), "race_hum", 0);
+    let female = resolve_character_model_path(assets.path(), "race_hum", 1);
+    assert_ne!(male, female, "precondition: an archetype WITH an _f variant loads two files");
+
+    record_skin_cap_downgrade(&mut map, &male,   StaticReason::ExceedsCap { joint_count: 140 });
+    record_skin_cap_downgrade(&mut map, &female, StaticReason::ExceedsCap { joint_count: 190 });
+    assert_eq!(map.len(), 2, "two distinct rigs must not collide into one entry");
+    assert_eq!(map.get("race_hum.glb"),   Some(&140));
+    assert_eq!(map.get("race_hum_f.glb"), Some(&190));
+}
+
+/// eqoxide#813: two genders that resolve to the SAME file must produce ONE entry.
+///
+/// Only 3 archetypes in the shipped model cache have an `_f` variant (measured 2026-07-31:
+/// `dwarf_f.glb`, `elf_f.glb`, `humanoid_f.glb`, out of 136 `.glb` files). For every other
+/// archetype both genders load the identical GLB, so a `(label, gender)` key — #798's key —
+/// recorded one downgraded file twice, under two keys, with the same count. That is a duplicate
+/// entry in a report an agent reads: it says two rigs were downgraded when one was.
+///
+/// Note what makes this structural rather than a guard: `record_skin_cap_downgrade` keys on the
+/// `&Path` it is given, so "same file, two entries" is not expressible — there is no second key to
+/// insert under.
+#[test]
+fn two_genders_that_load_the_same_file_are_reported_once() {
+    // No `_f` variant on disk — the shape of every archetype but 3.
+    let assets = ScratchAssets::with("one-file", &["race_pcfroglok.glb"]);
+    let mut map: BTreeMap<String, usize> = BTreeMap::new();
+    let male   = resolve_character_model_path(assets.path(), "race_pcfroglok", 0);
+    let female = resolve_character_model_path(assets.path(), "race_pcfroglok", 1);
+    assert_eq!(male, female, "precondition: an archetype with NO _f variant loads one file");
+
+    record_skin_cap_downgrade(&mut map, &male,   StaticReason::ExceedsCap { joint_count: 200 });
+    record_skin_cap_downgrade(&mut map, &female, StaticReason::ExceedsCap { joint_count: 200 });
+    assert_eq!(map.len(), 1,
+        "one GLB was downgraded once; reporting it twice would tell the agent two rigs failed");
+    assert_eq!(map.get("race_pcfroglok.glb"), Some(&200));
+}
+
+/// The universal form of the two tests above: over every combination of labels, genders and
+/// `_f`-variant presence, the number of entries equals the number of DISTINCT files loaded — never
+/// more, never fewer. #798 (two files, one entry) and #813 (one file, two entries) are the two ways
+/// this can break, and this is the single statement that excludes both.
+///
+/// Quantified over one asset root, which is what a renderer has. `distinct` counts distinct *paths*,
+/// and every path here shares a root, so distinct path and distinct base name coincide. They do not
+/// coincide in general — see `two_roots_with_the_same_basename_collide_into_one_entry`, which pins
+/// the one case where this equality does not hold.
+#[test]
+fn entry_count_always_equals_distinct_file_count() {
+    let labels = ["race_a", "race_b"];
+    for f_variants in 0..(1usize << labels.len()) {
+        let files: Vec<String> = labels
+            .iter()
+            .enumerate()
+            .flat_map(|(i, l)| {
+                let mut v = vec![format!("{l}.glb")];
+                if f_variants & (1 << i) != 0 { v.push(format!("{l}_f.glb")); }
+                v
+            })
+            .collect();
+        let refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let assets = ScratchAssets::with(&format!("combo-{f_variants}"), &refs);
+
+        let mut map: BTreeMap<String, usize> = BTreeMap::new();
+        let mut distinct = std::collections::BTreeSet::new();
+        for label in labels {
+            for gender in [0u8, 1u8] {
+                let p = resolve_character_model_path(assets.path(), label, gender);
+                distinct.insert(p.clone());
+                record_skin_cap_downgrade(&mut map, &p,
+                    StaticReason::ExceedsCap { joint_count: 999 });
+            }
+        }
+        assert_eq!(map.len(), distinct.len(),
+            "f_variants={f_variants:02b} files={files:?}: {} entries for {} distinct files loaded",
+            map.len(), distinct.len());
+    }
+}
+
+/// The resolver itself, on the two shapes that matter: with an `_f` variant present gender 1 gets
+/// its own file; without one it falls back to the male GLB. Read directly rather than assumed,
+/// because every downgrade-key claim above rests on it.
+#[test]
+fn gender_1_falls_back_to_the_male_glb_when_no_f_variant_exists() {
+    let with_f = ScratchAssets::with("resolver-with-f", &["race_hum.glb", "race_hum_f.glb"]);
+    assert_eq!(resolve_character_model_path(with_f.path(), "race_hum", 1),
+        with_f.path().join("race_hum_f.glb"));
+    assert_eq!(resolve_character_model_path(with_f.path(), "race_hum", 0),
+        with_f.path().join("race_hum.glb"));
+
+    let without_f = ScratchAssets::with("resolver-no-f", &["race_hum.glb"]);
+    assert_eq!(resolve_character_model_path(without_f.path(), "race_hum", 1),
+        without_f.path().join("race_hum.glb"),
+        "gender 1 with no _f variant must fall back to the male GLB");
+}
+
+/// A later re-classification of the same file updates its recorded joint count rather than
 /// leaving a stale one behind (relevant if a model is ever reloaded after a rebake).
 #[test]
-fn re_recording_the_same_label_updates_the_joint_count() {
+fn re_recording_the_same_file_updates_the_joint_count() {
     let mut map: BTreeMap<String, usize> = BTreeMap::new();
-    record_skin_cap_downgrade(&mut map, "race_x", StaticReason::ExceedsCap { joint_count: 130 });
-    record_skin_cap_downgrade(&mut map, "race_x", StaticReason::ExceedsCap { joint_count: 200 });
-    assert_eq!(map.get("race_x"), Some(&200));
+    let p = Path::new("/models/race_x.glb");
+    record_skin_cap_downgrade(&mut map, p, StaticReason::ExceedsCap { joint_count: 130 });
+    record_skin_cap_downgrade(&mut map, p, StaticReason::ExceedsCap { joint_count: 200 });
+    assert_eq!(map.get("race_x.glb"), Some(&200));
     assert_eq!(map.len(), 1);
 }
 
-/// Recording a non-downgrade for a label that already had a recorded downgrade must not erase it —
+/// Recording a non-downgrade for a file that already had a recorded downgrade must not erase it —
 /// `record_skin_cap_downgrade` only ever inserts, never removes, so a caller that (incorrectly)
-/// re-derives `NoSkin`/`EmptySkin` for an already-downgraded label can't accidentally un-report it.
+/// re-derives `NoSkin`/`EmptySkin` for an already-downgraded file can't accidentally un-report it.
 #[test]
 fn a_non_downgrade_call_never_removes_an_existing_entry() {
     let mut map: BTreeMap<String, usize> = BTreeMap::new();
-    record_skin_cap_downgrade(&mut map, "race_x", StaticReason::ExceedsCap { joint_count: 130 });
-    record_skin_cap_downgrade(&mut map, "race_x", StaticReason::NoSkin);
-    assert_eq!(map.get("race_x"), Some(&130), "a non-downgrade call must not clear a prior record");
+    let p = Path::new("/models/race_x.glb");
+    record_skin_cap_downgrade(&mut map, p, StaticReason::ExceedsCap { joint_count: 130 });
+    record_skin_cap_downgrade(&mut map, p, StaticReason::NoSkin);
+    assert_eq!(map.get("race_x.glb"), Some(&130),
+        "a non-downgrade call must not clear a prior record");
+}
+
+// ── eqoxide#814: the cap's VALUE has a floor, and it is not silent ──────────────────────────────
+
+/// `JOINT_CAP` must clear the widest rig that actually ships, and every measured shipped rig must
+/// classify as skinned.
+///
+/// **Why this test exists.** Before eqoxide#798 the cap was spelled independently in WGSL and in
+/// Rust, so a mistyped cap produced a wgpu binding-size error. Unification removed that accident:
+/// the tree is now self-consistent for *any* `JOINT_CAP`, including one too small for the shipped
+/// rigs. Such a cap does not error — it reclassifies real rigs `ExceedsCap` and renders them
+/// unskinned. Silent wrong answer.
+///
+/// **Where the numbers came from — measured, not reasoned.** Scanned on 2026-07-31: the GLB JSON
+/// chunk of every `.glb` in the local model cache that `build_character_model` can be handed
+/// (`race_*` + the named archetypes; zone terrain and `*_doors.glb` excluded). 136 `.glb` files
+/// present, 49 character-relevant ones carry a skin. The distribution's top and bottom:
+/// `race_pcfroglok.glb` 127 (the max), `race_huf.glb`/`humanoid_f.glb` 110, six `race_*f.glb` +
+/// `elf.glb`/`elf_f.glb` 109, `race_kem.glb` 108, … down to `fish.glb` 8. That is the same scan
+/// `no_shipped_local_model_exceeds_the_cap_today` re-runs against the live cache; it is `#[ignore]`d
+/// because the cache is a dev-machine artifact, which is precisely why the measured figures are
+/// pinned here as constants that run in a plain `cargo test`.
+///
+/// **What this does and does not prove.** It proves the cap clears the corpus measured on that
+/// date. It does NOT re-measure the cache (that is the ignored test's job) and it cannot know about
+/// a rig baked after that date — a wider rig arriving later is caught by the ignored scan, not by
+/// this one. The primary enforcement is not this test at all: `renderer.rs` carries
+/// `const _: () = assert!(JOINT_CAP >= MAX_MEASURED_CHARACTER_RIG_JOINTS)`, so a too-small cap is a
+/// **compile error** and this test never gets the chance to run. This test exists to state the
+/// provenance and to check the consequence the const cannot express — that `SkinFit::classify`
+/// actually calls each measured rig skinned.
+#[test]
+fn joint_cap_clears_the_widest_shipped_rig() {
+    /// Every distinct joint count at the top of the measured distribution, plus the minimum.
+    const MEASURED_SHIPPED_RIG_JOINTS: &[usize] = &[127, 110, 109, 108, 106, 105, 104, 8];
+
+    assert_eq!(MAX_MEASURED_CHARACTER_RIG_JOINTS, 127,
+        "MAX_MEASURED_CHARACTER_RIG_JOINTS moved off the measured 127 (race_pcfroglok.glb) without \
+         this test's provenance paragraph moving with it");
+    assert_eq!(
+        MEASURED_SHIPPED_RIG_JOINTS.iter().copied().max(), Some(MAX_MEASURED_CHARACTER_RIG_JOINTS),
+        "the constant must be the maximum of the measured corpus, not an unrelated number"
+    );
+    assert!(JOINT_CAP >= MAX_MEASURED_CHARACTER_RIG_JOINTS,
+        "JOINT_CAP is {JOINT_CAP}, below the widest shipped rig ({MAX_MEASURED_CHARACTER_RIG_JOINTS} \
+         joints, race_pcfroglok.glb). A cap this small does not error — it silently renders real \
+         rigs unskinned.");
+    for &n in MEASURED_SHIPPED_RIG_JOINTS {
+        assert!(SkinFit::classify(Some(n)).is_skinned(),
+            "a shipped rig with {n} joints is classified {:?} — it would render unskinned",
+            SkinFit::classify(Some(n)));
+    }
 }
 
 // ── Measured, not inferred: does any shipped model actually exceed the cap today? ───────────────

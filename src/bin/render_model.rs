@@ -549,10 +549,8 @@ fn gpu_skin_y_extent(
     use wgpu::util::DeviceExt;
     let n = cpu_verts.len();
     if n == 0 { return 0.0; }
-    // Joint uniform buffer (128 mat4).
-    let id4 = [[1f32,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]];
-    let mut joint_array = [id4; 128];
-    for (i, m) in matrices.iter().enumerate().take(128) { joint_array[i] = *m; }
+    // Joint uniform buffer: a full JOINT_CAP-sized palette, built by the one shared padder.
+    let joint_array = eqoxide::renderer::pad_joint_palette(matrices);
     let joints_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("probe_joints"), contents: bytemuck::cast_slice(&joint_array),
         usage: wgpu::BufferUsages::UNIFORM });
@@ -571,7 +569,8 @@ fn gpu_skin_y_extent(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("skin_probe"),
-        source: wgpu::ShaderSource::Wgsl(eqoxide::pipeline::SKIN_PROBE_WGSL.into()) });
+        source: wgpu::ShaderSource::Wgsl(
+            eqoxide::pipeline::wgsl(eqoxide::pipeline::SKIN_PROBE_WGSL).into()) });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("skin_probe"), layout: None, module: &module, entry_point: "main",
         compilation_options: Default::default(), cache: None });
@@ -739,7 +738,8 @@ impl ApplicationHandler for ModelViewerApp {
         let wireframe_pipeline = {
             let vert = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("wireframe_vert"),
-                source: wgpu::ShaderSource::Wgsl(eqoxide::pipeline::CHARACTER_WGSL.into()),
+                source: wgpu::ShaderSource::Wgsl(
+                    eqoxide::pipeline::wgsl(eqoxide::pipeline::CHARACTER_WGSL).into()),
             });
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("wireframe_layout"),
@@ -866,7 +866,8 @@ impl ApplicationHandler for ModelViewerApp {
         let skinned: Option<SkinnedView> = if self.race.is_some() {
             let skin = std::mem::take(&mut asset.skin);
             match skin {
-                Some(skin) if skin.joint_count > 0 && skin.joint_count <= 128 => {
+                Some(skin) if eqoxide::renderer::SkinFit::classify(Some(skin.joint_count))
+                    .is_skinned() => {
                     let (_, sk_tex_bgs) = gpu::upload_textures(&device, &queue, &asset.textures, &layouts.texture_bgl);
                     let mut smeshes: Vec<GpuSkinnedMesh>                          = Vec::new();
                     let mut sslots: Vec<Option<eqoxide::models::EquipSlot>>       = Vec::new();
@@ -910,7 +911,8 @@ impl ApplicationHandler for ModelViewerApp {
                         feet_offset: asset.feet_offset,
                     };
                     let joints_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("render_model_joints"), size: 128 * 64,
+                        label: Some("render_model_joints"),
+                        size: eqoxide::renderer::JOINT_BUF_BYTES,
                         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false });
                     let joints_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1228,9 +1230,7 @@ fn render_frame(s: &mut ViewerState) {
         } else {
             sk.model.skin.evaluate(idle, sk.anim_time)
         };
-        let id4 = [[1f32,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]];
-        let mut joint_array = [id4; 128];
-        for (i, m) in matrices.iter().enumerate().take(128) { joint_array[i] = *m; }
+        let joint_array = eqoxide::renderer::pad_joint_palette(&matrices);
         s.queue.write_buffer(&sk.joints_buf, 0, bytemuck::cast_slice(&joint_array));
         // One-shot: CPU-skin the GPU's EXACT vertex inputs with the GPU's EXACT joint
         // matrices for THIS frame. If this differs from the visible GPU size, the bug is

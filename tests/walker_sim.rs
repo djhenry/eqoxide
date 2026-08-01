@@ -13,13 +13,21 @@
 use eqoxide::movement::CharacterController;
 use eqoxide::nav::collision::{Collision, LocalOutcome, PlanCtx, PlanOutcome};
 use eqoxide::nav::steering::{carrot_along, carrot_along_los, fast_steer_aim, swim_vspeed};
+// Production tuning constants, IMPORTED rather than copied. Every name here was a private
+// `const … = <literal>;` inside a test fn until #733's review found `LOCAL_REACH` still copied three
+// lines under a comment promising the opposite; the rest came out of the same grep. Values were
+// identical at the time of the change, so this is a drift-proofing, not a behaviour change.
+use eqoxide::nav::steering::{
+    LOCAL_CELL, LOCAL_REACH, NAV_BACKOFF_TICKS, NAV_HOP_TICKS, NAV_LOCAL_STUCK_TICKS,
+    NAV_STUCK_TICKS, REPLAN_COOLDOWN_TICKS,
+};
 use eqoxide::traversability::{Point, Traversability, PLAYER_BODY};
 use eqoxide::assets::{MeshData, RenderMode, ZoneAssets};
 use eqoxide::region_map::RegionMap;
 // #762: water/region data is carried as a MEASURED-or-UNMEASURED value, never as an `Option` a
 // corpus can silently read as "this zone has no water".
 use eqoxide::nav::water_grid::{WaterRollup, ZoneWater, UNMEASURED};
-use eqoxide_core::physics::PLAYER_RADIUS;
+use eqoxide_core::physics::{PLAYER_RADIUS, RUN_SPEED};
 use eqoxide_ipc::MoveIntent;
 
 // ── helpers, copied verbatim from the nav crate's test modules (they also still serve the nav unit
@@ -238,7 +246,7 @@ use eqoxide_ipc::MoveIntent;
             let d = (dx * dx + dy * dy).sqrt();
             let wish_dir = if d > 1e-3 { [dx / d, dy / d] } else { [0.0, 0.0] };
             ctrl.step(MoveIntent { wish_dir, wish_vspeed, jump: false, want_swim,
-                speed: 44.0, climb: 0.0, hop: false }, DT, &col);
+                speed: RUN_SPEED, climb: 0.0, hop: false }, DT, &col);
 
             let at_goal = (ctrl.pos[0] - goal[0]).hypot(ctrl.pos[1] - goal[1]) < 3.0
                 && (ctrl.pos[2] - (-24.0)).abs() < 2.0;
@@ -305,21 +313,40 @@ use eqoxide_ipc::MoveIntent;
     #[ignore = "requires baked zone glbs at $ZONE_DIR; the faithful per-tick-recovery drift baseline"]
     fn faithful_walker_drift_corpus() {
 
-        // Production constants, COPIED from walker.rs. They are copies, not imports (walker.rs is not
-        // reachable from an integration test), so they can and did drift — see the ⚠️ correction in
-        // this test's doc. Anything with a public home is now CALLED rather than copied
-        // (`steering::resync_cursor`, `Collision::carrot_los_clear`, `Collision::ground_continuous`).
-        const RUN_SPEED: f32 = 44.0;
-        const LOOK_AHEAD: f32 = 5.0;
-        const LOCAL_REACH: f32 = 24.0;
-        const LOCAL_BOUND: f32 = 40.0;
-        const LOCAL_CELL:  f32 = 2.0;
-        const NAV_STUCK_TICKS: u32 = 20;
-        const NAV_HOP_TICKS: u32 = 6;
-        const NAV_BACKOFF_TICKS: u32 = 3;
-        const NAV_LOCAL_STUCK_TICKS: u32 = 3;
-        const REPLAN_COOLDOWN_TICKS: u32 = 6;
-        const MAX_REPATHS: u32 = 8;
+        // ⚠️ **Correction (#733 review).** This block used to open: "Production constants, COPIED
+        // from walker.rs. They are copies, not imports (walker.rs is not reachable from an
+        // integration test) … Anything with a public home is now CALLED rather than copied". Both
+        // halves were wrong by the time they were read. This file already does
+        // `use eqoxide::nav::steering::{…}` and calls `steering::resync_cursor`, so `walker.rs`'s
+        // module IS reachable; and `LOCAL_REACH` sat three lines under that sentence as a literal
+        // `24.0` while `steering::LOCAL_REACH` existed. So did seven more.
+        //
+        // ⚠️ **Correction, round 2 of the same review — the repair above was itself wrong twice.**
+        // It went on to claim "everything with a public home is imported at the top of the file, and
+        // only the three below are still literals", and that all three are "private `const`s inside
+        // `walker.rs::drive_walk`". Both were falsified by grep:
+        //
+        //   * `RUN_SPEED` is imported and used by NAME at seven sites, and was ALSO still spelled as
+        //     a bare `speed: 44.0` at five others. Fixed — they now read `speed: RUN_SPEED`. The
+        //     reason the previous round missed them is worth keeping: the value was grepped in
+        //     `steering.rs` and the identifier in this file, so a value-shaped survivor here was
+        //     invisible to both. Grep the value AND the identifier AND the concept, in every file.
+        //     Then READ each hit: four of this file's nine `44.0`s (lines ~199, 200, 205, 921) are
+        //     coordinates and polygon vertices that merely happen to equal the run speed, and
+        //     promoting one would assert a relationship that does not exist — a later change to
+        //     `RUN_SPEED` would move a wall. `speed: 35.0` at ~160 is likewise a deliberately
+        //     different speed, not a stale copy.
+        //   * `MAX_REPATHS` does not exist in `walker.rs`. `grep -rn MAX_REPATHS` hits this file and
+        //     nothing else; production spells the cap as a bare `if self.nav_repaths < 8` at
+        //     `walker.rs:1768`. So it is not a copy of a private const — it MIRRORS AN UNNAMED
+        //     LITERAL, which is strictly worse, and the fix is to name it there first.
+        //
+        // So, precisely: everything that HAS a public home is imported at the top of this file and
+        // is not restated anywhere in it. The three below have no public home, for two different
+        // reasons, and each says which.
+        const LOOK_AHEAD: f32 = 5.0;   // private `const` in walker.rs `drive_walk` (walker.rs:1496)
+        const LOCAL_BOUND: f32 = 40.0; // private `const` in walker.rs `drive_walk` (walker.rs:1507)
+        const MAX_REPATHS: u32 = 8;    // NOT a const anywhere: mirrors the bare `8` at walker.rs:1768
         const DT: f32 = 1.0 / 100.0;          // ~100 Hz controller, per navigation.rs's fast-steer note
         const FRAMES_PER_TICK: u32 = 15;      // 150 ms / 10 ms
         // The swim-up vertical wish is `drift_swim_up_wish` (module fn below), mirroring the walker
@@ -815,7 +842,7 @@ use eqoxide_ipc::MoveIntent;
         let mut ctrl = CharacterController::new(start);
         ctrl.on_ground = true;
         for _ in 0..600 {
-            ctrl.step(MoveIntent { wish_dir: [1.0, 0.0], speed: 44.0, ..Default::default() },
+            ctrl.step(MoveIntent { wish_dir: [1.0, 0.0], speed: RUN_SPEED, ..Default::default() },
                       1.0 / 60.0, &c);
         }
         assert!(ctrl.pos[0] < 0.0,
@@ -852,7 +879,7 @@ use eqoxide_ipc::MoveIntent;
         let mut ctrl = CharacterController::new(start);
         ctrl.on_ground = true;
         for _ in 0..600 {
-            ctrl.step(MoveIntent { wish_dir: [1.0, 0.0], speed: 44.0, ..Default::default() },
+            ctrl.step(MoveIntent { wish_dir: [1.0, 0.0], speed: RUN_SPEED, ..Default::default() },
                       1.0 / 60.0, &c);
         }
         assert!(ctrl.pos[0] < 0.0,
@@ -942,7 +969,7 @@ use eqoxide_ipc::MoveIntent;
         let mut ctrl = CharacterController::new([36.0, 36.0, 0.0]);
         ctrl.on_ground = true;
         for _ in 0..600 {
-            ctrl.step(MoveIntent { wish_dir: [0.7071, 0.7071], speed: 44.0, ..Default::default() },
+            ctrl.step(MoveIntent { wish_dir: [0.7071, 0.7071], speed: RUN_SPEED, ..Default::default() },
                       1.0 / 60.0, &c);
         }
         assert!(ctrl.pos[2] < 6.0,
@@ -997,7 +1024,7 @@ use eqoxide_ipc::MoveIntent;
         ctrl.on_ground = true;
         let mut topped = false;
         for _ in 0..900 {
-            ctrl.step(MoveIntent { wish_dir: [0.7071, 0.7071], speed: 44.0, ..Default::default() },
+            ctrl.step(MoveIntent { wish_dir: [0.7071, 0.7071], speed: RUN_SPEED, ..Default::default() },
                       1.0 / 60.0, &c);
             if ctrl.on_ground && ctrl.pos[2] > 12.0 {
                 topped = true;
@@ -1048,7 +1075,6 @@ use eqoxide_ipc::MoveIntent;
 #[ignore = "requires baked zone glbs at $ZONE_DIR; the #639 goal-append over-tightening blast radius"]
 fn goal_append_blast_radius() {
     use eqoxide::nav::collision::NoRoute;
-    const RUN_SPEED: f32 = 44.0;
     const LOOK_AHEAD: f32 = 5.0;
     const DT: f32 = 1.0 / 100.0;
     const FRAMES_PER_TICK: u32 = 15;
@@ -1213,7 +1239,6 @@ fn goal_append_blast_radius() {
 #[test]
 #[ignore = "requires baked zone glbs at $ZONE_DIR; the #685 corner-buffer inflation blast radius"]
 fn corner_buffer_blast_radius() {
-    const RUN_SPEED: f32 = 44.0;
     const LOOK_AHEAD: f32 = 5.0;
     const STOP_DIST: f32 = 2.0;
     const Z_TOL: f32 = 8.0;
@@ -1396,7 +1421,6 @@ fn corner_buffer_blast_radius() {
 #[test]
 #[ignore = "requires baked zone glbs at $ZONE_DIR; the #693 descent-guard blast radius"]
 fn descent_guard_blast_radius() {
-    const RUN_SPEED: f32 = 44.0;
     const LOOK_AHEAD: f32 = 5.0;
     const STOP_DIST: f32 = 2.0;
     const Z_TOL: f32 = 8.0;
@@ -1544,14 +1568,14 @@ fn descent_guard_blast_radius() {
 #[test]
 #[ignore = "requires baked zone glbs at $ZONE_DIR; the #381 parallel-wall blast radius"]
 fn parallel_wall_clearance_blast_radius() {
-    const RUN_SPEED: f32 = 44.0;
     const LOOK_AHEAD: f32 = 5.0;
     const STOP_DIST: f32 = 2.0;
     const Z_TOL: f32 = 8.0;
     const DT: f32 = 1.0 / 100.0;
     const FRAMES_PER_TICK: u32 = 15;
     const MAX_TICKS: u32 = 300;
-    const FINE_CELL: f32 = 2.0; // nav::steering::LOCAL_CELL — the tier where path_clear is the edge test
+    // Aliased, not restated: 2.0 here and 2.0 in `steering` would agree by coincidence.
+    const FINE_CELL: f32 = LOCAL_CELL; // the tier where path_clear is the edge test
     let pairs_per_zone: usize = std::env::var("PAIRS").ok().and_then(|s| s.parse().ok()).unwrap_or(80);
 
     let run = |col: &Collision, route: &[[f32; 3]], goal: [f32; 3]| -> (bool, u32) {
