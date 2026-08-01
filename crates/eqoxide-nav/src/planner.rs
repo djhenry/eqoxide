@@ -1227,7 +1227,7 @@ mod tests {
         assert!(!outcome.threaded(), "fixture sanity: the carrot is behind a solid wall");
 
         // What it pays now:
-        let mut lp = LocalPlanner::spawn();
+        let mut lp = LocalPlanner::spawn(); // #787-NOT-PRODUCTION
         let t1 = Instant::now();
         lp.post_if_idle(LocalRequest {
             gen: 0, start, goal, cell: 2.0, bound: 40.0, carrot_tol: 4.0, collision: col.clone(),
@@ -1310,7 +1310,7 @@ mod tests {
     #[test]
     fn an_abandoned_fine_plan_is_discarded_not_applied() {
         let col = plane_with_a_solid_wall();
-        let mut lp = LocalPlanner::spawn();
+        let mut lp = LocalPlanner::spawn(); // #787-NOT-PRODUCTION
         let mk = |start: [f32; 3], goal: [f32; 3], col: &Arc<Collision>| LocalRequest {
             gen: 0, start, goal, cell: 2.0, bound: 40.0, carrot_tol: 4.0, collision: col.clone(),
         };
@@ -1349,7 +1349,7 @@ mod tests {
     #[test]
     fn a_dead_fine_planner_is_reported_and_does_not_wedge_the_walker() {
         let col = plane_with_a_solid_wall();
-        let mut lp = LocalPlanner::spawn();
+        let mut lp = LocalPlanner::spawn(); // #787-NOT-PRODUCTION
         assert!(!lp.is_dead());
         lp.kill_worker_for_test();
         lp.post_if_idle(LocalRequest { gen: 0, start: [-20.0, 0.0, 0.0], goal: [20.0, 0.0, 0.0],

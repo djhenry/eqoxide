@@ -2473,6 +2473,40 @@ fn winit_to_egui_key(code: KeyCode) -> Option<egui::Key> {
 ///
 /// An empty `scene_zone` (no zone yet, or a transient reset) never triggers a load: there is no
 /// `<empty>.glb` to fetch, and loading it would only blow away real terrain for a fallback plane.
+///
+/// **The `!=` below is an EXACT, case-SENSITIVE comparison, while `zone_assets::usability` — the
+/// function that decides whether the loaded grid may be used to answer about the world — compares
+/// the same two zone names with `eq_ignore_ascii_case`. That asymmetry is deliberate, not an
+/// oversight (#826).**
+///
+/// The safety rule the pair has to satisfy is one-directional: *the reload trigger must be at least
+/// as eager as the bless test.* If it is, then "no reload is pending" implies "the names match by
+/// the bless test too", so a blessed grid is always the zone the character is in. Exact comparison
+/// is the most eager comparison there is, so it satisfies that rule **for every non-empty
+/// `scene_zone`** — and the cost of the extra eagerness is bounded: a case-only difference can only
+/// cause a *spurious* reload — `Pending`, then an honest 503 — never a stale-but-blessed grid
+/// (#821 review round 2).
+///
+/// The empty `scene_zone` case is carried by a different mechanism, not by this comparison: the
+/// `is_empty()` short-circuit means an empty `scene_zone` against a loaded `current_zone` starts no
+/// reload at all. `usability` is what stays honest there — it reads `player_zone`, not `scene_zone`,
+/// and refuses an empty one outright with `PlayerZoneUnknown` (#837 review, N1).
+///
+/// A case-only divergence between the two sides also cannot arise from the current data flow at
+/// all: `scene.zone` and the `player_zone` handed to `usability` are both copies of the single
+/// `gs.world.zone_name`, and `current_zone` is itself a copy of `scene.zone`. That makes the
+/// eagerness a margin against a scenario one source already excludes — cheap insurance, which is
+/// why keeping it costs nothing (#837 review, attack 5).
+///
+/// So do NOT "fix" the inconsistency by making this comparison case-insensitive as well. That does
+/// not tighten anything; it drops the pair to exact parity and makes the safety argument depend on
+/// the extra assumption that two zone shortnames differing only in ASCII case are always the same
+/// zone. Today they are, which is why this is a margin and not a live bug — but the margin is free
+/// and the assumption is not enforced anywhere. More seriously, the same edit taken one step
+/// further — any comparison here that is *more lenient* than `usability`'s — silently breaks the
+/// rule: a real zone change would fail to start a reload while `usability` went on blessing the
+/// previous zone's collision grid, which is precisely the stale-ready lie `NotUsable::
+/// StaleForPreviousZone` exists to report.
 fn zone_needs_reload(scene_zone: &str, current_zone: &str) -> bool {
     !scene_zone.is_empty() && scene_zone != current_zone
 }
@@ -2691,24 +2725,50 @@ fn smooth_entity_motion(
         // every-entity loop, and the compared position is bit-identical frame to frame
         // unless the entity actually moved (near: the glide has settled; far: the raw
         // server pos only changes on a sparse update), so only re-raycast on movement (#152).
-        if b.floating {
-            // Boats/ships float on the water surface: keep their server-sent z, do NOT snap to the
-            // floor. The server skips FixZ for boats too (Mob::FixZ: `if (GetIsBoat()) return;`)
-            // because they're GravityBehavior::Floating; floor_z would find the seabed/dock a few
-            // units down in shallow harbor water and yank the ship underwater (#194).
-        } else {
-            match collision {
-                Some(col) => {
+        //
+        // #753: the `collision` match runs UNCONDITIONALLY — including while `b.floating` — so
+        // the `None` arm's cache invalidation can never be skipped by the floating exemption. The
+        // original shape nested the whole match inside `if !b.floating`, so while an entity was
+        // floating (a levitate toggle, a boat ride — `floating()` is re-derived from the LIVE
+        // flymode every frame, #578, not a one-time spawn flag) the `None` arm was unreachable no
+        // matter what `collision` did. Confirmed: the only other `[f32::NAN; 3]` in this file is
+        // the `motion.entry(..).or_insert_with(..)` initialiser (~2592), which invalidates only
+        // on entry *creation*; nothing else invalidates a live entry. And `self.collision` has
+        // exactly two production writers (`Some` on load completion, `None` on reload start), so
+        // every real collision swap passes through `None`. `b.floating` now only gates whether
+        // the snap is *applied* (the boat/#194 behavior — keep the server-sent z), never whether
+        // the `None` arm is reachable.
+        //
+        // NOT measured: whether a floating entity's cache entry can actually survive a live
+        // `Some(A) -> None -> Some(B)` zone swap end to end — `motion.retain` (below) drops an
+        // absent entity's entry the first frame it's missing from the billboard list, and
+        // `begin_zone_in` clears `world.entities` before `self.collision` goes `None`
+        // (`crates/eqoxide-core/src/game_state.rs`). This restructure closes the code-shape hazard
+        // (a floating exemption able to bypass an invalidation) regardless of whether that live
+        // sequence is reachable today.
+        match collision {
+            Some(col) => {
+                if !b.floating {
                     if b.pos != m.floor_at {
                         m.floor_at = b.pos;
                         m.floor_z  = col.floor_z(b.pos[0], b.pos[1], b.pos[2]);
                     }
                     b.pos[2] = m.floor_z;
                 }
-                // No collision loaded (zone (re)loading): invalidate the cache so the snap is
-                // recomputed against the NEW zone geometry once it arrives, not served stale.
-                None => m.floor_at = [f32::NAN; 3],
+                // Boats/ships float on the water surface: keep their server-sent z, do NOT snap to
+                // the floor. The server skips FixZ for boats too (Mob::FixZ: `if (GetIsBoat())
+                // return;`) because they're GravityBehavior::Floating; floor_z would find the
+                // seabed/dock a few units down in shallow harbor water and yank the ship underwater
+                // (#194). Left write-free (not memoizing `floor_at`/`floor_z` here) to keep this
+                // fix's diff minimal and preserve pre-#753 behavior exactly — memoizing while
+                // floating is a plausible alternate design (mutation-checked as M7 in the #753 PR
+                // review: the suite stays green under it), but changing it is unrelated to this
+                // fix's scope.
             }
+            // No collision loaded (zone (re)loading): invalidate the cache so the snap is
+            // recomputed against the NEW zone geometry once it arrives, not served stale. Runs
+            // regardless of `b.floating` — see above.
+            None => m.floor_at = [f32::NAN; 3],
         }
     }
 
@@ -3108,9 +3168,10 @@ mod tests {
         let now = std::time::Instant::now();
         let surface_z = 4.0_f32;
 
-        // Floating (boat): z untouched, and still untouched on the second frame. The floating
-        // arm never touches the memo cache (it's comment-only), so there's nothing for a later
-        // frame to resurrect from — the second frame is belt-and-braces, not load-bearing.
+        // Floating (boat): z untouched, and still untouched on the second frame. While floating,
+        // the `Some(col)` arm deliberately skips writing `floor_at`/`floor_z` too (#753), so
+        // there's nothing for a later frame to resurrect from — the second frame is
+        // belt-and-braces, not load-bearing.
         let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
         for _ in 0..2 {
             let mut boat = bb(9, [10.0, 0.0, surface_z]);
@@ -3128,6 +3189,70 @@ mod tests {
         smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col), now, 1.0 / 60.0);
         assert!(bbs[0].pos[2].abs() < 1e-3,
             "a non-floating entity at the same spot must still snap to the floor, got z={}",
+            bbs[0].pos[2]);
+    }
+
+    /// #753: a zone-geometry change that happens WHILE an entity is floating must still
+    /// invalidate the floor-snap memo, so a later grounded frame — even one that lands back on
+    /// the exact bit-identical position — re-raycasts against the CURRENT collision instead of
+    /// serving a z computed against geometry that is no longer loaded.
+    ///
+    /// Sequence, `b.pos` held bit-identical throughout so the ONLY things that change are
+    /// `b.floating` and `collision` — exactly the call-site shape the bug needs:
+    ///   1. Grounded on `col_a` (floor z=-3): caches the snap.
+    ///   2. Entity starts floating (levitate toggle / boat) at the SAME instant a zone reload
+    ///      drops `collision` to `None` — the real-world trigger (`self.collision = None` always
+    ///      precedes a zone swap, `src/app.rs` zone-reload path).
+    ///   3. Still floating, the new zone's collision (`col_b`, floor z=5) arrives.
+    ///   4. Entity lands (floating clears) at the SAME position. A correct memo must re-raycast
+    ///      against `col_b` and report z=5 — NOT the pre-reload col_a value of z=-3.
+    ///
+    /// `col_a`'s height is deliberately non-zero (review finding 3, PR #834): `EntityMotion`'s
+    /// own zero-init for `floor_z` is also 0.0, so a `col_a` at z=0 couldn't tell "served the
+    /// stale col_a raycast" apart from "served the never-initialised default" from the failure
+    /// value alone. -3 makes the two cases distinguishable by the number in the panic message.
+    #[test]
+    fn floating_across_a_zone_reload_does_not_resurrect_the_old_zones_floor() {
+        let col_a = flat_collision_at(-3.0);
+        let col_b = flat_collision_at(5.0); // different height — any stale serve is detectable
+        let now = std::time::Instant::now();
+        // z=10 sits ABOVE both floors (-3 and 5) so the downward raycast can find either one;
+        // x/y/z is bit-identical across every frame below.
+        let p = [10.0, 0.0, 10.0];
+
+        let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
+
+        // 1. Grounded on the OLD zone's collision — caches floor_at=p, floor_z=-3.
+        let mut bbs = vec![bb(9, p)];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col_a), now, 1.0 / 60.0);
+        assert!((bbs[0].pos[2] + 3.0).abs() < 1e-3, "precondition: grounded on col_a at z=-3");
+        // Pin the bit-identity the rest of this test depends on (review finding 4, PR #834): the
+        // memo really did cache the raycast at exactly `p`. Steps 2-4 reuse `p` unchanged, so if
+        // `m.display`/`m.floor_at` ever drifted by an epsilon, step 4 would re-raycast for the
+        // wrong reason and this test would stop pinning #753 while still passing.
+        assert_eq!(motion[&9].floor_at, p, "memo must key on the exact position it raycast at");
+
+        // 2. Floating starts exactly as the zone reload drops collision to None (the real
+        // trigger path: `self.collision = None` always precedes a zone swap).
+        let mut boat = bb(9, p);
+        boat.floating = true;
+        let mut bbs = vec![boat];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], None, now, 1.0 / 60.0);
+
+        // 3. Still floating, the NEW zone's collision arrives.
+        let mut boat = bb(9, p);
+        boat.floating = true;
+        let mut bbs = vec![boat];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col_b), now, 1.0 / 60.0);
+
+        // 4. Lands at the SAME position. Must re-raycast against col_b (z=5), not resurrect the
+        // pre-reload col_a value (z=-3) from a memo that was never invalidated across the change.
+        let mut bbs = vec![bb(9, p)];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col_b), now, 1.0 / 60.0);
+        assert!((bbs[0].pos[2] - 5.0).abs() < 1e-3,
+            "grounded frame after a floating zone-reload transition must re-raycast against the \
+             CURRENT collision (col_b, z=5), got z={} — a stale memo would report the pre-reload \
+             col_a value of z=-3",
             bbs[0].pos[2]);
     }
 

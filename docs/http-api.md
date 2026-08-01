@@ -313,7 +313,7 @@ off, the character free-floats instead of falling and holds altitude with no inp
 
 | Value | Meaning |
 |-------|---------|
-| `true`  | Levitating. `pos_up` is a height the character will **not** fall from, and the controller applies no gravity. |
+| `true`  | Levitating. `player.pos[2]` — the up component of the served position array `[east, north, up]` — is a height the character will **not** fall from, and the controller applies no gravity. |
 | `false` | A **trustworthy** negative — the client has complete buff information and none of it is levitate. |
 | `null`  | **UNKNOWN.** The client received a buff it could not resolve (its spell table — `spells_us.txt` — is missing or truncated) and no channel positively asserts levitate, so it genuinely cannot say. This is **never** silently reported as `false`. |
 
@@ -381,8 +381,13 @@ window rather than a silence. Read `"hold": null` as *no hold is in force*, neve
 this frame*. `underworld_no_recovery` has no such lag; it is raised on the first refused descent.
 (#724 round-2 review, N5.)
 
-**The key is always present** (never omitted), so an agent that greps for `hold` and finds nothing
-knows it is talking to a client too old to report the state, rather than concluding all is well.
+**The key is always present in `GET /v1/observe/debug`'s `player` object** (never omitted), so an
+agent that greps that response for `hold` and finds nothing knows it is talking to a client too old
+to report the state, rather than concluding all is well. This is a claim about *that one route*, not
+about the API in general — no other endpoint carries the field, and there is no bare `GET /v1/observe`
+or `/v1/observe/state` route to carry it (#817 shipped the `player.insert("hold", …)` in
+`observe::get_debug` that makes the key reachable at all; before it, `player.hold` was computed,
+mirrored into `GameState` every tick, and covered by tests, and still reached no response body).
 And it does not latch. On every **rendered** frame the controller recomputes it from scratch, so it
 disappears the frame the body is freed. On the frames that render but do not **step** it is cleared
 explicitly instead: for the whole ~10 s of a zone's asset load there is no collision to step against,
@@ -431,7 +436,7 @@ came, try a different heading — and only then treat it as a genuine trap.
 
 | Field | What it is |
 |---|---|
-| `secs` | How long the stall has been continuously in force, in **controller frame time** as of the last stepped frame — the same clock and the same caveat as `hold.held_secs` (that field is documented above but is **not currently served by any handler** — #817 — so treat the comparison as describing the clock, not as pointing you at something to read). It counts the whole window including the part before the threshold, so it is the true age of the stall and is always at least `stall_threshold_secs`. |
+| `secs` | How long the stall has been continuously in force, in **controller frame time** as of the last stepped frame — the same clock and the same caveat as `hold.held_secs`, both documented above. |
 | `anchor_*` | The position the window opened at: the point the body has failed to get more than `progress_threshold` away from, in any direction. Same coordinate frame and FOOT datum as **`player.pos`** in this same response, which is the array `[east, north, up]` — so `anchor_east - pos[0]`, `anchor_north - pos[1]`, `anchor_up - pos[2]` are the drift on each axis, differenceable directly. (Position is served as that one array; there are no `pos_east`/`pos_north`/`pos_up` keys — those are internal field names, not part of this contract.) |
 | `stall_threshold_secs`, `progress_threshold` | The two thresholds this report was produced against, published so you do not have to guess them. |
 
@@ -478,9 +483,11 @@ loop goes idle it stops recomputing, but a stalled body cannot be *freed* withou
 either, so idling cannot manufacture a stall; what it freezes is `secs`. Detect that directly: poll
 `afloat_stall.secs` twice and compare the delta against your own wall clock — a `secs` that advances
 by much less than the elapsed time is a render loop that has gone idle, not a stall that is being
-re-earned. (This paragraph used to say "detectable exactly the way `held_secs` is". It is not:
-`hold` is not served by any handler today — #817 — so `held_secs` is not a field you can poll, and
-that phrasing handed you a procedure that does not run.)
+re-earned. Since #817, `player.hold.held_secs` is served the same way and detects a stalled render
+loop by the identical procedure (poll twice, compare the delta against your own wall clock). Before
+#817, `hold` was not served by any handler at all, so this paragraph used to warn that "detectable
+exactly the way `held_secs` is" pointed at a field you could not actually poll; that caveat no
+longer applies.
 
 ### `zone_assets` — is the world this response describes actually loaded? (#579)
 
@@ -612,18 +619,21 @@ never read. It now publishes the `region_data_*` reason above as its `nav_reason
 two surfaces answer the same question with the same vocabulary. See the `zone_cross` reason table
 under [Navigation state](#navigation-state).
 
-**Still not covered, on `zone_cross` only:** when the reason is `zone_line_not_in_map`, you cannot
-tell a region map that **loaded** and genuinely lacks a matching zone-line region from a collision
-slot that held **no grid at all** — both produce that one reason. (What #815 separates out is the
-third case, a grid that is present but whose region data failed to load: that now reports
-`region_data_*`.) `/v1/observe/zone_exits` does not have this gap (it takes verdict and grid from
-the single `usable_collision` call #821 introduced);
-`zone_cross` reads the zone-asset verdict and the collision slot under two separate locks, so a zone
-change landing between them can pair a usable verdict with an emptied slot. The **end state** has
-been constructed directly — a usable verdict over an emptied slot does return `no_path` /
-`zone_line_not_in_map` — so no type or invariant rules that pairing out. Whether a real zone change
-actually interleaves that way is a separate question, still **reasoned from the write order, not
-measured**. Tracked as #827.
+**Now closed on `zone_cross` too (#827).** Until #827, a `zone_cross` reporting
+`zone_line_not_in_map` could not be told apart from a collision slot that held **no grid at all** —
+`zone_cross` asked the zone-asset state for permission and then read the collision slot under a
+*second*, separate lock, and `begin_zone_load` empties that slot **before** it publishes `pending`,
+so a zone change landing between the two reads paired a usable verdict with an emptied slot and the
+lookup returned nothing for want of a grid. #829's reviewer constructed that end state directly and
+got `no_path` / `zone_line_not_in_map` out of it. `zone_cross` now takes the verdict **and** the
+grid from the one `usable_collision` call #821 introduced for `/v1/observe/zone_exits`: that call
+hands back the `Arc<Collision>` the `ready` state owns, so the region lookup cannot be reached
+without the grid the gate just vouched for and there is no longer an optional grid to be absent.
+`zone_line_not_in_map` on `zone_cross` therefore means a region map that was read. (The third case,
+a grid that is present but whose region data failed to load, is what #815 split out to
+`region_data_*`.) Two limits, stated rather than implied: whether a real zone change actually
+interleaves that way was never measured — the fix removes the pairing, so the question is moot
+rather than answered; and this constrains `zone_cross`, not the other readers of the collision slot.
 
 ### Camera override for `/observe/frame` (#422)
 
@@ -778,8 +788,8 @@ is not snapped: it fails as `no_path` / `goal_not_walkable`.)
 | Reason | Meaning |
 |--------|---------|
 | `no_zone_line_to_zone` | The server never advertised (`OP_SendZonepoints`) any zone line from here to the requested `zone_id` — it will not appear in `/v1/observe/zone_exits` either. A genuinely invalid request: pick a `zone_id` that's actually one of this zone's exits. |
-| `zone_line_not_in_map` | The requested `zone_id` **is** advertised by the server as a real exit, but the zone's region map **loaded** and has no matching WLD zone-line (DRNTP) trigger region for it — a client-side `.wtr` map-data gap, not proof the exit doesn't exist in the real game. Before reporting this, the client tries one fallback (#683): if the map has a zone-line region under some OTHER (unadvertised) index — e.g. an exit baked with index 0 — and this zone advertises no same-zone teleport pad and server zone points are available, it walks there instead and lets the server resolve the destination, so this reason now means no usable zone-line region exists at all (or the fallback is gated: a same-zone pad is advertised, or no server zone points are available). When the fallback **is** taken you do not have to infer it from the message log: `zone_cross_best_effort` on `/v1/observe/debug` says so structurally (#713, [below](#zone-cross-degradations-you-can-detect-713)). It is also omitted from `/v1/observe/zone_exits` (which only lists regions actually found in the loaded map), so "absent from `zone_exits`" does not by itself distinguish this from `no_zone_line_to_zone` — only `nav_reason` does. **One caveat on "loaded" (#827):** this reason is also what you get when the client held **no collision grid at all**. Since #815 a grid that is present but whose region data failed to load reports `region_data_*` instead (next row), but an *absent* grid still lands here. So this reason always means "no zone-line region was found for it", and *usually* — not always — also means "and the map was read". |
-| `region_data_missing`, `region_data_unreadable`, `region_data_not_region_data`, `region_data_unsupported_version`, `region_data_truncated` | **The zone's region map (its `.wtr`) did not load, so the client does not know whether a zone line to `zone_id` exists** (#815). This is NOT `zone_line_not_in_map`: that reason is the *map-data gap* answer — normally "the map was read and the region is not in it" (previous row, with its own residual caveat) — and publishing it for a file the client never read would be a definitive claim about contents it does not have. The cause strings are the same ones `/v1/observe/zone_exits` refuses with — [same table, same meanings](#zone-exits--means-exactly-one-thing-803). **This does not resolve itself by polling**, which is why the state is `no_path` rather than `zone_loading`: it is a missing/unusable asset, not a load in progress, and it applies to *every* exit in this zone, not just the one you asked for. Re-sync the zone's asset pack; `/v1/observe/zone_entrances` (server-advertised, independent of the `.wtr`) still works meanwhile. The sixth cause, `region_data_not_attached`, can reach this field by the same path and carries the same "a client bug, not an asset problem" reading given [above](#zone-exits--means-exactly-one-thing-803) — with the same caveat that no release build is believed to construct such a grid. |
+| `zone_line_not_in_map` | The requested `zone_id` **is** advertised by the server as a real exit, but the zone's region map **loaded** and has no matching WLD zone-line (DRNTP) trigger region for it — a client-side `.wtr` map-data gap, not proof the exit doesn't exist in the real game. Before reporting this, the client tries one fallback (#683): if the map has a zone-line region under some OTHER (unadvertised) index — e.g. an exit baked with index 0 — and this zone advertises no same-zone teleport pad and server zone points are available, it walks there instead and lets the server resolve the destination, so this reason now means no usable zone-line region exists at all (or the fallback is gated: a same-zone pad is advertised, or no server zone points are available). When the fallback **is** taken you do not have to infer it from the message log: `zone_cross_best_effort` on `/v1/observe/debug` says so structurally (#713, [below](#zone-cross-degradations-you-can-detect-713)). It is also omitted from `/v1/observe/zone_exits` (which only lists regions actually found in the loaded map), so "absent from `zone_exits`" does not by itself distinguish this from `no_zone_line_to_zone` — only `nav_reason` does. **"loaded" is now literal (#827):** this reason used to also be what you got when the client held **no collision grid at all**, because the permission check and the grid read came from two separate slots. `zone_cross` now takes both from one `usable_collision` call, so the grid it looks in is the grid the check blessed and there is no gridless path to this reason. Together with #815 (a present grid whose region data failed to load reports `region_data_*` instead, next row), this reason means: a region map was read, and it has no matching zone-line region. |
+| `region_data_missing`, `region_data_unreadable`, `region_data_not_region_data`, `region_data_unsupported_version`, `region_data_truncated` | **The zone's region map (its `.wtr`) did not load, so the client does not know whether a zone line to `zone_id` exists** (#815). This is NOT `zone_line_not_in_map`: that reason is the *map-data gap* answer — "the map was read and the region is not in it" (previous row) — and publishing it for a file the client never read would be a definitive claim about contents it does not have. The cause strings are the same ones `/v1/observe/zone_exits` refuses with — [same table, same meanings](#zone-exits--means-exactly-one-thing-803). **This does not resolve itself by polling**, which is why the state is `no_path` rather than `zone_loading`: it is a missing/unusable asset, not a load in progress, and it applies to *every* exit in this zone, not just the one you asked for. Re-sync the zone's asset pack; `/v1/observe/zone_entrances` (server-advertised, independent of the `.wtr`) still works meanwhile. The sixth cause, `region_data_not_attached`, can reach this field by the same path and carries the same "a client bug, not an asset problem" reading given [above](#zone-exits--means-exactly-one-thing-803) — with the same caveat that no release build is believed to construct such a grid. |
 
 **Distance no longer decides *whether* the client acts (#725).** It still decides how long the
 crossing takes — you are walked to the line, so a line 30 u away takes longer than one 3 u away —
@@ -1041,11 +1051,20 @@ corridor is not threadable" from "the steering planner hasn't caught up." `nav_l
 stays `true` for the life of that worker, because the thread does not come back — recovering it needs
 a client restart.
 
-*Session-scoped* is the agent-facing name for that lifetime, and it is accurate: the latch the client
-keeps internally is scoped to the fine **worker**, and exactly one fine worker is built per client
-process, so from out here the two are the same span. The distinction only matters to the client's own
-code, which is where it is written down — as is the fact that nothing currently pins the one-worker
-premise this name rests on (#787).
+*Session-scoped* is the agent-facing name for that lifetime, and it is accurate today: the latch the
+client keeps internally is scoped to the fine **worker**, and exactly one fine worker is built per
+client process, so from out here the two are the same span. The distinction only matters to the
+client's own code, which is where it is written down — together with a **tripwire, not a proof**,
+under the one-worker premise this name rests on: a scan of the tracked tree that fails, naming this
+paragraph, when a second fine-worker construction *site* is added in the ordinary way (#787). It
+counts construction sites in source text, so it does **not** catch a second worker reached by a
+function-pointer binding, an angle-bracket qualified path, a construction inside a `macro_rules!`
+body that carries the guard's non-production marker, a site anyone marked as non-production
+regardless of which file it is in, or — the one that matters most — **the same single site executed
+twice**, which is exactly the in-process relogin shape. Every one of those gaps was measured, not
+inferred. The scan's own reach is also weaker in environments without a git checkout, which the
+guard now states on every run; the merge gate has one. Read "session-scoped" as accurate today and
+cheaply checked, not as guaranteed.
 
 **Over a running client this field is one-way.** Nothing in the process constructs a second fine
 worker, so nothing clears it. That is a property of the *process*, not of the field, and it was

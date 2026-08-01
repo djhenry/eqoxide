@@ -163,7 +163,8 @@ pub struct CharacterController {
     /// The hold in force THIS frame, or `None` (#724 review B1). Cleared unconditionally at the top
     /// of every [`Self::step`] and re-set only by a branch that is actively holding the body, so it
     /// is level-triggered by construction and cannot outlive its cause. Read by `app.rs` into
-    /// `ControllerView::hold` → `GameState::player_hold` → `GET /v1/observe` `player.hold`.
+    /// `ControllerView::hold` → `GameState::player_hold` → `GET /v1/observe/debug` `player.hold`
+    /// (#817 — the last hop was missing until then; `GET /v1/observe` is not a registered route).
     ///
     /// Physics never reads this; it is purely the disclosure that the body is frozen. `secs` is the
     /// controller's own accumulated frame time for the current, unbroken hold.
@@ -683,8 +684,9 @@ impl CharacterController {
         //
         // The trade stands, but it is paid for by DISCLOSURE, not by an imaginary rescue: both
         // recovery paths now record a `ControllerHold` (see `enter_hold`), which is logged on a
-        // throttle and published to agents as `player.hold` on `GET /v1/observe`. A hold is a
-        // reported failure, which is what makes it better than a silent wrong answer.
+        // throttle and published to agents as `player.hold` on `GET /v1/observe/debug` (#817 —
+        // `GET /v1/observe` is not a registered route). A hold is a reported failure, which is what
+        // makes it better than a silent wrong answer.
         //
         // Small corrections do not pay any of this: under `CORRECTION_SQ` (12 u, 2D) the net never
         // calls `teleport` at all.
