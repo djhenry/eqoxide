@@ -3182,19 +3182,33 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
         let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
             .expect("#787 guard reach: the workspace manifest must be readable — it is the corpus \
                      definition when there is no git index");
+        // Take every QUOTED string between the `members` key's brackets. The first draft of this
+        // filtered on `p.contains('/')`, which silently dropped the manifest's first member — `tools`,
+        // a top-level crate with no slash in its path — and checked 12 of 13 while claiming "every
+        // workspace member". Round-2 review measured that. There is no path-shape filter here now:
+        // whatever the manifest lists is what must be covered.
         let mut members = Vec::new();
         let mut in_members = false;
-        for line in manifest.lines() {
-            let t = line.trim();
-            if t.starts_with("members") && t.contains('[') { in_members = true; }
-            if in_members {
-                for piece in t.split(['[', ']', ',']) {
-                    let p = piece.trim().trim_matches('"');
-                    if !p.is_empty() && p.contains('/') && !p.starts_with('#') {
-                        members.push(p.trim_end_matches('/').to_string());
-                    }
+        let mut buf = String::new();
+        let mut in_str = false;
+        for ch in manifest.chars() {
+            if !in_members {
+                buf.push(ch);
+                if buf.ends_with("members") { in_members = true; buf.clear(); }
+                if buf.len() > 32 { buf.remove(0); }
+                continue;
+            }
+            match ch {
+                '"' if in_str => {
+                    in_str = false;
+                    let p = buf.trim().trim_end_matches('/');
+                    if !p.is_empty() { members.push(p.to_string()); }
+                    buf.clear();
                 }
-                if t.contains(']') { break; }
+                '"' => { in_str = true; buf.clear(); }
+                ']' if !in_str => break,
+                _ if in_str => buf.push(ch),
+                _ => {}
             }
         }
         assert!(!members.is_empty(),
@@ -3332,10 +3346,16 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     ///
     /// **MEASURED evasions. This list is the honest description of the instrument** — round-1 review
     /// of #836 planted eight production fine-worker constructions simultaneously and this test
-    /// reported `ok`. Two of the eight are now closed, one turned out to be narrower than it was
-    /// recorded as; the rest are not closable by a text scan without turning it into a Rust parser
-    /// (#799 catalogues the family). Every row below was RUN against the code as shipped, not
-    /// reasoned about — including the rows that say "NOT caught".
+    /// reported `ok`. Two of the eight are now closed; the rest are not closable by a text scan
+    /// without turning it into a Rust parser (#799 catalogues the family). Every row below was RUN
+    /// against the code as shipped, not reasoned about — including the rows that say "NOT caught".
+    ///
+    /// A round-2 draft of this comment claimed the marker hole was *narrower* than review recorded —
+    /// that the opt-out could only relocate the production site within its own file. **That was
+    /// wrong and round-2 review refuted it by construction**: a marked second construction in a
+    /// different file, original untouched, leaves the guard green. Two rows in this very table (the
+    /// marker row and the macro row) are instances of the form that claim said could not exist. The
+    /// narrowing is withdrawn; what follows is what was measured, nothing inferred from it.
     ///
     /// | form | status |
     /// |---|---|
@@ -3347,9 +3367,7 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// | same, for `LocalPlanner::spawn` | **NOT caught** |
     /// | `<…::Walker>::new(..)` — qualified path | **NOT caught** |
     /// | a `macro_rules!` body carrying the marker, invoked from production | **NOT caught** |
-    /// | a `// #787-NOT-PRODUCTION` marker pasted onto the sole PRODUCTION line, alone | **caught** — the production count falls to 0 and the "expected exactly ONE" assert fires. Measured on `action_loop.rs` line 626 |
-    /// | marker on the production line **plus** an unmarked replacement in a DIFFERENT file | **caught** by the locality anchor ("has MOVED"). Measured with the replacement in `src/app.rs` |
-    /// | marker on the production line **plus** an unmarked replacement in the SAME file | **NOT caught.** Count stays 1, locality still satisfied. This is the whole of the marker hole and it is narrower than round-1 review recorded: the opt-out cannot *hide* the production site, only *relocate it within its own file*. Measured both ways |
+    /// | a `// #787-NOT-PRODUCTION` marker on a second PRODUCTION construction, original untouched, ANY file | **NOT caught.** The marker is an unpinned opt-out: nothing asserts where a marker may appear, so a marked line is invisible wherever it is. Measured in `observe.rs` — guard green with two production constructions in two files; removing the marker went RED naming the file |
     /// | one textual site executed twice (the relogin shape) | **NOT caught** — see the subject mismatch above |
     /// | a `Default`/`Clone` impl for `Walker` | **NOT caught.** `Walker` derives neither today, and the private `planner`/`local_planner` fields keep a bare struct literal inside this crate |
     /// | the needle inside a `/* … */` block comment, or inside a string literal | **false RED** (measured). The two passes are combined by MAX per line so that two constructions on one line still count as two; the cost is that the raw pass's hit survives even where the blanked pass correctly sees none. Harmless direction, disclosed rather than left to be tripped over |
@@ -3379,14 +3397,33 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// that into a hard failure of the entire suite — a missing index reported as if it were evidence
     /// about workers, which is the same class of dishonesty #787 is about. So:
     ///
-    ///   * git present (any developer or agent worktree) — index equality, per FILE;
-    ///   * git absent (the builder) — every workspace member read from the root `Cargo.toml` must
-    ///     contribute at least one walked file, per MEMBER. This still catches the failure that was
+    ///   * git present (any developer or agent worktree, and CI — the workflow uses
+    ///     `actions/checkout@v4`, so **the merge gate runs index equality**) — per FILE;
+    ///   * git absent (the remote builder) — every workspace member read from the root `Cargo.toml`
+    ///     must contribute at least one walked file, per MEMBER. It catches the failure that was
     ///     actually measured, because that failure was a whole crate directory dropping out of the
     ///     walk; it cannot catch one missing file.
     ///
-    /// The per-member assert prints `git index available: false` when it fires, so a builder-only run
-    /// is never mistaken for the stronger check having passed.
+    /// **How weak the degraded control is, in numbers.** A corpus satisfying every git-absent check
+    /// needs 13 member representatives plus the two anchors that live outside any member
+    /// (`src/app.rs`, `tests/walker_sim.rs`): **15 of 172 files. Up to 157 — 91% — could be dark and
+    /// every control would still pass.** That is far worse than the 11.6% tolerance band round-1
+    /// review made me delete, and it is the honest ceiling on what a builder-only run proves.
+    ///
+    /// Two things bound it in practice, and neither is a fix. The merge gate has git, so nothing
+    /// reaches `main` on the weak path — it is every pre-merge run a developer or agent sees that
+    /// takes it. And the guard now prints its mode and its file count **unconditionally, before any
+    /// finding** (`cargo test -- --nocapture`), so a degraded run states its own coverage rather than
+    /// looking identical to a strong one. Round-2 review found that disclosure on the failure path
+    /// only, which is the #778 property reproduced inside this guard's own reporting: it told the
+    /// truth exactly when it was already failing.
+    ///
+    /// **Why the corpus is still cross-checked against git rather than being the walk alone.**
+    /// Measured on two trees that have both: `git ls-files '*.rs'` and the walk produce the **same
+    /// 172 files, identical by name**, not merely the same count. So the corpus is already the walk
+    /// either way — the union adds nothing — and dropping the index would not simplify the corpus,
+    /// it would only delete the one per-FILE reach control the merge gate actually runs. The two
+    /// modes are a difference in CHECKING, not in what gets scanned.
     #[test]
     fn exactly_one_production_fine_worker_is_built_in_the_tree_787() {
         let root = repo_root_787();
@@ -3406,6 +3443,31 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
         let walked: std::collections::BTreeSet<String> = walked_paths.iter()
             .map(|p| p.strip_prefix(&root).unwrap_or(p).to_string_lossy().replace('\\', "/"))
             .collect();
+
+        let members = workspace_members_787(&root);
+
+        // MODE DISCLOSURE, UNCONDITIONAL AND BEFORE ANY FINDING. Round-2 review: the mode was printed
+        // only when the guard was already failing, so a PASSING degraded run was byte-identical to a
+        // passing strong one — the #778 property reproduced inside this guard's own reporting. It is
+        // printed here, ahead of every assert, so it survives a failure too.
+        //
+        // It goes to the process's REAL stderr handle rather than through `println!`, because libtest
+        // captures the macros and shows their output only for tests that FAIL — which would have left
+        // the disclosure on the failure path again, in a different disguise. A direct handle write is
+        // not captured, so this line is in the default suite log of a PASSING run, which is the run
+        // whose strength was previously unknowable. Measured, not assumed.
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(),
+            "#787 guard: reach control = {}; walked {} .rs file(s); git index available = {} \
+             ({} tracked); workspace members checked = {}",
+            if tracked.is_some() { "INDEX EQUALITY, per FILE" } else { "PER WORKSPACE MEMBER only (weaker)" },
+            walked.len(),
+            tracked.is_some(),
+            tracked.as_ref().map(|t| t.len()).unwrap_or(0),
+            members.len(),
+            );
+        }
 
         // REACH CONTROL 1 — EQUALITY against the git index, not a tolerance. Every tracked `.rs` file
         // must have been reached by the walk. The old form was `files.len() >= 150`, and review
@@ -3428,14 +3490,15 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
         // Every workspace member must contribute at least one walked `.rs` file. It cannot see a
         // single missing file the way control 1 can; it CAN see the failure that was actually
         // measured (a whole crate directory dropping out of the walk), and it needs no index.
-        for member in workspace_members_787(&root) {
+        for member in &members {
             let prefix = format!("{member}/");
             let n = walked.iter().filter(|f| f.starts_with(&prefix)).count();
             assert!(n > 0,
                 "#787 guard reach: workspace member `{member}` contributed ZERO files to the walk — \
                  a whole crate is dark, so 'exactly one production construction' is a claim about \
-                 less of the tree than it sounds like. git index available: {}. Walked {} file(s).",
-                tracked.is_some(), walked.len());
+                 less of the tree than it sounds like. git index available: {}. Walked {} file(s). \
+                 Members checked: {}.",
+                tracked.is_some(), walked.len(), members.len());
         }
 
         // Scan the UNION where the index is available. Untracked strays are included deliberately: an

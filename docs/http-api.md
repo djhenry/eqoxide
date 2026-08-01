@@ -1031,10 +1031,13 @@ client's own code, which is where it is written down — together with a **tripw
 under the one-worker premise this name rests on: a scan of the tracked tree that fails, naming this
 paragraph, when a second fine-worker construction *site* is added in the ordinary way (#787). It
 counts construction sites in source text, so it does **not** catch a second worker reached by a
-function-pointer binding, an angle-bracket qualified path, a macro-wrapped site, a site someone
-marked as non-production, or — the one that matters most — **the same single site executed twice**,
-which is exactly the in-process relogin shape. That last gap is measured, not theoretical. Read
-"session-scoped" as accurate today and cheaply checked, not as guaranteed.
+function-pointer binding, an angle-bracket qualified path, a construction inside a `macro_rules!`
+body that carries the guard's non-production marker, a site anyone marked as non-production
+regardless of which file it is in, or — the one that matters most — **the same single site executed
+twice**, which is exactly the in-process relogin shape. Every one of those gaps was measured, not
+inferred. The scan's own reach is also weaker in environments without a git checkout, which the
+guard now states on every run; the merge gate has one. Read "session-scoped" as accurate today and
+cheaply checked, not as guaranteed.
 
 **Over a running client this field is one-way.** Nothing in the process constructs a second fine
 worker, so nothing clears it. That is a property of the *process*, not of the field, and it was
