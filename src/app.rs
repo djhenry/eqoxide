@@ -104,10 +104,15 @@ pub(crate) fn build_zone_collision(
 ///
 /// What the explicit arms buy, stated no wider than it is: adding a variant to
 /// [`crate::nav::zone_assets::ZoneAssetState`] makes **this file fail to compile** with `E0004`,
-/// which forces whoever adds it to classify it as in-flight or terminal here. It does not stop
-/// someone from later re-introducing a wildcard, and no runtime test can establish the property —
-/// a test can only construct variants that already exist, which is why the tests below stay green
-/// under a probe variant. Do not collapse these arms back into `_`.
+/// which forces whoever adds it to decide, at this site, whether the new state is in-flight or
+/// terminal. Measured on the #838 PR by adding a fifth in-flight variant to that enum and running
+/// `cargo check` on the binary crate: with these arms, that check reports exactly one `E0004` in the
+/// whole crate and it is this `match`; with `_ => None` put back and the same probe variant still in
+/// place, it reports none. What that does *not* buy: it does not stop someone re-introducing a
+/// wildcard later, and it does not make the new arm's answer correct — only forced. No runtime test
+/// can close either gap, because a test can only construct variants that already exist, so nothing
+/// below can tell the two forms apart. The compiler is the whole guard. Do not collapse these arms
+/// back into `_`.
 ///
 /// Same class of fix as #826/#837 on `ZoneAssetState::collision()`; that one is in
 /// `crates/eqoxide-nav/` and its E0004 probe did not name this site, because the wildcard absorbed
@@ -2842,11 +2847,12 @@ mod tests {
     /// never left waiting for a `ready` that is not coming; a loader that panicked (or whose reply
     /// was clobbered) published nothing at all, which used to leave `Pending` frozen forever.
     ///
-    /// **What this test cannot do** (#838): it enumerates the states that exist today, so it stays
-    /// green when a new `ZoneAssetState` variant is added — it can only construct variants that
-    /// already exist. That gap is covered by the compiler, not here: `lost_load_zone`'s arms are
-    /// written out, so a new variant reds `src/app.rs` with `E0004` instead of being classified
-    /// silently. Do not add a case here that claims to cover it.
+    /// **What this test cannot do** (#838): it can only construct variants that exist today, so it
+    /// says nothing about a `ZoneAssetState` variant added later — once the compiler has forced an
+    /// arm for that variant in `lost_load_zone`, this test goes green again whatever the new arm
+    /// answers. That gap is covered by the compiler, not here: the arms are written out, so a new
+    /// variant reds `src/app.rs` with `E0004` instead of being classified silently. Do not add a
+    /// case here that claims to cover it.
     #[test]
     fn a_pending_load_with_no_live_loader_is_declared_lost() {
         use crate::nav::zone_assets::ZoneAssetState;
