@@ -7227,7 +7227,16 @@ mod tests {
         use std::time::Instant;
         let dir = format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap());
         // The biggest grids first — those are where a full close is largest.
-        let zones = ["everfrost"]; // F839-SCRATCH: temporarily narrowed for mutation-check speed
+        // #839: the default list is unchanged; the `ZONES` override is new here, and exists for the
+        // same reason its four sibling corpora in this file already have one — this corpus is
+        // otherwise unrunnable in a debug build (three of the largest zones in the tree, 120 starts
+        // x 6 off-mesh probes each at an 8M node cap), so its accounting could not be
+        // mutation-checked at all. Overriding it measures a DIFFERENT corpus than the default, and
+        // the printed WORST number is then not the one this test's doc claims.
+        let zones: Vec<String> = std::env::var("ZONES").ok()
+            .map(|z| z.split(',').map(str::to_string).collect())
+            .unwrap_or_else(|| ["everfrost", "butcher", "gfaydark"]
+                .into_iter().map(str::to_string).collect());
         println!("\n{:<12} {:>12} {:>12} {:>10}", "zone", "xy_cells@8u", "MAX_closed", "ms");
         let mut worst = 0usize;
         // #839: this corpus has no water dependency at all (no `in_water` call, no water-grid
@@ -7239,7 +7248,7 @@ mod tests {
         // `cover.add(zone, &zw.tally())` (a zero-valued, "no water" tally) so the rollup's
         // denominator stays honest without a second accounting mechanism.
         let mut cover = crate::water_grid::WaterRollup::new();
-        for zone in zones {
+        for zone in &zones {
             let (col, zw) = match crate::water_grid::open_corpus_zone(
                 &mut cover, std::path::Path::new(&dir), zone, 32.0) {
                 Ok(ready) => ready,
@@ -7277,11 +7286,14 @@ mod tests {
             worst = worst.max(max_closed);
             let xy = (col.cols as f32 * col.cell_size / 8.0).ceil() * (col.rows as f32 * col.cell_size / 8.0).ceil();
             println!("{zone:<12} {:>12.0} {:>12} {:>10}", xy, max_closed, max_ms);
-            // F839-SCRATCH: delete-a-close mutation — cover.add(zone, &zw.tally()); //#839
+            cover.add(zone, &zw.tally()); // #839: CLOSE the zone — forgetting makes it `unaccounted`
         }
         println!("\nWORST reachable-component close across corpus: {worst} nodes");
         println!("=> the coarse MAX_NODES backstop must be comfortably above this (it is: 8M).");
-        println!("zones: {cover}");
+        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus measures no water,
+        // so that number is a `tally()` zero by construction, not a finding — label it, or a reader
+        // takes "0" for "0 wet things found here".
+        println!("zone coverage [leading 0 = water total; this corpus measures no water]: {cover}");
         assert!(cover.is_complete(),
             "#839: this run is not a complete corpus measurement — it covered {}/{} of the zones it \
              was asked for. unmeasured (the .wtr was read and did not load): {:?}; skipped (dropped \
@@ -7422,7 +7434,8 @@ mod tests {
                 // walk-through-walls-into-water, #329 spawn-pocket dead-end, and unimplemented water
                 // nav #359/#197), so a route-success/cost number there is not clean evidence about
                 // this refactor. Pass ZONES=qcat explicitly if you want to look at it in isolation.
-                "akanon", // F839-SCRATCH: temporarily narrowed for mutation-check speed
+                "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka", "felwithea",
+                "highpass", "everfrost", "butcher",
             ].into_iter().map(str::to_string).collect());
 
         // A seeded LCG: a failure here must be reproducible, and an unseeded sample is not evidence.
@@ -7528,7 +7541,7 @@ mod tests {
             tot_pairs += pairs.len(); tot_old_ok += old_ok; tot_new_ok += new_ok;
             tot_new_only += new_only; tot_old_only += old_only;
             old_us.extend(zo); new_us.extend(zn);
-            // F839-SCRATCH: delete-a-close mutation — cover.add(zone, &zw.tally()); //#839
+            cover.add(zone, &zw.tally()); // #839: CLOSE the zone — forgetting makes it `unaccounted`
         }
 
         old_us.sort_unstable(); new_us.sort_unstable();
@@ -7549,7 +7562,10 @@ mod tests {
         // #839: the accounting assert fires BEFORE `tot_pairs > 0` — a run that dropped every zone
         // is still RED either way, but this ordering names which zones dropped and why instead of
         // only saying the corpus produced no pairs.
-        println!("zones: {cover}");
+        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus measures no water,
+        // so that number is a `tally()` zero by construction, not a finding — label it, or a reader
+        // takes "0" for "0 wet things found here".
+        println!("zone coverage [leading 0 = water total; this corpus measures no water]: {cover}");
         assert!(cover.is_complete(),
             "#839: the FINE-TIER CORPUS numbers above are not this corpus — they cover {}/{} of the \
              zones it was asked for. unmeasured (the .wtr was read and did not load): {:?}; skipped \
@@ -7904,9 +7920,10 @@ mod tests {
             .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
         let zones: Vec<String> = std::env::var("ZONES").ok()
             .map(|z| z.split(',').map(str::to_string).collect())
-            .unwrap_or_else(|| ["qeynos"] // F839-SCRATCH: temporarily narrowed for mutation-check speed
+            .unwrap_or_else(|| ["qeynos", "qcat", "halas", "akanon", "blackburrow", "qeynos2", "gfaydark",
+                "crushbone", "neriaka", "felwithea", "highpass", "everfrost", "butcher", "cazicthule", "oasis"]
                 .into_iter().map(str::to_string).collect());
-        let pairs_per_zone: usize = std::env::var("PAIRS").ok().and_then(|s| s.parse().ok()).unwrap_or(10); // F839-SCRATCH
+        let pairs_per_zone: usize = std::env::var("PAIRS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
         let mut seed: u64 = 0x693A_11CE;
         let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
         let unit = |r: u32| r as f32 / u32::MAX as f32;
@@ -7931,6 +7948,7 @@ mod tests {
                 Err(why) => { println!("AB {zone} {why}"); continue }
             };
             let (mut z_pairs, mut tries) = (0usize, 0usize);
+            let mut z_wet = 0usize; // #839: the wet pairs this corpus's filter dropped — a REAL number
             while z_pairs < pairs_per_zone && tries < pairs_per_zone * 70 + 500 {
                 tries += 1;
                 let e = col.origin[0] + unit(rnd()) * (col.cols as f32 * col.cell_size);
@@ -7941,7 +7959,7 @@ mod tests {
                 let (ge, gn) = (e + d * ang.cos(), n + d * ang.sin());
                 let Some(gz) = col.nearest_floor(ge, gn, z, 400.0, 400.0) else { continue };
                 let (s, g) = ([e, n, z], [ge, gn, gz]);
-                if col.in_water(s) || col.in_water(g) { continue; }
+                if col.in_water(s) || col.in_water(g) { z_wet += 1; continue; }
                 z_pairs += 1; g_pairs += 1;
                 match col.find_path_ex(s, g, eqoxide_core::physics::PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) {
                     PlanOutcome::Route(route) => {
@@ -7960,12 +7978,14 @@ mod tests {
                         other.reason(), s[0],s[1],s[2], g[0],g[1],g[2]),
                 }
             }
-            // F839-SCRATCH: delete-a-close mutation — cover.add(zone, &zw.tally()); //#839
+            cover.add(zone, &zw.measure(|_| z_wet)); // #839: CLOSE the zone — forgetting makes it `unaccounted`
         }
         println!("AB_TOTAL pairs={g_pairs} routed={g_routed} steep_drop_routes={g_steep}");
         // #839: the accounting assert fires BEFORE `g_pairs > 0`, same as the other four corpora in
         // this family — it names which zones dropped and why instead of just saying no zones loaded.
-        println!("zones: {cover}");
+        // #839: unlike the other four corpora in this family, this one DOES use water — as its
+        // pair filter — so the leading number is a real count of wet start/goal pairs excluded.
+        println!("wet start/goal pairs excluded by the water filter: {cover}");
         assert!(cover.is_complete(),
             "#839 (refs #762): the AB_TOTAL above is not this corpus — it covers {}/{} of the zones \
              it was asked for. unmeasured (the .wtr was read and did not load): {:?}; skipped \
@@ -8232,7 +8252,7 @@ mod tests {
             .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
         let zones: Vec<String> = std::env::var("ZONES").ok()
             .map(|z| z.split(',').map(str::to_string).collect())
-            .unwrap_or_else(|| ["highpass"].iter().map(|s| s.to_string()).collect()); // F839-SCRATCH: narrowed
+            .unwrap_or_else(|| ["highpass", "permafrost", "neriakc", "qcat"].iter().map(|s| s.to_string()).collect());
         let mut seed: u64 = 0x0155_EA1D;
         let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
         println!("\n{:<12} {:>10} {:>10} {:>12} {:>10}", "zone", "fits", "recovered", "headroom-rej", "steep-rej");
@@ -8270,7 +8290,7 @@ mod tests {
                 }
             }
             println!("{zone:<12} {fits:>10} {recovered:>10} {head_rej:>12} {steep_rej:>10}");
-            // F839-SCRATCH: delete-a-close mutation — cover.add(zone, &zw.tally()); //#839
+            cover.add(zone, &zw.tally()); // #839: CLOSE the zone — forgetting makes it `unaccounted`
         }
         println!("\n=== Q1: 'recovered' = floor is_standable KEEPS (the #375 win). 'headroom-rej' = \
             rejected for a solid surface < {NAV_AGENT_HEIGHT}u above. A mutation-checked test confirms \
@@ -8278,7 +8298,10 @@ mod tests {
             below body height (correct). Route-success held, BUT the corpus cannot distinguish a rejected \
             ceiling from a sealed pocket (it samples via nearest_floor, so a sealed pocket is invisible \
             to it) — this is NOT proof every reject is a ceiling. ===");
-        println!("zones: {cover}");
+        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus measures no water,
+        // so that number is a `tally()` zero by construction, not a finding — label it, or a reader
+        // takes "0" for "0 wet things found here".
+        println!("zone coverage [leading 0 = water total; this corpus measures no water]: {cover}");
         assert!(cover.is_complete(),
             "#839: the Q1 numbers above are not a complete seal measurement — they cover {}/{} of the \
              zones this run was asked for. unmeasured (the .wtr was read and did not load): {:?}; \
@@ -8334,7 +8357,9 @@ mod tests {
         let zones: Vec<String> = std::env::var("ZONES").ok()
             .map(|z| z.split(',').map(str::to_string).collect())
             .unwrap_or_else(|| vec![
-                "qcat", // F839-SCRATCH: temporarily narrowed for mutation-check speed
+                "qcat", "highpass", "permafrost", "neriakc",  // inverted-art zones (#375) — high on main
+                "gfaydark",                                   // open outdoor: the believable clean control (~0)
+                "qeynos2",                                    // ceiling-rich city: reads high (see HONEST LIMIT)
             ].into_iter().map(str::to_string).collect());
 
         let mut seed: u64 = 0x5044_0F7D; // distinct stream
@@ -8384,14 +8409,17 @@ mod tests {
             let pct = if sampled > 0 { 100.0 * drift as f32 / sampled as f32 } else { 0.0 };
             println!("{zone:<12} {sampled:>10} {drift:>12} {pct:>7.2}%", );
             tot_pts += sampled; tot_drift += drift;
-            // F839-SCRATCH: delete-a-close mutation — cover.add(zone, &zw.tally()); //#839
+            cover.add(zone, &zw.tally()); // #839: CLOSE the zone — forgetting makes it `unaccounted`
         }
         println!("\n=== FLOOR-MODEL DISAGREEMENT: {tot_drift} / {tot_pts} standable-looking surfaces the \
             planner's floor model omits (UPPER BOUND — conflates inverted-art floor with ceilings on main; \
             see HONEST LIMIT). D-2 gate: → 0 by construction (both sides share is_standable). ===");
         // #839: the accounting assert fires BEFORE `tot_pts > 0` — a run that dropped every zone is
         // still RED either way, but this ordering names which zones dropped and why.
-        println!("zones: {cover}");
+        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus measures no water,
+        // so that number is a `tally()` zero by construction, not a finding — label it, or a reader
+        // takes "0" for "0 wet things found here".
+        println!("zone coverage [leading 0 = water total; this corpus measures no water]: {cover}");
         assert!(cover.is_complete(),
             "#839: the FLOOR-MODEL DISAGREEMENT total above is not a complete scan — it covers {}/{} \
              of the zones this run was asked for. unmeasured (the .wtr was read and did not load): \

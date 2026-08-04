@@ -1346,7 +1346,8 @@ fn goal_append_blast_radius() {
         .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
     let zones: Vec<String> = std::env::var("ZONES").ok()
         .map(|z| z.split(',').map(str::to_string).collect())
-        .unwrap_or_else(|| ["akanon"] // F839-SCRATCH: temporarily narrowed for mutation-check speed
+        .unwrap_or_else(|| ["akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka",
+            "felwithea", "highpass", "everfrost", "butcher", "cazicthule", "oasis"]
             .into_iter().map(str::to_string).collect());
 
     let mut seed: u64 = 0x639A_11CE;
@@ -1537,7 +1538,8 @@ fn corner_buffer_blast_radius() {
         .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
     let zones: Vec<String> = std::env::var("ZONES").ok()
         .map(|z| z.split(',').map(str::to_string).collect())
-        .unwrap_or_else(|| ["akanon"] // F839-SCRATCH: temporarily narrowed for mutation-check speed
+        .unwrap_or_else(|| ["akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka",
+            "felwithea", "highpass", "everfrost", "butcher", "cazicthule", "oasis"]
             .into_iter().map(str::to_string).collect());
 
     let mut seed: u64 = 0x685A_11CE;

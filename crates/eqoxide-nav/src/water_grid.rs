@@ -418,22 +418,44 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// levers are that a loop opens its zones through [`open_corpus_zone`], or wires
 /// `begin_zone`/`add`/`skip` by hand as `faithful_walker_drift_corpus` does.
 ///
-/// As of #839 every zone-corpus loop in `crates/eqoxide-nav/src/collision.rs` and
-/// `tests/walker_sim.rs` goes through this type: `faithful_walker_drift_corpus` (hand-wired, two
-/// rollups) and ten corpora via [`open_corpus_zone`] — the four `*_blast_radius` corpora in
-/// `tests/walker_sim.rs`, and, in `collision.rs`, `water_grid_budget_measurement` (#807),
-/// `worst_case_reachable_component`, `fine_tier_corpus_route_success_and_cost`,
-/// `fix_700_planner_ab_corpus`, `q1_headroom_seal_measurement`, and
-/// `floor_model_disagreement_scan` (#839). Four of the last five have no water dependency at all —
-/// no `in_water` call, no water-grid build — and still route through `open_corpus_zone` rather than
-/// a bespoke two-drop wrapper, closing with `cover.add(zone, &zw.tally())`, a zero-valued "no water
-/// number" close: one owner for the accounting, not two. **What this paragraph does NOT claim:** a
-/// zone-corpus loop that never constructs a `WaterRollup` is invisible to this type by construction
-/// (see above) and #839 did not audit outside `collision.rs`/`walker_sim.rs` —
-/// `depenetration_corpus_over_baked_zones` in `src/movement.rs` is a zone loop with the same
-/// bare-`continue` shape, still unwired, out of #839's scope. Do not re-derive or restate this
-/// paragraph's own tally by rereading the source; it will drift the same way the version it
-/// replaced did.
+/// As of #839, in `crates/eqoxide-nav/src/collision.rs` and `tests/walker_sim.rs`, every loop that
+/// opens a baked zone goes through this type. That is a COUNT, and it is the kind of sentence that
+/// rots; re-measure it rather than re-reading for it:
+///
+/// ```text
+/// grep -c 'open_corpus_zone(' crates/eqoxide-nav/src/collision.rs tests/walker_sim.rs   # 6 + 4 = 10
+/// grep -n  'for zone in'      crates/eqoxide-nav/src/collision.rs tests/walker_sim.rs   # 6 + 6 = 12
+/// ```
+///
+/// Measured at the #839 merge: **ten** [`open_corpus_zone`] call sites — the four `*_blast_radius`
+/// corpora in `tests/walker_sim.rs`, and, in `collision.rs`, `water_grid_budget_measurement` (#807)
+/// plus the five #839 converted: `worst_case_reachable_component`,
+/// `fine_tier_corpus_route_success_and_cost`, `fix_700_planner_ab_corpus`,
+/// `q1_headroom_seal_measurement`, `floor_model_disagreement_scan`. The twelve `for zone in` loops
+/// are those ten, plus `faithful_walker_drift_corpus` (hand-wired to two rollups — see above), plus
+/// `zone_accounting_stays_silent_while_every_zone_is_closed`, which is a unit test OF this type: it
+/// drives a rollup over hard-coded zone NAMES and opens no asset at all (measured: zero `from_glb`
+/// calls in its body). So: twelve loops, twelve accounted, none of them bare.
+///
+/// Four of the five #839 converted — every one but `fix_700_planner_ab_corpus` — have no water
+/// dependency whatsoever (measured: zero `in_water` calls, zero `ZoneWater::load` calls in the
+/// function body) and still route through [`open_corpus_zone`] rather than a bespoke drop wrapper,
+/// closing with `cover.add(zone, &zw.tally())` — a zero-valued "no water number" close. One owner
+/// for the accounting, not two.
+///
+/// **The cost of that choice, stated because it is a real behaviour change and not a free win:**
+/// [`open_corpus_zone`]'s DROP 3 refuses a zone whose `.wtr` did not load. Those four corpora
+/// therefore became gated on `maps/water/<zone>.wtr` that they never read, and on a host missing one
+/// they now go RED (`unmeasured`) where before they would have measured the zone and printed a
+/// number. That is the honesty trade #807 made deliberately — refusing to measure beats measuring
+/// and not saying so — but it is a trade, not a no-op.
+///
+/// **What this does NOT claim:** a corpus loop that never constructs a `WaterRollup` is invisible to
+/// this type by construction (see above), and #839 audited only `collision.rs` and `walker_sim.rs`.
+/// `depenetration_corpus_over_baked_zones` in `src/movement.rs` is a baked-zone loop of exactly the
+/// same shape — `src/movement.rs:2610` `let Ok(za) = … from_glb(…) else { continue }` and `:2612`
+/// `if col.cols == 0 { continue; }`, both bare, no rollup — and is out of #839's scope, still
+/// unwired.
 #[derive(Clone, Debug, Default)]
 pub struct WaterRollup {
     total: usize,
