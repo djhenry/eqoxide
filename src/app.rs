@@ -105,18 +105,31 @@ pub(crate) fn build_zone_collision(
 /// What the explicit arms buy, stated no wider than it is: adding a variant to
 /// [`crate::nav::zone_assets::ZoneAssetState`] makes **this file fail to compile** with `E0004`,
 /// which forces whoever adds it to decide, at this site, whether the new state is in-flight or
-/// terminal. Measured on the #838 PR by adding a fifth in-flight variant to that enum and running
-/// `cargo check` on the binary crate: with these arms, that check reports exactly one `E0004` in the
-/// whole crate and it is this `match`; with `_ => None` put back and the same probe variant still in
-/// place, it reports none. What that does *not* buy: it does not stop someone re-introducing a
+/// terminal. Measured on the #838 PR by adding a fifth in-flight variant to that enum — but *which
+/// invocation* reds this file is load-bearing, and most of them do not. `cargo check -p eqoxide-nav`
+/// does **not** red this file: the same variant reds `eqoxide-nav`'s own lib with six `E0004`s (all
+/// in `zone_assets.rs`), compilation stops upstream, and the crate holding this file is never built
+/// at all — `Checking eqoxide v` appears **0** times in that run. Only once those six nav arms are
+/// filled in (`=> todo!()` suffices) does `cargo check -p eqoxide --locked` reach this crate, and it
+/// then reports **exactly one** `E0004` in package `eqoxide`, at `src/app.rs:136:11`, which is this
+/// `match`; adding `--all-targets` to that same `-p eqoxide` check changes neither number. With
+/// `_ => None` put back and the probe variant and filled nav arms still in place, that same command
+/// exits 0 with zero errors and zero warnings, `Checking eqoxide v0.1.0` present once as the reach
+/// control. (Package `eqoxide-nav` checked with `--all-targets` reports one further `E0004`, at
+/// `zone_assets.rs:705`, inside #826's own test — a different package, not part of the count above.)
+/// What that does *not* buy: it does not stop someone re-introducing a
 /// wildcard later, and it does not make the new arm's answer correct — only forced. No runtime test
 /// can close either gap, because a test can only construct variants that already exist, so nothing
 /// below can tell the two forms apart. The compiler is the whole guard. Do not collapse these arms
 /// back into `_`.
 ///
-/// Same class of fix as #826/#837 on `ZoneAssetState::collision()`; that one is in
-/// `crates/eqoxide-nav/` and its E0004 probe did not name this site, because the wildcard absorbed
-/// the new variant instead of erroring.
+/// Same class of fix as #826/#837 on `ZoneAssetState::collision()`. That one is in
+/// `crates/eqoxide-nav/`, and its `E0004` probe did not name this site — but **not** because the
+/// wildcard absorbed the new variant, which is what an earlier draft of this paragraph asserted
+/// without running it. The measurement above falsifies that: a probe scoped to `eqoxide-nav` never
+/// compiles the crate this file lives in, so this `match` is never type-checked and a wildcard here
+/// and four explicit arms here are indistinguishable to it. The wildcard's danger is real; that
+/// particular probe simply was not the thing that failed to see it.
 fn lost_load_zone(any_loader_alive: bool, st: &crate::nav::zone_assets::ZoneAssetState) -> Option<String> {
     use crate::nav::zone_assets::ZoneAssetState as S;
     if any_loader_alive { return None; }
