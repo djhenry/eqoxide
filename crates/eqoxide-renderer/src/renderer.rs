@@ -217,14 +217,23 @@ impl StaticReason {
     ///
     /// It returns the count rather than a `bool` so the two channels cannot be gated by two
     /// separately-mutable expressions, and so the log message can interpolate the bound count.
-    /// Three measured rows of the eqoxide#780 PR's mutation table say exactly how far that goes,
-    /// and no further. C4: replacing the `if let` with `if true` is `E0425`, because the binding
-    /// disappears out from under the log message. C3: keeping the binding but widening the gate
-    /// (`.or(Some(0))`) compiles and goes RED, because the gate's value leaves the function as
-    /// `ObservedSkinFit::reported_downgrade` and the tests pin it against the recorded entry.
-    /// C6: what still survives is a *deliberate* re-split — widen the gate, then reassign
-    /// `reported` back to the honest value — which logs `boat.glb` and stays green. That is a
-    /// two-line edit, not an omission.
+    /// What that buys, and only that:
+    ///
+    /// - C4: replacing the `if let` with `if true` is `E0425` at two sites, because the binding
+    ///   disappears out from under both the log message and the `reported` assignment.
+    /// - C3: keeping the binding but widening the gate (`.or(Some(0))`) compiles and goes RED
+    ///   (267 / 3 / 12 against a 270 / 0 / 12 control), because the gate's value leaves the
+    ///   function as `ObservedModel::reported_downgrade` and the tests pin it against the recorded
+    ///   entry.
+    ///
+    /// It buys nothing at all about the **log**, in either direction. Deleting the whole
+    /// `tracing::error!` statement — one statement — compiles and leaves `-p eqoxide-renderer` at
+    /// 270 / 0 / 12, identical to control; only two warnings appear, and this workspace sets no
+    /// `deny(warnings)`. An earlier version of this paragraph ended "and no further" after the C4/C3
+    /// rows and drew the boundary at a *two-line* re-split; a reviewer measured the one-statement
+    /// deletion and it survives, so the boundary was in the wrong place. The report is the pinned
+    /// channel. The log is not pinned. See `skin_observation`'s "Does not: grade the log line"
+    /// bullet for the full row list.
     ///
     /// The two channels *were* separately gated, before: the log tested [`is_downgrade`] while the
     /// report re-matched `ExceedsCap` itself, so a mutation that made `is_downgrade` return `true`
@@ -440,12 +449,24 @@ pub struct EqRenderer {
     /// describes; see [`record_skin_cap_downgrade`] for why that distinction is load-bearing
     /// (eqoxide#813).
     ///
-    /// Written in exactly one place, [`crate::skin_observation::observe_skin_fit`], which is also
-    /// the only producer of the [`crate::skin_observation::ObservedSkinFit`] that
-    /// `build_character_model` requires. Two things follow, and neither is more than what it says:
+    /// Written in exactly one place *as the tree stands* — [`crate::skin_observation::observe_skin_fit`],
+    /// which is also the only producer of the [`crate::skin_observation::ObservedModel`] that
+    /// `build_character_model` requires. Read that as a measured fact about today's tree, **not** as
+    /// an invariant the type system holds: this field is `pub`, so any holder of a
+    /// `&mut EqRenderer`, inside the crate or outside it, can write or clear it, and the compiler
+    /// would not object. The measurement, re-run for round 4: `git grep -n skin_cap_downgrades`
+    /// over the whole tree returns this declaration, the `BTreeMap::new()` initialiser in
+    /// `EqRenderer::new`, `DowngradeSink::of`'s borrow, comment/doc mentions, and one comment in
+    /// `src/bin/render_model.rs` — no other write. Narrowing the visibility would not make the
+    /// sentence structural either, only smaller in scope: `skin_observation` is a different module,
+    /// so the tightest this field can be and still be reportable-into is `pub(crate)`, which leaves
+    /// every writer inside this crate exactly where it is. What *is* structural is the second
+    /// bullet below.
+    ///
+    /// Two things follow, and neither is more than what it says:
     ///
     /// - An arm cannot be chosen without an observation having run (omitting it is a compile error).
-    /// - That observation cannot have been written anywhere else, because
+    /// - That observation cannot have been *aimed* anywhere else, because
     ///   [`crate::skin_observation::DowngradeSink`] borrows *this* field and, outside `cfg(test)`,
     ///   has no other constructor. An earlier version of this comment claimed the two "cannot drift
     ///   apart" while the destination was a caller-supplied `&mut BTreeMap`; a reviewer substituted
@@ -945,19 +966,25 @@ impl EqRenderer {
         match crate::models::ModelAsset::load(&path) {
             Ok(asset) => {
                 // Classify + log + record in ONE call, before the model is built, because
-                // `build_character_model` cannot choose a render arm without the `ObservedSkinFit`
+                // `build_character_model` cannot choose a render arm without the `ObservedModel`
                 // this returns. Skipping the report is therefore a compile error rather than a
                 // silent regression (eqoxide#780; the reachability hole is eqoxide#797/#799).
+                // The whole `asset` is handed over, not a joint count read off it here: the
+                // observation and the upload then come out of one value, so the arm cannot be
+                // chosen for a joint count the uploaded model does not have. That argument was a
+                // caller-computed `Option<usize>` until round 4, and replacing it with `None` here
+                // was a compile-clean, still-green way back to eqoxide#780.
                 // Keyed by the file that was just loaded — `path`, not `key`/`gender`, because
                 // gender 1 falls back to the male GLB when there is no `_f` variant and the joint
-                // count belongs to the file (eqoxide#813).
+                // count belongs to the file (eqoxide#813). `path` is still caller-supplied and
+                // still unpinned; see `observe_skin_fit`'s doc for what that leaves open.
                 let observed = crate::skin_observation::observe_skin_fit(
                     crate::skin_observation::DowngradeSink::of(self),
                     &path,
                     key,
-                    asset.skin.as_ref().map(|s| s.joint_count),
+                    asset,
                 );
-                let model = self.build_character_model(key, asset, observed);
+                let model = self.build_character_model(key, observed);
                 self.gpu_character_models.insert((key, gender), model);
                 tracing::debug!("renderer: lazily loaded character model '{key}' (gender {gender})");
             }
@@ -976,20 +1003,29 @@ impl EqRenderer {
     /// `ensure_character_model`, which serves both archetype keys and per-race (`race_<code>.glb`)
     /// keys through the same path.
     ///
-    /// Takes the render-arm choice as an [`ObservedSkinFit`], which only
+    /// Takes the model **and** the render-arm choice as one [`ObservedModel`], which only
     /// [`crate::skin_observation::observe_skin_fit`] can produce. This method takes `&self`, not
     /// `&mut self`, so it cannot record into `self.skin_cap_downgrades` itself; rather than return
     /// a bare [`SkinFit`] and *hope* the caller reports it (which is what eqoxide#795 did, and what
     /// eqoxide#797 measured to be unreachable from any test), it demands the witness that the
     /// reporting already happened. See `ensure_character_model`.
+    ///
+    /// There is deliberately no separate `asset` parameter: the asset comes out of the witness via
+    /// [`crate::skin_observation::ObservedModel::into_parts`], so the geometry uploaded here is the
+    /// same *value* that was classified and reported, not merely one that compares equal to it. A
+    /// reviewer measured the previous shape — `(label, asset, observed)` with the joint count read
+    /// at the call site — and replacing that count with `None` compiled clean and left the crate
+    /// green while a 129-joint rig went unreported.
+    ///
+    /// [`ObservedModel`]: crate::skin_observation::ObservedModel
     fn build_character_model(
         &self,
         label: &str,
-        asset: crate::models::ModelAsset,
-        observed: crate::skin_observation::ObservedSkinFit,
+        observed: crate::skin_observation::ObservedModel,
     ) -> crate::gpu::GpuModel {
         use wgpu::util::DeviceExt;
         use crate::models::SkinnedMeshData;
+        let (asset, fit) = observed.into_parts();
         tracing::info!("renderer: loaded '{}' — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
             label, asset.y_bottom, asset.y_extent, asset.x_center, asset.z_center);
 
@@ -999,7 +1035,7 @@ impl EqRenderer {
         let tex_names: Vec<String> =
             asset.textures.iter().map(|t| t.name.clone()).collect();
 
-        if observed.is_skinned() {
+        if fit.is_skinned() {
             let skin = asset.skin.unwrap();
             let mut meshes: Vec<GpuSkinnedMesh>                       = Vec::new();
             let mut skinned_slots: Vec<Option<crate::models::EquipSlot>> = Vec::new();

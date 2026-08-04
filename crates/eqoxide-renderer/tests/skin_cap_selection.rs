@@ -43,7 +43,7 @@
 //!   `skin_observation::observe_skin_fit`, exercised directly by that module's own `mod tests`
 //!   (they cannot live here — see the WIRING note further down). What remains uncovered is only the
 //!   two device-dependent methods' own bodies — and a render arm cannot be chosen in either without
-//!   an `ObservedSkinFit`, which only `observe_skin_fit` produces.
+//!   an `ObservedModel`, which only `observe_skin_fit` produces.
 //! - That the `error!` log line is emitted with any particular text — this project's own
 //!   `AGENT-HONESTY` guidance is that a log line is a weak signal anyway (the driving agent does
 //!   not read logs), so this file grades the *structured* observable
