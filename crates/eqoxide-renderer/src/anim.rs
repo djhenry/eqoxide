@@ -590,10 +590,22 @@ mod tests {
         assert_eq!(skin.clip_for_action("dead"), Some(0), "dead → D05A_death clip (index 0)");
     }
 
-    /// A skin mirroring the real converted skeleton GLB: clip 0 is the death clip, there is a
-    /// neutral idle, and there is NO C-family combat clip. (#692)
-    fn skeleton_skin() -> SkinData {
-        // Exact clip order of the shipped skeleton.glb: death FIRST (index 0), no combat clip.
+    /// A **synthetic** skin with the clip SHAPE that #692 is about: clip 0 is the death clip,
+    /// there is a neutral idle, and there is NO C-family combat clip. The names are borrowed from
+    /// EQ's animation codes so the fixture exercises the real `clip_for_action` matching rules.
+    ///
+    /// This is deliberately **not** a claim about any shipped asset. It used to be described as
+    /// "the exact clip order of the shipped skeleton.glb", which was a hardcoded literal that no
+    /// test could ever falsify — so it would have kept describing an asset that had changed
+    /// underneath it while staying green (the skeleton bake is moving to a rig that *does* carry
+    /// C-family clips and does *not* carry `P03`; see asset-server #41 / eqoxide#704). The
+    /// asset-coupled half of that claim now lives in
+    /// `shipped_skeleton_glb_combat_routing_matches_its_own_clips`, which reads the real GLB.
+    ///
+    /// The shape below is asserted, not just asserted-about: the test's preconditions re-derive
+    /// "clip 0 is death", "no combat clip" and "there is an idle" from this list, so editing the
+    /// list into a different shape turns the test RED rather than quietly changing what it means.
+    fn death_first_no_combat_skin() -> SkinData {
         let names = ["D05_death", "L01_walk", "L02_run", "O01_idle",
                      "P01_idle_neutral", "P02_sit", "P03_crouch"];
         let (rest_translations, rest_rotations, rest_scales) = default_rest(3);
@@ -610,28 +622,75 @@ mod tests {
     }
 
     /// #692: a combat swing on a model with no C0N clip must fall back to the IDLE clip — never to
-    /// clip 0, which for the skeleton is the death/collapse clip (the "falls apart on attack" bug).
+    /// clip 0, which for this model shape is the death/collapse clip (the "falls apart on attack"
+    /// bug, first seen on the skeleton).
     ///
     /// Mutation check: revert the renderer sites to `clip_for_action(action).unwrap_or(0)` — i.e.
-    /// make `clip_for_action_or_idle` return `unwrap_or(0)` — and this goes RED, because the
-    /// skeleton's clip 0 IS the death clip, so the `!= 0` / `!= death` / `== idle` assertions fail.
+    /// make `clip_for_action_or_idle` return `unwrap_or(0)` — and this goes RED, because clip 0 IS
+    /// the death clip here, so the `!= 0` / `!= death` / `== idle` assertions fail.
     #[test]
     fn combat_swing_without_combat_clip_falls_back_to_idle_not_death() {
-        let skin = skeleton_skin();
+        let skin = death_first_no_combat_skin();
 
-        // Preconditions: this really is the skeleton-shaped model the bug needs.
+        // Preconditions: this really is the model shape the bug needs.
         let death = skin.clip_for_action("dead");
-        assert_eq!(death, Some(0), "precondition: skeleton clip 0 is the death clip");
+        assert_eq!(death, Some(0), "precondition: clip 0 is the death clip");
         assert_eq!(skin.clip_for_action("C05"), None,
-            "precondition: skeleton has no C0N combat clip, so a swing resolves to None");
-        let idle = skin.clip_for_action("idle").expect("skeleton has a neutral idle");
+            "precondition: no C0N combat clip, so a swing resolves to None");
+        let idle = skin.clip_for_action("idle").expect("fixture has a neutral idle");
         assert_eq!(idle, 4, "idle resolves to P01_idle_neutral (index 4)");
 
         // The fix: the swing falls back to idle, NOT clip 0 (= death).
         let chosen = skin.clip_for_action_or_idle("C05");
         assert_eq!(chosen, Some(idle), "missing combat clip must fall back to the idle/neutral stand");
         assert_ne!(chosen, Some(0), "must NOT fall back to clip 0 (the death/collapse clip) — #692");
-        assert_ne!(chosen, death, "an attacking skeleton must never play its death clip");
+        assert_ne!(chosen, death, "an attacking model must never play its death clip");
+    }
+
+    /// The asset-coupled half of #692, kept honest against the **real** GLB instead of a hardcoded
+    /// clip list. Asserts the routing property in whichever world the shipped asset is in, so it
+    /// cannot go stale across a rebake:
+    ///
+    /// * asset HAS a combat clip  → `"C05"` must resolve TO that clip (not idle, not death);
+    /// * asset has NO combat clip → `"C05"` must fall back to the idle clip, never to clip 0.
+    ///
+    /// Today the shipped `skeleton.glb` is in the second world; asset-server #41 moves it to the
+    /// first. Either way this test states the truth and one of its two branches runs.
+    ///
+    /// `#[ignore]` because the GLB is a synced runtime asset, not a repo fixture — it is absent in
+    /// CI. Run it in the real-asset pass:
+    /// `cargo test -p eqoxide-renderer -- --ignored shipped_skeleton_glb --nocapture`
+    /// (override the directory with `EQOXIDE_MODELS_DIR`).
+    #[test]
+    #[ignore = "requires the synced runtime asset ~/.local/share/eqoxide/assets/models/skeleton.glb"]
+    fn shipped_skeleton_glb_combat_routing_matches_its_own_clips() {
+        let dir = std::env::var("EQOXIDE_MODELS_DIR").unwrap_or_else(|_| {
+            format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap())
+        });
+        let path = std::path::PathBuf::from(&dir).join("skeleton.glb");
+        let asset = crate::models::ModelAsset::load(&path)
+            .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+        let skin = asset.skin.expect("skeleton.glb is a skinned model");
+
+        let clips: Vec<&str> = skin.clips.iter().map(|c| c.name.as_str()).collect();
+        println!("shipped skeleton.glb clips ({}): {clips:?}", clips.len());
+
+        let combat = skin.clip_for_action("C05");
+        let idle = skin.clip_for_action("idle");
+        let death = skin.clip_for_action("dead");
+        let chosen = skin.clip_for_action_or_idle("C05");
+
+        if let Some(c) = combat {
+            assert_eq!(chosen, Some(c),
+                "asset ships a C-family clip ({}) — a swing must play it, not fall back",
+                clips[c]);
+            assert_ne!(chosen, death, "a swing must never resolve to the death clip");
+        } else {
+            let idle = idle.expect("asset with no combat clip must at least have an idle to fall back to");
+            assert_eq!(chosen, Some(idle),
+                "no combat clip in the asset — a swing must fall back to idle ({})", clips[idle]);
+            assert_ne!(chosen, Some(0), "must never fall back to clip 0 — #692");
+        }
     }
 
     /// Hardening (reviewer finding on #694): when a model has NEITHER the action clip NOR any
