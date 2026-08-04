@@ -86,8 +86,9 @@
 //!    is a fact about the current asset bake, not a property of the code. #780 does not change
 //!    that fact; it changes what happens the day it stops being true — see
 //!    `tests/skin_cap_selection.rs` for the classifier this note now describes and
-//!    `EqRenderer::skin_cap_downgrades` / the `error!` log `build_character_model` now emits when
-//!    `ExceedsCap` is reached.
+//!    `EqRenderer::skin_cap_downgrades` / the `error!` log `skin_observation::observe_skin_fit`
+//!    emits when `ExceedsCap` is reached. (That log lived in `build_character_model` until the
+//!    `skin_observation` module moved both channels into one device-free function.)
 //! 2. **A skinned rig's raw vertex origin is not a stable EQ datum.** `race_hum.glb` reported
 //!    `y_min = -10.430519`; `race_huf.glb` reported `y_min = -3.688780`. Both are nominally
 //!    6.0-foot humans (`race_target_height("HUM") == 6.0`), so their raw origins sit at wildly

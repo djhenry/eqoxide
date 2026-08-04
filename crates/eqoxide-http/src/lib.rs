@@ -195,8 +195,11 @@ pub struct PlayerState {
     /// list cross-referenced to SPA 57. This is the Levitate *buff* state ONLY — it is deliberately
     /// NOT a general "am I subject to gravity?" reading: GM `#flymode 1` (Flying) genuinely turns
     /// gravity off yet reports `false`, because #529 scoped this to Levitating(2)/LevitateWhileRunning(5).
-    /// Exposed because it changes what movement commands do: an agent that reads `pos_up` while
-    /// levitating is reading a height it will NOT fall from. No `skip_serializing_if`: the key is
+    /// Exposed because it changes what movement commands do: an agent that reads the up component of
+    /// the served position array (`player.pos[2]` on `GET /v1/observe/debug`) while levitating is
+    /// reading a height it will NOT fall from. The `pos_up` field beside this one is the internal
+    /// name that value is built from, not a response key — position is served as the one `pos` array
+    /// (#822). No `skip_serializing_if`: the key is
     /// ALWAYS present so an absent-key can never be misread as "known false".
     pub levitating:    Option<bool>,
     /// Current target's display name and HP percent (0–100), or None when nothing is targeted.
@@ -239,9 +242,22 @@ pub struct PlayerState {
     pub run_mode:  bool,
     /// #724 review B1: **the controller has stopped the body and cannot resume** — see
     /// [`PlayerHoldView`]. `null` when it has not, which is the overwhelmingly normal case.
-    /// No `skip_serializing_if`: the key is ALWAYS present, so an agent that greps for it and finds
-    /// nothing knows it is talking to a client too old to report the state, rather than concluding
-    /// the character is fine.
+    ///
+    /// No `skip_serializing_if`: the key is always present in a serialisation of *this struct*.
+    /// **That is a different and weaker claim than being present in any response body** — #817
+    /// found this field computed, mirrored into [`eqoxide_core::game_state::GameState`] on every
+    /// **net tick** by `ActionLoop::stream_position` (whose own rustdoc says "Runs every tick"),
+    /// from a `ControllerView` snapshot the **render** thread republishes on every rendered frame
+    /// — so the mirror is as fresh as the last *published* frame, not as fresh as the last *net*
+    /// tick, and an idle render loop leaves the net thread faithfully re-copying a stale view. See
+    /// the staleness bullet on [`PlayerHoldView`] below, which this sentence must not be read as
+    /// softening. And covered by tests, and STILL absent from `GET
+    /// /v1/observe/debug`, because nothing serialises `PlayerState` whole: `observe::get_debug`
+    /// hand-builds its `player` object and patches extras in with `player.insert`. What makes the
+    /// key reachable is the `player.insert("hold", …)` there, alongside `levitating`/`run_mode`/
+    /// `afloat_stall` — see that call site and `hold_reaches_the_debug_json_817`, which asserts
+    /// `contains_key` on bytes returned by the real router, not on this attribute or on any test
+    /// that serialises `PlayerState` directly.
     pub hold: Option<PlayerHoldView>,
     /// #776/#801 (agent-honesty): **the character is afloat, is being wished at, and is going
     /// nowhere** — see [`PlayerAfloatStallView`], which also states plainly which real traps this
@@ -547,6 +563,9 @@ fn ser_error_kind<S: serde::Serializer>(
 }
 
 /// **The character is physically stuck and the client cannot free it** — `player.hold` (#724).
+/// Served as `player.hold` by `GET /v1/observe/debug`, and by no other route (#817 — this type
+/// existed, was populated, and reached no response body until the `player.insert("hold", …)` in
+/// `observe::get_debug` was added; see that call site).
 /// `null` for a healthy character, including one that is simply standing still.
 ///
 /// This exists because "standing still because nothing asked me to move" and "frozen in rock and

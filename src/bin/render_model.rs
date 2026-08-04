@@ -867,9 +867,22 @@ impl ApplicationHandler for ModelViewerApp {
         // race-driven scale). The static `model` above is left unused in this mode.
         let skinned: Option<SkinnedView> = if self.race.is_some() {
             let skin = std::mem::take(&mut asset.skin);
+            // eqoxide#780: this viewer picks its own arm and has no `skin_cap_downgrades` map to
+            // report into, so a rig over the cap would just silently appear as an unanimated static
+            // mesh. Say it out loud instead. (The renderer's structural guarantee — that an arm
+            // cannot be chosen without the downgrade having been reported — covers `EqRenderer`,
+            // not this binary; see `skin_observation`'s "Does not" list.)
+            let fit = eqoxide::renderer::SkinFit::classify(skin.as_ref().map(|s| s.joint_count));
+            if let Some(over_cap_joints) =
+                fit.static_reason().and_then(|r| r.downgrade_joint_count())
+            {
+                let cap = eqoxide::renderer::JOINT_CAP;
+                eprintln!("render_model[skinned]: race model has {over_cap_joints} joints, \
+                           EXCEEDING the {cap}-joint cap — falling back to the STATIC mesh; \
+                           it will NOT animate. See eqoxide issue 780.");
+            }
             match skin {
-                Some(skin) if eqoxide::renderer::SkinFit::classify(Some(skin.joint_count))
-                    .is_skinned() => {
+                Some(skin) if fit.is_skinned() => {
                     let (_, sk_tex_bgs) = gpu::upload_textures(&device, &queue, &asset.textures, &layouts.texture_bgl);
                     let mut smeshes: Vec<GpuSkinnedMesh>                          = Vec::new();
                     let mut sslots: Vec<Option<eqoxide::models::EquipSlot>>       = Vec::new();

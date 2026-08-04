@@ -1584,7 +1584,9 @@ pub struct NavStatus {
     /// come back and recovering it needs a client restart. The one writer that clears it is
     /// `Walker::new` (`eqoxide-nav`), which does so as it spawns a REPLACEMENT worker — so what the
     /// latch describes is the worker, not the process. Those coincide today, exactly one `Walker`
-    /// being built per process, which is why the agent-facing docs call the field session-scoped; the
+    /// being built per process — a premise checked, to the limited extent a source scan can check it,
+    /// by `walker::tests::exactly_one_production_fine_worker_is_built_in_the_tree_787` (#787) — which
+    /// is why the agent-facing docs call the field session-scoped; the
     /// last paragraph here says why the distinction is worth keeping anyway. Published as the
     /// top-level `nav_local_planner_dead` on GET /v1/observe/debug, always, in both states: an agent
     /// checking its own health needs to be able to read "alive", not merely fail to read "dead".
@@ -1612,8 +1614,15 @@ pub struct NavStatus {
     /// `ActionLoop::new`, and the one production call site of `ActionLoop::new` is in
     /// `run_login_flow`, which returns as soon as the gameplay phase ends — so exactly one fine
     /// worker exists per process and "latched forever" and "latched for this worker" coincide.
-    /// **That premise is pinned by nothing — no guard, no test — and #787 tracks it**; the B9 test
-    /// below cannot be the pin, because building a second `Walker` is its method. They
+    /// **That premise now has a TRIPWIRE under it, not a pin** (#787):
+    /// `walker::tests::exactly_one_production_fine_worker_is_built_in_the_tree_787` in `eqoxide-nav`
+    /// is a whole-tree source scan that fails — naming THIS sentence and the three others that rest
+    /// on it — when a second *plainly-written* `Walker::new` or `LocalPlanner::spawn` construction
+    /// site appears. Do not read it as stronger than that. It counts construction SITES; the premise
+    /// is about construction EVENTS, and the two come apart on the in-process relogin this comment is
+    /// about — one site, called twice, leaves the scan green. That was measured. Its rustdoc carries
+    /// the full table of what it does and does not see. The B9 test
+    /// below is NOT the pin either, because building a second `Walker` is its method. They
     /// stop coinciding the moment anything builds a second `Walker` over this row (the shape an
     /// in-process relogin would take): a NEW, healthy `LocalPlanner` would inherit `true` and the
     /// client would report a fault it had just repaired, permanently — #343's shape, and a lie in the
