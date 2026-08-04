@@ -3,8 +3,10 @@
 //!
 //! ## The bug
 //!
-//! `build_character_model` (`renderer.rs`) decides whether a loaded model uses the skinned
-//! (GPU-animated) render arm or the static one. Before #780 that decision was one `bool`:
+//! Whether a loaded model uses the skinned (GPU-animated) render arm or the static one is decided
+//! by `skin_observation::observe_skin_fit`, which classifies the skin; `build_character_model`
+//! applies that decision and builds the GPU model. Before #780 the decision was one `bool`, made
+//! inside `build_character_model` itself:
 //!
 //! ```text
 //! let use_skinned = asset.skin.as_ref().is_some_and(|s| s.joint_count > 0 && s.joint_count <= 128);
@@ -24,17 +26,24 @@
 //! `renderer::SkinFit::classify` names the three-way split explicitly (`NoSkin` / `EmptySkin` /
 //! `ExceedsCap` / `Fits`) so a call site can no longer discard the distinction on the way into a
 //! `bool`. `StaticReason` (the subset that actually reaches the static arm) exposes
-//! `is_downgrade()` — true only for `ExceedsCap` — and `build_character_model` logs at `error!`
-//! and records into `EqRenderer::skin_cap_downgrades` exactly when that's true.
+//! `is_downgrade()`, true only for `ExceedsCap`. `skin_observation::observe_skin_fit` logs at
+//! `error!` and records into `EqRenderer::skin_cap_downgrades` under one `if let` on
+//! `StaticReason::downgrade_joint_count` — the actual gate; `is_downgrade` is a convenience with no
+//! production caller, and the test below that relates the two says only that, having once said
+//! more. (Both channels lived in `build_character_model` / `ensure_character_model` until
+//! eqoxide#780 moved them into one function a test can call.)
 //!
 //! ## What this file does NOT cover
 //!
-//! - That `build_character_model` actually calls `SkinFit::classify` and wires its result to
-//!   `error!`/`skin_cap_downgrades` — that needs a `wgpu::Device`, which nothing in this crate's
-//!   test harness can construct (see `shadow_routing.rs`'s header for the established precedent).
-//!   What's covered here is the decision itself: `SkinFit::classify`, `SkinFit::is_skinned`,
-//!   `SkinFit::static_reason`, `StaticReason::is_downgrade`, and `record_skin_cap_downgrade` are
-//!   all pure and reached directly.
+//! - That `EqRenderer::ensure_character_model` and `EqRenderer::build_character_model` behave as
+//!   described — both need a `wgpu::Device`, which nothing in this crate's test harness can
+//!   construct (see `shadow_routing.rs`'s header for the established precedent). **The wiring
+//!   between them is no longer in that blind spot**, though, and that is the change eqoxide#797
+//!   asked for: the classify → log → record sequence is now one device-free function,
+//!   `skin_observation::observe_skin_fit`, exercised directly by that module's own `mod tests`
+//!   (they cannot live here — see the WIRING note further down). What remains uncovered is only the
+//!   two device-dependent methods' own bodies — and a render arm cannot be chosen in either without
+//!   an `ObservedModel`, which only `observe_skin_fit` produces.
 //! - That the `error!` log line is emitted with any particular text — this project's own
 //!   `AGENT-HONESTY` guidance is that a log line is a weak signal anyway (the driving agent does
 //!   not read logs), so this file grades the *structured* observable
@@ -199,6 +208,48 @@ fn record_skin_cap_downgrade_only_inserts_for_exceeds_cap() {
         "an ExceedsCap reason must be recorded under the loaded FILE with its joint count");
     assert_eq!(map.len(), 1);
 }
+
+/// `StaticReason::is_downgrade` agrees with the predicate that actually gates the report.
+///
+/// Scope, stated because an earlier version of this test overstated it: `is_downgrade` has **no
+/// production caller**. It does not gate the log — `skin_observation::observe_skin_fit` gates on
+/// `downgrade_joint_count()` directly, and `the_log_and_the_report_come_from_one_gate_evaluation`
+/// (a unit test in that module) is what pins the real gate. This test only keeps the public
+/// convenience method from diverging from the method it delegates to, which is worth having because
+/// `is_downgrade` is `pub` and a reader will believe it.
+///
+/// The delegation is not decorative. On an intermediate commit of this branch the log tested
+/// `is_downgrade` while `record_skin_cap_downgrade` re-matched `ExceedsCap` itself, and mutating
+/// `is_downgrade` to `true` changed which models got logged without changing which got reported.
+#[test]
+fn is_downgrade_agrees_with_the_report_gate() {
+    for reason in [
+        StaticReason::NoSkin,
+        StaticReason::EmptySkin,
+        StaticReason::ExceedsCap { joint_count: 129 },
+    ] {
+        let mut map: BTreeMap<String, usize> = BTreeMap::new();
+        record_skin_cap_downgrade(&mut map, Path::new("/models/x.glb"), reason);
+
+        assert_eq!(map.contains_key("x.glb"), reason.is_downgrade(),
+            "{reason:?}: `is_downgrade` disagrees with whether a report entry was written");
+        assert_eq!(map.get("x.glb").copied(), reason.downgrade_joint_count(),
+            "{reason:?}: the recorded count must be exactly what the shared predicate yields");
+    }
+}
+
+// ── The WIRING: classify -> log -> record, as one reachable function (eqoxide#780 / eqoxide#797) ──
+//
+// Those tests are NOT here. They are unit tests in `src/skin_observation.rs`, because the sink that
+// names the report's destination has no constructor outside `cfg(test)` — an integration test is a
+// separate crate and links the library built without it. Moving them was the point: giving this
+// file a way to build a sink would have handed the same escape hatch to the renderer.
+//
+// What lives there: `observing_a_cap_exceeding_skin_takes_the_static_arm_and_reports_it`,
+// `observing_an_unremarkable_static_model_takes_the_static_arm_and_reports_nothing`,
+// `observing_a_fitting_skin_takes_the_skinned_arm_and_reports_nothing`,
+// `the_log_and_the_report_come_from_one_gate_evaluation`, and
+// `observation_and_arm_agree_over_the_whole_range`.
 
 /// The documented limit of the file-name key: two files with the same base name under two different
 /// asset roots collapse into ONE entry.

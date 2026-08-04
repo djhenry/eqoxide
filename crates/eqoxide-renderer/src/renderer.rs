@@ -210,14 +210,61 @@ pub enum StaticReason {
 }
 
 impl StaticReason {
+    /// The joint count that caused a genuine cap downgrade, or `None` when the static arm was taken
+    /// for an unremarkable reason. This is the **single predicate both eqoxide#780 channels use**:
+    /// [`crate::skin_observation::observe_skin_fit`] evaluates it once, in one `if let`, and inside
+    /// that arm both fires the `error!` and calls [`record_skin_cap_downgrade`].
+    ///
+    /// It returns the count rather than a `bool` so the two channels cannot be gated by two
+    /// separately-mutable expressions, and so the log message can interpolate the bound count.
+    /// What that buys, and only that:
+    ///
+    /// - C4: replacing the `if let` with `if true` is `E0425` at two sites, because the binding
+    ///   disappears out from under both the log message and the `reported` assignment.
+    /// - C3: keeping the binding but widening the gate (`.or(Some(0))`) compiles and goes RED
+    ///   (267 / 3 / 12 against a 270 / 0 / 12 control), because the gate's value leaves the
+    ///   function as `ObservedModel::reported_downgrade` and the tests pin it against the recorded
+    ///   entry.
+    ///
+    /// It buys nothing at all about the **log**, in either direction. Deleting the whole
+    /// `tracing::error!` statement — one statement — compiles and leaves `-p eqoxide-renderer` at
+    /// 270 / 0 / 12, identical to control; only two warnings appear, and this workspace sets no
+    /// `deny(warnings)`. An earlier version of this paragraph ended "and no further" after the C4/C3
+    /// rows and drew the boundary at a *two-line* re-split; a reviewer measured the one-statement
+    /// deletion and it survives, so the boundary was in the wrong place. The report is the pinned
+    /// channel. The log is not pinned. See `skin_observation`'s "Does not: grade the log line"
+    /// bullet for the full row list.
+    ///
+    /// The two channels *were* separately gated, before: the log tested [`is_downgrade`] while the
+    /// report re-matched `ExceedsCap` itself, so a mutation that made `is_downgrade` return `true`
+    /// for every variant changed which models got logged without changing which got reported. That
+    /// was measured on the intermediate commit that had both gates, and is the reason this method
+    /// exists; the same mutation against this shape is row M5 of the eqoxide#780 PR's mutation
+    /// table.
+    ///
+    /// [`is_downgrade`]: StaticReason::is_downgrade
+    pub fn downgrade_joint_count(self) -> Option<usize> {
+        match self {
+            StaticReason::ExceedsCap { joint_count } => Some(joint_count),
+            StaticReason::NoSkin | StaticReason::EmptySkin => None,
+        }
+    }
+
     /// The one case eqoxide#780 requires to stop being silent: the model had real skin data that
     /// simply did not fit the uniform buffer, and got rendered as if it were never skinned at all.
+    /// Delegates to [`StaticReason::downgrade_joint_count`] rather than re-matching, so it cannot
+    /// disagree with what actually gets reported.
+    ///
+    /// It has **no production caller**: the report and the log are both gated on
+    /// `downgrade_joint_count` directly. It is kept because it is `pub` and reads better at a call
+    /// site that only wants the yes/no; `is_downgrade_agrees_with_the_report_gate` pins the
+    /// delegation. Do not describe it as "the gate" — an earlier test message did, and it was false.
     pub fn is_downgrade(self) -> bool {
-        matches!(self, StaticReason::ExceedsCap { .. })
+        self.downgrade_joint_count().is_some()
     }
 }
 
-/// Record `(label, gender)`'s joint count into `downgrades` iff `reason` is a genuine cap downgrade
+/// Record `model_path`'s joint count into `downgrades` iff `reason` is a genuine cap downgrade
 /// (`StaticReason::ExceedsCap`) — the one outcome eqoxide#780 requires to stop being silent. Pure
 /// so the recording decision is unit-testable without a `wgpu::Device`; `EqRenderer` cannot be
 /// constructed at all in a test (no `wgpu` backend has a non-adapter constructor), which is why
@@ -257,16 +304,18 @@ impl StaticReason {
 /// set by `load_character_models` and there is one per renderer, so it does not happen in the
 /// shipped flow, but nothing here *prevents* it.
 ///
-/// The base name is still the right key, for a reason unrelated to collisions: this map is read by
-/// an AI agent over HTTP, and an absolute local path is both unstable across machines and local
-/// detail this project does not publish. `race_pcfroglok.glb` identifies the rig; the absolute path
-/// in front of it identifies the machine.
+/// The base name is still the right key, for a reason unrelated to collisions: this map is *meant*
+/// to be read by an AI agent over HTTP (eqoxide#797 — nothing publishes it yet; grep for
+/// `skin_cap_downgrades` outside this crate and the only hit is a comment in
+/// `src/bin/render_model.rs`), and an absolute local path is both unstable across machines and
+/// local detail this project does not publish. `race_pcfroglok.glb` identifies the rig; the
+/// absolute path in front of it identifies the machine.
 pub fn record_skin_cap_downgrade(
     downgrades: &mut std::collections::BTreeMap<String, usize>,
     model_path: &std::path::Path,
     reason: StaticReason,
 ) {
-    if let StaticReason::ExceedsCap { joint_count } = reason {
+    if let Some(joint_count) = reason.downgrade_joint_count() {
         downgrades.insert(downgrade_key(model_path), joint_count);
     }
 }
@@ -399,6 +448,30 @@ pub struct EqRenderer {
     /// The key is the file rather than `(label, gender)` because the file is what the joint count
     /// describes; see [`record_skin_cap_downgrade`] for why that distinction is load-bearing
     /// (eqoxide#813).
+    ///
+    /// Written in exactly one place *as the tree stands* — [`crate::skin_observation::observe_skin_fit`],
+    /// which is also the only producer of the [`crate::skin_observation::ObservedModel`] that
+    /// `build_character_model` requires. Read that as a measured fact about today's tree, **not** as
+    /// an invariant the type system holds: this field is `pub`, so any holder of a
+    /// `&mut EqRenderer`, inside the crate or outside it, can write or clear it, and the compiler
+    /// would not object. The measurement, re-run for round 4: `git grep -n skin_cap_downgrades`
+    /// over the whole tree returns this declaration, the `BTreeMap::new()` initialiser in
+    /// `EqRenderer::new`, `DowngradeSink::of`'s borrow, comment/doc mentions, and one comment in
+    /// `src/bin/render_model.rs` — no other write. Narrowing the visibility would not make the
+    /// sentence structural either, only smaller in scope: `skin_observation` is a different module,
+    /// so the tightest this field can be and still be reportable-into is `pub(crate)`, which leaves
+    /// every writer inside this crate exactly where it is. What *is* structural is the second
+    /// bullet below.
+    ///
+    /// Two things follow, and neither is more than what it says:
+    ///
+    /// - An arm cannot be chosen without an observation having run (omitting it is a compile error).
+    /// - That observation cannot have been *aimed* anywhere else, because
+    ///   [`crate::skin_observation::DowngradeSink`] borrows *this* field and, outside `cfg(test)`,
+    ///   has no other constructor. An earlier version of this comment claimed the two "cannot drift
+    ///   apart" while the destination was a caller-supplied `&mut BTreeMap`; a reviewer substituted
+    ///   a throwaway map, the crate compiled clean and stayed green, and this field stayed empty for
+    ///   a 129-joint rig. That route is closed; see the module's "Does not" list for what is not.
     pub skin_cap_downgrades: std::collections::BTreeMap<String, usize>,
     /// Channel to the background model-sync worker: send a race model KEY (e.g. "race_hum") to
     /// fetch its `charmodel/<key>` set on demand the first time a spawn of that race is seen, so
@@ -892,13 +965,26 @@ impl EqRenderer {
         }
         match crate::models::ModelAsset::load(&path) {
             Ok(asset) => {
-                let (model, skin_fit) = self.build_character_model(key, asset);
-                if let Some(reason) = skin_fit.static_reason() {
-                    // Keyed by the file that was just loaded — `path`, not `key`/`gender`, because
-                    // gender 1 falls back to the male GLB when there is no `_f` variant and the
-                    // joint count belongs to the file (eqoxide#813).
-                    record_skin_cap_downgrade(&mut self.skin_cap_downgrades, &path, reason);
-                }
+                // Classify + log + record in ONE call, before the model is built, because
+                // `build_character_model` cannot choose a render arm without the `ObservedModel`
+                // this returns. Skipping the report is therefore a compile error rather than a
+                // silent regression (eqoxide#780; the reachability hole is eqoxide#797/#799).
+                // The whole `asset` is handed over, not a joint count read off it here: the
+                // observation and the upload then come out of one value, so the arm cannot be
+                // chosen for a joint count the uploaded model does not have. That argument was a
+                // caller-computed `Option<usize>` until round 4, and replacing it with `None` here
+                // was a compile-clean, still-green way back to eqoxide#780.
+                // Keyed by the file that was just loaded — `path`, not `key`/`gender`, because
+                // gender 1 falls back to the male GLB when there is no `_f` variant and the joint
+                // count belongs to the file (eqoxide#813). `path` is still caller-supplied and
+                // still unpinned; see `observe_skin_fit`'s doc for what that leaves open.
+                let observed = crate::skin_observation::observe_skin_fit(
+                    crate::skin_observation::DowngradeSink::of(self),
+                    &path,
+                    key,
+                    asset,
+                );
+                let model = self.build_character_model(key, observed);
                 self.gpu_character_models.insert((key, gender), model);
                 tracing::debug!("renderer: lazily loaded character model '{key}' (gender {gender})");
             }
@@ -913,17 +999,33 @@ impl EqRenderer {
     }
 
     /// Upload one `ModelAsset` to the GPU as a `GpuModel` (skinned when it has a
-    /// usable skin, else static). `label` is only used for log lines. Shared by the
-    /// archetype loader and the per-race (`race_<code>.glb`) loader.
+    /// usable skin, else static). `label` is only used for log lines. Its one caller is
+    /// `ensure_character_model`, which serves both archetype keys and per-race (`race_<code>.glb`)
+    /// keys through the same path.
     ///
-    /// Returns the [`SkinFit`] alongside the model so the caller can record a cap downgrade
-    /// (eqoxide#780) — this method takes `&self`, not `&mut self`, so it cannot update
-    /// `self.skin_cap_downgrades` itself; see `ensure_character_model`.
-    fn build_character_model(&self, label: &str, asset: crate::models::ModelAsset)
-        -> (crate::gpu::GpuModel, SkinFit)
-    {
+    /// Takes the model **and** the render-arm choice as one [`ObservedModel`], which only
+    /// [`crate::skin_observation::observe_skin_fit`] can produce. This method takes `&self`, not
+    /// `&mut self`, so it cannot record into `self.skin_cap_downgrades` itself; rather than return
+    /// a bare [`SkinFit`] and *hope* the caller reports it (which is what eqoxide#795 did, and what
+    /// eqoxide#797 measured to be unreachable from any test), it demands the witness that the
+    /// reporting already happened. See `ensure_character_model`.
+    ///
+    /// There is deliberately no separate `asset` parameter: the asset comes out of the witness via
+    /// [`crate::skin_observation::ObservedModel::into_parts`], so the geometry uploaded here is the
+    /// same *value* that was classified and reported, not merely one that compares equal to it. A
+    /// reviewer measured the previous shape — `(label, asset, observed)` with the joint count read
+    /// at the call site — and replacing that count with `None` compiled clean and left the crate
+    /// green while a 129-joint rig went unreported.
+    ///
+    /// [`ObservedModel`]: crate::skin_observation::ObservedModel
+    fn build_character_model(
+        &self,
+        label: &str,
+        observed: crate::skin_observation::ObservedModel,
+    ) -> crate::gpu::GpuModel {
         use wgpu::util::DeviceExt;
         use crate::models::SkinnedMeshData;
+        let (asset, fit) = observed.into_parts();
         tracing::info!("renderer: loaded '{}' — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
             label, asset.y_bottom, asset.y_extent, asset.x_center, asset.z_center);
 
@@ -933,18 +1035,7 @@ impl EqRenderer {
         let tex_names: Vec<String> =
             asset.textures.iter().map(|t| t.name.clone()).collect();
 
-        let skin_fit = SkinFit::classify(asset.skin.as_ref().map(|s| s.joint_count));
-        if let Some(reason) = skin_fit.static_reason() {
-            if reason.is_downgrade() {
-                tracing::error!(
-                    "renderer: character model '{label}' has a skin that EXCEEDS the \
-                     {JOINT_CAP}-joint cap ({skin_fit:?}) — falling back to the STATIC \
-                     (unskinned) render arm; this model will not animate (eqoxide#780)"
-                );
-            }
-        }
-
-        if skin_fit.is_skinned() {
+        if fit.is_skinned() {
             let skin = asset.skin.unwrap();
             let mut meshes: Vec<GpuSkinnedMesh>                       = Vec::new();
             let mut skinned_slots: Vec<Option<crate::models::EquipSlot>> = Vec::new();
@@ -992,7 +1083,7 @@ impl EqRenderer {
             }
             tracing::info!("renderer: loaded skinned model '{}' ({} joints, {} clips)",
                       label, skin.joint_count, skin.clips.len());
-            (GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: skinned_slots, head_parts: skinned_head_parts, head_default_hidden: skinned_head_hidden, true_height: asset.true_height, clip_bounds: asset.clip_bounds.clone(), feet_offset: asset.feet_offset }), skin_fit)
+            GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: skinned_slots, head_parts: skinned_head_parts, head_default_hidden: skinned_head_hidden, true_height: asset.true_height, clip_bounds: asset.clip_bounds.clone(), feet_offset: asset.feet_offset })
         } else {
             let mut meshes: Vec<GpuMesh>                              = Vec::new();
             let mut static_slots: Vec<Option<crate::models::EquipSlot>> = Vec::new();
@@ -1029,7 +1120,7 @@ impl EqRenderer {
                 static_head_hidden.push(dh);
             }
             tracing::info!("renderer: loaded static model '{}'", label);
-            (GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, bounds: crate::models::ModelBounds { y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center }, prefix: asset.prefix.clone(), equip_slots: static_slots, head_parts: static_head_parts, head_default_hidden: static_head_hidden, true_height: asset.true_height, clip_bounds: vec![], feet_offset: 0.0 }), skin_fit)
+            GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, bounds: crate::models::ModelBounds { y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center }, prefix: asset.prefix.clone(), equip_slots: static_slots, head_parts: static_head_parts, head_default_hidden: static_head_hidden, true_height: asset.true_height, clip_bounds: vec![], feet_offset: 0.0 })
         }
     }
 
