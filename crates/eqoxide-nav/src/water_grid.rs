@@ -464,15 +464,22 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// narrow. MEASURED (#849): on `highpass`, with full workload on both sides and the attachment as
 /// the only difference, the close count went 7,229 -> 7,394 (**+2.3%**). That is one zone, and it is
 /// not the zone that binds `worst_case_reachable_component` — `highpass` is not in that corpus's
-/// default set. **The effect on `butcher` is PENDING MEASUREMENT**, and "some effect" is not a safe
-/// default either: two of the four converted corpora printed BYTE-IDENTICAL tables under this same
-/// attachment, so a zero move is observed, not merely possible.
+/// default set. On `butcher`, which IS that zone, the same attachment takes 352,493 -> **4,583,785**
+/// (**13.0x**, full workload, `dev`, `ZONES=butcher`). So the effect is a property of the ZONE and
+/// its spread is enormous: +2.3% on one, 13x on another, and exactly zero on two more — two of the
+/// four converted corpora printed BYTE-IDENTICAL tables under this same attachment. Neither "some
+/// effect" nor "a big effect" is a safe default for a zone nobody has measured.
 ///
-/// An earlier revision of this doc quoted 352,493 -> 4,583,748 (13.0x); the 4,583,748 has been
-/// withdrawn by the reviewer who produced it (its run did more work than the base run in less wall
-/// time, which is not possible at equal workload) and must not be quoted. Only the 352,493
-/// no-region-map figure and the `highpass` A/B survive. See `MAX_NODES`' doc, marked pending on the
-/// same run.
+/// Two runs measured the attached `butcher` figure and they differ by **37 nodes**: 4,583,785
+/// (`dev`-confirmed, butcher-only) and 4,583,748 (three-zone, **profile never captured**). The
+/// 0.00081% gap is unexplained. Profile, corpus composition and the grid/assets are excluded; the
+/// **leading open candidate is that the earlier run executed fewer searches** — its wall time allows
+/// ≤ 2.08 s per pair at the nominal count, against 4.92 s for the mapless base, and its working tree
+/// was never recorded so a probe-loop edit would leave no trace. Filed separately. Three successive
+/// revisions of this doc asserted a cause ("impossible, unusable"; "`release` vs `dev`"; "sample count
+/// excluded") and all three were wrong, so this one asserts none. What holds regardless: the figure is
+/// a MAX OVER SAMPLES, so the smaller number is a valid LOWER BOUND, and both round to
+/// 57.3% / 1.75x / 13.0x. See `MAX_NODES`' doc for the full account.
 ///
 /// **The cost of that choice, stated because it is a real behaviour change and not a free win:**
 /// [`open_corpus_zone`]'s DROP 3 refuses a zone whose `.wtr` did not load. Those four corpora
@@ -484,9 +491,9 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// whether they run. Two of the four (`q1_headroom_seal_measurement`,
 /// `floor_model_disagreement_scan`) were measured byte-identical either way — so the attachment's
 /// effect CAN be exactly zero, which is measured, not assumed; one
-/// (`worst_case_reachable_component`) has no A/B on its binding zone at all and is **PENDING
-/// MEASUREMENT** (an earlier "13x" here is withdrawn — see the withdrawal paragraph above in this
-/// same doc, not `open_corpus_zone`'s, which does not contain it); one
+/// (`worst_case_reachable_component`) now has a full A/B on its binding zone and moves **13.0x**
+/// (`butcher`, 352,493 -> 4,583,785) — the largest effect anywhere in this file, and the reason the
+/// `MAX_NODES` headroom figure changed; one
 /// (`fine_tier_corpus_route_success_and_cost`)
 /// showed no change over a reduced 4-zone run, which is not the same as showing there is none.
 ///
