@@ -457,11 +457,15 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// construction of a zone's collision grid, and it ALWAYS calls `set_region_data` — with the loaded
 /// map, or with the loader's `Err`. A `Collision` with no region data attached is therefore a
 /// configuration the shipped client never builds, and a corpus that measured one would be measuring
-/// a grid that does not exist in the field. That is not hypothetical: MEASURED (#849), the
-/// `worst_case_reachable_component` corpus reports **352,493** nodes for `butcher` with no region
-/// map and **4,583,748** with one — **13.0x** — and that corpus's whole purpose is to bound the
-/// production constant [`crate::collision::MAX_NODES`]. The smaller number was the comfortable one
-/// and the wrong one. See `MAX_NODES`' doc for the correction it forced.
+/// a grid that does not exist in the field. That is not hypothetical: MEASURED (#849), attaching the
+/// map raises the flooded component — `highpass` goes 7,229 -> 7,394 (+2.3%) with full workload on
+/// both sides and the attachment as the only difference — and the corpus that measures it,
+/// `worst_case_reachable_component`, exists to bound the production constant
+/// [`crate::collision::MAX_NODES`]. **The MAGNITUDE on `butcher` is PENDING MEASUREMENT.** An earlier
+/// revision of this doc quoted 352,493 -> 4,583,748 (13.0x); the 4,583,748 has been withdrawn by the
+/// reviewer who produced it (its run did more work than the base run in less wall time, which is not
+/// possible at equal workload) and must not be quoted. Only the 352,493 no-region-map figure and the
+/// `highpass` A/B survive. See `MAX_NODES`' doc, which is marked pending on the same run.
 ///
 /// **The cost of that choice, stated because it is a real behaviour change and not a free win:**
 /// [`open_corpus_zone`]'s DROP 3 refuses a zone whose `.wtr` did not load. Those four corpora

@@ -67,43 +67,52 @@ pub struct Hit {
 /// in the production configuration — `astar`'s water-descent, haul-out and surface-crossing edge
 /// families are live, and a reachable component in a zone with real water volume is far larger.
 ///
-/// Re-measured (MEASURED, `#849`, debug build, default corpus):
+/// **PENDING MEASUREMENT — the production-config figure for `butcher` is NOT currently known.** An
+/// earlier revision of this doc stated it as 4,583,748 (57% of the cap, 1.75× headroom). That number
+/// came from a reviewer run which its own author has since **withdrawn**: the run reported 13× more
+/// nodes on butcher *plus* two extra zones in 46% of the wall time the butcher-only base run needed,
+/// same profile and same box, which is not possible at equal workload; three later full-workload
+/// attempts on the same configuration emitted no butcher row at all. The author now believes it was a
+/// reduced-workload probe and cannot verify it, so **4,583,748, the 13.0× derived from it, and the
+/// everfrost/gfaydark figures from the same run are all withdrawn and must not be quoted.** A
+/// full-workload re-measurement is in flight; when it lands this block is replaced with the figure.
 ///
-/// | zone | `MAX_closed`, no region map | `MAX_closed`, region map attached (production config) |
-/// |---|---|---|
-/// | everfrost | — | 65,616 |
-/// | **butcher** | **352,493** | **4,583,748** |
-/// | gfaydark | — | 355,304 |
+/// What survives, and is enough to falsify the OLD claim even though it does not yet replace it:
 ///
-/// So the honest statement of this cap's margin is: **the worst measured close is butcher at
-/// 4,583,748 against an 8,000,000 cap — 57% of the cap consumed, 1.75× headroom** — not 7×, and not
-/// everfrost. The 13.0× on butcher is the water edge families, not noise; Butcherblock has open
-/// ocean. **REASONED, not measured:** that the 13× is *specifically* attributable to the
-/// water-descent/haul-out/surface-crossing families rather than to some other consequence of
-/// `region_map()` turning `Some` — nobody has instrumented which family supplies the nodes. What is
-/// measured is the total, on both sides, with the region-map attachment as the only difference.
+/// | measurement | status |
+/// |---|---|
+/// | everfrost 1,121,438, no region map — the figure that set this cap | MEASURED (pre-#849) |
+/// | butcher 352,493, no region map, full workload | MEASURED (#849 review, base) |
+/// | `highpass` 7,229 → 7,394 (**+2.3%**), full workload on BOTH sides, region map the only change | MEASURED (#849 review) |
+/// | butcher WITH region map (production config) | **PENDING** |
 ///
-/// 1.75× is a real margin, not a comfortable one, and this doc no longer calls it comfortable.
+/// The direction is therefore measured and the magnitude is not. That is sufficient to retire the
+/// old "~7× headroom" claim — it was measured on a `Collision` with **no region data attached**, and
+/// `build_zone_collision` (`src/app.rs`) is the client's ONE production construction of a zone's
+/// collision grid and ALWAYS calls `set_region_data`, so that number describes a configuration the
+/// client never builds. It is NOT sufficient to state a replacement margin, and this doc does not
+/// state one until the run lands.
+///
 /// Whether 8M should MOVE is a production-constant decision that #849 deliberately does not take —
-/// it is tracked as **#856**. Two things make the residual risk bounded rather than latent: the
-/// failure mode below is honest-but-imprecise rather than wrong, and
-/// `worst_case_reachable_component` now asserts `worst < MAX_NODES` and prints the percentage, so a
-/// future zone that eats the remaining margin makes that corpus say so instead of a human noticing.
+/// it is tracked as **#856** (which is likewise marked pending until the figure is in). Two things
+/// make the residual risk bounded rather than latent even while the margin is unknown: the failure
+/// mode below is honest-but-imprecise rather than wrong, and `worst_case_reachable_component` now
+/// asserts `worst < MAX_NODES` and prints the percentage, so a zone that eats the remaining margin
+/// makes that corpus say so instead of a human noticing.
 ///
-/// **Caveat, stated honestly, and it now bites harder than when it was written:** butcher is the
-/// worst zone *in the corpus*, NOT the worst in RoF2 — larger and wetter outdoor zones exist and are
-/// unmeasured, and at 57% of the cap it takes only a ~1.75× worse zone to exceed it, where the old
-/// (wrong) 7× reading implied a zone would have to be 7× worse. **A future zone joining this corpus
-/// is therefore a live possibility, not a theoretical one, and the assert in
-/// `worst_case_reachable_component` is what turns it into a RED run instead of a silent
+/// **Caveat, stated honestly:** butcher is the worst zone *in the corpus*, NOT the worst in RoF2 —
+/// larger and wetter outdoor zones exist and are unmeasured. With the true production-config margin
+/// unknown, how much worse a future zone would have to be before it exceeds the cap is also unknown,
+/// so **a future zone joining this corpus is a live possibility, not a theoretical one, and the
+/// assert in `worst_case_reachable_component` is what turns it into a RED run instead of a silent
 /// imprecision.** The residual risk is still bounded, for two reasons that did not change: (1) a
 /// REACHABLE goal is found by goal-directed A* long before the cap (the admissible heuristic pulls the
 /// search toward the goal, so it does not explore the whole component), so a bigger zone does not make
 /// a reachable goal false-`Exhausted`; (2) the only failure is an UNREACHABLE goal in a >8M-node
 /// component reporting `Exhausted(NodeCap)` ("I don't know") instead of `Unreachable(SearchClosed)`
 /// ("no") — which is still HONEST, just less precise. So 8M is a precision floor, not a safety floor.
-/// That is the whole reason 1.75× is shippable while being reported rather than quietly accepted:
-/// exceeding it costs precision, not correctness.
+/// That is also why an unknown margin is reportable rather than blocking: exceeding the cap costs
+/// precision, not correctness, and the assert makes the crossing loud when it happens.
 ///
 /// It is the cap for the ENTIRE plan (`plan_path` makes up to 13 A* calls sharing one `PlanCtx`
 /// budget), so the plan is bounded by one budget, not one-per-call (#340).
@@ -7314,12 +7323,20 @@ mod tests {
         // builds, and a component size measured on one is not the worst case `MAX_NODES` has to
         // clear in the field — it is a smaller number about a grid that does not exist.
         //
-        // MEASURED, and it is not a rounding difference (#849): on `butcher`, with the region map
-        // attached 4,583,748 nodes; without it 352,493. **13.0x.** Butcher is the zone that sets
-        // this corpus's headline figure, and Butcherblock has open ocean. So the pre-#839 number
-        // was not perturbed by this change — it was measuring the wrong grid, and the margin it
-        // implied against `MAX_NODES` was overstated by an order of magnitude. See `MAX_NODES`'s
-        // own doc, which this measurement forced a correction to.
+        // MAGNITUDE: **PENDING MEASUREMENT.** An earlier revision of this comment said "with the
+        // region map attached 4,583,748 nodes; without it 352,493. **13.0x.**" The 4,583,748 has
+        // since been WITHDRAWN by the reviewer who produced it — the run that reported it did more
+        // work than the base run in 46% of the wall time, which is not possible at equal workload,
+        // and three later full-workload attempts on that configuration emitted no butcher row. So
+        // the 13.0x is withdrawn with it and must not be quoted. A full-workload re-measurement is
+        // in flight; when it lands, this comment and `MAX_NODES`' doc take the figure it emits.
+        //
+        // What remains MEASURED is the DIRECTION, not the magnitude: on `highpass`, full workload on
+        // both sides with the region-map attachment as the only difference, 7,229 -> 7,394 (+2.3%);
+        // and `butcher` with no region map, full workload, 352,493. Attaching the map is therefore
+        // known to grow the flooded component, by an amount nobody has yet measured on butcher. That
+        // is still enough to retire the pre-#839 reading, which was not "perturbed" by this change —
+        // it was measuring a grid the client never builds.
         let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
             let (col, zw) = match crate::water_grid::open_corpus_zone(
@@ -7396,13 +7413,14 @@ mod tests {
         // `PlanLimit::NodeCap` once the cap is passed. This is therefore a TRUNCATION DETECTOR: it
         // fires when some zone's whole-component close actually hit the cap, which is exactly the
         // honesty bug `MAX_NODES` was sized to avoid. It is NOT a margin check and will not fire at
-        // 57%, or at 90%. The early warning for margin erosion is the printed percentage above, not
-        // this line.
+        // 50%, or at 90%. The early warning for margin erosion is the printed percentage above, not
+        // this line — which is why the percentage is printed on every run rather than only asserted.
         //
         // Deliberately `<` against the cap and NOT against some invented safety factor: picking a
         // required margin is a production-constant decision, and inventing one here would be this
-        // file asserting a policy nobody chose. Whether 8M should move given a measured 1.75x is
-        // tracked as #856 rather than settled by a test author.
+        // file asserting a policy nobody chose. Whether 8M should move is tracked as #856 rather
+        // than settled by a test author — and #856 is itself pending the production-config figure
+        // for `butcher`, which is not currently known (see `MAX_NODES`' doc).
         assert!(worst < MAX_NODES,
             "#849: the worst measured whole-zone reachable-component close ({worst}) is at or above \
              MAX_NODES ({MAX_NODES}) — a legitimate whole-zone \"no route\" in this corpus now \
