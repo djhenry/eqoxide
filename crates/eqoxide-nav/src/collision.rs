@@ -65,7 +65,11 @@ pub struct Hit {
 /// production construction of a zone's collision grid and it ALWAYS calls `set_region_data`, so a
 /// grid without one is a configuration the client never builds. With the region map attached — i.e.
 /// in the production configuration — `astar`'s water-descent, haul-out and surface-crossing edge
-/// families are live, and a reachable component in a zone with real water volume is far larger.
+/// families are live; on a mapless grid they are gated off entirely (that gating is a source fact,
+/// checked at the `self.region_map()` tests those families sit behind). **What that does to the size
+/// of the flooded component has been measured on exactly ONE zone** — `highpass`, 7,229 -> 7,394
+/// (+2.3%) — **and is not known on `butcher`.** An earlier revision of this sentence said "far
+/// larger"; the only measurement that ever supported *far* is the withdrawn one. See below.
 ///
 /// **PENDING MEASUREMENT — the production-config figure for `butcher` is NOT currently known.** An
 /// earlier revision of this doc stated it as 4,583,748 (57% of the cap, 1.75× headroom). That number
@@ -7331,12 +7335,23 @@ mod tests {
         // the 13.0x is withdrawn with it and must not be quoted. A full-workload re-measurement is
         // in flight; when it lands, this comment and `MAX_NODES`' doc take the figure it emits.
         //
-        // What remains MEASURED is the DIRECTION, not the magnitude: on `highpass`, full workload on
-        // both sides with the region-map attachment as the only difference, 7,229 -> 7,394 (+2.3%);
-        // and `butcher` with no region map, full workload, 352,493. Attaching the map is therefore
-        // known to grow the flooded component, by an amount nobody has yet measured on butcher. That
-        // is still enough to retire the pre-#839 reading, which was not "perturbed" by this change —
-        // it was measuring a grid the client never builds.
+        // What remains MEASURED, stated as narrowly as the evidence allows: on `highpass`, full
+        // workload on both sides with the region-map attachment as the only difference, the close
+        // count went 7,229 -> 7,394 (+2.3%); and `butcher` with no region map, full workload, is
+        // 352,493.
+        //
+        // **That is one zone, and it is not this corpus's zone.** `highpass` is not in
+        // `DEFAULT_ZONES`. And a zero move is not merely conceivable, it is OBSERVED: under this
+        // same attachment two of the four converted corpora (`q1_headroom_seal_measurement`,
+        // `floor_model_disagreement_scan`) printed BYTE-IDENTICAL tables either way. So nothing here
+        // establishes that `butcher`'s number moves AT ALL, let alone by how much — only the pending
+        // run can say. An earlier revision of this comment said the attachment was "known to grow
+        // the flooded component"; it is known to have grown it on `highpass`, which is a different
+        // and much smaller claim.
+        //
+        // What DOES survive independently of any of that is the reason to attach: `build_zone_collision`
+        // is the client's one production construction site and always attaches, so the pre-#839
+        // reading was not "perturbed" by this change — it was measuring a grid the client never builds.
         let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
             let (col, zw) = match crate::water_grid::open_corpus_zone(
@@ -7613,8 +7628,13 @@ mod tests {
         // pair counts and success rates on both sides (23 pairs, 100%/100%), so no change was
         // demonstrated here — which is NOT the same as demonstrating there is none. The full 10-zone
         // default at full budget was not run on either side; see `worst_case_reachable_component`,
-        // where the same attachment is known to move the headline number by an amount PENDING
-        // MEASUREMENT (an earlier "13x" here is withdrawn — see `MAX_NODES`' doc).
+        // where the same attachment's effect on that corpus's headline number is PENDING
+        // MEASUREMENT. The attachment is measured to have RAISED the close count on `highpass`
+        // (7,229 -> 7,394, +2.3%) — a zone that is not in that corpus's default set — and measured
+        // to change NOTHING at all in two of the four converted corpora, which printed
+        // byte-identical tables either way. An earlier revision here said the attachment was "known
+        // to move" that number; no A/B exists on that corpus and the "13x" it once cited is
+        // withdrawn (see `MAX_NODES`' doc).
         let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
             let (col, zw) = match crate::water_grid::open_corpus_zone(
