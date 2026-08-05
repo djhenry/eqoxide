@@ -476,7 +476,9 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// #839's first draft did not state:** the attachment changes what those corpora MEASURE, not just
 /// whether they run. Two of the four (`q1_headroom_seal_measurement`,
 /// `floor_model_disagreement_scan`) were measured byte-identical either way; one
-/// (`worst_case_reachable_component`) moved 13x; one (`fine_tier_corpus_route_success_and_cost`)
+/// (`worst_case_reachable_component`) moves by an amount PENDING MEASUREMENT on its binding zone (an
+/// earlier "13x" here is withdrawn — see this module's `open_corpus_zone` doc); one
+/// (`fine_tier_corpus_route_success_and_cost`)
 /// showed no change over a reduced 4-zone run, which is not the same as showing there is none.
 ///
 /// **What this does NOT claim:** a corpus loop that never constructs a `WaterRollup` is invisible to

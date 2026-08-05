@@ -7386,9 +7386,11 @@ mod tests {
         // #849: this line used to read "the coarse MAX_NODES backstop must be comfortably above
         // this (it is: 8M)" — an ADJECTIVE and a hardcoded restatement of the constant, where the
         // reader needs the ratio. "Comfortably" was written when this corpus measured a grid with
-        // no region map attached and reported ~352k for butcher; against the production
-        // configuration the same zone reports ~4.58M, and "comfortably" was doing far more work
-        // than its author knew. Print the margin and let the reader judge it.
+        // no region map attached and reported ~352k for butcher; the production configuration
+        // floods a strictly larger component (MEASURED on `highpass`, +2.3% full-workload both
+        // sides) by an amount not yet measured on butcher, so "comfortably" was resting on an
+        // unknown. Print the margin and let the reader judge it, rather than judging it here from a
+        // number this corpus does not currently know.
         let pct = worst as f64 * 100.0 / MAX_NODES as f64;
         let headroom = MAX_NODES as f64 / (worst.max(1)) as f64;
         println!("=> the coarse MAX_NODES backstop is {MAX_NODES} nodes: this corpus consumes \
@@ -7611,7 +7613,8 @@ mod tests {
         // pair counts and success rates on both sides (23 pairs, 100%/100%), so no change was
         // demonstrated here — which is NOT the same as demonstrating there is none. The full 10-zone
         // default at full budget was not run on either side; see `worst_case_reachable_component`,
-        // where the same attachment moved the headline number 13x.
+        // where the same attachment is known to move the headline number by an amount PENDING
+        // MEASUREMENT (an earlier "13x" here is withdrawn — see `MAX_NODES`' doc).
         let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
             let (col, zw) = match crate::water_grid::open_corpus_zone(
