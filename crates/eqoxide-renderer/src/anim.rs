@@ -602,9 +602,14 @@ mod tests {
     /// asset-coupled half of that claim now lives in
     /// `shipped_skeleton_glb_combat_routing_matches_its_own_clips`, which reads the real GLB.
     ///
-    /// The shape below is asserted, not just asserted-about: the test's preconditions re-derive
-    /// "clip 0 is death", "no combat clip" and "there is an idle" from this list, so editing the
-    /// list into a different shape turns the test RED rather than quietly changing what it means.
+    /// The list below is asserted, not just asserted-about. Its consumer's first precondition pins
+    /// the clip names **verbatim**, and the rest re-derive "clip 0 is death", "no combat clip" and
+    /// "idle is index 4" from it — so any edit to this list, including dropping or renaming an
+    /// entry nothing routes to, turns the test RED instead of quietly changing what it means.
+    /// (Review measured the earlier version of this doc: dropping `P03_crouch` — the very element
+    /// whose silent drift this PR is about — stayed green. It no longer does.) That assertion pins
+    /// the fixture to **itself**, not to any shipped asset; the asset-coupled claim is the separate
+    /// GLB-reading test named above, and this fixture is under no obligation to resemble it.
     fn death_first_no_combat_skin() -> SkinData {
         let names = ["D05_death", "L01_walk", "L02_run", "O01_idle",
                      "P01_idle_neutral", "P02_sit", "P03_crouch"];
@@ -631,6 +636,14 @@ mod tests {
     #[test]
     fn combat_swing_without_combat_clip_falls_back_to_idle_not_death() {
         let skin = death_first_no_combat_skin();
+
+        // Precondition 0: the fixture is the list its doc describes. Pins every entry, including
+        // the ones nothing here routes to, so the doc cannot drift from the code. This is a pin to
+        // the FIXTURE, not to any shipped asset — see the fixture's doc.
+        let names: Vec<&str> = skin.clips.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["D05_death", "L01_walk", "L02_run", "O01_idle",
+                           "P01_idle_neutral", "P02_sit", "P03_crouch"],
+            "fixture clip list changed — update death_first_no_combat_skin's doc to match");
 
         // Preconditions: this really is the model shape the bug needs.
         let death = skin.clip_for_action("dead");
