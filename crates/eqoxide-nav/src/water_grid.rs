@@ -418,14 +418,90 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// levers are that a loop opens its zones through [`open_corpus_zone`], or wires
 /// `begin_zone`/`add`/`skip` by hand as `faithful_walker_drift_corpus` does.
 ///
-/// As of #807 the corpora that go through this type are `faithful_walker_drift_corpus` (hand-wired,
-/// two rollups), the four `*_blast_radius` corpora in `tests/walker_sim.rs`, and
-/// `water_grid_budget_measurement` in `crates/eqoxide-nav/src/collision.rs` — the last five via
-/// [`open_corpus_zone`]. What remains uncovered is a set of further zone loops in `collision.rs`
-/// that still drop zones on a `continue` without opening them here — some accumulating into a
-/// local `Vec`, some printing nothing at all — see **issue #839**, which carries the current
-/// per-line list. Do not re-derive or restate that tally here; it will drift. This paragraph names
-/// the mechanism; #839 names the sites.
+/// As of #839, in `crates/eqoxide-nav/src/collision.rs` and `tests/walker_sim.rs`, every loop that
+/// opens a baked zone goes through this type. That is a COUNT, and it is the kind of sentence that
+/// rots; re-measure it rather than re-reading for it:
+///
+/// ```text
+/// grep -c 'open_corpus_zone(' crates/eqoxide-nav/src/collision.rs tests/walker_sim.rs   # 6 + 4 = 10
+/// grep -n  'for zone in'      crates/eqoxide-nav/src/collision.rs tests/walker_sim.rs   # 6 + 6 = 12
+/// ```
+///
+/// Measured at the #839 merge: **ten** [`open_corpus_zone`] call sites — the four `*_blast_radius`
+/// corpora in `tests/walker_sim.rs`, and, in `collision.rs`, `water_grid_budget_measurement` (#807)
+/// plus the five #839 converted: `worst_case_reachable_component`,
+/// `fine_tier_corpus_route_success_and_cost`, `fix_700_planner_ab_corpus`,
+/// `q1_headroom_seal_measurement`, `floor_model_disagreement_scan`. The twelve `for zone in` loops
+/// are those ten, plus `faithful_walker_drift_corpus` (hand-wired to two rollups — see above), plus
+/// `zone_accounting_stays_silent_while_every_zone_is_closed`, which is a unit test OF this type: it
+/// drives a rollup over hard-coded zone NAMES and opens no asset at all (measured: zero `from_glb`
+/// calls in its body). So: twelve loops, twelve accounted, none of them bare.
+///
+/// Four of the five #839 converted — every one but `fix_700_planner_ab_corpus` — report no water
+/// NUMBER (measured: zero `in_water` calls, zero `ZoneWater::load` calls in the function body) and
+/// still route through [`open_corpus_zone`] rather than a bespoke drop wrapper, closing with
+/// `cover.add(zone, &zw.tally())` — a zero-valued "no water number" close. One owner for the
+/// accounting, not two.
+///
+/// **#849 correction — that sentence used to read "have no water dependency whatsoever", and the
+/// predicate in the parenthesis does not support it.** The greps were really run and really return
+/// zero; "zero `in_water` calls in the function body" simply is not the same proposition as "no
+/// water dependency", because the dependency is not in those bodies — it is in
+/// [`crate::collision::Collision::astar`], which those bodies call, and which gates whole edge
+/// families (water descent, haul-out/ascent, surface crossing, floating-start anchoring) on
+/// `self.region_map()` being `Some`. `open_corpus_zone` makes it `Some`. A real measurement of the
+/// wrong predicate is the most convincing form of the reasoned-not-measured defect, and this is one.
+///
+/// **Attaching the region map is deliberate, and the reason is production fidelity, not
+/// convenience.** `build_zone_collision` (`src/app.rs`) is documented as the client's ONE production
+/// construction of a zone's collision grid, and it ALWAYS calls `set_region_data` — with the loaded
+/// map, or with the loader's `Err`. A `Collision` with no region data attached is therefore a
+/// configuration the shipped client never builds, and a corpus that measured one would be measuring
+/// a grid that does not exist in the field. That reason stands on `build_zone_collision` alone and
+/// needs no benchmark.
+///
+/// What the attachment DOES to a measurement is a separate question, and the honest answer is
+/// narrow. MEASURED (#849): on `highpass`, with full workload on both sides and the attachment as
+/// the only difference, the close count went 7,229 -> 7,394 (**+2.3%**). That is one zone, and it is
+/// not the zone that binds `worst_case_reachable_component` — `highpass` is not in that corpus's
+/// default set. **The effect on `butcher` is PENDING MEASUREMENT**, and "some effect" is not a safe
+/// default either: two of the four converted corpora printed BYTE-IDENTICAL tables under this same
+/// attachment, so a zero move is observed, not merely possible.
+///
+/// An earlier revision of this doc quoted 352,493 -> 4,583,748 (13.0x); the 4,583,748 has been
+/// withdrawn by the reviewer who produced it (its run did more work than the base run in less wall
+/// time, which is not possible at equal workload) and must not be quoted. Only the 352,493
+/// no-region-map figure and the `highpass` A/B survive. See `MAX_NODES`' doc, marked pending on the
+/// same run.
+///
+/// **The cost of that choice, stated because it is a real behaviour change and not a free win:**
+/// [`open_corpus_zone`]'s DROP 3 refuses a zone whose `.wtr` did not load. Those four corpora
+/// therefore became gated on `maps/water/<zone>.wtr` that they never read, and on a host missing one
+/// they now go RED (`unmeasured`) where before they would have measured the zone and printed a
+/// number. That is the honesty trade #807 made deliberately — refusing to measure beats measuring
+/// and not saying so — but it is a trade, not a no-op. **And the second half of the trade, which
+/// #839's first draft did not state:** the attachment changes what those corpora MEASURE, not just
+/// whether they run. Two of the four (`q1_headroom_seal_measurement`,
+/// `floor_model_disagreement_scan`) were measured byte-identical either way — so the attachment's
+/// effect CAN be exactly zero, which is measured, not assumed; one
+/// (`worst_case_reachable_component`) has no A/B on its binding zone at all and is **PENDING
+/// MEASUREMENT** (an earlier "13x" here is withdrawn — see the withdrawal paragraph above in this
+/// same doc, not `open_corpus_zone`'s, which does not contain it); one
+/// (`fine_tier_corpus_route_success_and_cost`)
+/// showed no change over a reduced 4-zone run, which is not the same as showing there is none.
+///
+/// **What this does NOT claim:** a corpus loop that never constructs a `WaterRollup` is invisible to
+/// this type by construction (see above), and #839 audited only `collision.rs` and `walker_sim.rs`.
+/// `depenetration_corpus_over_baked_zones` in `src/movement.rs` is a baked-zone loop of exactly the
+/// same shape and is out of #839's scope, still unwired: two bare drops, no rollup. Deliberately
+/// cited by source text and not by line number — the first draft of this sentence carried
+/// `movement.rs:2610`/`:2612`, and a routine merge of `origin/main` moved both by two lines before
+/// this PR was even opened:
+///
+/// ```text
+/// grep -n 'from_glb(&dir.join(format!("{name}.glb"))) else { continue }' src/movement.rs
+/// grep -n 'if col.cols == 0 { continue; }'                              src/movement.rs
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct WaterRollup {
     total: usize,

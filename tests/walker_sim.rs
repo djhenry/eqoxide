@@ -1431,7 +1431,10 @@ fn goal_append_blast_radius() {
     println!("\nTOTAL pairs {g_pairs}  routed {g_routed}  LOST(newly-refused) {g_lost}  drove {g_drove}  OVER-TIGHTENED {g_over}");
     println!("(gained = 0 by construction: #639 only ADDS refusals. OVER-TIGHTENED must be 0 — any LOST \
              pair where the REAL controller reached the goal's own tier is a regression.)");
-    assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
+    // #839: the accounting assert must fire BEFORE `g_pairs > 0` — a run that skipped/lost every
+    // zone is still RED either way, but ordered this way the failure names WHICH zones dropped and
+    // why, instead of reporting the pre-#807 "set ZONE_DIR" message over an accounting hole it
+    // could have diagnosed.
     println!("wet start/goal pairs excluded by the water filter: {cover}");
     assert!(cover.is_complete(),
         "#807: the TOTALs above are not this corpus — they cover {}/{} of the zones it was asked \
@@ -1441,6 +1444,7 @@ fn goal_append_blast_radius() {
          not an asset problem): {:?}",
         cover.measured_zones(), cover.attempted_zones(),
         cover.unmeasured_zones(), cover.skipped_zones(), cover.unaccounted_zones());
+    assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
     assert_eq!(g_over, 0,
         "#639 over-tightening: {g_over} LOST pair(s) were reachable by the REAL controller — the goal-\
          append check refused a goal the walker can actually stand on. Investigate the printed pairs.");
@@ -1623,7 +1627,10 @@ fn corner_buffer_blast_radius() {
     println!("INFLATION FIRED: {g_routes_touched} of the sampled routes had >=1 waypoint moved; {g_moved_wp}/{g_total_wp} waypoints offset off a wall.");
     println!("(BROKEN must be 0 — a route the plain coarse route completed that inflation broke is a narrow-corridor \
              over-tightening. SLOWDOWN must be ~1.0. turning<1.0 and SMOOTHED>0 is the anti-wiggle win.)");
-    assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
+    // #839: the accounting assert must fire BEFORE `g_pairs > 0` — a run that skipped/lost every
+    // zone is still RED either way, but ordered this way the failure names WHICH zones dropped and
+    // why, instead of reporting the pre-#807 "set ZONE_DIR" message over an accounting hole it
+    // could have diagnosed.
     println!("wet start/goal pairs excluded by the water filter: {cover}");
     assert!(cover.is_complete(),
         "#807: the TOTALs above are not this corpus — they cover {}/{} of the zones it was asked \
@@ -1633,6 +1640,7 @@ fn corner_buffer_blast_radius() {
          not an asset problem): {:?}",
         cover.measured_zones(), cover.attempted_zones(),
         cover.unmeasured_zones(), cover.skipped_zones(), cover.unaccounted_zones());
+    assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
     assert_eq!(g_broken, 0,
         "#685 over-tightening: {g_broken} route(s) the plain coarse route completed FAILED after inflation — \
          the corner-buffer offset broke a passable route (likely a narrow corridor). Investigate the printed pairs.");
@@ -1790,7 +1798,10 @@ fn descent_guard_blast_radius() {
         cover.add(zone, &zw.measure(|_| z_wet)); // #807: CLOSE the zone — forgetting makes it `unaccounted`
     }
     println!("\nTOTAL pairs {g_pairs}  routed {g_routed}  complete {g_complete}  refused {g_refused}  descent_routes {g_descent_routes}");
-    assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
+    // #839: the accounting assert must fire BEFORE `g_pairs > 0` — a run that skipped/lost every
+    // zone is still RED either way, but ordered this way the failure names WHICH zones dropped and
+    // why, instead of reporting the pre-#807 "set ZONE_DIR" message over an accounting hole it
+    // could have diagnosed.
     println!("wet start/goal pairs excluded by the water filter: {cover}");
     assert!(cover.is_complete(),
         "#807: the TOTALs above are not this corpus — they cover {}/{} of the zones it was asked \
@@ -1800,6 +1811,7 @@ fn descent_guard_blast_radius() {
          not an asset problem): {:?}",
         cover.measured_zones(), cover.attempted_zones(),
         cover.unmeasured_zones(), cover.skipped_zones(), cover.unaccounted_zones());
+    assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
 }
 
 /// **#381 parallel-wall clearance blast radius over baked zones — REAL `CharacterController`, cross-
@@ -1944,7 +1956,10 @@ fn parallel_wall_clearance_blast_radius() {
         cover.add(zone, &zw.measure(|_| z_wet)); // #807: CLOSE the zone — forgetting makes it `unaccounted`
     }
     println!("\nTOTAL pairs {g_pairs}  routed {g_routed}  complete {g_complete}  refused {g_refused}");
-    assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
+    // #839: the accounting assert must fire BEFORE `g_pairs > 0` — a run that skipped/lost every
+    // zone is still RED either way, but ordered this way the failure names WHICH zones dropped and
+    // why, instead of reporting the pre-#807 "set ZONE_DIR" message over an accounting hole it
+    // could have diagnosed.
     println!("wet start/goal pairs excluded by the water filter: {cover}");
     assert!(cover.is_complete(),
         "#807: the TOTALs above are not this corpus — they cover {}/{} of the zones it was asked \
@@ -1954,4 +1969,5 @@ fn parallel_wall_clearance_blast_radius() {
          not an asset problem): {:?}",
         cover.measured_zones(), cover.attempted_zones(),
         cover.unmeasured_zones(), cover.skipped_zones(), cover.unaccounted_zones());
+    assert!(g_pairs > 0, "no zones loaded — set ZONE_DIR to the baked glbs");
 }
