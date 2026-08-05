@@ -182,16 +182,27 @@ bug — `gs.player_z` is often the spawn z, not the real floor). Walkable = a fl
 needs a small floor-height step (`STEP_H=20`) and a clear chest-height segment.
 
 **Limitations (real, hit during play):**
-- **Water** — *this bullet's pathing half is history, not current behaviour.* It used to read "fish/
-  water mobs sit in water a walking character can't path to; `find_path` returns no route to them".
-  That described the 2D-with-water-hacks planner. Today `astar` builds 4u water columns and emits 3D
-  interior, descent, surface-crossing and haul-out edges, gated on `Collision::region_map()`, which
-  the production grid build always attaches — so water mobs are **not** categorically unreachable.
-  The still-live part is the *combat* observation: even where `path_clear` (LOS over water) passes,
-  melee may not connect across/below water. The auto-grind excludes nothing by name, relying on
-  `path_clear`; excluding `fish` by name is now a workaround for that combat behaviour, not for a
-  pathing limitation. Narrower real limits (haul-out height cap, open water-nav issues) are in
-  `collision-system.md` and the two water specs.
+- **Water** — *the pathing half of this bullet is now conditional; the combat half is unchanged and
+  unverified.* It used to read, flatly: "fish/water mobs sit in water a walking character can't path
+  to; `find_path` returns no route to them, and even if `path_clear` (LOS over water) passes, melee
+  won't connect across/below water. The auto-grind excludes nothing by name now, relying on
+  `path_clear`; if you target water mobs, exclude `fish` by name."
+
+  **What changed (pathing only).** The first clause described the 2D-with-water-hacks planner. Today
+  `astar` builds 4u water columns and emits water-entry, 3D interior, descent, surface-crossing and
+  haul-out edges — **but every one is gated on `Collision::region_map()`, which is `Ok` only when the
+  zone's `.wtr` loaded.** So there are two real states: with a water map, water mobs are *not*
+  categorically unreachable; without one, the zone is navigated **water-blind**, those edges do not
+  exist, and the original sentence is still literally true for that zone. Check which state you are
+  in before concluding anything from a no-route. Details, including the four refusal reasons and why
+  `haul_out_up` is an admission threshold rather than a limit on the character, are in
+  `collision-system.md`.
+
+  **What did NOT change.** The melee clause ("melee won't connect across/below water") is a play-time
+  observation this PR did **not** re-verify, so it stands exactly as written. The `fish`-exclusion
+  advice also stands — but note its original rationale bundled pathing and combat together, and the
+  pathing leg has now been corrected. Whether the advice still rests on the combat leg alone is
+  **open, not established here**; re-verify in play before treating it as settled either way.
 - **Sealed pockets / doors**: doors are NOT in the collision (the client suppresses `OP_SPAWN_DOOR`),
   so a room behind a closed door is a disconnected "pocket" — `find_path` correctly finds no route
   (e.g. qcat's merchant rooms are unreachable on foot from the fish room). Reaching them needs door
