@@ -151,10 +151,11 @@ graph-to-graph adapter.
   `:2082-2083`, `:74` — are stale; #849 moved that doc, and `:74` now lands inside a paragraph
   withdrawing a retracted figure, which is precisely the reason to cite text instead. **The 1.12M
   is the NO-REGION-MAP figure** — it was measured on a `Collision` with no region data attached, a
-  configuration `build_zone_collision` never produces; see `MAX_NODES`' doc, where the
-  production-config figure is marked pending). A 2u voxelization of a 6400×6400u zone with a modest
-  200u vertical band is 3200·3200·100 = **1.0×10⁹ voxels** [derived] — ~10³× the surface graph
-  and 128× the backstop, with a 26-way branching factor on top. Water, by contrast, is small and
+  configuration `build_zone_collision` never produces. The production-config worst case is
+  `butcher` at **4.58M** (57.3% of the backstop, 1.75× headroom); see `MAX_NODES`' doc). A 2u
+  voxelization of a 6400×6400u zone with a modest
+  200u vertical band is 3200·3200·100 = **1.0×10⁹ voxels** [derived] — ~10³× everfrost's surface
+  graph (~200× butcher's) and 128× the backstop, with a 26-way branching factor on top. Water, by contrast, is small and
   bounded: the **measured** volumes (§5.4) put whole pools at 10³-10⁵ nodes.
 * **The known land bugs are floor-model quality, not dimensionality.** The #375/#420 line
   (probe heights, headroom classification, facing-blindness — `collision.rs:891-993`,

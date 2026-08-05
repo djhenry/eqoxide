@@ -66,47 +66,60 @@ pub struct Hit {
 /// grid without one is a configuration the client never builds. With the region map attached — i.e.
 /// in the production configuration — `astar`'s water-descent, haul-out and surface-crossing edge
 /// families are live; on a mapless grid they are gated off entirely (that gating is a source fact,
-/// checked at the `self.region_map()` tests those families sit behind). **What that does to the size
-/// of the flooded component has been measured on exactly ONE zone** — `highpass`, 7,229 -> 7,394
-/// (+2.3%) — **and is not known on `butcher`.** An earlier revision of this sentence said "far
-/// larger"; the only measurement that ever supported *far* is the withdrawn one. See below.
+/// checked at the `self.region_map()` tests those families sit behind). How much that grows the
+/// flooded component is strongly **zone-dependent**, and both ends of the observed range are now
+/// measured: `highpass` 7,229 -> 7,394 (**+2.3%**), `butcher` 352,493 -> **13.0×** (the ratio is
+/// 13.0× against either of the two butcher figures below).
 ///
-/// **PENDING MEASUREMENT — the production-config figure for `butcher` is NOT currently known.** An
-/// earlier revision of this doc stated it as 4,583,748 (57% of the cap, 1.75× headroom). That number
-/// came from a reviewer run which its own author has since **withdrawn**: the run reported 13× more
-/// nodes on butcher *plus* two extra zones in 46% of the wall time the butcher-only base run needed,
-/// same profile and same box, which is not possible at equal workload; three later full-workload
-/// attempts on the same configuration emitted no butcher row at all. The author now believes it was a
-/// reduced-workload probe and cannot verify it, so **4,583,748, the 13.0× derived from it, and the
-/// everfrost/gfaydark figures from the same run are all withdrawn and must not be quoted.** A
-/// full-workload re-measurement is in flight; when it lands this block is replaced with the figure.
+/// **The production-config figure for `butcher` is 4,583,785 — 57.3% of this cap, i.e. 1.75×
+/// headroom.** Measured full workload under the `dev` profile on a butcher-only corpus, 10 h 24 m,
+/// exit 0.
 ///
-/// What survives, and is enough to falsify the OLD claim even though it does not yet replace it:
+/// **Two measurements exist and they do not quite agree.** An independent earlier run, under the
+/// `release` profile on the three-zone corpus, reported **4,583,748**. They differ by **37 nodes
+/// (0.00081%)** and that difference is **NOT explained**. Three candidates remain with no evidence
+/// favouring any: the profile (`dev` vs `release`); the corpus composition (butcher-only vs three
+/// zones — the per-zone independence that makes them comparable is verified at source but has never
+/// been measured); or transcription. It is filed as its own issue rather than resolved here, because
+/// resolving it costs either a `release` run (not currently available) or a ~10.4 h three-zone `dev`
+/// run. **Both figures round to 57.3% and 1.75×**, so the open question does not touch the conclusion
+/// this constant rests on — only the last two digits of one input.
+///
+/// **A prior revision of this block withdrew 4,583,748 and instructed readers that it "must not be
+/// quoted". That withdrawal is itself withdrawn** — the number was right to 0.0008%. Why it looked
+/// sound, recorded so nobody re-derives the same false impossibility from the same two numbers: it
+/// rested on the argument that the run reported 13× more nodes on butcher *plus* two extra zones in
+/// 46% of the wall time the butcher-only base run needed, which "is not possible at equal workload".
+/// That argument silently compared a `release` run against a `dev` one. 37,453 s / 1,620 s =
+/// **23.1×**, a textbook `dev`:`release` ratio — and butcher DOMINATES this corpus (everfrost 65,616
+/// and gfaydark 355,304 against butcher's 4.58 M), so a three-zone run and a butcher-only run are
+/// near-identical workloads. There was no impossibility. Note also that this test's own doc specifies
+/// `--release`, so the *withdrawn* run was the documented path and the re-measurement was not.
 ///
 /// | measurement | status |
 /// |---|---|
 /// | everfrost 1,121,438, no region map — the figure that set this cap | MEASURED (pre-#849) |
 /// | butcher 352,493, no region map, full workload | MEASURED (#849 review, base) |
 /// | `highpass` 7,229 → 7,394 (**+2.3%**), full workload on BOTH sides, region map the only change | MEASURED (#849 review) |
-/// | butcher WITH region map (production config) | **PENDING** |
+/// | butcher **4,583,785** WITH region map, `dev`, butcher-only, full workload | MEASURED (#856) |
+/// | butcher **4,583,748** WITH region map, `release`, three-zone, full workload | MEASURED (#849 review) |
+/// | why those two differ by 37 nodes | **UNRESOLVED** |
 ///
-/// The direction is therefore measured and the magnitude is not. That is sufficient to retire the
-/// old "~7× headroom" claim — it was measured on a `Collision` with **no region data attached**, and
-/// `build_zone_collision` (`src/app.rs`) is the client's ONE production construction of a zone's
-/// collision grid and ALWAYS calls `set_region_data`, so that number describes a configuration the
-/// client never builds. It is NOT sufficient to state a replacement margin, and this doc does not
-/// state one until the run lands.
+/// The old "~7× headroom" claim is retired on measurement, not inference: it was taken on a
+/// `Collision` with **no region data attached**, and `build_zone_collision` (`src/app.rs`) is the
+/// client's ONE production construction of a zone's collision grid and ALWAYS calls
+/// `set_region_data`, so that number describes a configuration the client never builds.
 ///
 /// Whether 8M should MOVE is a production-constant decision that #849 deliberately does not take —
-/// it is tracked as **#856** (which is likewise marked pending until the figure is in). Two things
-/// make the residual risk bounded rather than latent even while the margin is unknown: the failure
+/// it is tracked as **#856**, which now carries the measured figure. Two things make the residual
+/// risk bounded rather than latent at a 1.75× margin: the failure
 /// mode below is honest-but-imprecise rather than wrong, and `worst_case_reachable_component` now
 /// asserts `worst < MAX_NODES` and prints the percentage, so a zone that eats the remaining margin
 /// makes that corpus say so instead of a human noticing.
 ///
 /// **Caveat, stated honestly:** butcher is the worst zone *in the corpus*, NOT the worst in RoF2 —
-/// larger and wetter outdoor zones exist and are unmeasured. With the true production-config margin
-/// unknown, how much worse a future zone would have to be before it exceeds the cap is also unknown,
+/// larger and wetter outdoor zones exist and are unmeasured. The margin is now measured, and it is
+/// **1.75×** — a zone only 75% heavier than butcher exceeds the cap,
 /// so **a future zone joining this corpus is a live possibility, not a theoretical one, and the
 /// assert in `worst_case_reachable_component` is what turns it into a RED run instead of a silent
 /// imprecision.** The residual risk is still bounded, for two reasons that did not change: (1) a
@@ -115,7 +128,7 @@ pub struct Hit {
 /// a reachable goal false-`Exhausted`; (2) the only failure is an UNREACHABLE goal in a >8M-node
 /// component reporting `Exhausted(NodeCap)` ("I don't know") instead of `Unreachable(SearchClosed)`
 /// ("no") — which is still HONEST, just less precise. So 8M is a precision floor, not a safety floor.
-/// That is also why an unknown margin is reportable rather than blocking: exceeding the cap costs
+/// That is also why a thin margin is reportable rather than blocking: exceeding the cap costs
 /// precision, not correctness, and the assert makes the crossing loud when it happens.
 ///
 /// It is the cap for the ENTIRE plan (`plan_path` makes up to 13 A* calls sharing one `PlanCtx`
@@ -7327,27 +7340,32 @@ mod tests {
         // builds, and a component size measured on one is not the worst case `MAX_NODES` has to
         // clear in the field — it is a smaller number about a grid that does not exist.
         //
-        // MAGNITUDE: **PENDING MEASUREMENT.** An earlier revision of this comment said "with the
-        // region map attached 4,583,748 nodes; without it 352,493. **13.0x.**" The 4,583,748 has
-        // since been WITHDRAWN by the reviewer who produced it — the run that reported it did more
-        // work than the base run in 46% of the wall time, which is not possible at equal workload,
-        // and three later full-workload attempts on that configuration emitted no butcher row. So
-        // the 13.0x is withdrawn with it and must not be quoted. A full-workload re-measurement is
-        // in flight; when it lands, this comment and `MAX_NODES`' doc take the figure it emits.
+        // MAGNITUDE, on `butcher`, MEASURED: with the region map attached **4,583,785** nodes;
+        // without it 352,493. **13.0x.** The attached arm is a full-workload `dev`-profile run over
+        // a `ZONES=butcher` corpus (10h24m, exit 0) — 57.3% of `MAX_NODES`, 1.75x headroom.
         //
-        // What remains MEASURED, stated as narrowly as the evidence allows: on `highpass`, full
-        // workload on both sides with the region-map attachment as the only difference, the close
-        // count went 7,229 -> 7,394 (+2.3%); and `butcher` with no region map, full workload, is
-        // 352,493.
+        // TWO measurements exist and they do not quite agree. An independent earlier run, `release`
+        // profile over the three-zone default corpus, reported **4,583,748** — 37 nodes apart
+        // (0.00081%). That gap is NOT explained; the candidates are the profile, the corpus
+        // composition, or transcription, with no evidence favouring any, and it is filed as its own
+        // issue. Both round to 57.3% and 1.75x, so the cap's conclusion is unaffected either way.
         //
-        // **That is one zone, and it is not this corpus's zone.** `highpass` is not in
-        // `DEFAULT_ZONES`. And a zero move is not merely conceivable, it is OBSERVED: under this
-        // same attachment two of the four converted corpora (`q1_headroom_seal_measurement`,
-        // `floor_model_disagreement_scan`) printed BYTE-IDENTICAL tables either way. So nothing here
-        // establishes that `butcher`'s number moves AT ALL, let alone by how much — only the pending
-        // run can say. An earlier revision of this comment said the attachment was "known to grow
-        // the flooded component"; it is known to have grown it on `highpass`, which is a different
-        // and much smaller claim.
+        // An earlier revision of this comment WITHDREW the 4,583,748 and said it "must not be
+        // quoted". That withdrawal was wrong and is itself withdrawn. It rested on an impossibility
+        // — "more work than the base run in 46% of the wall time" — which silently compared a
+        // `release` run against a `dev` one: 37,453s / 1,620s = 23.1x, a textbook dev:release
+        // ratio. And `butcher` DOMINATES this corpus (everfrost 65,616, gfaydark 355,304, against
+        // butcher's 4.58M), so a three-zone run and a butcher-only run are near-identical workloads.
+        // Note that this test's own doc above specifies `--release`: the withdrawn run took the
+        // DOCUMENTED path and the re-measurement did not.
+        //
+        // The other measured points, kept because they bound how zone-dependent this is: on
+        // `highpass`, full workload both sides with the attachment as the only difference, the close
+        // count went 7,229 -> 7,394 (+2.3%) — three orders of magnitude smaller a move than
+        // butcher's. And a ZERO move is not merely conceivable, it is OBSERVED: under this same
+        // attachment two of the four converted corpora (`q1_headroom_seal_measurement`,
+        // `floor_model_disagreement_scan`) printed BYTE-IDENTICAL tables either way. The size of the
+        // effect is a property of the zone, not of the attachment.
         //
         // What DOES survive independently of any of that is the reason to attach: `build_zone_collision`
         // is the client's one production construction site and always attaches, so the pre-#839
@@ -7627,14 +7645,13 @@ mod tests {
         // MEASURED (#849 review): over a 4-zone reduced-budget run this corpus produced identical
         // pair counts and success rates on both sides (23 pairs, 100%/100%), so no change was
         // demonstrated here — which is NOT the same as demonstrating there is none. The full 10-zone
-        // default at full budget was not run on either side; see `worst_case_reachable_component`,
-        // where the same attachment's effect on that corpus's headline number is PENDING
-        // MEASUREMENT. The attachment is measured to have RAISED the close count on `highpass`
-        // (7,229 -> 7,394, +2.3%) — a zone that is not in that corpus's default set — and measured
-        // to change NOTHING at all in two of the four converted corpora, which printed
-        // byte-identical tables either way. An earlier revision here said the attachment was "known
-        // to move" that number; no A/B exists on that corpus and the "13x" it once cited is
-        // withdrawn (see `MAX_NODES`' doc).
+        // default at full budget was not run on either side. The size of the attachment's effect is
+        // a property of the zone, and the measured spread is enormous: `butcher` 352,493 ->
+        // 4,583,785 (13.0x, see `worst_case_reachable_component`), `highpass` 7,229 -> 7,394
+        // (+2.3%), and two of the four converted corpora printed byte-identical tables either way —
+        // a change of exactly nothing. So a 13x elsewhere predicts nothing here: the "no change was
+        // demonstrated" above stands on its own reduced-budget run, and what THIS corpus's full
+        // default would do is still unmeasured.
         let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
             let (col, zw) = match crate::water_grid::open_corpus_zone(
