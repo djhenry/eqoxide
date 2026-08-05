@@ -7489,10 +7489,12 @@ mod tests {
         // this (it is: 8M)" — an ADJECTIVE and a hardcoded restatement of the constant, where the
         // reader needs the ratio. "Comfortably" was written when this corpus measured a grid with
         // no region map attached and reported ~352k for butcher; the production configuration
-        // floods a strictly larger component (MEASURED on `highpass`, +2.3% full-workload both
-        // sides) by an amount not yet measured on butcher, so "comfortably" was resting on an
-        // unknown. Print the margin and let the reader judge it, rather than judging it here from a
-        // number this corpus does not currently know.
+        // floods a strictly larger component, and at the time that amount was NOT measured on
+        // butcher — so "comfortably" WAS resting on an unknown, which is why it went. #859 has
+        // since measured it: butcher floods 4,583,785 nodes with the region map attached, 13.0x the
+        // mapless 352,493, leaving 1.75x headroom. So the adjective would now be defensible on the
+        // numbers, and the line still does not use one — print the margin and let the reader judge
+        // it, because a ratio stays true as the corpus grows and an adjective quietly stops being.
         let pct = worst as f64 * 100.0 / MAX_NODES as f64;
         let headroom = MAX_NODES as f64 / (worst.max(1)) as f64;
         println!("=> the coarse MAX_NODES backstop is {MAX_NODES} nodes: this corpus consumes \
@@ -7523,8 +7525,9 @@ mod tests {
         // Deliberately `<` against the cap and NOT against some invented safety factor: picking a
         // required margin is a production-constant decision, and inventing one here would be this
         // file asserting a policy nobody chose. Whether 8M should move is tracked as #856 rather
-        // than settled by a test author — and #856 is itself pending the production-config figure
-        // for `butcher`, which is not currently known (see `MAX_NODES`' doc).
+        // than settled by a test author. #856 was once blocked on the production-config figure for
+        // `butcher`; #859 measured it at 4,583,785 (57.3% of the cap, 1.75x headroom), so what is
+        // left there is the DECISION, not the measurement (see `MAX_NODES`' doc).
         assert!(worst < MAX_NODES,
             "#849: the worst measured whole-zone reachable-component close ({worst}) is at or above \
              MAX_NODES ({MAX_NODES}) — a legitimate whole-zone \"no route\" in this corpus now \

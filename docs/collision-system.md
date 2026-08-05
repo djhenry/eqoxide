@@ -91,11 +91,46 @@ waypoints by emitting a `MoveIntent` toward the next carrot, and the ONE collide
   levels — so multi-level dungeons work even when the caller's `start.z` is stale (a common bug:
   `gs.player_z` is often the spawn z, not the real floor). Don't pass a bogus z and expect failure —
   it self-corrects, but a wildly wrong z can still miss.
-- Capped at `MAX_NODES=200000`. Emits a `find_path: no route` diagnostic (expanded count + start/
-  goal floor) when it fails.
-- **Limitations**: can't path across **water** (no walkable floor — water mobs like fish are
-  unreachable) or through **doors / sealed pockets** (doors aren't in the collision; a room behind a
-  closed door is a disconnected component, so A* correctly finds no route). See `autonomous-play.md`.
+- Capped at `MAX_NODES` (`collision.rs`), currently **`8_000_000`**. This line said `200000` until
+  #861 — wrong by 40×, and stale for long enough that it is worth reading the constant rather than
+  this sentence. (The same line also claimed a `find_path: no route` diagnostic; **no such string is
+  in the tree** — give-up is reported through the planner's `PlanOutcome`, so that clause went too.)
+  The cap is a **precision** floor, not a safety floor: exceeding it returns
+  `Exhausted(NodeCap)` ("I don't know"), never a false `Unreachable(SearchClosed)` ("no"). For what
+  actually fits under it, and for the measured whole-zone figure, read `MAX_NODES`' own doc comment.
+  Deliberately not restated here: a figure copied into a second doc is a figure that will go stale
+  in one of them.
+- **Limitations**: **doors / sealed pockets** — doors aren't in the collision; a room behind a
+  closed door is a disconnected component, so A* correctly finds no route. See `autonomous-play.md`.
+- **Water is not a blanket limitation — *when the zone has a water map*.** This section used to say
+  A* "can't path across water (no walkable floor — water mobs like fish are unreachable)". That
+  described the 2D-with-water-hacks planner and is not what the code does today. **Read the
+  condition before the capability**, because both states are real and the client picks between them
+  per zone at load:
+  - **`.wtr` loaded (`RegionMap::try_load` → `Ok`)** — `astar` builds 4u water columns
+    (`WaterColumn`) and emits genuine water-entry, 3D interior, water-descent, surface-crossing and
+    haul-out edge families. Water mobs are **not** categorically unreachable.
+  - **`.wtr` missing or unusable (`try_load` → `Err`)** — `build_zone_collision` (`app.rs`) always
+    *calls* `set_region_data`, but it passes the loader's `Result` through, and `Collision::water`
+    stays an `Err`. Every one of those families is gated on `region_map()`, which is
+    `self.water.as_ref().ok()` — so on the `Err` arm **none of them exist**, the zone is navigated
+    **water-blind**, and water reads as plain missing floor, i.e. the old sentence above becomes
+    accurate again. The load failure is logged (`zone '…' has no usable region data: …`) and the
+    reason is retained (`RegionDataAbsent`) rather than discarded. This is a modelled operational
+    state with named causes in `region_map.rs`, not a corner case — do not assume the `Ok` arm.
+
+  For the degraded arm, `specs/2026-07-16-water-navigation-design.md` §"Degraded-mode visibility"
+  states it exactly and **is still current** — read it as fact, not history. Elsewhere both water
+  specs are dated snapshots whose *other* current-state material has moved on, so check
+  `collision.rs` before relying on those parts.
+
+  On the `Ok` arm the remaining refusals are specific, and there are four, not one:
+  `RejectReason::Water` (a water family's precondition is absent), `DescentBlocked` (an intervening
+  solid surface under the landing), `HaulOutTooHigh`, and `Clearance` (which covers a blocked swim
+  band as well as walls). Note that `PLAYER_BODY.haul_out_up` is a **planner admission threshold,
+  not a physical limit on the character**: `tests/synthetic_water_capability.rs` pins the controller
+  rising **8×** `haul_out_up` under ordinary buoyancy, because the swim plane is recomputed at the
+  body's own column each frame. Do not read it as a capability boundary.
 
 ---
 
