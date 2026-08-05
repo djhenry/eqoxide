@@ -75,35 +75,61 @@ pub struct Hit {
 /// headroom.** Measured full workload under the `dev` profile on a butcher-only corpus, 10 h 24 m,
 /// exit 0.
 ///
-/// **Two measurements exist and they do not quite agree.** An independent earlier run, under the
-/// `release` profile on the three-zone corpus, reported **4,583,748**. They differ by **37 nodes
-/// (0.00081%)** and that difference is **NOT explained**. Three candidates remain with no evidence
-/// favouring any: the profile (`dev` vs `release`); the corpus composition (butcher-only vs three
-/// zones — the per-zone independence that makes them comparable is verified at source but has never
-/// been measured); or transcription. It is filed as its own issue rather than resolved here, because
-/// resolving it costs either a `release` run (not currently available) or a ~10.4 h three-zone `dev`
-/// run. **Both figures round to 57.3% and 1.75×**, so the open question does not touch the conclusion
-/// this constant rests on — only the last two digits of one input.
+/// **Two measurements exist and they do not quite agree.** An independent earlier run, over the
+/// three-zone corpus, reported **4,583,748** for the same zone — **37 nodes (0.00081%)** apart. That
+/// difference is **NOT explained**, and it is tracked as its own issue rather than resolved here.
+/// **Both figures round to 57.3% and 1.75×**, so nothing this constant rests on depends on which is
+/// right — only the last two digits of one input do.
 ///
-/// **A prior revision of this block withdrew 4,583,748 and instructed readers that it "must not be
-/// quoted". That withdrawal is itself withdrawn** — the number was right to 0.0008%. Why it looked
-/// sound, recorded so nobody re-derives the same false impossibility from the same two numbers: it
-/// rested on the argument that the run reported 13× more nodes on butcher *plus* two extra zones in
-/// 46% of the wall time the butcher-only base run needed, which "is not possible at equal workload".
-/// That argument silently compared a `release` run against a `dev` one. 37,453 s / 1,620 s =
-/// **23.1×**, a textbook `dev`:`release` ratio — and butcher DOMINATES this corpus (everfrost 65,616
-/// and gfaydark 355,304 against butcher's 4.58 M), so a three-zone run and a butcher-only run are
-/// near-identical workloads. There was no impossibility. Note also that this test's own doc specifies
-/// `--release`, so the *withdrawn* run was the documented path and the re-measurement was not.
+/// **What the earlier run WAS cannot be established, and that is a fact about its artefacts, not an
+/// inference about it.** Its stderr was never captured, so it has no compile sentinel and **its
+/// profile is unknown** — it must not be described as `dev` or as `release`. Its stdout does bound
+/// its CODE: it printed two strings that exist only between `99c45b3` and `3eb8e3a`, and across that
+/// entire window the construct-and-search path is unchanged — `eqoxide-assets` untouched,
+/// `water_grid.rs` zero non-comment changes, and `collision.rs`'s forty non-comment changed lines all
+/// inside this test's own body (zone-list plumbing, prints, an assert placed after the measurement,
+/// and `Some(8_000_000)` -> `Some(MAX_NODES)`, which is value-identical).
+///
+/// Every mechanism proposed for the 37 so far has been EXCLUDED:
+///
+/// * **profile** — the #849 determinism audit found no profile-sensitive mechanism in the search; and
+///   the earlier run's slowest search ran at 151.7 µs/node against this run's `dev`-confirmed 123.7,
+///   so it shows no release-like speed. (Per-node cost is NOT a profile signature here — the two
+///   `dev`-confirmed runs themselves differ by 1.87×, 66.0 against 123.7. What it excludes is a
+///   *faster* build, since `release` cannot be slower than `dev` on the same work.)
+/// * **corpus composition** — `let mut seed: u64 = 99;` is re-seeded INSIDE `for zone in &zones`, over
+///   a fixed `0..120` of five corners plus one random draw, so butcher draws the identical 720 probe
+///   pairs whether it is one zone of three or the only zone. Excluded at source.
+/// * **a different sample set** — would need a different probe count, i.e. different code, which the
+///   window diff above rules out.
+/// * **different assets** — `butcher.glb` and `butcher.wtr` both predate BOTH runs by two weeks.
+///   Excluded on mtime, not on content.
+///
+/// So the disagreement survives every explanation offered for it. A second unexplained signature sits
+/// alongside it: in the earlier run the single search that set the figure was **42.9%** of the whole
+/// three-zone wall time, against **1.51%** here and **0.66%** in the no-region-map base — a ratio in
+/// which profile cancels, because it compares one search against the rest of the same run. The two
+/// `dev`-confirmed butcher-only runs scale consistently with each other (352,493 -> 4,583,785 nodes
+/// for 3,545 s -> 37,453 s, 13.0× the nodes for 10.6× the time); the earlier run is the outlier
+/// against both.
+///
+/// **None of that makes 4,583,748 wrong.** This test reports a MAX over sampled pairs, and a max over
+/// any subset is a LOWER BOUND on the max over the whole — and 4,583,748 < 4,583,785, the right way
+/// round. A prior revision of this block withdrew it as "must not be quoted"; **that withdrawal was
+/// right that the run could not be reconciled and wrong to call the number unusable.** A later
+/// revision replaced it with a `dev`-vs-`release` story built by dividing the two runs' *total* wall
+/// times (37,453 / 1,620 = 23.1×); that story is refuted by the per-node figures above and must not
+/// be reinstated. Two mechanisms have now been asserted here and both were wrong — state the
+/// exclusions and leave the cause open.
 ///
 /// | measurement | status |
 /// |---|---|
 /// | everfrost 1,121,438, no region map — the figure that set this cap | MEASURED (pre-#849) |
 /// | butcher 352,493, no region map, full workload | MEASURED (#849 review, base) |
 /// | `highpass` 7,229 → 7,394 (**+2.3%**), full workload on BOTH sides, region map the only change | MEASURED (#849 review) |
-/// | butcher **4,583,785** WITH region map, `dev`, butcher-only, full workload | MEASURED (#856) |
-/// | butcher **4,583,748** WITH region map, `release`, three-zone, full workload | MEASURED (#849 review) |
-/// | why those two differ by 37 nodes | **UNRESOLVED** |
+/// | butcher **4,583,785** WITH region map, `dev`-confirmed, butcher-only, full workload | MEASURED (#856) |
+/// | butcher **4,583,748** WITH region map, three-zone — profile NOT captured, wall time inconsistent with the other two runs; valid as a LOWER BOUND | MEASURED (#849 review) |
+/// | why those two differ by 37 nodes | **UNRESOLVED** — every proposed mechanism excluded |
 ///
 /// The old "~7× headroom" claim is retired on measurement, not inference: it was taken on a
 /// `Collision` with **no region data attached**, and `build_zone_collision` (`src/app.rs`) is the
@@ -7344,20 +7370,31 @@ mod tests {
         // without it 352,493. **13.0x.** The attached arm is a full-workload `dev`-profile run over
         // a `ZONES=butcher` corpus (10h24m, exit 0) — 57.3% of `MAX_NODES`, 1.75x headroom.
         //
-        // TWO measurements exist and they do not quite agree. An independent earlier run, `release`
-        // profile over the three-zone default corpus, reported **4,583,748** — 37 nodes apart
-        // (0.00081%). That gap is NOT explained; the candidates are the profile, the corpus
-        // composition, or transcription, with no evidence favouring any, and it is filed as its own
-        // issue. Both round to 57.3% and 1.75x, so the cap's conclusion is unaffected either way.
+        // TWO measurements exist and they do not quite agree. An independent earlier run over the
+        // three-zone default corpus reported **4,583,748** for this zone — 37 nodes apart
+        // (0.00081%), filed as its own issue. Both round to 57.3% and 1.75x, so the cap's
+        // conclusion is unaffected either way.
         //
-        // An earlier revision of this comment WITHDREW the 4,583,748 and said it "must not be
-        // quoted". That withdrawal was wrong and is itself withdrawn. It rested on an impossibility
-        // — "more work than the base run in 46% of the wall time" — which silently compared a
-        // `release` run against a `dev` one: 37,453s / 1,620s = 23.1x, a textbook dev:release
-        // ratio. And `butcher` DOMINATES this corpus (everfrost 65,616, gfaydark 355,304, against
-        // butcher's 4.58M), so a three-zone run and a butcher-only run are near-identical workloads.
-        // Note that this test's own doc above specifies `--release`: the withdrawn run took the
-        // DOCUMENTED path and the re-measurement did not.
+        // That earlier run's PROFILE IS UNKNOWN — its stderr was never captured, so there is no
+        // compile sentinel for it and it must not be called `dev` or `release`. Its CODE is bounded
+        // by its stdout (two print strings that exist only between 99c45b3 and 3eb8e3a), and across
+        // that whole window nothing on the construct-and-search path changed.
+        //
+        // Every mechanism proposed for the 37 has been excluded: PROFILE (the #849 audit found none
+        // in the search, and that run's slowest search was 151.7 us/node against this run's
+        // dev-confirmed 123.7 — no release-like speed; note 66.0 vs 123.7 between two dev-confirmed
+        // runs, so per-node cost is not a profile signature, only an upper bound on speed);
+        // COMPOSITION (`seed` is re-seeded inside `for zone in &zones` over a fixed `0..120`, so
+        // butcher draws the identical 720 pairs either way); SAMPLE SET (needs different code, which
+        // the window diff rules out); ASSETS (both butcher files predate both runs). The
+        // disagreement outlives all of them.
+        //
+        // TWO explanations have now been asserted in this comment and both were wrong: first that
+        // the run was impossible and its number unusable, then that it was `release` against this
+        // one's `dev` (built by dividing TOTAL wall times, 37,453/1,620 = 23.1x — refuted by the
+        // per-node figures). What is true and mechanism-free: this test reports a MAX OVER SAMPLES,
+        // a max over any subset is a LOWER BOUND on the max over the whole, and 4,583,748 <
+        // 4,583,785 is the right way round. State the exclusions; do not supply a third story.
         //
         // The other measured points, kept because they bound how zone-dependent this is: on
         // `highpass`, full workload both sides with the attachment as the only difference, the close

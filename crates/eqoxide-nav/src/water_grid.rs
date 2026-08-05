@@ -470,12 +470,14 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// four converted corpora printed BYTE-IDENTICAL tables under this same attachment. Neither "some
 /// effect" nor "a big effect" is a safe default for a zone nobody has measured.
 ///
-/// Two runs measured the attached `butcher` figure and they differ by **37 nodes**: 4,583,785 (`dev`,
-/// butcher-only) and 4,583,748 (`release`, three-zone). The 0.00081% gap is unexplained — profile,
-/// corpus composition, or transcription — and is filed separately. An earlier revision of this doc
-/// WITHDREW the 4,583,748 as impossible; that withdrawal was wrong and is retracted (the
-/// impossibility argument compared a `release` run against a `dev` one, a 23.1x ratio). See
-/// `MAX_NODES`' doc for the full account.
+/// Two runs measured the attached `butcher` figure and they differ by **37 nodes**: 4,583,785
+/// (`dev`-confirmed, butcher-only) and 4,583,748 (three-zone, **profile never captured**). The
+/// 0.00081% gap is unexplained, and every mechanism proposed for it — profile, corpus composition, a
+/// differing sample set, differing assets — has been excluded; it is filed separately. Two successive
+/// revisions of this doc asserted a cause (first "impossible, unusable", then "`release` vs `dev`")
+/// and both were wrong, so this one asserts none. What holds regardless: the figure is a MAX OVER
+/// SAMPLES, so the smaller number is a valid LOWER BOUND, and both round to 57.3% / 1.75x / 13.0x.
+/// See `MAX_NODES`' doc for the full account.
 ///
 /// **The cost of that choice, stated because it is a real behaviour change and not a free win:**
 /// [`open_corpus_zone`]'s DROP 3 refuses a zone whose `.wtr` did not load. Those four corpora
