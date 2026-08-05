@@ -21,6 +21,46 @@ pub struct EntityAnimState {
     /// Idle-cycle phase: incremented each time an idle clip completes a loop, used to alternate
     /// the neutral stand with periodic fidget animations (see `SkinData::idle_clip_for_phase`).
     pub idle_phase:  u32,
+    /// Whether `clip_idx` should play once and clamp-hold on its final frame (dead/sitting/
+    /// crouching) rather than loop. Decided ONCE, at the same place `clip_idx` itself is resolved,
+    /// from the resolution (`ActionClip`) rather than re-derived from the action string wherever
+    /// it's read (eqoxide#858) — a held-pose action that had no clip of its own and fell back to
+    /// idle is playing idle, and idle must loop, never clamp-and-freeze on its last frame.
+    pub held:        bool,
+}
+
+/// Apply a `clip_for_action_or_idle` resolution to `state`: sets `clip_idx`, `animate`, and `held`
+/// together from the single `resolved` value, so they can never disagree about which clip is
+/// actually playing (eqoxide#858). `None` routes to the `usize::MAX` bind-pose sentinel, matching
+/// the `"dead"`-with-no-death-clip path.
+fn apply_action_clip(
+    state:    &mut EntityAnimState,
+    skin:     &crate::anim::SkinData,
+    action:   &str,
+    resolved: Option<crate::anim::ActionClip>,
+) {
+    use crate::anim::ActionClip;
+    match resolved {
+        Some(ActionClip::Own(ci)) => {
+            state.clip_idx = ci;
+            state.held     = crate::anim::SkinData::is_held_pose(action);
+            state.animate  = skin.action_animates(action, ci);
+        }
+        Some(ActionClip::FellBackToIdle(ci)) => {
+            // No clip for `action` — the clip that will actually play is idle, so it must be
+            // treated exactly like a genuine idle resolution: never held, and animate/hold-static
+            // decided by idle's own rule (e.g. a walk-used-as-idle fallback holds static), not by
+            // whatever `action` asked for.
+            state.clip_idx = ci;
+            state.held     = false;
+            state.animate  = skin.action_animates("idle", ci);
+        }
+        None => {
+            state.clip_idx = usize::MAX; // sentinel: no action or idle clip → bind pose
+            state.animate  = false;
+            state.held     = false;
+        }
+    }
 }
 
 /// Pre-allocated entity uniform buffer slot count.
@@ -1440,7 +1480,7 @@ impl EqRenderer {
 
             let state = self.anim_states.entry(*id).or_insert_with(|| {
                 let clip_idx = skinned.skin.clip_for_action("walking").unwrap_or(0);
-                EntityAnimState { clip_idx, time: 0.0, last_action: String::new(), animate: true, idle_phase: 0 }
+                EntityAnimState { clip_idx, time: 0.0, last_action: String::new(), animate: true, idle_phase: 0, held: false }
             });
 
             if *action != state.last_action {
@@ -1455,15 +1495,18 @@ impl EqRenderer {
                         Some(ci) => {
                             state.clip_idx = ci;
                             state.animate  = true;  // play once, renderer clamps at end
+                            state.held     = true;
                         }
                         None => {
                             state.clip_idx = usize::MAX; // sentinel: no death clip → bind pose
                             state.animate  = false;
+                            state.held     = false;
                         }
                     }
                 } else if is_idle {
                     state.clip_idx = skinned.skin.idle_clip_for_phase(0).unwrap_or(0);
                     state.animate  = skinned.skin.action_animates(action, state.clip_idx);
+                    state.held     = false;
                 } else {
                     // #692: when the model has no clip for this action (e.g. a skeleton has no
                     // C0N combat clip for a swing), fall back to the idle/neutral stand — NEVER to
@@ -1475,16 +1518,12 @@ impl EqRenderer {
                     // NOR any idle/walk clip, `clip_for_action_or_idle` returns `None` — route that
                     // to the SAME `usize::MAX` bind-pose sentinel the `"dead"` branch above uses,
                     // so clip 0 is never reached by any model shape, not just ones with an idle.
-                    match skinned.skin.clip_for_action_or_idle(action) {
-                        Some(ci) => {
-                            state.clip_idx = ci;
-                            state.animate  = skinned.skin.action_animates(action, ci);
-                        }
-                        None => {
-                            state.clip_idx = usize::MAX; // sentinel: no action or idle clip → bind pose
-                            state.animate  = false;
-                        }
-                    }
+                    //
+                    // #858: `clip_for_action_or_idle` returns which clip AND whether it's the
+                    // model's own clip for `action` or an idle fallback, as one value — see
+                    // `apply_action_clip`. A held-pose action (e.g. "crouching") that falls back to
+                    // idle must NOT be held: the clip actually playing is idle, and idle loops.
+                    apply_action_clip(state, &skinned.skin, action, skinned.skin.clip_for_action_or_idle(action));
                 }
             }
 
@@ -1498,27 +1537,24 @@ impl EqRenderer {
                 // #692: same idle fallback as above — a re-resolution that finds no action clip
                 // must land on idle, not clip 0 (death for minimal models). Same #694 hardening:
                 // `None` (no action AND no idle clip either) routes to the bind-pose sentinel.
-                match skinned.skin.clip_for_action_or_idle(action) {
-                    Some(ci) => {
-                        state.clip_idx = ci;
-                        state.animate  = skinned.skin.action_animates(action, ci);
-                    }
-                    None => {
-                        state.clip_idx = usize::MAX; // sentinel: no action or idle clip → bind pose
-                        state.animate  = false;
-                    }
-                }
+                // #858: same single-value resolution as the dispatch above.
+                apply_action_clip(state, &skinned.skin, action, skinned.skin.clip_for_action_or_idle(action));
             }
 
             // Advance animation time. Held poses (dead, sitting, crouching) play their entry
             // transition once then hold at the final frame; all other actions loop, with idle
             // cycling through fidgets. (Previously only "dead" held — sit/kneel looped the
             // stand→pose transition forever, eqoxide#83.)
+            //
+            // `state.held` — not `SkinData::is_held_pose(action)` — decides this (#858): it was set
+            // above from the SAME resolution that picked `clip_idx`, so a held-pose action whose
+            // clip fell back to idle is correctly `held == false` here and loops instead of
+            // clamping on the idle clip's last frame.
             if state.animate && state.clip_idx < skinned.skin.clips.len() && !skinned.skin.clips.is_empty() {
                 let dur = skinned.skin.clips[state.clip_idx].duration;
                 if dur > 0.0 {
                     let next = state.time + dt;
-                    if crate::anim::SkinData::is_held_pose(action) {
+                    if state.held {
                         // Play once: clamp time to duration so evaluate() returns the last frame
                         // (the resting seated/kneeling/dead pose), then stop animating and hold.
                         state.time = next.min(dur);
@@ -1805,5 +1841,95 @@ mod tests {
         let result = weapon_lib_lookup(&weapon_lib, "IT10649");
         assert!(result.is_some(), "a present key must still resolve to its mesh list");
         assert_eq!(result.unwrap().len(), 1);
+    }
+
+    /// Minimal single-joint `SkinData` fixture builder for `apply_action_clip` tests, mirroring
+    /// the tiny fixtures in `anim::tests` (this module can't reach those — they're private to that
+    /// module — so this is a small local copy, not a new pattern).
+    fn one_joint_skin(clip_names: &[&str]) -> crate::anim::SkinData {
+        use crate::anim::{AnimClip, JointChannel, JointProperty, SkinData};
+        let make_channel = || JointChannel {
+            joint: 0, property: JointProperty::Rotation,
+            times: vec![0.0, 1.0], values: vec![[0.0, 0.0, 0.0, 1.0]; 2],
+        };
+        SkinData {
+            joint_count: 1,
+            parents: vec![None],
+            inv_bind: vec![[[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0],[0.0,0.0,0.0,1.0]]],
+            clips: clip_names.iter().map(|n| AnimClip {
+                name: n.to_string(), duration: 1.0, channels: vec![make_channel()],
+            }).collect(),
+            rest_translations: vec![[0.0; 3]], rest_rotations: vec![[0.0, 0.0, 0.0, 1.0]],
+            rest_scales: vec![[1.0; 3]], ground_probes: vec![], joint_names: vec![],
+        }
+    }
+
+    fn fresh_anim_state() -> EntityAnimState {
+        EntityAnimState { clip_idx: usize::MAX, time: 0.0, last_action: String::new(), animate: true, idle_phase: 0, held: true }
+    }
+
+    /// #858, the core bug: a held-pose action ("crouching") whose model has NO crouch clip resolves
+    /// through the idle fallback — but must NOT be treated as held, because the clip that will
+    /// actually play is idle, and idle loops. Before this fix, hold-vs-loop was decided from the
+    /// action string alone (`SkinData::is_held_pose("crouching") == true`), disagreeing with the
+    /// clip that was actually chosen (idle) and freezing the model on idle's last frame forever.
+    ///
+    /// Mutation check: change `apply_action_clip`'s `ActionClip::FellBackToIdle` arm to set
+    /// `state.held = crate::anim::SkinData::is_held_pose(action)` instead of `false` (i.e. revert to
+    /// deciding hold-vs-loop from the action string) — this test goes RED, because
+    /// `is_held_pose("crouching")` is `true`.
+    #[test]
+    fn crouch_without_crouch_clip_falls_back_to_idle_and_is_not_held() {
+        let skin = one_joint_skin(&["O01_idle"]); // idle only — no P03/crouch clip (eqoxide#858)
+
+        // Precondition: the model really has no crouch clip, so resolution falls back to idle.
+        let resolved = skin.clip_for_action_or_idle("crouching");
+        assert!(matches!(resolved, Some(crate::anim::ActionClip::FellBackToIdle(0))),
+            "precondition: no crouch clip → falls back to the idle clip (index 0)");
+        // Precondition: read in isolation, the action string alone says this is a held pose.
+        assert!(crate::anim::SkinData::is_held_pose("crouching"),
+            "precondition: \"crouching\" is a held-pose action");
+
+        let mut state = fresh_anim_state();
+        apply_action_clip(&mut state, &skin, "crouching", resolved);
+
+        assert_eq!(state.clip_idx, 0, "plays the idle clip that was actually resolved");
+        assert!(!state.held,
+            "must NOT be held: the clip playing is idle, not a crouch pose, so it must loop, \
+             not clamp-and-freeze on idle's last frame");
+    }
+
+    /// Companion: when the model DOES carry its own crouch clip, the held-pose decision must still
+    /// fire — this fix must not turn held poses into loops across the board, only when the clip
+    /// resolution actually fell back to idle.
+    #[test]
+    fn crouch_with_crouch_clip_is_held() {
+        let skin = one_joint_skin(&["O01_idle", "P03_crouch"]);
+
+        let resolved = skin.clip_for_action_or_idle("crouching");
+        assert!(matches!(resolved, Some(crate::anim::ActionClip::Own(1))),
+            "precondition: the model's own crouch clip (index 1) is found directly");
+
+        let mut state = fresh_anim_state();
+        apply_action_clip(&mut state, &skin, "crouching", resolved);
+
+        assert_eq!(state.clip_idx, 1, "plays the model's own crouch clip");
+        assert!(state.held, "a genuine crouch-clip resolution must still play once and hold");
+    }
+
+    /// A held-pose action with NEITHER its own clip NOR an idle clip to fall back to (the #694
+    /// hardening case) must land on the bind-pose sentinel, not be marked held (nothing to hold).
+    #[test]
+    fn crouch_with_no_clip_at_all_is_bind_pose_sentinel_not_held() {
+        let skin = one_joint_skin(&["D05_death"]); // no idle- or walk-named clip, no crouch clip
+        let resolved = skin.clip_for_action_or_idle("crouching");
+        assert_eq!(resolved, None, "precondition: neither the action clip nor an idle clip exists");
+
+        let mut state = fresh_anim_state();
+        apply_action_clip(&mut state, &skin, "crouching", resolved);
+
+        assert_eq!(state.clip_idx, usize::MAX, "bind-pose sentinel");
+        assert!(!state.animate);
+        assert!(!state.held);
     }
 }
