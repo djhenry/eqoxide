@@ -437,18 +437,43 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// drives a rollup over hard-coded zone NAMES and opens no asset at all (measured: zero `from_glb`
 /// calls in its body). So: twelve loops, twelve accounted, none of them bare.
 ///
-/// Four of the five #839 converted — every one but `fix_700_planner_ab_corpus` — have no water
-/// dependency whatsoever (measured: zero `in_water` calls, zero `ZoneWater::load` calls in the
-/// function body) and still route through [`open_corpus_zone`] rather than a bespoke drop wrapper,
-/// closing with `cover.add(zone, &zw.tally())` — a zero-valued "no water number" close. One owner
-/// for the accounting, not two.
+/// Four of the five #839 converted — every one but `fix_700_planner_ab_corpus` — report no water
+/// NUMBER (measured: zero `in_water` calls, zero `ZoneWater::load` calls in the function body) and
+/// still route through [`open_corpus_zone`] rather than a bespoke drop wrapper, closing with
+/// `cover.add(zone, &zw.tally())` — a zero-valued "no water number" close. One owner for the
+/// accounting, not two.
+///
+/// **#849 correction — that sentence used to read "have no water dependency whatsoever", and the
+/// predicate in the parenthesis does not support it.** The greps were really run and really return
+/// zero; "zero `in_water` calls in the function body" simply is not the same proposition as "no
+/// water dependency", because the dependency is not in those bodies — it is in
+/// [`crate::collision::Collision::astar`], which those bodies call, and which gates whole edge
+/// families (water descent, haul-out/ascent, surface crossing, floating-start anchoring) on
+/// `self.region_map()` being `Some`. `open_corpus_zone` makes it `Some`. A real measurement of the
+/// wrong predicate is the most convincing form of the reasoned-not-measured defect, and this is one.
+///
+/// **Attaching the region map is deliberate, and the reason is production fidelity, not
+/// convenience.** `build_zone_collision` (`src/app.rs`) is documented as the client's ONE production
+/// construction of a zone's collision grid, and it ALWAYS calls `set_region_data` — with the loaded
+/// map, or with the loader's `Err`. A `Collision` with no region data attached is therefore a
+/// configuration the shipped client never builds, and a corpus that measured one would be measuring
+/// a grid that does not exist in the field. That is not hypothetical: MEASURED (#849), the
+/// `worst_case_reachable_component` corpus reports **352,493** nodes for `butcher` with no region
+/// map and **4,583,748** with one — **13.0x** — and that corpus's whole purpose is to bound the
+/// production constant [`crate::collision::MAX_NODES`]. The smaller number was the comfortable one
+/// and the wrong one. See `MAX_NODES`' doc for the correction it forced.
 ///
 /// **The cost of that choice, stated because it is a real behaviour change and not a free win:**
 /// [`open_corpus_zone`]'s DROP 3 refuses a zone whose `.wtr` did not load. Those four corpora
 /// therefore became gated on `maps/water/<zone>.wtr` that they never read, and on a host missing one
 /// they now go RED (`unmeasured`) where before they would have measured the zone and printed a
 /// number. That is the honesty trade #807 made deliberately — refusing to measure beats measuring
-/// and not saying so — but it is a trade, not a no-op.
+/// and not saying so — but it is a trade, not a no-op. **And the second half of the trade, which
+/// #839's first draft did not state:** the attachment changes what those corpora MEASURE, not just
+/// whether they run. Two of the four (`q1_headroom_seal_measurement`,
+/// `floor_model_disagreement_scan`) were measured byte-identical either way; one
+/// (`worst_case_reachable_component`) moved 13x; one (`fine_tier_corpus_route_success_and_cost`)
+/// showed no change over a reduced 4-zone run, which is not the same as showing there is none.
 ///
 /// **What this does NOT claim:** a corpus loop that never constructs a `WaterRollup` is invisible to
 /// this type by construction (see above), and #839 audited only `collision.rs` and `walker_sim.rs`.

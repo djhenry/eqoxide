@@ -54,20 +54,56 @@ pub struct Hit {
 /// `Exhausted(NodeCap)`, an honest and *reproducible* "I stopped looking".
 ///
 /// **Chosen by measurement** (`worst_case_reachable_component`, over the biggest baked zones in the
-/// test corpus): the largest **measured-corpus** reachable-component close is **everfrost, 1,121,438
-/// nodes** (its 8 u nav grid is ~1.1M cells). That is the worst legitimate whole-zone "no route" the
-/// cap must let through as `SearchClosed` — and note it already EXCEEDED the previous
-/// `MAX_NODES = 1_000_000`, so main was silently truncating everfrost's honest closes into false
-/// `Exhausted`. This cap is ~7× above it, so a legitimate whole-zone close reaches `SearchClosed` with
-/// headroom, while still bounding a true runaway.
+/// test corpus). That corpus measures the worst legitimate whole-zone "no route" the cap must let
+/// through as `SearchClosed`. The cap was originally set from a figure of **everfrost, 1,121,438
+/// nodes**, which already EXCEEDED the previous `MAX_NODES = 1_000_000` — so main was at that point
+/// silently truncating everfrost's honest closes into false `Exhausted`, which is why the cap moved.
 ///
-/// **Caveat, stated honestly:** everfrost is the biggest zone *in the corpus*, NOT the biggest in RoF2
-/// — larger outdoor zones exist and are unmeasured. But the residual risk is small and bounded: (1) a
+/// **CORRECTION, #849 — the "~7× headroom" this doc used to claim was never a fact about the shipped
+/// client, and the binding zone is not everfrost.** The figure above was measured with a `Collision`
+/// that had **no region data attached**. `build_zone_collision` (`src/app.rs`) is the client's ONE
+/// production construction of a zone's collision grid and it ALWAYS calls `set_region_data`, so a
+/// grid without one is a configuration the client never builds. With the region map attached — i.e.
+/// in the production configuration — `astar`'s water-descent, haul-out and surface-crossing edge
+/// families are live, and a reachable component in a zone with real water volume is far larger.
+///
+/// Re-measured (MEASURED, `#849`, debug build, default corpus):
+///
+/// | zone | `MAX_closed`, no region map | `MAX_closed`, region map attached (production config) |
+/// |---|---|---|
+/// | everfrost | — | 65,616 |
+/// | **butcher** | **352,493** | **4,583,748** |
+/// | gfaydark | — | 355,304 |
+///
+/// So the honest statement of this cap's margin is: **the worst measured close is butcher at
+/// 4,583,748 against an 8,000,000 cap — 57% of the cap consumed, 1.75× headroom** — not 7×, and not
+/// everfrost. The 13.0× on butcher is the water edge families, not noise; Butcherblock has open
+/// ocean. **REASONED, not measured:** that the 13× is *specifically* attributable to the
+/// water-descent/haul-out/surface-crossing families rather than to some other consequence of
+/// `region_map()` turning `Some` — nobody has instrumented which family supplies the nodes. What is
+/// measured is the total, on both sides, with the region-map attachment as the only difference.
+///
+/// 1.75× is a real margin, not a comfortable one, and this doc no longer calls it comfortable.
+/// Whether 8M should MOVE is a production-constant decision that #849 deliberately does not take —
+/// it is tracked as **#856**. Two things make the residual risk bounded rather than latent: the
+/// failure mode below is honest-but-imprecise rather than wrong, and
+/// `worst_case_reachable_component` now asserts `worst < MAX_NODES` and prints the percentage, so a
+/// future zone that eats the remaining margin makes that corpus say so instead of a human noticing.
+///
+/// **Caveat, stated honestly, and it now bites harder than when it was written:** butcher is the
+/// worst zone *in the corpus*, NOT the worst in RoF2 — larger and wetter outdoor zones exist and are
+/// unmeasured, and at 57% of the cap it takes only a ~1.75× worse zone to exceed it, where the old
+/// (wrong) 7× reading implied a zone would have to be 7× worse. **A future zone joining this corpus
+/// is therefore a live possibility, not a theoretical one, and the assert in
+/// `worst_case_reachable_component` is what turns it into a RED run instead of a silent
+/// imprecision.** The residual risk is still bounded, for two reasons that did not change: (1) a
 /// REACHABLE goal is found by goal-directed A* long before the cap (the admissible heuristic pulls the
 /// search toward the goal, so it does not explore the whole component), so a bigger zone does not make
 /// a reachable goal false-`Exhausted`; (2) the only failure is an UNREACHABLE goal in a >8M-node
 /// component reporting `Exhausted(NodeCap)` ("I don't know") instead of `Unreachable(SearchClosed)`
 /// ("no") — which is still HONEST, just less precise. So 8M is a precision floor, not a safety floor.
+/// That is the whole reason 1.75× is shippable while being reported rather than quietly accepted:
+/// exceeding it costs precision, not correctness.
 ///
 /// It is the cap for the ENTIRE plan (`plan_path` makes up to 13 A* calls sharing one `PlanCtx`
 /// budget), so the plan is bounded by one budget, not one-per-call (#340).
@@ -7233,20 +7269,57 @@ mod tests {
         // x 6 off-mesh probes each at an 8M node cap), so its accounting could not be
         // mutation-checked at all. Overriding it measures a DIFFERENT corpus than the default, and
         // the printed WORST number is then not the one this test's doc claims.
-        let zones: Vec<String> = std::env::var("ZONES").ok()
+        const DEFAULT_ZONES: [&str; 3] = ["everfrost", "butcher", "gfaydark"];
+        let override_zones = std::env::var("ZONES").ok();
+        let zones: Vec<String> = override_zones.as_deref()
             .map(|z| z.split(',').map(str::to_string).collect())
-            .unwrap_or_else(|| ["everfrost", "butcher", "gfaydark"]
-                .into_iter().map(str::to_string).collect());
+            .unwrap_or_else(|| DEFAULT_ZONES.into_iter().map(str::to_string).collect());
+        // #849 review (non-blocking 2): the rollup's coverage line reports `1/1 zones` for a
+        // ZONES-overridden run, which is a true statement about what was ATTEMPTED and a misleading
+        // one about what the corpus IS — and the line above it says "across corpus". The accounting
+        // added by #839 covers zones dropped inside the loop; it cannot see a corpus narrowed before
+        // the loop starts. Say so in the output, where the reader of the number is.
+        if let Some(z) = &override_zones {
+            println!("\n*** CORPUS OVERRIDDEN by ZONES={z} — default is {DEFAULT_ZONES:?}. The WORST \
+                      number below is NOT this corpus's headline figure and must not be quoted as \
+                      one; `butcher` is the zone that sets it. ***");
+        }
         println!("\n{:<12} {:>12} {:>12} {:>10}", "zone", "xy_cells@8u", "MAX_closed", "ms");
         let mut worst = 0usize;
-        // #839: this corpus has no water dependency at all (no `in_water` call, no water-grid
-        // build) — but a missing `.glb` or an empty collision grid used to drop a zone through a
-        // bare `continue` that touched no ledger, so a host missing one zone's asset silently
-        // shrank "WORST reachable-component close across corpus" to whatever subset it had, with
-        // no trace anywhere. `open_corpus_zone` is the SAME single-owner prologue #807's other five
-        // corpora use; a zone with no water number to report still closes through
-        // `cover.add(zone, &zw.tally())` (a zero-valued, "no water" tally) so the rollup's
-        // denominator stays honest without a second accounting mechanism.
+        // #839: a missing `.glb` or an empty collision grid used to drop a zone through a bare
+        // `continue` that touched no ledger, so a host missing one zone's asset silently shrank
+        // "WORST reachable-component close across corpus" to whatever subset it had, with no trace
+        // anywhere. `open_corpus_zone` is the SAME single-owner prologue #807's other five corpora
+        // use; this corpus reports no water NUMBER, so it still closes through
+        // `cover.add(zone, &zw.tally())` (a zero-valued tally) and the rollup's denominator stays
+        // honest without a second accounting mechanism.
+        //
+        // **`open_corpus_zone` ATTACHES THE REGION MAP, AND THAT IS THE POINT — it is not incidental
+        // to this measurement, it is what makes the measurement about production** (#849 review,
+        // blocking finding). The body below contains no `in_water` call, but `astar` gates whole
+        // edge families on `self.region_map()` being `Some` — water descent, haul-out/ascent,
+        // surface crossing, floating-start anchoring — so with a region map attached the "reachable
+        // component" this floods includes navigable water volume, and without one it does not.
+        //
+        // An earlier draft of this comment claimed the corpus "has no water dependency at all". That
+        // was FALSE and it was load-bearing: the predicate actually measured was "zero `in_water`
+        // calls in the function body", which does not entail "no water dependency" when the
+        // dependency lives inside the `astar` this body calls.
+        //
+        // Which configuration is the honest one to measure is settled by `build_zone_collision`
+        // (`src/app.rs`), documented as "the client's ONE production construction of a zone's
+        // collision grid": it ALWAYS calls `set_region_data`, with the loaded map or with the
+        // loader's `Err`. There is exactly one production construction site and it always attaches.
+        // So a grid with no region data attached is a configuration the shipped client never
+        // builds, and a component size measured on one is not the worst case `MAX_NODES` has to
+        // clear in the field — it is a smaller number about a grid that does not exist.
+        //
+        // MEASURED, and it is not a rounding difference (#849): on `butcher`, with the region map
+        // attached 4,583,748 nodes; without it 352,493. **13.0x.** Butcher is the zone that sets
+        // this corpus's headline figure, and Butcherblock has open ocean. So the pre-#839 number
+        // was not perturbed by this change — it was measuring the wrong grid, and the margin it
+        // implied against `MAX_NODES` was overstated by an order of magnitude. See `MAX_NODES`'s
+        // own doc, which this measurement forced a correction to.
         let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
             let (col, zw) = match crate::water_grid::open_corpus_zone(
@@ -7278,7 +7351,11 @@ mod tests {
                     let t = Instant::now();
                     let (sr, _t) = col.search_tiered_for_test(
                         [e, n, z], [ge, gn, gz], eqoxide_core::physics::PLAYER_RADIUS, &[], 8.0, None, 0.0,
-                        PlanCtx { node_cap: Some(8_000_000), ..PlanCtx::default() });
+                        // #849: was a hardcoded `8_000_000`. The whole point of this corpus is to
+                        // bound `MAX_NODES`, so it now reads the constant it is measuring against —
+                        // a literal here can drift away from the constant and silently turn the
+                        // measurement into one about a cap the client does not use.
+                        PlanCtx { node_cap: Some(MAX_NODES), ..PlanCtx::default() });
                     let ms = t.elapsed().as_millis();
                     if sr.closed_n > max_closed { max_closed = sr.closed_n; max_ms = ms; }
                 }
@@ -7289,11 +7366,48 @@ mod tests {
             cover.add(zone, &zw.tally()); // #839: CLOSE the zone — forgetting makes it `unaccounted`
         }
         println!("\nWORST reachable-component close across corpus: {worst} nodes");
-        println!("=> the coarse MAX_NODES backstop must be comfortably above this (it is: 8M).");
-        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus measures no water,
-        // so that number is a `tally()` zero by construction, not a finding — label it, or a reader
-        // takes "0" for "0 wet things found here".
-        println!("zone coverage [leading 0 = water total; this corpus measures no water]: {cover}");
+        // #849: this line used to read "the coarse MAX_NODES backstop must be comfortably above
+        // this (it is: 8M)" — an ADJECTIVE and a hardcoded restatement of the constant, where the
+        // reader needs the ratio. "Comfortably" was written when this corpus measured a grid with
+        // no region map attached and reported ~352k for butcher; against the production
+        // configuration the same zone reports ~4.58M, and "comfortably" was doing far more work
+        // than its author knew. Print the margin and let the reader judge it.
+        let pct = worst as f64 * 100.0 / MAX_NODES as f64;
+        let headroom = MAX_NODES as f64 / (worst.max(1)) as f64;
+        println!("=> the coarse MAX_NODES backstop is {MAX_NODES} nodes: this corpus consumes \
+                  {pct:.1}% of it, i.e. {headroom:.2}x headroom.");
+        println!("   (a component LARGER than the cap is still HONEST — it reports \
+                  Exhausted(NodeCap), \"I don't know\", rather than a false Unreachable — but it is \
+                  less precise than the SearchClosed \"no\" this cap exists to preserve. See \
+                  MAX_NODES' doc for that trade.)");
+        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus reports no water
+        // number, so that total is a `tally()` zero by construction, not a finding — label it, or a
+        // reader takes "0" for "0 wet things found here". #849: it does NOT mean the search ran dry
+        // — `open_corpus_zone` attaches the region map and `astar`'s water edge families are live,
+        // which is deliberate and is what production does. "Reports no water number" is the claim;
+        // "has no water dependency" was the earlier claim and it was false.
+        println!("zone coverage [leading 0 = water total; this corpus reports no water number — \
+                  but it DOES search with the region map attached]: {cover}");
+        // #849: the correctness condition this corpus exists to check, asserted rather than left to
+        // a human reading a printed line and judging an adjective.
+        //
+        // **What this assert can and cannot catch, stated precisely.** The searches above run AT
+        // `MAX_NODES`, so `closed_n` can never meaningfully exceed it — `astar` breaks with
+        // `PlanLimit::NodeCap` once the cap is passed. This is therefore a TRUNCATION DETECTOR: it
+        // fires when some zone's whole-component close actually hit the cap, which is exactly the
+        // honesty bug `MAX_NODES` was sized to avoid. It is NOT a margin check and will not fire at
+        // 57%, or at 90%. The early warning for margin erosion is the printed percentage above, not
+        // this line.
+        //
+        // Deliberately `<` against the cap and NOT against some invented safety factor: picking a
+        // required margin is a production-constant decision, and inventing one here would be this
+        // file asserting a policy nobody chose. Whether 8M should move given a measured 1.75x is
+        // tracked as #856 rather than settled by a test author.
+        assert!(worst < MAX_NODES,
+            "#849: the worst measured whole-zone reachable-component close ({worst}) is at or above \
+             MAX_NODES ({MAX_NODES}) — a legitimate whole-zone \"no route\" in this corpus now \
+             truncates into Exhausted(NodeCap) instead of Unreachable(SearchClosed). That is still \
+             honest but strictly less precise, and it is the condition MAX_NODES was sized to avoid.");
         assert!(cover.is_complete(),
             "#839: this run is not a complete corpus measurement — it covered {}/{} of the zones it \
              was asked for. unmeasured (the .wtr was read and did not load): {:?}; skipped (dropped \
@@ -7427,13 +7541,26 @@ mod tests {
         let zones: Vec<String> = std::env::var("ZONES").ok()
             .map(|z| z.split(',').map(str::to_string).collect())
             .unwrap_or_else(|| vec![
-                // A deliberately mixed DRY corpus: the zone #382's own numbers came from (akanon), the
+                // A deliberately mixed corpus: the zone #382's own numbers came from (akanon), the
                 // one whose route success the last nav tightening cost 29% (akanon again), a dense
                 // city, a big outdoor zone, dungeons, and the gfaydark corner an earlier budget cut
-                // broke. **qcat is deliberately NOT here**: it is confounded by known bugs (#423
-                // walk-through-walls-into-water, #329 spawn-pocket dead-end, and unimplemented water
-                // nav #359/#197), so a route-success/cost number there is not clean evidence about
-                // this refactor. Pass ZONES=qcat explicitly if you want to look at it in isolation.
+                // broke.
+                //
+                // #849: this list used to be described as "a deliberately mixed **DRY** corpus", and
+                // that word is now wrong in a way that matters. #839 routes every zone here through
+                // `open_corpus_zone`, which attaches the zone's region map, so the water-nav
+                // machinery is live for all ten of these zones — `butcher` and `everfrost` in
+                // particular are not dry. Nothing about the SELECTION changed; the description was
+                // never load-bearing for the selection, and it is corrected rather than deleted
+                // because a future reader would otherwise use "DRY corpus" to conclude the corpus is
+                // water-free by construction, which it is not and now visibly is not.
+                //
+                // **qcat is still deliberately NOT here**, and that reason is unchanged and is NOT
+                // about dryness: it is confounded by known bugs (#423 walk-through-walls-into-water,
+                // #329 spawn-pocket dead-end, and unimplemented water nav #359/#197), so a
+                // route-success/cost number there is not clean evidence about this refactor. Note
+                // the exclusion is about *confounded* zones, not *wet* ones — wet-but-unconfounded
+                // zones are in the list and always were. Pass ZONES=qcat to look at it in isolation.
                 "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka", "felwithea",
                 "highpass", "everfrost", "butcher",
             ].into_iter().map(str::to_string).collect());
@@ -7449,12 +7576,24 @@ mod tests {
 
         println!("\n{:<12} {:>6} {:>10} {:>10} {:>9} {:>9} {:>10} {:>10}",
             "zone", "pairs", "old ok", "new ok", "new-only", "old-only", "old mean", "new mean");
-        // #839: this corpus has no water dependency (no `in_water` call anywhere in it) — but a
-        // missing `.glb` or an empty collision grid used to drop a zone through a bare `continue`
-        // that printed a message and touched no ledger, so the FINE-TIER CORPUS totals below read
-        // as complete over whatever subset of `zones` happened to load. `open_corpus_zone` is the
-        // SAME single-owner prologue #807's other five corpora use; a zone with no water number to
-        // report still closes through `cover.add(zone, &zw.tally())`.
+        // #839: a missing `.glb` or an empty collision grid used to drop a zone through a bare
+        // `continue` that printed a message and touched no ledger, so the FINE-TIER CORPUS totals
+        // below read as complete over whatever subset of `zones` happened to load.
+        // `open_corpus_zone` is the SAME single-owner prologue #807's other five corpora use; this
+        // corpus reports no water NUMBER, so it still closes through `cover.add(zone, &zw.tally())`.
+        //
+        // #849: an earlier draft said "this corpus has no water dependency (no `in_water` call
+        // anywhere in it)". The parenthetical was measured; the sentence it supported was false.
+        // `open_corpus_zone` attaches the region map, and `astar` gates its water-descent, haul-out
+        // and surface-crossing edge families on `self.region_map()` — so this corpus now routes with
+        // those families live. That is DELIBERATE: `build_zone_collision` (`src/app.rs`) is the
+        // client's only production construction of a nav grid and always attaches region data, so
+        // "attached" is the configuration a fine-tier route-success number should be measured in.
+        // MEASURED (#849 review): over a 4-zone reduced-budget run this corpus produced identical
+        // pair counts and success rates on both sides (23 pairs, 100%/100%), so no change was
+        // demonstrated here — which is NOT the same as demonstrating there is none. The full 10-zone
+        // default at full budget was not run on either side; see `worst_case_reachable_component`,
+        // where the same attachment moved the headline number 13x.
         let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
             let (col, zw) = match crate::water_grid::open_corpus_zone(
@@ -7504,6 +7643,25 @@ mod tests {
                     pairs.push((from, carrot));
                 }
             }
+            // #849 review (non-blocking 1): **this is the ELEVENTH drop site**, and #839's recount
+            // of "ten drop sites in these five loops" missed it — it is disclosed here rather than
+            // left for the next reader to rediscover by running a red corpus.
+            //
+            // It has exactly the shape #839 is about: it printed a per-zone line and then vanished
+            // from the denominator, so the `=== FINE-TIER CORPUS (N pairs) ===` total below covered
+            // fewer zones than the corpus names, and said nothing. It is a genuinely different
+            // DROP KIND from `open_corpus_zone`'s three — the assets loaded fine, the grid is real,
+            // the `.wtr` is fine; the zone simply yielded no start/carrot pair to score. That is why
+            // it is wired here at the call site rather than inside the prologue.
+            //
+            // **This is a real behaviour change, stated because it is not free:** `skip` fails
+            // `is_complete()`, so a host where any corpus zone produces zero pairs now goes RED
+            // where before it went green with a quietly smaller denominator. MEASURED (#849 review):
+            // on the reviewer's host at reduced per-zone budget `akanon` yields zero pairs, and this
+            // corpus therefore fails there — base passed, head fails. At full default budget on that
+            // same host it does not. Both outcomes are correct reports; only the second is a passing
+            // one, and a zero-pair zone is exactly the case where "23 pairs, 100%" was never a
+            // statement about the corpus it named.
             if pairs.is_empty() {
                 println!("{zone:<12}  (no routable pairs — skipped)");
                 cover.skip(zone, "no routable pairs");
@@ -7562,10 +7720,14 @@ mod tests {
         // #839: the accounting assert fires BEFORE `tot_pairs > 0` — a run that dropped every zone
         // is still RED either way, but this ordering names which zones dropped and why instead of
         // only saying the corpus produced no pairs.
-        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus measures no water,
-        // so that number is a `tally()` zero by construction, not a finding — label it, or a reader
-        // takes "0" for "0 wet things found here".
-        println!("zone coverage [leading 0 = water total; this corpus measures no water]: {cover}");
+        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus reports no water
+        // NUMBER, so that total is a `tally()` zero by construction, not a finding — label it, or a
+        // reader takes "0" for "0 wet things found here". #849: it does NOT mean the search ran dry.
+        // `open_corpus_zone` attaches the region map (deliberately — that is what production does),
+        // so `astar`'s water edge families are live here. "Reports no water number" is the claim;
+        // "has no water dependency" was the earlier claim and it was false.
+        println!("zone coverage [leading 0 = water total; this corpus reports no water number — \
+                  but it DOES search with the region map attached]: {cover}");
         assert!(cover.is_complete(),
             "#839: the FINE-TIER CORPUS numbers above are not this corpus — they cover {}/{} of the \
              zones it was asked for. unmeasured (the .wtr was read and did not load): {:?}; skipped \
@@ -8256,11 +8418,19 @@ mod tests {
         let mut seed: u64 = 0x0155_EA1D;
         let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
         println!("\n{:<12} {:>10} {:>10} {:>12} {:>10}", "zone", "fits", "recovered", "headroom-rej", "steep-rej");
-        // #839: this corpus has no water dependency (no `in_water` call) — but a missing `.glb` or
-        // an empty collision grid used to drop a zone through a bare `continue` that printed nothing
-        // (the `cols == 0` arm) or a message nobody accounted for, so the Q1 numbers above read as a
-        // complete seal measurement over whatever subset of `zones` happened to load. Same
-        // single-owner prologue as the other four corpora in this family.
+        // #839: a missing `.glb` or an empty collision grid used to drop a zone through a bare
+        // `continue` that printed nothing (the `cols == 0` arm) or a message nobody accounted for,
+        // so the Q1 numbers above read as a complete seal measurement over whatever subset of
+        // `zones` happened to load. Same single-owner prologue as the other four corpora in this
+        // family.
+        //
+        // #849: an earlier draft said "this corpus has no water dependency (no `in_water` call)".
+        // The grep was real; the conclusion was not — `open_corpus_zone` attaches the region map and
+        // `astar`'s water edge families gate on it, so the dependency is inside the search this body
+        // calls, not in the body. Attaching is deliberate and matches `build_zone_collision`, the
+        // client's only production nav-grid construction. MEASURED (#849 review): this corpus printed
+        // a BYTE-IDENTICAL table with and without the attachment, so here the old sentence's
+        // CONCLUSION happens to hold empirically even though its reasoning did not.
         let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
             let (col, zw) = match crate::water_grid::open_corpus_zone(
@@ -8298,10 +8468,14 @@ mod tests {
             below body height (correct). Route-success held, BUT the corpus cannot distinguish a rejected \
             ceiling from a sealed pocket (it samples via nearest_floor, so a sealed pocket is invisible \
             to it) — this is NOT proof every reject is a ceiling. ===");
-        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus measures no water,
-        // so that number is a `tally()` zero by construction, not a finding — label it, or a reader
-        // takes "0" for "0 wet things found here".
-        println!("zone coverage [leading 0 = water total; this corpus measures no water]: {cover}");
+        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus reports no water
+        // NUMBER, so that total is a `tally()` zero by construction, not a finding — label it, or a
+        // reader takes "0" for "0 wet things found here". #849: it does NOT mean the search ran dry.
+        // `open_corpus_zone` attaches the region map (deliberately — that is what production does),
+        // so `astar`'s water edge families are live here. "Reports no water number" is the claim;
+        // "has no water dependency" was the earlier claim and it was false.
+        println!("zone coverage [leading 0 = water total; this corpus reports no water number — \
+                  but it DOES search with the region map attached]: {cover}");
         assert!(cover.is_complete(),
             "#839: the Q1 numbers above are not a complete seal measurement — they cover {}/{} of the \
              zones this run was asked for. unmeasured (the .wtr was read and did not load): {:?}; \
@@ -8368,11 +8542,18 @@ mod tests {
         let mut tot_pts = 0usize;
         let mut tot_drift = 0usize;
         println!("\n{:<12} {:>10} {:>12} {:>8}", "zone", "sampled", "drift-pts", "%");
-        // #839: this corpus has no water dependency (no `in_water` call) — but a missing `.glb` or
-        // an empty collision grid used to drop a zone through a `continue` that printed a message
-        // and touched no ledger, so the FLOOR-MODEL DISAGREEMENT total below read as complete over
-        // whatever subset of `zones` happened to load. Same single-owner prologue as the other four
-        // corpora in this family.
+        // #839: a missing `.glb` or an empty collision grid used to drop a zone through a `continue`
+        // that printed a message and touched no ledger, so the FLOOR-MODEL DISAGREEMENT total below
+        // read as complete over whatever subset of `zones` happened to load. Same single-owner
+        // prologue as the other four corpora in this family.
+        //
+        // #849: an earlier draft said "this corpus has no water dependency (no `in_water` call)".
+        // The grep was real; the conclusion was not — `open_corpus_zone` attaches the region map and
+        // `astar`'s water edge families gate on it, so the dependency is inside the search this body
+        // calls, not in the body. Attaching is deliberate and matches `build_zone_collision`, the
+        // client's only production nav-grid construction. MEASURED (#849 review): this corpus printed
+        // a BYTE-IDENTICAL table with and without the attachment, so here the old sentence's
+        // CONCLUSION happens to hold empirically even though its reasoning did not.
         let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
             let (col, zw) = match crate::water_grid::open_corpus_zone(
@@ -8416,10 +8597,14 @@ mod tests {
             see HONEST LIMIT). D-2 gate: → 0 by construction (both sides share is_standable). ===");
         // #839: the accounting assert fires BEFORE `tot_pts > 0` — a run that dropped every zone is
         // still RED either way, but this ordering names which zones dropped and why.
-        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus measures no water,
-        // so that number is a `tally()` zero by construction, not a finding — label it, or a reader
-        // takes "0" for "0 wet things found here".
-        println!("zone coverage [leading 0 = water total; this corpus measures no water]: {cover}");
+        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus reports no water
+        // NUMBER, so that total is a `tally()` zero by construction, not a finding — label it, or a
+        // reader takes "0" for "0 wet things found here". #849: it does NOT mean the search ran dry.
+        // `open_corpus_zone` attaches the region map (deliberately — that is what production does),
+        // so `astar`'s water edge families are live here. "Reports no water number" is the claim;
+        // "has no water dependency" was the earlier claim and it was false.
+        println!("zone coverage [leading 0 = water total; this corpus reports no water number — \
+                  but it DOES search with the region map attached]: {cover}");
         assert!(cover.is_complete(),
             "#839: the FLOOR-MODEL DISAGREEMENT total above is not a complete scan — it covers {}/{} \
              of the zones this run was asked for. unmeasured (the .wtr was read and did not load): \
