@@ -182,15 +182,25 @@ bug — `gs.player_z` is often the spawn z, not the real floor). Walkable = a fl
 needs a small floor-height step (`STEP_H=20`) and a clear chest-height segment.
 
 **Limitations (real, hit during play):**
-- **Water**: fish/water mobs sit in water a walking character can't path to; `find_path` returns no
-  route to them, and even if `path_clear` (LOS over water) passes, melee won't connect across/below
-  water. The auto-grind excludes nothing by name now, relying on `path_clear`; if you target water
-  mobs, exclude `fish` by name.
+- **Water** — *this bullet's pathing half is history, not current behaviour.* It used to read "fish/
+  water mobs sit in water a walking character can't path to; `find_path` returns no route to them".
+  That described the 2D-with-water-hacks planner. Today `astar` builds 4u water columns and emits 3D
+  interior, descent, surface-crossing and haul-out edges, gated on `Collision::region_map()`, which
+  the production grid build always attaches — so water mobs are **not** categorically unreachable.
+  The still-live part is the *combat* observation: even where `path_clear` (LOS over water) passes,
+  melee may not connect across/below water. The auto-grind excludes nothing by name, relying on
+  `path_clear`; excluding `fish` by name is now a workaround for that combat behaviour, not for a
+  pathing limitation. Narrower real limits (haul-out height cap, open water-nav issues) are in
+  `collision-system.md` and the two water specs.
 - **Sealed pockets / doors**: doors are NOT in the collision (the client suppresses `OP_SPAWN_DOOR`),
   so a room behind a closed door is a disconnected "pocket" — `find_path` correctly finds no route
   (e.g. qcat's merchant rooms are unreachable on foot from the fish room). Reaching them needs door
   modeling or DB-positioning.
-- A* is capped at `MAX_NODES=200000`.
+- A* is capped at `MAX_NODES` (`collision.rs`), currently **`8_000_000`**. This line said `200000`
+  until #861 — wrong by 40×. Read the constant, not this sentence. Hitting the cap is reported
+  honestly as `Exhausted(NodeCap)` ("I don't know"), never as `Unreachable(SearchClosed)` ("no"), so
+  an agent must not read a cap-exhausted plan as proof the goal is unreachable. `MAX_NODES`' doc
+  comment carries the measured headroom; don't re-quote a figure from here.
 
 ---
 

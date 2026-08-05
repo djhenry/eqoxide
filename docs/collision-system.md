@@ -91,11 +91,29 @@ waypoints by emitting a `MoveIntent` toward the next carrot, and the ONE collide
   levels — so multi-level dungeons work even when the caller's `start.z` is stale (a common bug:
   `gs.player_z` is often the spawn z, not the real floor). Don't pass a bogus z and expect failure —
   it self-corrects, but a wildly wrong z can still miss.
-- Capped at `MAX_NODES=200000`. Emits a `find_path: no route` diagnostic (expanded count + start/
-  goal floor) when it fails.
-- **Limitations**: can't path across **water** (no walkable floor — water mobs like fish are
-  unreachable) or through **doors / sealed pockets** (doors aren't in the collision; a room behind a
-  closed door is a disconnected component, so A* correctly finds no route). See `autonomous-play.md`.
+- Capped at `MAX_NODES` (`collision.rs`), currently **`8_000_000`**. This line said `200000` until
+  #861 — wrong by 40×, and stale for long enough that it is worth reading the constant rather than
+  this sentence. (The same line also claimed a `find_path: no route` diagnostic; **no such string is
+  in the tree** — give-up is reported through the planner's `PlanOutcome`, so that clause went too.)
+  The cap is a **precision** floor, not a safety floor: exceeding it returns
+  `Exhausted(NodeCap)` ("I don't know"), never a false `Unreachable(SearchClosed)` ("no"). For what
+  actually fits under it, and for the one measured whole-zone figure (`butcher` floods 4,583,785
+  nodes — 57.3% of the cap, 1.75× headroom), read `MAX_NODES`' own doc comment; do not re-quote the
+  number from here.
+- **Limitations**: **doors / sealed pockets** — doors aren't in the collision; a room behind a
+  closed door is a disconnected component, so A* correctly finds no route. See `autonomous-play.md`.
+- **Water is no longer a blanket limitation.** This section used to say A* "can't path across water
+  (no walkable floor — water mobs like fish are unreachable)". That was true of the 2D-with-water-
+  hacks planner and is **not** true of the code today: `astar` builds 4u water columns
+  (`WaterColumn`) and emits genuine 3D interior, water-descent, surface-crossing and haul-out edge
+  families, all gated on `Collision::region_map()`. The production construction of a zone's grid
+  (`build_zone_collision`, `app.rs`) always attaches the region map, so the shipped client always
+  runs with those families live. Real remaining limits are narrower and specific — chiefly the
+  haul-out height cap (`PLAYER_BODY.haul_out_up`; an exit is refused with
+  `RejectReason::HaulOutTooHigh` above it) and the open water-nav issues. See
+  `specs/2026-07-16-water-navigation-design.md` and `specs/2026-07-17-3d-water-volume-nav-design.md`
+  for the design; note both are **dated snapshots**, so treat their "current state" tables as
+  history and check `collision.rs` for the live behaviour.
 
 ---
 
