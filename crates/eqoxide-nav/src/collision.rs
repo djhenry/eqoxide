@@ -81,16 +81,11 @@ pub struct Hit {
 /// **Both figures round to 57.3% and 1.75×**, so nothing this constant rests on depends on which is
 /// right — only the last two digits of one input do.
 ///
-/// **What the earlier run WAS cannot be established, and that is a fact about its artefacts, not an
-/// inference about it.** Its stderr was never captured, so it has no compile sentinel and **its
-/// profile is unknown** — it must not be described as `dev` or as `release`. Its stdout does bound
-/// its CODE: it printed two strings that exist only between `99c45b3` and `3eb8e3a`, and across that
-/// entire window the construct-and-search path is unchanged — `eqoxide-assets` untouched,
-/// `water_grid.rs` zero non-comment changes, and `collision.rs`'s forty non-comment changed lines all
-/// inside this test's own body (zone-list plumbing, prints, an assert placed after the measurement,
-/// and `Some(8_000_000)` -> `Some(MAX_NODES)`, which is value-identical).
+/// **What the earlier run WAS cannot be fully established, and that is a fact about its artefacts.**
+/// Its stderr was never captured, so it has no compile sentinel and **its profile is unknown** — it
+/// must not be described as `dev` or as `release`.
 ///
-/// Every mechanism proposed for the 37 so far has been EXCLUDED:
+/// THREE mechanisms are excluded. The list is NOT complete, and the leading candidate is open:
 ///
 /// * **profile** — the #849 determinism audit found no profile-sensitive mechanism in the search; and
 ///   the earlier run's slowest search ran at 151.7 µs/node against this run's `dev`-confirmed 123.7,
@@ -98,20 +93,41 @@ pub struct Hit {
 ///   `dev`-confirmed runs themselves differ by 1.87×, 66.0 against 123.7. What it excludes is a
 ///   *faster* build, since `release` cannot be slower than `dev` on the same work.)
 /// * **corpus composition** — `let mut seed: u64 = 99;` is re-seeded INSIDE `for zone in &zones`, over
-///   a fixed `0..120` of five corners plus one random draw, so butcher draws the identical 720 probe
-///   pairs whether it is one zone of three or the only zone. Excluded at source.
-/// * **a different sample set** — would need a different probe count, i.e. different code, which the
-///   window diff above rules out.
-/// * **different assets** — `butcher.glb` and `butcher.wtr` both predate BOTH runs by two weeks.
-///   Excluded on mtime, not on content.
+///   five corners plus one random draw, so butcher draws the identical pairs whether it is one zone of
+///   three or the only zone. Excluded at source. Note what this fixes: **WHICH pairs, not HOW MANY.**
+/// * **the grid and the assets** — all three runs print `xy_cells@8u = 751120` for butcher. That is
+///   derived from the loaded geometry, so it is CONTENT evidence that they built the same grid from
+///   the same assets — strictly stronger than the file mtimes an earlier revision of this doc relied
+///   on, and mtime is the method that already misled once on this branch.
 ///
-/// So the disagreement survives every explanation offered for it. A second unexplained signature sits
-/// alongside it: in the earlier run the single search that set the figure was **42.9%** of the whole
-/// three-zone wall time, against **1.51%** here and **0.66%** in the no-region-map base — a ratio in
-/// which profile cancels, because it compares one search against the rest of the same run. The two
-/// `dev`-confirmed butcher-only runs scale consistently with each other (352,493 -> 4,583,785 nodes
-/// for 3,545 s -> 37,453 s, 13.0× the nodes for 10.6× the time); the earlier run is the outlier
-/// against both.
+/// **OPEN, and the leading candidate: the earlier run executed FEWER SEARCHES.** Its own wall time
+/// says so, using only `dev`-confirmed anchors. Its total was 1,620.16 s, of which everfrost's and
+/// gfaydark's figure-setting searches alone are 124.34 s, leaving its butcher zone **≤ 1,495.82 s**:
+///
+/// | run | butcher zone, per pair at the nominal 720 | butcher `MAX_closed` |
+/// |---|---|---|
+/// | earlier run | **≤ 2.08 s** | 4,583,748 |
+/// | base, no region map (`dev`) | 4.92 s | 352,493 |
+/// | this run (`dev`) | 52.02 s | 4,583,785 |
+///
+/// It would have to have run at **less than half the per-pair cost of the no-region-map base** while
+/// reporting a **13× larger** maximum — and profile cannot rescue that, since it is the *slower* of the
+/// pair per node. So the nominal sample count is the thing its wall time will not support.
+///
+/// **Why the code-window argument does not close this.** The earlier run's stdout bounds its code to
+/// between `99c45b3` and `3eb8e3a`, and across that window the construct-and-search path is unchanged
+/// (`eqoxide-assets` untouched, `water_grid.rs` zero non-comment changes, `collision.rs`'s forty
+/// non-comment changed lines all inside this test's own body). But that is a diff over **committed**
+/// revisions, and the run came from a working tree whose state was never recorded. **An edit to the
+/// probe loop bound prints no distinguishing string**, so a reduced reach probe is invisible to every
+/// artefact that survives. The bound is sound for what it bounds; it does not bound this.
+///
+/// **The obvious objection, and the only answer anyone has:** a reduced sample should undershoot by
+/// far more than 0.00081%. The proposed answer is that `Key = (col, row, floor_bucket)` makes the
+/// maximum a broad PLATEAU rather than a sharp peak — many pairs flood nearly the same component — so
+/// 37 nodes is endpoint jitter between two different winning pairs. **That is reasoning from the key
+/// type, NOT a measurement.** It is recorded because *any* explanation of a gap this small needs a
+/// plateau of some kind, not because it has been shown.
 ///
 /// **None of that makes 4,583,748 wrong.** This test reports a MAX over sampled pairs, and a max over
 /// any subset is a LOWER BOUND on the max over the whole — and 4,583,748 < 4,583,785, the right way
@@ -119,8 +135,9 @@ pub struct Hit {
 /// right that the run could not be reconciled and wrong to call the number unusable.** A later
 /// revision replaced it with a `dev`-vs-`release` story built by dividing the two runs' *total* wall
 /// times (37,453 / 1,620 = 23.1×); that story is refuted by the per-node figures above and must not
-/// be reinstated. Two mechanisms have now been asserted here and both were wrong — state the
-/// exclusions and leave the cause open.
+/// be reinstated. A third revision listed the sample count as EXCLUDED; that was wrong too, and it is
+/// now the leading open candidate. Three mechanisms have been asserted here and three were refuted —
+/// state what is excluded, state what is open, and do not supply a fourth.
 ///
 /// | measurement | status |
 /// |---|---|
@@ -129,7 +146,7 @@ pub struct Hit {
 /// | `highpass` 7,229 → 7,394 (**+2.3%**), full workload on BOTH sides, region map the only change | MEASURED (#849 review) |
 /// | butcher **4,583,785** WITH region map, `dev`-confirmed, butcher-only, full workload | MEASURED (#856) |
 /// | butcher **4,583,748** WITH region map, three-zone — profile NOT captured, wall time inconsistent with the other two runs; valid as a LOWER BOUND | MEASURED (#849 review) |
-/// | why those two differ by 37 nodes | **UNRESOLVED** — every proposed mechanism excluded |
+/// | why those two differ by 37 nodes | **UNRESOLVED** — profile/composition/grid excluded; sample COUNT open |
 ///
 /// The old "~7× headroom" claim is retired on measurement, not inference: it was taken on a
 /// `Collision` with **no region data attached**, and `build_zone_collision` (`src/app.rs`) is the
@@ -7376,25 +7393,40 @@ mod tests {
         // conclusion is unaffected either way.
         //
         // That earlier run's PROFILE IS UNKNOWN — its stderr was never captured, so there is no
-        // compile sentinel for it and it must not be called `dev` or `release`. Its CODE is bounded
-        // by its stdout (two print strings that exist only between 99c45b3 and 3eb8e3a), and across
-        // that whole window nothing on the construct-and-search path changed.
+        // compile sentinel for it and it must not be called `dev` or `release`.
         //
-        // Every mechanism proposed for the 37 has been excluded: PROFILE (the #849 audit found none
-        // in the search, and that run's slowest search was 151.7 us/node against this run's
+        // THREE mechanisms are excluded, and the list is NOT complete. PROFILE (the #849 audit found
+        // none in the search, and that run's slowest search was 151.7 us/node against this run's
         // dev-confirmed 123.7 — no release-like speed; note 66.0 vs 123.7 between two dev-confirmed
-        // runs, so per-node cost is not a profile signature, only an upper bound on speed);
-        // COMPOSITION (`seed` is re-seeded inside `for zone in &zones` over a fixed `0..120`, so
-        // butcher draws the identical 720 pairs either way); SAMPLE SET (needs different code, which
-        // the window diff rules out); ASSETS (both butcher files predate both runs). The
-        // disagreement outlives all of them.
+        // runs, so per-node cost is not a profile signature, only a bound on speed). COMPOSITION
+        // (`seed` is re-seeded inside `for zone in &zones`, so butcher draws the identical pairs
+        // either way — that fixes WHICH pairs, not HOW MANY). GRID AND ASSETS (all three runs print
+        // xy_cells@8u = 751120, which is derived from the loaded geometry — content evidence, not
+        // the file mtimes an earlier revision leaned on).
         //
-        // TWO explanations have now been asserted in this comment and both were wrong: first that
-        // the run was impossible and its number unusable, then that it was `release` against this
-        // one's `dev` (built by dividing TOTAL wall times, 37,453/1,620 = 23.1x — refuted by the
-        // per-node figures). What is true and mechanism-free: this test reports a MAX OVER SAMPLES,
-        // a max over any subset is a LOWER BOUND on the max over the whole, and 4,583,748 <
-        // 4,583,785 is the right way round. State the exclusions; do not supply a third story.
+        // OPEN, and the leading candidate: the earlier run executed FEWER SEARCHES. Its total was
+        // 1620.16s, minus 124.34s for everfrost's and gfaydark's figure-setting searches, so its
+        // butcher zone had <= 1495.82s -- <= 2.08s per pair at the nominal 720, against 4.92s for
+        // the no-region-map base and 52.02s here (both dev-confirmed). It would have to be under
+        // HALF the per-pair cost of the mapless base while reporting a 13x larger maximum, and
+        // profile cannot rescue that since it is the slower of the pair per node.
+        //
+        // The code-window bound does NOT close this: it is a diff over COMMITTED revisions, and that
+        // run came from a working tree never recorded. An edit to this loop's bound prints no
+        // distinguishing string, so a reduced reach probe leaves no trace in any surviving artefact.
+        //
+        // Objection: a reduced sample should undershoot by far more than 0.00081%. The proposed
+        // answer is that `Key = (col, row, floor_bucket)` makes the maximum a PLATEAU rather than a
+        // peak, so 37 nodes is endpoint jitter between two winning pairs. That is reasoning from the
+        // key type, NOT a measurement -- recorded because any explanation of a gap this small needs
+        // a plateau of some kind, not because it has been shown.
+        //
+        // THREE explanations have now been asserted in this comment and three were refuted: that the
+        // run was impossible and its number unusable; that it was `release` against this one's `dev`
+        // (from dividing TOTAL wall times, 37,453/1,620 = 23.1x); and that the sample count was
+        // excluded. What is true and mechanism-free: this test reports a MAX OVER SAMPLES, a max
+        // over any subset is a LOWER BOUND on the max over the whole, and 4,583,748 < 4,583,785 is
+        // the right way round. State what is excluded and what is open; do not supply a fourth.
         //
         // The other measured points, kept because they bound how zone-dependent this is: on
         // `highpass`, full workload both sides with the attachment as the only difference, the close

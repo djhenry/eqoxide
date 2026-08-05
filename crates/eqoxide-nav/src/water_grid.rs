@@ -472,12 +472,14 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 ///
 /// Two runs measured the attached `butcher` figure and they differ by **37 nodes**: 4,583,785
 /// (`dev`-confirmed, butcher-only) and 4,583,748 (three-zone, **profile never captured**). The
-/// 0.00081% gap is unexplained, and every mechanism proposed for it — profile, corpus composition, a
-/// differing sample set, differing assets — has been excluded; it is filed separately. Two successive
-/// revisions of this doc asserted a cause (first "impossible, unusable", then "`release` vs `dev`")
-/// and both were wrong, so this one asserts none. What holds regardless: the figure is a MAX OVER
-/// SAMPLES, so the smaller number is a valid LOWER BOUND, and both round to 57.3% / 1.75x / 13.0x.
-/// See `MAX_NODES`' doc for the full account.
+/// 0.00081% gap is unexplained. Profile, corpus composition and the grid/assets are excluded; the
+/// **leading open candidate is that the earlier run executed fewer searches** — its wall time allows
+/// ≤ 2.08 s per pair at the nominal count, against 4.92 s for the mapless base, and its working tree
+/// was never recorded so a probe-loop edit would leave no trace. Filed separately. Three successive
+/// revisions of this doc asserted a cause ("impossible, unusable"; "`release` vs `dev`"; "sample count
+/// excluded") and all three were wrong, so this one asserts none. What holds regardless: the figure is
+/// a MAX OVER SAMPLES, so the smaller number is a valid LOWER BOUND, and both round to
+/// 57.3% / 1.75x / 13.0x. See `MAX_NODES`' doc for the full account.
 ///
 /// **The cost of that choice, stated because it is a real behaviour change and not a free win:**
 /// [`open_corpus_zone`]'s DROP 3 refuses a zone whose `.wtr` did not load. Those four corpora
