@@ -1659,8 +1659,14 @@ pub struct NavStatus {
     /// walker has already tried, and whether the route it is failing to execute even reaches the
     /// goal — which is what an agent needs to decide between waiting, re-issuing and giving up.
     ///
-    /// Retired with the goal (see [`NavStatus::retire_to_idle`]) and cleared on every state
-    /// transition, for the same reason `tier` is: it is a fact about the route being executed now.
+    /// Retired on every state change, for the same reason `tier` is: it is a fact about the route
+    /// being executed now. That is a property of all three exhaustive writers, not of a habit —
+    /// [`NavStatus::retire_to_idle`] (the goal ended), [`NavStatus::stamp_fresh_goal`] (a new goal
+    /// replaced it) and [`NavStatus::transition_within_goal`] (the same journey moved state) each
+    /// destructure this struct with no `..`, so this field could not have been added without a
+    /// decision being recorded in all three. It was, in the first, when this field was introduced;
+    /// the other two were flat lists then and one of them leaked a dead goal's payload under the
+    /// next goal's `pending` (#851 review round 1, B1).
     pub stall:  Option<NavStall>,
     /// **The fine worker thread has died — latched, and scoped to that WORKER** (#766 review B3/B9).
     /// Set `true` the instant `LocalPlanner::is_dead()` is observed, and cleared by **nothing on any
@@ -1751,8 +1757,19 @@ pub struct NavStall {
     /// route cursor advancing by walking, or the closest 3-D approach to the goal improving. Equal
     /// to `nav::steering::NAV_STUCK_TICKS` on the first stalled tick and rising from there.
     pub quiet_ticks: u32,
-    /// Milliseconds since the stall began (measured from the tick the verdict flipped, not derived
-    /// from `quiet_ticks` × a nominal tick — the nav tick is a floor, not a guarantee).
+    /// **The same window `quiet_ticks` counts, in milliseconds**: measured from the walker's last
+    /// progressing tick, so on the first stalled tick it reads ≈ `NAV_STUCK_TICKS × 150` (~3000),
+    /// not `0`.
+    ///
+    /// It is MEASURED, never derived from `quiet_ticks` × a nominal tick — the 150 ms nav tick is a
+    /// floor, not a guarantee, so under load this runs longer than the arithmetic. That is the only
+    /// reason the two disagree.
+    ///
+    /// It used to be measured from the tick the VERDICT flipped, which made it read `0` at the
+    /// moment a stall was first announced: a uniform ~3 s understatement of how long the body had
+    /// been going nowhere, sitting beside a `quiet_ticks` that counted the whole window (#851 review
+    /// round 1, B2c). An understatement that makes an agent wait longer is still something the agent
+    /// cannot detect from the payload, so it was corrected rather than documented.
     pub quiet_ms: u64,
     /// Stall-recovery re-paths run at this spot so far. The walker gives up at 8 with
     /// `blocked`/`walker_stalled`, so this is also "how much runway is left".
@@ -1819,6 +1836,13 @@ impl NavStatus {
     /// the same construction `AssetSyncState::slots()` uses in `eqoxide-ipc::asset_sync`. Note the
     /// weaker precondition: `NavStatus`'s fields are `pub` and read directly by several crates, so
     /// this pins the *retirement path* only. It does not stop other code writing the fields.
+    ///
+    /// **All THREE state-changing routes carry that net now, not just this one** (#851 review round
+    /// 1, B1). Until then `idle` was the only exhaustive writer, and the other two were flat
+    /// assignment lists — which is exactly how `stall` came to be decided here and forgotten there.
+    /// Its siblings are [`NavStatus::stamp_fresh_goal`] (a new goal supersedes the old one) and
+    /// [`NavStatus::transition_within_goal`] (the walker moves state inside one journey). A field
+    /// added to [`NavStatus`] is now force-decided on every route out of a state, not one of three.
     ///
     /// **#766 moved `local` from KEPT to retired.** #732 left it standing with a `_keep_local`
     /// binding on the grounds that the FINE tier is "a different tier" whose clearing
@@ -1920,6 +1944,94 @@ impl NavStatus {
         *blocked_frontier = None;
         *tier             = None;
         *local            = None;
+        *stall            = None;
+    }
+
+    /// **Stamp a FRESH GOAL's row: the non-idle twin of [`NavStatus::retire_to_idle`]** (#851 review
+    /// round 1, B1). `CommandState::stamp_new_goal`'s only non-idle route, reached with `pending` by
+    /// `request_goto`, `request_follow` and `request_zone_cross`.
+    ///
+    /// Same argument, same construction, different destination: a new goal ends the previous one, so
+    /// every fact that was ABOUT that goal goes with it — and the write is EXHAUSTIVE (no `..`), so a
+    /// field added to [`NavStatus`] is an `error[E0027]` here until someone decides its fate.
+    ///
+    /// **This function exists because that net was built for `idle` only, and the gap was then
+    /// walked into.** `stamp_new_goal` used to carry a flat assignment list for the non-idle route,
+    /// with the `#732` comment directly above it recording that a flat list has no exhaustiveness and
+    /// that a field had already been silently forgotten in it once (measured, with a throwaway
+    /// `probe_route_len`). #851 then added `stall` to [`NavStatus`], decided it in `retire_to_idle`
+    /// where the compiler forced the decision, and missed the flat list where nothing did — so a
+    /// re-issued goal published `nav_state: "pending"` beside the DEAD goal's live `nav_stall`, which
+    /// is #851's own failure shape one goal later and in the false-alarm direction. Fixing the field
+    /// alone would have left the next per-goal field to be lost the same way; the fix is the net.
+    ///
+    /// `why` is `None` for every production caller today (a `pending` needs no explanation — the
+    /// request itself is the explanation); it is a parameter rather than a hard-coded `None` because
+    /// nothing about a fresh goal makes a reason wrong, and the `idle` twin proves reasons matter.
+    /// `idle` is refused outright: that state is a RETIREMENT and has its own writer, and routing it
+    /// through here would silently skip the `#725` "an `idle` must say how it got there" guard.
+    pub fn stamp_fresh_goal(&mut self, new_state: &str, why: Option<&str>, goal: Option<[f32; 3]>) {
+        debug_assert!(new_state != "idle",
+            "#851 B1: `idle` is a retirement, not a fresh goal — use `NavStatus::retire_to_idle`");
+        let NavStatus {
+            state, reason,
+            // KEPT — see `retire_to_idle`: `goal_id` is a monotonic IDENTITY stamp, and the caller
+            // has already bumped it for this goal. Re-deciding it here would break #349's
+            // correlation between a request and the row that answers it.
+            goal_id: _keep_goal_id,
+            goal: goal_slot,
+            blocked_goal, blocked_frontier, tier, local, stall,
+            // KEPT — a dead fine worker is a fact about the WORKER, not about any goal, and a new
+            // goal has repaired nothing. Same argument as in `retire_to_idle`; see the field's doc.
+            local_planner_dead: _keep_local_planner_dead,
+        } = self;
+        *state  = new_state.to_string();
+        *reason = why.map(str::to_string);
+        *goal_slot        = goal;
+        *blocked_goal     = None;
+        *blocked_frontier = None;
+        *tier             = None;
+        *local            = None;
+        *stall            = None;
+    }
+
+    /// **Move to a new state WITHIN the same goal** — the walker's mid-route transition
+    /// (`Walker::write_nav_state_locked`), and the third exhaustive writer of this row (#851 review
+    /// round 1, B1). Exhaustive for the same reason as the other two: a field added to [`NavStatus`]
+    /// is an `error[E0027]` here until its fate on a mid-route transition is decided.
+    ///
+    /// It keeps two things the goal-changing writers retire, and both are deliberate:
+    ///   * `goal` — the goal has NOT changed. `planning` → `navigating` → `arrived` are all states
+    ///     of the same journey, and clearing its coordinates mid-flight would be a fresh lie.
+    ///   * `local` — #382: the fine tier's last word is an independent fact about a different tier
+    ///     and is the EVIDENCE behind a terminal `blocked`/`no_path`. `retire_to_idle` clears it
+    ///     because `idle` means the goal is over; a transition within the goal is not that.
+    ///
+    /// `idle` is refused here too, for the same reason as in [`NavStatus::stamp_fresh_goal`]: the
+    /// caller routes it to `retire_to_idle` before reaching this.
+    pub fn transition_within_goal(&mut self, new_state: &str, why: Option<&str>) {
+        debug_assert!(new_state != "idle",
+            "#851 B1: `idle` retires the goal — route it through `NavStatus::retire_to_idle`");
+        let NavStatus {
+            state, reason,
+            goal_id: _keep_goal_id,
+            // KEPT — the journey is the same one; see the doc above.
+            goal: _keep_goal,
+            blocked_goal, blocked_frontier, tier,
+            // KEPT — #382; see the doc above.
+            local: _keep_local,
+            // #851: RETIRED. `stall` is a fact about executing the route under the state we are
+            // LEAVING. `publish_drive_state` re-asserts it in the same lock hold when the new state
+            // is still a driving one; anywhere else — `blocked`, `arrived`, `planning`,
+            // `zone_loading` — it must go, or a terminal row would carry a live-wedge payload.
+            stall,
+            local_planner_dead: _keep_local_planner_dead,
+        } = self;
+        *state  = new_state.to_string();
+        *reason = why.map(str::to_string);
+        *blocked_goal     = None;
+        *blocked_frontier = None;
+        *tier             = None;
         *stall            = None;
     }
 }

@@ -294,12 +294,14 @@ after a dropped `/zone_cross` (#725), and `following` after the followed entity 
 
 `GET /v1/observe/debug` carries **`nav_stall`** (top-level, a sibling of `player`, not under it).
 It is `null` except while `nav_state` is `navigating_stalled`, and the two are written together from
-one verdict — you will never see one without the other.
+one verdict under one lock hold — you will never see one without the other. That holds across a new
+goal too: every route out of a nav state clears this payload, so a re-issued `/move/goto` returns
+`pending` with `nav_stall: null`, never the previous goal's numbers.
 
 ```json
 "nav_stall": {
   "quiet_ticks": 34,
-  "quiet_ms":    5100,
+  "quiet_ms":    5310,
   "repaths":     2,
   "route":       "complete",
   "detail":      "…"
@@ -308,8 +310,8 @@ one verdict — you will never see one without the other.
 
 | field | meaning |
 |-------|---------|
-| `quiet_ticks` | Consecutive walker ticks (150 ms each) with **no** route-cursor advance and **no** closest-approach improvement. Crosses the threshold at 20. |
-| `quiet_ms` | Wall-clock milliseconds since the verdict flipped to stalled. Not `quiet_ticks × 150`: back-off ticks return early without re-evaluating, so this is the honest elapsed time and the tick count is the honest evidence count. |
+| `quiet_ticks` | Consecutive walker ticks (150 ms each) with **no** route-cursor advance and **no** closest-approach improvement. Crosses the threshold at 20, so the smallest value you can ever read here is 20. |
+| `quiet_ms` | The **same window as `quiet_ticks`**, in wall-clock milliseconds: measured from the walker's last progressing tick. So the first `navigating_stalled` you see already reads ≈ 3000, not `0`. It is measured, never computed as `quiet_ticks × 150`, and that is the only reason the two can disagree — the 150 ms nav tick is a floor, not a guarantee, so under load this runs **longer** than the arithmetic (the example above is 34 ticks in 5310 ms). Use `quiet_ticks` as the evidence count and this as the clock. |
 | `repaths` | How many recovery re-paths the walker has spent on this goal. It gives up at 8, which is where `blocked`/`walker_stalled` comes from. |
 | `route` | `complete` (the committed route ends at your goal) or `partial` (it ends short of it). A stall on a `partial` means the walker is not executing even the partial. |
 
@@ -815,7 +817,7 @@ GET  /v1/observe/debug     -> nav_state: "arrived"   <-- but nav_goal_id: 7, the
 
 Now the accept **atomically** bumps `nav_goal_id` and resets `nav_state` to `pending`, so the read above returns `nav_state: "pending", nav_goal_id: 8` — honest.
 
-**Rule: ignore any `nav_state` whose `nav_goal_id` is LOWER than the `goal_id` your POST returned — that is an older goal's outcome. At your id or above, the state is current.** A matching id with `pending`/`planning`/`navigating` means your goal is genuinely in flight — and it will not stay that way, because any in-progress state with nothing behind it retires to `idle` with a reason on the next walker tick ([Why an in-progress `nav_state` can never stick](#why-an-in-progress-nav_state-can-never-stick-725)). `idle` **at or above your own goal id** is therefore an outcome, not a "not started yet": read `nav_reason`, which since #725 always says which outcome it was.
+**Rule: ignore any `nav_state` whose `nav_goal_id` is LOWER than the `goal_id` your POST returned — that is an older goal's outcome. At your id or above, the state is current.** A matching id with `pending`/`planning`/`navigating`/`navigating_partial`/`navigating_stalled`/`following` means your goal is genuinely in flight — `navigating_stalled` included: it is a walker that has a route and is not currently executing it, still recovering, not a verdict (see [`nav_stall`](#nav_stall--a-committed-route-the-walker-is-not-executing-851)) — and it will not stay that way, because any in-progress state with nothing behind it retires to `idle` with a reason on the next walker tick ([Why an in-progress `nav_state` can never stick](#why-an-in-progress-nav_state-can-never-stick-725)). `idle` **at or above your own goal id** is therefore an outcome, not a "not started yet": read `nav_reason`, which since #725 always says which outcome it was.
 
 **Why the rule is "at or above" and not "equal" — `/v1/move/zone_cross` in particular.** A *higher*
 id does not mean your read is stale; it means your goal was superseded, **or that the client

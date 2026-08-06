@@ -303,10 +303,22 @@ pub struct Walker {
     /// goto as already wedged.
     pub exec:             crate::steering::RouteExecution,
     pub exec_goal_id:     u64,
-    /// When [`Walker::exec`] last flipped from advancing to stalled (`None` while advancing) — the
-    /// source of `nav_stall.quiet_ms`. Measured, not derived from `quiet_ticks` × a nominal tick:
-    /// the nav tick is a floor, not a guarantee.
-    pub stall_since:      Option<std::time::Instant>,
+    /// **When the walker last made progress on this goal** — the origin `nav_stall.quiet_ms` is
+    /// measured from. `None` only before the first drive tick of a journey.
+    ///
+    /// It is the origin of the SAME window [`Walker::exec`]`.quiet_ticks()` counts, and that is the
+    /// fix for #851 review round 1, B2c. It used to be the moment the verdict FLIPPED, which made
+    /// `quiet_ms` read `0` on the very tick a stall was first announced and left it a uniform
+    /// [`crate::steering::NAV_STUCK_TICKS`]-tick (~3 s) understatement of how long the body had
+    /// actually been going nowhere — while sitting in the payload next to a `quiet_ticks` that
+    /// counted the whole window. Two fields with the same name-stem measuring two different windows
+    /// is a trap an agent cannot detect from the payload, and erring towards "wait longer" does not
+    /// make an understatement true. Both fields now measure one window: `quiet_ticks` is the
+    /// evidence count, this is its wall clock.
+    ///
+    /// Measured, never derived from `quiet_ticks` × a nominal tick: the 150 ms nav tick is a floor,
+    /// not a guarantee, so under load the real elapsed time runs longer than the arithmetic.
+    pub last_progress_at: Option<std::time::Instant>,
     /// The currently committed route and the per-route facts published beside it. `None` when no
     /// route is committed. See [`CommittedFacts`].
     pub committed:        Option<CommittedFacts>,
@@ -396,7 +408,7 @@ impl Walker {
             nav_progress_at: std::time::Instant::now(),
             exec: crate::steering::RouteExecution::fresh(),
             exec_goal_id: 0,
-            stall_since: None,
+            last_progress_at: None,
             committed: None,
             backoff_ticks: 0,
             backoff_dir: [0.0, 0.0],
@@ -579,20 +591,17 @@ impl Walker {
         // re-gating it is currently fully GREEN — every route now clears `goal`, so an already-`idle`
         // row has nothing left to clear. This guards the shape, not a scenario I can exhibit.)
         if state == "idle" { s.retire_to_idle(reason); return; }
-        let reason = reason.map(str::to_string);
-        if s.state != state || s.reason != reason {
-            s.state = state.to_string();
-            s.reason = reason;
+        if s.state != state || s.reason.as_deref() != reason {
             // A state transition retires the previous route's per-instance facts (#378 Phase 2,
-            // #343 discipline) — see the pre-extraction doc comment for the full rationale.
-            s.blocked_goal = None;
-            s.blocked_frontier = None;
-            s.tier = None;
-            // #851: `stall` is a fact about the route being executed under the state we are
-            // LEAVING. It is re-asserted immediately by `publish_drive_state` when the new state is
-            // still a driving one; anywhere else — `blocked`, `arrived`, `planning`, `zone_loading`
-            // — it must go, or a terminal row would carry a live-wedge payload beside it.
-            s.stall = None;
+            // #343 discipline) — see the pre-extraction doc comment for the full rationale, and
+            // `NavStatus::transition_within_goal` for WHICH facts and why `goal`/`local` survive.
+            //
+            // #851 review round 1, B1: this used to be a flat assignment list, the third of three
+            // and the last one with no exhaustiveness. `stall` was remembered here and forgotten in
+            // `CommandState::stamp_new_goal`; the remedy is not to remember harder, it is that all
+            // three routes out of a state now destructure `NavStatus` with no `..`, so the next
+            // field added is force-decided on every one of them (E0027).
+            s.transition_within_goal(state, reason);
         }
     }
 
@@ -602,7 +611,11 @@ impl Walker {
     pub fn reset_drive_state(&mut self) {
         self.exec = crate::steering::RouteExecution::fresh();
         self.exec_goal_id = self.nav.nav_state.lock().unwrap().goal_id;
-        self.stall_since = None;
+        // The quiet window starts NOW, not at `None`: a journey that never progresses at all still
+        // owes an honest "how long has the body been going nowhere", and its origin is the moment
+        // the journey began. (Leaving it `None` would publish `quiet_ms: 0` for exactly that walker
+        // — the worst-wedged one — which is the understatement B2c is about, re-introduced.)
+        self.last_progress_at = Some(std::time::Instant::now());
         self.committed = None;
     }
 
@@ -619,18 +632,21 @@ impl Walker {
     /// forgotten reset would report a freshly-accepted goto as already wedged — a lie in the
     /// pessimistic direction, but still a lie.
     fn tick_drive_state(&mut self, progressed: bool) -> crate::steering::RouteExecution {
+        let now = std::time::Instant::now();
         let goal_id = self.nav.nav_state.lock().unwrap().goal_id;
         if goal_id != self.exec_goal_id {
             self.exec = crate::steering::RouteExecution::fresh();
             self.exec_goal_id = goal_id;
-            self.stall_since = None;
+            self.last_progress_at = Some(now); // a new journey's quiet window starts here
         }
-        let was_stalled = self.exec.is_stalled();
         self.exec = self.exec.tick(progressed, self.nav_repaths);
-        match (was_stalled, self.exec.is_stalled()) {
-            (false, true) => self.stall_since = Some(std::time::Instant::now()),
-            (_, false)    => self.stall_since = None,
-            (true, true)  => {}
+        // [`Walker::last_progress_at`] is the ORIGIN of the window `quiet_ticks` counts — the last
+        // tick that reported progress — not the moment the verdict flipped (#851 review round 1,
+        // B2c). `tick` resets `quiet_ticks` to 0 on exactly the ticks that progressed, so this reads
+        // the machine's own answer rather than re-deriving `progressed`. `is_none()` seeds a journey
+        // whose very first drive tick is already quiet.
+        if self.exec.quiet_ticks() == 0 || self.last_progress_at.is_none() {
+            self.last_progress_at = Some(now);
         }
         self.exec
     }
@@ -666,7 +682,9 @@ impl Walker {
             crate::steering::RouteExecution::Stalled { quiet_ticks, repaths } =>
                 Some(eqoxide_ipc::NavStall {
                     quiet_ticks,
-                    quiet_ms: self.stall_since.map_or(0, |t| t.elapsed().as_millis() as u64),
+                    // Measured over the SAME window `quiet_ticks` counts — since the walker last
+                    // made progress, not since the verdict flipped (#851 review round 1, B2c).
+                    quiet_ms: self.last_progress_at.map_or(0, |t| t.elapsed().as_millis() as u64),
                     repaths,
                     route: facts.route.as_str(),
                 }),
@@ -1813,6 +1831,14 @@ impl Walker {
                 }
                 *self.nav.goto_target.lock().unwrap() = None;
                 *self.nav_intent.lock().unwrap() = None; // stop driving the controller
+                // #851 review round 1, N3 — `reset_drive_state`'s own doc names "a terminated
+                // journey", and ARRIVAL is the one terminal route that was not calling it. The
+                // published row was already honest (the word change above clears `nav_stall`), so
+                // this was latent rather than live; what it left standing was the WALKER-side
+                // `exec`/`last_progress_at`/`committed`, i.e. a stalled verdict and a route for a
+                // journey that ended in success. `stop_nav` (the terminal failure route) has always
+                // done this; the two terminal routes now agree.
+                self.reset_drive_state();
                 gs.player_heading = eq_heading(gdx, gdy);
                 self.publish_debug(Self::known_pos(gs), None);
                 return;
@@ -2156,9 +2182,16 @@ mod tests {
     /// `eqoxide-renderer` can all lock and write `state` (they name the field; being unable to name
     /// a *type* is not being unable to reach a *state*). At the time of writing, every such write in
     /// those crates is in `#[cfg(test)]` code — checked by grep, not by this test, and nothing keeps
-    /// it that way. The runtime backstop for both gaps is the `debug_assert!` in `drive_walk`, which
-    /// re-reads the PUBLISHED row each tick and fires if a stalled verdict ever coexists with an
-    /// unqualified word, whatever wrote it.
+    /// it that way. The backstop for both gaps is the `debug_assert!` in `drive_walk`, which re-reads
+    /// the PUBLISHED row each tick and fires if a stalled verdict ever coexists with an unqualified
+    /// word, whatever wrote it — **a TEST-TIME instrument, not a runtime one** (#851 review round 1,
+    /// N1). `debug_assert!` compiles out under `--release` and this workspace has no
+    /// `[profile.release]` overriding `debug-assertions = false`; the reviewer confirmed by string-
+    /// searching the shipped binary (ABSENT) against a debug test binary (PRESENT). So outside tests
+    /// these two gaps have no enforcement at all — not weaker enforcement — and this convention is
+    /// what stands between them and a regression. The same reading `NavStatus::retire_to_idle`'s doc
+    /// and `a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725` already
+    /// record for the other `debug_assert!`s on this row.
     #[test]
     fn the_driving_nav_state_word_is_only_ever_written_through_the_verdict_851() {
         const SRC: &str = include_str!("walker.rs");
@@ -4814,6 +4847,46 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
         assert!(checked > NAV_STUCK_TICKS,
             "reach control: only {checked} ticks were checked, which is inside the {NAV_STUCK_TICKS}\
              -tick threshold — this control never reached the region it claims to cover");
+    }
+
+    /// **`quiet_ms` measures the window `quiet_ticks` counts — not the window since the verdict
+    /// flipped (#851 review round 1, B2c).**
+    ///
+    /// The old origin was the flip, so the first `navigating_stalled` an agent ever saw carried
+    /// `quiet_ms: 0` beside `quiet_ticks: 20` — a uniform [`NAV_STUCK_TICKS`]-tick (~3 s)
+    /// understatement of how long the body had been going nowhere, in the direction that makes an
+    /// agent wait longer. Erring safely does not make a number true, and the payload gives an agent
+    /// no way to detect the offset.
+    ///
+    /// Unit ticks run microseconds apart, so a real ~3 s figure is not observable here. What IS
+    /// observable is the ORIGIN: park 60 ms of wall clock inside the quiet window, before the tick
+    /// that flips the verdict, and the honest reading must include it.
+    ///
+    /// Mutation check: restore the old origin (`Some(Instant::now())` when the verdict flips, `None`
+    /// otherwise) → RED here, `quiet_ms` reads ~0. Delete the `last_progress_at` seed from
+    /// `reset_drive_state` → also RED (the `is_none()` seed in `tick_drive_state` then stamps the
+    /// origin one tick INTO the quiet window instead of at the journey's start… and this test's
+    /// sleep is before that tick, so the 60 ms is lost).
+    #[test]
+    fn the_stall_clock_measures_the_whole_quiet_window_not_just_since_the_verdict_851() {
+        let (mut w, nav, mut gs, goal) = stalled_walker_fixture();
+        // Every tick below is quiet, so the whole loop is inside the window `quiet_ticks` counts.
+        for _ in 0..(NAV_STUCK_TICKS - 1) { w.drive_walk(&mut gs, goal); }
+        assert_eq!(nav.nav_state.lock().unwrap().state, "navigating",
+            "PREMISE: the verdict has NOT flipped yet, so the sleep below lands strictly inside the \
+             detection window the old origin excluded");
+        const PARKED: u64 = 60;
+        std::thread::sleep(std::time::Duration::from_millis(PARKED));
+        w.drive_walk(&mut gs, goal); // …the tick that flips it
+
+        let s = nav.nav_state.lock().unwrap();
+        assert_eq!(s.state, "navigating_stalled", "PREMISE: the verdict flipped on this tick");
+        let stall = s.stall.expect("the stalled state carries its calibration");
+        assert!(stall.quiet_ms >= PARKED,
+            "#851 B2c: `quiet_ms` reported {} ms for a body that had already been going nowhere for \
+             at least {PARKED} ms when the verdict flipped. It must measure the same window \
+             `quiet_ticks` ({}) counts — since the walker last made progress — not since the flip.",
+            stall.quiet_ms, stall.quiet_ticks);
     }
 
     /// **A NEW goal starts clean.** The verdict is keyed on `NavStatus::goal_id`, so a stall latched

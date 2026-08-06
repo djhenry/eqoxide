@@ -755,8 +755,14 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     }));
     // #851 — the calibration data behind `nav_state: "navigating_stalled"`. `null` whenever the
     // walker is not stalled, so a healthy walk says nothing here, exactly like `nav_local` above.
-    // The pair is written from ONE verdict in ONE call (`Walker::publish_drive_state`), so the word
-    // and this payload cannot disagree; an agent may read either.
+    // The pair is written from ONE verdict in ONE call (`Walker::publish_drive_state`), under one
+    // lock hold, so the word and this payload cannot disagree; an agent may read either.
+    //
+    // That covers the walker's own publication. The OTHER two writers of `state` are retirements —
+    // `NavStatus::retire_to_idle` and `NavStatus::stamp_fresh_goal` — and neither can leave this
+    // payload behind, because all three routes out of a state destructure `NavStatus` exhaustively
+    // and clear it (#851 review round 1, B1: `stamp_fresh_goal` did not exist then, and the flat
+    // list it replaced published the dead goal's `nav_stall` beside the next goal's `pending`).
     let nav_stall = nav.stall.map(|s| serde_json::json!({
         "quiet_ticks": s.quiet_ticks,
         "quiet_ms":    s.quiet_ms,
@@ -4392,12 +4398,19 @@ mod tests {
             "#851: a walker that is executing its route has no stall to disclose — a non-null here \
              would make the field noise an agent learns to ignore");
 
-        // What `Walker::publish_drive_state` writes the moment the verdict flips.
+        // What `Walker::publish_drive_state` writes once the verdict has flipped.
+        //
+        // The pair is REACHABLE, and that is load bearing (#851 review round 1, B2a). The earlier
+        // fixture said `quiet_ticks: 34, quiet_ms: 5100` — exactly `34 × 150`, the one arithmetic
+        // `docs/http-api.md` says never to do — and the implementation cannot produce it, because
+        // `quiet_ms` is a measured wall clock over the window `quiet_ticks` counts and the 150 ms
+        // nav tick is a floor. So the "pin" pinned a row that could not occur. 34 ticks in 5310 ms
+        // is a tick running ~6% slow, which is an ordinary loaded frame.
         {
             let mut s = state.nav.nav_state.lock().unwrap();
             s.state = "navigating_stalled".into();
             s.stall = Some(eqoxide_ipc::NavStall {
-                quiet_ticks: 34, quiet_ms: 5100, repaths: 2, route: "complete",
+                quiet_ticks: 34, quiet_ms: 5310, repaths: 2, route: "complete",
             });
         }
         let v = debug_json(state).await;
@@ -4406,7 +4419,7 @@ mod tests {
             "#851: the evidence count must reach the reader — `navigating_stalled` on its own says \
              THAT the walker is stuck, not for how long, and 3 s of stall reads very differently \
              from 30 s");
-        assert_eq!(v["nav_stall"]["quiet_ms"], serde_json::json!(5100));
+        assert_eq!(v["nav_stall"]["quiet_ms"], serde_json::json!(5310));
         assert_eq!(v["nav_stall"]["repaths"], serde_json::json!(2),
             "the re-path count is how an agent tells a stall that is about to recover from one \
              approaching the 8-attempt give-up");

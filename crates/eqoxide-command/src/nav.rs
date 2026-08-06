@@ -154,29 +154,30 @@ impl CommandState {
         let mut s = self.nav.nav_state.lock().unwrap();
         s.goal_id += 1;
         // #732 review round 1, B1 — `stopped` and `goto_superseded` are two of the six documented
-        // routes to `idle`, and they used to reach it through the flat assignment list below. That
+        // routes to `idle`, and they used to reach it through a flat assignment list. That kind of
         // list has no exhaustiveness: a field added to `NavStatus` is force-decided in
         // `retire_to_idle` (E0027) and was SILENTLY FORGOTTEN here, so the guard #732 installs would
         // have re-opened #732's own defect shape on the next per-goal field added. Measured with a
         // throwaway `probe_route_len` field: E0027 in `eqoxide-ipc`, `eqoxide-command` compiled
         // clean, and `request_stop` published the field beside `state: "idle"`.
         //
-        // Behaviour-identical: `retire_to_idle` writes exactly what this list writes for `idle`, and
-        // both `idle` call sites already pass `goal: None`. (#766 removed the last difference — the
-        // explicit `s.local = None;` that used to sit here because `retire_to_idle` kept `local`.
-        // `retire_to_idle` now retires `local` itself, so keeping the line would only mean two
-        // writers for one field and a comment that has to explain the overlap.)
+        // #851 review round 1, B1 — and then that is EXACTLY what happened, on the other branch.
+        // #851 added `stall` to `NavStatus`, decided it in `retire_to_idle` where the compiler
+        // forced a decision, and missed the non-idle flat list that used to stand below, where
+        // nothing did: a re-issued goal published `pending` beside the DEAD goal's `nav_stall`.
+        // Adding `s.stall = None;` would have closed the field and left the shape open, so the
+        // non-idle route now has the same E0027 net — `NavStatus::stamp_fresh_goal`. BOTH branches
+        // are exhaustive writers now, which is what the comment above was asking for.
+        //
+        // Behaviour-identical on both branches: each helper writes exactly what its list wrote, and
+        // both `idle` call sites already pass `goal: None`. (#766 removed the last difference on the
+        // `idle` side — the explicit `s.local = None;` that used to sit here because
+        // `retire_to_idle` kept `local`.)
         if new_state == "idle" {
             s.retire_to_idle(reason);
             return s.goal_id;
         }
-        s.state = new_state.to_string();
-        s.reason = reason.map(str::to_string);
-        s.goal = goal.map(|(x, y, z)| [x, y, z]);
-        s.blocked_goal = None;
-        s.blocked_frontier = None;
-        s.tier = None;
-        s.local = None;
+        s.stamp_fresh_goal(new_state, reason, goal.map(|(x, y, z)| [x, y, z]));
         s.goal_id
     }
 
@@ -758,5 +759,81 @@ mod tests {
              about a row nothing retired");
         assert_eq!(s.local, None,
             "#766: the sixth route to `idle` retires the fine verdict like the other five");
+    }
+
+    /// **#851 review round 1, B1 (agent-honesty): a NEW goal must never inherit the previous goal's
+    /// `nav_stall`.**
+    ///
+    /// Three tracked sites state the same universal — `docs/http-api.md` ("you will never see one
+    /// without the other"), `NavStatus::stall`'s rustdoc, and the `#851` comment in
+    /// `eqoxide-http/src/observe.rs`. The walker keeps it: its verdict is keyed on `goal_id`, and
+    /// `write_nav_state_locked` clears the payload on the word change. The COMMAND side did not.
+    /// `stamp_new_goal`'s non-idle branch cleared `tier` and `local` and left `stall` standing, so
+    /// this sequence published a well-formed, confident, false calibration block for a route that
+    /// did not exist yet:
+    ///
+    ///   1. the walker wedges → `navigating_stalled` + `nav_stall { quiet_ticks: 87, … }`;
+    ///   2. the agent does what `docs/http-api.md` tells it to and re-issues (or `/zone_cross`es
+    ///      out, or follows something else);
+    ///   3. `GET /v1/observe/debug` → `nav_state: "pending"` **with the dead goal's `nav_stall`**.
+    ///
+    /// That is #851's own failure shape one goal later, in the false-alarm direction, and it was
+    /// newly reachable because #851 is what added the field.
+    ///
+    /// **The fix under test is the E0027 net, not the clearing line.** `s.stall = None;` would make
+    /// this test green and leave the next per-goal field to be lost identically — which is what the
+    /// `#732` comment above `stamp_new_goal`'s branch had already argued, after measuring the same
+    /// loss once. Both branches now delegate to an exhaustive destructure of `NavStatus`
+    /// (`retire_to_idle` / `stamp_fresh_goal`), so a field added to that struct is force-decided on
+    /// every route out of a goal. This test pins the behaviour; the compiler pins the shape.
+    ///
+    /// **Mutation checks:** replace the `s.stamp_fresh_goal(…)` call with the old flat list minus
+    /// `stall` → all three cases RED here. Add a field to `NavStatus` without touching
+    /// `stamp_fresh_goal` → `error[E0027]`, this crate does not build at all.
+    #[test]
+    fn a_new_goal_never_inherits_the_previous_goals_stall_payload_851() {
+        let wedged = || eqoxide_ipc::NavStall {
+            quiet_ticks: 87, quiet_ms: 13_050, repaths: 7, route: "complete",
+        };
+        for (label, act) in [
+            ("goto",       Box::new(|cs: &CommandState| { cs.request_goto((10.0, 20.0, 30.0)); })
+                               as Box<dyn Fn(&CommandState)>),
+            ("follow",     Box::new(|cs: &CommandState| { cs.request_follow("Guard".into(), (1.0, 2.0, 3.0)); })
+                               as Box<dyn Fn(&CommandState)>),
+            ("zone_cross", Box::new(|cs: &CommandState| { cs.request_zone_cross(30); })
+                               as Box<dyn Fn(&CommandState)>),
+        ] {
+            let cs = CommandState::default();
+            // The wedged goal. `request_goto` FIRST, then plant — the fresh-goal stamp clears the
+            // payload, so planting before it would meet the post-condition without running the code
+            // under test (the same ordering hazard as the #766 test above).
+            cs.request_goto((2216.0, 579.0, -113.0));
+            {
+                let mut s = cs.nav.nav_state.lock().unwrap();
+                s.state = "navigating_stalled".into();
+                s.stall = Some(wedged());
+                s.tier  = Some("preferred");
+            }
+            let wedged_id = cs.nav.nav_state.lock().unwrap().goal_id;
+            assert_eq!(cs.nav.nav_state.lock().unwrap().stall, Some(wedged()),
+                "{label}: PREMISE — the wedge really is published, so the assertion below cannot \
+                 pass on a `NavStatus::default()` row");
+
+            act(&cs); // the agent re-issues, exactly as the docs advise
+
+            let s = cs.nav.nav_state.lock().unwrap();
+            assert!(s.goal_id > wedged_id,
+                "{label}: PREMISE — a fresh goal identity was stamped (#349)");
+            assert_eq!(s.state, "pending", "{label}: the new goal is in flight, not wedged");
+            assert_eq!(s.stall, None,
+                "{label}: #851 — `nav_stall` is the calibration for the route being executed NOW. \
+                 Beside `pending` under a NEW `nav_goal_id` it is a confident, well-formed answer \
+                 about a route that does not exist yet, and an agent following this client's own \
+                 documented advice (re-issue if the stall persists) reads it as the new goal's.");
+            assert_eq!(s.tier, None,
+                "{label}: and the per-route tier goes with it — same lifetime, same argument. This \
+                 half already passed before the fix, which is what showed the two fields had drifted \
+                 apart in a list nothing checked for exhaustiveness.");
+        }
     }
 }

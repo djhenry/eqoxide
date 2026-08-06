@@ -121,7 +121,17 @@ impl CommittedRoute {
 /// **The walker's verdict on whether the BODY is executing the committed route (#851).**
 ///
 /// This is the type that makes "reports progress while going nowhere" unrepresentable at the
-/// publication site. Before #851 the walker's stall knowledge lived in three loose `u32`s
+/// publication site — **for values that came out of [`RouteExecution::tick`]**, which is the
+/// precise claim and worth stating as such (#851 review round 1, N2). The variants carry public
+/// fields, so `RouteExecution::Stalled { quiet_ticks: 0, repaths: 0 }` and
+/// `Advancing { quiet_ticks: 5_000 }` are both *values* — nonsense ones, contradicting the field
+/// docs below, that the machine cannot reach but the syntax can write. `#[non_exhaustive]` on each
+/// variant confines that to THIS crate (the idiom `zone_assets::ZoneAssetState` uses), and inside
+/// it the only writer of `Walker::exec` is `Walker::tick_drive_state`. So: unreachable in
+/// production, unconstructible downstream, constructible in this crate's own tests — which is where
+/// the fixtures that drive the machine to a named state have to live anyway.
+///
+/// Before #851 the walker's stall knowledge lived in three loose `u32`s
 /// (`stuck_ticks`, `nav_repaths`, `backoff_ticks`), none of which was published anywhere, and the
 /// published `nav_state` was a `&str` literal written once at plan commit. So the whole
 /// stall/back-off/re-path recovery window — ~32 s of it, measured live at the qcat pocket — read as
@@ -138,9 +148,11 @@ impl CommittedRoute {
 pub enum RouteExecution {
     /// The body is executing the route: it has made progress within the last `quiet_ticks` ticks,
     /// and `quiet_ticks < NAV_STUCK_TICKS`.
+    #[non_exhaustive]
     Advancing { quiet_ticks: u32 },
     /// The body has STOPPED executing the route: no progress for `quiet_ticks` consecutive ticks
     /// (`>= NAV_STUCK_TICKS`), with `repaths` stall-recovery re-paths run in the meantime.
+    #[non_exhaustive]
     Stalled { quiet_ticks: u32, repaths: u32 },
 }
 
@@ -3574,12 +3586,24 @@ mod tests {
     /// that are both *checked below* rather than merely argued:
     ///   1. [`driving_nav_state`] never reads `quiet_ticks` — checked by the first assertion in the
     ///      body below (its condition is bound to a named `let` that says so).
-    ///   2. [`RouteExecution::tick`] reads it only through `>= NAV_STUCK_TICKS`, and every `Stalled`
-    ///      state already satisfies that — checked by the second assertion, the same way.
-    ///      (`Advancing` can never hold `quiet_ticks >= NAV_STUCK_TICKS` by construction, so the cap
-    ///      is a no-op on that variant — asserted in the loop.)
+    ///   2. two states the cap identifies step to the SAME capped successor, for every input —
+    ///      checked by the second assertion, as an equality of successors and not merely of
+    ///      `.is_stalled()`. That distinction is the whole premise: successor equality is what a
+    ///      bisimulation needs, and the parity form this test carried first was measurably weaker —
+    ///      a `tick` branching on the exact `quiet_ticks` into `repaths` breaks the quotient and
+    ///      leaves parity, and the entire model check, green (#851 review round 1). Do not weaken it
+    ///      back. (`Advancing` can never hold `quiet_ticks >= NAV_STUCK_TICKS` by construction, so
+    ///      the cap is a no-op on that variant — asserted inside `cap` itself.)
     /// So two states identified by the cap have identical futures and identical published words, and
     /// covering the quotient covers the infinite original.
+    ///
+    /// **What this test does and does not establish.** It establishes the invariant over the
+    /// reachable product of the verdict machine and its oracle: no input sequence, of any length,
+    /// drives [`driving_nav_state`] to a progress word while the body has been quiet for
+    /// [`NAV_STUCK_TICKS`] ticks. It says nothing about whether the WALKER feeds this machine the
+    /// right `progressed` signal, nor about what any other writer of `NavStatus::state` publishes —
+    /// those are `walker.rs`'s tests and the source scan
+    /// `the_driving_nav_state_word_is_only_ever_written_through_the_verdict_851`.
     ///
     /// **Three controls, so a vacuously-green run is impossible.** REACH: the search must visit the
     /// cap. NON-DEGENERACY: all three driving words must be produced somewhere in the reachable set
@@ -3601,28 +3625,8 @@ mod tests {
         use std::collections::HashSet;
         let routes = [CommittedRoute::Complete, CommittedRoute::Partial];
 
-        // ── The two bisimulation premises, CHECKED (see the doc above) ────────────────────────
-        // 1. the published word does not depend on `quiet_ticks`…
-        for &r in &routes {
-            let word_ignores_quiet_ticks = (NAV_STUCK_TICKS..NAV_STUCK_TICKS + 50).all(|q|
-                driving_nav_state(r, RouteExecution::Stalled { quiet_ticks: q, repaths: 3 })
-                    == driving_nav_state(r, RouteExecution::Stalled { quiet_ticks: NAV_STUCK_TICKS, repaths: 3 }));
-            assert!(word_ignores_quiet_ticks,
-                "the quotient below is unsound: `driving_nav_state` reads `quiet_ticks`");
-        }
-        // 2. …and neither does the TRANSITION, once stalled.
-        for q in NAV_STUCK_TICKS..NAV_STUCK_TICKS + 50 {
-            for progressed in [false, true] {
-                let tick_ignores_quiet_ticks_once_stalled =
-                    RouteExecution::Stalled { quiet_ticks: q, repaths: 3 }.tick(progressed, 3).is_stalled()
-                    == RouteExecution::Stalled { quiet_ticks: NAV_STUCK_TICKS, repaths: 3 }
-                        .tick(progressed, 3).is_stalled();
-                assert!(tick_ignores_quiet_ticks_once_stalled,
-                    "the quotient below is unsound: `tick` branches on the exact `quiet_ticks` ({q})");
-            }
-        }
-
-        // Cap `quiet_ticks` at the threshold — sound by the two checks above.
+        // Cap `quiet_ticks` at the threshold. Sound by the two premises checked immediately below —
+        // which are stated in terms of this closure, hence its position above them.
         let cap = |e: RouteExecution| match e {
             RouteExecution::Advancing { quiet_ticks } => {
                 assert!(quiet_ticks < NAV_STUCK_TICKS,
@@ -3632,14 +3636,47 @@ mod tests {
             RouteExecution::Stalled { quiet_ticks, repaths } =>
                 RouteExecution::Stalled { quiet_ticks: quiet_ticks.min(NAV_STUCK_TICKS), repaths },
         };
-        // The oracle saturates at the same place, for the same reason: past the threshold the
-        // invariant's antecedent is already true and cannot become false without a `progressed`.
-        let oracle_cap = NAV_STUCK_TICKS;
         // The input alphabet. `repaths` is modelled as {0, 1, 8} — never re-pathed, mid-recovery,
         // and at the walker's give-up cap — because it is carried into the verdict, and a machine
         // that (wrongly) reset on a re-path must have a re-path to reset on.
         let inputs: Vec<(bool, u32)> = [false, true].iter()
             .flat_map(|&p| [0u32, 1, 8].iter().map(move |&r| (p, r))).collect();
+
+        // ── The two bisimulation premises, CHECKED (see the doc above) ────────────────────────
+        // 1. the published word does not depend on `quiet_ticks`…
+        for &r in &routes {
+            let word_ignores_quiet_ticks = (NAV_STUCK_TICKS..NAV_STUCK_TICKS + 50).all(|q|
+                driving_nav_state(r, RouteExecution::Stalled { quiet_ticks: q, repaths: 3 })
+                    == driving_nav_state(r, RouteExecution::Stalled { quiet_ticks: NAV_STUCK_TICKS, repaths: 3 }));
+            assert!(word_ignores_quiet_ticks,
+                "the quotient below is unsound: `driving_nav_state` reads `quiet_ticks`");
+        }
+        // 2. …and the TRANSITION, once stalled, lands two capped-identical states on the SAME capped
+        //    successor — for every input, not merely on the same `is_stalled()` answer.
+        //
+        //    Successor EQUALITY is what a bisimulation needs, and the first draft of this premise
+        //    compared `.is_stalled()` parity instead (#851 review round 1). That is strictly weaker,
+        //    and measurably so: a `tick` that branches on the exact `quiet_ticks` into any field the
+        //    parity check does not inspect breaks the quotient while satisfying the premise. The
+        //    reviewer measured it — make `tick` write `repaths: 999` when
+        //    `quiet_ticks == NAV_STUCK_TICKS` exactly, and the parity form of this premise, and the
+        //    whole model check with it, stayed GREEN (a different test killed that mutant). Under
+        //    the form below it is RED here, which is where a broken quotient belongs.
+        for q in NAV_STUCK_TICKS..NAV_STUCK_TICKS + 50 {
+            for (progressed, repaths) in inputs.iter().copied() {
+                let from_q   = cap(RouteExecution::Stalled { quiet_ticks: q, repaths: 3 }
+                                    .tick(progressed, repaths));
+                let from_cap = cap(RouteExecution::Stalled { quiet_ticks: NAV_STUCK_TICKS, repaths: 3 }
+                                    .tick(progressed, repaths));
+                assert_eq!(from_q, from_cap,
+                    "the quotient below is unsound: `tick` branches on the exact `quiet_ticks` ({q}) \
+                     — capped successors differ under (progressed={progressed}, repaths={repaths})");
+            }
+        }
+
+        // The oracle saturates at the same place as `cap`, for the same reason: past the threshold
+        // the invariant's antecedent is already true and cannot become false without a `progressed`.
+        let oracle_cap = NAV_STUCK_TICKS;
 
         let start = (RouteExecution::fresh(), 0u32);
         let mut seen: HashSet<(RouteExecution, u32)> = HashSet::new();
