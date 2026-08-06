@@ -2207,8 +2207,8 @@ mod cursor_resync_tests {
     /// round-trips for one edit.
     ///
     /// **Why the key is the line's TEXT and not its line number (#882 round 2, blocking).** The
-    /// list was keyed on `(file, absolute line)`. Two measurements, both re-derived rather than
-    /// argued, both over `crates/`, `tests/`, `src/` and `tools/`:
+    /// list was keyed on `(file, absolute line)`. Three measurements, all re-derived rather than
+    /// argued, all over `crates/`, `tests/`, `src/` and `tools/`:
     ///
     /// * **Backwards, over merged history.** Of the 159 offenders at `origin/main` (`749c932`),
     ///   121 sat at the same `file:line` five commits earlier, **28 carried byte-identical
@@ -2219,6 +2219,17 @@ mod cursor_resync_tests {
     ///   different line, across 7 files. Line keys: 30 entries to re-derive by hand, or a red
     ///   `main` for whichever of the two PRs merges second — with **no git conflict** to warn
     ///   anyone, since the two touch unrelated concerns. Text keys: **0**.
+    /// * **Observed, on this branch's own merge — not a constructed example.** Merging
+    ///   `origin/main` at `749c932` into this branch moved four offenders in
+    ///   `crates/eqoxide-core/src/game_state.rs` down ten lines (880/881/1331/1332 to
+    ///   890/891/1341/1342) with byte-identical text. Under line keys that routine merge is
+    ///   4 NEW and 4 DEAD — a red build, from a merge that changed no doc comment this list
+    ///   names. Under text keys the offender multiset is unchanged: **0 NEW, 0 DEAD**.
+    ///
+    /// A later merge of `origin/main` at `6ca5ab7` moved nothing and is **not** evidence either
+    /// way: all three files it touched are citation-corpus files held to zero offenders, so no
+    /// entry could have shifted under either keying. Recorded here so the 0/0 is not misread as
+    /// a third confirmation.
     ///
     /// Every one of those edits would be forced on an author who did nothing but insert a line
     /// somewhere above, and would arrive as a red `main` naming a file whose author did nothing
