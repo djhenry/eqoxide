@@ -2905,16 +2905,34 @@ mod tests {
         }).collect();
         zones.sort();
         assert!(!zones.is_empty(), "no baked zones at {dir:?}");
+        // #850: `zones.len()` (renamed `discovered` below) used to be computed, asserted
+        // non-empty, and never referenced again. The rollup line printed `t_zones` — the count of
+        // zones that survived BOTH of this loop's bare `continue`s — as though it were the corpus
+        // size, so a run where half the GLBs failed to load or produced an empty grid still printed
+        // a confident, uncaveated `zones=N/2` with nothing anywhere naming the other half. Every
+        // `continue` below now records WHY the zone was dropped instead of vanishing silently, and
+        // the closing assertion checks covered+dropped against `discovered` directly from the
+        // filesystem scan — not from anything the loop body decides — so a THIRD drop path added
+        // later without being wired into `dropped` fails loudly instead of quietly shrinking the
+        // denominator again.
+        let discovered = zones.len();
 
         let (mut t_zones, mut t_emb) = (0usize, 0u64);
         let (mut ch_dry, mut ch_chest, mut ch_wet) = (0u64, 0u64, 0u64);
         let (mut same_dry, mut same_chest, mut same_wet) = (0u64, 0u64, 0u64);
         let (mut none_legacy, mut none_new) = (0u64, 0u64);
         let mut drifters: Vec<(String, [f32; 3], [f32; 3])> = Vec::new();
+        let mut dropped: Vec<(String, &'static str)> = Vec::new();
         for name in &zones {
-            let Ok(za) = crate::assets::ZoneAssets::from_glb(&dir.join(format!("{name}.glb"))) else { continue };
+            let Ok(za) = crate::assets::ZoneAssets::from_glb(&dir.join(format!("{name}.glb"))) else {
+                dropped.push((name.clone(), "glb load failed"));
+                continue
+            };
             let mut col = Collision::build(&za, 32.0);
-            if col.cols == 0 { continue; }
+            if col.cols == 0 {
+                dropped.push((name.clone(), "empty collision grid (cols == 0)"));
+                continue;
+            }
             col.set_region_data(crate::region_map::RegionMap::try_load(&dir.join("maps/water"), name)
                 .map(std::sync::Arc::new));
             t_zones += 1;
@@ -2971,9 +2989,24 @@ mod tests {
             }
             println!("{name:>12}: embedded={zone_emb}");
         }
-        println!("\nzones={t_zones} embedded={t_emb}\n  changed: dry-body={ch_dry} wet-chest-dry-feet={ch_chest} \
+        println!("\nzones: discovered={discovered} covered={t_zones} dropped={} embedded={t_emb}\n  \
+                  dropped detail: {dropped:?}\n  \
+                  changed: dry-body={ch_dry} wet-chest-dry-feet={ch_chest} \
                   submerged={ch_wet}\n  unchanged: dry-body={same_dry} wet-chest-dry-feet={same_chest} \
-                  submerged={same_wet}\n  no recovery: legacy={none_legacy} new={none_new}");
+                  submerged={same_wet}\n  no recovery: legacy={none_legacy} new={none_new}",
+                  dropped.len());
+        // #850 reach control: every zone `read_dir` discovered must land in EXACTLY one of
+        // `covered` (t_zones) or `dropped` (named, with a reason) — never neither. This is not a
+        // restatement of the loop's own bookkeeping: `discovered` comes from the filesystem scan
+        // above, before either `continue` runs, so a drop path added later without a matching
+        // `dropped.push(...)` makes this fail instead of silently shrinking `t_zones` again. Forcing
+        // EVERY zone to drop (mutation-checked below) must report every zone as dropped, not zero —
+        // the corpus-emptying case a same-shaped scanner has silently passed before (#778).
+        assert_eq!(t_zones + dropped.len(), discovered,
+            "#850: covered ({t_zones}) + dropped ({}) must equal discovered ({discovered}) — a zone \
+             fell through neither bucket, which means a drop path in this loop is not wired into \
+             `dropped` and the corpus is silently smaller than its own rollup line says",
+            dropped.len());
         assert!(drifters.is_empty(),
             "a recovery must never itself be embedded — {} sample(s) were STILL MOVING and STILL \
              EMBEDDED after two input-free seconds (the review's finding-1 drift signature): {:?}",

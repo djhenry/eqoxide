@@ -499,15 +499,21 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 ///
 /// **What this does NOT claim:** a corpus loop that never constructs a `WaterRollup` is invisible to
 /// this type by construction (see above), and #839 audited only `collision.rs` and `walker_sim.rs`.
-/// `depenetration_corpus_over_baked_zones` in `src/movement.rs` is a baked-zone loop of exactly the
-/// same shape and is out of #839's scope, still unwired: two bare drops, no rollup. Deliberately
-/// cited by source text and not by line number — the first draft of this sentence carried
-/// `movement.rs:2610`/`:2612`, and a routine merge of `origin/main` moved both by two lines before
-/// this PR was even opened:
+/// `depenetration_corpus_over_baked_zones` in `src/movement.rs` was a baked-zone loop of exactly the
+/// same shape and was out of #839's scope; **#850 wired it**, but not through this type — it does not
+/// print a water number, so a `WaterRollup` would be the wrong tool (see `Four of the five #839
+/// converted` above: a corpus with no water number closes with a zero-valued `cover.add`, it does not
+/// skip the rollup entirely). Instead its own two bare `continue`s now push a
+/// `(zone, reason)` onto a local `dropped: Vec<_>`, and the closing line asserts
+/// `covered + dropped.len() == discovered` — `discovered` read from the filesystem scan before either
+/// drop can run, so a third drop path added later without a matching `dropped.push` fails loudly
+/// instead of quietly shrinking the printed count again, the same reach-control shape as
+/// `WaterRollup::is_complete` above. Cited by source text and not by line number, per the same lesson
+/// the previous draft of this paragraph recorded — a routine merge moved the old citations before the
+/// PR that added them was even opened:
 ///
 /// ```text
-/// grep -n 'from_glb(&dir.join(format!("{name}.glb"))) else { continue }' src/movement.rs
-/// grep -n 'if col.cols == 0 { continue; }'                              src/movement.rs
+/// grep -n 'dropped.push' src/movement.rs
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct WaterRollup {
