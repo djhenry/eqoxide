@@ -398,25 +398,37 @@ false hold; what it freezes is `held_secs`, and the paragraph above tells you ho
 (#724 round-3 review, N1 — this used to say "recomputes it from scratch every frame", which is not
 true of the load, zone-in or idle paths.)
 
-**Why an idle render loop cannot make `hold` describe a predicament you have left — and the one
-tick where `pos` is fresher than `hold` (#846).** The obvious attack is the one the table above
+**Why an idle render loop cannot leave `hold` describing a predicament you have left — and the two
+places the client withdraws it on purpose (#846).** The obvious attack is the one the table above
 tells you to use: a GM `#summon`. It arrives on the *network* thread, and the network thread is not
-the one that recomputes the hold. It still cannot leave you with a stale `hold`, for a structural
-reason rather than a lucky one: the movement controller is owned by the render thread, in a crate
-the network code cannot even name, so the network side has no way to move your body. All it can do
-is hand the new coordinates over and wait; the render frame that picks them up is the frame that
-clears the hold and recomputes. Adopting the summon and dropping the hold are the same frame, and
-the network side of that boundary is property-tested (`no_net_tick_can_free_or_manufacture_a_hold_846`).
+the one that recomputes the hold. It still cannot leave you with a stale `hold`. The movement
+controller is owned by the render thread, in a crate the network code cannot even name, so the
+network side has no way to move your body: all it can do is hand the new coordinates over and wait,
+and the render frame that picks them up is the frame that clears the hold and recomputes. Adopting
+the summon and dropping the hold are the same frame, and the network side of that boundary is
+property-tested (`no_net_tick_can_free_or_manufacture_a_hold_846`, plus
+`the_hold_mirror_tracks_the_render_thread_over_time_846` for the case where the render thread
+publishes a *different* answer, withdrawal included).
 
-Two honest caveats. **(a)** Nothing above bounds how *long* the render loop may idle before it picks
-the correction up. It is woken by any inbound state change, including the summon itself, so in
+Two places the client does clear `hold` from the network side, both deliberately and both in the
+"say less" direction — you may briefly get `null` where a hold is still in force, never a hold where
+there is none:
+
+- **A zone change.** A hold describes collision geometry, and a zone-in drops it. `hold` goes `null`
+  for the whole load rather than reporting a wedge in a zone you have left.
+- **The tick a server reposition is handed to the render thread.** For that tick `pos` is already
+  the server's new coordinates, so the client withdraws `hold` rather than pair fresh coordinates
+  with the predicament you were just lifted out of. (An earlier draft of this section described that
+  mismatch as a one-tick window you could poll inside. That was measured against a server that
+  asserts the correction once; against one that re-asserts it every tick while the render loop
+  idles, it recurred indefinitely. It is withdrawn now instead of bounded.)
+
+One honest caveat remains: nothing above bounds how *long* the render loop may idle before it picks
+a correction up. It is woken by any inbound state change, including the summon itself, so in
 practice this is tens of milliseconds — but that is a timing property of a render loop no test in
-this repo can reach, so treat it as a latency expectation and not as a promise. **(b)** For exactly
-one network tick after a server reposition, `pos` is the server's new coordinates while `hold` still
-describes where the controller is frozen. The following tick puts `pos` back to the controller's
-position, so the two agree again — but if you poll inside that window you will see a `hold` next to
-a `pos` it does not describe. If that matters to you, the `held_secs`-against-your-own-clock check
-above is what distinguishes a frozen controller from a live one.
+this repo can reach, so treat it as a latency expectation and not as a promise. If it matters to
+you, the `held_secs`-against-your-own-clock check above is what distinguishes a frozen controller
+from a live one.
 
 ### `afloat_stall` — this swimmer is being asked to swim and is going nowhere (#776/#801)
 

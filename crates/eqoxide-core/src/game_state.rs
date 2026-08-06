@@ -1030,18 +1030,43 @@ pub struct GameState {
     /// the body either and this holds its last computed value — the position beside it is stale in
     /// the same breath and by the same amount.
     ///
-    /// **One measured exception to that last clause (#846), because it was written as unqualified
-    /// and is not.** On the single tick where `stream_position` detects a server correction (a GM
-    /// `#summon`, a knockback, an anti-cheat snap), it hands the jump to the render thread through
-    /// `ipc::PosCorrection` and returns EARLY — so on that tick `player_x/y/z` are the SERVER's new
-    /// coordinates while this field is still the frozen controller's, and the pair is a fresh
-    /// position beside an old predicament. The next net tick's normal path writes the controller's
-    /// position back over `player_x/y/z`, so the pair is mutually consistent again and the window is
-    /// ONE net tick (~10 ms) wide, not "until the render loop wakes". Measured, and pinned by
-    /// `a_server_summon_while_the_render_loop_idles_moves_pos_for_one_tick_846` in `eqoxide-net`.
-    /// What the net thread cannot do — property-tested next to it by
-    /// `no_net_tick_can_free_or_manufacture_a_hold_846` — is edit this field: it may only mirror
-    /// what the render thread published, so it can neither free a held body nor invent a hold.
+    /// **Two measured exceptions to that last clause (#846), because it was written as unqualified
+    /// and is not.**
+    ///
+    /// 1. **A server correction.** On a tick where `stream_position` detects one (a GM `#summon`, a
+    ///    knockback, an anti-cheat snap), it hands the jump to the render thread through
+    ///    `ipc::PosCorrection` and returns EARLY, so `player_x/y/z` are already the SERVER's new
+    ///    coordinates while the controller is still frozen where it was. That branch therefore
+    ///    WITHDRAWS this field (and `player_afloat_stall`) rather than leave the pair as a fresh
+    ///    position beside an old predicament. The withdrawal is not the net thread inventing an
+    ///    answer: the correction it just handed over is consumed by `CharacterController::teleport`,
+    ///    which drops the hold and the afloat window as its first act, so `None` is the render
+    ///    thread's own next value, published one tick early. Pinned by
+    ///    `a_re_asserted_summon_never_pairs_a_fresh_pos_with_a_stale_hold_846` in `eqoxide-net`.
+    ///    (An earlier revision of this paragraph called the mismatch a ONE-tick, ~10 ms window. That
+    ///    was measured against a server asserting the correction once; against one that re-asserts
+    ///    it every tick while the render loop idles, it recurred on every other tick indefinitely —
+    ///    "until the render loop wakes" after all. The claim was wrong, not merely imprecise, so the
+    ///    branch was changed rather than the sentence.)
+    /// 2. **A zone-in.** [`GameState::begin_zone_in`] below clears this field on the net thread,
+    ///    because a hold describes collision geometry the zone-in has just dropped. That clear only
+    ///    works when it also reaches the `ControllerView` the mirror reads — see that method's doc
+    ///    and `eqoxide_ipc::ControllerSlots::begin_zone_in`.
+    ///
+    /// So the net thread CAN change this field, in exactly those two places, and in both it
+    /// WITHDRAWS. What it cannot do — property-tested by
+    /// `no_net_tick_can_free_or_manufacture_a_hold_846` in `eqoxide-net` — is put a hold here that
+    /// the render thread did not publish. That test freezes the view (an idle render loop, modelled
+    /// exactly) across a matrix of server repositions on both sides of the correction threshold;
+    /// `the_hold_mirror_tracks_the_render_thread_over_time_846` beside it varies the other axis,
+    /// the render thread republishing over time, so a mirror that latches and never withdraws goes
+    /// red rather than green.
+    ///
+    /// **What none of that bounds is how long the render loop may stay idle.** That coupling lives
+    /// in `app.rs`'s `poll_external` (a pending `pos_correction`, or any `GameState` change at all,
+    /// marks the loop active) and it is UNGUARDED: that call site needs a GPU and a window, and
+    /// neutering the condition was measured to leave the whole workspace green (#846). It is the
+    /// latency bound, not the honesty guarantee.
     ///
     /// This is a CLIENT-SIDE physics fact, not server truth. It deliberately does not live in
     /// [`WorldState`]: the server has no opinion about it and would happily agree with the position
@@ -1406,6 +1431,14 @@ impl GameState {
     /// coordinates (there is nothing else to set them to yet). What it DOES do is clear
     /// [`GameState::player_pos_known`] to `false`, so consumers know those stale numbers are not
     /// yet trustworthy for the new zone — see that field's doc.
+    ///
+    /// **Net-thread callers: call `eqoxide_ipc::ControllerSlots::begin_zone_in` instead of this
+    /// (#846 review B1).** The two controller disclosures cleared below are MIRRORED into this
+    /// struct from a `ControllerView` that lives above this crate, by an unconditional write on
+    /// every ~10 ms net tick. Clearing them here without invalidating that view was measured to
+    /// survive exactly one tick before the departed zone's hold came back — which is the opposite of
+    /// what the comments on those two lines claim to achieve. This function cannot reach the view
+    /// itself (`eqoxide-core` sits below `eqoxide-ipc`), so the pairing lives there.
     pub fn begin_zone_in(&mut self) {
         self.world.entities.clear();
         self.world.doors.clear();
@@ -1434,13 +1467,22 @@ impl GameState {
         // dropped. The controller stops being stepped while the new zone loads, so without this the
         // last mirrored value would sit here — a confident "you are wedged" about a zone we have
         // left — until the first frame after the new collision lands. Unknown, not false-positive.
+        //
+        // #846 review B1: THIS CLEAR IS NOT SUFFICIENT ON ITS OWN, and could not be — the value it
+        // is racing lives in `ControllerView`, in a crate that sits above this one.
+        // `ActionLoop::stream_position` mirrors that view into this field on every ~10 ms net tick,
+        // unconditionally, so a caller that clears here and nowhere else gets the departed zone's
+        // hold back on the very next tick (measured). Net-thread callers must go through
+        // `eqoxide_ipc::ControllerSlots::begin_zone_in`, which pairs this with the view clear.
         self.player_hold = None;
         // #776/#801: and the afloat stall, for the identical reason and with a sharper edge — a
         // stall names an ANCHOR, a specific position in the departed zone's coordinate frame that
         // the body failed to get away from. Carried across a crossing it would report a trapped
         // swimmer at a point in a zone we are no longer in. `clear_hold` on `app.rs`'s not-stepped
         // frames covers the case where the render loop keeps rendering through the load; this covers
-        // the case where it does not publish at all. Neither alone is sufficient.
+        // the case where it does not publish at all. Neither alone is sufficient — and, per the
+        // note above, this half only actually covers its case when paired with the `ControllerView`
+        // clear in `ControllerSlots::begin_zone_in` (#846 review B1 measured it not covering it).
         self.player_afloat_stall = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
@@ -2972,6 +3014,14 @@ pub(crate) mod tests {
     /// `clear_hold()` on frames that render without stepping drops the window on the render side and
     /// covers the case where the loop keeps rendering through the load; this covers the case where it
     /// does not publish at all. Neither alone is sufficient, which is why both exist.
+    ///
+    /// **#846 review B1 corrected the second half of that sentence, which was measurably false when
+    /// written.** This clear did NOT cover "the render loop does not publish at all": the mirror is
+    /// unconditional, so it restored the departed zone's value on the next net tick and the clear
+    /// survived about 10 ms. It covers that case now because the net-thread zone-in path goes
+    /// through `eqoxide_ipc::ControllerSlots::begin_zone_in`, which invalidates the `ControllerView`
+    /// as well — see `a_zone_in_clears_the_departed_zones_hold_for_good_846` in `eqoxide-net`, which
+    /// is the test that would have caught it (this one cannot: it never runs a mirror tick).
     ///
     /// The fixture uses a REAL matured stall from the real clock, not a hand-built value — the type
     /// has no public constructor, by design (see `crates/eqoxide-core/tests/afloat_unconstructible.rs`),

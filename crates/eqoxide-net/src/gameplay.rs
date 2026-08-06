@@ -618,6 +618,7 @@ pub async fn run_gameplay_phase(
                     &char_name,
                     &net_health,
                     &game_state_snapshot,
+                    action_loop.controller_slots(),
                     ZONE_ENTRY_HANDSHAKE_DEADLINE,
                 ).await;
                 if !zoned_in {
@@ -664,6 +665,7 @@ pub async fn run_gameplay_phase(
                         &char_name,
                         &net_health,
                         &game_state_snapshot,
+                        action_loop.controller_slots(),
                         ZONE_ENTRY_HANDSHAKE_DEADLINE,
                     ).await;
                     if !zoned_in {
@@ -978,12 +980,18 @@ async fn run_zone_entry_handshake(
     char_name:            &str,
     net_health:           &eqoxide_ipc::NetHealthShared,
     game_state_snapshot:  &eqoxide_ipc::GameStateSnapshot,
+    controller:           &eqoxide_ipc::ControllerSlots,
     deadline_dur:         Duration,
 ) -> bool {
     // Purge the previous zone's spawns/doors now, before OP_ReqClientSpawn asks for the new zone's
     // stream, and re-arm the once-per-zone-in OP_NewZone apply so the repeat OP_NewZone this
     // handshake provokes can't clear again mid-stream (#322). Also clears any prior zone_in_failed.
-    gs.begin_zone_in();
+    //
+    // `ControllerSlots::begin_zone_in`, NOT `gs.begin_zone_in()` (#846 review B1): the `GameState`
+    // clear alone does not survive one net tick, because `ActionLoop::stream_position` mirrors the
+    // controller view's disclosures into `gs` unconditionally and would put the departed zone's
+    // hold straight back. This clears the view too. See that method's doc.
+    controller.begin_zone_in(gs);
 
     // The one and ONLY OP_ZoneEntry for this session (see the fn doc — a second one self-kicks).
     // `poll_resend` retransmits this same datagram if it is lost in flight; nothing here ever issues a
@@ -1685,6 +1693,7 @@ mod zone_entry_handshake_publish_tests {
             // deadline is never reached (WEATHER/EXP_ZONE_IN withheld).
             run_zone_entry_handshake(
                 &mut stream, &mut net_rx, &mut gs, "Tester", &last_inbound_bg, &snapshot_bg,
+                &eqoxide_ipc::ControllerSlots::default(),
                 Duration::from_secs(30),
             ).await;
         });
@@ -1742,6 +1751,7 @@ mod zone_entry_handshake_publish_tests {
 
         let ok = run_zone_entry_handshake(
             &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
+            &eqoxide_ipc::ControllerSlots::default(),
             Duration::from_millis(3200), // > the 2.5s the KB warns a blind resend could fire at
         ).await;
 
@@ -1772,6 +1782,7 @@ mod zone_entry_handshake_publish_tests {
 
         let ok = run_zone_entry_handshake(
             &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
+            &eqoxide_ipc::ControllerSlots::default(),
             Duration::from_millis(200),  // deadline — never completes
         ).await;
 
@@ -1782,6 +1793,53 @@ mod zone_entry_handshake_publish_tests {
         let published = snapshot.load();
         assert!(published.world.zone_in_failed && published.world.zone_name.is_empty(),
             "the honest failure state must be PUBLISHED to the snapshot, not just held locally");
+    }
+
+    /// **#846 review B1 — the CALL SITE half.** The zone-entry handshake must clear the departed
+    /// zone's controller disclosures at the VIEW, not only in the `GameState` copy.
+    ///
+    /// `ActionLoop::stream_position` mirrors `ControllerView::disclosures()` into `gs` on every
+    /// ~10 ms net tick, unconditionally. A handshake that called `gs.begin_zone_in()` alone left the
+    /// departed zone's `Some(EmbeddedNoRecovery, ..)` sitting in the view, and the next tick put it
+    /// straight back — measured in round 1 of this PR's review: the clear survived about one net
+    /// tick, which is precisely the case (`the render loop publishes nothing at all across the
+    /// load`) that `GameState::begin_zone_in`'s own doc claims it covers. The behaviour that follows
+    /// from getting this wrong is pinned one layer down by
+    /// `a_zone_in_clears_the_departed_zones_hold_for_good_846` in `action_loop.rs`; this pins that
+    /// the production zone-entry path is wired to the whole clear rather than the half.
+    ///
+    /// Runs the handshake on its timeout path on purpose — it is the shortest route through the
+    /// function, and the clear happens at the very top, before OP_ZoneEntry goes out.
+    ///
+    /// MUTATION CHECK (#846, run independently, result in the PR body): revert the call at the top
+    /// of `run_zone_entry_handshake` to `gs.begin_zone_in();`, leaving everything else in place →
+    /// RED at the view assertion (the `gs` assertions still pass, which is exactly why this test
+    /// asserts the view).
+    #[tokio::test]
+    async fn a_zone_entry_handshake_clears_the_departed_zones_hold_at_the_view_846() {
+        use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason};
+
+        let (mut stream, _unused_rx) = test_stream(0, 0).await;
+        let (_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
+        let (mut gs, snapshot, health) = fresh_gs_snapshot();
+
+        // The render thread's last word before the zone change: wedged, in the zone we are leaving.
+        let controller = eqoxide_ipc::ControllerSlots::default();
+        let hold = ControllerHold { reason: ControllerHoldReason::EmbeddedNoRecovery, secs: 7.5 };
+        controller.controller_view.lock().unwrap().publish_disclosures((Some(hold), None));
+        gs.player_hold = Some(hold);
+
+        let _ = run_zone_entry_handshake(
+            &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
+            &controller,
+            Duration::from_millis(50), // deadline — never completes; the clear is at the top
+        ).await;
+
+        assert!(gs.player_hold.is_none(),
+            "the GameState half of the zone-in clear (`GameState::begin_zone_in`, #724)");
+        assert_eq!(controller.controller_view.lock().unwrap().disclosures(), (None, None),
+            "and the VIEW half — without it `stream_position`'s next tick mirrors the departed \
+             zone's hold straight back into the field an agent reads (#846 review B1)");
     }
 }
 

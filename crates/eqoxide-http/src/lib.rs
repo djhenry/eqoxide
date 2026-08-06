@@ -590,31 +590,52 @@ fn ser_error_kind<S: serde::Serializer>(
 ///   false hold. What it can do is freeze `held_secs`; see that field, which tells you how to
 ///   detect it.
 ///
-/// # Why the idle bullet is true, and what it costs to say so (#846)
+/// # Why the idle bullet is true, where it is NOT true, and at what tier each part rests (#846)
 ///
 /// #846 attacked that third bullet directly: a GM `#summon` lands on the **net** thread, so if the
 /// net thread could move the body out of the geometry it is wedged in while the render loop idled,
 /// the hold would keep being mirrored — a well-formed field an agent cannot tell from a fresh one,
 /// which is the #343 `connected: true` shape. The bullet asserted the conclusion and named no
 /// mechanism, and a reasoned-not-measured mechanism claim is the defect class this invariant exists
-/// for. So, the mechanism, in the order it actually carries the weight:
+/// for. Round 1 of #846's review then falsified the first mechanism this doc offered, in two
+/// independent places. What follows is what survived, each claim marked with what supports it.
 ///
-/// 1. **The net thread has no `CharacterController` to free.** The controller is a plain owned field
-///    of `App` in the root `eqoxide` crate; `eqoxide-net` cannot so much as name the type, because
-///    depending on the root crate would be a dependency cycle. This is not a convention — it is the
-///    crate graph.
-/// 2. **The only channel it has is a REQUEST.** `ActionLoop::stream_position` publishes a large
-///    server jump into `ipc::PosCorrection` — coordinates, not a controller handle — and returns.
-///    Only `app.rs`'s rendered frame consumes it, and it consumes it by calling
-///    `CharacterController::teleport`, which drops the hold; the `step` below that recomputes from
-///    scratch. So adopting the summon and clearing the hold are the same stepped frame, by
-///    construction.
-/// 3. That this is what the net side actually does is **property-tested**, not reasoned:
+/// 1. **The net thread has no `CharacterController` to free — TIER 1 (crate graph), and no wider
+///    than that sentence.** The controller is a plain owned field of `App` in the root `eqoxide`
+///    crate; `eqoxide-net` cannot so much as name the type, because depending on the root crate
+///    would be a dependency cycle. What that makes unrepresentable is precisely *"the net thread
+///    calls a method on the controller"*. It does **not** make *"the net side cannot make
+///    `player.hold` wrong"* unrepresentable, and reading it that way is what let B1 below through:
+///    the net side does not need the controller to write the published field.
+/// 2. **The channel for a reposition is a REQUEST, not a handle.** `ActionLoop::stream_position`
+///    publishes a large server jump into `ipc::PosCorrection` — coordinates, not a controller
+///    handle — and returns. Only `app.rs`'s rendered frame consumes it, and it consumes it by
+///    calling `CharacterController::teleport`, which drops the hold; the `step` below that
+///    recomputes from scratch. So adopting the summon and clearing the hold are the same stepped
+///    frame. **This is a statement about the correction path only** — it is not a claim that the
+///    net thread never touches the shared `ControllerView`, which would be false: `stream_position`
+///    take-and-clears `landed_fall_height` on that same view, and `ControllerView::publish_disclosures`
+///    is `pub` to `eqoxide-net`. Privacy makes the *pair* of disclosures impossible to update by
+///    halves; it does not make the view read-only to the net crate.
+/// 3. **What the net thread does with the hold is property-tested, not reasoned.**
 ///    `action_loop::tests::no_net_tick_can_free_or_manufacture_a_hold_846` freezes the
-///    `ControllerView` (an idle render loop, modelled exactly), then runs the net tick against a
-///    matrix of summons on both sides of the correction threshold and asserts the mirrored hold is
-///    the render thread's answer verbatim and the controller view is untouched. Three WRAP
-///    mutations were run against it and all three went red — see that test's doc.
+///    `ControllerView` (an idle render loop, modelled exactly), runs the net tick against a matrix
+///    of summons on both sides of the correction threshold, and asserts that whatever ends up in
+///    the field is the render thread's own answer or nothing — never a third value — and that
+///    `pos`, `heading` and both disclosures **on the view** are unchanged. (Those three; the test
+///    does not assert `landed_fall_height`, which the code legitimately takes.)
+///    `the_hold_mirror_tracks_the_render_thread_over_time_846` beside it varies the other axis, the
+///    one round 1 found missing: the render thread republishing over time, so a mirror that never
+///    withdraws goes red instead of green.
+///
+/// **The two places the net side CAN change this field, both deliberate:**
+///
+/// * **A zone-in withdraws it.** `GameState::begin_zone_in` runs on the net thread and clears the
+///   mirrored copy, because a hold describes collision geometry the zone-in has just dropped. Round
+///   1 measured that clear failing: the mirror is unconditional, so the departed zone's hold was
+///   back one net tick later — the clear had to reach the `ControllerView` too. It does now, through
+///   [`eqoxide_ipc::ControllerSlots::begin_zone_in`], which both net-thread zone-in sites call.
+/// * **A server correction withdraws it for the tick it is handed over.** See the residual below.
 ///
 /// **What is NOT guaranteed, stated plainly.** None of the above bounds *how long* the view can
 /// stay frozen. That bound is a timing coupling in `app.rs`'s `poll_external`: a pending
@@ -623,21 +644,24 @@ fn ser_error_kind<S: serde::Serializer>(
 /// renders. That is ~50 ms + a frame from the constants, **reasoned from those constants, not
 /// measured on a running client**, and it is **unguarded**: `app.rs`'s event loop needs a GPU and a
 /// window, and deleting that wake condition leaves the whole workspace green (measured on #846).
-/// Treat the wake as the latency bound, not as the honesty guarantee — the honesty guarantee is
-/// points 1–3.
+/// Treat the wake as the latency bound, not as the honesty guarantee.
 ///
-/// **And one measured residual.** On the single net tick that detects the correction,
-/// `stream_position` returns early, so `player.pos` is the SERVER's new coordinates while
-/// `player.hold` is still the frozen controller's: for that one tick the payload pairs a fresh
-/// position with an old predicament. The next tick writes the controller's position back and the
-/// pair is mutually consistent again, so the window is one net tick (~10 ms) wide rather than
-/// "until the render loop wakes". Measured and pinned by
-/// `action_loop::tests::a_server_summon_while_the_render_loop_idles_moves_pos_for_one_tick_846`.
+/// **And the residual, re-measured.** On a net tick that detects a server correction,
+/// `stream_position` returns early, so `player.pos` is the SERVER's new coordinates while the
+/// controller is still frozen where it was. Round 1 of this PR called the resulting mismatch "one
+/// net tick (~10 ms) wide"; re-measured against a server that RE-ASSERTS the correction each tick
+/// while the render loop idles, it recurred on every other tick indefinitely, so that bound was
+/// wrong. The branch now **withdraws** `hold` (and `afloat_stall`) on the tick it hands the
+/// correction over: `null`, not a predicament at coordinates the body was just lifted away from.
+/// That is not an invention — `CharacterController::teleport`, which consumes the correction, drops
+/// both as its first act, so it is the render thread's own next value published one tick early.
+/// Pinned by `action_loop::tests::a_re_asserted_summon_never_pairs_a_fresh_pos_with_a_stale_hold_846`.
+/// The residual that remains is a *missing* warning for those ticks, not a false one.
 ///
 /// So: a non-`null` `hold` is never stale-because-idle in the sense of describing a predicament the
-/// body has left — because nothing an idle render loop is idle *through* can free the body. It can
-/// be stale in *age* (`held_secs`), which is measurable from the caller, and for one net tick after
-/// a server reposition it can sit beside a `pos` fresher than itself.
+/// body has left — nothing an idle render loop is idle *through* can free the body, and the two net
+/// paths that can change the field both withdraw it rather than assert one. It can still be stale
+/// in *age* (`held_secs`), which is measurable from the caller.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlayerHoldView {
     /// `embedded_no_recovery` — embedded in geometry, push-out found nowhere to go, no recovery

@@ -100,7 +100,7 @@ pub async fn run_login_flow(
             tracing::warn!("EQ: retry {}/{}", attempt, max_retries);
             sleep(Duration::from_secs(3)).await;
         }
-        match run_login_phase(&config, &net_health).await {
+        match run_login_phase(&config, &net_health, &controller).await {
             // A server-rejected create can't succeed on retry — surface it and stop now so the
             // user sees the real reason instead of an endless "Login timed out" loop. (#6)
             Err(LoginError::Fatal(e)) => return Err(e),
@@ -161,6 +161,7 @@ fn record_login_liveness(net_health: &eqoxide_ipc::NetHealthShared, now: std::ti
 async fn run_login_phase(
     config: &LoginConfig,
     net_health: &eqoxide_ipc::NetHealthShared,
+    controller: &eqoxide_ipc::ControllerSlots,
 ) -> Result<(EqStream, UnboundedReceiver<AppPacket>, GameState, WorldCredentials), LoginError> {
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<AppPacket>();
 
@@ -209,7 +210,17 @@ async fn run_login_phase(
                         .map_err(|e| format!("Zone connection failed: {e}"))?;
                     // Purge stale spawns/doors before zone entry so the OP_ZoneSpawns/OP_SpawnDoor
                     // stream repopulates fresh, and re-arm the once-per-zone-in OP_NewZone apply (#322).
-                    gs.begin_zone_in();
+                    //
+                    // Through `ControllerSlots` for the same reason `run_zone_entry_handshake` does
+                    // (#846 review B1) — the disclosure clear has to reach the view the mirror reads,
+                    // or the next `stream_position` tick undoes it. Nothing has published into that
+                    // view yet on THIS path (the render thread only marks it `initialized` after
+                    // camera-init, which needs a `player_id` from a snapshot, and `run_login_phase`
+                    // is handed no snapshot slot to publish one — it is a parameterless-by-signature
+                    // fact, not a timing hope), so today this call is a no-op rather than a fix. It
+                    // is written the same way anyway: the asymmetry "one of the two zone-in sites
+                    // clears the view" is precisely the shape that let B1 through.
+                    controller.begin_zone_in(&mut gs);
                     proto.on_zone_connected(&mut stream);
                 }
             }
