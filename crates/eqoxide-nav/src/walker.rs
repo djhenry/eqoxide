@@ -775,11 +775,16 @@ impl Walker {
     /// cursor advance actually reaches a consumer in a way that misleads. It does, and that test is
     /// the execution-level proof.
     ///
-    /// The reachability predicate is a conjunction — chest-height LOS (walls) **and** a floor-column
-    /// probe (voids/drops), see [`crate::collision::Collision::ground_continuous`] — because the LOS ray alone cannot
+    /// The reachability predicate is a conjunction — chest-height LOS (walls) **and** a WIDTH-swept
+    /// floor-column probe (voids/drops, on three parallel lines, not one — #734 gap 2, see
+    /// [`crate::steering::ground_continuous_swept`], pinned by
+    /// `a_resync_must_not_cross_a_ridge_narrower_than_the_body`) — because the LOS ray alone cannot
     /// answer the question rule 2 asks. It is still only a necessary condition; the `stuck_i` raise
     /// above is what makes a wrong answer harmless to the honesty machinery rather than merely
-    /// unlikely.
+    /// unlikely. In particular the width sweep does not close #734 gap 1 — a hole narrower than
+    /// `Collision::ground_continuous`'s own probe spacing, in the direction of travel, still crosses
+    /// undetected; measured by `a_narrow_hole_between_probes_still_crosses_the_resync_undetected`
+    /// below, driven through this exact function.
     fn advance_cursor(&mut self, p: [f32; 3]) {
         while self.path_i + 2 < self.path.len() {
             let (a, b) = (self.path[self.path_i], self.path[self.path_i + 1]);
@@ -794,7 +799,8 @@ impl Walker {
         let resynced = {
             let coll = self.collision.read().unwrap();
             let reachable = |a: [f32; 3], b: [f32; 3]| coll.as_ref().map_or(true, |c| {
-                c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE) && c.ground_continuous(a, b)
+                c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE)
+                    && crate::steering::ground_continuous_swept(c, a, b, STEER_LOS_CLEARANCE)
             });
             crate::steering::resync_cursor(&self.path, walked_to, p, reachable)
         };
@@ -2059,6 +2065,150 @@ mod tests {
             "the cursor jumped through a wall; path_i = {}", w.path_i);
     }
 
+    // ─────────────────────────── #734: width-blind and line-sampled ───────────────────────────
+
+    /// Twin of `chasm_zone`, but the "hole" is FILLED with a floor STRIP narrower than the body
+    /// instead of left open. Same two ledges, same `gap`-wide split, but the crossing at n = 0 —
+    /// where the #727 counterexample's direct hop actually runs — is a `ridge_width`-wide ridge
+    /// instead of nothing. `carrot_los_clear` (no walls anywhere in this fixture) and a bare
+    /// centre-line `ground_continuous` (floor sits under n = 0 the whole way across, flat) both
+    /// read this as clear; only a check that also samples off-centre can tell the ridge apart from
+    /// a body-width crossing.
+    fn ridge_zone(gap: f32, ridge_width: f32) -> crate::collision::SharedCollision {
+        let slab = |e0: f32, e1: f32, n0: f32, n1: f32, h: f32| {
+            quad(vec![[n0, h, e0], [n1, h, e0], [n1, h, e1], [n0, h, e1]])
+        };
+        let half = gap / 2.0;
+        let rh = ridge_width / 2.0;
+        let terrain = vec![
+            slab(-60.0, -half, -100.0, 100.0, 0.0), // west ledge
+            slab(half, 60.0, -100.0, 100.0, 0.0),   // east ledge
+            slab(-half, half, -rh, rh, 0.0),        // the ridge: the ONLY crossing, at n = 0
+        ];
+        let col = crate::collision::Collision::build(
+            &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+        Arc::new(std::sync::RwLock::new(Some(Arc::new(col))))
+    }
+
+    /// **#734 gap 2, closed for this shape: the width sweep refuses a ridge narrower than the
+    /// body.**
+    ///
+    /// `steering::ground_continuous_swept` is the fix; this drives it through the real
+    /// `Walker::advance_cursor`, on a fixture shaped exactly like `chasm_zone`'s round-1
+    /// counterexample except the void is filled by a ridge instead of left open — here narrower
+    /// than `2 * STEER_LOS_CLEARANCE` (the body's own diameter at this radius).
+    ///
+    /// PREMISE, both halves. **Narrow ridge, bare predicate:** the centre-line-only
+    /// `ground_continuous` — what production ran before this fix — accepts the hop, or the ridge
+    /// isn't narrow enough to test anything. **Wide ridge, real predicate:** a ridge wider than the
+    /// body must still be crossed by the ACTUAL (swept) predicate, or the fix is over-tight and
+    /// makes the resync inert on ordinary terrain — the false-negative failure mode #727's own
+    /// tests have repeatedly guarded against.
+    ///
+    /// Mutation check (run at authoring time, both directions): replacing
+    /// `ground_continuous_swept`'s body with a bare `col.ground_continuous(from, to)` turns the
+    /// narrow-ridge assertion below RED; restoring the sweep turns it GREEN again, with the wide
+    /// ridge unaffected either way.
+    #[test]
+    fn a_resync_must_not_cross_a_ridge_narrower_than_the_body() {
+        const GAP: f32 = 10.0;
+        const NARROW: f32 = 0.8; // < 2 * STEER_LOS_CLEARANCE (2.0)
+        const WIDE: f32 = 4.0;   // > 2 * STEER_LOS_CLEARANCE
+
+        let narrow_col = ridge_zone(GAP, NARROW);
+        let path: Vec<[f32; 3]> = CHASM_ROUTE.to_vec();
+
+        // PREMISE 1: the bare centre-line predicate still declares the far side reachable.
+        let centre_only = crate::steering::resync_cursor(&path, 2, CHASM_BODY, |a, b| {
+            narrow_col.read().unwrap().as_ref().unwrap().ground_continuous(a, b)
+        });
+        assert!(centre_only > 2,
+            "fixture no longer reproduces the width-blind counterexample (centre-line-only cursor \
+             stayed at {centre_only})");
+
+        // THE CLAIM: the real predicate, width sweep included, refuses it.
+        let (mut w, _nav, _intent, _view) = walker_with(narrow_col);
+        w.path = path.clone();
+        w.path_i = 2;
+        w.advance_cursor(CHASM_BODY);
+        assert_eq!(w.path_i, 2,
+            "the cursor crossed a {NARROW} u ridge — narrower than the body's own \
+             {} u diameter (2 * STEER_LOS_CLEARANCE) — and declared the far ledge walked; \
+             path_i = {}", 2.0 * STEER_LOS_CLEARANCE, w.path_i);
+
+        // PREMISE 2 / false-negative guard: a ridge WIDER than the body must still be crossed.
+        let wide_col = ridge_zone(GAP, WIDE);
+        let (mut w2, _nav2, _intent2, _view2) = walker_with(wide_col);
+        w2.path = path;
+        w2.path_i = 2;
+        w2.advance_cursor(CHASM_BODY);
+        assert!(w2.path_i > 2,
+            "a {WIDE} u ridge is wider than the body and must still be crossed — refusing it would \
+             make the width sweep a false negative on ordinary terrain; path_i = {}", w2.path_i);
+    }
+
+    /// **#734 gap 1, measured: a hole narrower than the probe spacing is invisible to
+    /// `ground_continuous` in the direction of travel, and the width sweep added above for gap 2
+    /// does nothing about it** — sweeping PERPENDICULAR to travel does not change what is sampled
+    /// ALONG it.
+    ///
+    /// One floor, one 1.5 u hole (`< PROBE_SPACING` = 2.0 u) positioned in the middle of one probe
+    /// interval on the `CHASM_BODY -> [10, 0, 0]` hop (`run` = 16 u; `PROBE_SPACING` = 2 u divides
+    /// it evenly, so the probes land at whole-metre offsets e ∈ {-4,-2,0,2,4,6,8,10} — the same set
+    /// `collision.rs`'s own
+    /// `ground_continuous_probe_spacing_catches_every_hole_wider_than_the_spacing` documents for a
+    /// WIDER hole on this same shape). This hole sits at e ∈ [2.25, 3.75], strictly between the
+    /// e = 2 and e = 4 probes and spanning the whole north extent this fixture models, so no probe
+    /// on any of the three swept lines ever lands inside it.
+    ///
+    /// **No fix is attempted for this gap in this change.** Closing it means changing
+    /// `PROBE_SPACING` or the sampling strategy inside `Collision::ground_continuous` itself, in
+    /// `collision.rs` — see `steering::resync_cursor`'s rustdoc for why that file is out of scope
+    /// here.
+    ///
+    /// Sensitivity control, same shape: widening the hole to 2.5 u (still starting at e = 2.25, now
+    /// spanning the e = 4 probe) is refused by the same predicate — so the acceptance above is not
+    /// simply "this predicate accepts everything on this fixture", it is specifically the
+    /// narrower-than-spacing case.
+    #[test]
+    fn a_narrow_hole_between_probes_still_crosses_the_resync_undetected() {
+        let make = |hole_width: f32| {
+            let slab = |e0: f32, e1: f32| quad(vec![
+                [-50.0, 0.0, e0], [50.0, 0.0, e0], [50.0, 0.0, e1], [-50.0, 0.0, e1],
+            ]);
+            let terrain = vec![slab(-60.0, 2.25), slab(2.25 + hole_width, 60.0)];
+            let col = crate::collision::Collision::build(
+                &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+            Arc::new(std::sync::RwLock::new(Some(Arc::new(col))))
+        };
+
+        // NARROW: the gap this test is about.
+        let narrow_col: crate::collision::SharedCollision = make(1.5);
+        // PREMISE: the hole is really there — a direct probe of its own column finds no floor.
+        assert!(narrow_col.read().unwrap().as_ref().unwrap()
+                .ground_below(3.0, 0.0, 10.0, 20.0).is_none(),
+            "fixture broken: the hole at e = 3.0 must have no floor for this test to mean anything");
+        let (mut w, _nav, _intent, _view) = walker_with(narrow_col);
+        w.path = CHASM_ROUTE.to_vec();
+        w.path_i = 2;
+        w.advance_cursor(CHASM_BODY);
+        assert!(w.path_i > 2,
+            "measured gap (#734 gap 1): the full production predicate — width sweep included — \
+             still crosses a hole narrower than PROBE_SPACING because it falls between probes on \
+             every swept line; path_i = {} (expected > 2 to confirm the gap is still live)",
+            w.path_i);
+
+        // SENSITIVITY CONTROL: a wider hole, same start, spans a real probe and is refused.
+        let wide_col: crate::collision::SharedCollision = make(2.5);
+        let (mut w2, _nav2, _intent2, _view2) = walker_with(wide_col);
+        w2.path = CHASM_ROUTE.to_vec();
+        w2.path_i = 2;
+        w2.advance_cursor(CHASM_BODY);
+        assert_eq!(w2.path_i, 2,
+            "control: a 2.5 u hole spans a probe and must be refused, or this test's acceptance \
+             above proves nothing about hole WIDTH; path_i = {}", w2.path_i);
+    }
+
     /// **A RESYNC IS NOT PROGRESS (#727, agent honesty).** #631 channel (a) justifies calling an
     /// advancing complete route "progress *by construction*" on the premise that `path_i` only moves
     /// by WALKING. A resync moves it without walking, so a resync must not reach that channel — or
@@ -2147,6 +2297,11 @@ mod tests {
             // #787: cited by `NOT_PRODUCTION`'s rustdoc, which points at the guard that decides what
             // the marker means. Caught by `steering`'s scan when the citation was written.
             exactly_one_production_fine_worker_is_built_in_the_tree_787,
+            // #734: cited by `Walker::advance_cursor`'s rustdoc and by
+            // `steering::ground_continuous_swept`'s and `steering::resync_cursor`'s rustdoc (cross-file,
+            // no guard entry required there — see that scan's own rule 1 vs rule 2).
+            a_resync_must_not_cross_a_ridge_narrower_than_the_body,
+            a_narrow_hole_between_probes_still_crosses_the_resync_undetected,
         ];
     }
 
