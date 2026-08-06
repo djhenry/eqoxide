@@ -552,6 +552,26 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 ///
 /// The fix for all three is the same and it is this type, which is why the loop now calls
 /// [`open_corpus_zone`] instead of carrying a second hand-rolled control.
+///
+/// ## What the `movement.rs` corpus consumes, and what it only prints (#831 crossing #879)
+///
+/// #881 landed this type's `— COMPLETE` marker (see the note on its `Display` impl below) while this
+/// paragraph was in review, so two documents were briefly describing the same type and disagreeing
+/// about what it prints. Reconciled here rather than left for the next reader to trip over, because
+/// the distinction that makes them compatible is the one that matters for the corpus:
+///
+/// * The **verdict** is `is_complete()` — a `bool` — plus an integer compare of
+///   `attempted_zones()` against the filesystem scan. Neither reads the rendered string.
+/// * `{cover}` appears in `movement.rs` in exactly two positions, a `println!` and that assert's
+///   FAILURE MESSAGE. Both are diagnostics; neither can influence a verdict.
+///
+/// So the marker changes what the corpus *prints* on a clean run — a green rollup line now ends
+/// `— COMPLETE` — and cannot change whether it passes. Any output captured before #881 is stale in
+/// exactly that one way and in no other. **And if you go looking for either marker: reach for
+/// `"— COMPLETE"` with the em-dash, never a bare `.contains("COMPLETE")` — `"INCOMPLETE"` contains
+/// `"COMPLETE"`, so the naive check passes on the dirty line too and proves nothing.** That hazard
+/// is a property of the strings, so it applies to a reviewer's ad-hoc grep exactly as it applies to
+/// the assertions #881 added.
 #[derive(Clone, Debug, Default)]
 pub struct WaterRollup {
     total: usize,
