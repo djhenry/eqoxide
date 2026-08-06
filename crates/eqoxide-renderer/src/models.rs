@@ -114,16 +114,25 @@ pub struct SkinnedMeshData {
 }
 
 pub struct ModelAsset {
-    /// The path [`ModelAsset::load`] actually opened. This is the ANSWER to eqoxide#848's R3: a
-    /// downgrade report used to be keyed by a path the caller supplied separately from the asset
+    /// The path [`ModelAsset::load`] actually opened, readable only through
+    /// [`ModelAsset::loaded_from`]. This is the ANSWER to eqoxide#848's R3: a downgrade report used
+    /// to be keyed by a path the caller supplied separately from the asset
     /// (`skin_observation::observe_skin_fit`'s `model_path: &Path` argument), and a mutation that
     /// swapped that argument for an unrelated literal compiled clean and filed the report under the
     /// wrong name (measured, see that module's doc). Carrying the loaded path INSIDE the asset makes
-    /// that argument disappear rather than harder to misuse: nothing constructs a `ModelAsset`
-    /// outside `load` (see the module's construction-site inventory), so a caller cannot hand over a
-    /// `loaded_from` that disagrees with what was actually opened without going through `load` again
-    /// for real.
-    pub loaded_from:       std::path::PathBuf,
+    /// that argument disappear rather than harder to misuse.
+    ///
+    /// **Private, not `pub`, and that is load-bearing** (eqoxide#900 review round 1). While this
+    /// field was `pub` on an all-`pub` struct, R3 had been *relocated* rather than closed: the
+    /// reviewer measured that inserting `asset.loaded_from = PathBuf::from("/models/boat.glb");`
+    /// into `EqRenderer::ensure_character_model`, immediately after `ModelAsset::load` returned,
+    /// compiled clean, filed every downgrade in the session under `boat.glb`, and left
+    /// `-p eqoxide-renderer` byte-identical to its control at 277 passed / 0 failed / 13 ignored.
+    /// A public field is assignable, so "nothing else constructs a `ModelAsset`" never implied
+    /// "nothing else writes this". Privacy is what makes the write, not merely the construction,
+    /// unrepresentable outside this module — the same tier
+    /// `renderer::SkinCapDowngrade::source` already sits at.
+    loaded_from:           std::path::PathBuf,
     pub meshes:            Vec<MeshData>,
     pub textures:          Vec<TextureData>,
     pub skin:              Option<SkinData>,
@@ -205,6 +214,57 @@ fn y_bottom_and_extent(y_min: f32, y_max: f32) -> (f32, f32) {
 }
 
 impl ModelAsset {
+    /// The path [`ModelAsset::load`] opened to produce this asset.
+    ///
+    /// Read-only on purpose: the backing field is private to this module, so no code outside
+    /// `models.rs` can either construct a `ModelAsset` carrying a chosen path or overwrite the one
+    /// [`load`] recorded. That is what lets `skin_observation::observe_skin_fit` key its downgrade
+    /// report off this value and call the key unforgeable from the call site (eqoxide#848 R3/R3b).
+    ///
+    /// [`load`]: ModelAsset::load
+    pub fn loaded_from(&self) -> &Path {
+        &self.loaded_from
+    }
+
+    /// A field-minimal asset for this crate's own unit tests: the two things
+    /// `skin_observation::observe_skin_fit` reads (the skin, and the loaded path) set as asked,
+    /// every other field empty/zero.
+    ///
+    /// `cfg(test)` **and** `pub(crate)`, deliberately, and it is the only way to obtain a
+    /// `ModelAsset` whose `loaded_from` was not set by [`load`]:
+    ///
+    /// - the plain (non-test) lib build has no such route at all, so nothing in a shipped binary
+    ///   can name a `loaded_from` — the forgery is not "harder", it does not compile;
+    /// - `tests/skin_cap_selection.rs` is a separate crate linking the library compiled *without*
+    ///   `cfg(test)`, so an integration test cannot reach it either;
+    /// - only a `cfg(test)` build of this crate's own lib can call it, which is the same tier
+    ///   `skin_observation::DowngradeSink::detached` already occupies for the report's destination.
+    ///
+    /// [`load`]: ModelAsset::load
+    #[cfg(test)]
+    pub(crate) fn probe_for_tests(loaded_from: &str, skin: Option<SkinData>) -> ModelAsset {
+        ModelAsset {
+            loaded_from: std::path::PathBuf::from(loaded_from),
+            meshes: vec![],
+            textures: vec![],
+            skin,
+            skin_meshes: vec![],
+            skinned_node_scale: 1.0,
+            skinned_mesh_scales: vec![],
+            y_bottom: 0.0,
+            y_extent: 0.0,
+            x_center: 0.0,
+            z_center: 0.0,
+            prefix: String::new(),
+            equip_slots: vec![],
+            head_parts: vec![],
+            head_default_hidden: vec![],
+            true_height: 0.0,
+            clip_bounds: vec![],
+            feet_offset: 0.0,
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)
             .with_context(|| format!("failed to open glTF: {}", path.display()))?;

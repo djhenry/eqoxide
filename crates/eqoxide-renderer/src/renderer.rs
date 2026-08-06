@@ -430,8 +430,9 @@ pub struct SkinCapDowngrade {
 /// *current* write happens to agree with whichever source is currently remembered would let a
 /// three-load sequence (A, B, A) report `key_collision: false` after the third write despite two
 /// genuinely different files having shared this key — the flag would then be lying about exactly
-/// the thing it exists to disclose. `record_skin_cap_downgrade_is_reachable_from_two_different_keys`
-/// pins that a second collision on an *already-collided* key does not clear it back.
+/// the thing it exists to disclose. `key_collision_is_sticky_and_does_not_clear_on_a_later_agreeing_write`
+/// (in `tests/skin_cap_selection.rs`) pins that: it drives an a, b, a, a sequence and asserts the
+/// flag never clears once two distinct sources have written the key.
 ///
 /// The base name is still the right key, for a reason unrelated to collisions: this map is meant to
 /// be read by an AI agent over HTTP (eqoxide#797 — see `/v1/observe/debug`'s `skin_cap_downgrades`
@@ -1124,11 +1125,15 @@ impl EqRenderer {
                 // chosen for a joint count the uploaded model does not have. That argument was a
                 // caller-computed `Option<usize>` until round 4, and replacing it with `None` here
                 // was a compile-clean, still-green way back to eqoxide#780.
-                // Keyed by `asset.loaded_from` — the file `ModelAsset::load` actually opened, not
+                // Keyed by `asset.loaded_from()` — the file `ModelAsset::load` actually opened, not
                 // `path` handed in separately (eqoxide#848: a caller-supplied `model_path` argument
                 // could disagree with what was really loaded and file the report under the wrong
-                // name, silently). `asset.loaded_from` is set by `load` itself from the same `path`
-                // it opened, so there is no longer a second value here that could drift from it.
+                // name, silently). It is set by `load` itself from the same `path` it opened, into a
+                // field PRIVATE to `models.rs`, so there is no second value here that could drift
+                // from it AND no way to overwrite the first. The privacy is what closes it: while
+                // the field was `pub`, inserting `asset.loaded_from = "…boat.glb".into();` on this
+                // very line compiled clean and left the suite green (eqoxide#900 review, row R3′ in
+                // `skin_observation`'s header) — removing the argument had only moved the forgery.
                 let observed = crate::skin_observation::observe_skin_fit(
                     crate::skin_observation::DowngradeSink::of(self),
                     asset,

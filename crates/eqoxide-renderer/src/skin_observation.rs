@@ -82,19 +82,35 @@
 //!     hands `observe_skin_fit` real `ModelAsset` values. That is the reachability control
 //!     (eqoxide#797 / eqoxide#799): the line that decides what is observed is executed by the suite,
 //!     which is exactly what was not true of the call-site expression it replaced.
-//! - **Does (closed by eqoxide#848 — was the open "Does not" here):** pin the function's *other*
-//!   caller-supplied arguments, `model_path` and `label`. As of #848 they are not merely pinned,
-//!   they are **gone as separate arguments**: [`crate::models::ModelAsset::loaded_from`] carries the
-//!   path `ModelAsset::load` actually opened, set inside `load()` itself, and `observe_skin_fit`
-//!   derives both the report key and the log's identifying string from that field. The two rows this
-//!   closed:
+//! - **Does (closed by eqoxide#848, and only actually closed by eqoxide#900's review round — was
+//!   the open "Does not" here):** pin the function's *other* caller-supplied arguments,
+//!   `model_path` and `label`. They are **gone as separate arguments**: `ModelAsset` carries the
+//!   path `ModelAsset::load` actually opened, set inside `load()` itself, exposed read-only through
+//!   [`crate::models::ModelAsset::loaded_from`], and `observe_skin_fit` derives both the report key
+//!   and the log's identifying string from it. The two rows this closed:
 //!   - **R3** (was open) — `&path` replaced by `Path::new("/models/boat.glb")` at the call site.
-//!     Structurally unrepresentable now: there is no `&path` argument left at the call site to
-//!     replace. `ensure_character_model` calls `observe_skin_fit(sink, asset)` — two arguments, not
-//!     four — so this exact mutation is not an edit that type-checks against a different value, it
-//!     is an edit with nowhere to land.
+//!     There is no `&path` argument left at the call site to replace: `ensure_character_model`
+//!     calls `observe_skin_fit(sink, asset)` — two arguments, not four — so this exact mutation is
+//!     an edit with nowhere to land.
 //!   - **R3b** (was open) — `key`/`label` replaced by a string literal. Same closure, same reason:
 //!     `label` does not exist as a parameter to swap.
+//!   - **R3′** — the same *symptom* reached without either argument, by writing the field instead
+//!     of passing it: `Ok(mut asset) => { asset.loaded_from = PathBuf::from("/models/boat.glb"); }`
+//!     inserted into `ensure_character_model` right where `load` returns. **Deleting an argument
+//!     did not close this**, and the eqoxide#900 reviewer measured it: while `loaded_from` was a
+//!     `pub` field on an all-`pub` struct, that insertion compiled clean, filed every downgrade in
+//!     the session under `boat.glb`, and left `-p eqoxide-renderer` at **277 passed / 0 failed /
+//!     13 ignored**, byte-identical to its control. The fix is privacy, not another argument
+//!     removal: the field is now private to `models.rs` with a read-only accessor, and the only
+//!     other constructor is `ModelAsset::probe_for_tests`, which is `cfg(test)` **and**
+//!     `pub(crate)` — the same tier as `DowngradeSink::detached` below. Re-measured after the fix
+//!     by re-applying the identical insertion: `error[E0616]`, "field `loaded_from` of struct
+//!     `ModelAsset` is private", reported **twice** — once in `(lib)` and once in `(lib test)`, so
+//!     no build accepts it. The *other* route to the same forgery, a `ModelAsset` struct literal
+//!     naming the field (which is what the test helper below used to be, and what the reviewer
+//!     cited as proof the literal was expressible), was measured separately because typeck aborts
+//!     before the privacy pass runs when both are applied at once: `error[E0451]`, same field, same
+//!     verdict. See the eqoxide#900 round-2 PR comment for both runs.
 //!
 //!   What replaces both as the live mutation target is the [`crate::renderer::downgrade_key`]
 //!   collision path itself, which R3 was gesturing at: two downgraded rigs keyed alike (same base
@@ -262,16 +278,17 @@ impl ObservedModel {
 /// downgrade under the wrong name (the previous revision of this doc's row R3), and two rigs keyed
 /// alike silently collapsed into one entry, which is exactly eqoxide#848's collision symptom.
 ///
-/// Neither argument exists anymore. [`crate::models::ModelAsset`] now carries
-/// [`crate::models::ModelAsset::loaded_from`] — the path `ModelAsset::load` actually opened — and
-/// this function derives both the report key and the log's identifying string from that field
-/// instead of from a second, independently-suppliable value. The `asset` parameter this function
-/// already took by value (closing eqoxide#780's own R1) is now *also* what closes R3/R3b: there is
-/// no longer a `model_path` or `label` token at the call site for a mutation to swap out, because
-/// there is no longer a parameter there to swap. `ensure_character_model`'s call site went from
-/// four arguments (`sink, &path, key, asset`) to two (`sink, asset`) — see that function's own
-/// comment for why `asset.loaded_from` cannot drift from what was loaded (it is set by `load`
-/// itself, from the same `path` it opened, in the same function call).
+/// Neither argument exists anymore. [`crate::models::ModelAsset`] now carries the path
+/// `ModelAsset::load` actually opened, readable through
+/// [`crate::models::ModelAsset::loaded_from`], and this function derives both the report key and
+/// the log's identifying string from it instead of from a second, independently-suppliable value.
+/// The `asset` parameter this function already took by value (closing eqoxide#780's own R1) is now
+/// *also* what closes R3/R3b: there is no longer a `model_path` or `label` token at the call site
+/// for a mutation to swap out, because there is no longer a parameter there to swap.
+/// `ensure_character_model`'s call site went from four arguments (`sink, &path, key, asset`) to two
+/// (`sink, asset`) — see that function's own comment for why the loaded path cannot drift from what
+/// was loaded (it is set by `load` itself, from the same `path` it opened, in the same function
+/// call, into a field private to `models.rs`).
 ///
 /// Nothing is recorded for `NoSkin`, `EmptySkin`, or `Fits`. That asymmetry is the entire point of
 /// eqoxide#780: an unskinned `boat.glb` and a 129-joint rig both take the static arm, and only the
@@ -296,9 +313,9 @@ pub fn observe_skin_fit(sink: DowngradeSink<'_>, asset: crate::models::ModelAsse
                 "renderer: character model '{}' has a skin of {over_cap_joints} joints, EXCEEDING \
                  the {JOINT_CAP}-joint cap — falling back to the STATIC (unskinned) render arm; \
                  this model will not animate (eqoxide#780)",
-                asset.loaded_from.display()
+                asset.loaded_from().display()
             );
-            record_skin_cap_downgrade(sink.entries, &asset.loaded_from, reason);
+            record_skin_cap_downgrade(sink.entries, asset.loaded_from(), reason);
             reported = Some(over_cap_joints);
         }
     }
@@ -315,19 +332,28 @@ mod tests {
     /// (`boat.glb`), `Some(n)` for one with an `n`-joint rig, keyed for the report by `loaded_from`.
     ///
     /// Every other field is the empty/zero value. That is deliberate: `observe_skin_fit` reads
-    /// exactly two things off the asset — the skin, and `loaded_from` — and building the asset here
-    /// rather than passing bare arguments is what makes the *derivation* —
-    /// `asset.skin.as_ref().map(|s| s.joint_count)` and `asset.loaded_from` — part of what the suite
-    /// executes rather than something a test hands over pre-computed. Before eqoxide#780's round 4
-    /// the joint-count expression lived at the call site in `ensure_character_model`, where no test
-    /// could reach it, and a reviewer measured that replacing it with `None` there compiled clean
-    /// and left the crate green; `loaded_from` closes the same hole for eqoxide#848's `model_path`.
+    /// exactly two things off the asset — the skin, and the loaded path — and building the asset
+    /// here rather than passing bare arguments is what makes the *derivation* —
+    /// `asset.skin.as_ref().map(|s| s.joint_count)` and `asset.loaded_from()` — part of what the
+    /// suite executes rather than something a test hands over pre-computed. Before eqoxide#780's
+    /// round 4 the joint-count expression lived at the call site in `ensure_character_model`, where
+    /// no test could reach it, and a reviewer measured that replacing it with `None` there compiled
+    /// clean and left the crate green; the loaded path closes the same hole for eqoxide#848's
+    /// `model_path`.
+    ///
+    /// This goes through [`crate::models::ModelAsset::probe_for_tests`] rather than writing a
+    /// struct literal, because since eqoxide#900's review round the loaded path is a field private
+    /// to `models.rs`. That is the point of the change: the struct literal this helper used to
+    /// write was itself the standing proof that a caller-chosen `loaded_from` was expressible, and
+    /// the eqoxide#900 reviewer cited exactly this helper as the counter-example to the PR's
+    /// "nothing outside `load` constructs a `ModelAsset`" claim. Measured on this head: restoring a
+    /// literal that names the field here — even as a functional-update expression over
+    /// `probe_for_tests` — is `error[E0451]`, "field `loaded_from` of struct `models::ModelAsset`
+    /// is private", in the `(lib test)` build. There is no build in which it is accepted.
     fn asset_with_skin(joint_count: Option<usize>, loaded_from: &str) -> crate::models::ModelAsset {
-        crate::models::ModelAsset {
-            loaded_from: std::path::PathBuf::from(loaded_from),
-            meshes: vec![],
-            textures: vec![],
-            skin: joint_count.map(|joint_count| crate::anim::SkinData {
+        crate::models::ModelAsset::probe_for_tests(
+            loaded_from,
+            joint_count.map(|joint_count| crate::anim::SkinData {
                 joint_count,
                 parents: vec![],
                 inv_bind: vec![],
@@ -338,21 +364,7 @@ mod tests {
                 ground_probes: vec![],
                 joint_names: vec![],
             }),
-            skin_meshes: vec![],
-            skinned_node_scale: 1.0,
-            skinned_mesh_scales: vec![],
-            y_bottom: 0.0,
-            y_extent: 0.0,
-            x_center: 0.0,
-            z_center: 0.0,
-            prefix: String::new(),
-            equip_slots: vec![],
-            head_parts: vec![],
-            head_default_hidden: vec![],
-            true_height: 0.0,
-            clip_bounds: vec![],
-            feet_offset: 0.0,
-        }
+        )
     }
 
     /// Verbatim transcription of the pre-eqoxide#780 boolean (`renderer.rs`,
