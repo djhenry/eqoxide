@@ -937,6 +937,21 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // with a thread that no longer exists. Read them together — age says "is this stale?",
     // `net_thread_dead` says "will it ever un-stale?" (no).
     let net_thread_dead = s.net_thread_dead.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    // #816 (agent-honesty): the client-synthesized "to " map-label fallback entries
+    // `ActionLoop::sync_zone_points` merges into `zone_points` (`/v1/observe/zone_entrances`) come
+    // from a `.txt` file read that can fail the same way `.wtr` region-data reads can (#762/#803):
+    // missing file, or present-but-unreadable. `null` while the last load for the CURRENT zone
+    // succeeded (or none has run yet). Non-null means this zone's map-label fallback exits are
+    // UNKNOWN, not confirmed absent — `zone_points`/`zone_entrances` may be missing entries a
+    // successful load would have contributed. This is deliberately NOT a 503 gate the way
+    // `zone_region_data_unavailable` is for `/zone_exits`: server-advertised zone points (the
+    // primary source `zone_entrances` serves) are unaffected, so refusing the whole endpoint over a
+    // purely-additive fallback failing would be a strictly worse answer than disclosing the gap
+    // here and still serving what IS known.
+    let zone_map_load = s.world.zone_map_load.lock().unwrap().clone().map(|e| serde_json::json!({
+        "reason": e.as_str(),
+        "detail": e.to_string(),
+    }));
     let (guild_name, guild_id, guild_rank) = {
         let g = s.guild_slots.guild.lock().unwrap();
         (g.guild_name.clone(), g.guild_id, g.guild_rank)
@@ -1111,6 +1126,9 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // #634: the network thread itself is dead — `null` while it is alive. When this is non-null,
         // EVERY other field in this payload is a frozen final snapshot. See where it is built.
         "net_thread_dead": net_thread_dead,
+        // #816 — see where it is built, above. `null` while this zone's map-label fallback exits
+        // (a purely-additive contribution to `zone_points`/`zone_entrances`) loaded fine.
+        "zone_map_load": zone_map_load,
         // The FINE 2u STEERING tier (#382). `null` while it is healthy (a complete fine route to its
         // carrot) or has not yet answered. Non-null when the tier that is actually steering the
         // character cannot see a way through the next 40u — and it says WHICH kind of cannot:
@@ -2017,6 +2035,15 @@ async fn get_doors(State(s): State<HttpState>) -> Response {
 /// heading when you cross into a zone, keyed by destination `zone_id` + `iterator`. This is NOT
 /// where you go to *leave* the current zone — for that, see `/zone_exits`. (Also served at the
 /// deprecated alias `/zone_points`.)
+///
+/// The list can also carry a handful of client-synthesized entries read from this zone's map `.txt`
+/// (labels starting `"to "`, currently only recognized for North/South Qeynos) — a fallback for
+/// zones the server doesn't fully advertise. **#816:** if that `.txt` read fails, those fallback
+/// entries are simply absent from this list rather than announced as missing — check
+/// `zone_map_load` on `GET /v1/observe/debug` (`null` = this zone's map-label fallback loaded fine
+/// or hasn't been needed yet; non-null names why it didn't, so an empty/short list here can be told
+/// apart from "this zone's map genuinely has no fallback labels"). The SERVER-advertised entries in
+/// this list are never affected — this only ever narrows the additive fallback.
 async fn get_zone_entrances(State(s): State<HttpState>) -> Response {
     // #646: bare array body (backward-compatible shape, also served under the deprecated
     // `/zone_points` alias) — freshness rides `SNAPSHOT_AGE_HEADER` instead of a JSON key.
@@ -5259,6 +5286,45 @@ mod zone_asset_gate_tests {
         let (_, j) = get(ready_state(), "/debug").await;
         assert_eq!(j["common_assets_failed"], serde_json::Value::Null);
         assert_eq!(j["model_sync_dead"], serde_json::Value::Null);
+    }
+
+    /// #816 (agent-honesty): `zone_map_load` must be PRESENT-and-null by default, same discipline as
+    /// `net_thread_dead` above (#647 review F3) — a missing key and an explicit null both render as
+    /// `Value::Null` through plain `assert_eq!`, so the presence check is a separate assertion.
+    #[tokio::test]
+    async fn debug_reports_zone_map_load_as_null_when_healthy() {
+        let (_, j) = get(ready_state(), "/debug").await;
+        assert!(j.get("zone_map_load").is_some(), "the field must be present, not omitted");
+        assert_eq!(j["zone_map_load"], serde_json::Value::Null);
+    }
+
+    /// #816: once `sync_zone_points` records a failed `.txt` load, `/debug` must surface it — with a
+    /// machine-readable `reason` (matching `ZoneMapLoadError::as_str()`) as well as a human `detail`.
+    #[tokio::test]
+    async fn debug_surfaces_a_failed_zone_map_load() {
+        let s = ready_state();
+        *s.world.zone_map_load.lock().unwrap() =
+            Some(eqoxide_core::zone_map::ZoneMapLoadError::Missing);
+        let (_, j) = get(s, "/debug").await;
+        assert_eq!(j["zone_map_load"]["reason"], "zone_map_missing");
+        assert_eq!(j["zone_map_load"]["detail"], "no .txt map file for this zone");
+    }
+
+    /// The `Unreadable` variant must be distinguishable from `Missing` — "the file is there but I
+    /// could not read it" is a materially different diagnosis (permissions, a directory where a file
+    /// was expected, disk trouble) than "there is no map for this zone at all".
+    #[tokio::test]
+    async fn debug_distinguishes_unreadable_zone_map_from_missing() {
+        let s = ready_state();
+        *s.world.zone_map_load.lock().unwrap() = Some(
+            eqoxide_core::zone_map::ZoneMapLoadError::Unreadable(std::io::ErrorKind::PermissionDenied),
+        );
+        let (_, j) = get(s, "/debug").await;
+        assert_eq!(j["zone_map_load"]["reason"], "zone_map_unreadable");
+        assert_ne!(
+            j["zone_map_load"]["reason"], "zone_map_missing",
+            "an unreadable file must not be reported the same way as a confirmed-absent one"
+        );
     }
 
     #[tokio::test]

@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. Optional `preset`/`pitch`/`yaw`/`distance` params request a one-off diagnostic camera angle for just this capture — see [Camera override for `/frame`](#camera-override-for-observeframe-422). |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses, snapshot_age_ms}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. The default bare-map shape carries the same freshness value in the `X-Snapshot-Age-Ms` header instead — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646). |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -42,7 +42,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | `GET /v1/observe/spells` | The 9 memorized gems `{gems:[{gem, spell_id, name}], snapshot_age_ms}` (empty = null). |
 | `GET /v1/observe/skills` | All skills with current trained value `{skills:[{id, name, value}], snapshot_age_ms}`; `value == 0` means untrained. |
 | `GET /v1/observe/doors` | Current zone's doors — a bare array `[{door_id,name,x,y,z,heading,opentype,is_open}]`; freshness rides the `X-Snapshot-Age-Ms` header (no room for a JSON key on a bare array). |
-| `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side — see [Navigation state](#navigation-state) for the distinction from `zone_exits`). Also served at the deprecated alias `GET /v1/observe/zone_points`. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. |
+| `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side — see [Navigation state](#navigation-state) for the distinction from `zone_exits`), plus a handful of client-synthesized entries read from the CURRENT zone's own map (the heuristic only ever recognizes a label naming North/South Qeynos or Qeynos2, but — measured — five zones' shipped map packs actually carry such a label: see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) for the list and method). Also served at the deprecated alias `GET /v1/observe/zone_points`. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. **If those synthesized entries failed to load, this list is silently short** — check [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) on `/v1/observe/debug`. This same list also backs `POST /v1/move/zone_cross`'s reachable-`zone_id` check and the walker's `no_zone_line_to_zone` result — a load gap here is not only a reporting gap, it can change what a crossing request does. |
 | `GET /v1/observe/zone_exits` | Current zone's exits (the WLD zone-line regions you navigate toward — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579) for its 503 gating). An entry with `"zone_id": null` is a REAL exit region whose baked index matches no advertised zone point (#683) — its destination is honestly unknown until the server resolves a crossing there. Crossing it works **only if this zone advertises no same-zone teleport point and server zone points are available** (received and not all filtered client-side) — the same #679 gate that keeps the client from firing a blind crossing off an intra-zone pad. In a gated zone (e.g. one with teleport pads), standing on a `zone_id: null` exit does NOT cross. **Each entry carries `"gated": true|false` (#713)** — it reports the **#679/#683 zone-level** unresolved-cross gate and nothing else, so you can see that refusal **before** walking there instead of reading about it in the message log after. **`gated` is a property of the zone and the entry, not of you**: your position is not an input to it. `gated` is only ever `true` for `zone_id: null` entries (an advertised destination is crossed directly and is never subject to the #679 gate); it **reports** the gate verdict and does not change it. **`gated: false` is not a promise the auto-cross will fire.** It says only that this gate is open — the stand-scoped [#713 attempt bound](#zone-cross-degradations-you-can-detect-713) can independently have stopped auto-crossing, and `zone_exits` never consults it, so cross-check `zone_cross_stopped` on `/v1/observe/debug` before concluding an exit is broken. The message-log line ("auto-cross is disabled here", once per stand) is still emitted for callers that watch events. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. |
 | `GET /v1/observe/item_text` | Text of the most recently read book/note `{text, snapshot_age_ms}` (`text: null` if none read this session). |
 | `GET /v1/observe/packets[?summary=1]` | Packet-telemetry ring dump (#525), default-off capture. `{enabled, count, packets, snapshot_age_ms}`, or with `?summary=1`, `{enabled, summary, snapshot_age_ms}` (opcode histogram + reliable-sequence-gap analysis). |
@@ -397,6 +397,40 @@ but a held body cannot be *freed* without a stepped frame either, so idling cann
 false hold; what it freezes is `held_secs`, and the paragraph above tells you how to detect that.
 (#724 round-3 review, N1 — this used to say "recomputes it from scratch every frame", which is not
 true of the load, zone-in or idle paths.)
+
+**Why an idle render loop cannot free your body behind `hold`'s back — and the two places the client
+withdraws it on purpose (#846).** The obvious attack is the one the table above
+tells you to use: a GM `#summon`. It arrives on the *network* thread, and the network thread is not
+the one that recomputes the hold. It still cannot free your body behind the hold's back — which is
+what would make the field a confident falsehood rather than merely an old one. The movement
+controller is owned by the render thread, in a crate the network code cannot even name, so the
+network side has no way to move your body: all it can do is hand the new coordinates over and wait,
+and the render frame that picks them up is the frame that clears the hold and recomputes. Adopting
+the summon and dropping the hold are the same frame, and the network side of that boundary is
+property-tested (`no_net_tick_can_free_or_manufacture_a_hold_846`, plus
+`the_hold_mirror_tracks_the_render_thread_over_time_846` for the case where the render thread
+publishes a *different* answer, withdrawal included).
+
+Two places the client does clear `hold` from the network side, both deliberately and both in the
+"say less" direction — you may briefly get `null` where a hold is still in force, never a hold where
+there is none:
+
+- **A zone change.** A hold describes collision geometry, and a zone-in drops it. `hold` goes `null`
+  for the whole load rather than reporting a wedge in a zone you have left.
+- **The tick a server reposition is handed to the render thread.** For that tick `pos` is already
+  the server's new coordinates, so the client withdraws `hold` rather than pair fresh coordinates
+  with the predicament you were just lifted out of. (An earlier draft of this section described that
+  mismatch as a one-tick window you could poll inside. That was measured against a server that
+  asserts the correction once; against one that re-asserts it every tick while the render loop
+  idles, it recurred indefinitely. It is withdrawn now instead of bounded.)
+
+One honest caveat remains: nothing above bounds how *long* the render loop may idle before it picks
+a correction up. It is woken by any inbound state change, including the summon itself, which works
+out to tens of milliseconds — but that number is **derived from the loop's own idle-poll and frame
+constants, not observed on a running client**, and the wake itself is reached by no test in this
+repo (measured: forcing the condition dead leaves the whole suite green and unchanged). Treat it as
+a latency expectation, not a promise. If it matters to you, the `held_secs`-against-your-own-clock
+check above is what distinguishes a frozen controller from a live one.
 
 ### `afloat_stall` — this swimmer is being asked to swim and is going nowhere (#776/#801)
 
@@ -1377,6 +1411,89 @@ world hung", read `world_responsive`, not `last_packet_age_ms`.**
 > if future server content adds one, it would silently turn every idle session `world_responsive:
 > false`. If that signal ever misfires on a known-healthy idle zone, check for a global consider hook
 > before trusting it.
+
+---
+
+### `zone_map_load` — the map-labeled fallback's load outcome (#816)
+
+Top-level on `GET /v1/observe/debug`. `zone_entrances` (and its deprecated alias `zone_points`)
+carries two kinds of entries: the server-advertised ones (`OP_SendZonepoints`), and a handful of
+**client-synthesized** entries the client reads from the CURRENT zone's own map `.txt` pack (base
+file plus its optional `_1`/`_2`/`_3` detail layers). The label heuristic only ever recognizes a
+`"to "`-prefixed label naming North Qeynos, South Qeynos, or Qeynos2 — i.e. it only ever synthesizes
+an entry whose destination `zone_id` is 1 or 2. That is a property of the label TEXT, not of which
+zone you are standing in: any zone whose own map pack happens to contain such a label contributes.
+
+**Measured, not assumed** (round 2 of #816's review found the previous wording — "only North/South
+Qeynos" — read as "only those two zones contribute", which is false). Method: `ZoneMap::try_load`
+plus this exact matching heuristic, run for real (not re-derived by reading the code) over every
+base `.txt` pack in the real shipped maps directory (`~/.local/share/eqoxide/assets/models/maps`,
+526 base packs found, reach-controlled at >400 scanned as an integrity check against silent
+early-exit). Five zones' own packs carry at least one qualifying label — the number in parentheses
+is how many: `erudsxing` (2), `qcat` (13), `qeynos` (4), `qeynos2` (4), `qeytoqrg` (1). Every other
+zone's map, if it has one, contributes nothing — not a special case, just that no other shipped pack
+happens to contain matching text. Two of the five (`erudsxing`, `qeytoqrg`) carry 100% of their
+qualifying labels in a `_1.txt` detail layer and 0% in the base file — the detail-layer read matters
+for real data, not just in principle (see the `zone_map_layer_unreadable` bullet below).
+
+That `.txt` read (base or a detail layer) can fail (no file for this zone, a permissions error, a
+directory in its place), and when it does, those fallback entries are simply absent from
+`zone_entrances` rather than announced as missing — the exact silent-omission shape the
+agent-honesty invariant forbids.
+
+`zone_map_load` names the outcome instead of hiding it:
+
+- `null` — either this zone's map (base file, and every detail layer that exists) loaded fine and
+  `zone_entrances` is carrying every fallback entry it has to offer, OR the zone has not changed yet
+  this session and no load has been attempted, in which case it is carrying none of them. Cross-check
+  `zone` and `zone_assets` if you need to tell the two apart.
+- `{"reason": "zone_map_missing", ...}` — there is no base map `.txt` for this zone at all. Measured:
+  the shipped pack contains 526 base `.txt` maps, covering essentially every zone a character plays in,
+  so this is NOT the ordinary reading for a normal zone — the ordinary reading for a zone with a map
+  and no qualifying label is `null`. Treat `zone_map_missing` as "this client's maps cache does not
+  have this zone", i.e. usually an incomplete asset sync, and only harmless once you have confirmed
+  you were not relying on this zone's synthesized entries.
+- `{"reason": "zone_map_unreadable", "detail": "..."}` — the base file is present but could not be
+  read (a permissions error, a directory sitting where the file should be, a corrupt mount).
+  Distinct from `zone_map_missing` on purpose: "confirmed absent" and "present but unreadable" are
+  different diagnoses and must not collapse into one value.
+- `{"reason": "zone_map_layer_unreadable", "detail": "..."}` — the base file loaded fine, but a
+  `_1`/`_2`/`_3.txt` detail layer that IS present could not be read. Added in #816 round 2: this
+  used to be swallowed silently one level below the base-file case this whole field exists to
+  fix — a present-but-unreadable detail layer read as a healthy `null` with whatever the base file
+  alone contributed, which is the identical confident-but-wrong shape for a zone like `erudsxing` or
+  `qeytoqrg` whose ENTIRE qualifying label set lives in a layer, not the base file. It is now a
+  distinct, named, non-null outcome instead.
+
+**This is deliberately NOT a 503 gate**, unlike `region_data_missing` et al. on `/v1/observe/zone_exits`
+(#815). The reasoning differs from that case: `zone_exits` derives its verdict entirely from the
+`.wtr` region map, so a failed `.wtr` read leaves it with nothing truthful to say about ANY exit.
+`zone_entrances`'s primary content — server-advertised zone points — is completely unaffected by a
+`.txt` load failure; only the small, zone-specific, purely-additive fallback contribution is in
+question. Refusing the whole endpoint over that would be a strictly worse answer than serving what
+IS known and disclosing the gap here.
+
+Recorded fresh on every zone change (success included), so a failure from a PREVIOUS zone can never
+survive, stale, into a zone whose map load actually succeeded.
+
+**Not just a reporting gap.** `zone_entrances` and the in-memory list it reads
+(`world.zone_points`) are the same `Arc<Mutex<Vec<ZonePoint>>>` two other HTTP-observable code
+paths consult — confirmed by reading all three call sites, not independently confirmed on a live
+client this round (see below): `POST /v1/move/zone_cross`'s reachable-`zone_id` check
+(`crates/eqoxide-http/src/move_api.rs`, `reachable_zone_ids`) rejects a `zone_id` with 400 if it is
+not in this same list, and the walker's own zone-cross resolution
+(`crates/eqoxide-net/src/action_loop.rs`) reports `nav_reason: "no_zone_line_to_zone"` when a
+requested destination isn't found in it. A load gap that shortens `zone_entrances` shortens the
+list both of those consult too — the practical effect of a swallowed layer error is not only a
+shorter HTTP report, it is a real 400 or a real `no_path` for a crossing that a fully-loaded map
+would have allowed. **Not measured live this round**: an attempt to launch a client to confirm this
+end-to-end (e.g. a `POST /v1/move/zone_cross` for a Qeynos-adjacent zone_id from inside `qcat`) was
+blocked by this environment's own client-launch guard; the shared-field claim above rests on reading
+`crates/eqoxide-http/src/move_api.rs:392`, `crates/eqoxide-net/src/action_loop.rs:1745`, and
+`crates/eqoxide-http/src/observe.rs`'s `get_zone_entrances`, not on an observed wire response.
+Widening the #816 fix itself was not needed for this: `ZoneMap::try_load` (this PR's fix target) is
+the single source both of those call sites' data flows through, so the code fix already covers them;
+what changed here is only that the docs and PR body now say so.
 
 ---
 

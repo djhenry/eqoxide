@@ -524,6 +524,37 @@ impl CharacterController {
     /// [`Self::clear_hold`] instead; an idle render loop does not publish at all, and cannot
     /// manufacture a false hold because freeing the body also requires a stepped frame.
     /// (#724 round-3 review, N1 — this used to say "every frame" flatly.)
+    ///
+    /// **Why "freeing the body also requires a stepped frame" is a fact about THIS value, and what
+    /// it does not cover (#846).** The obvious attack is a GM `#summon`, which lands on the NET
+    /// thread while the render loop idles. It cannot free the body: `CharacterController` lives in
+    /// this crate, the root binary crate, and `eqoxide-net` cannot depend on it without a dependency
+    /// cycle — so the net thread has no handle to reach. All it can do is publish coordinates into
+    /// `ipc::PosCorrection` and wait; `app.rs`'s rendered frame is what takes them, and it takes
+    /// them by calling [`Self::teleport`], which drops the hold before the `step` beside it
+    /// recomputes. Adopting the summon and clearing the hold are therefore the same frame.
+    ///
+    /// **Scope that claim carefully — #846's round-1 review overturned the wider reading of it.**
+    /// The crate graph makes "the net thread calls a method on `CharacterController`"
+    /// unrepresentable. It does NOT make "the net side cannot publish a wrong hold" unrepresentable:
+    /// the published field is `GameState::player_hold`, not this one, and the net thread owns that
+    /// copy. Two net paths change it deliberately — `GameState::begin_zone_in` (paired with a clear
+    /// of the `ControllerView` through `eqoxide_ipc::ControllerSlots::begin_zone_in`, because
+    /// clearing only the copy was measured to survive exactly one net tick) and the correction
+    /// branch of `ActionLoop::stream_position`, which withdraws the disclosure on the tick it hands
+    /// the jump over rather than pairing a fresh position with the old predicament. Both withdraw;
+    /// neither invents. That "never invents" property is what
+    /// `no_net_tick_can_free_or_manufacture_a_hold_846` in `eqoxide-net`'s `action_loop` tests
+    /// property-tests, with `the_hold_mirror_tracks_the_render_thread_over_time_846` beside it for
+    /// the withdrawal axis.
+    ///
+    /// What none of that establishes is how long an idle loop can stay idle. `app.rs`'s
+    /// `poll_external` bounds it — a pending `pos_correction`, or any `GameState` change, marks the
+    /// loop active — but that call site needs a GPU and a window and is reachable by no test here;
+    /// wrapping it dead (`if false && …`, the stronger form — the line still compiles and is still
+    /// reached by `--all-targets`) was measured to leave the workspace green, with five figures
+    /// byte-identical to a clean run (#846). It is the latency bound, not
+    /// the honesty guarantee.
     pub fn hold(&self) -> Option<ControllerHold> { self.hold }
 
     /// #776: the afloat stall in force, or `None` — see [`AfloatStall`] and `eqoxide_core::afloat`'s
