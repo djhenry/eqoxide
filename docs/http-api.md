@@ -42,7 +42,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | `GET /v1/observe/spells` | The 9 memorized gems `{gems:[{gem, spell_id, name}], snapshot_age_ms}` (empty = null). |
 | `GET /v1/observe/skills` | All skills with current trained value `{skills:[{id, name, value}], snapshot_age_ms}`; `value == 0` means untrained. |
 | `GET /v1/observe/doors` | Current zone's doors — a bare array `[{door_id,name,x,y,z,heading,opentype,is_open}]`; freshness rides the `X-Snapshot-Age-Ms` header (no room for a JSON key on a bare array). |
-| `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side — see [Navigation state](#navigation-state) for the distinction from `zone_exits`), plus a handful of client-synthesized entries read from this zone's map (currently only North/South Qeynos). Also served at the deprecated alias `GET /v1/observe/zone_points`. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. **If those synthesized entries failed to load, this list is silently short** — check [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) on `/v1/observe/debug`. |
+| `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side — see [Navigation state](#navigation-state) for the distinction from `zone_exits`), plus a handful of client-synthesized entries read from the CURRENT zone's own map (the heuristic only ever recognizes a label naming North/South Qeynos or Qeynos2, but — measured — five zones' shipped map packs actually carry such a label: see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) for the list and method). Also served at the deprecated alias `GET /v1/observe/zone_points`. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. **If those synthesized entries failed to load, this list is silently short** — check [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) on `/v1/observe/debug`. This same list also backs `POST /v1/move/zone_cross`'s reachable-`zone_id` check and the walker's `no_zone_line_to_zone` result — a load gap here is not only a reporting gap, it can change what a crossing request does. |
 | `GET /v1/observe/zone_exits` | Current zone's exits (the WLD zone-line regions you navigate toward — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579) for its 503 gating). An entry with `"zone_id": null` is a REAL exit region whose baked index matches no advertised zone point (#683) — its destination is honestly unknown until the server resolves a crossing there. Crossing it works **only if this zone advertises no same-zone teleport point and server zone points are available** (received and not all filtered client-side) — the same #679 gate that keeps the client from firing a blind crossing off an intra-zone pad. In a gated zone (e.g. one with teleport pads), standing on a `zone_id: null` exit does NOT cross. **Each entry carries `"gated": true|false` (#713)** — it reports the **#679/#683 zone-level** unresolved-cross gate and nothing else, so you can see that refusal **before** walking there instead of reading about it in the message log after. **`gated` is a property of the zone and the entry, not of you**: your position is not an input to it. `gated` is only ever `true` for `zone_id: null` entries (an advertised destination is crossed directly and is never subject to the #679 gate); it **reports** the gate verdict and does not change it. **`gated: false` is not a promise the auto-cross will fire.** It says only that this gate is open — the stand-scoped [#713 attempt bound](#zone-cross-degradations-you-can-detect-713) can independently have stopped auto-crossing, and `zone_exits` never consults it, so cross-check `zone_cross_stopped` on `/v1/observe/debug` before concluding an exit is broken. The message-log line ("auto-cross is disabled here", once per stand) is still emitted for callers that watch events. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. |
 | `GET /v1/observe/item_text` | Text of the most recently read book/note `{text, snapshot_age_ms}` (`text: null` if none read this session). |
 | `GET /v1/observe/packets[?summary=1]` | Packet-telemetry ring dump (#525), default-off capture. `{enabled, count, packets, snapshot_age_ms}`, or with `?summary=1`, `{enabled, summary, snapshot_age_ms}` (opcode histogram + reliable-sequence-gap analysis). |
@@ -1384,25 +1384,50 @@ world hung", read `world_responsive`, not `last_packet_age_ms`.**
 
 Top-level on `GET /v1/observe/debug`. `zone_entrances` (and its deprecated alias `zone_points`)
 carries two kinds of entries: the server-advertised ones (`OP_SendZonepoints`), and a handful of
-**client-synthesized** entries the client reads from this zone's map `.txt` pack — currently only
-recognized for a `"to "`-prefixed label naming North or South Qeynos. That `.txt` read can fail
-(no file for this zone, a permissions error, a directory in its place), and when it does, those
-fallback entries are simply absent from `zone_entrances` rather than announced as missing — the
-exact silent-omission shape the agent-honesty invariant forbids.
+**client-synthesized** entries the client reads from the CURRENT zone's own map `.txt` pack (base
+file plus its optional `_1`/`_2`/`_3` detail layers). The label heuristic only ever recognizes a
+`"to "`-prefixed label naming North Qeynos, South Qeynos, or Qeynos2 — i.e. it only ever synthesizes
+an entry whose destination `zone_id` is 1 or 2. That is a property of the label TEXT, not of which
+zone you are standing in: any zone whose own map pack happens to contain such a label contributes.
+
+**Measured, not assumed** (round 2 of #816's review found the previous wording — "only North/South
+Qeynos" — read as "only those two zones contribute", which is false). Method: `ZoneMap::try_load`
+plus this exact matching heuristic, run for real (not re-derived by reading the code) over every
+base `.txt` pack in the real shipped maps directory (`~/.local/share/eqoxide/assets/models/maps`,
+526 base packs found, reach-controlled at >400 scanned as an integrity check against silent
+early-exit). Five zones' own packs carry at least one qualifying label — the number in parentheses
+is how many: `erudsxing` (2), `qcat` (13), `qeynos` (4), `qeynos2` (4), `qeytoqrg` (1). Every other
+zone's map, if it has one, contributes nothing — not a special case, just that no other shipped pack
+happens to contain matching text. Two of the five (`erudsxing`, `qeytoqrg`) carry 100% of their
+qualifying labels in a `_1.txt` detail layer and 0% in the base file — the detail-layer read matters
+for real data, not just in principle (see the `zone_map_layer_unreadable` bullet below).
+
+That `.txt` read (base or a detail layer) can fail (no file for this zone, a permissions error, a
+directory in its place), and when it does, those fallback entries are simply absent from
+`zone_entrances` rather than announced as missing — the exact silent-omission shape the
+agent-honesty invariant forbids.
 
 `zone_map_load` names the outcome instead of hiding it:
 
-- `null` — this zone's map loaded fine (or the zone hasn't changed yet this session, so no load has
-  been attempted). `zone_entrances` is carrying every fallback entry this zone's map has to offer.
-- `{"reason": "zone_map_missing", "detail": "no .txt map file for this zone"}` — there is no map
-  `.txt` for this zone at all. This is the common, harmless case for the overwhelming majority of
-  zones (only North/South Qeynos currently contribute any fallback entries at all), so a non-null
-  reading here is not by itself evidence of a problem — it only matters if you were relying on this
-  zone's synthesized entries.
-- `{"reason": "zone_map_unreadable", "detail": "..."}` — the file is present but could not be read
-  (a permissions error, a directory sitting where the file should be, a corrupt mount). Distinct
-  from `zone_map_missing` on purpose: "confirmed absent" and "present but unreadable" are different
-  diagnoses and must not collapse into one value.
+- `null` — this zone's map (base file, and every detail layer that exists) loaded fine, or the zone
+  hasn't changed yet this session so no load has been attempted. `zone_entrances` is carrying every
+  fallback entry this zone's map has to offer.
+- `{"reason": "zone_map_missing", "detail": "no .txt map file for this zone"}` — there is no base
+  map `.txt` for this zone at all. This is the common, harmless case for the overwhelming majority of
+  zones (measured: only the five zones named above contribute any fallback entries at all), so a
+  non-null reading here is not by itself evidence of a problem — it only matters if you were relying
+  on this zone's synthesized entries.
+- `{"reason": "zone_map_unreadable", "detail": "..."}` — the base file is present but could not be
+  read (a permissions error, a directory sitting where the file should be, a corrupt mount).
+  Distinct from `zone_map_missing` on purpose: "confirmed absent" and "present but unreadable" are
+  different diagnoses and must not collapse into one value.
+- `{"reason": "zone_map_layer_unreadable", "detail": "..."}` — the base file loaded fine, but a
+  `_1`/`_2`/`_3.txt` detail layer that IS present could not be read. Added in #816 round 2: this
+  used to be swallowed silently one level below the base-file case this whole field exists to
+  fix — a present-but-unreadable detail layer read as a healthy `null` with whatever the base file
+  alone contributed, which is the identical confident-but-wrong shape for a zone like `erudsxing` or
+  `qeytoqrg` whose ENTIRE qualifying label set lives in a layer, not the base file. It is now a
+  distinct, named, non-null outcome instead.
 
 **This is deliberately NOT a 503 gate**, unlike `region_data_missing` et al. on `/v1/observe/zone_exits`
 (#815). The reasoning differs from that case: `zone_exits` derives its verdict entirely from the
@@ -1414,6 +1439,25 @@ IS known and disclosing the gap here.
 
 Recorded fresh on every zone change (success included), so a failure from a PREVIOUS zone can never
 survive, stale, into a zone whose map load actually succeeded.
+
+**Not just a reporting gap.** `zone_entrances` and the in-memory list it reads
+(`world.zone_points`) are the same `Arc<Mutex<Vec<ZonePoint>>>` two other HTTP-observable code
+paths consult — confirmed by reading all three call sites, not independently confirmed on a live
+client this round (see below): `POST /v1/move/zone_cross`'s reachable-`zone_id` check
+(`crates/eqoxide-http/src/move_api.rs`, `reachable_zone_ids`) rejects a `zone_id` with 400 if it is
+not in this same list, and the walker's own zone-cross resolution
+(`crates/eqoxide-net/src/action_loop.rs`) reports `nav_reason: "no_zone_line_to_zone"` when a
+requested destination isn't found in it. A load gap that shortens `zone_entrances` shortens the
+list both of those consult too — the practical effect of a swallowed layer error is not only a
+shorter HTTP report, it is a real 400 or a real `no_path` for a crossing that a fully-loaded map
+would have allowed. **Not measured live this round**: an attempt to launch a client to confirm this
+end-to-end (e.g. a `POST /v1/move/zone_cross` for a Qeynos-adjacent zone_id from inside `qcat`) was
+blocked by this environment's own client-launch guard; the shared-field claim above rests on reading
+`crates/eqoxide-http/src/move_api.rs:392`, `crates/eqoxide-net/src/action_loop.rs:1745`, and
+`crates/eqoxide-http/src/observe.rs`'s `get_zone_entrances`, not on an observed wire response.
+Widening the #816 fix itself was not needed for this: `ZoneMap::try_load` (this PR's fix target) is
+the single source both of those call sites' data flows through, so the code fix already covers them;
+what changed here is only that the docs and PR body now say so.
 
 ---
 

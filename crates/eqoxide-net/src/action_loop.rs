@@ -4033,6 +4033,52 @@ mod tests {
         );
     }
 
+    /// **#816 round 2 (PR #869 review, B2) — reproduces the REAL `erudsxing`/`qeytoqrg` shape end to
+    /// end through `sync_zone_points`, not just at the `try_load` unit level.** Measured over the
+    /// live client's real maps cache: those two zones' base `.txt` has ZERO qualifying (qeynos-
+    /// heuristic) labels and their `_1.txt` detail layer has ALL of them — so an unreadable `_1.txt`
+    /// for either is, on the wire, bit-identical to a genuinely label-less zone UNLESS `zone_map_load`
+    /// says otherwise.
+    ///
+    /// Before the B2 fix, this scenario published `zone_points.len() == before` (no fallback exits
+    /// added — correct, we couldn't read them) alongside `zone_map_load == None` (a LIE: the load did
+    /// not actually succeed, it silently dropped the layer). After the fix, the zero-added-exits
+    /// outcome is unchanged but `zone_map_load` now honestly names why.
+    ///
+    /// Mutation check: this is subsumed by the `try_load`-level mutation check above (silently
+    /// skipping the layer failure), but is pinned again at the `sync_zone_points` boundary because
+    /// that is the boundary the review found actually reaches an HTTP-observable field.
+    #[test]
+    fn sync_zone_points_names_an_unreadable_layer_instead_of_reading_as_no_labels_816() {
+        let dir = tempfile::tempdir().unwrap();
+        // Base loads fine but (like erudsxing/qeytoqrg) contributes zero qualifying labels itself.
+        std::fs::write(dir.path().join("erudsxing.txt"), "L 1,2,0,3,4,0,1,1,1").unwrap();
+        // A directory in place of the layer that (on the real data) carries ALL of this zone's
+        // qualifying labels — present, but unreadable as a file.
+        std::fs::create_dir(dir.path().join("erudsxing_1.txt")).unwrap();
+
+        let g: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
+        let mut nav = test_action_loop_with_maps_dir(g, dir.path().to_path_buf());
+        let mut gs = GameState::new();
+        gs.world.zone_name = "erudsxing".into();
+        nav.sync_zone_points(&gs);
+
+        assert_eq!(
+            nav.world.zone_points.lock().unwrap().len(), 0,
+            "no fallback exits are added — the layer that would have carried them is unreadable"
+        );
+        let load_result = nav.world.zone_map_load.lock().unwrap().clone();
+        match load_result {
+            Some(eqoxide_core::zone_map::ZoneMapLoadError::LayerUnreadable(suffix, _)) =>
+                assert_eq!(suffix, "_1"),
+            other => panic!(
+                "an unreadable layer that (on real data) carries every one of this zone's fallback \
+                 labels must NOT read as a healthy `None` — got {other:?}. A `None` here is the exact \
+                 confident-but-wrong reading #816 exists to prevent, reproduced one level down."
+            ),
+        }
+    }
+
     /// **#600 (review round 2): `drain_zone_cross` is the THIRD world-answering consumer, and it must
     /// route its collision-derived refusal through the ONE decision function too.** It reads the SAME
     /// shared collision grid and publishes an agent-observable `nav_state`. Before this fix, while the

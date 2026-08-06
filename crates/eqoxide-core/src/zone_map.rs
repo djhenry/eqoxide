@@ -55,6 +55,17 @@ pub enum ZoneMapLoadError {
     /// this into `Missing` would report "no map for this zone" for a fact that isn't that at all.
     /// Carries the raw `io::ErrorKind` so the message names what actually happened.
     Unreadable(std::io::ErrorKind),
+    /// #816 round 2 (PR #869 review, B1/B2): the BASE file loaded fine, but one of the optional
+    /// `<zone>_1/_2/_3.txt` detail layers exists and could not be read for a reason OTHER than "does
+    /// not exist". Silently continuing with just the base content here would reproduce #816's exact
+    /// silent-partial shape ONE LEVEL DOWN, inside the fix for #816: most zones carry their labels in
+    /// the detail layers, not the base file — measured over the live client's real maps cache,
+    /// `erudsxing` and `qeytoqrg` (2 of the only 5 zones anywhere in the pack whose map contributes
+    /// a fallback zone point at all) have **100%** of their qualifying labels in `_1.txt` and **zero**
+    /// in the base file, so an unreadable `_1.txt` for either would otherwise silently read as "this
+    /// zone's map has no fallback exits" — false. Carries the layer suffix (`"_1"`/`"_2"`/`"_3"`) and
+    /// the raw `io::ErrorKind`.
+    LayerUnreadable(&'static str, std::io::ErrorKind),
 }
 
 impl ZoneMapLoadError {
@@ -64,8 +75,9 @@ impl ZoneMapLoadError {
     /// there" and "the file exists but can't be read" call for different operator action.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Missing         => "zone_map_missing",
-            Self::Unreadable(_)   => "zone_map_unreadable",
+            Self::Missing            => "zone_map_missing",
+            Self::Unreadable(_)      => "zone_map_unreadable",
+            Self::LayerUnreadable(..) => "zone_map_layer_unreadable",
         }
     }
 }
@@ -78,6 +90,10 @@ impl std::fmt::Display for ZoneMapLoadError {
             Self::Missing => write!(f, "no .txt map file for this zone"),
             Self::Unreadable(kind) =>
                 write!(f, ".txt map file present but unreadable ({kind:?}), not confirmed absent"),
+            Self::LayerUnreadable(suffix, kind) =>
+                write!(f, "base .txt map loaded, but its {suffix}.txt detail layer is present and \
+                    unreadable ({kind:?}) — this zone's fallback labels may be incomplete, not \
+                    confirmed as this zone's full set"),
         }
     }
 }
@@ -90,9 +106,14 @@ impl ZoneMap {
     ///
     /// EQ map packs split a zone across `<zone>.txt` (base geometry) plus optional
     /// `<zone>_1/_2/_3.txt` detail layers — labels and POIs usually live in the layers, so all of
-    /// them are merged here. **Only the base file's failure is carried**: the detail layers are
-    /// documented as optional and stay silently skipped when absent, same as before #816 — a
-    /// missing `_1.txt` is not evidence of anything, unlike a missing base file.
+    /// them are merged here. **A MISSING layer is not evidence of anything** and stays silently
+    /// skipped, same as before #816 — the overwhelming majority of zones simply have none. **A
+    /// PRESENT-but-unreadable layer is a different fact and is NOT silently skipped** (#816 round
+    /// 2/B2): treating it the same as "absent" would reproduce this issue's exact silent-partial
+    /// shape one level down, since most zones keep their labels in the layers rather than the base
+    /// file (see [`ZoneMapLoadError::LayerUnreadable`]) — such a layer turns the WHOLE load into
+    /// `Err(LayerUnreadable)`, even though the base file itself read fine, because "some content
+    /// plus an unknown gap" is not the same claim as "this zone's full, complete label set".
     ///
     /// EQ map .txt files (eqmaps/Brewall format) store coordinates as the **negated** server
     /// position: the file's (x, y) is (−server_x, −server_y). `parse_into` negates both back to
@@ -116,12 +137,22 @@ impl ZoneMap {
         let mut labels = Vec::new();
         Self::parse_into(&text, &mut lines, &mut labels);
 
-        // Merge detail layers if present (silently skipped when absent — documented optional,
-        // unlike the base file above).
+        // Merge detail layers if present. A MISSING layer (`NotFound`) is silently skipped —
+        // documented optional, unlike the base file above. A PRESENT-but-unreadable layer is NOT
+        // silently skipped (#816 round 2/B2): it fails the whole load, because we cannot otherwise
+        // tell "this zone's map has no more labels" from "some of this zone's labels are stuck
+        // behind an unreadable file" — see the doc comment above and `ZoneMapLoadError::LayerUnreadable`.
         for suffix in ["_1", "_2", "_3"] {
             let layer = maps_dir.join(format!("{}{}.txt", zone_name, suffix));
-            if let Ok(t) = std::fs::read_to_string(&layer) {
-                Self::parse_into(&t, &mut lines, &mut labels);
+            match std::fs::read_to_string(&layer) {
+                Ok(t) => Self::parse_into(&t, &mut lines, &mut labels),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!("zone_map: layer {:?} present but unreadable: {} — the base map \
+                        for '{}' loaded, but this load is failing rather than serving a possibly \
+                        INCOMPLETE label set", layer, e, zone_name);
+                    return Err(ZoneMapLoadError::LayerUnreadable(suffix, e.kind()));
+                }
             }
         }
 
@@ -280,5 +311,106 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
         // No basezone_1/_2/_3.txt written at all.
         let zm = ZoneMap::try_load(dir.path(), "basezone").expect("base-only zone must still load");
         assert_eq!(zm.lines.len(), 1);
+    }
+
+    /// #816 round 2 (PR #869 review, B2): a PRESENT-but-unreadable detail layer must fail the WHOLE
+    /// load, not silently serve just the base content — the exact silent-partial shape #816 itself
+    /// fixed one level up, reproduced one level down. Measured over the live client's real maps
+    /// cache: `erudsxing`/`qeytoqrg` have zero qualifying labels in their base file and all of them
+    /// in `_1.txt` (see the `LayerUnreadable` doc comment), so before this fix an unreadable `_1.txt`
+    /// for either would have silently read as "this zone's map has no fallback exits" — false.
+    ///
+    /// Mutation check: revert the `Err(e) => return Err(...)` arm in `try_load`'s layer loop back to
+    /// `if let Ok(t) = ...` (silently skip unreadable layers same as missing ones) and this goes RED.
+    #[test]
+    fn present_but_unreadable_detail_layer_fails_the_whole_load_816() {
+        let dir = tempfile::tempdir().unwrap();
+        // Base file loads fine but (like erudsxing/qeytoqrg) contributes nothing itself.
+        std::fs::write(dir.path().join("goodbase.txt"), "L 1,2,0,3,4,0,1,1,1").unwrap();
+        // A DIRECTORY in place of the `_1.txt` layer — present, but not readable as a file.
+        std::fs::create_dir(dir.path().join("goodbase_1.txt")).unwrap();
+
+        match ZoneMap::try_load(dir.path(), "goodbase").unwrap_err() {
+            ZoneMapLoadError::LayerUnreadable(suffix, kind) => {
+                assert_eq!(suffix, "_1");
+                assert_ne!(kind, std::io::ErrorKind::NotFound,
+                    "a directory that exists must not be reported as the NotFound kind");
+            }
+            other => panic!("an unreadable-but-present layer must not read as {other:?} — Missing/ \
+                Unreadable both describe the BASE file, which loaded fine here"),
+        }
+
+        // The reason/detail strings must be distinct from the base-file failure modes too — a
+        // caller must be able to tell "the base is fine but a layer is stuck" from "no map at all".
+        assert_eq!(
+            ZoneMapLoadError::LayerUnreadable("_1", std::io::ErrorKind::PermissionDenied).as_str(),
+            "zone_map_layer_unreadable"
+        );
+        assert_ne!(
+            ZoneMapLoadError::LayerUnreadable("_1", std::io::ErrorKind::PermissionDenied).as_str(),
+            ZoneMapLoadError::Missing.as_str()
+        );
+    }
+
+    /// A layer that is simply ABSENT (the overwhelmingly common case, no `_1.txt` at all) must be
+    /// unaffected by the B2 fix above — only a PRESENT-but-unreadable layer fails the load.
+    /// Companion to `missing_detail_layers_do_not_fail_the_load_816`, pinned again here so the two
+    /// "layer is missing" vs "layer is present but broken" cases sit side by side.
+    #[test]
+    fn absent_layer_is_unaffected_by_the_present_but_unreadable_fix_816() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("z.txt"), "P 1.0, 2.0, 0, 0, 0, 0, 3, to_Somewhere").unwrap();
+        // No z_1/_2/_3.txt written — genuinely absent, not present-but-broken.
+        let zm = ZoneMap::try_load(dir.path(), "z").expect("an absent layer must not fail the load");
+        assert_eq!(zm.labels.len(), 1);
+    }
+
+    /// Kept (not thrown away as scaffolding) because #816 round-2 review found a prose claim about
+    /// which zones' maps contribute fallback entries that was flat wrong ("only North/South Qeynos"
+    /// — actually five zones' packs qualify, see `docs/http-api.md`'s `zone_map_load` section). A
+    /// sentence can drift from the code again; this test is the reproducible way to re-check it: it
+    /// runs the REAL `try_load` plus the REAL label heuristic
+    /// (`crates/eqoxide-net/src/action_loop.rs`'s `sync_zone_points`, copied verbatim below, so keep
+    /// the two in sync if that heuristic ever changes) over the real, LOCAL client maps cache — not
+    /// a re-derivation by reading the heuristic. Needs the asset-sync maps dir to exist, so it is
+    /// `#[ignore]`d (CI has no client cache) — run explicitly with `cargo test -p eqoxide-core --lib
+    /// zone_map::tests::diagnostic_measure_contributing_zones_869 -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn diagnostic_measure_contributing_zones_869() {
+        let maps_dir = std::path::PathBuf::from(
+            std::env::var("HOME").unwrap()
+        ).join(".local/share/eqoxide/assets/models/maps");
+        let mut base_names: Vec<String> = std::fs::read_dir(&maps_dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".txt"))
+            .filter(|n| !n.ends_with("_1.txt") && !n.ends_with("_2.txt") && !n.ends_with("_3.txt"))
+            .map(|n| n.trim_end_matches(".txt").to_string())
+            .collect();
+        base_names.sort();
+        let reach = base_names.len();
+        assert!(reach > 400, "REACH CONTROL: only scanned {reach} base zone packs, expected >400");
+
+        let mut contributing: Vec<(String, usize)> = Vec::new();
+        for zone in &base_names {
+            let zm = match ZoneMap::try_load(&maps_dir, zone) {
+                Ok(zm) => zm,
+                Err(_) => continue,
+            };
+            let mut count = 0;
+            for label in &zm.labels {
+                let lower = label.text.to_lowercase();
+                if !lower.starts_with("to ") { continue; }
+                let dest_zone_id: u16 =
+                    if lower.contains("north qeynos") || lower.contains("qeynos2") { 2 }
+                    else if lower.contains("south qeynos") { 1 }
+                    else { 0 };
+                if dest_zone_id != 0 { count += 1; }
+            }
+            if count > 0 { contributing.push((zone.clone(), count)); }
+        }
+        eprintln!("REACH: {reach} base zone packs scanned");
+        eprintln!("CONTRIBUTING ({}): {:?}", contributing.len(), contributing);
     }
 }
