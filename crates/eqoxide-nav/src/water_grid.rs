@@ -424,8 +424,17 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 ///
 /// ```text
 /// grep -c 'open_corpus_zone(' crates/eqoxide-nav/src/collision.rs tests/walker_sim.rs   # 6 + 4 = 10
-/// grep -n  'for zone in'      crates/eqoxide-nav/src/collision.rs tests/walker_sim.rs   # 6 + 6 = 12
+/// grep -cE '^ +for zone in'   crates/eqoxide-nav/src/collision.rs tests/walker_sim.rs   # 6 + 6 = 12
+/// grep -c 'open_corpus_zone(' src/movement.rs                                           # 1  (#879)
 /// ```
+///
+/// The second recipe used to be an unanchored `grep -n 'for zone in'`, and it ROTTED exactly as
+/// this paragraph warns: two later commits added the string `for zone in &zones` inside PROSE in
+/// `collision.rs` (a doc bullet and an inline comment), so the printed command returns 8 + 6 = 14
+/// against a stated 6 + 6 = 12. Re-measured on this branch: the LOOP count is unchanged at twelve —
+/// it was the recipe that decayed, not the fact — and the recipe is now anchored to leading
+/// whitespace so it counts loops. A recipe a reader is told to run has to reproduce the figure
+/// printed beside it, or it teaches them the fact is wrong.
 ///
 /// Measured at the #839 merge: **ten** [`open_corpus_zone`] call sites — the four `*_blast_radius`
 /// corpora in `tests/walker_sim.rs`, and, in `collision.rs`, `water_grid_budget_measurement` (#807)
@@ -499,22 +508,50 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 ///
 /// **What this does NOT claim:** a corpus loop that never constructs a `WaterRollup` is invisible to
 /// this type by construction (see above), and #839 audited only `collision.rs` and `walker_sim.rs`.
-/// `depenetration_corpus_over_baked_zones` in `src/movement.rs` was a baked-zone loop of exactly the
-/// same shape and was out of #839's scope; **#850 wired it**, but not through this type — it does not
-/// print a water number, so a `WaterRollup` would be the wrong tool (see `Four of the five #839
-/// converted` above: a corpus with no water number closes with a zero-valued `cover.add`, it does not
-/// skip the rollup entirely). Instead its own two bare `continue`s now push a
-/// `(zone, reason)` onto a local `dropped: Vec<_>`, and the closing line asserts
-/// `covered + dropped.len() == discovered` — `discovered` read from the filesystem scan before either
-/// drop can run, so a third drop path added later without a matching `dropped.push` fails loudly
-/// instead of quietly shrinking the printed count again, the same reach-control shape as
-/// `WaterRollup::is_complete` above. Cited by source text and not by line number, per the same lesson
-/// the previous draft of this paragraph recorded — a routine merge moved the old citations before the
-/// PR that added them was even opened:
+/// `depenetration_corpus_over_baked_zones` in `src/movement.rs` — the ROOT package, so a
+/// `-p eqoxide-nav` run never builds it — was a baked-zone loop of exactly the same shape and was
+/// out of #839's scope. **#879 (#850) routes it through [`open_corpus_zone`]**, so it is accounted
+/// through this type rather than being the counter-example this paragraph used to name. (That does
+/// not make the tree-wide count of bare baked-zone loops zero; nobody has audited outside
+/// `collision.rs`, `walker_sim.rs` and now `movement.rs`.)
+/// Cited by source text, not line number, per the lesson the previous draft recorded — a routine
+/// merge moved the old citations before the PR that added them was even opened:
 ///
 /// ```text
-/// grep -n 'dropped.push' src/movement.rs
+/// grep -n 'open_corpus_zone(' src/movement.rs
 /// ```
+///
+/// # What #879's FIRST draft of this paragraph claimed, and how each part was falsified
+///
+/// Kept because all three are shapes that recur here, and because the replacement text is only
+/// trustworthy if the thing it replaced is on the record. Round 1 said the loop was wired "but not
+/// through this type — it does not print a water number, so a `WaterRollup` would be the wrong
+/// tool", and that its `covered + dropped.len() == discovered` assertion was "the same reach-control
+/// shape as [`WaterRollup::is_complete`] above". An independent reviewer measured all three:
+///
+/// 1. **"Does not print a water number" was false by this file's own predicate** — the one two
+///    paragraphs above, "zero `in_water` calls, zero `ZoneWater::load` calls in the function body".
+///    Measured in that function's body: two `col.in_water` calls (the feet/chest partition every
+///    sample is bucketed by), one `col.water_surface` call (the in-water depth ladder), and
+///    `body_in_water` inside its `new_recovery` helper. The rollup line the PR itself quoted reads
+///    `wet-chest-dry-feet=815 submerged=535`. Contradicted by the PR's own output, not merely
+///    unproven.
+/// 2. **The support cited argued the opposite of the conclusion.** The parenthetical pointed at
+///    `Four of the five #839 converted` above — which establishes that a corpus with no water
+///    number still routes through this type and closes with a zero-valued `add`. That is a reason
+///    to USE the type, quoted as a reason not to.
+/// 3. **The control was not `is_complete`'s shape, in three ways.** Its covered counter was
+///    incremented near the TOP of the loop body, so it counted ENTRY: a reviewer's one-line
+///    `continue` added just after it, with nothing pushed to `dropped`, printed
+///    `discovered=2 covered=2 dropped=0` over a corpus with one of two zones silently abandoned,
+///    and passed green — bit-for-bit the defect #850 exists to kill, now under an assertion
+///    advertising completeness. It had no `attempted_zones() > 0` analogue, so an all-bad corpus
+///    (`covered=0 dropped=2`) also passed green having measured zero zones. And per-call-site
+///    `dropped.push` is precisely the mechanism the round-3 lesson above rejects — round 1 adopted
+///    the round-2 shape while claiming the round-3 property.
+///
+/// The fix for all three is the same and it is this type, which is why the loop now calls
+/// [`open_corpus_zone`] instead of carrying a second hand-rolled control.
 #[derive(Clone, Debug, Default)]
 pub struct WaterRollup {
     total: usize,

@@ -2842,7 +2842,11 @@ mod tests {
     /// **THE DEPENETRATION CORPUS — the blast-radius harness, committed so its numbers are
     /// reproducible (#649 review, finding 6).**
     ///
-    /// Two things at once, over every baked zone found at `$EQZONES`:
+    /// Two things at once, over every baked zone found at `$EQZONES` — where **a zone is a
+    /// `<name>.glb` with a matching `maps/water/<name>.wtr`**, not any `.glb` that is not furniture
+    /// (see the discovery block below: that older predicate admitted 52 character/creature/prop
+    /// models as "zones"). Discovery and the per-zone accounting are both asserted, so the counts
+    /// this prints are the corpus, not the survivors:
     ///
     /// 1. **An ITERATION invariant, driven through the real controller.** The first cut of the #649
     ///    fix shipped a recovery that was itself embedded, and no one-shot harness could see it —
@@ -2898,52 +2902,123 @@ mod tests {
             None
         }
 
-        let mut zones: Vec<String> = std::fs::read_dir(&dir).expect("$EQZONES").filter_map(|e| {
-            let path = e.ok()?.path();
-            let n = path.file_name()?.to_str()?.strip_suffix(".glb")?.to_string();
-            (!n.ends_with("_doors") && !n.ends_with("_obj")).then_some(n)
-        }).collect();
+        // ── #850 / #879 review B3: DISCOVERY, with every directory entry accounted ──────────────
+        //
+        // What used to stand here was a `filter_map` whose predicate was "any `.glb` not ending in
+        // `_doors`/`_obj`", and whose count was then printed as the corpus size. Measured on the
+        // default `$EQZONES` at the time of writing: 185 directory entries, 136 `.glb`, 42 of them
+        // `_doors`/`_obj`, leaving 94 — and **52 of those 94 are character/creature/prop models**
+        // (`bat`, `bear`, `race_*`, `weapons`, …), which the loop below happily built a collision
+        // grid for and sampled 500 random columns inside. A line reading `zones=94` over a corpus
+        // that is 55% not-zones is the same confident falsehood #850 is about, one level up from
+        // the drop paths.
+        //
+        // The predicate is now `maps/water/<name>.wtr exists`, which is what the rest of the tree
+        // already gates a zone corpus on (#807's DROP 3) and, on the same host, splits the 94
+        // exactly: 42 with, 52 without. It is also the predicate this test NEEDS — its whole bucket
+        // partition is `in_water(feet)` x `in_water(chest)`, so a name with no region data
+        // contributes vacuous dry counts and a vacuously-empty water ladder.
+        //
+        // Every entry `read_dir` yields lands in EXACTLY ONE bucket, and the buckets are asserted
+        // against the raw entry count below — so the `e.ok()?` / `to_str()?` swallows the old
+        // `filter_map` performed (review N2) are counted and named instead of vanishing.
+        let water_dir = dir.join("maps/water");
+        let mut entries = 0usize;
+        let mut unreadable: Vec<String> = Vec::new();
+        let mut non_glb = 0usize;
+        let mut furniture: Vec<String> = Vec::new();
+        let mut not_a_zone: Vec<String> = Vec::new();
+        let mut zones: Vec<String> = Vec::new();
+        for ent in std::fs::read_dir(&dir).expect("$EQZONES") {
+            entries += 1;
+            let path = match ent {
+                Ok(e) => e.path(),
+                Err(e) => { unreadable.push(format!("<unreadable dir entry: {e}>")); continue }
+            };
+            let Some(os_name) = path.file_name() else {
+                unreadable.push(format!("<no file name: {}>", path.display()));
+                continue;
+            };
+            let Some(file) = os_name.to_str() else {
+                unreadable.push(format!("<non-UTF-8 name: {}>", path.to_string_lossy()));
+                continue;
+            };
+            let Some(name) = file.strip_suffix(".glb") else { non_glb += 1; continue };
+            if name.ends_with("_doors") || name.ends_with("_obj") {
+                furniture.push(name.to_string());
+            } else if !water_dir.join(format!("{name}.wtr")).is_file() {
+                not_a_zone.push(name.to_string());
+            } else {
+                zones.push(name.to_string());
+            }
+        }
         zones.sort();
-        assert!(!zones.is_empty(), "no baked zones at {dir:?}");
-        // #850: `zones.len()` (renamed `discovered` below) used to be computed, asserted
-        // non-empty, and never referenced again. The rollup line printed `t_zones` — the count of
-        // zones that survived BOTH of this loop's bare `continue`s — as though it were the corpus
-        // size, so a run where half the GLBs failed to load or produced an empty grid still printed
-        // a confident, uncaveated `zones=N/2` with nothing anywhere naming the other half. Every
-        // `continue` below now records WHY the zone was dropped instead of vanishing silently, and
-        // the closing assertion checks covered+dropped against `discovered` directly from the
-        // filesystem scan — not from anything the loop body decides — so a THIRD drop path added
-        // later without being wired into `dropped` fails loudly instead of quietly shrinking the
-        // denominator again.
+        furniture.sort();
+        not_a_zone.sort();
+        unreadable.sort();
+        assert_eq!(entries,
+            unreadable.len() + non_glb + furniture.len() + not_a_zone.len() + zones.len(),
+            "#850: every entry $EQZONES yielded must land in exactly one discovery bucket — \
+             {entries} entries vs {} unreadable + {non_glb} non-glb + {} doors/obj + {} non-zone \
+             glb + {} zone glb", unreadable.len(), furniture.len(), not_a_zone.len(), zones.len());
+        assert!(!zones.is_empty(),
+            "no baked zones at {dir:?} — a zone here is a `<name>.glb` WITH a matching \
+             `maps/water/<name>.wtr` ({entries} entries scanned, {non_glb} non-glb, {} doors/obj, \
+             {} glb with no .wtr)", furniture.len(), not_a_zone.len());
         let discovered = zones.len();
 
-        let (mut t_zones, mut t_emb) = (0usize, 0u64);
+        // ── #850 / #879 review B1: the ACCOUNTING, owned by a type instead of by call sites ─────
+        //
+        // Round 1 of this fix pushed `(zone, reason)` onto a local `dropped: Vec<_>` at each
+        // `continue` and asserted `covered + dropped.len() == discovered`. That is the round-2
+        // shape `water_grid.rs`'s own round-3 lesson rejects, and it failed the same way: the
+        // covered counter was incremented near the TOP of the loop body, so it counted ENTRY, not
+        // completion, and a reviewer's one-line `continue` added after it — no `dropped.push` —
+        // produced `discovered=2 covered=2 dropped=0` over a corpus with one zone silently
+        // abandoned, green. Bit-for-bit the pre-fix defect, now with an assertion advertising
+        // completeness.
+        //
+        // So the state "an iteration ended without being classified" is no longer representable
+        // here: `open_corpus_zone` calls `WaterRollup::begin_zone` as its first statement and every
+        // `Err` return is preceded by a `skip`/`add` that closes the zone; the only way to close an
+        // OPEN zone is the `cover.add` at the very bottom of the body. Anything that leaves the
+        // body in between — an existing `continue`, a `continue` added next year, a `break`, a `?`,
+        // an early `return` — lands the zone in `unaccounted`, which makes `is_complete()` false
+        // and names the zone in `Display`. Nothing has to be wired per call site, and nothing has
+        // to be re-verified by enumeration when this loop changes.
+        //
+        // `is_complete()` also carries the clean-over-nothing guard (`attempted_zones() > 0`) that
+        // round 1's arithmetic control had no analogue for: an all-bad corpus satisfies
+        // `covered + dropped == discovered` and passed green having measured zero zones, with
+        // `drifters.is_empty()` and `ch_dry == 0` both vacuously true.
+        let mut cover = crate::nav::water_grid::WaterRollup::new();
+        let mut t_emb = 0u64;
         let (mut ch_dry, mut ch_chest, mut ch_wet) = (0u64, 0u64, 0u64);
         let (mut same_dry, mut same_chest, mut same_wet) = (0u64, 0u64, 0u64);
         let (mut none_legacy, mut none_new) = (0u64, 0u64);
+        let (mut t_cols, mut no_floor) = (0u64, 0u64);
         let mut drifters: Vec<(String, [f32; 3], [f32; 3])> = Vec::new();
-        let mut dropped: Vec<(String, &'static str)> = Vec::new();
         for name in &zones {
-            let Ok(za) = crate::assets::ZoneAssets::from_glb(&dir.join(format!("{name}.glb"))) else {
-                dropped.push((name.clone(), "glb load failed"));
-                continue
+            let (col, zw) = match crate::nav::water_grid::open_corpus_zone(&mut cover, &dir, name, 32.0) {
+                Ok(v) => v,
+                // Already recorded in `cover` by the time this value exists — printing it is
+                // diagnostics, not bookkeeping.
+                Err(why) => { println!("{name:>12}: DROPPED — {why}"); continue }
             };
-            let mut col = Collision::build(&za, 32.0);
-            if col.cols == 0 {
-                dropped.push((name.clone(), "empty collision grid (cols == 0)"));
-                continue;
-            }
-            col.set_region_data(crate::region_map::RegionMap::try_load(&dir.join("maps/water"), name)
-                .map(std::sync::Arc::new));
-            t_zones += 1;
             let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
             let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
                                (seed >> 11) as f64 / (1u64 << 53) as f64 };
             let mut zone_emb = 0u32;
             for _ in 0..500 {
+                t_cols += 1;
                 let e = col.origin[0] + rnd() as f32 * (col.cols as f32 * col.cell_size);
                 let n = col.origin[1] + rnd() as f32 * (col.rows as f32 * col.cell_size);
-                let Some(fz) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { continue };
+                // A SAMPLE drop, not a zone drop: 500 random columns over a zone's bounding box are
+                // expected to miss the floor, and #850 says to decide about this one deliberately
+                // rather than fold it into the zone accounting. Decided: it stays a `continue`, and
+                // it is COUNTED and printed (`no floor: N of M columns`) so the reader can see how
+                // much of the sample budget never became a probe.
+                let Some(fz) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { no_floor += 1; continue };
                 // A ladder of z around the column's floor (below it = embedded in rock, above =
                 // open air), plus, when the column holds water, a ladder of depths inside it.
                 let mut zs: Vec<f32> = [-16.0f32, -8.0, -4.0, -2.0, -1.0, -0.25, 0.0, 0.5, 2.0, 6.0, 15.0]
@@ -2988,25 +3063,46 @@ mod tests {
                 }
             }
             println!("{name:>12}: embedded={zone_emb}");
+            // The ONLY way to close the zone `open_corpus_zone` opened. Reached only by an
+            // iteration that ran to the bottom; anything else leaves the zone `unaccounted`.
+            cover.add(name, &zw.tally());
         }
-        println!("\nzones: discovered={discovered} covered={t_zones} dropped={} embedded={t_emb}\n  \
-                  dropped detail: {dropped:?}\n  \
+        println!("\nzones: discovered={discovered} covered={} embedded={t_emb}\n  \
+                  accounting: {cover}\n  \
+                  discovery: {entries} $EQZONES entries = {discovered} zone glb (with a matching \
+                  maps/water/<name>.wtr) + {} doors/obj glb + {} glb with no .wtr (NOT sampled) + \
+                  {non_glb} non-glb + {} unreadable\n  \
+                  no .wtr, excluded: {not_a_zone:?}\n  \
+                  unreadable: {unreadable:?}\n  \
+                  no floor: {no_floor} of {t_cols} sampled columns\n  \
                   changed: dry-body={ch_dry} wet-chest-dry-feet={ch_chest} \
                   submerged={ch_wet}\n  unchanged: dry-body={same_dry} wet-chest-dry-feet={same_chest} \
                   submerged={same_wet}\n  no recovery: legacy={none_legacy} new={none_new}",
-                  dropped.len());
-        // #850 reach control: every zone `read_dir` discovered must land in EXACTLY one of
-        // `covered` (t_zones) or `dropped` (named, with a reason) — never neither. This is not a
-        // restatement of the loop's own bookkeeping: `discovered` comes from the filesystem scan
-        // above, before either `continue` runs, so a drop path added later without a matching
-        // `dropped.push(...)` makes this fail instead of silently shrinking `t_zones` again. Forcing
-        // EVERY zone to drop (mutation-checked below) must report every zone as dropped, not zero —
-        // the corpus-emptying case a same-shaped scanner has silently passed before (#778).
-        assert_eq!(t_zones + dropped.len(), discovered,
-            "#850: covered ({t_zones}) + dropped ({}) must equal discovered ({discovered}) — a zone \
-             fell through neither bucket, which means a drop path in this loop is not wired into \
-             `dropped` and the corpus is silently smaller than its own rollup line says",
-            dropped.len());
+                  cover.measured_zones(), furniture.len(), not_a_zone.len(), unreadable.len());
+        // #850 reach control. `is_complete()` is false unless EVERY zone this loop opened was
+        // closed by the `cover.add` at the bottom of the body — no `skipped` (dropped before the
+        // water check ran), no `unmeasured` (its `.wtr` did not load), no `unaccounted` (opened and
+        // abandoned by ANY control flow), and at least one zone folded in at all. That last term is
+        // the clean-over-nothing guard: a host whose asset cache is broken now goes RED here
+        // instead of reporting `ok` over zero zones with `drifters`/`ch_dry` vacuously satisfied —
+        // the case a same-shaped scanner has silently passed before (#778).
+        assert!(cover.is_complete(),
+            "#850: every discovered zone must be measured, or named as the reason it was not — \
+             {cover}");
+        // …and the rollup's own denominator must equal what the filesystem scan found, which is
+        // the one thing the rollup cannot check for itself: a zone skipped by a filter added to
+        // this loop's HEAD would never be opened at all, so it would be invisible to `cover`.
+        assert_eq!(cover.attempted_zones(), discovered,
+            "#850: the rollup saw {} zones but discovery found {discovered} — a zone was never even \
+             opened, so the corpus is smaller than its own rollup line says",
+            cover.attempted_zones());
+        // Sample-level clean-over-nothing: every zone can be measured and still contribute no
+        // probe (an empty grid that somehow reports cols > 0, a floor probe that always misses).
+        // The two assertions below are both satisfied by an empty sample.
+        assert!(t_emb > 0,
+            "#850: {discovered} zone(s) measured but ZERO embedded samples were found — \
+             `drifters.is_empty()` and `ch_dry == 0` below are vacuous at this coverage \
+             ({no_floor} of {t_cols} sampled columns found no floor)");
         assert!(drifters.is_empty(),
             "a recovery must never itself be embedded — {} sample(s) were STILL MOVING and STILL \
              EMBEDDED after two input-free seconds (the review's finding-1 drift signature): {:?}",
