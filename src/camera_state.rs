@@ -214,14 +214,40 @@ impl CameraState {
         }
     }
 
-    /// Snapshot of the current state for the HTTP GET /camera response.
+    /// Snapshot describing the frame `drawn` proves was encoded — **not** "the current state".
     ///
     /// `resolved` is the [`ResolvedEye`] the SAME `resolve_camera_eye` call that produced the
-    /// eye/look-target passed to this frame's `render_frame` returned — this method just carries
+    /// eye/look-target passed to that `render_frame` returned — this method just carries
     /// it through into the published struct, it does not recompute an eye from
     /// `azimuth`/`elevation`/`radius`/`focus` itself (#852: that recomputation is exactly the bug
-    /// this fixes — it would silently reproduce the pre-collision eye).
-    pub fn snapshot(&self, resolved: ResolvedEye) -> CameraSnapshot {
+    /// that fixed — it would silently reproduce the pre-collision eye).
+    ///
+    /// `drawn` is #867's structural half. `App::render_frame` can `return` before the draw on three
+    /// `wgpu::SurfaceError` arms, and a publish that only *textually* follows the render call is
+    /// still reachable from before it after any ordinary refactor (extract-method, an `Arc::clone`
+    /// alias). Taking an [`eqoxide_renderer::DrawnFrame`] by value instead means a pre-draw caller
+    /// has no argument to pass and does not compile. See that type's doc for the exact scope: it
+    /// proves a `render_frame` call returned, not that the frame was submitted or presented.
+    ///
+    /// For the pre-first-frame seed, use [`CameraState::undrawn_snapshot`], which is honest about
+    /// having no frame rather than borrowing one.
+    pub fn snapshot(&self, resolved: ResolvedEye, drawn: eqoxide_renderer::DrawnFrame) -> CameraSnapshot {
+        CameraSnapshot {
+            drawn_frame:   Some(drawn.index()),
+            drawn_at:      Some(std::time::Instant::now()),
+            ..self.undrawn_snapshot(resolved)
+        }
+    }
+
+    /// The startup seed (#867): a snapshot with `drawn_frame`/`drawn_at` = `None`, i.e. **no frame
+    /// has been drawn yet**.
+    ///
+    /// `main.rs` publishes one of these before `EventLoop::new()`, so `/v1/camera` and
+    /// `/v1/observe/debug` serve a camera block through GPU init, `resumed()`, and the first zone
+    /// load. Before #867 that seed was indistinguishable from a rendered snapshot; `drawn_frame:
+    /// None` makes the pre-first-frame state representable, which is why the docs can say what the
+    /// fields mean without a "never" that startup falsifies.
+    pub fn undrawn_snapshot(&self, resolved: ResolvedEye) -> CameraSnapshot {
         CameraSnapshot {
             mode:          self.mode,
             azimuth:       self.azimuth,
@@ -231,6 +257,8 @@ impl CameraState {
             eye:           resolved.eye,
             occluded:      resolved.occluded,
             still_blocked: resolved.still_blocked,
+            drawn_frame:   None,
+            drawn_at:      None,
         }
     }
 }
@@ -537,7 +565,7 @@ mod tests {
         let mut cam = CameraState::new([1.0, 2.0, 3.0], 40.0);
         cam.radius = 80.0;
         let resolved = ResolvedEye { eye: [999.0, -42.0, 7.5], occluded: true, still_blocked: true };
-        let snap = cam.snapshot(resolved);
+        let snap = cam.snapshot(resolved, eqoxide_renderer::DrawnFrame::for_test(11));
         assert_eq!(snap.eye, [999.0, -42.0, 7.5]);
         assert!(snap.occluded);
         assert!(snap.still_blocked);
@@ -545,5 +573,44 @@ mod tests {
         assert_ne!(derived, snap.eye,
             "test fixture bug: the arbitrary resolved eye must differ from what compute_eye would \
              derive, or this test cannot tell the two code paths apart");
+    }
+
+    /// #867 — a snapshot must say WHICH frame it describes, and the two constructors must disagree
+    /// about whether there was one. Without this the caller cannot distinguish a snapshot published
+    /// this tick from one frozen since the window was minimised: every other field is identical in
+    /// both cases, and the nearby `snapshot_age_ms` on `/v1/observe/debug` is the NETWORK clock, so
+    /// it reads fresh throughout a rendering stall.
+    ///
+    /// The ordering half of #867 is not asserted here — it is enforced by the type system: the
+    /// `DrawnFrame` argument below can only be produced by `EqRenderer::render_frame` (its field is
+    /// private, its `for_test` constructor is dev-only), so a publisher sitting before the draw has
+    /// nothing to pass and fails to compile. See `eqoxide_renderer::DrawnFrame`'s `compile_fail`
+    /// doctest, which is the proof that it cannot be fabricated.
+    #[test]
+    fn a_snapshot_names_the_frame_it_describes_or_admits_there_was_none() {
+        let cam = CameraState::new([1.0, 2.0, 3.0], 40.0);
+        let resolved = ResolvedEye { eye: [5.0, 6.0, 7.0], occluded: false, still_blocked: false };
+
+        let drawn = cam.snapshot(resolved, eqoxide_renderer::DrawnFrame::for_test(4242));
+        assert_eq!(drawn.drawn_frame, Some(4242),
+            "a snapshot built from a DrawnFrame token must carry that frame's index — it is the \
+             ONLY way a caller can tell a fresh publish from one frozen since the last draw");
+        assert!(drawn.drawn_at.is_some(),
+            "…and must stamp when that frame was drawn, so `drawn_age_ms` can be computed at read \
+             time rather than the caller guessing from an unrelated clock");
+
+        let seed = cam.undrawn_snapshot(resolved);
+        assert_eq!(seed.drawn_frame, None,
+            "the pre-first-frame seed main.rs publishes must say NO frame has been drawn (#867 \
+             blocking 2): it is served through GPU init and the whole first zone load, and a \
+             `Some(_)` here would name a frame that never happened");
+        assert!(seed.drawn_at.is_none(),
+            "…and must have no draw timestamp, so `drawn_age_ms` is null rather than an age since \
+             process start masquerading as an age since a draw");
+
+        // The two constructors must agree on everything EXCEPT the freshness pair — otherwise this
+        // test could pass with `snapshot` having quietly stopped carrying `resolved` through.
+        assert_eq!(drawn.eye, seed.eye);
+        assert_eq!(drawn.radius, seed.radius);
     }
 }

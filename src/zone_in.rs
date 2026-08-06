@@ -1459,83 +1459,16 @@ mod tests {
              (which is what `movement.rs` has) cannot see the difference. See #799.");
     }
 
-    // ── #867: camera_snapshot must only describe a frame that was actually drawn ──────────────
-    //
-    // `App::render_frame` writes `self.camera_snapshot` from the resolved eye. Before #867 that
-    // write happened right after the eye was resolved, BEFORE the `surface.get_current_texture()`
-    // match whose `Lost`/`Outdated`/`Timeout` arms `return` without ever calling
-    // `renderer.render_frame(..)` — so on a resize or a throttled compositor the published `eye`
-    // named a frame that was never drawn, even though `CameraSnapshot::eye`'s doc claimed it was
-    // "the exact position the frame this snapshot describes was drawn from". The fix moved the
-    // write to right after the `render_frame` call. `App::render_frame` needs a real window/GPU
-    // adapter and cannot be driven from this crate's unit-test tier, so — exactly like this
-    // module's own `the_app_rs_call_into_this_module_is_an_unconditional_statement` above — these
-    // two tests prove it by scanning `app.rs`'s own source text with this module's existing
-    // comment/string-aware scanner, reusing `APP_RS`/`strip_comments`/`code_occurrences`/
-    // `open_braces`/`block_head`/`is_conditional` rather than duplicating them: a second copy of
-    // this scanner INSIDE `app.rs` (rather than here) would scan its own byte-literal brace
-    // comparisons (`b'{'`/`b'}'`) as code, corrupting `the_app_rs_scan_reads_a_balanced_file`'s
-    // depth measurement — measured while writing this pin, not a hypothetical.
-
-    /// The write must be an unconditional sibling of whatever block it is in, not nested behind a
-    /// fresh `if`/`match`/etc that could skip it. Catches the `if false { … }` WRAP mutation that
-    /// a bare substring/offset check cannot see — the same evasion #791's round-1 review used
-    /// against an earlier pin of this shape (see `the_app_rs_call_into_this_module_is_an_unconditional_statement`
-    /// above for the fuller account of what this technique can and cannot establish).
-    #[test]
-    fn camera_snapshot_publish_is_not_nested_behind_a_condition() {
-        let (text, code) = strip_comments(APP_RS);
-
-        let hits = code_occurrences(&text, &code, "self.camera_snapshot.lock()");
-        assert_eq!(hits.len(), 1,
-            "app.rs should publish camera_snapshot in exactly one place (#867) — a second write \
-             site elsewhere is a second chance to reintroduce a pre-draw publish. Found {}.",
-            hits.len());
-
-        for b in open_braces(&text, &code, hits[0]) {
-            let head = block_head(&text, &code, b);
-            assert!(!is_conditional(&head),
-                "the #867 camera_snapshot write must run unconditionally once this tick's frame \
-                 has actually been rendered, but its call sits inside a block that can be \
-                 skipped: `{}`. A source scan cannot tell a write that never runs from one that is \
-                 merely written — which is exactly how #791's round-1 pin was defeated by \
-                 `if false {{ … }}` — so this check refuses the nesting outright.",
-                head.trim());
-        }
-    }
-
-    /// The write must come AFTER `renderer.render_frame(..)` has actually been called this tick,
-    /// not before the `surface.get_current_texture()` early-return match that can skip drawing
-    /// entirely (`Lost`/`Outdated`/`Timeout`). `camera_snapshot_publish_is_not_nested_behind_a_condition`
-    /// above proves the write is unconditional GIVEN it runs; this proves WHERE in the tick it
-    /// runs — the two are independent and a reviewer could break either one alone.
-    ///
-    /// Anchored on the render call's full, exact argument list rather than a bare
-    /// `renderer.render_frame(` prefix: `submit_frame`'s off-screen capture-override path (#422)
-    /// makes a second, differently-worded `render_frame` call elsewhere in this file
-    /// (`&mut ov_enc, &offscreen_view, scene, eye, look, 0.0`) that must not be confused with the
-    /// primary one this pin is about.
-    #[test]
-    fn camera_snapshot_publish_comes_after_render_frame_is_called() {
-        let (text, code) = strip_comments(APP_RS);
-
-        let write_at = code_occurrences(&text, &code, "self.camera_snapshot.lock()")
-            .into_iter().next()
-            .expect("app.rs no longer writes self.camera_snapshot at all — the #867 fix (publish \
-                     only after render_frame has actually run) appears to have been removed; put \
-                     it back");
-        let render_at = code_occurrences(&text, &code,
-                "renderer.render_frame(&mut enc, &view, &self.scene, cam_eye, cam_target, dt);")
-            .into_iter().next()
-            .expect("app.rs no longer has the primary render_frame call this #867 pin is \
-                     anchored on — if it moved or was reworded, re-anchor this test; do not \
-                     delete it");
-
-        assert!(write_at > render_at,
-            "#867: camera_snapshot must be published AFTER render_frame is actually called this \
-             tick (render_frame call at byte {render_at}), not before it — found the publish at \
-             byte {write_at}. Publishing earlier lets the surface-error early returns \
-             (Lost/Outdated/Timeout) skip drawing while the snapshot still describes a frame that \
-             was never rendered.");
-    }
+    // #867's ordering guarantee is NOT pinned here, deliberately. An earlier revision of this fix
+    // added two scans of `app.rs` asserting the `camera_snapshot` write sat at a higher byte offset
+    // than the `render_frame` call and was not brace-nested behind a condition. Independent review
+    // defeated both while they stayed green: extracting the write into a helper placed later in
+    // `impl App` and calling it from the old pre-draw site satisfies both scans, and so does adding
+    // a second pre-draw write through `Arc::clone(&self.camera_snapshot)` (the `hits.len() == 1`
+    // guard is a substring count over one spelling). Neither is an attack; the first is an ordinary
+    // tidy-up. What a byte-offset scan measures is where characters sit, not when a write executes.
+    // The ordering is now a type fact instead — `CameraState::snapshot` takes the
+    // `eqoxide_renderer::DrawnFrame` that only `render_frame` returns, so a pre-draw publisher has
+    // no argument to pass and does not compile. See #799 for the pattern, and `DrawnFrame`'s own
+    // `compile_fail` doctest for the proof that it cannot be fabricated.
 }
