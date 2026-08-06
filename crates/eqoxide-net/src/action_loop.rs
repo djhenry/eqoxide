@@ -1157,38 +1157,52 @@ impl ActionLoop {
             // Start fresh with server entries.
             shared.clear();
             shared.extend(gs.world.zone_points.iter().cloned());
-            // Load map labels from disk.
-            if let Some(zm) = eqoxide_core::zone_map::ZoneMap::load(&self.maps_dir, &gs.world.zone_name) {
-                let before = shared.len();
-                for label in &zm.labels {
-                    let lower = label.text.to_lowercase();
-                    if !lower.starts_with("to ") { continue; }
-                    let dest_zone_id: u16 = if lower.contains("north qeynos") || lower.contains("qeynos2") {
-                        2
-                    } else if lower.contains("south qeynos") {
-                        1 // qeynos south
-                    } else {
-                        0
-                    };
-                    if dest_zone_id == 0 { continue; }
-                    let dup = shared.iter().any(|zp| {
-                        zp.zone_id == dest_zone_id
-                            && ((zp.server_x - label.east).powi(2) + (zp.server_y - label.north).powi(2)) < 2500.0
-                    });
-                    if dup { continue; }
-                    shared.push(ZonePoint {
-                        iterator: u32::MAX,
-                        server_x: label.east,
-                        server_y: label.north,
-                        server_z: 0.0,
-                        heading: 0.0,
-                        zone_id: dest_zone_id,
-                    });
-                    tracing::info!("zone_map: added exit '{}' at ({:.1}, {:.1}) → zone_id={}",
-                              label.text, label.east, label.north, dest_zone_id);
+            // Load map labels from disk, KEEPING the failure (#816) instead of collapsing it into
+            // silently adding nothing — the same shape `RegionMap::try_load` fixed for `.wtr`
+            // (#762/#803). `Err` here means the fallback exits this zone's map WOULD have
+            // contributed are UNKNOWN, not that this zone genuinely has none; publishing that as an
+            // indistinguishable empty contribution is exactly the confident falsehood the
+            // agent-honesty invariant forbids. The verdict is recorded in `zone_map_load` (read by
+            // `GET /v1/observe/debug`) on EVERY zone change, `Ok` included, so a stale failure from
+            // a previous zone can never survive into one whose load actually succeeded.
+            match eqoxide_core::zone_map::ZoneMap::try_load(&self.maps_dir, &gs.world.zone_name) {
+                Ok(zm) => {
+                    *self.world.zone_map_load.lock().unwrap() = None;
+                    let before = shared.len();
+                    for label in &zm.labels {
+                        let lower = label.text.to_lowercase();
+                        if !lower.starts_with("to ") { continue; }
+                        let dest_zone_id: u16 = if lower.contains("north qeynos") || lower.contains("qeynos2") {
+                            2
+                        } else if lower.contains("south qeynos") {
+                            1 // qeynos south
+                        } else {
+                            0
+                        };
+                        if dest_zone_id == 0 { continue; }
+                        let dup = shared.iter().any(|zp| {
+                            zp.zone_id == dest_zone_id
+                                && ((zp.server_x - label.east).powi(2) + (zp.server_y - label.north).powi(2)) < 2500.0
+                        });
+                        if dup { continue; }
+                        shared.push(ZonePoint {
+                            iterator: u32::MAX,
+                            server_x: label.east,
+                            server_y: label.north,
+                            server_z: 0.0,
+                            heading: 0.0,
+                            zone_id: dest_zone_id,
+                        });
+                        tracing::info!("zone_map: added exit '{}' at ({:.1}, {:.1}) → zone_id={}",
+                                  label.text, label.east, label.north, dest_zone_id);
+                    }
+                    if shared.len() > before {
+                        tracing::info!("zone_map: {} fallback exits added (total {})", shared.len() - before, shared.len());
+                    }
                 }
-                if shared.len() > before {
-                    tracing::info!("zone_map: {} fallback exits added (total {})", shared.len() - before, shared.len());
+                Err(e) => {
+                    tracing::warn!("zone_map: '{}' fallback exits unavailable: {}", gs.world.zone_name, e);
+                    *self.world.zone_map_load.lock().unwrap() = Some(e);
                 }
             }
         } else {
@@ -3936,6 +3950,87 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(
                 eqoxide_nav::zone_assets::ZoneAssetState::Idle)), // zone_assets (#600)
         )
+    }
+
+    /// Same as `test_action_loop` but with a caller-controlled `maps_dir`, for the #816
+    /// `zone_map_load` tests below (which need a real directory on disk to place/omit `.txt` files).
+    fn test_action_loop_with_maps_dir(
+        group: eqoxide_ipc::GroupShared, maps_dir: std::path::PathBuf,
+    ) -> ActionLoop {
+        ActionLoop::new(
+            eqoxide_ipc::NavSlots {
+                nav_state: std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::NavStatus::default())),
+                ..Default::default()
+            },
+            Default::default(), // world
+            Default::default(), // quest
+            eqoxide_ipc::GroupSlots { group, ..Default::default() },
+            Default::default(), // command (CommandState)
+            Default::default(), // social
+            Default::default(), // merchant_slots
+            Default::default(), // inventory_slots
+            Default::default(), // interact
+            Default::default(), // chat
+            Default::default(), // controller
+            Default::default(), // guild_slots
+            Default::default(), // collision
+            maps_dir,
+            Default::default(), // nav_debug (#608)
+            std::sync::Arc::new(std::sync::Mutex::new(
+                eqoxide_nav::zone_assets::ZoneAssetState::Idle)), // zone_assets (#600)
+        )
+    }
+
+    /// **#816 (agent-honesty): `sync_zone_points`' zone-change branch must record the REAL outcome of
+    /// this zone's map `.txt` load in `zone_map_load` — not just discard it as the old `ZoneMap::load`
+    /// did.** Drives the real production hook (`sync_zone_points`), not a re-implementation.
+    ///
+    /// Three transitions, each independently mutation-sensitive:
+    /// 1. No map file at all → `Some(Missing)`.
+    /// 2. A zone whose map DOES load → `None` — proves success doesn't leave a prior failure lying
+    ///    around AND that success is itself recorded as `None` (not just "never touched").
+    /// 3. Back to a zone with no map file → `Some(Missing)` again — proves a stale `None` from a
+    ///    previous zone's SUCCESS cannot survive into one whose load genuinely fails.
+    ///
+    /// **Mutation check:** delete either `*self.world.zone_map_load.lock().unwrap() = None;` (in the
+    /// `Ok` arm) or the `Err` arm's `= Some(e);` and the corresponding assertion below goes RED.
+    #[test]
+    fn sync_zone_points_records_the_real_zone_map_load_outcome_816() {
+        let dir = tempfile::tempdir().unwrap();
+        // "goodzone" has a real, loadable map; "badzone" has no .txt at all.
+        std::fs::write(dir.path().join("goodzone.txt"), "L 1,2,0,3,4,0,1,1,1").unwrap();
+
+        let g: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
+        let mut nav = test_action_loop_with_maps_dir(g, dir.path().to_path_buf());
+        let mut gs = GameState::new();
+
+        // 1. First zone has no map file → the failure must be recorded, named.
+        gs.world.zone_name = "badzone".into();
+        nav.sync_zone_points(&gs);
+        assert_eq!(
+            *nav.world.zone_map_load.lock().unwrap(),
+            Some(eqoxide_core::zone_map::ZoneMapLoadError::Missing),
+            "a zone with no .txt file must record Missing, not silently stay None"
+        );
+
+        // 2. Crossing into a zone whose map DOES load must clear the failure.
+        gs.world.zone_name = "goodzone".into();
+        nav.sync_zone_points(&gs);
+        assert_eq!(
+            *nav.world.zone_map_load.lock().unwrap(),
+            None,
+            "a successful load must clear a PRIOR zone's recorded failure"
+        );
+
+        // 3. Crossing back into a zone with no map file must re-record the failure — a stale `None`
+        //    from goodzone's success must not survive into badzone's genuine failure.
+        gs.world.zone_name = "badzone".into();
+        nav.sync_zone_points(&gs);
+        assert_eq!(
+            *nav.world.zone_map_load.lock().unwrap(),
+            Some(eqoxide_core::zone_map::ZoneMapLoadError::Missing),
+            "a stale success must not survive into a zone whose load genuinely fails again"
+        );
     }
 
     /// **#600 (review round 2): `drain_zone_cross` is the THIRD world-answering consumer, and it must
