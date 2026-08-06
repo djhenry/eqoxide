@@ -937,6 +937,72 @@ mod tests {
         assert!(text.contains('x') && text.contains('y'), "message: {text}");
     }
 
+    /// A gap in the MIDDLE of the raw triple — `x` and `z` present, `y` missing — must still name
+    /// exactly `y` as missing (not e.g. mistake the presence of x/z for a complete target, and not
+    /// name x or z as missing since both were provided). `partial_coords_message` scans the whole
+    /// raw group regardless of which field is present, so this should already be correct; this test
+    /// pins that rather than leaving it to inference.
+    #[tokio::test]
+    async fn goto_partial_xz_gap_in_middle_names_y_as_missing() {
+        let state = empty_state();
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":100.0,"z":5.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert!(text.contains("missing"), "message must name what's missing: {text}");
+        assert!(text.contains('y'), "message must name y specifically as missing: {text}");
+        assert!(text.contains("got") && text.contains('x') && text.contains('z'),
+            "message must acknowledge x and z were both received: {text}");
+        assert!(!text.contains("no target; provide a name or coords"),
+            "must not fall back to the misleading empty-request message when coords WERE given: {text}");
+        assert!(goto_target.lock().unwrap().is_none());
+    }
+
+    /// A body MIXING the two coordinate forms — `map_x` (map form) with `y` (raw form) — must not
+    /// silently fall through to the false "no target" message either. The message may legitimately
+    /// list both forms' missing fields (the two forms aren't merged into one target), but it must
+    /// never claim nothing was sent when `map_x` and `y` plainly were.
+    #[tokio::test]
+    async fn goto_mixed_map_x_and_raw_y_does_not_claim_no_target() {
+        let state = empty_state();
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"map_x":100.0,"y":200.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert!(!text.contains("no target; provide a name or coords"),
+            "must not lie that nothing was sent when map_x and y WERE given: {text}");
+        assert!(text.contains("map_x") && text.contains('y'),
+            "message must acknowledge both map_x and y were received: {text}");
+        assert!(goto_target.lock().unwrap().is_none());
+    }
+
+    /// The mirror mix — `x` (raw form) with `map_y` (map form) — same honesty bar as above.
+    #[tokio::test]
+    async fn goto_mixed_raw_x_and_map_y_does_not_claim_no_target() {
+        let state = empty_state();
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":100.0,"map_y":200.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert!(!text.contains("no target; provide a name or coords"),
+            "must not lie that nothing was sent when x and map_y WERE given: {text}");
+        assert!(text.contains('x') && text.contains("map_y"),
+            "message must acknowledge both x and map_y were received: {text}");
+        assert!(goto_target.lock().unwrap().is_none());
+    }
+
     /// Regression guard for the LEGITIMATE case the fix must not disturb: a genuinely empty body
     /// (no name, no coordinate fields at all) with no current target set must still answer the
     /// honest "no target; provide a name or coords" — that framing IS accurate when nothing at all
