@@ -787,9 +787,12 @@ mod tests {
     /// (`retire_to_idle` / `stamp_fresh_goal`), so a field added to that struct is force-decided on
     /// every route out of a goal. This test pins the behaviour; the compiler pins the shape.
     ///
-    /// **Mutation checks:** replace the `s.stamp_fresh_goal(…)` call with the old flat list minus
-    /// `stall` → all three cases RED here. Add a field to `NavStatus` without touching
-    /// `stamp_fresh_goal` → `error[E0027]`, this crate does not build at all.
+    /// **Mutation checks (run, not reasoned — outputs in the PR's round-2 comment):** neuter the
+    /// `*stall = None;` line inside `NavStatus::stamp_fresh_goal` while keeping the binding (so the
+    /// destructure still compiles) → this test RED. Add one field to `NavStatus` without touching
+    /// any writer → `error[E0027]` at **all three** destructures in `eqoxide-ipc/src/lib.rs`
+    /// (`retire_to_idle`, `stamp_fresh_goal`, `transition_within_goal`), so `eqoxide-ipc` does not
+    /// compile and nothing downstream of it — this crate included — builds either.
     #[test]
     fn a_new_goal_never_inherits_the_previous_goals_stall_payload_851() {
         let wedged = || eqoxide_ipc::NavStall {

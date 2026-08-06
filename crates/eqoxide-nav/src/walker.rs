@@ -2750,6 +2750,12 @@ mod tests {
             // including when the cited test is the guard. A rename is now a compile error, which is
             // the whole point: the instruction must not be able to point at a fn that moved.
             every_walker_test_name_cited_in_a_doc_comment_still_exists,
+            // #851 review round 1, N1: cited by
+            // `the_driving_nav_state_word_is_only_ever_written_through_the_verdict_851`'s rustdoc,
+            // which points at it as the prior reading that already recorded the same
+            // `debug_assert!`-is-test-time-only fact for the other assertions on this row. Caught by
+            // `steering`'s scan on the run that added the citation, not by me.
+            a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725,
         ];
     }
 
