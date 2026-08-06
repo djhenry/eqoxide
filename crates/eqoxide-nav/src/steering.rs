@@ -167,11 +167,29 @@ impl RouteExecution {
     /// into the verdict so the published payload can say how hard the walker has already tried.
     ///
     /// Total, pure and `#[must_use]`: the only way to move this machine is to take its answer.
+    ///
+    /// **The `Stalled` verdict is a LATCH — nothing but real progress clears it — and that is a
+    /// consequence of the line below, not a separate flag.** `quiet_ticks` is MONOTONE: the early
+    /// return is the only place it ever decreases, so once it reaches [`NAV_STUCK_TICKS`] it stays
+    /// there, and the comparison alone re-derives `Stalled` on every subsequent quiet tick.
+    ///
+    /// That matters because the walker's own recovery machinery resets the signals this replaces:
+    /// `stuck_ticks` is set to 0 at every threshold *before* the back-off, so a state published
+    /// from it would have flickered back to a clean reading every ~3 s with the body in exactly the
+    /// same place — a flicker an agent cannot distinguish from a recovery that worked.
+    ///
+    /// This was written the other way first, as `if self.is_stalled() || quiet_ticks >= …`, and the
+    /// mutation check is what removed it: dropping `self.is_stalled() ||` left every test GREEN,
+    /// because it is redundant given monotonicity. Redundant text that no test can distinguish is a
+    /// liability — it reads like the thing carrying the property when the comparison is. The real
+    /// mutation for the latch is one that breaks monotonicity (reset `quiet_ticks` when
+    /// `repaths > 0`, the shape a "the re-path fixed it" bug would take), and it is RED — see
+    /// `a_repath_and_backoff_cannot_launder_the_851_stall`.
     #[must_use]
     pub fn tick(self, progressed: bool, repaths: u32) -> Self {
         if progressed { return RouteExecution::fresh(); }
         let quiet_ticks = self.quiet_ticks().saturating_add(1);
-        if self.is_stalled() || quiet_ticks >= NAV_STUCK_TICKS {
+        if quiet_ticks >= NAV_STUCK_TICKS {
             RouteExecution::Stalled { quiet_ticks, repaths }
         } else {
             RouteExecution::Advancing { quiet_ticks }
@@ -3554,9 +3572,10 @@ mod tests {
     /// without bound, so the raw product is infinite; the search is run over a QUOTIENT that caps it
     /// at `NAV_STUCK_TICKS`. That quotient is a bisimulation of the real machine, for two reasons
     /// that are both *checked below* rather than merely argued:
-    ///   1. [`driving_nav_state`] never reads `quiet_ticks` — checked by `word_ignores_quiet_ticks`.
+    ///   1. [`driving_nav_state`] never reads `quiet_ticks` — checked by the first assertion in the
+    ///      body below (its condition is bound to a named `let` that says so).
     ///   2. [`RouteExecution::tick`] reads it only through `>= NAV_STUCK_TICKS`, and every `Stalled`
-    ///      state already satisfies that — checked by `tick_ignores_quiet_ticks_once_stalled`.
+    ///      state already satisfies that — checked by the second assertion, the same way.
     ///      (`Advancing` can never hold `quiet_ticks >= NAV_STUCK_TICKS` by construction, so the cap
     ///      is a no-op on that variant — asserted in the loop.)
     /// So two states identified by the cap have identical futures and identical published words, and
@@ -3568,8 +3587,11 @@ mod tests {
     /// perfectly). COUNTING: the reachable set must be larger than the threshold.
     ///
     /// **Mutation checks, both directions** (run at authoring time — outputs in the PR):
-    ///   * drop the `self.is_stalled() ||` latch from [`RouteExecution::tick`] → RED on the
-    ///     invariant (a post-stall tick un-stalls the machine while the oracle stays quiet);
+    ///   * break `quiet_ticks` monotonicity in [`RouteExecution::tick`] by resetting it on a re-path
+    ///     (the shape a "the re-path fixed it" bug takes) → RED on the invariant (the
+    ///     machine un-stalls itself on a re-path while the oracle stays quiet). Dropping the
+    ///     `self.is_stalled() ||` clause the first draft had instead was EQUIVALENT — see
+    ///     [`RouteExecution::tick`], which is why that clause is gone;
     ///   * WRAP the `Stalled` arm of [`driving_nav_state`] in `if false { … }` so it falls through
     ///     to the route match → RED on the invariant;
     ///   * make [`driving_nav_state`] answer `NAV_STATE_NAVIGATING_STALLED` unconditionally → RED on

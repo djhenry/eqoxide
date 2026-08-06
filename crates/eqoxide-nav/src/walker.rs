@@ -4742,8 +4742,10 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// otherwise this is just the previous test with a longer loop and proves nothing about
     /// laundering.
     ///
-    /// Mutation check: drop `self.is_stalled() ||` from `RouteExecution::tick` → RED (the word
-    /// returns to `navigating` after each back-off).
+    /// Mutation check: break `quiet_ticks` monotonicity in `RouteExecution::tick` — reset it on a
+    /// re-path (`let quiet_ticks = if repaths > 0 { 1 } else { … };`), which is the shape a "the
+    /// re-path fixed it" bug takes → RED here (the word returns to `navigating` after each
+    /// back-off). Output in the PR.
     #[test]
     fn a_repath_and_backoff_cannot_launder_the_851_stall() {
         let (mut w, nav, mut gs, goal) = stalled_walker_fixture();
