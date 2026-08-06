@@ -1030,6 +1030,19 @@ pub struct GameState {
     /// the body either and this holds its last computed value — the position beside it is stale in
     /// the same breath and by the same amount.
     ///
+    /// **One measured exception to that last clause (#846), because it was written as unqualified
+    /// and is not.** On the single tick where `stream_position` detects a server correction (a GM
+    /// `#summon`, a knockback, an anti-cheat snap), it hands the jump to the render thread through
+    /// `ipc::PosCorrection` and returns EARLY — so on that tick `player_x/y/z` are the SERVER's new
+    /// coordinates while this field is still the frozen controller's, and the pair is a fresh
+    /// position beside an old predicament. The next net tick's normal path writes the controller's
+    /// position back over `player_x/y/z`, so the pair is mutually consistent again and the window is
+    /// ONE net tick (~10 ms) wide, not "until the render loop wakes". Measured, and pinned by
+    /// `a_server_summon_while_the_render_loop_idles_moves_pos_for_one_tick_846` in `eqoxide-net`.
+    /// What the net thread cannot do — property-tested next to it by
+    /// `no_net_tick_can_free_or_manufacture_a_hold_846` — is edit this field: it may only mirror
+    /// what the render thread published, so it can neither free a held body nor invent a hold.
+    ///
     /// This is a CLIENT-SIDE physics fact, not server truth. It deliberately does not live in
     /// [`WorldState`]: the server has no opinion about it and would happily agree with the position
     /// we keep streaming from inside the rock.

@@ -590,8 +590,54 @@ fn ser_error_kind<S: serde::Serializer>(
 ///   false hold. What it can do is freeze `held_secs`; see that field, which tells you how to
 ///   detect it.
 ///
+/// # Why the idle bullet is true, and what it costs to say so (#846)
+///
+/// #846 attacked that third bullet directly: a GM `#summon` lands on the **net** thread, so if the
+/// net thread could move the body out of the geometry it is wedged in while the render loop idled,
+/// the hold would keep being mirrored — a well-formed field an agent cannot tell from a fresh one,
+/// which is the #343 `connected: true` shape. The bullet asserted the conclusion and named no
+/// mechanism, and a reasoned-not-measured mechanism claim is the defect class this invariant exists
+/// for. So, the mechanism, in the order it actually carries the weight:
+///
+/// 1. **The net thread has no `CharacterController` to free.** The controller is a plain owned field
+///    of `App` in the root `eqoxide` crate; `eqoxide-net` cannot so much as name the type, because
+///    depending on the root crate would be a dependency cycle. This is not a convention — it is the
+///    crate graph.
+/// 2. **The only channel it has is a REQUEST.** `ActionLoop::stream_position` publishes a large
+///    server jump into `ipc::PosCorrection` — coordinates, not a controller handle — and returns.
+///    Only `app.rs`'s rendered frame consumes it, and it consumes it by calling
+///    `CharacterController::teleport`, which drops the hold; the `step` below that recomputes from
+///    scratch. So adopting the summon and clearing the hold are the same stepped frame, by
+///    construction.
+/// 3. That this is what the net side actually does is **property-tested**, not reasoned:
+///    `action_loop::tests::no_net_tick_can_free_or_manufacture_a_hold_846` freezes the
+///    `ControllerView` (an idle render loop, modelled exactly), then runs the net tick against a
+///    matrix of summons on both sides of the correction threshold and asserts the mirrored hold is
+///    the render thread's answer verbatim and the controller view is untouched. Three WRAP
+///    mutations were run against it and all three went red — see that test's doc.
+///
+/// **What is NOT guaranteed, stated plainly.** None of the above bounds *how long* the view can
+/// stay frozen. That bound is a timing coupling in `app.rs`'s `poll_external`: a pending
+/// `pos_correction` marks the loop active (#116), and so independently does any `GameState` change
+/// at all — including the summon packet that caused it — so the loop wakes within its idle poll and
+/// renders. That is ~50 ms + a frame from the constants, **reasoned from those constants, not
+/// measured on a running client**, and it is **unguarded**: `app.rs`'s event loop needs a GPU and a
+/// window, and deleting that wake condition leaves the whole workspace green (measured on #846).
+/// Treat the wake as the latency bound, not as the honesty guarantee — the honesty guarantee is
+/// points 1–3.
+///
+/// **And one measured residual.** On the single net tick that detects the correction,
+/// `stream_position` returns early, so `player.pos` is the SERVER's new coordinates while
+/// `player.hold` is still the frozen controller's: for that one tick the payload pairs a fresh
+/// position with an old predicament. The next tick writes the controller's position back and the
+/// pair is mutually consistent again, so the window is one net tick (~10 ms) wide rather than
+/// "until the render loop wakes". Measured and pinned by
+/// `action_loop::tests::a_server_summon_while_the_render_loop_idles_moves_pos_for_one_tick_846`.
+///
 /// So: a non-`null` `hold` is never stale-because-idle in the sense of describing a predicament the
-/// body has left. It can be stale in *age* (`held_secs`), which is measurable from the caller.
+/// body has left — because nothing an idle render loop is idle *through* can free the body. It can
+/// be stale in *age* (`held_secs`), which is measurable from the caller, and for one net tick after
+/// a server reposition it can sit beside a `pos` fresher than itself.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlayerHoldView {
     /// `embedded_no_recovery` — embedded in geometry, push-out found nowhere to go, no recovery

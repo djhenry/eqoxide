@@ -524,6 +524,23 @@ impl CharacterController {
     /// [`Self::clear_hold`] instead; an idle render loop does not publish at all, and cannot
     /// manufacture a false hold because freeing the body also requires a stepped frame.
     /// (#724 round-3 review, N1 — this used to say "every frame" flatly.)
+    ///
+    /// **Why "freeing the body also requires a stepped frame" is a fact and not a hope (#846).**
+    /// The obvious attack is a GM `#summon`, which lands on the NET thread while the render loop
+    /// idles. It cannot free the body: `CharacterController` lives in this crate, the root binary
+    /// crate, and `eqoxide-net` cannot depend on it without a dependency cycle — so the net thread
+    /// has no handle to reach. All it can do is publish coordinates into `ipc::PosCorrection` and
+    /// wait; `app.rs`'s rendered frame is what takes them, and it takes them by calling
+    /// [`Self::teleport`], which drops the hold before the `step` beside it recomputes. Adopting the
+    /// summon and clearing the hold are therefore the same frame. The net side of that boundary is
+    /// property-tested by `no_net_tick_can_free_or_manufacture_a_hold_846` in
+    /// `eqoxide-net`'s `action_loop` tests (three WRAP mutations, all red).
+    ///
+    /// What that does NOT establish is how long an idle loop can stay idle. `app.rs`'s
+    /// `poll_external` bounds it — a pending `pos_correction`, or any `GameState` change, marks the
+    /// loop active — but that call site needs a GPU and a window and is reachable by no test here;
+    /// deleting it was measured to leave the workspace green (#846). It is the latency bound, not
+    /// the honesty guarantee.
     pub fn hold(&self) -> Option<ControllerHold> { self.hold }
 
     /// #776: the afloat stall in force, or `None` — see [`AfloatStall`] and `eqoxide_core::afloat`'s
