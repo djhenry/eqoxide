@@ -557,6 +557,21 @@ impl Walker {
         debug_assert!(!(state == "idle" && reason.is_none()),
             "#725 B1: `idle` must name how it got there; `nav_reason: null` is reserved for boot");
         let mut s = self.nav.nav_state.lock().unwrap();
+        Self::write_nav_state_locked(&mut s, state, reason);
+    }
+
+    /// The body of [`Walker::set_nav_state_because`], with the lock passed in rather than taken.
+    ///
+    /// It is split out for exactly one reason (#851): [`Walker::publish_drive_state`] writes the
+    /// state word AND the `stall` payload that must accompany it, and the row's own documented
+    /// invariant is that `stall` is `Some` **exactly** while the state is `navigating_stalled`. Two
+    /// separate `lock()`s would leave a window in which a reader on the HTTP thread — which clones
+    /// the whole row under one lock — sees the transition into `navigating_stalled` with `stall`
+    /// still cleared by the transition branch below. That window is short, and it is on the mild
+    /// side (the WORD is honest, the calibration is momentarily missing), but "you will never see
+    /// one without the other" is a universal the docs state, and a universal that is only usually
+    /// true is the kind of claim this project treats as a defect. One lock, no window.
+    fn write_nav_state_locked(s: &mut eqoxide_ipc::NavStatus, state: &str, reason: Option<&str>) {
         // #732: `idle` means the goal is over, so it goes through the ONE writer that retires the
         // goal's facts — including `goal` itself, which the transition branch below never touched.
         // Unconditional, not gated on `s.state != state`: defence in depth, so no caller can
@@ -641,8 +656,10 @@ impl Walker {
     fn publish_drive_state(&self) {
         let Some(facts) = self.committed else { return };
         let word = crate::steering::driving_nav_state(facts.route, self.exec);
-        self.set_nav_state_because(word, facts.reason);
+        // ONE lock for the word, the tier and the stall payload — see `write_nav_state_locked` for
+        // why they cannot be three separate acquisitions.
         let mut s = self.nav.nav_state.lock().unwrap();
+        Self::write_nav_state_locked(&mut s, word, facts.reason);
         s.tier  = facts.tier;
         s.stall = match self.exec {
             crate::steering::RouteExecution::Advancing { .. } => None,
