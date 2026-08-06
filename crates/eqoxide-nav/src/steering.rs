@@ -3694,10 +3694,11 @@ mod tests {
     ///      checked by the second assertion, as an equality of successors and not merely of
     ///      `.is_stalled()`. That distinction is the whole premise: successor equality is what a
     ///      bisimulation needs, and the parity form this test carried first was measurably weaker —
-    ///      a `tick` branching on the exact `quiet_ticks` into `repaths` breaks the quotient and
-    ///      leaves parity, and the entire model check, green (#851 review round 1). Do not weaken it
-    ///      back. (`Advancing` can never hold `quiet_ticks >= NAV_STUCK_TICKS` by construction, so
-    ///      the cap is a no-op on that variant — asserted inside `cap` itself.)
+    ///      a `tick` branching on the SOURCE state's exact `quiet_ticks` into `repaths` breaks the
+    ///      quotient and leaves parity, and the entire model check, green (#851 review round 1). Do
+    ///      not weaken it back. The body below records what this premise does NOT cover, measured
+    ///      rather than assumed. (`Advancing` can never hold `quiet_ticks >= NAV_STUCK_TICKS` by
+    ///      construction, so the cap is a no-op on that variant — asserted inside `cap` itself.)
     /// So two states identified by the cap have identical futures and identical published words, and
     /// covering the quotient covers the infinite original.
     ///
@@ -3759,13 +3760,27 @@ mod tests {
         //    successor — for every input, not merely on the same `is_stalled()` answer.
         //
         //    Successor EQUALITY is what a bisimulation needs, and the first draft of this premise
-        //    compared `.is_stalled()` parity instead (#851 review round 1). That is strictly weaker,
-        //    and measurably so: a `tick` that branches on the exact `quiet_ticks` into any field the
-        //    parity check does not inspect breaks the quotient while satisfying the premise. The
-        //    reviewer measured it — make `tick` write `repaths: 999` when
-        //    `quiet_ticks == NAV_STUCK_TICKS` exactly, and the parity form of this premise, and the
-        //    whole model check with it, stayed GREEN (a different test killed that mutant). Under
-        //    the form below it is RED here, which is where a broken quotient belongs.
+        //    compared `.is_stalled()` parity instead (#851 review round 1). That is strictly weaker:
+        //    a `tick` that branches on the SOURCE state's exact `quiet_ticks` into any field the
+        //    parity check does not inspect breaks the quotient while satisfying the premise.
+        //
+        //    "Write `repaths: 999` at the cap" has TWO readings, and they do not behave alike. Both
+        //    were RUN, because the difference is exactly the scope of this premise (round-2 outputs
+        //    are in the PR comment):
+        //
+        //      * SOURCE reading — branch on the state being stepped FROM. This is the one that
+        //        breaks the quotient, and it is RED right here, reporting
+        //        `left: Stalled { quiet_ticks: 20, repaths: 0 }` against
+        //        `right: Stalled { quiet_ticks: 20, repaths: 999 }`. Do not weaken this back.
+        //
+        //      * SUCCESSOR reading — branch on the value being written. This premise CANNOT see it,
+        //        and does not claim to: every source state quantified over below already holds
+        //        `quiet_ticks >= NAV_STUCK_TICKS`, so every successor holds one MORE than that, and
+        //        the mutated branch never fires. It fires only on the ENTRY transition, which the
+        //        quotient is not about. Measured GREEN here and across the whole model check, with
+        //        the flip-boundary test below the one that kills it (263 passed / 1 failed over
+        //        `-p eqoxide-nav --lib`). That division of labour is deliberate: this premise is
+        //        about the cap being SOUND, not about the flip being in the right place.
         for q in NAV_STUCK_TICKS..NAV_STUCK_TICKS + 50 {
             for (progressed, repaths) in inputs.iter().copied() {
                 let from_q   = cap(RouteExecution::Stalled { quiet_ticks: q, repaths: 3 }
