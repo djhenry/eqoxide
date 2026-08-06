@@ -715,6 +715,36 @@ pub const NAV_PREFERRED_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS * 
 pub const NAV_NEAR_HORIZONTAL: f32 = crate::traversability::PLAYER_BODY.near_horizontal;
 pub const NAV_AGENT_HEIGHT: f32 = crate::traversability::PLAYER_BODY.agent_height;
 
+/// **THE ONE RAY-HIT ACCEPTANCE WINDOW (#855).** A Möller–Trumbore `t` counts as a hit iff it lands
+/// in here. Every ray scan in this module — [`Collision::nearest_hit_t`], [`Collision::nearest_hit`],
+/// [`Collision::column_hits`] — tests `t` against THIS constant, so the module cannot hold two
+/// opinions about whether a given face is on a given segment.
+///
+/// **It used to hold two.** `column_hits` accepted `[0,1]`; the two `nearest_hit*` scans accepted
+/// `t > 1e-3`. That `1e-3` is a fraction of a caller-chosen ray length, so it is a *blind band of
+/// `1e-3 × ray length` in each caller's own units* — measured exactly (ratio `1.000e-3` at ray
+/// lengths 0.56 / 2.5 / 100), and measured to make the two scans disagree: over a floor at z=0, a
+/// ray from the face down 2.5 returns `None` from `nearest_hit_t` while `column_surfaces` reports the
+/// face twice. `CharacterController::swim_sink` casts a `35·dt` ray, so a swimmer whose feet sat
+/// inside that band read "open water below" and descended THROUGH the pool floor — reached with no
+/// synthetic placement, and knife-edge on `dt` (#855).
+///
+/// **Why no epsilon is needed here.** The band reads like a self-intersection guard for a ray
+/// starting ON a face, but that case is already rejected one test earlier: a ray lying IN a
+/// triangle's plane is parallel to it, so `det.abs() < eps` drops it (pinned by
+/// `a_ray_starting_on_a_face_is_handled_by_the_parallel_test_not_the_t_window`). A ray that starts on
+/// a face and heads INTO it yields `t = 0`, which is a true zero-distance contact — and every caller
+/// carries its own back-off (`SKIN`, `Body::radius`) that turns `t = 0` into "no progress", not into
+/// a negative move. Accepting it is what makes contact detectable instead of silently absent.
+///
+/// **The one tie this window cannot break**, measured and deliberate: a face at distance exactly
+/// zero reports for a ray heading EITHER way off it, because Möller–Trumbore returns `t = -0.0` for
+/// the away direction and `-0.0 == 0.0` in IEEE. No `f32` lower bound separates the two sides at the
+/// point of contact. The tie resolves to "you are touching it" — the conservative side for every
+/// caller here — and is measure-zero given those back-offs. Pinned by
+/// `a_ray_starting_on_a_face_is_handled_by_the_parallel_test_not_the_t_window`.
+pub const HIT_WINDOW: std::ops::RangeInclusive<f32> = 0.0..=1.0;
+
 /// The steepest grade (rise/run) A* accepts on a walk edge — walkable up to ~50°; steeper makes the
 /// controller slide on the face and wedge (#205, eqoxide#212). Was a const local to `astar`; hoisted
 /// to module scope so the #630 profile check (`walk_profile_ok`) shares the same number.
@@ -1595,7 +1625,7 @@ impl Collision {
                     let v = dot(dir, q) * inv;
                     if v < 0.0 || u + v > 1.0 { continue; }
                     let t = dot(e2, q) * inv;
-                    if !(0.0..=1.0).contains(&t) { continue; }
+                    if !HIT_WINDOW.contains(&t) { continue; } // #855: the ONE window, shared with `nearest_hit*`
                     all.push((gather_top + t * dir_z, nz));
                 }
             }
@@ -1671,8 +1701,11 @@ impl Collision {
         hits.first().map(|&(z, _)| z) // high→low ⇒ the first is the highest floor at/below z+up
     }
 
-    /// Nearest geometry hit along segment `from → to`, as fraction `t ∈ (0,1]`.
+    /// Nearest geometry hit along segment `from → to`, as fraction `t ∈ [0,1]`.
     /// Both points are GPU world space `[east, north, height]`. Möller–Trumbore.
+    ///
+    /// The window is `[0,1]` — [`HIT_WINDOW`], the SAME window [`Collision::column_hits`] uses.
+    /// See that constant for why it used to be `(1e-3, 1]` and what that cost (#855).
     pub fn nearest_hit_t(&self, from: [f32; 3], to: [f32; 3]) -> Option<f32> {
         if self.cols == 0 { return None; }
         let dir = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
@@ -1708,7 +1741,7 @@ impl Collision {
                     let v = dot(dir, q) * inv;
                     if v < 0.0 || u + v > 1.0 { continue; }
                     let t = dot(e2, q) * inv;
-                    if t > 1e-3 && t <= 1.0 && best.map_or(true, |b| t < b) {
+                    if HIT_WINDOW.contains(&t) && best.map_or(true, |b| t < b) {
                         best = Some(t);
                     }
                 }
@@ -1741,6 +1774,8 @@ impl Collision {
     /// Like [`nearest_hit_t`] but also returns the hit triangle's **unit normal**, flipped to
     /// oppose the segment direction (so it faces back toward `from`). Used by [`sweep`] to provide
     /// the slide plane for collide-and-slide. Möller–Trumbore over the broad-phase cells.
+    ///
+    /// Same [`HIT_WINDOW`] as [`nearest_hit_t`] and [`Collision::column_hits`] (#855).
     pub fn nearest_hit(&self, from: [f32; 3], to: [f32; 3]) -> Option<(f32, [f32; 3])> {
         if self.cols == 0 { return None; }
         let dir = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
@@ -1772,7 +1807,7 @@ impl Collision {
                     let v = dot(dir, q) * inv;
                     if v < 0.0 || u + v > 1.0 { continue; }
                     let t = dot(e2, q) * inv;
-                    if t > 1e-3 && t <= 1.0 && best.map_or(true, |(b, _)| t < b) {
+                    if HIT_WINDOW.contains(&t) && best.map_or(true, |(b, _)| t < b) {
                         // Geometric normal e1×e2, normalised, flipped to face back toward `from`.
                         let mut n = cross(e1, e2);
                         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
@@ -1810,6 +1845,26 @@ impl Collision {
         let mut hits = Vec::new();
         self.column_hits(east, north, origin_z, 0.0, depth.max(0.0), true, &mut hits);
         hits.first().map(|&(z, _)| z) // sorted high→low ⇒ first = highest standable at/below origin_z
+    }
+
+    /// The **highest surface at or below `from_z`** within `depth`, FACING-BLIND — the nearest thing
+    /// under a point that a descent cannot pass through, regardless of the face's winding or whether
+    /// anything could *stand* on it (#855).
+    ///
+    /// This is deliberately NOT [`ground_below`]: that one filters through `is_standable`, which
+    /// requires `NAV_AGENT_HEIGHT` of headroom, so it reports `None` for the floor of a submerged
+    /// tunnel — precisely where a descent guard is most needed. A slab stops a body whether or not
+    /// the body could stand on it, which is the same premise [`descent_corridor_clear`] argues from.
+    ///
+    /// Because it runs through [`column_hits`] it inherits that scan's `HIT_WINDOW`, so a face
+    /// exactly at `from_z` (distance zero) IS reported. That is the property
+    /// `CharacterController::swim_sink` leans on: the clamp must not have a blind band of its own,
+    /// or it would only move the #855 cliff rather than close it.
+    pub fn obstruction_below(&self, east: f32, north: f32, from_z: f32, depth: f32) -> Option<f32> {
+        if self.cols == 0 { return None; }
+        let mut hits = Vec::new();
+        self.column_hits(east, north, from_z, 0.0, depth.max(0.0), false, &mut hits);
+        hits.first().map(|&(z, _)| z) // sorted high→low ⇒ first = nearest below `from_z`
     }
 
     /// **THE PHANTOM-DESCENT GUARD (#693).** Can a body actually FALL from `takeoff_z` down to
@@ -5092,6 +5147,153 @@ mod tests {
         }
     }
 
+    // ── #855: the ONE ray-hit acceptance window ──────────────────────────────────────────────────
+
+    /// A single up-facing floor quad at z = 0, 100 x 100 around the origin.
+    fn one_floor() -> Collision {
+        Collision::build(&ZoneAssets {
+            terrain: vec![slab(0.0, -50.0, 50.0, -50.0, 50.0, true)],
+            objects: vec![], textures: vec![],
+        }, 32.0)
+    }
+
+    /// **THE #855 REGRESSION, stated as the disagreement it was.** `nearest_hit_t` and the column
+    /// scan look at the same triangles down the same vertical line; before #855 they answered
+    /// differently about a face flush with the ray origin, because the ray scan's window started at
+    /// `t > 1e-3` and the column scan's at `t >= 0`.
+    ///
+    /// MUTATION-CHECK (run both directions, and the failure MESSAGE observed, not predicted):
+    /// restoring `t > 1e-3` in `nearest_hit_t` turns this RED at the first `eps = 0` row it reaches
+    /// — measured `len=0.056 eps=0: column=[(0.0, 1.0), (0.0, 1.0)] ray=None`. Restoring the epsilon
+    /// in `nearest_hit` instead leaves it GREEN (this test reaches only the `_t` scan) — which is
+    /// why the controller-side reach control lives in
+    /// `movement`'s `a_driven_swim_descent_never_passes_the_pool_floor_at_any_dt`.
+    #[test]
+    fn the_ray_scan_and_the_column_scan_agree_about_a_face_flush_with_the_origin() {
+        let c = one_floor();
+        for &len in &[0.056f32, 0.56, 2.5, 100.0] {
+            for &eps in &[0.0f32, 1e-6, 1e-4, 5e-4, 1e-3, 2.4e-3, 0.05] {
+                if eps >= len { continue; } // the face is genuinely past the end of the ray
+                let column = c.column_surfaces(0.0, 0.0, eps, 0.0, len);
+                let ray = c.nearest_hit_t([0.0, 0.0, eps], [0.0, 0.0, eps - len]);
+                assert_eq!(!column.is_empty(), ray.is_some(),
+                    "len={len} eps={eps}: column={column:?} ray={ray:?} — the two scans must not \
+                     disagree about whether the z=0 floor is on this segment");
+                assert!(ray.is_some(), "len={len} eps={eps}: the floor IS on this segment");
+            }
+        }
+    }
+
+    /// The blind band is GONE, not merely smaller: for a face `eps` under the origin, the hit is
+    /// reported whenever `eps < len` — with no `len`-proportional dead zone. Bisecting for the
+    /// smallest visible `eps` measured exactly `1e-3 × len` before the fix (0.00056 / 0.0025 / 0.1
+    /// at len 0.56 / 2.5 / 100); it must now be 0.
+    #[test]
+    fn the_hit_window_has_no_len_proportional_blind_band() {
+        let c = one_floor();
+        for &len in &[0.56f32, 2.5, 100.0] {
+            // Bisect the smallest eps the ray still sees. `hi` is always visible, `lo` never.
+            let (mut lo, mut hi) = (0.0f32, len * 0.5);
+            for _ in 0..60 {
+                let mid = 0.5 * (lo + hi);
+                if c.nearest_hit_t([0.0, 0.0, mid], [0.0, 0.0, mid - len]).is_some() { hi = mid; } else { lo = mid; }
+            }
+            assert!(hi <= 1e-6 * len.max(1.0),
+                "len={len}: blind band {hi} (ratio {:.3e}) — a caller-length-proportional dead zone \
+                 is exactly the #855 defect", hi / len);
+        }
+    }
+
+    /// **The load-bearing premise of deleting the epsilon:** the case it looked like a guard for —
+    /// a ray that starts ON a face — is rejected one test EARLIER, by the `det.abs() < eps`
+    /// parallel test, not by the `t` window. This test measures both halves of that claim so it is
+    /// not left as reasoning:
+    ///   * a ray lying IN the face's plane returns `None` (parallel; the self-hit case);
+    ///   * a ray from the same origin heading INTO the face returns `t = 0` (a true contact).
+    ///
+    /// A face genuinely BEHIND the origin is still rejected — the window's lower bound is a real
+    /// bound, not an "accept everything". MUTATION-CHECK: widening `HIT_WINDOW` to `-1.0..=1.0`
+    /// turns the last assertion RED.
+    ///
+    /// MEASURED CAVEAT, recorded because it is a real semantic and not an oversight: a face at
+    /// distance EXACTLY zero is reported for a ray heading either way off it. Möller–Trumbore
+    /// yields `t = -0.0` for the away direction and `-0.0 == 0.0` in IEEE, so no lower bound
+    /// expressible in `f32` can separate the two sides at the point of contact. That tie resolves
+    /// toward "you are touching it", which is the conservative direction for every caller here (an
+    /// over-reported contact costs a frame of progress; an under-reported one is #855). It is
+    /// measure-zero in practice: every caller's own back-off (`SKIN`, `Body::radius`) keeps its ray
+    /// origin off the face.
+    #[test]
+    fn a_ray_starting_on_a_face_is_handled_by_the_parallel_test_not_the_t_window() {
+        let c = one_floor();
+        assert_eq!(c.nearest_hit_t([0.0, 0.0, 0.0], [10.0, 0.0, 0.0]), None,
+            "a ray sliding along the face it starts on is parallel to it — dropped by det, not by t");
+        let t = c.nearest_hit_t([0.0, 0.0, 0.0], [0.0, 0.0, -2.5])
+            .expect("a ray from the face heading INTO it is a real zero-distance contact");
+        assert!(t.abs() < 1e-6, "contact must be reported at t=0, got {t}");
+        // The documented tie: flush contact reports in BOTH directions (t = ±0.0).
+        assert!(c.nearest_hit_t([0.0, 0.0, 0.0], [0.0, 0.0, 5.0]).is_some_and(|t| t.abs() < 1e-6),
+            "a flush face is a contact whichever way the ray leaves it (-0.0 == 0.0)");
+        // But a face at a genuinely negative t — one unit BEHIND the origin — is rejected.
+        assert_eq!(c.nearest_hit_t([0.0, 0.0, 1.0], [0.0, 0.0, 6.0]), None,
+            "the floor is 1 u behind an upward ray; it must not be reported");
+    }
+
+    /// The `line_clear` row of the #855 inventory: a line-of-sight query is normally issued FROM a
+    /// body in contact with geometry, which is where a `t`-proportional band is largest in absolute
+    /// terms. On a 100-unit ray the old band was ~0.1 u, so a wall you were standing 0.05 u from was
+    /// invisible to LOS. MUTATION-CHECK: restoring `t > 1e-3` turns this RED.
+    #[test]
+    fn line_of_sight_does_not_see_through_a_wall_it_is_almost_touching() {
+        // Vertical wall at east = 0 (a slab in the north/height plane), and a viewer 0.05 u west.
+        let c = Collision::build(&ZoneAssets {
+            terrain: vec![MeshData {
+                positions: vec![[-50.0, -50.0, 0.0], [50.0, -50.0, 0.0], [50.0, 50.0, 0.0], [-50.0, 50.0, 0.0]],
+                normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+                texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+                render_mode: RenderMode::Opaque, anim: None,
+            }],
+            objects: vec![], textures: vec![],
+        }, 32.0);
+        let from = [-0.05, 0.0, 0.0];
+        let to = [99.95, 0.0, 0.0]; // 100 units east, straight through the wall
+        assert!(c.nearest_hit_t(from, to).is_some(), "positive control: the wall is on this ray");
+        assert!(!c.line_clear(from, to, 0.0),
+            "LOS from 0.05 u away must be blocked by the wall, not fall inside a 0.1 u blind band");
+    }
+
+    /// `obstruction_below` is the descent bound `CharacterController::swim_sink` clamps against
+    /// (#855). Two properties it must have, both of which `ground_below` does NOT:
+    ///   * it reports a surface at distance ZERO (no blind band of its own — otherwise the clamp
+    ///     would only move the cliff);
+    ///   * it reports the floor of a space with no standing headroom, where `ground_below`'s
+    ///     `is_standable` filter returns `None` — a submerged tunnel is exactly that space.
+    ///
+    /// MUTATION-CHECK, both a deletion and a REACH form (#799): making `obstruction_below` inert
+    /// (body still called, still computing, but returning `None`) turns this RED — so the test
+    /// depends on the probe's ANSWER, not merely on the function existing. Widening `HIT_WINDOW` to
+    /// `-1.0..=1.0` also turns it RED, measured `left: Some(2.0)` against `right: Some(0.0)` — the
+    /// ceiling 2 u ABOVE gets admitted at negative `t`. That second one is the reach control for
+    /// `column_hits` reading the shared window at all.
+    #[test]
+    fn obstruction_below_is_blind_band_free_and_survives_a_low_ceiling() {
+        let c = one_floor();
+        assert_eq!(c.obstruction_below(0.0, 0.0, 0.0, 2.5), Some(0.0),
+            "a face flush with the query point must be reported");
+        assert_eq!(c.obstruction_below(0.0, 0.0, 5.0, 2.5), None, "out of range: nothing within 2.5");
+
+        // Floor at 0 with a ceiling 2 u above — no standing headroom (NAV_AGENT_HEIGHT is larger).
+        let tunnel = Collision::build(&ZoneAssets {
+            terrain: vec![slab(0.0, -50.0, 50.0, -50.0, 50.0, true),
+                          slab(2.0, -50.0, 50.0, -50.0, 50.0, false)],
+            objects: vec![], textures: vec![],
+        }, 32.0);
+        assert_eq!(tunnel.ground_below(0.0, 0.0, 1.0, 50.0), None,
+            "positive control: the standable filter refuses this floor (no headroom)");
+        assert_eq!(tunnel.obstruction_below(0.0, 0.0, 1.0, 50.0), Some(0.0),
+            "a descent guard must still see the tunnel floor — a slab stops a body it cannot stand on");
+    }
+
     // ── #727 round 3: `ground_continuous`'s numeric envelope (review finding C) ──────────────────
     //
     // Round 2 shipped the predicate with its behaviour pinned only where it is TOTAL (a void refuses,
@@ -5305,6 +5507,8 @@ mod tests {
             qcat_pocket_nearest_floor_is_never_the_ceiling,
             qcat_support_floor_is_visible_to_the_planner,
             worst_case_reachable_component,
+            // #855: the ray-hit acceptance window.
+            a_ray_starting_on_a_face_is_handled_by_the_parallel_test_not_the_t_window,
         ];
     }
 

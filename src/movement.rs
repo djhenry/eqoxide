@@ -1240,11 +1240,48 @@ impl CharacterController {
     /// COLLIDED vertical swim descent: the downward mirror of [`Self::swim_rise`] — sweeps the
     /// FEET down through `want` (< 0) and stops `SKIN` short of the floor/geometry below, so an
     /// explicit swim-down can't drive the character through the pool bottom.
+    ///
+    /// **THE FLOOR FLOOR (#855).** This is the ONLY path by which a swim descent moves the body
+    /// down (the down-wish branch of `step` and `try_duck_under` both route through here), so its
+    /// postcondition is the whole controller's: *the returned delta never takes the feet below the
+    /// nearest surface underneath them.* The sweep alone did not give that. `nearest_hit`'s
+    /// acceptance window used to start at `t > 1e-3`, a blind band of `1e-3 × ray length` — here
+    /// `1e-3 × |wish_vspeed| · dt`, which at the 35 u/s swim cap is 0.56 mm at `dt = 0.016` and
+    /// 0.58 mm at 60 Hz — and a swimmer whose feet sat inside it got `None` back, read it as open
+    /// water, and descended THROUGH the floor (#855, reached naturally).
+    ///
+    /// #855 closes that window (see `collision::HIT_WINDOW`), which removes the band that was
+    /// measured to bite. The clamp below is a SECOND, structurally different bound — the
+    /// facing-blind column `Collision::obstruction_below` — and its scope is stated exactly rather
+    /// than sold as belt-and-braces:
+    ///
+    /// * **Measured to catch what the sweep still cannot answer at all.** `nearest_hit` returns
+    ///   `None` unconditionally when the ray's squared length is under `1e-9`, i.e. `|want| <
+    ///   ~3.16e-5`. That is reachable — `want = wish_vspeed · dt`, and an agent may drive a small
+    ///   `wish_vspeed` (0.001 at 60 Hz is `1.6e-5`) — and without the clamp such a swimmer sinks a
+    ///   step per frame with no collision test whatsoever. `column_hits` answers there (its own
+    ///   degenerate guard is `1e-6` on the ray, not `1e-9` on its square). Pinned by
+    ///   `a_swim_descent_too_short_for_the_sweep_to_answer_is_still_floor_bounded`.
+    /// * **NOT claimed:** that the clamp catches a case the fixed sweep misses at ordinary speeds.
+    ///   Both scans cast the SAME purely-vertical ray over the same triangles and share the same
+    ///   `det.abs() < eps` parallel test, so once the window agrees they agree. The `dt`/`eps`/speed
+    ///   sweep in `a_driven_swim_descent_never_passes_the_pool_floor_at_any_dt` was measured GREEN
+    ///   with this clamp DELETED, and GREEN again with it WRAPPED so the bounding arm never runs.
+    ///   This is a stated postcondition at the one descent choke point, not a second detector of
+    ///   the #855 cliff.
+    ///
+    /// It never pushes UP: the clamp is `min(0.0)`-ed, so a body already below the surface beneath
+    /// it (a depenetration/teleport artifact) is left alone rather than teleported — recovering
+    /// that is the depenetration net's job, not the swim step's.
     fn swim_sink(&self, want: f32, col: &Collision) -> f32 {
         let to = [self.pos[0], self.pos[1], self.pos[2] + want];
-        match col.nearest_hit(self.pos, to) {
+        let swept = match col.nearest_hit(self.pos, to) {
             Some((t, _)) => (t * want + SKIN).min(0.0),
             None => want,
+        };
+        match col.obstruction_below(self.pos[0], self.pos[1], self.pos[2], -want.min(0.0)) {
+            Some(z) => swept.max((z + SKIN - self.pos[2]).min(0.0)),
+            None => swept,
         }
     }
 
@@ -1744,6 +1781,114 @@ mod tests {
         assert!(ctrl.pos[2] > start_z + 1.0,
             "swimmer should still have risen toward the surface, got z={}", ctrl.pos[2]);
     }
+
+    // ── #855: a driven swim descent is floor-bounded ─────────────────────────────────────────────
+
+    /// Pool floor at `FLOOR_Z` with water from just under it up to z = 5 — a swimmer near the
+    /// bottom is wet at the feet, so `want_swim` really engages the swim branch.
+    const POOL_FLOOR_Z: f32 = -20.0;
+    fn pool() -> Collision {
+        let mut c = col(vec![floor(POOL_FLOOR_Z, -100.0, 100.0)]);
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::water_slab(POOL_FLOOR_Z - 0.5, 5.0))));
+        c
+    }
+    fn dive(vspeed: f32) -> MoveIntent {
+        MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: vspeed, jump: false, want_swim: true,
+                     speed: 0.0, climb: 0.0, hop: false }
+    }
+
+    /// **#855 — THE UNIVERSAL: a driven swim descent never puts the feet below the floor, at ANY
+    /// `dt`.** Written as a `dt` sweep on purpose: the reported defect was knife-edge on the frame
+    /// time, and "whether the pool bottom is solid" is not allowed to be a property of the frame
+    /// rate. The starting `eps` sweep covers the band the issue measured as fatal (0 … 0.0005 at
+    /// `dt = 0.016`) and the old `1e-3 × ray length` cliff at every swept speed.
+    ///
+    /// **Scope, stated so the sweep is not mistaken for a reproduction.** The issue's knife-edge
+    /// (`dt = 0.016` fell through, `dt = 1/60` parked) was measured on real zone geometry, which
+    /// this test does not have and which was NOT re-run here. In this synthetic pool the mutation
+    /// falls through at *every* swept `dt` — measured lowest z, floor at −20: `1/60 → −24.08`,
+    /// `0.016 → −23.92`, `0.02 → −24.20`, `0.05 → −25.25`, `0.25 → −28.75`, `1.0 → −55.0`; all
+    /// exactly −20 with the fix. So this asserts a STRICTER bound than the reported symptom rather
+    /// than reproducing its `dt` dependence.
+    ///
+    /// MUTATION-CHECK — every row below was RUN, in both directions, not predicted:
+    ///   * epsilon restored in `Collision::nearest_hit` (the scan `swim_sink` actually calls), clamp
+    ///     deleted → **RED**, `reached z=-55 … at dt=1 eps=0 vspeed=-35`. This is the REACH control
+    ///     (#799): it proves this test exercises `nearest_hit`'s window, not merely that the window
+    ///     was edited.
+    ///   * epsilon restored in `nearest_hit_t` ONLY, clamp deleted → **GREEN**. Correct and worth
+    ///     recording: the controller never routes through the `_t` scan, so a fix applied to only
+    ///     that one would have shipped with this test still passing.
+    ///   * clamp deleted, and clamp WRAPPED (`Some(z) if false`, arm never taken) with the window
+    ///     fixed → both **GREEN**. The clamp is not what holds this line; the window is. That is
+    ///     why `swim_sink`'s doc refuses to claim otherwise, and why the clamp carries its own
+    ///     test below.
+    #[test]
+    fn a_driven_swim_descent_never_passes_the_pool_floor_at_any_dt() {
+        let c = pool();
+        let mut worst = (f32::MAX, 0.0f32, 0.0f32, 0.0f32); // (z, dt, eps, vspeed)
+        for &dt in &[1.0 / 60.0, 0.016, 0.0161, 0.017, 0.02, 0.033, 0.05, 0.1, 0.25, 0.5, 1.0] {
+            for &eps in &[0.0f32, 1e-6, 1e-4, 3e-4, 5e-4, 1e-3, 2.5e-3, 9e-3, 0.05, 0.5] {
+                for &vspeed in &[-35.0f32, -10.0, -1.0, -0.1] {
+                    let mut ctrl = CharacterController::new([0.0, 0.0, POOL_FLOOR_Z + eps]);
+                    for _ in 0..300 {
+                        ctrl.step(dive(vspeed), dt, &c);
+                        if ctrl.pos[2] < worst.0 { worst = (ctrl.pos[2], dt, eps, vspeed); }
+                    }
+                }
+            }
+        }
+        assert!(worst.0 >= POOL_FLOOR_Z - 1e-3,
+            "a driven swim descent reached z={} (floor {POOL_FLOOR_Z}) at dt={} eps={} vspeed={} — \
+             the pool bottom must not be permeable, and must not depend on the frame time",
+            worst.0, worst.1, worst.2, worst.3);
+    }
+
+    /// The clamp's OWN reason to exist, measured (#855). `Collision::nearest_hit` returns `None`
+    /// unconditionally when the ray's squared length is under `1e-9` — `|want| < ~3.16e-5` — so a
+    /// small driven `wish_vspeed` produces a descent the sweep does not test at all, whatever its
+    /// acceptance window is. `obstruction_below` answers there (`column_hits` guards on `1e-6` of
+    /// ray, not `1e-9` of its square), and it is the only thing standing between this swimmer and
+    /// the floor.
+    ///
+    /// MUTATION-CHECK, all three RUN with the epsilon fix fully in place — this is the one test
+    /// that separates the two halves of #855:
+    ///   * clamp DELETED → RED.
+    ///   * clamp WRAPPED so the bounding arm is never taken (`Some(z) if false`) while the call site
+    ///     is still reached → RED. The reach form (#799), because "the clamp is written" and "the
+    ///     clamp runs" are different claims.
+    ///   * `obstruction_below` made inert (still called, still scanning, returns `None`) → RED. So
+    ///     the dependency is on the probe's ANSWER, not on the call.
+    #[test]
+    fn a_swim_descent_too_short_for_the_sweep_to_answer_is_still_floor_bounded() {
+        let c = pool();
+        // 0.001 u/s at 60 Hz ⇒ want ≈ 1.67e-5, under nearest_hit's 1e-9 squared-length guard.
+        let want = 0.001 * (1.0 / 60.0);
+        assert!(want * want < 1e-9, "positive control: this ray is shorter than the sweep will answer");
+        assert!(c.nearest_hit([0.0, 0.0, POOL_FLOOR_Z], [0.0, 0.0, POOL_FLOOR_Z - want]).is_none(),
+            "positive control: the sweep declines a ray this short even with the floor flush at its origin");
+
+        let mut ctrl = CharacterController::new([0.0, 0.0, POOL_FLOOR_Z + 1e-6]);
+        let mut lowest = f32::MAX;
+        for _ in 0..2000 { ctrl.step(dive(-0.001), 1.0 / 60.0, &c); lowest = lowest.min(ctrl.pos[2]); }
+        assert!(lowest >= POOL_FLOOR_Z - 1e-3,
+            "a descent below the sweep's answerable length must still be bounded by the column scan: \
+             reached z={lowest} under floor {POOL_FLOOR_Z}");
+    }
+
+    /// Negative control for the two tests above: the clamp must not have welded the swimmer to the
+    /// floor. Started well ABOVE the bottom, the same driven dive still descends — so a GREEN result
+    /// there means "stopped at the floor", not "never moved".
+    #[test]
+    fn the_floor_clamp_does_not_stop_a_swim_descent_that_has_water_below_it() {
+        let c = pool();
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        for _ in 0..60 { ctrl.step(dive(-10.0), 1.0 / 60.0, &c); }
+        assert!(ctrl.pos[2] < -8.0, "the dive must actually descend in open water, got z={}", ctrl.pos[2]);
+        assert!(ctrl.pos[2] >= POOL_FLOOR_Z - 1e-3, "…and still not pass the floor, got z={}", ctrl.pos[2]);
+    }
+
 
     #[test]
     fn falls_normally_in_air_without_water() {
