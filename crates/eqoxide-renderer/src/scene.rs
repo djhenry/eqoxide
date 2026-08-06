@@ -489,7 +489,7 @@ mod tests {
             race: "GNL".into(),
             heading: 0.0,
             dead: false,
-            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, is_boat: false, flymode: 0,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, is_boat: false, flymode: 0, npc_tint_index: 0,
             face: 0, hairstyle: 0, haircolor: 0,
             pose: Pose::Standing, gait: None,
         });
@@ -593,7 +593,7 @@ mod tests {
             race: String::new(),
             heading: 0.0,
             dead: false,
-            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, is_boat: false, flymode: 0,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, is_boat: false, flymode: 0, npc_tint_index: 0,
             face: 0, hairstyle: 0, haircolor: 0,
             pose: Pose::Standing, gait: None,
         });
@@ -632,7 +632,7 @@ mod tests {
             race: String::new(),
             heading: 0.0,
             dead: false,
-            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, is_boat: false, flymode: 0,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, is_boat: false, flymode: 0, npc_tint_index: 0,
             face: 0, hairstyle: 0, haircolor: 0,
             pose: Pose::Standing, gait: None,
         });
@@ -654,7 +654,7 @@ mod tests {
             spawn_id: 5, name: "x".into(), level: 1, is_npc: true,
             x: 0.0, y: 0.0, z: 0.0, hp_pct: 100.0, cur_hp: 1, max_hp: 1,
             race: "HUM".into(), heading: 0.0, dead: false,
-            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, is_boat: false, flymode: 0,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, is_boat: false, flymode: 0, npc_tint_index: 0,
             face: 0, hairstyle: 0, haircolor: 0,
             pose: Pose::Standing, gait: None,
         };
@@ -674,7 +674,7 @@ mod tests {
             spawn_id: 5, name: "x".into(), level: 1, is_npc: true,
             x: 0.0, y: 0.0, z: 0.0, hp_pct: 100.0, cur_hp: 1, max_hp: 1,
             race: "HUM".into(), heading: 0.0, dead: false,
-            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 1, helm: 0, showhelm: 0, is_boat: false, flymode: 0,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 1, helm: 0, showhelm: 0, is_boat: false, flymode: 0, npc_tint_index: 0,
             face: 0, hairstyle: 0, haircolor: 0,
             pose: Pose::Standing, gait: None,
         };
@@ -721,7 +721,7 @@ mod tests {
             spawn_id, name: "an_orc".into(), level: 5, is_npc: true,
             x, y, z: 0.0, hp_pct: 90.0, cur_hp: 90, max_hp: 100,
             race: "ORC".into(), heading, dead: false,
-            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, is_boat: false, flymode: 0,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, is_boat: false, flymode: 0, npc_tint_index: 0,
             face: 0, hairstyle: 0, haircolor: 0,
             pose: Pose::Standing, gait: None,
         }
