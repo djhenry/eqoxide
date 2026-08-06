@@ -4104,7 +4104,8 @@ mod tests {
         assert_eq!(gs.player_hold, Some(hold),
             "precondition: the old zone's wedge is live in the GameState the API serialises");
         assert_eq!(gs.player_afloat_stall.map(|s| s.anchor()), Some(WEDGED_IN_OLD_ZONE),
-            "precondition: and so is the afloat stall, anchored in the departed zone's frame —              without this the stall assertions in the loop below cannot fail (review F1)");
+            "precondition: and so is the afloat stall, anchored in the departed zone's frame — \
+             without this the stall assertions in the loop below cannot fail (review F1)");
 
         // The zone-entry handshake begins.
         //
