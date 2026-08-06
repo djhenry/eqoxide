@@ -59,6 +59,7 @@ fn npc_spawn(spawn_id: u32, name: &str, stand_state: u8) -> SpawnInfo {
         animation: 0,
         equipment: [0u32; 9],
         equipment_tint: [[0u8; 3]; 9],
+        npc_tint_index: 0,
     }
 }
 
