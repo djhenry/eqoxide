@@ -1576,7 +1576,7 @@ mod cursor_resync_tests {
             // #789/#874: the two new tests cited by name in the ⚠️ Correction blocks above and in
             // `unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace`'s
             // own doc — caught by this file's own scan on the run that added the citations.
-            unbalanced_doc_code_spans_outside_the_citation_corpus_are_a_named_shrinking_backlog,
+            unbalanced_doc_code_spans_in_the_whole_workspace_are_a_named_shrinking_backlog,
             the_doc_span_scan_reaches_the_full_resolution_corpus_at_three_depths_each,
             // …and this one the scan caught on its first run, on a citation added in round 6
             // itself — which is the whole argument for having it.
@@ -1737,7 +1737,7 @@ mod cursor_resync_tests {
     ///   corpus is whatever `citation_corpus` returns, which is the only claim this doc makes going
     ///   forward.
     /// * **The span check WAS widened**, contrary to the paragraph just above: a second test,
-    ///   `unbalanced_doc_code_spans_outside_the_citation_corpus_are_a_named_shrinking_backlog`,
+    ///   `unbalanced_doc_code_spans_in_the_whole_workspace_are_a_named_shrinking_backlog`,
     ///   runs the same `scan_doc_spans` over the full resolution corpus and holds it to zero NEW
     ///   offenders — pre-existing ones are named individually in that test's `KNOWN_VIOLATIONS`,
     ///   which must shrink as they are fixed (a stale entry fails the build) and cannot silently
@@ -1890,21 +1890,39 @@ mod cursor_resync_tests {
     /// scan, the code-span scan, and the code-span scan's reach control. One definition, so a reach
     /// control cannot end up measuring a corpus the guard does not use.
     ///
-    /// The return type is `[PathBuf; 5]`, not a `Vec`, on purpose. Three test names in this module
-    /// say "five_citation_files"; the array length is what makes adding a sixth file a **compile
-    /// error** at every call site rather than a silent drift between what the names claim and what
-    /// runs.
+    /// The return type is `[PathBuf; 5]`, not a `Vec`, on purpose: three test names in this module
+    /// say "five_citation_files", and the length in this signature is one place a reader is forced
+    /// to edit, and to see the number, when the corpus grows.
+    ///
+    /// ⚠️ **Correction (#882 round 2, blocking).** This used to claim the array length makes adding
+    /// a sixth file "a **compile error** at every call site". **Measured, and false.** Grown to
+    /// `[PathBuf; 6]` with a sixth path, `cargo test -p eqoxide-nav --lib --no-run` builds the test
+    /// executable with **zero errors**: no call site binds the length —
+    /// `citation_corpus().to_vec()`, `let files = citation_corpus()`, `&citation_corpus()` and
+    /// `.len()` are all length-agnostic. The only edit the compiler forces is the one in this
+    /// signature. Nothing mechanical catches the three `…_five_citation_files…` names drifting; they
+    /// are renamed by hand, which is exactly what #874 had to do for 4 → 5. This is a
+    /// reasoned-not-measured mechanism claim that survived to the first change ever to perform the
+    /// growth — the change that could have run the experiment and did not.
     ///
     /// ⚠️ **Correction (#874).** This was `[PathBuf; 4]` — `steering.rs`, `walker.rs`,
     /// `collision.rs`, `tests/walker_sim.rs` — and did not include `src/movement.rs`, where
     /// `CharacterController` lives and where `MUTATION-CHECK` blocks cite test names by name. #866
     /// found two doc defects there by hand (a `MUTATION-CHECK` quoting a message its own assertion
     /// cannot produce, and an "either of two" claim where there are three) that a mechanical check
-    /// would have caught if it read the file at all. Grown to five deliberately, per this fn's own
-    /// friction-by-design: every reference to "four" in this module's test names and docs was
-    /// renamed in the same change, not left to drift. `movement.rs`'s own pre-existing unbalanced
-    /// spans (8 lines, 4 sites) were fixed before it was added, so the corpus starts clean rather
-    /// than landing the guard already red — see #789's PR for the count and the fix.
+    /// would have caught if it read the file at all. Grown to five deliberately. `movement.rs`'s
+    /// own pre-existing unbalanced doc spans were fixed before it was added, so the corpus starts
+    /// clean rather than landing the guard already red.
+    ///
+    /// ⚠️ **Correction (#882 round 2, blocking).** This block used to say "every reference to
+    /// 'four' in this module's test names and docs was renamed in the same change, not left to
+    /// drift", which contradicted the `⚠️ Correction (#789/#874)` block on
+    /// `every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard` — written
+    /// in the same commit — saying every "four" above it is *preserved as it was written*. The
+    /// second one is what actually happened: only the three test names were renamed, and the
+    /// corpus-descriptive "four"s in the older `⚠️ Correction` blocks are still there, deliberately,
+    /// as history of what #727's and #788's corpus was at the time. So a remaining "four" in this
+    /// module is not evidence of drift, and this doc no longer says it is.
     fn citation_corpus() -> [std::path::PathBuf; 5] {
         let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let ws = workspace_root();
@@ -1917,16 +1935,28 @@ mod cursor_resync_tests {
         ]
     }
 
-    /// Every `.rs` file under the workspace's `crates/`, `tests/` and `src/`, minus anything under a
-    /// `target/` directory — generated sources, where a stale build artifact could vouch for a
-    /// citation. Sorted, so a failure message is stable between runs.
+    /// Every `.rs` file under the workspace's `crates/`, `tests/`, `src/` and `tools/`, minus
+    /// anything under a `target/` directory — generated sources, where a stale build artifact could
+    /// vouch for a citation. Sorted, so a failure message is stable between runs.
     ///
-    /// This is the RESOLUTION corpus, and only the resolution corpus. Nothing in this module scans
-    /// these files for doc-comment defects; see #788.
+    /// ⚠️ **Correction (#882 round 2, blocking).** `tools/` was missing. It is a first-class
+    /// `[workspace] members` entry in the root `Cargo.toml`, and leaving it out made this fn cover
+    /// strictly fewer files than the workspace, while every doc built on top of it said "the full
+    /// resolution corpus" and "the workspace". `tools/src/main.rs` carried two genuine unbalanced
+    /// doc spans that nothing was holding. That is the #788 defect class — a corpus
+    /// narrower than its name — inside the PR whose whole subject is corpus reach. Added to the
+    /// walk; the two spans are now named in `KNOWN_VIOLATIONS` like every other pre-existing one.
+    ///
+    /// This is the resolution corpus for the citation scan AND, since #789, the corpus the
+    /// doc-span backlog test scans for defects. (Until #789 it was resolution-only, and this doc
+    /// said so; that sentence is deleted rather than qualified, because it stopped being true in
+    /// the same commit that widened the span check onto these files.)
     fn workspace_rs_files() -> Vec<std::path::PathBuf> {
         let ws = workspace_root();
         let mut out: Vec<std::path::PathBuf> = Vec::new();
-        let mut stack = vec![ws.join("crates"), ws.join("tests"), ws.join("src")];
+        let mut stack = vec![
+            ws.join("crates"), ws.join("tests"), ws.join("src"), ws.join("tools"),
+        ];
         while let Some(d) = stack.pop() {
             let Ok(rd) = std::fs::read_dir(&d) else { continue };
             for e in rd.flatten() {
@@ -1997,12 +2027,12 @@ mod cursor_resync_tests {
     /// `src/movement.rs`. Five files. This test holds them to **zero** offenders, unconditionally.
     ///
     /// **The rest of the workspace is not unclaimed any more (#789).**
-    /// `unbalanced_doc_code_spans_outside_the_citation_corpus_are_a_named_shrinking_backlog` runs
-    /// the identical `scan_doc_spans` mechanism over the full resolution corpus and holds
-    /// everything outside these five files to zero *new* offenders, with pre-existing ones named
-    /// individually and required to shrink. This test's own five files are a subset of that wider
-    /// corpus and are asserted clean by both; the split exists so a citation-corpus regression
-    /// fails with a five-file, un-allowlistable message rather than a backlog-list diff.
+    /// `unbalanced_doc_code_spans_in_the_whole_workspace_are_a_named_shrinking_backlog` runs
+    /// the identical `scan_doc_spans` mechanism over every `.rs` file `workspace_rs_files()` walks
+    /// and holds it to zero *new* offenders, with pre-existing ones named individually and required
+    /// to shrink. That corpus is a superset of these five, which it also scans (and finds clean);
+    /// the split exists so a citation-corpus regression fails with a five-file, un-allowlistable
+    /// message rather than a backlog-list diff.
     ///
     /// **Reach, not just shape.** That this check *can* detect a wrapped span says nothing about
     /// whether it *arrives* at file 5, or at line 2000 of file 1.
@@ -2036,278 +2066,322 @@ mod cursor_resync_tests {
             report.len(), files.len(), report.join("\n  "));
     }
 
-    /// **#789: the doc-span scan, widened to the FULL resolution corpus — a named, shrinking
-    /// backlog instead of an unclaimed 149.**
+    /// **#789: the doc-span scan, widened to the WHOLE workspace — a named, shrinking backlog
+    /// instead of an unclaimed pile.**
     ///
     /// The guard above holds the five citation files to zero. #789 measured that the workspace
     /// outside them is not clean by the same check — 105 offenders across 30 files at #788's
-    /// original measurement, **re-measured fresh for this fix at 149 offenders across 42 files**
-    /// (170-file, 125,394-line resolution corpus; movement.rs's own 10 are already fixed and
-    /// excluded, see `citation_corpus`'s doc). Both the file/offender totals and the exact
-    /// `file:line` list had drifted from #789's filed figures by the time this landed — the repo
-    /// kept moving. `KNOWN_VIOLATIONS` below is today's re-measurement, not the issue's.
+    /// original measurement, which had already drifted by the time this landed, and drifts again
+    /// with every merge. `KNOWN_VIOLATIONS` below is the list as re-measured for this change, and
+    /// the live totals are **printed by this test at run time** (see its `println!`) rather than
+    /// restated here.
     ///
-    /// **What this test does NOT do: bulk-fix or silently bless the 149.** Every entry is named
-    /// individually, with the file and line it was found at. Two things keep the list honest
+    /// ⚠️ **Correction (#882 round 2, blocking).** This block used to carry a hard-coded
+    /// "170-file, 125,394-line resolution corpus". That line count matched no tree — neither `main`
+    /// nor this branch — while the test printed the true one twelve lines below it. Deleted rather
+    /// than corrected: a corpus-size figure written into a doc comment inside the corpus it
+    /// measures is self-invalidating, since editing this very sentence changes it. The same
+    /// correction deletes a second false clause, "movement.rs's own 10 are already fixed and
+    /// excluded": eight of those ten were fixed, two were blockquote-fence false positives that
+    /// were never real defects, and `movement.rs` is *included* in this corpus (scanned, and clean),
+    /// not excluded.
+    ///
+    /// **What this test does NOT do: bulk-fix or silently bless the backlog.** Every entry is named
+    /// individually, by file and by the text of the offending line. Two things keep the list honest
     /// instead of decorative:
     ///
     /// * an offender the scan finds that is **not** in this list fails the build — the backlog
     ///   cannot silently grow, and a doc edit anywhere in the workspace that introduces a new wrap
     ///   is caught the moment it lands, not the next time someone widens a corpus by hand;
-    /// * an entry in this list the scan **no longer finds** also fails the build — fixing one of
-    ///   these 149 and not deleting its line here is itself a build break, so the list can only
-    ///   shrink by an explicit deletion next to the fix that earned it, and can never go stale in
-    ///   the safe direction silently.
+    /// * an entry in this list the scan **no longer finds** also fails the build — fixing one and
+    ///   not deleting its entry here is itself a build break, so the list can only shrink by an
+    ///   explicit deletion next to the fix that earned it, and can never go stale in the safe
+    ///   direction silently.
     ///
-    /// The mechanism for the count going to zero is: fix a wrap, delete its line(s) from
-    /// `KNOWN_VIOLATIONS` in the same change (the dead-entry check above requires it), and the
-    /// tracked total goes down by exactly that many. Nothing here schedules that work; it only
-    /// makes the backlog visible, bounded, and unable to grow without being caught.
+    /// Both halves are reported by **one** assertion, deliberately: keyed separately, a fixer sees
+    /// "add it" on the first run and "now delete the stale one" only on the next, which is two
+    /// round-trips for one edit.
+    ///
+    /// **Why the key is the line's TEXT and not its line number (#882 round 2, blocking).** The
+    /// list was keyed on `(file, absolute line)`. Two measurements, both re-derived rather than
+    /// argued, both over `crates/`, `tests/`, `src/` and `tools/`:
+    ///
+    /// * **Backwards, over merged history.** Of the 159 offenders at `origin/main` (`749c932`),
+    ///   121 sat at the same `file:line` five commits earlier, **28 carried byte-identical
+    ///   normalized text at a *different* line**, and only 10 were genuinely new or edited text.
+    ///   Line keys would have needed 28 hand-edits in five commits; text keys, zero.
+    /// * **Forwards, against a PR in flight.** `fix-797-848-cap-reporting` (`e89985a`) changes no
+    ///   doc span at all, yet compared with its own merge-base it moves **30** offenders to a
+    ///   different line, across 7 files. Line keys: 30 entries to re-derive by hand, or a red
+    ///   `main` for whichever of the two PRs merges second — with **no git conflict** to warn
+    ///   anyone, since the two touch unrelated concerns. Text keys: **0**.
+    ///
+    /// Every one of those edits would be forced on an author who did nothing but insert a line
+    /// somewhere above, and would arrive as a red `main` naming a file whose author did nothing
+    /// wrong. A guard that fails on innocent edits is a guard people switch off, and a predicate
+    /// stricter than the thing it models produces false refusals — dishonest in the same direction
+    /// as a false pass. Keyed on `(file, normalized line text)` both directions above still bite
+    /// (proved by mutation, both ways, on this head) and the only thing that reopens an entry is
+    /// somebody actually touching that doc line. The line number is not stored at all — not even as
+    /// a trailing comment, because a comment nobody is forced to update is the stale-figure defect
+    /// this module keeps re-learning; the failure message prints the live line number instead,
+    /// which is always right.
+    ///
+    /// The mechanism for the backlog going to zero is: fix a wrap, delete its entry from
+    /// `KNOWN_VIOLATIONS` in the same change (the dead-entry check requires it). Nothing here
+    /// schedules that work; it only makes the backlog visible, bounded, and unable to grow without
+    /// being caught.
     ///
     /// Reach is proven separately by
     /// `the_doc_span_scan_reaches_the_full_resolution_corpus_at_three_depths_each` — this test
     /// pins the reach of the RUN it actually did (`files_scanned` below) but does not itself prove
     /// the scanner cannot silently shrink its own corpus over time; the sibling reach control does.
     #[test]
-    fn unbalanced_doc_code_spans_outside_the_citation_corpus_are_a_named_shrinking_backlog() {
-        use std::collections::HashSet;
+    fn unbalanced_doc_code_spans_in_the_whole_workspace_are_a_named_shrinking_backlog() {
+        use std::collections::HashMap;
 
-        // (workspace-relative path, 1-based line). Sorted by path then line. Re-measure with
-        // `cargo test -p eqoxide-nav --lib unbalanced_doc_code_spans -- --nocapture` after any fix
-        // and delete the corresponding line(s) — a stale entry fails this test on its own.
-        const KNOWN_VIOLATIONS: &[(&str, usize)] = &[
-        // crates/eqoxide-command/src/nav.rs
-        ("crates/eqoxide-command/src/nav.rs", 444),
-        ("crates/eqoxide-command/src/nav.rs", 445),
-
-        // crates/eqoxide-core/src/config.rs
-        ("crates/eqoxide-core/src/config.rs", 120),
-        ("crates/eqoxide-core/src/config.rs", 121),
-
-        // crates/eqoxide-core/src/eqstr.rs
-        ("crates/eqoxide-core/src/eqstr.rs", 74),
-        ("crates/eqoxide-core/src/eqstr.rs", 76),
-
-        // crates/eqoxide-core/src/game_state.rs
-        ("crates/eqoxide-core/src/game_state.rs", 18),
-        ("crates/eqoxide-core/src/game_state.rs", 880),
-        ("crates/eqoxide-core/src/game_state.rs", 881),
-        ("crates/eqoxide-core/src/game_state.rs", 1331),
-        ("crates/eqoxide-core/src/game_state.rs", 1332),
-
-        // crates/eqoxide-core/src/physics.rs
-        ("crates/eqoxide-core/src/physics.rs", 347),
-        ("crates/eqoxide-core/src/physics.rs", 348),
-
-        // crates/eqoxide-core/src/region_map.rs
-        ("crates/eqoxide-core/src/region_map.rs", 10),
-        ("crates/eqoxide-core/src/region_map.rs", 11),
-
-        // crates/eqoxide-core/src/zone_map.rs
-        ("crates/eqoxide-core/src/zone_map.rs", 382),
-        ("crates/eqoxide-core/src/zone_map.rs", 383),
-
-        // crates/eqoxide-crash/src/lib.rs
-        ("crates/eqoxide-crash/src/lib.rs", 412),
-        ("crates/eqoxide-crash/src/lib.rs", 413),
-
-        // crates/eqoxide-http/src/combat.rs
-        ("crates/eqoxide-http/src/combat.rs", 113),
-        ("crates/eqoxide-http/src/combat.rs", 114),
-
-        // crates/eqoxide-http/src/guild.rs
-        ("crates/eqoxide-http/src/guild.rs", 300),
-        ("crates/eqoxide-http/src/guild.rs", 301),
-
-        // crates/eqoxide-http/src/lib.rs
-        ("crates/eqoxide-http/src/lib.rs", 254),
-        ("crates/eqoxide-http/src/lib.rs", 255),
-
-        // crates/eqoxide-http/src/merchant.rs
-        ("crates/eqoxide-http/src/merchant.rs", 39),
-        ("crates/eqoxide-http/src/merchant.rs", 40),
-        ("crates/eqoxide-http/src/merchant.rs", 43),
-        ("crates/eqoxide-http/src/merchant.rs", 44),
-        ("crates/eqoxide-http/src/merchant.rs", 116),
-        ("crates/eqoxide-http/src/merchant.rs", 117),
-        ("crates/eqoxide-http/src/merchant.rs", 169),
-        ("crates/eqoxide-http/src/merchant.rs", 170),
-
-        // crates/eqoxide-http/src/name_match.rs
-        ("crates/eqoxide-http/src/name_match.rs", 202),
-        ("crates/eqoxide-http/src/name_match.rs", 203),
-
-        // crates/eqoxide-http/src/observe.rs
-        ("crates/eqoxide-http/src/observe.rs", 1719),
-        ("crates/eqoxide-http/src/observe.rs", 1720),
-        ("crates/eqoxide-http/src/observe.rs", 2791),
-        ("crates/eqoxide-http/src/observe.rs", 2792),
-        ("crates/eqoxide-http/src/observe.rs", 5162),
-        ("crates/eqoxide-http/src/observe.rs", 5163),
-
-        // crates/eqoxide-http/src/refusal.rs
-        ("crates/eqoxide-http/src/refusal.rs", 16),
-        ("crates/eqoxide-http/src/refusal.rs", 17),
-
-        // crates/eqoxide-http/src/testkit.rs
-        ("crates/eqoxide-http/src/testkit.rs", 24),
-        ("crates/eqoxide-http/src/testkit.rs", 25),
-        ("crates/eqoxide-http/src/testkit.rs", 66),
-        ("crates/eqoxide-http/src/testkit.rs", 67),
-
-        // crates/eqoxide-ipc/src/asset_sync.rs
-        ("crates/eqoxide-ipc/src/asset_sync.rs", 1529),
-        ("crates/eqoxide-ipc/src/asset_sync.rs", 1530),
-
-        // crates/eqoxide-ipc/src/lib.rs
-        ("crates/eqoxide-ipc/src/lib.rs", 5),
-        ("crates/eqoxide-ipc/src/lib.rs", 6),
-        ("crates/eqoxide-ipc/src/lib.rs", 232),
-        ("crates/eqoxide-ipc/src/lib.rs", 233),
-        ("crates/eqoxide-ipc/src/lib.rs", 584),
-        ("crates/eqoxide-ipc/src/lib.rs", 585),
-        ("crates/eqoxide-ipc/src/lib.rs", 1154),
-        ("crates/eqoxide-ipc/src/lib.rs", 1155),
-        ("crates/eqoxide-ipc/src/lib.rs", 1178),
-        ("crates/eqoxide-ipc/src/lib.rs", 1179),
-        ("crates/eqoxide-ipc/src/lib.rs", 1469),
-        ("crates/eqoxide-ipc/src/lib.rs", 1470),
-        ("crates/eqoxide-ipc/src/lib.rs", 1497),
-        ("crates/eqoxide-ipc/src/lib.rs", 1498),
-        ("crates/eqoxide-ipc/src/lib.rs", 1552),
-        ("crates/eqoxide-ipc/src/lib.rs", 1553),
-        ("crates/eqoxide-ipc/src/lib.rs", 2459),
-        ("crates/eqoxide-ipc/src/lib.rs", 2460),
-
-        // crates/eqoxide-ipc/src/result.rs
-        ("crates/eqoxide-ipc/src/result.rs", 25),
-        ("crates/eqoxide-ipc/src/result.rs", 26),
-
-        // crates/eqoxide-nav/src/water_grid.rs
-        ("crates/eqoxide-nav/src/water_grid.rs", 880),
-        ("crates/eqoxide-nav/src/water_grid.rs", 881),
-        ("crates/eqoxide-nav/src/water_grid.rs", 936),
-        ("crates/eqoxide-nav/src/water_grid.rs", 937),
-
-        // crates/eqoxide-nav/src/zone_assets.rs
-        ("crates/eqoxide-nav/src/zone_assets.rs", 134),
-        ("crates/eqoxide-nav/src/zone_assets.rs", 135),
-
-        // crates/eqoxide-net/src/action_loop.rs
-        ("crates/eqoxide-net/src/action_loop.rs", 278),
-        ("crates/eqoxide-net/src/action_loop.rs", 279),
-        ("crates/eqoxide-net/src/action_loop.rs", 4034),
-        ("crates/eqoxide-net/src/action_loop.rs", 4035),
-        ("crates/eqoxide-net/src/action_loop.rs", 4326),
-        ("crates/eqoxide-net/src/action_loop.rs", 4327),
-        ("crates/eqoxide-net/src/action_loop.rs", 5343),
-        ("crates/eqoxide-net/src/action_loop.rs", 5344),
-        ("crates/eqoxide-net/src/action_loop.rs", 6929),
-        ("crates/eqoxide-net/src/action_loop.rs", 6930),
-        ("crates/eqoxide-net/src/action_loop.rs", 7309),
-        ("crates/eqoxide-net/src/action_loop.rs", 7310),
-
-        // crates/eqoxide-net/src/gameplay.rs
-        ("crates/eqoxide-net/src/gameplay.rs", 1805),
-        ("crates/eqoxide-net/src/gameplay.rs", 1806),
-
-        // crates/eqoxide-net/src/packet_handler.rs
-        ("crates/eqoxide-net/src/packet_handler.rs", 1944),
-        ("crates/eqoxide-net/src/packet_handler.rs", 1945),
-
-        // crates/eqoxide-net/src/transport.rs
-        ("crates/eqoxide-net/src/transport.rs", 1952),
-        ("crates/eqoxide-net/src/transport.rs", 1953),
-        ("crates/eqoxide-net/src/transport.rs", 2000),
-        ("crates/eqoxide-net/src/transport.rs", 2002),
-        ("crates/eqoxide-net/src/transport.rs", 2148),
-        ("crates/eqoxide-net/src/transport.rs", 2149),
-
-        // crates/eqoxide-protocol/src/protocol/group.rs
-        ("crates/eqoxide-protocol/src/protocol/group.rs", 29),
-        ("crates/eqoxide-protocol/src/protocol/group.rs", 30),
-
-        // crates/eqoxide-renderer/src/models.rs
-        ("crates/eqoxide-renderer/src/models.rs", 983),
-        ("crates/eqoxide-renderer/src/models.rs", 984),
-
-        // crates/eqoxide-renderer/src/pipeline.rs
-        ("crates/eqoxide-renderer/src/pipeline.rs", 29),
-        ("crates/eqoxide-renderer/src/pipeline.rs", 30),
-
-        // crates/eqoxide-renderer/src/renderer.rs
-        ("crates/eqoxide-renderer/src/renderer.rs", 442),
-        ("crates/eqoxide-renderer/src/renderer.rs", 443),
-
-        // crates/eqoxide-renderer/src/skin_observation.rs
-        ("crates/eqoxide-renderer/src/skin_observation.rs", 68),
-        ("crates/eqoxide-renderer/src/skin_observation.rs", 69),
-        ("crates/eqoxide-renderer/src/skin_observation.rs", 72),
-        ("crates/eqoxide-renderer/src/skin_observation.rs", 73),
-
-        // crates/eqoxide-renderer/tests/floating_placement.rs
-        ("crates/eqoxide-renderer/tests/floating_placement.rs", 527),
-        ("crates/eqoxide-renderer/tests/floating_placement.rs", 528),
-        ("crates/eqoxide-renderer/tests/floating_placement.rs", 543),
-        ("crates/eqoxide-renderer/tests/floating_placement.rs", 544),
-        ("crates/eqoxide-renderer/tests/floating_placement.rs", 545),
-        ("crates/eqoxide-renderer/tests/floating_placement.rs", 546),
-
-        // crates/eqoxide-renderer/tests/joint_cap_single_source.rs
-        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 176),
-        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 177),
-        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 467),
-        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 468),
-        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 623),
-        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 624),
-        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 654),
-        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 655),
-
-        // crates/eqoxide-renderer/tests/shadow_caster_selection.rs
-        ("crates/eqoxide-renderer/tests/shadow_caster_selection.rs", 257),
-        ("crates/eqoxide-renderer/tests/shadow_caster_selection.rs", 258),
-        ("crates/eqoxide-renderer/tests/shadow_caster_selection.rs", 826),
-        ("crates/eqoxide-renderer/tests/shadow_caster_selection.rs", 827),
-        ("crates/eqoxide-renderer/tests/shadow_caster_selection.rs", 1134),
-        ("crates/eqoxide-renderer/tests/shadow_caster_selection.rs", 1135),
-
-        // crates/eqoxide-renderer/tests/shadow_shader.rs
-        ("crates/eqoxide-renderer/tests/shadow_shader.rs", 361),
-        ("crates/eqoxide-renderer/tests/shadow_shader.rs", 362),
-
-        // crates/eqoxide-renderer/tests/skin_cap_selection.rs
-        ("crates/eqoxide-renderer/tests/skin_cap_selection.rs", 114),
-        ("crates/eqoxide-renderer/tests/skin_cap_selection.rs", 115),
-
-        // crates/eqoxide-renderer/tests/weather_shader.rs
-        ("crates/eqoxide-renderer/tests/weather_shader.rs", 9),
-        ("crates/eqoxide-renderer/tests/weather_shader.rs", 10),
-
-        // crates/eqoxide-telemetry/src/lib.rs
-        ("crates/eqoxide-telemetry/src/lib.rs", 561),
-        ("crates/eqoxide-telemetry/src/lib.rs", 562),
-
-        // crates/eqoxide-ui/src/lib.rs
-        ("crates/eqoxide-ui/src/lib.rs", 391),
-        ("crates/eqoxide-ui/src/lib.rs", 392),
-
-        // src/app.rs
-        ("src/app.rs", 2553),
-        ("src/app.rs", 2554),
-        ("src/app.rs", 3586),
-        ("src/app.rs", 3587),
-
-        // src/camera_state.rs
-        ("src/camera_state.rs", 8),
-        ("src/camera_state.rs", 9),
-
-        // src/zone_in.rs
-        ("src/zone_in.rs", 1429),
-        ("src/zone_in.rs", 1430),
-
-        // tests/synthetic_water_capability.rs
-        ("tests/synthetic_water_capability.rs", 131),
-        ("tests/synthetic_water_capability.rs", 132),
+        // (workspace-relative path, the offending doc lines' NORMALIZED text — see
+        // `normalized_doc_line`). Grouped by file, in the order the lines appear in it. Re-measure
+        // with `cargo test -p eqoxide-nav --lib unbalanced_doc_code_spans -- --nocapture` after any
+        // fix and delete the corresponding entry — a stale entry fails this test on its own.
+        const KNOWN_VIOLATIONS: &[(&str, &[&str])] = &[
+        ("crates/eqoxide-command/src/nav.rs", &[
+            r#"cancel and the *success* path of a zone crossing all published `idle` with `nav_reason:"#,
+            r#"null`, which is byte-identical to "no request has ever been made" — so the endpoint's"#,
+        ]),
+        ("crates/eqoxide-core/src/config.rs", &[
+            r#"than `std::env::set_current_dir` — so `load_wires_the_fallback_dir_through_"#,
+            r#"to_load_with_fallback_dir` below can drive the real `load()` call site"#,
+        ]),
+        ("crates/eqoxide-core/src/eqstr.rs", &[
+            r#"arrives — the server sends `string_id=554` with `args=[npc_name, "1148", player_name,"#,
+            r#"probably find a %4 handy."`) is itself resolved from arg slot 2, whose own `%3`/`%4`"#,
+        ]),
+        ("crates/eqoxide-core/src/game_state.rs", &[
+            r#"(`eq_constants.h` `Animation`: `Standing=100, Freeze=102, Looting=105, Sitting=110,"#,
+            r#"which every `underworld_no_recovery` hold guarantees (its arm runs only inside `if"#,
+            r#"!self.on_ground`) — so on that shape the republish cannot wake a loop that was not already"#,
+            r#"and `Mob::SendSpellBarEnable` (zone/spells.cpp:5752) send with `spell_id = the cast that"#,
+            r#"ended`. It is the ONLY way to name the spell in a *fizzle*: EQEmu decides a fizzle in"#,
+        ]),
+        ("crates/eqoxide-core/src/physics.rs", &[
+            r#"`anim = speed_u_per_s * (0.7 * 40 / RUN_SPEED)` — EQEmu computes `base_runspeed = runspeed_float *"#,
+            r#"40` with the player special-case run `0.7 → 28` and walk `0.3 → 12` (`EQEmu/zone/mob.cpp:190-196`,"#,
+        ]),
+        ("crates/eqoxide-core/src/region_map.rs", &[
+            r#"- **v1** record = 36 bytes: `i32 node_number; f32 normal[3]; f32 split; i32 region; i32 special;"#,
+            r#"i32 left; i32 right`."#,
+        ]),
+        ("crates/eqoxide-core/src/zone_map.rs", &[
+            r#"`#[ignore]`d (CI has no client cache) — run explicitly with `cargo test -p eqoxide-core --lib"#,
+            r#"zone_map::tests::diagnostic_measure_contributing_zones_869 -- --ignored --nocapture`."#,
+        ]),
+        ("crates/eqoxide-crash/src/lib.rs", &[
+            r#"thing that kills the process. `src/http/mod.rs` adds a second, more specific `INSTANCE"#,
+            r#"api_port=<N>` line later if (and only if) the listener actually binds; this fallback line is"#,
+        ]),
+        ("crates/eqoxide-http/src/combat.rs", &[
+            r#"#513 (agent-honesty): the response now DISCLOSES the matched entity — `matched:{id, name,"#,
+            r#"quality, distance?}` — so the caller can confirm the resolution picked the intended spawn."#,
+        ]),
+        ("crates/eqoxide-http/src/guild.rs", &[
+            r#"conjuncts 2 or 3 — deleting either of them left the round-2 suite green at `240 passed;"#,
+            r#"0 failed` (the round-3 reviewer's measurement, mutations M-R3a and M-R3c; not re-run here,"#,
+        ]),
+        ("crates/eqoxide-http/src/lib.rs", &[
+            r#"softening. And covered by tests, and STILL absent from `GET"#,
+            r#"/v1/observe/debug`, because nothing serialises `PlayerState` whole: `observe::get_debug`"#,
+        ]),
+        ("crates/eqoxide-http/src/merchant.rs", &[
+            r#"• 200 — the server CONFIRMED the open (OP_ShopRequest echo, command=1). Body: `{status:"open","#,
+            r#"merchant_id}`. Watch GET /v1/merchant/list for the item list arriving."#,
+            r#"window (RoF2's server collapses all of these into the same echo). Body: `{status:"refused","#,
+            r#"reason}`."#,
+            r#"GET /v1/merchant/list — the open merchant's offered items (for buying). Returns `{open,"#,
+            r#"merchant_id, count, items:[{merchant_slot,item_id,name,icon,price,quantity}]}`. `open:false`"#,
+            r#"• 200 — the server CONFIRMED the buy (OP_ShopPlayerBuy echo). Body: `{status:"bought", item,"#,
+            r#"price, coin_after}` read back from the applied receipt."#,
+        ]),
+        ("crates/eqoxide-http/src/name_match.rs", &[
+            r#"This is not the only place in the HTTP layer that holds both at once — `move_api::"#,
+            r#"current_target_match` also does, in the same canonical order. The invariant that actually"#,
+        ]),
+        ("crates/eqoxide-http/src/observe.rs", &[
+            r#"are online before coordinating). Returns `{online: [{name, level, class, race, zone_id, guild,"#,
+            r#"anon}]}`. 503 if no response arrives in time. (#300)"#,
+            r#"appeared in `last_ended` **0 times** — buried by `startup game data`, then `model-sync"#,
+            r#"worker`, then `zone load: neriakc`. The documented recipe ("had a login fail →"#,
+            r#"publisher itself updates. Mirrors `last_packet_age_advances_between_reads_with_no_publisher_"#,
+            r#"running` above, over one of the newly-added JSON fields instead of the pre-existing `/debug`"#,
+        ]),
+        ("crates/eqoxide-http/src/refusal.rs", &[
+            r#"on top: with the mailbox **free** it queues the command *and* answers `409 … (it was NOT"#,
+            r#"queued)` (so an agent that trusts "409 is definitive" retries and double-fires), and with the"#,
+        ]),
+        ("crates/eqoxide-http/src/testkit.rs", &[
+            r#"guarded by `observe::tests::no_past_dated_net_health_stamp_is_taken_from_a_clock_other_than_the_"#,
+            r#"one_that_reads_it` — a source scan over four files, one statement at a time. It catches the"#,
+            r#"[`empty_state`] and derive the stamp from the fixture's own clock (`let c = h.clock;"#,
+            r#"h.last_probe_sent = Some(c.ago(15));`). A wall-clock `ago(15)` read back against a pinned"#,
+        ]),
+        ("crates/eqoxide-ipc/src/asset_sync.rs", &[
+            r#"**The adjudication, all four cells measured at round 9** (`-p eqoxide-ipc --locked"#,
+            r#"--no-fail-fast`; the round-7 head is reproduced exactly, since `5df7099..55ecbff` changes no"#,
+        ]),
+        ("crates/eqoxide-ipc/src/lib.rs", &[
+            r#"`eqoxide-core` and below everything else — the layering is `core ← ipc ← {net, render, http,"#,
+            r#"command, …}` — and depends ONLY on `eqoxide-core` plus the low-level channel/serde primitives"#,
+            r#"review, B1: `after begin_zone_in: hold=None` → `after ONE net tick:"#,
+            r#"hold=Some(EmbeddedNoRecovery, 7.5)`) — the mirror faithfully re-manufacturing a stale claim"#,
+            r#"level down — it happened, in review, to `debug_reports_world_unresponsive_when_a_probe_goes_"#,
+            r#"unanswered_while_the_link_acks` (a 15s stamp that had to clear a 10s bound: a 5s margin)."#,
+            r#"publisher in the most idiomatic Rust form — `world.entity_positions.lock().unwrap()"#,
+            r#".insert(..)`, mutation through a temporary guard with no binding at all — and the suite"#,
+            r#"- A production publisher written the idiomatic way — `world.entity_positions.lock().unwrap()"#,
+            r#".insert(..)` — fails to compile under **both** `cargo test --workspace` and"#,
+            r#"Command-with-result buy request (A3 Migration 1, #448) — `(merchant spawn id, merchant slot,"#,
+            r#"oneshot Sender)`. POST /v1/merchant/buy writes this and AWAITS the `Sender`; the nav thread"#,
+            r#"Command-with-result merchant-open request (A3 migration, eqoxide#479) — `(merchant spawn id,"#,
+            r#"oneshot Sender)`. POST /v1/merchant/open writes this and AWAITS the `Sender`; the nav thread's"#,
+            r#"Command-with-result give request (A3 Migration 2, #448) — `(npc spawn id, item from_slot,"#,
+            r#"oneshot Sender)`. POST /v1/interact/give writes this and AWAITS the `Sender`; the nav thread's"#,
+            r#"3. **half-neuter it** — `let keep = self.disclosures().1; self.publish_disclosures((None,"#,
+            r#"keep));` — so the hold is invalidated and the stall is not → RED at the stall assertion."#,
+        ]),
+        ("crates/eqoxide-ipc/src/result.rs", &[
+            r#"detail read back from the applied receipt (e.g. `BuyOk { item_name,"#,
+            r#"price, coin_after }`) — never an optimistic guess made at send time."#,
+        ]),
+        ("crates/eqoxide-nav/src/water_grid.rs", &[
+            r#"MUTATION CHECK: make `ZoneWater::measure` return `WaterMeasurement { value: Some(f(&default)),"#,
+            r#"reason: None }` in the `Unmeasured` arm (i.e. re-fabricate the old dry answer) and the"#,
+            r#"MUTATION CHECK: make `WaterRollup::add` treat `(None, Some(_))` as `self.total += 0;"#,
+            r#"self.measured_zones += 1` (the pre-fix behaviour) and `is_complete`/`unmeasured_zones`/the"#,
+        ]),
+        ("crates/eqoxide-nav/src/zone_assets.rs", &[
+            r#"Measured, not reasoned: with a wildcard here and a fifth `ProbeRefreshing { zone,"#,
+            r#"collision }` variant added (the enum has FOUR — `Idle`, `Pending`, `Ready`, `Failed`), the"#,
+        ]),
+        ("crates/eqoxide-net/src/action_loop.rs", &[
+            r#"Refused before any packet (empty gem, or a stale/non-clicky item slot). `finish_cast(0,"#,
+            r#""cast_failed", …)` was already recorded; the `String` is the human reason for the 409."#,
+            r#"unconditionally on every ~10 ms net tick, so the departed zone's `Some(EmbeddedNoRecovery,"#,
+            r#"7.5)` was back one tick after the clear —"#,
+            r#"bug this test was added to catch) → the received `anim` collapses to ~1 (fails the `anim >="#,
+            r#"20` assertion below), even though every pure-function unit test above still passes untouched."#,
+            r#"* re-guard the off-region reset with the cooldown (`if index.is_none() &&"#,
+            r#"self.last_zone_cross.elapsed() > ZONE_CROSS_COOLDOWN_MS`) — i.e. restore the pre-fix"#,
+            r#"A STALE prior outcome (recorded BEFORE this cast parked) must never resolve it — the `at >"#,
+            r#"sent_at` correlation is what keeps a previous cast's verdict from fabricating a result here."#,
+            r#"MUTATION CHECK: revert the verdict to the all-slot name-scan (`any(slot < TRADE_BEGIN && name =="#,
+            r#"item_name)`) and this goes RED — the duplicate in the general slot forces a bogus `Unconfirmed`."#,
+        ]),
+        ("crates/eqoxide-net/src/gameplay.rs", &[
+            r#"tick, which is precisely the case (`the render loop publishes nothing at all across the"#,
+            r#"load`) that `GameState::begin_zone_in`'s own doc claims it covers. The behaviour that follows"#,
+        ]),
+        ("crates/eqoxide-net/src/packet_handler.rs", &[
+            r#"display text and decode the body's hex fields. Only real saylinks (body `item_id =="#,
+            r#"SAYLINK_ITEM_ID`) become [`eqoxide_core::game_state::DialogueChoice`]s (click-to-say); every"#,
+        ]),
+        ("crates/eqoxide-net/src/transport.rs", &[
+            r#"scheduler luck, not the transport. `connect`'s retry decision is `session_request_due(last_send,"#,
+            r#"now)` (see its doc), which needs no real waiting to exercise — `Instant + Duration` builds a"#,
+            r#"pass unchanged even if `connect()` is WIRED to it incorrectly, e.g. `let _ ="#,
+            r#"session_request_due(...) { send(); /* forgot */ last_send = Instant::now(); }` (never resets"#,
+            r#"encoded-body assertion is the mutation check: revert `send_out_of_order` to `send_raw(.., &seq"#,
+            r#".to_be_bytes())` and the decoded-seq assertion fails (the raw bytes XOR-decode to garbage)."#,
+        ]),
+        ("crates/eqoxide-protocol/src/protocol/group.rs", &[
+            r#"`Wrong size on incoming [OP_GroupDisband] (structs::GroupGeneric_Struct): Got [128], expected"#,
+            r#"[148]` and silently dropped the packet (no roster change, no disband on either side). The"#,
+        ]),
+        ("crates/eqoxide-renderer/src/models.rs", &[
+            r#"transcribed literally (it also still passes a `center_xz` argument), `error[E0308]:"#,
+            r#"mismatched types` on a minimal transcription onto the 3-argument signature. Both measured;"#,
+        ]),
+        ("crates/eqoxide-renderer/src/pipeline.rs", &[
+            r#"to a joint shader produced `character_skinned.wgsl: WGSL failed to parse: expected identifier,"#,
+            r#"found '128'`. It also rewrote the shaders' own **comments**, so the text naga received described"#,
+        ]),
+        ("crates/eqoxide-renderer/src/renderer.rs", &[
+            r#"Resolve a mesh's animated-texture spec `(ms, frame names)` into `(ms, frame texture"#,
+            r#"indices)` against the loaded texture list. Returns `None` if fewer than 2 frames resolve."#,
+        ]),
+        ("crates/eqoxide-renderer/src/skin_observation.rs", &[
+            r#"i.e. the reviewer's own mutation applied one round later: `error[E0308]: mismatched types"#,
+            r#"… expected `ModelAsset`, found `Option<_>``, **twice** (once in `(lib)`, once in"#,
+            r#"- **R1b** — `crate::models::ModelAsset::default()` in its place: `error[E0599]: no associated"#,
+            r#"function or constant named `default` found for struct `ModelAsset``, twice. `ModelAsset`"#,
+        ]),
+        ("crates/eqoxide-renderer/tests/floating_placement.rs", &[
+            r#"edit no longer compiles (measured: `error[E0061]: this function takes 4 arguments but 5"#,
+            r#"arguments were supplied`). What is left open at the type level is calling"#,
+            r#"separate `center_xz` argument, so it is `error[E0061]: this function takes 3 arguments but 4"#,
+            r#"arguments were supplied`, with `expected &ModelBounds, found f32` as a sub-note rather than a"#,
+            r#"standalone error; transcribed minimally onto the 3-argument signature it is `error[E0308]:"#,
+            r#"mismatched types`, expected `&ModelBounds`, found `f32`. Neither compiles."#,
+        ]),
+        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", &[
+            r#"`discovered_corpus_is_not_silently_truncated` fail with `the shader walk never returned"#,
+            r#"["ghost.wgsl"]` — the honest direction, but an alarm about a file that never existed."#,
+            r#"This is the check that makes a hardcoded-but-currently-correct length impossible. `array<JMat,"#,
+            r#"128>` written literally compiles to the same IR as the placeholder does today, so"#,
+            r#"`const JOINT_CAP_SCALE: f32 = 1.0;` to a joint shader produced `character_skinned.wgsl: WGSL"#,
+            r#"failed to parse: expected identifier, found '128'`. Exhaustive over the shapes an identifier can"#,
+            r#"Every comment in `src`, in source order, as `(1-based line of its opener, text including the"#,
+            r#"opener)`."#,
+        ]),
+        ("crates/eqoxide-renderer/tests/shadow_caster_selection.rs", &[
+            r#"`ENTITY_DRAW_DIST` of the player, but one projects to NDC x = 1.6, outside `1.0 +"#,
+            r#"ENTITY_CULL_MARGIN`. A mutant that drops the frustum test (keeping only the distance test)"#,
+            r#"**Fixed (eqoxide#751): each scene now draws from its own `Rng(splitmix64(0x5EED_740 ^ scene as"#,
+            r#"u64))`**, built by `build_scene(scene)` and never threaded across scenes (see that function's"#,
+            r#"**not** catch the same coupling reached through an intermediate helper function (e.g. `fn"#,
+            r#"prior_signal(scene: usize) -> u64 { let (c, ..) = build_scene(scene - 1); c.len() as u64 }` called"#,
+        ]),
+        ("crates/eqoxide-renderer/tests/shadow_shader.rs", &[
+            r#"separate literal that merely reads the same. `masked_shadow_pipeline_binds_the_entry_point_"#,
+            r#"this_file_grades` below couples them."#,
+        ]),
+        ("crates/eqoxide-renderer/tests/skin_cap_selection.rs", &[
+            r#"The cap is INCLUSIVE — a skin with exactly `JOINT_CAP` joints fits, matching the deleted `<="#,
+            r#"128`. Getting this off by one either rejects the widest rig that currently ships"#,
+        ]),
+        ("crates/eqoxide-renderer/tests/weather_shader.rs", &[
+            r#"2. `pipeline.rs` wires the weather pipeline correctly: bind-group layouts `[camera_bgl,"#,
+            r#"weather_bgl]`, two vertex buffers (the static quad + the per-instance particle buffer),"#,
+        ]),
+        ("crates/eqoxide-telemetry/src/lib.rs", &[
+            r#"`Cargo.toml`). A bare `#[cfg(test)]` item is invisible outside `eqoxide-telemetry`'s own `cargo"#,
+            r#"test` — `cfg(test)` is per-crate, so it would NOT exist in the rlib the app crate links against"#,
+        ]),
+        ("crates/eqoxide-ui/src/lib.rs", &[
+            r#"SESSION. A body that sizes its canvas from `available - <hardcoded"#,
+            r#"footer>` and then draws a taller footer overflows its allotment; the"#,
+        ]),
+        ("src/app.rs", &[
+            r#"previous zone's collision grid, which is precisely the stale-ready lie `NotUsable::"#,
+            r#"StaleForPreviousZone` exists to report."#,
+            r#"`i32 index, 3×f32 normal, f32 split, i32 region, i32 special, i32 left, i32 right,"#,
+            r#"i32 zone_line_index`."#,
+        ]),
+        ("src/camera_state.rs", &[
+            r#"those types. Re-exported so every existing `crate::camera_state::{CameraMode,CameraCmd,"#,
+            r#"CameraSnapshot}` path across the tree keeps resolving unchanged."#,
+        ]),
+        ("src/zone_in.rs", &[
+            r#"**Complement, not duplicate.** `movement::tests::"#,
+            r#"the_zone_change_reload_block_still_forgets_the_recovery_ring` asserts the line is *written*"#,
+        ]),
+        ("tests/synthetic_water_capability.rs", &[
+            r#"puts a character on the lid (see `a_swimmer_at_the_pocket_swim_plane_holds_its_own_depth_not_"#,
+            r#"the_lid`), so the position here is manually authored rather than reached by driving the"#,
+        ]),
+        ("tools/src/main.rs", &[
+            r#"which is a valid **180° rotation**, NOT identity. The old `if denominator != 0 { … } else"#,
+            r#"{ IDENTITY }` guard silently dropped those flips: the wolf's rear hind-leg-top bones store"#,
+        ]),
         ];
 
         let resolve_in = workspace_rs_files();
@@ -2325,35 +2399,73 @@ mod cursor_resync_tests {
              below is about a corpus it did not actually cover",
             scan.files_scanned, resolve_in.len());
 
-        let allowed: HashSet<(std::path::PathBuf, usize)> = KNOWN_VIOLATIONS.iter()
-            .map(|(f, l)| (ws.join(f), *l)).collect();
-        let found: HashSet<(std::path::PathBuf, usize)> = scan.offenders.iter().cloned().collect();
+        // Keyed on TEXT, not line number — see this test's rustdoc for the measurement that
+        // decided it. A multiset, not a set: two offenders in one file may normalize to the same
+        // text, and losing one of them to set collapse would be a silent hole.
+        let mut allowed: HashMap<(&str, &str), usize> = HashMap::new();
+        let mut listed = 0usize;
+        for (f, texts) in KNOWN_VIOLATIONS {
+            for t in *texts { *allowed.entry((*f, *t)).or_default() += 1; listed += 1; }
+        }
 
-        let new: Vec<String> = scan.offenders.iter()
-            .filter(|o| !allowed.contains(o))
-            .map(|(p, l)| format!(
-                "{}:{l}: a code span opens on this line and closes on another, and this file:line \
-                 is not in KNOWN_VIOLATIONS. Either keep the span on one line, or — if this is a \
-                 pre-existing offender just now coming into scope — add it to KNOWN_VIOLATIONS with \
-                 a reason.",
-                p.strip_prefix(&ws).unwrap_or(p).display()))
-            .collect();
-        assert!(new.is_empty(),
-            "doc-span scan found {} new (non-allowlisted) problem(s) outside the citation corpus:\n  {}",
-            new.len(), new.join("\n  "));
+        // The offending line's text, looked up in the same bytes the scan read.
+        let src_of: HashMap<&std::path::PathBuf, &String> =
+            corpus.iter().map(|(p, s)| (p, s)).collect();
+        let mut found: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        for (p, line) in &scan.offenders {
+            let rel = p.strip_prefix(&ws).unwrap_or(p).display().to_string();
+            let src = src_of[p];
+            let text = normalized_doc_line(src.lines().nth(line - 1).unwrap_or_default());
+            found.entry((rel, text)).or_default().push(*line);
+        }
 
-        let dead: Vec<String> = KNOWN_VIOLATIONS.iter()
-            .filter(|(f, l)| !found.contains(&(ws.join(f), *l)))
-            .map(|(f, l)| format!("{f}:{l}"))
-            .collect();
-        assert!(dead.is_empty(),
-            "KNOWN_VIOLATIONS lists {} entry/entries the scan no longer finds unbalanced — the \
-             backlog shrank, delete them:\n  {}",
-            dead.len(), dead.join("\n  "));
+        // Both directions in ONE assertion: keyed separately, a fixer clears the "new" half, re-runs,
+        // and only then learns about the "dead" half — two round-trips for one edit.
+        let mut problems: Vec<String> = Vec::new();
+        for ((rel, text), lines) in &found {
+            let listed_here = allowed.get(&(rel.as_str(), text.as_str())).copied().unwrap_or(0);
+            for line in lines.iter().skip(listed_here) {
+                problems.push(format!(
+                    "{rel}:{line}: NEW — a code span opens on this line and closes on another, and \
+                     this line's text is not in KNOWN_VIOLATIONS. Either keep the span on one line, \
+                     or — if this is a pre-existing offender just now coming into scope — add it to \
+                     KNOWN_VIOLATIONS under {rel} as:\n      r#\"{text}\"#,"));
+            }
+        }
+        for ((f, t), n) in &allowed {
+            let found_here = found.get(&((*f).to_string(), (*t).to_string()))
+                .map_or(0, |v| v.len());
+            for _ in found_here..*n {
+                problems.push(format!(
+                    "{f}: DEAD — KNOWN_VIOLATIONS lists a line the scan no longer finds unbalanced. \
+                     The backlog shrank; delete this entry:\n      r#\"{t}\"#,"));
+            }
+        }
+        problems.sort();
+        assert!(problems.is_empty(),
+            "doc-span backlog: {} problem(s) across the workspace ({} entry/entries listed, {} \
+             offender(s) found over {} files):\n  {}",
+            problems.len(), listed, scan.offenders.len(), scan.files_scanned,
+            problems.join("\n  "));
 
         println!("#789 backlog: {} allowlisted offender(s) tracked, {} files / {} lines scanned \
-                  in the resolution corpus",
-            KNOWN_VIOLATIONS.len(), scan.files_scanned, scan.lines_scanned);
+                  in the whole-workspace corpus",
+            listed, scan.files_scanned, scan.lines_scanned);
+    }
+
+    /// The key an entry in `KNOWN_VIOLATIONS` is matched on: the offending source line with its
+    /// leading/trailing whitespace and its `///` or `//!` marker stripped, and every internal
+    /// whitespace run collapsed to a single space.
+    ///
+    /// Collapsing runs is not cosmetic. `check-wrapped-literals.py` fails the build on a run of 12+
+    /// spaces inside a string literal (it is how a lost `\` line-continuation is detected), and two
+    /// of the workspace's offending lines are inside an ASCII diagram with exactly that shape — so
+    /// storing them verbatim would trip a different guard. Collapsing also means re-indenting a doc
+    /// block, which moves no words, does not reopen an entry.
+    fn normalized_doc_line(line: &str) -> String {
+        let t = line.trim();
+        let body = t.strip_prefix("///").or_else(|| t.strip_prefix("//!")).unwrap_or(t);
+        body.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// Which of a file's fence-safe insertion points a reach probe goes at.
@@ -2442,14 +2554,20 @@ mod cursor_resync_tests {
     /// **#789's own reach control: the same proof, over `workspace_rs_files()` instead of the five
     /// citation files.**
     ///
-    /// `unbalanced_doc_code_spans_outside_the_citation_corpus_are_a_named_shrinking_backlog` claims
+    /// `unbalanced_doc_code_spans_in_the_whole_workspace_are_a_named_shrinking_backlog` claims
     /// to scan the whole resolution corpus, not just the five files the guard above already covers.
     /// That claim gets its own proof rather than resting on "it calls the same function" — #760's
     /// round-4 finding was exactly a scanner whose *positive* control passed while the scanner
     /// silently stopped short, and every probe used to validate it sat inside the window it could
-    /// still see. Running the identical probe-and-count method over 170+ files instead of 5 is the
-    /// difference between "a scanner that can find a wrapped span" and "a scanner that finds one
-    /// wherever it is."
+    /// still see. Running the identical probe-and-count method over every file in the workspace
+    /// instead of 5 is the difference between "a scanner that can find a wrapped span" and "a
+    /// scanner that finds one wherever it is."
+    ///
+    /// Verified at this head by execution, at the two hardest truncation points rather than an easy
+    /// one: a break after the second-to-last file (a tail truncation, which a probe set clustered
+    /// near the start would miss) and a break after the first 200 lines of *every* file (the #778
+    /// shape — full file reach, no line reach). Both fail this control; both are recorded in #882's
+    /// PR body.
     #[test]
     fn the_doc_span_scan_reaches_the_full_resolution_corpus_at_three_depths_each() {
         assert_doc_span_scan_reaches_corpus(&workspace_rs_files(), "resolution");
