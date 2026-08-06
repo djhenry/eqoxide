@@ -41,18 +41,26 @@ fn apply_action_clip(
 ) {
     use crate::anim::ActionClip;
     match resolved {
-        Some(ActionClip::Own(ci)) => {
+        Some(ci_kind @ ActionClip::Own(ci)) => {
             state.clip_idx = ci;
-            state.held     = crate::anim::SkinData::is_held_pose(action);
+            // Route through `ActionClip::is_held_pose` (not a second, hand-inlined
+            // `SkinData::is_held_pose(action)` check) so there is exactly one place that decides
+            // held-ness from a resolution — reviewer finding on #863: the two used to be able to
+            // drift apart even though `FellBackToIdle` always forced `false` by hand.
+            state.held     = ci_kind.is_held_pose(action);
             state.animate  = skin.action_animates(action, ci);
         }
-        Some(ActionClip::FellBackToIdle(ci)) => {
+        Some(ci_kind @ ActionClip::FellBackToIdle(ci)) => {
             // No clip for `action` — the clip that will actually play is idle, so it must be
-            // treated exactly like a genuine idle resolution: never held, and animate/hold-static
-            // decided by idle's own rule (e.g. a walk-used-as-idle fallback holds static), not by
-            // whatever `action` asked for.
+            // treated exactly like a genuine idle resolution: never held (`ActionClip::is_held_pose`
+            // returns `false` for this variant unconditionally), and animate/hold-static decided by
+            // idle's own rule (e.g. a walk-used-as-idle fallback holds static — see
+            // `SkinData::action_animates`'s doc), not by whatever `action` asked for. This is a
+            // deliberate scope widening beyond the three held-pose actions: ANY action that falls
+            // back to idle now gets idle's animate rule, not just dead/sitting/crouching — see
+            // `fallback_action_gets_idles_animate_rule_not_the_actions`.
             state.clip_idx = ci;
-            state.held     = false;
+            state.held     = ci_kind.is_held_pose(action); // false by construction for this variant
             state.animate  = skin.action_animates("idle", ci);
         }
         None => {
@@ -60,6 +68,39 @@ fn apply_action_clip(
             state.animate  = false;
             state.held     = false;
         }
+    }
+}
+
+/// Advance `state`'s animation clock by `dt`, given the already-resolved clip `duration`.
+/// Whether to clamp-and-hold at the final frame (a held pose) or loop is read ONLY from
+/// `state.held` — this function takes no `action` string and no `SkinData`, so it is structurally
+/// unable to re-derive hold-vs-loop from the action string the way the pre-#858 code did. That
+/// decision was already made, once, by `apply_action_clip`, from the same `ActionClip` resolution
+/// that picked `clip_idx`; this function cannot see anything else to disagree with it.
+///
+/// Returns `true` when a loop just completed (time wrapped past `duration`), so the caller can
+/// decide whether to advance idle-phase fidget cycling — that decision needs `is_idle` and the
+/// skin's clip set, which are not this function's concern.
+///
+/// This is `render_frame`'s actual `if state.held { … }` site, extracted so it can be unit-tested
+/// without a GPU device (`render_frame` itself needs one and is never called from any test in this
+/// crate — reviewer finding on #863: the three original `apply_action_clip`-only tests never
+/// reached this code).
+fn advance_clip_time(state: &mut EntityAnimState, duration: f32, dt: f32) -> bool {
+    if duration <= 0.0 { return false; }
+    let next = state.time + dt;
+    if state.held {
+        // Play once: clamp time to duration so evaluate() returns the last frame (the resting
+        // seated/kneeling/dead pose), then stop animating and hold.
+        state.time = next.min(duration);
+        if next >= duration { state.animate = false; } // done; hold pose
+        false
+    } else if next >= duration {
+        state.time = next % duration;
+        true // loop completed
+    } else {
+        state.time = next;
+        false
     }
 }
 
@@ -1546,32 +1587,25 @@ impl EqRenderer {
             // cycling through fidgets. (Previously only "dead" held — sit/kneel looped the
             // stand→pose transition forever, eqoxide#83.)
             //
-            // `state.held` — not `SkinData::is_held_pose(action)` — decides this (#858): it was set
-            // above from the SAME resolution that picked `clip_idx`, so a held-pose action whose
-            // clip fell back to idle is correctly `held == false` here and loops instead of
-            // clamping on the idle clip's last frame.
+            // `advance_clip_time` reads ONLY `state.held` — not `SkinData::is_held_pose(action)` —
+            // to decide this (#858): `held` was set above from the SAME resolution that picked
+            // `clip_idx`, so a held-pose action whose clip fell back to idle is correctly
+            // `held == false` and loops instead of clamping on the idle clip's last frame. The
+            // function has no `action` parameter, so this call site cannot silently regress back to
+            // reading the action string here even by accident (reviewer finding on #863).
             if state.animate && state.clip_idx < skinned.skin.clips.len() && !skinned.skin.clips.is_empty() {
                 let dur = skinned.skin.clips[state.clip_idx].duration;
-                if dur > 0.0 {
-                    let next = state.time + dt;
-                    if state.held {
-                        // Play once: clamp time to duration so evaluate() returns the last frame
-                        // (the resting seated/kneeling/dead pose), then stop animating and hold.
-                        state.time = next.min(dur);
-                        if next >= dur { state.animate = false; } // done; hold pose
-                    } else if next >= dur {
-                        state.time = next % dur;
-                        // On each completed idle loop, advance the cycle so the character
-                        // alternates the neutral stand with periodic fidgets (like native).
-                        if is_idle {
-                            state.idle_phase = state.idle_phase.wrapping_add(1);
-                            if let Some(ci) = skinned.skin.idle_clip_for_phase(state.idle_phase) {
-                                state.clip_idx = ci;
-                                state.animate = skinned.skin.action_animates(action, ci);
-                            }
+                if advance_clip_time(state, dur, dt) {
+                    // On each completed idle loop, advance the cycle so the character alternates
+                    // the neutral stand with periodic fidgets (like native). Only idle-family
+                    // actions cycle fidgets; a non-idle action whose clip happens to loop (e.g. a
+                    // real walk/run, or a held-pose action's fallen-back idle clip) just repeats.
+                    if is_idle {
+                        state.idle_phase = state.idle_phase.wrapping_add(1);
+                        if let Some(ci) = skinned.skin.idle_clip_for_phase(state.idle_phase) {
+                            state.clip_idx = ci;
+                            state.animate = skinned.skin.action_animates(action, ci);
                         }
-                    } else {
-                        state.time = next;
                     }
                 }
             }
@@ -1874,10 +1908,10 @@ mod tests {
     /// action string alone (`SkinData::is_held_pose("crouching") == true`), disagreeing with the
     /// clip that was actually chosen (idle) and freezing the model on idle's last frame forever.
     ///
-    /// Mutation check: change `apply_action_clip`'s `ActionClip::FellBackToIdle` arm to set
-    /// `state.held = crate::anim::SkinData::is_held_pose(action)` instead of `false` (i.e. revert to
-    /// deciding hold-vs-loop from the action string) — this test goes RED, because
-    /// `is_held_pose("crouching")` is `true`.
+    /// Mutation check: drop the `matches!(self, ActionClip::Own(_))` guard from
+    /// `ActionClip::is_held_pose` in `anim.rs` (i.e. make it return `SkinData::is_held_pose(action)`
+    /// unconditionally, ignoring which variant `self` is — reverting to deciding hold-vs-loop from
+    /// the action string alone) — this test goes RED, because `is_held_pose("crouching")` is `true`.
     #[test]
     fn crouch_without_crouch_clip_falls_back_to_idle_and_is_not_held() {
         let skin = one_joint_skin(&["O01_idle"]); // idle only — no P03/crouch clip (eqoxide#858)
@@ -1931,5 +1965,100 @@ mod tests {
         assert_eq!(state.clip_idx, usize::MAX, "bind-pose sentinel");
         assert!(!state.animate);
         assert!(!state.held);
+    }
+
+    /// BLOCKING reviewer finding on #863: the three tests above pin `apply_action_clip` directly
+    /// and never reach `render_frame`'s actual per-frame consumer of `state.held` — the
+    /// `if state.held { … }` block at the animation-advance site, which needs a GPU device and is
+    /// never exercised by any test in this crate. The reviewer proved this by reverting that one
+    /// line back to `if SkinData::is_held_pose(action)` (the literal pre-#858 bug) with
+    /// `apply_action_clip` left untouched, and the full suite stayed green.
+    ///
+    /// The fix: that block is now `advance_clip_time`, a free function extracted verbatim from
+    /// `render_frame` (see its doc comment) that takes NO `action` parameter — so it is
+    /// structurally unable to consult the action string at all, not just tested against doing so.
+    /// This test calls it directly, simulating the exact #858 scenario end-to-end: a held-pose
+    /// action ("crouching") falls back to idle, then the clock advances past the clip's duration —
+    /// exactly what `render_frame` does every frame. The model must LOOP, not freeze.
+    ///
+    /// Mutation check (re-run, both directions — measured, not claimed): `advance_clip_time`'s
+    /// missing `action` parameter means the reviewer's exact revert can no longer be written
+    /// without changing the function's signature — a visible diff, not a silent one. The closest
+    /// expressible mutation, inverting the branch guard (`if state.held` → `if !state.held`), was
+    /// applied by hand and both this test AND `advance_clip_time_clamps_and_stops_a_genuine_held_pose`
+    /// went RED (the fallback case then clamped to `dur` and set `animate = false` instead of
+    /// looping; the genuine-held case then reported a completed loop instead of clamping). The edit
+    /// was reverted afterward (`git diff --stat` confirmed empty).
+    #[test]
+    fn advance_clip_time_loops_a_fallen_back_held_pose_instead_of_freezing() {
+        let skin = one_joint_skin(&["O01_idle"]); // no crouch clip — falls back to idle (#858)
+        let resolved = skin.clip_for_action_or_idle("crouching");
+        let mut state = fresh_anim_state();
+        apply_action_clip(&mut state, &skin, "crouching", resolved);
+        assert!(!state.held, "precondition: fell back to idle, not held");
+        assert!(state.animate, "precondition: the resolved idle clip animates");
+
+        let dur = skin.clips[state.clip_idx].duration;
+        assert!(dur > 0.0);
+
+        // Advance well past the clip's duration — exactly what render_frame does every frame.
+        let looped = advance_clip_time(&mut state, dur, dur * 2.5);
+
+        assert!(looped, "time overran the duration — a loop must have completed");
+        assert!(state.time < dur,
+            "time must WRAP (loop), not clamp to duration — got {}, dur {}", state.time, dur);
+        assert!(state.animate,
+            "must still be animating: a looping clip never sets animate = false. Pre-fix, this \
+             would have been true (frozen forever) — the exact #858 symptom.");
+    }
+
+    /// Companion, the opposite branch: a genuine held pose (the model has its own crouch clip)
+    /// clamps to the final frame and stops — proving the fix above doesn't just make everything
+    /// loop; `advance_clip_time` still honors `held == true`.
+    #[test]
+    fn advance_clip_time_clamps_and_stops_a_genuine_held_pose() {
+        let skin = one_joint_skin(&["O01_idle", "P03_crouch"]);
+        let resolved = skin.clip_for_action_or_idle("crouching");
+        let mut state = fresh_anim_state();
+        apply_action_clip(&mut state, &skin, "crouching", resolved);
+        assert!(state.held, "precondition: the model's own crouch clip → held");
+
+        let dur = skin.clips[state.clip_idx].duration;
+        let looped = advance_clip_time(&mut state, dur, dur * 2.5);
+
+        assert!(!looped, "a held pose never reports a completed loop");
+        assert_eq!(state.time, dur, "time clamps to the clip's final frame");
+        assert!(!state.animate, "playback stops once the held pose reaches its final frame");
+    }
+
+    /// NON-BLOCKING reviewer finding on #863, now claimed and pinned rather than left unstated:
+    /// `apply_action_clip`'s `FellBackToIdle` arm decides `animate` using idle's OWN rule
+    /// (`action_animates("idle", ci)`), not the requested action's — and that reaches actions
+    /// outside the three held poses too. A "C05" combat swing with no combat clip, on a model that
+    /// also has no idle-named clip (so idle itself falls back to a walk clip via
+    /// `SkinData::clip_for_action`'s `walk_fallback` arm), must hold static on that walk clip rather
+    /// than loop it — "walking in place" while swinging would be exactly the wrong-but-different
+    /// bug `action_animates`'s doc already calls out for idle proper. This is intentional: treating
+    /// EVERY fallback-to-idle resolution exactly like idle (not just the held-pose ones) is the
+    /// whole point of `FellBackToIdle` existing as a distinct variant.
+    #[test]
+    fn fallback_action_gets_idles_animate_rule_not_the_actions() {
+        // No idle-named clip and no C05 clip — both "idle" and "C05" resolve through the walk
+        // fallback inside `clip_for_action("idle")`.
+        let skin = one_joint_skin(&["D05_death", "Walk"]);
+
+        let resolved = skin.clip_for_action_or_idle("C05");
+        assert!(matches!(resolved, Some(crate::anim::ActionClip::FellBackToIdle(1))),
+            "precondition: no C05 clip; idle itself falls back to the walk clip (index 1)");
+
+        let mut state = fresh_anim_state();
+        apply_action_clip(&mut state, &skin, "C05", resolved);
+
+        assert_eq!(state.clip_idx, 1, "plays the walk-used-as-idle fallback clip");
+        assert!(!state.held, "a combat swing is never a held pose");
+        assert!(!state.animate,
+            "must hold static on the walk clip, not loop it — a fallback action gets idle's own \
+             animate rule (SkinData::action_animates), which already holds a walk-used-as-idle \
+             fallback static, uniformly applied to every action that lands on it, not just idle");
     }
 }
