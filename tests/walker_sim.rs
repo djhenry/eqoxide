@@ -1029,7 +1029,7 @@ use eqoxide_ipc::MoveIntent;
     /// **Rename guard for this file's doc-comment citations.** `open_zone_checked`'s rustdoc names
     /// `faithful_walker_drift_corpus`; listing it here as a `fn` value makes a rename a COMPILE
     /// error instead of a citation that rots silently. The nav crate's citation scan
-    /// (`every_test_citation_in_the_four_citation_files_resolves_and_is_listed_in_a_guard`) requires
+    /// (`every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard`) requires
     /// exactly this and reads this file — measured, not assumed: the workspace suite failed with
     /// "`faithful_walker_drift_corpus` … no `_cited`/`_helpers` guard in this file names it" until
     /// this array existed.

@@ -1538,7 +1538,7 @@ mod cursor_resync_tests {
     ///
     /// **You do not have to remember to add a line here — for every citation shape that scan can
     /// see.** The list below is the *enforcement*; its *completeness* is checked mechanically by
-    /// `every_test_citation_in_the_four_citation_files_resolves_and_is_listed_in_a_guard`,
+    /// `every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard`,
     /// which reads the source and fails if a doc comment cites a test this array does not name.
     ///
     /// ⚠️ **Correction (#727 round 7 review, non-blocking 1).** Round 6 wrote that first sentence
@@ -1570,9 +1570,14 @@ mod cursor_resync_tests {
             // #788 split the doc-span half out of the citation test and renamed the citation test
             // so neither name reads as workspace-wide. All three are cited in doc comments in this
             // file, so all three are pinned here.
-            every_test_citation_in_the_four_citation_files_resolves_and_is_listed_in_a_guard,
-            unbalanced_doc_spans_are_rejected_in_the_four_citation_files_only_not_the_workspace,
-            the_doc_span_scan_reaches_all_four_citation_files_at_three_depths_each,
+            every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard,
+            unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace,
+            the_doc_span_scan_reaches_all_five_citation_files_at_three_depths_each,
+            // #789/#874: the two new tests cited by name in the ⚠️ Correction blocks above and in
+            // `unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace`'s
+            // own doc — caught by this file's own scan on the run that added the citations.
+            unbalanced_doc_code_spans_outside_the_citation_corpus_are_a_named_shrinking_backlog,
+            the_doc_span_scan_reaches_the_full_resolution_corpus_at_three_depths_each,
             // …and this one the scan caught on its first run, on a citation added in round 6
             // itself — which is the whole argument for having it.
             the_simulated_stall_is_a_bounded_overshoot_cycle_a_few_frames_wide,
@@ -1708,7 +1713,7 @@ mod cursor_resync_tests {
     ///   says so, because the name is what a `cargo test` result line shows and the fifth bullet
     ///   above — which says the same thing correctly — is not.
     /// * **The unbalanced-code-span half moved out**, into
-    ///   `unbalanced_doc_spans_are_rejected_in_the_four_citation_files_only_not_the_workspace`,
+    ///   `unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace`,
     ///   with a reach control of its own. It ran inside this test's `cited_in` loop and its green
     ///   was read as workspace coverage by three independent readers in two days, twice by the same
     ///   one. Same four files, same check, its own result line.
@@ -1722,8 +1727,25 @@ mod cursor_resync_tests {
     /// files is not clean by it. The count is recorded in #789 (filed by #788, not fixed by it) and
     /// deliberately not repeated here — a count in a comment is the "measurement with an expiry
     /// date" the round-9 block above already had to delete once.
+    ///
+    /// ⚠️ **Correction (#789/#874).** Two things changed above this test, not in it:
+    ///
+    /// * **The corpus grew from four files to five.** #874 added `src/movement.rs` to
+    ///   `citation_corpus` — where `CharacterController` lives and where `MUTATION-CHECK` blocks
+    ///   cite test names by name, previously read by nothing mechanical. Every "four" above is
+    ///   preserved as it was written, describing #727's and #788's corpus at the time; the current
+    ///   corpus is whatever `citation_corpus` returns, which is the only claim this doc makes going
+    ///   forward.
+    /// * **The span check WAS widened**, contrary to the paragraph just above: a second test,
+    ///   `unbalanced_doc_code_spans_outside_the_citation_corpus_are_a_named_shrinking_backlog`,
+    ///   runs the same `scan_doc_spans` over the full resolution corpus and holds it to zero NEW
+    ///   offenders — pre-existing ones are named individually in that test's `KNOWN_VIOLATIONS`,
+    ///   which must shrink as they are fixed (a stale entry fails the build) and cannot silently
+    ///   grow (an unlisted offender fails the build). This test and
+    ///   `unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace`
+    ///   still hold their five files to exactly zero, unconditionally.
     #[test]
-    fn every_test_citation_in_the_four_citation_files_resolves_and_is_listed_in_a_guard() {
+    fn every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard() {
         use std::collections::{HashMap, HashSet};
         use std::path::PathBuf;
 
@@ -1862,16 +1884,28 @@ mod cursor_resync_tests {
             .to_path_buf()
     }
 
-    /// **The citation corpus: the four files, as a value.**
+    /// **The citation corpus: the five files, as a value.**
     ///
-    /// Every scan in this module that READS doc comments reads exactly these four — the citation
+    /// Every scan in this module that READS doc comments reads exactly these five — the citation
     /// scan, the code-span scan, and the code-span scan's reach control. One definition, so a reach
     /// control cannot end up measuring a corpus the guard does not use.
     ///
-    /// The return type is `[PathBuf; 4]`, not a `Vec`, on purpose. Two test names in this module say
-    /// "four_citation_files"; the array length is what makes adding a fifth file a **compile error**
-    /// at every call site rather than a silent drift between what the names claim and what runs.
-    fn citation_corpus() -> [std::path::PathBuf; 4] {
+    /// The return type is `[PathBuf; 5]`, not a `Vec`, on purpose. Three test names in this module
+    /// say "five_citation_files"; the array length is what makes adding a sixth file a **compile
+    /// error** at every call site rather than a silent drift between what the names claim and what
+    /// runs.
+    ///
+    /// ⚠️ **Correction (#874).** This was `[PathBuf; 4]` — `steering.rs`, `walker.rs`,
+    /// `collision.rs`, `tests/walker_sim.rs` — and did not include `src/movement.rs`, where
+    /// `CharacterController` lives and where `MUTATION-CHECK` blocks cite test names by name. #866
+    /// found two doc defects there by hand (a `MUTATION-CHECK` quoting a message its own assertion
+    /// cannot produce, and an "either of two" claim where there are three) that a mechanical check
+    /// would have caught if it read the file at all. Grown to five deliberately, per this fn's own
+    /// friction-by-design: every reference to "four" in this module's test names and docs was
+    /// renamed in the same change, not left to drift. `movement.rs`'s own pre-existing unbalanced
+    /// spans (8 lines, 4 sites) were fixed before it was added, so the corpus starts clean rather
+    /// than landing the guard already red — see #789's PR for the count and the fix.
+    fn citation_corpus() -> [std::path::PathBuf; 5] {
         let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let ws = workspace_root();
         [
@@ -1879,6 +1913,7 @@ mod cursor_resync_tests {
             crate_root.join("src/walker.rs"),
             crate_root.join("src/collision.rs"),
             ws.join("tests/walker_sim.rs"),
+            ws.join("src/movement.rs"),
         ]
     }
 
@@ -1940,36 +1975,41 @@ mod cursor_resync_tests {
         DocSpanScan { offenders, files_scanned, lines_scanned }
     }
 
-    /// **A code span must not open on one line and close on the next — IN THE FOUR CITATION FILES.
-    /// Nowhere else. (#788)**
+    /// **A code span must not open on one line and close on the next — IN THE FIVE CITATION FILES.
+    /// Held to a separate, WIDER standard elsewhere. (#788, corpus grown by #874)**
     ///
     /// `cargo doc` renders the line break inside the span, so the rendered docs show something the
     /// source does not say. This is the check; `unbalanced_doc_spans` is the mechanism, and its own
     /// doc records what backtick parity does and does not imply.
     ///
     /// **Why this is a test of its own.** Until #788 this ran inside
-    /// `every_test_citation_in_the_four_citation_files_resolves_and_is_listed_in_a_guard`'s loop —
-    /// the same four files, and honestly described in that test's body. But the corpus was legible
+    /// `every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard`'s loop —
+    /// the same files, and honestly described in that test's body. But the corpus was legible
     /// only to a reader of the *code*. A reader of the *result* saw one passing line whose name
     /// began "every doc comment", and read it as the workspace. That happened to three independent
     /// readers within two days, one of them twice, including on two other PRs whose doc edits landed
-    /// outside these four files and were therefore covered by nothing. The corpus is now in the
+    /// outside the corpus and were therefore covered by nothing. The corpus is now in the
     /// name, which is the only part of a green run anybody reads.
     ///
     /// **The corpus, stated exactly**, and identical to the citation corpus by construction (both
     /// call `citation_corpus`): this crate's `src/steering.rs`, `src/walker.rs` and
-    /// `src/collision.rs`, plus the workspace's `tests/walker_sim.rs`. Four files. This test claims
-    /// **nothing** about the other `.rs` files in the workspace, and #788 measured, by running this
-    /// scan over the resolution corpus, that they are not clean by it. The count is filed as #789,
-    /// not repeated here — see the round-9 block above on why a count belongs in a comment's expiry
-    /// date, not its body.
+    /// `src/collision.rs`, the workspace's `tests/walker_sim.rs`, and — since #874 —
+    /// `src/movement.rs`. Five files. This test holds them to **zero** offenders, unconditionally.
+    ///
+    /// **The rest of the workspace is not unclaimed any more (#789).**
+    /// `unbalanced_doc_code_spans_outside_the_citation_corpus_are_a_named_shrinking_backlog` runs
+    /// the identical `scan_doc_spans` mechanism over the full resolution corpus and holds
+    /// everything outside these five files to zero *new* offenders, with pre-existing ones named
+    /// individually and required to shrink. This test's own five files are a subset of that wider
+    /// corpus and are asserted clean by both; the split exists so a citation-corpus regression
+    /// fails with a five-file, un-allowlistable message rather than a backlog-list diff.
     ///
     /// **Reach, not just shape.** That this check *can* detect a wrapped span says nothing about
-    /// whether it *arrives* at file 4, or at line 2000 of file 1.
-    /// `the_doc_span_scan_reaches_all_four_citation_files_at_three_depths_each` is the control for
+    /// whether it *arrives* at file 5, or at line 2000 of file 1.
+    /// `the_doc_span_scan_reaches_all_five_citation_files_at_three_depths_each` is the control for
     /// that, and it injects its probes into every file of this exact corpus, at three depths each.
     #[test]
-    fn unbalanced_doc_spans_are_rejected_in_the_four_citation_files_only_not_the_workspace() {
+    fn unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace() {
         let files = citation_corpus();
         for p in &files {
             assert!(p.is_file(), "citation corpus file is missing: {}", p.display());
@@ -1994,6 +2034,326 @@ mod cursor_resync_tests {
         assert!(report.is_empty(),
             "doc-span scan found {} problem(s) in the {} citation files:\n  {}",
             report.len(), files.len(), report.join("\n  "));
+    }
+
+    /// **#789: the doc-span scan, widened to the FULL resolution corpus — a named, shrinking
+    /// backlog instead of an unclaimed 149.**
+    ///
+    /// The guard above holds the five citation files to zero. #789 measured that the workspace
+    /// outside them is not clean by the same check — 105 offenders across 30 files at #788's
+    /// original measurement, **re-measured fresh for this fix at 149 offenders across 42 files**
+    /// (170-file, 125,394-line resolution corpus; movement.rs's own 10 are already fixed and
+    /// excluded, see `citation_corpus`'s doc). Both the file/offender totals and the exact
+    /// `file:line` list had drifted from #789's filed figures by the time this landed — the repo
+    /// kept moving. `KNOWN_VIOLATIONS` below is today's re-measurement, not the issue's.
+    ///
+    /// **What this test does NOT do: bulk-fix or silently bless the 149.** Every entry is named
+    /// individually, with the file and line it was found at. Two things keep the list honest
+    /// instead of decorative:
+    ///
+    /// * an offender the scan finds that is **not** in this list fails the build — the backlog
+    ///   cannot silently grow, and a doc edit anywhere in the workspace that introduces a new wrap
+    ///   is caught the moment it lands, not the next time someone widens a corpus by hand;
+    /// * an entry in this list the scan **no longer finds** also fails the build — fixing one of
+    ///   these 149 and not deleting its line here is itself a build break, so the list can only
+    ///   shrink by an explicit deletion next to the fix that earned it, and can never go stale in
+    ///   the safe direction silently.
+    ///
+    /// The mechanism for the count going to zero is: fix a wrap, delete its line(s) from
+    /// `KNOWN_VIOLATIONS` in the same change (the dead-entry check above requires it), and the
+    /// tracked total goes down by exactly that many. Nothing here schedules that work; it only
+    /// makes the backlog visible, bounded, and unable to grow without being caught.
+    ///
+    /// Reach is proven separately by
+    /// `the_doc_span_scan_reaches_the_full_resolution_corpus_at_three_depths_each` — this test
+    /// pins the reach of the RUN it actually did (`files_scanned` below) but does not itself prove
+    /// the scanner cannot silently shrink its own corpus over time; the sibling reach control does.
+    #[test]
+    fn unbalanced_doc_code_spans_outside_the_citation_corpus_are_a_named_shrinking_backlog() {
+        use std::collections::HashSet;
+
+        // (workspace-relative path, 1-based line). Sorted by path then line. Re-measure with
+        // `cargo test -p eqoxide-nav --lib unbalanced_doc_code_spans -- --nocapture` after any fix
+        // and delete the corresponding line(s) — a stale entry fails this test on its own.
+        const KNOWN_VIOLATIONS: &[(&str, usize)] = &[
+        // crates/eqoxide-command/src/nav.rs
+        ("crates/eqoxide-command/src/nav.rs", 444),
+        ("crates/eqoxide-command/src/nav.rs", 445),
+
+        // crates/eqoxide-core/src/config.rs
+        ("crates/eqoxide-core/src/config.rs", 120),
+        ("crates/eqoxide-core/src/config.rs", 121),
+
+        // crates/eqoxide-core/src/eqstr.rs
+        ("crates/eqoxide-core/src/eqstr.rs", 74),
+        ("crates/eqoxide-core/src/eqstr.rs", 76),
+
+        // crates/eqoxide-core/src/game_state.rs
+        ("crates/eqoxide-core/src/game_state.rs", 18),
+        ("crates/eqoxide-core/src/game_state.rs", 880),
+        ("crates/eqoxide-core/src/game_state.rs", 881),
+        ("crates/eqoxide-core/src/game_state.rs", 1331),
+        ("crates/eqoxide-core/src/game_state.rs", 1332),
+
+        // crates/eqoxide-core/src/physics.rs
+        ("crates/eqoxide-core/src/physics.rs", 347),
+        ("crates/eqoxide-core/src/physics.rs", 348),
+
+        // crates/eqoxide-core/src/region_map.rs
+        ("crates/eqoxide-core/src/region_map.rs", 10),
+        ("crates/eqoxide-core/src/region_map.rs", 11),
+
+        // crates/eqoxide-core/src/zone_map.rs
+        ("crates/eqoxide-core/src/zone_map.rs", 382),
+        ("crates/eqoxide-core/src/zone_map.rs", 383),
+
+        // crates/eqoxide-crash/src/lib.rs
+        ("crates/eqoxide-crash/src/lib.rs", 412),
+        ("crates/eqoxide-crash/src/lib.rs", 413),
+
+        // crates/eqoxide-http/src/combat.rs
+        ("crates/eqoxide-http/src/combat.rs", 113),
+        ("crates/eqoxide-http/src/combat.rs", 114),
+
+        // crates/eqoxide-http/src/guild.rs
+        ("crates/eqoxide-http/src/guild.rs", 300),
+        ("crates/eqoxide-http/src/guild.rs", 301),
+
+        // crates/eqoxide-http/src/lib.rs
+        ("crates/eqoxide-http/src/lib.rs", 254),
+        ("crates/eqoxide-http/src/lib.rs", 255),
+
+        // crates/eqoxide-http/src/merchant.rs
+        ("crates/eqoxide-http/src/merchant.rs", 39),
+        ("crates/eqoxide-http/src/merchant.rs", 40),
+        ("crates/eqoxide-http/src/merchant.rs", 43),
+        ("crates/eqoxide-http/src/merchant.rs", 44),
+        ("crates/eqoxide-http/src/merchant.rs", 116),
+        ("crates/eqoxide-http/src/merchant.rs", 117),
+        ("crates/eqoxide-http/src/merchant.rs", 169),
+        ("crates/eqoxide-http/src/merchant.rs", 170),
+
+        // crates/eqoxide-http/src/name_match.rs
+        ("crates/eqoxide-http/src/name_match.rs", 202),
+        ("crates/eqoxide-http/src/name_match.rs", 203),
+
+        // crates/eqoxide-http/src/observe.rs
+        ("crates/eqoxide-http/src/observe.rs", 1719),
+        ("crates/eqoxide-http/src/observe.rs", 1720),
+        ("crates/eqoxide-http/src/observe.rs", 2791),
+        ("crates/eqoxide-http/src/observe.rs", 2792),
+        ("crates/eqoxide-http/src/observe.rs", 5162),
+        ("crates/eqoxide-http/src/observe.rs", 5163),
+
+        // crates/eqoxide-http/src/refusal.rs
+        ("crates/eqoxide-http/src/refusal.rs", 16),
+        ("crates/eqoxide-http/src/refusal.rs", 17),
+
+        // crates/eqoxide-http/src/testkit.rs
+        ("crates/eqoxide-http/src/testkit.rs", 24),
+        ("crates/eqoxide-http/src/testkit.rs", 25),
+        ("crates/eqoxide-http/src/testkit.rs", 66),
+        ("crates/eqoxide-http/src/testkit.rs", 67),
+
+        // crates/eqoxide-ipc/src/asset_sync.rs
+        ("crates/eqoxide-ipc/src/asset_sync.rs", 1529),
+        ("crates/eqoxide-ipc/src/asset_sync.rs", 1530),
+
+        // crates/eqoxide-ipc/src/lib.rs
+        ("crates/eqoxide-ipc/src/lib.rs", 5),
+        ("crates/eqoxide-ipc/src/lib.rs", 6),
+        ("crates/eqoxide-ipc/src/lib.rs", 232),
+        ("crates/eqoxide-ipc/src/lib.rs", 233),
+        ("crates/eqoxide-ipc/src/lib.rs", 584),
+        ("crates/eqoxide-ipc/src/lib.rs", 585),
+        ("crates/eqoxide-ipc/src/lib.rs", 1154),
+        ("crates/eqoxide-ipc/src/lib.rs", 1155),
+        ("crates/eqoxide-ipc/src/lib.rs", 1178),
+        ("crates/eqoxide-ipc/src/lib.rs", 1179),
+        ("crates/eqoxide-ipc/src/lib.rs", 1469),
+        ("crates/eqoxide-ipc/src/lib.rs", 1470),
+        ("crates/eqoxide-ipc/src/lib.rs", 1497),
+        ("crates/eqoxide-ipc/src/lib.rs", 1498),
+        ("crates/eqoxide-ipc/src/lib.rs", 1552),
+        ("crates/eqoxide-ipc/src/lib.rs", 1553),
+        ("crates/eqoxide-ipc/src/lib.rs", 2459),
+        ("crates/eqoxide-ipc/src/lib.rs", 2460),
+
+        // crates/eqoxide-ipc/src/result.rs
+        ("crates/eqoxide-ipc/src/result.rs", 25),
+        ("crates/eqoxide-ipc/src/result.rs", 26),
+
+        // crates/eqoxide-nav/src/water_grid.rs
+        ("crates/eqoxide-nav/src/water_grid.rs", 880),
+        ("crates/eqoxide-nav/src/water_grid.rs", 881),
+        ("crates/eqoxide-nav/src/water_grid.rs", 936),
+        ("crates/eqoxide-nav/src/water_grid.rs", 937),
+
+        // crates/eqoxide-nav/src/zone_assets.rs
+        ("crates/eqoxide-nav/src/zone_assets.rs", 134),
+        ("crates/eqoxide-nav/src/zone_assets.rs", 135),
+
+        // crates/eqoxide-net/src/action_loop.rs
+        ("crates/eqoxide-net/src/action_loop.rs", 278),
+        ("crates/eqoxide-net/src/action_loop.rs", 279),
+        ("crates/eqoxide-net/src/action_loop.rs", 4034),
+        ("crates/eqoxide-net/src/action_loop.rs", 4035),
+        ("crates/eqoxide-net/src/action_loop.rs", 4326),
+        ("crates/eqoxide-net/src/action_loop.rs", 4327),
+        ("crates/eqoxide-net/src/action_loop.rs", 5343),
+        ("crates/eqoxide-net/src/action_loop.rs", 5344),
+        ("crates/eqoxide-net/src/action_loop.rs", 6929),
+        ("crates/eqoxide-net/src/action_loop.rs", 6930),
+        ("crates/eqoxide-net/src/action_loop.rs", 7309),
+        ("crates/eqoxide-net/src/action_loop.rs", 7310),
+
+        // crates/eqoxide-net/src/gameplay.rs
+        ("crates/eqoxide-net/src/gameplay.rs", 1805),
+        ("crates/eqoxide-net/src/gameplay.rs", 1806),
+
+        // crates/eqoxide-net/src/packet_handler.rs
+        ("crates/eqoxide-net/src/packet_handler.rs", 1944),
+        ("crates/eqoxide-net/src/packet_handler.rs", 1945),
+
+        // crates/eqoxide-net/src/transport.rs
+        ("crates/eqoxide-net/src/transport.rs", 1952),
+        ("crates/eqoxide-net/src/transport.rs", 1953),
+        ("crates/eqoxide-net/src/transport.rs", 2000),
+        ("crates/eqoxide-net/src/transport.rs", 2002),
+        ("crates/eqoxide-net/src/transport.rs", 2148),
+        ("crates/eqoxide-net/src/transport.rs", 2149),
+
+        // crates/eqoxide-protocol/src/protocol/group.rs
+        ("crates/eqoxide-protocol/src/protocol/group.rs", 29),
+        ("crates/eqoxide-protocol/src/protocol/group.rs", 30),
+
+        // crates/eqoxide-renderer/src/models.rs
+        ("crates/eqoxide-renderer/src/models.rs", 983),
+        ("crates/eqoxide-renderer/src/models.rs", 984),
+
+        // crates/eqoxide-renderer/src/pipeline.rs
+        ("crates/eqoxide-renderer/src/pipeline.rs", 29),
+        ("crates/eqoxide-renderer/src/pipeline.rs", 30),
+
+        // crates/eqoxide-renderer/src/renderer.rs
+        ("crates/eqoxide-renderer/src/renderer.rs", 442),
+        ("crates/eqoxide-renderer/src/renderer.rs", 443),
+
+        // crates/eqoxide-renderer/src/skin_observation.rs
+        ("crates/eqoxide-renderer/src/skin_observation.rs", 68),
+        ("crates/eqoxide-renderer/src/skin_observation.rs", 69),
+        ("crates/eqoxide-renderer/src/skin_observation.rs", 72),
+        ("crates/eqoxide-renderer/src/skin_observation.rs", 73),
+
+        // crates/eqoxide-renderer/tests/floating_placement.rs
+        ("crates/eqoxide-renderer/tests/floating_placement.rs", 527),
+        ("crates/eqoxide-renderer/tests/floating_placement.rs", 528),
+        ("crates/eqoxide-renderer/tests/floating_placement.rs", 543),
+        ("crates/eqoxide-renderer/tests/floating_placement.rs", 544),
+        ("crates/eqoxide-renderer/tests/floating_placement.rs", 545),
+        ("crates/eqoxide-renderer/tests/floating_placement.rs", 546),
+
+        // crates/eqoxide-renderer/tests/joint_cap_single_source.rs
+        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 176),
+        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 177),
+        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 467),
+        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 468),
+        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 623),
+        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 624),
+        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 654),
+        ("crates/eqoxide-renderer/tests/joint_cap_single_source.rs", 655),
+
+        // crates/eqoxide-renderer/tests/shadow_caster_selection.rs
+        ("crates/eqoxide-renderer/tests/shadow_caster_selection.rs", 257),
+        ("crates/eqoxide-renderer/tests/shadow_caster_selection.rs", 258),
+        ("crates/eqoxide-renderer/tests/shadow_caster_selection.rs", 826),
+        ("crates/eqoxide-renderer/tests/shadow_caster_selection.rs", 827),
+        ("crates/eqoxide-renderer/tests/shadow_caster_selection.rs", 1134),
+        ("crates/eqoxide-renderer/tests/shadow_caster_selection.rs", 1135),
+
+        // crates/eqoxide-renderer/tests/shadow_shader.rs
+        ("crates/eqoxide-renderer/tests/shadow_shader.rs", 361),
+        ("crates/eqoxide-renderer/tests/shadow_shader.rs", 362),
+
+        // crates/eqoxide-renderer/tests/skin_cap_selection.rs
+        ("crates/eqoxide-renderer/tests/skin_cap_selection.rs", 114),
+        ("crates/eqoxide-renderer/tests/skin_cap_selection.rs", 115),
+
+        // crates/eqoxide-renderer/tests/weather_shader.rs
+        ("crates/eqoxide-renderer/tests/weather_shader.rs", 9),
+        ("crates/eqoxide-renderer/tests/weather_shader.rs", 10),
+
+        // crates/eqoxide-telemetry/src/lib.rs
+        ("crates/eqoxide-telemetry/src/lib.rs", 561),
+        ("crates/eqoxide-telemetry/src/lib.rs", 562),
+
+        // crates/eqoxide-ui/src/lib.rs
+        ("crates/eqoxide-ui/src/lib.rs", 391),
+        ("crates/eqoxide-ui/src/lib.rs", 392),
+
+        // src/app.rs
+        ("src/app.rs", 2553),
+        ("src/app.rs", 2554),
+        ("src/app.rs", 3586),
+        ("src/app.rs", 3587),
+
+        // src/camera_state.rs
+        ("src/camera_state.rs", 8),
+        ("src/camera_state.rs", 9),
+
+        // src/zone_in.rs
+        ("src/zone_in.rs", 1429),
+        ("src/zone_in.rs", 1430),
+
+        // tests/synthetic_water_capability.rs
+        ("tests/synthetic_water_capability.rs", 131),
+        ("tests/synthetic_water_capability.rs", 132),
+        ];
+
+        let resolve_in = workspace_rs_files();
+        let ws = workspace_root();
+        // A silently empty/shrunk corpus would make this test vacuously green.
+        assert!(resolve_in.len() >= citation_corpus().len(),
+            "resolution corpus ({} files) is smaller than the citation corpus — the source tree \
+             is not where this test thinks it is",
+            resolve_in.len());
+
+        let corpus = read_corpus(&resolve_in);
+        let scan = scan_doc_spans(&corpus);
+        assert_eq!(scan.files_scanned, resolve_in.len(),
+            "the span scan visited {} of {} workspace files — it stopped early and every count \
+             below is about a corpus it did not actually cover",
+            scan.files_scanned, resolve_in.len());
+
+        let allowed: HashSet<(std::path::PathBuf, usize)> = KNOWN_VIOLATIONS.iter()
+            .map(|(f, l)| (ws.join(f), *l)).collect();
+        let found: HashSet<(std::path::PathBuf, usize)> = scan.offenders.iter().cloned().collect();
+
+        let new: Vec<String> = scan.offenders.iter()
+            .filter(|o| !allowed.contains(o))
+            .map(|(p, l)| format!(
+                "{}:{l}: a code span opens on this line and closes on another, and this file:line \
+                 is not in KNOWN_VIOLATIONS. Either keep the span on one line, or — if this is a \
+                 pre-existing offender just now coming into scope — add it to KNOWN_VIOLATIONS with \
+                 a reason.",
+                p.strip_prefix(&ws).unwrap_or(p).display()))
+            .collect();
+        assert!(new.is_empty(),
+            "doc-span scan found {} new (non-allowlisted) problem(s) outside the citation corpus:\n  {}",
+            new.len(), new.join("\n  "));
+
+        let dead: Vec<String> = KNOWN_VIOLATIONS.iter()
+            .filter(|(f, l)| !found.contains(&(ws.join(f), *l)))
+            .map(|(f, l)| format!("{f}:{l}"))
+            .collect();
+        assert!(dead.is_empty(),
+            "KNOWN_VIOLATIONS lists {} entry/entries the scan no longer finds unbalanced — the \
+             backlog shrank, delete them:\n  {}",
+            dead.len(), dead.join("\n  "));
+
+        println!("#789 backlog: {} allowlisted offender(s) tracked, {} files / {} lines scanned \
+                  in the resolution corpus",
+            KNOWN_VIOLATIONS.len(), scan.files_scanned, scan.lines_scanned);
     }
 
     /// Which of a file's fence-safe insertion points a reach probe goes at.
@@ -2026,9 +2386,24 @@ mod cursor_resync_tests {
                 in_fence = false;
                 continue;
             };
-            if body.trim_start().starts_with("```") { in_fence = !in_fence; }
+            if strip_blockquote_markers(body).starts_with("```") { in_fence = !in_fence; }
         }
         out
+    }
+
+    /// Strip leading Markdown blockquote markers (one or more `>` characters, each optionally
+    /// followed by whitespace, possibly repeated for a nested quote) so the fence check below can
+    /// see a quoted triple-backtick fence line for what it is: a fence. #789 found this gap live in
+    /// `movement.rs`, where a `⚠️ Correction` block quotes an old fenced example, its two fence
+    /// lines each starting with a `>` marker before the triple backticks. rustdoc renders a quoted
+    /// fence as a real fence — CommonMark nests fences inside blockquotes — but the fence check
+    /// used to test the raw line, never saw a fence, so it never toggled `in_fence`, and the two
+    /// fence-delimiter lines were scored as ordinary text with an odd backtick count each: two
+    /// false positives from one real example, zero actual span breaks.
+    fn strip_blockquote_markers(body: &str) -> &str {
+        let mut rest = body.trim_start();
+        while let Some(r) = rest.strip_prefix('>') { rest = r.trim_start(); }
+        rest
     }
 
     /// **The reach control for the doc-span scan: it must ARRIVE, not merely match (#788).**
@@ -2045,24 +2420,53 @@ mod cursor_resync_tests {
     /// one. `fence_safe_insertion_points` picks positions the scan is not entitled to skip. Then it
     /// runs the **same** `scan_doc_spans` the guard runs, and requires:
     ///
-    /// * every one of the 4 × 3 probes is reported, named by file and depth if not; and
-    /// * the total offender count is exactly the unmutated baseline plus twelve, so a scan that
+    /// * every one of the 5 × 3 probes is reported, named by file and depth if not; and
+    /// * the total offender count is exactly the unmutated baseline plus fifteen, so a scan that
     ///   reported the probes but dropped real findings on the way cannot pass either; and
-    /// * the scan reports having visited all four files.
+    /// * the scan reports having visited all five files.
     ///
     /// A scan that stops after file 1, or after the first 200 lines of a 2600-line file, fails this
     /// with a list of the probes it never reached. Deleting a depth from `PROBE_DEPTHS` does not
     /// quietly shrink the evidence — it fails to compile.
+    ///
+    /// ⚠️ **Correction (#789).** A sibling control,
+    /// `the_doc_span_scan_reaches_the_full_resolution_corpus_at_three_depths_each`, runs this same
+    /// probe-and-count method over `workspace_rs_files()` instead of `citation_corpus()` — every
+    /// file in the workspace, not just these five — so #789's wider backlog test has its own reach
+    /// proof rather than borrowing this one's on the strength of sharing a helper.
     #[test]
-    fn the_doc_span_scan_reaches_all_four_citation_files_at_three_depths_each() {
+    fn the_doc_span_scan_reaches_all_five_citation_files_at_three_depths_each() {
+        assert_doc_span_scan_reaches_corpus(&citation_corpus(), "citation");
+    }
+
+    /// **#789's own reach control: the same proof, over `workspace_rs_files()` instead of the five
+    /// citation files.**
+    ///
+    /// `unbalanced_doc_code_spans_outside_the_citation_corpus_are_a_named_shrinking_backlog` claims
+    /// to scan the whole resolution corpus, not just the five files the guard above already covers.
+    /// That claim gets its own proof rather than resting on "it calls the same function" — #760's
+    /// round-4 finding was exactly a scanner whose *positive* control passed while the scanner
+    /// silently stopped short, and every probe used to validate it sat inside the window it could
+    /// still see. Running the identical probe-and-count method over 170+ files instead of 5 is the
+    /// difference between "a scanner that can find a wrapped span" and "a scanner that finds one
+    /// wherever it is."
+    #[test]
+    fn the_doc_span_scan_reaches_the_full_resolution_corpus_at_three_depths_each() {
+        assert_doc_span_scan_reaches_corpus(&workspace_rs_files(), "resolution");
+    }
+
+    /// Shared body for the two reach-control tests above: mutate a copy of `files` with three
+    /// unbalanced-span probes per file (`PROBE_DEPTHS`), scan it, and require every probe found,
+    /// none dropped, and every file visited. One implementation so the citation-corpus proof and
+    /// the #789 full-workspace proof cannot silently diverge in what they actually check.
+    fn assert_doc_span_scan_reaches_corpus(files: &[std::path::PathBuf], label: &str) {
         use std::collections::HashSet;
         use std::path::PathBuf;
 
         // One backtick: odd parity on its own line, which is what the scan reports.
         const PROBE: &str = "    /// #788 reach probe: this code span opens `and never closes";
 
-        let files = citation_corpus();
-        let corpus = read_corpus(&files);
+        let corpus = read_corpus(files);
         let baseline = scan_doc_spans(&corpus);
 
         let mut mutated: Vec<(PathBuf, String)> = Vec::new();
@@ -2098,7 +2502,7 @@ mod cursor_resync_tests {
 
         let scan = scan_doc_spans(&mutated);
         assert_eq!(scan.files_scanned, corpus.len(),
-            "the scan visited {} of {} files — it stopped between files",
+            "[{label}] the scan visited {} of {} files — it stopped between files",
             scan.files_scanned, corpus.len());
 
         let found: HashSet<(PathBuf, usize)> = scan.offenders.iter().cloned().collect();
@@ -2107,17 +2511,18 @@ mod cursor_resync_tests {
             .map(|(p, d, line)| format!("{}:{line} ({d:?})", p.display()))
             .collect();
         assert!(missed.is_empty(),
-            "the doc-span scan never arrived at {} of {} probes — it matches the shape but does not \
-             reach the whole corpus:\n  {}",
+            "[{label}] the doc-span scan never arrived at {} of {} probes — it matches the shape \
+             but does not reach the whole corpus:\n  {}",
             missed.len(), expected.len(), missed.join("\n  "));
 
         assert_eq!(scan.offenders.len(), baseline.offenders.len() + expected.len(),
-            "mutated scan reported {} offender(s); expected the {} baseline offender(s) plus {} \
-             probes. A count that is short means the scan dropped findings it had already made; a \
-             count that is over means the probe insertion perturbed something it should not have",
+            "[{label}] mutated scan reported {} offender(s); expected the {} baseline offender(s) \
+             plus {} probes. A count that is short means the scan dropped findings it had already \
+             made; a count that is over means the probe insertion perturbed something it should not \
+             have",
             scan.offenders.len(), baseline.offenders.len(), expected.len());
 
-        println!("reach control: {} probes ({} files x {} depths) all reported; \
+        println!("[{label}] reach control: {} probes ({} files x {} depths) all reported; \
                   baseline {} offender(s) over {} files / {} lines",
             expected.len(), corpus.len(), PROBE_DEPTHS.len(),
             baseline.offenders.len(), baseline.files_scanned, baseline.lines_scanned);
@@ -2220,6 +2625,14 @@ mod cursor_resync_tests {
     /// wrapped fragment "IS visible" to `doc_citations`, unqualified. Left as originally written,
     /// as history — but for the reader, it holds only when the opening line's own backtick count
     /// is odd; the sixth bullet above (padding onto an even count) is the case where it does not.
+    ///
+    /// ⚠️ **Correction (#789/#874).** The fence check below used to test the raw line for a
+    /// triple-backtick prefix, so a fence quoted inside a blockquote marker never toggled
+    /// `in_fence`, and both its delimiter lines — each carrying a bare triple-backtick, an odd
+    /// count on its own — were reported as false positives. Found live widening the corpus for
+    /// #874: `movement.rs` quotes exactly this shape in a `⚠️ Correction` block. Fixed via
+    /// `strip_blockquote_markers`, which both this fn and `fence_safe_insertion_points` now call
+    /// before the fence test, so the two stay mirrored as their doc requires.
     fn unbalanced_doc_spans(src: &str) -> Vec<usize> {
         let mut out = Vec::new();
         let mut in_fence = false;
@@ -2231,7 +2644,7 @@ mod cursor_resync_tests {
                 in_fence = false;
                 continue;
             };
-            if body.trim_start().starts_with("```") { in_fence = !in_fence; continue; }
+            if strip_blockquote_markers(body).starts_with("```") { in_fence = !in_fence; continue; }
             if in_fence { continue; }
             if body.matches('`').count() % 2 == 1 { out.push(i + 1); }
         }
