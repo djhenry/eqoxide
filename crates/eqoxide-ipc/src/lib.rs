@@ -283,7 +283,13 @@ pub enum CameraCmd {
 /// `eye`/`occluded`/`still_blocked` are the RENDERED side of the contract (#852). `eye` is the
 /// exact position the frame this snapshot describes was drawn from — the render call and this
 /// struct are built from the same `resolve_camera_eye` return value, never two independently
-/// computed positions. `occluded` is true iff pull-in moved the eye away from the desired one;
+/// computed positions, and (#867) the write only happens once that render call has actually run:
+/// the render loop's `app.rs` publishes it right after `render_frame`, not when the eye is first
+/// resolved, so a tick whose draw is skipped (window resize, a throttled compositor) simply
+/// leaves the previous, actually-drawn snapshot in place instead of overwriting it with an eye
+/// that was never used to draw anything. That means `eye` can lag the CURRENT tick by one or a
+/// few ticks during that (transient, self-correcting) window — but it never names a frame that
+/// did not happen. `occluded` is true iff pull-in moved the eye away from the desired one;
 /// `still_blocked` is true iff, even after pull-in, the focus→eye segment was still not fully
 /// clear (a degenerate case — see `resolve_camera_eye`'s doc comment). A consumer that only reads
 /// `radius`/`focus` and reconstructs a "distance to eye" by hand will get the *desired* distance,
@@ -295,7 +301,9 @@ pub struct CameraSnapshot {
     pub elevation:     f32,
     pub radius:        f32,
     pub focus:         [f32; 3],
-    /// The eye position the frame this snapshot describes was actually rendered from.
+    /// The eye position the most recently ACTUALLY-DRAWN frame was rendered from (#867) — not
+    /// necessarily this tick's resolved eye, if this tick's draw was skipped (surface
+    /// resize/throttle). Never describes a frame that was never drawn.
     pub eye:           [f32; 3],
     /// True iff collision pulled `eye` in from the desired orbit position this frame.
     pub occluded:      bool,

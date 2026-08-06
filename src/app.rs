@@ -1873,14 +1873,16 @@ impl App {
         }
         let (desired_eye, cam_target) = self.camera.tick(dt, self.scene.player_pos, self.scene.player_heading);
         // Camera collision (#852): resolve the eye ONCE, here, and use that single value both
-        // for the render below and for the published snapshot. Before this fix the pull-in
+        // for the render below and for the published snapshot. Before the #852 fix the pull-in
         // mutated a local `cam_eye` for rendering only — `snapshot()` re-derived its own eye from
         // `radius`/`focus`, which the pull-in never touched, so a pulled-in frame and the
         // observable an agent reads disagreed 88% of the time a pull-in fired. See
         // `camera_state::resolve_camera_eye`'s doc comment.
+        //
+        // The snapshot ITSELF is published later, not here — see the write site right after
+        // `renderer.render_frame(..)` below, and #867.
         let resolved = crate::camera_state::resolve_camera_eye(self.collision.as_deref(), cam_target, desired_eye);
         let cam_eye = resolved.eye;
-        if let Ok(mut snap) = self.camera_snapshot.lock() { *snap = self.camera.snapshot(resolved); }
 
         // Nav diagnostics overlay (#608): while toggled on (--nav-debug / F11), attach the
         // walker's PUBLISHED snapshot to the scene — a cheap Arc clone — and the renderer draws
@@ -1915,6 +1917,19 @@ impl App {
         let prof_render = crate::profiling::Stopwatch::start();
         renderer.render_frame(&mut enc, &view, &self.scene, cam_eye, cam_target, dt);
         let dur_render = prof_render.elapsed();
+
+        // Camera snapshot (#867): publish ONLY now that `render_frame` has actually been called
+        // for this tick, not back when `resolved` was first computed above. Between the two sits
+        // the `surface.get_current_texture()` match, three of whose arms (`Lost`/`Outdated`,
+        // `Timeout`) `return` before ever reaching `render_frame` — publishing earlier meant
+        // `camera_snapshot` could hold an eye computed for a frame that was never drawn, while its
+        // docs claimed "the frame this snapshot describes" / "the exact value passed to
+        // `render_frame` this tick". Skipping the write on a skipped tick is correct, not merely
+        // convenient: the on-screen image did not change either, so leaving the previous
+        // (actually-drawn) snapshot in place keeps it describing whatever is really on screen —
+        // just possibly a tick or two stale during the transient, self-correcting resize/throttle
+        // window this issue is about. See `CameraSnapshot::eye`'s doc for the reader-facing side.
+        if let Ok(mut snap) = self.camera_snapshot.lock() { *snap = self.camera.snapshot(resolved); }
 
         // Cache picking data for the next mouse-click query.
         self.pick_view_proj = renderer.last_view_proj;

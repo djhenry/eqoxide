@@ -1213,12 +1213,18 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // #852: `azimuth_deg`/`elevation_deg`/`radius`/`focus` are the orbit's DESIRED framing —
         // NOT necessarily where the frame was actually rendered from. In tight geometry the
         // render loop pulls the eye in toward `focus` until it clears collision, and that
-        // pull-in does not touch these four fields. `eye` is the position the CURRENT frame was
-        // actually rendered from (the exact value passed to `render_frame` this tick — see
-        // `camera_state::resolve_camera_eye`); use it, not a `radius`-derived distance, for
-        // anything about what is actually on screen. `occluded` says whether pull-in fired this
-        // frame; `still_blocked` says whether, even after pull-in, `eye` is still not fully clear
-        // of collision (a degenerate case that must be reported, not silently rendered).
+        // pull-in does not touch these four fields. `eye` is the position the most recently
+        // ACTUALLY-DRAWN frame was rendered from (#867: the render loop publishes it only after
+        // `render_frame` has run, not when the eye is first resolved — a tick whose draw is
+        // skipped, e.g. a window resize or a throttled compositor, leaves the previous
+        // actually-drawn value in place rather than overwriting it with an eye nothing was ever
+        // drawn from). It can therefore lag the current tick by one or a few ticks during that
+        // transient window, but it never names a frame that did not happen — see
+        // `camera_state::resolve_camera_eye` and `eqoxide_ipc::CameraSnapshot::eye`. Use `eye`,
+        // not a `radius`-derived distance, for anything about what is actually on screen.
+        // `occluded` says whether pull-in fired on the frame `eye` describes; `still_blocked`
+        // says whether, even after pull-in, `eye` was still not fully clear of collision (a
+        // degenerate case that must be reported, not silently rendered).
         "camera": {
             "azimuth_deg":   cam.azimuth.to_degrees(),
             "elevation_deg": cam.elevation.to_degrees(),
