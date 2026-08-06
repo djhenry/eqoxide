@@ -114,6 +114,10 @@ pub struct UiCtx<'a> {
     pub zone_min: [f32; 2],
     pub zone_max: [f32; 2],
     pub zone_map: Option<&'a ZoneMap>,
+    /// #873: why `zone_map` is `None`, when there is a specific reason (an unreadable base file or
+    /// detail layer) rather than the ordinary case of a zone that simply has no map. Lets the map
+    /// window show a short "map data unavailable: …" line instead of a silently blank canvas.
+    pub zone_map_error: Option<&'a str>,
     pub minimap_zoom: &'a mut f32,
     pub fps: f32,
 }
@@ -198,6 +202,7 @@ impl UiState {
         zone_min: [f32; 2],
         zone_max: [f32; 2],
         zone_map: Option<&ZoneMap>,
+        zone_map_error: Option<&str>,
         fps: f32,
     ) {
         if !self.theme_applied {
@@ -271,6 +276,7 @@ impl UiState {
                 zone_min,
                 zone_max,
                 zone_map,
+                zone_map_error,
                 minimap_zoom: &mut self.minimap_zoom,
                 fps,
             };
@@ -371,7 +377,7 @@ mod tests {
             ui.sys.layout.set_locked(locked);
             let ctx = egui::Context::default();
             let _ = ctx.run(Default::default(), |ctx| {
-                ui.draw_all(ctx, [1280.0, 720.0], &scene, &spells, &acts, [0.0; 2], [100.0; 2], None, 60.0);
+                ui.draw_all(ctx, [1280.0, 720.0], &scene, &spells, &acts, [0.0; 2], [100.0; 2], None, None, 60.0);
             });
         }
         // Populated-ish scene (merchant open forces the transient path too).
@@ -382,7 +388,17 @@ mod tests {
         scene.coin = [1, 2, 3, 4];
         let ctx = egui::Context::default();
         let _ = ctx.run(Default::default(), |ctx| {
-            ui.draw_all(ctx, [1280.0, 720.0], &scene, &spells, &acts, [0.0; 2], [100.0; 2], None, 60.0);
+            ui.draw_all(ctx, [1280.0, 720.0], &scene, &spells, &acts, [0.0; 2], [100.0; 2], None, None, 60.0);
+        });
+        // #873: a `zone_map_error` with no `zone_map` (map load failed) must draw without panicking
+        // — this is the map window's new "map data unavailable: …" text path, otherwise unexercised
+        // by every other `draw_all` call in this test (all pass `None, None`).
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            ui.draw_all(
+                ctx, [1280.0, 720.0], &scene, &spells, &acts, [0.0; 2], [100.0; 2],
+                None, Some("zone_map_layer_unreadable test reason"), 60.0,
+            );
         });
         let _ = std::fs::remove_file(eqoxide_core::config::config_dir().join("ui_layout___uitest__.json"));
     }
@@ -434,7 +450,7 @@ mod tests {
         };
         let frame = |ui: &mut UiState, ctx: &egui::Context| {
             let _ = ctx.run(raw.clone(), |ctx| {
-                ui.draw_all(ctx, [1280.0, 720.0], &scene, &spells, &acts, [0.0; 2], [100.0; 2], None, 60.0);
+                ui.draw_all(ctx, [1280.0, 720.0], &scene, &spells, &acts, [0.0; 2], [100.0; 2], None, None, 60.0);
             });
         };
 
@@ -549,6 +565,7 @@ mod tests {
                         zone_min: [0.0, 0.0],
                         zone_max: [100.0, 100.0],
                         zone_map: None,
+                        zone_map_error: None,
                         minimap_zoom: &mut minimap_zoom,
                         fps: 60.0,
                     };

@@ -352,6 +352,41 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
         );
     }
 
+    /// #872 (agent-honesty, measured surviving mutant): the `LayerUnreadable` suffix must name the
+    /// layer that ACTUALLY broke, not just echo back whichever suffix the ONE existing regression
+    /// test above happens to break. That test only ever breaks `_1`, so a mutant that hardcodes the
+    /// reported suffix to `"_1"` left the whole suite green (PR #869 round 2 review) — the field
+    /// exists to tell a caller which file to go look at, and an unpinned wrong answer there sends
+    /// them to a file that is fine while the real broken layer keeps being skipped. Pin all three
+    /// positions so the suffix can only be correct by actually being read off `e.kind()`'s loop
+    /// variable, not by matching the one case every other test exercises.
+    #[test]
+    fn layer_unreadable_names_the_layer_that_actually_broke_872() {
+        for broken in ["_1", "_2", "_3"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("z.txt"), "L 1,2,0,3,4,0,1,1,1").unwrap();
+            // Only the layer under test is present (as a directory, so it exists but can't be read
+            // as a file); every OTHER layer is left absent. Absent layers are silently skipped, so
+            // the loop reaches `broken` regardless of its position (`_1`, `_2`, or `_3`), and no
+            // other layer can supply a stray `LayerUnreadable` that would make this pin vacuous.
+            std::fs::create_dir(dir.path().join(format!("z{broken}.txt"))).unwrap();
+
+            match ZoneMap::try_load(dir.path(), "z").unwrap_err() {
+                ZoneMapLoadError::LayerUnreadable(suffix, kind) => {
+                    assert_eq!(suffix, broken,
+                        "layer '{broken}' is the one that was made unreadable, but the reported \
+                         suffix was '{suffix}' — a wrong suffix sends whoever reads it to inspect \
+                         the WRONG file while the actually-broken layer keeps being silently skipped");
+                    assert_ne!(kind, std::io::ErrorKind::NotFound,
+                        "a directory that exists must not be reported as the NotFound kind");
+                }
+                other => panic!(
+                    "breaking layer '{broken}' must report LayerUnreadable({broken:?}, _), got {other:?}"
+                ),
+            }
+        }
+    }
+
     /// A layer that is simply ABSENT (the overwhelmingly common case, no `_1.txt` at all) must be
     /// unaffected by the B2 fix above — only a PRESENT-but-unreadable layer fails the load.
     /// Companion to `missing_detail_layers_do_not_fail_the_load_816`, pinned again here so the two

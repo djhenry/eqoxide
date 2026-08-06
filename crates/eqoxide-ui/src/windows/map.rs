@@ -183,6 +183,20 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                 );
             }
         }
+    } else if let Some(err) = cx.zone_map_error {
+        // #873: a present-but-unreadable base file or detail layer used to leave this canvas
+        // silently blank — indistinguishable from the very common, unremarkable case of a zone that
+        // simply has no map at all. `try_load` refusing the WHOLE load on a broken layer stays
+        // correct (drawing partial map art with no indication it's partial would just reproduce
+        // #816's silent-partial shape one layer further down); what changes here is that the reason
+        // is no longer thrown away, so a human driver sees WHY instead of an unexplained empty map.
+        painter.text(
+            rect.min + Vec2::new(6.0, 6.0),
+            egui::Align2::LEFT_TOP,
+            format!("map data unavailable: {err}"),
+            egui::FontId::proportional(10.0),
+            theme::TEXT_WEAK,
+        );
     }
 
     // No zone map: the grid ticks are still pending.
