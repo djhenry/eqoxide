@@ -1596,8 +1596,14 @@ pub type DialogueShared = Arc<Mutex<Vec<eqoxide_core::game_state::DialogueChoice
 /// Live navigation state for the active `/move/goto`, set by the nav thread and read by
 /// GET /v1/observe/debug. `state` is the agent-facing contract documented in `docs/http-api.md`:
 ///
-/// `pending` | `idle` | `planning` | `navigating` | `navigating_partial` | `following` | `arrived` |
-/// `no_path` | `search_exhausted` | `blocked` | `zone_loading`
+/// `pending` | `idle` | `planning` | `navigating` | `navigating_partial` | `navigating_stalled` |
+/// `following` | `arrived` | `no_path` | `search_exhausted` | `blocked` | `zone_loading`
+///
+/// The three `navigating*` words are not written as literals by the walker: they are DERIVED, every
+/// drive tick, from a typed verdict by `nav::steering::driving_nav_state` (#851), so the walker
+/// cannot publish a progress word while its own two-channel progress signal says the body is going
+/// nowhere. Before that, the entire ~32 s stall/back-off/re-path recovery window published a bare
+/// `navigating`.
 ///
 /// `reason` is the machine-readable WHY behind a terminal state (`goal_not_walkable`,
 /// `search_closed`, `search_node_cap`, …). The whole point of the split (#337): a driver must be
@@ -1644,6 +1650,18 @@ pub struct NavStatus {
     /// `nav_state: navigating` needs to know, in the same snapshot, whether the tier that is actually
     /// steering it can see a way through the next 40 u.
     pub local:  Option<NavLocal>,
+    /// **The walker HAS a route and is not executing it (#851).** `Some` exactly while
+    /// `state == "navigating_stalled"`, `None` otherwise — the two are written together, from one
+    /// verdict, by `Walker::publish_drive_state`, so the word and its calibration data cannot drift.
+    ///
+    /// This field is the *evidence* behind the word, not a second opinion about it. An agent that
+    /// only reads `nav_state` already gets the honest answer; this says how long, how hard the
+    /// walker has already tried, and whether the route it is failing to execute even reaches the
+    /// goal — which is what an agent needs to decide between waiting, re-issuing and giving up.
+    ///
+    /// Retired with the goal (see [`NavStatus::retire_to_idle`]) and cleared on every state
+    /// transition, for the same reason `tier` is: it is a fact about the route being executed now.
+    pub stall:  Option<NavStall>,
     /// **The fine worker thread has died — latched, and scoped to that WORKER** (#766 review B3/B9).
     /// Set `true` the instant `LocalPlanner::is_dead()` is observed, and cleared by **nothing on any
     /// nav route**: no goal, no zone change, no retirement touches it, because the thread does not
@@ -1719,6 +1737,30 @@ pub struct NavStatus {
 pub struct NavBlockage {
     pub hazard: &'static str,
     pub at: [f32; 3],
+}
+
+/// The calibration data behind `nav_state: "navigating_stalled"` (#851) — a walker that has a route
+/// and is not executing it.
+///
+/// It exists because the state word alone cannot answer "is this about to clear, or is it the
+/// beginning of the 32 s wedge?". Published as the top-level `nav_stall` on GET /v1/observe/debug,
+/// `null` whenever the walker is not stalled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NavStall {
+    /// Consecutive nav ticks (~150 ms) since the walker last made progress by EITHER channel — the
+    /// route cursor advancing by walking, or the closest 3-D approach to the goal improving. Equal
+    /// to `nav::steering::NAV_STUCK_TICKS` on the first stalled tick and rising from there.
+    pub quiet_ticks: u32,
+    /// Milliseconds since the stall began (measured from the tick the verdict flipped, not derived
+    /// from `quiet_ticks` × a nominal tick — the nav tick is a floor, not a guarantee).
+    pub quiet_ms: u64,
+    /// Stall-recovery re-paths run at this spot so far. The walker gives up at 8 with
+    /// `blocked`/`walker_stalled`, so this is also "how much runway is left".
+    pub repaths: u32,
+    /// `complete` | `partial` — whether the route the walker is failing to execute even reaches the
+    /// goal. A stalled PARTIAL is a weaker claim than a stalled complete route: the word
+    /// `navigating_stalled` covers both, and this is how they are told apart.
+    pub route: &'static str,
 }
 
 /// What the fine 2 u steering tier last said, verbatim. See `nav::collision::LocalOutcome`.
@@ -1855,6 +1897,12 @@ impl NavStatus {
             // Clearing it on `idle` clears that input too, which is what we want: on an `idle` row
             // there is no goal, so there is no corridor for it to be an opinion about.
             local,
+            // #851: RETIRED. `stall` says "the walker has a route and is not executing it" — a
+            // statement about the route committed for the goal that is now over. Left standing
+            // beside `idle` it would assert a live wedge for a journey nobody is on. It is also
+            // the E0027 net working as designed: this field could not be added without a decision
+            // being recorded here.
+            stall,
             // KEPT, deliberately — and this is the field the E0027 net was built for. A dead fine
             // worker is a fact about the WORKER, not about the goal that just ended, and it is
             // latched because that thread does not come back. Retiring a goal is not replacing a
@@ -1872,12 +1920,13 @@ impl NavStatus {
         *blocked_frontier = None;
         *tier             = None;
         *local            = None;
+        *stall            = None;
     }
 }
 
 impl Default for NavStatus {
     fn default() -> Self {
-        NavStatus { state: "idle".into(), reason: None, local: None,
+        NavStatus { state: "idle".into(), reason: None, local: None, stall: None,
             blocked_goal: None, blocked_frontier: None, tier: None,
             goal_id: 0, goal: None, local_planner_dead: false }
     }

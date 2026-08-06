@@ -189,6 +189,28 @@ pub(crate) const TRUST_ADVERTISED_SAME_ZONE_CROSSINGS: bool = false;
 /// tick keeps the diagnostic from perturbing what it observes.
 const CLEARANCE_REFRESH_TICKS: u32 = 8;
 
+/// Everything about the CURRENTLY COMMITTED route that the walker must remember in order to
+/// re-derive its published `nav_state` row on any later tick (#851).
+///
+/// Before #851 all three of these were written once, at plan commit, straight into the shared
+/// `NavStatus` and never reconstructible: `route` existed only as the choice of string literal,
+/// and `tier`/`reason` were retired by the next state transition. That was fine while the driving
+/// word was written exactly once per route. It is not fine now that the word is re-derived every
+/// tick — a `navigating` → `navigating_stalled` → `navigating` cycle would otherwise silently drop
+/// `nav_tier` and `nav_reason: goal_z_snapped` on the way through, replacing one honesty defect
+/// with a smaller one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommittedFacts {
+    /// Does this route reach the goal, or is it a partial toward a frontier?
+    pub route:  crate::steering::CommittedRoute,
+    /// The clearance tier that answered this route (`preferred` | `minimum`), or `None` for a
+    /// partial (no tier is recorded for one).
+    pub tier:   Option<&'static str>,
+    /// The `nav_reason` that belongs with this route for its whole life — `goal_z_snapped` for a
+    /// complete route whose z the planner moved, the search limit for a partial.
+    pub reason: Option<&'static str>,
+}
+
 /// The path-walker: (re)plans the coarse/fine route toward the active `/goto` goal, steers
 /// pure-pursuit along it, and drives arrival/stall/fall-edge/portal-escape handling.
 ///
@@ -263,6 +285,31 @@ pub struct Walker {
     /// chase, whose goal moves with the leader). `f32::MAX` = no approach measured yet on this goal.
     pub nav_best_g3d:     f32,
     pub nav_progress_at:  std::time::Instant,
+    /// **THE PUBLISHED DRIVING STATE (#851).** `exec` is the walker's own verdict on whether the
+    /// BODY is executing the committed route; `committed` is what route is committed and the
+    /// per-route facts that go beside it. Together they are the ONLY input to the `nav_state` word
+    /// the walker publishes while it has a route — see [`Walker::publish_drive_state`].
+    ///
+    /// `exec` is ticked once per drive tick from the SAME two-channel progress signal #631 already
+    /// computes (cursor advanced by walking, or closest 3-D approach improved), and it latches: the
+    /// stall/back-off/re-path recovery does not clear it, so it cannot read "fine" through a wedge
+    /// the way `stuck_ticks` (reset the instant the stall block fires) and `nav_repaths` (reset only
+    /// on a 200 u closest-approach improvement) both do.
+    ///
+    /// `exec_goal_id` is the `NavStatus::goal_id` the verdict is ABOUT (#349 identity). A verdict is
+    /// a per-goal fact, and this is what resets it: a new goal id means a new journey, so the
+    /// verdict starts fresh. Keying on identity rather than on remembering to reset at each of the
+    /// several places a goal can change is deliberate — a forgotten reset here would report a fresh
+    /// goto as already wedged.
+    pub exec:             crate::steering::RouteExecution,
+    pub exec_goal_id:     u64,
+    /// When [`Walker::exec`] last flipped from advancing to stalled (`None` while advancing) — the
+    /// source of `nav_stall.quiet_ms`. Measured, not derived from `quiet_ticks` × a nominal tick:
+    /// the nav tick is a floor, not a guarantee.
+    pub stall_since:      Option<std::time::Instant>,
+    /// The currently committed route and the per-route facts published beside it. `None` when no
+    /// route is committed. See [`CommittedFacts`].
+    pub committed:        Option<CommittedFacts>,
     /// Downhill back-off (#212): drive the reverse direction for this many ticks before re-pathing.
     pub backoff_ticks:    u32,
     pub backoff_dir:      [f32; 2],
@@ -347,6 +394,10 @@ impl Walker {
             nav_best_gdist: f32::MAX,
             nav_best_g3d: f32::MAX,
             nav_progress_at: std::time::Instant::now(),
+            exec: crate::steering::RouteExecution::fresh(),
+            exec_goal_id: 0,
+            stall_since: None,
+            committed: None,
             backoff_ticks: 0,
             backoff_dir: [0.0, 0.0],
             local_stuck_ticks: 0,
@@ -415,6 +466,12 @@ impl Walker {
         self.nav_best_gdist = f32::MAX;
         self.nav_best_g3d = f32::MAX; // #631 gap 3: closest-approach tracking is per-goal + per-zone
         self.nav_progress_at = std::time::Instant::now();
+        // #851: the execution verdict and the committed route's facts are about a route in the
+        // PREVIOUS zone's coordinate space. `exec_goal_id` is left alone on purpose — it is an
+        // identity stamp, and the goal id does not restart at a zone change; `reset_drive_state`
+        // re-stamps it from the live row so the next drive tick does not read this reset as a
+        // goal change and reset again.
+        self.reset_drive_state();
         self.backoff_ticks = 0;
         self.local_stuck_ticks = 0;
         self.replan_coarse = false;
@@ -465,8 +522,13 @@ impl Walker {
     /// Publish the current `/move/goto` navigation state for GET /v1/observe/debug (#166, #337).
     /// The value set is an AGENT-FACING CONTRACT — every value is documented in `docs/http-api.md`:
     ///
-    ///   pending | idle | planning | navigating | navigating_partial | following | arrived
-    ///   | no_path | search_exhausted | blocked | zone_loading
+    ///   pending | idle | planning | navigating | navigating_partial | navigating_stalled
+    ///   | following | arrived | no_path | search_exhausted | blocked | zone_loading
+    ///
+    /// **The three `navigating*` words do not belong to this writer (#851).** They are derived from
+    /// a typed verdict by [`Walker::publish_drive_state`], which is the only site that may write
+    /// one; passing one of them here directly would reintroduce exactly the defect #851 fixes (a
+    /// progress word published without consulting whether the body is progressing).
     ///
     /// `zone_loading` (#579) means the zone's collision grid is not built (assets still loading, or
     /// their load failed) — the client has no world model to route in, and no route claim of any
@@ -511,7 +573,87 @@ impl Walker {
             s.blocked_goal = None;
             s.blocked_frontier = None;
             s.tier = None;
+            // #851: `stall` is a fact about the route being executed under the state we are
+            // LEAVING. It is re-asserted immediately by `publish_drive_state` when the new state is
+            // still a driving one; anywhere else — `blocked`, `arrived`, `planning`, `zone_loading`
+            // — it must go, or a terminal row would carry a live-wedge payload beside it.
+            s.stall = None;
         }
+    }
+
+    /// Forget the execution verdict and the committed route's facts (#851): a new goal, a new zone,
+    /// or a terminated journey. Re-stamps [`Walker::exec_goal_id`] from the live row so the reset
+    /// is not immediately re-triggered by the goal-identity check in [`Walker::tick_drive_state`].
+    pub fn reset_drive_state(&mut self) {
+        self.exec = crate::steering::RouteExecution::fresh();
+        self.exec_goal_id = self.nav.nav_state.lock().unwrap().goal_id;
+        self.stall_since = None;
+        self.committed = None;
+    }
+
+    /// Advance the execution verdict by one nav tick (#851) and return it.
+    ///
+    /// `progressed` is #631's TWO-CHANNEL progress signal, computed by the caller: the route cursor
+    /// advanced by WALKING, or the closest 3-D approach to the goal improved by `NAV_PROGRESS_EPS`.
+    /// The signal is not new; publishing it is. Until #851 it was consulted only to decide when to
+    /// give up at 60 s, so a walker that had been going nowhere for 3 s and one walking cleanly were
+    /// the same `navigating` to every reader.
+    ///
+    /// **The goal-identity reset lives here** rather than at each site a goal can change: a verdict
+    /// is a fact about a journey, `NavStatus::goal_id` is that journey's identity (#349), and a
+    /// forgotten reset would report a freshly-accepted goto as already wedged — a lie in the
+    /// pessimistic direction, but still a lie.
+    fn tick_drive_state(&mut self, progressed: bool) -> crate::steering::RouteExecution {
+        let goal_id = self.nav.nav_state.lock().unwrap().goal_id;
+        if goal_id != self.exec_goal_id {
+            self.exec = crate::steering::RouteExecution::fresh();
+            self.exec_goal_id = goal_id;
+            self.stall_since = None;
+        }
+        let was_stalled = self.exec.is_stalled();
+        self.exec = self.exec.tick(progressed, self.nav_repaths);
+        match (was_stalled, self.exec.is_stalled()) {
+            (false, true) => self.stall_since = Some(std::time::Instant::now()),
+            (_, false)    => self.stall_since = None,
+            (true, true)  => {}
+        }
+        self.exec
+    }
+
+    /// **Publish the driving `nav_state` row from the verdict (#851) — the one place the walker
+    /// writes a `navigating*` word.**
+    ///
+    /// The word is not chosen here; it is `crate::steering::driving_nav_state`'s total function of
+    /// (committed route, execution verdict), and the `nav_stall` payload beside it is built from
+    /// the SAME verdict in the same call. That is what makes "reports progress while stalled"
+    /// unrepresentable at this site: there is no argument to this function that produces
+    /// `navigating` together with a `Stalled` verdict, and none that produces the word without the
+    /// payload agreeing with it.
+    ///
+    /// `tier` and `reason` are re-asserted from [`Walker::committed`] because
+    /// [`Walker::set_nav_state_because`] retires the previous route's per-instance facts on any
+    /// transition, and this word now transitions mid-route.
+    ///
+    /// A no-op when no route is committed: with nothing committed there is no driving state to
+    /// report, and inventing one (defaulting the route to `Complete`, say) is the fabrication class
+    /// this whole issue is about. The caller only reaches it with `have_path`, and `self.path` is
+    /// made non-empty only by the two `apply_plan` arms that set `committed` in the same breath.
+    fn publish_drive_state(&self) {
+        let Some(facts) = self.committed else { return };
+        let word = crate::steering::driving_nav_state(facts.route, self.exec);
+        self.set_nav_state_because(word, facts.reason);
+        let mut s = self.nav.nav_state.lock().unwrap();
+        s.tier  = facts.tier;
+        s.stall = match self.exec {
+            crate::steering::RouteExecution::Advancing { .. } => None,
+            crate::steering::RouteExecution::Stalled { quiet_ticks, repaths } =>
+                Some(eqoxide_ipc::NavStall {
+                    quiet_ticks,
+                    quiet_ms: self.stall_since.map_or(0, |t| t.elapsed().as_millis() as u64),
+                    repaths,
+                    route: facts.route.as_str(),
+                }),
+        };
     }
 
     /// Publish the FINE tier's last honest outcome (#382). Never touches `state`/`reason`.
@@ -836,6 +978,10 @@ impl Walker {
         self.path_goal = None;
         self.planner.cancel();
         self.awaiting_first_plan = false;
+        // #851: the journey is over and the route is gone. `set_nav_state_because` above already
+        // cleared the published `nav_stall`; this drops the walker-side facts so nothing can
+        // re-publish a driving row for a route that no longer exists.
+        self.reset_drive_state();
         *self.nav.goto_target.lock().unwrap() = None;
         *self.nav_intent.lock().unwrap() = None;
         // Publish the terminal state. `last_plan` is deliberately KEPT: its trace is the
@@ -956,13 +1102,18 @@ impl Walker {
                 self.path_i = 0;
                 self.stuck_i = 0;
                 self.clear_local_plan();
-                if self.goal_snapped {
-                    self.set_nav_state_because("navigating", Some("goal_z_snapped"));
-                } else {
-                    self.set_nav_state("navigating");
-                }
-                self.nav.nav_state.lock().unwrap().tier =
-                    Some(if reply.tight { "minimum" } else { "preferred" });
+                // #851: record the route's facts, then publish the row DERIVED from them and the
+                // live execution verdict. A re-plan is not progress — the verdict is deliberately
+                // NOT reset here, so a fresh route installed at the same wedge keeps reporting
+                // `navigating_stalled` instead of laundering the stall into a clean `navigating`
+                // eight times over. (`path_i`/`stuck_i` going back to 0 is exactly why the walker's
+                // own `stuck_ticks` cannot carry this: a re-plan resets it.)
+                self.committed = Some(CommittedFacts {
+                    route:  crate::steering::CommittedRoute::Complete,
+                    tier:   Some(if reply.tight { "minimum" } else { "preferred" }),
+                    reason: self.goal_snapped.then_some("goal_z_snapped"),
+                });
+                self.publish_drive_state();
                 self.publish_debug(Self::known_pos(gs), None);
                 false
             }
@@ -978,7 +1129,14 @@ impl Walker {
                 self.path_i = 0;
                 self.stuck_i = 0;
                 self.clear_local_plan();
-                self.set_nav_state_because("navigating_partial", Some(limit.as_str()));
+                // #851 — same as the `Route` arm above: facts recorded, row derived. `tier: None`
+                // matches the old behaviour (no tier is recorded for a partial).
+                self.committed = Some(CommittedFacts {
+                    route:  crate::steering::CommittedRoute::Partial,
+                    tier:   None,
+                    reason: Some(limit.as_str()),
+                });
+                self.publish_drive_state();
                 self.publish_debug(Self::known_pos(gs), None);
                 false
             }
@@ -1430,6 +1588,11 @@ impl Walker {
             // clock here too keeps the window honest across a re-aim.)
             self.nav_best_g3d = f32::MAX;
             self.nav_progress_at = std::time::Instant::now();
+            // #851: a genuinely NEW destination — the route facts describe a route to somewhere
+            // else, and the execution verdict is about a journey that is over. (A new `/goto` also
+            // bumps `goal_id`, which `tick_drive_state` keys off; this covers the routes that
+            // re-aim WITHOUT a new goal id — a `/follow` chase whose leader moved a cell.)
+            self.reset_drive_state();
             self.replan_cooldown = 0;
             self.replan_coarse = false;
             self.goal_snapped = false;
@@ -1656,7 +1819,9 @@ impl Walker {
         //
         // THE PROGRESS SIGNAL IS TWO-CHANNEL, and the walker is progressing if EITHER fires:
         //   (a) COMMITTED-ROUTE progress — the walker advanced along a COMPLETE route (`path_i` past
-        //       the max seen on this route, while `nav_state == navigating`). A complete route's end
+        //       the max seen on this route, while `self.committed` records a COMPLETE route; #851
+        //       moved that qualifier off the published string — see the note at the term itself,
+        //       and `driving_nav_state` for why the string stopped being usable for it). A complete route's end
         //       IS the goal, so advancing it is guaranteed goal-ward progress *by construction* — it
         //       cannot be a lap (a lap would be a re-planned PARTIAL, `navigating_partial`, or would
         //       stop advancing `path_i` and trip `walker_stalled`).
@@ -1689,13 +1854,49 @@ impl Walker {
         if have_path && !following {
             let g3d = (gdist * gdist + gdz * gdz).sqrt();
             let now = std::time::Instant::now();
-            // (a) advancing a COMPLETE committed route — `path_i` past this route's max-so-far
+            // The cursor advanced by WALKING this tick — `path_i` past this route's max-so-far
             // (`stuck_i`, which the stall block below maintains and which is reset to 0 on every
-            // re-plan, so a fresh route's advancement is always seen). `navigating` (not
-            // `navigating_partial`) means the committed route actually reaches the goal.
-            let advancing_complete_route = self.nav_state_is("navigating") && self.path_i > self.stuck_i;
+            // re-plan, so a fresh route's advancement is always seen; #727 raises it on a resync so
+            // that a jump the character did not walk cannot reach this).
+            let cursor_advanced = self.path_i > self.stuck_i;
+            // (a) advancing a COMPLETE committed route. A complete route's end IS the goal, so
+            // advancing it is guaranteed goal-ward progress by construction; on a PARTIAL it could
+            // be a lap, which is why the completeness qualifier is here.
+            //
+            // #851 reads that qualifier off `self.committed` — the walker's own record of what it
+            // installed — instead of off the published `nav_state` string it wrote earlier. The old
+            // `nav_state_is("navigating")` read was correct only while `navigating` was the ONLY
+            // word a complete route could be published under; adding `navigating_stalled` would have
+            // silently turned it into "…and not currently stalled", which is a different predicate
+            // and would have kept this clock running through a stall the walker then escaped.
+            let advancing_complete_route =
+                self.committed.map(|c| c.route) == Some(crate::steering::CommittedRoute::Complete)
+                && cursor_advanced;
             // (b) closest-approach improvement (side-effecting: lowers `nav_best_g3d`).
             let closer = crate::steering::progress_improved(&mut self.nav_best_g3d, g3d, NAV_PROGRESS_EPS);
+            // #851 — THE HONESTY PUBLICATION. The two-channel signal has always been computed here;
+            // until now it was only ever *consulted* at the 60 s give-up below, so a walker that had
+            // made no progress for 3 s and one walking cleanly published the identical
+            // `navigating`. `progressed` is deliberately the ROUTE-EXECUTION reading of the same two
+            // channels — cursor advance counts on a partial too, because executing a partial is
+            // real execution and `navigating_partial` already says the route is not to the goal.
+            //
+            // Ordering: this runs BEFORE the give-up below, before the oscillation guard and before
+            // the stall/back-off block, all of which may `return` from the tick. Publishing last
+            // would mean the ticks that matter most never publish at all.
+            let progressed = cursor_advanced || closer;
+            let exec = self.tick_drive_state(progressed);
+            self.publish_drive_state();
+            // The universal, re-checked against the ROW an observer actually reads, on every tick of
+            // every test that drives a walker. The words come from the constants, not from literals,
+            // so `the_driving_nav_state_word_is_only_ever_written_through_the_verdict_851` still
+            // reads zero driving-word literals in this file's production region.
+            debug_assert!(!(exec.is_stalled() && {
+                    let published = self.nav.nav_state.lock().unwrap().state.clone();
+                    published == crate::steering::NAV_STATE_NAVIGATING
+                        || published == crate::steering::NAV_STATE_NAVIGATING_PARTIAL
+                }),
+                "#851: a stalled verdict must never be published as unqualified progress");
             if advancing_complete_route || closer {
                 self.nav_progress_at = now;
             } else if now.duration_since(self.nav_progress_at) >= NAV_NO_PROGRESS_WINDOW {
@@ -1870,6 +2071,129 @@ mod tests {
             None    => crate::zone_assets::ZoneAssetState::pending(TEST_ZONE, "loading…"),
         };
         Arc::new(std::sync::Mutex::new(st))
+    }
+
+    /// The route facts `apply_plan`'s `Route` arm installs for a COMPLETE, untight, unsnapped route
+    /// (#851). Fixtures that used to say "this is a complete route" by publishing the string
+    /// `navigating` say it here instead — the string is derived from this now, not the reverse.
+    fn committed_complete() -> CommittedFacts {
+        CommittedFacts { route: crate::steering::CommittedRoute::Complete,
+                         tier: Some("preferred"), reason: None }
+    }
+
+    /// The route facts `apply_plan`'s `Exhausted { progress: Some(_) }` arm installs (#851).
+    fn committed_partial() -> CommittedFacts {
+        CommittedFacts { route: crate::steering::CommittedRoute::Partial,
+                         tier: None, reason: Some("search_node_cap") }
+    }
+
+    /// Every `set_nav_state…` call in `src` whose argument list contains a driving-word LITERAL,
+    /// as `(byte offset, the call text scanned)`. Split out from the test below so the test can run
+    /// it against synthetic sources whose answer is known — a matcher that always returns `vec![]`
+    /// is the obvious way to fake this guard, and the positive controls are what stop it.
+    ///
+    /// Deliberately NOT line-based: it walks from the call's `(` to the matching `)` (depth-counted,
+    /// bounded), so an argument split across lines is still one scanned unit.
+    fn nav_state_calls_writing_a_driving_word_literal(src: &str) -> Vec<(usize, String)> {
+        let mut hits = Vec::new();
+        for (at, _) in src.match_indices("set_nav_state") {
+            let Some(open) = src[at..].find('(') else { continue };
+            let mut depth = 0i32;
+            let mut end = at + open;
+            for (i, c) in src[at + open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => { depth -= 1; if depth == 0 { end = at + open + i; break; } }
+                    _ => {}
+                }
+                if i > 4096 { break; }
+            }
+            let call = &src[at..=end.min(src.len() - 1)];
+            if call.contains("\"navigating") { hits.push((at, call.to_string())); }
+        }
+        hits
+    }
+
+    /// **#851 — the three driving words are written in exactly ONE place, and that place is the
+    /// verdict.** The type work upstream (a [`crate::steering::RouteExecution`] that is `Advancing`
+    /// or `Stalled` and a total [`crate::steering::driving_nav_state`] mapping it to a word) makes
+    /// it impossible to compute `navigating` from a stalled verdict. It does not, on its own, stop
+    /// somebody writing the string past the verdict entirely — which is exactly how the bug being
+    /// fixed here was written in the first place: `apply_plan` published the literal `"navigating"`
+    /// and nothing downstream ever revised it.
+    ///
+    /// So: no `set_nav_state`/`set_nav_state_because` call in this file's PRODUCTION region may name
+    /// a driving word literally. The only producer is `driving_nav_state`, reached through
+    /// `publish_drive_state`.
+    ///
+    /// **What this is and is not.** It is a lexical scan, and this repo has eight measured cases of
+    /// source text written but never reached (#799), so the direction of its unsoundness matters
+    /// more than its strength. Comments and unrelated string literals can only ADD hits, never hide
+    /// one — a driving word commented out, or quoted in prose next to a `set_nav_state`, makes this
+    /// test FAIL loudly rather than pass falsely. That is why it does not strip comments and does
+    /// not claim to.
+    ///
+    /// **What it genuinely cannot see, stated so nobody reads it as more:** (a) an INDIRECT write —
+    /// `let w = "navigating"; self.set_nav_state(w);` is invisible to it; (b) anything outside
+    /// `walker.rs` — `NavStatus` is behind a shared `Arc` and `eqoxide-http`, `eqoxide-net` and
+    /// `eqoxide-renderer` can all lock and write `state` (they name the field; being unable to name
+    /// a *type* is not being unable to reach a *state*). At the time of writing, every such write in
+    /// those crates is in `#[cfg(test)]` code — checked by grep, not by this test, and nothing keeps
+    /// it that way. The runtime backstop for both gaps is the `debug_assert!` in `drive_walk`, which
+    /// re-reads the PUBLISHED row each tick and fires if a stalled verdict ever coexists with an
+    /// unqualified word, whatever wrote it.
+    #[test]
+    fn the_driving_nav_state_word_is_only_ever_written_through_the_verdict_851() {
+        const SRC: &str = include_str!("walker.rs");
+        // Slice off the test module: fixtures below legitimately publish these words to build a
+        // state to test against. `#[cfg(test)]` occurs once in this file — asserted, because a
+        // second one would silently move the boundary and shrink the scanned region.
+        let marks: Vec<usize> = SRC.match_indices("\n#[cfg(test)]").map(|(i, _)| i).collect();
+        assert_eq!(marks.len(), 1,
+            "expected exactly one top-level `#[cfg(test)]` in walker.rs, found {}; the production \
+             region this guard scans is defined by it", marks.len());
+        let production = &SRC[..marks[0]];
+
+        // REACH CONTROLS — a corpus that shrank, or a slice that missed, must fail rather than pass
+        // over nothing. #778's scanner silently covered ~12% of its corpus with every probe inside
+        // the visible window.
+        let call_sites = production.matches("set_nav_state").count();
+        assert!(call_sites >= 8,
+            "reach control: only {call_sites} `set_nav_state` mentions in the {} bytes of scanned \
+             production region — this guard is scanning the wrong slice of the file",
+            production.len());
+        assert!(production.contains("fn publish_drive_state"),
+            "reach control: the scanned region does not contain `publish_drive_state`, so it is not \
+             the region that publishes the driving word");
+        // NON-DEGENERACY — the one legitimate producer really is in the scanned region. Without
+        // this, deleting `publish_drive_state`'s body would leave this test green.
+        assert!(production.contains("driving_nav_state(facts.route, self.exec)"),
+            "the verdict→word call is gone from the scanned region: the words are now produced \
+             somewhere this guard is not looking");
+
+        // POSITIVE CONTROLS on the matcher itself, including a multi-line call and a nested-paren
+        // one, so `vec![]` and a line-based matcher are both excluded.
+        for probe in [
+            "self.set_nav_state(\"navigating\");",
+            "self.set_nav_state_because(\n    \"navigating_stalled\",\n    Some(\"x\"),\n);",
+            "self.set_nav_state_because(if a { \"navigating_partial\" } else { \"idle\" }, None);",
+        ] {
+            assert_eq!(nav_state_calls_writing_a_driving_word_literal(probe).len(), 1,
+                "positive control: the matcher failed to see a driving-word write in {probe:?}");
+        }
+        // NEGATIVE CONTROL — it must not fire on the non-driving words, or the check below is just
+        // "no `set_nav_state` calls exist".
+        assert!(nav_state_calls_writing_a_driving_word_literal(
+            "self.set_nav_state(\"arrived\"); self.set_nav_state_because(\"blocked\", None);").is_empty(),
+            "negative control: the matcher fires on words that are not driving words");
+
+        let hits = nav_state_calls_writing_a_driving_word_literal(production);
+        assert!(hits.is_empty(),
+            "#851: {} production call(s) in walker.rs write a driving word as a literal instead of \
+             letting `driving_nav_state` decide it. A literal cannot know whether the walker is \
+             still executing its route, which is the whole bug:\n{}",
+            hits.len(),
+            hits.iter().map(|(at, c)| format!("  @{at}: {c}")).collect::<Vec<_>>().join("\n"));
     }
 
     fn walker_with(collision: crate::collision::SharedCollision)
@@ -2081,6 +2405,9 @@ mod tests {
         gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
         let goal = (500.0, 0.0, 0.0);
         *nav.goto_target.lock().unwrap() = Some(goal);
+        // #851: "a COMPLETE route" is `committed`, not the published word. The `set_nav_state` line
+        // stays because the walker's own publication is what the assertions read.
+        w.committed = Some(committed_complete());
         w.set_nav_state("navigating");
         w.path = vec![
             [0.0, -30.0, 0.0], [40.0, -30.0, 0.0], [80.0, -30.0, 0.0],
@@ -2971,6 +3298,7 @@ mod tests {
         // touched at all, and therefore the only one in which its death is discoverable.
         let goal = (60.0, 0.0, 0.0);
         *nav.goto_target.lock().unwrap() = Some(goal);
+        w.committed = Some(committed_complete()); // #851
         w.set_nav_state("navigating");
         w.path = vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [40.0, 0.0, 0.0], [60.0, 0.0, 0.0]];
         w.path_i = 0;
@@ -3883,9 +4211,9 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     fn no_in_progress_nav_state_survives_a_tick_with_no_goal_725() {
         // The documented vocabulary, plus two words the codebase has never published — a future
         // in-progress state, and a typo'd one. Both must retire: unrecognised ⇒ in-progress.
-        const IN_PROGRESS: [&str; 7] = [
-            "pending", "planning", "navigating", "navigating_partial", "following",
-            "crossing_a_state_invented_next_year", "navigatng",
+        const IN_PROGRESS: [&str; 8] = [
+            "pending", "planning", "navigating", "navigating_partial", "navigating_stalled",
+            "following", "crossing_a_state_invented_next_year", "navigatng",
         ];
         for state in IN_PROGRESS {
             let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
@@ -4225,7 +4553,9 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
         gs.player_x = 10.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
         let goal = (500.0, 0.0, 0.0); // far → ArrivalAction::Drive
         *nav.goto_target.lock().unwrap() = Some(goal);
-        // A PARTIAL route (a moat lap), NOT a complete route to the goal.
+        // A PARTIAL route (a moat lap), NOT a complete route to the goal. (#851: the fact lives on
+        // `committed` now — the published word is derived from it, not the other way round.)
+        w.committed = Some(committed_partial());
         w.set_nav_state("navigating_partial");
         w.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0], [30.0, 0.0, 0.0]];
         w.path_i = 1;   // ADVANCING along the lap (path_i 1 > stuck_i 0) — looks like motion...
@@ -4266,7 +4596,8 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
         gs.player_x = 500.0; gs.player_y = 800.0; gs.player_z = 0.0; gs.player_pos_known = true;
         let goal = (1000.0, 0.0, 0.0);
         *nav.goto_target.lock().unwrap() = Some(goal);
-        w.set_nav_state("navigating"); // a COMPLETE route (reaches the goal), not a partial
+        w.committed = Some(committed_complete()); // #851: a COMPLETE route, not a partial
+        w.set_nav_state("navigating");
         w.path = vec![
             [0.0, 0.0, 0.0], [200.0, 400.0, 0.0], [400.0, 700.0, 0.0], [500.0, 800.0, 0.0],
             [700.0, 600.0, 0.0], [900.0, 200.0, 0.0], [1000.0, 0.0, 0.0],
@@ -4303,6 +4634,7 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
         gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
         let goal = (500.0, 0.0, 0.0);
         *nav.goto_target.lock().unwrap() = Some(goal);
+        w.committed = Some(committed_complete()); // #851
         w.set_nav_state("navigating");
         w.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0]];
         w.path_i = 0;
@@ -4319,5 +4651,173 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
              NOT be terminated — that would kill legitimate slow/detouring progress");
         assert!(nav.goto_target.lock().unwrap().is_some(), "navigation continues");
         assert!(w.nav_best_g3d <= 500.5, "the improved closest approach must be recorded");
+    }
+
+    // ───────────────────────── #851: the stall is PUBLISHED, not just detected ─────────────────
+
+    /// A walker with a committed COMPLETE route, a body that never moves, and a closest approach
+    /// that never improves. `drive_walk` is the real production tick.
+    ///
+    /// `path` deliberately starts 100u AWAY from the body so `advance_cursor` cannot move `path_i`
+    /// (a cursor advance is channel (a) progress and would legitimately reset the verdict), and
+    /// `nav_best_g3d` is pinned low so channel (b) cannot fire either. That is a genuinely stalled
+    /// walker, not a slow one.
+    fn stalled_walker_fixture() -> (Walker, eqoxide_ipc::NavSlots, eqoxide_core::game_state::GameState, (f32, f32, f32)) {
+        let (mut w, nav, _intent, _view) = walker_with(open_plane(2000.0));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.world.zone_name = TEST_ZONE.into(); // #600: loaded-zone match
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; gs.player_pos_known = true;
+        let goal = (500.0, 0.0, 0.0);
+        *nav.goto_target.lock().unwrap() = Some(goal);
+        nav.nav_state.lock().unwrap().goal_id = 1;
+        w.reset_drive_state();                       // as `apply_plan` does on a fresh route…
+        w.committed = Some(committed_complete());    // …then commits the facts…
+        w.publish_drive_state();                     // …and publishes the first word from them.
+        w.path = vec![[100.0, 0.0, 0.0], [200.0, 0.0, 0.0], [300.0, 0.0, 0.0],
+                      [400.0, 0.0, 0.0], [500.0, 0.0, 0.0]];
+        w.path_i = 0;
+        w.stuck_i = 0;
+        w.path_goal = Some(goal);
+        w.nav_best_g3d = 1.0;      // channel (b) can never improve on this
+        w.nav_best_gdist = 0.0;    // and the 200u repath-reset cannot fire either
+        (w, nav, gs, goal)
+    }
+
+    /// **#851 — THE BUG. A walker whose body has stopped making progress must stop publishing
+    /// `navigating`.** Drives the REAL `drive_walk` against a static body and reads the row an agent
+    /// reads (`NavStatus`), not an internal counter.
+    ///
+    /// The stall was already DETECTED before this change — `stuck_ticks` reaches
+    /// [`NAV_STUCK_TICKS`] in ~3 s and triggers a back-off and a re-path — it was simply never
+    /// published, so `nav_state` read `navigating` for the whole ~32 s the walker spent circling
+    /// under a ledge. That is what this test pins: the transition, and the calibration data beside
+    /// it.
+    ///
+    /// PRE-CONDITION (asserted, not assumed): the walker publishes plain `navigating` before the
+    /// threshold. Without it, a `driving_nav_state` hard-wired to `navigating_stalled` would pass.
+    ///
+    /// Mutation checks (outputs in the PR): WRAP the `Stalled` arm of `driving_nav_state` in
+    /// `if false { … }` → RED here; delete the `self.publish_drive_state();` call from `drive_walk`
+    /// → RED here.
+    #[test]
+    fn drive_walk_publishes_navigating_stalled_once_the_body_stops_progressing_851() {
+        let (mut w, nav, mut gs, goal) = stalled_walker_fixture();
+
+        // Before the threshold: unqualified progress is the HONEST answer — the walker has a route
+        // and has only just started.
+        for tick in 0..(NAV_STUCK_TICKS - 1) {
+            w.drive_walk(&mut gs, goal);
+            let s = nav.nav_state.lock().unwrap();
+            assert_eq!(s.state, "navigating",
+                "tick {tick}: a walker inside its own stall threshold must read as navigating");
+            assert!(s.stall.is_none(), "tick {tick}: no stall data before the verdict flips");
+        }
+        // The threshold tick.
+        w.drive_walk(&mut gs, goal);
+        let s = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(s.state, "navigating_stalled",
+            "#851: after {NAV_STUCK_TICKS} ticks with no cursor advance and no closest-approach \
+             improvement, `nav_state` must NOT still read as unqualified progress");
+        let stall = s.stall.expect("#851: the stalled state must carry its calibration data");
+        assert!(stall.quiet_ticks >= NAV_STUCK_TICKS,
+            "the published quiet-tick count must be the real one, got {}", stall.quiet_ticks);
+        assert_eq!(stall.route, "complete",
+            "the committed route is complete — the stall is about EXECUTING it, not about routing");
+        // …and the honesty fix must not have changed WHEN navigation gives up: the goal is still
+        // live, because a stall is recoverable and the walker is about to back off and re-path.
+        assert!(nav.goto_target.lock().unwrap().is_some(),
+            "publishing the stall must not terminate the goto — that is a different decision");
+    }
+
+    /// **The stall verdict cannot be laundered by the walker's own recovery.** The pre-#851 signals
+    /// were `stuck_ticks` (reset to 0 at every threshold, before the back-off) and `nav_repaths` —
+    /// so anything published from `stuck_ticks` would have flickered back to a clean reading every
+    /// [`NAV_STUCK_TICKS`] ticks while the body sat exactly where it was. That flicker is precisely
+    /// the shape that makes an agent's read a lie, so the verdict LATCHES: only real progress clears
+    /// it ([`crate::steering::RouteExecution::tick`]).
+    ///
+    /// Drives long enough to cross the threshold several times and collects EVERY published word.
+    ///
+    /// REACH CONTROL: the walker must actually have re-pathed and backed off during the run —
+    /// otherwise this is just the previous test with a longer loop and proves nothing about
+    /// laundering.
+    ///
+    /// Mutation check: drop `self.is_stalled() ||` from `RouteExecution::tick` → RED (the word
+    /// returns to `navigating` after each back-off).
+    #[test]
+    fn a_repath_and_backoff_cannot_launder_the_851_stall() {
+        let (mut w, nav, mut gs, goal) = stalled_walker_fixture();
+        let mut words: Vec<String> = Vec::new();
+        for _ in 0..(NAV_STUCK_TICKS * 4) {
+            w.drive_walk(&mut gs, goal);
+            words.push(nav.nav_state.lock().unwrap().state.clone());
+            if nav.goto_target.lock().unwrap().is_none() { break; } // terminated honestly — stop
+        }
+        assert!(w.nav_repaths > 0 || w.backoff_ticks > 0 || words.iter().any(|s| s == "blocked"),
+            "reach control: the walker never re-pathed, backed off or gave up in {} ticks, so this \
+             run never exercised the recovery path the latch exists to survive", words.len());
+        let first_stall = words.iter().position(|s| s == "navigating_stalled")
+            .expect("the walker must reach the stalled verdict at all");
+        for (i, w) in words.iter().enumerate().skip(first_stall) {
+            assert_ne!(w, "navigating",
+                "#851: tick {i} republished unqualified `navigating` after the stall at tick \
+                 {first_stall}, with the body in the same place the whole time. Sequence: {words:?}");
+            assert_ne!(w, "navigating_partial",
+                "#851: tick {i} republished `navigating_partial` after the stall at tick {first_stall}");
+        }
+    }
+
+    /// **Real progress clears the verdict, and a healthy walk never trips it.** The over-firing
+    /// control for the two tests above: a body that keeps closing on the goal must read `navigating`
+    /// for the whole run, well past [`NAV_STUCK_TICKS`]. A stall report on a walker that is walking
+    /// is the same class of lie in the other direction.
+    ///
+    /// Mutation check: make `RouteExecution::tick` ignore its `progressed` argument (always take the
+    /// quiet branch) → RED here, GREEN on the two tests above — which is why this control exists.
+    #[test]
+    fn a_walker_that_keeps_closing_on_the_goal_never_reads_as_stalled_851() {
+        let (mut w, nav, mut gs, goal) = stalled_walker_fixture();
+        w.nav_best_g3d = 1000.0; // the honest starting best for a body 500u out
+        let mut checked = 0u32;
+        for tick in 0..(NAV_STUCK_TICKS * 3) {
+            gs.player_x += 10.0; // …and it really is closing, 10u per tick
+            w.drive_walk(&mut gs, goal);
+            if nav.goto_target.lock().unwrap().is_none() { break; } // arrived
+            let s = nav.nav_state.lock().unwrap();
+            assert_eq!(s.state, "navigating",
+                "tick {tick}: a walker whose closest approach improves every tick must never be \
+                 reported as stalled");
+            assert!(s.stall.is_none(), "tick {tick}: no stall data on a healthy walk");
+            checked += 1;
+        }
+        // REACH CONTROL: the run must have gone WELL past the stall threshold, or an early arrival
+        // would leave this control green without ever testing the window it is about.
+        assert!(checked > NAV_STUCK_TICKS,
+            "reach control: only {checked} ticks were checked, which is inside the {NAV_STUCK_TICKS}\
+             -tick threshold — this control never reached the region it claims to cover");
+    }
+
+    /// **A NEW goal starts clean.** The verdict is keyed on `NavStatus::goal_id`, so a stall latched
+    /// against the previous goto cannot be reported against the next one — the failure mode a latch
+    /// invites is telling an agent its brand-new `/move/goto` is already wedged.
+    ///
+    /// Mutation check: delete the `goal_id != self.exec_goal_id` reset from `tick_drive_state` and
+    /// this goes RED.
+    #[test]
+    fn a_fresh_goal_id_clears_a_latched_851_stall() {
+        let (mut w, nav, mut gs, goal) = stalled_walker_fixture();
+        for _ in 0..NAV_STUCK_TICKS { w.drive_walk(&mut gs, goal); }
+        assert_eq!(nav.nav_state.lock().unwrap().state, "navigating_stalled",
+            "PREMISE: the walker is latched stalled before the new goal arrives");
+
+        // A new goto: `request_goto` bumps `goal_id`. Everything else about the walker is left
+        // exactly as the stalled run left it, which is the point — the reset must not depend on the
+        // caller having tidied up.
+        nav.nav_state.lock().unwrap().goal_id = 2;
+        w.drive_walk(&mut gs, goal);
+        let s = nav.nav_state.lock().unwrap();
+        assert_eq!(s.state, "navigating",
+            "#851: a stall latched against goal #1 must not be reported against goal #2");
+        assert!(s.stall.is_none(), "and its calibration data must go with it");
     }
 }
