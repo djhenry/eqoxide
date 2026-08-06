@@ -751,11 +751,9 @@ pub const NAV_AGENT_HEIGHT: f32 = crate::traversability::PLAYER_BODY.agent_heigh
 /// the only thing in a DEFAULT run standing between this constant and a silent lowering (the
 /// `#[ignore]`d corpus test also catches it, but nothing runs it) — MEASURED, not inferred:
 /// at `6`, `cargo test --workspace --lib --no-fail-fast` fails in `eqoxide-nav` and **nowhere
-/// else** — 13 crates run a lib suite, the other 12 are green (#876 review round 2; round 1 of
-/// that review said "11", having dropped `eqoxide-telemetry` from its own list). Wrapping that
-/// one case in `if false` at
-/// `6` returns the whole suite to GREEN, so it is the case doing the catching and not a
-/// pre-existing assertion.
+/// else** — 13 crates run a lib suite, the other 12 are green. Wrapping that one case in
+/// `if false` at `6` returns the whole suite to GREEN, so it is the case doing the catching and
+/// not a pre-existing assertion.
 ///
 /// **This paragraph used to say the opposite, and the history is worth being exact about.** Before
 /// #866 round 2 added that case, dropping to `6` left `-p eqoxide-nav --lib` and `-p eqoxide --lib`
