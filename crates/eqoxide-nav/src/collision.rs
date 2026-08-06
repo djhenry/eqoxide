@@ -751,6 +751,27 @@ pub const NAV_AGENT_HEIGHT: f32 = crate::traversability::PLAYER_BODY.agent_heigh
 /// so. That is a live coverage hole, not a resolved one; the low side of this constant is guarded by
 /// a test the default suite does not run.
 ///
+/// **A narrower, CI-runnable pin does exist now** (`#866` round-2 review, PR comment 5201986822
+/// §5): the last case in
+/// `tests::a_floor_z_the_module_just_reported_always_has_a_floor_under_it` uses a smaller quad
+/// (`h = 10`) sampled over a tighter span than the REGIMES fixtures above, which raises the ULPs
+/// the constant must cover and goes RED between `6` and `12`. That is not this doc's cliff of `7`
+/// — it is a different, synthetic fixture, and it pins only that the shipped `32` is not
+/// order-of-magnitude wrong (~2.7× margin over its own cliff), not that the blind band this
+/// constant bounds is closed. See the next paragraph for what "bounds" means here.
+///
+/// **This constant bounds the blind band; it does not close it.** #866 round-2 review densely
+/// sampled 94 baked zones near the world origin (599,875 columns within ±24 u of `(0,0)`) and
+/// measured 108 residual self-consistency misses at the shipped `32` — down from 582,089 on
+/// `main` (a 5390× reduction, not a closure). The mechanism: `contact_tol`'s budget is set by the
+/// *result* point and the triangle's vertices, but the reconstruction error it has to cover is set
+/// by the floor query's own start height and range (`ground_below`'s `start`/`range` arguments),
+/// which `contact_tol` never sees. Concretely, the same tilted quad this doc's cliff table used,
+/// queried with a start/range far from the fixture's own `60.0`/`400.0`, misses far more at the
+/// shipped `32` (up to 1045/1369 at `600`/`4000`) — so `ground_below`'s call-site parameters are
+/// load-bearing for the invariant this constant is asked to guarantee, and that envelope was
+/// previously unstated. Tracked as a follow-up: #875.
+///
 /// **Why the high side has room to spare.** The two failure directions are not symmetric. Too
 /// small = a body walks through the world and nothing says so — the silent-wrong-answer class this
 /// repo ranks above crashes. Too large = a face slightly behind the ray reports as touched, which
@@ -773,9 +794,9 @@ pub fn axis_scale(p: [f32; 3]) -> f32 { p[0].abs().max(p[1].abs()).max(p[2].abs(
 /// **Why any slack is needed, MEASURED — and it is not the mechanism round-1 review proposed.**
 /// The review's diagnosis was `f32` cancellation in `tvec = from − v0` scaling with the world
 /// coordinate, predicting that relocating an origin fixture to `tox`'s `(2081, 2320, −87)` would
-/// reproduce the residual. It does not: an axis-aligned *or* tilted synthetic quad at those
-/// coordinates measures a blind band of `0` even with this slack removed. The real driver is one
-/// step earlier, and it fires at the origin too.
+/// reproduce the residual. It does not: an axis-aligned synthetic quad at those coordinates
+/// measures a blind band of `0` even with this slack removed. The real driver is one step
+/// earlier, and it fires at the origin too.
 ///
 /// A floor query does not return a coordinate from the mesh — it returns a *reconstructed* one,
 /// `gather_top + t·dir_z` (`column_hits`). That `f32` does not generally lie on the triangle's
@@ -5343,9 +5364,10 @@ mod tests {
     /// not see the residual. Review's proposed cause was `f32` cancellation scaling with the world
     /// coordinate, and its proposed fixture was `one_floor()` relocated to `(2000, 2300, −87)`.
     ///
-    /// **MEASURED: that fixture does not reproduce it.** A synthetic quad at `tox`'s coordinates —
-    /// axis-aligned *or* tilted — measures a blind band of exactly `0` even with the world-unit
-    /// slack removed. Coordinate magnitude is not the driver.
+    /// **MEASURED: that fixture does not reproduce it.** An axis-aligned synthetic quad at `tox`'s
+    /// coordinates measures a blind band of exactly `0` even with the world-unit slack removed
+    /// (a *tilted* quad at the same coordinates does not — see the WRAP row of the mutation-check
+    /// table below). Coordinate magnitude is not the driver.
     ///
     /// **What actually reproduces it**, and the reason it is a real production state: a floor query
     /// does not hand back a coordinate from the mesh, it hands back a *reconstructed* one —
@@ -5402,6 +5424,59 @@ mod tests {
                 "{label}: {miss}/{total} columns report NO floor below the floor the module just \
                  returned for them; worst blind band {worst:.4e} world units at {at:?}. A body \
                  grounded there and given a down-wish descends through the world (#855)");
+        }
+
+        // #866 round-2 review (PR comment 5201986822, §5): `tol_cliff` — CONTACT_TOL_ULPS 32 → 6,
+        // a value MEASURED to let real bodies through real floors — is GREEN on both unit suites
+        // above. It is caught only by the `#[ignore]`d, asset-gated real-zone corpus, which a
+        // default `cargo test` never runs. This case is a CI-runnable pin for that gap: a smaller
+        // quad (`h = 10` vs. the REGIMES fixtures' `h = 50`) sampled over a narrower ±8 u span,
+        // which the reviewer measured requires ~12.6 ULPs of tolerance — against ~5.3 ULPs for the
+        // REGIMES fixtures above, which is why those stay green at ULPS as low as 6 and this one
+        // does not.
+        //
+        // MUTATION-CHECK, RUN (this exact fixture, not the reviewer's — strides differ so the
+        // miss count does too, but the direction is what the pin depends on):
+        // CONTACT_TOL_ULPS = 6.0 → RED, 16/1369 misses, worst band 3.1069e-6.
+        // CONTACT_TOL_ULPS = 12.0 → GREEN. Restored to the shipped 32.0 → GREEN. (The reviewer's
+        // own run, on their fixture, measured 4/1369 at ULPS=6 — see PR comment 5201986822 §5;
+        // both runs agree RED at 6, GREEN at 12 and 32, which is the property this pin needs.)
+        //
+        // **What this does NOT establish.** Its cliff sits somewhere between 6 and 12 ULPs, not at
+        // the corpus's measured cliff of 7 (see `CONTACT_TOL_ULPS`'s doc) — it is a different
+        // fixture, not a reproduction of that number. So this pins that the shipped constant is
+        // not order-of-magnitude wrong (~2.7x margin over this fixture's cliff, vs. the corpus's
+        // ~4.6x), not that the blind band is closed: §4.1 of the round-2 review measured 108/599875
+        // residual misses on real baked geometry near the world origin at the shipped constant, and
+        // that residual is unrelated to this pin (tracked as a follow-up issue referenced from
+        // `CONTACT_TOL_ULPS`'s doc).
+        {
+            let c = tilted_floor_sized(0.0, 0.0, 0.0, 10.0);
+            let (mut miss, mut total, mut worst, mut at) = (0usize, 0usize, 0.0f32, [0.0f32; 3]);
+            for i in 0..37 {
+                for j in 0..37 {
+                    // Same irrational-ish strides as the REGIMES loop above, scaled down 5x to
+                    // span roughly ±8 u instead of ±40 u.
+                    let e = -8.0 + (i as f32) * 0.43462;
+                    let n = -8.0 + (j as f32) * 0.41834;
+                    let Some(fz) = c.ground_below(e, n, 60.0, 400.0) else { continue };
+                    total += 1;
+                    if c.nearest_hit_t([e, n, fz], [e, n, fz - 1.75]).is_some() { continue }
+                    miss += 1;
+                    let (mut lo, mut hi) = (0.0f32, 0.5f32);
+                    for _ in 0..60 {
+                        let m = 0.5 * (lo + hi);
+                        if c.nearest_hit_t([e, n, fz + m], [e, n, fz + m - 1.75]).is_some() { hi = m } else { lo = m }
+                    }
+                    if hi > worst { worst = hi; at = [e, n, fz]; }
+                }
+            }
+            assert!(total > 1000, "origin, h=10, ±8u span: positive control — only {total} columns found a floor");
+            assert_eq!(miss, 0,
+                "origin, h=10, ±8u span: {miss}/{total} columns report NO floor below the floor \
+                 the module just reported for them; worst blind band {worst:.4e} world units at \
+                 {at:?}. This is the tol_cliff pin (#866 round-2 review §5) — if this goes red, \
+                 CONTACT_TOL_ULPS has been lowered past the ~12 ULP cliff this fixture measures");
         }
     }
 

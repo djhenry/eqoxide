@@ -1942,9 +1942,9 @@ mod tests {
     }
 
     /// **#855 — THE REAL-GEOMETRY CONTROL.** Round-1 review measured that the synthetic pool above,
-    /// green throughout, sat on top of 128 fall-throughs in 2952 driven descents on real baked
-    /// geometry. This is that corpus, kept as a test so the number can be re-taken rather than
-    /// quoted.
+    /// green throughout, sat on top of 698 fall-throughs in 4116 driven descents on real baked
+    /// geometry (PR comment 5200310297, "this PR" row). This is that corpus, kept as a test so the
+    /// number can be re-taken rather than quoted.
     ///
     /// It is a control for TWO things the synthetic pool cannot supply, and only the second is
     /// about coordinates. First, real floors are tilted, adjacent and re-triangulated, so a floor-z

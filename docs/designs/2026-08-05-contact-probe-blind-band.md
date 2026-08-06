@@ -613,9 +613,9 @@ inherits the cliff in its own units: `1e-3 × speed·dt` = 5.8e-4 at 35 u/s and 
 > **Correction, written by #866 when it merged (round 2).** Everything from here to the end of
 > §5 was written against #866's **round-1** shape and its round-1 PR body. Round 1's review found
 > the `[0.0, 1.0]` window did not actually close the blind band, and round 2 changed shape, so
-> three statements below are now false about what ships. They are struck through in place rather
-> than rewritten away, because this section's whole method was "VERIFIED against PR #866's stated
-> content", and a reader needs to see which of those warrants expired.
+> three statements below are now false about what ships. They are named at the head of the section
+> rather than rewritten away, because this section's whole method was "VERIFIED against PR #866's
+> stated content", and a reader needs to see which of those warrants expired.
 >
 > * **`HIT_WINDOW` does not exist.** A normalised `t` has no correct lower bound; the shipped test
 >   is `t <= 1.0 && t * len >= -contact_tol(scale)` in **world units**, where `scale` is the
