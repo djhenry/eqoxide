@@ -207,13 +207,14 @@ pub struct Hit {
 /// literals and got a GREEN run. Two mechanisms watch this constant, and they watch different
 /// things:
 ///
-/// * **`max_nodes_headroom_claim_stays_true`** — fast, on every `cargo test`, no assets. It
-///   guarantees **arithmetic consistency between `MEASURED_WORST_BUTCHER_PRODUCTION`, this constant
-///   and the 57.3%/1.75× prose above**, and pins this constant at 8,000,000 so THE DECISION recorded
-///   here is a check rather than only a sentence. It guarantees **nothing** about whether the
-///   measured figure still describes the client: change what `astar` admits (`can_traverse`,
-///   `ground_continuous`, the ray-hit acceptance window, water-edge admission), rebake butcher, or
-///   edit the corpus, and it stays green while the figures above go false.
+/// * **`max_nodes_headroom_claim_stays_true`** — fast, on every `cargo test`, no assets. It checks
+///   `MEASURED_WORST_BUTCHER_PRODUCTION` against this constant using the two-decimal figures
+///   hand-transcribed into its own body, not the prose above: editing `57.3%`/`1.75×` there without
+///   also editing those transcribed literals leaves it green. It pins this constant at 8,000,000 so
+///   THE DECISION recorded here is a check rather than only a sentence. It guarantees **nothing**
+///   about whether the measured figure still describes the client: change what `astar` admits
+///   (`can_traverse`, `ground_continuous`, the ray-hit acceptance window, water-edge admission),
+///   rebake butcher, or edit the corpus, and it stays green while the figures above go false.
 /// * **`worst_case_reachable_component`** — the `#[ignore]`d ~10h corpus run, the only thing that
 ///   can re-derive the number. It asserts `worst < MAX_NODES` (a truncation detector), and since
 ///   #880 it also asserts its freshly measured `butcher` close against
