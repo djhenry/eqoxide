@@ -610,6 +610,34 @@ verbatim from #855's issue body where it is also stale; `:1674` is inside a doc 
 The blind radius is `1e-3 ×` ray length. E′'s new feet-plane ray is a caller of `nearest_hit`, so it
 inherits the cliff in its own units: `1e-3 × speed·dt` = 5.8e-4 at 35 u/s and `dt = 1/60`.
 
+> **Correction, written by #866 when it merged (round 2).** Everything from here to the end of
+> §5 was written against #866's **round-1** shape and its round-1 PR body. Round 1's review found
+> the `[0.0, 1.0]` window did not actually close the blind band, and round 2 changed shape, so
+> three statements below are now false about what ships. They are named at the head of the section
+> rather than rewritten away, because this section's whole method was "VERIFIED against PR #866's
+> stated content", and a reader needs to see which of those warrants expired.
+>
+> * **`HIT_WINDOW` does not exist.** A normalised `t` has no correct lower bound; the shipped test
+>   is `t <= 1.0 && t * len >= -contact_tol(scale)` in **world units**, where `scale` is the
+>   largest coordinate across the ray's endpoints and the triangle's three vertices. It is shared
+>   by three scans, not two — `column_hits` joined them.
+> * **`Collision::obstruction_below` does not exist and `swim_sink` has no clamp.** Round 2
+>   reconciled the three degenerate-ray length guards onto one `MIN_RAY_LEN`, which removed the
+>   reason the clamp existed, so both were deleted. "Resolved 2"'s conclusion for E′ still holds —
+>   E′ was untouched by the clamp and is untouched by its removal — but its stated reason names
+>   code that is gone.
+> * **The `slide()` row's warrant expired.** That sweep was measured against round 1's `t >= 0`.
+>   Round 2 widens the lower bound by `contact_tol` (1.7e-2 u at the corpus's largest coordinate,
+>   ~1.7% of `PLAYER_RADIUS`), and the sweep was **NOT re-run** against the shipped window. The
+>   argument for why it cannot matter is unchanged and still reasoned, not measured: the resolver
+>   keeps the body centre `radius` (1.0) + `SKIN` clear of any detected face, and 1.0 dwarfs the
+>   tolerance. Treat that row as REASONED, not VERIFIED.
+>
+> Unchanged by round 2: E′ does not depend on the window (§2's rows are measured on unmodified
+> `collision.rs`), #866 still does not change `nearest_hit`'s signature or return type, and the
+> `|det| < 1e-6` tangency results are untouched. The `1e-3 × speed·dt = 5.8e-4` blind-radius
+> figure above describes the OLD behaviour and is what #866 removes.
+
 **Resolved 1 — #866 replaces the epsilon with a shared `HIT_WINDOW = 0.0..=1.0` in both scans.**
 
 - **E′ does not depend on it.** E′ closes the pass-through with the epsilon exactly as it stands on

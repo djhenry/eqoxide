@@ -1258,6 +1258,15 @@ impl CharacterController {
     /// the horizontal `slide` uses — so neither buoyancy nor the nav swim-up drive can ever push
     /// a swimmer's head into a ceiling. Against a flush ceiling the rise settles just below it
     /// and holds (rise → 0), instead of embedding and triggering a depenetration slam-back.
+    ///
+    /// **#855 applies here too, by construction.** This is the same `nearest_hit` the descent uses,
+    /// with the same `1e-3 × ray length` blind band before #855 and the same world-unit
+    /// `collision::hit_accepted` after it, and — since round 2 deleted the descent's extra clamp —
+    /// with no guard on either side that the other lacks. There is nothing asymmetric left to fix
+    /// (round-1 review, finding 7). The direction of the failure differs: a missed hit here stops a
+    /// swimmer's head short of nothing and lets it enter a ceiling, where the depenetration net
+    /// recovers it; a missed hit going down loses the floor with nothing underneath to recover
+    /// against, which is why #855 is a descent issue.
     fn swim_rise(&self, want: f32, col: &Collision) -> f32 {
         let top = self.pos[2] + crate::traversability::PLAYER_BODY.height;
         let from = [self.pos[0], self.pos[1], top];
@@ -1271,6 +1280,34 @@ impl CharacterController {
     /// COLLIDED vertical swim descent: the downward mirror of [`Self::swim_rise`] — sweeps the
     /// FEET down through `want` (< 0) and stops `SKIN` short of the floor/geometry below, so an
     /// explicit swim-down can't drive the character through the pool bottom.
+    ///
+    /// **THE FLOOR FLOOR (#855).** This is the ONLY path by which a swim descent moves the body
+    /// down (the down-wish branch of `step` and `try_duck_under` both route through here), so its
+    /// postcondition is the whole controller's: *the returned delta never takes the feet below the
+    /// nearest surface underneath them.* The sweep alone did not give that. `nearest_hit`'s
+    /// acceptance window used to start at `t > 1e-3`, a blind band of `1e-3 × ray length` — here
+    /// `1e-3 × |wish_vspeed| · dt`, i.e. `5.8e-4` world units at the 35 u/s swim cap and 60 Hz,
+    /// shrinking with `dt` (`1.8e-3` u at 20 Hz) — and a swimmer whose feet sat inside it got
+    /// `None` back, read it as open water, and descended THROUGH the floor (#855, reached
+    /// naturally). The band being `dt`-dependent is why the bug is knife-edge on frame rate.
+    ///
+    /// #855 replaces that window with `collision::hit_accepted` — a lower bound expressed in world
+    /// units rather than as a fraction of the caller's ray — which is what makes this sweep's answer
+    /// independent of both `dt` and the character's world coordinates.
+    ///
+    /// **This is the whole mechanism; there is no second one.** Round 1 of review shipped a
+    /// belt-and-braces clamp here against a facing-blind `column_hits` probe, justified by
+    /// `nearest_hit` refusing rays shorter than `3.16e-5`. Review measured that the clamp's answer
+    /// was a strict superset of the sweep's for this vertical ray, so it *masked* the sweep entirely
+    /// and left the primitive fix unpinned by any test. #855 round 2 removed the disagreement at its
+    /// source instead — `collision::MIN_RAY_LEN` is now the one degenerate-ray guard for all three
+    /// scans, so the sweep answers everything the column probe would have — and deleted the clamp.
+    /// The sweep is therefore load-bearing and measured so: see the MUTATION-CHECK block on
+    /// `a_driven_swim_descent_never_passes_the_pool_floor_at_any_dt`.
+    ///
+    /// It never pushes UP: the swept result is `min(0.0)`-ed, so a body already below the surface
+    /// beneath it (a depenetration/teleport artifact) is left alone rather than teleported —
+    /// recovering that is the depenetration net's job, not the swim step's.
     fn swim_sink(&self, want: f32, col: &Collision) -> f32 {
         let to = [self.pos[0], self.pos[1], self.pos[2] + want];
         match col.nearest_hit(self.pos, to) {
@@ -1774,6 +1811,241 @@ mod tests {
         // Positive control: it DID rise toward the surface (feet up near surface − float_depth = 3).
         assert!(ctrl.pos[2] > start_z + 1.0,
             "swimmer should still have risen toward the surface, got z={}", ctrl.pos[2]);
+    }
+
+    // ── #855: a driven swim descent is floor-bounded ─────────────────────────────────────────────
+
+    /// Pool floor at `FLOOR_Z` with water from just under it up to z = 5 — a swimmer near the
+    /// bottom is wet at the feet, so `want_swim` really engages the swim branch.
+    const POOL_FLOOR_Z: f32 = -20.0;
+    fn pool() -> Collision {
+        let mut c = col(vec![floor(POOL_FLOOR_Z, -100.0, 100.0)]);
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::water_slab(POOL_FLOOR_Z - 0.5, 5.0))));
+        c
+    }
+    fn dive(vspeed: f32) -> MoveIntent {
+        MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: vspeed, jump: false, want_swim: true,
+                     speed: 0.0, climb: 0.0, hop: false }
+    }
+
+    /// **#855 — THE UNIVERSAL: a driven swim descent never puts the feet below the floor, at ANY
+    /// `dt`.** Written as a `dt` sweep on purpose: the reported defect was knife-edge on the frame
+    /// time, and "whether the pool bottom is solid" is not allowed to be a property of the frame
+    /// rate. The starting `eps` sweep covers the band the issue measured as fatal (0 … 0.0005 at
+    /// `dt = 0.016`) and the old `1e-3 × ray length` cliff at every swept speed.
+    ///
+    /// **Scope, stated so the sweep is not mistaken for a reproduction.** The issue's knife-edge
+    /// (`dt = 0.016` fell through, `dt = 1/60` parked) was measured on real zone geometry, which
+    /// this test does not have and which was NOT re-run here. What this test asserts is the
+    /// stronger, `dt`-free bound; the reproduction lives in
+    /// `a_driven_swim_descent_never_passes_a_real_zone_floor`.
+    ///
+    /// One number, with its provenance: under the reach mutation below the assertion reports
+    /// `z=-55 (floor -20) at dt=1 eps=0 vspeed=-35`. That is the WORST cell and it is all the
+    /// assertion reports — it is deliberately not a per-`dt` table, because a previous version of
+    /// this block carried one whose per-row provenance could not be reconstructed and which the
+    /// panic message cannot support. Whether the mutation falls through at *every* swept `dt` was
+    /// therefore NOT measured and is not claimed here.
+    ///
+    /// MUTATION-CHECK — every row below was RUN against the code that SHIPS, in both directions,
+    /// not predicted. Round 1 of review caught that the previous version of this block drew its
+    /// reach conclusion from a configuration that did not ship (epsilon restored *plus* the clamp
+    /// deleted); the clamp is gone now and every row is the shipped shape.
+    ///   * epsilon `t > 1e-3` restored in `Collision::nearest_hit` — the scan `swim_sink` actually
+    ///     calls — and NOTHING else → **RED**. This is the REACH control (#799): it proves this
+    ///     test exercises `nearest_hit`'s acceptance test rather than merely coexisting with it.
+    ///   * `hit_accepted` WRAPPED to `t > 0.0 && t <= 1.0`, i.e. the call site still reached and the
+    ///     upper bound still enforced but the world-unit lower slack never applied → GREEN **here**,
+    ///     **RED** on the real-geometry corpus (`a_driven_swim_descent_never_passes_a_real_zone_floor`)
+    ///     and RED on three `collision.rs` unit pins. Recorded as a measured limit of THIS test, and
+    ///     the reason for it is NOT the one an earlier draft of this block gave. That draft said a
+    ///     pool "at the world origin cannot see the coordinate-scaled cancellation"; the discriminator
+    ///     was measured and it is not the coordinate magnitude. Moving a flat quad out to
+    ///     `(2081, 2320, −87)` does not reopen the band (it measures ~1e-28 with the slack removed),
+    ///     while a TILTED quad at the origin does:
+    ///     `a_floor_z_the_module_just_reported_always_has_a_floor_under_it`
+    ///     goes RED at 958/1369 in its origin regime under exactly this wrap. What
+    ///     matters is whether the floor z handed back was RECONSTRUCTED off-plane: on an axis-aligned
+    ///     quad the interpolated z is the plane's z exactly, so a ray from it never starts inside the
+    ///     solid. `pool()` is one axis-aligned quad, so it structurally cannot exhibit the defect this
+    ///     PR fixes — which is why the corpus test and the tilted fixtures exist and why this test is
+    ///     the `dt`-universal, not the reproduction.
+    ///   * epsilon restored in `nearest_hit_t` ONLY → **GREEN**. Correct and worth recording: the
+    ///     controller never routes through the `_t` scan, so a fix applied to only that one would
+    ///     have shipped with this test still passing.
+    #[test]
+    fn a_driven_swim_descent_never_passes_the_pool_floor_at_any_dt() {
+        let c = pool();
+        let mut worst = (f32::MAX, 0.0f32, 0.0f32, 0.0f32); // (z, dt, eps, vspeed)
+        for &dt in &[1.0 / 60.0, 0.016, 0.0161, 0.017, 0.02, 0.033, 0.05, 0.1, 0.25, 0.5, 1.0] {
+            for &eps in &[0.0f32, 1e-6, 1e-4, 3e-4, 5e-4, 1e-3, 2.5e-3, 9e-3, 0.05, 0.5] {
+                for &vspeed in &[-35.0f32, -10.0, -1.0, -0.1] {
+                    let mut ctrl = CharacterController::new([0.0, 0.0, POOL_FLOOR_Z + eps]);
+                    for _ in 0..300 {
+                        ctrl.step(dive(vspeed), dt, &c);
+                        if ctrl.pos[2] < worst.0 { worst = (ctrl.pos[2], dt, eps, vspeed); }
+                    }
+                }
+            }
+        }
+        assert!(worst.0 >= POOL_FLOOR_Z - 1e-3,
+            "a driven swim descent reached z={} (floor {POOL_FLOOR_Z}) at dt={} eps={} vspeed={} — \
+             the pool bottom must not be permeable, and must not depend on the frame time",
+            worst.0, worst.1, worst.2, worst.3);
+    }
+
+    /// **The short-ray hole, closed at its source (#855 round 2).** `Collision::nearest_hit` used
+    /// to return `None` unconditionally for a ray whose squared length was under `1e-9` — `|want| <
+    /// ~3.16e-5` — so a small driven `wish_vspeed` produced a descent the sweep did not test *at
+    /// all*, whatever its acceptance window was. That is reachable: `want = wish_vspeed · dt`, and
+    /// 0.001 u/s at 60 Hz is `1.67e-5`.
+    ///
+    /// Round 1 shipped a second, column-based clamp to cover it. Round 2 removed the cause instead:
+    /// all three scans now share `collision::MIN_RAY_LEN` (`1e-6`, linear, world units), so the
+    /// sweep answers here too and the clamp was deleted. The first assertion below is the pin on
+    /// that — it is the exact case that used to return `None`.
+    ///
+    /// MUTATION-CHECK, RUN: restoring `nearest_hit`'s `|dir|² < 1e-9` guard → **RED** on the first
+    /// assertion. Restoring `nearest_hit_t`'s `|dir|² < 1e-6` guard → GREEN here (wrong scan) but
+    /// **RED** on `the_three_scans_agree_on_short_segments` in `collision.rs`.
+    #[test]
+    fn a_swim_descent_shorter_than_the_old_sweep_would_answer_is_still_floor_bounded() {
+        let c = pool();
+        // 0.001 u/s at 60 Hz ⇒ want ≈ 1.67e-5: under the OLD 1e-9 squared-length guard, above
+        // MIN_RAY_LEN. This ray is the whole reason the guards had to be reconciled.
+        let want = 0.001 * (1.0 / 60.0);
+        assert!(want * want < 1e-9 && want > eqoxide_nav::collision::MIN_RAY_LEN,
+            "positive control: this ray is shorter than the OLD sweep would answer, longer than MIN_RAY_LEN");
+        assert!(c.nearest_hit([0.0, 0.0, POOL_FLOOR_Z], [0.0, 0.0, POOL_FLOOR_Z - want]).is_some(),
+            "the sweep must answer a ray this short with the floor flush at its origin — it is what \
+             the deleted clamp used to cover");
+
+        let mut ctrl = CharacterController::new([0.0, 0.0, POOL_FLOOR_Z + 1e-6]);
+        let mut lowest = f32::MAX;
+        for _ in 0..2000 { ctrl.step(dive(-0.001), 1.0 / 60.0, &c); lowest = lowest.min(ctrl.pos[2]); }
+        assert!(lowest >= POOL_FLOOR_Z - 1e-3,
+            "a descent below the OLD sweep's answerable length must still be floor-bounded: \
+             reached z={lowest} under floor {POOL_FLOOR_Z}");
+    }
+
+    /// Negative control for the two tests above: the floor bound must not have welded the swimmer to
+    /// the bottom. Started well ABOVE it, the same driven dive still descends — so a GREEN result
+    /// there means "stopped at the floor", not "never moved".
+    #[test]
+    fn the_floor_bound_does_not_stop_a_swim_descent_that_has_water_below_it() {
+        let c = pool();
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        for _ in 0..60 { ctrl.step(dive(-10.0), 1.0 / 60.0, &c); }
+        assert!(ctrl.pos[2] < -8.0, "the dive must actually descend in open water, got z={}", ctrl.pos[2]);
+        assert!(ctrl.pos[2] >= POOL_FLOOR_Z - 1e-3, "…and still not pass the floor, got z={}", ctrl.pos[2]);
+    }
+
+    /// **#855 — THE REAL-GEOMETRY CONTROL.** Round-1 review measured that the synthetic pool above,
+    /// green throughout, sat on top of 698 fall-throughs in 4116 driven descents on real baked
+    /// geometry (PR comment 5200310297, "this PR" row). This is that corpus, kept as a test so the
+    /// number can be re-taken rather than quoted.
+    ///
+    /// It is a control for TWO things the synthetic pool cannot supply, and only the second is
+    /// about coordinates. First, real floors are tilted, adjacent and re-triangulated, so a floor-z
+    /// query returns a reconstructed `f32` that lands either side of the plane — the mechanism
+    /// `collision::contact_tol` documents, which fires at the origin too. Second, real coordinates
+    /// are in the thousands, which sets how coarse that reconstruction is. Round-1 review proposed
+    /// the coordinate as the whole story; measurement says it is the multiplier, not the cause (see
+    /// `collision::contact_tol`, and the three-regime table on
+    /// `collision::tests::a_floor_z_the_module_just_reported_always_has_a_floor_under_it`).
+    ///
+    /// This drives the same dive against baked zone geometry with the zone's real `.wtr` region
+    /// map: sample columns whose floor is genuinely submerged, place the feet at a sweep of small
+    /// offsets above the floor `Collision` itself reports for that column, dive at the 35 u/s cap,
+    /// and count the runs that end more than 0.5 u **below their own starting floor** without
+    /// drifting more than 0.25 u horizontally — i.e. went THROUGH, rather than off an edge.
+    ///
+    /// `#[ignore]`d and env-gated because the baked assets are a local cache, not repo content.
+    /// Set `EQOXIDE_ZONE_ASSETS` to a directory holding `<zone>.glb` and `maps/water/<zone>.wtr`;
+    /// optionally `EQOXIDE_CORPUS_ZONES` (comma-separated) and `EQOXIDE_CORPUS_COLUMNS`.
+    /// Measured results for this corpus are recorded on PR #866; re-take them, do not quote them
+    /// from here, since the corpus depends on which zones the runner has baked.
+    #[test]
+    #[ignore = "real-geometry corpus: set $EQOXIDE_ZONE_ASSETS to a local baked-asset models dir"]
+    fn a_driven_swim_descent_never_passes_a_real_zone_floor() {
+        let root = std::path::PathBuf::from(std::env::var("EQOXIDE_ZONE_ASSETS").expect(
+            "set EQOXIDE_ZONE_ASSETS to a dir holding <zone>.glb and maps/water/<zone>.wtr"));
+        let zones = std::env::var("EQOXIDE_CORPUS_ZONES").unwrap_or_else(|_| {
+            "tox,qeynos,qeynos2,erudnext,oasis,lakerathe,everfrost,blackburrow,\
+             butcher,ecommons,freportn,gfaydark,innothule,misty".into()
+        });
+        let per_zone: usize = std::env::var("EQOXIDE_CORPUS_COLUMNS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+
+        let offsets = [0.0f32, 1e-5, 1e-4, 5e-4, 0.01, SKIN];
+        let dts = [1.0f32 / 60.0, 0.05];
+        let mut runs = 0usize;
+        let mut through = 0usize;
+        let mut by_offset = [0usize; 6];
+        let mut cols_used = 0usize;
+        let mut zones_used = 0usize;
+        let mut worst = (0.0f32, String::new(), 0.0f32, 0.0f32, [0.0f32; 3]);
+
+        for zone in zones.split(',').map(str::trim).filter(|z| !z.is_empty()) {
+            let glb = root.join(format!("{zone}.glb"));
+            let Ok(za) = ZoneAssets::from_glb(&glb) else { continue };
+            let Ok(w) = crate::region_map::RegionMap::try_load(&root.join("maps").join("water"), zone)
+                else { continue };
+            let mut c = Collision::build(&za, 32.0);
+            c.set_water(Some(std::sync::Arc::new(w)));
+
+            // Candidate columns from the terrain vertices themselves (libeq pos = [north, height,
+            // east]), deduped onto an 8 u grid so we sample places rather than triangles.
+            zones_used += 1;
+            let mut seen = std::collections::HashSet::new();
+            let mut picked = 0usize;
+            'cols: for m in za.terrain.iter() {
+                for p in m.positions.iter().step_by(17) {
+                    let (e, n) = (p[2], p[0]);
+                    if !seen.insert(((e / 8.0) as i32, (n / 8.0) as i32)) { continue; }
+                    let Some(fz) = c.ground_below(e, n, p[1] + 2.0, 400.0) else { continue };
+                    if !c.in_water([e, n, fz + 0.5]) { continue }
+                    let Some(surf) = c.water_surface([e, n, fz + 0.5]) else { continue };
+                    if surf < fz + 4.0 { continue } // need real depth, not a puddle
+                    cols_used += 1;
+                    picked += 1;
+                    for (oi, &off) in offsets.iter().enumerate() {
+                        for &dt in dts.iter() {
+                            runs += 1;
+                            let mut ctrl = CharacterController::new([e, n, fz + off]);
+                            for _ in 0..200 {
+                                ctrl.step(dive(-35.0), dt, &c);
+                                if ctrl.pos[2] < fz - 100.0 { break; } // runaway: depth is the story
+                            }
+                            let drift = ((ctrl.pos[0] - e).powi(2) + (ctrl.pos[1] - n).powi(2)).sqrt();
+                            let depth = fz - ctrl.pos[2];
+                            if drift <= 0.25 && depth > 0.5 {
+                                through += 1;
+                                by_offset[oi] += 1;
+                                if depth > worst.0 {
+                                    worst = (depth, zone.to_string(), dt, off, [e, n, fz]);
+                                }
+                            }
+                        }
+                    }
+                    if picked >= per_zone { break 'cols; }
+                }
+            }
+        }
+
+        // Printed on SUCCESS too, so the corpus this run actually covered is re-takeable with
+        // `-- --ignored --nocapture` rather than quoted from a doc (the assets are a local cache,
+        // so the size is a property of the runner, not of this branch).
+        println!("#855 corpus: {zones_used} zones, {cols_used} submerged columns, {runs} runs, \
+                  {through} through the floor");
+        assert!(runs > 0, "no corpus: EQOXIDE_ZONE_ASSETS found no zone with a submerged floor \
+                           (checked {zones}) — this test cannot pass vacuously");
+        assert_eq!(through, 0,
+            "{through}/{runs} driven swim descents over {cols_used} real submerged columns ended \
+             below their own floor; by start-offset {offsets:?} = {by_offset:?}; worst {:.3} u \
+             below floor in {} at dt={} offset={} col={:?}",
+            worst.0, worst.1, worst.2, worst.3, worst.4);
     }
 
     #[test]
