@@ -513,8 +513,10 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
             }
             other => panic!(
                 "a base map with a present-but-unreadable `_2` layer must reach the frame as \
-                 Some(Err(LayerUnreadable(\"_2\", _))), got {other:?} — `Some(Ok(_))` here is #873 \
-                 itself: the map is kept, the reason is gone, and the HUD goes blank saying nothing"),
+                 Some(Err(LayerUnreadable(\"_2\", _))), got {other:?}. Either wrong answer is #873: \
+                 `Some(Ok(_))` means the map was kept and the reason silently dropped, and `None` \
+                 means a load that DID run is reported as never attempted. Both end the same way — \
+                 the minimap goes blank and says nothing about why"),
         }
 
         // (b) An unreadable BASE file (a directory in its place) — the other defect cause.
