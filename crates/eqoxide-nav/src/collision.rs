@@ -747,8 +747,13 @@ pub const NAV_AGENT_HEIGHT: f32 = crate::traversability::PLAYER_BODY.agent_heigh
 /// cliff, i.e. a value known to let real bodies through real floors — is RUN, and
 /// `-p eqoxide-nav --lib` goes **RED**: `16/1369` columns, worst blind band `3.1069e-6`, at the
 /// last case of `tests::a_floor_z_the_module_just_reported_always_has_a_floor_under_it`. That case
-/// is the pin described in the next paragraph, and it is the only thing standing between this
-/// constant and a silent lowering.
+/// is the pin described below under "**A narrower, CI-runnable pin does exist now**", and it is
+/// the only thing in a DEFAULT run standing between this constant and a silent lowering (the
+/// `#[ignore]`d corpus test also catches it, but nothing runs it) — MEASURED, not inferred:
+/// at `6`, `cargo test --workspace --lib --no-fail-fast` fails in `eqoxide-nav` and **nowhere
+/// else**, all eleven other crates green (#876 review). Wrapping that one case in `if false` at
+/// `6` returns the whole suite to GREEN, so it is the case doing the catching and not a
+/// pre-existing assertion.
 ///
 /// **This paragraph used to say the opposite, and the history is the point.** Before #866 round 2
 /// added that case, dropping to `6` left `-p eqoxide-nav --lib` and `-p eqoxide --lib` both GREEN,
@@ -757,10 +762,10 @@ pub const NAV_AGENT_HEIGHT: f32 = crate::traversability::PLAYER_BODY.agent_heigh
 /// constant up to that point, it could have been lowered to a broken value and nothing in CI would
 /// have said so. Do not read the RED above as "this was always guarded".
 ///
-/// Two limits on that RED, so it is not over-read. It is measured for `-p eqoxide-nav --lib`;
-/// `-p eqoxide --lib` was **not** re-measured after the pin landed, and the pre-pin GREEN is the
-/// last figure taken for it. And the pin's own cliff sits between `6` and `12`, not at this doc's
-/// corpus cliff of `7` — see the next paragraph.
+/// One limit on that RED, so it is not over-read: the pin's own cliff sits between `6` and `12`,
+/// not at this doc's corpus cliff of `7` — see the next paragraph. And note the catch is
+/// **local to this crate**: `-p eqoxide --lib` is still GREEN at `6` (re-measured after the pin
+/// landed, #876 review), so the root crate's suite does not guard this constant and never did.
 ///
 /// **A narrower, CI-runnable pin does exist now** (`#866` round-2 review, PR comment 5201986822
 /// §5): the last case in
