@@ -743,13 +743,24 @@ pub const NAV_AGENT_HEIGHT: f32 = crate::traversability::PLAYER_BODY.agent_heigh
 /// diagnosed; it is disclosed so a re-runner who counts 21 is not misled by a "20" here, and it is
 /// NOT counted as evidence for this constant.)
 ///
-/// **What pins this number in CI, stated because the answer is "almost nothing".** Dropping the
-/// constant to `6` — one ULP below the measured cliff, i.e. a value known to let real bodies through
-/// real floors — was RUN, and `-p eqoxide-nav --lib` and `-p eqoxide --lib` are both **GREEN**. The
-/// only test that goes RED is the corpus one, which is `#[ignore]`d and needs `EQOXIDE_ZONE_ASSETS`.
-/// So on a default `cargo test` this constant may be lowered to a broken value and nothing will say
-/// so. That is a live coverage hole, not a resolved one; the low side of this constant is guarded by
-/// a test the default suite does not run.
+/// **What pins this number in CI.** Dropping the constant to `6` — one ULP below the measured
+/// cliff, i.e. a value known to let real bodies through real floors — is RUN, and
+/// `-p eqoxide-nav --lib` goes **RED**: `16/1369` columns, worst blind band `3.1069e-6`, at the
+/// last case of `tests::a_floor_z_the_module_just_reported_always_has_a_floor_under_it`. That case
+/// is the pin described in the next paragraph, and it is the only thing standing between this
+/// constant and a silent lowering.
+///
+/// **This paragraph used to say the opposite, and the history is the point.** Before #866 round 2
+/// added that case, dropping to `6` left `-p eqoxide-nav --lib` and `-p eqoxide --lib` both GREEN,
+/// and the only test that went RED was the corpus one — which is `#[ignore]`d and needs
+/// `EQOXIDE_ZONE_ASSETS`, so a default `cargo test` never runs it. For the whole life of this
+/// constant up to that point, it could have been lowered to a broken value and nothing in CI would
+/// have said so. Do not read the RED above as "this was always guarded".
+///
+/// Two limits on that RED, so it is not over-read. It is measured for `-p eqoxide-nav --lib`;
+/// `-p eqoxide --lib` was **not** re-measured after the pin landed, and the pre-pin GREEN is the
+/// last figure taken for it. And the pin's own cliff sits between `6` and `12`, not at this doc's
+/// corpus cliff of `7` — see the next paragraph.
 ///
 /// **A narrower, CI-runnable pin does exist now** (`#866` round-2 review, PR comment 5201986822
 /// §5): the last case in
