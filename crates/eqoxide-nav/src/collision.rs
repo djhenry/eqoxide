@@ -176,6 +176,36 @@ pub struct Hit {
 ///
 /// It is the cap for the ENTIRE plan (`plan_path` makes up to 13 A* calls sharing one `PlanCtx`
 /// budget), so the plan is bounded by one budget, not one-per-call (#340).
+///
+/// **THE DECISION (#856): stays at 8,000,000 — Option 1, not Option 2.** #856 existed to decide
+/// whether this constant should move now that the production-config margin over `butcher` is
+/// measured at 1.75×, not the ~7× a mapless corpus used to claim. It stays put, for three reasons:
+///
+/// 1. **The failure mode does not call for a pre-emptive raise.** Exceeding the cap costs precision
+///    (`Exhausted(NodeCap)`, "I don't know"), never correctness (never a false
+///    `Unreachable(SearchClosed)`, "no route") — see the two numbered reasons above. There is no
+///    open honesty bug here that raising the number would fix.
+/// 2. **Raising it has a cost nobody has measured.** `MAX_NODES` is also the runaway bound this
+///    whole doc opens with — a legitimate whole-zone close on `butcher` already runs **10h24m** for
+///    the full corpus at the CURRENT cap in a `dev` build. Moving the cap moves that bound too, and
+///    by how much wall time is unmeasured. Spending an unmeasured cost to buy margin against a risk
+///    whose size is *also* unmeasured (next point) is not a considered change — it is a guess with
+///    the shape of a decision.
+/// 3. **1.75× is a fact about `butcher`, not about RoF2.** #856 asked for two things: measure the
+///    production-config figure (done, #859), and widen the corpus with the wet Kunark/Velious ocean
+///    and lake zones most likely to stress the water edge families this cap gates (**not done** —
+///    no such zone is baked and measured as of this writing). Picking a raised target before that
+///    second half lands would be sizing the cap to satisfy a margin nobody has measured the need
+///    for.
+///
+/// So margin erosion stays a **watched** risk rather than an acted-on one, caught two ways: the
+/// `#[ignore]`d `worst_case_reachable_component`'s `assert!(worst < MAX_NODES)` (a truncation
+/// detector — needs baked zone glbs and ~10h) and the fast, always-on
+/// `max_nodes_headroom_claim_stays_true` (recomputes the 57.3%/1.75× figures above from
+/// `MEASURED_WORST_BUTCHER_PRODUCTION` and this constant on every `cargo test`, so those two numbers
+/// cannot go stale the way the "~7×" claim this issue replaced did, without a test going red first).
+/// If the corpus-widening half of #856 lands a wetter zone with a materially thinner margin, THAT
+/// measurement is what should reopen this decision — butcher's own number is settled.
 pub const MAX_NODES: usize = 8_000_000;
 
 /// Deterministic node cap for the FINE local tier (#394).
@@ -5950,6 +5980,9 @@ mod tests {
             a_face_just_past_the_far_end_is_caught_on_the_next_frame,
             a_ray_near_the_origin_still_finds_a_floor_whose_vertices_are_far_away,
             line_of_sight_does_not_see_through_a_wall_it_is_almost_touching,
+            // #856: the fast headroom-claim drift pin, cited by both `MAX_NODES`' doc comment and
+            // `MEASURED_WORST_BUTCHER_PRODUCTION`'s.
+            max_nodes_headroom_claim_stays_true,
         ];
     }
 
@@ -8186,6 +8219,56 @@ mod tests {
              WORST number above is only over the zones that were actually measured.",
             cover.measured_zones(), cover.attempted_zones(),
             cover.unmeasured_zones(), cover.skipped_zones(), cover.unaccounted_zones());
+    }
+
+    /// The production-config `butcher` whole-zone reachable-component close, MEASURED in #859:
+    /// `dev` profile, `ZONES=butcher` corpus (`worst_case_reachable_component` above), full
+    /// 120-start × 6-probe workload, 10h24m, exit 0 — **57.3% of `MAX_NODES`, 1.75× headroom**. An
+    /// independent three-zone run (profile never captured) measured 4,583,748 for the same zone,
+    /// 37 nodes apart for reasons tracked and NOT resolved as #860; both figures round to the same
+    /// 57.3%/1.75×, so this constant (the run with a captured compile sentinel) is the one pinned.
+    ///
+    /// This is **not** re-derived by any fast test — the run that measures it takes ~10h and needs
+    /// baked zone glbs. What runs on every `cargo test --lib` is `max_nodes_headroom_claim_stays_true`
+    /// below, which checks this constant and `MAX_NODES` have not drifted apart from what `MAX_NODES`'
+    /// doc comment states about them.
+    const MEASURED_WORST_BUTCHER_PRODUCTION: usize = 4_583_785;
+
+    /// **PIN for #856.** #856 existed because a headroom figure was quoted in a doc comment
+    /// (`MAX_NODES`, "~7× headroom") that was true of a grid the client never builds — a false claim
+    /// that sat in a tracked file, contested by nobody, until someone re-measured it. Nothing before
+    /// this test stopped the REPLACEMENT figures (57.3%, 1.75×) from going stale the same way the
+    /// moment either `MEASURED_WORST_BUTCHER_PRODUCTION` or `MAX_NODES` changes without the other:
+    /// `worst_case_reachable_component` that actually measures the real number is `#[ignore]`d and
+    /// takes ~10h, so nothing in a normal `cargo test` run would catch that drift.
+    ///
+    /// This test is the fast substitute: it recomputes the percentage and headroom from the two
+    /// constants and checks them against the figures `MAX_NODES`' doc comment states in prose. It
+    /// does NOT re-derive `MEASURED_WORST_BUTCHER_PRODUCTION` itself (only the ~10h corpus run can),
+    /// so it is a drift pin, not a correctness proof — but a drift pin is exactly what was missing.
+    ///
+    /// Mutation-checked both ways (see the #856 PR description for the transcript): edit either
+    /// constant and this goes red; put both back and it's green.
+    #[test]
+    fn max_nodes_headroom_claim_stays_true() {
+        let measured = MEASURED_WORST_BUTCHER_PRODUCTION;
+        let pct = measured as f64 * 100.0 / MAX_NODES as f64;
+        let headroom = MAX_NODES as f64 / measured as f64;
+        assert!((pct - 57.3).abs() < 0.05,
+            "MAX_NODES' doc comment states butcher consumes 57.3% of the cap; recomputed {pct:.4}% \
+             from MEASURED_WORST_BUTCHER_PRODUCTION={measured} and MAX_NODES={}. If you changed \
+             either constant deliberately, update the doc comment's prose (and this literal) to \
+             match — do not just widen this tolerance.", MAX_NODES);
+        assert!((headroom - 1.75).abs() < 0.005,
+            "MAX_NODES' doc comment states 1.75x headroom over butcher; recomputed {headroom:.4}x \
+             from the same two constants. Update the doc comment before changing this assertion.");
+        // A truncation-shaped regression, cheap to catch without the 10h corpus run: if MAX_NODES
+        // ever drops to or below the measured production-config butcher close, a legitimate
+        // whole-zone SearchClosed on butcher would truncate into a lossy Exhausted(NodeCap).
+        assert!(measured < MAX_NODES,
+            "MAX_NODES ({}) must stay above the measured production-config butcher close ({measured}) \
+             or a legitimate whole-zone close on butcher truncates into Exhausted(NodeCap) instead of \
+             Unreachable(SearchClosed).", MAX_NODES);
     }
 
     /// **THE #382 CORPUS MEASUREMENT.** Fine-tier route success and cost, OLD (inline, net-thread) vs
