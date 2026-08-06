@@ -120,8 +120,11 @@ pub struct UiCtx<'a> {
     ///
     /// A zone that simply ships no map is NOT a defect and arrives here as `None` (#877 round 2):
     /// the caller filters that case out (`hud_zone_map_view` in the client's `app.rs`), because
-    /// 27 zones in the shipped map pack are in exactly that ordinary state and painting a
-    /// failure-shaped line over all of them would be a false alarm. This field being `Some` means
+    /// **at least 27** zones in the shipped map pack are in exactly that ordinary state and painting
+    /// a failure-shaped line over all of them would be a false alarm. ("27" is exact only under the
+    /// measurement behind it — of the 497 zones shipping a `water/<zone>.wtr`, exactly 27 have no
+    /// base `<zone>.txt`; zones shipping neither were not counted. See `hud_zone_map_view`.) This
+    /// field being `Some` means
     /// something is genuinely broken; drawing it must not be softened into "no map here".
     pub zone_map_error: Option<&'a str>,
     pub minimap_zoom: &'a mut f32,
@@ -399,7 +402,7 @@ mod tests {
         // #873: a `zone_map_error` with no `zone_map` (map load failed) must draw without panicking
         // — this is the map window's new "map data unavailable: …" text path, otherwise unexercised
         // by every other `draw_all` call in this test (all pass `None, None`). Crash-safety ONLY;
-        // `zone_map_error_reaches_the_screen_873` below is what proves it renders anything.
+        // `zone_map_error_reaches_the_frames_shape_list_873` below is what proves it renders anything.
         let ctx = egui::Context::default();
         let _ = ctx.run(Default::default(), |ctx| {
             ui.draw_all(
@@ -429,7 +432,7 @@ mod tests {
         }
     }
 
-    /// #873, end-to-end (PR #877 round 2, BLOCKING 2): the map-load reason must reach the SCREEN.
+    /// #873 (PR #877 round 2, BLOCKING 2): the map-load reason must reach the frame's SHAPE LIST.
     ///
     /// `all_windows_draw_headless` above only proves the new branch doesn't panic — measured by
     /// #877's reviewer: with the entire `else if let Some(err) = cx.zone_map_error { … }` block in
@@ -439,15 +442,25 @@ mod tests {
     /// obliged to call, plus a smoke test that cannot see what it drew.
     ///
     /// This closes the rendering half: it asserts the reason STRING is in the frame's shape list, so
-    /// deleting the render branch fails it. The threading half is closed structurally instead — the
-    /// client now carries the map-load `Result` whole (`App::zone_map`), so the `.ok()` revert no
-    /// longer typechecks. See `hud_zone_map_view` in `src/app.rs`.
+    /// deleting *or wrapping out* the render branch fails it (both measured, #877 round 2). The
+    /// threading half is pinned separately — `zone_map::ZoneMapLoad` makes "keep the map, drop the
+    /// reason" un-writable outside its own module, and
+    /// `zone_map_load_attempt_keeps_both_halves_873` pins the production loader by execution.
+    ///
+    /// **The bound of this test, stated rather than left to be inferred** (#877 round 3, N2). It
+    /// measures exactly one thing: the string was laid out into a `Shape::Text` galley in
+    /// `FullOutput.shapes`. It does NOT establish that the text is at a sensible position, is a
+    /// legible size, survives clipping or window occlusion, or that the map window is even visible
+    /// to a user — the frame is headless, the shapes are untessellated, and every non-transient
+    /// window is force-opened above. The test is named for the shape list, not for the screen,
+    /// because "reaches the screen" is a claim only a photographed live client could carry.
     ///
     /// It also pins the OTHER half of the #877 design call: `zone_map_error: None` — the ordinary
-    /// no-map-for-this-zone state, 27 zones in the shipped pack — must put NO unavailability text on
-    /// screen. A false alarm on an ordinary state is as dishonest as hiding a real failure.
+    /// no-map-for-this-zone state, at least 27 zones in the shipped pack (see `UiCtx::zone_map_error`
+    /// for why that figure is a floor) — must put NO unavailability text on screen. A false alarm on
+    /// an ordinary state is as dishonest as hiding a real failure.
     #[test]
-    fn zone_map_error_reaches_the_screen_873() {
+    fn zone_map_error_reaches_the_frames_shape_list_873() {
         let mut ui = UiState::new("__uiprobe__", None);
         let acts = actions();
         let spells = eqoxide_core::spells::SpellDb::empty();
@@ -489,8 +502,8 @@ mod tests {
         let without_err = frame_text(&mut ui, None);
         assert!(!without_err.contains("map data unavailable"),
             "a zone with no map-load failure at all still painted an unavailability line — that is \
-             a false alarm on an ordinary state (27 zones in the shipped map pack simply have no \
-             .txt map), and a warning that fires on ordinary states stops being read. Text found \
+             a false alarm on an ordinary state (at least 27 zones in the shipped map pack simply \
+             have no .txt map), and a warning that fires on ordinary states stops being read. Text found \
              in the frame: {without_err:?}");
 
         let _ = std::fs::remove_file(eqoxide_core::config::config_dir().join("ui_layout___uiprobe__.json"));

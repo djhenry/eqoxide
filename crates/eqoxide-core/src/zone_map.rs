@@ -98,6 +98,53 @@ impl std::fmt::Display for ZoneMapLoadError {
     }
 }
 
+/// The outcome of ONE attempt to load a zone's map, carried from a loader thread to the frame that
+/// renders it (#873, #877 round 3). `not_attempted()` = no read was tried at all; otherwise the map,
+/// or why there isn't one.
+///
+/// **Why a newtype instead of a plain `Option<Result<ZoneMap, ZoneMapLoadError>>`.** #873 was the
+/// client keeping a loaded map and silently dropping the load's failure reason — the HUD went
+/// wordlessly blank and nothing said why. #877 round 1 fixed that by pairing the two fields; round 2
+/// replaced the pair with a single `Result`, and the round-2 review then *measured* that the fix was
+/// still one method call away from being undone: `try_load(..).ok().map(Ok)` at the production call
+/// site typechecked against `Option<Result<..>>` (the error type is inferred from the field), kept
+/// the map, dropped the reason, and left the whole workspace green.
+///
+/// This type removes that shape. The field is private to this module and **there is no constructor
+/// that accepts a [`ZoneMap`]** — [`ZoneMapLoad::attempt`] is the only way a loaded map gets in, and
+/// it cannot produce one without also carrying whatever the load returned. So outside this module,
+/// "keep the map, discard the reason" is not expressible: `.ok()`, `.ok().map(Ok)` and every other
+/// half-dropping shape fail to compile against `ZoneMapLoad`.
+///
+/// **What this does NOT prevent** (stated because the round-2 defect was an overclaim of exactly
+/// this kind): a caller can still throw the whole outcome away and substitute
+/// [`ZoneMapLoad::not_attempted`]. That loses the map as well as the reason, so it is a visibly
+/// different edit with a visibly different result on screen — but it is not a compile error. And
+/// inside this module the shape is of course still writable, which is why
+/// `zone_map_load_attempt_keeps_both_halves_873` pins [`ZoneMapLoad::attempt`] by execution rather
+/// than by type.
+#[derive(Debug)]
+pub struct ZoneMapLoad(Option<Result<ZoneMap, ZoneMapLoadError>>);
+
+impl ZoneMapLoad {
+    /// Attempt the load. **The one production path that puts a map into a `ZoneMapLoad`** — and,
+    /// because it is a named function taking only a maps directory and a zone name, the one a test
+    /// can drive. The round-2 review's finding was that the equivalent two lines lived inline in a
+    /// spawned thread closure where nothing could reach them; same lesson, and same remedy, as
+    /// `build_zone_collision` in `src/app.rs` (#821 review N2).
+    pub fn attempt(maps_dir: &Path, zone_name: &str) -> Self {
+        Self(Some(ZoneMap::try_load(maps_dir, zone_name)))
+    }
+
+    /// No load was attempted at all — not a success and not a failure. Used by the zone-loader's
+    /// panic backstop, and on the zone-change transition that drops the previous zone's map so a
+    /// stale sentence cannot outlive the zone it described (#877 round 2, finding 5).
+    pub fn not_attempted() -> Self { Self(None) }
+
+    /// Borrow the outcome for rendering. `None` = nothing was attempted.
+    pub fn outcome(&self) -> Option<&Result<ZoneMap, ZoneMapLoadError>> { self.0.as_ref() }
+}
+
 impl ZoneMap {
     /// Load an EQ map, **keeping the failure** ([`ZoneMapLoadError`]) instead of collapsing it to a
     /// bare absence (#816). This is the ONLY loader — the lossy `Option`-returning `load` this used
@@ -431,6 +478,69 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
         // No z_1/_2/_3.txt written — genuinely absent, not present-but-broken.
         let zm = ZoneMap::try_load(dir.path(), "z").expect("an absent layer must not fail the load");
         assert_eq!(zm.labels.len(), 1);
+    }
+
+    /// #873 / #877 round 3 (measured surviving mutant, agent-honesty): **the production path that
+    /// produces the HUD's map-load outcome must never keep the map and drop the reason.**
+    ///
+    /// This is the pin the round-2 review proved was missing. Round 2 asserted, in a doc comment,
+    /// that the `Option<Result<..>>` field made the discard untypeable; the reviewer applied
+    /// `ZoneMap::try_load(..).ok().map(Ok)` at the one production call site, it compiled, and the
+    /// whole workspace stayed green at byte-identical figures — because the two lines lived inline
+    /// in a spawned thread closure that no test could call. [`ZoneMapLoad::attempt`] is those two
+    /// lines as a named function, and this test is what a mutation of them now has to get past.
+    ///
+    /// The assertions are on the OUTCOME, not on the wrapper's shape, so the `.ok().map(Ok)` shape
+    /// fails here on the two broken causes rather than merely being un-writable one module over.
+    ///
+    /// **Bound:** this pins `attempt` itself. It does not reach the single line in `src/app.rs`'s
+    /// loader closure that *calls* `attempt` — that line still sits behind a thread spawn and a GPU
+    /// path, and is disclosed as unpinned where it is written. What the call site can no longer do
+    /// is keep the map while dropping the reason: no constructor on [`ZoneMapLoad`] accepts a
+    /// [`ZoneMap`], so that shape does not compile outside this module (see the type's doc).
+    #[test]
+    fn zone_map_load_attempt_keeps_both_halves_873() {
+        // (a) A present-but-broken detail layer: the base file reads fine, so this is exactly the
+        // shape that tempts a caller to keep the map and drop the reason.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("z.txt"), "L 1,2,0,3,4,0,1,1,1").unwrap();
+        std::fs::create_dir(dir.path().join("z_2.txt")).unwrap();
+        match ZoneMapLoad::attempt(dir.path(), "z").outcome() {
+            Some(Err(e @ ZoneMapLoadError::LayerUnreadable("_2", _))) => {
+                assert!(e.to_string().contains("_2.txt"),
+                    "the reason must survive the production loader AS TEXT — this string is the \
+                     HUD's 'map data unavailable: …' line: {}", e);
+            }
+            other => panic!(
+                "a base map with a present-but-unreadable `_2` layer must reach the frame as \
+                 Some(Err(LayerUnreadable(\"_2\", _))), got {other:?} — `Some(Ok(_))` here is #873 \
+                 itself: the map is kept, the reason is gone, and the HUD goes blank saying nothing"),
+        }
+
+        // (b) An unreadable BASE file (a directory in its place) — the other defect cause.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("z.txt")).unwrap();
+        assert!(matches!(ZoneMapLoad::attempt(dir.path(), "z").outcome(),
+                         Some(Err(ZoneMapLoadError::Unreadable(_)))),
+            "a present-but-unreadable base map must reach the frame as its own cause, not as a \
+             bare absence and not as a silently-empty map");
+
+        // (c) The ordinary absence stays an absence, and (d) a healthy map still arrives. Both are
+        // here so the two assertions above cannot be satisfied by a loader that just always fails.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(ZoneMapLoad::attempt(dir.path(), "z").outcome(),
+                         Some(Err(ZoneMapLoadError::Missing))),
+            "a zone that ships no .txt at all is Missing — 27 zones in the shipped pack are in \
+             exactly this state and must not be reported as a defect");
+        std::fs::write(dir.path().join("z.txt"), "L 1,2,0,3,4,0,1,1,1").unwrap();
+        match ZoneMapLoad::attempt(dir.path(), "z").outcome() {
+            Some(Ok(zm)) => assert_eq!(zm.lines.len(), 1, "the map itself must survive too"),
+            other => panic!("a healthy map must arrive as Some(Ok(_)), got {other:?}"),
+        }
+
+        // (e) And "nothing was tried" stays distinguishable from all four of the above.
+        assert!(ZoneMapLoad::not_attempted().outcome().is_none(),
+            "`not_attempted` must not masquerade as an outcome");
     }
 
     /// Kept (not thrown away as scaffolding) because #816 round-2 review found a prose claim about

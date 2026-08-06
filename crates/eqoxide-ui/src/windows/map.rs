@@ -194,8 +194,10 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         // This branch fires ONLY for a map that is there and broken — a zone that ships no map
         // reaches here with `zone_map_error: None` and keeps the blank canvas it has always had
         // (#877 round 2). The two are different events and must not read the same: calling an
-        // ordinary state an error is the same invariant violation as hiding a real one, and 27 of
-        // the shipped map pack's zones are in that ordinary state.
+        // ordinary state an error is the same invariant violation as hiding a real one, and at
+        // least 27 of the shipped map pack's zones are in that ordinary state (exactly 27 of the
+        // 497 that ship a `water/<zone>.wtr` have no base `<zone>.txt`; zones with neither were not
+        // counted, so 27 is a floor — see `hud_zone_map_view` in the client's `app.rs`).
         painter.text(
             rect.min + Vec2::new(6.0, 6.0),
             egui::Align2::LEFT_TOP,
