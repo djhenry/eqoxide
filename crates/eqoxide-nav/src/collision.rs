@@ -743,13 +743,33 @@ pub const NAV_AGENT_HEIGHT: f32 = crate::traversability::PLAYER_BODY.agent_heigh
 /// diagnosed; it is disclosed so a re-runner who counts 21 is not misled by a "20" here, and it is
 /// NOT counted as evidence for this constant.)
 ///
-/// **What pins this number in CI, stated because the answer is "almost nothing".** Dropping the
-/// constant to `6` — one ULP below the measured cliff, i.e. a value known to let real bodies through
-/// real floors — was RUN, and `-p eqoxide-nav --lib` and `-p eqoxide --lib` are both **GREEN**. The
-/// only test that goes RED is the corpus one, which is `#[ignore]`d and needs `EQOXIDE_ZONE_ASSETS`.
-/// So on a default `cargo test` this constant may be lowered to a broken value and nothing will say
-/// so. That is a live coverage hole, not a resolved one; the low side of this constant is guarded by
-/// a test the default suite does not run.
+/// **What pins this number in CI.** Dropping the constant to `6` — one ULP below the measured
+/// cliff, i.e. a value known to let real bodies through real floors — is RUN, and
+/// `-p eqoxide-nav --lib` goes **RED**: `16/1369` columns, worst blind band `3.1069e-6`, at the
+/// last case of `tests::a_floor_z_the_module_just_reported_always_has_a_floor_under_it`. That case
+/// is the pin described below under "**A narrower, CI-runnable pin does exist now**", and it is
+/// the only thing in a DEFAULT run standing between this constant and a silent lowering (the
+/// `#[ignore]`d corpus test also catches it, but nothing runs it) — MEASURED, not inferred:
+/// at `6`, `cargo test --workspace --lib --no-fail-fast` fails in `eqoxide-nav` and **nowhere
+/// else** — 13 crates run a lib suite, the other 12 are green. Wrapping that one case in
+/// `if false` at `6` returns the whole suite to GREEN, so it is the case doing the catching and
+/// not a pre-existing assertion.
+///
+/// **This paragraph used to say the opposite, and the history is worth being exact about.** Before
+/// #866 round 2 added that case, dropping to `6` left `-p eqoxide-nav --lib` and `-p eqoxide --lib`
+/// both GREEN, and the only test that went RED was the corpus one — which is `#[ignore]`d and needs
+/// `EQOXIDE_ZONE_ASSETS`, so a default `cargo test` never runs it. That unguarded window was real,
+/// but it existed **on #866's branch between review rounds, not on `main`**: this constant and its
+/// pin landed in the same squash commit (`acd0743`), so no commit on `main` has ever carried the
+/// constant without the pin. Checked against the log rather than assumed — `git log -S` for the
+/// constant and for the pin both return exactly `acd0743` (#876 review round 2). Read the RED above
+/// as "guarded from the moment it shipped", and read this paragraph as the reason the guard exists
+/// at all.
+///
+/// One limit on that RED, so it is not over-read: the pin's own cliff sits between `6` and `12`,
+/// not at this doc's corpus cliff of `7` — see the next paragraph. And note the catch is
+/// **local to this crate**: `-p eqoxide --lib` is still GREEN at `6` (re-measured after the pin
+/// landed, #876 review), so the root crate's suite does not guard this constant and never did.
 ///
 /// **A narrower, CI-runnable pin does exist now** (`#866` round-2 review, PR comment 5201986822
 /// §5): the last case in
