@@ -352,10 +352,12 @@ fn nearest_standing_place(col: &Collision, from: [f32; 3], underworld: f32) -> O
     // Probe from the feet, but never look BELOW the underworld: `nearest_floor` returns the nearest
     // floor and nothing else, so a column whose nearest surface is below-world boundary art would
     // answer with that one and be discarded — hiding a perfectly good floor higher up the same
-    // column. That is exactly the shape the #150 guard's caller is in (the body is AT the underworld
-    // and every deck it can see is under it), so clamping the reference height is what makes this
-    // search usable from the guard's arm at all, not a refinement. With the default underworld
-    // (−∞) both values fall back to the plain symmetric band.
+    // column. That is the #712 shape and it is not hypothetical here: the zone whose bake put the
+    // #845 casualty over a void also carries invisible-boundary art ~32 000 u down, which is what
+    // an unclamped probe on those columns would return and then throw away. Without the clamp the
+    // search's answer depends on how deep the below-world art happens to sit. With the default
+    // underworld (−∞) both values fall back to the plain symmetric band, so zones that declare no
+    // underworld are unaffected.
     let ref_z = from[2].max(underworld);
     let down = (ref_z - underworld).max(0.0).min(RESCUE_BAND);
     for &r in &RESCUE_RADII {
@@ -3341,6 +3343,79 @@ mod tests {
              frozen and `player.hold` is the only thing that says so");
         assert_eq!(hold.reason, ControllerHoldReason::EmbeddedNoRecovery);
         assert_eq!(ctrl.pos, start, "nothing to move to, so nothing may move: {:?}", ctrl.pos);
+    }
+
+    /// #845 — **the acceptance predicate, pinned.** `nearest_standing_place` rejects a candidate
+    /// column if it is `is_embedded` or `body_in_water`, and the doc on that function claims those
+    /// two rejections are what stop the search from handing the body straight back to the net
+    /// (#649: "a recovery that is itself embedded is not a recovery").
+    ///
+    /// ⚠️ This test exists because that claim was **measured unpinned**. Wrapping the predicate —
+    /// `if false && (is_embedded(col, q) || body_in_water(col, q)) { continue; }` — left the whole
+    /// suite GREEN at 225/225. Every other #845 test looks only at where the body ENDS UP, and the
+    /// search recovers on the following frame from a bad placement, so the bad placement is
+    /// invisible to a final-position assertion. The fix is to assert on EVERY frame instead.
+    ///
+    /// The zone is built so the two rejected kinds are strictly nearer than the good one:
+    /// an embedded column (a floor wedged between two walls) at radius 16, a submerged column at
+    /// radius 48, and honest dry ground only from radius 160 out.
+    ///
+    /// MUTATION-CHECK (both directions, RUN): wrap the predicate as above and this test fails —
+    /// `frame 14: the body was moved to [16.0, 0.0, 0.0], which the net reads as embedded`, 225
+    /// passed / 1 failed. Restore it and the suite is 226/228 green.
+    ///
+    /// ⚠️ Stated limit of that check: the wrap disables BOTH halves of the predicate at once and
+    /// the embedded decoy is nearer, so the RED above is the `is_embedded` half. The
+    /// `body_in_water` half is covered here by the fixture assertion (the middle column really is
+    /// wet and otherwise acceptable) and by the per-frame `!body_in_water` assertion, but it has
+    /// NOT been shown red by a mutation of its own — that needs a separate run with the water
+    /// decoy moved inside the embedded one.
+    #[test]
+    fn the_last_resort_never_places_a_body_somewhere_the_net_would_take_back_845() {
+        let mut c = col(vec![
+            // r≈16: a floor between two walls — a column with ground that is `is_embedded`.
+            floor(0.0, 14.0, 18.0), wall(15.2, 0.0, 10.0), wall(16.8, 0.0, 10.0),
+            // r≈48: a floor that is under water.
+            floor(0.0, 46.0, 50.0),
+            // r≈160: the only honest standing place in the zone.
+            floor(84.0, 133.0, 400.0),
+        ]);
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::box_below(-100.0, 100.0, 44.0, 52.0, 5.0))));
+
+        // Fixture, stated: the two decoys really are decoys, and the good place really is good.
+        assert!(is_embedded(&c, [16.0, 0.0, 0.0]),
+            "fixture: the near column must be embedded, else the `is_embedded` half is untested");
+        assert!(body_in_water(&c, [48.0, 0.0, 0.0]) && !is_embedded(&c, [48.0, 0.0, 0.0]),
+            "fixture: the middle column must be WET and otherwise fine, else the `body_in_water` \
+             half is untested");
+        assert!(!is_embedded(&c, [160.0, 0.0, 84.0]) && !body_in_water(&c, [160.0, 0.0, 84.0]),
+            "fixture: the far column must be acceptable");
+
+        let mut ctrl = CharacterController::new(VOID_START);
+        ctrl.set_underworld(Some(-222.0));
+        assert!(is_embedded(&c, VOID_START), "fixture: the start is the #845 entry state");
+
+        let mut relocations = 0usize;
+        let mut last = ctrl.pos;
+        for f in 0..90 {
+            ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c);
+            if ctrl.pos == last { continue; }
+            let d = ((ctrl.pos[0] - last[0]).powi(2) + (ctrl.pos[1] - last[1]).powi(2)).sqrt();
+            if d > 32.0 { relocations += 1; } // beyond any push-out radius: a last-resort placement
+            last = ctrl.pos;
+            assert!(!is_embedded(&c, ctrl.pos),
+                "#649/#845 frame {f}: the body was moved to {:?}, which the net reads as embedded \
+                 — a recovery that is itself embedded is not a recovery", ctrl.pos);
+            assert!(!body_in_water(&c, ctrl.pos),
+                "#649/#845 frame {f}: the body was moved into water at {:?}; `Recovery::Grounded` \
+                 promises feet on dry floor and this would make that promise false", ctrl.pos);
+        }
+        assert!(ctrl.hold().is_none(), "the zone HAS a standing place: {:?}", ctrl.hold());
+        assert!((ctrl.pos[2] - 84.0).abs() < GROUND_SNAP_TOL && ctrl.pos[0] >= 133.0,
+            "the body must end on the far honest ground, got {:?}", ctrl.pos);
+        assert_eq!(relocations, 1,
+            "one placement, not a walk across the zone via the decoys (#649); got {relocations}");
     }
 
     /// #845 — a banked position still wins. The ring holds somewhere this body actually STOOD,
