@@ -1287,6 +1287,15 @@ pub type EntityPoses = Arc<Mutex<Roster<EntityPoseView>>>;
 
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /v1/observe/zone_points.
 pub type ZonePoints = Arc<Mutex<Vec<eqoxide_core::game_state::ZonePoint>>>;
+/// Outcome of the most recent attempt to load the current zone's map `.txt` pack for the
+/// client-synthesized `"to "`-label fallback entries `ActionLoop::sync_zone_points` merges into
+/// [`ZonePoints`] (#816). `None` means the last attempt succeeded (or none has run yet this
+/// process — same "null while healthy" convention as `HttpState::net_thread_dead` /
+/// `common_assets_failed`). `Some(e)` means the fallback entries that zone's map WOULD have
+/// contributed are UNKNOWN, not confirmed absent — see [`eqoxide_core::zone_map::ZoneMapLoadError`].
+/// Published only by `sync_zone_points`'s zone-change branch; read by `GET /v1/observe/debug` as
+/// `zone_map_load`.
+pub type ZoneMapLoadShared = Arc<Mutex<Option<eqoxide_core::zone_map::ZoneMapLoadError>>>;
 /// Native Task-system quest log, published from GameState.tasks each tick (GET /v1/observe/quests/log).
 pub type TaskLog = Arc<Mutex<Vec<eqoxide_core::game_state::ActiveTask>>>;
 
@@ -2145,6 +2154,8 @@ pub struct WorldSlots {
     /// `sync_entities` full-replace so it can never go stale independently of the roster.
     entity_poses:     EntityPoses,
     pub zone_points:      ZonePoints,
+    /// #816 — see [`ZoneMapLoadShared`].
+    pub zone_map_load:    ZoneMapLoadShared,
 }
 
 // Hand-written rather than `#[derive(Default)]`: `Roster` deliberately has NO public constructor
@@ -2158,6 +2169,7 @@ impl Default for WorldSlots {
             entity_ids:       Arc::new(Mutex::new(Roster::new())),
             entity_poses:     Arc::new(Mutex::new(Roster::new())),
             zone_points:      Arc::new(Mutex::new(Vec::new())),
+            zone_map_load:    Arc::new(Mutex::new(None)),
         }
     }
 }

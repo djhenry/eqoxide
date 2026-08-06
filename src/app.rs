@@ -870,7 +870,14 @@ impl App {
                 .map(|za| Arc::new(build_zone_collision(za, &maps_dir, &zone_name)));
 
             set_status("Loading minimap…");
-            let zone_map = zone_map::ZoneMap::load(&maps_dir, &zone_name);
+            // #816: `ZoneMap::load` (the lossy `Option` wrapper) is gone — `try_load` names WHY a
+            // load failed. This is the HUD minimap's OWN copy of the map (distinct from the one
+            // `ActionLoop::sync_zone_points` reads for the agent-facing `zone_map_load` disclosure on
+            // `/v1/observe/debug`, see that function's doc): a rendering nicety with no HTTP-observed
+            // claim riding on it, so discarding the failure here with `.ok()` is a visible, explicit
+            // choice rather than a silent one — unlike the deleted `load`, a caller can no longer
+            // reach a discarded failure by simply calling the "normal" API.
+            let zone_map = zone_map::ZoneMap::try_load(&maps_dir, &zone_name).ok();
 
             set_status("Uploading to GPU…");
             publish_load(&pending, load_gen, PendingLoad {
