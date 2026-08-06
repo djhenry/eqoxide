@@ -674,10 +674,18 @@ impl WaterRollup {
 }
 
 impl std::fmt::Display for WaterRollup {
+    /// **#831 (item 2).** The dirty branch below marks itself with `— INCOMPLETE`; this branch used
+    /// to print nothing at all to say the opposite, so a caller printing two rollups side by side
+    /// (the corpus prints `wat-route` and `#423` on the same line) relied on the READER already
+    /// knowing that an absence of `INCOMPLETE` means complete, rather than the line saying so itself.
+    /// `— COMPLETE` closes that gap: every rollup line now states its own completeness. **Note for
+    /// anyone grepping either marker: `"INCOMPLETE".contains("COMPLETE")` is `true` — a naive
+    /// `line.contains("COMPLETE")` check matches BOTH branches. Match the em-dash too
+    /// (`"— COMPLETE"`), which the dirty branch's `"— INCOMPLETE"` never contains as a substring.**
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let zones = self.attempted_zones();
         if self.is_complete() {
-            return write!(f, "{} (over {}/{} zones)", self.total, self.measured_zones, zones);
+            return write!(f, "{} (over {}/{} zones) — COMPLETE", self.total, self.measured_zones, zones);
         }
         if zones == 0 {
             return write!(f, "{} over 0/0 zones — INCOMPLETE, no zone ever reached this rollup",
@@ -1005,6 +1013,15 @@ mod tests {
         assert_eq!(clean.measured_total(), 0);
         assert!(!clean.to_string().contains(UNMEASURED), "{}", clean.to_string());
         assert_ne!(clean.to_string(), line, "clean-zero and holed-zero are different outputs");
+
+        // #831 (item 2): the complete form now carries its OWN marker instead of relying on the
+        // reader to infer completeness from the absence of `INCOMPLETE`. Match the em-dash too:
+        // `"INCOMPLETE".contains("COMPLETE")` is `true`, so a bare `.contains("COMPLETE")` would pass
+        // on the dirty line above as well and prove nothing.
+        assert!(clean.to_string().contains("— COMPLETE"),
+            "the complete form must mark itself COMPLETE, not just omit INCOMPLETE: {}", clean.to_string());
+        assert!(!line.contains("— COMPLETE"),
+            "a rollup with a hole must never carry the COMPLETE marker: {line}");
     }
 
     /// **#762 ROUND 2 (B1, blocking): a zone dropped BEFORE the water check ever ran must still

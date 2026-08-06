@@ -634,6 +634,30 @@ pub struct SpawnInfo {
     pub animation:       u32,
     pub equipment:       [u32; 9],       // Texture_Struct.Material per slot (0-8)
     pub equipment_tint:  [[u8; 3]; 9],   // RGB tint per slot
+    /// `NpcTintIndex` — a second, **ungated** DB-driven appearance channel (eqoxide#857).
+    ///
+    /// **Measured directly** (not relayed) against the public EQEmu RoF2 patch encoder,
+    /// `common/patches/rof2.cpp` `ENCODE(OP_ZoneSpawns)`: line 4843 writes `emu->npc_tint_id`
+    /// with no enclosing `if`/`else` — the `is_playable` branch that gates the 7-slot
+    /// equipment-material/tint block starts three encode calls later, at line 4849. So this
+    /// field really is written for every spawn (NPC or player, any race), unlike the equipment
+    /// block a few fields below. Lines 4844-4847 (`PrimaryTintIndex`, `SecondaryTintIndex`, and
+    /// two `0xffffffff` fields) are literal constants in that same encoder, not DB-sourced —
+    /// hence they are skipped rather than parsed.
+    ///
+    /// Also measured directly against the live deployed `npc_types` table (read-only query,
+    /// 2026-08-06): the `npc_tint_id` column is `smallint(5) unsigned DEFAULT 0`, and 0 of 67530
+    /// rows set it nonzero (`MAX(npc_tint_id) = 0`) — so `0` is both the schema-documented
+    /// default and, on this content, the only value that has ever existed. The wire field is a
+    /// full `u32` (the encoder's `VARSTRUCT_ENCODE_TYPE(uint32, ...)`, confirmed at the same
+    /// line 4843), a natural widen of the 16-bit DB column with no truncation.
+    ///
+    /// **NOT independently measured**: what the native RoF2 client does with a nonzero value on
+    /// an incoming spawn — i.e. the actual render-application rule (color multiply, palette
+    /// index, or something else). That could not be established from source this pass; see
+    /// `register_spawn` in `eqoxide-net::packet_handler` for why this field is captured but
+    /// deliberately NOT wired into rendering.
+    pub npc_tint_index:  u32,
 }
 
 /// Parse one RoF2 spawn record from the front of `buf`.
@@ -652,7 +676,7 @@ pub struct SpawnInfo {
 ///   | class_ pvp StandState light flymode (5×u8)
 ///   | lastName\0 | aatitle(u32) | guild_show(u8) | TempPet(u8)
 ///   | petOwnerId(u32) | FindBits(u8) | PlayerState(u32)
-///   | NpcTintIdx PrimaryTintIdx SecondaryTintIdx unk unk (5×u32)
+///   | NpcTintIdx(u32, PARSED — eqoxide#857, ungated) | PrimaryTintIdx SecondaryTintIdx unk unk (4×u32, skipped)
 ///   | [TintProfile(36) + Equipment(180) for playable races, or 60 bytes for NPCs]
 ///   | Position(20) = 5×u32 with RoF2 bit layout
 ///   | [title\0 if OtherData & 0x10] | [suffix\0 if OtherData & 0x20]
@@ -799,8 +823,13 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
     skip!(1);
     // 46. PlayerState (u32)
     let player_state = rd_u32!();
-    // 47-51. NpcTintIndex PrimaryTintIndex SecondaryTintIndex unk unk (5×u32)
-    skip!(20);
+    // 47. NpcTintIndex (u32) — eqoxide#857: ungated (unlike the playable-race-gated equipment
+    // block below), written for every spawn regardless of NPC/player/race. Parsed unconditionally
+    // here to match the wire; do NOT gate this read behind `is_playable` below.
+    let npc_tint_index = rd_u32!();
+    // 48-51. PrimaryTintIndex SecondaryTintIndex unk unk (4×u32) — always-literal on the wire
+    // (rof2.cpp writes 0/0/0xffffffff/0xffffffff), not DB-driven; left unparsed.
+    skip!(16);
 
     // Equipment section — format depends on race.
     // Playable condition (from rof2.cpp): NPC==0 || race<=12 || race in {128,130,330,522}
@@ -900,7 +929,7 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
         body_type, cur_hp, helm, show_helm, face, hairstyle, haircolor, stand_state,
         flymode, pet_owner_id, player_state,
         x, y, z, heading, animation,
-        equipment, equipment_tint,
+        equipment, equipment_tint, npc_tint_index,
     }, r.pos()))
 }
 

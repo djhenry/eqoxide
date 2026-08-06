@@ -173,6 +173,16 @@ pub struct Entity {
     /// cached `floating: bool` that a later flymode change could not update — a stale, agent-facing
     /// Z falsehood.
     pub flymode: u8,
+    /// Raw `NpcTintIndex` from the spawn wire (Spawn_Struct `npc_tint_id` on RoF2, eqoxide#857) — an
+    /// ungated, DB-driven appearance channel distinct from `equipment_tint` (which only exists for
+    /// playable races). Captured here so it is not silently discarded, but **deliberately NOT yet
+    /// applied to rendering**: the native client's render-application algorithm for this value could
+    /// not be established from source, and a read-only query of the live deployed `npc_types` table
+    /// (2026-08-06) found 0 of 67530 rows set it nonzero, so nothing renders differently today either
+    /// way. `0` is the documented "no tint" sentinel. See `register_spawn` in
+    /// `eqoxide-net::packet_handler` for where this is wired from the wire decode.
+    #[allow(dead_code)]
+    pub npc_tint_index: u32,
 }
 
 impl Entity {
@@ -2023,7 +2033,7 @@ pub fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) ->
         dead: false,
         equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
         face: 0, hairstyle: 0, haircolor: 0,
-        pose: Pose::Standing, gait: None, is_boat: false, flymode: 0,
+        pose: Pose::Standing, gait: None, is_boat: false, flymode: 0, npc_tint_index: 0,
     }
 }
 
