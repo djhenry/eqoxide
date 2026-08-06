@@ -55,6 +55,10 @@ const HOP_COOLDOWN: f32 = 0.8;
 const MAX_SLIDE_ITERS: usize = 3;
 /// Vertical tolerance for "still standing on the same floor".
 const GROUND_SNAP_TOL: f32 = 0.5;
+/// Slack on [`CharacterController::try_duck_under`]'s float-plane envelope bound (#870). The bound
+/// it slackens is `STEP_UP + GROUND_SNAP_TOL` = 2.5 u; this is 1e-3 u of it. See the ⚠️ paragraph
+/// on that clause for the measurement — without it the bound is decided by ~1e-5 u of float noise.
+const DUCK_ENVELOPE_TOL: f32 = 1e-3;
 /// Seconds embedded with no push-out before falling back to the last good grounded position.
 const STUCK_FALLBACK_SECS: f32 = 0.5;
 /// How often (seconds) a good grounded position is sampled into the ring buffer.
@@ -1205,8 +1209,37 @@ impl CharacterController {
     ///
     /// Uses the centre ray (at foot and chest heights) for the contact, then backs the cylinder
     /// centre off by `radius` measured along the hit normal — a penetration-free "ray + radius"
-    /// capsule approximation. Grazing cases the thin centre ray slips past are caught next frame by
-    /// the depenetration net (§3.3).
+    /// capsule approximation.
+    ///
+    /// **#870 — THE RAY MUST LOOK AS FAR AS THE BACK-OFF IT WILL APPLY.** The ray used to be cast
+    /// exactly `|remaining|` long while the resolution backed the body off by `radius/ndot + SKIN`
+    /// (≥ 1.05 u). Those two lengths disagreeing is the whole defect: when a frame's step ENDED
+    /// short of a face, the ray never reached it, `nearest_hit` reported nothing, and the body
+    /// advanced its full step — coming to rest anywhere in `(0, radius + SKIN)` of a solid face,
+    /// i.e. with its own collision cylinder overlapping that face. The comment that stood here
+    /// ("grazing cases the thin centre ray slips past are caught next frame by the depenetration
+    /// net") named that as the remedy, and the remedy is a TELEPORT: `is_embedded` tests the
+    /// footprint ring at `Body::ring` = 3.0 with radius `PLAYER_RADIUS` = 1.0, so a body resting
+    /// 0.75 u from any face at least `Body::ring` tall reads EMBEDDED and the net relocates it to a
+    /// ring candidate up to `PUSHOUT_RADII` away. MEASURED on a grounded walker driven at a 3.0-tall
+    /// barrier: the net fired on alternate frames and carried the body **+342.9 u laterally** along
+    /// a wall it was merely leaning on, in 15 s of simulated time, at unchanged z — every one of
+    /// those units reported to the driving agent as an ordinary position. The `lip >= 3.00`
+    /// threshold in #870 is exactly `Body::ring`; below it the ring never sees the barrier at all.
+    ///
+    /// So the look-ahead is DERIVED from the back-off rather than being a second hand-tuned number:
+    /// `radius + SKIN` is the back-off at `ndot = 1`, the head-on case, and `contact` is now scaled
+    /// by the ray's own length instead of by `len`. A face inside the look-ahead but beyond the
+    /// step resolves to `advance == len` (no behaviour change, the body simply completes its step)
+    /// unless it is close enough that completing the step would penetrate — which is exactly the
+    /// case that used to be handed to the net.
+    ///
+    /// **Residual, stated because it is real:** the guarantee is `perpendicular clearance ≥
+    /// radius + SKIN·ndot`, so it is strict for a head-on approach and degrades toward `radius`
+    /// as the approach turns parallel; and the look-ahead is the head-on `radius + SKIN`, not the
+    /// oblique `radius/ndot + SKIN` (which reaches 20 u at the `ndot` floor and is not a sane ray
+    /// length). A near-parallel approach can therefore still leave the body inside the ring band.
+    /// Closing that needs a swept-cylinder contact, not a centre ray — out of scope here.
     fn slide(&self, from: [f32; 3], delta: [f32; 3], col: &Collision) -> ([f32; 3], bool) {
         // The contact heights AND the radius come from the ONE shared body (#386, #378 Phase 2):
         // the chest ray here and the planner's top edge probe are the same `Body::chest` field, and
@@ -1215,6 +1248,9 @@ impl CharacterController {
         let body = &crate::traversability::PLAYER_BODY;
         let probes = body.contact_probes();
         let radius = body.radius;
+        // #870: ONE expression, read by the ray length below and by the back-off in the resolution
+        // arm. Editing either alone re-opens the gap the net was papering over.
+        let back_off = radius + SKIN;
         let mut pos = from;
         let mut remaining = delta;
         let mut hit_any = false;
@@ -1222,11 +1258,13 @@ impl CharacterController {
             let len = hlen(remaining);
             if len < 1e-5 { break; }
             let d_hat = [remaining[0] / len, remaining[1] / len];
+            // #870: the step, PLUS the distance the resolution would back off by. See the doc above.
+            let ray_len = len + back_off;
             // Nearest contact among the foot and chest centre rays.
             let mut best: Option<crate::nav::collision::Hit> = None;
             for &hz in &probes {
                 let f = [pos[0], pos[1], pos[2] + hz];
-                let to = [f[0] + remaining[0], f[1] + remaining[1], f[2]];
+                let to = [f[0] + d_hat[0] * ray_len, f[1] + d_hat[1] * ray_len, f[2]];
                 if let Some((t, n)) = col.nearest_hit(f, to) {
                     if best.map_or(true, |b| t < b.t) { best = Some(crate::nav::collision::Hit { t, normal: n }); }
                 }
@@ -1237,8 +1275,19 @@ impl CharacterController {
                     hit_any = true;
                     // Distance into the plane along the motion (floored so grazing hits don't blow up).
                     let ndot = (-(d_hat[0] * hit.normal[0] + d_hat[1] * hit.normal[1])).max(0.05);
-                    let contact = hit.t * len;
+                    // #870: `hit.t` is a fraction of the RAY, which is now longer than the step.
+                    let contact = hit.t * ray_len;
                     let advance = (contact - radius / ndot - SKIN).max(0.0);
+                    // #870: the look-ahead lengthens the RAY, and must not lengthen the STEP.
+                    // `contact <= ray_len = len + radius + SKIN` and `radius/ndot >= radius`
+                    // (`ndot <= 1`), so `advance <= len` — the extra reach is spent entirely on the
+                    // back-off. Asserted rather than clamped: a `.min(len)` here would be
+                    // unreachable by that derivation, and an unreachable clamp hides the day the
+                    // derivation stops holding instead of reporting it. Debug-only, so it is live
+                    // under `cargo test` across every caller in the suite and free in release.
+                    debug_assert!(advance <= len + 1e-4,
+                        "#870: slide advanced {advance} past its own step {len} (contact {contact}, \
+                         ray {ray_len}, ndot {ndot}) — the look-ahead has become extra travel");
                     pos[0] += d_hat[0] * advance;
                     pos[1] += d_hat[1] * advance;
                     // Slide the unused budget along the plane (horizontal; z owned by ground/gravity).
@@ -1316,21 +1365,66 @@ impl CharacterController {
         }
     }
 
+    /// **#870 — the creep, and why it had to be added at the same time as the slide's look-ahead.**
+    /// This probe is a POINT probe down the destination's centre column, but the body is a cylinder
+    /// of `Body::radius`, and a riser it is pressed against is `radius + SKIN` ahead of that centre.
+    /// Before #870 the arithmetic worked only because `slide` left the body PENETRATING the riser:
+    /// resting `d` u short of the face with `d <= |wish|`, the raised sweep landed the centre at
+    /// `face + (|wish| - d)` — over the lip — and the centre probe found the tread. Once `slide`
+    /// honours its own back-off the body rests a full `radius + SKIN` = 1.05 u out, so at any frame
+    /// time with `|wish| < 1.05` (35 u/s at 60 Hz is 0.58) the raised sweep can no longer put the
+    /// centre past the face and NOTHING is ever mountable. MEASURED as three RED tests when the
+    /// look-ahead landed alone: `a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191`,
+    /// `a_swimmer_hauling_out_at_a_legitimate_bank_never_raises_the_afloat_stall`, and
+    /// `a_duck_across_a_divable_far_side_is_a_round_trip`, each ending at `east 2.95 = 4.0 − 1.05`,
+    /// i.e. correctly backed off and permanently unable to climb out.
+    ///
+    /// So the destination search creeps forward, in the travel direction, by AT MOST the same
+    /// `radius + SKIN` — one expression, the same one the slide backs off by — and takes the first
+    /// standable landing. It is the collision margin being spent, not extra travel: the body lands
+    /// at the near edge of the tread, which is at or behind where the penetrating version put it.
+    ///
+    /// Two soundness gates, both load-bearing:
+    ///   * the creep runs ONLY when the raised sweep made full progress. If the raised sweep was
+    ///     itself stopped by geometry, creeping past its stopping point would push the body into
+    ///     the thing that stopped it.
+    ///   * every creep sample re-runs the SAME band test as the centre probe, so the creep can
+    ///     only find a landing the centre probe would also have accepted — it changes WHERE the
+    ///     landing is looked for, never WHAT counts as one.
+    const STEP_LANDING_CREEP_SAMPLES: usize = 8;
+
     /// Step-offset climb (design §3.2): raise the cylinder by `STEP_UP`, sweep again, and — only if
     /// a floor exists to stand on at the raised destination (the no-geometry-gap guard) — return the
     /// stepped-up `[east, north, floor_z]`. `None` = no valid step (taller-than-2u wall or a gap).
     fn try_step_up(&self, wish: [f32; 3], max_step: f32, col: &Collision) -> Option<[f32; 3]> {
         let raised = [self.pos[0], self.pos[1], self.pos[2] + max_step];
         let (hi, _) = self.slide(raised, wish, col);
+        let origin = self.pos[2] + max_step + GROUND_ORIGIN;
+        let depth = max_step + GROUND_ORIGIN + GROUND_SNAP_TOL;
         // Probe for a floor near the raised destination, within the step band. The slide above only
         // makes progress when there is open space over the lip, so we never "climb" into solid wall;
         // and a floor must exist here to stand on, so a taller bare wall still returns None.
-        let f = col.ground_below(hi[0], hi[1], self.pos[2] + max_step + GROUND_ORIGIN, max_step + GROUND_ORIGIN + GROUND_SNAP_TOL)?;
-        if f >= self.pos[2] - GROUND_SNAP_TOL && f - self.pos[2] <= max_step + GROUND_SNAP_TOL {
-            Some([hi[0], hi[1], f])
-        } else {
-            None
+        let in_band = |f: f32| {
+            f >= self.pos[2] - GROUND_SNAP_TOL && f - self.pos[2] <= max_step + GROUND_SNAP_TOL
+        };
+        if let Some(f) = col.ground_below(hi[0], hi[1], origin, depth) {
+            if in_band(f) { return Some([hi[0], hi[1], f]); }
         }
+        // #870: creep the destination forward by up to the slide's own back-off. See the doc above.
+        let len = hlen(wish);
+        if len < 1e-5 { return None; }
+        let travelled = hlen([hi[0] - raised[0], hi[1] - raised[1], 0.0]);
+        if travelled + 1e-4 < len { return None; } // the raised sweep was itself blocked — do not creep
+        let d_hat = [wish[0] / len, wish[1] / len];
+        let back_off = crate::traversability::PLAYER_BODY.radius + SKIN;
+        for i in 1..=Self::STEP_LANDING_CREEP_SAMPLES {
+            let s = back_off * (i as f32) / (Self::STEP_LANDING_CREEP_SAMPLES as f32);
+            let (e, n) = (hi[0] + d_hat[0] * s, hi[1] + d_hat[1] * s);
+            if let Some(f) = col.ground_below(e, n, origin, depth) {
+                if in_band(f) { return Some([e, n, f]); }
+            }
+        }
+        None
     }
 
     /// The swimming step-up's downward mirror (#661): can a blocked swimmer pass UNDER the
@@ -1430,9 +1524,25 @@ impl CharacterController {
         // is a horizontal-wish driver (e.g. `/move/manual`) making a one-way crossing it cannot
         // undo; that driver now stalls wet at the mouth instead
         // (`qcat_pocket_horizontal_wish_alone_stalls_wet_at_the_mouth`).
+        //
+        // ⚠️ **The tolerance is not decoration (#870).** Without it this comparison is decided by
+        // float noise for the commonest case there is: a body resting AT its own float plane.
+        // Expand the left side — `surf − float_depth − (pos_z − sink)` with an unclamped
+        // `sink = −(STEP_UP + GROUND_SNAP_TOL)` — and the clause reduces exactly to
+        // `pos_z >= surf − float_depth`, i.e. "the body is at or above its float plane". Buoyancy
+        // parks it there asymptotically, so the deciding quantity is the last ULPs of the approach.
+        // MEASURED on the `a_duck_across_a_divable_far_side_is_a_round_trip` lintel, same fixture,
+        // two resting spots 0.78 u apart: `2.4999952 <= 2.5` (admits) at east 4.267 versus
+        // `2.5000072 <= 2.5` (REFUSES) at east 5.05 — a 1.2e-5 u swing across the boundary, which
+        // is far below anything the geometry means. `DUCK_ENVELOPE_TOL` is 1e-3 u: ~100× that
+        // noise and ~1/2500 of the envelope it slackens, so it cannot admit a duck whose return is
+        // in any physical doubt — the trap this bound exists to refuse is a 2 u mismatch, five
+        // thousand times wider. #870 found it by moving where the body rests, not by changing this
+        // clause; on `main` the same test passes only because its body happens to settle on the
+        // admitting side of the knife-edge.
         let surf = col.water_surface(lo)?;
         ((surf - crate::traversability::PLAYER_BODY.float_depth) - lo[2]
-            <= STEP_UP + GROUND_SNAP_TOL).then_some(lo)
+            <= STEP_UP + GROUND_SNAP_TOL + DUCK_ENVELOPE_TOL).then_some(lo)
     }
 
     /// Is the wedged-against barrier a *hoppable* fence — i.e. is there walkable floor `HOP_REACH`
@@ -2165,6 +2275,162 @@ mod tests {
         ctrl.step(walk(35.0, [1.0, 0.0]), 0.2, &c);
         assert!(ctrl.pos[0] > 5.0, "should have climbed past the ledge edge: {}", ctrl.pos[0]);
         assert!((ctrl.pos[2] - 2.0).abs() < 0.3, "should be standing on the 2u ledge: {}", ctrl.pos[2]);
+    }
+
+    // ── #870: a grounded walker must never be handed to the depenetration net by the slide ──────
+    //
+    // #870 reports a grounded walker ending up beyond a thin barrier it never crossed, at lips
+    // >= 3.00, with the mechanism explicitly UNDETERMINED. The mechanism established here is the
+    // COMPOSITION of two things, and it is NOT #854:
+    //
+    //   * #854 is `slide()`'s probe HEIGHTS — `contact_probes()` starts at `Body::foot` = 0.5, so a
+    //     face whose top lands in `(feet, feet + 0.5)` is never sampled horizontally. That band is
+    //     0.5 u tall and these barriers are 3.0-6.0 u tall, so it cannot reach this case; #870 says
+    //     so and this agrees.
+    //   * #870 is `slide()`'s ray LENGTH. The ray was cast `|delta|` long while the resolution backs
+    //     the body off by `radius/ndot + SKIN` >= 1.05 u. A step that ENDS short of a face never
+    //     reaches it, so the body advances in full and comes to rest with its own cylinder
+    //     overlapping the face. `is_embedded` then reads the footprint ring — cast at
+    //     `Body::ring` = 3.0 above the feet, at radius `PLAYER_RADIUS` = 1.0 — as pierced, and the
+    //     depenetration net TELEPORTS the body to a `PUSHOUT_RADII` ring candidate chosen on two
+    //     conditions only: the candidate's own footprint is clear, and its column has a floor. The
+    //     SEGMENT between the body and the candidate is never tested, which is the structural
+    //     reason a landing on the far side of the barrier is representable at all.
+    //
+    // `Body::ring` = 3.0 is where #870's reported `lip >= 3.00` threshold comes from, and
+    // `the_footprint_ring_band_is_what_makes_lips_at_body_ring_different` re-derives it from the
+    // field rather than inheriting the number from the issue.
+    //
+    // What is NOT claimed here: this file does not reproduce #870's specific reported endpoint
+    // (east 99.4, z -10). Driving the fixture as the issue states it — 240 runs over 6 lips x 2 far
+    // floors x 40 approach phases — produced the net's teleport every time and a far-side landing
+    // NONE of the times; on a planar barrier every ring candidate east of the face is correctly
+    // refused by `footprint_clear`, and the body is instead dragged sideways along the wall
+    // (measured: +99.7 u with a 100 u wall, +342.9 u with a 2000 u one, in 900 frames at dt 1/60).
+    // That lateral drag is the same falsehood as the crossing — a reported position the body never
+    // walked to — and it is what these tests pin. See the PR body for the full disclosure.
+
+    /// The REACH CONTROL for the property test below, and the re-derivation of #870's threshold.
+    ///
+    /// Two things a green property test cannot tell you on its own: that the bad state exists at
+    /// all, and that `is_embedded` is the predicate that sees it. Both are asserted here directly,
+    /// against a hand-placed body rather than a driven one — so the property test cannot be passing
+    /// because the harness is blind. The threshold is read off `Body::ring`, NOT off the issue.
+    #[test]
+    fn the_footprint_ring_band_is_what_makes_lips_at_body_ring_different() {
+        let ring = crate::traversability::PLAYER_BODY.ring;
+        let radius = crate::traversability::PLAYER_BODY.radius;
+        // A body 0.75 u from the face — inside its own collision radius of it, which is the state
+        // the un-extended ray used to leave behind.
+        let inside = -0.75_f32;
+        assert!(inside.abs() < radius, "the control must place the body inside the ring radius");
+        for &(lip, want_embedded) in &[
+            (ring - 0.5, false), (ring - 0.05, false), (ring + 0.05, true), (ring + 3.0, true),
+        ] {
+            let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, lip), floor(-10.0, 0.0, 100.0)]);
+            assert_eq!(is_embedded(&c, [inside, 0.0, 0.0]), want_embedded,
+                "a body {inside} from the face of a {lip}-tall barrier: is_embedded should be \
+                 {want_embedded} (Body::ring = {ring})");
+        }
+        // And the same body one back-off out is NOT embedded at any of those lips — which is the
+        // clearance the fix makes `slide` guarantee.
+        for lip in [ring - 0.5, ring + 0.05, ring + 3.0] {
+            let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, lip), floor(-10.0, 0.0, 100.0)]);
+            assert!(!is_embedded(&c, [-(radius + SKIN), 0.0, 0.0]),
+                "a body backed off by radius+SKIN from a {lip}-tall barrier must not read embedded");
+        }
+    }
+
+    /// **THE UNIVERSAL (#870).** Over a grid of barrier heights, far-floor depths, speeds, frame
+    /// times and approach phases, a grounded walker driven straight at a barrier taller than
+    /// `STEP_UP`:
+    ///
+    ///   * never ends up on the far side of it (the reported failure),
+    ///   * never moves sideways (the net's teleport is lateral, and the drive has no lateral
+    ///     component — any north displacement at all is motion the body did not make),
+    ///   * and, the invariant that makes both of those true rather than merely observed, is never
+    ///     classified `is_embedded` on ANY frame. That is the real claim: the depenetration net is
+    ///     a recovery for bodies stuck IN geometry, and a body walking into a wall is not one.
+    ///
+    /// A driven run cannot discharge a universal, and this does not pretend to: it is a grid, and
+    /// the parameters it sweeps are named above. What makes the frame-by-frame `is_embedded` check
+    /// worth more than the endpoint checks is that it fails at the FIRST frame the body enters the
+    /// band, before any teleport has had to be lucky enough to land somewhere visible.
+    #[test]
+    fn a_grounded_walk_at_a_barrier_never_enters_the_depenetration_net() {
+        let radius = crate::traversability::PLAYER_BODY.radius;
+        let mut runs = 0_usize;
+        let mut band_frames = 0_usize;
+        // ⚠️ **The lips start at 2.60, and the gap below it is a DIFFERENT, STILL-OPEN bug.**
+        // A lip in `(STEP_UP, STEP_UP + Body::foot)` = (2.00, 2.50) is passable, and #870's fix
+        // does not touch it: `try_step_up` raises the body by `STEP_UP` and sweeps again, and that
+        // raised sweep's own foot ray sits `Body::foot` = 0.5 ABOVE the raised feet, so a lip
+        // topping out inside that half-unit is invisible to it — #854's blind band, one storey up.
+        // MEASURED at lip 2.40, 20 u/s, 60 Hz: east −1.00 → −0.67 → −0.33 → 0.00 → +0.33 …, a
+        // smooth 0.333 u/frame walk THROUGH the barrier, `is_embedded` false the whole way — and
+        // byte-identical on unmodified `main` and on this branch, which is what makes it a
+        // separate bug and not a regression. It is excluded here rather than fixed because the fix
+        // is #854's (probe heights), not this one's (ray length), and asserting a barrier that low
+        // holds would be asserting something no code in this PR makes true.
+        for lip in [2.60_f32, 2.80, 2.95, 3.00, 3.05, 3.50, 4.00, 6.00, 12.00] {
+            for far in [0.0_f32, -10.0] {
+                for speed in [20.0_f32, 35.0, 44.0] {
+                    for dt in [1.0_f32 / 60.0, 1.0 / 30.0, 1.0 / 20.0] {
+                        for k in 0..7 {
+                            // Phase: where in the step the body first comes within a step of the
+                            // face. This is the parameter the un-extended ray was sensitive to.
+                            let start = -20.0 - (k as f32) * 0.017;
+                            let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, lip),
+                                             floor(far, 0.0, 100.0)]);
+                            let mut ctrl = CharacterController::new([start, 0.0, 0.0]);
+                            ctrl.on_ground = true;
+                            runs += 1;
+                            for f in 0..400 {
+                                assert!(!is_embedded(&c, ctrl.pos),
+                                    "lip {lip} far {far} speed {speed} dt {dt} k {k} frame {f}: \
+                                     a walker at a barrier was handed to the depenetration net at \
+                                     {:?} (#870)", ctrl.pos);
+                                ctrl.step(walk(speed, [1.0, 0.0]), dt, &c);
+                                // `-radius` is where the cylinder's east face touches the barrier;
+                                // 1e-4 is float slack on a ~20 u accumulated walk, not tolerance
+                                // for penetration (the failure this pins overshoots by ~1 u).
+                                assert!(ctrl.pos[0] <= -radius + 1e-4,
+                                    "lip {lip} far {far} speed {speed} dt {dt} k {k} frame {f}: \
+                                     east {} is inside/through a barrier at east 0 (#870)",
+                                    ctrl.pos[0]);
+                                assert!(ctrl.pos[1].abs() < 1e-3,
+                                    "lip {lip} far {far} speed {speed} dt {dt} k {k} frame {f}: \
+                                     north {} — the drive is due east, so this is displacement the \
+                                     body never made (#870)", ctrl.pos[1]);
+                                if ctrl.pos[0] > -(radius + SKIN) - 1e-3 { band_frames += 1; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Reach control for the LOOP: a grid that silently visited nothing would also be green.
+        assert_eq!(runs, 9 * 2 * 3 * 3 * 7, "the grid must actually run every combination");
+        assert!(band_frames > runs, "every run must reach the barrier and rest against it; \
+                                     only {band_frames} settled frames over {runs} runs");
+    }
+
+    /// #870's example, pinned: the drop shape it names (3.0 lip, floor beyond at -10). The walker
+    /// stops dead one back-off short of the face, stays on the line it was driven along, keeps its
+    /// z, stays grounded — and reports no hold, because it is not held: it is standing at a wall.
+    #[test]
+    fn a_grounded_walker_stops_at_a_3u_barrier_with_a_10u_drop_beyond() {
+        let radius = crate::traversability::PLAYER_BODY.radius;
+        let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, 3.0), floor(-10.0, 0.0, 100.0)]);
+        let mut ctrl = CharacterController::new([-20.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        for _ in 0..900 { ctrl.step(walk(35.0, [1.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!((ctrl.pos[0] - -(radius + SKIN)).abs() < 1e-3,
+            "should rest exactly one back-off short of the face: east={}", ctrl.pos[0]);
+        assert!(ctrl.pos[1].abs() < 1e-3, "no lateral drift: north={}", ctrl.pos[1]);
+        assert!(ctrl.pos[2].abs() < 1e-3, "still on the near floor: z={}", ctrl.pos[2]);
+        assert!(ctrl.on_ground, "still grounded");
+        assert!(ctrl.hold().is_none(), "standing at a wall is not a hold: {:?}", ctrl.hold());
     }
 
     #[test]
@@ -4261,8 +4527,21 @@ mod tests {
         // a lip 2.1 u above the swim plane, inside the swimming step-up's reach. The body presses,
         // mounts, and walks out — never stalling, because the approach makes progress and the
         // haul-out ends the afloat state entirely.
+        //
+        // ⚠️ **The bank floor runs to east 3000, not east 100 (#870).** The drive is 30 s at
+        // 35 u/s — 1050 u of travel — and the body starts at east −20, so a floor ending at east
+        // 100 is walked OFF at frame ~240, four fifths of the way through the run still to go.
+        // MEASURED on `main`, unmodified, with the old 100 u floor: from frame 240 the body was
+        // dragged 99.7 u NORTH under a due-east drive (`is_embedded` = true → ring push-out, ~0.4 u
+        // of teleport per frame, the #870 drift), and then oscillated across the floor edge for the
+        // remaining 1500 frames — grounded, ungrounded, grounded — so the closing
+        // `assert!(ctrl.on_ground)` was decided by which side of that oscillation frame 1799
+        // happened to land on. It landed grounded on `main` and ungrounded once #870's back-off
+        // moved the haul-out 0.78 u east: a passing test whose pass was a coin toss, not a claim
+        // about hauling out. Widening the floor puts the whole 1050 u drive on solid ground, which
+        // is the premise the test's own doc comment asserts.
         let c = flooded_corridor(
-            vec![floor(-40.0, -100.0, 4.0), floor(0.1, 4.0, 100.0), wall(4.0, -40.0, 0.1)],
+            vec![floor(-40.0, -100.0, 4.0), floor(0.1, 4.0, 3000.0), wall(4.0, -40.0, 0.1)],
             -40.0, 0.0);
         let mut ctrl = CharacterController::new([-20.0, 0.0, plane()]);
         for i in 0..(30 * 60) {
