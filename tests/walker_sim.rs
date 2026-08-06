@@ -867,35 +867,49 @@ use eqoxide_ipc::MoveIntent;
     ///   about, and leaving it terminal left the exhibit uncovered on exactly the hanging run.
     /// * `skipped` — "the zone was dropped before the water check ran at all: no `.glb`, no grid, no
     ///   routable pairs". **Deliberately NOT checked here, and the reason is DIAGNOSTICS, not
-    ///   decidability.** All three buckets are decidable the instant a zone closes and all three are
-    ///   monotone (they are push-only `Vec`s), so no hole this gate could catch ever heals itself
-    ///   later in the run — a zone landing in `unmeasured`/`unaccounted` stays there, so IF a run
-    ///   reached the terminal `is_complete()` assert, that same hole would still be there to refuse
-    ///   it. An earlier revision of this comment claimed the opposite of that property for
-    ///   `unmeasured`/`skipped` and the PR's reviewer measured it false.
+    ///   decidability.** `unmeasured_zones()` is a straight read of a push-only `Vec` and so is
+    ///   genuinely monotone. `unaccounted_zones()` — the bucket this gate actually reads — is NOT:
+    ///   it chains that push-only `Vec` with the single transient slot `open` (`water_grid.rs:522`),
+    ///   and `settle()` (the shared body of `add`/`skip`) `take()`s that slot on every call
+    ///   (`water_grid.rs:547`). Measured directly: after `begin_zone("z")`,
+    ///   `unaccounted_zones() == ["z"]`; right after `skip("z", …)`, it is `[]` again — the "hole" a
+    ///   caller would see mid-zone is not permanent at all. An earlier revision of this comment
+    ///   claimed the opposite of that property for `unmeasured`/`skipped` and the PR's reviewer
+    ///   measured it false.
+    ///
+    ///   **So why does this gate never miss a real hole? Not bucket monotonicity — call order.**
+    ///   `open_zone_checked` reads `unaccounted_zones()`/`unmeasured_zones()` BEFORE it calls
+    ///   `begin_zone` for the new zone, so what it sees is exactly what the PREVIOUS iteration left
+    ///   behind: if that zone was closed (`add`/`skip`), `open` is `None` and there is nothing to
+    ///   see; if it was abandoned, `open` still names it, and the chain surfaces it right here — via
+    ///   the TRANSIENT slot, before anything has cleared it. `begin_zone`'s own permanent record of
+    ///   an abandoned zone (`self.unaccounted.push(prev)`, `water_grid.rs:539-540`) is what a LATER
+    ///   reader (the terminal `is_complete()` assert, after zones opened after this one) relies on —
+    ///   but for THIS gate's own check, that push never even needs to run: the `panic!` below fires
+    ///   first, on the transient view, every time.
     ///
     ///   **The revision that replaced it — "a per-zone refusal could never fire where the terminal
-    ///   one would not" (#830) — is also not quite right, read literally.** That is an eventual/
-    ///   monotonicity claim (above), not a same-run reachability one, and the two differ:
-    ///   `faithful_walker_drift_corpus`'s own `assert!(tot_walked > 0)` runs BEFORE the terminal
-    ///   completeness assert, so a run that is all-`skipped` (never checked by this gate at all) or a
-    ///   single unmeasured zone with nothing opened after it (this gate only re-checks a zone's holes
-    ///   when the NEXT zone opens — the corpus's own terminal-assert comment, above, already notes
-    ///   this for "the last zone opened") dies at `tot_walked > 0` and the terminal assert never runs,
-    ///   full stop. And whenever THIS gate itself panics, that panic unwinds past both asserts, so in
-    ///   every run where the per-zone refusal actually fires, the terminal one provably does NOT run
-    ///   in that same execution — the opposite of "could never fire where the terminal one would
-    ///   not." The corrected claim is the monotonicity one: no NEW false positive, not "the terminal
-    ///   check would also have fired here."
+    ///   one would not" (#830) — is also not quite right, read literally**, for a simpler reason than
+    ///   bucket monotonicity: `faithful_walker_drift_corpus`'s own `assert!(tot_walked > 0)` runs
+    ///   BEFORE the terminal completeness assert, so a run that is all-`skipped` (never checked by
+    ///   this gate at all) or a single unmeasured zone with nothing opened after it (this gate only
+    ///   re-checks a zone's holes when the NEXT zone opens — the corpus's own terminal-assert
+    ///   comment, above, already notes this for "the last zone opened") dies at `tot_walked > 0` and
+    ///   the terminal assert never runs, full stop. And whenever THIS gate itself panics, that panic
+    ///   unwinds past both asserts, so in every run where the per-zone refusal actually fires, the
+    ///   terminal one provably does NOT run in that same execution — the opposite of "could never
+    ///   fire where the terminal one would not." The corrected claim is narrower: no NEW false
+    ///   positive — a hole this gate catches was always a real one (its zone was truly abandoned, or
+    ///   truly failed to load) — not that the terminal check is somehow redundant with this one.
     ///
     ///   **Why `skipped` is the one bucket exempt, restated because the old rationale overstated its
     ///   scope (#830).** Not because it is rarer than the other two — #762's own motivating exhibit
-    ///   (the `unmeasured` bullet, above) is a build host holding only 2 of 497 `.wtr` files, i.e.
-    ///   `unmeasured` on as many as 495 of 497 zones, so "`skipped` is the common state" is not a fact
-    ///   that distinguishes it from `unmeasured`, and no comparably-measured count exists here for how
-    ///   often each `skipped` cause fires on a real corpus — this file has no baked `$ZONE_DIR` to run
-    ///   that measurement against, so that piece of the asymmetry is left unmeasured, not assumed
-    ///   clean. What DOES distinguish them is what a hole SIGNALS, not how often it occurs:
+    ///   (the `unmeasured` bullet, above) is a build host holding only 2 of 497 `.wtr` files, so
+    ///   "`skipped` is the common state" is not a fact that distinguishes it from `unmeasured`, and no
+    ///   comparably-measured count exists here for how often each `skipped` cause fires on a real
+    ///   corpus — this file has no baked `$ZONE_DIR` to run that measurement against, so that piece
+    ///   of the asymmetry is left unmeasured, not assumed clean. What DOES distinguish them is what
+    ///   a hole SIGNALS, not how often it occurs:
     ///   `no glb`/`no grid` (two of `skipped`'s three causes) mean the zone was never in scope for
     ///   this run at all — the ROUTINE, expected shape of a `$ZONE_DIR` that only holds a
     ///   caller-chosen subset of zones. `unmeasured` means
