@@ -114,9 +114,15 @@ pub struct UiCtx<'a> {
     pub zone_min: [f32; 2],
     pub zone_max: [f32; 2],
     pub zone_map: Option<&'a ZoneMap>,
-    /// #873: why `zone_map` is `None`, when there is a specific reason (an unreadable base file or
-    /// detail layer) rather than the ordinary case of a zone that simply has no map. Lets the map
-    /// window show a short "map data unavailable: …" line instead of a silently blank canvas.
+    /// #873: why `zone_map` is `None`, **when its absence is a defect** — a base file or detail
+    /// layer that is present and could not be read. Lets the map window show a short "map data
+    /// unavailable: …" line instead of a silently blank canvas.
+    ///
+    /// A zone that simply ships no map is NOT a defect and arrives here as `None` (#877 round 2):
+    /// the caller filters that case out (`hud_zone_map_view` in the client's `app.rs`), because
+    /// 27 zones in the shipped map pack are in exactly that ordinary state and painting a
+    /// failure-shaped line over all of them would be a false alarm. This field being `Some` means
+    /// something is genuinely broken; drawing it must not be softened into "no map here".
     pub zone_map_error: Option<&'a str>,
     pub minimap_zoom: &'a mut f32,
     pub fps: f32,
@@ -392,7 +398,8 @@ mod tests {
         });
         // #873: a `zone_map_error` with no `zone_map` (map load failed) must draw without panicking
         // — this is the map window's new "map data unavailable: …" text path, otherwise unexercised
-        // by every other `draw_all` call in this test (all pass `None, None`).
+        // by every other `draw_all` call in this test (all pass `None, None`). Crash-safety ONLY;
+        // `zone_map_error_reaches_the_screen_873` below is what proves it renders anything.
         let ctx = egui::Context::default();
         let _ = ctx.run(Default::default(), |ctx| {
             ui.draw_all(
@@ -401,6 +408,92 @@ mod tests {
             );
         });
         let _ = std::fs::remove_file(eqoxide_core::config::config_dir().join("ui_layout___uitest__.json"));
+    }
+
+    /// Collect every string egui actually laid out into a frame, by walking the untessellated
+    /// `FullOutput.shapes` for `Shape::Text` (which owns the `Galley` the text was shaped into) and
+    /// recursing through the `Shape::Vec` nesting painters produce. This is the whole of the
+    /// "assert on rendered content" machinery — no new dependency, no snapshot harness.
+    fn rendered_text(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(ts) => {
+                out.push_str(ts.galley.text());
+                out.push('\n');
+            }
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    rendered_text(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// #873, end-to-end (PR #877 round 2, BLOCKING 2): the map-load reason must reach the SCREEN.
+    ///
+    /// `all_windows_draw_headless` above only proves the new branch doesn't panic — measured by
+    /// #877's reviewer: with the entire `else if let Some(err) = cx.zone_map_error { … }` block in
+    /// `windows/map.rs` deleted, that test stays green, and so does the whole workspace with the
+    /// production call site in `src/app.rs` reverted to the pre-fix `.ok()` + `None`. Nothing
+    /// between `try_load`'s `Err` and pixels was red-able: a unit-tested helper the product is not
+    /// obliged to call, plus a smoke test that cannot see what it drew.
+    ///
+    /// This closes the rendering half: it asserts the reason STRING is in the frame's shape list, so
+    /// deleting the render branch fails it. The threading half is closed structurally instead — the
+    /// client now carries the map-load `Result` whole (`App::zone_map`), so the `.ok()` revert no
+    /// longer typechecks. See `hud_zone_map_view` in `src/app.rs`.
+    ///
+    /// It also pins the OTHER half of the #877 design call: `zone_map_error: None` — the ordinary
+    /// no-map-for-this-zone state, 27 zones in the shipped pack — must put NO unavailability text on
+    /// screen. A false alarm on an ordinary state is as dishonest as hiding a real failure.
+    #[test]
+    fn zone_map_error_reaches_the_screen_873() {
+        let mut ui = UiState::new("__uiprobe__", None);
+        let acts = actions();
+        let spells = eqoxide_core::spells::SpellDb::empty();
+        for def in REGISTRY {
+            if !def.transient {
+                ui.sys.layout.set_open(def.id, true);
+            }
+        }
+        let scene = SceneState::default();
+
+        // Deliberately a string no other window could ever produce, so a match cannot come from
+        // some unrelated label that happens to share a word.
+        const REASON: &str = "PROBE-REASON-877-zonemap";
+
+        let frame_text = |ui: &mut UiState, err: Option<&str>| -> String {
+            let ctx = egui::Context::default();
+            // Two frames: egui's first frame has no meaningful `screen_rect`/window geometry yet, so
+            // read the second — the same reason the layout tests below run more than one frame.
+            let mut found = String::new();
+            for _ in 0..2 {
+                found.clear();
+                let out = ctx.run(Default::default(), |ctx| {
+                    ui.draw_all(ctx, [1280.0, 720.0], &scene, &spells, &acts,
+                                [0.0; 2], [100.0; 2], None, err, 60.0);
+                });
+                for cs in &out.shapes {
+                    rendered_text(&cs.shape, &mut found);
+                }
+            }
+            found
+        };
+
+        let with_err = frame_text(&mut ui, Some(REASON));
+        assert!(with_err.contains(REASON),
+            "a failed map load's reason never reached the frame's shape list — the HUD is back to \
+             a wordlessly blank minimap, which is the whole of what #873 asked to fix. Text found \
+             in the frame: {with_err:?}");
+
+        let without_err = frame_text(&mut ui, None);
+        assert!(!without_err.contains("map data unavailable"),
+            "a zone with no map-load failure at all still painted an unavailability line — that is \
+             a false alarm on an ordinary state (27 zones in the shipped map pack simply have no \
+             .txt map), and a warning that fires on ordinary states stops being read. Text found \
+             in the frame: {without_err:?}");
+
+        let _ = std::fs::remove_file(eqoxide_core::config::config_dir().join("ui_layout___uiprobe__.json"));
     }
 
     /// Regression: window sizes must STABILIZE across frames WITHIN ONE

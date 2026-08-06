@@ -190,6 +190,12 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         // correct (drawing partial map art with no indication it's partial would just reproduce
         // #816's silent-partial shape one layer further down); what changes here is that the reason
         // is no longer thrown away, so a human driver sees WHY instead of an unexplained empty map.
+        //
+        // This branch fires ONLY for a map that is there and broken — a zone that ships no map
+        // reaches here with `zone_map_error: None` and keeps the blank canvas it has always had
+        // (#877 round 2). The two are different events and must not read the same: calling an
+        // ordinary state an error is the same invariant violation as hiding a real one, and 27 of
+        // the shipped map pack's zones are in that ordinary state.
         painter.text(
             rect.min + Vec2::new(6.0, 6.0),
             egui::Align2::LEFT_TOP,

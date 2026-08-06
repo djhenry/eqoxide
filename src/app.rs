@@ -32,28 +32,46 @@ struct PendingLoad {
     /// `zone_assets` state can report a real FAILED reason instead of an eternal "pending".
     load_error: Option<String>,
     collision: Option<Arc<collision::Collision>>,
-    zone_map:  Option<zone_map::ZoneMap>,
-    /// #873: why `zone_map` is `None`, when there IS a reason — mirrors `load_error`'s pairing with
-    /// `assets` above. `.ok()` used to throw this away entirely, so a present-but-unreadable detail
-    /// layer (#816 round 2) blanked the HUD minimap with no on-screen explanation, indistinguishable
-    /// from the ordinary, common case of a zone that simply has no map. See `split_zone_map_result`.
-    zone_map_error: Option<String>,
+    /// The HUD minimap's map-load OUTCOME, carried whole (#873, #877 round 2). `None` = this load
+    /// attempted no map read at all (the panic backstop below); `Some(Ok)` = the map; `Some(Err)` =
+    /// why there isn't one.
+    ///
+    /// Deliberately ONE value rather than an `Option<ZoneMap>` beside an `Option<String>` reason.
+    /// Two fields can be set independently, and #877's reviewer measured exactly that failure: with
+    /// the reason-producing helper and its unit test left intact, reverting this one production call
+    /// site to the pre-fix `.ok()` + `None` — keeping the map, silently dropping the reason — left
+    /// the entire workspace green. A `Result` cannot lose half of itself, and the `.ok()` shape no
+    /// longer typechecks here.
+    zone_map: Option<Result<zone_map::ZoneMap, zone_map::ZoneMapLoadError>>,
     zone_min:  [f32; 2],
     zone_max:  [f32; 2],
 }
 
-/// #873: pair a `ZoneMap` load's outcome with a human reason on failure, so a caller that only wants
-/// the map (the HUD minimap, via `.ok()`-shaped code before this fix) can still say WHY there isn't
-/// one instead of rendering a wordlessly blank canvas. Kept as a standalone function (not inlined at
-/// the one call site) so it has its own unit test: this pairing must never disagree with itself
-/// (`Some` map ⇒ no reason, `None` map ⇒ always a reason), and a plain match arm makes that obvious
-/// by inspection rather than needing to trust the call site got both halves right.
-fn split_zone_map_result(
-    result: Result<zone_map::ZoneMap, zone_map::ZoneMapLoadError>,
-) -> (Option<zone_map::ZoneMap>, Option<String>) {
-    match result {
-        Ok(zm) => (Some(zm), None),
-        Err(e) => (None, Some(e.to_string())),
+/// #873: render a `ZoneMap` load outcome into what the HUD minimap needs — the map to draw, if any,
+/// and the reason there isn't one, if that absence is a DEFECT. Returns both halves from one call so
+/// a call site cannot keep the map and quietly discard the reason (see `PendingLoad::zone_map`).
+///
+/// **`Missing` is deliberately NOT a reason** (#877 round 2, owner direction). `Missing` and
+/// `LayerUnreadable` are different events and must not render identically: a zone that ships no
+/// `.txt` map at all is an ordinary, expected state — measured against the shipped map pack, 27
+/// zones that ship a `.wtr` have no base `.txt`, including `tutorial`, `arena2`, `bazaar_v0`/`_v1`,
+/// `guildhall3`, `shadowedmount`, `nektulos_v0`/`_v1` and `load`/`load2` — and painting "map data
+/// unavailable: …" over those would report a non-failure as a failure. That is the agent-honesty
+/// invariant pointing the other way: a false alarm is as dishonest as a false success, and an alarm
+/// that fires on 27 ordinary zones is exactly how a real one stops being read. The two
+/// present-but-broken causes (`Unreadable`, `LayerUnreadable`) ARE defects a driver should see, so
+/// only those carry a reason.
+///
+/// This filter is HUD-only. `/v1/observe/debug`'s `zone_map_load` still reports all three causes
+/// distinctly (see `eqoxide-net`'s `sync_zone_points`) — the agent-facing disclosure is unchanged.
+fn hud_zone_map_view(
+    outcome: Option<&Result<zone_map::ZoneMap, zone_map::ZoneMapLoadError>>,
+) -> (Option<&zone_map::ZoneMap>, Option<String>) {
+    match outcome {
+        None => (None, None),
+        Some(Ok(zm)) => (Some(zm), None),
+        Some(Err(zone_map::ZoneMapLoadError::Missing)) => (None, None),
+        Some(Err(e)) => (None, Some(e.to_string())),
     }
 }
 
@@ -303,13 +321,12 @@ pub struct App {
     load_status:    Arc<Mutex<String>>,
     /// Background thread writes completed load data here; render loop drains it.
     pending_load:   Arc<Mutex<Option<PendingLoad>>>,
-    // Minimap
+    // Minimap. `zone_map` is the map-load OUTCOME carried whole, not a map beside a separately
+    // droppable reason (#873, #877 round 2) — see `PendingLoad::zone_map` for why, and
+    // `hud_zone_map_view` for how it becomes pixels. `None` until a load has reported.
     zone_min:      [f32; 2],
     zone_max:      [f32; 2],
-    zone_map:      Option<zone_map::ZoneMap>,
-    /// #873: the reason `zone_map` is `None`, so the HUD can say why instead of drawing a wordlessly
-    /// blank minimap. See `split_zone_map_result`.
-    zone_map_error: Option<String>,
+    zone_map:      Option<Result<zone_map::ZoneMap, zone_map::ZoneMapLoadError>>,
     // Camera & smooth position
     visual_player_pos:  [f32; 3],
     prev_logical_pos:   [f32; 3],
@@ -585,7 +602,6 @@ impl App {
             pending_load: Arc::new(Mutex::new(None)),
             zone_min: [0.0; 2], zone_max: [0.0; 2],
             zone_map: None,
-            zone_map_error: None,
             visual_player_pos: [0.0, 0.0, 0.0],
             prev_logical_pos:  [0.0, 0.0, 0.0],
             last_moved_at:     std::time::Instant::now(),
@@ -907,15 +923,17 @@ impl App {
             // "renders wordlessly empty", as an unplanned side effect of that loader change rather
             // than a decision anyone made. Kept the whole-load-refusal itself (drawing map art with no
             // indication some of it is missing would just be the same lie one layer further down), but
-            // the reason is no longer thrown away — `split_zone_map_result` keeps it so the minimap can
-            // show a short "map data unavailable: …" line instead of an unexplained blank canvas.
-            let (zone_map, zone_map_error) =
-                split_zone_map_result(zone_map::ZoneMap::try_load(&maps_dir, &zone_name));
+            // the reason is no longer thrown away: the WHOLE `Result` is handed on, and
+            // `hud_zone_map_view` decides at render time what the minimap says about it — for the two
+            // present-but-BROKEN causes, a short "map data unavailable: …" line instead of an
+            // unexplained blank canvas; for a zone that simply ships no map, the same quiet blank
+            // canvas it has always had (see that function's doc).
+            let zone_map = Some(zone_map::ZoneMap::try_load(&maps_dir, &zone_name));
 
             set_status("Uploading to GPU…");
             publish_load(&pending, load_gen, PendingLoad {
                 gen: load_gen, zone_name, assets: opt_assets, load_error, collision, zone_map,
-                zone_map_error, zone_min, zone_max,
+                zone_min, zone_max,
             });
             });
             if std::panic::catch_unwind(body).is_err() {
@@ -929,7 +947,7 @@ impl App {
                 publish_load(&pending_for_panic, load_gen, PendingLoad {
                     gen: load_gen, zone_name: zone_for_panic, assets: None,
                     load_error: Some(reason.to_string()), collision: None, zone_map: None,
-                    zone_map_error: None, zone_min: [0.0; 2], zone_max: [0.0; 2],
+                    zone_min: [0.0; 2], zone_max: [0.0; 2],
                 });
             }
         }).expect("spawn zone-asset-loader thread");
@@ -989,7 +1007,6 @@ impl App {
         self.collision = self.shared_collision.read().unwrap().clone();
         tracing::info!("APP: zone_assets → {:?}", crate::nav::zone_assets::lock_state(&self.zone_assets));
         self.zone_map  = load.zone_map;
-        self.zone_map_error = load.zone_map_error;
         self.loading   = false;
         *self.load_status.lock().unwrap() = String::new();
     }
@@ -1531,6 +1548,16 @@ impl App {
             // `Pending` for the new zone in one call, so the observable state can never sit
             // stale-`Ready` from the previous zone while the client stands in a terrain-less one.
             self.collision = None;
+            // #877 round 2 (finding 5): same reasoning, one field over. `zone_map` is written in
+            // exactly ONE place (`apply_load`), and three paths clear `self.loading` without ever
+            // reaching it — `watch_for_lost_load`, `reload_zone`'s no-GPU early return, and
+            // `reload_zone`'s `testzone` branch (which attempts no map load at all). On those the map
+            // window would redraw the PREVIOUS zone's map — and, since #873, the previous zone's
+            // failure REASON. The stale-line-art version of this is pre-existing and merely ugly; a
+            // stale SENTENCE is a well-formed statement about the wrong zone, which is the failure
+            // shape this project ranks highest. Dropping the outcome here closes all three at once,
+            // because they all run downstream of this transition.
+            self.zone_map = None;
             crate::nav::zone_assets::begin_zone_load(
                 &self.shared_collision, &self.zone_assets,
                 &self.current_zone, "Zone change — starting asset load…");
@@ -1959,13 +1986,16 @@ impl App {
         // Egui pass — use associated function to avoid reborrowing self.
         let load_status_text = self.load_status.lock().unwrap().clone();
         let sync_frac = *self.sync_progress.lock().unwrap();
+        // #873/#877: the map to draw and the reason there isn't one come from ONE call, so a future
+        // edit cannot keep the first and silently drop the second (see `hud_zone_map_view`).
+        let (zone_map_view, zone_map_reason) = hud_zone_map_view(self.zone_map.as_ref());
         let prof_egui = crate::profiling::Stopwatch::start();
         let egui_wants_repaint = Self::egui_pass(
             &mut self.egui_state, &mut self.egui_renderer, &self.egui_ctx, &mut self.ui_state, &self.window,
             &mut enc, &view, renderer, self.loading, self.fade, &self.current_zone, &load_status_text,
             sync_frac,
             &self.scene, self.zone_min, self.zone_max,
-            self.current_fps, self.zone_map.as_ref(), self.zone_map_error.as_deref(),
+            self.current_fps, zone_map_view, zone_map_reason.as_deref(),
             cam_eye, self.collision.as_deref(),
             &self.acts, &self.spells,
             self.show_debug, self.game_state_view.server_corrections,
@@ -2858,14 +2888,14 @@ fn smooth_entity_motion(
 #[cfg(test)]
 mod tests {
     use super::{smooth_entity_motion, zone_needs_reload, next_fade, select_player_action, EntityMotion, MOTION_SMOOTH_DIST};
-    use super::{lost_load_zone, publish_load, split_zone_map_result, PendingLoad};
+    use super::{hud_zone_map_view, lost_load_zone, publish_load, PendingLoad};
     use crate::zone_map;
     use std::collections::HashMap;
 
     fn load(gen: u64, zone: &str) -> PendingLoad {
         PendingLoad {
             gen, zone_name: zone.to_string(), assets: None, load_error: Some("x".into()),
-            collision: None, zone_map: None, zone_map_error: None,
+            collision: None, zone_map: None,
             zone_min: [0.0; 2], zone_max: [0.0; 2],
         }
     }
@@ -2873,22 +2903,53 @@ mod tests {
     /// #873: the pre-fix code discarded a failed `ZoneMap::try_load` with a bare `.ok()`, so the HUD
     /// minimap went from "draws whatever loaded" to "renders wordlessly empty" the moment #816 round
     /// 2 made a present-but-unreadable detail layer fail the WHOLE load — an unplanned side effect,
-    /// not a decision. `split_zone_map_result` is the fix: it must never lose the reason on failure,
-    /// and must never invent one on success — the two halves of its return can't drift apart because
-    /// there's only one match arm producing each.
+    /// not a decision. `hud_zone_map_view` is the fix: it must never lose the reason on a
+    /// present-but-BROKEN map, and must never invent one on success.
+    ///
+    /// It must ALSO stay silent on `Missing` (#877 round 2, owner direction): a zone that ships no
+    /// `.txt` map is an ordinary, expected state, not a defect, and 27 zones in the shipped map pack
+    /// are in exactly that state. Rendering them identically to a broken layer would report a
+    /// non-failure as a failure — the agent-honesty invariant pointing the other way, where a false
+    /// alarm is as dishonest as a false success.
+    ///
+    /// This is the LOGIC half of #873's pin. The rendering half — that the reason reaches the
+    /// screen at all — is `eqoxide-ui`'s `zone_map_error_reaches_the_screen_873`, which walks the
+    /// frame's shape list for the laid-out text.
     #[test]
-    fn split_zone_map_result_pairs_the_reason_with_the_absence_873() {
-        let (map, err) = split_zone_map_result(Err(zone_map::ZoneMapLoadError::Missing));
+    fn hud_zone_map_view_keeps_a_defect_reason_and_stays_quiet_on_an_ordinary_absence_873() {
+        // ORDINARY absence: no map file at all. Quiet — no reason, nothing for the HUD to paint.
+        let missing = Err(zone_map::ZoneMapLoadError::Missing);
+        let (map, err) = hud_zone_map_view(Some(&missing));
         assert!(map.is_none(), "a failed load must not fabricate a map");
-        assert_eq!(
-            err.as_deref(),
-            Some(zone_map::ZoneMapLoadError::Missing.to_string().as_str()),
-            "a failed load must carry ITS OWN reason, not a generic/empty one — this is what lets \
-             the HUD show WHY instead of a wordless blank"
-        );
+        assert_eq!(err, None,
+            "a zone that simply ships no map is an ORDINARY state, not a failure — giving it a \
+             reason paints 'map data unavailable: …' over 27 perfectly normal zones and trains a \
+             reader to ignore the message that matters");
 
-        let ok = zone_map::ZoneMap { lines: Vec::new(), labels: Vec::new() };
-        let (map, err) = split_zone_map_result(Ok(ok));
+        // No load has reported yet (the panic backstop, or a zone change in flight): also quiet.
+        let (map, err) = hud_zone_map_view(None);
+        assert!(map.is_none() && err.is_none(),
+            "no load outcome at all must say nothing — inventing a reason here would put a sentence \
+             on screen about a load that was never attempted");
+
+        // DEFECTS: the map is there and could not be read. These must carry their own reason, and
+        // that reason must name what actually happened — the whole point of keeping it.
+        for broken in [
+            zone_map::ZoneMapLoadError::Unreadable(std::io::ErrorKind::PermissionDenied),
+            zone_map::ZoneMapLoadError::LayerUnreadable("_2", std::io::ErrorKind::InvalidData),
+        ] {
+            let outcome = Err(broken.clone());
+            let (map, err) = hud_zone_map_view(Some(&outcome));
+            assert!(map.is_none(), "a failed load must not fabricate a map");
+            assert_eq!(
+                err.as_deref(), Some(broken.to_string().as_str()),
+                "a BROKEN map must carry ITS OWN reason, not a generic/empty one and not another \
+                 cause's — this is what lets the HUD show WHY instead of a wordless blank"
+            );
+        }
+
+        let ok = Ok(zone_map::ZoneMap { lines: Vec::new(), labels: Vec::new() });
+        let (map, err) = hud_zone_map_view(Some(&ok));
         assert!(map.is_some(), "a successful load must be kept, not thrown away");
         assert!(err.is_none(), "a successful load must not carry a stale/phantom failure reason");
     }

@@ -360,6 +360,21 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
     /// them to a file that is fine while the real broken layer keeps being skipped. Pin all three
     /// positions so the suffix can only be correct by actually being read off `e.kind()`'s loop
     /// variable, not by matching the one case every other test exercises.
+    ///
+    /// **The RENDERED string is pinned, not just the variant payload** (PR #877 round 2, measured):
+    /// nothing reads the `&'static str` out of the enum — the suffix reaches a caller only through
+    /// [`std::fmt::Display`], which `eqoxide-http`'s `observe` renders into `zone_map_load.detail`
+    /// and which `src/app.rs` renders into the HUD's "map data unavailable: …" line. An earlier
+    /// version of this test asserted on the payload alone, and hardcoding the suffix in the
+    /// `Display` arm left the WHOLE workspace green — i.e. `detail` could still confidently name
+    /// `_1.txt` while `_2.txt` was the broken file, the exact sentence #872 was filed to falsify.
+    /// The honesty surface is the text, so the text is what gets asserted.
+    ///
+    /// **Bound of this pin** (#877 round 2 finding 6): each iteration breaks exactly ONE layer and
+    /// leaves the others absent, so it does not distinguish first-broken-wins from
+    /// last-broken-wins when two layers are unreadable at once. Both answers are honest — this test
+    /// claims only that the reported suffix names a layer that actually broke, not which one is
+    /// picked when several did.
     #[test]
     fn layer_unreadable_names_the_layer_that_actually_broke_872() {
         for broken in ["_1", "_2", "_3"] {
@@ -371,7 +386,25 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
             // other layer can supply a stray `LayerUnreadable` that would make this pin vacuous.
             std::fs::create_dir(dir.path().join(format!("z{broken}.txt"))).unwrap();
 
-            match ZoneMap::try_load(dir.path(), "z").unwrap_err() {
+            let err = ZoneMap::try_load(dir.path(), "z").unwrap_err();
+
+            // THE surface that matters: what a caller actually reads. It must name the broken
+            // layer's file, and must NOT name either of the two files that are perfectly fine.
+            let rendered = err.to_string();
+            assert!(rendered.contains(&format!("{broken}.txt")),
+                "layer '{broken}' is the one that was made unreadable, but the rendered detail \
+                 string never names '{broken}.txt': {rendered:?} — this string IS the report \
+                 (`zone_map_load.detail`, and the HUD's map-unavailable line), so a suffix that is \
+                 right in the enum and wrong in the text is still a wrong answer to whoever reads it");
+            for innocent in ["_1", "_2", "_3"] {
+                if innocent == broken { continue; }
+                assert!(!rendered.contains(&format!("{innocent}.txt")),
+                    "the rendered detail string names '{innocent}.txt', which was never even \
+                     created, while '{broken}.txt' is the layer that actually broke: {rendered:?} \
+                     — that sends whoever reads it to inspect a file that is fine");
+            }
+
+            match err {
                 ZoneMapLoadError::LayerUnreadable(suffix, kind) => {
                     assert_eq!(suffix, broken,
                         "layer '{broken}' is the one that was made unreadable, but the reported \
