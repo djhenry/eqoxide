@@ -61,3 +61,6 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # `tracing_subscriber::fmt()` capture subscriber to assert the parse-failure WARN is emitted (not
 # silently swallowed). Test-only; the release binary's subscriber is wired up in the app crate.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# #816: `sync_zone_points`' zone-map-load tests need a real `maps_dir` on disk (a missing file vs. a
+# present-but-unreadable one), same reasoning as `eqoxide-core`'s `region_map.rs`/`zone_map.rs` tests.
+tempfile = "3"

@@ -982,6 +982,7 @@ dependencies = [
  "eqoxide-telemetry",
  "miniz_oxide",
  "rand",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
