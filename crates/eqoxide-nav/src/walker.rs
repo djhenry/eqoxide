@@ -5091,34 +5091,49 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// no way to detect the offset.
     ///
     /// Unit ticks run microseconds apart, so a real ~3 s figure is not observable here. What IS
-    /// observable is the ORIGIN: park 60 ms of wall clock inside the quiet window, before the tick
-    /// that flips the verdict, and the honest reading must include it.
+    /// observable is the ORIGIN, and there are TWO distinct wrong origins to exclude, so the test
+    /// parks wall clock in two places and demands both back:
     ///
-    /// Mutation check: restore the old origin (`Some(Instant::now())` when the verdict flips, `None`
-    /// otherwise) → RED here, `quiet_ms` reads ~0. Delete the `last_progress_at` seed from
-    /// `reset_drive_state` → also RED (the `is_none()` seed in `tick_drive_state` then stamps the
-    /// origin one tick INTO the quiet window instead of at the journey's start… and this test's
-    /// sleep is before that tick, so the 60 ms is lost).
+    /// 1. before the journey's FIRST drive tick — the window starts when the journey does
+    ///    (`reset_drive_state`'s seed), not one tick in;
+    /// 2. inside the quiet window, before the tick that flips the verdict — the origin is the last
+    ///    progressing tick, not the flip.
+    ///
+    /// **Mutation checks (run, not reasoned — outputs in the PR's round-2 comment):** restore the
+    /// old origin (stamp `last_progress_at` when the verdict flips instead of on the ticks that
+    /// progressed) → RED, `quiet_ms` reads ~0. Delete the `last_progress_at` seed from
+    /// `reset_drive_state` → RED, `quiet_ms` reads ~`PARKED` instead of ~`2 × PARKED`, because
+    /// `tick_drive_state`'s `is_none()` fallback then stamps the origin one tick INTO the window and
+    /// park (1) is lost. Round 1 of this test asserted only `>= PARKED` and only parked at (2); the
+    /// seed-deletion mutant SURVIVED it, and the rustdoc claiming otherwise was reasoning, not a
+    /// measurement — see the round-2 comment for the surviving run.
     #[test]
     fn the_stall_clock_measures_the_whole_quiet_window_not_just_since_the_verdict_851() {
+        const PARKED: u64 = 60;
         let (mut w, nav, mut gs, goal) = stalled_walker_fixture();
+        // (1) The journey has begun — `stalled_walker_fixture` calls `reset_drive_state`, as
+        // `apply_plan` does — but no drive tick has run yet. This body is already going nowhere.
+        std::thread::sleep(std::time::Duration::from_millis(PARKED));
+
         // Every tick below is quiet, so the whole loop is inside the window `quiet_ticks` counts.
         for _ in 0..(NAV_STUCK_TICKS - 1) { w.drive_walk(&mut gs, goal); }
         assert_eq!(nav.nav_state.lock().unwrap().state, "navigating",
             "PREMISE: the verdict has NOT flipped yet, so the sleep below lands strictly inside the \
              detection window the old origin excluded");
-        const PARKED: u64 = 60;
+        // (2) …and more wall clock strictly inside the window, before the flip.
         std::thread::sleep(std::time::Duration::from_millis(PARKED));
         w.drive_walk(&mut gs, goal); // …the tick that flips it
 
         let s = nav.nav_state.lock().unwrap();
         assert_eq!(s.state, "navigating_stalled", "PREMISE: the verdict flipped on this tick");
         let stall = s.stall.expect("the stalled state carries its calibration");
-        assert!(stall.quiet_ms >= PARKED,
+        assert!(stall.quiet_ms >= 2 * PARKED,
             "#851 B2c: `quiet_ms` reported {} ms for a body that had already been going nowhere for \
-             at least {PARKED} ms when the verdict flipped. It must measure the same window \
-             `quiet_ticks` ({}) counts — since the walker last made progress — not since the flip.",
-            stall.quiet_ms, stall.quiet_ticks);
+             at least {} ms when the verdict flipped ({PARKED} ms of it before the journey's first \
+             drive tick). It must measure the whole window `quiet_ticks` ({}) counts — since the \
+             journey began, or since the walker last made progress — not since the flip, and not \
+             since the first tick.",
+            stall.quiet_ms, 2 * PARKED, stall.quiet_ticks);
     }
 
     /// **A NEW goal starts clean.** The verdict is keyed on `NavStatus::goal_id`, so a stall latched
