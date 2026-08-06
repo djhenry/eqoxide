@@ -401,7 +401,8 @@ true of the load, zone-in or idle paths.)
 **Why an idle render loop cannot leave `hold` describing a predicament you have left — and the two
 places the client withdraws it on purpose (#846).** The obvious attack is the one the table above
 tells you to use: a GM `#summon`. It arrives on the *network* thread, and the network thread is not
-the one that recomputes the hold. It still cannot leave you with a stale `hold`. The movement
+the one that recomputes the hold. It still cannot free your body behind the hold's back — which is
+what would make the field a confident falsehood rather than merely an old one. The movement
 controller is owned by the render thread, in a crate the network code cannot even name, so the
 network side has no way to move your body: all it can do is hand the new coordinates over and wait,
 and the render frame that picks them up is the frame that clears the hold and recomputes. Adopting

@@ -3874,7 +3874,12 @@ mod tests {
     /// if gs.player_hold.is_none() { gs.player_hold = __prev; }   // never withdraw
     /// ```
     ///
-    /// — left the whole workspace green (42 headers, 1854 passed, 0 failed). A hold that is never
+    /// — left the whole workspace green apart from the two tests THIS PR adds: with this test and
+    /// `a_re_asserted_summon_never_pairs_a_fresh_pos_with_a_stale_hold_846` skipped, the latch is
+    /// invisible to every other target in the repo (42 headers / 42 `test result:` lines, 1856
+    /// passed, 0 failed, 45 ignored, 2 filtered — the clean baseline is 1858 passed). The round-1
+    /// property test beside this one passes under all three latch mutations below, which is what
+    /// made B2 a real gap and not a stylistic one. A hold that is never
     /// withdrawn is the exact failure `ControllerView::hold`'s own doc names: a body that has been
     /// freed keeps reporting wedged, indefinitely, in a well-formed field, and nothing looks wrong.
     /// The afloat half of the same statement has had this axis since #801
@@ -4038,8 +4043,10 @@ mod tests {
             "the clear must reach the view the mirror reads — clearing only the GameState copy is \
              what round 1 measured as surviving exactly one net tick");
 
-        // And the render thread is still the only thing that can put a hold back: the first frame
-        // it publishes in the NEW zone is mirrored normally.
+        // And the render thread can still put a hold back: the first frame it publishes in the NEW
+        // zone is mirrored normally. (That it is the ONLY thing that can is the separate universal
+        // held by `no_net_tick_can_free_or_manufacture_a_hold_846`; this example only shows the
+        // invalidation is not a latch.)
         let new_hold = held(EmbeddedNoRecovery, 0.25);
         nav.controller.controller_view.lock().unwrap().publish_disclosures((Some(new_hold), None));
         nav.stream_position(&mut stream, &mut gs);

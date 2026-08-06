@@ -643,7 +643,10 @@ fn ser_error_kind<S: serde::Serializer>(
 /// at all — including the summon packet that caused it — so the loop wakes within its idle poll and
 /// renders. That is ~50 ms + a frame from the constants, **reasoned from those constants, not
 /// measured on a running client**, and it is **unguarded**: `app.rs`'s event loop needs a GPU and a
-/// window, and deleting that wake condition leaves the whole workspace green (measured on #846).
+/// window, so nothing exercises it. Measured on #846 by leaving the condition written and forcing
+/// it dead (`if false && …`, a wrap rather than a deletion): `cargo test --workspace --all-targets`
+/// came back with the five figures of a clean run, unchanged — 42 `running` headers / 42
+/// `test result:` lines, 1858 passed, 0 failed, 45 ignored, 0 filtered out.
 /// Treat the wake as the latency bound, not as the honesty guarantee.
 ///
 /// **And the residual, re-measured.** On a net tick that detects a server correction,
