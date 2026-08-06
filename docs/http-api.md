@@ -398,6 +398,40 @@ false hold; what it freezes is `held_secs`, and the paragraph above tells you ho
 (#724 round-3 review, N1 — this used to say "recomputes it from scratch every frame", which is not
 true of the load, zone-in or idle paths.)
 
+**Why an idle render loop cannot free your body behind `hold`'s back — and the two places the client
+withdraws it on purpose (#846).** The obvious attack is the one the table above
+tells you to use: a GM `#summon`. It arrives on the *network* thread, and the network thread is not
+the one that recomputes the hold. It still cannot free your body behind the hold's back — which is
+what would make the field a confident falsehood rather than merely an old one. The movement
+controller is owned by the render thread, in a crate the network code cannot even name, so the
+network side has no way to move your body: all it can do is hand the new coordinates over and wait,
+and the render frame that picks them up is the frame that clears the hold and recomputes. Adopting
+the summon and dropping the hold are the same frame, and the network side of that boundary is
+property-tested (`no_net_tick_can_free_or_manufacture_a_hold_846`, plus
+`the_hold_mirror_tracks_the_render_thread_over_time_846` for the case where the render thread
+publishes a *different* answer, withdrawal included).
+
+Two places the client does clear `hold` from the network side, both deliberately and both in the
+"say less" direction — you may briefly get `null` where a hold is still in force, never a hold where
+there is none:
+
+- **A zone change.** A hold describes collision geometry, and a zone-in drops it. `hold` goes `null`
+  for the whole load rather than reporting a wedge in a zone you have left.
+- **The tick a server reposition is handed to the render thread.** For that tick `pos` is already
+  the server's new coordinates, so the client withdraws `hold` rather than pair fresh coordinates
+  with the predicament you were just lifted out of. (An earlier draft of this section described that
+  mismatch as a one-tick window you could poll inside. That was measured against a server that
+  asserts the correction once; against one that re-asserts it every tick while the render loop
+  idles, it recurred indefinitely. It is withdrawn now instead of bounded.)
+
+One honest caveat remains: nothing above bounds how *long* the render loop may idle before it picks
+a correction up. It is woken by any inbound state change, including the summon itself, which works
+out to tens of milliseconds — but that number is **derived from the loop's own idle-poll and frame
+constants, not observed on a running client**, and the wake itself is reached by no test in this
+repo (measured: forcing the condition dead leaves the whole suite green and unchanged). Treat it as
+a latency expectation, not a promise. If it matters to you, the `held_secs`-against-your-own-clock
+check above is what distinguishes a frozen controller from a live one.
+
 ### `afloat_stall` — this swimmer is being asked to swim and is going nowhere (#776/#801)
 
 `player.afloat_stall`, in the `player` object of **`GET /v1/observe/debug`**, is `null` for every

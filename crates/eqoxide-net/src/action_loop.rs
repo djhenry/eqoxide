@@ -1113,6 +1113,15 @@ impl ActionLoop {
         }));
     }
 
+    /// The controller slots this loop streams from, for the zone-entry handshake (#846 review B1).
+    ///
+    /// `gameplay::run_zone_entry_handshake` needs [`eqoxide_ipc::ControllerSlots::begin_zone_in`]
+    /// rather than `GameState::begin_zone_in`: clearing the `GameState` disclosure fields without
+    /// invalidating the `ControllerView` they are mirrored from leaves `stream_position` to restore
+    /// the departed zone's hold on its very next tick. This is a read-only borrow — the handshake
+    /// has no business driving the loop, it just needs the shared slots.
+    pub fn controller_slots(&self) -> &eqoxide_ipc::ControllerSlots { &self.controller }
+
     /// Sync zone exit points from `gs` into the shared zone_points map.
     /// On zone change, also loads map-label exits from disk as fallback zone points.
     pub fn sync_zone_points(&mut self, gs: &GameState) {
@@ -2999,6 +3008,30 @@ impl ActionLoop {
         if cd[0] * cd[0] + cd[1] * cd[1] > CORRECTION_SQ {
             tracing::info!("NAV: server correction → handing controller new pos ({:.1},{:.1},{:.1})", gp[0], gp[1], gp[2]);
             *self.controller.pos_correction.lock().unwrap() = Some(gp);
+            // #846 review B3: this branch returns EARLY, so `gs.player_x/y/z` keep the SERVER's new
+            // coordinates while the two disclosures above still hold the frozen controller's answer
+            // about the place we were just moved OUT of — a fresh position beside an old
+            // predicament, with nothing in the payload marking the pair as coming from two different
+            // instants. Measured to recur indefinitely, not for one tick, whenever the server
+            // re-asserts the correction while the render loop idles (`D.D.D.D.D.D.`, diverged 6 of
+            // 12 ticks at a 50% duty cycle).
+            //
+            // Withdraw both instead. This is NOT the net thread inventing an answer: `pos_correction`
+            // has just been handed to `CharacterController::teleport`, which drops the hold and
+            // resets the afloat window UNCONDITIONALLY, on every path through it — the function is
+            // straight-line with no early return. (Round 2 corrected "as its FIRST act", which was
+            // literally wrong: `forget_recovery_history()` is first, `self.hold = None` second and
+            // the afloat reset last. "On every path" is both true and the stronger statement.)
+            //
+            // So the withdrawal publishes the disclosure the controller itself will hold the moment
+            // it adopts. It is NOT a promise about the render thread's next publication: if the
+            // summon drops the body inside geometry, the very next published value is `Some(..)` —
+            // about the NEW position, which is correct and is precisely why withdrawing here is
+            // right rather than merely early. The direction is what carries the argument:
+            // withdrawing can only lose a warning for a tick, whereas keeping the old `Some`
+            // asserts a wedge at coordinates the body was just lifted away from, which is the #343
+            // shape and the thing #846 is about.
+            (gs.player_hold, gs.player_afloat_stall) = (None, None);
             // `from = gp` (== the sent position): a server correction is a snap-adopt, not motion
             // WE performed, so it must report zero speed/anim, never a spike from whatever
             // `last_sent_pos` happened to be before the jump (#624 review — the reviewer confirmed
@@ -3033,12 +3066,23 @@ impl ActionLoop {
         // for the new zone (i.e. between `begin_zone_in` and the controller being placed here),
         // `player_x/y/z` still hold whatever they held before: the OLD zone's last-known
         // coordinates on every zone change after the first, or the struct's construction-time
-        // zeroes on the very first zone-in of the session. Either way `GameState::player_pos_known`
-        // is false during that window (see its doc), so anything derived from `player_x/y/z` —
-        // notably the `distance` a name-resolution endpoint reports — would be a confident wrong
-        // number (a stale-but-plausible old position is the more dangerous case, since it doesn't
-        // look absurd the way an origin-relative one would). Consumers gate on this via
-        // `HttpState::player_pos()` and report an honest "unknown" until it flips.
+        // zeroes on the very first zone-in of the session. Anything derived from `player_x/y/z` in
+        // that window — notably the `distance` a name-resolution endpoint reports — would be a
+        // confident wrong number (a stale-but-plausible old position is the more dangerous case,
+        // since it doesn't look absurd the way an origin-relative one would). Consumers gate on
+        // `player_pos_known` via `HttpState::player_pos()` and report an honest "unknown".
+        //
+        // **#846 review / #871: the last two sentences of the paragraph above USED to end "either
+        // way `player_pos_known` is false during that window", and that is not true.** The only gate
+        // on this whole path is `view.initialized`, which `app.rs` sets once when the controller
+        // first spawns and never re-clears on a zone change. So the first net tick after
+        // `begin_zone_in` runs THIS line — writing the DEPARTED zone's controller position into
+        // `player_x/y/z` and flipping the flag back to true on it — roughly 10 ms into a load that
+        // takes seconds. `player_pos_known`'s own doc states the precondition ("once the controller
+        // has actually been placed in this zone"); nothing here enforces it, because the mirror
+        // cannot tell that placement from the one before it. Filed as #871 rather than fixed in
+        // #846: same mechanism as the hold (one unconditional mirror, no zone identity on the
+        // view), different field, and this one's blast radius is position streaming.
         gs.player_pos_known = true;
         gs.player_heading = view.heading;
         self.last_streamed = pos;
@@ -3658,6 +3702,602 @@ mod tests {
         assert!(gs.player_afloat_stall.is_none(),
             "the mirror is level-triggered and must also be the clear — a stall that is written \
              once and never withdrawn keeps reporting a trapped swimmer who is already swimming");
+    }
+
+    /// A `ControllerHold` fixture. Public fields, so this is just a named literal — but naming it
+    /// keeps the #846 tests below reading as "the render thread published THIS" rather than as
+    /// struct-literal noise.
+    fn held(reason: eqoxide_core::game_state::ControllerHoldReason, secs: f32)
+        -> eqoxide_core::game_state::ControllerHold
+    {
+        eqoxide_core::game_state::ControllerHold { reason, secs }
+    }
+
+    /// **#846 — the net thread can never publish a hold the render thread did not publish,
+    /// whatever the server does to our position and however long the render loop stays idle.**
+    ///
+    /// This is the universal `PlayerHoldView`'s rustdoc asserts, tested as a universal rather than
+    /// left as prose. #846 attacked it with a GM `#summon`: the summon lands on the NET thread, and
+    /// if the net thread could invent a predicament — or keep asserting a stale one — while the
+    /// render loop idled, `player.hold` would be a well-formed field an agent has no way to tell
+    /// from a fresh one. That is the #343 `connected: true` shape.
+    ///
+    /// The render loop is modelled by NEVER republishing the `ControllerView` for the whole run:
+    /// the view is written once, before the first tick, and then frozen. Every tick after that is a
+    /// net tick with an idle render thread, which is exactly the window under attack. (The
+    /// complementary axis — the render thread publishing DIFFERENT values over time, including a
+    /// withdrawal — is `the_hold_mirror_tracks_the_render_thread_over_time_846` below. Round 1 of
+    /// this PR's review found that axis missing here and a latching mirror green across the whole
+    /// workspace because of it.)
+    ///
+    /// **Axes deliberately varied:** the published hold (absent / embedded / underworld); the size
+    /// and axis of the server reposition, spanning both sides of `CORRECTION_SQ` (no jump, a 3u
+    /// drift below it, a 50u summon, a 500u cross-map summon, a negative-direction summon, and a
+    /// Z-only 400u drop the 2D correction test cannot see); and the number of consecutive net ticks
+    /// (1..=6), because a one-tick check cannot distinguish "never" from "not yet".
+    ///
+    /// **The expected value is exact, not "unchanged", and the difference is the #846 review's B3
+    /// fix.** On a tick that reaches the correction branch the mirror is WITHDRAWN
+    /// (`player_hold = None`), because that branch returns early with `gs.player_x/y/z` holding the
+    /// SERVER's new coordinates: pairing them with the frozen controller's hold would assert a wedge
+    /// at a position the body was just lifted away from. `None` there is not an invention — the
+    /// `pos_correction` handed over on that same statement runs `CharacterController::teleport`,
+    /// which drops the hold and the afloat window as its first act — it is that value, one tick
+    /// early. Both the exact expectation and the weaker never-manufacture property are asserted, so
+    /// a change that starts inventing holds fails even if it also changes the branch structure.
+    ///
+    /// **Axis deliberately NOT varied:** whether the hold is CORRECT. Whether the controller was
+    /// right to raise one is `movement.rs`'s job. This pins the property #846 disputes — that
+    /// nothing on the net side of the boundary can put a predicament into the answer.
+    ///
+    /// **What this does NOT establish** (say it, don't imply it away): it does not prove the render
+    /// loop ever wakes. The bound on how long a frozen view can persist lives in `app.rs`'s
+    /// `poll_external` — a pending `pos_correction`, and any `GameState` mutation at all, mark the
+    /// loop active — and `app.rs`'s event loop needs a GPU and a window, so no test in this
+    /// workspace reaches it. That wake is UNGUARDED: neutering it (`if false && ..` at
+    /// `app.rs:1258`) leaves the whole workspace green, measured. This test covers the honesty claim
+    /// (the net side cannot make the value wrong); the wake is the latency bound.
+    ///
+    /// MUTATION CHECKS (#846, each run independently, results in the PR body — all are WRAP
+    /// mutations that leave the mirror statement in place and executing, per #799):
+    /// 1. in the correction branch, replace the withdrawal with `gs.player_hold = Some(held(..))`
+    ///    (a net-side invention) → RED;
+    /// 2. in the correction branch, add
+    ///    `self.controller.controller_view.lock().unwrap().pos = gp;` (the net thread adopting the
+    ///    correction itself instead of asking the render thread) → RED;
+    /// 3. keep the mirror statement but substitute a plausible wrong value for the hold half
+    ///    (`Some(ControllerHold { EmbeddedNoRecovery, 1.0 })`) → RED;
+    /// 4. drop the correction branch's `(gs.player_hold, gs.player_afloat_stall) = (None, None);`
+    ///    (the B3 fix) → RED on every far row.
+    #[tokio::test]
+    async fn no_net_tick_can_free_or_manufacture_a_hold_846() {
+        use eqoxide_core::game_state::ControllerHoldReason::*;
+
+        let published: [Option<eqoxide_core::game_state::ControllerHold>; 3] = [
+            None,
+            Some(held(EmbeddedNoRecovery, 3.25)),
+            Some(held(UnderworldNoRecovery, 0.5)),
+        ];
+        // Server repositions, relative to where the controller is frozen. Both sides of
+        // `CORRECTION_SQ` (144.0 = 12u, 2D) are covered on purpose: only the far ones reach the
+        // correction branch, and the near ones must be just as unable to touch the hold.
+        let jumps: [[f32; 3]; 6] = [
+            [   0.0,    0.0,    0.0], // no reposition at all
+            [   3.0,   -1.0,    0.5], // ordinary sync drift, under the correction threshold
+            [  50.0,    0.0,    0.0], // a GM #summon across the room
+            [   0.0,  500.0,  -30.0], // a cross-map summon
+            [-320.0, -180.0,   12.0], // ...in the other direction
+            [   0.0,    0.0, -400.0], // Z only — the correction test is 2D and cannot see this one
+        ];
+
+        for hold in published {
+            for jump in jumps {
+                for ticks in 1..=6u32 {
+                    let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+                    let mut nav = new_loop();
+                    let mut gs = GameState::new();
+
+                    // The render thread publishes ONCE and then goes idle. Nothing below ever
+                    // republishes: every tick from here is a net tick against a frozen view.
+                    const FROZEN_POS: [f32; 3] = [812.5, -44.0, 3.75];
+                    const FROZEN_HEADING: f32 = 137.5;
+                    {
+                        let mut view = nav.controller.controller_view.lock().unwrap();
+                        view.initialized = true;
+                        view.pos = FROZEN_POS;
+                        view.heading = FROZEN_HEADING;
+                        view.publish_disclosures((hold, None));
+                    }
+                    // Baseline tick: anchors `last_streamed`/`last_pos_send` and returns. Seed `gs`
+                    // at the frozen position first, so the anchor is the controller's placement and
+                    // not the origin — otherwise EVERY case below would enter the correction branch
+                    // on its first tick (measured: it did) and the sub-threshold rows would stop
+                    // testing the normal path they were added for.
+                    gs.player_x = FROZEN_POS[0];
+                    gs.player_y = FROZEN_POS[1];
+                    gs.player_z = FROZEN_POS[2];
+                    nav.stream_position(&mut stream, &mut gs);
+
+                    // Whether this row's jump can reach the correction branch at all.
+                    let far = jump[0] * jump[0] + jump[1] * jump[1] > CORRECTION_SQ;
+                    let mut corrections = 0u32;
+
+                    for t in 0..ticks {
+                        // The server keeps telling us we are somewhere else — the summon, re-sent.
+                        gs.player_x = FROZEN_POS[0] + jump[0];
+                        gs.player_y = FROZEN_POS[1] + jump[1];
+                        gs.player_z = FROZEN_POS[2] + jump[2];
+
+                        // Per-tick probe of which branch ran. Clearing the slot only affects what
+                        // this test can observe — `stream_position` writes it and never reads it —
+                        // and the branch taken ALTERNATES on a far row: the correction tick sets
+                        // `last_streamed` to the server's position, so the next tick sees no jump,
+                        // takes the normal path and writes the controller's position back, which
+                        // makes the tick after that a jump again. Expecting `None` on every far
+                        // tick would be wrong for exactly that reason.
+                        *nav.controller.pos_correction.lock().unwrap() = None;
+                        nav.stream_position(&mut stream, &mut gs);
+                        let corrected = nav.controller.pos_correction.lock().unwrap().is_some();
+                        if corrected { corrections += 1; }
+                        let expected = if corrected { None } else { hold };
+
+                        let ctx = format!(
+                            "hold={hold:?} jump={jump:?} far={far} corrected={corrected} \
+                             tick {}/{ticks}", t + 1);
+
+                        // 1. THE NET THREAD NEVER MANUFACTURES A PREDICAMENT. The weak form of the
+                        //    property, asserted on EVERY row so it survives any change to the branch
+                        //    structure: whatever ends up in the field is either the render thread's
+                        //    own answer or nothing at all — never a third value the net side made up.
+                        assert!(gs.player_hold.is_none() || gs.player_hold == hold,
+                            "the net thread published a hold the render thread never did: {ctx} \
+                             got={:?}", gs.player_hold);
+
+                        // 2. AND THE EXACT VALUE. Mirrored verbatim on the normal path; withdrawn on
+                        //    the correction tick, where `pos` is the server's and the frozen hold
+                        //    would describe the place we were lifted out of (#846 review B3).
+                        assert_eq!(gs.player_hold, expected,
+                            "on the normal path the net thread must MIRROR the render thread's hold \
+                             verbatim, and on a correction tick it must WITHDRAW it rather than \
+                             pair a fresh server position with the old predicament: {ctx}");
+
+                        // 3. AND IT DID NOT REACH ACROSS AND MOVE THE BODY ITSELF. The controller is
+                        //    the render thread's; the only thing the net side may do with a
+                        //    correction is publish it into `pos_correction` and wait to be asked.
+                        //    Note the withdrawal above is a write to `gs`, NOT to the view: the
+                        //    render thread's published answer is left exactly as it published it.
+                        let view = *nav.controller.controller_view.lock().unwrap();
+                        assert_eq!(view.pos, FROZEN_POS,
+                            "the net thread must not write the controller's position — freeing the \
+                             body is the render thread's move to make: {ctx}");
+                        assert_eq!(view.heading, FROZEN_HEADING,
+                            "nor its heading: {ctx}");
+                        assert_eq!(view.disclosures(), (hold, None),
+                            "nor either disclosure — the view is the render thread's to publish, \
+                             and the correction-tick withdrawal writes `gs`, not this: {ctx}");
+                    }
+
+                    // REACH CONTROL (#778's lesson: a guard that never reaches its target passes
+                    // for the wrong reason). The rows whose 2D jump clears `CORRECTION_SQ` must
+                    // actually have entered the correction branch; the rows below it must not.
+                    // Without this, a threshold change could quietly move the whole matrix onto the
+                    // normal path and every assertion above would still pass.
+                    let asked = corrections > 0;
+                    assert_eq!(asked, far,
+                        "reach control: a jump past CORRECTION_SQ must reach the correction branch \
+                         and one under it must not (note the test is 2D, so the Z-only row is an \
+                         'under it' row — that blindness is `stream_position`'s, deliberately): \
+                         jump={jump:?} far={far} asked={asked}");
+                }
+            }
+        }
+    }
+
+    /// **#846 review B2 — the hold mirror must TRACK the render thread over time, withdrawal
+    /// included.** The axis the round-1 property test was missing.
+    ///
+    /// The matrix above varies what the SERVER does across 108 rows and freezes what the render
+    /// thread published; it therefore could not see a mirror that never withdraws. Measured in
+    /// review: wrapping the mirror in a latch —
+    ///
+    /// ```text
+    /// let __prev = gs.player_hold;
+    /// (gs.player_hold, gs.player_afloat_stall) = view.disclosures();
+    /// if gs.player_hold.is_none() { gs.player_hold = __prev; }   // never withdraw
+    /// ```
+    ///
+    /// — left the whole workspace green apart from the two tests THIS PR adds: with this test and
+    /// `a_re_asserted_summon_never_pairs_a_fresh_pos_with_a_stale_hold_846` skipped, the latch is
+    /// invisible to every other target in the repo (42 headers / 42 `test result:` lines, 1856
+    /// passed, 0 failed, 45 ignored, 2 filtered — the clean baseline is 1858 passed). The round-1
+    /// property test beside this one passes under all three latch mutations below, which is what
+    /// made B2 a real gap and not a stylistic one. A hold that is never
+    /// withdrawn is the exact failure `ControllerView::hold`'s own doc names: a body that has been
+    /// freed keeps reporting wedged, indefinitely, in a well-formed field, and nothing looks wrong.
+    /// The afloat half of the same statement has had this axis since #801
+    /// (`stream_position_mirrors_and_withdraws_the_afloat_stall_801`); this is its missing twin, so
+    /// the "published on exactly the same terms" symmetry the docs assert is now true of the
+    /// coverage as well as of the code.
+    ///
+    /// **Axes varied:** every ordered transition between four published values — absent, two
+    /// DIFFERENT `Some`s with different reasons, and a third `Some` differing from one of them only
+    /// in `secs`. The last one matters: a latch keyed on `is_none()` survives a `Some`→`Some` check,
+    /// and a write-once latch survives a `None`→`Some` one, so the schedule walks all of them in
+    /// both directions. The body is kept still, so every tick takes the normal (mirroring) path —
+    /// the correction path's deliberate withdrawal is the matrix above's job, and mixing them here
+    /// would let a mutation hide in the disjunction.
+    ///
+    /// **The afloat stall is varied WITH the hold, not held constant (#846 round-2 review F1).**
+    /// `stream_position` mirrors the two in one destructuring statement, so a stall that latches
+    /// while the hold tracks is a live defect shape — and with the round-2 fixtures publishing
+    /// `(Some(hold), None)` throughout, nothing in the repo could see it. The four values pair the
+    /// hold with `None`, a stall at the body's own position, `None` again, and a stall at a
+    /// DIFFERENT anchor, so the 16 transitions cover `None`→`Some`, `Some`→`None`, `Some`→`Some`
+    /// with a moved anchor, and `Some`→`Some` unchanged on that axis too.
+    ///
+    /// MUTATION CHECKS (#846, run independently, results in the PR body):
+    /// 1. the latch above (mirror statement left written and executing, per #799) → RED;
+    /// 2. a write-once latch (`if gs.player_hold.is_none() { gs.player_hold = view.disclosures().0 }`)
+    ///    → RED;
+    /// 3. mirror only the reason and keep the previous `secs` → RED;
+    /// 4. mirror the hold and latch the stall (`if d.1.is_some() { gs.player_afloat_stall = d.1 }`)
+    ///    → RED (round 2; would have been GREEN before the stall axis existed).
+    #[tokio::test]
+    async fn the_hold_mirror_tracks_the_render_thread_over_time_846() {
+        use eqoxide_core::game_state::ControllerHoldReason::*;
+
+        // Four published values, walked as EVERY ordered pair (16 transitions, self-transitions
+        // included) so no single-direction latch survives.
+        let values: [Option<eqoxide_core::game_state::ControllerHold>; 4] = [
+            None,
+            Some(held(EmbeddedNoRecovery, 3.25)),
+            Some(held(UnderworldNoRecovery, 12.0)),
+            Some(held(EmbeddedNoRecovery, 41.5)), // same reason as [1], different `secs`
+        ];
+
+        const STILL: [f32; 3] = [-64.0, 220.5, 18.25];
+        const ELSEWHERE: [f32; 3] = [117.0, -8.25, 42.5];
+
+        // The stall axis, paired with the hold axis rather than held constant (#846 round-2 review
+        // F1). Every fixture in this crate used to publish `(Some(hold), None)`, which made every
+        // afloat assertion in these tests satisfiable by `GameState::begin_zone_in`'s own field
+        // clear and therefore unfalsifiable — measured, twice, as workspace-GREEN half-neuterings.
+        // The four stalls below give the transition matrix `None → Some`, `Some → None`,
+        // `Some → Some` at a DIFFERENT anchor, and `Some → Some` unchanged, so a mirror that
+        // follows the hold and latches the stall beside it goes red.
+        let stalls: [Option<eqoxide_core::afloat::AfloatStall>; 4] = [
+            None,
+            Some(crate::test_afloat::matured_stall(STILL)),
+            None,
+            Some(crate::test_afloat::matured_stall(ELSEWHERE)),
+        ];
+        let values: [(Option<eqoxide_core::game_state::ControllerHold>,
+                      Option<eqoxide_core::afloat::AfloatStall>); 4] =
+            [(values[0], stalls[0]), (values[1], stalls[1]),
+             (values[2], stalls[2]), (values[3], stalls[3])];
+
+        for from in values {
+            for to in values {
+                let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+                let mut nav = new_loop();
+                let mut gs = GameState::new();
+
+                {
+                    let mut view = nav.controller.controller_view.lock().unwrap();
+                    view.initialized = true;
+                    view.pos = STILL;
+                    view.publish_disclosures(from);
+                }
+                gs.player_x = STILL[0];
+                gs.player_y = STILL[1];
+                gs.player_z = STILL[2];
+                nav.stream_position(&mut stream, &mut gs); // baseline: anchors last_streamed
+                nav.stream_position(&mut stream, &mut gs);
+                assert_eq!((gs.player_hold, gs.player_afloat_stall), from,
+                    "precondition: the render thread's first answer reached the GameState \
+                     (from={from:?} to={to:?})");
+
+                // The render thread renders another frame and publishes a DIFFERENT answer — the
+                // body was freed, or wedged, or has been wedged for longer.
+                nav.controller.controller_view.lock().unwrap().publish_disclosures(to);
+                nav.stream_position(&mut stream, &mut gs);
+
+                assert_eq!((gs.player_hold, gs.player_afloat_stall), to,
+                    "the mirror is level-triggered and the republish IS the clear: a hold written \
+                     once and never withdrawn keeps reporting a wedged body that is already free, \
+                     and one whose `secs` never advances reports a fresh wedge as an old one \
+                     (from={from:?} to={to:?})");
+
+                // …and it stays tracked, not just on the transition tick.
+                for _ in 0..3 {
+                    nav.stream_position(&mut stream, &mut gs);
+                    assert_eq!((gs.player_hold, gs.player_afloat_stall), to,
+                        "and it keeps tracking on later ticks (from={from:?} to={to:?})");
+                }
+
+                // Reach control: the body never moved, so nothing here took the correction branch —
+                // every assertion above is about the MIRROR, not about the withdrawal beside it.
+                assert!(nav.controller.pos_correction.lock().unwrap().is_none(),
+                    "reach control: this test must exercise the normal (mirroring) path only — a \
+                     correction here would make the withdrawal, not the mirror, explain the result");
+            }
+        }
+    }
+
+    /// **#846 review B1 — a zone-in must clear the departed zone's hold, and it must STAY clear
+    /// when the render loop publishes nothing across the whole zone load.**
+    ///
+    /// `GameState::begin_zone_in` sets `player_hold = None`, and its own doc says that clear is what
+    /// covers "the render loop does not publish at all" (the ~10 s asset load) while `app.rs`'s
+    /// `clear_hold` covers "it keeps rendering through the load". Measured in the round-1 review:
+    /// the first half did not work. `stream_position` mirrors `ControllerView::disclosures()`
+    /// unconditionally on every ~10 ms net tick, so the departed zone's `Some(EmbeddedNoRecovery,
+    /// 7.5)` was back one tick after the clear —
+    ///
+    /// ```text
+    /// after begin_zone_in: hold=None                            after ONE net tick: hold=Some(..)
+    /// ```
+    ///
+    /// — a confident "you are wedged" about geometry in a zone the character has left, served on
+    /// `GET /v1/observe/debug` with nothing to distinguish it from a live one. The mirror is not at
+    /// fault: it faithfully republishes what the render thread last published, and what the render
+    /// thread last published is exactly the stale thing. The clear therefore has to reach the VIEW,
+    /// which is what `ControllerSlots::begin_zone_in` does and what the two net-thread zone-in call
+    /// sites (`gameplay::run_zone_entry_handshake`, `login.rs`'s zone reconnect) now call.
+    ///
+    /// The render loop is modelled by never republishing after the wedge: not one frame across the
+    /// entire load. That is the case under test, and the case the pre-existing pairing claimed to
+    /// cover.
+    ///
+    /// **What that model is and is not (round-2 correction).** It is NOT a claim that the render
+    /// thread falls silent when `begin_zone_in` runs — it does not. `controller.begin_zone_in(gs)`
+    /// is the first statement of `run_zone_entry_handshake`, before `send_zone_entry`, and the
+    /// render thread does not learn of the zone change until `OP_NEW_ZONE` arrives later in that
+    /// same loop, so during the early handshake it is still stepping the OLD collision and
+    /// republishing the old hold into the view. The reason the clear actually sticks is different:
+    /// `stream_position` is not running at all during the handshake (it is awaited inside
+    /// `run_gameplay_phase`), and by the time gameplay resumes the render thread has seen the new
+    /// zone, dropped collision and published `(None, None)` via `clear_hold`. Never-republishing is
+    /// therefore the STRICTEST model of that gap — the one under which a mirror that restores the
+    /// departed value has nothing else to blame — not a description of the render thread.
+    ///
+    /// MUTATION CHECKS (#846, run independently, results in the PR body):
+    /// 1. drop `self.controller_view.lock().unwrap().invalidate_disclosures();` from
+    ///    `ControllerSlots::begin_zone_in`, leaving the `gs.begin_zone_in()` call in place and
+    ///    executing (the pre-fix behaviour, and a WRAP mutation per #799) → RED on the first
+    ///    post-zone-in tick;
+    /// 2. revert `run_zone_entry_handshake` to `gs.begin_zone_in()` → RED in
+    ///    `a_zone_entry_handshake_clears_the_departed_zones_hold_at_the_view_846`
+    ///    (`gameplay.rs`), which is the call-site half of this;
+    /// 3. half-neuter the invalidation so it clears the hold and keeps the stall → RED at the stall
+    ///    assertion in the loop below. That mutation was **workspace-GREEN** until this test's
+    ///    fixture started publishing a real matured `AfloatStall` (#846 round-2 review F1): with
+    ///    `(Some(hold), None)` published, `GameState::begin_zone_in`'s own field clear satisfied
+    ///    the stall assertion whatever the view did, and it could not fail.
+    #[tokio::test]
+    async fn a_zone_in_clears_the_departed_zones_hold_for_good_846() {
+        use eqoxide_core::game_state::ControllerHoldReason::EmbeddedNoRecovery;
+
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+
+        const WEDGED_IN_OLD_ZONE: [f32; 3] = [-812.5, 43.0, -119.75];
+        let hold = held(EmbeddedNoRecovery, 7.5);
+        // BOTH disclosures, not just the hold (#846 round-2 review F1). A fixture that publishes
+        // `(Some(hold), None)` makes every stall assertion below unfalsifiable — `begin_zone_in`'s
+        // own field clear satisfies them whether or not the view was ever invalidated, which is how
+        // a half-neutered `invalidate_disclosures` measured workspace-GREEN.
+        let stall = crate::test_afloat::matured_stall(WEDGED_IN_OLD_ZONE);
+
+        {
+            let mut view = nav.controller.controller_view.lock().unwrap();
+            view.initialized = true;
+            view.pos = WEDGED_IN_OLD_ZONE;
+            view.publish_disclosures((Some(hold), Some(stall)));
+        }
+        gs.player_x = WEDGED_IN_OLD_ZONE[0];
+        gs.player_y = WEDGED_IN_OLD_ZONE[1];
+        gs.player_z = WEDGED_IN_OLD_ZONE[2];
+        nav.stream_position(&mut stream, &mut gs); // baseline
+        nav.stream_position(&mut stream, &mut gs);
+        assert_eq!(gs.player_hold, Some(hold),
+            "precondition: the old zone's wedge is live in the GameState the API serialises");
+        assert_eq!(gs.player_afloat_stall.map(|s| s.anchor()), Some(WEDGED_IN_OLD_ZONE),
+            "precondition: and so is the afloat stall, anchored in the departed zone's frame — \
+             without this the stall assertions in the loop below cannot fail (review F1)");
+
+        // The zone-entry handshake begins.
+        //
+        // NOTE ON WHY THIS HOLDS, corrected in round 2: it is NOT that the render thread goes quiet
+        // at this moment. `controller.begin_zone_in(gs)` is the FIRST statement of
+        // `run_zone_entry_handshake`, before `send_zone_entry`, and the render thread does not learn
+        // of the zone change until `OP_NEW_ZONE` arrives later in that same loop — so for the early
+        // handshake it is still stepping the OLD collision and republishing the old hold into the
+        // view. What makes the clear stick is that `stream_position` is not running at all during
+        // the handshake (it is awaited inside `run_gameplay_phase`), and by the time gameplay
+        // resumes the render thread has seen the new zone, dropped collision, and published
+        // `(None, None)` via `clear_hold`. Never-republishing is therefore a MODEL of that gap, not
+        // a claim about the render thread's behaviour — and it is the strictest model, because it
+        // is the one under which a mirror that restores the departed value has nothing else to
+        // blame.
+        nav.controller_slots().begin_zone_in(&mut gs);
+        assert!(gs.player_hold.is_none(),
+            "the zone-in clear itself (this half is `GameState::begin_zone_in` and predates #846)");
+
+        for tick in 1..=12 {
+            nav.stream_position(&mut stream, &mut gs);
+            assert!(gs.player_hold.is_none(),
+                "net tick {tick} after the zone-in restored the DEPARTED zone's hold — the mirror \
+                 republishing a predicament about geometry that has been dropped, which is exactly \
+                 what an agent cannot tell from a live one (#846 review B1)");
+            assert!(gs.player_afloat_stall.is_none(),
+                "…and the same for the afloat stall beside it, whose staleness is sharper still: \
+                 it names an ANCHOR in the departed zone's coordinate frame (net tick {tick}). \
+                 The fixture publishes a REAL matured stall, so this half fails on its own if \
+                 `invalidate_disclosures` clears the hold and leaves the stall (review F1 RV-B)");
+        }
+
+        // The source, not just the copy: the value the mirror reads is what was cleared.
+        assert_eq!(nav.controller.controller_view.lock().unwrap().disclosures(), (None, None),
+            "the clear must reach the view the mirror reads — clearing only the GameState copy is \
+             what round 1 measured as surviving exactly one net tick");
+
+        // And the render thread can still put a hold back: the first frame it publishes in the NEW
+        // zone is mirrored normally. (That it is the ONLY thing that can is the separate universal
+        // held by `no_net_tick_can_free_or_manufacture_a_hold_846`; this example only shows the
+        // invalidation is not a latch.)
+        const WEDGED_IN_NEW_ZONE: [f32; 3] = [117.0, -8.25, 42.5];
+        let new_hold = held(EmbeddedNoRecovery, 0.25);
+        let new_stall = crate::test_afloat::matured_stall(WEDGED_IN_NEW_ZONE);
+        nav.controller.controller_view.lock().unwrap()
+            .publish_disclosures((Some(new_hold), Some(new_stall)));
+        nav.stream_position(&mut stream, &mut gs);
+        assert_eq!(gs.player_hold, Some(new_hold),
+            "the invalidation must not latch the field OFF either — a zone-in that permanently \
+             silenced the disclosure would trade a stale wedge alarm for a missing one");
+        assert_eq!(gs.player_afloat_stall.map(|s| s.anchor()), Some(WEDGED_IN_NEW_ZONE),
+            "…and the same for the stall, re-anchored in the NEW zone's frame");
+    }
+
+    /// **#846 — the one window where `pos` and `hold` came apart, and what closed it.**
+    ///
+    /// `GameState::player_hold`'s doc says the position beside a stale hold "is stale in the same
+    /// breath and by the same amount". On the tick `stream_position` detects a server correction
+    /// (a GM `#summon`, a knockback, an anti-cheat snap) that was not true: the branch hands the
+    /// jump to the controller and returns EARLY, leaving `gs.player_x/y/z` holding the SERVER's new
+    /// coordinates while `gs.player_hold` still held the controller's frozen answer — a fresh
+    /// position next to an old predicament, with nothing in the payload marking the pair.
+    ///
+    /// Round 1 of this PR called that window "ONE net tick (~10 ms) wide". **That was measured
+    /// against a server that asserts the correction once.** Re-measured against one that re-asserts
+    /// it every tick while the render loop idles, the window reopened on every other tick,
+    /// indefinitely (`D.D.D.D.D.D.` — diverged 6 of 12) — it was "until the render loop wakes"
+    /// after all, at a 50% duty cycle. Whether a live EQEmu server re-asserts is UNDETERMINED here;
+    /// no live run backs this test, and the repeat model is not exotic (`app.rs:1256`'s own #116
+    /// comment describes the loop that produces it).
+    ///
+    /// So the branch now WITHDRAWS both disclosures instead of leaving them standing, and this test
+    /// pins the fixed pairing under the re-asserting server: on every correction tick `pos` is the
+    /// server's and `hold` is `None`, and once the render thread adopts the correction the two are
+    /// the controller's again. The withdrawal is not an invention — see the branch's comment and
+    /// `CharacterController::teleport`, which drops both as its first act.
+    ///
+    /// MUTATION CHECKS (#846, WRAP mutations, results in the PR body):
+    /// 1. drop the correction branch's `(gs.player_hold, gs.player_afloat_stall) = (None, None);`
+    ///    → RED (the round-1 behaviour: `pos` fresh, `hold` stale, every other tick, forever);
+    /// 2. gate the `pos_correction` hand-off on `gs.player_hold.is_none()` → RED at the
+    ///    `pos_correction` assertion. That is the mutation that would make the divergence
+    ///    genuinely unrecoverable in the field: a held body would never ask the render loop to
+    ///    adopt anything.
+    #[tokio::test]
+    async fn a_re_asserted_summon_never_pairs_a_fresh_pos_with_a_stale_hold_846() {
+        use eqoxide_core::game_state::ControllerHoldReason::EmbeddedNoRecovery;
+
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+
+        const WEDGED: [f32; 3] = [100.0, 200.0, 10.0];
+        const SUMMONED_TO: [f32; 3] = [-250.0, 640.0, -14.0];
+        let hold = held(EmbeddedNoRecovery, 7.5);
+
+        // The render thread publishes a wedged body, then the loop goes idle. It publishes again
+        // only at the very end, when it finally adopts the correction.
+        // BOTH disclosures (#846 round-2 review F1): the branch withdraws a PAIR, and with
+        // `(Some(hold), None)` published the stall half of that withdrawal is asserted by nothing —
+        // measured, as a workspace-GREEN half-neutering of this very line.
+        let stall = crate::test_afloat::matured_stall(WEDGED);
+        {
+            let mut view = nav.controller.controller_view.lock().unwrap();
+            view.initialized = true;
+            view.pos = WEDGED;
+            view.publish_disclosures((Some(hold), Some(stall)));
+        }
+        gs.player_x = WEDGED[0];
+        gs.player_y = WEDGED[1];
+        gs.player_z = WEDGED[2];
+        nav.stream_position(&mut stream, &mut gs); // baseline tick
+        nav.stream_position(&mut stream, &mut gs);
+        assert_eq!(gs.player_hold, Some(hold), "precondition: the wedge reached the GameState");
+        assert_eq!(gs.player_afloat_stall.map(|s| s.anchor()), Some(WEDGED),
+            "precondition: and so did the stall, anchored where the body failed to get away from");
+        assert_eq!([gs.player_x, gs.player_y, gs.player_z], WEDGED,
+            "precondition: and so did the position it describes");
+        assert!(nav.controller.pos_correction.lock().unwrap().is_none(),
+            "precondition: nothing has asked the controller to move");
+
+        // A GM #summon lands on the net thread and the server KEEPS asserting it: every tick, the
+        // OP_ClientUpdate handler writes the server's coordinates back into `gs`. The render loop
+        // is idle throughout, so the controller never adopts and the branch fires every time.
+        let mut corrections = 0;
+        for tick in 1..=12 {
+            gs.player_x = SUMMONED_TO[0];
+            gs.player_y = SUMMONED_TO[1];
+            gs.player_z = SUMMONED_TO[2];
+            nav.stream_position(&mut stream, &mut gs);
+
+            // Which branch ran is readable from `gs` itself, so the `pos_correction` slot is left
+            // untouched all the way through — the correction the net thread parked on tick 1 must
+            // still be sitting there at the end, unconsumed. (The branch ALTERNATES: a correction
+            // tick sets `last_streamed` to the server's position, so the next tick sees no jump and
+            // the normal path writes the frozen controller's position back.)
+            let corrected = [gs.player_x, gs.player_y, gs.player_z] == SUMMONED_TO;
+            if corrected { corrections += 1; }
+            assert!(nav.controller.pos_correction.lock().unwrap().is_some(),
+                "tick {tick}: the correction must stay parked for the render thread — the net \
+                 thread hands it over and waits, it never adopts it itself");
+
+            if corrected {
+                assert_eq!([gs.player_x, gs.player_y, gs.player_z], SUMMONED_TO,
+                    "tick {tick}: on the correction tick `pos` is the SERVER's — the early return \
+                     leaves it standing");
+                assert!(gs.player_hold.is_none(),
+                    "tick {tick}: …and `hold` must be WITHDRAWN, not left describing the place the \
+                     body was just lifted out of. This pairing is what #846 was filed about, and \
+                     under a re-asserting server it recurs indefinitely rather than for one tick");
+                assert!(gs.player_afloat_stall.is_none(),
+                    "tick {tick}: …and the stall with it, in the SAME statement. Its staleness is \
+                     sharper — it names an ANCHOR the body has just been lifted away from, so a \
+                     withdrawal that drops only the hold leaves a stall pointing at coordinates \
+                     `pos` no longer reports (review F1 RV-A)");
+            } else {
+                assert_eq!([gs.player_x, gs.player_y, gs.player_z], WEDGED,
+                    "tick {tick}: on a normal-path tick the controller's position is written back");
+                assert_eq!(gs.player_hold, Some(hold),
+                    "tick {tick}: …and it is paired with the controller's own hold, both describing \
+                     the same frozen instant");
+                assert_eq!(gs.player_afloat_stall.map(|s| s.anchor()), Some(WEDGED),
+                    "tick {tick}: …and with the controller's own stall, whose anchor is the same \
+                     frozen position — the withdrawal is the correction tick's, not a blanket one");
+            }
+        }
+        // REACH CONTROL: the re-asserting server must actually keep re-entering the branch. If the
+        // fixture stopped producing corrections the loop above would pass vacuously on its
+        // normal-path arm. Round 1 measured 6 of 12 here (the alternating duty cycle); the count is
+        // asserted as ">= 6" rather than "== 6" so the test pins the recurrence, not the phase.
+        assert!(corrections >= 6,
+            "reach control: the re-asserting server must keep reaching the correction branch — \
+             got {corrections} of 12 ticks");
+
+        // The render loop finally wakes, adopts the correction and publishes from the new position:
+        // `teleport` has dropped the hold, so what it publishes is `None` at the summoned position —
+        // the same pair the net thread has been serving, now from the controller itself.
+        {
+            let mut view = nav.controller.controller_view.lock().unwrap();
+            view.pos = SUMMONED_TO;
+            view.publish_disclosures((None, None));
+        }
+        *nav.controller.pos_correction.lock().unwrap() = None;
+        nav.stream_position(&mut stream, &mut gs);
+        assert_eq!([gs.player_x, gs.player_y, gs.player_z], SUMMONED_TO,
+            "after adoption the controller's position IS the server's, so the correction branch is \
+             done firing and the normal path writes it back");
+        assert!(gs.player_hold.is_none(), "and the pair is the controller's own again");
+        assert!(gs.player_afloat_stall.is_none(), "…both halves of it");
+        assert!(nav.controller.pos_correction.lock().unwrap().is_none(),
+            "reach control: no correction is detected once the controller has adopted — otherwise \
+             the assertions above would be the correction branch's again, not the normal path's");
     }
 
     /// #624 REVIEW FOLLOW-UP: exercises the REAL send cadence — `stream_position`/
