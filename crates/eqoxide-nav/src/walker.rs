@@ -952,11 +952,20 @@ impl Walker {
     /// cursor advance actually reaches a consumer in a way that misleads. It does, and that test is
     /// the execution-level proof.
     ///
-    /// The reachability predicate is a conjunction — chest-height LOS (walls) **and** a floor-column
-    /// probe (voids/drops), see [`crate::collision::Collision::ground_continuous`] — because the LOS ray alone cannot
-    /// answer the question rule 2 asks. It is still only a necessary condition; the `stuck_i` raise
-    /// above is what makes a wrong answer harmless to the honesty machinery rather than merely
-    /// unlikely.
+    /// The reachability predicate is [`crate::steering::resync_reachable`] — a conjunction of a
+    /// chest-height LOS ray (walls) and a floor-column probe (voids/drops) — because the LOS ray
+    /// alone cannot answer the question rule 2 asks. It is named once and shared with both offline
+    /// harnesses rather than spelled out here, so a change to it cannot leave them modelling a
+    /// predicate this function no longer runs (#887 round 1 measured exactly that drift).
+    ///
+    /// It is still only a necessary condition; the `stuck_i` raise above is what makes a wrong
+    /// answer harmless to the honesty machinery rather than merely unlikely. Two known limits, both
+    /// on that function's rustdoc: #734 gap 1 — a hole narrower than `ground_continuous`'s probe
+    /// spacing, in the direction of travel, crosses undetected (measured below by
+    /// `a_narrow_hole_between_probes_still_crosses_the_resync_undetected`, driven through this exact
+    /// function) — and #734 gap 2, the floor probe's width-blindness, which was measured to be
+    /// AGREEMENT with the controller's own centre-column floor clamp rather than a defect, and whose
+    /// attempted fix is held out by `a_resync_must_still_cross_ground_the_controller_can_stand_on`.
     fn advance_cursor(&mut self, p: [f32; 3]) {
         while self.path_i + 2 < self.path.len() {
             let (a, b) = (self.path[self.path_i], self.path[self.path_i + 1]);
@@ -970,9 +979,8 @@ impl Walker {
         let walked_to = self.path_i;
         let resynced = {
             let coll = self.collision.read().unwrap();
-            let reachable = |a: [f32; 3], b: [f32; 3]| coll.as_ref().map_or(true, |c| {
-                c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE) && c.ground_continuous(a, b)
-            });
+            let reachable = |a: [f32; 3], b: [f32; 3]| coll.as_ref()
+                .map_or(true, |c| crate::steering::resync_reachable(c, a, b));
             crate::steering::resync_cursor(&self.path, walked_to, p, reachable)
         };
         self.path_i = resynced;
@@ -2433,6 +2441,211 @@ mod tests {
             "the cursor jumped through a wall; path_i = {}", w.path_i);
     }
 
+    // ───────────── #734: the line-sampled gap, and the width gap that was not one ─────────────
+
+    /// A single flat slab whose NORTH edge sits `margin` from the hop line (n = 0) the resync
+    /// tests: east ∈ [-60, 60], north ∈ [-100, `margin`], all at h = 0. The body's centre column is
+    /// over floor the whole way; a probe offset `+PLAYER_RADIUS` north is over void whenever
+    /// `margin < 1.0`. This is the ordinary "route runs along a ledge lip" shape, and the
+    /// controller walks it — its floor clamp only ever asks about the centre.
+    fn lip_zone(margin: f32) -> crate::collision::SharedCollision {
+        let slab = |e0: f32, e1: f32, n0: f32, n1: f32, h: f32| {
+            quad(vec![[n0, h, e0], [n1, h, e0], [n1, h, e1], [n0, h, e1]])
+        };
+        let terrain = vec![slab(-60.0, 60.0, -100.0, margin, 0.0)];
+        let col = crate::collision::Collision::build(
+            &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+        Arc::new(std::sync::RwLock::new(Some(Arc::new(col))))
+    }
+
+    /// Twin of `chasm_zone`, but the "hole" is FILLED with a floor STRIP narrower than the body
+    /// instead of left open. Same two ledges, same `gap`-wide split, but the crossing at n = 0 —
+    /// where the #727 counterexample's direct hop actually runs — is a `ridge_width`-wide ridge
+    /// instead of nothing. `carrot_los_clear` (no walls anywhere in this fixture) and the
+    /// centre-line `ground_continuous` production runs (floor sits under n = 0 the whole way across,
+    /// flat) both read this as clear — and so does the controller's own floor clamp, which is why
+    /// that agreement is the thing being guarded rather than the thing being fixed.
+    fn ridge_zone(gap: f32, ridge_width: f32) -> crate::collision::SharedCollision {
+        let slab = |e0: f32, e1: f32, n0: f32, n1: f32, h: f32| {
+            quad(vec![[n0, h, e0], [n1, h, e0], [n1, h, e1], [n0, h, e1]])
+        };
+        let half = gap / 2.0;
+        let rh = ridge_width / 2.0;
+        let terrain = vec![
+            slab(-60.0, -half, -100.0, 100.0, 0.0), // west ledge
+            slab(half, 60.0, -100.0, 100.0, 0.0),   // east ledge
+            slab(-half, half, -rh, rh, 0.0),        // the ridge: the ONLY crossing, at n = 0
+        ];
+        let col = crate::collision::Collision::build(
+            &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+        Arc::new(std::sync::RwLock::new(Some(Arc::new(col))))
+    }
+
+    /// **#734 gap 2 is not a defect, and this is the guard that keeps the "fix" out (#887).**
+    ///
+    /// The resync's floor probe samples the body's CENTRE line only, so it cannot tell a
+    /// body-width crossing from a knife-edge ridge. #734 called that "width-blind" and #887 round 1
+    /// implemented the obvious fix — `ground_continuous` on three lines at `-r / 0 / +r`
+    /// perpendicular to travel. Measured, that fix refuses hops the **controller** walks:
+    /// `CharacterController`'s floor clamp is a single column under the body centre — in
+    /// `src/movement.rs`, `ground_below(self.pos[0], self.pos[1], foot + GROUND_ORIGIN, GROUND_DEPTH)`
+    /// with no `±radius` term in either arm — so a shoulder over void is supported and walks
+    /// normally. A predicate stricter than the model it exists to approximate produces FALSE
+    /// REFUSALS — reporting an ordinary reachable state as unreachable — which is a wrong answer in
+    /// the same sense a false acceptance is, and it withholds the #673 resync exactly on ledge-lip
+    /// and trench geometry, where #673 was observed live.
+    ///
+    /// Each arm below is a shape where the controller's own floor probe is satisfied at every
+    /// sample along the hop. Each is asserted twice: **premise** — the controller really can stand
+    /// there, so a failure of the second assert is over-tightening and not a broken fixture — and
+    /// **claim** — the production resync still crosses it.
+    ///
+    /// Mutation check, both directions (#887 round 2). Reinstating the three-line sweep in
+    /// `steering::resync_reachable`'s floor half turns this test RED — `255 passed; 1 failed`,
+    /// exactly this test and nothing else in the 272 — and removing it again turns it GREEN
+    /// (`256 passed; 0 failed`). Note what the mutant run does **not** show: an `assert!` aborts the
+    /// loop, so only the FIRST arm (the 0.5 u lip) was observed failing. That the two ridge arms are
+    /// refused by the same mutant is measured separately, in the readout table on
+    /// `steering::resync_reachable`'s rustdoc, not by this run. The refusal band there is exactly
+    /// "lip margin below one `STEER_LOS_CLEARANCE`" and "ridge narrower than
+    /// `2 * STEER_LOS_CLEARANCE`", which is why 1.9 u is an arm here and 2.1 u is not.
+    #[test]
+    fn a_resync_must_still_cross_ground_the_controller_can_stand_on() {
+        // The controller's own ground-probe window, `src/movement.rs`:35 and :37. Restated because
+        // it lives in the app crate and this one sits below it. Nothing enforces agreement between
+        // this copy and the app crate's constants — this test compares only against the fixture.
+        const GROUND_ORIGIN: f32 = 1.0;
+        const GROUND_DEPTH: f32 = 200.0;
+
+        // `CharacterController`'s floor clamp, sampled every 0.5 u along the hop the resync tests
+        // (`CHASM_BODY` → `[10, 0, 0]`, 16 u of run at n = 0).
+        let controller_stands_the_whole_way = |sh: &crate::collision::SharedCollision| -> bool {
+            let guard = sh.read().unwrap();
+            let c = guard.as_ref().unwrap();
+            (0..=32).all(|i| {
+                let e = CHASM_BODY[0] + i as f32 * 0.5;
+                c.ground_below(e, 0.0, CHASM_BODY[2] + GROUND_ORIGIN, GROUND_DEPTH).is_some()
+            })
+        };
+        let cursor_after_resync = |sh: crate::collision::SharedCollision| -> usize {
+            let (mut w, _nav, _intent, _view) = walker_with(sh);
+            w.path = CHASM_ROUTE.to_vec();
+            w.path_i = 2;
+            w.advance_cursor(CHASM_BODY);
+            w.path_i
+        };
+
+        for (what, sh) in [
+            ("a ledge whose lip is 0.5 u north of the hop line", lip_zone(0.5)),
+            ("a 0.8 u ridge with void either side", ridge_zone(10.0, 0.8)),
+            ("a 1.9 u ridge — just under the body's 2 u diameter", ridge_zone(10.0, 1.9)),
+        ] {
+            assert!(controller_stands_the_whole_way(&sh),
+                "PREMISE broken for {what}: the controller's own centre-column floor probe must \
+                 find standable ground at every 0.5 u sample along the hop, or this arm is not \
+                 about over-tightening at all");
+            let got = cursor_after_resync(sh);
+            assert!(got > 2,
+                "OVER-TIGHTENING (#887): the resync refused {what} — ground the controller's own \
+                 floor clamp stands on at every sample along the hop. That is a FALSE REFUSAL. The \
+                 floor half of `steering::resync_reachable` must stay a CENTRE-line probe: the \
+                 controller has no shoulder term, so a ±STEER_LOS_CLEARANCE sweep models a body \
+                 production does not have. See that function's rustdoc for the measurement, and \
+                 `Collision::edge_clear`'s for what this direction cost the planner (876 → 813 \
+                 routable pairs). path_i = {got}");
+        }
+
+        // CONTROL. This driver is not simply "accepts everything": a genuine void is still refused,
+        // by the same predicate, on the same route, from the same cursor.
+        assert_eq!(cursor_after_resync(chasm_zone(10.0)), 2,
+            "control: a 10 u chasm with the next floor 200 u down must still be REFUSED, or the \
+             three acceptances above prove nothing about over-tightening");
+    }
+
+    /// **⚠️ THIS TEST PINS A BUG. It asserts the resync DOES step over a hole it should not. If it
+    /// goes RED, the bug is FIXED — DELETE this test, do not weaken the assertion.** The deletion
+    /// list is in the failure message below and repeated here: this test, its entry in
+    /// `every_walker_test_name_cited_in_a_doc_comment_still_exists`'s array at the bottom of this
+    /// module, and the "#734 gap 1" bullet in `steering::resync_cursor`'s rustdoc plus the gap-1
+    /// clause in [`Walker::advance_cursor`]'s.
+    ///
+    /// **#734 gap 1, measured: a hole narrower than `Collision::ground_continuous`'s probe spacing,
+    /// in the direction of TRAVEL, is invisible to it.**
+    ///
+    /// One floor, one 1.5 u hole (`< PROBE_SPACING` = 2.0 u) positioned in the middle of one probe
+    /// interval on the `CHASM_BODY -> [10, 0, 0]` hop (`run` = 16 u; `PROBE_SPACING` = 2 u divides
+    /// it evenly, so the probes land at whole-metre offsets e ∈ {-4,-2,0,2,4,6,8,10}). The hole sits
+    /// at e ∈ [2.25, 3.75], strictly between the e = 2 and e = 4 probes and spanning the whole north
+    /// extent this fixture models, so no probe ever lands inside it. `collision.rs`'s own
+    /// `ground_continuous_probe_spacing_catches_every_hole_wider_than_the_spacing` is the
+    /// complementary case — the same 2 u spacing, but a WIDER hole, on a different hop
+    /// (`[-18,0,0] → [18,0,0]`) and sweeping the hole's start position rather than pinning one
+    /// offset set; the shared property is the spacing, not the geometry.
+    ///
+    /// **No fix is attempted for this gap in this change.** Closing it means changing
+    /// `PROBE_SPACING` or the sampling strategy inside `Collision::ground_continuous` itself, in
+    /// `collision.rs` — see `steering::resync_cursor`'s rustdoc for why that file is out of scope
+    /// here.
+    ///
+    /// **The delete-me path is measured, not asserted (#887 round 2).** `PROBE_SPACING` was
+    /// temporarily set to 1.0 in `collision.rs` and the walker tests re-run: this test alone went
+    /// RED (`43 passed; 1 failed` of the 44 walker tests) with the instruction above, and the
+    /// mutation was hand-restored. So a future `collision.rs` change that shrinks the spacing turns
+    /// `main` RED here, with **no git conflict** to warn anyone first — that is the whole reason
+    /// the instruction is in the assertion message and not only in this doc.
+    ///
+    /// Sensitivity control, same shape: widening the hole to 2.5 u (still starting at e = 2.25, now
+    /// spanning the e = 4 probe) is refused by the same predicate — so the acceptance above is not
+    /// simply "this predicate accepts everything on this fixture", it is specifically the
+    /// narrower-than-spacing case. **What that control does and does not establish:** it proves the
+    /// fixture responds to hole width ALONG travel, i.e. to `PROBE_SPACING`, which is exactly what
+    /// this test is about. It says nothing about any across-travel property, and no assertion here
+    /// should be read as covering one.
+    #[test]
+    fn a_narrow_hole_between_probes_still_crosses_the_resync_undetected() {
+        let make = |hole_width: f32| {
+            let slab = |e0: f32, e1: f32| quad(vec![
+                [-50.0, 0.0, e0], [50.0, 0.0, e0], [50.0, 0.0, e1], [-50.0, 0.0, e1],
+            ]);
+            let terrain = vec![slab(-60.0, 2.25), slab(2.25 + hole_width, 60.0)];
+            let col = crate::collision::Collision::build(
+                &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+            Arc::new(std::sync::RwLock::new(Some(Arc::new(col))))
+        };
+
+        // NARROW: the gap this test is about.
+        let narrow_col: crate::collision::SharedCollision = make(1.5);
+        // PREMISE: the hole is really there — a direct probe of its own column finds no floor.
+        assert!(narrow_col.read().unwrap().as_ref().unwrap()
+                .ground_below(3.0, 0.0, 10.0, 20.0).is_none(),
+            "fixture broken: the hole at e = 3.0 must have no floor for this test to mean anything");
+        let (mut w, _nav, _intent, _view) = walker_with(narrow_col);
+        w.path = CHASM_ROUTE.to_vec();
+        w.path_i = 2;
+        w.advance_cursor(CHASM_BODY);
+        assert!(w.path_i > 2,
+            "THIS TEST PINS A BUG AND IT HAS JUST BEEN FIXED — DELETE THIS TEST, do not weaken \
+             this assertion. It asserted (#734 gap 1) that the production resync predicate STILL \
+             crosses a hole narrower than PROBE_SPACING because the hole falls between two probes; \
+             path_i = {} (expected > 2 while the gap is live). Deleting it also requires removing \
+             `a_narrow_hole_between_probes_still_crosses_the_resync_undetected` from the array in \
+             `every_walker_test_name_cited_in_a_doc_comment_still_exists` at the bottom of this \
+             module — that guard fails on a dangling citation, and it is a second, \
+             unrelated-looking red if you miss it — and dropping the '#734 gap 1' bullet from \
+             `steering::resync_cursor`'s rustdoc and the gap-1 clause from `advance_cursor`'s",
+            w.path_i);
+
+        // SENSITIVITY CONTROL: a wider hole, same start, spans a real probe and is refused.
+        let wide_col: crate::collision::SharedCollision = make(2.5);
+        let (mut w2, _nav2, _intent2, _view2) = walker_with(wide_col);
+        w2.path = CHASM_ROUTE.to_vec();
+        w2.path_i = 2;
+        w2.advance_cursor(CHASM_BODY);
+        assert_eq!(w2.path_i, 2,
+            "control: a 2.5 u hole spans a probe and must be refused, or this test's acceptance \
+             above proves nothing about hole WIDTH; path_i = {}", w2.path_i);
+    }
+
     /// **A RESYNC IS NOT PROGRESS (#727, agent honesty).** #631 channel (a) justifies calling an
     /// advancing complete route "progress *by construction*" on the premise that `path_i` only moves
     /// by WALKING. A resync moves it without walking, so a resync must not reach that channel — or
@@ -2524,6 +2737,19 @@ mod tests {
             // #787: cited by `NOT_PRODUCTION`'s rustdoc, which points at the guard that decides what
             // the marker means. Caught by `steering`'s scan when the citation was written.
             exactly_one_production_fine_worker_is_built_in_the_tree_787,
+            // #734: cited by `Walker::advance_cursor`'s rustdoc and by `steering::resync_reachable`'s
+            // and `steering::resync_cursor`'s rustdoc (cross-file, no guard entry required there —
+            // see that scan's own rule 1 vs rule 2).
+            a_resync_must_still_cross_ground_the_controller_can_stand_on,
+            // ⚠️ This one pins a bug. When #734 gap 1 is closed the test goes RED and must be
+            // DELETED — and this line deleted with it, or the deletion produces a second red here
+            // that looks unrelated. Its own failure message says so too.
+            a_narrow_hole_between_probes_still_crosses_the_resync_undetected,
+            // This guard names ITSELF because that delete-me instruction cites it by name in a doc
+            // comment, and this scan's rule is that a cited test in this file must be listed here —
+            // including when the cited test is the guard. A rename is now a compile error, which is
+            // the whole point: the instruction must not be able to point at a fn that moved.
+            every_walker_test_name_cited_in_a_doc_comment_still_exists,
         ];
     }
 
