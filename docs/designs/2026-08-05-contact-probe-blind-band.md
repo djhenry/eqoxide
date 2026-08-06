@@ -28,6 +28,23 @@ changed the recommendation. Round 2 re-ran the elimination with that population 
 variant 4, §3's E′ row, §7 and §8 are the result. Anything the reviewer measured and this document
 now repeats is marked **MEASURED (round 2)** and was re-run here rather than copied.
 
+**Round 3.** The same reviewer falsified **two more sentences**, both of which were mine and neither
+of which had been measured:
+
+1. "E′ restores every crossing wherever a landing exists." False. The round-2 tables sampled the
+   floor beyond the lip at exactly two heights (level, and −10). Sweeping the continuum between them
+   shows E′'s residual is **"any landing more than `GROUND_SNAP_TOL` = 0.5 u below the feet"** — an
+   ordinary shape, not a bottomless drop — and that the wedge is **silent** (`hold()` is `None`).
+2. "The controller has no levitate mode; the levitating body is not measurable today." False.
+   `levitating` ships (`src/movement.rs:195`, `:423`, hover branch `:1004`, two green tests). Driven,
+   it turns out levitators **already pass through blind-band lips on `main`** — they are inside
+   #854's population, not a hypothetical one — and they inherit the residual in full.
+
+Both are corrected below from **runs made here**, not from the review text. The reviewer's root cause
+for (1) — `try_step_up` is a step *up* with no downward half — implies a candidate this document did
+not contain; §2 works it up as **two** distinct shapes (variants 5 and 6) and §3 records what each
+costs. Round 3 sentences are tagged **MEASURED (round 3)**.
+
 Per `tests/synthetic_scenes/mod.rs`'s own warning: a synthetic scene that agrees with a shipped
 zone is evidence the **mechanism** is understood. It is not a second measurement of the shipped
 geometry, and the numeric agreement below with #854's qcat figures is arithmetic (the constants
@@ -203,9 +220,39 @@ invents; v3 lowers an already-present threshold from 0.61 to 0.
 `FreeStep::None` is not in force at contact. There is **no measured ballistic regression** — the
 reviewer named this owner but did not drive it.
 
-*Levitating body*: **not measurable today.** The controller has no levitate mode; `VerticalOwner::
-Levitating` in §4 is a placeholder whose whole purpose is to be a compile error when it is added.
-Round 2 does **not** claim a levitator result in either direction.
+*Levitating body*: **RETRACTED — round 2 said "not measurable today; the controller has no levitate
+mode". That was false.** `levitating: bool` is a controller field (`src/movement.rs:195`),
+`set_levitating` is public (`:423`), the gravity-off hover branch ships (`:1004`, #529) and two unit
+tests cover it. Driving it is one extra call. **MEASURED (round 3)** — levitator hovering at z 0.10
+over a floor at 0, driven east at 35 u/s for 900 frames into a lip at east 0, final east (`−0.167` =
+stopped dead):
+
+| lip | 0.30 | 0.45 | 0.60 | 0.61 | 1.00 | 2.00 |
+|---|---|---|---|---|---|---|
+| `main`, curb (floor beyond at 0) | 99.15 | 99.15 | **−0.167** | −0.167 | −0.167 | −0.167 |
+| `main`, drop (floor beyond at −10) | 99.15 | 99.15 | **−0.167** | −0.167 | −0.167 | −0.167 |
+| v3, either shape | **−0.167** | **−0.167** | −0.167 | −0.167 | −0.167 | −0.167 |
+
+Two consequences, and the second is why the retraction matters more than the arithmetic:
+
+- The levitator is **already in #854's defect population on `main`**, not a future one. It crosses
+  0.30 and 0.45 lips by translating through them, on the same `feet + Body::foot` threshold as every
+  other owner. `VerticalOwner::Levitating` in §4 is therefore a *live* variant, not a placeholder.
+- The frame trace makes the pass-through explicit. **MEASURED (round 3)**, `main`, lip 0.45 topping
+  at 0.45, floor beyond at −1.0, levitator hovering at 0.10:
+
+  ```
+  f= 7 pre=[ -0.9167, 0.1000] post=[ -0.3333, 0.1000] ground=false
+  f= 8 pre=[ -0.3333, 0.1000] post=[  0.2500, 0.1000] ground=false   <-- crossing
+  f= 9 pre=[  0.2500, 0.1000] post=[  0.8333, 0.1000] ground=false
+  ```
+
+  The reported z is 0.1000 on every frame. The body ends east of a face whose top is 0.45 without its
+  reported height ever reaching it. Under v3 frame 8's post is `[-0.3333, 0.1000]` and stays there.
+
+This population matters more than the buoyant one for a *predicament* argument: levitate ignores
+vertical input by design (`:1004`'s own doc — "free-floats over land, gaps, and water"; jump and
+`wish_vspeed` are discarded), so a levitating player wedged by v3 has no manual escape at all.
 
 ### Variant 4 (**E′**) — variant 3, **plus** arming the existing recovery for `FreeStep::None` bodies
 
@@ -229,10 +276,140 @@ Variant 4 extends the arm to those bodies and changes nothing else. MEASURED (ro
 | `cargo test --test walker_sim` | 11 / 0 / 5 ign | 11 / 0 / 5 ign | **11 / 0 / 5 ign** |
 | synthetic water / walk-profile / goal-append | 6 / 4 / 5 | 6 / 4 / 5 | **6 / 4 / 5** |
 
-E′ restores every crossing v3 removed **wherever a landing exists**, and fixes one pre-existing
-`main` wedge on the way. What it does not restore is the drop case — a lip with nothing to land on
-— but `main` does not carry that case either above 0.60, so E′ leaves an existing boundary where it
-is rather than moving it. §8 states that residual as a residual.
+#### E′'s residual, measured at its true size — **RETRACTED and replaced**
+
+Round 2 wrote: *"E′ restores every crossing v3 removed **wherever a landing exists**"*, and §3's E′
+row said *"Breaks: nothing in the driven population"*. **Both are false**, and the error is visible
+in the table above: it tests the floor beyond the lip at exactly two heights, 0.0 and −10. That
+binary hides the whole continuum, and the boundary lives inside it.
+
+**MEASURED (round 3)** — buoyant body (feet held at 0.10), lip fixed at **0.45** (inside the band),
+sweeping the height of the floor beyond it. Final east after 900 frames:
+
+| floor beyond | +0.45 | +0.20 | 0.00 | −0.25 | −0.38 | **−0.40** | −0.50 | −1.00 | −1.90 | −2.40 | −10.0 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `main` | 99.58 | 99.58 | 99.58 | 99.58 | 99.58 | 99.58 | 99.58 | 99.58 | 99.58 | 99.58 | 99.58 |
+| **E′ (v4)** | 99.58 | 99.58 | 99.58 | 99.58 | 99.58 | **−0.167** | **−0.167** | **−0.167** | **−0.167** | **−0.167** | **−0.167** |
+
+The cutoff is exactly `feet − GROUND_SNAP_TOL` = 0.10 − 0.50 = **−0.40**, and it is not a coincidence:
+`try_step_up` (`src/movement.rs:1258-1266`) both *searches* and *accepts* only down to
+`self.pos[2] − GROUND_SNAP_TOL` —
+
+```rust
+let f = col.ground_below(hi[0], hi[1], self.pos[2] + max_step + GROUND_ORIGIN,
+                         max_step + GROUND_ORIGIN + GROUND_SNAP_TOL)?;
+if f >= self.pos[2] - GROUND_SNAP_TOL && f - self.pos[2] <= max_step + GROUND_SNAP_TOL {
+```
+
+— so the recovery E′ arms is a step **up** with no downward half. E′ offers the denied body a step up
+and never a step over-and-down. The same sweep on a **levitator** gives the same shape one sample
+later (crosses to −0.40, stops at −0.50 and below), because its feet sit at the same 0.10.
+
+So the residual is **not** "a lip with no landing beyond". It is **"any landing more than
+`GROUND_SNAP_TOL` below the feet"** — e.g. a submerged 0.3 kerb with the bed a unit lower, or a rock
+on a gently falling seabed. That is ordinary geometry.
+
+**And it is silent. MEASURED (round 3):** at every wedged sample above, `CharacterController::hold()`
+returns `None` at frame 3600, and the position is unchanged from frame 8. The client reports an
+ordinary stationary body to the driving agent. `main`'s own >0.60 wedge is equally silent, so this is
+pre-existing *in kind* — but E′ enlarges the set of positions where the client is stuck and says
+nothing, and that is the `agent-honesty` class this project ranks first
+(`[[eq-agent-honesty-invariant]]`). This is not a mobility nuisance and §8 no longer describes it as
+one.
+
+### Variant 5 (**F1**) — E′, plus a **downward half** on the landing gate
+
+The reviewer's root cause names the fix: give the recovery a downward half. The narrowest form keeps
+`try_step_up`'s structure and only widens its landing window for the bodies E′ newly arms — search
+and accept out to the same envelope the step reaches upward, `STEP_UP + GROUND_SNAP_TOL` = 2.5:
+
+```rust
+let reach = max_step + GROUND_SNAP_TOL;                       // 2.5
+let f = col.ground_below(hi[0], hi[1], self.pos[2] + max_step + GROUND_ORIGIN,
+                         max_step + GROUND_ORIGIN + reach)?;  // was + GROUND_SNAP_TOL
+f >= self.pos[2] - reach && f - self.pos[2] <= max_step + GROUND_SNAP_TOL
+```
+
+**MEASURED (round 3).** It moves the boundary and does not remove it:
+
+| | buoyant, lip 0.45, floor beyond | levitator, lip 0.45, floor beyond | levitator, lip 0.30/0.45, floor beyond −10 |
+|---|---|---|---|
+| `main` | crosses all | crosses all | crosses |
+| E′ (v4) | stops ≤ −0.40 | stops ≤ −0.50 | **stops** |
+| **F1 (v5)** | stops ≤ **−2.40** | stops ≤ **−2.60** | **stops** |
+
+Three findings, all measured:
+
+- **The residual survives, six times further out.** −0.40 becomes −2.40 (= `feet − 2.5`). Every shape
+  with a landing deeper than that is still wedged, still silently.
+- **It does nothing at all for the case levitate exists for.** A levitator gliding at a gap or a
+  −10 drop has no landing within any finite envelope, so F1 refuses exactly as E′ does. That is the
+  paradigmatic levitate geometry, and `main` carries it.
+- **Where F1 does cross, it costs the hover.** MEASURED, levitator at 0.10, lip 0.45, floor beyond at
+  −1.0: frame 8 post is `[0.2500, −1.0000] ground=true`. The body is *landed* on the lower floor —
+  a 1.1 u drop out of a hover that `:1004` documents as holding altitude over exactly this shape.
+  The step-up's contract is "land on a floor", and handing it to a body whose vertical it does not
+  own contradicts §4's own type: `FreeStep::None` means *the owner keeps the z*, and F1 takes it.
+
+### Variant 6 (**F2**) — E′, plus a **step-over** that does not land
+
+The other shape of "a downward half": don't land at all. Raise, sweep, require the destination's foot
+plane to be clear — the highest floor at or below the raised probe start must be **at or below the
+feet**, which is what proves the obstruction does not extend to where we are going — and then apply
+the horizontal move only, leaving the z to whoever owns it:
+
+```rust
+fn try_step_over(&self, wish, max_step, col) -> Option<[f32; 3]> {
+    let raised = [self.pos[0], self.pos[1], self.pos[2] + max_step];
+    let (hi, _) = self.slide(raised, wish, col);
+    match col.ground_below(hi[0], hi[1], self.pos[2] + max_step + GROUND_ORIGIN, GROUND_DEPTH) {
+        // a floor ABOVE the feet at the destination = the obstruction extends there: that is a
+        // MOUNT, leave it to try_step_up (this clause is what keeps #854 fixed)
+        Some(z) if z > self.pos[2] + SKIN => None,
+        _ => Some([hi[0], hi[1], self.pos[2]]),   // z unchanged: the owner keeps it
+    }
+}
+```
+
+Tried **before** `try_step_up`, only for `FreeStep::None` bodies. **MEASURED (round 3)** — F2 wins
+every mobility comparison in this document:
+
+| check | `main` | E′ (v4) | F1 (v5) | **F2 (v6)** |
+|---|---|---|---|---|
+| buoyant, lip 0.45, floor beyond +0.45 … −10 | crosses all | stops ≤ −0.40 | stops ≤ −2.40 | **crosses all** |
+| levitator, same sweep | crosses all | stops ≤ −0.50 | stops ≤ −2.60 | **crosses all** |
+| levitator, lip 0.30 … 2.00, drop −10 | crosses ≤ 0.45 | stops all | stops all | **crosses all** |
+| levitator hover z across the crossing frame | 0.1000 | (wedged) | **−1.0000** | **0.1000** |
+| buoyant, curb 0.30 … 2.00 | crosses ≤ 0.60 | crosses all | crosses all | crosses all |
+| grounded ladder, both shapes, 0.30 … 2.80 | — | identical | identical | **identical** |
+| #854 crossing frame (§6.2 fixture) | pass-through | mount | mount | **mount** |
+| `--lib movement::` / `--test walker_sim` / synthetics | 85·0·1 / 11·0·5 / 6·4·5 | same | same | **same** |
+
+**And the discriminating control that decides against it. MEASURED (round 3).** Two 0.45-topped lips
+0.30 apart, floor beyond at −1.0, levitator at 0.10:
+
+```
+v6   f= 8 pre=[ -0.3333, 0.1000] post=[  0.2500, 0.1000] ground=false
+```
+
+One admitted step carries the body from west of the **first** face to east of the **second**, with
+its reported z pinned at 0.1000 the whole way. F2's clearance evidence is taken at
+`feet + STEP_UP`; the body never goes there. Nothing in the frame discharges the fiction, because
+refusing to write a z is the entire point of the variant.
+
+That is the same sentence #854 is about — *the client reports a position reached by translating
+through a face it never went over* — with a bound of `STEP_UP` = 2.0 instead of `Body::foot` = 0.5,
+and now **sanctioned** rather than accidental. F1 at least discharges the raise with a real landing
+write, which is precisely the fiction the grounded step-up already ships and the ground clamp already
+consumes. F2 discharges nothing.
+
+**This is the tradeoff, stated so the owner can take it rather than inherit it:**
+
+| | crossings a `main` body keeps | truthfulness of the crossings it does make | new silent wedges |
+|---|---|---|---|
+| **E′** | loses those with a landing > 0.5 u below the feet | every crossing is a real mount, z written | **yes** — measured, silent, ordinary geometry |
+| **F1** | loses those with a landing > 2.5 u below the feet, and all gap/drop glides | crossings land on a real floor; a levitator loses its hover | **yes** — smaller set, same silence |
+| **F2** | loses none | crossings are asserted, not performed; up to 2.0 u of unmodelled rise, multiple faces per step | **no** |
 
 ---
 
@@ -246,9 +423,12 @@ is rather than moving it. §8 states that residual as a residual.
 | C | Probe height derived from the remaining step budget | nothing #854 has | — | as A′ | the budget is `STEP_UP` = 2.0 whenever the body can step at all, so the derived height is ≥ 0.5 in exactly the failing case; where the budget is 0 it degenerates into E′ with a misleading name |
 | D | Stop the swim clamp parking feet in the band (clamp to `surface − float_depth`) | the measured qcat trigger | the #359 haul-out geometry: `haul_out_up` = 2.0 is measured **from the surface**, the swimming step-up reaches `STEP_UP + GROUND_SNAP_TOL` = 2.5 **from the feet**; parking feet at `surface − 2.0` makes the tallest admissible lip 4.0 against a 2.5 reach (**REASONED** from `traversability.rs`'s field docs, arithmetic not re-run) | nil | leaves the defect: the band is a body-model defect, and every non-water entrance (ballistic, levitating, a #543 pad landing) is untouched |
 | E | A′ + support gate (variant 3) | **MEASURED:** the pass-through | **MEASURED (round 2):** stops a buoyant, non-swimming body at any lip in the band, permanently, because the probe fires where the recovery does not arm | +1 ray per low-slide iter while not grounded | compatible; ladder byte-identical to baseline |
-| **E′** | **E + arm the existing recovery for `FreeStep::None` bodies (variant 4)** | **MEASURED:** the pass-through; and one pre-existing `main` wedge (buoyant body, 1.00 curb) | **MEASURED:** nothing in the driven population; residual in §8 | as E, plus at most one extra `try_step_up` on frames where the new contact fires | compatible; ladder byte-identical to baseline |
+| **E′** | **E + arm the existing recovery for `FreeStep::None` bodies (variant 4)** | **MEASURED:** the pass-through; and one pre-existing `main` wedge (buoyant body, 1.00 curb) | **MEASURED (round 3):** every crossing whose landing is more than `GROUND_SNAP_TOL` = 0.5 u below the feet — buoyant *and* levitating bodies, ordinary geometry, **silently** (`hold()` = `None` at 3600 frames). Not "no landing"; see §2 and §8 residual 2 | as E, plus at most one extra `try_step_up` on frames where the new contact fires | compatible; ladder byte-identical to baseline |
+| F1 | E′ + a downward half on `try_step_up`'s landing gate (variant 5) | **MEASURED:** the pass-through; moves E′'s cutoff from −0.40 to −2.40 | **MEASURED (round 3):** the residual survives at `feet − 2.5`; **no** improvement at all for gap/drop glides (levitate's own use case); where it does cross it **lands** the body, dropping a levitator out of its documented hover (0.10 → −1.00, `ground=true`) | as E′; the widened `ground_below` window is one column query with a larger depth, same call count | compatible; grounded ladder byte-identical |
+| F2 | E′ + a `try_step_over` that translates and leaves the z to its owner (variant 6) | **MEASURED:** the pass-through; **and every mobility case in this document** — no measured wedge remains, hover preserved, grounded byte-identical, all suites green | **MEASURED (round 3):** it does not remove the falsehood, it enlarges and sanctions it — clearance is checked at `feet + STEP_UP` and the body never goes there; one admitted step was measured crossing **two** band-height faces with reported z pinned at 0.1000 | as E′, plus one extra `slide` (≤ 3 iters × 2 rays) + one `ground_below`, on blocked `FreeStep::None` frames only; it runs *before* `try_step_up` and replaces it when it succeeds (**REASONED** from the call structure — not profiled) | compatible; grounded ladder byte-identical |
 
-**Recommendation: E′.**
+**Recommendation: E′ — but this is now a genuine owner call, and §2's three-row tradeoff table is
+the thing to decide from, not this sentence.**
 
 **Round 1 recommended E and that was wrong** — not in its mechanism but in its scope. §7 claimed,
 REASONED and unmeasured, that E's failure mode was "extra work, not a new stall", citing the arming
@@ -267,6 +447,44 @@ and of `try_step_up` together, on the path that runs every movement frame, to fi
 with one gated ray and one extended condition. C is E′ wearing a label that says "step budget" while
 meaning "who owns the body's z"; a misleading name in this codebase is how #386/#312-class drift
 starts. D re-opens #359 and fixes one door of a room with several.
+
+**F1 is eliminated by measurement, not by argument.** It was the obvious reading of "give the gate a
+downward half", and it fails on its own terms: it keeps a residual of exactly the same kind six times
+further out, it does nothing for the gap/drop glide that is levitate's whole purpose, and the
+crossings it does buy are paid for by landing a body whose z it does not own. Nothing recommends it
+over either neighbour.
+
+**F2 is not eliminated, and I am not going to pretend it is.** On every mobility measurement in this
+document F2 dominates E′: no wedge survives, the hover is preserved, the grounded ladder is
+byte-identical, #854 stays fixed, all five suites stay green. If the deciding question were "which
+option leaves the fewest bodies stuck", F2 wins outright and E′ should be dropped.
+
+I still recommend **E′**, on one ground, and it is a ranking not a refutation: **F2 buys its mobility
+by re-admitting the exact translation #854 objects to.** The step-over asserts a 2.0 u vertical
+excursion the body never performs and never reports — measured crossing two faces in a single frame
+with z pinned — where E′'s crossings are all real mounts with a written z. Under this project's
+stated first priority, a client that quietly reports having got somewhere it did not go is worse than
+a client that stops (`[[eq-agent-honesty-invariant]]`). E′'s cost is a *stall*; F2's cost is a
+*confident falsehood*, only a wider one than today's.
+
+That ranking depends entirely on that priority ordering, so it is the owner's to overturn:
+
+- If a **checked** step-over counts as a legitimate crossing for a body whose vertical is externally
+  owned — i.e. "cleared at `feet + STEP_UP` and the destination's foot plane is clear" is a
+  physically meaningful admission rule rather than a fiction — then **F2 is the better option and
+  should be taken**, and #854's fix becomes "make the crossing checked", not "make it impossible".
+  It would then want a companion issue for the multi-face case measured above (an admitted step
+  should probably be limited to one face, or re-swept at the feet plane on arrival).
+- If it does not, E′ is the answer and its residual must be made **loud**, which is the next bullet.
+
+**E′ is only defensible with the silence fixed.** The residual's worst property is not the stall, it
+is that `hold()` returns `None` while the body cannot move under any driver — measured. A
+`ControllerHoldReason` raised when a `FreeStep::None` body is blocked at the feet plane *and* the
+recovery finds nothing would convert a silent wedge into a reported predicament, which is the shape
+this repo already uses for the other two hold cases (`enter_hold`, §724/#679). **UNMEASURED** — no
+hold variant was implemented or driven here — and it should be a stated part of the implementation
+issue rather than a footnote, because without it E′'s honesty advantage over F2 is smaller than the
+paragraph above claims.
 
 ---
 
@@ -290,6 +508,9 @@ away. E′ passes them as types:
 ```rust
 /// What owns the body's vertical THIS frame. Exhaustive on purpose: adding a variant is a
 /// compile error at `free_step` until its allowance is stated. (Same discipline as #826/#838.)
+/// Every variant here is LIVE and drivable today — `Levitating` reads `self.levitating`
+/// (`src/movement.rs:195`), whose hover branch is at `:1004`. Round 2 called it a placeholder;
+/// §2 retracts that and measures it.
 enum VerticalOwner { Floor, WaterSurfaceClamp, Buoyant, Ballistic, Levitating }
 
 impl VerticalOwner {
@@ -340,6 +561,16 @@ the probe keys off `FreeStep::None` puts two different answers to "which bodies 
 free step" in two places three hundred lines apart — precisely the drift the type exists to prevent.
 The implementation should derive the arm from the same `free_step()` call, not from a second
 predicate that happens to agree today.
+
+**And a fourth, added in round 3: arming the recovery is not the same as the recovery being able to
+help.** E′ arms `try_step_up` for `FreeStep::None` bodies, and `try_step_up`'s landing gate then
+refuses every landing more than `GROUND_SNAP_TOL` below the feet (§2, measured). So the type says
+"this body is denied the free step, so offer it the step" while the recovery it is offered can only
+answer *up*. The type does not close that gap and this document should not pretend it does: a
+`FreeStep::None` body needs a **stated policy for what happens when the step refuses**, and there are
+exactly three coherent ones — refuse the move and *say so* (E′ + a hold reason), land it lower (F1),
+or translate it without landing (F2). §3 costs all three. What must not happen is the current
+implicit fourth: refuse, and report nothing.
 
 `FreeStep::None` additionally selects the walls-only veto on that ray (`|n_z| < near_horizontal`),
 because §2 measured a coplanar floor hit at the feet plane. **UNMEASURED:** whether the veto is
@@ -521,6 +752,24 @@ prove nothing. This is the single most important sentence in §6 for whoever imp
   **`walker_sim::p1_haul_out_admission_matches_controller_execution`** — the last of which *does*
   run in CI (see §7) and is the only guard here that is both CI-run and sensitive to the haul-out
   contract.
+- **The beyond-floor sweep (new in round 3, and the control the whole option space now turns on).**
+  Same lip height (0.45, inside the band), *sweeping the height of the floor beyond it* across at
+  least `{+0.45, 0.00, −0.25, −0.40, −0.50, −1.00, −2.40, −10.0}`, driven by **both** a buoyant body
+  and a **levitating** one. Whatever option ships, this sweep is where its residual becomes visible,
+  and its result must be written into the test as an explicit table rather than a `crosses()`
+  assertion — E′ is *expected* to stop below −0.40, so the test's job is to pin *where*, not to
+  demand success. If a later change moves that boundary without moving the table, that is the
+  regression this control exists to catch.
+- **Two-face admission control** (only if F2 ships): two band-height faces 0.30 apart. Measured under
+  F2, one admitted step crosses both. Pin the count of faces a single step may cross at **one**.
+
+**Existing fixtures cannot decide any of this — measured, and this is the reason the new ones are
+required.** `cargo test --lib movement::` (85/0/1), `--test walker_sim` (11/0/5) and the three
+synthetic binaries (6, 4, 5) are **green on `main` and green under E′, F1 and F2 alike**. Four
+behaviourally different builds, one of which has a measured silent wedge on ordinary geometry, are
+indistinguishable to the entire shipped suite. The sweeps above are ~30 lines each on top of a single
+new `tests/synthetic_scenes/mod.rs` builder — `lip_with_floor_beyond(lip_top, beyond_z, water: Option<f32>)`
+— which is all the infrastructure any of the round-3 measurements needed.
 
 **The falsification control — and why it cannot be built.** #854's control is that the same
 horizontal drive with *zero* pitch, from the buoyancy plane, stalls wet for ever; the escape
@@ -572,7 +821,8 @@ indistinguishable from one that cannot lose. `[[eq-verification-hierarchy]]`.
   for them. MEASURED: step ladder, grounded lip-with-drop ladder, and ballistic runs all identical
   to baseline; `cargo test --lib movement::` 85 passed / 0 failed / 1 ignored; `--test walker_sim`
   11 / 0 / 5 ignored; 6, 4, 5 on the three synthetic integration binaries.
-- **Swimming / buoyant / ballistic / (future) levitating bodies with a horizontal wish** gain a
+- **Swimming / buoyant / ballistic / levitating bodies with a horizontal wish** (all four ship today
+  — the "(future)" that stood here for levitate was wrong, see §2) gain a
   contact at the feet plane against non-standable faces, **and** gain the step-up/duck recovery that
   today only grounded and swimming bodies get. **If the recommendation is wrong, this is where it
   shows:** a swimmer that used to slide along a submerged lip now stops at it or climbs it; a
@@ -584,10 +834,14 @@ indistinguishable from one that cannot lose. `[[eq-verification-hierarchy]]`.
   for a body that is ungrounded and not swimming, which is exactly the population the gated probe
   newly blocks. MEASURED (round 2): under variant 3 a buoyant, non-swimming body stops dead at a
   0.30 lip that `main` crosses, and is still there at frame 3600. The recommendation was amended to
-  E′ (§2 variant 4, §3) precisely because of this; under E′ the stall is measured gone wherever a
-  landing exists. Reported here rather than quietly deleted because the *reasoning error* is the
-  reusable lesson: a gate and its recovery are one decision, and a sentence about a branch is not a
-  measurement of it.
+  E′ (§2 variant 4, §3) precisely because of this.
+  **Round 3 narrows the repair, too:** "under E′ the stall is gone wherever a landing exists" was
+  also false — it is gone only where the landing is within `GROUND_SNAP_TOL` of the feet, and
+  measured wedges remain below that for buoyant *and* levitating bodies, silently. Both errors are
+  reported rather than quietly deleted because the *reasoning error* is the reusable lesson twice
+  over: a gate and its recovery are one decision; and a two-point sample (`0` and `−10`) is not a
+  measurement of a continuum. The second is the more embarrassing one — the boundary was inside the
+  interval the table skipped.
 - **Cost:** +1 ray cast per low-slide iteration, ≤ `MAX_SLIDE_ITERS` = 3 per frame, only while not
   grounded, zero when grounded; plus at most one extra `try_step_up` on frames where that new
   contact fires. Arithmetic from the loop bound, **not** a profile.
@@ -605,17 +859,32 @@ ground — say a lintel spanning `feet + 1.0` to `feet + 3.0` — is invisible t
 and remains invisible under E′. It is the same defect class, and option B is what fixes it.
 **REASONED** from the probe heights; not measured.
 
-**Found while building the round-2 controls, and NOT part of this design.** On a grounded walker
-driven into a lip with the floor beyond dropped to −10, the crossing ladder is **not monotone**:
-lips of 2.40 / 2.60 / 2.80 stop the body dead, while 3.00 / 3.50 / 4.00 / 5.00 all end at east 99.4,
-z −10 — i.e. beyond a wall the body never went over. MEASURED, and **identical on `main` and under
-every variant here**, so it is a pre-existing behaviour and not a consequence of anything proposed.
-A frame trace shows the body oscillating east/west by ~0.6 u per frame at the face (−0.92 → −1.30 →
-−0.72 → −1.10 …) rather than crossing cleanly, which is the signature of the depenetration net
-fighting the slide; the mechanism is **UNMEASURED** beyond that, and this fixture puts the west
-floor's east edge exactly coplanar with the wall, which may itself be degenerate. It is
-agent-honesty-flavoured (a body ends beyond geometry it never contacted) and should be filed and
-investigated separately rather than folded into #854.
+**Found while building the round-2 controls, NOT part of this design, and now filed as #870.** On a
+grounded walker driven into a lip with the floor beyond dropped to −10, the crossing ladder is **not
+monotone**: lips of 2.40 / 2.60 / 2.80 stop the body dead, while 3.00 / 3.50 / 4.00 / 5.00 all end at
+east 99.4, z −10 — beyond a wall the body never went over. MEASURED, and **identical on `main` and
+under every variant here**, so it is pre-existing and not a consequence of anything proposed. The
+independent reviewer reproduced it, found it wider (the curb shape too, and out to a 6.0 wall), and
+measured the frame trace round 2 left unmeasured: ~70 frames of ±0.6 u oscillation at the face, then
+**one frame** carrying the body from east −0.7068 / z 0 to east +0.0003 / z −10.
+
+**My round-2 "coplanar floor edge" suspicion is withdrawn — the reviewer's control refutes it**
+(insetting the floor edge so the junction is no longer coplanar still crosses). Its replacement
+hypothesis, that **zero thickness** is the cause, is **not supported by my own re-run** and I am
+recording the disagreement rather than adopting the tidier claim. **MEASURED (round 3)**, grounded
+walker, 3.0-tall barrier, floor beyond at −10, varying only the barrier's thickness (back face + cap
+added when thick), final east:
+
+| thickness | 0.0 | 0.5 | 1.0 | 2.0 | 3.0 | 5.0 |
+|---|---|---|---|---|---|---|
+| result | **99.40 (crosses)** | −0.60 stop | −0.60 stop | **98.98 (crosses)** | **98.98 (crosses)** | −0.60 stop |
+
+The 1.0-thick row agrees with the reviewer; 2.0 and 3.0 do not. So thickness is **not monotone** and
+"zero thickness is the cause" over-fits three samples. What both runs do establish is that the
+crossing is sensitive to the barrier's cross-section — some thicknesses stop it and some do not with
+nothing else changed — which is a useful discriminator for #870 and a mechanism claim for **neither**
+of us to make. The depenetration-net attribution stays **UNMEASURED** in this document.
+Everything above belongs in #870; nothing in #854's fix depends on it.
 
 ---
 
@@ -636,13 +905,35 @@ contacted. The lip-with-drop fixture is exactly that shape, and it is crossed bo
 under E′. Whether "step over a curb at a cliff edge and fall" is legal player behaviour or a second
 instance of #854 is an **owner call**, and this design does not make it.
 
-**NOT removed, residual 2 — the ungrounded no-landing lip.** A buoyant, non-swimming body driven at
-a lip with no landing beyond stops there permanently under E′, for lips of any height. On `main` it
-stops there for lips above `feet + 0.5` and drifts through below it. So E′ does not create this
-outcome, it removes the exception to it — and the exception was the pass-through. MEASURED both
-ways (§2). The honest framing: E′ makes the behaviour *uniform and truthful* rather than *sometimes
-passable by translating through matter*. A body that reports "I am stopped at east −0.167" while
-pressed against a real face is telling the driving agent the truth; the previous behaviour was not.
+**NOT removed, residual 2 — RESTATED IN ROUND 3, and it is bigger and worse than round 2 said.**
+
+Round 2 wrote this residual as "the ungrounded **no-landing** lip", i.e. bottomless drops. That was
+false, and the correction is the main content of round 3. **MEASURED (§2):**
+
+> Under E′, a body whose vertical is not floor-owned — **buoyant or levitating**, both shipping
+> today — driven at any face in the blind band is stopped **permanently** whenever the floor beyond
+> that face is more than `GROUND_SNAP_TOL` = **0.5 u below its feet**. `main` crosses every one of
+> those. The boundary is `try_step_up`'s landing gate: the recovery E′ arms is a step *up* with no
+> downward half.
+
+That is a submerged 0.3 kerb with the bed a unit lower; a rock on a gently falling seabed; a
+levitator gliding at a small obstruction with a dip beyond. Ordinary geometry, not a corner case.
+
+**And it is silent — this is the part that matters most.** MEASURED: `hold()` returns `None` at every
+wedged position at frame 3600. The client tells the driving agent it has an ordinary stationary body
+in an ordinary place. A driver polling `player.hold` sees nothing to react to, will re-issue the same
+wish for ever, and has no observable that distinguishes "arrived and idle" from "cannot move under
+any driver". Under `[[eq-agent-honesty-invariant]]` that is a *silent wrong answer*, which this
+project ranks above both features and crashes — the same class as #854 itself, arrived at from the
+other side. Levitate makes it a true predicament rather than an inconvenience: `:1004` discards
+vertical input, so the player cannot rise over the obstruction manually.
+
+**What is genuinely true, and all that is:** where E′ *does* cross, the crossing is a real mount with
+a written z, and a body reporting "stopped at east −0.167" while pressed against a real face is
+telling the truth about its position. E′ trades a silent falsehood about *position* for a silent
+falsehood about *mobility*. Round 2's framing ("uniform and truthful") claimed the first half and
+skipped the second. **Shipping E′ without the hold reason proposed in §3 makes that trade worse, not
+better**, and this design now says so where a reader will see it rather than leaving it to §3.
 
 **Do not read this as closing the qcat escape.** After E′, leaving the pocket is a `try_step_up`
 whose legality is decided by the haul-out contract (`haul_out_up` = 2.0 from the surface), and it
@@ -672,6 +963,20 @@ So, corrected:
 
 Recommendation: file one new issue for the mount-vs-strand capability question, cross-reference
 #329, and do **not** re-open or re-target #661/#543/#266.
+
+**What the implementation issue must carry out of round 3** (in decision order, because the first
+answer changes the rest):
+
+1. **The owner picks among E′ / F2** on §2's three-row tradeoff table. This design ranks E′ first on
+   the honesty ordering and says why, and says equally plainly that F2 wins every mobility
+   measurement taken here. Neither is a default.
+2. **If E′: the hold reason is not optional.** A `FreeStep::None` body blocked at the feet plane with
+   no recovery available must raise a `ControllerHold`, or E′ ships a measured silent wedge on
+   ordinary geometry and the fix trades one `agent-honesty` defect for another.
+3. **If F2: file the multi-face admission question** — one admitted step was measured crossing two
+   band-height faces — and decide whether a step-over is limited to one face or re-swept at the feet
+   plane on arrival.
+4. **F1 needs no issue.** It is measured out (§3).
 
 **Two prior diagnoses of #854 were retracted publicly** ("the camera has no collision test"; "the
 chamber is sealed on all six sides"). Neither is restated here, and §6.2's paired reach control
