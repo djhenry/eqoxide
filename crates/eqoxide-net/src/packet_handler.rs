@@ -3003,6 +3003,12 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         // #643: no gait until this entity actually sends a position update. `None` means
         // "the server has not told us", which is NOT the same as "standing still".
         gait:           None,
+        // eqoxide#857: captured off the wire (see `SpawnInfo::npc_tint_index` for what is/isn't
+        // established), but deliberately stops HERE — not threaded to `SceneState::Billboard` or
+        // any render path, since the actual visual-application rule is unverified and today's
+        // deployed content never sets it nonzero anyway. This is the "place in the client where
+        // the spawn struct's appearance fields are read" the issue asks be a considered decision.
+        npc_tint_index: info.npc_tint_index,
     });
 }
 
@@ -3148,6 +3154,7 @@ mod tests {
             race: String::new(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
             face: 0, hairstyle: 0, haircolor: 0, pose: Pose::Standing, gait: None, is_boat: false, flymode: 0,
+            npc_tint_index: 0,
         }
     }
 
@@ -4914,7 +4921,7 @@ mod tests {
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
             flymode: 0, pet_owner_id: 0, player_state: 64,
             x: 1.0, y: 2.0, z: 3.0, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
         };
 
         // Case mismatch: config says "aldric", the server's real character record is "Aldric".
@@ -4962,7 +4969,7 @@ mod tests {
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
             flymode: 0, pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
         };
         register_spawn(&mut gs, info);
         assert_eq!(gs.player_name, "Aldric", "server-authoritative name must have replaced the config value");
@@ -5088,7 +5095,7 @@ mod tests {
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
             flymode: 0, pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
         };
         register_spawn(&mut gs, info);
 
@@ -5149,7 +5156,7 @@ mod tests {
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
             stand_state: 100, flymode: 0, pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
         };
         // A PC corpse (npc=2) arriving via the bulk zone-in path (which calls register_spawn directly,
         // NOT apply_new_spawn) must be flagged dead + Lying so the renderer lays it down — the earlier
@@ -5190,7 +5197,7 @@ mod tests {
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
             stand_state: 100, flymode: 0, pet_owner_id: 0, player_state: 64,
             x, y, z, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
         };
 
         // campday000-style controller (bodytype 11 = NoTarget) at the exact sentinel (0,0,0)
@@ -5260,7 +5267,7 @@ mod tests {
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
             stand_state: 100, flymode, pet_owner_id: 0, player_state: 64,
             x: 50.0, y: -60.0, z: 100.0, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
         };
 
         let mut gs = GameState::new();
@@ -5302,7 +5309,7 @@ mod tests {
             body_type: 1, cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
             stand_state: 100, flymode, pet_owner_id: 0, player_state: 64,
             x: 50.0, y: -60.0, z, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
         }
     }
 
@@ -5449,7 +5456,7 @@ mod tests {
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
             flymode: 0, pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
-            equipment, equipment_tint,
+            equipment, equipment_tint, npc_tint_index: 0,
         };
         register_spawn(&mut gs, info);
         let e = gs.world.entities.get(&7).expect("entity registered");
@@ -6105,6 +6112,12 @@ mod tests {
     /// Build a minimal valid RoF2 NPC spawn record (non-playable race → 60-byte equipment block).
     /// Shared by the #407 roster-completeness / honesty tests below.
     fn build_npc_record(name: &str, id: u32, x: f32, y: f32, z: f32) -> Vec<u8> {
+        build_npc_record_with_tint(name, id, x, y, z, 0)
+    }
+
+    /// Same as [`build_npc_record`] but with a settable `NpcTintIndex` (eqoxide#857) — used to prove
+    /// the field decodes off the wire regardless of the non-playable equipment branch that follows it.
+    fn build_npc_record_with_tint(name: &str, id: u32, x: f32, y: f32, z: f32, npc_tint: u32) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(name.as_bytes()); b.push(0);
         b.extend_from_slice(&id.to_le_bytes());
@@ -6132,7 +6145,8 @@ mod tests {
         b.extend_from_slice(&0u32.to_le_bytes()); // petOwnerId
         b.push(0); // FindBits
         b.extend_from_slice(&64u32.to_le_bytes()); // PlayerState
-        b.extend_from_slice(&[0u8; 20]); // NpcTintIndex..unk (5×u32)
+        b.extend_from_slice(&npc_tint.to_le_bytes()); // NpcTintIndex (eqoxide#857)
+        b.extend_from_slice(&[0u8; 16]); // PrimaryTintIndex..unk (4×u32)
         b.extend_from_slice(&[0u8; 60]); // non-playable equipment block
         let (yp, xp, zp) = (enc_eq19(y), enc_eq19(x), enc_eq19(z));
         b.extend_from_slice(&(yp << 12).to_le_bytes()); // word0: y
@@ -6154,6 +6168,14 @@ mod tests {
     /// race 7, etc.) that are classic playable races (≤12) take THIS branch on the wire even as NPCs
     /// — the branch the eq-client-expert flagged for #407. `mat0`/`mat8` seed slot 0 / slot 8 Material.
     fn build_playable_npc_record(name: &str, id: u32, race: u32, mat0: u32, mat8: u32) -> Vec<u8> {
+        build_playable_npc_record_with_tint(name, id, race, mat0, mat8, 0)
+    }
+
+    /// Same as [`build_playable_npc_record`] but with a settable `NpcTintIndex` (eqoxide#857) — used
+    /// to prove the field decodes off the wire regardless of the PLAYABLE (216-byte) equipment branch
+    /// that follows it, i.e. that the race gate at rof2.cpp:4849 does not also gate this field.
+    fn build_playable_npc_record_with_tint(name: &str, id: u32, race: u32, mat0: u32, mat8: u32,
+                                            npc_tint: u32) -> Vec<u8> {
         assert!(race <= 12 || matches!(race, 128 | 130 | 330 | 522), "must be a playable race");
         let mut b = Vec::new();
         b.extend_from_slice(name.as_bytes()); b.push(0);
@@ -6182,7 +6204,8 @@ mod tests {
         b.extend_from_slice(&0u32.to_le_bytes()); // petOwnerId
         b.push(0); // FindBits
         b.extend_from_slice(&64u32.to_le_bytes()); // PlayerState
-        b.extend_from_slice(&[0u8; 20]); // NpcTintIndex..unk (5×u32)
+        b.extend_from_slice(&npc_tint.to_le_bytes()); // NpcTintIndex (eqoxide#857)
+        b.extend_from_slice(&[0u8; 16]); // PrimaryTintIndex..unk (4×u32)
         // PLAYABLE equipment block (216 bytes): 36B tint + 180B equipment.
         b.extend_from_slice(&[0u8; 36]); // 9×u32 tint
         for slot in 0..9u32 {
@@ -6231,6 +6254,61 @@ mod tests {
             apply_zone_entry(&mut gs, &buf);
             assert!(gs.world.entities.contains_key(&id), "{name} (race {race}) must register");
         }
+    }
+
+    /// eqoxide#857 crux: `NpcTintIndex` (rof2.cpp:4843) is written BEFORE the `is_playable` branch
+    /// point (rof2.cpp:4849) that gates the 7-slot equipment/tint block — so it must decode to the
+    /// same value whether the spawn takes the 60-byte non-playable branch or the 216-byte playable
+    /// branch. If the race gate were (wrongly) applied to this field too, one of these two would
+    /// come back 0 instead of the seeded value.
+    #[test]
+    fn npc_tint_index_decodes_ungated_regardless_of_race_branch() {
+        use crate::protocol::parse_rof2_spawn;
+
+        // Stride pin (eqoxide#857): the old decoder did one `skip!(20)` over
+        // NpcTintIndex+PrimaryTintIndex+SecondaryTintIndex+unk+unk. This splits that into
+        // `rd_u32!()` (4B) + `skip!(16)` (the remaining 16B) — same total width, but if that
+        // arithmetic were off by even one byte, every field the decoder reads AFTER this point
+        // (the whole equipment block, then position, then animation) would silently desync. So
+        // this test asserts not just `npc_tint_index` but every field downstream of it, on BOTH
+        // equipment branches, with a NONZERO tint value present (a zero value could accidentally
+        // "work" even with a stride bug, since zero bytes are byte-position-insensitive noise).
+        let non_playable = build_npc_record_with_tint("a_gnoll", 601, 11.0, 22.0, 3.0, 42);
+        let (info, consumed) = parse_rof2_spawn(&non_playable).expect("non-playable spawn must parse");
+        assert_eq!(consumed, non_playable.len(), "must consume the whole non-playable record");
+        assert_eq!(info.npc_tint_index, 42,
+            "NpcTintIndex must decode for a non-playable (60-byte equipment) NPC");
+        // Fields decoded AFTER the tint block in build_npc_record_with_tint: Primary/Secondary
+        // weapon material (60-byte non-playable equipment block) are left at 0 by that builder,
+        // so assert position/animation instead — the fields that immediately follow equipment.
+        assert!((info.x - 11.0).abs() < 0.2, "x after tint block must not have shifted: {}", info.x);
+        assert!((info.y - 22.0).abs() < 0.2, "y after tint block must not have shifted: {}", info.y);
+        assert!((info.z - 3.0).abs() < 0.2, "z after tint block must not have shifted: {}", info.z);
+        assert_eq!(info.animation, 100, "animation word must not have shifted");
+
+        let playable = build_playable_npc_record_with_tint("Hansl_Bigroon", 602, 1, 111, 222, 42);
+        let (info2, consumed2) = parse_rof2_spawn(&playable).expect("playable spawn must parse");
+        assert_eq!(consumed2, playable.len(), "must consume the whole playable record");
+        assert_eq!(info2.npc_tint_index, 42,
+            "NpcTintIndex must decode identically for a playable-race (216-byte equipment) NPC — \
+             the race gate at rof2.cpp:4849 does not cover this field");
+        // The 216-byte playable equipment block comes right after the tint block; a one-byte
+        // stride error here would corrupt these Material reads.
+        assert_eq!(info2.equipment[0], 111, "slot 0 Material must not have shifted after the tint read");
+        assert_eq!(info2.equipment[8], 222, "slot 8 Material must not have shifted after the tint read");
+    }
+
+    /// eqoxide#857: the documented DB default for `npc_tint_id` is 0 ("no tint") — confirm the
+    /// decoder reports it as the literal value 0, not e.g. a sentinel that gets remapped, and that
+    /// a distinct nonzero value at the SAME wire position is not confused with an adjacent field
+    /// (PrimaryTintIndex, which sits immediately after and must stay 0/skipped either way).
+    #[test]
+    fn npc_tint_index_zero_is_reported_as_zero_not_defaulted_away() {
+        use crate::protocol::parse_rof2_spawn;
+
+        let buf = build_npc_record_with_tint("a_rat", 603, 0.0, 0.0, 0.0, 0);
+        let (info, _) = parse_rof2_spawn(&buf).expect("spawn must parse");
+        assert_eq!(info.npc_tint_index, 0, "zero NpcTintIndex must be reported as the literal 0");
     }
 
     /// #407 completeness: a multi-record OP_ZoneSpawns must register EVERY spawn in the packet, not
@@ -7043,7 +7121,7 @@ mod tests {
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9],
             helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0, haircolor: 0,
+            face: 0, hairstyle: 0, haircolor: 0, npc_tint_index: 0,
         });
         // Build a 32-byte Death_Struct payload: spawn_id=42, killer_id=1 (player)
         let mut pkt = [0u8; 32];
