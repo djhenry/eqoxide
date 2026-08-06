@@ -2138,8 +2138,8 @@ mod tests {
     #[test]
     fn a_resync_must_still_cross_ground_the_controller_can_stand_on() {
         // The controller's own ground-probe window, `src/movement.rs`:35 and :37. Restated because
-        // it lives in the app crate and this one sits below it; if those ever diverge, the premise
-        // assert below is what notices.
+        // it lives in the app crate and this one sits below it. Nothing enforces agreement between
+        // this copy and the app crate's constants — this test compares only against the fixture.
         const GROUND_ORIGIN: f32 = 1.0;
         const GROUND_DEPTH: f32 = 200.0;
 

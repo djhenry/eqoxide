@@ -594,8 +594,10 @@ pub fn resync_reachable(col: &crate::collision::Collision, from: [f32; 3], to: [
 /// `a_resync_must_not_cross_a_chasm_the_character_cannot_walk`).
 ///
 /// Even with the floor probe this is a **necessary, not a sufficient** condition — read
-/// `true` as *"not proven unreachable"*, never as *"reachable"*. Of the two gaps #734 files against
-/// it, one is live and one has been withdrawn on measurement:
+/// `true` as *"not proven unreachable"*, never as *"reachable"*. #734 gaps 1 and 2 bear directly
+/// on this predicate; #734 also files further gaps against `Collision::ground_continuous` itself
+/// (see `collision.rs`) that this rustdoc does not enumerate. Of gaps 1 and 2, one is live and one
+/// has been withdrawn on measurement:
 ///
 /// * **Line-sampled (#734 gap 1) — MEASURED, NOT FIXED, still live.** The floor probe samples the
 ///   column at `PROBE_SPACING` (2 u) intervals along the hop, so a hole narrower than that can fall
