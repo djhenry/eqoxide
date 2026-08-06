@@ -2366,7 +2366,9 @@ impl ControllerSlots {
     /// Deliberately does NOT touch `ControllerView::pos`, `heading` or `initialized`: this crate
     /// does not own the controller's placement, and blanking `initialized` here would only move the
     /// stale-position window from "one net tick" to "one render frame" rather than close it (that
-    /// residual is `player_pos_known`'s, and is filed separately — see `stream_position`).
+    /// residual is `player_pos_known`'s, and is filed as #871 rather than fixed here — a different
+    /// field, whose only writer is the same unconditional mirror, but whose blast radius is position
+    /// streaming).
     pub fn begin_zone_in(&self, gs: &mut eqoxide_core::game_state::GameState) {
         gs.begin_zone_in();
         self.controller_view.lock().unwrap().invalidate_disclosures();

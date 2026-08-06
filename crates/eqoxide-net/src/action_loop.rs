@@ -3045,12 +3045,23 @@ impl ActionLoop {
         // for the new zone (i.e. between `begin_zone_in` and the controller being placed here),
         // `player_x/y/z` still hold whatever they held before: the OLD zone's last-known
         // coordinates on every zone change after the first, or the struct's construction-time
-        // zeroes on the very first zone-in of the session. Either way `GameState::player_pos_known`
-        // is false during that window (see its doc), so anything derived from `player_x/y/z` —
-        // notably the `distance` a name-resolution endpoint reports — would be a confident wrong
-        // number (a stale-but-plausible old position is the more dangerous case, since it doesn't
-        // look absurd the way an origin-relative one would). Consumers gate on this via
-        // `HttpState::player_pos()` and report an honest "unknown" until it flips.
+        // zeroes on the very first zone-in of the session. Anything derived from `player_x/y/z` in
+        // that window — notably the `distance` a name-resolution endpoint reports — would be a
+        // confident wrong number (a stale-but-plausible old position is the more dangerous case,
+        // since it doesn't look absurd the way an origin-relative one would). Consumers gate on
+        // `player_pos_known` via `HttpState::player_pos()` and report an honest "unknown".
+        //
+        // **#846 review / #871: the last two sentences of the paragraph above USED to end "either
+        // way `player_pos_known` is false during that window", and that is not true.** The only gate
+        // on this whole path is `view.initialized`, which `app.rs` sets once when the controller
+        // first spawns and never re-clears on a zone change. So the first net tick after
+        // `begin_zone_in` runs THIS line — writing the DEPARTED zone's controller position into
+        // `player_x/y/z` and flipping the flag back to true on it — roughly 10 ms into a load that
+        // takes seconds. `player_pos_known`'s own doc states the precondition ("once the controller
+        // has actually been placed in this zone"); nothing here enforces it, because the mirror
+        // cannot tell that placement from the one before it. Filed as #871 rather than fixed in
+        // #846: same mechanism as the hold (one unconditional mirror, no zone identity on the
+        // view), different field, and this one's blast radius is position streaming.
         gs.player_pos_known = true;
         gs.player_heading = view.heading;
         self.last_streamed = pos;
