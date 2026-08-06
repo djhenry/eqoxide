@@ -1826,8 +1826,13 @@ mod zone_entry_handshake_publish_tests {
         // The render thread's last word before the zone change: wedged, in the zone we are leaving.
         let controller = eqoxide_ipc::ControllerSlots::default();
         let hold = ControllerHold { reason: ControllerHoldReason::EmbeddedNoRecovery, secs: 7.5 };
-        controller.controller_view.lock().unwrap().publish_disclosures((Some(hold), None));
+        // A REAL matured stall beside it (#846 round-2 review F1). With `None` there, the
+        // `(None, None)` assertion below is blind on its second element: a half-neutered
+        // `invalidate_disclosures` that keeps the stall passes it, measured workspace-GREEN.
+        let stall = crate::test_afloat::matured_stall([-812.5, 43.0, -119.75]);
+        controller.controller_view.lock().unwrap().publish_disclosures((Some(hold), Some(stall)));
         gs.player_hold = Some(hold);
+        gs.player_afloat_stall = Some(stall);
 
         let _ = run_zone_entry_handshake(
             &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
@@ -1837,6 +1842,7 @@ mod zone_entry_handshake_publish_tests {
 
         assert!(gs.player_hold.is_none(),
             "the GameState half of the zone-in clear (`GameState::begin_zone_in`, #724)");
+        assert!(gs.player_afloat_stall.is_none(), "…and its stall half (#776/#801)");
         assert_eq!(controller.controller_view.lock().unwrap().disclosures(), (None, None),
             "and the VIEW half — without it `stream_position`'s next tick mirrors the departed \
              zone's hold straight back into the field an agent reads (#846 review B1)");

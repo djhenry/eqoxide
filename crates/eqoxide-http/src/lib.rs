@@ -657,7 +657,11 @@ fn ser_error_kind<S: serde::Serializer>(
 /// wrong. The branch now **withdraws** `hold` (and `afloat_stall`) on the tick it hands the
 /// correction over: `null`, not a predicament at coordinates the body was just lifted away from.
 /// That is not an invention — `CharacterController::teleport`, which consumes the correction, drops
-/// both as its first act, so it is the render thread's own next value published one tick early.
+/// both **unconditionally, on every path through it** (straight-line, no early return), so it is the
+/// disclosure the controller itself holds the instant it adopts. It is *not* a promise about the
+/// render thread's next publication: a summon that drops the body inside geometry publishes
+/// `Some(..)` on the very next frame, about the NEW position. The argument that carries the change
+/// is the direction — withdrawing can only lose a warning for a tick.
 /// Pinned by `action_loop::tests::a_re_asserted_summon_never_pairs_a_fresh_pos_with_a_stale_hold_846`.
 /// The residual that remains is a *missing* warning for those ticks, not a false one.
 ///

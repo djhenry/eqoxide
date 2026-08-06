@@ -398,8 +398,8 @@ false hold; what it freezes is `held_secs`, and the paragraph above tells you ho
 (#724 round-3 review, N1 — this used to say "recomputes it from scratch every frame", which is not
 true of the load, zone-in or idle paths.)
 
-**Why an idle render loop cannot leave `hold` describing a predicament you have left — and the two
-places the client withdraws it on purpose (#846).** The obvious attack is the one the table above
+**Why an idle render loop cannot free your body behind `hold`'s back — and the two places the client
+withdraws it on purpose (#846).** The obvious attack is the one the table above
 tells you to use: a GM `#summon`. It arrives on the *network* thread, and the network thread is not
 the one that recomputes the hold. It still cannot free your body behind the hold's back — which is
 what would make the field a confident falsehood rather than merely an old one. The movement
@@ -425,11 +425,12 @@ there is none:
   idles, it recurred indefinitely. It is withdrawn now instead of bounded.)
 
 One honest caveat remains: nothing above bounds how *long* the render loop may idle before it picks
-a correction up. It is woken by any inbound state change, including the summon itself, so in
-practice this is tens of milliseconds — but that is a timing property of a render loop no test in
-this repo can reach, so treat it as a latency expectation and not as a promise. If it matters to
-you, the `held_secs`-against-your-own-clock check above is what distinguishes a frozen controller
-from a live one.
+a correction up. It is woken by any inbound state change, including the summon itself, which works
+out to tens of milliseconds — but that number is **derived from the loop's own idle-poll and frame
+constants, not observed on a running client**, and the wake itself is reached by no test in this
+repo (measured: forcing the condition dead leaves the whole suite green and unchanged). Treat it as
+a latency expectation, not a promise. If it matters to you, the `held_secs`-against-your-own-clock
+check above is what distinguishes a frozen controller from a live one.
 
 ### `afloat_stall` — this swimmer is being asked to swim and is going nowhere (#776/#801)
 

@@ -1040,8 +1040,14 @@ pub struct GameState {
     ///    WITHDRAWS this field (and `player_afloat_stall`) rather than leave the pair as a fresh
     ///    position beside an old predicament. The withdrawal is not the net thread inventing an
     ///    answer: the correction it just handed over is consumed by `CharacterController::teleport`,
-    ///    which drops the hold and the afloat window as its first act, so `None` is the render
-    ///    thread's own next value, published one tick early. Pinned by
+    ///    which drops the hold and the afloat window UNCONDITIONALLY, on every path through it (the
+    ///    function is straight-line with no early return — "as its first act", written in round 2,
+    ///    was literally wrong and is retracted). So the withdrawal publishes the disclosure the
+    ///    controller itself holds the moment it adopts. It is not a promise about the render
+    ///    thread's next publication — a summon into geometry publishes `Some(..)` next frame, about
+    ///    the NEW position — and the argument that carries it is the direction: withdrawing can only
+    ///    lose a warning for a tick. Pinned, on BOTH halves of the pair since #846's round-2 review
+    ///    put a real matured `AfloatStall` into the fixture, by
     ///    `a_re_asserted_summon_never_pairs_a_fresh_pos_with_a_stale_hold_846` in `eqoxide-net`.
     ///    (An earlier revision of this paragraph called the mismatch a ONE-tick, ~10 ms window. That
     ///    was measured against a server asserting the correction once; against one that re-asserts

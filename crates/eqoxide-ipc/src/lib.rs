@@ -234,8 +234,18 @@ impl ControllerView {
     /// precisely because it is faithful. The clear has to happen here, at the value the mirror
     /// reads, or it does not survive contact with the mirror.
     ///
-    /// Call it through [`ControllerSlots::begin_zone_in`] rather than directly, so the `GameState`
-    /// clear and this one cannot be separated.
+    /// Call it through [`ControllerSlots::begin_zone_in`] rather than directly, so that a caller
+    /// does not perform half of the act.
+    ///
+    /// That is **convention, not a guarantee**, and the earlier wording here ("so the `GameState`
+    /// clear and this one cannot be separated") was simply false — flagged in #846's round-2 review.
+    /// Both this method and `GameState::begin_zone_in` are `pub`; nothing stops a caller from
+    /// running one without the other, and #846's own M10 mutation *demonstrates* the separation by
+    /// making `run_zone_entry_handshake` do exactly that. `ControllerSlots::begin_zone_in`'s doc
+    /// says the same thing correctly, and the reason it cannot be a guarantee is structural:
+    /// `eqoxide-core` sits below this crate, so `GameState::begin_zone_in` has to stay `pub` and
+    /// separately reachable. What the pairing buys is one name for the whole act and a call-site
+    /// test per existing caller — not unrepresentability.
     pub fn invalidate_disclosures(&mut self) {
         self.publish_disclosures((None, None));
     }
@@ -2433,28 +2443,43 @@ mod zone_in_disclosure_tests {
     /// 1. drop `self.controller_view.lock().unwrap().invalidate_disclosures();` from
     ///    `ControllerSlots::begin_zone_in` (the `gs.begin_zone_in()` call left written and
     ///    executing — a WRAP mutation per #799) → RED at the view assertions;
-    /// 2. drop `gs.begin_zone_in()` from it → RED at the GameState assertions.
+    /// 2. drop `gs.begin_zone_in()` from it → RED at the GameState assertions;
+    /// 3. **half-neuter it** — `let keep = self.disclosures().1; self.publish_disclosures((None,
+    ///    keep));` — so the hold is invalidated and the stall is not → RED at the stall assertion.
+    ///    Mutation 3 was **workspace-GREEN** before #846's round-2 revision, because every fixture
+    ///    in this crate and in `eqoxide-net` published `(Some(hold), None)`, which left every
+    ///    stall assertion satisfied by `GameState::begin_zone_in`'s own field clear and therefore
+    ///    unfalsifiable. Hence [`matured_stall`] below: the stall axis has to be REACHED, not just
+    ///    asserted (#778's lesson, applied to an axis rather than a branch).
     #[test]
     fn controller_slots_begin_zone_in_clears_both_the_copy_and_the_source() {
         let slots = ControllerSlots::default();
         let mut gs = GameState::new();
 
+        const IN_THE_OLD_ZONE: [f32; 3] = [-812.5, 43.0, -119.75];
         let hold = ControllerHold { reason: ControllerHoldReason::EmbeddedNoRecovery, secs: 7.5 };
-        slots.controller_view.lock().unwrap().publish_disclosures((Some(hold), None));
+        let stall = matured_stall(IN_THE_OLD_ZONE);
+        slots.controller_view.lock().unwrap().publish_disclosures((Some(hold), Some(stall)));
         gs.player_hold = Some(hold);
+        gs.player_afloat_stall = Some(stall);
         gs.player_pos_known = true;
 
         slots.begin_zone_in(&mut gs);
 
         assert!(gs.player_hold.is_none(),
             "the GameState copy must be cleared — a hold describes geometry the zone-in dropped");
+        assert!(gs.player_afloat_stall.is_none(),
+            "and so must the stall copy, which is worse when stale: it names an ANCHOR in the \
+             departed zone's coordinate frame");
         assert!(!gs.player_pos_known,
             "and the rest of `GameState::begin_zone_in` must still run: this method WRAPS it, it \
              does not replace it");
         assert_eq!(slots.controller_view.lock().unwrap().disclosures(), (None, None),
-            "and the SOURCE must be cleared too, or the next unconditional mirror in \
-             `ActionLoop::stream_position` puts the departed zone's hold straight back — measured \
-             to happen on the very next net tick (#846 review B1)");
+            "and the SOURCE must be cleared too — BOTH halves of it — or the next unconditional \
+             mirror in `ActionLoop::stream_position` puts the departed zone's disclosures straight \
+             back; measured to happen on the very next net tick (#846 review B1). The stall this \
+             fixture publishes is a real matured one, so the second element of this tuple is a \
+             live assertion rather than a `None == None` tautology (review F1).");
     }
 
     /// The invalidation must not latch the disclosures OFF: the render thread's first publication
@@ -2469,9 +2494,33 @@ mod zone_in_disclosure_tests {
         view.invalidate_disclosures();
         assert_eq!(view.disclosures(), (None, None));
 
-        view.publish_disclosures((Some(hold), None));
-        assert_eq!(view.disclosures(), (Some(hold), None),
-            "the render thread must still be able to publish a hold after a zone-in");
+        let stall = matured_stall([117.0, -8.25, 42.5]);
+        view.publish_disclosures((Some(hold), Some(stall)));
+        assert_eq!(view.disclosures(), (Some(hold), Some(stall)),
+            "the render thread must still be able to publish BOTH disclosures after a zone-in");
+    }
+
+    /// Mature a real [`eqoxide_core::afloat::AfloatStall`] the only way any crate outside
+    /// `eqoxide-core` can: real `Wished` frames at a fixed position until the clock matures.
+    ///
+    /// #800/#801 made a premature or fabricated stall unrepresentable outside its defining module —
+    /// no `Default`, private fields, no way to edit an obtained one — and
+    /// `crates/eqoxide-core/tests/afloat_unconstructible.rs` pins that from across a crate
+    /// boundary. This helper is the consequence: getting the stall axis into a fixture costs a few
+    /// simulated frames, which is exactly why the fixtures above did not have it until #846's
+    /// round-2 review measured what that cost the tests.
+    fn matured_stall(pos: [f32; 3]) -> eqoxide_core::afloat::AfloatStall {
+        use eqoxide_core::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
+        const DT: f32 = 0.016;
+        let mut clock = AfloatStallClock::default();
+        // `+ 3`: the first `Wished` frame opens the window at `secs = 0.0` and adds no time, and
+        // f32 accumulation can cost another frame — the clock errs toward silence.
+        for _ in 0..((AFLOAT_STALL_SECS / DT).ceil() as usize + 3) {
+            clock.observe(AfloatFrame::Wished, pos, DT);
+        }
+        clock.stall().expect(
+            "a body pinned at one point under a sustained wish must stall — if this returns None \
+             the fixtures above go blind on the afloat axis again (#846 review F1)")
     }
 }
 

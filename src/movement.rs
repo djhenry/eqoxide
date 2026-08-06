@@ -551,7 +551,9 @@ impl CharacterController {
     /// What none of that establishes is how long an idle loop can stay idle. `app.rs`'s
     /// `poll_external` bounds it — a pending `pos_correction`, or any `GameState` change, marks the
     /// loop active — but that call site needs a GPU and a window and is reachable by no test here;
-    /// deleting it was measured to leave the workspace green (#846). It is the latency bound, not
+    /// wrapping it dead (`if false && …`, the stronger form — the line still compiles and is still
+    /// reached by `--all-targets`) was measured to leave the workspace green, with five figures
+    /// byte-identical to a clean run (#846). It is the latency bound, not
     /// the honesty guarantee.
     pub fn hold(&self) -> Option<ControllerHold> { self.hold }
 
