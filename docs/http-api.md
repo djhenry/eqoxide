@@ -2099,3 +2099,56 @@ it ever turned on you). Never infer one from the other.
 `level` is the spawn's actual character level (from its spawn record), when known — `null` is an
 honest "unknown" (e.g. it had already left the entity table by the time the reply arrived), never a
 guessed number.
+
+## `skin_cap_downgrades` — the renderer's silent render-arm downgrades, made visible (#797/#848)
+
+The renderer has an animation joint cap. A character model whose skin exceeds it is not refused —
+it is silently switched to the **static (unskinned) render arm**: it still appears on screen, in the
+right place, but it will never animate again for the rest of the session. Before #797 there was no
+observable for this at all — the client logged an error server-side of the agent's view and moved
+on. An agent with no eyes on the screen had no way to learn that what it believes is a walking,
+attacking character is actually a frozen pose, short of a human telling it so.
+
+`GET /v1/observe/debug` carries it as a top-level object, keyed by the **base file name** of the
+model that was loaded (never a full path — see below):
+
+```jsonc
+"skin_cap_downgrades": {
+  "race_hum.glb": { "joint_count": 190, "key_collision": false }
+}
+```
+
+- **`{}` (never `null`, never omitted) when nothing has downgraded yet this session.** Like
+  `nav_local_planner_dead`, this field is *always present* rather than `null`-when-healthy, so an
+  agent that greps this response and finds the key missing entirely knows it is talking to a client
+  too old to report this, rather than concluding every model in the zone animates fine.
+- **`joint_count`** — the joint count that triggered the downgrade. If the same key has been (re)loaded
+  more than once this session, this is the **most recent** load's count, not the first.
+- **`key_collision`** — see below. `false` for the overwhelming common case (one file, one key).
+
+### Why the key is a base name, not a path — and what that costs (#848)
+
+The renderer never loads two files from the same directory with the same base name for one race —
+gender variants and equipment-driven swaps all produce distinct base names — so a base-name key
+almost always identifies one real file uniquely, without ever putting a local filesystem path in an
+agent-facing response (this project does not publish local paths over the API).
+
+The cost is that if two *different* asset roots ever legitimately produce two different files that
+share a base name (a custom asset override alongside the stock one, for instance), they collide onto
+the same map entry. Before #848 that collision was silent: the second load's joint count quietly
+overwrote the first's, with nothing in the response saying two distinct files had ever shared the
+key — a caller who trusted the entry would have been reading a number that belonged to *either* file,
+with no way to tell which, or that there was even a question to ask.
+
+`key_collision: true` is what makes that detectable. It is **sticky**: once two source files with
+different identities have ever both written the same key in a session, it stays `true` for that key
+for the rest of the session, even if every write after that agrees with the one before it (loading
+the same colliding file twice in a row does not clear it — the collision already happened and the
+entry is still unable to say which file `joint_count` currently describes). Treat `key_collision:
+true` as "this entry's `joint_count` is not reliably attributable to one file" — not as "the count
+shown is wrong," and not as something that self-heals.
+
+Both fields are keyed off `ModelAsset::loaded_from` — the path `ModelAsset::load` itself actually
+opened — rather than a caller-supplied path/label pair. Nothing outside `load` constructs a
+`ModelAsset`, so nothing upstream of the renderer can forge what this map reports about which file
+was loaded.

@@ -684,6 +684,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let prov = player.position_provisional_since;
     let health = s.health();
     let frame_profile = *s.frame_profile.lock().unwrap();
+    // #797 — the STATIC-arm skin-cap downgrades the renderer has recorded so far this session,
+    // keyed by loaded file base name (never a full local path — see `downgrade_key`). Cloned out
+    // from behind the lock so the JSON literal below can move it in without holding the mutex
+    // across serialization.
+    let skin_cap_downgrades = s.skin_cap_downgrades.lock().unwrap().clone();
     let nav = s.nav.nav_state.lock().unwrap().clone();
     // Is nav answering from WINDING-BLIND (inverted-art) ground in this zone? (#375, D-2)
     //
@@ -1208,8 +1213,19 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // Distinct from the zone-lifetime `nav_tight` counter — this is the route being walked now.
         "nav_tier": nav_tier,
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
-        // Render-owned — the one field here the render loop legitimately publishes.
         "frame_profile": frame_profile,
+        // #797 — models whose skin joint count EXCEEDED the renderer's animation cap and were
+        // downgraded to the static (unskinned) render arm this session. Keyed by loaded file base
+        // name; `{}` (never `null`) when nothing has downgraded yet, so an agent can distinguish
+        // "checked, nothing downgraded" from "this client predates the field" the same way
+        // `nav_local_planner_dead` does above. Each entry is `{joint_count, key_collision}`:
+        //   joint_count   — the joint count that triggered the downgrade (the MOST RECENT one, if
+        //                   this key has been (re)loaded more than once this session).
+        //   key_collision — true iff two files that hash to the SAME base-name key were BOTH loaded
+        //                   this session (eqoxide#848). When true, `joint_count` is not reliably
+        //                   attributable to either file — see docs/http-api.md.
+        // See `eqoxide_renderer::renderer::record_skin_cap_downgrade` for how this map is built.
+        "skin_cap_downgrades": skin_cap_downgrades,
         // #852: `azimuth_deg`/`elevation_deg`/`radius`/`focus` are the orbit's DESIRED framing —
         // NOT necessarily where the frame was actually rendered from. In tight geometry the
         // render loop pulls the eye in toward `focus` until it clears collision, and that

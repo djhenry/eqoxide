@@ -61,9 +61,13 @@
 //!   `cfg(test)`-gated) and `E0624` in the lib-test build (it is private to this module, so even a
 //!   `cfg(test)` build of the renderer cannot call it).
 //! - **Does:** the observation cannot be about a joint count the asset does not have, because the
-//!   caller no longer supplies one. Measured three ways on this head, against the control
-//!   `cargo test -p eqoxide-renderer --locked --no-fail-fast` = **270 passed / 0 failed /
-//!   12 ignored**, 14 `running N tests` headers vs 14 `test result:` lines:
+//!   caller no longer supplies one. Measured three ways on this head (eqoxide#797 round), against
+//!   the then-current control `cargo test -p eqoxide-renderer --locked --no-fail-fast` = **270
+//!   passed / 0 failed / 12 ignored**, 14 `running N tests` headers vs 14 `test result:` lines. (The
+//!   control has since grown to **277 / 0 / 13** — see the eqoxide#848 note below — but these three
+//!   rows were not re-run against it; the mechanism they establish, that the joint count comes from
+//!   the asset and not a caller-supplied `Option<usize>`, is unchanged by #848, which touched a
+//!   different pair of arguments.)
 //!   - **R1** — `None` in place of the `asset` argument at `ensure_character_model`'s call site,
 //!     i.e. the reviewer's own mutation applied one round later: `error[E0308]: mismatched types
 //!     … expected `ModelAsset`, found `Option<_>``, **twice** (once in `(lib)`, once in
@@ -72,32 +76,46 @@
 //!   - **R1b** — `crate::models::ModelAsset::default()` in its place: `error[E0599]: no associated
 //!     function or constant named `default` found for struct `ModelAsset``, twice. `ModelAsset`
 //!     carries no `#[derive]` and no `impl Default`, so conjuring a second asset means writing all
-//!     17 fields out by hand rather than calling one function.
+//!     the fields out by hand rather than calling one function.
 //!   - **R1c** — blanking the derivation *inside* this function (`SkinFit::classify(None)`):
 //!     compiles, and goes **RED — 266 passed / 4 failed / 12 ignored**, because `mod tests` below
 //!     hands `observe_skin_fit` real `ModelAsset` values. That is the reachability control
 //!     (eqoxide#797 / eqoxide#799): the line that decides what is observed is executed by the suite,
 //!     which is exactly what was not true of the call-site expression it replaced.
-//! - **Does not:** pin the function's *other* caller-supplied arguments. Round 4 moved **one**
-//!   argument under type control. `sink` was already pinned (one constructor); `asset` is pinned
-//!   now. `model_path` and `label` are not, and lying about either at the call site is silent.
-//!   Both measured on this head — each compiles clean and leaves the crate at **270 / 0 / 12,
-//!   identical to control**:
-//!   - **R3** — `&path` replaced by `Path::new("/models/boat.glb")`. This is the serious one,
-//!     because `model_path` is what the report is *keyed by*: every downgraded rig is then filed
-//!     under a name that is not its own. And because [`crate::renderer::downgrade_key`] is a pure
-//!     function of the path and the destination is a `BTreeMap`, two downgraded rigs keyed alike
-//!     collapse into one entry and the second simply disappears — the collision is not
-//!     hypothetical, `two_roots_with_the_same_basename_collide_into_one_entry` in
-//!     `tests/skin_cap_selection.rs` plants it. A report that names the wrong file is the same
-//!     class of defect as eqoxide#780 itself, not a lesser one.
-//!   - **R3b** — `key` replaced by a string literal. `label` reaches only the log line, so this is
-//!     cosmetic next to R3, but it is equally unpinned.
+//! - **Does (closed by eqoxide#848 — was the open "Does not" here):** pin the function's *other*
+//!   caller-supplied arguments, `model_path` and `label`. As of #848 they are not merely pinned,
+//!   they are **gone as separate arguments**: [`crate::models::ModelAsset::loaded_from`] carries the
+//!   path `ModelAsset::load` actually opened, set inside `load()` itself, and `observe_skin_fit`
+//!   derives both the report key and the log's identifying string from that field. The two rows this
+//!   closed:
+//!   - **R3** (was open) — `&path` replaced by `Path::new("/models/boat.glb")` at the call site.
+//!     Structurally unrepresentable now: there is no `&path` argument left at the call site to
+//!     replace. `ensure_character_model` calls `observe_skin_fit(sink, asset)` — two arguments, not
+//!     four — so this exact mutation is not an edit that type-checks against a different value, it
+//!     is an edit with nowhere to land.
+//!   - **R3b** (was open) — `key`/`label` replaced by a string literal. Same closure, same reason:
+//!     `label` does not exist as a parameter to swap.
 //!
-//!   Stating this is the point of the bullet rather than an aside: the defect fixed in round 1 (the
-//!   destination), in round 4 (the subject), and left open here (the key) is one defect that walks
-//!   one argument to the right each time it is closed, and it has not run out of arguments.
-//!   `build_character_model`'s remaining parameter is `label`, on the same footing as R3b.
+//!   What replaces both as the live mutation target is the [`crate::renderer::downgrade_key`]
+//!   collision path itself, which R3 was gesturing at: two downgraded rigs keyed alike (same base
+//!   name, different source path) still collapse into one *entry* — `downgrade_key` is deliberately
+//!   a pure function of the file's base name, not the full path, per this project's no-local-detail
+//!   policy — but the entry now carries `key_collision: bool` so the collapse is a distinguishable,
+//!   observable state instead of a silent one. Mutation-tested this session, both directions, on
+//!   `SkinCapDowngrade`'s sticky-OR update in `record_skin_cap_downgrade`
+//!   (`existing.key_collision = existing.key_collision || collided_this_write`):
+//!   - **Revert** (naive from-scratch recompute `existing.source != source` in place of the sticky
+//!     OR) — RED: `key_collision_is_sticky_and_does_not_clear_on_a_later_agreeing_write` panics,
+//!     "the flag must stay set forever once two distinct sources have collided, even once every
+//!     subsequent write agrees with the one immediately before it". **276 / 1 / 13.**
+//!   - **WRAP** (`if false { existing.key_collision = … }`) — RED: the same test fails plus
+//!     `two_roots_with_the_same_basename_collide_into_one_entry`. **275 / 2 / 13.**
+//!   - Both restored to **277 / 0 / 13**, the current control, with a `Compiling eqoxide-renderer`
+//!     line confirmed in the post-restore log (not just a cached, mtime-skipped rebuild).
+//!
+//!   `two_genders_that_load_the_same_file_are_reported_once` and
+//!   `two_genders_that_load_two_different_files_are_reported_separately` in
+//!   `tests/skin_cap_selection.rs` pin the ordinary (non-colliding) cases on either side of it.
 //! - **Does not:** check that the asset it is handed is the one `ModelAsset::load` just returned. A
 //!   deliberate edit could load a second asset and observe *that*. What the by-value witness buys is
 //!   that such an edit is no longer silent: `build_character_model` uploads whatever asset is inside
@@ -119,7 +137,10 @@
 //!   shared `if let` buys is only that the *gate* resists a cheap widening — the `error!` and the
 //!   `record_skin_cap_downgrade` call sit inside one `if let`, the message interpolates that
 //!   binding, and the binding's value leaves the function as [`ObservedModel::reported_downgrade`],
-//!   where the tests pin it against the recorded entry. All four rows re-measured on this head:
+//!   where the tests pin it against the recorded entry. All four rows re-measured on this head
+//!   (eqoxide#797 round, against the then-current 270/0/12 control; not re-run against the
+//!   277/0/13 control eqoxide#848 left behind, since none of the four touches the arguments #848
+//!   changed):
 //!   - **C4** — the gate replaced by `if true`: `error[E0425]` at **two** sites, `skin_observation.rs`
 //!     line 224 col 74 (the `{over_cap_joints}` interpolation in the log message) and line 230
 //!     col 29 (the `reported = Some(over_cap_joints)` assignment).
@@ -142,9 +163,8 @@
 //!   boundary anyway.)
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
-use crate::renderer::{record_skin_cap_downgrade, EqRenderer, SkinFit, JOINT_CAP};
+use crate::renderer::{record_skin_cap_downgrade, EqRenderer, SkinCapDowngrade, SkinFit, JOINT_CAP};
 
 /// Where a cap downgrade gets reported: a mutable borrow of `EqRenderer::skin_cap_downgrades`.
 ///
@@ -155,7 +175,7 @@ use crate::renderer::{record_skin_cap_downgrade, EqRenderer, SkinFit, JOINT_CAP}
 /// leave the renderer's report empty. That was measured on the first version of this module, and it
 /// is exactly the eqoxide#780 failure mode reached by a compile-clean edit.
 pub struct DowngradeSink<'a> {
-    entries: &'a mut BTreeMap<String, usize>,
+    entries: &'a mut BTreeMap<String, SkinCapDowngrade>,
 }
 
 impl<'a> DowngradeSink<'a> {
@@ -170,7 +190,7 @@ impl<'a> DowngradeSink<'a> {
     /// compiled *without* `cfg(test)`, so exposing this to one would reopen the hole it exists to
     /// close.
     #[cfg(test)]
-    fn detached(entries: &'a mut BTreeMap<String, usize>) -> DowngradeSink<'a> {
+    fn detached(entries: &'a mut BTreeMap<String, SkinCapDowngrade>) -> DowngradeSink<'a> {
         DowngradeSink { entries }
     }
 }
@@ -233,16 +253,25 @@ impl ObservedModel {
 /// enters and leaves through the same value, so what was observed and what gets uploaded are the
 /// same model.
 ///
-/// `model_path` is the GLB that was actually loaded — the report is keyed by its file name, not by
-/// `label`, because the joint count belongs to the file (eqoxide#813); `label` appears only in the
-/// log line. It is a separate argument because `ModelAsset` does not retain the path it was loaded
-/// from, and that is the honest limit of what round 4 achieved: `model_path` is **still**
-/// caller-supplied and **still** unpinned. Handing this function a path that is not the one the
-/// asset came from compiles clean and leaves the crate at 270 / 0 / 12, identical to control
-/// (row R3, measured) — the entry is then written under the wrong file name, and two rigs keyed
-/// alike collapse to one. Fixing that means either giving `ModelAsset` the path it was loaded from
-/// or passing a type that pairs them; neither is done here. Do not read the by-value `asset`
-/// parameter as covering it.
+/// ## eqoxide#848: `model_path` and `label` are gone, not just unpinned
+///
+/// Earlier rounds of this function took `model_path: &Path` and `label: &str` as separate
+/// caller-supplied arguments — the report was keyed by `model_path`'s file name, and `label`
+/// appeared only in the log line. Both were measured **unpinned**: handing this function a path
+/// that was not the one the asset actually came from compiled clean, stayed green, and filed the
+/// downgrade under the wrong name (the previous revision of this doc's row R3), and two rigs keyed
+/// alike silently collapsed into one entry, which is exactly eqoxide#848's collision symptom.
+///
+/// Neither argument exists anymore. [`crate::models::ModelAsset`] now carries
+/// [`crate::models::ModelAsset::loaded_from`] — the path `ModelAsset::load` actually opened — and
+/// this function derives both the report key and the log's identifying string from that field
+/// instead of from a second, independently-suppliable value. The `asset` parameter this function
+/// already took by value (closing eqoxide#780's own R1) is now *also* what closes R3/R3b: there is
+/// no longer a `model_path` or `label` token at the call site for a mutation to swap out, because
+/// there is no longer a parameter there to swap. `ensure_character_model`'s call site went from
+/// four arguments (`sink, &path, key, asset`) to two (`sink, asset`) — see that function's own
+/// comment for why `asset.loaded_from` cannot drift from what was loaded (it is set by `load`
+/// itself, from the same `path` it opened, in the same function call).
 ///
 /// Nothing is recorded for `NoSkin`, `EmptySkin`, or `Fits`. That asymmetry is the entire point of
 /// eqoxide#780: an unskinned `boat.glb` and a 129-joint rig both take the static arm, and only the
@@ -250,12 +279,7 @@ impl ObservedModel {
 ///
 /// Pure apart from the log line and the sink it is handed, so the wiring this function *is* can be
 /// driven directly from a test with no `wgpu::Device` — see `mod tests` below.
-pub fn observe_skin_fit(
-    sink: DowngradeSink<'_>,
-    model_path: &Path,
-    label: &str,
-    asset: crate::models::ModelAsset,
-) -> ObservedModel {
+pub fn observe_skin_fit(sink: DowngradeSink<'_>, asset: crate::models::ModelAsset) -> ObservedModel {
     let fit = SkinFit::classify(asset.skin.as_ref().map(|s| s.joint_count));
     let mut reported = None;
     if let Some(reason) = fit.static_reason() {
@@ -264,17 +288,17 @@ pub fn observe_skin_fit(
         // below. The assignment alone is enough: with the whole `error!` deleted *and* the gate
         // forced open, it is still E0425 at the assignment (row R2C4, measured). Nothing here holds
         // the *log* honest, though: deleting the `error!` statement on its own compiles and stays
-        // green at 270/0/12 (row R2) — see the module header's "Does not: grade the log line" row.
+        // green (row R2) — see the module header's "Does not: grade the log line" row.
         // `record_skin_cap_downgrade` tests the same predicate again internally; that is redundancy,
         // not a second decision.
         if let Some(over_cap_joints) = reason.downgrade_joint_count() {
             tracing::error!(
-                "renderer: character model '{label}' ({}) has a skin of {over_cap_joints} joints, \
-                 EXCEEDING the {JOINT_CAP}-joint cap — falling back to the STATIC (unskinned) \
-                 render arm; this model will not animate (eqoxide#780)",
-                crate::renderer::downgrade_key(model_path)
+                "renderer: character model '{}' has a skin of {over_cap_joints} joints, EXCEEDING \
+                 the {JOINT_CAP}-joint cap — falling back to the STATIC (unskinned) render arm; \
+                 this model will not animate (eqoxide#780)",
+                asset.loaded_from.display()
             );
-            record_skin_cap_downgrade(sink.entries, model_path, reason);
+            record_skin_cap_downgrade(sink.entries, &asset.loaded_from, reason);
             reported = Some(over_cap_joints);
         }
     }
@@ -286,17 +310,21 @@ mod tests {
     use super::*;
     use crate::renderer::MAX_MEASURED_CHARACTER_RIG_JOINTS;
 
-    /// A minimal [`crate::models::ModelAsset`] whose only interesting property is its skin: `None`
-    /// for a model with no skin at all (`boat.glb`), `Some(n)` for one with an `n`-joint rig.
+    /// A minimal [`crate::models::ModelAsset`] whose only interesting properties are its skin and
+    /// the path it claims to have been loaded from: `None` for a model with no skin at all
+    /// (`boat.glb`), `Some(n)` for one with an `n`-joint rig, keyed for the report by `loaded_from`.
     ///
     /// Every other field is the empty/zero value. That is deliberate: `observe_skin_fit` reads
-    /// exactly one thing off the asset, and building the asset here rather than passing a bare
-    /// `Option<usize>` is what makes the *derivation* — `asset.skin.as_ref().map(|s| s.joint_count)`
-    /// — part of what the suite executes. Before round 4 that expression lived at the call site in
-    /// `ensure_character_model`, where no test can reach it, and a reviewer measured that replacing
-    /// it with `None` there compiled clean and left the crate green.
-    fn asset_with_skin(joint_count: Option<usize>) -> crate::models::ModelAsset {
+    /// exactly two things off the asset — the skin, and `loaded_from` — and building the asset here
+    /// rather than passing bare arguments is what makes the *derivation* —
+    /// `asset.skin.as_ref().map(|s| s.joint_count)` and `asset.loaded_from` — part of what the suite
+    /// executes rather than something a test hands over pre-computed. Before eqoxide#780's round 4
+    /// the joint-count expression lived at the call site in `ensure_character_model`, where no test
+    /// could reach it, and a reviewer measured that replacing it with `None` there compiled clean
+    /// and left the crate green; `loaded_from` closes the same hole for eqoxide#848's `model_path`.
+    fn asset_with_skin(joint_count: Option<usize>, loaded_from: &str) -> crate::models::ModelAsset {
         crate::models::ModelAsset {
+            loaded_from: std::path::PathBuf::from(loaded_from),
             meshes: vec![],
             textures: vec![],
             skin: joint_count.map(|joint_count| crate::anim::SkinData {
@@ -343,19 +371,19 @@ mod tests {
     /// keeps asserting the case the issue names even if the cap moves.
     #[test]
     fn observing_a_cap_exceeding_skin_takes_the_static_arm_and_reports_it() {
-        let mut map: BTreeMap<String, usize> = BTreeMap::new();
+        let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
         let observed = observe_skin_fit(
             DowngradeSink::detached(&mut map),
-            Path::new("/models/race_over.glb"),
-            "race_over",
-            asset_with_skin(Some(129)),
+            asset_with_skin(Some(129), "/models/race_over.glb"),
         );
 
         assert!(!observed.is_skinned(), "a 129-joint skin must take the STATIC arm");
         assert_eq!(observed.fit(), SkinFit::ExceedsCap { joint_count: 129 });
         assert_eq!(observed.reported_downgrade(), Some(129));
-        assert_eq!(map.get("race_over.glb"), Some(&129),
+        assert_eq!(map.get("race_over.glb").map(|e| e.joint_count), Some(129),
             "a 129-joint skin must be REPORTED as a downgrade, keyed by the loaded file");
+        assert_eq!(map.get("race_over.glb").map(|e| e.key_collision), Some(false),
+            "one file loaded once is not a collision");
         assert_eq!(map.len(), 1);
     }
 
@@ -364,13 +392,11 @@ mod tests {
     /// nothing distinguished them; the point is that the arm is the same and the report is not.
     #[test]
     fn observing_an_unremarkable_static_model_takes_the_static_arm_and_reports_nothing() {
-        let mut map: BTreeMap<String, usize> = BTreeMap::new();
+        let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
 
         let empty = observe_skin_fit(
             DowngradeSink::detached(&mut map),
-            Path::new("/models/race_empty.glb"),
-            "race_empty",
-            asset_with_skin(Some(0)),
+            asset_with_skin(Some(0), "/models/race_empty.glb"),
         );
         assert!(!empty.is_skinned());
         assert_eq!(empty.fit(), SkinFit::EmptySkin);
@@ -379,8 +405,8 @@ mod tests {
             "a zero-joint skin is degenerate data, not a cap downgrade — it must not be reported");
 
         let none = observe_skin_fit(
-            DowngradeSink::detached(&mut map), Path::new("/models/boat.glb"), "boat",
-            asset_with_skin(None),
+            DowngradeSink::detached(&mut map),
+            asset_with_skin(None, "/models/boat.glb"),
         );
         assert!(!none.is_skinned());
         assert_eq!(none.fit(), SkinFit::NoSkin);
@@ -393,12 +419,10 @@ mod tests {
     /// that fired on every load would also be a falsehood, just a noisier one.
     #[test]
     fn observing_a_fitting_skin_takes_the_skinned_arm_and_reports_nothing() {
-        let mut map: BTreeMap<String, usize> = BTreeMap::new();
+        let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
         let observed = observe_skin_fit(
             DowngradeSink::detached(&mut map),
-            Path::new("/models/race_pcfroglok.glb"),
-            "race_pcfroglok",
-            asset_with_skin(Some(MAX_MEASURED_CHARACTER_RIG_JOINTS)),
+            asset_with_skin(Some(MAX_MEASURED_CHARACTER_RIG_JOINTS), "/models/race_pcfroglok.glb"),
         );
 
         assert!(observed.is_skinned(),
@@ -419,13 +443,13 @@ mod tests {
     #[test]
     fn the_log_and_the_report_come_from_one_gate_evaluation() {
         for joint_count in [None, Some(0), Some(1), Some(JOINT_CAP), Some(JOINT_CAP + 1)] {
-            let mut map: BTreeMap<String, usize> = BTreeMap::new();
+            let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
             let observed = observe_skin_fit(
-                DowngradeSink::detached(&mut map), Path::new("/models/x.glb"), "x",
-                asset_with_skin(joint_count),
+                DowngradeSink::detached(&mut map),
+                asset_with_skin(joint_count, "/models/x.glb"),
             );
 
-            assert_eq!(observed.reported_downgrade(), map.get("x.glb").copied(),
+            assert_eq!(observed.reported_downgrade(), map.get("x.glb").map(|e| e.joint_count),
                 "{joint_count:?}: the gate that fired the log must be the gate that wrote the \
                  report — one evaluation, one entry");
         }
@@ -442,13 +466,12 @@ mod tests {
     #[test]
     fn observation_and_arm_agree_over_the_whole_range() {
         for n in 0..=(JOINT_CAP + 8) {
-            let mut map: BTreeMap<String, usize> = BTreeMap::new();
+            let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
             let observed = observe_skin_fit(
-                DowngradeSink::detached(&mut map), Path::new("/models/x.glb"), "x",
-                asset_with_skin(Some(n)),
+                DowngradeSink::detached(&mut map), asset_with_skin(Some(n), "/models/x.glb"),
             );
 
-            let reported = map.get("x.glb").copied();
+            let reported = map.get("x.glb").map(|e| e.joint_count);
             assert_eq!(reported, (n > JOINT_CAP).then_some(n),
                 "joint_count {n}: reported-as-downgrade must hold exactly when the cap is exceeded");
             assert_eq!(observed.reported_downgrade(), reported,
@@ -460,10 +483,9 @@ mod tests {
         }
 
         // The `None` (no skin at all) case, which the numeric loop cannot express.
-        let mut map: BTreeMap<String, usize> = BTreeMap::new();
+        let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
         let observed = observe_skin_fit(
-            DowngradeSink::detached(&mut map), Path::new("/models/boat.glb"), "boat",
-            asset_with_skin(None),
+            DowngradeSink::detached(&mut map), asset_with_skin(None, "/models/boat.glb"),
         );
         assert!(map.is_empty(), "no skin at all is not a downgrade");
         assert_eq!(observed.reported_downgrade(), None);

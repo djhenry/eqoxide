@@ -114,6 +114,16 @@ pub struct SkinnedMeshData {
 }
 
 pub struct ModelAsset {
+    /// The path [`ModelAsset::load`] actually opened. This is the ANSWER to eqoxide#848's R3: a
+    /// downgrade report used to be keyed by a path the caller supplied separately from the asset
+    /// (`skin_observation::observe_skin_fit`'s `model_path: &Path` argument), and a mutation that
+    /// swapped that argument for an unrelated literal compiled clean and filed the report under the
+    /// wrong name (measured, see that module's doc). Carrying the loaded path INSIDE the asset makes
+    /// that argument disappear rather than harder to misuse: nothing constructs a `ModelAsset`
+    /// outside `load` (see the module's construction-site inventory), so a caller cannot hand over a
+    /// `loaded_from` that disagrees with what was actually opened without going through `load` again
+    /// for real.
+    pub loaded_from:       std::path::PathBuf,
     pub meshes:            Vec<MeshData>,
     pub textures:          Vec<TextureData>,
     pub skin:              Option<SkinData>,
@@ -626,7 +636,7 @@ impl ModelAsset {
         // Prefer the measured idle extent for scaling; fall back to eq_height/measured bounds.
         let true_height = if idle_extent > 0.001 { idle_extent } else { true_height };
 
-        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots, head_parts, head_default_hidden, true_height, clip_bounds, feet_offset })
+        Ok(ModelAsset { loaded_from: path.to_path_buf(), meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots, head_parts, head_default_hidden, true_height, clip_bounds, feet_offset })
     }
 
 }

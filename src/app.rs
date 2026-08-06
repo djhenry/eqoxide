@@ -385,11 +385,18 @@ pub struct App {
     // Frame capture for /frame API
     frame_req:    FrameReq,
     /// Smoothed per-phase frame timings, published for `/v1/observe/debug` → `frame_profile`.
-    /// This is the ONLY agent-facing value the render loop publishes: everything else an agent reads
-    /// is projected at HTTP read time from the network thread's `GameState` (#343). Publishing world
-    /// state from a loop whose whole design goal is to STOP RUNNING when nothing is happening is how
-    /// `connected: true` survived a dead connection forever.
+    /// Everything else an agent reads is projected at HTTP read time from the network thread's
+    /// `GameState` (#343); this and `skin_cap_downgrades_shared` below are the render loop's own
+    /// publications. Publishing world state from a loop whose whole design goal is to STOP RUNNING
+    /// when nothing is happening is how `connected: true` survived a dead connection forever.
     frame_profile_shared: crate::ipc::FrameProfileShared,
+    /// The renderer's skin-cap downgrades (eqoxide#797), converted from
+    /// `EqRenderer::skin_cap_downgrades` into the ipc-facing `SkinCapDowngradeView` and published
+    /// for `/v1/observe/debug` → `skin_cap_downgrades` once per frame, same rhythm as
+    /// `frame_profile_shared` just above. The conversion happens HERE (not lower in the crate
+    /// graph) because `eqoxide-renderer`'s `SkinCapDowngrade` keeps its `source` path private —
+    /// this crate is where the renderer and ipc types are both visible.
+    skin_cap_downgrades_shared: crate::ipc::SkinCapDowngradesShared,
     // Precomputed zone collision grid: floor grounding, camera collision, nameplate occlusion.
     // Held as Arc and also published to `shared_collision` so the nav thread can read it.
     collision:    Option<Arc<collision::Collision>>,
@@ -521,6 +528,7 @@ impl App {
         // and handed to BOTH this app (the sole writer) and `HttpState` (the reader).
         asset_sync_activity:  crate::ipc::AssetSyncShared,
         frame_profile_shared: crate::ipc::FrameProfileShared,
+        skin_cap_downgrades_shared: crate::ipc::SkinCapDowngradesShared,
         testzone_mode:   bool,
         nav_debug:       bool,
         shutdown:        std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -591,7 +599,8 @@ impl App {
             pick_screen_w: 800,
             pick_screen_h: 600,
             scene: SceneState::default(), last_inbound: std::time::Instant::now(), frame_req,
-            frame_profile_shared, shutdown, collision: None, shared_collision, zone_assets,
+            frame_profile_shared, skin_cap_downgrades_shared,
+            shutdown, collision: None, shared_collision, zone_assets,
             load_threads: Vec::new(), load_gen: 0,
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
@@ -1915,6 +1924,25 @@ impl App {
         let prof_render = crate::profiling::Stopwatch::start();
         renderer.render_frame(&mut enc, &view, &self.scene, cam_eye, cam_target, dt);
         let dur_render = prof_render.elapsed();
+
+        // #797 — `render_frame` (via `ensure_character_model`) is what actually populates/updates
+        // `renderer.skin_cap_downgrades`, so publish it right here, straight off the call that just
+        // ran, rather than reusing the top-of-frame publish point `frame_profile_shared` uses (that
+        // point runs BEFORE this call and would publish a stale prior-frame snapshot the first time
+        // any given model downgrades). `eqoxide_ipc::SkinCapDowngradeView` is the plain, source-free
+        // ipc mirror of `eqoxide_renderer::renderer::SkinCapDowngrade` — this is the one place in the
+        // crate graph that can see both types and do the conversion (see the field doc on
+        // `skin_cap_downgrades_shared` above).
+        {
+            let mut view = std::collections::BTreeMap::new();
+            for (k, d) in renderer.skin_cap_downgrades.iter() {
+                view.insert(k.clone(), crate::ipc::SkinCapDowngradeView {
+                    joint_count: d.joint_count,
+                    key_collision: d.key_collision,
+                });
+            }
+            *self.skin_cap_downgrades_shared.lock().unwrap() = view;
+        }
 
         // Cache picking data for the next mouse-click query.
         self.pick_view_proj = renderer.last_view_proj;

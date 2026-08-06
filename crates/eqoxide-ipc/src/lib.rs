@@ -1102,9 +1102,42 @@ pub fn send_starved(streak: u64, last_pressure_ago: Option<std::time::Duration>)
 
 pub type NetHealthShared = std::sync::Arc<std::sync::Mutex<NetHealth>>;
 
-/// Smoothed per-frame phase timings, published by the **render** thread (the only agent-visible
-/// value the renderer legitimately owns — see `PlayerState`'s note on the network/render split).
+/// Smoothed per-frame phase timings, published by the **render** thread — see `PlayerState`'s note
+/// on the network/render split. As of eqoxide#797, [`SkinCapDowngradesShared`] below is published
+/// the same way, by the same thread, so this is no longer the only render-owned agent-visible value
+/// (an earlier version of this doc claimed it was; that claim is what eqoxide#797 made false).
 pub type FrameProfileShared = std::sync::Arc<std::sync::Mutex<FrameProfile>>;
+
+/// One reported character-model joint-cap downgrade, as served to an agent over HTTP. The plain,
+/// serializable HTTP-facing shape of `eqoxide_renderer::renderer::SkinCapDowngrade` — that type
+/// cannot be used directly here, because `eqoxide-ipc` sits BELOW `eqoxide-renderer` in the crate
+/// graph (see this crate's own layering note at the top of this file) and cannot name a renderer
+/// type. `src/app.rs` converts one into the other once per frame, the same shape
+/// `FrameProfile`/`FrameProfileShared` already established for a render-owned value crossing this
+/// same layering boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SkinCapDowngradeView {
+    /// The joint count that exceeded the cap and caused the downgrade.
+    pub joint_count: usize,
+    /// True iff this report key has ever been written by two different source files — see
+    /// `eqoxide_renderer::renderer::SkinCapDowngrade`'s doc (eqoxide#848) for why the key (a file's
+    /// base name) can collide across two asset roots, and why this flag exists to disclose it
+    /// rather than silently overwrite one rig's downgrade with another's.
+    pub key_collision: bool,
+}
+
+/// Character models downgraded to the static (unskinned) render arm because their skin exceeded
+/// `eqoxide_renderer::renderer::JOINT_CAP`, keyed by the loaded GLB's file name — the same map as
+/// `eqoxide_renderer::renderer::EqRenderer::skin_cap_downgrades`, published for
+/// `/v1/observe/debug`'s `skin_cap_downgrades` field (eqoxide#797; documented in
+/// `docs/http-api.md`). Absent = no downgrade has happened; a missing or genuinely unskinned model
+/// is never a key here.
+///
+/// Before eqoxide#797 this map existed but was reachable only from Rust code inside this process —
+/// a driving agent with no other channel to the world had no way to read it, no matter how public
+/// the renderer's own field was. That gap is exactly what this type and its publish path close.
+pub type SkinCapDowngradesShared =
+    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, SkinCapDowngradeView>>>;
 
 /// Aggro-avoidance knobs the `/v1/move/*` handlers set and the nav walker reads (#242). `enabled`
 /// gates the always-on NPC-camp avoidance (#67) — `false` routes straight through (e.g. to reach a
