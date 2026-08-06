@@ -134,6 +134,43 @@ impl MoveBody {
         self.x.is_some() || self.y.is_some() || self.z.is_some()
             || self.map_x.is_some() || self.map_y.is_some()
     }
+
+    /// #886: when the body supplies SOME coordinate field(s) but not enough to form a complete
+    /// `{x,y,z}` or `{map_x,map_y}` target, name exactly which field(s) are missing — instead of
+    /// letting `/goto` fall through to the "no name/coords at all" default-to-current-target path,
+    /// which used to answer `400 no target; provide a name or coords` even though coords WERE
+    /// provided (just not all of them). That false "empty request" framing sent an agent's retry
+    /// straight back to re-sending the SAME `x`/`y` it already sent, forever — the one field that
+    /// would actually fix it (`z`, on the raw form) was never named.
+    ///
+    /// `z` is REQUIRED on the raw `{x,y,z}` form by design, not by oversight: `map_x`/`map_y` gets
+    /// a default z (Brewall map coordinates are inherently 2D — there IS no z to send), and the
+    /// planner infers the actual floor from there via `Collision::goal_z_was_snapped` regardless of
+    /// how rough that default is. Raw server coordinates carry no such excuse — a caller who already
+    /// knows `x`/`y` in server units can trivially read `z` too (e.g. from `GET /v1/observe/debug`
+    /// `player.pos`), so a missing `z` here is a genuine caller error worth naming, not a gap this
+    /// endpoint should paper over with a guess.
+    ///
+    /// Returns `None` when NO coordinate field is present at all — that's the legitimate "default to
+    /// current target" case, left untouched.
+    fn partial_coords_message(&self) -> Option<String> {
+        let raw = [("x", self.x.is_some()), ("y", self.y.is_some()), ("z", self.z.is_some())];
+        let map = [("map_x", self.map_x.is_some()), ("map_y", self.map_y.is_some())];
+        let mut present: Vec<&str> = Vec::new();
+        let mut missing: Vec<&str> = Vec::new();
+        if raw.iter().any(|&(_, p)| p) {
+            for &(name, p) in &raw { if p { present.push(name); } else { missing.push(name); } }
+        }
+        if map.iter().any(|&(_, p)| p) {
+            for &(name, p) in &map { if p { present.push(name); } else { missing.push(name); } }
+        }
+        if present.is_empty() { return None; } // no coord field at all — not a partial target
+        Some(format!(
+            "partial target: got {{{}}} but missing {{{}}} — provide the missing field(s) to \
+             complete it, or send no coordinate fields at all to fall back to the current target",
+            present.join(", "), missing.join(", ")
+        ))
+    }
 }
 
 /// Resolve the player's current target (the player's `target_id`) to its (key, position).
@@ -232,6 +269,12 @@ async fn post_goto(
         ((-mx, -my, b.z.unwrap_or(3.75)), None)
     } else if let (Some(x), Some(y), Some(z)) = (b.x, b.y, b.z) {
         ((x, y, z), None)
+    } else if let Some(msg) = b.partial_coords_message() {
+        // #886: a PARTIAL target (e.g. {"x":..,"y":..} with no z) is not the same failure as no
+        // target at all — say which field(s) are missing instead of the misleading "no target;
+        // provide a name or coords", which reads as "you sent nothing" and sends an agent back to
+        // resend the SAME x/y forever.
+        return text(StatusCode::BAD_REQUEST, msg);
     } else {
         // No name/coords → default to the player's current target (one-time snapshot). Disclose it
         // too: the agent should still be able to confirm WHICH spawn "the current target" resolved to.
@@ -833,6 +876,82 @@ mod tests {
         let resp = app.oneshot(Request::post("/goto").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(*goto_target.lock().unwrap(), Some((10.0, 20.0, 3.0)));
+    }
+
+    // ── #886: a PARTIAL target must name the missing field, not be told "no target" ─────────────
+
+    /// The exact repro from #886: `{"x":..,"y":..}` with no `z` and no current target set must
+    /// name `z` as missing — NOT answer the "no target; provide a name or coords" message, which
+    /// falsely describes the request as empty and sends the caller to resend the x/y it already
+    /// sent. MUTATION CHECK (delete): remove the `partial_coords_message` branch in `post_goto` and
+    /// this goes RED (the response reverts to the false "no target" message). MUTATION CHECK
+    /// (wrap): wrap that branch's body in `if false { .. }` and this ALSO goes RED, for the same
+    /// reason — the branch is never reached either way (#799: written isn't reached).
+    #[tokio::test]
+    async fn goto_partial_xy_missing_z_names_the_missing_field() {
+        let state = empty_state(); // no current target set
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":100.0,"y":200.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert!(text.contains("missing"), "message must name what's missing: {text}");
+        assert!(text.contains('z'), "message must name z specifically: {text}");
+        assert!(!text.contains("no target; provide a name or coords"),
+            "must not fall back to the misleading empty-request message when coords WERE given: {text}");
+        assert!(goto_target.lock().unwrap().is_none(), "a partial target must not queue a nav goal");
+    }
+
+    /// The same defect, on the map-coordinate form: `{"map_x":..}` alone must name `map_y` as
+    /// missing, not fall through to the "no target" default.
+    #[tokio::test]
+    async fn goto_partial_map_x_missing_map_y_names_the_missing_field() {
+        let state = empty_state();
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"map_x":100.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert!(text.contains("map_y"), "message must name map_y specifically: {text}");
+        assert!(!text.contains("no target; provide a name or coords"), "message: {text}");
+        assert!(goto_target.lock().unwrap().is_none());
+    }
+
+    /// `z` alone (no x/y) must name x AND y as missing.
+    #[tokio::test]
+    async fn goto_partial_z_only_names_x_and_y_as_missing() {
+        let state = empty_state();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"z":5.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert!(text.contains('x') && text.contains('y'), "message: {text}");
+    }
+
+    /// Regression guard for the LEGITIMATE case the fix must not disturb: a genuinely empty body
+    /// (no name, no coordinate fields at all) with no current target set must still answer the
+    /// honest "no target; provide a name or coords" — that framing IS accurate when nothing at all
+    /// was sent. MUTATION CHECK: broadening `partial_coords_message`'s "present.is_empty()" guard
+    /// to also fire on a fully-empty body would make this go RED (the message would silently change
+    /// even though nothing was provided).
+    #[tokio::test]
+    async fn goto_truly_empty_body_with_no_target_still_says_no_target() {
+        let state = empty_state(); // no current target
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/goto").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert_eq!(text, "no target; provide a name or coords",
+            "a genuinely empty request must keep the honest message: {text}");
     }
 
     // --- follow: a malformed body must not silently fall back to "current target" --------------
