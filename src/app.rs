@@ -10,7 +10,7 @@ use winit::{
 };
 
 use glam::Vec4Swizzles as _;
-use crate::camera_state::{lerp3, lerp_angle, CameraCmd, CameraSnapshot, CameraState};
+use crate::camera_state::{lerp_angle, CameraCmd, CameraSnapshot, CameraState};
 use crate::frame_capture::encode_frame_png;
 use crate::game_state::GameState;
 
@@ -1864,23 +1864,16 @@ impl App {
         if let Ok(mut lock) = self.camera_cmd.lock() {
             if let Some(cmd) = lock.take() { self.camera.apply_cmd(cmd); }
         }
-        let (mut cam_eye, cam_target) = self.camera.tick(dt, self.scene.player_pos, self.scene.player_heading);
-        // Camera collision: iteratively pull the eye toward the target until
-        // the segment is clear.  A single pass fails in multi-story buildings
-        // where the eye lands between two floor slabs.
-        if let Some(col) = self.collision.as_deref() {
-            for _ in 0..5 {
-                if let Some(t) = col.nearest_hit_t(cam_target, cam_eye) {
-                    let frac = (t * 0.85).clamp(0.05, 1.0);
-                    let new_eye = lerp3(cam_target, cam_eye, frac);
-                    if new_eye == cam_eye { break; }
-                    cam_eye = new_eye;
-                } else {
-                    break;
-                }
-            }
-        }
-        if let Ok(mut snap) = self.camera_snapshot.lock() { *snap = self.camera.snapshot(); }
+        let (desired_eye, cam_target) = self.camera.tick(dt, self.scene.player_pos, self.scene.player_heading);
+        // Camera collision (#852): resolve the eye ONCE, here, and use that single value both
+        // for the render below and for the published snapshot. Before this fix the pull-in
+        // mutated a local `cam_eye` for rendering only — `snapshot()` re-derived its own eye from
+        // `radius`/`focus`, which the pull-in never touched, so a pulled-in frame and the
+        // observable an agent reads disagreed 88% of the time a pull-in fired. See
+        // `camera_state::resolve_camera_eye`'s doc comment.
+        let resolved = crate::camera_state::resolve_camera_eye(self.collision.as_deref(), cam_target, desired_eye);
+        let cam_eye = resolved.eye;
+        if let Ok(mut snap) = self.camera_snapshot.lock() { *snap = self.camera.snapshot(resolved); }
 
         // Nav diagnostics overlay (#608): while toggled on (--nav-debug / F11), attach the
         // walker's PUBLISHED snapshot to the scene — a cheap Arc clone — and the renderer draws

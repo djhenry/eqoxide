@@ -239,13 +239,36 @@ pub enum CameraCmd {
 /// Snapshot of the current camera state for the HTTP GET `/camera` response. Relocated from
 /// `camera_state` (#544 Step 2c); `camera_state::CameraState::snapshot` produces it. Serde form
 /// preserved verbatim (it is the JSON body).
+///
+/// `azimuth`/`elevation`/`radius`/`focus` are the orbit's DESIRED framing — the parameters a
+/// `/v1/camera Set` would reproduce. They are NOT necessarily the eye position a frame was
+/// actually rendered from: in tight geometry the render loop pulls the eye in along the
+/// focus→eye segment until it clears collision (`camera_state::resolve_camera_eye`), and that
+/// pull-in does not touch these fields.
+///
+/// `eye`/`occluded`/`still_blocked` are the RENDERED side of the contract (#852). `eye` is the
+/// exact position the frame this snapshot describes was drawn from — the render call and this
+/// struct are built from the same `resolve_camera_eye` return value, never two independently
+/// computed positions. `occluded` is true iff pull-in moved the eye away from the desired one;
+/// `still_blocked` is true iff, even after pull-in, the focus→eye segment was still not fully
+/// clear (a degenerate case — see `resolve_camera_eye`'s doc comment). A consumer that only reads
+/// `radius`/`focus` and reconstructs a "distance to eye" by hand will get the *desired* distance,
+/// not the rendered one — use `eye` for anything about what is actually on screen.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CameraSnapshot {
-    pub mode:      CameraMode,
-    pub azimuth:   f32,
-    pub elevation: f32,
-    pub radius:    f32,
-    pub focus:     [f32; 3],
+    pub mode:          CameraMode,
+    pub azimuth:       f32,
+    pub elevation:     f32,
+    pub radius:        f32,
+    pub focus:         [f32; 3],
+    /// The eye position the frame this snapshot describes was actually rendered from.
+    pub eye:           [f32; 3],
+    /// True iff collision pulled `eye` in from the desired orbit position this frame.
+    pub occluded:      bool,
+    /// True iff, even after the pull-in's iteration budget, `eye` is still not clear of
+    /// collision along the segment to `focus` — a degenerate case (see
+    /// `camera_state::resolve_camera_eye`).
+    pub still_blocked: bool,
 }
 
 /// Camera azimuth that places the camera behind a player facing `heading_deg`
@@ -2351,11 +2374,14 @@ mod c2_boundary_tests {
         let camera = CameraSlots {
             cmd_tx:      Arc::new(Mutex::new(None)),
             snapshot:    Arc::new(Mutex::new(CameraSnapshot {
-                mode:      CameraMode::AutoFollow,
-                azimuth:   0.0,
-                elevation: 0.0,
-                radius:    0.0,
-                focus:     [0.0, 0.0, 0.0],
+                mode:          CameraMode::AutoFollow,
+                azimuth:       0.0,
+                elevation:     0.0,
+                radius:        0.0,
+                focus:         [0.0, 0.0, 0.0],
+                eye:           [0.0, 0.0, 0.0],
+                occluded:      false,
+                still_blocked: false,
             })),
             frame_req:   Arc::new(Mutex::new(None)),
             manual_move: Arc::new(Mutex::new(None)),
