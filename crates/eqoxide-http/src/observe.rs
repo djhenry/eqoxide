@@ -758,11 +758,14 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // The pair is written from ONE verdict in ONE call (`Walker::publish_drive_state`), under one
     // lock hold, so the word and this payload cannot disagree; an agent may read either.
     //
-    // That covers the walker's own publication. The OTHER two writers of `state` are retirements —
-    // `NavStatus::retire_to_idle` and `NavStatus::stamp_fresh_goal` — and neither can leave this
-    // payload behind, because all three routes out of a state destructure `NavStatus` exhaustively
-    // and clear it (#851 review round 1, B1: `stamp_fresh_goal` did not exist then, and the flat
-    // list it replaced published the dead goal's `nav_stall` beside the next goal's `pending`).
+    // That covers the walker's own publication. Every route OUT of a nav state goes through one of
+    // exactly three writers on `NavStatus` — `retire_to_idle` (the `idle` retirement),
+    // `stamp_fresh_goal` (a new goal arriving from the command side) and `transition_within_goal`
+    // (the walker's mid-route word change) — and none of them can leave this payload behind, because
+    // all three destructure `NavStatus` exhaustively (no `..`) and so cannot forget a field (#851
+    // review round 1, B1: only `retire_to_idle` existed then, and the flat assignment list that
+    // `stamp_new_goal` used instead published the dead goal's `nav_stall` beside the next goal's
+    // `pending`).
     let nav_stall = nav.stall.map(|s| serde_json::json!({
         "quiet_ticks": s.quiet_ticks,
         "quiet_ms":    s.quiet_ms,
