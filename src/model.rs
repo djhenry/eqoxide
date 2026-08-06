@@ -444,14 +444,6 @@ mod mock {
                 gait: None,
                 is_boat: false,
                 flymode: 0,
-                // NOT part of #870. `main` (ad1bfd2, #857) added this field to `Entity` and
-                // updated the initializers it could see — its own commit message enumerates
-                // "`renderer/scene.rs` and `net/action_loop.rs`" — but this one lives in the app
-                // crate's `#[cfg(test)]` scripted-zone builder, so `cargo build` stayed green and
-                // `cargo test --lib` for the `eqoxide` crate does not compile on `main` as of
-                // 749c932: `error[E0063]: missing field `npc_tint_index` in initializer of
-                // `Entity`` at this line. Repaired here only because #870 cannot be tested against
-                // a base that does not build; the value matches every other test initializer.
                 npc_tint_index: 0,
             })
         }
