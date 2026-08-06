@@ -428,61 +428,83 @@ pub fn carrot_leads(path: &[[f32; 3]], start_i: usize, from: [f32; 3], reach: f3
     }
 }
 
-/// **Sweep `Collision::ground_continuous` across the body's WIDTH, not just its centreline
-/// (#734 gap 2 — "width-blind").**
+/// **The reachability predicate production drives [`resync_cursor`] with — ONE definition, every
+/// caller (#734).**
 ///
-/// `ground_continuous` probes a single line down the middle of the hop. A floor strip narrower
-/// than the body — a ridge with void on either side — has a standable centre and nothing under
-/// either shoulder, and the bare centre-line call cannot tell the two apart: every probe still
-/// finds a floor. This calls it three times instead of once, on three PARALLEL lines offset
-/// perpendicular to the direction of travel by `-radius`, `0`, and `+radius`, and requires all
-/// three to pass. It is the same "don't trust one line where the body has width" move
-/// `Collision::path_clear` already makes for WALLS (its `FEELERS`), applied here to the FLOOR.
+/// A conjunction of two `Collision` primitives, both deliberately CENTRE-line:
 ///
-/// **An approximation, not a fix — same caveat class as `path_clear`'s own.** Three points across
-/// the diameter is coarser than `path_clear`'s five: each point here costs a full
-/// `ground_continuous` probe walk (up to ~12 floor queries on a [`CURSOR_RESYNC_MAX_HOP`] hop)
-/// rather than one ray, and this sits behind [`resync_cursor`]'s candidate loop, which can invoke
-/// `reachable` up to once per waypoint in a single resync. Two residual gaps, both disclosed
-/// rather than silently accepted:
+/// * `Collision::carrot_los_clear` at the walker's `STEER_LOS_CLEARANCE` — a chest-height centre
+///   ray, so a WALL between the body and the candidate refuses the hop.
+/// * `Collision::ground_continuous` — a floor-column probe along the hop, so a VOID, or a drop
+///   outside the controller's slope+step envelope, refuses it. **A hole is not a wall**: #727's
+///   round-1 review broke the LOS ray alone with a 200 u chasm the chest ray flew straight over.
 ///
-/// * A ridge narrower than the body but wide enough to straddle the swept lines — missing the
-///   centre and both outer samples while still catching a probe on each — can still pass. Closing
-///   that costs more samples than three, and nobody has measured where the marginal sample stops
-///   paying for itself; not attempted here.
-/// * Each of the three lines is still `ground_continuous`, so each is still LINE-SAMPLED along the
-///   direction of travel — a hole narrower than `PROBE_SPACING` in *that* direction is invisible to
-///   all three swept lines exactly as it is to one. That is #734 gap 1, unchanged by this function;
-///   see `Collision::ground_continuous`'s own rustdoc, and
-///   `a_narrow_hole_between_probes_still_crosses_the_resync_undetected` for the measured
-///   demonstration that it is still live after this sweep.
+/// It is a named function rather than a closure spelled out per call site because it *was* spelled
+/// out at three of them — `Walker::advance_cursor`, `cursor_resync_tests::fixture_run` below, and
+/// `tests/walker_sim.rs` — and #887's round-1 review measured what that costs: changing the
+/// walker's copy left the other two modelling a predicate production no longer ran, while both of
+/// their doc comments went on saying they ran "the walker's own predicate". `pub`, not
+/// `pub(crate)`, specifically so the integration harness can call it: `tests/walker_sim.rs` also
+/// hand-copies the clearance today (its own ⚠️ Correction discloses that the copy agrees with
+/// `STEER_LOS_CLEARANCE` by coincidence rather than by construction), and this function closes both
+/// holes for whoever edits that file next.
 ///
-/// `radius <= 0.0`, or a `from`/`to` with no horizontal separation, degrades to the bare
-/// centre-line call — there is no width to sweep.
+/// ## Why BOTH halves are centre-line — and why the floor half must not be widened to the body
 ///
-/// Mutation-checked: replacing the body with a bare `col.ground_continuous(from, to)` turns
-/// `a_resync_must_not_cross_a_ridge_narrower_than_the_body` RED.
-pub(crate) fn ground_continuous_swept(
-    col: &crate::collision::Collision,
-    from: [f32; 3],
-    to: [f32; 3],
-    radius: f32,
-) -> bool {
-    if radius <= 0.0 {
-        return col.ground_continuous(from, to);
-    }
-    let d = [to[0] - from[0], to[1] - from[1]];
-    let len = (d[0] * d[0] + d[1] * d[1]).sqrt();
-    if len < 1e-5 {
-        return col.ground_continuous(from, to);
-    }
-    let perp = [-d[1] / len * radius, d[0] / len * radius];
-    [-1.0f32, 0.0, 1.0].iter().all(|&f| {
-        col.ground_continuous(
-            [from[0] + perp[0] * f, from[1] + perp[1] * f, from[2]],
-            [to[0] + perp[0] * f, to[1] + perp[1] * f, to[2]],
-        )
-    })
+/// #734 names the floor probe "width-blind": a floor strip narrower than the body reads exactly
+/// like a body-width crossing, because only the centre is ever sampled. Widening it to three
+/// parallel lines at `-radius / 0 / +radius` was implemented, measured, and **withdrawn**. The
+/// reason is that the width-blindness is *faithful*, not a defect:
+///
+/// **The consumer has no shoulders.** `CharacterController`'s floor clamp is a single column under
+/// the body's CENTRE — in `src/movement.rs` it is
+/// `ground_below(self.pos[0], self.pos[1], foot + GROUND_ORIGIN, GROUND_DEPTH)`, with no
+/// `±radius` term in either the grounded or the levitating arm. A body whose shoulder overhangs a
+/// ledge lip is supported and walks normally. A floor test at `±PLAYER_RADIUS` therefore models a
+/// body production does not have, and every hop it newly refuses is one the controller would in
+/// fact have walked.
+///
+/// Measured — the real `Walker::advance_cursor` on the `CHASM_ROUTE`/`CHASM_BODY` fixture, cursor
+/// starting at 2, alongside the controller's own `ground_below` sampled every 0.5 u along the same
+/// hop. Reproduced by `crate::walker`'s
+/// `a_resync_must_still_cross_ground_the_controller_can_stand_on`:
+///
+/// ```text
+/// fixture                            controller floor    centre-line    ±radius swept
+/// slab edge 0.5 u from the hop line   standable, all      2 -> 6         2  (REFUSED)
+/// slab edge 1.0 u from the hop line   standable, all      2 -> 6         2 -> 6
+/// 0.8 u ridge, void either side       standable, all      2 -> 6         2  (REFUSED)
+/// 1.9 u ridge, void either side       standable, all      2 -> 6         2  (REFUSED)
+/// 2.1 u ridge, void either side       standable, all      2 -> 6         2 -> 6
+/// ```
+///
+/// The refusal band is exactly "floor narrower than the body's diameter", and in every row of it
+/// the controller's floor model is satisfied at every sample. A predicate stricter than the thing
+/// it models does not fail safe: it reports an ordinary reachable state as UNREACHABLE, which under
+/// this project's agent-honesty invariant is a wrong answer in the same way a false acceptance is,
+/// and it withholds the #673 resync precisely on the geometry #673 was observed live on.
+///
+/// The repo has measured this direction severe once already, on the planner side:
+/// `Collision::edge_clear`'s rustdoc records that sweeping the body volume along a coarse edge
+/// "does not reject *unwalkable corridors*, it rejects *corridors*" — routable pairs 876 → 813,
+/// Ak'Anon 90/120 → 55/120. The resync's candidates come off that same coarse route.
+///
+/// The wall half is centre-line for its own separately measured reason, which points the same way:
+/// `carrot_los_clear`'s rustdoc records that a more aggressive variant "slowed the walker 5-8x and
+/// newly FAILED dozens of routes (measured)".
+///
+/// **So this is ACCEPTED on purpose and is not a defect of this predicate:** a knife-edge ridge
+/// with void either side reads as a clean crossing, because to the controller's floor model it *is*
+/// one. What is genuinely not modelled is whether the walker can STEER accurately enough to stay on
+/// such a ridge — a different question from floor continuity, unmeasured here, and the reason
+/// `Walker::advance_cursor` raises `stuck_i` on every resync jump instead of trusting this answer.
+///
+/// Not-a-regression guard: `a_resync_must_still_cross_ground_the_controller_can_stand_on` goes RED
+/// if the floor half is ever widened to a `±STEER_LOS_CLEARANCE` sweep (mutation-checked in both
+/// directions).
+pub fn resync_reachable(col: &crate::collision::Collision, from: [f32; 3], to: [f32; 3]) -> bool {
+    let clearance = crate::walker::STEER_LOS_CLEARANCE;
+    col.carrot_los_clear(from, to, clearance) && col.ground_continuous(from, to)
 }
 
 /// **Resync a stale coarse-route cursor (#673).**
@@ -560,40 +582,44 @@ pub(crate) fn ground_continuous_swept(
 /// ## What guard 3 does and does not establish — read this before trusting it
 ///
 /// `reachable` is a caller-supplied predicate and this function makes **no** claim about
-/// walkability on its own. The walker passes a conjunction of a chest-height line-of-sight ray
-/// (excludes WALLS) and a WIDTH-swept floor-column probe along the hop (excludes VOIDS and drops
-/// steeper than the controller's own slope+step envelope, on three parallel lines rather than one —
-/// see [`ground_continuous_swept`]). That pairing exists because the round-1 review broke the LOS
-/// ray alone with a counterexample and it is worth stating plainly: **a hole is not a wall.**
-/// `Collision::carrot_los_clear` is documented in its own rustdoc as a chest-height centre ray,
-/// chosen deliberately to ride ABOVE ground undulation; asked "has the character reached this
-/// segment" it flies straight over a chasm. Measured: two ledges split by a 10 u gap with the next
-/// floor 200 u down, and the LOS ray alone moved the cursor 2 → 6, declaring an entire bridge
-/// detour walked (`crate::walker`'s `a_resync_must_not_cross_a_chasm_the_character_cannot_walk`).
+/// walkability on its own. Production passes [`resync_reachable`] — a conjunction of a chest-height
+/// line-of-sight ray (excludes WALLS) and a floor-column probe along the hop (excludes VOIDS and
+/// drops steeper than the controller's own slope+step envelope). That pairing exists because the
+/// round-1 review broke the LOS ray alone with a counterexample and it is worth stating plainly:
+/// **a hole is not a wall.** `Collision::carrot_los_clear` is documented in its own rustdoc as a
+/// chest-height centre ray, chosen deliberately to ride ABOVE ground undulation; asked "has the
+/// character reached this segment" it flies straight over a chasm. Measured: two ledges split by a
+/// 10 u gap with the next floor 200 u down, and the LOS ray alone moved the cursor 2 → 6, declaring
+/// an entire bridge detour walked (`crate::walker`'s
+/// `a_resync_must_not_cross_a_chasm_the_character_cannot_walk`).
 ///
 /// Even with the floor probe this is a **necessary, not a sufficient** condition — read
-/// `true` as *"not proven unreachable"*, never as *"reachable"*. Two gaps remain, filed as #734:
+/// `true` as *"not proven unreachable"*, never as *"reachable"*. Of the two gaps #734 files against
+/// it, one is live and one has been withdrawn on measurement:
 ///
-/// * **Width-blind (#734 gap 2) — MITIGATED, not closed.** A single centre line cannot tell a
-///   body-width floor strip from a knife-edge ridge with void either side; both read as continuous.
-///   [`ground_continuous_swept`] closes the common case by probing three parallel lines instead of
-///   one (mutation-checked: `a_resync_must_not_cross_a_ridge_narrower_than_the_body` goes RED under
-///   the bare-centre-line mutant). It is still an approximation — see that function's own rustdoc
-///   for the sample-count residual it does not claim to close.
-/// * **Line-sampled (#734 gap 1) — MEASURED, NOT FIXED.** Both the original centre line and the two
-///   swept lines added above are each still `ground_continuous`, so a hole narrower than
-///   `PROBE_SPACING` in the direction of TRAVEL can fall between two probes on all three lines at
-///   once — sweeping perpendicular to travel does nothing about a gap that is invisible along it.
-///   `crate::walker`'s `a_narrow_hole_between_probes_still_crosses_the_resync_undetected` measures
-///   this directly: a 1.5 u hole placed inside one 2 u probe interval is stepped over by the full
-///   production predicate, width sweep included. **No fix is attempted here** — closing it means
-///   changing `PROBE_SPACING` or replacing the line sample with an exact analytic test inside
-///   `Collision::ground_continuous` itself, in `collision.rs`, which this change does not touch.
+/// * **Line-sampled (#734 gap 1) — MEASURED, NOT FIXED, still live.** The floor probe samples the
+///   column at `PROBE_SPACING` (2 u) intervals along the hop, so a hole narrower than that can fall
+///   between two probes and is invisible. `crate::walker`'s
+///   `a_narrow_hole_between_probes_still_crosses_the_resync_undetected` measures it directly: a
+///   1.5 u hole placed inside one probe interval is stepped over by the production predicate.
+///   **No fix is attempted here** — closing it means changing `PROBE_SPACING` or replacing the line
+///   sample with an exact analytic test inside `Collision::ground_continuous` itself, in
+///   `collision.rs`, which this change does not touch.
+/// * **Width-blind (#734 gap 2) — WITHDRAWN as a defect, on measurement (#887).** The floor probe
+///   samples the centre only and so cannot tell a body-width crossing from a knife-edge ridge. That
+///   is not a gap between this predicate and production, it is *agreement* with it: the controller's
+///   floor clamp is also a single centre column. A three-line `±PLAYER_RADIUS` sweep was built and
+///   measured to refuse hops whose floor the controller stands on at every sample — a false refusal,
+///   which under the agent-honesty invariant is as wrong as a false acceptance. The numbers, the
+///   `edge_clear` precedent (876 → 813 routable pairs), and the regression guard that keeps the
+///   sweep out are on [`resync_reachable`]'s rustdoc. **#734's gap-2 framing is superseded by that
+///   measurement**; a comment recording the retraction is on the issue, so a reader of the issue and
+///   a reader of this file are not told different things.
 ///
 /// So the honest statement of what a resync means is *"the character is within
-/// [`CURSOR_RESYNC_MAX_HOP`] of this segment, with no wall and no sampled void — across three lines,
-/// not one — between"* — **not** "the character walked this leg". Which is why the walker
-/// deliberately does not report a resync jump as PROGRESS: see `Walker::advance_cursor`.
+/// [`CURSOR_RESYNC_MAX_HOP`] of this segment, with no wall and no sampled void between"* — **not**
+/// "the character walked this leg". Which is why the walker deliberately does not report a resync
+/// jump as PROGRESS: see `Walker::advance_cursor`.
 ///
 /// ## When it fires — two triggers, not one (#733)
 ///
@@ -1122,7 +1148,10 @@ mod cursor_resync_tests {
     /// and no fix, so a harness that reported a stall unconditionally would fail its own control.
     ///
     /// `resync` selects the cursor rule: `false` = the monotone advance alone (pre-#727), `true` =
-    /// the advance plus [`resync_cursor`] with the walker's own predicate.
+    /// the advance plus [`resync_cursor`] with the walker's own predicate — [`resync_reachable`],
+    /// the same function `Walker::advance_cursor` passes, not a restatement of it. It used to be a
+    /// restatement, and #887 round 1 caught the restatement still claiming to be "the walker's own
+    /// predicate" after production's had been changed out from under it.
     fn fixture_run(col: &crate::collision::Collision, start_i: usize, resync: bool, verbose: bool)
         -> Run
     {
@@ -1173,9 +1202,7 @@ mod cursor_resync_tests {
                 if t >= 1.0 { path_i += 1; } else { break; }
             }
             if resync {
-                path_i = resync_cursor(&HAIRPIN, path_i, p, |a, b| {
-                    col.carrot_los_clear(a, b, clearance) && col.ground_continuous(a, b)
-                });
+                path_i = resync_cursor(&HAIRPIN, path_i, p, |a, b| resync_reachable(col, a, b));
             }
             let coarse = carrot_along(&HAIRPIN, path_i, p, LOOK_AHEAD).unwrap_or(goal);
             // `drive_walk`: apply whatever the fine planner finished, then drop it if the body has
