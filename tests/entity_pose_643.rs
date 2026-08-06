@@ -59,12 +59,6 @@ fn npc_spawn(spawn_id: u32, name: &str, stand_state: u8) -> SpawnInfo {
         animation: 0,
         equipment: [0u32; 9],
         equipment_tint: [[0u8; 3]; 9],
-        // NOT part of #867. `npc_tint_index` was added to `SpawnInfo` by #857 (commit ad1bfd2),
-        // which did not update this exhaustive literal, so `origin/main` does not compile its own
-        // integration tests — E0063 here, reproduced below. Repaired with the neutral value so this
-        // branch has a meaningful gate; the underlying "the merge gate never built this target"
-        // problem is filed separately. 0 is what EQEmu sends for an untinted NPC and this test
-        // asserts nothing about tinting.
         npc_tint_index: 0,
     }
 }

@@ -444,10 +444,6 @@ mod mock {
                 gait: None,
                 is_boat: false,
                 flymode: 0,
-                // NOT part of #867 — see the same note in `tests/entity_pose_643.rs`. #857
-                // (ad1bfd2) added this field to `Entity` without updating the root crate's
-                // exhaustive literals, so `origin/main` fails to build its own `--lib` tests
-                // (E0063 right here). 0 = untinted, which is what this builder's callers assume.
                 npc_tint_index: 0,
             })
         }
