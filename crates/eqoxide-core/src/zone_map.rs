@@ -369,10 +369,16 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
     /// which zones' maps contribute fallback entries that was flat wrong ("only North/South Qeynos"
     /// — actually five zones' packs qualify, see `docs/http-api.md`'s `zone_map_load` section). A
     /// sentence can drift from the code again; this test is the reproducible way to re-check it: it
-    /// runs the REAL `try_load` plus the REAL label heuristic
-    /// (`crates/eqoxide-net/src/action_loop.rs`'s `sync_zone_points`, copied verbatim below, so keep
-    /// the two in sync if that heuristic ever changes) over the real, LOCAL client maps cache — not
-    /// a re-derivation by reading the heuristic. Needs the asset-sync maps dir to exist, so it is
+    /// runs the REAL `try_load` plus the SAME destination-matching rule
+    /// `crates/eqoxide-net/src/action_loop.rs`'s `sync_zone_points` uses
+    /// (`"to "` + north/south Qeynos / Qeynos2 text match) over the real, LOCAL client maps cache —
+    /// not a re-derivation by reading the heuristic. **This is a hand copy, not a verbatim one — say
+    /// so rather than overclaim it** (#869 round 2, N7): it counts qualifying LABELS present in a
+    /// zone's pack, which is what the "five zones contribute" claim is about, but it deliberately
+    /// omits `sync_zone_points`'s dedup-against-already-advertised-point check (that check decides
+    /// how many of those labels turn into a NEW zone_point entry at runtime, a different, narrower
+    /// question this diagnostic does not answer). Keep the matching rule in sync by hand if
+    /// `sync_zone_points`'s ever changes. Needs the asset-sync maps dir to exist, so it is
     /// `#[ignore]`d (CI has no client cache) — run explicitly with `cargo test -p eqoxide-core --lib
     /// zone_map::tests::diagnostic_measure_contributing_zones_869 -- --ignored --nocapture`.
     #[test]

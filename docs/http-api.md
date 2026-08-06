@@ -1409,14 +1409,16 @@ agent-honesty invariant forbids.
 
 `zone_map_load` names the outcome instead of hiding it:
 
-- `null` — this zone's map (base file, and every detail layer that exists) loaded fine, or the zone
-  hasn't changed yet this session so no load has been attempted. `zone_entrances` is carrying every
-  fallback entry this zone's map has to offer.
-- `{"reason": "zone_map_missing", "detail": "no .txt map file for this zone"}` — there is no base
-  map `.txt` for this zone at all. This is the common, harmless case for the overwhelming majority of
-  zones (measured: only the five zones named above contribute any fallback entries at all), so a
-  non-null reading here is not by itself evidence of a problem — it only matters if you were relying
-  on this zone's synthesized entries.
+- `null` — either this zone's map (base file, and every detail layer that exists) loaded fine and
+  `zone_entrances` is carrying every fallback entry it has to offer, OR the zone has not changed yet
+  this session and no load has been attempted, in which case it is carrying none of them. Cross-check
+  `zone` and `zone_assets` if you need to tell the two apart.
+- `{"reason": "zone_map_missing", ...}` — there is no base map `.txt` for this zone at all. Measured:
+  the shipped pack contains 526 base `.txt` maps, covering essentially every zone a character plays in,
+  so this is NOT the ordinary reading for a normal zone — the ordinary reading for a zone with a map
+  and no qualifying label is `null`. Treat `zone_map_missing` as "this client's maps cache does not
+  have this zone", i.e. usually an incomplete asset sync, and only harmless once you have confirmed
+  you were not relying on this zone's synthesized entries.
 - `{"reason": "zone_map_unreadable", "detail": "..."}` — the base file is present but could not be
   read (a permissions error, a directory sitting where the file should be, a corrupt mount).
   Distinct from `zone_map_missing` on purpose: "confirmed absent" and "present but unreadable" are
