@@ -3809,7 +3809,9 @@ mod tests {
                         if corrected { corrections += 1; }
                         let expected = if corrected { None } else { hold };
 
-                        let ctx = format!("hold={hold:?} jump={jump:?} far={far}                                            corrected={corrected} tick {}/{ticks}", t + 1);
+                        let ctx = format!(
+                            "hold={hold:?} jump={jump:?} far={far} corrected={corrected} \
+                             tick {}/{ticks}", t + 1);
 
                         // 1. THE NET THREAD NEVER MANUFACTURES A PREDICAMENT. The weak form of the
                         //    property, asserted on EVERY row so it survives any change to the branch
