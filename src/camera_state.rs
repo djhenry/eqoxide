@@ -65,6 +65,66 @@ pub fn heading_deg_from_azimuth(azimuth: f32) -> f32 {
     (azimuth + std::f32::consts::FRAC_PI_2).to_degrees().rem_euclid(360.0)
 }
 
+/// The eye actually usable to render a frame, together with whether it differs from what was
+/// asked for. Returned by [`resolve_camera_eye`] — see that function's doc comment for why this
+/// exists (#852).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedEye {
+    /// The eye position to render from THIS frame.
+    pub eye:           [f32; 3],
+    /// True iff pull-in moved `eye` away from the desired orbit position.
+    pub occluded:      bool,
+    /// True iff, even after the pull-in loop's iteration budget, the focus→eye segment is still
+    /// not clear of collision (a degenerate case: e.g. the camera's minimum radius still doesn't
+    /// fit the space). A caller that renders `eye` anyway in this case is drawing a frame that
+    /// still has geometry between the lens and the target — this flag is how it says so instead
+    /// of rendering it silently.
+    pub still_blocked: bool,
+}
+
+/// Pull `desired_eye` in along the segment toward `focus` until the segment is clear of
+/// `collision`, or the iteration budget is spent. Mirrors a standard third-person camera: cast
+/// from the look target toward the desired eye each frame, and stop short of the first hit.
+///
+/// #852: **this is the single place camera collision is resolved.** Both the on-screen render
+/// and the published `/v1/observe/debug` snapshot must be built from this same return value —
+/// never from a value either one recomputes independently — so "what was rendered" and "what was
+/// reported" cannot drift apart the way they did before this fix (the old call site in `app.rs`
+/// mutated a local `cam_eye` for rendering but published `CameraState::snapshot()`'s untouched
+/// `radius`, so an agent reading `/v1/observe/debug` got the pre-collision eye 88% of the time a
+/// pull-in fired — see #852).
+///
+/// A single pass can fail in multi-story buildings where the eye lands between two floor slabs,
+/// hence the small iteration budget rather than one shot.
+pub fn resolve_camera_eye(
+    collision: Option<&crate::nav::collision::Collision>,
+    focus: [f32; 3],
+    desired_eye: [f32; 3],
+) -> ResolvedEye {
+    let mut eye = desired_eye;
+    let mut occluded = false;
+    let mut still_blocked = false;
+    if let Some(col) = collision {
+        for _ in 0..5 {
+            match col.nearest_hit_t(focus, eye) {
+                Some(t) => {
+                    still_blocked = true;
+                    let frac = (t * 0.85).clamp(0.05, 1.0);
+                    let new_eye = lerp3(focus, eye, frac);
+                    if new_eye == eye { break; }
+                    eye = new_eye;
+                    occluded = true;
+                }
+                None => {
+                    still_blocked = false;
+                    break;
+                }
+            }
+        }
+    }
+    ResolvedEye { eye, occluded, still_blocked }
+}
+
 // `CameraMode`, `CameraCmd`, and `CameraSnapshot` moved to `eqoxide-ipc` (#544 Step 2c) — re-exported
 // at the top of this module.
 
@@ -155,13 +215,22 @@ impl CameraState {
     }
 
     /// Snapshot of the current state for the HTTP GET /camera response.
-    pub fn snapshot(&self) -> CameraSnapshot {
+    ///
+    /// `resolved` is the [`ResolvedEye`] the SAME `resolve_camera_eye` call that produced the
+    /// eye/look-target passed to this frame's `render_frame` returned — this method just carries
+    /// it through into the published struct, it does not recompute an eye from
+    /// `azimuth`/`elevation`/`radius`/`focus` itself (#852: that recomputation is exactly the bug
+    /// this fixes — it would silently reproduce the pre-collision eye).
+    pub fn snapshot(&self, resolved: ResolvedEye) -> CameraSnapshot {
         CameraSnapshot {
-            mode:      self.mode,
-            azimuth:   self.azimuth,
-            elevation: self.elevation,
-            radius:    self.radius,
-            focus:     self.focus,
+            mode:          self.mode,
+            azimuth:       self.azimuth,
+            elevation:     self.elevation,
+            radius:        self.radius,
+            focus:         self.focus,
+            eye:           resolved.eye,
+            occluded:      resolved.occluded,
+            still_blocked: resolved.still_blocked,
         }
     }
 }
@@ -368,5 +437,113 @@ mod tests {
         assert_eq!(cam.mode, CameraMode::ManualOrbit);
         cam.apply_cmd(CameraCmd::Reset);
         assert_eq!(cam.mode, CameraMode::AutoFollow);
+    }
+
+    // ── #852: the published eye must be the rendered eye ─────────────────────────────────────
+
+    #[test]
+    fn resolve_camera_eye_is_a_noop_with_no_collision() {
+        let desired = [12.0, -34.0, 56.0];
+        let resolved = resolve_camera_eye(None, [0.0, 0.0, 0.0], desired);
+        assert_eq!(resolved.eye, desired);
+        assert!(!resolved.occluded);
+        assert!(!resolved.still_blocked);
+    }
+
+    /// A wall standing directly on the segment between `focus` and `desired_eye`, perpendicular to
+    /// the east axis at `wall_x` — mirrors `collision::tests::parallel_wall`'s "GLB axes -> world:
+    /// east = p[2], north = p[0], height = p[1]" convention, just built here instead of imported
+    /// (this crate cannot see `eqoxide-nav`'s `#[cfg(test)]` helpers).
+    fn wall_at_east(wall_x: f32) -> crate::nav::collision::Collision {
+        use crate::assets::{MeshData, RenderMode, ZoneAssets};
+        use crate::nav::collision::Collision;
+        let wall = MeshData {
+            positions: vec![
+                [-500.0, -500.0, wall_x], [500.0, -500.0, wall_x],
+                [500.0,   500.0, wall_x], [-500.0, 500.0, wall_x],
+            ],
+            normals: vec![[0.0, 0.0, -1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        };
+        Collision::build(&ZoneAssets { terrain: vec![wall], objects: vec![], textures: vec![] }, 8.0)
+    }
+
+    #[test]
+    fn resolve_camera_eye_pulls_in_behind_a_blocking_wall() {
+        // Player-side reproduction of the #852 measured case: a wall sits between the focus and
+        // the desired (unoccluded) eye. The resolved eye must land on the FOCUS side of the wall,
+        // not beyond it.
+        let col = wall_at_east(10.0);
+        let focus = [0.0_f32, 0.0, 0.0];
+        let desired_eye = [80.0_f32, 0.0, 0.0];
+        let resolved = resolve_camera_eye(Some(&col), focus, desired_eye);
+        assert!(resolved.eye[0] < 10.0,
+            "resolved eye x={} is beyond the wall at x=10 — this is the #852 bug", resolved.eye[0]);
+        assert!(resolved.occluded, "pulling the eye in must be reported as occluded");
+        assert!(!resolved.still_blocked, "the resolved eye landed clear of the wall");
+        assert_ne!(resolved.eye, desired_eye);
+    }
+
+    /// **THE property test (#852).** For a sweep of wall placements and desired-eye distances, the
+    /// resolved eye must never sit on the far side of a wall that stands between `focus` and the
+    /// desired eye — checked against an INDEPENDENT geometric fact (the wall's fixed x-coordinate),
+    /// not by re-deriving the expected answer from `resolve_camera_eye` itself. A premise counter
+    /// guards against the sweep vacuously containing no blocked case.
+    ///
+    /// Mutation-checked by execution (#852): reverting the fix — i.e. going back to the original
+    /// `app.rs` shape where the pull-in loop mutates a local eye that never reaches the published
+    /// snapshot — cannot be expressed as a mutation of `resolve_camera_eye` alone (that was the
+    /// point: the old bug was in what the CALLER did with the result, not in this function). The
+    /// mutation that matters lives at the call site and is guarded by
+    /// `snapshot_carries_the_resolved_eye_verbatim_not_a_recomputed_one` below instead.
+    #[test]
+    fn resolve_camera_eye_never_reports_an_eye_across_a_blocking_wall() {
+        let focus = [0.0_f32, 0.0, 0.0];
+        let mut blocked_cases = 0;
+        // Deliberately none of these equal an `eye_dist` value below — an eye sitting exactly ON
+        // the wall plane is a separate degenerate case, not what this sweep is checking.
+        for wall_x in [4.0_f32, 11.0, 21.0, 39.0, 49.0, 79.0] {
+            let col = wall_at_east(wall_x);
+            for eye_dist in [10.0_f32, 40.0, 80.0, 150.0, 500.0] {
+                let desired_eye = [eye_dist, 0.0, 0.0];
+                let resolved = resolve_camera_eye(Some(&col), focus, desired_eye);
+                if wall_x < eye_dist {
+                    blocked_cases += 1;
+                    assert!(resolved.eye[0] < wall_x,
+                        "wall_x={wall_x} eye_dist={eye_dist}: resolved eye x={} crossed the wall",
+                        resolved.eye[0]);
+                    assert!(resolved.occluded,
+                        "wall_x={wall_x} eye_dist={eye_dist}: a pulled-in eye must be reported occluded");
+                } else {
+                    assert_eq!(resolved.eye, desired_eye,
+                        "wall_x={wall_x} eye_dist={eye_dist}: wall is not between focus and the \
+                         desired eye, so the eye must be unchanged");
+                    assert!(!resolved.occluded);
+                }
+            }
+        }
+        assert!(blocked_cases > 0, "premise: the sweep must contain at least one blocked case");
+    }
+
+    #[test]
+    fn snapshot_carries_the_resolved_eye_verbatim_not_a_recomputed_one() {
+        // #852 mutation guard: `snapshot` must publish EXACTLY the `ResolvedEye` it is handed, not
+        // an eye it derives itself from `azimuth`/`elevation`/`radius`/`focus` — that recomputation
+        // is exactly the bug this fix removes (`snapshot()` used to take no eye at all and always
+        // reported the pre-collision position). If `snapshot` were reverted to recompute the eye
+        // internally, this test goes RED: the arbitrary `resolved.eye` below is deliberately NOT
+        // what `compute_eye` would derive from this camera's own azimuth/elevation/radius/focus.
+        let mut cam = CameraState::new([1.0, 2.0, 3.0], 40.0);
+        cam.radius = 80.0;
+        let resolved = ResolvedEye { eye: [999.0, -42.0, 7.5], occluded: true, still_blocked: true };
+        let snap = cam.snapshot(resolved);
+        assert_eq!(snap.eye, [999.0, -42.0, 7.5]);
+        assert!(snap.occluded);
+        assert!(snap.still_blocked);
+        let derived = compute_eye(cam.azimuth, cam.elevation, cam.radius, cam.focus);
+        assert_ne!(derived, snap.eye,
+            "test fixture bug: the arbitrary resolved eye must differ from what compute_eye would \
+             derive, or this test cannot tell the two code paths apart");
     }
 }

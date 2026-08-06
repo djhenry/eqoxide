@@ -28,6 +28,43 @@ pub struct GroundProbe {
     pub weights: [f32; 4],
 }
 
+/// The outcome of resolving an action to a playable clip (see
+/// [`SkinData::clip_for_action_or_idle`]): whether the model actually carries a clip for the
+/// requested action, or the model has no such clip and the resolution fell back to idle.
+///
+/// This exists so "which clip index" and "is that clip really the requested pose" travel as one
+/// value instead of two a caller could read inconsistently (eqoxide#858): a model with no crouch
+/// clip still gets asked to "crouch", and the clip that plays is idle — a caller that keys its
+/// hold-vs-loop decision on the action string alone (`is_held_pose("crouching") == true`) rather
+/// than on this resolution would clamp-and-freeze the idle clip on its last frame forever, instead
+/// of looping idle like the model is actually doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionClip {
+    /// The model has its own clip for the requested action; `held`-pose semantics for that action
+    /// (see [`SkinData::is_held_pose`]) apply to this clip.
+    Own(usize),
+    /// The model has no clip for the requested action; this is the idle/neutral fallback instead.
+    /// It must be treated exactly like a genuine idle resolution — looped, never held — regardless
+    /// of what the requested action was.
+    FellBackToIdle(usize),
+}
+
+impl ActionClip {
+    /// The clip index to play, regardless of which case this is.
+    pub fn clip_idx(self) -> usize {
+        match self {
+            ActionClip::Own(i) | ActionClip::FellBackToIdle(i) => i,
+        }
+    }
+
+    /// Whether hold-vs-loop for `action` should be decided as a held pose. `false` whenever the
+    /// resolution fell back to idle, no matter what `is_held_pose(action)` says — the clip that
+    /// will actually play is idle, and idle always loops.
+    pub fn is_held_pose(self, action: &str) -> bool {
+        matches!(self, ActionClip::Own(_)) && SkinData::is_held_pose(action)
+    }
+}
+
 pub struct SkinData {
     pub joint_count: usize,
     pub parents:     Vec<Option<usize>>,
@@ -238,6 +275,12 @@ impl SkinData {
     /// Held poses (dead, sitting, crouching/kneeling) play their entry transition ONCE and then
     /// HOLD the final frame — like the native client — instead of looping the stand→pose
     /// transition endlessly (eqoxide#83). The final frame of the transition clip is the resting pose.
+    ///
+    /// This alone does NOT decide whether a given clip resolution should hold — a model with no
+    /// clip for the requested pose still names the action "crouching" while playing its idle
+    /// fallback, and the idle clip must loop, not hold (eqoxide#858). Callers must gate this on
+    /// [`ActionClip::Own`], never call it on the action string alone when the resolution can have
+    /// fallen back — see [`SkinData::clip_for_action_or_idle`].
     pub fn is_held_pose(action: &str) -> bool {
         matches!(action, "dead" | "sitting" | "crouching")
     }
@@ -344,11 +387,22 @@ impl SkinData {
     /// sentinel instead, so clip 0 is NEVER reached by ANY model shape, not just the ones that happen
     /// to have an idle clip.
     ///
+    /// Returns [`ActionClip`], not a bare index (#858): whether the resolution landed on the
+    /// model's OWN clip for `action` versus fell back to idle is exactly the fact a caller needs to
+    /// decide hold-vs-loop — a held-pose action (`is_held_pose`) that fell back to idle is playing
+    /// idle, not the pose, and must loop like idle, not clamp-and-freeze on the idle clip's last
+    /// frame. Baking that distinction into the return type (instead of a bare `usize` the caller
+    /// would have to re-derive by re-checking `clip_for_action(action).is_some()`) makes the two
+    /// facts — "which clip" and "is it really the pose" — a single value instead of two that a
+    /// caller could read out of sync.
+    ///
     /// Do NOT route the `"dead"` action through this — dead has its own `usize::MAX` bind-pose
     /// sentinel path in the renderer and must not be coerced to idle.
-    pub fn clip_for_action_or_idle(&self, action: &str) -> Option<usize> {
-        self.clip_for_action(action)
-            .or_else(|| self.clip_for_action("idle"))
+    pub fn clip_for_action_or_idle(&self, action: &str) -> Option<ActionClip> {
+        if let Some(ci) = self.clip_for_action(action) {
+            return Some(ActionClip::Own(ci));
+        }
+        self.clip_for_action("idle").map(ActionClip::FellBackToIdle)
     }
 
     /// Lively idle "fidget" animations (look around, shift weight, etc.) that the native client
@@ -653,11 +707,16 @@ mod tests {
         let idle = skin.clip_for_action("idle").expect("fixture has a neutral idle");
         assert_eq!(idle, 4, "idle resolves to P01_idle_neutral (index 4)");
 
-        // The fix: the swing falls back to idle, NOT clip 0 (= death).
+        // The fix: the swing falls back to idle, NOT clip 0 (= death) — and the resolution says so
+        // (#858): it must come back tagged `FellBackToIdle`, not `Own`, since C05 is not this
+        // model's own clip for the action.
         let chosen = skin.clip_for_action_or_idle("C05");
-        assert_eq!(chosen, Some(idle), "missing combat clip must fall back to the idle/neutral stand");
-        assert_ne!(chosen, Some(0), "must NOT fall back to clip 0 (the death/collapse clip) — #692");
-        assert_ne!(chosen, death, "an attacking model must never play its death clip");
+        assert_eq!(chosen, Some(ActionClip::FellBackToIdle(idle)),
+            "missing combat clip must fall back to the idle/neutral stand, tagged as a fallback");
+        assert_ne!(chosen.map(ActionClip::clip_idx), Some(0),
+            "must NOT fall back to clip 0 (the death/collapse clip) — #692");
+        assert_ne!(chosen.map(ActionClip::clip_idx), death,
+            "an attacking model must never play its death clip");
     }
 
     /// The asset-coupled half of #692, kept honest against the **real** GLB instead of a hardcoded
@@ -694,15 +753,16 @@ mod tests {
         let chosen = skin.clip_for_action_or_idle("C05");
 
         if let Some(c) = combat {
-            assert_eq!(chosen, Some(c),
+            assert_eq!(chosen, Some(ActionClip::Own(c)),
                 "asset ships a C-family clip ({}) — a swing must play it, not fall back",
                 clips[c]);
-            assert_ne!(chosen, death, "a swing must never resolve to the death clip");
+            assert_ne!(chosen.map(ActionClip::clip_idx), death,
+                "a swing must never resolve to the death clip");
         } else {
             let idle = idle.expect("asset with no combat clip must at least have an idle to fall back to");
-            assert_eq!(chosen, Some(idle),
-                "no combat clip in the asset — a swing must fall back to idle ({})", clips[idle]);
-            assert_ne!(chosen, Some(0), "must never fall back to clip 0 — #692");
+            assert_eq!(chosen, Some(ActionClip::FellBackToIdle(idle)),
+                "no combat clip in the asset — a swing must fall back to idle ({}), tagged as a fallback", clips[idle]);
+            assert_ne!(chosen.map(ActionClip::clip_idx), Some(0), "must never fall back to clip 0 — #692");
         }
     }
 
@@ -764,8 +824,9 @@ mod tests {
         };
         assert_eq!(skin.clip_for_action("C05"), Some(1),
             "a model with a real C05 combat clip resolves it directly");
-        assert_eq!(skin.clip_for_action_or_idle("C05"), Some(1),
-            "the idle fallback must NOT override a model that actually has the combat clip");
+        assert_eq!(skin.clip_for_action_or_idle("C05"), Some(ActionClip::Own(1)),
+            "the idle fallback must NOT override a model that actually has the combat clip, \
+             and the resolution must be tagged Own, not FellBackToIdle");
     }
 
     #[test]

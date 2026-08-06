@@ -242,11 +242,19 @@ fn main() {
     // `ui::Actions` bundle, and/or `App::new`. This is what preserves the cross-thread sharing that
     // used to be implicit in each individual `Arc::new(...)` being cloned by hand — see the
     // per-bundle `.clone()` calls below; nothing here is `Default`-constructed twice.
-    let camera = ipc::CameraSlots {
-        cmd_tx:      Arc::new(Mutex::new(None)),
-        snapshot:    Arc::new(Mutex::new(camera_state::CameraState::new([0.0, 0.0, 0.0], 0.0).snapshot())),
-        frame_req:   Arc::new(Mutex::new(None)),
-        manual_move: Arc::new(Mutex::new(None)),
+    let camera = {
+        let cam = camera_state::CameraState::new([0.0, 0.0, 0.0], 0.0);
+        // No collision is loaded yet at startup (no zone), so the initial published eye is just
+        // the desired orbit position, unoccluded — the same fallback `resolve_camera_eye` would
+        // produce for `collision: None`.
+        let init_eye = camera_state::compute_eye(cam.azimuth, cam.elevation, cam.radius, cam.focus);
+        let resolved = camera_state::ResolvedEye { eye: init_eye, occluded: false, still_blocked: false };
+        ipc::CameraSlots {
+            cmd_tx:      Arc::new(Mutex::new(None)),
+            snapshot:    Arc::new(Mutex::new(cam.snapshot(resolved))),
+            frame_req:   Arc::new(Mutex::new(None)),
+            manual_move: Arc::new(Mutex::new(None)),
+        }
     };
     let nav = ipc::NavSlots {
         goto_target:   Arc::new(Mutex::new(None)),
