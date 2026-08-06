@@ -1192,12 +1192,24 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
         // Render-owned — the one field here the render loop legitimately publishes.
         "frame_profile": frame_profile,
+        // #852: `azimuth_deg`/`elevation_deg`/`radius`/`focus` are the orbit's DESIRED framing —
+        // NOT necessarily where the frame was actually rendered from. In tight geometry the
+        // render loop pulls the eye in toward `focus` until it clears collision, and that
+        // pull-in does not touch these four fields. `eye` is the position the CURRENT frame was
+        // actually rendered from (the exact value passed to `render_frame` this tick — see
+        // `camera_state::resolve_camera_eye`); use it, not a `radius`-derived distance, for
+        // anything about what is actually on screen. `occluded` says whether pull-in fired this
+        // frame; `still_blocked` says whether, even after pull-in, `eye` is still not fully clear
+        // of collision (a degenerate case that must be reported, not silently rendered).
         "camera": {
             "azimuth_deg":   cam.azimuth.to_degrees(),
             "elevation_deg": cam.elevation.to_degrees(),
             "radius":        cam.radius,
             "focus":         cam.focus,
             "mode":          cam.mode,
+            "eye":           cam.eye,
+            "occluded":      cam.occluded,
+            "still_blocked": cam.still_blocked,
         },
     });
     // #371 — attached here (not inside the literal above, which is already at the json! recursion
@@ -3206,6 +3218,48 @@ mod tests {
              body it could free itself with a driven dive, got {}", player["hold"]);
     }
 
+    /// #852 — `/v1/observe/debug`'s `camera` object must publish the RENDERED eye, not just the
+    /// desired orbit `radius`/`focus`/`azimuth`/`elevation`. Before this fix those four were the
+    /// only camera fields served, and none of them reflect the collision pull-in the render loop
+    /// applies each frame — an agent reading them cannot tell an occluded frame from a clear one
+    /// (measured: 88% of pull-in frames disagreed — see #852). Same failure shape as
+    /// `afloat_stall_reaches_the_debug_json_801`/`hold_reaches_the_debug_json_817`: this drives
+    /// the REAL router with a REAL request and parses the REAL bytes, because a struct field that
+    /// is correct but never reaches the served JSON is exactly what those two exist to catch too.
+    ///
+    /// `radius`/`focus` are deliberately set FAR from the fixture `eye` below, so a test that
+    /// accidentally read a radius-derived position instead of the new `eye` field would fail loud
+    /// rather than passing by coincidence.
+    ///
+    /// MUTATION CHECK (#852, executed): deleting the `"eye"`/`"occluded"`/`"still_blocked"`
+    /// entries from the `"camera"` object literal in `get_debug` turns the first `contains_key`
+    /// assertion here RED; restoring them turns it green again.
+    #[tokio::test]
+    async fn camera_eye_reaches_the_debug_json_852() {
+        let state = empty_state();
+        {
+            let mut snap = state.camera.snapshot.lock().unwrap();
+            snap.eye           = [12.5, -34.0, 56.75];
+            snap.occluded      = true;
+            snap.still_blocked = true;
+            snap.radius        = 80.0;
+            snap.focus         = [0.0, 0.0, 0.0];
+        }
+        let v = debug_json(state).await;
+        let cam = v["camera"].as_object().expect("camera object");
+        assert!(cam.contains_key("eye"),
+            "camera.eye must be PRESENT in the served body — an agent that greps for it and finds \
+             nothing cannot tell \"unoccluded\" from \"this client cannot report one\". Keys \
+             served: {:?}", cam.keys().collect::<Vec<_>>());
+        assert_eq!(cam["eye"], serde_json::json!([12.5, -34.0, 56.75]),
+            "camera.eye must be the RENDERED eye carried through from the snapshot, not a position \
+             derived from radius/focus (that recomputation is the #852 bug)");
+        assert_eq!(cam["occluded"], serde_json::json!(true),
+            "camera.occluded must say a pull-in fired this frame");
+        assert_eq!(cam["still_blocked"], serde_json::json!(true),
+            "camera.still_blocked must say the eye is still not fully clear of collision");
+    }
+
     /// #724/#817 — the stuck-and-cannot-free disclosure must reach a RESPONSE BODY, not just a
     /// struct. Same failure shape as `afloat_stall_reaches_the_debug_json_801` just above:
     /// `PlayerState::hold` was computed, mirrored into `GameState` on every **net tick** by
@@ -4930,6 +4984,9 @@ mod tests {
             elevation: 0.222,
             radius: 99.0,
             focus: [0.0, 0.0, 0.0],
+            eye: [99.0, 0.0, 0.0],
+            occluded: false,
+            still_blocked: false,
         }
     }
 
