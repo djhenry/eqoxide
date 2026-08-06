@@ -359,14 +359,23 @@ impl PlayerState {
                 held_secs: h.secs,
                 detail: match h.reason {
                     eqoxide_core::game_state::ControllerHoldReason::EmbeddedNoRecovery =>
-                        "the character is EMBEDDED in world geometry. The client's push-out search \
-                         found nowhere it can legally stand, and it has no recovery position to fall \
-                         back to (a position discontinuity — a summon, a large server correction — \
+                        "the character cannot be placed: it is either EMBEDDED in world geometry or \
+                         standing over a VOID with no floor within 200 u below its feet. (The \
+                         client's test is a disjunction of those two and this field cannot tell you \
+                         which; the case reported in #845 was measured to be the void half, so do \
+                         not assume geometry is piercing the body.) The push-out search found \
+                         nowhere it can legally stand, and it has no recovery position to fall back \
+                         to (a position discontinuity — a summon, a large server correction — \
                          supersedes that history, #724). Physics is frozen: every movement command \
-                         will be accepted and produce NO motion, in any direction. This will not \
-                         clear on its own — the client keeps streaming this position and the server \
-                         agrees with it, so no further correction is coming. Ask a GM to move the \
-                         character (#goto/#summon), or zone out.",
+                         will be accepted and produce NO motion, in any direction. Since #845 the \
+                         client re-searches the WHOLE zone about once a second for anywhere a body \
+                         could stand and relocates itself there, so the normal outcome is that this \
+                         hold clears on its own within a second or two and `player.pos` jumps — \
+                         that jump is a client-side relocation, not a server correction. A hold \
+                         that PERSISTS means that search keeps answering `nowhere`. If it persists: \
+                         a GM `#goto`, `#summon` or `#zone` clears it (all three measured live on \
+                         #845, each on the first frame) — but those need GM status, so an ordinary \
+                         character has no client-API exit and is waiting on the search.",
                     eqoxide_core::game_state::ControllerHoldReason::UnderworldNoRecovery =>
                         "the character fell to the zone's UNDERWORLD floor and the client is holding \
                          it there rather than let it drop out of the world (#150). It has no \
@@ -374,7 +383,10 @@ impl PlayerState {
                          history, #724), so it is hanging in place: not falling, not landing, not \
                          grounded. Horizontal movement still works, but there is probably nothing \
                          under it. This will not clear on its own — ask a GM to move the character, \
-                         or zone out.",
+                         or zone out. (#845 deliberately did NOT extend its zone-wide relocation \
+                         search to this hold: unlike `embedded_no_recovery`, this one leaves \
+                         horizontal movement working, so `/v1/move/manual` may walk the character \
+                         out over a floor that is above the underworld.)",
                 },
             }),
             // #776/#801: the afloat stall, mirrored into `gs` by the same `stream_position` tick as
