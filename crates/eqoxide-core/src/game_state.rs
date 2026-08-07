@@ -839,20 +839,46 @@ pub struct WorldState {
 ///
 /// Both variants are the SAME shape: a recovery path decided it must not let the body go where the
 /// physics was taking it, looked for a banked "last good" position to put it at instead, and found
-/// none. The frame then changes nothing and re-runs identically next frame, so the body is frozen
-/// until something external moves it. Before #724 the ring was almost never empty, so these branches
-/// were rare; #724 clears the ring on every position discontinuity, which makes an empty ring the
-/// NORMAL post-relocation state and these holds an ordinary outcome of a GM summon into rock.
+/// none. Before #724 the ring was almost never empty, so these branches were rare; #724 clears the
+/// ring on every position discontinuity, which makes an empty ring the NORMAL post-relocation state
+/// and these holds an ordinary outcome of a GM summon into rock.
+///
+/// ⚠️ AMENDED (#845), for `EmbeddedNoRecovery` ONLY. This doc used to continue "the frame then
+/// changes nothing and re-runs identically next frame, so the body is frozen until something
+/// external moves it". That was an accurate description of an ABSORBING state, which is what made
+/// the embedded branch a bug rather than a disclosure, and #845 removed it there: that branch now
+/// falls through to a zone-wide search for anywhere a body could stand before it raises a hold, so
+/// the hold means the ZONE has nowhere, not that this body has no memory. It is still a frozen body
+/// while it lasts, and it can still last indefinitely — what changed is when it is raised, not how
+/// it ends.
+///
+/// ⚠️ Do not read the amendment as "these clear themselves now"; both directions were measured and
+/// both run the other way. A SUCCEEDING search never publishes this at all — the search arm returns
+/// before the hold is raised, so the relocation happens with the field `None` throughout (0 held
+/// frames of 300, in a zone the search solves). A hold that IS published does not clear on its own:
+/// in a zone whose geometry does not change, the once-a-second retry keeps failing for the same
+/// reason (1800 frames / 60 s, raised and never cleared). So a published hold is the signature of a
+/// FAILED search, and it still takes something external to end it. See `movement.rs`'s
+/// `nearest_standing_place`; that nothing published marks the relocation is #925.
+///
+/// The sentence still stands, unamended, for `UnderworldNoRecovery`. That branch was left alone on
+/// purpose: it runs after collide-and-slide, so lateral driver input still reaches the body and the
+/// state is not absorbing — see `last_resort_placement`'s doc for why extending the search there was
+/// reverted.
 ///
 /// This is deliberately NOT "am I stuck?" in general — a character walking into a wall is blocked
 /// and is not this. It is specifically "the controller has stopped the body and has no way to
 /// resume", which is the state an agent would otherwise read as a perfectly healthy stand-still.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerHoldReason {
-    /// The body is embedded in geometry, the depenetration push-out ring found nowhere it can
-    /// occupy, and there is no banked good position to fall back to. `depenetrate` returns `true`
-    /// every frame, so the whole rest of the step is skipped: the body cannot move at all, in any
-    /// direction, under any driver (WASD, `/goto`, `/move`).
+    /// The body cannot be placed: the client's embedded test is a DISJUNCTION — geometry pierces
+    /// the footprint, **or** there is no floor within `GROUND_DEPTH` (200 u) below the feet — and
+    /// this variant covers both. (#845's live casualty was the second: a column with zero triangles
+    /// over it. The name says "embedded"; do not read it as "geometry is inside the body".) The
+    /// depenetration push-out ring found nowhere it can occupy, there is no banked good position to
+    /// fall back to, and — since #845 — the zone-wide last-resort search also found nowhere. While
+    /// it lasts, `depenetrate` returns `true` every frame, so the whole rest of the step is skipped:
+    /// the body cannot move at all, in any direction, under any driver (WASD, `/goto`, `/move`).
     EmbeddedNoRecovery,
     /// The #150 fall-through guard refused a descent to/below the zone's underworld floor and had
     /// no banked good position to restore. The body hangs at the height it reached, not falling and
