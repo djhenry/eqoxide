@@ -532,8 +532,8 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(ZoneMapLoad::attempt(dir.path(), "z").outcome(),
                          Some(Err(ZoneMapLoadError::Missing))),
-            "a zone that ships no .txt at all is Missing — 27 zones in the shipped pack are in \
-             exactly this state and must not be reported as a defect");
+            "a zone that ships no .txt at all is Missing — at least 27 zones in the shipped pack \
+             are in exactly this state and must not be reported as a defect");
         std::fs::write(dir.path().join("z.txt"), "L 1,2,0,3,4,0,1,1,1").unwrap();
         match ZoneMapLoad::attempt(dir.path(), "z").outcome() {
             Some(Ok(zm)) => assert_eq!(zm.lines.len(), 1, "the map itself must survive too"),
