@@ -867,16 +867,62 @@ use eqoxide_ipc::MoveIntent;
     ///   about, and leaving it terminal left the exhibit uncovered on exactly the hanging run.
     /// * `skipped` — "the zone was dropped before the water check ran at all: no `.glb`, no grid, no
     ///   routable pairs". **Deliberately NOT checked here, and the reason is DIAGNOSTICS, not
-    ///   decidability.** All three buckets are decidable the instant a zone closes and all three are
-    ///   monotone (they are push-only `Vec`s), so a per-zone refusal on any of them could never fire
-    ///   where the terminal one would not — an earlier revision of this comment claimed the opposite
-    ///   for `unmeasured`/`skipped` and the PR's reviewer measured it false. What is true is that
-    ///   `skipped` is the COMMON state of a partial `$ZONE_DIR`, which is the normal state of a dev
-    ///   box: measured on a two-zone run (`ZONES=akanon,crushbone`) against real baked GLBs, akanon
-    ///   skipped for "no routable pairs" at zone 1 of 2, so gating `skipped` here would have killed
-    ///   the run before crushbone's 60 journeys ever ran. That cost is paid for a bucket the table
-    ///   already prints per zone (`(no glb — skipped)`), so it buys little. It stays in the terminal
-    ///   assert. That is a judgement call, not a wall.
+    ///   decidability.** `unmeasured_zones()` is a straight read of a push-only `Vec` and so is
+    ///   genuinely monotone. `unaccounted_zones()` — the bucket this gate actually reads — is NOT:
+    ///   it chains that push-only `Vec` with the single transient slot `open` (`water_grid.rs:522`),
+    ///   and `settle()` (the shared body of `add`/`skip`) `take()`s that slot on every call
+    ///   (`water_grid.rs:547`). Measured directly: after `begin_zone("z")`,
+    ///   `unaccounted_zones() == ["z"]`; right after `skip("z", …)`, it is `[]` again — the "hole" a
+    ///   caller would see mid-zone is not permanent at all. An earlier revision of this comment
+    ///   claimed the opposite of that property for `unmeasured`/`skipped` and the PR's reviewer
+    ///   measured it false.
+    ///
+    ///   **So why does this gate never miss a real hole? Not bucket monotonicity — call order.**
+    ///   `open_zone_checked` reads `unaccounted_zones()`/`unmeasured_zones()` BEFORE it calls
+    ///   `begin_zone` for the new zone, so what it sees is exactly what the PREVIOUS iteration left
+    ///   behind: if that zone was closed (`add`/`skip`), `open` is `None` and there is nothing to
+    ///   see; if it was abandoned, `open` still names it, and the chain surfaces it right here — via
+    ///   the TRANSIENT slot, before anything has cleared it. `begin_zone`'s own permanent record of
+    ///   an abandoned zone (`self.unaccounted.push(prev)`, `water_grid.rs:539-540`) is what a LATER
+    ///   reader (the terminal `is_complete()` assert, after zones opened after this one) relies on —
+    ///   but for THIS gate's own check, that push never even needs to run: the `panic!` below fires
+    ///   first, on the transient view, every time.
+    ///
+    ///   **The revision that replaced it — "a per-zone refusal could never fire where the terminal
+    ///   one would not" (#830) — is also not quite right, read literally**, for a simpler reason than
+    ///   bucket monotonicity: `faithful_walker_drift_corpus`'s own `assert!(tot_walked > 0)` runs
+    ///   BEFORE the terminal completeness assert, so a run that is all-`skipped` (never checked by
+    ///   this gate at all) or a single unmeasured zone with nothing opened after it (this gate only
+    ///   re-checks a zone's holes when the NEXT zone opens — the corpus's own terminal-assert
+    ///   comment, above, already notes this for "the last zone opened") dies at `tot_walked > 0` and
+    ///   the terminal assert never runs, full stop. And whenever THIS gate itself panics, that panic
+    ///   unwinds past both asserts, so in every run where the per-zone refusal actually fires, the
+    ///   terminal one provably does NOT run in that same execution — the opposite of "could never
+    ///   fire where the terminal one would not." The corrected claim is narrower: no NEW false
+    ///   positive — a hole this gate catches was always a real one (its zone was truly abandoned, or
+    ///   truly failed to load) — not that the terminal check is somehow redundant with this one.
+    ///
+    ///   **Why `skipped` is the one bucket exempt, restated because the old rationale overstated its
+    ///   scope (#830).** Not because it is rarer than the other two — #762's own motivating exhibit
+    ///   (the `unmeasured` bullet, above) is a build host holding only 2 of 497 `.wtr` files, so
+    ///   "`skipped` is the common state" is not a fact that distinguishes it from `unmeasured`, and no
+    ///   comparably-measured count exists here for how often each `skipped` cause fires on a real
+    ///   corpus — this file has no baked `$ZONE_DIR` to run that measurement against, so that piece
+    ///   of the asymmetry is left unmeasured, not assumed clean. What DOES distinguish them is what
+    ///   a hole SIGNALS, not how often it occurs:
+    ///   `no glb`/`no grid` (two of `skipped`'s three causes) mean the zone was never in scope for
+    ///   this run at all — the ROUTINE, expected shape of a `$ZONE_DIR` that only holds a
+    ///   caller-chosen subset of zones. `unmeasured` means
+    ///   the zone WAS in scope — its `.glb` and grid loaded, so someone deliberately provided it — and
+    ///   specifically its paired `.wtr` failed, which is a claim about a broken delivery for a zone
+    ///   you asked for; #762 was filed as a bug for exactly that reason, not treated as routine.
+    ///   Measured on a two-zone run (`ZONES=akanon,crushbone`) against real baked GLBs: akanon skipped
+    ///   for "no routable pairs" (`skipped`'s third cause, unrelated to asset absence, and itself not
+    ///   measured against the other two here) at zone 1 of 2, so gating `skipped` here would have
+    ///   killed the run before crushbone's 60 journeys ever ran. That cost is paid for a bucket the
+    ///   table already prints per zone (`(no glb — skipped)`), so it buys little. `skipped` stays out
+    ///   of this gate. That is a judgement call about what a hole signals, not a frequency claim, and
+    ///   not a wall.
     ///
     /// **What an abort here costs (N4).** This panics mid-loop, so the zones AFTER `zone` are never
     /// opened and their holes are never seen: the message is a partial picture and names only the
@@ -956,6 +1002,60 @@ use eqoxide_ipc::MoveIntent;
                 caught the abandoned zone — which is exactly the #805 defect");
     }
 
+    /// **#831 — the `[ABORTED …]` report's CONTENT is pinned by an execution-observable, not source
+    /// text.** `open_zone_checked` prints a `[ABORTED while opening {zone}]` block before it panics
+    /// (see its doc's N4 paragraph) — that block, not the panic message, is the honesty affordance:
+    /// it is what tells a reader the run died mid-corpus and the water columns above it are not a
+    /// score. The reviewer's R7 mutation on #824 deleted that `println!` entirely and the suite
+    /// stayed green (11 passed / 0 failed): the three `should_panic` strings in this file pin only
+    /// the PANIC message's bucket names, never the report block, so nothing noticed it was gone.
+    ///
+    /// A source-text grep for the `println!` call would have the same shape as the eight prior
+    /// measured evasions in this project (#799) — it proves the call is WRITTEN, not that it RUNS.
+    /// So this test instead runs the real defect fixture
+    /// (`zone_accounting_fires_before_the_corpus_loop_ends`, above) as a SUBPROCESS with
+    /// `--nocapture`, captures its actual stdout, and asserts the report's own words are IN the
+    /// captured bytes: the `[ABORTED …]` tag naming the zone the run died on, `PARTIAL`, and the
+    /// "not a corpus score" disclaimer. Only an interpreter that actually executed the `println!`
+    /// could have produced them.
+    ///
+    /// **Mutation check (see PR body for the transcript of all three runs):**
+    /// 1. Delete the `println!` in `open_zone_checked` → this test goes RED (the captured stdout no
+    ///    longer contains the report), while the fixture test it shells out to still passes (its
+    ///    `should_panic` string lives in the `panic!` two lines below the deleted call, untouched).
+    /// 2. Wrap that same `println!` in `if false { … }` → RED for the identical reason: the call is
+    ///    still fully compiled and present in the source text, so a text-presence pin would stay
+    ///    green here, but it is never reached, so the captured stdout is still missing the report.
+    /// 3. Restore the call → GREEN.
+    #[test]
+    fn aborted_report_content_is_pinned_by_execution() {
+        let exe = std::env::current_exe().expect("test binary path (for the subprocess re-run)");
+        let out = std::process::Command::new(&exe)
+            .arg("zone_accounting_fires_before_the_corpus_loop_ends")
+            .arg("--exact")
+            .arg("--nocapture")
+            .output()
+            .expect("failed to spawn the inner test as a subprocess");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // The inner test is `#[should_panic(...)]`; libtest reports it "ok" and the process exits 0
+        // when the expected panic occurred. A non-zero exit here means the FIXTURE broke — a
+        // different failure from the one this test exists to catch — so fail loudly with both
+        // streams rather than let a fixture regression masquerade as a report regression.
+        assert!(out.status.success(),
+            "fixture broke: zone_accounting_fires_before_the_corpus_loop_ends did not pass as a \
+             subprocess (status {:?}) — this test cannot judge the report until that fixture is \
+             healthy again.\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
+        assert!(stdout.contains("[ABORTED while opening zone_c_never_terminates]"),
+            "the [ABORTED …] tag naming the zone the run died on is missing from the captured \
+             stdout — the report was deleted, unreached, or renamed.\ncaptured stdout:\n{stdout}");
+        assert!(stdout.contains("PARTIAL"),
+            "the PARTIAL tag is missing from the captured stdout.\ncaptured stdout:\n{stdout}");
+        assert!(stdout.contains("this is not a corpus score"),
+            "the \"this is not a corpus score\" disclaimer is missing from the captured stdout.\n\
+             captured stdout:\n{stdout}");
+    }
+
     /// **#805 — GREEN direction, and the pin on `skipped` being exempt.** Every zone here is CLOSED,
     /// three by `skip` (a partial `$ZONE_DIR`, the normal state of a dev box) and one by a MEASURED
     /// `add`. The per-zone refusal must stay silent through all of them — otherwise the corpus would
@@ -1029,15 +1129,19 @@ use eqoxide_ipc::MoveIntent;
     /// **Rename guard for this file's doc-comment citations.** `open_zone_checked`'s rustdoc names
     /// `faithful_walker_drift_corpus`; listing it here as a `fn` value makes a rename a COMPILE
     /// error instead of a citation that rots silently. The nav crate's citation scan
-    /// (`every_test_citation_in_the_four_citation_files_resolves_and_is_listed_in_a_guard`) requires
+    /// (`every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard`) requires
     /// exactly this and reads this file — measured, not assumed: the workspace suite failed with
     /// "`faithful_walker_drift_corpus` … no `_cited`/`_helpers` guard in this file names it" until
-    /// this array existed.
+    /// this array existed. `aborted_report_content_is_pinned_by_execution`'s doc comment (#831) names
+    /// `zone_accounting_fires_before_the_corpus_loop_ends` the same way — added below after the
+    /// workspace suite failed on that citation too, for the identical reason.
     #[test]
     fn doc_comment_citations_in_this_file_are_rename_guarded() {
         let _cited: &[fn()] = &[
             // cited by `open_zone_checked`'s rustdoc (#805)
             faithful_walker_drift_corpus,
+            // cited by `aborted_report_content_is_pinned_by_execution`'s rustdoc (#831)
+            zone_accounting_fires_before_the_corpus_loop_ends,
         ];
     }
 

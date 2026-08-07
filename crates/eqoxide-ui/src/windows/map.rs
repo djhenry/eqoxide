@@ -183,6 +183,28 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                 );
             }
         }
+    } else if let Some(err) = cx.zone_map_error {
+        // #873: a present-but-unreadable base file or detail layer used to leave this canvas
+        // silently blank — indistinguishable from the very common, unremarkable case of a zone that
+        // simply has no map at all. `try_load` refusing the WHOLE load on a broken layer stays
+        // correct (drawing partial map art with no indication it's partial would just reproduce
+        // #816's silent-partial shape one layer further down); what changes here is that the reason
+        // is no longer thrown away, so a human driver sees WHY instead of an unexplained empty map.
+        //
+        // This branch fires ONLY for a map that is there and broken — a zone that ships no map
+        // reaches here with `zone_map_error: None` and keeps the blank canvas it has always had
+        // (#877 round 2). The two are different events and must not read the same: calling an
+        // ordinary state an error is the same invariant violation as hiding a real one, and at
+        // least 27 of the shipped map pack's zones are in that ordinary state (exactly 27 of the
+        // 497 that ship a `water/<zone>.wtr` have no base `<zone>.txt`; zones with neither were not
+        // counted, so 27 is a floor — see `hud_zone_map_view` in the client's `app.rs`).
+        painter.text(
+            rect.min + Vec2::new(6.0, 6.0),
+            egui::Align2::LEFT_TOP,
+            format!("map data unavailable: {err}"),
+            egui::FontId::proportional(10.0),
+            theme::TEXT_WEAK,
+        );
     }
 
     // No zone map: the grid ticks are still pending.

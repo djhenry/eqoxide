@@ -345,6 +345,35 @@ impl StaticReason {
     }
 }
 
+/// One reported cap downgrade, keyed in [`EqRenderer::skin_cap_downgrades`] by [`downgrade_key`].
+///
+/// `joint_count` is the thing eqoxide#780 exists to report. `key_collision` is eqoxide#848's
+/// answer to the failure mode below: `downgrade_key` is only the loaded file's **base name**, so
+/// two different files under two different asset roots that happen to share a name key the same
+/// `BTreeMap` entry. Before this type existed that collision was invisible — the second load simply
+/// overwrote the first and an agent reading the report had no way to tell "this is the only
+/// `race_hum.glb` that exists" from "this is one of two, and the other one's downgrade just got
+/// erased". `source` (private — see below) is what lets [`record_skin_cap_downgrade`] tell those
+/// two cases apart on every write, and `key_collision` is the caller-visible answer.
+///
+/// `source` is deliberately **not** `pub`: it exists purely so the recorder can compare "the file
+/// this write is about" against "the file the last write to this key was about", and a caller
+/// outside this module has no legitimate use for a path that — per [`downgrade_key`]'s own doc — is
+/// local-machine detail this project does not publish. Making it unconstructable from outside the
+/// crate also means a caller cannot hand-build a `SkinCapDowngrade` with `key_collision: false` and
+/// insert it directly, bypassing the detection this type exists to hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkinCapDowngrade {
+    pub joint_count: usize,
+    /// True iff two files that are NOT the same file (by path) have ever been recorded under this
+    /// same key. Sticky, not a snapshot of "the current entry disagrees with the current source":
+    /// once two distinct sources have collided on a key, this stays `true` for the rest of the
+    /// map's life, even if every write after that happens to be from only one of the two files
+    /// again. See [`record_skin_cap_downgrade`] for why that stickiness is deliberate.
+    pub key_collision: bool,
+    source: std::path::PathBuf,
+}
+
 /// Record `model_path`'s joint count into `downgrades` iff `reason` is a genuine cap downgrade
 /// (`StaticReason::ExceedsCap`) — the one outcome eqoxide#780 requires to stop being silent. Pure
 /// so the recording decision is unit-testable without a `wgpu::Device`; `EqRenderer` cannot be
@@ -368,36 +397,68 @@ impl StaticReason {
 ///
 /// Both errors are the same mistake: a key that is a *proxy* for the file instead of the file. This
 /// function therefore takes the `&Path` that was actually handed to `ModelAsset::load` and derives
-/// the key from it.
+/// the key from it. As of eqoxide#848, `model_path` itself is no longer caller-supplied in the
+/// production call path: it comes from [`crate::models::ModelAsset::loaded_from`], the path
+/// `ModelAsset::load` actually opened, carried inside the asset the witness in `skin_observation`
+/// already owns — see that module's `observe_skin_fit` for why a caller can no longer hand this
+/// function a path that disagrees with what was loaded.
 ///
-/// ## Exactly how far that goes
+/// ## Exactly how far the KEY choice goes, and what eqoxide#848 changed
 ///
-/// One direction is structural: **two loads of one file cannot produce two entries**, because
-/// [`downgrade_key`] is a pure function of the path — same path in, same key out, and a `BTreeMap`
-/// does the rest.
+/// One direction was already structural: **two loads of one file cannot produce two entries**,
+/// because [`downgrade_key`] is a pure function of the path — same path in, same key out, and a
+/// `BTreeMap` does the rest.
 ///
-/// The other direction is not. The key is the path's **file name**, not the whole path, so two
-/// files with the same base name under two different asset roots collapse into one entry. That is
-/// measured, not reasoned: `two_roots_with_the_same_basename_collide_into_one_entry` in
-/// `tests/skin_cap_selection.rs` plants it. An earlier version of this doc claimed the collision was
-/// inexpressible "because the key IS the file"; it is not, and a reviewer said so. Reaching it needs
-/// one renderer to load character models from two roots that share a file name — `assets_path` is
-/// set by `load_character_models` and there is one per renderer, so it does not happen in the
-/// shipped flow, but nothing here *prevents* it.
+/// The other direction was not, and eqoxide#848 does not remove the underlying ambiguity — the key
+/// is still the path's **file name**, not the whole path, so two files with the same base name
+/// under two different asset roots still key the same `BTreeMap` entry. What changes is that this
+/// is no longer *silent*: every write compares the incoming `model_path` against the `source` the
+/// entry was last written from, and if they disagree, `key_collision` is set and stays set. An
+/// agent reading the report can now tell "this is the only `race_hum.glb`" (`key_collision: false`)
+/// from "two different files are fighting over this name and the joint count you're looking at
+/// might not be either of theirs" (`key_collision: true`) — see
+/// `two_roots_with_the_same_basename_collide_into_one_entry` in `tests/skin_cap_selection.rs`,
+/// which used to assert the silent overwrite as accepted behavior and now asserts the flag instead.
+/// Reaching the collision at all needs one renderer to load character models from two roots that
+/// share a file name — `assets_path` is set by `load_character_models` and there is one per
+/// renderer, so it does not happen in the shipped flow today, but nothing here *prevents* it, which
+/// is exactly why the detection has to be structural rather than "know your assets don't collide".
 ///
-/// The base name is still the right key, for a reason unrelated to collisions: this map is *meant*
-/// to be read by an AI agent over HTTP (eqoxide#797 — nothing publishes it yet; grep for
-/// `skin_cap_downgrades` outside this crate and the only hit is a comment in
-/// `src/bin/render_model.rs`), and an absolute local path is both unstable across machines and
-/// local detail this project does not publish. `race_pcfroglok.glb` identifies the rig; the
-/// absolute path in front of it identifies the machine.
+/// The stickiness (`existing || this_write_disagrees`, never recomputed from scratch) is
+/// deliberate: a `BTreeMap` holds one `SkinCapDowngrade` per key, so once two sources have written
+/// one key, only one `source` can be remembered going forward. Resetting the flag whenever the
+/// *current* write happens to agree with whichever source is currently remembered would let a
+/// three-load sequence (A, B, A) report `key_collision: false` after the third write despite two
+/// genuinely different files having shared this key — the flag would then be lying about exactly
+/// the thing it exists to disclose. `key_collision_is_sticky_and_does_not_clear_on_a_later_agreeing_write`
+/// (in `tests/skin_cap_selection.rs`) pins that: it drives an a, b, a, a sequence and asserts the
+/// flag never clears once two distinct sources have written the key.
+///
+/// The base name is still the right key, for a reason unrelated to collisions: this map is meant to
+/// be read by an AI agent over HTTP (eqoxide#797 — see `/v1/observe/debug`'s `skin_cap_downgrades`
+/// field, documented in `docs/http-api.md`), and an absolute local path is both unstable across
+/// machines and local detail this project does not publish. `race_pcfroglok.glb` identifies the
+/// rig; the absolute path in front of it identifies the machine — which is also exactly why
+/// `source` above is not `pub`.
 pub fn record_skin_cap_downgrade(
-    downgrades: &mut std::collections::BTreeMap<String, usize>,
+    downgrades: &mut std::collections::BTreeMap<String, SkinCapDowngrade>,
     model_path: &std::path::Path,
     reason: StaticReason,
 ) {
     if let Some(joint_count) = reason.downgrade_joint_count() {
-        downgrades.insert(downgrade_key(model_path), joint_count);
+        let key = downgrade_key(model_path);
+        let source = model_path.to_path_buf();
+        match downgrades.get_mut(&key) {
+            Some(existing) => {
+                let collided_this_write = existing.source != source;
+                existing.joint_count = joint_count;
+                existing.source = source;
+                existing.key_collision = existing.key_collision || collided_this_write;
+            }
+            None => {
+                downgrades.insert(key, SkinCapDowngrade { joint_count, key_collision: false, source });
+            }
+        }
     }
 }
 
@@ -483,10 +544,70 @@ fn build_unit_cube(device: &wgpu::Device) -> GpuMesh {
     }
 }
 
+/// Proof that [`EqRenderer::render_frame`] actually ran, carrying the monotonic index of the frame
+/// it encoded (#867).
+///
+/// This exists so an observable that claims to describe a *drawn* frame cannot be published on a
+/// tick where no draw happened. `app.rs`'s render tick can `return` before `render_frame` on three
+/// `wgpu::SurfaceError` arms (`Lost`/`Outdated`/`Timeout`); a publisher that only *textually* sits
+/// after the render call is still reachable on those paths after any ordinary refactor. Requiring a
+/// `DrawnFrame` value instead makes the pre-draw publish fail to compile: there is nothing to pass.
+///
+/// The guarantee is structural, and exactly this wide:
+///
+/// - The single field is private and there is no public constructor, so **outside this crate the
+///   only way to obtain one is to call `render_frame`.** (`test-fixtures` adds
+///   [`DrawnFrame::for_test`]; that feature is dev-only and off in a production build — the same
+///   convention `eqoxide_core::game_state::make_entity` uses.)
+/// - It is deliberately **not** `Copy`/`Clone`, so one `render_frame` call yields one token and a
+///   consumer that takes it by value takes it once.
+/// - It proves a `render_frame` call *returned*. It does **not** prove the frame was submitted to
+///   the queue, presented, or reached a screen — `queue.submit`/`present` happen after, and the
+///   off-screen capture path (#422) calls `render_frame` too. "Drawn" here means encoded.
+/// - Nothing stops a caller storing a token in a field and consuming it on a later tick. That would
+///   publish a stale `index`, which is precisely what [`index`](Self::index) is for: the staleness
+///   becomes visible to the reader rather than silent.
+///
+/// ```
+/// // The type and its accessor are public and nameable — the control for the `compile_fail`
+/// // below, which would otherwise pass on a typo.
+/// fn _read(d: eqoxide_renderer::DrawnFrame) -> u64 { d.index() }
+/// ```
+///
+/// ```compile_fail
+/// // …but it cannot be fabricated. `index` is private and there is no constructor, so a
+/// // would-be pre-draw publisher has no way to produce the argument. This test going GREEN
+/// // (i.e. the snippet failing to compile) is the whole guarantee; if `index` were made `pub`,
+/// // or a public constructor added, this doctest fails.
+/// let _ = eqoxide_renderer::DrawnFrame { index: 7 };
+/// ```
+#[derive(Debug)]
+#[must_use = "a DrawnFrame is proof that a frame was encoded — publish it or explicitly discard it"]
+pub struct DrawnFrame {
+    index: u64,
+}
+
+impl DrawnFrame {
+    /// Monotonic, process-lifetime index of this frame. Starts at 1 for the first
+    /// `render_frame` call; a consumer that records it can tell "the value I am reading came from
+    /// the frame after the one I read last" from "nothing has been drawn since".
+    pub fn index(&self) -> u64 { self.index }
+
+    /// Fabricate a token in tests. Dev-only: gated behind `test-fixtures`, which downstream crates
+    /// enable as a **dev-dependency** feature so a production build cannot reach it. Without this,
+    /// no unit test outside this crate could exercise a code path that takes a `DrawnFrame`, since
+    /// `render_frame` needs a real GPU device.
+    #[cfg(feature = "test-fixtures")]
+    pub fn for_test(index: u64) -> Self { Self { index } }
+}
+
 /// All GPU resources for the currently-loaded zone: the wgpu device/queue/surface, uploaded zone +
 /// placed-object meshes, character models + textures, pipelines/layouts, and per-entity animation
 /// state. Rebuilt on each zone change; `pass.rs` reads it to issue the frame's draw calls.
 pub struct EqRenderer {
+    /// Count of `render_frame` calls that have completed, process-lifetime. Handed out as
+    /// [`DrawnFrame::index`] so a published observable can name *which* frame it describes (#867).
+    frames_drawn:            u64,
     pub device:              wgpu::Device,
     pub queue:               wgpu::Queue,
     pub surface_config:      wgpu::SurfaceConfiguration,
@@ -519,16 +640,25 @@ pub struct EqRenderer {
     model_load_tried:        std::collections::HashSet<(&'static str, u8)>,
     /// Character models whose skin EXCEEDED [`JOINT_CAP`] and were therefore downgraded to the
     /// static (unskinned) render arm, keyed by the **GLB file name that was loaded** (e.g.
-    /// `race_hum_f.glb`), with the joint count that caused it. This is the observable eqoxide#780
-    /// exists to add. Absent = no downgrade has happened; a missing model or a genuinely unskinned
-    /// one (e.g. `boat.glb`) is never inserted here, only a model that HAD real skin data and
-    /// didn't fit. Not yet wired to the HTTP API (that crosses into `src/app.rs`, out of scope —
-    /// see the #780 PR body) but is public and queryable in-process, and every downgrade is also
-    /// logged at `error!`.
+    /// `race_hum_f.glb`), with the joint count that caused it and whether that key has ever been
+    /// written by two different files (see [`SkinCapDowngrade`]). This is the observable
+    /// eqoxide#780 exists to add. Absent = no downgrade has happened; a missing model or a
+    /// genuinely unskinned one (e.g. `boat.glb`) is never inserted here, only a model that HAD real
+    /// skin data and didn't fit. Every downgrade is also logged at `error!`.
+    ///
+    /// Wired to the HTTP API as of eqoxide#797: `src/app.rs` publishes a per-frame snapshot of this
+    /// map into `eqoxide_ipc::SkinCapDowngradesShared`, and `/v1/observe/debug`'s
+    /// `skin_cap_downgrades` field (`crates/eqoxide-http/src/observe.rs`, documented in
+    /// `docs/http-api.md`) serves it — the same publish shape `frame_profile` already used. Before
+    /// eqoxide#797 this sentence read "not yet wired to the HTTP API... but is public and queryable
+    /// in-process": that was true and is why #797 was filed — a value only a Rust caller inside this
+    /// process could read is not an observable the driving agent has, no matter how public the
+    /// field is.
     ///
     /// The key is the file rather than `(label, gender)` because the file is what the joint count
     /// describes; see [`record_skin_cap_downgrade`] for why that distinction is load-bearing
-    /// (eqoxide#813).
+    /// (eqoxide#813), and for why the key can still collide across two asset roots (eqoxide#848) and
+    /// what `key_collision` does about it.
     ///
     /// Written in exactly one place *as the tree stands* — [`crate::skin_observation::observe_skin_fit`],
     /// which is also the only producer of the [`crate::skin_observation::ObservedModel`] that
@@ -553,7 +683,7 @@ pub struct EqRenderer {
     ///   apart" while the destination was a caller-supplied `&mut BTreeMap`; a reviewer substituted
     ///   a throwaway map, the crate compiled clean and stayed green, and this field stayed empty for
     ///   a 129-joint rig. That route is closed; see the module's "Does not" list for what is not.
-    pub skin_cap_downgrades: std::collections::BTreeMap<String, usize>,
+    pub skin_cap_downgrades: std::collections::BTreeMap<String, SkinCapDowngrade>,
     /// Channel to the background model-sync worker: send a race model KEY (e.g. "race_hum") to
     /// fetch its `charmodel/<key>` set on demand the first time a spawn of that race is seen, so
     /// the client never downloads the ~450 MB of race models it doesn't need. None until wired in
@@ -788,6 +918,7 @@ impl EqRenderer {
             }).collect();
 
         Self {
+            frames_drawn: 0,
             device,
             queue,
             surface_config,
@@ -1055,14 +1186,17 @@ impl EqRenderer {
                 // chosen for a joint count the uploaded model does not have. That argument was a
                 // caller-computed `Option<usize>` until round 4, and replacing it with `None` here
                 // was a compile-clean, still-green way back to eqoxide#780.
-                // Keyed by the file that was just loaded — `path`, not `key`/`gender`, because
-                // gender 1 falls back to the male GLB when there is no `_f` variant and the joint
-                // count belongs to the file (eqoxide#813). `path` is still caller-supplied and
-                // still unpinned; see `observe_skin_fit`'s doc for what that leaves open.
+                // Keyed by `asset.loaded_from()` — the file `ModelAsset::load` actually opened, not
+                // `path` handed in separately (eqoxide#848: a caller-supplied `model_path` argument
+                // could disagree with what was really loaded and file the report under the wrong
+                // name, silently). It is set by `load` itself from the same `path` it opened, into a
+                // field PRIVATE to `models.rs`, so there is no second value here that could drift
+                // from it AND no way to overwrite the first. The privacy is what closes it: while
+                // the field was `pub`, inserting `asset.loaded_from = "…boat.glb".into();` on this
+                // very line compiled clean and left the suite green (eqoxide#900 review, row R3′ in
+                // `skin_observation`'s header) — removing the argument had only moved the forgery.
                 let observed = crate::skin_observation::observe_skin_fit(
                     crate::skin_observation::DowngradeSink::of(self),
-                    &path,
-                    key,
                     asset,
                 );
                 let model = self.build_character_model(key, observed);
@@ -1446,6 +1580,10 @@ impl EqRenderer {
 
     /// Encode all render passes for one frame in correct depth order.
     /// Camera is computed here and stored on self for HUD label projection.
+    ///
+    /// Returns a [`DrawnFrame`] — the token an observable must hold to claim it describes a frame
+    /// that was actually drawn (#867). See that type's doc for exactly what the token does and does
+    /// not prove.
     pub fn render_frame(
         &mut self,
         encoder:    &mut wgpu::CommandEncoder,
@@ -1454,7 +1592,7 @@ impl EqRenderer {
         cam_eye:    [f32; 3],
         cam_target: [f32; 3],
         dt:         f32,
-    ) {
+    ) -> DrawnFrame {
         use crate::gpu::GpuModel;
 
         // Lazy character-model loading (eqoxide#224): parse + upload the models that the entities
@@ -1718,6 +1856,12 @@ impl EqRenderer {
         // Nav diagnostics overlay (#608): depth-tested world-space lines drawing the walker's
         // PUBLISHED snapshot verbatim. No-op unless `scene.nav_debug` is present (F11).
         crate::nav_overlay::encode_nav_overlay_pass(self, encoder, view, scene);
+
+        // #867: the token is minted HERE, at the end of the only function that encodes a frame, so
+        // holding one is proof the passes above were encoded. Nothing else in this crate constructs
+        // a `DrawnFrame` (outside `test-fixtures`), and its field is private, so no other crate can.
+        self.frames_drawn += 1;
+        DrawnFrame { index: self.frames_drawn }
     }
 
     /// Recreate the depth texture to match new surface dimensions.
@@ -1788,7 +1932,11 @@ mod tests {
             view: &wgpu::TextureView,
             scene: &crate::scene::SceneState,
         ) {
-            r.render_frame(enc, view, scene,
+            // #867: the return type is part of the signature under test — `render_frame` must hand
+            // back the `DrawnFrame` token that `CameraState::snapshot` requires. Binding it with an
+            // explicit type annotation (not `let _`) is what makes a silent change back to `-> ()`
+            // fail to compile here.
+            let _drawn: DrawnFrame = r.render_frame(enc, view, scene,
                 [0.0_f32; 3], [0.0_f32; 3], 0.016);
         }
     }

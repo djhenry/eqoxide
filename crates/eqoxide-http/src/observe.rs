@@ -684,6 +684,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let prov = player.position_provisional_since;
     let health = s.health();
     let frame_profile = *s.frame_profile.lock().unwrap();
+    // #797 — the STATIC-arm skin-cap downgrades the renderer has recorded so far this session,
+    // keyed by loaded file base name (never a full local path — see `downgrade_key`). Cloned out
+    // from behind the lock so the JSON literal below can move it in without holding the mutex
+    // across serialization.
+    let skin_cap_downgrades = s.skin_cap_downgrades.lock().unwrap().clone();
     let nav = s.nav.nav_state.lock().unwrap().clone();
     // Is nav answering from WINDING-BLIND (inverted-art) ground in this zone? (#375, D-2)
     //
@@ -1208,17 +1213,55 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // Distinct from the zone-lifetime `nav_tight` counter — this is the route being walked now.
         "nav_tier": nav_tier,
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
-        // Render-owned — the one field here the render loop legitimately publishes.
         "frame_profile": frame_profile,
-        // #852: `azimuth_deg`/`elevation_deg`/`radius`/`focus` are the orbit's DESIRED framing —
-        // NOT necessarily where the frame was actually rendered from. In tight geometry the
-        // render loop pulls the eye in toward `focus` until it clears collision, and that
-        // pull-in does not touch these four fields. `eye` is the position the CURRENT frame was
-        // actually rendered from (the exact value passed to `render_frame` this tick — see
-        // `camera_state::resolve_camera_eye`); use it, not a `radius`-derived distance, for
-        // anything about what is actually on screen. `occluded` says whether pull-in fired this
-        // frame; `still_blocked` says whether, even after pull-in, `eye` is still not fully clear
-        // of collision (a degenerate case that must be reported, not silently rendered).
+        // #797 — models whose skin joint count EXCEEDED the renderer's animation cap and were
+        // downgraded to the static (unskinned) render arm this session. Keyed by loaded file base
+        // name. Always present, `{}` rather than `null`, so a caller that greps and finds the key
+        // MISSING knows it is talking to a client too old to report this at all — the same
+        // distinction `nav_local_planner_dead` draws above.
+        //
+        // What `{}` does and does not say (#900 review r1, finding 6): it is an exact mirror of the
+        // renderer's own map, which is written only by `ensure_character_model` (via
+        // `observe_skin_fit`) inside `render_frame`, is insert/update-only, and is published
+        // immediately after that same `render_frame` call — so `{}` is never a STALE non-empty
+        // state going unreported. But it does conflate two situations an agent cannot separate from
+        // this field alone: "every character model loaded so far fits the cap" and "no character
+        // model has been loaded yet" (loading screen, zoning, nothing in view). Read `{}` as "no
+        // downgrade has been recorded so far this session", NOT as "the model you are asking about
+        // animates" — that second reading is only justified once you know the model is on screen.
+        // Each entry is `{joint_count, key_collision}`:
+        //   joint_count   — the joint count that triggered the downgrade (the MOST RECENT one, if
+        //                   this key has been (re)loaded more than once this session).
+        //   key_collision — true iff two files that hash to the SAME base-name key were BOTH loaded
+        //                   this session (eqoxide#848). When true, `joint_count` is not reliably
+        //                   attributable to either file — see docs/http-api.md.
+        // See `eqoxide_renderer::renderer::record_skin_cap_downgrade` for how this map is built.
+        "skin_cap_downgrades": skin_cap_downgrades,
+        // EVERY field in this block describes ONE frame — the one named by `drawn_frame` — and not
+        // "now" (#867). The render loop publishes the whole struct in a single write, only after
+        // `render_frame` has actually encoded a frame; on a tick that returns early from the
+        // `wgpu::SurfaceError` match (`Lost`/`Outdated`/`Timeout`) nothing is published and the
+        // previous values stay. `drawn_frame` is `null` before the first frame is ever drawn — the
+        // startup seed `main.rs` publishes, which the API serves through GPU init and the first zone
+        // load.
+        //
+        // READ `drawn_frame`/`drawn_age_ms` BEFORE TRUSTING ANYTHING ELSE HERE. The staleness is
+        // unbounded: `about_to_wait` stops requesting redraws 300 ms after the last activity, so a
+        // surface that keeps returning `Outdated` (a minimised or occluded window, not just a
+        // resize) freezes this whole block indefinitely, with every field looking exactly as it does
+        // on a healthy tick. `snapshot_age_ms` above is the NETWORK clock and does NOT age this —
+        // it reads fresh throughout a rendering stall. `drawn_age_ms` is computed when this response
+        // is encoded; `drawn_frame` unchanged across two reads means nothing was drawn in between.
+        //
+        // #852: `azimuth_deg`/`elevation_deg`/`radius`/`focus`/`mode` are the orbit's DESIRED
+        // framing as of that frame — NOT necessarily where it was rendered from. In tight geometry
+        // the render loop pulls the eye in toward `focus` until it clears collision, and that
+        // pull-in does not touch those fields. `eye` is the position that frame was actually
+        // rendered from — see `camera_state::resolve_camera_eye` and
+        // `eqoxide_ipc::CameraSnapshot`. Use `eye`, not a `radius`-derived distance, for anything
+        // about what was drawn. `occluded` says whether pull-in fired on the frame `eye` describes;
+        // `still_blocked` says whether, even after pull-in, `eye` was still not fully clear of
+        // collision (a degenerate case that must be reported, not silently rendered).
         "camera": {
             "azimuth_deg":   cam.azimuth.to_degrees(),
             "elevation_deg": cam.elevation.to_degrees(),
@@ -1228,6 +1271,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "eye":           cam.eye,
             "occluded":      cam.occluded,
             "still_blocked": cam.still_blocked,
+            "drawn_frame":   cam.drawn_frame,
+            "drawn_age_ms":  cam.drawn_at.map(|t| t.elapsed().as_millis() as u64),
         },
     });
     // #371 — attached here (not inside the literal above, which is already at the json! recursion
@@ -3287,6 +3332,125 @@ mod tests {
             "camera.still_blocked must say the eye is still not fully clear of collision");
     }
 
+    /// #797 (added in #900's review round 2) — the renderer's skin-cap downgrade report must reach
+    /// a RESPONSE BODY, not merely an `HttpState` field. This is #797's own failure mode one layer
+    /// up: `EqRenderer::skin_cap_downgrades` existed since #795/#820 and was perfectly public, and
+    /// the driving agent still could not read it, because nothing carried it to a response. A
+    /// serving path that quietly stops serving reproduces exactly that, and the round-1 reviewer
+    /// measured that it could: deleting the `"skin_cap_downgrades"` entry from `get_debug`'s JSON
+    /// literal was compile-clean and left the whole workspace green.
+    ///
+    /// Same shape as `camera_eye_reaches_the_debug_json_852` above and
+    /// `hold_reaches_the_debug_json_817` below: drive the REAL router through `debug_json`, parse
+    /// the REAL bytes, and assert on both the empty and the populated case — the empty case pins
+    /// that the key is always PRESENT (an agent that greps and finds nothing cannot tell "nothing
+    /// downgraded" from "this client predates the field"), the populated case pins that a
+    /// downgrade the renderer actually recorded is carried through with both sub-fields intact.
+    ///
+    /// MUTATION CHECK (remote builder, both directions, run for #900 round 2 and reported in that
+    /// PR comment — not reasoned):
+    /// - **DELETE** the `"skin_cap_downgrades": skin_cap_downgrades,` entry from `get_debug`'s JSON
+    ///   literal → RED at the `contains_key` assertion below.
+    /// - **WRAP** the `let skin_cap_downgrades = …lock().unwrap().clone();` read in `if false { … }`
+    ///   (leaving an empty `BTreeMap` behind) → RED at the populated-case assertions. The WRAP is
+    ///   run because DELETE alone does not distinguish "this check runs" from "this check is merely
+    ///   written" — eqoxide#799, eight measured cases in this repo.
+    #[tokio::test]
+    async fn skin_cap_downgrades_reaches_the_debug_json_797() {
+        // ── Empty: an explicit `{}` that IS in the object, never an omitted key. ────────────────
+        let v = debug_json(empty_state()).await;
+        let obj = v.as_object().expect("debug object");
+        assert!(obj.contains_key("skin_cap_downgrades"),
+            "skin_cap_downgrades must be PRESENT in the served body even when empty — an agent \
+             that greps for it and finds nothing cannot tell \"nothing has downgraded\" from \
+             \"this client cannot report downgrades at all\". Top-level keys served: {:?}",
+            obj.keys().collect::<Vec<_>>());
+        assert_eq!(v["skin_cap_downgrades"], serde_json::json!({}),
+            "with nothing recorded it must serialise as an empty OBJECT, not null and not omitted, \
+             got {}", v["skin_cap_downgrades"]);
+
+        // ── Populated: what the renderer recorded, carried through with both sub-fields. ────────
+        let state = empty_state();
+        {
+            let mut recorded = state.skin_cap_downgrades.lock().unwrap();
+            recorded.insert("race_hum.glb".to_string(),
+                eqoxide_ipc::SkinCapDowngradeView { joint_count: 190, key_collision: false });
+            // The #848 case: one key two different files have written. `key_collision` is the only
+            // thing in the response that discloses it, so it has to survive the trip.
+            recorded.insert("race_pcfroglok.glb".to_string(),
+                eqoxide_ipc::SkinCapDowngradeView { joint_count: 204, key_collision: true });
+        }
+        let v = debug_json(state).await;
+        let served = v["skin_cap_downgrades"].as_object()
+            .expect("skin_cap_downgrades must be an OBJECT in the served body");
+        assert_eq!(served.len(), 2,
+            "every recorded downgrade must be served, not just the first — served: {:?}",
+            served.keys().collect::<Vec<_>>());
+        assert_eq!(v["skin_cap_downgrades"]["race_hum.glb"],
+            serde_json::json!({ "joint_count": 190, "key_collision": false }),
+            "the recorded joint count and collision flag must both reach the body verbatim");
+        assert_eq!(v["skin_cap_downgrades"]["race_pcfroglok.glb"]["key_collision"],
+            serde_json::json!(true),
+            "key_collision: true must reach the body — it is the ONLY signal an agent has that this \
+             entry's joint_count is not reliably attributable to one file (eqoxide#848)");
+        assert_eq!(v["skin_cap_downgrades"]["race_pcfroglok.glb"]["joint_count"],
+            serde_json::json!(204),
+            "a colliding entry still carries its joint count; the flag qualifies it, not replaces it");
+    }
+
+    /// #867 — the camera block's FRESHNESS signal must reach the served body, in both states.
+    ///
+    /// Every other field in `camera` looks identical on a snapshot published this tick and on one
+    /// frozen since the window was minimised (`about_to_wait` stops requesting redraws 300 ms after
+    /// the last activity, so a persistently `Outdated` surface freezes it indefinitely). The
+    /// neighbouring `snapshot_age_ms` is the NETWORK clock and stays fresh right through such a
+    /// stall, so an agent that reaches for it is actively misled. `drawn_frame`/`drawn_age_ms` are
+    /// the only way to tell — which makes their PRESENCE in the response the thing worth pinning,
+    /// exactly as `camera_eye_reaches_the_debug_json_852` above pins `eye`'s.
+    ///
+    /// Both states are asserted because they fail differently: a `null` `drawn_frame` that never
+    /// reaches the JSON reads as "this client cannot report one", while a `Some` that never reaches
+    /// it reads as "nothing has been drawn" — opposite wrong answers from the same omission.
+    ///
+    /// MUTATION CHECK (executed, both directions): deleting the `"drawn_frame"`/`"drawn_age_ms"`
+    /// entries from `get_debug`'s `"camera"` literal turns the first `contains_key` RED; leaving
+    /// them but publishing `drawn_frame: None` in the drawn case turns the `Some(4242)` assertion
+    /// RED.
+    #[tokio::test]
+    async fn camera_freshness_reaches_the_debug_json_867() {
+        // (a) never drawn — the state `main.rs` seeds before the event loop exists.
+        let state = empty_state();
+        let v = debug_json(state).await;
+        let cam = v["camera"].as_object().expect("camera object");
+        assert!(cam.contains_key("drawn_frame") && cam.contains_key("drawn_age_ms"),
+            "camera.drawn_frame/drawn_age_ms must be PRESENT in the served body — without them an \
+             agent cannot tell a snapshot published this tick from one frozen since the window was \
+             minimised. Keys served: {:?}", cam.keys().collect::<Vec<_>>());
+        assert_eq!(cam["drawn_frame"], serde_json::json!(null),
+            "before any frame is drawn, camera.drawn_frame must be null — the startup seed is a \
+             plausible-looking orbit position that nothing was ever rendered from (#867)");
+        assert_eq!(cam["drawn_age_ms"], serde_json::json!(null),
+            "…and drawn_age_ms must be null rather than an age since process start, which would \
+             read as a recent draw");
+
+        // (b) drawn — a snapshot the render loop would publish after a real `render_frame`.
+        let state = empty_state();
+        {
+            let mut snap = state.camera.snapshot.lock().unwrap();
+            snap.drawn_frame = Some(4242);
+            snap.drawn_at    = Some(std::time::Instant::now());
+        }
+        let v = debug_json(state).await;
+        let cam = v["camera"].as_object().expect("camera object");
+        assert_eq!(cam["drawn_frame"], serde_json::json!(4242),
+            "camera.drawn_frame must carry the published frame index through verbatim — polling it \
+             for change is how a caller detects that drawing has stopped");
+        assert!(cam["drawn_age_ms"].as_u64().is_some(),
+            "camera.drawn_age_ms must be a number once a frame has been drawn, computed at READ \
+             time (an age computed at publish time would itself go stale). Got: {:?}",
+            cam["drawn_age_ms"]);
+    }
+
     /// #724/#817 — the stuck-and-cannot-free disclosure must reach a RESPONSE BODY, not just a
     /// struct. Same failure shape as `afloat_stall_reaches_the_debug_json_801` just above:
     /// `PlayerState::hold` was computed, mirrored into `GameState` on every **net tick** by
@@ -5014,6 +5178,8 @@ mod tests {
             eye: [99.0, 0.0, 0.0],
             occluded: false,
             still_blocked: false,
+            drawn_frame: Some(7),
+            drawn_at: Some(std::time::Instant::now()),
         }
     }
 

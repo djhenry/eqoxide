@@ -975,7 +975,9 @@ pub struct HttpState {
     pub(crate) game_state:       GameStateSnapshot,
     /// The network thread's three liveness clocks — turned into `Health` on every read (#343).
     pub(crate) net_health:       NetHealthShared,
-    /// Render-owned frame timings (the ONLY agent-visible value the render loop publishes).
+    /// Render-owned frame timings. As of eqoxide#797, `skin_cap_downgrades` below is a second
+    /// render-owned value published the same way — an earlier version of this comment called this
+    /// "the ONLY agent-visible value the render loop publishes", which #797 made false.
     pub(crate) frame_profile:    FrameProfileShared,
     /// `/v1/quests/*` slots (#M4).
     pub(crate) quest:           eqoxide_ipc::QuestSlots,
@@ -989,6 +991,13 @@ pub struct HttpState {
     /// nav-owned types — no hand-mapped fields to drift) on `GET /v1/observe/nav_debug`. This
     /// layer only reads and encodes it; it computes no floor height and no walkability verdict.
     pub(crate) nav_debug_view:  eqoxide_nav::diagnostics::NavDebugView,
+    /// Character models downgraded to the static render arm because their skin exceeded the joint
+    /// cap (eqoxide#780/#797/#848), published by the render thread once per frame — same shape as
+    /// `frame_profile` above, and for the same reason: the authoritative map lives inside
+    /// `eqoxide_renderer::EqRenderer`, a lower crate this one cannot depend on, so `src/app.rs`
+    /// converts it into this crate's [`eqoxide_ipc::SkinCapDowngradesShared`] view once per frame.
+    /// Served on `GET /v1/observe/debug`'s `skin_cap_downgrades` field (`docs/http-api.md`).
+    pub(crate) skin_cap_downgrades: eqoxide_ipc::SkinCapDowngradesShared,
 }
 
 impl HttpState {
@@ -1220,6 +1229,7 @@ pub fn spawn_camera_server(
     lifecycle:       eqoxide_ipc::LifecycleSlots,
     guild_slots:     eqoxide_ipc::GuildSlots,
     nav_debug_view:  eqoxide_nav::diagnostics::NavDebugView,
+    skin_cap_downgrades: eqoxide_ipc::SkinCapDowngradesShared,
     port:             u16,
     // When `Some`, an already-bound listener from `--api-port` (exact port, no scan).
     // When `None`, scan upward from `port` for the first free port.
@@ -1240,7 +1250,7 @@ pub fn spawn_camera_server(
                 camera, nav, world, shared_collision, zone_assets, common_assets_failed,
                 model_sync_dead, net_thread_dead, asset_sync, command, social, merchant_slots,
                 inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
-                quest, group_slots, lifecycle, guild_slots, nav_debug_view,
+                quest, group_slots, lifecycle, guild_slots, nav_debug_view, skin_cap_downgrades,
             };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.

@@ -76,6 +76,10 @@ eqoxide-telemetry = { path = "crates/eqoxide-telemetry", features = ["test-fixtu
 # build an `HttpState` and hit the observe router while calling this crate's `eq_net::packet_handler`
 # apply fns (the app crate sits ABOVE eqoxide-http, so those tests can't live inside it) (#544 Step 2l).
 eqoxide-http = { path = "crates/eqoxide-http", features = ["test-fixtures"] }
+# Same reasoning as eqoxide-core above, for `DrawnFrame::for_test` (#867): `camera_state`'s unit
+# tests call `CameraState::snapshot`, which now requires the proof-of-draw token that only a real
+# `render_frame` (i.e. a real GPU device) can mint in a production build.
+eqoxide-renderer = { path = "crates/eqoxide-renderer", features = ["test-fixtures"] }
 # `test-util` (not in tokio's `full`) enables `#[tokio::test(start_paused = true)]` so the A3
 # merchant-buy timeout test (#448) exercises the real 4s elapse in virtual time — instantly.
 tokio = { version = "1", features = ["full", "test-util"] }

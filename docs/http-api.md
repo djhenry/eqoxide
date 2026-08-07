@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + **camera state** (`camera`, describing the last frame ACTUALLY DRAWN, not the current tick — read `drawn_frame`/`drawn_age_ms` first, and note that the `snapshot_age_ms` in the same payload is the network clock and does not age it; see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867)). |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. Optional `preset`/`pitch`/`yaw`/`distance` params request a one-off diagnostic camera angle for just this capture — see [Camera override for `/frame`](#camera-override-for-observeframe-422). |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses, snapshot_age_ms}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. The default bare-map shape carries the same freshness value in the `X-Snapshot-Age-Ms` header instead — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646). |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -62,7 +62,7 @@ breakdown and why.
 
 | Route | Body | Description |
 |-------|------|-------------|
-| `POST /v1/move/goto` | `{"name":"Guard Phaeton"}` \| `{"x":,"y":,"z":}` \| `{"map_x":,"map_y":}` \| `{}` | Walk to an entity (fuzzy name, one-time snapshot) or coordinates and **stop** on arrival. Empty body → the player's current target. `map_*` are Brewall map coords (= negated server x/y). **Returns JSON**, including [`matched`](#matched--which-entity-a-name-actually-resolved-to) when the goal came from a name/target. |
+| `POST /v1/move/goto` | `{"name":"Guard Phaeton"}` \| `{"x":,"y":,"z":}` \| `{"map_x":,"map_y":}` \| `{}` | Walk to an entity (fuzzy name, one-time snapshot) or coordinates and **stop** on arrival. Empty body → the player's current target. `map_*` are Brewall map coords (= negated server x/y); `z` is optional there (defaults, then the walker snaps to the actual floor) but **required** on the raw `{x,y,z}` form. A body with SOME coordinate field(s) but not a complete `{x,y,z}` or `{map_x,map_y}` — e.g. `{"x":,"y":}` with no `z` — 400s naming exactly which field(s) are missing (`partial target: got {x, y} but missing {z}`), never the "no target; provide a name or coords" message, which is reserved for a body with no coordinate field at all (#886). **Returns JSON**, including [`matched`](#matched--which-entity-a-name-actually-resolved-to) when the goal came from a name/target. |
 | `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected (400). **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to). |
 | `POST /v1/move/stop` | — | Cancel any active goto/follow. |
 | `POST /v1/move/zone_cross` | `{"zone_id":N}` \| `{}` | Cross a zone line and send OP_ZoneChange (specific zone, or nearest line). |
@@ -177,9 +177,32 @@ shape.
 
 | Route | Body | Description |
 |-------|------|-------------|
-| `GET /v1/camera` | — | Current orbit camera (azimuth, elevation, radius, focus, mode). |
-| `POST /v1/camera` | `{"azimuth":,"elevation":,"radius":,"focus":[x,y,z]}` (all optional) | Set the orbit camera. |
+| `GET /v1/camera` | — | The orbit camera **as of the last frame actually drawn** (azimuth, elevation, radius, focus, mode, plus the rendered `eye`/`occluded`/`still_blocked` and the freshness pair `drawn_frame`/`drawn_age_ms`). Not "now" — see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867). |
+| `POST /v1/camera` | `{"azimuth":,"elevation":,"radius":,"focus":[x,y,z]}` (all optional) | Set the orbit camera. Returns 200 when the command is **queued**, not when it has been applied or drawn — poll `drawn_frame` to see it land. |
 | `POST /v1/camera/reset` | — | Reset to the default follow view. |
+
+### Camera freshness: `drawn_frame` / `drawn_age_ms` (#867)
+
+Every field of the camera block — on `GET /v1/camera` and in `/v1/observe/debug`'s `camera` object
+alike — describes **one frame**: the one named by `drawn_frame`. The render loop publishes the whole
+struct in a single write, and only after a frame has actually been encoded. On a tick that returns
+early from the surface-acquire match (`Lost`/`Outdated`/`Timeout`) nothing is published and the
+previous values stay in place, including the four *desired-framing* fields, which an earlier
+`/v1/camera` Set in that same tick may already have changed.
+
+| Field | Meaning |
+|-------|---------|
+| `drawn_frame` | Monotonic index of the frame the block describes. `null` = **no frame has been drawn yet** — the startup seed, served from process start through GPU init and the first zone load. |
+| `drawn_age_ms` | Milliseconds since that frame was drawn, computed when the response is encoded. `null` whenever `drawn_frame` is. |
+
+**The staleness is unbounded.** The event loop stops requesting redraws 300 ms after the last
+activity, so a surface that keeps failing to acquire — a minimised or occluded window, not just a
+resize — freezes the camera block indefinitely, with every other field looking exactly as it does on
+a healthy tick. Read `drawn_frame`/`drawn_age_ms` before trusting the rest; `drawn_frame` unchanged
+across two reads means nothing was drawn in between.
+
+**`snapshot_age_ms` does not age this block.** That field is the *network* health clock
+(see [Connection health](#connection-health)) and reads fresh throughout a rendering stall.
 
 ---
 
@@ -1493,6 +1516,21 @@ agent-honesty invariant forbids.
   alone contributed, which is the identical confident-but-wrong shape for a zone like `erudsxing` or
   `qeytoqrg` whose ENTIRE qualifying label set lives in a layer, not the base file. It is now a
   distinct, named, non-null outcome instead.
+  **The base file's OWN entries are forfeited too, not just the broken layer's** (#873): `try_load`
+  fails the WHOLE load, so `zone_entrances` gets none of this zone's map-labeled fallback entries at
+  all — for `qcat`, an unreadable `_1.txt` takes the zone from **13 qualifying labels** (6 in the
+  base file, 7 in `_1.txt`, 0 in `_2.txt`; measured over the shipped map pack) to **0**, not down to
+  the 6 the base file alone would have supplied. Those 13 are *labels*, not entries: `sync_zone_points`
+  dedups each qualifying label against the zone points the server already advertised (same `zone_id`,
+  within 50 units) before any of them becomes an entry, so the number of `zone_entrances` entries
+  actually forfeited is **≤13 and has not been measured** — it needs a live session. What is exact is
+  the direction: whatever the base file would have contributed, an unreadable layer takes it to zero.
+  This is deliberate, the same reasoning as the rest of this bullet: a half-map that reads as "the
+  load worked" is the exact failure #816 is about, and the base file's entries loading fine in
+  isolation gives no guarantee they're the zone's
+  COMPLETE fallback set once a layer next to them is known to be broken. Treat `zone_map_load` being
+  non-null as "assume none of `zone_entrances`' map-derived fallback entries for this zone are
+  present", not "assume only the broken layer's entries are missing".
 
 **This is deliberately NOT a 503 gate**, unlike `region_data_missing` et al. on `/v1/observe/zone_exits`
 (#815). The reasoning differs from that case: `zone_exits` derives its verdict entirely from the
@@ -2128,3 +2166,72 @@ it ever turned on you). Never infer one from the other.
 `level` is the spawn's actual character level (from its spawn record), when known — `null` is an
 honest "unknown" (e.g. it had already left the entity table by the time the reply arrived), never a
 guessed number.
+
+## `skin_cap_downgrades` — the renderer's silent render-arm downgrades, made visible (#797/#848)
+
+The renderer has an animation joint cap. A character model whose skin exceeds it is not refused —
+it is silently switched to the **static (unskinned) render arm**: it still appears on screen, in the
+right place, but it will never animate again for the rest of the session. Before #797 there was no
+observable for this at all — the client logged an error server-side of the agent's view and moved
+on. An agent with no eyes on the screen had no way to learn that what it believes is a walking,
+attacking character is actually a frozen pose, short of a human telling it so.
+
+`GET /v1/observe/debug` carries it as a top-level object, keyed by the **base file name** of the
+model that was loaded (never a full path — see below):
+
+```jsonc
+"skin_cap_downgrades": {
+  "race_hum.glb": { "joint_count": 190, "key_collision": false }
+}
+```
+
+- **`{}` (never `null`, never omitted) when no downgrade has been recorded yet this session.** Like
+  `nav_local_planner_dead`, this field is *always present* rather than `null`-when-healthy, so an
+  agent that greps this response and finds the key missing entirely knows it is talking to a client
+  too old to report this, rather than concluding every model in the zone animates fine.
+  **Read `{}` precisely.** It means "nothing has downgraded so far", which covers two states this
+  field cannot separate: *every character model loaded so far fits the cap*, and *no character
+  model has been loaded yet* — a loading screen, a zone-in still in progress, or simply nothing in
+  view. `{}` is not evidence that a particular model animates; it is only evidence that no model
+  the renderer has actually loaded has been recorded as downgraded. What `{}` does **not** hide is
+  a stale non-empty state: the map's only writer runs inside `render_frame`, the publish is the
+  next statement after that same call, and the map is only ever inserted into or updated (never
+  cleared), so a downgrade that has happened is visible on the very next response.
+- **`joint_count`** — the joint count that triggered the downgrade. If the same key has been (re)loaded
+  more than once this session, this is the **most recent** load's count, not the first.
+- **`key_collision`** — see below. `false` for the overwhelming common case (one file, one key).
+
+### Why the key is a base name, not a path — and what that costs (#848)
+
+The renderer never loads two files from the same directory with the same base name for one race —
+gender variants and equipment-driven swaps all produce distinct base names — so a base-name key
+almost always identifies one real file uniquely, without ever putting a local filesystem path in an
+agent-facing response (this project does not publish local paths over the API).
+
+The cost is that if two *different* asset roots ever legitimately produce two different files that
+share a base name (a custom asset override alongside the stock one, for instance), they collide onto
+the same map entry. Before #848 that collision was silent: the second load's joint count quietly
+overwrote the first's, with nothing in the response saying two distinct files had ever shared the
+key — a caller who trusted the entry would have been reading a number that belonged to *either* file,
+with no way to tell which, or that there was even a question to ask.
+
+`key_collision: true` is what makes that detectable. It is **sticky**: once two source files with
+different identities have ever both written the same key in a session, it stays `true` for that key
+for the rest of the session, even if every write after that agrees with the one before it (loading
+the same colliding file twice in a row does not clear it — the collision already happened and the
+entry is still unable to say which file `joint_count` currently describes). Treat `key_collision:
+true` as "this entry's `joint_count` is not reliably attributable to one file" — not as "the count
+shown is wrong," and not as something that self-heals.
+
+Both fields are keyed off the path `ModelAsset::load` itself actually opened, rather than a
+caller-supplied path/label pair. That path is stored in a field private to the renderer's
+`models.rs` and readable only through `ModelAsset::loaded_from()`, so no code upstream of the
+renderer — nor anywhere else in the client outside that one module — can either construct a
+`ModelAsset` carrying a path of its choosing or overwrite the one `load` recorded. Both routes are
+compile errors, and both were tried: removing the old caller-supplied argument alone was *not*
+enough (with the field still public, an assignment at the call site compiled clean and filed every
+downgrade under the wrong name), which is why the field is private rather than merely unused.
+
+What this does **not** promise: that the file `load` opened is the right file for the character you
+are looking at. The key is faithful to what was loaded; choosing what to load is a separate
+question, and this field cannot answer it.
