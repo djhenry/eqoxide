@@ -438,30 +438,85 @@ async fn post_give(
 #[serde(deny_unknown_fields)]
 struct DoorClickBody { door_id: Option<u8>, name: Option<String> }
 
+/// The 400 for an empty body — the ONLY malformed-request failure this endpoint has. #891 found the
+/// `None` arm of the old `if`/`else if` serving this same text for a *name that matched nothing*,
+/// which told an agent to send an argument it had just sent. A lookup miss now gets
+/// [`door_lookup_miss`] instead, and these two texts never overlap again.
+const DOOR_NO_ARGUMENT: &str = "provide {\"door_id\":N} or {\"name\":\"...\"}";
+
+/// The 404 body for a door the roster does not contain (#891, agent-honesty).
+///
+/// `what` names what was looked for ("id 250" / "a door named \"HHCELL\""); `known` is the number of
+/// doors this client currently holds for the zone. Phrased in the same terms as the dead-net-thread
+/// refusal in `require_live_session`: it says outright that the click was NOT sent, so an agent does
+/// not read the failure as "queued but unconfirmed" and does not retry a body that can never work.
+///
+/// **The empty-roster case is deliberately worded differently, because it is a different claim.**
+/// The client publishes doors from `OP_SpawnDoor` into one shared list that zone-in clears; there is
+/// no separate "the door records have arrived" observable. So with an empty list the client cannot
+/// tell "this zone has no doors" from "this zone's doors have not been received yet", and asserting
+/// either would be a guess presented as a fact. It says which of the two it cannot rule out instead.
+/// With a populated roster there is no such ambiguity to hedge: the client demonstrably holds this
+/// zone's door records, and the requested door is not among them.
+fn door_lookup_miss(what: &str, known: usize) -> (StatusCode, String) {
+    let body = if known == 0 {
+        format!(
+            "no door matching {what}: this client's door roster for the current zone is EMPTY. \
+             That does NOT establish that the door does not exist — the client cannot tell a \
+             genuinely doorless zone from one whose door records have not arrived or been published \
+             yet, because an empty roster is the only observable for both. This click was NOT sent \
+             and will not take effect. Check GET /v1/observe/doors: if it is still empty once the \
+             zone has finished loading, there is no door here to click."
+        )
+    } else {
+        format!(
+            "no door matching {what} among the {known} doors this client holds for the current \
+             zone. This click was NOT sent and will not take effect. Do not retry the same body — \
+             it can never resolve. List the zone's doors with GET /v1/observe/doors and use a \
+             `door_id` or `name` from there."
+        )
+    };
+    (StatusCode::NOT_FOUND, body)
+}
+
 /// POST /v1/interact/click_door {"door_id": N}  or  {"name": "DOOR1"} (case-insensitive name match).
+///
+/// **Both forms are resolved against the same door roster before anything is queued** (#891). Until
+/// that issue the id form did no lookup at all: it echoed the caller's number straight back as
+/// `200 "clicking door 250"` even when the client held no such door — measured against both an empty
+/// roster and a populated 70-door one — while the name form three lines away consulted the roster
+/// correctly. A `door_id` is a `u8`, so an unvalidated wrong id does not merely address nothing; it
+/// can address a *different real door*. One standard of truth now applies to both.
+///
+/// Failure modes, each with its own body so the caller can act on them differently:
+///   * neither argument given → 400 [`DOOR_NO_ARGUMENT`] (the request shape is wrong)
+///   * argument given, no match in the roster → 404 [`door_lookup_miss`] (the request shape is fine)
+///   * the command slot is still occupied → 409 [`BUSY_DOOR`]
 async fn post_door_click(
     State(s): State<HttpState>,
     body: axum::extract::Json<DoorClickBody>,
 ) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    let id = if let Some(id) = body.door_id {
-        Some(id)
+    // Snapshot the roster ONCE so the resolution and the "N doors known" figure in any failure body
+    // describe the same list — a second `lock()` could report a count the lookup never saw.
+    let roster = s.interact.doors_shared.lock().unwrap().clone();
+    let known = roster.len();
+    let id = if let Some(want) = body.door_id {
+        match roster.iter().find(|d| d.door_id == want) {
+            Some(d) => d.door_id,
+            None => return door_lookup_miss(&format!("id {want}"), known),
+        }
     } else if let Some(name) = &body.name {
         let up = name.to_uppercase();
-        s.interact.doors_shared.lock().unwrap().iter()
-            .find(|d| d.name.to_uppercase() == up)
-            .map(|d| d.door_id)
-    } else {
-        None
-    };
-    match id {
-        Some(id) => {
-            if let Some(busy) = s.command.request_door_click(id).refused(BUSY_DOOR) { return busy; }
-            (StatusCode::OK, format!("clicking door {}", id))
+        match roster.iter().find(|d| d.name.to_uppercase() == up) {
+            Some(d) => d.door_id,
+            None => return door_lookup_miss(&format!("the name {name:?}"), known),
         }
-        None => (StatusCode::BAD_REQUEST,
-                 "provide {\"door_id\":N} or {\"name\":\"...\"}".into()),
-    }
+    } else {
+        return (StatusCode::BAD_REQUEST, DOOR_NO_ARGUMENT.into());
+    };
+    if let Some(busy) = s.command.request_door_click(id).refused(BUSY_DOOR) { return busy; }
+    (StatusCode::OK, format!("clicking door {}", id))
 }
 
 /// POST /v1/interact/sit — sit down (mana/HP regen).
@@ -931,5 +986,156 @@ mod tests {
         let msg = v["message"].as_str().unwrap();
         assert!(msg.contains("UNKNOWN"), "the body must state the outcome is unknown");
         drop(held);
+    }
+
+    // ── #891: click_door resolves BOTH forms against the roster, and names a miss as a miss ──────
+    //
+    // Baseline on `main` before this fix, measured live by the reporter against a 70-door roster
+    // that did not contain ids 28/45/250:
+    //     POST /click_door {"door_id":250}            → 200  clicking door 250
+    //     POST /click_door {"name":"NO_SUCH_DOOR_XYZ"} → 400  provide {"door_id":N} or {"name":"..."}
+    // The id form invented a success; the name form blamed the caller for omitting an argument it
+    // had supplied. `door_id` is a `u8`, so an unchecked id can even name a DIFFERENT real door.
+
+    /// Publish one door exactly as `ActionLoop::sync_doors` does, so these tests see the same
+    /// roster GET /v1/observe/doors serves.
+    fn seed_door(state: &crate::HttpState, door_id: u8, name: &str) {
+        state.interact.doors_shared.lock().unwrap().push(eqoxide_ipc::DoorView {
+            door_id, name: name.into(),
+            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, opentype: 58, is_open: false,
+        });
+    }
+
+    async fn body_of(resp: axum::response::Response) -> String {
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(b.to_vec()).unwrap()
+    }
+
+    /// THE HONESTY PROOF for the id form: an id absent from a POPULATED roster must never be
+    /// reported as an action in progress, and must never be queued.
+    #[tokio::test]
+    async fn door_click_unknown_id_with_a_populated_roster_is_404_never_200() {
+        let state = empty_state();
+        seed_door(&state, 6, "HHCELL");
+        seed_door(&state, 7, "HHDOOR");
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/click_door").header("content-type", "application/json")
+            .body(Body::from(r#"{"door_id":250}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::OK,
+            "an id the client has no record of MUST NOT be answered as success — #891");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(command.take_door_click().is_none(),
+            "a 404 must not queue a door click");
+        let body = body_of(resp).await;
+        assert!(body.contains("250"), "the body must name the id that missed: {body:?}");
+        assert!(body.contains("2 doors"),
+            "the body must name how many doors the client does hold: {body:?}");
+        assert!(body.contains("NOT sent"),
+            "the body must say outright that the click was not sent: {body:?}");
+        assert!(!body.contains("clicking door"),
+            "the body must not read as an action in progress: {body:?}");
+    }
+
+    /// The same id form against an EMPTY roster. Still a 404 and still unqueued — but the body must
+    /// NOT assert the door does not exist, because with no separate "doors have arrived" observable
+    /// the client cannot tell a doorless zone from one whose door records have not landed yet.
+    #[tokio::test]
+    async fn door_click_unknown_id_with_an_empty_roster_says_the_roster_is_empty() {
+        let state = empty_state();
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/click_door").header("content-type", "application/json")
+            .body(Body::from(r#"{"door_id":250}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::OK, "#891: no invented success on an empty roster");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(command.take_door_click().is_none());
+        let body = body_of(resp).await;
+        assert!(body.contains("EMPTY"),
+            "the empty-roster body must say the roster is empty, not merely 'no such door': {body:?}");
+        assert!(body.contains("not arrived"),
+            "the empty-roster body must disclose that unloaded doors look identical to no doors: \
+             {body:?}");
+        assert!(body.contains("NOT sent"), "{body:?}");
+    }
+
+    /// THE HONESTY PROOF for the name form: a name that matches nothing is a LOOKUP MISS, and must
+    /// not be reported with the malformed-request text that asks for the argument just supplied.
+    #[tokio::test]
+    async fn door_click_name_miss_is_404_not_the_missing_argument_message() {
+        let state = empty_state();
+        seed_door(&state, 6, "HHCELL");
+        seed_door(&state, 7, "HHDOOR");
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/click_door").header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"NO_SUCH_DOOR_XYZ"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND,
+            "a name that matched nothing is a lookup miss, not a malformed request — #891");
+        assert!(command.take_door_click().is_none());
+        let body = body_of(resp).await;
+        assert!(!body.contains("provide {\"door_id\""),
+            "a supplied name must never be answered by asking for an argument the caller sent: \
+             {body:?}");
+        assert!(body.contains("NO_SUCH_DOOR_XYZ"),
+            "the body must name what missed: {body:?}");
+        assert!(body.contains("2 doors"),
+            "the body must name the roster size: {body:?}");
+    }
+
+    /// The two failure bodies must be DISTINGUISHABLE — a caller has to be able to tell "you sent
+    /// the wrong shape" from "there is no such door" without guessing.
+    #[tokio::test]
+    async fn door_click_no_argument_and_lookup_miss_do_not_share_a_message() {
+        let state = empty_state();
+        seed_door(&state, 6, "HHCELL");
+        let command = state.command.clone();
+        let app = router().with_state(state);
+
+        let empty = app.clone().oneshot(Request::post("/click_door")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#)).unwrap()).await.unwrap();
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST,
+            "an empty body really IS a malformed request — that 400 stays");
+        let empty_body = body_of(empty).await;
+
+        let miss = app.oneshot(Request::post("/click_door")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"NO_SUCH_DOOR_XYZ"}"#)).unwrap()).await.unwrap();
+        let miss_body = body_of(miss).await;
+
+        assert_ne!(empty_body, miss_body,
+            "#891: two distinct failures must not share one message");
+        assert!(command.take_door_click().is_none(), "neither failure may queue a click");
+    }
+
+    /// The lookups themselves still work — the fix rejects misses, it does not reject everything.
+    #[tokio::test]
+    async fn door_click_known_id_still_queues() {
+        let state = empty_state();
+        seed_door(&state, 6, "HHCELL");
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/click_door").header("content-type", "application/json")
+            .body(Body::from(r#"{"door_id":6}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(command.take_door_click(), Some(6));
+    }
+
+    #[tokio::test]
+    async fn door_click_known_name_still_resolves_and_queues() {
+        let state = empty_state();
+        seed_door(&state, 6, "HHCELL");
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/click_door").header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"hhcell"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "case-insensitive name matching must survive");
+        assert_eq!(command.take_door_click(), Some(6));
     }
 }
