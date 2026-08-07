@@ -384,23 +384,49 @@ over the column, nearest ground 133 u away — while this table and the `detail`
 "embedded in world geometry". Nothing in the API distinguishes the two halves; if you need to know
 which, look at the geometry, not at this field.
 
-**Since #845, an `embedded_no_recovery` hold usually clears itself within a second or two.** When
-both the push-out and the recovery ring come up empty, the client now searches the whole zone (out
-to 512 u, retried about once a second) for anywhere a body could legally stand, and relocates itself
-there. So the expected life of one of these holds is: raised, then cleared with `player.pos`
-**jumped** — that jump is a *client-side relocation*, not a server correction, and it is logged at
-`warn` with the distance moved. A hold that *persists* is the honest report that the search keeps
-answering `nowhere`.
+**Since #845 the client no longer only reports this state — it also tries to leave it.** When both
+the push-out and the recovery ring come up empty, the client searches the zone (out to 512 u,
+retried about once a second) for anywhere a body could legally stand, and relocates itself there.
+
+⚠️ **This does not mean the hold you are looking at is about to clear. It means the opposite.**
+Both directions were measured and both run the other way round:
+
+- **A succeeding search never publishes this field at all.** The relocation happens inside the
+  physics step and returns *before* the hold is raised, so `player.hold` stays `null` throughout —
+  measured at **0 held frames out of 300** in a zone the search can solve. There is no
+  `Some(..) → null` transition to watch for, because there was never a `Some(..)`.
+- **A hold that *is* published does not clear on its own.** In a zone whose geometry does not
+  change, the once-a-second retry keeps failing for the same reason — measured at **1800 frames /
+  60 s, raised at frame 14 and never cleared**, with the body never moving a unit.
+
+So a published `embedded_no_recovery` is the signature of a search that **failed**, and it still
+takes something external to end it. (The contrast, same probe: truncate the search's reach so the
+solvable zone above becomes unsolvable and it reports **286 held frames of 300**.) A `hold` going
+non-null → null means the underlying *condition* ended — a GM moved the body, the character zoned,
+or geometry finished loading in underneath it — which is what it has always meant.
 
 This applies to `embedded_no_recovery` only. `underworld_no_recovery` was left alone deliberately:
 it does not freeze lateral movement, so `/v1/move/manual` may still walk the character out over a
 floor above the underworld, and #724 holds that body where the server put it on purpose. If it has
 nowhere lateral to go, it still needs a GM.
 
-There is no dedicated field for "the client just relocated me". The discriminator available today is
-`player.server_corrections`, which does **not** advance for one of these: a `pos` jump with
-`server_corrections` unchanged, beside a `hold` that just went non-null → null, is a client-side
-relocation. (This is weaker than a purpose-built counter and is called out as such.)
+⚠️ **There is currently no reliable way to detect a client-side relocation through this API** —
+including the one #845 introduced, which can move the body up to 512 u without the driver asking.
+There is no dedicated field, and the two that look like they might serve do not:
+
+- **`player.hold` does not**, for the reason above: a succeeding relocation never publishes one.
+- **`player.server_corrections` does not advance for one** — correctly, since it is not a server
+  correction. But that is all it tells you. It has exactly one incrementer, in the network layer's
+  `OP_ClientUpdate` handler, gated on the server-vs-client horizontal delta exceeding 12 u; it is a
+  counter of large *server-driven* snaps, and it is not a function of `player.pos` changing at all.
+  A body standing perfectly still leaves it unchanged, and so does an ordinary `/v1/move/goto` walk
+  (that handler treats sub-12 u deltas as normal sync lag and does not count them). "Unchanged"
+  therefore carries no information about whether anything moved you.
+
+What you will actually see is a bare `pos` jump with nothing to attribute it to. The relocation *is*
+recorded, at `warn`, in the client log — `controller RELOCATED [#845]: … moved N u to …`, with the
+origin and destination — but that channel is not reachable from this API. Tracked as **#925**; do
+not build an agent behaviour on inferring it until there is a field for it.
 
 **A persistent hold still needs an outside push, and an ordinary character has no client-API way to
 produce one.** Every movement endpoint (`/v1/move/manual`, `/v1/move/jump`, `/v1/move/goto`,

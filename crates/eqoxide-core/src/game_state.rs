@@ -849,9 +849,17 @@ pub struct WorldState {
 /// the embedded branch a bug rather than a disclosure, and #845 removed it there: that branch now
 /// falls through to a zone-wide search for anywhere a body could stand before it raises a hold, so
 /// the hold means the ZONE has nowhere, not that this body has no memory. It is still a frozen body
-/// while it lasts, and it can still last indefinitely — but it is no longer unconditionally
-/// terminal, and the usual life of one is a second or two ending in a client-side relocation. See
-/// `movement.rs`'s `nearest_standing_place`.
+/// while it lasts, and it can still last indefinitely — what changed is when it is raised, not how
+/// it ends.
+///
+/// ⚠️ Do not read the amendment as "these clear themselves now"; both directions were measured and
+/// both run the other way. A SUCCEEDING search never publishes this at all — the search arm returns
+/// before the hold is raised, so the relocation happens with the field `None` throughout (0 held
+/// frames of 300, in a zone the search solves). A hold that IS published does not clear on its own:
+/// in a zone whose geometry does not change, the once-a-second retry keeps failing for the same
+/// reason (1800 frames / 60 s, raised and never cleared). So a published hold is the signature of a
+/// FAILED search, and it still takes something external to end it. See `movement.rs`'s
+/// `nearest_standing_place`; that nothing published marks the relocation is #925.
 ///
 /// The sentence still stands, unamended, for `UnderworldNoRecovery`. That branch was left alone on
 /// purpose: it runs after collide-and-slide, so lateral driver input still reaches the body and the

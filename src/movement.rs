@@ -784,12 +784,22 @@ impl CharacterController {
         if self.hold_log_cooldown <= 0.0 {
             self.hold_log_cooldown = HOLD_LOG_SECS;
             match reason {
+                // ⚠️ #845/#920 review B2: this line used to open "embedded at {pos}". It is the
+                // channel #845 was reported through, and it was asserting the half of the
+                // disjunction the reported case was NOT in — `is_embedded` is
+                // `!footprint_clear(..) || ground_below(..).is_none()`, and the live casualty was
+                // the void disjunct (zero triangles over the column). It states the disjunction now,
+                // like the published `detail` string already did.
                 ControllerHoldReason::EmbeddedNoRecovery => tracing::info!(
-                    "controller HOLD [embedded_no_recovery]: embedded at {:?} for {:.1}s, push-out \
-                     found nowhere to go and there is no recovery history to fall back to — the \
-                     body is FROZEN (every step is skipped) until something relocates it. Published \
-                     as player.hold; this line is throttled to one per {:.0}s while it lasts.",
-                    self.pos, secs, HOLD_LOG_SECS),
+                    "controller HOLD [embedded_no_recovery]: cannot place the body at {:?} for \
+                     {:.1}s — it is EITHER pierced by geometry OR standing over a void with no \
+                     floor within {:.0}u below its feet (the test is a disjunction; this line \
+                     cannot tell you which, and #845's live casualty was the void half). Push-out \
+                     found nowhere to go, there is no recovery history to fall back to, and the \
+                     zone-wide last-resort search found nowhere either — the body is FROZEN (every \
+                     step is skipped) until something relocates it. Published as player.hold; this \
+                     line is throttled to one per {:.0}s while it lasts.",
+                    self.pos, secs, GROUND_DEPTH, HOLD_LOG_SECS),
                 ControllerHoldReason::UnderworldNoRecovery => tracing::info!(
                     "controller HOLD [underworld_no_recovery]: blocked descent below underworld \
                      {:.1} → holding at {:?} for {:.1}s (no recovery history to restore; the body \
@@ -1737,14 +1747,23 @@ impl CharacterController {
     /// effect. The consequence to be honest about: an `underworld_no_recovery` body whose zone has no
     /// floor within lateral reach still has no exit, and this PR does not change that.
     ///
-    /// **This is a relocation, and it is loud about it.** The body is moved as much as
+    /// **This is a relocation, and the log is loud about it.** The body is moved as much as
     /// [`RESCUE_RADII`]'s reach, without the driver asking, which is exactly the kind of silent
-    /// client-side write this project treats as a lie. Three things keep it honest: it fires only
+    /// client-side write this project treats as a lie. Two things keep it honest: it fires only
     /// from a state the body could not leave under ANY driver (so the alternative is not "walk
-    /// there yourself", it is "stay frozen until a GM intervenes"); it logs at `warn` with the
-    /// distance actually travelled, unthrottled, because a relocation is an event rather than a
-    /// condition; and it clears the hold by moving the body, so `player.hold` going from
-    /// `Some(..)` to `None` beside a jumped `player.pos` is the agent-visible signature.
+    /// there yourself", it is "stay frozen until a GM intervenes"); and it logs at `warn`,
+    /// unthrottled, with the origin and the destination in full — because a relocation is an event
+    /// rather than a condition. (The `moved` figure on that line is HORIZONTAL only, so read the
+    /// destination, not the distance, if the placement changed height.)
+    ///
+    /// ⚠️ **A third thing does NOT keep it honest, and an earlier version of this comment claimed
+    /// it did.** A success here is invisible to `player.hold`: this arm returns before
+    /// [`Self::enter_hold`] is reached, and `step` takes the hold at the top of every frame, so the
+    /// body is relocated with the field `None` throughout — measured at 0 held frames of 300 in a
+    /// zone this search solves. The transition an agent can see is the inverse one: a *published*
+    /// hold means this search answered `nowhere`, and it does not clear on its own (measured at
+    /// 1800 frames / 60 s in a static zone it cannot solve, raised and never cleared). Nothing on
+    /// the HTTP side marks the relocation; the `warn` below is its only record. That gap is #925.
     ///
     /// Not throttled on success — a success moves the body, so it cannot repeat from the same
     /// place. [`RESCUE_RETRY_SECS`] throttles only the failing search.
@@ -3352,24 +3371,29 @@ mod tests {
     ///
     /// ⚠️ This test exists because that claim was **measured unpinned**. Wrapping the predicate —
     /// `if false && (is_embedded(col, q) || body_in_water(col, q)) { continue; }` — left the whole
-    /// suite GREEN at 225/225. Every other #845 test looks only at where the body ENDS UP, and the
-    /// search recovers on the following frame from a bad placement, so the bad placement is
-    /// invisible to a final-position assertion. The fix is to assert on EVERY frame instead.
+    /// suite GREEN, with nothing failing anywhere. Every other #845 test looks only at where the
+    /// body ENDS UP, and the search recovers on the following frame from a bad placement, so the bad
+    /// placement is invisible to a final-position assertion. The fix is to assert on EVERY frame
+    /// instead.
     ///
     /// The zone is built so the two rejected kinds are strictly nearer than the good one:
     /// an embedded column (a floor wedged between two walls) at radius 16, a submerged column at
     /// radius 48, and honest dry ground only from radius 160 out.
     ///
-    /// MUTATION-CHECK (both directions, RUN): wrap the predicate as above and this test fails —
-    /// `frame 14: the body was moved to [16.0, 0.0, 0.0], which the net reads as embedded`, 225
-    /// passed / 1 failed. Restore it and the suite is 226/228 green.
+    /// MUTATION-CHECK (both directions, RUN): wrap the predicate as above and this test fails on
+    /// `frame 14: the body was moved to [16.0, 0.0, 0.0], which the net reads as embedded`.
+    /// Restore it and the suite is green again. (No suite totals are quoted here on purpose — they
+    /// move with every merge, and a stale one reads as a live measurement.)
     ///
-    /// ⚠️ Stated limit of that check: the wrap disables BOTH halves of the predicate at once and
-    /// the embedded decoy is nearer, so the RED above is the `is_embedded` half. The
-    /// `body_in_water` half is covered here by the fixture assertion (the middle column really is
-    /// wet and otherwise acceptable) and by the per-frame `!body_in_water` assertion, but it has
-    /// NOT been shown red by a mutation of its own — that needs a separate run with the water
-    /// decoy moved inside the embedded one.
+    /// The wrap above disables BOTH halves at once and the embedded decoy is nearer, so that RED is
+    /// the `is_embedded` half. A stated limit here used to say the `body_in_water` half would need
+    /// the water decoy moved inside the embedded one to isolate. **It does not** — struck after the
+    /// #920 review constructed the isolating mutation and I re-ran it. Leaving `is_embedded` live
+    /// already rejects the r≈16 decoy, which promotes the submerged r≈48 one to nearest, so wrapping
+    /// only the water half — `if is_embedded(col, q) || (false && body_in_water(col, q))` — reds
+    /// this same test, alone, on the water-specific message
+    /// (`#649/#845 frame 14: the body was moved into water at [48.0, 0.0, 0.0]`).
+    /// Both halves are independently mutation-killed.
     #[test]
     fn the_last_resort_never_places_a_body_somewhere_the_net_would_take_back_845() {
         let mut c = col(vec![

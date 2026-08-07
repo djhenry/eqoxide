@@ -368,14 +368,15 @@ impl PlayerState {
                          to (a position discontinuity — a summon, a large server correction — \
                          supersedes that history, #724). Physics is frozen: every movement command \
                          will be accepted and produce NO motion, in any direction. Since #845 the \
-                         client re-searches the WHOLE zone about once a second for anywhere a body \
-                         could stand and relocates itself there, so the normal outcome is that this \
-                         hold clears on its own within a second or two and `player.pos` jumps — \
-                         that jump is a client-side relocation, not a server correction. A hold \
-                         that PERSISTS means that search keeps answering `nowhere`. If it persists: \
-                         a GM `#goto`, `#summon` or `#zone` clears it (all three measured live on \
-                         #845, each on the first frame) — but those need GM status, so an ordinary \
-                         character has no client-API exit and is waiting on the search.",
+                         client also searches the zone out to 512 u, about once a second, for \
+                         anywhere a body could legally stand, and relocates itself there — but a \
+                         SUCCEEDING search never publishes this field at all, so if you are reading \
+                         this, that search has just answered `nowhere`. It will NOT clear on its \
+                         own: in a zone whose geometry does not change the retry keeps failing for \
+                         the same reason (measured: raised at 0.5 s, still held after 60 s, body \
+                         never moved). A GM `#goto`, `#summon` or `#zone` clears it (all three \
+                         measured live on #845, each on the first frame) — but those need GM \
+                         status, so an ordinary character has no client-API exit.",
                     eqoxide_core::game_state::ControllerHoldReason::UnderworldNoRecovery =>
                         "the character fell to the zone's UNDERWORLD floor and the client is holding \
                          it there rather than let it drop out of the world (#150). It has no \
@@ -683,8 +684,11 @@ fn ser_error_kind<S: serde::Serializer>(
 /// in *age* (`held_secs`), which is measurable from the caller.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlayerHoldView {
-    /// `embedded_no_recovery` — embedded in geometry, push-out found nowhere to go, no recovery
-    /// history: **the body cannot move at all**, in any direction, under any driver.
+    /// `embedded_no_recovery` — the body cannot be placed (geometry pierces its footprint **or**
+    /// there is no floor within 200 u below its feet — the client's test is a disjunction and this
+    /// field cannot tell you which; #845's live casualty was the second), push-out found nowhere to
+    /// go, no recovery history, and since #845 the zone-wide search found nowhere either:
+    /// **the body cannot move at all**, in any direction, under any driver.
     /// `underworld_no_recovery` — a descent below the zone's underworld floor was refused with no
     /// recovery history: the body hangs at the height it reached. Lateral movement still works.
     ///
