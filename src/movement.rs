@@ -55,6 +55,10 @@ const HOP_COOLDOWN: f32 = 0.8;
 const MAX_SLIDE_ITERS: usize = 3;
 /// Vertical tolerance for "still standing on the same floor".
 const GROUND_SNAP_TOL: f32 = 0.5;
+/// Slack on [`CharacterController::try_duck_under`]'s float-plane envelope bound (#870). The bound
+/// it slackens is `STEP_UP + GROUND_SNAP_TOL` = 2.5 u; this is 1e-3 u of it. See the ⚠️ paragraph
+/// on that clause for the measurement — without it the bound is decided by ~1e-5 u of float noise.
+const DUCK_ENVELOPE_TOL: f32 = 1e-3;
 /// Seconds embedded with no push-out before falling back to the last good grounded position.
 const STUCK_FALLBACK_SECS: f32 = 0.5;
 /// How often (seconds) a good grounded position is sampled into the ring buffer.
@@ -94,6 +98,45 @@ const HOLD_LOG_SECS: f32 = 5.0;
 const PUSHOUT_RADII: [f32; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 /// Directions sampled per push-out ring.
 const PUSHOUT_DIRS: usize = 16;
+
+/// #845 — reach of the LAST-RESORT placement search ([`nearest_standing_place`]), in units.
+///
+/// Deliberately an order of magnitude past [`PUSHOUT_RADII`], because the two searches answer
+/// different questions. The push-out asks *"can this body be nudged out of the thing it is inside"*,
+/// which is a local question and is right to be local. This one asks *"is there anywhere at all in
+/// this zone this body could stand"*, and it runs only when the answer to the first was no AND
+/// there is no banked history — i.e. only from a state that was, before #845, permanently frozen.
+///
+/// **Sized against a measurement, not a guess.** The live #845 casualty was at
+/// `(-2190.5, 902.125, 3.5)` in steamfont; a scan of that zone's baked GLB (the `__collision__`
+/// mesh, the rendered terrain and every placed object, 63 391 triangles) found **zero** triangles
+/// over that column, the nearest vertex of any kind 15.7 u away at h ≈ -32652 (invisible-boundary
+/// art), the nearest terrain vertex 121.5 u away at h = 101.0, and the nearest column holding a
+/// floor within ±200 u of the feet **133 u away**. That independently reproduces the number
+/// `CharacterController::forget_recovery_history` records from #712 ("nearest standable floor 133 u
+/// away"). 32 u cannot reach it; 512 u can, with room for a worse case.
+///
+/// This is a REACH, not a tuning: raising it lets more bodies be rescued and rescues them from
+/// further away, lowering it strands more of them. There is no "correct" value to converge on —
+/// it is bounded by what a client-side relocation is worth, which is why the log line reports the
+/// distance actually travelled.
+const RESCUE_RADII: [f32; 15] = [4.0, 8.0, 16.0, 32.0, 48.0, 64.0, 96.0, 128.0,
+                                 160.0, 192.0, 256.0, 320.0, 384.0, 448.0, 512.0];
+/// Directions sampled per last-resort ring. Twice [`PUSHOUT_DIRS`] because the rings are far wider:
+/// at 512 u, 16 spokes leave 200 u gaps between samples.
+const RESCUE_DIRS: usize = 32;
+/// Vertical band the last-resort search looks through, above AND below the body's feet.
+///
+/// Wider than [`GROUND_DEPTH`] and symmetric, because the body it serves has no column of its own
+/// to anchor on: in the measured steamfont case the nearest real ground is ~81 u *above* the feet,
+/// and a body already held at the underworld floor is below everything. `GROUND_DEPTH`'s
+/// down-only band is the right question for "what am I standing over"; it is the wrong question
+/// for "where could I stand instead".
+const RESCUE_BAND: f32 = 1000.0;
+/// Minimum seconds between last-resort searches that FAIL. A successful one moves the body and so
+/// cannot repeat; a failing one is ~500 column probes that will fail again next frame for the same
+/// reason, and this branch re-runs at frame rate for as long as the hold lasts.
+const RESCUE_RETRY_SECS: f32 = 1.0;
 /// Buoyancy: vertical settle rate toward the swim plane (u/s). The plane itself —
 /// `surface − float_depth` — comes from the shared [`crate::traversability::PLAYER_BODY`]
 /// (#359/#386: the planner sizes water exits from the same `float_depth`/`haul_out_up` fields,
@@ -170,6 +213,12 @@ pub struct CharacterController {
     /// controller's own accumulated frame time for the current, unbroken hold.
     hold:          Option<ControllerHold>,
     stuck_time:    f32,
+    /// #845: seconds until another FAILED last-resort placement search may be attempted (see
+    /// [`RESCUE_RETRY_SECS`]). Diagnostics/cost only — no physics reads this, and a value of 0
+    /// changes nothing but how often ~500 column probes are spent on a question that just failed.
+    /// Reset by [`Self::teleport`], because a relocation is a new predicament and deserves an
+    /// immediate answer rather than the tail of the previous one's cooldown.
+    rescue_cooldown: f32,
     /// Seconds until another nav auto-hop is allowed (prevents jump-spamming a wall we can't clear).
     hop_cooldown:  f32,
     /// Zone "underworld" floor from OP_NewZone (`GameState::zone_underworld`), or NEG_INFINITY when
@@ -253,6 +302,83 @@ fn body_in_water(col: &Collision, p: [f32; 3]) -> bool {
 fn is_embedded(col: &Collision, p: [f32; 3]) -> bool {
     !col.footprint_clear(p[0], p[1], p[2], PLAYER_RADIUS, PUSHOUT_DIRS / 2)
         || col.ground_below(p[0], p[1], p[2] + GROUND_ORIGIN, GROUND_DEPTH).is_none()
+}
+
+/// #845 — **the nearest place in THIS zone where this body could legally stand**, or `None` if the
+/// zone offers none within [`RESCUE_RADII`] × [`RESCUE_BAND`] of `from`.
+///
+/// # Why this exists at all: recovery used to be a fact about the body's PAST
+///
+/// Both of the controller's "no recovery" branches — the stuck fallback in
+/// [`CharacterController::depenetrate`] and the #150 fall-through guard in
+/// [`CharacterController::step`] — recovered by restoring a banked position from the `good` ring.
+/// #724 then made the ring cleared on every position discontinuity and on every zone change, for
+/// good reasons (a restored sample from another zone names a point in a different coordinate
+/// space). The two facts compose into a trap: **the events that most often put a body somewhere it
+/// cannot be are exactly the events that erase the only thing that could get it out.** After a
+/// relocation the ring is empty by construction, so both branches take their `None` arm, and the
+/// `None` arm of the depenetration one changes nothing at all — same `pos`, same `on_ground`, same
+/// empty ring, `depenetrate` returns `true`, `step` early-returns. The next frame is bit-identical.
+/// It is an absorbing state of the controller's state machine: nothing the driver can do — WASD,
+/// `/move`, `/goto`, jump, swim — writes any of the variables the branch reads. Only an external
+/// [`CharacterController::teleport`] (a GM `#summon`, a large server correction) or a change of
+/// collision can leave it. That is issue #845, and it cost two live validation runs.
+///
+/// The fix is not a wider push-out and not a bigger ring: it is to make the recovery a fact about
+/// the WORLD instead of a fact about the body's history. "Somewhere in this zone this body could
+/// stand" is available whenever the zone's collision is, no matter what the body did before, and it
+/// is what a GM does by hand when they `#goto` a wedged character to real ground.
+///
+/// # What counts as a place
+///
+/// A candidate column `(e, n)` supplies a floor `f` (nearest to the feet within `±RESCUE_BAND` —
+/// UP as well as down, see [`RESCUE_BAND`]), and `[e, n, f]` is accepted only if:
+///
+/// * `f > underworld` — the #150 guard would refuse to let the body rest there, so putting it there
+///   accomplishes nothing but a second predicament (the same test [`zone_in_reground`] applies);
+/// * `!is_embedded(col, [e, n, f])` — **the net's own door predicate**, so the destination is by
+///   construction not a place the net will immediately take custody of again. This is what stops
+///   #649's "a recovery that is itself embedded is not a recovery … the body walks off across the
+///   zone one ring-radius at a time, ignoring input". Checking the door's exact predicate rather
+///   than a look-alike is deliberate: a look-alike is how that bug happened (the old check tested
+///   the footprint and not `ground_below`'s nav-headroom filter);
+/// * `!body_in_water(col, [e, n, f])` — a dry standing place. #649 made "afloat in water AND
+///   `on_ground`" unrepresentable through [`Recovery`]; this search must not smuggle it back in by
+///   handing [`CharacterController::recover`] a submerged floor. **The cost is stated, not hidden:**
+///   a body whose only nearby ground is under water is not rescued and keeps its hold.
+///
+/// Rings are tried nearest-first and the search stops at the first radius that yields anything, so
+/// the body is moved the least distance the zone allows; within a ring the smallest `|f - from[2]|`
+/// wins. This is nearest-in-the-sampled-set, not a true nearest — the sampling is polar
+/// (`RESCUE_DIRS` spokes), so a place between two spokes at ring `r` can lose to one on a spoke at
+/// ring `r`. It is a placement search, not a metric.
+fn nearest_standing_place(col: &Collision, from: [f32; 3], underworld: f32) -> Option<[f32; 3]> {
+    // Probe from the feet, but never look BELOW the underworld: `nearest_floor` returns the nearest
+    // floor and nothing else, so a column whose nearest surface is below-world boundary art would
+    // answer with that one and be discarded — hiding a perfectly good floor higher up the same
+    // column. That is the #712 shape and it is not hypothetical here: the zone whose bake put the
+    // #845 casualty over a void also carries invisible-boundary art ~32 000 u down, which is what
+    // an unclamped probe on those columns would return and then throw away. Without the clamp the
+    // search's answer depends on how deep the below-world art happens to sit. With the default
+    // underworld (−∞) both values fall back to the plain symmetric band, so zones that declare no
+    // underworld are unaffected.
+    let ref_z = from[2].max(underworld);
+    let down = (ref_z - underworld).max(0.0).min(RESCUE_BAND);
+    for &r in &RESCUE_RADII {
+        let mut best: Option<([f32; 3], f32)> = None;
+        for i in 0..RESCUE_DIRS {
+            let a = (i as f32) / (RESCUE_DIRS as f32) * std::f32::consts::TAU;
+            let (e, n) = (from[0] + a.cos() * r, from[1] + a.sin() * r);
+            let Some(f) = col.nearest_floor(e, n, ref_z, RESCUE_BAND, down) else { continue };
+            if f <= underworld { continue; }
+            let q = [e, n, f];
+            if is_embedded(col, q) || body_in_water(col, q) { continue; }
+            let dz = (f - from[2]).abs();
+            if best.map_or(true, |(_, b)| dz < b) { best = Some((q, dz)); }
+        }
+        if let Some((q, _)) = best { return Some(q); }
+    }
+    None
 }
 
 /// What the one-shot zone-in reground should do with a freshly-arrived body (#712).
@@ -394,7 +520,7 @@ impl CharacterController {
         Self { pos, vel_z: 0.0, on_ground: false, in_water: false,
                good: std::collections::VecDeque::new(), good_timer: 0.0, hold_log_cooldown: 0.0,
                hold: None,
-               stuck_time: 0.0,
+               stuck_time: 0.0, rescue_cooldown: 0.0,
                hop_cooldown: 0.0, underworld: f32::NEG_INFINITY,
                airborne_start_z: None, landed_fall_height: None, levitating: false,
                swim_sinking: false,
@@ -662,12 +788,22 @@ impl CharacterController {
         if self.hold_log_cooldown <= 0.0 {
             self.hold_log_cooldown = HOLD_LOG_SECS;
             match reason {
+                // ⚠️ #845/#920 review B2: this line used to open "embedded at {pos}". It is the
+                // channel #845 was reported through, and it was asserting the half of the
+                // disjunction the reported case was NOT in — `is_embedded` is
+                // `!footprint_clear(..) || ground_below(..).is_none()`, and the live casualty was
+                // the void disjunct (zero triangles over the column). It states the disjunction now,
+                // like the published `detail` string already did.
                 ControllerHoldReason::EmbeddedNoRecovery => tracing::info!(
-                    "controller HOLD [embedded_no_recovery]: embedded at {:?} for {:.1}s, push-out \
-                     found nowhere to go and there is no recovery history to fall back to — the \
-                     body is FROZEN (every step is skipped) until something relocates it. Published \
-                     as player.hold; this line is throttled to one per {:.0}s while it lasts.",
-                    self.pos, secs, HOLD_LOG_SECS),
+                    "controller HOLD [embedded_no_recovery]: cannot place the body at {:?} for \
+                     {:.1}s — it is EITHER pierced by geometry OR standing over a void with no \
+                     floor within {:.0}u below its feet (the test is a disjunction; this line \
+                     cannot tell you which, and #845's live casualty was the void half). Push-out \
+                     found nowhere to go, there is no recovery history to fall back to, and the \
+                     zone-wide last-resort search found nowhere either — the body is FROZEN (every \
+                     step is skipped) until something relocates it. Published as player.hold; this \
+                     line is throttled to one per {:.0}s while it lasts.",
+                    self.pos, secs, GROUND_DEPTH, HOLD_LOG_SECS),
                 ControllerHoldReason::UnderworldNoRecovery => tracing::info!(
                     "controller HOLD [underworld_no_recovery]: blocked descent below underworld \
                      {:.1} → holding at {:?} for {:.1}s (no recovery history to restore; the body \
@@ -729,6 +865,10 @@ impl CharacterController {
         self.vel_z = 0.0;
         self.on_ground = false;
         self.stuck_time = 0.0;
+        // #845: a relocation is a NEW predicament, so it must not inherit the tail of the previous
+        // one's last-resort-search cooldown. (Cost only: `rescue_cooldown` gates how often a FAILED
+        // ~500-probe search is retried; it can never make a rescue happen that would not otherwise.)
+        self.rescue_cooldown = 0.0;
         // A teleport / large server correction is a position discontinuity, NOT a fall: drop any
         // airborne tracking and any not-yet-consumed landing so a correction is never misread as a
         // fall landing (§442 hazard 2b — `app.rs` calls this from the `pos_correction` handler).
@@ -745,6 +885,8 @@ impl CharacterController {
     /// Advance one frame. Returns the new authoritative position.
     pub fn step(&mut self, intent: MoveIntent, dt: f32, col: &Collision) -> [f32; 3] {
         self.hold_log_cooldown = (self.hold_log_cooldown - dt).max(0.0);
+        // #845: the failed-search retry throttle (cost only — see `rescue_cooldown`).
+        self.rescue_cooldown = (self.rescue_cooldown - dt).max(0.0);
         // #724 review B1 — THE CLEAR PATH, and the whole reason this is a `take` and not a read.
         // The hold is dropped here, unconditionally, before anything can look at it. The only code
         // that can put one back is a branch that is actively holding the body on THIS frame (there
@@ -1149,6 +1291,19 @@ impl CharacterController {
                         // in `depenetrate`. Behaviour-identical routing: `recover` additionally
                         // zeroes `stuck_time`, but this arm only runs on frames `depenetrate`
                         // returned false, which already reset it.
+                        // ⚠️ NOT AMENDED BY #845, deliberately — see `last_resort_placement`. This
+                        // arm looks like `depenetrate`'s dead end and is NOT one: it runs AFTER
+                        // collide-and-slide, so the driver's lateral input has already reached the
+                        // body this frame and `UnderworldNoRecovery` is not absorbing. A held body
+                        // here can be walked out under its own client-API power, which is precisely
+                        // the exit #845 is about. Widening the zone search to cover this arm as
+                        // well was tried and reverted: it would teleport bodies the #724 guard is
+                        // deliberately holding where the SERVER put them, and three tests pin that
+                        // intent (`a_body_held_above_the_underworld_with_no_recovery_history_says_so_too`,
+                        // `a_large_same_zone_relocation_forgets_the_pre_relocation_recovery_ring`,
+                        // and the `fell_through` half of
+                        // `no_recovery_ever_restores_a_position_a_relocation_superseded`). Overturning
+                        // #724's rationale needs its own evidence, not a side effect of this fix.
                         let recovered = match self.good.back().copied() {
                             Some(g) => { self.recover(g[0], g[1], Recovery::Grounded(g[2])); true }
                             None => false, // hold current pos; don't sink below underworld
@@ -1205,8 +1360,57 @@ impl CharacterController {
     ///
     /// Uses the centre ray (at foot and chest heights) for the contact, then backs the cylinder
     /// centre off by `radius` measured along the hit normal — a penetration-free "ray + radius"
-    /// capsule approximation. Grazing cases the thin centre ray slips past are caught next frame by
-    /// the depenetration net (§3.3).
+    /// capsule approximation.
+    ///
+    /// **#870 — THE RAY MUST LOOK AS FAR AS THE BACK-OFF IT WILL APPLY.** The ray used to be cast
+    /// exactly `|remaining|` long while the resolution backed the body off by `radius/ndot + SKIN`
+    /// (≥ 1.05 u). Those two lengths disagreeing is the whole defect: when a frame's step ENDED
+    /// short of a face, the ray never reached it, `nearest_hit` reported nothing, and the body
+    /// advanced its full step — coming to rest anywhere in `(0, radius + SKIN)` of a solid face,
+    /// i.e. with its own collision cylinder overlapping that face. The comment that stood here
+    /// ("grazing cases the thin centre ray slips past are caught next frame by the depenetration
+    /// net") named that as the remedy, and the remedy is a TELEPORT: `is_embedded` tests the
+    /// footprint ring at `Body::ring` = 3.0 with radius `PLAYER_RADIUS` = 1.0, so a body resting
+    /// 0.75 u from any face at least `Body::ring` tall reads EMBEDDED and the net relocates it to a
+    /// ring candidate up to `PUSHOUT_RADII` away. MEASURED on a grounded walker driven at a 3.0-tall
+    /// barrier: the net fired on alternate frames and carried the body **+342.9 u laterally** along
+    /// a wall it was merely leaning on, in 15 s of simulated time, at unchanged z — every one of
+    /// those units reported to the driving agent as an ordinary position. The `lip >= 3.00`
+    /// threshold in #870 is exactly `Body::ring`; below it the ring never sees the barrier at all.
+    ///
+    /// So the look-ahead is DERIVED from the back-off rather than being a second hand-tuned number:
+    /// `radius + SKIN` is the back-off at `ndot = 1`, the head-on case, and `contact` is now scaled
+    /// by the ray's own length instead of by `len`. A face inside the look-ahead but beyond the
+    /// step resolves to `advance == len` (no behaviour change, the body simply completes its step)
+    /// unless it is close enough that completing the step would penetrate — which is exactly the
+    /// case that used to be handed to the net.
+    ///
+    /// **Residual, stated because it is real — and it obeys NO formula.** The ray is lengthened by
+    /// the head-on `radius + SKIN`, not by the oblique `radius/ndot + SKIN` (which reaches 20 u at
+    /// the `ndot` floor and is not a sane ray length), so head-on is the only approach with a
+    /// clean clearance. MEASURED, driving a grounded body at a 6 u wall at eight approach angles,
+    /// 40 phases each, 600 frames, 35 u/s at 60 Hz, recording the closest perpendicular approach
+    /// ever reached, where `ndot` is the cosine of the approach against the face normal:
+    ///
+    /// | `ndot` | 1.000 | 0.985 | 0.866 | 0.707 | 0.500 | 0.342 | 0.174 | 0.087 |
+    /// |---|---|---|---|---|---|---|---|---|
+    /// | this branch | 1.050 | 1.037 | 0.920 | 0.743 | 0.708 | 0.801 | 0.899 | 0.949 |
+    /// | pre-#870 `ce1d89f` | 0.417 | 0.426 | 0.495 | 0.588 | 0.708 | 0.801 | 0.899 | 0.949 |
+    ///
+    /// (`ce1d89f` is the pre-#870 baseline for both tables in this file.)
+    ///
+    /// `is_embedded` still fires from `ndot` 0.866 down — those are the rows whose worst clearance
+    /// is inside `PLAYER_RADIUS` = 1.0, and they are the rows with nonzero embedded frames on this
+    /// branch. It does NOT fire on the two rows above them; read the table rather than this
+    /// sentence for where the boundary is. Two things follow, and
+    /// both contradict what an earlier draft of this paragraph asserted: there is no useful lower
+    /// bound at all below head-on, and the residual is NOT monotonic in the approach angle — it is
+    /// worst through the oblique middle and recovers toward parallel, so any claim of the form
+    /// "degrades toward X as the approach turns parallel" has the shape wrong as well as the
+    /// number. What the fix does buy is measured and one-directional: this branch is strictly
+    /// better than `ce1d89f` at `ndot` >= 0.707 and exactly tied at 0.500 and below, where the
+    /// lengthened ray changes neither the worst clearance nor the embedded-frame count. Closing
+    /// the oblique case needs a swept-cylinder contact, not a centre ray — out of scope here.
     fn slide(&self, from: [f32; 3], delta: [f32; 3], col: &Collision) -> ([f32; 3], bool) {
         // The contact heights AND the radius come from the ONE shared body (#386, #378 Phase 2):
         // the chest ray here and the planner's top edge probe are the same `Body::chest` field, and
@@ -1215,6 +1419,9 @@ impl CharacterController {
         let body = &crate::traversability::PLAYER_BODY;
         let probes = body.contact_probes();
         let radius = body.radius;
+        // #870: ONE expression, read by the ray length below and by the back-off in the resolution
+        // arm. Editing either alone re-opens the gap the net was papering over.
+        let back_off = radius + SKIN;
         let mut pos = from;
         let mut remaining = delta;
         let mut hit_any = false;
@@ -1222,11 +1429,13 @@ impl CharacterController {
             let len = hlen(remaining);
             if len < 1e-5 { break; }
             let d_hat = [remaining[0] / len, remaining[1] / len];
+            // #870: the step, PLUS the distance the resolution would back off by. See the doc above.
+            let ray_len = len + back_off;
             // Nearest contact among the foot and chest centre rays.
             let mut best: Option<crate::nav::collision::Hit> = None;
             for &hz in &probes {
                 let f = [pos[0], pos[1], pos[2] + hz];
-                let to = [f[0] + remaining[0], f[1] + remaining[1], f[2]];
+                let to = [f[0] + d_hat[0] * ray_len, f[1] + d_hat[1] * ray_len, f[2]];
                 if let Some((t, n)) = col.nearest_hit(f, to) {
                     if best.map_or(true, |b| t < b.t) { best = Some(crate::nav::collision::Hit { t, normal: n }); }
                 }
@@ -1237,8 +1446,19 @@ impl CharacterController {
                     hit_any = true;
                     // Distance into the plane along the motion (floored so grazing hits don't blow up).
                     let ndot = (-(d_hat[0] * hit.normal[0] + d_hat[1] * hit.normal[1])).max(0.05);
-                    let contact = hit.t * len;
+                    // #870: `hit.t` is a fraction of the RAY, which is now longer than the step.
+                    let contact = hit.t * ray_len;
                     let advance = (contact - radius / ndot - SKIN).max(0.0);
+                    // #870: the look-ahead lengthens the RAY, and must not lengthen the STEP.
+                    // `contact <= ray_len = len + radius + SKIN` and `radius/ndot >= radius`
+                    // (`ndot <= 1`), so `advance <= len` — the extra reach is spent entirely on the
+                    // back-off. Asserted rather than clamped: a `.min(len)` here would be
+                    // unreachable by that derivation, and an unreachable clamp hides the day the
+                    // derivation stops holding instead of reporting it. Debug-only, so it is live
+                    // under `cargo test` across every caller in the suite and free in release.
+                    debug_assert!(advance <= len + 1e-4,
+                        "#870: slide advanced {advance} past its own step {len} (contact {contact}, \
+                         ray {ray_len}, ndot {ndot}) — the look-ahead has become extra travel");
                     pos[0] += d_hat[0] * advance;
                     pos[1] += d_hat[1] * advance;
                     // Slide the unused budget along the plane (horizontal; z owned by ground/gravity).
@@ -1316,21 +1536,92 @@ impl CharacterController {
         }
     }
 
+    /// **#870 — the creep, and why it had to be added at the same time as the slide's look-ahead.**
+    /// This probe is a POINT probe down the destination's centre column, but the body is a cylinder
+    /// of `Body::radius`, and a riser it is pressed against is `radius + SKIN` ahead of that centre.
+    /// Before #870 the arithmetic worked only because `slide` left the body PENETRATING the riser:
+    /// resting `d` u short of the face with `d <= |wish|`, the raised sweep landed the centre at
+    /// `face + (|wish| - d)` — over the lip — and the centre probe found the tread. Once `slide`
+    /// honours its own back-off the body rests a full `radius + SKIN` = 1.05 u out, so at any frame
+    /// time with `|wish| < 1.05` (35 u/s at 60 Hz is 0.58) the raised sweep can no longer put the
+    /// centre past the face and NOTHING is ever mountable. MEASURED as three RED tests when the
+    /// look-ahead landed alone: `a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191`,
+    /// `a_swimmer_hauling_out_at_a_legitimate_bank_never_raises_the_afloat_stall`, and
+    /// `a_duck_across_a_divable_far_side_is_a_round_trip`, each ending at `east 2.95 = 4.0 − 1.05`,
+    /// i.e. correctly backed off and permanently unable to climb out.
+    ///
+    /// So the destination search creeps forward, in the travel direction, by AT MOST the same
+    /// `radius + SKIN` — one expression, the same one the slide backs off by — and takes the first
+    /// standable landing.
+    ///
+    /// **That is a real WIDENING of what counts as climbable, not a restoration of the pre-fix
+    /// reach.** An earlier draft of this paragraph claimed the creep lands the body "at or behind
+    /// where the penetrating version put it"; that is false and the measurement is the refutation.
+    /// Fixture: a 2.0 riser at east 0 whose tread only BEGINS `g` east of the face — a slot the
+    /// centre probe lands in — driven at 20 u/s, 60 Hz, 600 frames, recording the first mounting
+    /// frame (so a depenetration teleport cannot be mistaken for a creep; `is_embedded` was false
+    /// on every frame before every mount, and lateral drift was 0.0000 throughout).
+    ///
+    /// | tread gap `g` | 0.00 | 0.20 | 0.34 | 0.80 | 1.20 | 1.38 | 1.39 |
+    /// |---|---|---|---|---|---|---|---|
+    /// | `ce1d89f`, east at mount | 0.0000 | 0.3333 | none | none | none | none | none |
+    /// | this branch, east at mount | 0.0000 | 0.3333 | 0.4646 | 0.8583 | 1.2521 | 1.3833 | none |
+    ///
+    /// For every gap from 0.34 up, the penetrating version puts the body nowhere on the tread at
+    /// all, so "at or behind where it put it" had no true reading there. The landings step in
+    /// exact increments of `(radius + SKIN) / STEP_LANDING_CREEP_SAMPLES` = 0.13125 and stop at
+    /// east 1.3833 — one whole `radius + SKIN` past a base of 0.3333 (that base is the measured
+    /// value on this fixture, not a traced mechanism). The 0.13125 stride and the 1.3833 ceiling
+    /// are together the fingerprint of the cap, and are what
+    /// `the_step_landing_creep_reaches_one_back_off_past_the_riser_and_no_further` pins.
+    ///
+    /// **Open, and deliberately not asserted either way: whether the widening is DESIRED.**
+    /// Stepping over a crack narrower than the body's own diameter is defensible, but it is a
+    /// reachability change, it was not compared against the reference client, and no live client
+    /// was run. See #930, which also covers `try_step_up`'s own doc below still calling a gap an
+    /// unconditional `None`.
+    ///
+    /// Two soundness gates, both load-bearing:
+    ///   * the creep runs ONLY when the raised sweep made full progress. If the raised sweep was
+    ///     itself stopped by geometry, creeping past its stopping point would push the body into
+    ///     the thing that stopped it.
+    ///   * every creep sample re-runs the SAME band test as the centre probe, so the creep can
+    ///     only find a landing the centre probe would also have accepted — it changes WHERE the
+    ///     landing is looked for, never WHAT counts as one.
+    const STEP_LANDING_CREEP_SAMPLES: usize = 8;
+
     /// Step-offset climb (design §3.2): raise the cylinder by `STEP_UP`, sweep again, and — only if
     /// a floor exists to stand on at the raised destination (the no-geometry-gap guard) — return the
     /// stepped-up `[east, north, floor_z]`. `None` = no valid step (taller-than-2u wall or a gap).
     fn try_step_up(&self, wish: [f32; 3], max_step: f32, col: &Collision) -> Option<[f32; 3]> {
         let raised = [self.pos[0], self.pos[1], self.pos[2] + max_step];
         let (hi, _) = self.slide(raised, wish, col);
+        let origin = self.pos[2] + max_step + GROUND_ORIGIN;
+        let depth = max_step + GROUND_ORIGIN + GROUND_SNAP_TOL;
         // Probe for a floor near the raised destination, within the step band. The slide above only
         // makes progress when there is open space over the lip, so we never "climb" into solid wall;
         // and a floor must exist here to stand on, so a taller bare wall still returns None.
-        let f = col.ground_below(hi[0], hi[1], self.pos[2] + max_step + GROUND_ORIGIN, max_step + GROUND_ORIGIN + GROUND_SNAP_TOL)?;
-        if f >= self.pos[2] - GROUND_SNAP_TOL && f - self.pos[2] <= max_step + GROUND_SNAP_TOL {
-            Some([hi[0], hi[1], f])
-        } else {
-            None
+        let in_band = |f: f32| {
+            f >= self.pos[2] - GROUND_SNAP_TOL && f - self.pos[2] <= max_step + GROUND_SNAP_TOL
+        };
+        if let Some(f) = col.ground_below(hi[0], hi[1], origin, depth) {
+            if in_band(f) { return Some([hi[0], hi[1], f]); }
         }
+        // #870: creep the destination forward by up to the slide's own back-off. See the doc above.
+        let len = hlen(wish);
+        if len < 1e-5 { return None; }
+        let travelled = hlen([hi[0] - raised[0], hi[1] - raised[1], 0.0]);
+        if travelled + 1e-4 < len { return None; } // the raised sweep was itself blocked — do not creep
+        let d_hat = [wish[0] / len, wish[1] / len];
+        let back_off = crate::traversability::PLAYER_BODY.radius + SKIN;
+        for i in 1..=Self::STEP_LANDING_CREEP_SAMPLES {
+            let s = back_off * (i as f32) / (Self::STEP_LANDING_CREEP_SAMPLES as f32);
+            let (e, n) = (hi[0] + d_hat[0] * s, hi[1] + d_hat[1] * s);
+            if let Some(f) = col.ground_below(e, n, origin, depth) {
+                if in_band(f) { return Some([e, n, f]); }
+            }
+        }
+        None
     }
 
     /// The swimming step-up's downward mirror (#661): can a blocked swimmer pass UNDER the
@@ -1430,9 +1721,27 @@ impl CharacterController {
         // is a horizontal-wish driver (e.g. `/move/manual`) making a one-way crossing it cannot
         // undo; that driver now stalls wet at the mouth instead
         // (`qcat_pocket_horizontal_wish_alone_stalls_wet_at_the_mouth`).
+        //
+        // ⚠️ **The tolerance is not decoration (#870).** Without it this comparison is decided by
+        // float noise for the commonest case there is: a body resting AT its own float plane.
+        // Expand the left side — `surf − float_depth − (pos_z − sink)` with an unclamped
+        // `sink = −(STEP_UP + GROUND_SNAP_TOL)` — and the clause reduces exactly to
+        // `pos_z >= surf − float_depth`, i.e. "the body is at or above its float plane". Buoyancy
+        // parks it there asymptotically, so the deciding quantity is the last ULPs of the approach.
+        // MEASURED on the `a_duck_across_a_divable_far_side_is_a_round_trip` lintel, same fixture,
+        // two resting spots 0.78 u apart: `2.4999952 <= 2.5` (admits) at east 4.267 versus
+        // `2.5000072 <= 2.5` (REFUSES) at east 5.05 — a 1.2e-5 u swing across the boundary, which
+        // is far below anything the geometry means. `DUCK_ENVELOPE_TOL` is 1e-3 u, and both
+        // ratios are re-derived from the constants rather than quoted: 1e-3 / 1.2e-5 = 83× that
+        // noise, and 1e-3 / (STEP_UP + GROUND_SNAP_TOL) = 1e-3 / 2.5 = 1/2500 of the envelope it
+        // slackens, so it cannot admit a duck whose return is in any physical doubt — the trap
+        // this bound exists to refuse is a 2 u mismatch, and 2.0 / 1e-3 = two thousand times
+        // wider. #870 found it by moving where the body rests, not by changing this
+        // clause; on `main` the same test passes only because its body happens to settle on the
+        // admitting side of the knife-edge.
         let surf = col.water_surface(lo)?;
         ((surf - crate::traversability::PLAYER_BODY.float_depth) - lo[2]
-            <= STEP_UP + GROUND_SNAP_TOL).then_some(lo)
+            <= STEP_UP + GROUND_SNAP_TOL + DUCK_ENVELOPE_TOL).then_some(lo)
     }
 
     /// Is the wedged-against barrier a *hoppable* fence — i.e. is there walkable floor `HOP_REACH`
@@ -1535,7 +1844,9 @@ impl CharacterController {
         // Push-out failed: count time stuck, then fall back to the most recent good position.
         self.stuck_time += dt;
         if self.stuck_time >= STUCK_FALLBACK_SECS {
-            match self.good.back().copied() {
+            // Bound the ring borrow before the `None` arm needs `&mut self` (#845).
+            let banked = self.good.back().copied();
+            match banked {
                 Some(g) => {
                     tracing::info!("depenetrate: stuck {:.1}s, falling back to last good pos {:?}", self.stuck_time, g);
                     // The ring buffer only ever samples GROUNDED, NON-EMBEDDED positions — enforced
@@ -1554,10 +1865,85 @@ impl CharacterController {
                 // was completely silent — the `tracing::info!` above is inside the `Some` arm, and
                 // no agent-visible field carried a stuck/embedded signal at all. Say so, on both
                 // channels.
+                //
+                // ⚠️ AMENDED (#845). "The body cannot move in ANY direction, under any driver, for
+                // ever" was an accurate description of this arm and that is the whole problem: it
+                // is an ABSORBING state of this state machine. Nothing the arm executes writes
+                // `pos`, `on_ground`, `good` or `stuck_time`, so the next frame is bit-identical
+                // and no driver input appears in any variable the arm reads. Two live validation
+                // runs died in it; the second was measured — every one of `/v1/move/manual`
+                // (east / north / west+jump / up), `/v1/move/jump` and `/v1/move/stop` returned
+                // HTTP 200 and left `pos` byte-identical at `[-2190.5, 902.125, 3.5]` while
+                // `held_secs` ran from 38 s to 130 s. The hold below is still raised, and is still
+                // the honest disclosure; what changed is that it is now raised only after
+                // `last_resort_placement` has asked the ZONE whether there is anywhere to stand,
+                // rather than only asking this body's own erased history. See
+                // `nearest_standing_place`.
+                None if self.last_resort_placement(col, dt) => {}
                 None => self.enter_hold(ControllerHoldReason::EmbeddedNoRecovery, dt, prev_hold),
             }
         }
         true
+    }
+
+    /// #845 — **the last resort for the one arm that is genuinely absorbing.** Returns `true` if the
+    /// body was placed somewhere it can stand, `false` if this zone offered nowhere (or the retry
+    /// throttle declined to look this frame).
+    ///
+    /// Called from exactly ONE site: the stuck fallback in [`Self::depenetrate`], and only on the
+    /// arm where the `good` ring is empty. Where the ring HAS a sample nothing changes — the restore
+    /// still wins, because a banked position is a place this body actually stood, which is strictly
+    /// better evidence than a search result.
+    ///
+    /// **Deliberately NOT called from `step`'s #150 fall-through guard**, whose no-history arm looks
+    /// like the same dead end and is not one. That arm runs after collide-and-slide, so the driver's
+    /// lateral input has already been applied to the body by the time it executes: a body holding
+    /// `UnderworldNoRecovery` can be walked out through `/v1/move/manual` under its own power, so it
+    /// already has the client-API exit #845 asks for. Extending the search there was implemented and
+    /// then reverted, because it relocates bodies that #724 is deliberately holding where the SERVER
+    /// put them; that rationale deserves its own evidence rather than being overturned as a side
+    /// effect. The consequence to be honest about: an `underworld_no_recovery` body whose zone has no
+    /// floor within lateral reach still has no exit, and this PR does not change that.
+    ///
+    /// **This is a relocation, and the log is loud about it.** The body is moved as much as
+    /// [`RESCUE_RADII`]'s reach, without the driver asking, which is exactly the kind of silent
+    /// client-side write this project treats as a lie. Two things keep it honest: it fires only
+    /// from a state the body could not leave under ANY driver (so the alternative is not "walk
+    /// there yourself", it is "stay frozen until a GM intervenes"); and it logs at `warn`,
+    /// unthrottled, with the origin and the destination in full — because a relocation is an event
+    /// rather than a condition. (The `moved` figure on that line is HORIZONTAL only, so read the
+    /// destination, not the distance, if the placement changed height.)
+    ///
+    /// ⚠️ **A third thing does NOT keep it honest, and an earlier version of this comment claimed
+    /// it did.** A success here is invisible to `player.hold`: this arm returns before
+    /// [`Self::enter_hold`] is reached, and `step` takes the hold at the top of every frame, so the
+    /// body is relocated with the field `None` throughout — measured at 0 held frames of 300 in a
+    /// zone this search solves. The transition an agent can see is the inverse one: a *published*
+    /// hold means this search answered `nowhere`, and it does not clear on its own (measured at
+    /// 1800 frames / 60 s in a static zone it cannot solve, raised and never cleared). Nothing on
+    /// the HTTP side marks the relocation; the `warn` below is its only record. That gap is #925.
+    ///
+    /// Not throttled on success — a success moves the body, so it cannot repeat from the same
+    /// place. [`RESCUE_RETRY_SECS`] throttles only the failing search.
+    fn last_resort_placement(&mut self, col: &Collision, dt: f32) -> bool {
+        if self.rescue_cooldown > 0.0 { return false; }
+        let from = self.pos;
+        match nearest_standing_place(col, from, self.underworld) {
+            Some(q) => {
+                let moved = ((q[0] - from[0]).powi(2) + (q[1] - from[1]).powi(2)).sqrt();
+                tracing::warn!(
+                    "controller RELOCATED [#845]: {:?} was unrecoverable (push-out found nowhere, \
+                     no recovery history) — moved {:.1} u to the nearest place this zone can stand \
+                     a body, {:?}. This is a client-side relocation, not a server correction.",
+                    from, moved, q);
+                self.recover(q[0], q[1], Recovery::Grounded(q[2]));
+                true
+            }
+            None => {
+                self.rescue_cooldown = RESCUE_RETRY_SECS.max(dt);
+                false
+            }
+        }
     }
 
     /// Apply a [`Recovery`] — the ONLY place the depenetration net writes position and support
@@ -2165,6 +2551,253 @@ mod tests {
         ctrl.step(walk(35.0, [1.0, 0.0]), 0.2, &c);
         assert!(ctrl.pos[0] > 5.0, "should have climbed past the ledge edge: {}", ctrl.pos[0]);
         assert!((ctrl.pos[2] - 2.0).abs() < 0.3, "should be standing on the 2u ledge: {}", ctrl.pos[2]);
+    }
+
+    // ── #870: a grounded walker must never be handed to the depenetration net by the slide ──────
+    //
+    // #870 reports a grounded walker ending up beyond a thin barrier it never crossed, at lips
+    // >= 3.00, with the mechanism explicitly UNDETERMINED. The mechanism established here is the
+    // COMPOSITION of two things, and it is NOT #854:
+    //
+    //   * #854 is `slide()`'s probe HEIGHTS — `contact_probes()` starts at `Body::foot` = 0.5, so a
+    //     face whose top lands in `(feet, feet + 0.5)` is never sampled horizontally. That band is
+    //     0.5 u tall and these barriers are 3.0-6.0 u tall, so it cannot reach this case; #870 says
+    //     so and this agrees.
+    //   * #870 is `slide()`'s ray LENGTH. The ray was cast `|delta|` long while the resolution backs
+    //     the body off by `radius/ndot + SKIN` >= 1.05 u. A step that ENDS short of a face never
+    //     reaches it, so the body advances in full and comes to rest with its own cylinder
+    //     overlapping the face. `is_embedded` then reads the footprint ring — cast at
+    //     `Body::ring` = 3.0 above the feet, at radius `PLAYER_RADIUS` = 1.0 — as pierced, and the
+    //     depenetration net TELEPORTS the body to a `PUSHOUT_RADII` ring candidate chosen on two
+    //     conditions only: the candidate's own footprint is clear, and its column has a floor. The
+    //     SEGMENT between the body and the candidate is never tested, which is the structural
+    //     reason a landing on the far side of the barrier is representable at all.
+    //
+    // `Body::ring` = 3.0 is where #870's reported `lip >= 3.00` threshold comes from, and
+    // `the_footprint_ring_band_is_what_makes_lips_at_body_ring_different` re-derives it from the
+    // field rather than inheriting the number from the issue.
+    //
+    // What is NOT claimed here: this file does not reproduce #870's specific reported endpoint
+    // (east 99.4, z -10). Driving the fixture as the issue states it — 240 runs over 6 lips x 2 far
+    // floors x 40 approach phases — produced the net's teleport every time and a far-side landing
+    // NONE of the times; on a planar barrier every ring candidate east of the face is correctly
+    // refused by `footprint_clear`, and the body is instead dragged sideways along the wall
+    // (measured: +99.7 u with a 100 u wall, +342.9 u with a 2000 u one, in 900 frames at dt 1/60).
+    // That lateral drag is the same falsehood as the crossing — a reported position the body never
+    // walked to — and it is what these tests pin. See the PR body for the full disclosure.
+
+    /// The REACH CONTROL for the property test below, and the re-derivation of #870's threshold.
+    ///
+    /// Two things a green property test cannot tell you on its own: that the bad state exists at
+    /// all, and that `is_embedded` is the predicate that sees it. Both are asserted here directly,
+    /// against a hand-placed body rather than a driven one — so the property test cannot be passing
+    /// because the harness is blind. The threshold is read off `Body::ring`, NOT off the issue.
+    #[test]
+    fn the_footprint_ring_band_is_what_makes_lips_at_body_ring_different() {
+        let ring = crate::traversability::PLAYER_BODY.ring;
+        let radius = crate::traversability::PLAYER_BODY.radius;
+        // A body 0.75 u from the face — inside its own collision radius of it, which is the state
+        // the un-extended ray used to leave behind.
+        let inside = -0.75_f32;
+        assert!(inside.abs() < radius, "the control must place the body inside the ring radius");
+        for &(lip, want_embedded) in &[
+            (ring - 0.5, false), (ring - 0.05, false), (ring + 0.05, true), (ring + 3.0, true),
+        ] {
+            let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, lip), floor(-10.0, 0.0, 100.0)]);
+            assert_eq!(is_embedded(&c, [inside, 0.0, 0.0]), want_embedded,
+                "a body {inside} from the face of a {lip}-tall barrier: is_embedded should be \
+                 {want_embedded} (Body::ring = {ring})");
+        }
+        // And the same body one back-off out is NOT embedded at any of those lips — which is the
+        // clearance the fix makes `slide` guarantee.
+        for lip in [ring - 0.5, ring + 0.05, ring + 3.0] {
+            let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, lip), floor(-10.0, 0.0, 100.0)]);
+            assert!(!is_embedded(&c, [-(radius + SKIN), 0.0, 0.0]),
+                "a body backed off by radius+SKIN from a {lip}-tall barrier must not read embedded");
+        }
+    }
+
+    /// **THE UNIVERSAL (#870).** Over a grid of barrier heights, far-floor depths, speeds, frame
+    /// times and approach phases, a grounded walker driven straight at a barrier taller than
+    /// `STEP_UP`:
+    ///
+    ///   * never ends up on the far side of it (the reported failure),
+    ///   * never moves sideways (the net's teleport is lateral, and the drive has no lateral
+    ///     component — any north displacement at all is motion the body did not make),
+    ///   * and, the invariant that makes both of those true rather than merely observed, is never
+    ///     classified `is_embedded` on ANY frame. That is the real claim: the depenetration net is
+    ///     a recovery for bodies stuck IN geometry, and a body walking into a wall is not one.
+    ///
+    /// A driven run cannot discharge a universal, and this does not pretend to: it is a grid, and
+    /// the parameters it sweeps are named above. What makes the frame-by-frame `is_embedded` check
+    /// worth more than the endpoint checks is that it fails at the FIRST frame the body enters the
+    /// band, before any teleport has had to be lucky enough to land somewhere visible.
+    #[test]
+    fn a_grounded_walk_at_a_barrier_never_enters_the_depenetration_net() {
+        let radius = crate::traversability::PLAYER_BODY.radius;
+        let mut runs = 0_usize;
+        let mut band_frames = 0_usize;
+        // ⚠️ **The lips start at 2.60, and the gap below it is a DIFFERENT, STILL-OPEN bug.**
+        // A lip in `(STEP_UP, STEP_UP + Body::foot)` = (2.00, 2.50) is passable, and #870's fix
+        // does not touch it: `try_step_up` raises the body by `STEP_UP` and sweeps again, and that
+        // raised sweep's own foot ray sits `Body::foot` = 0.5 ABOVE the raised feet, so a lip
+        // topping out inside that half-unit is invisible to it — #854's blind band, one storey up.
+        // MEASURED at lip 2.40, 20 u/s, 60 Hz: east −1.00 → −0.67 → −0.33 → 0.00 → +0.33 …, a
+        // smooth 0.333 u/frame walk THROUGH the barrier, `is_embedded` false the whole way — and
+        // byte-identical on unmodified `main` and on this branch, which is what makes it a
+        // separate bug and not a regression. It is excluded here rather than fixed because the fix
+        // is #854's (probe heights), not this one's (ray length), and asserting a barrier that low
+        // holds would be asserting something no code in this PR makes true.
+        for lip in [2.60_f32, 2.80, 2.95, 3.00, 3.05, 3.50, 4.00, 6.00, 12.00] {
+            for far in [0.0_f32, -10.0] {
+                for speed in [20.0_f32, 35.0, 44.0] {
+                    for dt in [1.0_f32 / 60.0, 1.0 / 30.0, 1.0 / 20.0] {
+                        for k in 0..7 {
+                            // Phase: where in the step the body first comes within a step of the
+                            // face. This is the parameter the un-extended ray was sensitive to.
+                            let start = -20.0 - (k as f32) * 0.017;
+                            let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, lip),
+                                             floor(far, 0.0, 100.0)]);
+                            let mut ctrl = CharacterController::new([start, 0.0, 0.0]);
+                            ctrl.on_ground = true;
+                            runs += 1;
+                            for f in 0..400 {
+                                assert!(!is_embedded(&c, ctrl.pos),
+                                    "lip {lip} far {far} speed {speed} dt {dt} k {k} frame {f}: \
+                                     a walker at a barrier was handed to the depenetration net at \
+                                     {:?} (#870)", ctrl.pos);
+                                ctrl.step(walk(speed, [1.0, 0.0]), dt, &c);
+                                // `-radius` is where the cylinder's east face touches the barrier;
+                                // 1e-4 is float slack on a ~20 u accumulated walk, not tolerance
+                                // for penetration (the failure this pins overshoots by ~1 u).
+                                assert!(ctrl.pos[0] <= -radius + 1e-4,
+                                    "lip {lip} far {far} speed {speed} dt {dt} k {k} frame {f}: \
+                                     east {} is inside/through a barrier at east 0 (#870)",
+                                    ctrl.pos[0]);
+                                assert!(ctrl.pos[1].abs() < 1e-3,
+                                    "lip {lip} far {far} speed {speed} dt {dt} k {k} frame {f}: \
+                                     north {} — the drive is due east, so this is displacement the \
+                                     body never made (#870)", ctrl.pos[1]);
+                                if ctrl.pos[0] > -(radius + SKIN) - 1e-3 { band_frames += 1; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Reach control for the LOOP: a grid that silently visited nothing would also be green.
+        assert_eq!(runs, 9 * 2 * 3 * 3 * 7, "the grid must actually run every combination");
+        assert!(band_frames > runs, "every run must reach the barrier and rest against it; \
+                                     only {band_frames} settled frames over {runs} runs");
+    }
+
+    /// #870's example, pinned: the drop shape it names (3.0 lip, floor beyond at -10). The walker
+    /// stops dead one back-off short of the face, stays on the line it was driven along, keeps its
+    /// z, stays grounded — and reports no hold, because it is not held: it is standing at a wall.
+    #[test]
+    fn a_grounded_walker_stops_at_a_3u_barrier_with_a_10u_drop_beyond() {
+        let radius = crate::traversability::PLAYER_BODY.radius;
+        let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, 3.0), floor(-10.0, 0.0, 100.0)]);
+        let mut ctrl = CharacterController::new([-20.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        for _ in 0..900 { ctrl.step(walk(35.0, [1.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!((ctrl.pos[0] - -(radius + SKIN)).abs() < 1e-3,
+            "should rest exactly one back-off short of the face: east={}", ctrl.pos[0]);
+        assert!(ctrl.pos[1].abs() < 1e-3, "no lateral drift: north={}", ctrl.pos[1]);
+        assert!(ctrl.pos[2].abs() < 1e-3, "still on the near floor: z={}", ctrl.pos[2]);
+        assert!(ctrl.on_ground, "still grounded");
+        assert!(ctrl.hold().is_none(), "standing at a wall is not a hold: {:?}", ctrl.hold());
+    }
+
+    /// **The step-landing creep's `radius + SKIN` cap, pinned in BOTH directions (#870, review
+    /// round 2).** Round 2's independent review ran a mutant that multiplied the creep's `back_off`
+    /// by 10 — reach 10.5 u instead of 1.05 u — through the whole `--lib` suite and it SURVIVED,
+    /// green. That mutation lets a body step across a chasm ten times its own diameter and then
+    /// report standing on ground it never crossed: a silent wrong-position generator behind a green
+    /// suite, which this repo ranks above crashes. Nothing pinned the cap because every existing
+    /// #870 test asks whether a body climbs, never how far past the riser it is willing to look.
+    ///
+    /// This asks exactly that, and it is a bracket, not a one-sided assertion — which is what makes
+    /// it fail under a WIDENED cap and under a NARROWED one:
+    ///
+    ///   * a gap of 1.38 u past the riser face must still mount, AND must land at east 1.3833.
+    ///     Halve the cap and the reachable landings stop at 0.8583, so this row stops mounting.
+    ///   * a gap of 1.39 u and everything above it must NOT mount at all. Multiply the cap by 10
+    ///     and the first creep sample lands at 1.6458, so every one of these rows mounts.
+    ///
+    /// A third mutant was run and it is the reason the east column exists at all: changing
+    /// `STEP_LANDING_CREEP_SAMPLES` from 8 to 4 leaves the CAP intact and so SURVIVED the
+    /// mount/refuse rows alone, green — a draft of this comment asserted, by reasoning rather than
+    /// measurement, that any change to either factor would be caught. It is not; the coarser
+    /// stride happens to reach the same 1.3833 ceiling. Pinning the measured east of each landing
+    /// closes it (8 samples put the 0.34 row at 0.4646, 4 samples at 0.5958).
+    ///
+    /// A refusal is checked POSITIVELY too — the body must be left on the near floor, grounded,
+    /// never `is_embedded` on any frame and never laterally displaced — so a mutant that turns a
+    /// refusal into a depenetration teleport cannot pass by merely failing to reach z.
+    #[test]
+    fn the_step_landing_creep_reaches_one_back_off_past_the_riser_and_no_further() {
+        let radius = crate::traversability::PLAYER_BODY.radius;
+        // A 2.0 riser at east 0 whose tread only BEGINS `gap` east of the face: the centre probe
+        // lands in the slot, so only the creep can find the tread.
+        let run = |gap: f32| -> Option<[f32; 3]> {
+            let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, 2.0), floor(2.0, gap, 100.0)]);
+            let mut ctrl = CharacterController::new([-20.0, 0.0, 0.0]);
+            ctrl.on_ground = true;
+            for _ in 0..600 {
+                ctrl.step(walk(20.0, [1.0, 0.0]), 1.0 / 60.0, &c);
+                assert!(!is_embedded(&c, ctrl.pos),
+                    "gap {gap}: the depenetration net must never be involved here — {:?}", ctrl.pos);
+                assert!(ctrl.pos[1].abs() < 1e-3,
+                    "gap {gap}: north {} — the drive is due east", ctrl.pos[1]);
+                if ctrl.pos[2] > 1.5 { return Some(ctrl.pos); }
+            }
+            None
+        };
+        // Reach control: the fixture must be climbable at all, or every "refused" row below is
+        // vacuous. Gap 0 is a plain 2.0 step and must mount.
+        assert!(run(0.0).is_some(), "the fixture is not climbable even with no tread gap");
+        // MEASURED landings. The east column is what pins the STRIDE as well as the cap: the
+        // samples sit at `base + i*(radius + SKIN)/STEP_LANDING_CREEP_SAMPLES` for `i` in 1..=8, so
+        // halving or doubling the sample count moves the 0.34 row (measured: 8 samples → 0.4646,
+        // 4 samples → 0.5958) even where it leaves the coarser rows alone.
+        for &(gap, want_east) in &[(0.20_f32, 0.3333_f32), (0.34, 0.4646), (0.80, 0.8583),
+                                   (1.20, 1.2521), (1.38, 1.3833)] {
+            let p = run(gap).unwrap_or_else(|| panic!(
+                "gap {gap} must still mount — the creep reaches radius+SKIN = {} past the face; \
+                 a NARROWED cap fails here", radius + SKIN));
+            assert!((p[2] - 2.0).abs() < 1e-3, "gap {gap}: mounted to z {} not the 2.0 tread", p[2]);
+            assert!((p[0] - want_east).abs() < 2e-3,
+                "gap {gap}: landed at east {} not the measured {want_east} — the creep's stride \
+                 (radius+SKIN)/STEP_LANDING_CREEP_SAMPLES has moved (#870)", p[0]);
+        }
+        // THE CAP. The deepest landing the creep can ever reach on this fixture is one whole
+        // `radius + SKIN` past the base it starts from, in `STEP_LANDING_CREEP_SAMPLES` steps of
+        // (radius+SKIN)/8 = 0.13125. Measured base on this fixture: east 0.3333.
+        let deepest = run(1.38).expect("gap 1.38 must mount");
+        assert!((deepest[0] - 1.3833).abs() < 2e-3,
+            "the creep's deepest landing must be east 1.3833 = 0.3333 + (radius+SKIN) = 0.3333 + \
+             {}; got {} — the cap has moved (#870)", radius + SKIN, deepest[0]);
+        // And one stride further out is unreachable, at every gap above it.
+        for gap in [1.39_f32, 1.50, 2.00, 4.00, 10.00] {
+            assert!(run(gap).is_none(),
+                "gap {gap} must NOT mount — it is more than radius+SKIN = {} past the face; \
+                 a WIDENED cap fails here, and a body that mounts it reports standing on ground \
+                 it never crossed (#870)", radius + SKIN);
+        }
+        // A refusal must leave the body on the NEAR floor and grounded — not somewhere odd, and in
+        // particular not on the far tread by some other route. Deliberately NOT asserted here: the
+        // east it rests at. This riser is exactly `STEP_UP` tall, which is BELOW `Body::ring` = 3.0,
+        // so `is_embedded` structurally cannot see it and the body ends flush against the face
+        // (measured: east 5.4e-7). Whether that is right is #854's band, not #870's ray length, and
+        // asserting a back-off here would be asserting something no code in this PR makes true.
+        let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, 2.0), floor(2.0, 4.0, 100.0)]);
+        let mut ctrl = CharacterController::new([-20.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        for _ in 0..600 { ctrl.step(walk(20.0, [1.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(ctrl.pos[2].abs() < 1e-3, "a refused creep stays on the near floor: z={}", ctrl.pos[2]);
+        assert!(ctrl.on_ground, "still grounded");
+        assert!(ctrl.pos[1].abs() < 1e-3, "no lateral drift: north={}", ctrl.pos[1]);
     }
 
     #[test]
@@ -2782,14 +3415,27 @@ mod tests {
         assert!(ctrl.on_ground && ctrl.pos[0].abs() < 0.1,
             "fixture: it waded in place, grounded, for the whole banking period: {:?}", ctrl.pos);
 
-        // Relocate over a column with NO floor below (the floor at z=0 is far above) — dry, clear
-        // footprint, `ground_below` none → the net's no-floor arm, whose only recovery is the ring.
-        ctrl.pos = [50.0, 0.0, -49.0];
+        // #845: assert B3's property WHERE IT LIVES, on the ring itself, instead of only inferring
+        // it from a downstream restore. The original test could only observe the ring through the
+        // stuck fallback's behaviour, which made it hostage to what that fallback does next; this
+        // states the invariant directly and holds whatever the fallback is changed to.
+        assert!(ctrl.good.is_empty(),
+            "#661 review B3: an embedded wade must bank NOTHING; the ring holds {:?}", ctrl.good);
+
+        // Relocate over a column with NO floor below — dry, clear footprint, `ground_below` none →
+        // the net's no-floor arm, whose only recovery is the ring. East 1000 rather than east 50
+        // since #845: the zone's floor spans east ±100, so at east 50 the last-resort search finds
+        // ground ~54 u away and rescues the body, which would silently turn the assertions below
+        // into a test of the rescue instead of a test of the ring. At east 1000 the nearest floor
+        // is ~900 u away, past `RESCUE_RADII`'s reach, and the arm under test is reached again.
+        ctrl.pos = [1000.0, 0.0, -49.0];
         assert!(!c.in_water(ctrl.pos)
-                && c.ground_below(50.0, 0.0, -48.0, GROUND_DEPTH).is_none(),
-            "fixture: the relocation target is dry with nothing below in probe range");
+                && c.ground_below(1000.0, 0.0, -48.0, GROUND_DEPTH).is_none()
+                && nearest_standing_place(&c, ctrl.pos, f32::NEG_INFINITY).is_none(),
+            "fixture: the relocation target is dry, with nothing below in probe range and nothing \
+             the last-resort search can reach");
         for _ in 0..90 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
-        assert!((ctrl.pos[0] - 50.0).abs() < 1.5,
+        assert!((ctrl.pos[0] - 1000.0).abs() < 1.5,
             "#661 review B3: the ring must hold NO sample from the embedded wade — restoring one \
              rubber-bands the body back into the slot it was standing embedded in; got {:?}",
             ctrl.pos);
@@ -2839,10 +3485,126 @@ mod tests {
              it on the slab at z=2, grounded — got {:?} on_ground={}", ctrl.pos, ctrl.on_ground);
     }
 
+    /// Does the asset tree carry any evidence that `<name>.glb` names a ZONE, as opposed to a
+    /// character/creature/prop model sitting in the same directory?
+    ///
+    /// **This deliberately does not ask whether the zone's water map is USABLE** (#850, #879
+    /// round-2 BLOCKING 1). The predicate that stood here was
+    /// `maps/water/<name>.wtr` `is_file()`, and a name that failed it was deleted from the corpus
+    /// before the loop — so it was never opened, never entered the rollup, and could not make
+    /// the rollup incomplete. Measured on four scratch corpora against that code, varying only one
+    /// zone's `.wtr`: a CORRUPT file failed the run RED, while DELETING the same file passed
+    /// `ok … — COMPLETE` over a corpus of one, and a DIRECTORY in its place passed too. Deleting a
+    /// broken file made the build greener than fixing nothing, and the directory case collapsed
+    /// `RegionLoadError::Unreadable` into "no water map" — the substitution
+    /// `every_wtr_load_failure_is_a_distinct_named_value_762` in `region_map.rs` exists to forbid.
+    ///
+    /// So membership of the corpus is decided WITHOUT consulting the water map's contents. Three
+    /// signals, and **any one** of them puts the name in the population, where the loader — not a
+    /// filesystem predicate — classifies it as measured or as `unmeasured` with a named reason:
+    ///
+    /// 1. `<name>_doors.glb` — the doors companion a baked zone ships beside it.
+    /// 2. `maps/<name>.txt` — the EQ map pack `ZoneMap::try_load` reads.
+    /// 3. **Any filesystem entry at all** at `maps/water/<name>.wtr`. This uses
+    ///    `symlink_metadata`, not `is_file()`, so a directory, a dangling symlink and an
+    ///    unreadable file all count as evidence and send the name INTO the corpus to fail loudly.
+    ///
+    /// Measured on the default `$EQZONES` at the time of writing, over the 94 non-furniture `.glb`
+    /// names: each of the three signals splits them the same way, 42 with and 52 without, and the
+    /// 52 are exactly the character/creature/prop models. Three signals rather than one because
+    /// each is a separate asset that a partial sync can drop on its own; only a name with **none**
+    /// of them leaves the population.
+    ///
+    /// **The residual, stated rather than hidden.** A `<name>.glb` with none of the three is
+    /// indistinguishable from a creature model by anything on disk, and is excluded — printed by
+    /// name on the discovery line. That is the boundary of what this can know, not an oversight.
+    /// Widening it needs a source of truth outside the asset directory: a baked-zone manifest, so
+    /// the corpus can ASSERT its population rather than infer it. Filed as #928 with the exact
+    /// corpus and both outputs; not closable by a change to this predicate.
+    fn zone_evidence(dir: &std::path::Path, name: &str) -> bool {
+        let entry_at = |p: std::path::PathBuf| p.symlink_metadata().is_ok();
+        entry_at(dir.join(format!("{name}_doors.glb")))
+            || entry_at(dir.join("maps").join(format!("{name}.txt")))
+            || entry_at(dir.join("maps/water").join(format!("{name}.wtr")))
+    }
+
+    /// **The corpus population may never shrink because a water map got WORSE (#850, #879 round-2
+    /// BLOCKING 1).** The universal, in one sentence: *no state of a zone's water asset may produce
+    /// a verdict greener than a strictly better state of the same asset.*
+    ///
+    /// The way that gets violated is a pre-filter. A name removed from the population before the
+    /// loop is a name the rollup cannot see, so it cannot be counted, named, or reddened — and the
+    /// filter's own signal was the very asset whose failure the run is supposed to announce. The
+    /// four-state table below is the shape of the round-2 defect: `is_file()` admitted only the
+    /// first row, dropped rows 2 and 4 silently, and reddened only row 3 — so the two states that
+    /// are no better than row 3 were the two that passed.
+    ///
+    /// This is a unit test over the population predicate, with no baked assets, so CI runs it. The
+    /// other half — that a name IN the population with a bad water map goes RED — belongs to
+    /// `open_corpus_zone`'s DROP 3 and is pinned by its own tests in `water_grid.rs`.
+    #[test]
+    fn no_state_of_a_water_map_can_shrink_the_corpus_population_850() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("maps/water")).unwrap();
+
+        // ── the universal, as a table over the water asset ───────────────────────────────────
+        // Each row is a state of `maps/water/<zone>.wtr` for a name the tree ALREADY says is a
+        // zone (it has a map pack). Every row must stay in the population; what the water map
+        // says is the LOADER's verdict to give, not a filter's.
+        let states: &[(&str, fn(&std::path::Path))] = &[
+            ("a valid-looking .wtr", |p| std::fs::write(p, b"EQEMUWATER\x02\0\0\0\0\0\0\0").unwrap()),
+            ("absent",               |_| ()),
+            ("corrupt",              |p| std::fs::write(p, b"not region data at all").unwrap()),
+            ("a directory",          |p| std::fs::create_dir(p).unwrap()),
+        ];
+        for (what, make) in states {
+            let zone = format!("zone{}", what.replace(|c: char| !c.is_ascii_alphanumeric(), ""));
+            std::fs::write(dir.join(format!("{zone}.glb")), b"").unwrap();
+            std::fs::write(dir.join(format!("maps/{zone}.txt")), b"").unwrap();
+            make(&dir.join(format!("maps/water/{zone}.wtr")));
+            assert!(zone_evidence(dir, &zone),
+                "#850: a zone whose water map is {what} was dropped from the corpus population. \
+                 Every state of that file must leave the zone IN the corpus so the loader can name \
+                 it — filtering here is how DELETING a corrupt .wtr came to make the run greener \
+                 than leaving it in place");
+        }
+
+        // ── each signal alone is enough ──────────────────────────────────────────────────────
+        // A real zone that lost two of the three assets is still a zone, and still has to be
+        // measured or named. Written as three separate names so one signal cannot cover another.
+        let alone: &[(&str, fn(&std::path::Path, &str))] = &[
+            ("only the doors companion", |d, z| { std::fs::write(d.join(format!("{z}_doors.glb")), b"").unwrap(); }),
+            ("only the map pack",        |d, z| { std::fs::write(d.join(format!("maps/{z}.txt")), b"").unwrap(); }),
+            ("only a .wtr directory",    |d, z| { std::fs::create_dir(d.join(format!("maps/water/{z}.wtr"))).unwrap(); }),
+        ];
+        for (i, (what, make)) in alone.iter().enumerate() {
+            let zone = format!("lone{i}");
+            std::fs::write(dir.join(format!("{zone}.glb")), b"").unwrap();
+            make(dir, &zone);
+            assert!(zone_evidence(dir, &zone),
+                "#850: a zone with {what} must still be in the corpus population — the three \
+                 signals are OR'd precisely so a partial asset sync cannot silently shrink it");
+        }
+
+        // ── and the documented residual, pinned so it stays deliberate ───────────────────────
+        // A `.glb` with none of the three is what `bat` and `weapons` are, and is excluded. This
+        // half of the pin is what the `if false` wrap mutation reddens.
+        std::fs::write(dir.join("bat.glb"), b"").unwrap();
+        assert!(!zone_evidence(dir, "bat"),
+            "a .glb with no doors companion, no map pack and no .wtr entry is indistinguishable \
+             from a creature model, and must be excluded and named — admitting it here would red \
+             the real corpus on all 52 character/creature/prop models");
+    }
+
     /// **THE DEPENETRATION CORPUS — the blast-radius harness, committed so its numbers are
     /// reproducible (#649 review, finding 6).**
     ///
-    /// Two things at once, over every baked zone found at `$EQZONES`:
+    /// Two things at once, over every baked zone found at `$EQZONES` — where **a zone is a
+    /// `<name>.glb` the asset tree carries zone evidence for** (see `zone_evidence` and the
+    /// discovery block below), not any `.glb` that is not furniture: that older predicate admitted
+    /// 52 character/creature/prop models as "zones". Discovery and the per-zone accounting are both
+    /// asserted, so the counts this prints are the corpus, not the survivors:
     ///
     /// 1. **An ITERATION invariant, driven through the real controller.** The first cut of the #649
     ///    fix shipped a recovery that was itself embedded, and no one-shot harness could see it —
@@ -2898,34 +3660,131 @@ mod tests {
             None
         }
 
-        let mut zones: Vec<String> = std::fs::read_dir(&dir).expect("$EQZONES").filter_map(|e| {
-            let path = e.ok()?.path();
-            let n = path.file_name()?.to_str()?.strip_suffix(".glb")?.to_string();
-            (!n.ends_with("_doors") && !n.ends_with("_obj")).then_some(n)
-        }).collect();
+        // ── #850 / #879 review B3: DISCOVERY, with every directory entry accounted ──────────────
+        //
+        // What used to stand here was a `filter_map` whose predicate was "any `.glb` not ending in
+        // `_doors`/`_obj`", and whose count was then printed as the corpus size. Measured on the
+        // default `$EQZONES` at the time of writing: 185 directory entries, 136 `.glb`, 42 of them
+        // `_doors`/`_obj`, leaving 94 — and **52 of those 94 are character/creature/prop models**
+        // (`bat`, `bear`, `race_*`, `weapons`, …), which the loop below happily built a collision
+        // grid for and sampled 500 random columns inside. A line reading `zones=94` over a corpus
+        // that is 55% not-zones is the same confident falsehood #850 is about, one level up from
+        // the drop paths.
+        //
+        // The predicate is `zone_evidence` — see its doc comment for what it reads and why it does
+        // NOT read whether the water map loads. Round 2 of this fix used
+        // `maps/water/<name>.wtr` `is_file()` here, which measurably made a DELETED water map
+        // greener than a corrupt one and collapsed `Unreadable` into "missing"; that is #879's
+        // round-2 blocking finding and `no_state_of_a_water_map_can_shrink_the_corpus_population_850`
+        // is the pin. The narrowing this bucket exists for is still needed: the whole sample
+        // partition is `in_water(feet)` x `in_water(chest)`, so a creature model contributes
+        // vacuous dry counts and an empty water ladder.
+        //
+        // Every entry `read_dir` yields lands in EXACTLY ONE bucket, and the buckets are asserted
+        // against the raw entry count below — so the `e.ok()?` / `to_str()?` swallows the old
+        // `filter_map` performed (review N2) are counted and named instead of vanishing.
+        let mut entries = 0usize;
+        let mut unreadable: Vec<String> = Vec::new();
+        let mut non_glb = 0usize;
+        let mut furniture: Vec<String> = Vec::new();
+        let mut not_a_zone: Vec<String> = Vec::new();
+        let mut zones: Vec<String> = Vec::new();
+        for ent in std::fs::read_dir(&dir).expect("$EQZONES") {
+            entries += 1;
+            let path = match ent {
+                Ok(e) => e.path(),
+                Err(e) => { unreadable.push(format!("<unreadable dir entry: {e}>")); continue }
+            };
+            let Some(os_name) = path.file_name() else {
+                unreadable.push(format!("<no file name: {}>", path.display()));
+                continue;
+            };
+            let Some(file) = os_name.to_str() else {
+                unreadable.push(format!("<non-UTF-8 name: {}>", path.to_string_lossy()));
+                continue;
+            };
+            let Some(name) = file.strip_suffix(".glb") else { non_glb += 1; continue };
+            if name.ends_with("_doors") || name.ends_with("_obj") {
+                furniture.push(name.to_string());
+            } else if !zone_evidence(&dir, name) {
+                not_a_zone.push(name.to_string());
+            } else {
+                zones.push(name.to_string());
+            }
+        }
         zones.sort();
-        assert!(!zones.is_empty(), "no baked zones at {dir:?}");
+        furniture.sort();
+        not_a_zone.sort();
+        unreadable.sort();
+        // A FUTURE-EDIT guard, not a check on the filesystem (#879 review N4). As the loop above is
+        // written every path increments `entries` and lands in exactly one bucket, so this cannot
+        // fail on any input — a reader must not take a green run here as evidence that the scan saw
+        // what the directory holds. What it catches is the next `continue` added to that loop
+        // without a bucket, which is the shape #850 is about one level up.
+        assert_eq!(entries,
+            unreadable.len() + non_glb + furniture.len() + not_a_zone.len() + zones.len(),
+            "#850: every entry $EQZONES yielded must land in exactly one discovery bucket — \
+             {entries} entries vs {} unreadable + {non_glb} non-glb + {} doors/obj + {} non-zone \
+             glb + {} zone glb", unreadable.len(), furniture.len(), not_a_zone.len(), zones.len());
+        assert!(!zones.is_empty(),
+            "no baked zones at {dir:?} — a zone here is a `<name>.glb` the tree carries zone \
+             evidence for: a `<name>_doors.glb`, a `maps/<name>.txt`, or any entry at \
+             `maps/water/<name>.wtr` ({entries} entries scanned, {non_glb} non-glb, {} doors/obj, \
+             {} glb with no zone evidence)", furniture.len(), not_a_zone.len());
+        let discovered = zones.len();
 
-        let (mut t_zones, mut t_emb) = (0usize, 0u64);
+        // ── #850 / #879 review B1: the ACCOUNTING, owned by a type instead of by call sites ─────
+        //
+        // Round 1 of this fix pushed `(zone, reason)` onto a local `dropped: Vec<_>` at each
+        // `continue` and asserted `covered + dropped.len() == discovered`. That is the round-2
+        // shape `water_grid.rs`'s own round-3 lesson rejects, and it failed the same way: the
+        // covered counter was incremented near the TOP of the loop body, so it counted ENTRY, not
+        // completion, and a reviewer's one-line `continue` added after it — no `dropped.push` —
+        // produced `discovered=2 covered=2 dropped=0` over a corpus with one zone silently
+        // abandoned, green. Bit-for-bit the pre-fix defect, now with an assertion advertising
+        // completeness.
+        //
+        // So the state "an iteration ended without being classified" is no longer representable
+        // here: `open_corpus_zone` calls `WaterRollup::begin_zone` as its first statement and every
+        // `Err` return is preceded by a `skip`/`add` that closes the zone; the only way to close an
+        // OPEN zone is the `cover.add` at the very bottom of the body. Anything that leaves the
+        // body in between — an existing `continue`, a `continue` added next year, a `break`, a `?`,
+        // an early `return` — lands the zone in `unaccounted`, which makes `is_complete()` false
+        // and names the zone in `Display`. Nothing has to be wired per call site, and nothing has
+        // to be re-verified by enumeration when this loop changes.
+        //
+        // `is_complete()` also carries the clean-over-nothing guard (`attempted_zones() > 0`) that
+        // round 1's arithmetic control had no analogue for: an all-bad corpus satisfies
+        // `covered + dropped == discovered` and passed green having measured zero zones, with
+        // `drifters.is_empty()` and `ch_dry == 0` both vacuously true.
+        let mut cover = crate::nav::water_grid::WaterRollup::new();
+        let mut t_emb = 0u64;
         let (mut ch_dry, mut ch_chest, mut ch_wet) = (0u64, 0u64, 0u64);
         let (mut same_dry, mut same_chest, mut same_wet) = (0u64, 0u64, 0u64);
         let (mut none_legacy, mut none_new) = (0u64, 0u64);
+        let (mut t_cols, mut no_floor) = (0u64, 0u64);
         let mut drifters: Vec<(String, [f32; 3], [f32; 3])> = Vec::new();
         for name in &zones {
-            let Ok(za) = crate::assets::ZoneAssets::from_glb(&dir.join(format!("{name}.glb"))) else { continue };
-            let mut col = Collision::build(&za, 32.0);
-            if col.cols == 0 { continue; }
-            col.set_region_data(crate::region_map::RegionMap::try_load(&dir.join("maps/water"), name)
-                .map(std::sync::Arc::new));
-            t_zones += 1;
+            let (col, zw) = match crate::nav::water_grid::open_corpus_zone(&mut cover, &dir, name, 32.0) {
+                Ok(v) => v,
+                // Already recorded in `cover` by the time this value exists — printing it is
+                // diagnostics, not bookkeeping.
+                Err(why) => { println!("{name:>12}: DROPPED — {why}"); continue }
+            };
             let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
             let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
                                (seed >> 11) as f64 / (1u64 << 53) as f64 };
             let mut zone_emb = 0u32;
             for _ in 0..500 {
+                t_cols += 1;
                 let e = col.origin[0] + rnd() as f32 * (col.cols as f32 * col.cell_size);
                 let n = col.origin[1] + rnd() as f32 * (col.rows as f32 * col.cell_size);
-                let Some(fz) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { continue };
+                // A SAMPLE drop, not a zone drop: 500 random columns over a zone's bounding box are
+                // expected to miss the floor, and #850 says to decide about this one deliberately
+                // rather than fold it into the zone accounting. Decided: it stays a `continue`, and
+                // it is COUNTED and printed (`no floor: N of M columns`) so the reader can see how
+                // much of the sample budget never became a probe.
+                let Some(fz) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { no_floor += 1; continue };
                 // A ladder of z around the column's floor (below it = embedded in rock, above =
                 // open air), plus, when the column holds water, a ladder of depths inside it.
                 let mut zs: Vec<f32> = [-16.0f32, -8.0, -4.0, -2.0, -1.0, -0.25, 0.0, 0.5, 2.0, 6.0, 15.0]
@@ -2970,10 +3829,53 @@ mod tests {
                 }
             }
             println!("{name:>12}: embedded={zone_emb}");
+            // The ONLY way to close the zone `open_corpus_zone` opened. Reached only by an
+            // iteration that ran to the bottom; anything else leaves the zone `unaccounted`.
+            cover.add(name, &zw.tally());
         }
-        println!("\nzones={t_zones} embedded={t_emb}\n  changed: dry-body={ch_dry} wet-chest-dry-feet={ch_chest} \
+        // `accounting:` is ZONE accounting only. The rollup's own water total is structurally 0
+        // here (#879 review N6) because this corpus keeps its water numbers in the plain counters
+        // below — the `changed:`/`unchanged:` buckets — and folds a zero-valued tally per zone. The
+        // "0" on that line is not a measurement of anything; the "over N/M zones" and the
+        // COMPLETE/INCOMPLETE verdict are.
+        println!("\nzones: discovered={discovered} covered={} embedded={t_emb}\n  \
+                  accounting (zones only; the leading 0 is not a water measurement): {cover}\n  \
+                  discovery: {entries} $EQZONES entries = {discovered} zone glb (with zone \
+                  evidence) + {} doors/obj glb + {} glb with no zone evidence (NOT sampled) + \
+                  {non_glb} non-glb + {} unreadable\n  \
+                  no zone evidence, excluded: {not_a_zone:?}\n  \
+                  unreadable: {unreadable:?}\n  \
+                  no floor: {no_floor} of {t_cols} sampled columns\n  \
+                  changed: dry-body={ch_dry} wet-chest-dry-feet={ch_chest} \
                   submerged={ch_wet}\n  unchanged: dry-body={same_dry} wet-chest-dry-feet={same_chest} \
-                  submerged={same_wet}\n  no recovery: legacy={none_legacy} new={none_new}");
+                  submerged={same_wet}\n  no recovery: legacy={none_legacy} new={none_new}",
+                  cover.measured_zones(), furniture.len(), not_a_zone.len(), unreadable.len());
+        // #850 reach control. `is_complete()` is false unless EVERY zone this loop opened was
+        // closed by the `cover.add` at the bottom of the body — no `skipped` (dropped before the
+        // water check ran), no `unmeasured` (its `.wtr` did not load), no `unaccounted` (opened and
+        // abandoned by ANY control flow), and at least one zone folded in at all. That last term is
+        // the clean-over-nothing guard: a host whose asset cache is broken now goes RED here
+        // instead of reporting `ok` over zero zones with `drifters`/`ch_dry` vacuously satisfied —
+        // the case a same-shaped scanner has silently passed before (#778).
+        assert!(cover.is_complete(),
+            "#850: every discovered zone must be measured, or named as the reason it was not — \
+             {cover}");
+        // …and the rollup's own denominator must equal what the filesystem scan found, which is
+        // the one thing the rollup cannot check for itself: a zone skipped by a filter added to
+        // this loop's HEAD would never be opened at all, so it would be invisible to `cover`.
+        assert_eq!(cover.attempted_zones(), discovered,
+            "#850: the rollup saw {} zones but discovery found {discovered} — a zone was never even \
+             opened, so the corpus is smaller than its own rollup line says",
+            cover.attempted_zones());
+        // CORPUS-level clean-over-nothing, and only that (#879 review N5): `t_emb` is the total
+        // across every zone, so this catches a corpus that probed nothing at all and NOT a corpus
+        // where all but one zone contributed zero probes. It exists because `drifters.is_empty()`
+        // and `ch_dry == 0` below are both vacuously true on an empty sample. A per-zone version
+        // would be the stronger claim and is not what this is.
+        assert!(t_emb > 0,
+            "#850: {discovered} zone(s) measured but ZERO embedded samples were found across the \
+             WHOLE corpus — `drifters.is_empty()` and `ch_dry == 0` below are vacuous at this \
+             coverage ({no_floor} of {t_cols} sampled columns found no floor)");
         assert!(drifters.is_empty(),
             "a recovery must never itself be embedded — {} sample(s) were STILL MOVING and STILL \
              EMBEDDED after two input-free seconds (the review's finding-1 drift signature): {:?}",
@@ -3003,6 +3905,482 @@ mod tests {
         // body that IS standing — pinned here because #649 routed this write through the shared
         // `recover` (`Recovery::Grounded`) and an unpinned refactor is an unnoticed behaviour change.
         assert!(ctrl.on_ground, "the last-good position is a grounded one: {:?}", ctrl.pos);
+    }
+
+    // ── #845: the two "no recovery" arms are no longer absorbing states ──────────────────────────
+    //
+    // What #845 is, in state-machine terms: `depenetrate`'s stuck fallback with an empty ring, and
+    // `step`'s underworld arm with an empty ring, both used to write NOTHING — not `pos`, not
+    // `on_ground`, not `good`, not `stuck_time` — and `depenetrate` returning `true` makes `step`
+    // skip the rest of the frame. So the successor state equalled the current state for every
+    // possible input: an absorbing state, reachable in ordinary play. Live measurement on the
+    // reported casualty (issue #845, and an independent live run recorded there) agrees exactly:
+    // thirteen client-API calls — manual moves in four directions, jump, swim-up, stop, two
+    // `/goto`s, two `/zone_cross`es, sit, stand, respawn — all returned their documented success
+    // shape and moved the body ZERO units, while the state survived a full client restart. The
+    // exits that DID work were all external position writes (GM `#summon`, GM `#goto`, `#zone`),
+    // i.e. exactly the `teleport` edge the source analysis predicts, and all three need GM status,
+    // which an ordinary character does not have.
+    //
+    // The fix is not a new escape hatch on the API. It removes the absorbing property at the arm
+    // itself, by changing the question asked when the ring is empty from "where was this body"
+    // (erased by #724 on precisely the events that create the predicament) to "where in this zone
+    // could a body stand" (available whenever collision is). The hold is still raised when the zone
+    // genuinely answers nowhere — that disclosure is load-bearing and is pinned below.
+    //
+    // Scope: this covers `EmbeddedNoRecovery` ONLY. `step`'s #150 fall-through guard has an
+    // empty-ring arm of the same SHAPE that is not the same THING — it runs after collide-and-slide,
+    // so lateral driver input still reaches the body and `UnderworldNoRecovery` is not absorbing.
+    // Extending the search there was implemented and reverted; see `last_resort_placement`'s doc.
+    //
+    // Fixtures here are stated in the measured geometry of the live case rather than round numbers:
+    // an empty column, and the nearest floor 133 u away and ~81 u ABOVE the feet.
+
+    /// The live #845 column, reduced: nothing whatever over the body, and the only ground in the
+    /// zone is a slab 133 u east and 80.5 u up. `PUSHOUT_RADII` reaches 32 u, so the push-out
+    /// cannot see it; `Recovery::at_column`'s `STEP_UP + GROUND_ORIGIN` up-band would reject it
+    /// even if it could. Both numbers are from the offline scan of the reported zone's baked GLB.
+    fn void_column_with_distant_ground() -> Collision {
+        col(vec![floor(84.0, 133.0, 400.0)])
+    }
+    const VOID_START: [f32; 3] = [0.0, 0.0, 3.5];
+
+    /// #845 — the absorbing state itself. A body in an empty column with no banked history used to
+    /// stay at its exact start coordinate for ever, under any driver. It must now be placed on the
+    /// zone's real ground, and must be able to walk once it is there.
+    ///
+    /// MUTATION-CHECK (both directions): wrap `depenetrate`'s rescue call so the source is present
+    /// but unreachable — `None if false && self.last_resort_placement(col, dt) => {}` — and this
+    /// test fails on the "never left" assertion. Restore it and it passes. Separately, truncating
+    /// `RESCUE_RADII` below 133 fails the same assertion, which is what pins the REACH rather than
+    /// merely the call.
+    #[test]
+    fn a_body_in_an_empty_column_with_no_history_is_no_longer_frozen_845() {
+        let c = void_column_with_distant_ground();
+        let mut ctrl = CharacterController::new(VOID_START);
+        ctrl.set_underworld(Some(-222.0));
+
+        // Fixture, stated rather than assumed: this really is the #845 entry state — embedded by
+        // the void half of the predicate, with an empty ring and no floor the push-out can reach.
+        assert!(is_embedded(&c, VOID_START), "fixture: the start column must be `is_embedded`");
+        assert!(c.ground_below(VOID_START[0], VOID_START[1], VOID_START[2] + GROUND_ORIGIN,
+                               GROUND_DEPTH).is_none(),
+            "fixture: the body must be embedded by the VOID half of the predicate (nothing below), \
+             not by being pierced — that is the shape the live casualty was in");
+        assert!(ctrl.good.is_empty(), "fixture: no recovery history, as after #724's forget");
+
+        // Before `STUCK_FALLBACK_SECS` nothing should happen: the rescue is the last resort, not
+        // the first, and a test that passed instantly would not be watching the arm it claims to.
+        for _ in 0..10 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); } // 0.33 s < 0.5 s
+        assert_eq!(ctrl.pos, VOID_START,
+            "the push-out and the ring must be tried first — nothing may move before \
+             STUCK_FALLBACK_SECS: {:?}", ctrl.pos);
+
+        for _ in 0..50 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); } // to 2.0 s total
+
+        assert_ne!(ctrl.pos, VOID_START,
+            "#845: the body never left the void column — this is the absorbing state the issue \
+             reports, in which every driver input produces zero motion for ever");
+        assert!(ctrl.hold().is_none(),
+            "the hold must clear by the body MOVING, not by being suppressed: {:?}", ctrl.hold());
+        assert!(ctrl.on_ground, "the placement is a grounded one: {:?}", ctrl.pos);
+        assert!((ctrl.pos[2] - 84.0).abs() < GROUND_SNAP_TOL,
+            "the body must be standing on the zone's only floor (z=84), got {:?}", ctrl.pos);
+        let moved = (ctrl.pos[0].powi(2) + ctrl.pos[1].powi(2)).sqrt();
+        assert!(moved >= 133.0 && moved <= *RESCUE_RADII.last().unwrap(),
+            "the placement must be at least as far as the nearest ground (133 u) and within the \
+             search's own reach, got {moved:.1} u to {:?}", ctrl.pos);
+
+        // The point of the exercise: it can be DRIVEN now. A body placed somewhere it cannot move
+        // from would satisfy every assertion above and still be the bug.
+        let before = ctrl.pos;
+        for _ in 0..30 { ctrl.step(walk(20.0, [1.0, 0.0]), 1.0 / 30.0, &c); }
+        assert!((ctrl.pos[0] - before[0]).abs() > 1.0,
+            "after the placement the body must respond to a driver, moved {:?} → {:?}",
+            before, ctrl.pos);
+    }
+
+    /// #845 — the disclosure is NOT removed. A zone that genuinely offers nowhere to stand must
+    /// still raise `EmbeddedNoRecovery`: the fix narrows when the hold fires, it does not silence
+    /// it, and a "fix" that stopped reporting the state would be strictly worse than the bug.
+    ///
+    /// MUTATION-CHECK: make `nearest_standing_place` return `Some(from)` unconditionally and this
+    /// test fails — which is what stops the rescue from being written as "move it anywhere".
+    #[test]
+    fn a_zone_with_nowhere_to_stand_still_raises_the_hold_845() {
+        // Two walls and no floor anywhere in the zone: nothing is standable at any radius.
+        let c = col(vec![wall(39.2, 0.0, 10.0), wall(40.8, 0.0, 10.0)]);
+        let start = [40.0, 40.0, 0.0];
+        let mut ctrl = CharacterController::new(start);
+        ctrl.set_underworld(Some(-222.0));
+        assert!(nearest_standing_place(&c, start, -222.0).is_none(),
+            "fixture: this zone must genuinely have nowhere to stand");
+
+        for _ in 0..60 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); } // 2 s
+
+        let hold = ctrl.hold().expect(
+            "#845 must not remove the disclosure: with nowhere in the zone to stand, the body IS \
+             frozen and `player.hold` is the only thing that says so");
+        assert_eq!(hold.reason, ControllerHoldReason::EmbeddedNoRecovery);
+        assert_eq!(ctrl.pos, start, "nothing to move to, so nothing may move: {:?}", ctrl.pos);
+    }
+
+    /// #845 — **the acceptance predicate, pinned.** `nearest_standing_place` rejects a candidate
+    /// column if it is `is_embedded` or `body_in_water`, and the doc on that function claims those
+    /// two rejections are what stop the search from handing the body straight back to the net
+    /// (#649: "a recovery that is itself embedded is not a recovery").
+    ///
+    /// ⚠️ This test exists because that claim was **measured unpinned**. Wrapping the predicate —
+    /// `if false && (is_embedded(col, q) || body_in_water(col, q)) { continue; }` — left the whole
+    /// suite GREEN, with nothing failing anywhere. Every other #845 test looks only at where the
+    /// body ENDS UP, and the search recovers on the following frame from a bad placement, so the bad
+    /// placement is invisible to a final-position assertion. The fix is to assert on EVERY frame
+    /// instead.
+    ///
+    /// The zone is built so the two rejected kinds are strictly nearer than the good one:
+    /// an embedded column (a floor wedged between two walls) at radius 16, a submerged column at
+    /// radius 48, and honest dry ground only from radius 160 out.
+    ///
+    /// MUTATION-CHECK (both directions, RUN): wrap the predicate as above and this test fails on
+    /// `frame 14: the body was moved to [16.0, 0.0, 0.0], which the net reads as embedded`.
+    /// Restore it and the suite is green again. (No suite totals are quoted here on purpose — they
+    /// move with every merge, and a stale one reads as a live measurement.)
+    ///
+    /// The wrap above disables BOTH halves at once and the embedded decoy is nearer, so that RED is
+    /// the `is_embedded` half. A stated limit here used to say the `body_in_water` half would need
+    /// the water decoy moved inside the embedded one to isolate. **It does not** — struck after the
+    /// #920 review constructed the isolating mutation and I re-ran it. Leaving `is_embedded` live
+    /// already rejects the r≈16 decoy, which promotes the submerged r≈48 one to nearest, so wrapping
+    /// only the water half — `if is_embedded(col, q) || (false && body_in_water(col, q))` — reds
+    /// this same test, alone, on the water-specific message
+    /// (`#649/#845 frame 14: the body was moved into water at [48.0, 0.0, 0.0]`).
+    /// Both halves are independently mutation-killed.
+    #[test]
+    fn the_last_resort_never_places_a_body_somewhere_the_net_would_take_back_845() {
+        let mut c = col(vec![
+            // r≈16: a floor between two walls — a column with ground that is `is_embedded`.
+            floor(0.0, 14.0, 18.0), wall(15.2, 0.0, 10.0), wall(16.8, 0.0, 10.0),
+            // r≈48: a floor that is under water.
+            floor(0.0, 46.0, 50.0),
+            // r≈160: the only honest standing place in the zone.
+            floor(84.0, 133.0, 400.0),
+        ]);
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::box_below(-100.0, 100.0, 44.0, 52.0, 5.0))));
+
+        // Fixture, stated: the two decoys really are decoys, and the good place really is good.
+        assert!(is_embedded(&c, [16.0, 0.0, 0.0]),
+            "fixture: the near column must be embedded, else the `is_embedded` half is untested");
+        assert!(body_in_water(&c, [48.0, 0.0, 0.0]) && !is_embedded(&c, [48.0, 0.0, 0.0]),
+            "fixture: the middle column must be WET and otherwise fine, else the `body_in_water` \
+             half is untested");
+        assert!(!is_embedded(&c, [160.0, 0.0, 84.0]) && !body_in_water(&c, [160.0, 0.0, 84.0]),
+            "fixture: the far column must be acceptable");
+
+        let mut ctrl = CharacterController::new(VOID_START);
+        ctrl.set_underworld(Some(-222.0));
+        assert!(is_embedded(&c, VOID_START), "fixture: the start is the #845 entry state");
+
+        let mut relocations = 0usize;
+        let mut last = ctrl.pos;
+        for f in 0..90 {
+            ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c);
+            if ctrl.pos == last { continue; }
+            let d = ((ctrl.pos[0] - last[0]).powi(2) + (ctrl.pos[1] - last[1]).powi(2)).sqrt();
+            if d > 32.0 { relocations += 1; } // beyond any push-out radius: a last-resort placement
+            last = ctrl.pos;
+            assert!(!is_embedded(&c, ctrl.pos),
+                "#649/#845 frame {f}: the body was moved to {:?}, which the net reads as embedded \
+                 — a recovery that is itself embedded is not a recovery", ctrl.pos);
+            assert!(!body_in_water(&c, ctrl.pos),
+                "#649/#845 frame {f}: the body was moved into water at {:?}; `Recovery::Grounded` \
+                 promises feet on dry floor and this would make that promise false", ctrl.pos);
+        }
+        assert!(ctrl.hold().is_none(), "the zone HAS a standing place: {:?}", ctrl.hold());
+        assert!((ctrl.pos[2] - 84.0).abs() < GROUND_SNAP_TOL && ctrl.pos[0] >= 133.0,
+            "the body must end on the far honest ground, got {:?}", ctrl.pos);
+        assert_eq!(relocations, 1,
+            "one placement, not a walk across the zone via the decoys (#649); got {relocations}");
+    }
+
+    /// #845 — a banked position still wins. The ring holds somewhere this body actually STOOD,
+    /// which is strictly better evidence than a search result, and the search must not start
+    /// pre-empting it (that would silently change every existing rubber-band into a relocation).
+    #[test]
+    fn a_banked_recovery_still_beats_the_last_resort_search_845() {
+        // A platform to bank on in the west, and the #845 far slab in the east.
+        let c = col(vec![floor(0.0, -100.0, -50.0), floor(84.0, 133.0, 400.0)]);
+        let mut ctrl = CharacterController::new([-80.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        ctrl.set_underworld(Some(-222.0));
+        for _ in 0..60 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); }
+        let banked = *ctrl.good.back().expect("fixture: the platform must bank a good sample");
+
+        // Jam it into the void column WITHOUT `teleport`, so the ring survives (a `teleport` would
+        // clear it — #724 — which is the very thing that makes the empty-ring arm ordinary).
+        ctrl.pos = VOID_START;
+        for _ in 0..40 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); }
+
+        assert!((ctrl.pos[0] - banked[0]).abs() < 1e-2 && (ctrl.pos[1] - banked[1]).abs() < 1e-2,
+            "the banked sample {banked:?} must still win over the search; got {:?}", ctrl.pos);
+        assert!(ctrl.pos[2] < 10.0,
+            "and specifically NOT the far slab at z=84 the search would have picked: {:?}", ctrl.pos);
+    }
+
+    // ── #845 property test: every reachable state has an exit ────────────────────────────────────
+
+    /// xorshift64* — a seeded PRNG in `[0,1)`. The workspace has no `proptest`/`quickcheck`, and a
+    /// hand-rolled seeded generator is the house style for property tests here.
+    fn a845_rand(state: &mut u64) -> f32 {
+        let mut x = *state;
+        x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+        *state = x;
+        ((x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32) / ((1u32 << 24) as f32)
+    }
+    fn a845_range(state: &mut u64, lo: f32, hi: f32) -> f32 { lo + a845_rand(state) * (hi - lo) }
+    /// Axis-aligned horizontal slab: height `z`, east [e0,e1] × north [n0,n1]. `floor` fixes north
+    /// to ±100, which cannot express a zone with holes in BOTH axes.
+    fn slab(z: f32, e0: f32, e1: f32, n0: f32, n1: f32) -> MeshData {
+        mesh(vec![[n0, z, e0], [n1, z, e0], [n1, z, e1], [n0, z, e1]])
+    }
+
+    /// The INDEPENDENT oracle for the property below: a dense Cartesian grid scan, deliberately a
+    /// different search strategy from the production polar-ring search, sharing only the collision
+    /// primitives and the acceptance predicate (which is the definition of "standable" and would be
+    /// meaningless to vary). Answers: "does this zone offer this body anywhere to stand?"
+    ///
+    /// ⚠️ **This oracle is deliberately CONSERVATIVE, and the property is correspondingly narrow.**
+    /// The production search is a SAMPLED one — 15 rings × 32 spokes — and is therefore not
+    /// complete: ground can exist in a zone and fall between its samples. A test that asserted
+    /// "the oracle found a point, so the search must have" would be asserting completeness, which
+    /// is false, and would fail for the right reason at the wrong time. So this oracle reports a
+    /// place only when it is (a) within 256 u — well inside `RESCUE_RADII`'s 512 u, with ten rings
+    /// crossing that band — and (b) part of a standable REGION, confirmed by its four neighbours
+    /// one grid step out, so the region is ~96 u across against a worst-case angular gap of ~50 u
+    /// at 256 u. Everything the oracle reports is thus something the ring search cannot miss.
+    ///
+    /// The property below is therefore not "the search is complete". It is "a zone that plainly
+    /// offers ground never leaves the body frozen", and the conservatism is on the side that makes
+    /// the test quieter, not louder.
+    fn a845_oracle(c: &Collision, from: [f32; 3], underworld: f32) -> Option<[f32; 3]> {
+        const STEP: f32 = 48.0;
+        const REACH: f32 = 256.0;
+        let ref_z = from[2].max(underworld);
+        let down = (ref_z - underworld).max(0.0).min(RESCUE_BAND);
+        let standable = |e: f32, n: f32| -> Option<f32> {
+            let f = c.nearest_floor(e, n, ref_z, RESCUE_BAND, down)?;
+            if f <= underworld { return None; }
+            let q = [e, n, f];
+            (!is_embedded(c, q) && !body_in_water(c, q)).then_some(f)
+        };
+        let k = (REACH / STEP) as i32;
+        for i in -k..=k {
+            for j in -k..=k {
+                let (e, n) = (from[0] + i as f32 * STEP, from[1] + j as f32 * STEP);
+                if ((e - from[0]).powi(2) + (n - from[1]).powi(2)).sqrt() > REACH { continue; }
+                let Some(f) = standable(e, n) else { continue };
+                // Region check: a lone standable grid point could be a sliver the ring search is
+                // entitled to miss. Four neighbours make it a place.
+                if [(STEP, 0.0), (-STEP, 0.0), (0.0, STEP), (0.0, -STEP)]
+                    .iter().any(|(de, dn)| standable(e + de, n + dn).is_none()) { continue; }
+                return Some([e, n, f]);
+            }
+        }
+        None
+    }
+
+    /// #845 — **the universal**. "Every reachable state has an exit" is a claim no live run can
+    /// discharge: a race that usually wins is indistinguishable from one that cannot lose, and the
+    /// live evidence on this issue is an existence proof over exactly one trajectory. This is the
+    /// half that a transcript structurally cannot supply.
+    ///
+    /// Over 200 seeded zones × start positions, spanning voids, below-underworld decks, walls the
+    /// body starts inside, and ordinary ground, it asserts three things at once:
+    ///
+    /// * **P_A (the universal):** whenever an `EmbeddedNoRecovery` hold is in force at the end of a
+    ///   run, the independent oracle agrees there was nowhere to stand. Contrapositive: a zone with
+    ///   somewhere to stand never ends in the frozen state. This is the property #845 is about.
+    ///   Scoped to that variant on purpose — this PR deliberately does not change the underworld
+    ///   arm, so claiming the universal over both would be claiming something the code does not do.
+    /// * **P_B (no ping-pong):** at most two rescue-sized relocations per run. #649 measured the
+    ///   failure mode where a net that keeps finding "somewhere better" walks a body across a zone
+    ///   one ring-radius at a time; a rescue that fired every frame would satisfy P_A and be a new
+    ///   bug.
+    /// * **P_C (mobility after):** a body left un-held and grounded responds to a driver in at least
+    ///   one of the four cardinal directions. Applied only to the wall-free zones, because a body
+    ///   legitimately wedged in a corner would fail it for the right reason.
+    /// * **P_D (the untouched arm is not absorbing):** a body holding `UnderworldNoRecovery` still
+    ///   responds to a lateral drive. This is the premise the scope decision rests on — the reason
+    ///   #845's rescue is NOT wired into `step`'s #150 guard — so it is measured here rather than
+    ///   argued from reading the control flow.
+    ///
+    /// The counters are printed so a reader can see the family was not vacuous — a run in which
+    /// nothing ever got stuck would pass P_A trivially. Both P_A and P_D carry an explicit vacuity
+    /// assertion rather than relying on a human reading the printed line; P_D's first version was
+    /// measured at **0 of 200** while passing, which is exactly the failure those guards exist for.
+    #[test]
+    fn every_reachable_controller_state_has_an_exit_845() {
+        const CASES: usize = 200;
+        const FRAMES: usize = 200; // 6.7 s at 30 Hz — ~13× STUCK_FALLBACK_SECS
+        const DT: f32 = 1.0 / 30.0;
+        let mut seed: u64 = 0x845_845_845_845;
+
+        let (mut stuck_ever, mut rescued, mut held_end, mut mobile, mut mobility_cases) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut underworld_cases, mut underworld_drivable, mut oracle_checked) =
+            (0usize, 0usize, 0usize);
+
+        for case in 0..CASES {
+            // ── zone ────────────────────────────────────────────────────────────────────────────
+            let n_slabs = 1 + (a845_rand(&mut seed) * 3.0) as usize; // 1..=3
+            let n_walls = (a845_rand(&mut seed) * 3.0) as usize;     // 0..=2
+            let mut meshes = Vec::new();
+            let mut lowest = f32::MAX;
+            for _ in 0..n_slabs {
+                let z = a845_range(&mut seed, -180.0, 180.0);
+                let e0 = a845_range(&mut seed, -500.0, 300.0);
+                let n0 = a845_range(&mut seed, -500.0, 300.0);
+                let (w, d) = (a845_range(&mut seed, 256.0, 512.0), a845_range(&mut seed, 256.0, 512.0));
+                lowest = lowest.min(z);
+                meshes.push(slab(z, e0, e0 + w, n0, n0 + d));
+            }
+            for _ in 0..n_walls {
+                let e = a845_range(&mut seed, -300.0, 300.0);
+                let n0 = a845_range(&mut seed, -300.0, 200.0);
+                let h0 = a845_range(&mut seed, -200.0, 150.0);
+                meshes.push(wall_seg(e, n0, n0 + a845_range(&mut seed, 50.0, 300.0),
+                                     h0, h0 + a845_range(&mut seed, 10.0, 80.0)));
+            }
+            let underworld = lowest - 20.0;
+            // Every other zone gets a wide deck BELOW the underworld — the #712 shape, and the only
+            // way this family can reach `step`'s #150 guard at all. Without it a body that falls
+            // past every slab has nothing within `GROUND_DEPTH` beneath it, so `is_embedded`'s void
+            // disjunct is true, `depenetrate` early-returns, and the gravity path is never taken:
+            // the first version of P_D was measured VACUOUS at 0/0 for exactly this reason. With
+            // the deck the body lands in the guard's band instead and the guard has to refuse it.
+            let deck = case % 2 == 0;
+            if deck { meshes.push(slab(underworld - 40.0, -400.0, 400.0, -400.0, 400.0)); }
+            let c = col(meshes);
+
+            // ── body ────────────────────────────────────────────────────────────────────────────
+            let start = [a845_range(&mut seed, -300.0, 300.0),
+                         a845_range(&mut seed, -300.0, 300.0),
+                         a845_range(&mut seed, -200.0, 200.0)];
+            let mut ctrl = CharacterController::new(start);
+            ctrl.set_underworld(Some(underworld));
+
+            let mut jumps = 0usize;
+            let mut ever_stuck = false;
+            for _ in 0..FRAMES {
+                let before = ctrl.pos;
+                ctrl.step(walk(0.0, [0.0, 0.0]), DT, &c);
+                let dxy = ((ctrl.pos[0] - before[0]).powi(2) + (ctrl.pos[1] - before[1]).powi(2)).sqrt();
+                // Larger than the push-out can ever move a body (`PUSHOUT_RADII` tops out at 32),
+                // so this counts last-resort relocations and nothing else.
+                if dxy > 32.0 { jumps += 1; }
+                if ctrl.stuck_time >= STUCK_FALLBACK_SECS || ctrl.hold().is_some() { ever_stuck = true; }
+            }
+            // ⚠️ The obvious counter — "did I ever observe `stuck_time >= STUCK_FALLBACK_SECS`
+            // after a step" — UNDERCOUNTS by an order of magnitude, and the first version of this
+            // test failed its own vacuity guard because of it (5 of 200, measured). `recover()`
+            // zeroes `stuck_time`, and the last resort runs through `recover()`, so every case the
+            // rescue SUCCEEDS on has already had the evidence erased by the time the loop looks.
+            // A rescue-sized jump is that evidence: the arm is reachable only from the stuck
+            // fallback. With it: 123 of 200.
+            if ever_stuck || jumps > 0 || ctrl.hold().is_some() { stuck_ever += 1; }
+            if jumps > 0 { rescued += 1; }
+
+            // P_A — the universal, for the arm this PR changes.
+            if let Some(h) = ctrl.hold() {
+                held_end += 1;
+                if h.reason == ControllerHoldReason::EmbeddedNoRecovery {
+                    oracle_checked += 1;
+                    let oracle = a845_oracle(&c, ctrl.pos, underworld);
+                    assert!(oracle.is_none(),
+                        "#845 case {case}: the controller is held ({:?}) at {:?} while an \
+                         independent dense-grid scan of the SAME zone found a standable place at \
+                         {:?} — a reachable state with an exit the controller did not take \
+                         (underworld {underworld:.1})",
+                        h.reason, ctrl.pos, oracle);
+                }
+            }
+
+            // P_B — no ping-pong.
+            assert!(jumps <= 2,
+                "#845 case {case}: {jumps} rescue-sized relocations in {FRAMES} frames — the last \
+                 resort must fire once, not walk the body across the zone (#649)");
+
+            // P_C — a placed body can be driven.
+            if n_walls == 0 && ctrl.hold().is_none() && ctrl.on_ground {
+                mobility_cases += 1;
+                let base = ctrl.pos;
+                let mut moved = false;
+                for dir in [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]] {
+                    // `CharacterController` is not `Clone`, so each direction is probed on a fresh
+                    // controller placed at the same coordinate. A fresh ring is harmless here: this
+                    // asks only whether the position is drivable, not how it got there.
+                    let mut probe = CharacterController::new(base);
+                    probe.on_ground = true;
+                    probe.set_underworld(Some(underworld));
+                    for _ in 0..30 { probe.step(walk(20.0, dir), DT, &c); }
+                    if ((probe.pos[0] - base[0]).powi(2) + (probe.pos[1] - base[1]).powi(2)).sqrt() > 1.0 {
+                        moved = true;
+                        break;
+                    }
+                }
+                if moved { mobile += 1; }
+                assert!(moved,
+                    "#845 case {case}: body left un-held and grounded at {base:?} but no cardinal \
+                     drive moved it — un-held is supposed to mean drivable");
+            }
+
+            // P_D — the claim the SCOPE rests on, measured instead of read. This PR does not touch
+            // `step`'s #150 fall-through guard, and the stated reason is that its no-history arm is
+            // NOT absorbing: it runs after collide-and-slide, so lateral driver input has already
+            // reached the body. That is a universal about a state I am deliberately leaving in
+            // place, so it gets tested rather than asserted in prose. Restricted to wall-free zones
+            // for the same reason P_C is — a body wedged in a corner would fail it for the right
+            // reason. NOTE this drives the real `ctrl`, so it must stay last in the case body.
+            if n_walls == 0
+                && matches!(ctrl.hold(), Some(h) if h.reason == ControllerHoldReason::UnderworldNoRecovery)
+            {
+                underworld_cases += 1;
+                let base = ctrl.pos;
+                for _ in 0..30 { ctrl.step(walk(20.0, [1.0, 0.0]), DT, &c); }
+                let d = ((ctrl.pos[0] - base[0]).powi(2) + (ctrl.pos[1] - base[1]).powi(2)).sqrt();
+                assert!(d > 1.0,
+                    "#845 case {case}: a body holding `underworld_no_recovery` at {base:?} did not \
+                     respond to a lateral drive (moved {d:.2} u) — if this is RED then that arm IS \
+                     absorbing after all, and the scope decision in this PR is wrong");
+                underworld_drivable += 1;
+            }
+        }
+        // P_D's own vacuity guard. It is an assertion about a state the generator has to REACH, and
+        // the first version reached it zero times out of 200 while passing.
+        assert!(underworld_cases >= 10,
+            "P_D never exercised the arm it is about: only {underworld_cases} of {CASES} cases \
+             ended in an `underworld_no_recovery` hold in a wall-free zone");
+
+        println!("#845 property: {CASES} cases, {stuck_ever} reached the stuck/held branch, \
+                  {rescued} were relocated by the last resort, {held_end} ended held \
+                  (of which {oracle_checked} were `embedded_no_recovery` and checked against the \
+                  oracle), {mobile}/{mobility_cases} drivable-after checks passed, \
+                  {underworld_drivable}/{underworld_cases} underworld holds still drivable");
+        // Not an assertion about the FIX — an assertion about the FAMILY. If the generator drifts
+        // to zones where nothing ever gets stuck, P_A passes vacuously and this test stops being
+        // evidence. Re-tune the generator rather than lowering this.
+        assert!(stuck_ever >= CASES / 10,
+            "the generated family must actually exercise the stuck branch; only {stuck_ever} of \
+             {CASES} cases did");
+        // P_A's own family guard, and the one to read carefully. `oracle_checked` is SMALL (single
+        // digits, measured) and that is not a defect: P_A's antecedent is "ended `embedded_no_recovery`",
+        // and making that antecedent rare is the entire point of the fix. The evidence that P_A is
+        // not vacuous is therefore the OTHER side of it — the cases that entered the arm and were
+        // let out again, counted by `rescued`. If this ever goes RED, the generator has stopped
+        // reaching the arm and P_A has stopped meaning anything, whatever `oracle_checked` says.
+        assert!(rescued >= CASES / 4,
+            "the family must actually exercise the last resort: only {rescued} of {CASES} cases \
+             were relocated, so P_A's antecedent is untested rather than rare");
     }
 
     #[test]
@@ -3547,7 +4925,7 @@ mod tests {
     fn a_large_same_zone_relocation_forgets_the_ring_for_the_stuck_fallback_too() {
         // Platform to bank on, plus a walled slot with no floor anywhere near it: every push-out
         // radius finds no column that yields a `Recovery`, so the stuck fallback is the only exit.
-        let c = col(vec![floor(0.0, -100.0, -50.0), wall(39.2, 0.0, 10.0), wall(40.8, 0.0, 10.0)]);
+        let c = col(vec![floor(0.0, -100.0, -50.0), wall(999.2, 0.0, 10.0), wall(1000.8, 0.0, 10.0)]);
         let mut ctrl = CharacterController::new([-80.0, 0.0, 0.0]);
         ctrl.on_ground = true;
         ctrl.set_underworld(Some(-222.0));
@@ -3556,14 +4934,17 @@ mod tests {
 
         // Fixture, checked against the pure predicate so it holds under the mutation too: the slot
         // is a place the body reads as embedded, with nothing in push-out range to recover onto.
-        let target = [40.0, 40.0, 0.0]; // summoned into the slot, 120 u from the platform
+        let target = [1000.0, 40.0, 0.0]; // summoned into the slot, 1050 u from the platform
         assert!(is_embedded(&c, target), "fixture: the slot must read as embedded");
+        assert!(nearest_standing_place(&c, target, -222.0).is_none(),
+            "fixture (#845): the last-resort search must find nowhere, else this test measures a \
+             rescued body instead of a held one");
 
         ctrl.teleport(target);
         for _ in 0..40 { ctrl.step(walk(0.0, [0.0, 0.0]), 0.05, &c); } // 2 s ≫ STUCK_FALLBACK_SECS
 
         assert!(ctrl.pos != stale, "#724: stuck fallback restored the superseded position {stale:?}");
-        assert!((ctrl.pos[0] - 40.0).abs() < 1e-3 && (ctrl.pos[1] - 40.0).abs() < 1e-3,
+        assert!((ctrl.pos[0] - 1000.0).abs() < 1e-3 && (ctrl.pos[1] - 40.0).abs() < 1e-3,
             "#724: the body must be held where the server put it, got {:?}", ctrl.pos);
         // …and it is genuinely still STUCK there, i.e. the fallback branch really was reached and
         // declined for want of history — not a body that quietly walked out of the fixture.
@@ -3597,7 +4978,7 @@ mod tests {
         for case in 0..240 {
             let embedded_case = case % 2 == 0;
             let c = if embedded_case {
-                col(vec![floor(0.0, -100.0, -50.0), wall(39.2, 0.0, 10.0), wall(40.8, 0.0, 10.0)])
+                col(vec![floor(0.0, -100.0, -50.0), wall(999.2, 0.0, 10.0), wall(1000.8, 0.0, 10.0)])
             } else {
                 zone_with_a_hole()
             };
@@ -3614,7 +4995,7 @@ mod tests {
             // Vary the relocation target. Both branches are ≫ 12 u from the platform, i.e. exactly
             // the corrections that reach `teleport` at all.
             let target = if embedded_case {
-                [40.0, 40.0, 0.0]
+                [1000.0, 40.0, 0.0]
             } else {
                 // z chosen so the sub-underworld deck is inside `GROUND_DEPTH` of the arrival:
                 // the body then takes the gravity path and meets the #150 guard, rather than
@@ -3623,6 +5004,11 @@ mod tests {
             };
             assert_eq!(is_embedded(&c, target), embedded_case,
                 "case {case}: fixture must exercise the intended recovery path at {target:?}");
+            if embedded_case {
+                assert!(nearest_standing_place(&c, target, -222.0).is_none(),
+                    "case {case} fixture (#845): the embedded half must have nowhere to be \
+                     rescued to, else it stops exercising the stuck fallback");
+            }
             ctrl.teleport(target);
 
             for f in 0..200 {
@@ -3652,8 +5038,18 @@ mod tests {
     /// away with no floor anywhere near it, so every push-out radius fails and the stuck fallback is
     /// the only exit. Identical to the fixture in
     /// `a_large_same_zone_relocation_forgets_the_ring_for_the_stuck_fallback_too`.
+    ///
+    /// ⚠️ AMENDED (#845): the slot moved from east 40 to east **1000**, and every user's relocation
+    /// target moved with it. Nothing about what these tests assert changed — but the state they are
+    /// about ("embedded with no recovery available") now requires that the WHOLE ZONE offer nowhere
+    /// to stand, not merely that nothing is within push-out range. At east 40 the platform is ~120 u
+    /// away, which the new last-resort search reaches, so the body would be rescued and these tests
+    /// would be measuring a different state than the one their names claim. At east 1000 the
+    /// platform is ~1050 u away, beyond `RESCUE_RADII`'s 512 u reach, and the premise holds again.
+    /// Each user asserts that premise directly against `nearest_standing_place` so it cannot rot
+    /// silently if the reach is ever raised.
     fn platform_and_inescapable_slot() -> Collision {
-        col(vec![floor(0.0, -100.0, -50.0), wall(39.2, 0.0, 10.0), wall(40.8, 0.0, 10.0)])
+        col(vec![floor(0.0, -100.0, -50.0), wall(999.2, 0.0, 10.0), wall(1000.8, 0.0, 10.0)])
     }
 
     /// #724 round-2 review, **B1 — the mutation that catches the silent freeze.**
@@ -3682,8 +5078,11 @@ mod tests {
             "fixture: a body standing on ordinary ground must NOT report a hold, else this test \
              would pass on a field that is always set");
 
-        let target = [40.0, 40.0, 0.0];
+        let target = [1000.0, 40.0, 0.0];
         assert!(is_embedded(&c, target), "fixture: the slot must read as embedded");
+        assert!(nearest_standing_place(&c, target, -222.0).is_none(),
+            "fixture (#845): the last-resort search must find nowhere, else this test measures a \
+             rescued body instead of a held one");
         ctrl.teleport(target); // the relocation — clears the ring, per this PR
 
         // The freeze itself, measured rather than assumed: 2 s of frames, none of which move the
@@ -3727,7 +5126,9 @@ mod tests {
         ctrl.on_ground = true;
         ctrl.set_underworld(Some(-222.0));
         for _ in 0..60 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); }
-        ctrl.teleport([40.0, 40.0, 0.0]);
+        assert!(nearest_standing_place(&c, [1000.0, 40.0, 0.0], -222.0).is_none(),
+            "fixture (#845): the last-resort search must find nowhere for the slot");
+        ctrl.teleport([1000.0, 40.0, 0.0]);
         for _ in 0..40 { ctrl.step(walk(0.0, [0.0, 0.0]), 0.05, &c); }
         assert!(ctrl.hold().is_some(), "fixture: the body must be held before we test the clear");
 
@@ -3742,7 +5143,7 @@ mod tests {
 
         // Route 2 — a relocation out of the predicament. Get held again, then teleport somewhere
         // standable; the hold must not survive either the `teleport` itself or the next step.
-        ctrl.teleport([40.0, 40.0, 0.0]);
+        ctrl.teleport([1000.0, 40.0, 0.0]);
         for _ in 0..40 { ctrl.step(walk(0.0, [0.0, 0.0]), 0.05, &c); }
         assert!(ctrl.hold().is_some(), "fixture: held again");
         ctrl.teleport([-80.0, 0.0, 0.0]);
@@ -4262,8 +5663,21 @@ mod tests {
         // a lip 2.1 u above the swim plane, inside the swimming step-up's reach. The body presses,
         // mounts, and walks out — never stalling, because the approach makes progress and the
         // haul-out ends the afloat state entirely.
+        //
+        // ⚠️ **The bank floor runs to east 3000, not east 100 (#870).** The drive is 30 s at
+        // 35 u/s — 1050 u of travel — and the body starts at east −20, so a floor ending at east
+        // 100 is walked OFF at frame ~240, four fifths of the way through the run still to go.
+        // MEASURED on `main`, unmodified, with the old 100 u floor: from frame 240 the body was
+        // dragged 99.7 u NORTH under a due-east drive (`is_embedded` = true → ring push-out, ~0.4 u
+        // of teleport per frame, the #870 drift), and then oscillated across the floor edge for the
+        // remaining 1500 frames — grounded, ungrounded, grounded — so the closing
+        // `assert!(ctrl.on_ground)` was decided by which side of that oscillation frame 1799
+        // happened to land on. It landed grounded on `main` and ungrounded once #870's back-off
+        // moved the haul-out 0.78 u east: a passing test whose pass was a coin toss, not a claim
+        // about hauling out. Widening the floor puts the whole 1050 u drive on solid ground, which
+        // is the premise the test's own doc comment asserts.
         let c = flooded_corridor(
-            vec![floor(-40.0, -100.0, 4.0), floor(0.1, 4.0, 100.0), wall(4.0, -40.0, 0.1)],
+            vec![floor(-40.0, -100.0, 4.0), floor(0.1, 4.0, 3000.0), wall(4.0, -40.0, 0.1)],
             -40.0, 0.0);
         let mut ctrl = CharacterController::new([-20.0, 0.0, plane()]);
         for i in 0..(30 * 60) {
@@ -4578,6 +5992,14 @@ mod tests {
             exiting_the_bottom_of_a_suspended_water_volume_resumes_the_fall,
             a_large_same_zone_relocation_forgets_the_ring_for_the_stuck_fallback_too,
             a_hold_clears_as_soon_as_the_body_is_free_again,
+            // #870 (review round 2). These four are cited by the `STEP_LANDING_CREEP_SAMPLES` doc
+            // comment. They are NOT pre-existing offenders newly pulled into scope by #882's
+            // widened guard — the citations are new lines added by this PR — so they belong here
+            // and NOT in the guard's `KNOWN_VIOLATIONS` list, which is labelled "pre-existing".
+            a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191,
+            a_swimmer_hauling_out_at_a_legitimate_bank_never_raises_the_afloat_stall,
+            a_duck_across_a_divable_far_side_is_a_round_trip,
+            the_step_landing_creep_reaches_one_back_off_past_the_riser_and_no_further,
         ];
     }
 }
