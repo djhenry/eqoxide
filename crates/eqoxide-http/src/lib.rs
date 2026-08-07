@@ -931,7 +931,7 @@ pub struct HttpState {
     /// and therefore will never publish again. This is the field that tells an agent the frozen world
     /// it is reading is frozen FOREVER, which no age can say. Written only by
     /// `eqoxide::model::run_net_thread`; same shared-`Arc`-identity discipline as the two above.
-    pub(crate) net_thread_dead: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    pub(crate) net_thread_dead: eqoxide_ipc::NetThreadDeadShared,
     /// Every asset-server activity in flight (#715/#731, agent-honesty). Empty = nothing is in
     /// progress; each entry is either a set sync (naming its set and phase) or the login that
     /// precedes one (#731). Written ONLY by the app crate's `asset_sync::sync_set_observed` and
@@ -1123,12 +1123,16 @@ pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::Sta
     // #634: the net thread has published its own death. This is checked FIRST because it is both
     // IMMEDIATE (no 5s tick-staleness or 15s link-staleness wait) and TERMINAL (the two clock-based
     // verdicts below are ambiguous between "wedged, may recover" and "gone"; this one is not).
-    if let Some(reason) = s.net_thread_dead.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+    if let Some(death) = s.net_thread_dead.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        // "is not running" rather than "is dead": the same slot also carries `NeverStarted`
+        // (`--testzone`, where no thread was ever spawned), and the HTTP server runs in that mode
+        // (#890). The relayed reason says which state it is; this prefix must be true of all of them.
+        let reason = death.reason();
         return Err((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             format!(
-                "the network thread is dead — {reason} This command was NOT sent and will not \
-                 take effect. Do not retry: nothing will drain it. See GET /v1/observe/debug \
+                "the network thread is not running — {reason} This command was NOT sent and will \
+                 not take effect. Do not retry: nothing will drain it. See GET /v1/observe/debug \
                  (`net_thread_dead`)."
             ),
         ));
@@ -1200,7 +1204,7 @@ pub fn spawn_camera_server(
     zone_assets:      eqoxide_nav::zone_assets::ZoneAssetStateShared,
     common_assets_failed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     model_sync_dead:      std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    net_thread_dead:      std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    net_thread_dead:      eqoxide_ipc::NetThreadDeadShared,
     asset_sync:           eqoxide_ipc::AssetSyncShared,
     command:         eqoxide_command::CommandState,
     social:          eqoxide_ipc::SocialSlots,
@@ -1452,13 +1456,31 @@ mod live_session_guard_tests {
     fn dead_net_thread_is_503_immediately_even_with_perfectly_fresh_clocks() {
         let s = empty_state();
         assert!(require_live_session(&s).is_ok(), "precondition: fresh clocks are otherwise live");
-        *s.net_thread_dead.lock().unwrap() =
-            Some("the eq-net thread PANICKED (boom).".to_string());
+        *s.net_thread_dead.lock().unwrap() = Some(eqoxide_ipc::NetThreadDeath::new(
+            eqoxide_ipc::NetThreadEnd::Panicked, "the eq-net thread PANICKED (boom)."));
         let (code, msg) = require_live_session(&s).unwrap_err();
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(msg.contains("network thread is dead"), "message: {msg}");
+        assert!(msg.contains("network thread is not running"), "message: {msg}");
         assert!(msg.contains("PANICKED"), "the published reason must be relayed verbatim: {msg}");
         assert!(msg.contains("Do not retry"), "a terminal failure must say so: {msg}");
+    }
+
+    /// The SAME guard on `--testzone`'s `NeverStarted`, which is not a death at all (#890 review
+    /// B2c). The refusal must still fire — nothing will drain the command either way — but the
+    /// sentence must not tell an agent a thread died when none was ever spawned. Restore the old
+    /// "the network thread is dead" prefix and this goes RED while the test above stays green.
+    #[test]
+    fn a_net_thread_that_was_never_started_is_refused_without_claiming_it_died() {
+        let s = empty_state();
+        *s.net_thread_dead.lock().unwrap() = Some(eqoxide_ipc::NetThreadDeath::new(
+            eqoxide_ipc::NetThreadEnd::NeverStarted,
+            "--testzone: the eq-net thread was never started (offline renderer mode)."));
+        let (code, msg) = require_live_session(&s).unwrap_err();
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!msg.contains("is dead"),
+            "nothing died here — the thread was never spawned: {msg}");
+        assert!(msg.contains("never started"),
+            "the published reason must be relayed verbatim: {msg}");
     }
 
     /// A dead LINK (no datagram for > CONN_STALE_SECS) → 503, regardless of the tick clock.

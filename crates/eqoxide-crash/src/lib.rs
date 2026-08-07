@@ -469,9 +469,13 @@ fn install_panic_hook() {
 /// render loop keeps drawing (measured at ~46fps across the whole watchdog window). It used to pass
 /// the constant `render-loop-wedged` and so blamed a healthy subsystem in the durable record a
 /// later investigation reads as fact. It now derives the reason from live state — see
-/// `eqoxide_http`'s `watchdog_reason`, which emits `net-thread-dead` / `camp-not-drained` /
-/// `watchdog-shutdown-timeout`. NOT MEASURED: whether that watchdog ever fires with a genuinely
-/// wedged render loop; every #890 measurement comes from the dead-net-thread path.
+/// `eqoxide_http`'s `watchdog_reason`, which emits `net-thread-dead` / `net-thread-never-started` /
+/// `shutdown-not-completed` / `camp-not-drained` / `watchdog-shutdown-timeout`, one per
+/// distinguishable state. Note that "the net thread has ended" is NOT one state: it covers a panic,
+/// an exit that a requested shutdown asked for, and `--testzone`, where the thread was never
+/// started at all — and `net-thread-dead` would be a false label for the last two. NOT MEASURED:
+/// whether that watchdog ever fires with a genuinely wedged render loop; every #890 measurement
+/// comes from the dead-net-thread path.
 pub fn log_exit(reason: &str, code: i32) {
     let line = format_exit_line(now_epoch_secs(), pid(), reason, code);
     tracing::info!(target: "eqoxide::crash", "{line}");
