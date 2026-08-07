@@ -247,11 +247,17 @@ fn main() {
         // No collision is loaded yet at startup (no zone), so the initial published eye is just
         // the desired orbit position, unoccluded — the same fallback `resolve_camera_eye` would
         // produce for `collision: None`.
+        //
+        // #867: `undrawn_snapshot`, not `snapshot`. `spawn_camera_server` is called ~30 lines below
+        // `EventLoop::new()` and well before `run_app`, so this value is served on `/v1/camera` and
+        // `/v1/observe/debug` through GPU init, `resumed()`, and the whole first zone load — before
+        // a single frame exists. It publishes `drawn_frame: null`, which says exactly that; the
+        // alternative (a snapshot indistinguishable from a rendered one) is the thing #867 is about.
         let init_eye = camera_state::compute_eye(cam.azimuth, cam.elevation, cam.radius, cam.focus);
         let resolved = camera_state::ResolvedEye { eye: init_eye, occluded: false, still_blocked: false };
         ipc::CameraSlots {
             cmd_tx:      Arc::new(Mutex::new(None)),
-            snapshot:    Arc::new(Mutex::new(cam.snapshot(resolved))),
+            snapshot:    Arc::new(Mutex::new(cam.undrawn_snapshot(resolved))),
             frame_req:   Arc::new(Mutex::new(None)),
             manual_move: Arc::new(Mutex::new(None)),
         }
@@ -419,9 +425,13 @@ fn main() {
     // time, so a frozen world can never masquerade as a live one (#343).
     let net_health_shared: ipc::NetHealthShared =
         Arc::new(Mutex::new(ipc::NetHealth::default()));
-    // Render-owned frame timings — the one agent-visible value the render loop publishes (#343).
+    // Render-owned frame timings, published by the render loop (#343).
     let frame_profile_shared: ipc::FrameProfileShared =
         Arc::new(Mutex::new(eqoxide::profiling::FrameProfile::default()));
+    // Render-owned skin-cap downgrades (eqoxide#797) — same publish rhythm as `frame_profile_shared`
+    // just above; see the field doc on `App::skin_cap_downgrades_shared`.
+    let skin_cap_downgrades_shared: ipc::SkinCapDowngradesShared =
+        Arc::new(Mutex::new(std::collections::BTreeMap::new()));
 
     // EQ network task — skipped in --testzone mode (offline debug)
     let character_name = login_cfg.character_name.clone();
@@ -547,6 +557,7 @@ fn main() {
     };
     let app_spells  = spells.clone();
     let app_frame_profile = frame_profile_shared.clone();
+    let app_skin_cap_downgrades = skin_cap_downgrades_shared.clone();
     // --api-port N: bind exactly N now and FAIL THE LAUNCH if it's taken (don't open a window with
     // a dead API). The bound listener is handed to the server thread so there's no re-bind race.
     // Without --api-port, pass None and let the server scan upward from the config base port.
@@ -585,6 +596,7 @@ fn main() {
         lifecycle.clone(),
         guild_slots,
         nav_debug_view.clone(),
+        skin_cap_downgrades_shared.clone(),
         app_cfg.http_port,
         exact_listener,
     );
@@ -608,6 +620,7 @@ fn main() {
         model_sync_dead,
         asset_sync_activity,
         app_frame_profile,
+        app_skin_cap_downgrades,
         testzone_mode,
         nav_debug_flag,
         shutdown.clone(),

@@ -68,8 +68,8 @@ const GOOD_SAMPLE_SECS: f32 = 0.5;
 /// next citation is checkable.
 ///
 /// **This number is DEAD, not merely untested.** The only production reads of the ring are
-/// `self.good.back()` at the two recovery sites (the #150 fall-through guard in [`
-/// CharacterController::step`] and the stuck fallback in [`CharacterController::depenetrate`]);
+/// `self.good.back()` at the two recovery sites (the #150 fall-through guard in
+/// [`CharacterController::step`] and the stuck fallback in [`CharacterController::depenetrate`]);
 /// the push site below is its only other use, and it reads this constant solely to decide when to
 /// drop the *oldest* entry — which nothing will ever look at. `GOOD_RING_LEN = 1` is therefore
 /// behaviourally identical to `8`, the whole `VecDeque` could be an `Option<[f32; 3]>`, and #724's
@@ -2006,9 +2006,9 @@ mod tests {
     }
 
     /// **The short-ray hole, closed at its source (#855 round 2).** `Collision::nearest_hit` used
-    /// to return `None` unconditionally for a ray whose squared length was under `1e-9` — `|want| <
-    /// ~3.16e-5` — so a small driven `wish_vspeed` produced a descent the sweep did not test *at
-    /// all*, whatever its acceptance window was. That is reachable: `want = wish_vspeed · dt`, and
+    /// to return `None` unconditionally for a ray whose squared length was under `1e-9` —
+    /// `|want| < ~3.16e-5` — so a small driven `wish_vspeed` produced a descent the sweep did not
+    /// test *at all*, whatever its acceptance window was. That is reachable: `want = wish_vspeed · dt`, and
     /// 0.001 u/s at 60 Hz is `1.67e-5`.
     ///
     /// Round 1 shipped a second, column-based clamp to cover it. Round 2 removed the cause instead:
@@ -3418,9 +3418,10 @@ mod tests {
     /// no fall-damage signal, and (agent-honesty) the character would still read as having just been
     /// swimming rather than plummeting.
     ///
-    /// MUTATION-CHECK: disabling the `was_in_water && was_swim_sinking && !self.in_water &&
-    /// !self.on_ground && ...` re-arm added for #444 (verified by short-circuiting it to `false`)
-    /// makes this RED — `take_landed_fall_height()` returns `None` instead of `Some(height)`. The
+    /// MUTATION-CHECK: disabling the
+    /// `was_in_water && was_swim_sinking && !self.in_water && !self.on_ground && ...` re-arm added
+    /// for #444 (verified by short-circuiting it to `false`) makes this RED —
+    /// `take_landed_fall_height()` returns `None` instead of `Some(height)`. The
     /// `was_swim_sinking` gate itself is also load-bearing: swapping it for a bare `was_in_water`
     /// check turns `water_breaks_a_fall_no_phantom_damage_on_shore` (below) RED instead — a
     /// passively-floating character whose water vanishes must NOT get a phantom fall height.
@@ -3468,10 +3469,10 @@ mod tests {
     /// pitch into a downward vertical component whenever you swim forward looking even slightly down)
     /// drifts LATERALLY out of the water — never through the bottom. `swim_sink` clamps to ~0 against
     /// the floor, so there is NO real fall: the character only moved sideways and stayed on the floor.
-    /// It must latch NO fall height. Pre-tightening this false-positived (the gate was `wish_vspeed <
-    /// 0` alone), re-arming `airborne_start_z` and latching a spurious `Some(~0)` — a phantom "fall"
-    /// for a purely lateral exit, violating the §442 DEFECT-1 invariant (inert today only because
-    /// `SAFE_FALL_HEIGHT` discards it, but wrong).
+    /// It must latch NO fall height. Pre-tightening this false-positived (the gate was
+    /// `wish_vspeed < 0` alone), re-arming `airborne_start_z` and latching a spurious `Some(~0)` —
+    /// a phantom "fall" for a purely lateral exit, violating the §442 DEFECT-1 invariant (inert
+    /// today only because `SAFE_FALL_HEIGHT` discards it, but wrong).
     ///
     /// MUTATION-CHECK: reverting the gate to `if want < 0.0 { self.swim_sinking = true; }` (the
     /// down-intent sign, ignoring the resolved `swim_sink` delta) turns this RED —
@@ -4811,5 +4812,51 @@ mod tests {
         assert!(stalls > 1000,
             "the sweep must actually REACH the stalled state often enough to mean something — a \
              green run that never stalled would prove nothing; got {stalls}");
+    }
+
+    /// **Rename guard for this file's doc-comment citations (#874).** Growing `citation_corpus` in
+    /// `crates/eqoxide-nav/src/steering.rs` to include this file turned the nav crate's
+    /// citation-resolution scan
+    /// (`every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard`) onto
+    /// every `#[test]` this file's own doc comments cite by name — mostly `MUTATION-CHECK` notes
+    /// pointing at the fixture that proves a given behavior true.
+    ///
+    /// Measured, not assumed: #874 explicitly left "how many existing `movement.rs` citations would
+    /// fail the guard today" as unmeasured. Running the scan against the widened corpus answered it.
+    /// **Measured on `main` at `d63776d`, before this array existed:** fourteen distinct test names
+    /// over nineteen citation sites — ten cited once and four cited more than once (×3, ×2, ×2, ×2;
+    /// 10 + 9 = 19) — all fourteen resolving to real `#[test] fn`s in this same file and none of
+    /// them named in any guard, because this file had none. This is that guard, mirroring the one
+    /// already in `steering.rs`/`walker.rs`/`collision.rs`/`tests/walker_sim.rs`. The fourteen names
+    /// are the array below; that is the live list, and it is what a rename breaks the build on.
+    ///
+    /// ⚠️ **Corrections (#882 round 2).** Two, both in the sentence above. It said **five** names
+    /// were cited more than once and then listed four; the arithmetic only closes with four
+    /// (10 singletons + 9 repeat sites = 19), and re-deriving the scan's own charset rules against
+    /// `main` gives four. And the nineteen is a **historical** figure with the predicate now stated:
+    /// this doc comment is itself in the file the scan reads, so every test name written into it
+    /// counts as one more citation site — the first version of this paragraph named the four
+    /// repeat-cited tests and raised the live count to twenty-three the moment it landed, while
+    /// still saying nineteen in the present tense. The names are gone from the prose (the array
+    /// below is the list that matters), the pin is `main` before this guard, which cannot move, and
+    /// nothing here asserts a live number.
+    #[test]
+    fn doc_comment_citations_in_this_file_are_rename_guarded() {
+        let _cited: &[fn()] = &[
+            fall_through_guard_disabled_when_underworld_unknown,
+            a_large_same_zone_relocation_forgets_the_pre_relocation_recovery_ring,
+            the_zone_change_reload_block_still_forgets_the_recovery_ring,
+            the_frames_that_do_not_step_still_clear_the_hold,
+            clear_hold_drops_a_hold_without_stepping,
+            a_driven_swim_descent_never_passes_the_pool_floor_at_any_dt,
+            a_duck_never_dives_out_the_bottom_of_its_own_water_volume,
+            a_duck_never_exits_the_water_sideways,
+            a_driven_swim_descent_never_passes_a_real_zone_floor,
+            p3_collided_swim_does_not_embed_under_a_flush_ceiling,
+            water_breaks_a_fall_no_phantom_damage_on_shore,
+            exiting_the_bottom_of_a_suspended_water_volume_resumes_the_fall,
+            a_large_same_zone_relocation_forgets_the_ring_for_the_stuck_fallback_too,
+            a_hold_clears_as_soon_as_the_body_is_free_again,
+        ];
     }
 }

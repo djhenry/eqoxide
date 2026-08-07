@@ -145,6 +145,10 @@ pub fn empty_state() -> HttpState {
             eye: [0.0, 0.0, 0.0],
             occluded: false,
             still_blocked: false,
+            // #867: `None` = "no frame has been drawn", the same honest state `main.rs` seeds
+            // before the event loop exists. A test that needs a drawn-looking snapshot sets these.
+            drawn_frame: None,
+            drawn_at: None,
         })),
         frame_req: Arc::new(Mutex::new(None)),
         manual_move: Arc::new(Mutex::new(None)),
@@ -198,6 +202,7 @@ pub fn empty_state() -> HttpState {
         lifecycle,
         guild_slots: Default::default(),
         nav_debug_view: Default::default(),
+        skin_cap_downgrades: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
     }
 }
 
