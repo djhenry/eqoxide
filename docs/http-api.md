@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + **camera state** (`camera`, describing the last frame ACTUALLY DRAWN, not the current tick — read `drawn_frame`/`drawn_age_ms` first, and note that the `snapshot_age_ms` in the same payload is the network clock and does not age it; see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867)). |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_stall`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + **camera state** (`camera`, describing the last frame ACTUALLY DRAWN, not the current tick — read `drawn_frame`/`drawn_age_ms` first, and note that the `snapshot_age_ms` in the same payload is the network clock and does not age it; see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867)). |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. Optional `preset`/`pitch`/`yaw`/`distance` params request a one-off diagnostic camera angle for just this capture — see [Camera override for `/frame`](#camera-override-for-observeframe-422). |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses, snapshot_age_ms}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. The default bare-map shape carries the same freshness value in the `X-Snapshot-Age-Ms` header instead — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646). |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -290,6 +290,7 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `planning` | A route is being computed on the pathfinding worker thread. The character stands still. Normally < 1 s. | — |
 | `navigating` | Walking a **complete route to your goal**. | `goal_z_snapped` (see below) or — |
 | `navigating_partial` | Walking a **partial** route: the search was cut short, so this is *not* a route to your goal — it's progress toward a frontier, and it will re-plan from the far end. Usually resolves to `navigating` or `arrived`. | `search_node_cap` |
+| `navigating_stalled` | **A route is committed and the walker is NOT executing it.** The body has neither advanced its route cursor nor improved its closest approach to the goal for `NAV_STUCK_TICKS` (20) walker ticks — about 3 s. **Only fixed-destination goals reach this state** — see the limitation under `nav_stall` below. This is **not terminal** — it is not on the terminal list below, and the walker goes on backing off and re-pathing under it. **The verdict latches:** a re-path or a back-off does not clear it. It exists because the alternative is worse — before #851 a walker circling under a ledge published plain `navigating` for the whole ~32 s it spent recovering, and an agent polling `nav_state` had no way to tell it apart from a walk that was working. Read **`nav_stall`** (below) for how long and how many re-paths. If the walker never recovers you will eventually get `blocked` (`walker_stalled` or `local_no_way_through`, at 8 re-path attempts) or `blocked`/`no_progress` (60 s). | `goal_z_snapped` (see below), `search_node_cap`, or — (it carries whatever reason the committed route carries) |
 | `following` | A `/follow` chase has caught up; holding near the leader, still latched. | — |
 | `arrived` | Reached the goal. | `goal_z_snapped` (see below) or — |
 | `no_path` | **No route was published for this goal — read `nav_reason` before concluding one cannot exist.** For most reasons it is definitive: the planner searched to completion, so do not retry the same goal, pick another. **Not all of them are.** `planner_dead` means the pathfinding worker died, and on `/move/zone_cross` the `region_data_*` reasons (#815) mean the zone's region map could not be read — neither is a completed search, and both are **"I don't know", not "no"** — the same reading `search_exhausted` carries, but reported under this state rather than that one. The state itself is still terminal — nothing will retire it for you — so the retry decision is `nav_reason`'s to make, not this row's. | see below |
@@ -311,6 +312,54 @@ remembered to clean itself up.
 That rule replaced an opt-in list of states-to-retire, under which any state missing from the list
 survived forever once its goal vanished. Two were missing, and both were observed live: `pending`
 after a dropped `/zone_cross` (#725), and `following` after the followed entity despawned.
+
+### `nav_stall` — a committed route the walker is not executing (#851)
+
+`GET /v1/observe/debug` carries **`nav_stall`** (top-level, a sibling of `player`, not under it).
+It is `null` except while `nav_state` is `navigating_stalled`, and the two are written together from
+one verdict under one lock hold — you will never see one without the other. **Both belong to the goal
+in `nav_goal_id` and to no other:** the walker's stall verdict carries the goal id it was measured
+against, and reading it for a different goal is not something the client can express — so neither
+this payload nor the `navigating_stalled` word can outlive the goal that earned them.
+
+```json
+"nav_stall": {
+  "quiet_ticks": 34,
+  "quiet_ms":    5310,
+  "repaths":     2,
+  "route":       "complete",
+  "detail":      "…"
+}
+```
+
+| field | meaning |
+|-------|---------|
+| `quiet_ticks` | Consecutive walker ticks (150 ms each) with **no** route-cursor advance and **no** closest-approach improvement. Crosses the threshold at 20, so the smallest value you can ever read here is 20. |
+| `quiet_ms` | The **same window as `quiet_ticks`**, in wall-clock milliseconds: measured from the walker's last progressing tick. So the first `navigating_stalled` you see already reads ≈ 3000, not `0`. It is measured, never computed as `quiet_ticks × 150`, and that is the only reason the two can disagree — the 150 ms nav tick is a floor, not a guarantee, so under load this runs **longer** than the arithmetic (the example above is 34 ticks in 5310 ms). Use `quiet_ticks` as the evidence count and this as the clock. |
+| `repaths` | How many recovery re-paths the walker has spent on this goal. It gives up at 8, which is where the terminal `blocked` comes from — reason `local_no_way_through` if the fine planner also says there is no way through at that moment, `walker_stalled` otherwise. |
+| `route` | `complete` (the committed route ends at your goal) or `partial` (it ends short of it). A stall on a `partial` means the walker is not executing even the partial. |
+| `detail` | A prose restatement of the four fields above, for an agent reading the JSON without this document. Present whenever `nav_stall` is. |
+
+**What it does and does not mean.** It means: *a route is committed and the body is not moving along
+it.* It does **not** mean the goal is unreachable — the walker is still in back-off/re-path recovery
+and may escape it. Treat it as "give this a few more seconds, and if it persists, expect a `blocked`
+verdict rather than an arrival".
+
+**Limitation: this state is only ever published for a fixed destination** — `/move/goto` and
+`/move/zone_cross`. A `/move/follow` chase is driven down a different path that does not run the
+stall verdict at all, so a chase reads `navigating` (or `navigating_partial`, or `following` once it
+has caught up) and **never** `navigating_stalled`, even while it is genuinely wedged. Measured, not
+argued: `a_wedged_follow_chase_is_not_reported_as_stalled_at_all_851` drives the real walker tick
+with a body that does not move for 60 ticks (~9 s) under a chase and reads `navigating` for every one
+of them; the same fixture without the chase reaches `navigating_stalled` at tick 20. So for a
+`/follow`, `nav_state` alone does not distinguish a chase that is walking from one that is stuck —
+poll the character's position. Closing this gap means deciding what "progress" means for a moving
+target, which is a separate change (#929).
+
+**Why it exists.** The stall was always *detected* — the back-off/re-path machinery has fired at 20
+quiet ticks for a long time — it was never *published*. So a walker circling under a ledge for ~32 s
+and a walker making perfect progress produced the identical `nav_state: "navigating"`, and an agent
+polling that field had nothing to distinguish them. #851.
 
 ### Every `idle` says how it got there (#725)
 
@@ -804,7 +853,7 @@ GET  /v1/observe/debug     -> nav_state: "arrived"   <-- but nav_goal_id: 7, the
 
 Now the accept **atomically** bumps `nav_goal_id` and resets `nav_state` to `pending`, so the read above returns `nav_state: "pending", nav_goal_id: 8` — honest.
 
-**Rule: ignore any `nav_state` whose `nav_goal_id` is LOWER than the `goal_id` your POST returned — that is an older goal's outcome. At your id or above, the state is current.** A matching id with `pending`/`planning`/`navigating` means your goal is genuinely in flight — and it will not stay that way, because any in-progress state with nothing behind it retires to `idle` with a reason on the next walker tick ([Why an in-progress `nav_state` can never stick](#why-an-in-progress-nav_state-can-never-stick-725)). `idle` **at or above your own goal id** is therefore an outcome, not a "not started yet": read `nav_reason`, which since #725 always says which outcome it was.
+**Rule: ignore any `nav_state` whose `nav_goal_id` is LOWER than the `goal_id` your POST returned — that is an older goal's outcome. At your id or above, the state is current.** A matching id with `pending`/`planning`/`navigating`/`navigating_partial`/`navigating_stalled`/`following` means your goal is genuinely in flight — `navigating_stalled` included: it is a walker that has a route and is not currently executing it, still recovering, not a verdict (see [`nav_stall`](#nav_stall--a-committed-route-the-walker-is-not-executing-851)) — and it will not stay that way, because any in-progress state with nothing behind it retires to `idle` with a reason on the next walker tick ([Why an in-progress `nav_state` can never stick](#why-an-in-progress-nav_state-can-never-stick-725)). `idle` **at or above your own goal id** is therefore an outcome, not a "not started yet": read `nav_reason`, which since #725 always says which outcome it was.
 
 **Why the rule is "at or above" and not "equal" — `/v1/move/zone_cross` in particular.** A *higher*
 id does not mean your read is stale; it means your goal was superseded, **or that the client
@@ -2137,3 +2186,72 @@ it ever turned on you). Never infer one from the other.
 `level` is the spawn's actual character level (from its spawn record), when known — `null` is an
 honest "unknown" (e.g. it had already left the entity table by the time the reply arrived), never a
 guessed number.
+
+## `skin_cap_downgrades` — the renderer's silent render-arm downgrades, made visible (#797/#848)
+
+The renderer has an animation joint cap. A character model whose skin exceeds it is not refused —
+it is silently switched to the **static (unskinned) render arm**: it still appears on screen, in the
+right place, but it will never animate again for the rest of the session. Before #797 there was no
+observable for this at all — the client logged an error server-side of the agent's view and moved
+on. An agent with no eyes on the screen had no way to learn that what it believes is a walking,
+attacking character is actually a frozen pose, short of a human telling it so.
+
+`GET /v1/observe/debug` carries it as a top-level object, keyed by the **base file name** of the
+model that was loaded (never a full path — see below):
+
+```jsonc
+"skin_cap_downgrades": {
+  "race_hum.glb": { "joint_count": 190, "key_collision": false }
+}
+```
+
+- **`{}` (never `null`, never omitted) when no downgrade has been recorded yet this session.** Like
+  `nav_local_planner_dead`, this field is *always present* rather than `null`-when-healthy, so an
+  agent that greps this response and finds the key missing entirely knows it is talking to a client
+  too old to report this, rather than concluding every model in the zone animates fine.
+  **Read `{}` precisely.** It means "nothing has downgraded so far", which covers two states this
+  field cannot separate: *every character model loaded so far fits the cap*, and *no character
+  model has been loaded yet* — a loading screen, a zone-in still in progress, or simply nothing in
+  view. `{}` is not evidence that a particular model animates; it is only evidence that no model
+  the renderer has actually loaded has been recorded as downgraded. What `{}` does **not** hide is
+  a stale non-empty state: the map's only writer runs inside `render_frame`, the publish is the
+  next statement after that same call, and the map is only ever inserted into or updated (never
+  cleared), so a downgrade that has happened is visible on the very next response.
+- **`joint_count`** — the joint count that triggered the downgrade. If the same key has been (re)loaded
+  more than once this session, this is the **most recent** load's count, not the first.
+- **`key_collision`** — see below. `false` for the overwhelming common case (one file, one key).
+
+### Why the key is a base name, not a path — and what that costs (#848)
+
+The renderer never loads two files from the same directory with the same base name for one race —
+gender variants and equipment-driven swaps all produce distinct base names — so a base-name key
+almost always identifies one real file uniquely, without ever putting a local filesystem path in an
+agent-facing response (this project does not publish local paths over the API).
+
+The cost is that if two *different* asset roots ever legitimately produce two different files that
+share a base name (a custom asset override alongside the stock one, for instance), they collide onto
+the same map entry. Before #848 that collision was silent: the second load's joint count quietly
+overwrote the first's, with nothing in the response saying two distinct files had ever shared the
+key — a caller who trusted the entry would have been reading a number that belonged to *either* file,
+with no way to tell which, or that there was even a question to ask.
+
+`key_collision: true` is what makes that detectable. It is **sticky**: once two source files with
+different identities have ever both written the same key in a session, it stays `true` for that key
+for the rest of the session, even if every write after that agrees with the one before it (loading
+the same colliding file twice in a row does not clear it — the collision already happened and the
+entry is still unable to say which file `joint_count` currently describes). Treat `key_collision:
+true` as "this entry's `joint_count` is not reliably attributable to one file" — not as "the count
+shown is wrong," and not as something that self-heals.
+
+Both fields are keyed off the path `ModelAsset::load` itself actually opened, rather than a
+caller-supplied path/label pair. That path is stored in a field private to the renderer's
+`models.rs` and readable only through `ModelAsset::loaded_from()`, so no code upstream of the
+renderer — nor anywhere else in the client outside that one module — can either construct a
+`ModelAsset` carrying a path of its choosing or overwrite the one `load` recorded. Both routes are
+compile errors, and both were tried: removing the old caller-supplied argument alone was *not*
+enough (with the field still public, an assignment at the call site compiled clean and filed every
+downgrade under the wrong name), which is why the field is private rather than merely unused.
+
+What this does **not** promise: that the file `load` opened is the right file for the character you
+are looking at. The key is faithful to what was loaded; choosing what to load is a separate
+question, and this field cannot answer it.

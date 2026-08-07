@@ -684,6 +684,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let prov = player.position_provisional_since;
     let health = s.health();
     let frame_profile = *s.frame_profile.lock().unwrap();
+    // #797 — the STATIC-arm skin-cap downgrades the renderer has recorded so far this session,
+    // keyed by loaded file base name (never a full local path — see `downgrade_key`). Cloned out
+    // from behind the lock so the JSON literal below can move it in without holding the mutex
+    // across serialization.
+    let skin_cap_downgrades = s.skin_cap_downgrades.lock().unwrap().clone();
     let nav = s.nav.nav_state.lock().unwrap().clone();
     // Is nav answering from WINDING-BLIND (inverted-art) ground in this zone? (#375, D-2)
     //
@@ -752,6 +757,34 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                                  openings worse. This is a client fault; restart to recover it.",
             _                => "",
         },
+    }));
+    // #851 — the calibration data behind `nav_state: "navigating_stalled"`. `null` whenever the
+    // walker is not stalled, so a healthy walk says nothing here, exactly like `nav_local` above.
+    // The pair is written from ONE verdict in ONE call (`Walker::publish_drive_state`), under one
+    // lock hold, so the word and this payload cannot disagree; an agent may read either.
+    //
+    // That covers the walker's own publication. Every route OUT of a nav state goes through one of
+    // exactly three writers on `NavStatus` — `retire_to_idle` (the `idle` retirement),
+    // `stamp_fresh_goal` (a new goal arriving from the command side) and `transition_within_goal`
+    // (the walker's mid-route word change) — and none of them can leave this payload behind, because
+    // all three destructure `NavStatus` exhaustively (no `..`) and so cannot forget a field (#851
+    // review round 1, B1: only `retire_to_idle` existed then, and the flat assignment list that
+    // `stamp_new_goal` used instead published the dead goal's `nav_stall` beside the next goal's
+    // `pending`).
+    let nav_stall = nav.stall.map(|s| serde_json::json!({
+        "quiet_ticks": s.quiet_ticks,
+        "quiet_ms":    s.quiet_ms,
+        "repaths":     s.repaths,
+        "route":       s.route,
+        "detail": "the walker HAS a committed route and is NOT executing it: neither progress \
+                   channel — the route cursor advancing by walking, nor the closest 3-D approach to \
+                   the goal improving — has fired for `quiet_ticks` nav ticks. It is still in \
+                   stall/back-off/re-path recovery and may escape; it gives up at 8 re-paths with \
+                   `blocked` — reason `local_no_way_through` when the fine planner also says there \
+                   is no way through, `walker_stalled` otherwise. Do NOT read this as terminal, and \
+                   do NOT read it as progress. If `route` is `partial` the committed route did not \
+                   reach your goal in the first place. This payload is about the goal in \
+                   `nav_goal_id` and no other.",
     }));
     // The agent-honesty blockage payload behind a terminal `no_path` (#378 Phase 2). `null` when
     // there is nothing to report (not a terminal no_path, or the diagnosis could not be computed —
@@ -1071,6 +1104,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             // simply given up, or whether the walker was physically wedged — so an unreachable goal
             // presented as a silent permanent freeze, which disguised the real nav root cause for
             // months. See docs/http-api.md ("Navigation state") for the full contract.
+            //   navigating_stalled — #851: a route IS committed and the walker is NOT executing it
+            //                      (no progress on either channel for >= ~3s). In-progress, not
+            //                      terminal: it is in stall/back-off/re-path recovery. Read
+            //                      `nav_stall` for how long and how many re-paths are left. This
+            //                      state exists because `navigating` used to cover it for ~32s.
             //   no_path          — DEFINITIVE: no route exists (nav_reason: goal_not_walkable |
             //                      search_closed | start_isolated | no_geometry). Pick another goal.
             //   search_exhausted — the planner GAVE UP (search_node_cap). This is
@@ -1147,6 +1185,9 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // clock" with no way to ask which, and `nav_state` said a confident `navigating` throughout.
         // The clock is gone; the ambiguity went with it.
         "nav_local": nav_local,
+        // #851. See where it is built, above. Non-null EXACTLY when `nav_state` is
+        // `navigating_stalled` — the honest middle state between "walking your route" and "gave up".
+        "nav_stall": nav_stall,
         // WORKER-scoped fine-planner liveness (#766 review B3; scope corrected from "session" by
         // round-6 review B12 — the latch is cleared by `Walker::new` as it spawns a replacement, and
         // it reads as session-scoped from outside only because exactly one fine worker is built per
@@ -1208,8 +1249,30 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // Distinct from the zone-lifetime `nav_tight` counter — this is the route being walked now.
         "nav_tier": nav_tier,
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
-        // Render-owned — the one field here the render loop legitimately publishes.
         "frame_profile": frame_profile,
+        // #797 — models whose skin joint count EXCEEDED the renderer's animation cap and were
+        // downgraded to the static (unskinned) render arm this session. Keyed by loaded file base
+        // name. Always present, `{}` rather than `null`, so a caller that greps and finds the key
+        // MISSING knows it is talking to a client too old to report this at all — the same
+        // distinction `nav_local_planner_dead` draws above.
+        //
+        // What `{}` does and does not say (#900 review r1, finding 6): it is an exact mirror of the
+        // renderer's own map, which is written only by `ensure_character_model` (via
+        // `observe_skin_fit`) inside `render_frame`, is insert/update-only, and is published
+        // immediately after that same `render_frame` call — so `{}` is never a STALE non-empty
+        // state going unreported. But it does conflate two situations an agent cannot separate from
+        // this field alone: "every character model loaded so far fits the cap" and "no character
+        // model has been loaded yet" (loading screen, zoning, nothing in view). Read `{}` as "no
+        // downgrade has been recorded so far this session", NOT as "the model you are asking about
+        // animates" — that second reading is only justified once you know the model is on screen.
+        // Each entry is `{joint_count, key_collision}`:
+        //   joint_count   — the joint count that triggered the downgrade (the MOST RECENT one, if
+        //                   this key has been (re)loaded more than once this session).
+        //   key_collision — true iff two files that hash to the SAME base-name key were BOTH loaded
+        //                   this session (eqoxide#848). When true, `joint_count` is not reliably
+        //                   attributable to either file — see docs/http-api.md.
+        // See `eqoxide_renderer::renderer::record_skin_cap_downgrade` for how this map is built.
+        "skin_cap_downgrades": skin_cap_downgrades,
         // EVERY field in this block describes ONE frame — the one named by `drawn_frame` — and not
         // "now" (#867). The render loop publishes the whole struct in a single write, only after
         // `render_frame` has actually encoded a frame; on a tick that returns early from the
@@ -3305,6 +3368,72 @@ mod tests {
             "camera.still_blocked must say the eye is still not fully clear of collision");
     }
 
+    /// #797 (added in #900's review round 2) — the renderer's skin-cap downgrade report must reach
+    /// a RESPONSE BODY, not merely an `HttpState` field. This is #797's own failure mode one layer
+    /// up: `EqRenderer::skin_cap_downgrades` existed since #795/#820 and was perfectly public, and
+    /// the driving agent still could not read it, because nothing carried it to a response. A
+    /// serving path that quietly stops serving reproduces exactly that, and the round-1 reviewer
+    /// measured that it could: deleting the `"skin_cap_downgrades"` entry from `get_debug`'s JSON
+    /// literal was compile-clean and left the whole workspace green.
+    ///
+    /// Same shape as `camera_eye_reaches_the_debug_json_852` above and
+    /// `hold_reaches_the_debug_json_817` below: drive the REAL router through `debug_json`, parse
+    /// the REAL bytes, and assert on both the empty and the populated case — the empty case pins
+    /// that the key is always PRESENT (an agent that greps and finds nothing cannot tell "nothing
+    /// downgraded" from "this client predates the field"), the populated case pins that a
+    /// downgrade the renderer actually recorded is carried through with both sub-fields intact.
+    ///
+    /// MUTATION CHECK (remote builder, both directions, run for #900 round 2 and reported in that
+    /// PR comment — not reasoned):
+    /// - **DELETE** the `"skin_cap_downgrades": skin_cap_downgrades,` entry from `get_debug`'s JSON
+    ///   literal → RED at the `contains_key` assertion below.
+    /// - **WRAP** the `let skin_cap_downgrades = …lock().unwrap().clone();` read in `if false { … }`
+    ///   (leaving an empty `BTreeMap` behind) → RED at the populated-case assertions. The WRAP is
+    ///   run because DELETE alone does not distinguish "this check runs" from "this check is merely
+    ///   written" — eqoxide#799, eight measured cases in this repo.
+    #[tokio::test]
+    async fn skin_cap_downgrades_reaches_the_debug_json_797() {
+        // ── Empty: an explicit `{}` that IS in the object, never an omitted key. ────────────────
+        let v = debug_json(empty_state()).await;
+        let obj = v.as_object().expect("debug object");
+        assert!(obj.contains_key("skin_cap_downgrades"),
+            "skin_cap_downgrades must be PRESENT in the served body even when empty — an agent \
+             that greps for it and finds nothing cannot tell \"nothing has downgraded\" from \
+             \"this client cannot report downgrades at all\". Top-level keys served: {:?}",
+            obj.keys().collect::<Vec<_>>());
+        assert_eq!(v["skin_cap_downgrades"], serde_json::json!({}),
+            "with nothing recorded it must serialise as an empty OBJECT, not null and not omitted, \
+             got {}", v["skin_cap_downgrades"]);
+
+        // ── Populated: what the renderer recorded, carried through with both sub-fields. ────────
+        let state = empty_state();
+        {
+            let mut recorded = state.skin_cap_downgrades.lock().unwrap();
+            recorded.insert("race_hum.glb".to_string(),
+                eqoxide_ipc::SkinCapDowngradeView { joint_count: 190, key_collision: false });
+            // The #848 case: one key two different files have written. `key_collision` is the only
+            // thing in the response that discloses it, so it has to survive the trip.
+            recorded.insert("race_pcfroglok.glb".to_string(),
+                eqoxide_ipc::SkinCapDowngradeView { joint_count: 204, key_collision: true });
+        }
+        let v = debug_json(state).await;
+        let served = v["skin_cap_downgrades"].as_object()
+            .expect("skin_cap_downgrades must be an OBJECT in the served body");
+        assert_eq!(served.len(), 2,
+            "every recorded downgrade must be served, not just the first — served: {:?}",
+            served.keys().collect::<Vec<_>>());
+        assert_eq!(v["skin_cap_downgrades"]["race_hum.glb"],
+            serde_json::json!({ "joint_count": 190, "key_collision": false }),
+            "the recorded joint count and collision flag must both reach the body verbatim");
+        assert_eq!(v["skin_cap_downgrades"]["race_pcfroglok.glb"]["key_collision"],
+            serde_json::json!(true),
+            "key_collision: true must reach the body — it is the ONLY signal an agent has that this \
+             entry's joint_count is not reliably attributable to one file (eqoxide#848)");
+        assert_eq!(v["skin_cap_downgrades"]["race_pcfroglok.glb"]["joint_count"],
+            serde_json::json!(204),
+            "a colliding entry still carries its joint count; the flag qualifies it, not replaces it");
+    }
+
     /// #867 — the camera block's FRESHNESS signal must reach the served body, in both states.
     ///
     /// Every other field in `camera` looks identical on a snapshot published this tick and on one
@@ -4407,6 +4536,66 @@ mod tests {
             "#766: `no_way_through` beside `idle`/`zoned` describes a corridor in the zone the \
              reader has LEFT, computed against a collision grid that no longer exists — the fine \
              tier's verdict is about threading toward a goal, so it retires with the goal");
+    }
+
+    /// **#851 (agent-honesty) — the OBSERVER half of the stall publication.**
+    ///
+    /// The walker-side tests in `eqoxide-nav` prove that a stalled walker stops publishing
+    /// `navigating` into `NavStatus`. They cannot prove an agent can READ it: this crate is where
+    /// `NavStatus` becomes JSON, and a field that is computed but never serialized is exactly the
+    /// written-but-not-reached shape #799 tracks. So this drives the real `/debug` handler.
+    ///
+    /// Both directions, because either one alone is satisfiable by a constant: `nav_stall` is `null`
+    /// on an ordinary `navigating`, and carries the whole object on `navigating_stalled`.
+    ///
+    /// Mutation check: delete `"nav_stall": nav_stall,` from the `/debug` body → the second half
+    /// goes RED; hard-code `let nav_stall = None;` → also RED, and the `null` half stays green,
+    /// which is why the `null` half is not the test.
+    #[tokio::test]
+    async fn debug_publishes_the_nav_stall_calibration_only_while_stalled_851() {
+        let state = empty_state();
+        {
+            let mut s = state.nav.nav_state.lock().unwrap();
+            s.goal_id = 4;
+            s.state   = "navigating".into();
+            s.goal    = Some([100.0, 200.0, 0.0]);
+        }
+        let v = debug_json(state.clone()).await;
+        assert_eq!(v["player"]["nav_state"], serde_json::json!("navigating"),
+            "PREMISE: an ordinary walk is being published at all");
+        assert_eq!(v["nav_stall"], serde_json::json!(null),
+            "#851: a walker that is executing its route has no stall to disclose — a non-null here \
+             would make the field noise an agent learns to ignore");
+
+        // What `Walker::publish_drive_state` writes once the verdict has flipped.
+        //
+        // The pair is REACHABLE, and that is load bearing (#851 review round 1, B2a). The earlier
+        // fixture said `quiet_ticks: 34, quiet_ms: 5100` — exactly `34 × 150`, the one arithmetic
+        // `docs/http-api.md` says never to do — and the implementation cannot produce it, because
+        // `quiet_ms` is a measured wall clock over the window `quiet_ticks` counts and the 150 ms
+        // nav tick is a floor. So the "pin" pinned a row that could not occur. 34 ticks in 5310 ms
+        // is a tick running ~6% slow, which is an ordinary loaded frame.
+        {
+            let mut s = state.nav.nav_state.lock().unwrap();
+            s.state = "navigating_stalled".into();
+            s.stall = Some(eqoxide_ipc::NavStall {
+                quiet_ticks: 34, quiet_ms: 5310, repaths: 2, route: "complete",
+            });
+        }
+        let v = debug_json(state).await;
+        assert_eq!(v["player"]["nav_state"], serde_json::json!("navigating_stalled"));
+        assert_eq!(v["nav_stall"]["quiet_ticks"], serde_json::json!(34),
+            "#851: the evidence count must reach the reader — `navigating_stalled` on its own says \
+             THAT the walker is stuck, not for how long, and 3 s of stall reads very differently \
+             from 30 s");
+        assert_eq!(v["nav_stall"]["quiet_ms"], serde_json::json!(5310));
+        assert_eq!(v["nav_stall"]["repaths"], serde_json::json!(2),
+            "the re-path count is how an agent tells a stall that is about to recover from one \
+             approaching the 8-attempt give-up");
+        assert_eq!(v["nav_stall"]["route"], serde_json::json!("complete"),
+            "and whether the committed route even ends at the goal");
+        assert!(v["nav_stall"]["detail"].as_str().is_some_and(|d| !d.is_empty()),
+            "the prose half of the disclosure must be present too");
     }
 
     /// **#766 review B3 — the worker-scoped fault must NOT retire with the goal.**

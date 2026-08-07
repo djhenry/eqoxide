@@ -345,6 +345,35 @@ impl StaticReason {
     }
 }
 
+/// One reported cap downgrade, keyed in [`EqRenderer::skin_cap_downgrades`] by [`downgrade_key`].
+///
+/// `joint_count` is the thing eqoxide#780 exists to report. `key_collision` is eqoxide#848's
+/// answer to the failure mode below: `downgrade_key` is only the loaded file's **base name**, so
+/// two different files under two different asset roots that happen to share a name key the same
+/// `BTreeMap` entry. Before this type existed that collision was invisible — the second load simply
+/// overwrote the first and an agent reading the report had no way to tell "this is the only
+/// `race_hum.glb` that exists" from "this is one of two, and the other one's downgrade just got
+/// erased". `source` (private — see below) is what lets [`record_skin_cap_downgrade`] tell those
+/// two cases apart on every write, and `key_collision` is the caller-visible answer.
+///
+/// `source` is deliberately **not** `pub`: it exists purely so the recorder can compare "the file
+/// this write is about" against "the file the last write to this key was about", and a caller
+/// outside this module has no legitimate use for a path that — per [`downgrade_key`]'s own doc — is
+/// local-machine detail this project does not publish. Making it unconstructable from outside the
+/// crate also means a caller cannot hand-build a `SkinCapDowngrade` with `key_collision: false` and
+/// insert it directly, bypassing the detection this type exists to hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkinCapDowngrade {
+    pub joint_count: usize,
+    /// True iff two files that are NOT the same file (by path) have ever been recorded under this
+    /// same key. Sticky, not a snapshot of "the current entry disagrees with the current source":
+    /// once two distinct sources have collided on a key, this stays `true` for the rest of the
+    /// map's life, even if every write after that happens to be from only one of the two files
+    /// again. See [`record_skin_cap_downgrade`] for why that stickiness is deliberate.
+    pub key_collision: bool,
+    source: std::path::PathBuf,
+}
+
 /// Record `model_path`'s joint count into `downgrades` iff `reason` is a genuine cap downgrade
 /// (`StaticReason::ExceedsCap`) — the one outcome eqoxide#780 requires to stop being silent. Pure
 /// so the recording decision is unit-testable without a `wgpu::Device`; `EqRenderer` cannot be
@@ -368,36 +397,68 @@ impl StaticReason {
 ///
 /// Both errors are the same mistake: a key that is a *proxy* for the file instead of the file. This
 /// function therefore takes the `&Path` that was actually handed to `ModelAsset::load` and derives
-/// the key from it.
+/// the key from it. As of eqoxide#848, `model_path` itself is no longer caller-supplied in the
+/// production call path: it comes from [`crate::models::ModelAsset::loaded_from`], the path
+/// `ModelAsset::load` actually opened, carried inside the asset the witness in `skin_observation`
+/// already owns — see that module's `observe_skin_fit` for why a caller can no longer hand this
+/// function a path that disagrees with what was loaded.
 ///
-/// ## Exactly how far that goes
+/// ## Exactly how far the KEY choice goes, and what eqoxide#848 changed
 ///
-/// One direction is structural: **two loads of one file cannot produce two entries**, because
-/// [`downgrade_key`] is a pure function of the path — same path in, same key out, and a `BTreeMap`
-/// does the rest.
+/// One direction was already structural: **two loads of one file cannot produce two entries**,
+/// because [`downgrade_key`] is a pure function of the path — same path in, same key out, and a
+/// `BTreeMap` does the rest.
 ///
-/// The other direction is not. The key is the path's **file name**, not the whole path, so two
-/// files with the same base name under two different asset roots collapse into one entry. That is
-/// measured, not reasoned: `two_roots_with_the_same_basename_collide_into_one_entry` in
-/// `tests/skin_cap_selection.rs` plants it. An earlier version of this doc claimed the collision was
-/// inexpressible "because the key IS the file"; it is not, and a reviewer said so. Reaching it needs
-/// one renderer to load character models from two roots that share a file name — `assets_path` is
-/// set by `load_character_models` and there is one per renderer, so it does not happen in the
-/// shipped flow, but nothing here *prevents* it.
+/// The other direction was not, and eqoxide#848 does not remove the underlying ambiguity — the key
+/// is still the path's **file name**, not the whole path, so two files with the same base name
+/// under two different asset roots still key the same `BTreeMap` entry. What changes is that this
+/// is no longer *silent*: every write compares the incoming `model_path` against the `source` the
+/// entry was last written from, and if they disagree, `key_collision` is set and stays set. An
+/// agent reading the report can now tell "this is the only `race_hum.glb`" (`key_collision: false`)
+/// from "two different files are fighting over this name and the joint count you're looking at
+/// might not be either of theirs" (`key_collision: true`) — see
+/// `two_roots_with_the_same_basename_collide_into_one_entry` in `tests/skin_cap_selection.rs`,
+/// which used to assert the silent overwrite as accepted behavior and now asserts the flag instead.
+/// Reaching the collision at all needs one renderer to load character models from two roots that
+/// share a file name — `assets_path` is set by `load_character_models` and there is one per
+/// renderer, so it does not happen in the shipped flow today, but nothing here *prevents* it, which
+/// is exactly why the detection has to be structural rather than "know your assets don't collide".
 ///
-/// The base name is still the right key, for a reason unrelated to collisions: this map is *meant*
-/// to be read by an AI agent over HTTP (eqoxide#797 — nothing publishes it yet; grep for
-/// `skin_cap_downgrades` outside this crate and the only hit is a comment in
-/// `src/bin/render_model.rs`), and an absolute local path is both unstable across machines and
-/// local detail this project does not publish. `race_pcfroglok.glb` identifies the rig; the
-/// absolute path in front of it identifies the machine.
+/// The stickiness (`existing || this_write_disagrees`, never recomputed from scratch) is
+/// deliberate: a `BTreeMap` holds one `SkinCapDowngrade` per key, so once two sources have written
+/// one key, only one `source` can be remembered going forward. Resetting the flag whenever the
+/// *current* write happens to agree with whichever source is currently remembered would let a
+/// three-load sequence (A, B, A) report `key_collision: false` after the third write despite two
+/// genuinely different files having shared this key — the flag would then be lying about exactly
+/// the thing it exists to disclose. `key_collision_is_sticky_and_does_not_clear_on_a_later_agreeing_write`
+/// (in `tests/skin_cap_selection.rs`) pins that: it drives an a, b, a, a sequence and asserts the
+/// flag never clears once two distinct sources have written the key.
+///
+/// The base name is still the right key, for a reason unrelated to collisions: this map is meant to
+/// be read by an AI agent over HTTP (eqoxide#797 — see `/v1/observe/debug`'s `skin_cap_downgrades`
+/// field, documented in `docs/http-api.md`), and an absolute local path is both unstable across
+/// machines and local detail this project does not publish. `race_pcfroglok.glb` identifies the
+/// rig; the absolute path in front of it identifies the machine — which is also exactly why
+/// `source` above is not `pub`.
 pub fn record_skin_cap_downgrade(
-    downgrades: &mut std::collections::BTreeMap<String, usize>,
+    downgrades: &mut std::collections::BTreeMap<String, SkinCapDowngrade>,
     model_path: &std::path::Path,
     reason: StaticReason,
 ) {
     if let Some(joint_count) = reason.downgrade_joint_count() {
-        downgrades.insert(downgrade_key(model_path), joint_count);
+        let key = downgrade_key(model_path);
+        let source = model_path.to_path_buf();
+        match downgrades.get_mut(&key) {
+            Some(existing) => {
+                let collided_this_write = existing.source != source;
+                existing.joint_count = joint_count;
+                existing.source = source;
+                existing.key_collision = existing.key_collision || collided_this_write;
+            }
+            None => {
+                downgrades.insert(key, SkinCapDowngrade { joint_count, key_collision: false, source });
+            }
+        }
     }
 }
 
@@ -579,16 +640,25 @@ pub struct EqRenderer {
     model_load_tried:        std::collections::HashSet<(&'static str, u8)>,
     /// Character models whose skin EXCEEDED [`JOINT_CAP`] and were therefore downgraded to the
     /// static (unskinned) render arm, keyed by the **GLB file name that was loaded** (e.g.
-    /// `race_hum_f.glb`), with the joint count that caused it. This is the observable eqoxide#780
-    /// exists to add. Absent = no downgrade has happened; a missing model or a genuinely unskinned
-    /// one (e.g. `boat.glb`) is never inserted here, only a model that HAD real skin data and
-    /// didn't fit. Not yet wired to the HTTP API (that crosses into `src/app.rs`, out of scope —
-    /// see the #780 PR body) but is public and queryable in-process, and every downgrade is also
-    /// logged at `error!`.
+    /// `race_hum_f.glb`), with the joint count that caused it and whether that key has ever been
+    /// written by two different files (see [`SkinCapDowngrade`]). This is the observable
+    /// eqoxide#780 exists to add. Absent = no downgrade has happened; a missing model or a
+    /// genuinely unskinned one (e.g. `boat.glb`) is never inserted here, only a model that HAD real
+    /// skin data and didn't fit. Every downgrade is also logged at `error!`.
+    ///
+    /// Wired to the HTTP API as of eqoxide#797: `src/app.rs` publishes a per-frame snapshot of this
+    /// map into `eqoxide_ipc::SkinCapDowngradesShared`, and `/v1/observe/debug`'s
+    /// `skin_cap_downgrades` field (`crates/eqoxide-http/src/observe.rs`, documented in
+    /// `docs/http-api.md`) serves it — the same publish shape `frame_profile` already used. Before
+    /// eqoxide#797 this sentence read "not yet wired to the HTTP API... but is public and queryable
+    /// in-process": that was true and is why #797 was filed — a value only a Rust caller inside this
+    /// process could read is not an observable the driving agent has, no matter how public the
+    /// field is.
     ///
     /// The key is the file rather than `(label, gender)` because the file is what the joint count
     /// describes; see [`record_skin_cap_downgrade`] for why that distinction is load-bearing
-    /// (eqoxide#813).
+    /// (eqoxide#813), and for why the key can still collide across two asset roots (eqoxide#848) and
+    /// what `key_collision` does about it.
     ///
     /// Written in exactly one place *as the tree stands* — [`crate::skin_observation::observe_skin_fit`],
     /// which is also the only producer of the [`crate::skin_observation::ObservedModel`] that
@@ -613,7 +683,7 @@ pub struct EqRenderer {
     ///   apart" while the destination was a caller-supplied `&mut BTreeMap`; a reviewer substituted
     ///   a throwaway map, the crate compiled clean and stayed green, and this field stayed empty for
     ///   a 129-joint rig. That route is closed; see the module's "Does not" list for what is not.
-    pub skin_cap_downgrades: std::collections::BTreeMap<String, usize>,
+    pub skin_cap_downgrades: std::collections::BTreeMap<String, SkinCapDowngrade>,
     /// Channel to the background model-sync worker: send a race model KEY (e.g. "race_hum") to
     /// fetch its `charmodel/<key>` set on demand the first time a spawn of that race is seen, so
     /// the client never downloads the ~450 MB of race models it doesn't need. None until wired in
@@ -1116,14 +1186,17 @@ impl EqRenderer {
                 // chosen for a joint count the uploaded model does not have. That argument was a
                 // caller-computed `Option<usize>` until round 4, and replacing it with `None` here
                 // was a compile-clean, still-green way back to eqoxide#780.
-                // Keyed by the file that was just loaded — `path`, not `key`/`gender`, because
-                // gender 1 falls back to the male GLB when there is no `_f` variant and the joint
-                // count belongs to the file (eqoxide#813). `path` is still caller-supplied and
-                // still unpinned; see `observe_skin_fit`'s doc for what that leaves open.
+                // Keyed by `asset.loaded_from()` — the file `ModelAsset::load` actually opened, not
+                // `path` handed in separately (eqoxide#848: a caller-supplied `model_path` argument
+                // could disagree with what was really loaded and file the report under the wrong
+                // name, silently). It is set by `load` itself from the same `path` it opened, into a
+                // field PRIVATE to `models.rs`, so there is no second value here that could drift
+                // from it AND no way to overwrite the first. The privacy is what closes it: while
+                // the field was `pub`, inserting `asset.loaded_from = "…boat.glb".into();` on this
+                // very line compiled clean and left the suite green (eqoxide#900 review, row R3′ in
+                // `skin_observation`'s header) — removing the argument had only moved the forgery.
                 let observed = crate::skin_observation::observe_skin_fit(
                     crate::skin_observation::DowngradeSink::of(self),
-                    &path,
-                    key,
                     asset,
                 );
                 let model = self.build_character_model(key, observed);
