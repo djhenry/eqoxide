@@ -249,6 +249,16 @@ contradicts, instead of queueing it and answering `200`. Nothing is queued and n
 | `POST /v1/merchant/sell` | `GET /v1/observe/inventory` | `slot` holds no item |
 | `POST /v1/combat/scribe` | `GET /v1/observe/inventory` | `from` is supplied and holds no item |
 | `POST /v1/interact/read` | `GET /v1/observe/inventory` | `slot` holds no item (`409` if it holds something unreadable) |
+| `POST /v1/interact/click_door` | `GET /v1/observe/doors` | no door in the roster matches the `door_id` **or** the `name` — both forms are looked up, neither is taken on trust |
+
+`click_door` is the one row where a `404` does not always mean "contradicted". With a **populated**
+roster it does: the client holds this zone's door records and yours is not among them. With an
+**empty** roster the snapshot contradicts nothing, and the body says so at length instead of
+pretending otherwise — an empty roster does not distinguish a zone with no doors from a zone whose
+door records have not arrived yet, and zoning empties the roster, so a zone-in in progress looks the
+same. Read that `404` as *unknown*, not as *disproved*, and re-check `GET /v1/observe/doors` once the
+zone has finished loading. (`503` would claim the session is not live, and `409` would claim
+something is pending; neither is true, so the code stays `404` and the body carries the distinction.)
 
 The snapshot these are checked against is the one the network thread publishes. It is refreshed on
 every inbound packet, **and** — since #347 — immediately after the client mirrors a change the server

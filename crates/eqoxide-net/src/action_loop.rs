@@ -1103,6 +1103,11 @@ impl ActionLoop {
     }
 
     /// Publish the current zone's doors from `gs` into the shared slot (GET /doors).
+    ///
+    /// The ONLY writer of `interact.doors_shared` other than the zone-in clear that
+    /// [`Self::doors_shared`] hands to `gameplay::run_zone_entry_handshake`. This one is called only
+    /// from `run_gameplay_phase`'s packet drain, which does not run during a zone-entry handshake —
+    /// see that accessor's doc for why the handshake has to do the clear itself.
     pub fn sync_doors(&self, gs: &GameState) {
         let mut out = self.interact.doors_shared.lock().unwrap();
         out.clear();
@@ -1121,6 +1126,23 @@ impl ActionLoop {
     /// the departed zone's hold on its very next tick. This is a read-only borrow — the handshake
     /// has no business driving the loop, it just needs the shared slots.
     pub fn controller_slots(&self) -> &eqoxide_ipc::ControllerSlots { &self.controller }
+
+    /// The published door roster, for the zone-entry handshake to CLEAR (#934 review B1, #891).
+    ///
+    /// `GameState::begin_zone_in` empties `gs.world.doors`, but the shared roster published FROM it
+    /// is republished only by [`Self::sync_doors`], whose sole caller is `run_gameplay_phase`'s
+    /// packet drain. `run_zone_entry_handshake` runs its own drain and never reaches that one, so
+    /// without an explicit clear the roster keeps the DEPARTED zone's doors for the whole handshake
+    /// (bounded by `ZONE_ENTRY_HANDSHAKE_DEADLINE`), while `publish_snapshot` keeps the HTTP session
+    /// live and answering. GET /v1/observe/doors then serves the old zone's list as the current
+    /// one, and POST /v1/interact/click_door resolves a departed zone's id straight back to
+    /// `200 clicking door N` — #891's own failure mode, with a lookup behind it.
+    ///
+    /// The handshake clears rather than republishes: it has no `ActionLoop` to publish through (see
+    /// [`Self::controller_slots`]), and an empty roster is the honest reading during a zone-in
+    /// anyway — the client cannot yet tell how much of the new zone's door stream has landed, which
+    /// is exactly what `http::interact::door_lookup_miss`'s empty-roster body says.
+    pub fn doors_shared(&self) -> &eqoxide_ipc::DoorsShared { &self.interact.doors_shared }
 
     /// Sync zone exit points from `gs` into the shared zone_points map.
     /// On zone change, also loads map-label exits from disk as fallback zone points.
