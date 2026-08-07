@@ -749,9 +749,12 @@ character is moving through a world the client has not built, so prefer waiting 
 **Ungated is not the same as honest during a load, and `/v1/observe/doors` is the case that
 matters.** Zoning empties the door roster (#891), and the records refill from server packets on no
 schedule this client publishes — so during a zone-in the endpoint returns a confident `[]` for a
-zone that does have doors. That is the same shape `/v1/observe/zone_exits` was gated for in #803:
-an empty list an agent reads as a fact about the world when it is a fact about what has arrived.
-Nothing here distinguishes them, and unlike the geometry gate there is no `ready` to wait for.
+zone that does have doors — the same bytes as the true answer "this zone has no doors". That is the
+shape #803 removed from [`zone_exits`](#zone-exits--means-exactly-one-thing-803): an empty list
+serving as both a reading of the world and a non-answer. The *cause* differs — there a file read
+had failed, here records have not arrived yet — and that difference is why doors are the harder
+case. A failed read is a terminal fact the client can name in a `503`; "not arrived yet" has no
+terminal moment to report, and unlike the geometry gate there is no `ready` to wait for.
 Treat `[]` from this endpoint as *not yet known*; re-listing is the only recourse. Tracked as
 #939.
 
