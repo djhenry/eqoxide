@@ -1244,15 +1244,31 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
         // Render-owned — the one field here the render loop legitimately publishes.
         "frame_profile": frame_profile,
-        // #852: `azimuth_deg`/`elevation_deg`/`radius`/`focus` are the orbit's DESIRED framing —
-        // NOT necessarily where the frame was actually rendered from. In tight geometry the
-        // render loop pulls the eye in toward `focus` until it clears collision, and that
-        // pull-in does not touch these four fields. `eye` is the position the CURRENT frame was
-        // actually rendered from (the exact value passed to `render_frame` this tick — see
-        // `camera_state::resolve_camera_eye`); use it, not a `radius`-derived distance, for
-        // anything about what is actually on screen. `occluded` says whether pull-in fired this
-        // frame; `still_blocked` says whether, even after pull-in, `eye` is still not fully clear
-        // of collision (a degenerate case that must be reported, not silently rendered).
+        // EVERY field in this block describes ONE frame — the one named by `drawn_frame` — and not
+        // "now" (#867). The render loop publishes the whole struct in a single write, only after
+        // `render_frame` has actually encoded a frame; on a tick that returns early from the
+        // `wgpu::SurfaceError` match (`Lost`/`Outdated`/`Timeout`) nothing is published and the
+        // previous values stay. `drawn_frame` is `null` before the first frame is ever drawn — the
+        // startup seed `main.rs` publishes, which the API serves through GPU init and the first zone
+        // load.
+        //
+        // READ `drawn_frame`/`drawn_age_ms` BEFORE TRUSTING ANYTHING ELSE HERE. The staleness is
+        // unbounded: `about_to_wait` stops requesting redraws 300 ms after the last activity, so a
+        // surface that keeps returning `Outdated` (a minimised or occluded window, not just a
+        // resize) freezes this whole block indefinitely, with every field looking exactly as it does
+        // on a healthy tick. `snapshot_age_ms` above is the NETWORK clock and does NOT age this —
+        // it reads fresh throughout a rendering stall. `drawn_age_ms` is computed when this response
+        // is encoded; `drawn_frame` unchanged across two reads means nothing was drawn in between.
+        //
+        // #852: `azimuth_deg`/`elevation_deg`/`radius`/`focus`/`mode` are the orbit's DESIRED
+        // framing as of that frame — NOT necessarily where it was rendered from. In tight geometry
+        // the render loop pulls the eye in toward `focus` until it clears collision, and that
+        // pull-in does not touch those fields. `eye` is the position that frame was actually
+        // rendered from — see `camera_state::resolve_camera_eye` and
+        // `eqoxide_ipc::CameraSnapshot`. Use `eye`, not a `radius`-derived distance, for anything
+        // about what was drawn. `occluded` says whether pull-in fired on the frame `eye` describes;
+        // `still_blocked` says whether, even after pull-in, `eye` was still not fully clear of
+        // collision (a degenerate case that must be reported, not silently rendered).
         "camera": {
             "azimuth_deg":   cam.azimuth.to_degrees(),
             "elevation_deg": cam.elevation.to_degrees(),
@@ -1262,6 +1278,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "eye":           cam.eye,
             "occluded":      cam.occluded,
             "still_blocked": cam.still_blocked,
+            "drawn_frame":   cam.drawn_frame,
+            "drawn_age_ms":  cam.drawn_at.map(|t| t.elapsed().as_millis() as u64),
         },
     });
     // #371 — attached here (not inside the literal above, which is already at the json! recursion
@@ -3321,6 +3339,59 @@ mod tests {
             "camera.still_blocked must say the eye is still not fully clear of collision");
     }
 
+    /// #867 — the camera block's FRESHNESS signal must reach the served body, in both states.
+    ///
+    /// Every other field in `camera` looks identical on a snapshot published this tick and on one
+    /// frozen since the window was minimised (`about_to_wait` stops requesting redraws 300 ms after
+    /// the last activity, so a persistently `Outdated` surface freezes it indefinitely). The
+    /// neighbouring `snapshot_age_ms` is the NETWORK clock and stays fresh right through such a
+    /// stall, so an agent that reaches for it is actively misled. `drawn_frame`/`drawn_age_ms` are
+    /// the only way to tell — which makes their PRESENCE in the response the thing worth pinning,
+    /// exactly as `camera_eye_reaches_the_debug_json_852` above pins `eye`'s.
+    ///
+    /// Both states are asserted because they fail differently: a `null` `drawn_frame` that never
+    /// reaches the JSON reads as "this client cannot report one", while a `Some` that never reaches
+    /// it reads as "nothing has been drawn" — opposite wrong answers from the same omission.
+    ///
+    /// MUTATION CHECK (executed, both directions): deleting the `"drawn_frame"`/`"drawn_age_ms"`
+    /// entries from `get_debug`'s `"camera"` literal turns the first `contains_key` RED; leaving
+    /// them but publishing `drawn_frame: None` in the drawn case turns the `Some(4242)` assertion
+    /// RED.
+    #[tokio::test]
+    async fn camera_freshness_reaches_the_debug_json_867() {
+        // (a) never drawn — the state `main.rs` seeds before the event loop exists.
+        let state = empty_state();
+        let v = debug_json(state).await;
+        let cam = v["camera"].as_object().expect("camera object");
+        assert!(cam.contains_key("drawn_frame") && cam.contains_key("drawn_age_ms"),
+            "camera.drawn_frame/drawn_age_ms must be PRESENT in the served body — without them an \
+             agent cannot tell a snapshot published this tick from one frozen since the window was \
+             minimised. Keys served: {:?}", cam.keys().collect::<Vec<_>>());
+        assert_eq!(cam["drawn_frame"], serde_json::json!(null),
+            "before any frame is drawn, camera.drawn_frame must be null — the startup seed is a \
+             plausible-looking orbit position that nothing was ever rendered from (#867)");
+        assert_eq!(cam["drawn_age_ms"], serde_json::json!(null),
+            "…and drawn_age_ms must be null rather than an age since process start, which would \
+             read as a recent draw");
+
+        // (b) drawn — a snapshot the render loop would publish after a real `render_frame`.
+        let state = empty_state();
+        {
+            let mut snap = state.camera.snapshot.lock().unwrap();
+            snap.drawn_frame = Some(4242);
+            snap.drawn_at    = Some(std::time::Instant::now());
+        }
+        let v = debug_json(state).await;
+        let cam = v["camera"].as_object().expect("camera object");
+        assert_eq!(cam["drawn_frame"], serde_json::json!(4242),
+            "camera.drawn_frame must carry the published frame index through verbatim — polling it \
+             for change is how a caller detects that drawing has stopped");
+        assert!(cam["drawn_age_ms"].as_u64().is_some(),
+            "camera.drawn_age_ms must be a number once a frame has been drawn, computed at READ \
+             time (an age computed at publish time would itself go stale). Got: {:?}",
+            cam["drawn_age_ms"]);
+    }
+
     /// #724/#817 — the stuck-and-cannot-free disclosure must reach a RESPONSE BODY, not just a
     /// struct. Same failure shape as `afloat_stall_reaches_the_debug_json_801` just above:
     /// `PlayerState::hold` was computed, mirrored into `GameState` on every **net tick** by
@@ -5108,6 +5179,8 @@ mod tests {
             eye: [99.0, 0.0, 0.0],
             occluded: false,
             still_blocked: false,
+            drawn_frame: Some(7),
+            drawn_at: Some(std::time::Instant::now()),
         }
     }
 
