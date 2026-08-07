@@ -1234,12 +1234,32 @@ impl CharacterController {
     /// unless it is close enough that completing the step would penetrate — which is exactly the
     /// case that used to be handed to the net.
     ///
-    /// **Residual, stated because it is real:** the guarantee is `perpendicular clearance ≥
-    /// radius + SKIN·ndot`, so it is strict for a head-on approach and degrades toward `radius`
-    /// as the approach turns parallel; and the look-ahead is the head-on `radius + SKIN`, not the
-    /// oblique `radius/ndot + SKIN` (which reaches 20 u at the `ndot` floor and is not a sane ray
-    /// length). A near-parallel approach can therefore still leave the body inside the ring band.
-    /// Closing that needs a swept-cylinder contact, not a centre ray — out of scope here.
+    /// **Residual, stated because it is real — and it obeys NO formula.** The ray is lengthened by
+    /// the head-on `radius + SKIN`, not by the oblique `radius/ndot + SKIN` (which reaches 20 u at
+    /// the `ndot` floor and is not a sane ray length), so head-on is the only approach with a
+    /// clean clearance. MEASURED, driving a grounded body at a 6 u wall at eight approach angles,
+    /// 40 phases each, 600 frames, 35 u/s at 60 Hz, recording the closest perpendicular approach
+    /// ever reached, where `ndot` is the cosine of the approach against the face normal:
+    ///
+    /// | `ndot` | 1.000 | 0.985 | 0.866 | 0.707 | 0.500 | 0.342 | 0.174 | 0.087 |
+    /// |---|---|---|---|---|---|---|---|---|
+    /// | this branch | 1.050 | 1.037 | 0.920 | 0.743 | 0.708 | 0.801 | 0.899 | 0.949 |
+    /// | pre-#870 `ce1d89f` | 0.417 | 0.426 | 0.495 | 0.588 | 0.708 | 0.801 | 0.899 | 0.949 |
+    ///
+    /// (`ce1d89f` is the pre-#870 baseline for both tables in this file: `git diff` of it against
+    /// the `origin/main` this branch is merged with touches no production line of this module —
+    /// its only non-comment change is the addition of this file's own citation-guard test.)
+    ///
+    /// Every oblique row is inside `PLAYER_RADIUS` = 1.0, so `is_embedded` still fires there
+    /// (nonzero embedded frames on this branch from `ndot` 0.866 down). Two things follow, and
+    /// both contradict what an earlier draft of this paragraph asserted: there is no useful lower
+    /// bound at all below head-on, and the residual is NOT monotonic in the approach angle — it is
+    /// worst through the oblique middle and recovers toward parallel, so any claim of the form
+    /// "degrades toward X as the approach turns parallel" has the shape wrong as well as the
+    /// number. What the fix does buy is measured and one-directional: this branch is strictly
+    /// better than `ce1d89f` at `ndot` >= 0.707 and exactly tied at 0.500 and below, where the
+    /// lengthened ray changes neither the worst clearance nor the embedded-frame count. Closing
+    /// the oblique case needs a swept-cylinder contact, not a centre ray — out of scope here.
     fn slide(&self, from: [f32; 3], delta: [f32; 3], col: &Collision) -> ([f32; 3], bool) {
         // The contact heights AND the radius come from the ONE shared body (#386, #378 Phase 2):
         // the chest ray here and the planner's top edge probe are the same `Body::chest` field, and
@@ -1381,8 +1401,34 @@ impl CharacterController {
     ///
     /// So the destination search creeps forward, in the travel direction, by AT MOST the same
     /// `radius + SKIN` — one expression, the same one the slide backs off by — and takes the first
-    /// standable landing. It is the collision margin being spent, not extra travel: the body lands
-    /// at the near edge of the tread, which is at or behind where the penetrating version put it.
+    /// standable landing.
+    ///
+    /// **That is a real WIDENING of what counts as climbable, not a restoration of the pre-fix
+    /// reach.** An earlier draft of this paragraph claimed the creep lands the body "at or behind
+    /// where the penetrating version put it"; that is false and the measurement is the refutation.
+    /// Fixture: a 2.0 riser at east 0 whose tread only BEGINS `g` east of the face — a slot the
+    /// centre probe lands in — driven at 20 u/s, 60 Hz, 600 frames, recording the first mounting
+    /// frame (so a depenetration teleport cannot be mistaken for a creep; `is_embedded` was false
+    /// on every frame before every mount, and lateral drift was 0.0000 throughout).
+    ///
+    /// | tread gap `g` | 0.00 | 0.20 | 0.34 | 0.80 | 1.20 | 1.38 | 1.39 |
+    /// |---|---|---|---|---|---|---|---|
+    /// | `ce1d89f`, east at mount | 0.0000 | 0.3333 | none | none | none | none | none |
+    /// | this branch, east at mount | 0.0000 | 0.3333 | 0.4646 | 0.8583 | 1.2521 | 1.3833 | none |
+    ///
+    /// For every gap from 0.34 up, the penetrating version puts the body nowhere on the tread at
+    /// all, so "at or behind where it put it" had no true reading there. The landings step in
+    /// exact increments of `(radius + SKIN) / STEP_LANDING_CREEP_SAMPLES` = 0.13125 and stop at
+    /// east 1.3833 — one whole `radius + SKIN` past a base of 0.3333 (that base is the measured
+    /// value on this fixture, not a traced mechanism). The 0.13125 stride and the 1.3833 ceiling
+    /// are together the fingerprint of the cap, and are what
+    /// `the_step_landing_creep_reaches_one_back_off_past_the_riser_and_no_further` pins.
+    ///
+    /// **Open, and deliberately not asserted either way: whether the widening is DESIRED.**
+    /// Stepping over a crack narrower than the body's own diameter is defensible, but it is a
+    /// reachability change, it was not compared against the reference client, and no live client
+    /// was run. See #930, which also covers `try_step_up`'s own doc below still calling a gap an
+    /// unconditional `None`.
     ///
     /// Two soundness gates, both load-bearing:
     ///   * the creep runs ONLY when the raised sweep made full progress. If the raised sweep was
@@ -1534,10 +1580,12 @@ impl CharacterController {
         // MEASURED on the `a_duck_across_a_divable_far_side_is_a_round_trip` lintel, same fixture,
         // two resting spots 0.78 u apart: `2.4999952 <= 2.5` (admits) at east 4.267 versus
         // `2.5000072 <= 2.5` (REFUSES) at east 5.05 — a 1.2e-5 u swing across the boundary, which
-        // is far below anything the geometry means. `DUCK_ENVELOPE_TOL` is 1e-3 u: ~100× that
-        // noise and ~1/2500 of the envelope it slackens, so it cannot admit a duck whose return is
-        // in any physical doubt — the trap this bound exists to refuse is a 2 u mismatch, five
-        // thousand times wider. #870 found it by moving where the body rests, not by changing this
+        // is far below anything the geometry means. `DUCK_ENVELOPE_TOL` is 1e-3 u, and both
+        // ratios are re-derived from the constants rather than quoted: 1e-3 / 1.2e-5 = 83× that
+        // noise, and 1e-3 / (STEP_UP + GROUND_SNAP_TOL) = 1e-3 / 2.5 = 1/2500 of the envelope it
+        // slackens, so it cannot admit a duck whose return is in any physical doubt — the trap
+        // this bound exists to refuse is a 2 u mismatch, and 2.0 / 1e-3 = two thousand times
+        // wider. #870 found it by moving where the body rests, not by changing this
         // clause; on `main` the same test passes only because its body happens to settle on the
         // admitting side of the knife-edge.
         let surf = col.water_surface(lo)?;
@@ -2431,6 +2479,97 @@ mod tests {
         assert!(ctrl.pos[2].abs() < 1e-3, "still on the near floor: z={}", ctrl.pos[2]);
         assert!(ctrl.on_ground, "still grounded");
         assert!(ctrl.hold().is_none(), "standing at a wall is not a hold: {:?}", ctrl.hold());
+    }
+
+    /// **The step-landing creep's `radius + SKIN` cap, pinned in BOTH directions (#870, review
+    /// round 2).** Round 2's independent review ran a mutant that multiplied the creep's `back_off`
+    /// by 10 — reach 10.5 u instead of 1.05 u — through the whole `--lib` suite and it SURVIVED,
+    /// green. That mutation lets a body step across a chasm ten times its own diameter and then
+    /// report standing on ground it never crossed: a silent wrong-position generator behind a green
+    /// suite, which this repo ranks above crashes. Nothing pinned the cap because every existing
+    /// #870 test asks whether a body climbs, never how far past the riser it is willing to look.
+    ///
+    /// This asks exactly that, and it is a bracket, not a one-sided assertion — which is what makes
+    /// it fail under a WIDENED cap and under a NARROWED one:
+    ///
+    ///   * a gap of 1.38 u past the riser face must still mount, AND must land at east 1.3833.
+    ///     Halve the cap and the reachable landings stop at 0.8583, so this row stops mounting.
+    ///   * a gap of 1.39 u and everything above it must NOT mount at all. Multiply the cap by 10
+    ///     and the first creep sample lands at 1.6458, so every one of these rows mounts.
+    ///
+    /// A third mutant was run and it is the reason the east column exists at all: changing
+    /// `STEP_LANDING_CREEP_SAMPLES` from 8 to 4 leaves the CAP intact and so SURVIVED the
+    /// mount/refuse rows alone, green — a draft of this comment asserted, by reasoning rather than
+    /// measurement, that any change to either factor would be caught. It is not; the coarser
+    /// stride happens to reach the same 1.3833 ceiling. Pinning the measured east of each landing
+    /// closes it (8 samples put the 0.34 row at 0.4646, 4 samples at 0.5958).
+    ///
+    /// A refusal is checked POSITIVELY too — the body must be left on the near floor, grounded,
+    /// never `is_embedded` on any frame and never laterally displaced — so a mutant that turns a
+    /// refusal into a depenetration teleport cannot pass by merely failing to reach z.
+    #[test]
+    fn the_step_landing_creep_reaches_one_back_off_past_the_riser_and_no_further() {
+        let radius = crate::traversability::PLAYER_BODY.radius;
+        // A 2.0 riser at east 0 whose tread only BEGINS `gap` east of the face: the centre probe
+        // lands in the slot, so only the creep can find the tread.
+        let run = |gap: f32| -> Option<[f32; 3]> {
+            let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, 2.0), floor(2.0, gap, 100.0)]);
+            let mut ctrl = CharacterController::new([-20.0, 0.0, 0.0]);
+            ctrl.on_ground = true;
+            for _ in 0..600 {
+                ctrl.step(walk(20.0, [1.0, 0.0]), 1.0 / 60.0, &c);
+                assert!(!is_embedded(&c, ctrl.pos),
+                    "gap {gap}: the depenetration net must never be involved here — {:?}", ctrl.pos);
+                assert!(ctrl.pos[1].abs() < 1e-3,
+                    "gap {gap}: north {} — the drive is due east", ctrl.pos[1]);
+                if ctrl.pos[2] > 1.5 { return Some(ctrl.pos); }
+            }
+            None
+        };
+        // Reach control: the fixture must be climbable at all, or every "refused" row below is
+        // vacuous. Gap 0 is a plain 2.0 step and must mount.
+        assert!(run(0.0).is_some(), "the fixture is not climbable even with no tread gap");
+        // MEASURED landings. The east column is what pins the STRIDE as well as the cap: the
+        // samples sit at `base + i*(radius + SKIN)/STEP_LANDING_CREEP_SAMPLES` for `i` in 1..=8, so
+        // halving or doubling the sample count moves the 0.34 row (measured: 8 samples → 0.4646,
+        // 4 samples → 0.5958) even where it leaves the coarser rows alone.
+        for &(gap, want_east) in &[(0.20_f32, 0.3333_f32), (0.34, 0.4646), (0.80, 0.8583),
+                                   (1.20, 1.2521), (1.38, 1.3833)] {
+            let p = run(gap).unwrap_or_else(|| panic!(
+                "gap {gap} must still mount — the creep reaches radius+SKIN = {} past the face; \
+                 a NARROWED cap fails here", radius + SKIN));
+            assert!((p[2] - 2.0).abs() < 1e-3, "gap {gap}: mounted to z {} not the 2.0 tread", p[2]);
+            assert!((p[0] - want_east).abs() < 2e-3,
+                "gap {gap}: landed at east {} not the measured {want_east} — the creep's stride \
+                 (radius+SKIN)/STEP_LANDING_CREEP_SAMPLES has moved (#870)", p[0]);
+        }
+        // THE CAP. The deepest landing the creep can ever reach on this fixture is one whole
+        // `radius + SKIN` past the base it starts from, in `STEP_LANDING_CREEP_SAMPLES` steps of
+        // (radius+SKIN)/8 = 0.13125. Measured base on this fixture: east 0.3333.
+        let deepest = run(1.38).expect("gap 1.38 must mount");
+        assert!((deepest[0] - 1.3833).abs() < 2e-3,
+            "the creep's deepest landing must be east 1.3833 = 0.3333 + (radius+SKIN) = 0.3333 + \
+             {}; got {} — the cap has moved (#870)", radius + SKIN, deepest[0]);
+        // And one stride further out is unreachable, at every gap above it.
+        for gap in [1.39_f32, 1.50, 2.00, 4.00, 10.00] {
+            assert!(run(gap).is_none(),
+                "gap {gap} must NOT mount — it is more than radius+SKIN = {} past the face; \
+                 a WIDENED cap fails here, and a body that mounts it reports standing on ground \
+                 it never crossed (#870)", radius + SKIN);
+        }
+        // A refusal must leave the body on the NEAR floor and grounded — not somewhere odd, and in
+        // particular not on the far tread by some other route. Deliberately NOT asserted here: the
+        // east it rests at. This riser is exactly `STEP_UP` tall, which is BELOW `Body::ring` = 3.0,
+        // so `is_embedded` structurally cannot see it and the body ends flush against the face
+        // (measured: east 5.4e-7). Whether that is right is #854's band, not #870's ray length, and
+        // asserting a back-off here would be asserting something no code in this PR makes true.
+        let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, 2.0), floor(2.0, 4.0, 100.0)]);
+        let mut ctrl = CharacterController::new([-20.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        for _ in 0..600 { ctrl.step(walk(20.0, [1.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(ctrl.pos[2].abs() < 1e-3, "a refused creep stays on the near floor: z={}", ctrl.pos[2]);
+        assert!(ctrl.on_ground, "still grounded");
+        assert!(ctrl.pos[1].abs() < 1e-3, "no lateral drift: north={}", ctrl.pos[1]);
     }
 
     #[test]
@@ -4857,6 +4996,14 @@ mod tests {
             exiting_the_bottom_of_a_suspended_water_volume_resumes_the_fall,
             a_large_same_zone_relocation_forgets_the_ring_for_the_stuck_fallback_too,
             a_hold_clears_as_soon_as_the_body_is_free_again,
+            // #870 (review round 2). These four are cited by the `STEP_LANDING_CREEP_SAMPLES` doc
+            // comment. They are NOT pre-existing offenders newly pulled into scope by #882's
+            // widened guard — the citations are new lines added by this PR — so they belong here
+            // and NOT in the guard's `KNOWN_VIOLATIONS` list, which is labelled "pre-existing".
+            a_swimmer_at_a_solid_bank_still_hauls_out_the_duck_does_not_override_191,
+            a_swimmer_hauling_out_at_a_legitimate_bank_never_raises_the_afloat_stall,
+            a_duck_across_a_divable_far_side_is_a_round_trip,
+            the_step_landing_creep_reaches_one_back_off_past_the_riser_and_no_further,
         ];
     }
 }
