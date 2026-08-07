@@ -1487,6 +1487,21 @@ agent-honesty invariant forbids.
   alone contributed, which is the identical confident-but-wrong shape for a zone like `erudsxing` or
   `qeytoqrg` whose ENTIRE qualifying label set lives in a layer, not the base file. It is now a
   distinct, named, non-null outcome instead.
+  **The base file's OWN entries are forfeited too, not just the broken layer's** (#873): `try_load`
+  fails the WHOLE load, so `zone_entrances` gets none of this zone's map-labeled fallback entries at
+  all — for `qcat`, an unreadable `_1.txt` takes the zone from **13 qualifying labels** (6 in the
+  base file, 7 in `_1.txt`, 0 in `_2.txt`; measured over the shipped map pack) to **0**, not down to
+  the 6 the base file alone would have supplied. Those 13 are *labels*, not entries: `sync_zone_points`
+  dedups each qualifying label against the zone points the server already advertised (same `zone_id`,
+  within 50 units) before any of them becomes an entry, so the number of `zone_entrances` entries
+  actually forfeited is **≤13 and has not been measured** — it needs a live session. What is exact is
+  the direction: whatever the base file would have contributed, an unreadable layer takes it to zero.
+  This is deliberate, the same reasoning as the rest of this bullet: a half-map that reads as "the
+  load worked" is the exact failure #816 is about, and the base file's entries loading fine in
+  isolation gives no guarantee they're the zone's
+  COMPLETE fallback set once a layer next to them is known to be broken. Treat `zone_map_load` being
+  non-null as "assume none of `zone_entrances`' map-derived fallback entries for this zone are
+  present", not "assume only the broken layer's entries are missing".
 
 **This is deliberately NOT a 503 gate**, unlike `region_data_missing` et al. on `/v1/observe/zone_exits`
 (#815). The reasoning differs from that case: `zone_exits` derives its verdict entirely from the
