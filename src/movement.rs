@@ -1401,8 +1401,10 @@ impl CharacterController {
     /// the `origin/main` this branch is merged with touches no production line of this module —
     /// its only non-comment change is the addition of this file's own citation-guard test.)
     ///
-    /// Every oblique row is inside `PLAYER_RADIUS` = 1.0, so `is_embedded` still fires there
-    /// (nonzero embedded frames on this branch from `ndot` 0.866 down). Two things follow, and
+    /// `is_embedded` still fires from `ndot` 0.866 down — those are the rows whose worst clearance
+    /// is inside `PLAYER_RADIUS` = 1.0, and they are the rows with nonzero embedded frames on this
+    /// branch. It does NOT fire on the two rows above them; read the table rather than this
+    /// sentence for where the boundary is. Two things follow, and
     /// both contradict what an earlier draft of this paragraph asserted: there is no useful lower
     /// bound at all below head-on, and the residual is NOT monotonic in the approach angle — it is
     /// worst through the oblique middle and recovers toward parallel, so any claim of the form
