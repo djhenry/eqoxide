@@ -2103,6 +2103,18 @@ async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
 }
 
 /// GET /v1/observe/doors — list the current zone's doors (id, name, position, opentype, open state).
+///
+/// **`[]` does NOT mean "this zone has no doors" (#939).** The roster is emptied on zone entry
+/// (#891) and refills from `OP_SpawnDoor` records as they arrive, on no schedule this client
+/// publishes — so during a zone-in this endpoint returns a confident empty list for a zone that
+/// does have doors, and nothing served here tells the two apart. There is no completeness
+/// observable to wait on: `zone_assets.state` reaching `"ready"` is about geometry, not about which
+/// door packets have landed.
+///
+/// The same limit binds the other direction, and this is the reason `/v1/interact/click_door`
+/// answers a miss with `404` *unknown* rather than *disproved*: a **populated** roster is not a
+/// closed set either, so "not among the doors held right now" is the strongest claim available at
+/// any roster size. Do not let a non-empty list here read as a complete one.
 async fn get_doors(State(s): State<HttpState>) -> Response {
     // #646: bare array body (backward-compatible shape) — freshness rides `SNAPSHOT_AGE_HEADER`
     // instead of a JSON key. See that const's doc for the clock this reuses.
