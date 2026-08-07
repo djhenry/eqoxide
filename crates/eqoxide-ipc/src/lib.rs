@@ -274,35 +274,92 @@ pub enum CameraCmd {
 /// `camera_state` (#544 Step 2c); `camera_state::CameraState::snapshot` produces it. Serde form
 /// preserved verbatim (it is the JSON body).
 ///
-/// `azimuth`/`elevation`/`radius`/`focus` are the orbit's DESIRED framing — the parameters a
-/// `/v1/camera Set` would reproduce. They are NOT necessarily the eye position a frame was
-/// actually rendered from: in tight geometry the render loop pulls the eye in along the
-/// focus→eye segment until it clears collision (`camera_state::resolve_camera_eye`), and that
-/// pull-in does not touch these fields.
+/// # Every field here describes ONE frame — the one named by `drawn_frame` — not "now" (#867)
 ///
-/// `eye`/`occluded`/`still_blocked` are the RENDERED side of the contract (#852). `eye` is the
-/// exact position the frame this snapshot describes was drawn from — the render call and this
-/// struct are built from the same `resolve_camera_eye` return value, never two independently
-/// computed positions. `occluded` is true iff pull-in moved the eye away from the desired one;
-/// `still_blocked` is true iff, even after pull-in, the focus→eye segment was still not fully
-/// clear (a degenerate case — see `resolve_camera_eye`'s doc comment). A consumer that only reads
-/// `radius`/`focus` and reconstructs a "distance to eye" by hand will get the *desired* distance,
-/// not the rendered one — use `eye` for anything about what is actually on screen.
+/// The whole struct is published in a single write, and (#867) that write happens only after
+/// `render_frame` has actually encoded a frame. `app.rs`'s render tick can `return` before the draw
+/// on three `wgpu::SurfaceError` arms (`Lost`/`Outdated`/`Timeout`), and on those ticks **nothing is
+/// published at all** — the previous snapshot stays. So on a skipped tick every field below is
+/// stale, including the four "desired framing" ones, which can already have been mutated by an
+/// `apply_cmd` earlier in that same tick.
+///
+/// **The staleness is not bounded.** `about_to_wait` only requests a redraw while
+/// `now < active_until` (`ACTIVE_LINGER` = 300 ms), so a surface that keeps returning
+/// `Outdated`/`Timeout` — a minimised or occluded window, not just a resize — plus 300 ms of quiet
+/// stops the loop calling `render_frame` at all, and this snapshot then holds indefinitely. Do not
+/// read "lag" as "a tick or two": read `drawn_frame`/`drawn_age_ms` and decide.
+///
+/// **Do not use the `snapshot_age_ms` on `/v1/observe/debug` to age this.** That is the *network*
+/// health clock (`NetHealth::last_tick`) and stays fresh while a rendering stall makes every field
+/// here arbitrarily old.
+///
+/// ## The desired side
+///
+/// `azimuth`/`elevation`/`radius`/`focus` are the orbit's DESIRED framing as of the frame named by
+/// `drawn_frame` — the parameters a `/v1/camera Set` would reproduce. They are NOT necessarily the
+/// eye position that frame was rendered from: in tight geometry the render loop pulls the eye in
+/// along the focus→eye segment until it clears collision (`camera_state::resolve_camera_eye`), and
+/// that pull-in does not touch these fields. A consumer that only reads `radius`/`focus` and
+/// reconstructs a "distance to eye" by hand gets the *desired* distance, not the rendered one — use
+/// `eye` for anything about what was actually drawn.
+///
+/// ## The rendered side
+///
+/// `eye`/`occluded`/`still_blocked` are the RENDERED side of the contract (#852). The render call
+/// and this struct are built from the same `resolve_camera_eye` return value, never two
+/// independently computed positions.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CameraSnapshot {
+    /// Camera mode as of the frame named by `drawn_frame`. See `azimuth`.
     pub mode:          CameraMode,
+    /// Desired orbit azimuth **as of the frame named by `drawn_frame`** — not necessarily as of
+    /// now, and not necessarily the last value a `/v1/camera` Set wrote (see the struct doc).
     pub azimuth:       f32,
+    /// Desired orbit elevation as of the frame named by `drawn_frame`. See `azimuth`.
     pub elevation:     f32,
+    /// Desired orbit radius as of the frame named by `drawn_frame`. See `azimuth`.
     pub radius:        f32,
+    /// Desired orbit focus point as of the frame named by `drawn_frame`. See `azimuth`.
     pub focus:         [f32; 3],
-    /// The eye position the frame this snapshot describes was actually rendered from.
+    /// The eye position the frame named by `drawn_frame` was rendered from (#852).
+    ///
+    /// When `drawn_frame` is `Some`, this describes a frame that was really encoded: the write is
+    /// gated on an `eqoxide_renderer::DrawnFrame` token that only `render_frame` can produce, so it
+    /// is not reachable on a tick whose draw was skipped. When `drawn_frame` is `None`, **no frame
+    /// has been drawn yet** and this is the startup seed `main.rs` publishes before the event loop
+    /// exists — a plausible-looking orbit position that nothing was ever rendered from.
     pub eye:           [f32; 3],
-    /// True iff collision pulled `eye` in from the desired orbit position this frame.
+    /// True iff collision pulled `eye` in from the desired orbit position **on the frame named by
+    /// `drawn_frame`** (not necessarily on the current tick — see the struct doc).
     pub occluded:      bool,
-    /// True iff, even after the pull-in's iteration budget, `eye` is still not clear of
-    /// collision along the segment to `focus` — a degenerate case (see
-    /// `camera_state::resolve_camera_eye`).
+    /// True iff, even after the pull-in's iteration budget, `eye` was still not clear of collision
+    /// along the segment to `focus` **on the frame named by `drawn_frame`** — a degenerate case
+    /// (see `camera_state::resolve_camera_eye`).
     pub still_blocked: bool,
+    /// Monotonic index of the frame every other field describes (#867), or `None` if **no frame has
+    /// been drawn yet** — the startup seed. This is the freshness signal: without it a caller cannot
+    /// distinguish a snapshot published this tick from one frozen since the window was minimised,
+    /// because every other field looks identical in both cases. Poll it: unchanged across two reads
+    /// means nothing has been drawn in between.
+    pub drawn_frame:   Option<u64>,
+    /// When that frame was drawn. Serialized as **`drawn_age_ms`** — milliseconds elapsed at the
+    /// moment the response is encoded, or `null` when `drawn_frame` is `None`. `Instant` itself is
+    /// never serialized; an absolute stamp would be meaningless to a remote reader and an age
+    /// computed at publish time would itself go stale, so it is computed at read time.
+    #[serde(rename = "drawn_age_ms", serialize_with = "serialize_age_ms")]
+    pub drawn_at:      Option<std::time::Instant>,
+}
+
+/// Serialize an `Option<Instant>` as an age in whole milliseconds, measured when the response body
+/// is encoded. See [`CameraSnapshot::drawn_at`].
+fn serialize_age_ms<S: serde::Serializer>(
+    v: &Option<std::time::Instant>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(t) => s.serialize_some(&(t.elapsed().as_millis() as u64)),
+        None    => s.serialize_none(),
+    }
 }
 
 /// Camera azimuth that places the camera behind a player facing `heading_deg`
@@ -2593,6 +2650,8 @@ mod c2_boundary_tests {
                 eye:           [0.0, 0.0, 0.0],
                 occluded:      false,
                 still_blocked: false,
+                drawn_frame:   None,   // no frame drawn — a fixture, not a rendered snapshot
+                drawn_at:      None,
             })),
             frame_req:   Arc::new(Mutex::new(None)),
             manual_move: Arc::new(Mutex::new(None)),
