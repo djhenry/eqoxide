@@ -32,9 +32,51 @@ struct PendingLoad {
     /// `zone_assets` state can report a real FAILED reason instead of an eternal "pending".
     load_error: Option<String>,
     collision: Option<Arc<collision::Collision>>,
-    zone_map:  Option<zone_map::ZoneMap>,
+    /// The HUD minimap's map-load OUTCOME, carried whole (#873, #877 rounds 2–3) — see
+    /// [`zone_map::ZoneMapLoad`] for why it is a newtype and not an
+    /// `Option<Result<ZoneMap, ZoneMapLoadError>>`, and for the precise bound of what that buys.
+    ///
+    /// Short version, because two earlier rounds each overstated this: the map and its failure
+    /// reason are ONE value so a call site cannot keep the first and drop the second, and the
+    /// newtype's private field means the "keep the map, drop the reason" shape — `#873` itself —
+    /// does not compile outside `zone_map`. Round 2 claimed the bare `Option<Result<..>>` already
+    /// achieved that; the round-2 reviewer measured otherwise (`try_load(..).ok().map(Ok)` compiled,
+    /// and the whole workspace stayed green), which is why the newtype exists.
+    zone_map: zone_map::ZoneMapLoad,
     zone_min:  [f32; 2],
     zone_max:  [f32; 2],
+}
+
+/// #873: render a `ZoneMap` load outcome into what the HUD minimap needs — the map to draw, if any,
+/// and the reason there isn't one, if that absence is a DEFECT. Both halves come out of one call, so
+/// a caller that wants only the map has to write the discard of the reason explicitly rather than
+/// getting it from a bare `.ok()` (see [`zone_map::ZoneMapLoad`] for what the input type does and
+/// does not make impossible — this function's signature is a convenience, not a guarantee).
+///
+/// **`Missing` is deliberately NOT a reason** (#877 round 2, owner direction). `Missing` and
+/// `LayerUnreadable` are different events and must not render identically: a zone that ships no
+/// `.txt` map at all is an ordinary, expected state — measured against the shipped map pack, 27
+/// zones that ship a `.wtr` have no base `.txt`, including `tutorial`, `arena2`, `bazaar_v0`/`_v1`,
+/// `guildhall3`, `shadowedmount`, `nektulos_v0`/`_v1` and `load`/`load2` — and painting "map data
+/// unavailable: …" over those would report a non-failure as a failure. That is the agent-honesty
+/// invariant pointing the other way: a false alarm is as dishonest as a false success, and an alarm
+/// that fires on 27-plus ordinary zones is exactly how a real one stops being read. (27 is a FLOOR,
+/// not a total: it is exact only for the 497 zones that ship a `water/<zone>.wtr`, which is the set
+/// the measurement enumerated — zones shipping neither file were never counted.) The two
+/// present-but-broken causes (`Unreadable`, `LayerUnreadable`) ARE defects a driver should see, so
+/// only those carry a reason.
+///
+/// This filter is HUD-only. `/v1/observe/debug`'s `zone_map_load` still reports all three causes
+/// distinctly (see `eqoxide-net`'s `sync_zone_points`) — the agent-facing disclosure is unchanged.
+fn hud_zone_map_view(
+    outcome: Option<&Result<zone_map::ZoneMap, zone_map::ZoneMapLoadError>>,
+) -> (Option<&zone_map::ZoneMap>, Option<String>) {
+    match outcome {
+        None => (None, None),
+        Some(Ok(zm)) => (Some(zm), None),
+        Some(Err(zone_map::ZoneMapLoadError::Missing)) => (None, None),
+        Some(Err(e)) => (None, Some(e.to_string())),
+    }
 }
 
 /// Hand a finished load to the main thread, refusing to displace a NEWER load's result (#595
@@ -283,10 +325,13 @@ pub struct App {
     load_status:    Arc<Mutex<String>>,
     /// Background thread writes completed load data here; render loop drains it.
     pending_load:   Arc<Mutex<Option<PendingLoad>>>,
-    // Minimap
+    // Minimap. `zone_map` is the map-load OUTCOME carried whole, not a map beside a separately
+    // droppable reason (#873, #877 rounds 2–3) — see `zone_map::ZoneMapLoad` for why and for the
+    // bound of what the newtype prevents, and `hud_zone_map_view` for how it becomes pixels.
+    // `ZoneMapLoad::not_attempted()` until a load has reported.
     zone_min:      [f32; 2],
     zone_max:      [f32; 2],
-    zone_map:      Option<zone_map::ZoneMap>,
+    zone_map:      zone_map::ZoneMapLoad,
     // Camera & smooth position
     visual_player_pos:  [f32; 3],
     prev_logical_pos:   [f32; 3],
@@ -561,7 +606,7 @@ impl App {
             load_status:  Arc::new(Mutex::new(String::new())),
             pending_load: Arc::new(Mutex::new(None)),
             zone_min: [0.0; 2], zone_max: [0.0; 2],
-            zone_map: None,
+            zone_map: zone_map::ZoneMapLoad::not_attempted(),
             visual_player_pos: [0.0, 0.0, 0.0],
             prev_logical_pos:  [0.0, 0.0, 0.0],
             last_moved_at:     std::time::Instant::now(),
@@ -874,10 +919,36 @@ impl App {
             // load failed. This is the HUD minimap's OWN copy of the map (distinct from the one
             // `ActionLoop::sync_zone_points` reads for the agent-facing `zone_map_load` disclosure on
             // `/v1/observe/debug`, see that function's doc): a rendering nicety with no HTTP-observed
-            // claim riding on it, so discarding the failure here with `.ok()` is a visible, explicit
-            // choice rather than a silent one — unlike the deleted `load`, a caller can no longer
-            // reach a discarded failure by simply calling the "normal" API.
-            let zone_map = zone_map::ZoneMap::try_load(&maps_dir, &zone_name).ok();
+            // claim riding on it.
+            //
+            // #873: this used to discard the failure outright with `.ok()`. That reproduced the same
+            // silent-partial shape #816 fixed on the API one level down, in visual form: a
+            // present-but-unreadable detail layer (#816 round 2) now fails the WHOLE `try_load` — even
+            // though the base file read fine — so the minimap went from "draws whatever it could" to
+            // "renders wordlessly empty", as an unplanned side effect of that loader change rather
+            // than a decision anyone made. Kept the whole-load-refusal itself (drawing map art with no
+            // indication some of it is missing would just be the same lie one layer further down), but
+            // the reason is no longer thrown away: the WHOLE `Result` is handed on, and
+            // `hud_zone_map_view` decides at render time what the minimap says about it — for the two
+            // present-but-BROKEN causes, a short "map data unavailable: …" line instead of an
+            // unexplained blank canvas; for a zone that simply ships no map, the same quiet blank
+            // canvas it has always had (see that function's doc).
+            //
+            // #877 round 3: the load is `ZoneMapLoad::attempt` rather than two lines written out
+            // here, for the reason `build_zone_collision` above is a named function — while it was
+            // inline in this closure, no test could reach it, and the round-2 reviewer proved the
+            // consequence by rewriting exactly this line to `.ok().map(Ok)`: the map was kept, the
+            // reason silently dropped (#873 verbatim), and the entire workspace stayed green. That
+            // rewrite no longer compiles (`ZoneMapLoad` has no constructor taking a `ZoneMap`) and
+            // `attempt` itself is pinned by `zone_map_load_attempt_keeps_both_halves_873`.
+            //
+            // **This LINE is still reached by no test** — it is inside a spawned thread, behind an
+            // asset sync and a GPU upload, and the same is true of the `build_zone_collision` call
+            // three lines up. What is pinned is what it calls, and what is prevented is keeping the
+            // map while dropping the reason; substituting `ZoneMapLoad::not_attempted()` here, or
+            // passing the wrong directory, would still pass the suite. Said plainly rather than
+            // left to be inferred, because round 2's version of this claim was measured false.
+            let zone_map = zone_map::ZoneMapLoad::attempt(&maps_dir, &zone_name);
 
             set_status("Uploading to GPU…");
             publish_load(&pending, load_gen, PendingLoad {
@@ -895,7 +966,8 @@ impl App {
                 let _ = &za_for_panic; // the verdict is published by `finish_zone_load` on the main thread
                 publish_load(&pending_for_panic, load_gen, PendingLoad {
                     gen: load_gen, zone_name: zone_for_panic, assets: None,
-                    load_error: Some(reason.to_string()), collision: None, zone_map: None,
+                    load_error: Some(reason.to_string()), collision: None,
+                    zone_map: zone_map::ZoneMapLoad::not_attempted(),
                     zone_min: [0.0; 2], zone_max: [0.0; 2],
                 });
             }
@@ -1497,6 +1569,24 @@ impl App {
             // `Pending` for the new zone in one call, so the observable state can never sit
             // stale-`Ready` from the previous zone while the client stands in a terrain-less one.
             self.collision = None;
+            // #877 round 2 (finding 5): same reasoning, one field over. `zone_map` is written in
+            // exactly ONE place (`apply_load`), and three paths clear `self.loading` without ever
+            // reaching it — `watch_for_lost_load`, `reload_zone`'s no-GPU early return, and
+            // `reload_zone`'s `testzone` branch (which attempts no map load at all). On those the map
+            // window would redraw the PREVIOUS zone's map — and, since #873, the previous zone's
+            // failure REASON. The stale-line-art version of this is pre-existing and merely ugly; a
+            // stale SENTENCE is a well-formed statement about the wrong zone, which is the failure
+            // shape this project ranks highest. Dropping the outcome here closes all three at once,
+            // because they all run downstream of this transition.
+            //
+            // **NO TEST REACHES THIS LINE** (#877 round 3, disclosed here rather than only in the
+            // PR body). It sits on the window/GPU path, as does the `self.collision = None;` above
+            // it, which is not pinned either. The "written in exactly ONE place" and "all three run
+            // downstream" statements above were established by READING the three `self.loading =
+            // false` sites, not by measuring them — reasoned-not-measured mechanism claims are this
+            // repo's dominant defect class, so treat them as a hypothesis to re-check, and a future
+            // edit can delete this line without turning anything red.
+            self.zone_map = zone_map::ZoneMapLoad::not_attempted();
             crate::nav::zone_assets::begin_zone_load(
                 &self.shared_collision, &self.zone_assets,
                 &self.current_zone, "Zone change — starting asset load…");
@@ -1873,14 +1963,18 @@ impl App {
         }
         let (desired_eye, cam_target) = self.camera.tick(dt, self.scene.player_pos, self.scene.player_heading);
         // Camera collision (#852): resolve the eye ONCE, here, and use that single value both
-        // for the render below and for the published snapshot. Before this fix the pull-in
+        // for the render below and for the published snapshot. Before the #852 fix the pull-in
         // mutated a local `cam_eye` for rendering only — `snapshot()` re-derived its own eye from
         // `radius`/`focus`, which the pull-in never touched, so a pulled-in frame and the
         // observable an agent reads disagreed 88% of the time a pull-in fired. See
         // `camera_state::resolve_camera_eye`'s doc comment.
+        //
+        // The snapshot ITSELF is published later, not here — see the write site right after
+        // `renderer.render_frame(..)` below, and #867. Moving it back up here does not compile:
+        // `CameraState::snapshot` takes an `eqoxide_renderer::DrawnFrame`, and there is no way to
+        // produce one before the draw.
         let resolved = crate::camera_state::resolve_camera_eye(self.collision.as_deref(), cam_target, desired_eye);
         let cam_eye = resolved.eye;
-        if let Ok(mut snap) = self.camera_snapshot.lock() { *snap = self.camera.snapshot(resolved); }
 
         // Nav diagnostics overlay (#608): while toggled on (--nav-debug / F11), attach the
         // walker's PUBLISHED snapshot to the scene — a cheap Arc clone — and the renderer draws
@@ -1913,8 +2007,32 @@ impl App {
         );
 
         let prof_render = crate::profiling::Stopwatch::start();
-        renderer.render_frame(&mut enc, &view, &self.scene, cam_eye, cam_target, dt);
+        let drawn = renderer.render_frame(&mut enc, &view, &self.scene, cam_eye, cam_target, dt);
         let dur_render = prof_render.elapsed();
+
+        // Camera snapshot (#867): published ONLY now that `render_frame` has actually run, and the
+        // ordering is enforced by the type system rather than by this line's position in the file.
+        // Between `resolved` above and here sits the `surface.get_current_texture()` match, three of
+        // whose arms (`Lost`/`Outdated`, `Timeout`) `return` before ever reaching `render_frame`;
+        // publishing earlier meant `camera_snapshot` could hold an eye computed for a frame that was
+        // never drawn, while its docs claimed "the frame this snapshot describes".
+        //
+        // `snapshot` takes the `DrawnFrame` token `render_frame` returns, so moving this call above
+        // the draw — by hand, or by the extract-method refactor that a source-text pin cannot see —
+        // fails to compile: there is no token to pass. That is the whole guarantee; see
+        // `eqoxide_renderer::DrawnFrame` for what it does NOT cover (submit/present, and the #422
+        // off-screen capture path, which mints a token this site never sees).
+        //
+        // On a skipped tick nothing is published and the previous snapshot stays. That snapshot is
+        // then STALE, by an unbounded amount — `about_to_wait` stops requesting redraws 300 ms
+        // (`ACTIVE_LINGER`) after the last activity, so a persistently `Outdated` surface (minimised
+        // or occluded window) freezes it indefinitely. It is NOT claimed here that the on-screen
+        // image is unchanged over that window: `Outdated` usually means the surface was resized or
+        // reconfigured, so what the compositor shows is a stretched/blank presentation, and a
+        // minimised window shows nothing at all. The staleness is made DETECTABLE instead of argued
+        // away: `drawn_frame`/`drawn_age_ms` in the published struct let a reader tell a fresh
+        // snapshot from an ancient one. See `CameraSnapshot`'s doc for the reader-facing side.
+        if let Ok(mut snap) = self.camera_snapshot.lock() { *snap = self.camera.snapshot(resolved, drawn); }
 
         // Cache picking data for the next mouse-click query.
         self.pick_view_proj = renderer.last_view_proj;
@@ -1925,13 +2043,18 @@ impl App {
         // Egui pass — use associated function to avoid reborrowing self.
         let load_status_text = self.load_status.lock().unwrap().clone();
         let sync_frac = *self.sync_progress.lock().unwrap();
+        // #873/#877: the map to draw and the reason there isn't one come from ONE call, so an edit
+        // that keeps the first and drops the second has to be written out deliberately rather than
+        // falling out of a bare `.ok()` (see `hud_zone_map_view`, and `zone_map::ZoneMapLoad` for
+        // what is prevented by the type and what is only made conspicuous).
+        let (zone_map_view, zone_map_reason) = hud_zone_map_view(self.zone_map.outcome());
         let prof_egui = crate::profiling::Stopwatch::start();
         let egui_wants_repaint = Self::egui_pass(
             &mut self.egui_state, &mut self.egui_renderer, &self.egui_ctx, &mut self.ui_state, &self.window,
             &mut enc, &view, renderer, self.loading, self.fade, &self.current_zone, &load_status_text,
             sync_frac,
             &self.scene, self.zone_min, self.zone_max,
-            self.current_fps, self.zone_map.as_ref(),
+            self.current_fps, zone_map_view, zone_map_reason.as_deref(),
             cam_eye, self.collision.as_deref(),
             &self.acts, &self.spells,
             self.show_debug, self.game_state_view.server_corrections,
@@ -1992,6 +2115,7 @@ impl App {
         zone_max:      [f32; 2],
         current_fps:   f32,
         zone_map:      Option<&zone_map::ZoneMap>,
+        zone_map_error: Option<&str>,
         cam_eye:       [f32; 3],
         collision:     Option<&collision::Collision>,
         acts:          &crate::ui::Actions,
@@ -2052,7 +2176,7 @@ impl App {
                 // (#608: the old egui `draw_nav_debug` screen-space overlay is GONE. The nav
                 // diagnostics overlay is now a depth-tested 3D pass inside the renderer
                 // (`eqoxide_renderer::nav_overlay`), fed from `scene.nav_debug` — see render_frame.)
-                ui_state.draw_all(ctx, screen_pts, scene, spells, acts, zone_min, zone_max, zone_map, current_fps);
+                ui_state.draw_all(ctx, screen_pts, scene, spells, acts, zone_min, zone_max, zone_map, zone_map_error, current_fps);
                 if show_debug {
                     hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);
                 }
@@ -2192,7 +2316,10 @@ impl App {
         // dt=0.0: this is a SECOND `render_frame` call within the same real frame — passing the
         // real dt again would double-advance every entity's animation clock for this tick. 0.0
         // draws the exact same pose the primary pass just drew, from a different angle.
-        renderer.render_frame(&mut ov_enc, &offscreen_view, scene, eye, look, 0.0);
+        // The returned `DrawnFrame` (#867) is deliberately discarded: this draw goes to an
+        // off-screen texture for one PNG, so using its token to publish `camera_snapshot` would
+        // name a frame nobody saw at an angle the live camera never held.
+        let _off_screen_only = renderer.render_frame(&mut ov_enc, &offscreen_view, scene, eye, look, 0.0);
 
         let staging = renderer.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("frame_staging_override"), size: (row_pitch * h) as u64,
@@ -2823,14 +2950,75 @@ fn smooth_entity_motion(
 #[cfg(test)]
 mod tests {
     use super::{smooth_entity_motion, zone_needs_reload, next_fade, select_player_action, EntityMotion, MOTION_SMOOTH_DIST};
-    use super::{lost_load_zone, publish_load, PendingLoad};
+    use super::{hud_zone_map_view, lost_load_zone, publish_load, PendingLoad};
+    use crate::zone_map;
     use std::collections::HashMap;
 
     fn load(gen: u64, zone: &str) -> PendingLoad {
         PendingLoad {
             gen, zone_name: zone.to_string(), assets: None, load_error: Some("x".into()),
-            collision: None, zone_map: None, zone_min: [0.0; 2], zone_max: [0.0; 2],
+            collision: None, zone_map: zone_map::ZoneMapLoad::not_attempted(),
+            zone_min: [0.0; 2], zone_max: [0.0; 2],
         }
+    }
+
+    /// #873: the pre-fix code discarded a failed `ZoneMap::try_load` with a bare `.ok()`, so the HUD
+    /// minimap went from "draws whatever loaded" to "renders wordlessly empty" the moment #816 round
+    /// 2 made a present-but-unreadable detail layer fail the WHOLE load — an unplanned side effect,
+    /// not a decision. `hud_zone_map_view` is the fix: it must never lose the reason on a
+    /// present-but-BROKEN map, and must never invent one on success.
+    ///
+    /// It must ALSO stay silent on `Missing` (#877 round 2, owner direction): a zone that ships no
+    /// `.txt` map is an ordinary, expected state, not a defect, and **at least 27** zones in the
+    /// shipped map pack are in exactly that state. "27" is exact only under the measurement that
+    /// produced it — of the 497 zones that ship a `water/<zone>.wtr`, exactly 27 have no base
+    /// `<zone>.txt` (see `hud_zone_map_view`); zones shipping neither file were never counted, so
+    /// 27 is a floor, not a total. Rendering these identically to a broken layer would report a
+    /// non-failure as a failure — the agent-honesty invariant pointing the other way, where a false
+    /// alarm is as dishonest as a false success.
+    ///
+    /// This is the LOGIC half of #873's pin. The rendering half — that the reason reaches the
+    /// frame's shape list at all — is `eqoxide-ui`'s
+    /// `zone_map_error_reaches_the_frames_shape_list_873`, which walks that list for the laid-out
+    /// text. Neither half reaches `src/app.rs`'s loader closure; the load itself is pinned one crate
+    /// over by `zone_map_load_attempt_keeps_both_halves_873`.
+    #[test]
+    fn hud_zone_map_view_keeps_a_defect_reason_and_stays_quiet_on_an_ordinary_absence_873() {
+        // ORDINARY absence: no map file at all. Quiet — no reason, nothing for the HUD to paint.
+        let missing = Err(zone_map::ZoneMapLoadError::Missing);
+        let (map, err) = hud_zone_map_view(Some(&missing));
+        assert!(map.is_none(), "a failed load must not fabricate a map");
+        assert_eq!(err, None,
+            "a zone that simply ships no map is an ORDINARY state, not a failure — giving it a \
+             reason paints 'map data unavailable: …' over at least 27 perfectly normal zones and \
+             trains a reader to ignore the message that matters");
+
+        // No load has reported yet (the panic backstop, or a zone change in flight): also quiet.
+        let (map, err) = hud_zone_map_view(None);
+        assert!(map.is_none() && err.is_none(),
+            "no load outcome at all must say nothing — inventing a reason here would put a sentence \
+             on screen about a load that was never attempted");
+
+        // DEFECTS: the map is there and could not be read. These must carry their own reason, and
+        // that reason must name what actually happened — the whole point of keeping it.
+        for broken in [
+            zone_map::ZoneMapLoadError::Unreadable(std::io::ErrorKind::PermissionDenied),
+            zone_map::ZoneMapLoadError::LayerUnreadable("_2", std::io::ErrorKind::InvalidData),
+        ] {
+            let outcome = Err(broken.clone());
+            let (map, err) = hud_zone_map_view(Some(&outcome));
+            assert!(map.is_none(), "a failed load must not fabricate a map");
+            assert_eq!(
+                err.as_deref(), Some(broken.to_string().as_str()),
+                "a BROKEN map must carry ITS OWN reason, not a generic/empty one and not another \
+                 cause's — this is what lets the HUD show WHY instead of a wordless blank"
+            );
+        }
+
+        let ok = Ok(zone_map::ZoneMap { lines: Vec::new(), labels: Vec::new() });
+        let (map, err) = hud_zone_map_view(Some(&ok));
+        assert!(map.is_some(), "a successful load must be kept, not thrown away");
+        assert!(err.is_none(), "a successful load must not carry a stale/phantom failure reason");
     }
 
     /// #595 review F3 — the single handoff slot is shared by every loader. A slow OLD loader

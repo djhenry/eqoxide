@@ -247,11 +247,17 @@ fn main() {
         // No collision is loaded yet at startup (no zone), so the initial published eye is just
         // the desired orbit position, unoccluded — the same fallback `resolve_camera_eye` would
         // produce for `collision: None`.
+        //
+        // #867: `undrawn_snapshot`, not `snapshot`. `spawn_camera_server` is called ~30 lines below
+        // `EventLoop::new()` and well before `run_app`, so this value is served on `/v1/camera` and
+        // `/v1/observe/debug` through GPU init, `resumed()`, and the whole first zone load — before
+        // a single frame exists. It publishes `drawn_frame: null`, which says exactly that; the
+        // alternative (a snapshot indistinguishable from a rendered one) is the thing #867 is about.
         let init_eye = camera_state::compute_eye(cam.azimuth, cam.elevation, cam.radius, cam.focus);
         let resolved = camera_state::ResolvedEye { eye: init_eye, occluded: false, still_blocked: false };
         ipc::CameraSlots {
             cmd_tx:      Arc::new(Mutex::new(None)),
-            snapshot:    Arc::new(Mutex::new(cam.snapshot(resolved))),
+            snapshot:    Arc::new(Mutex::new(cam.undrawn_snapshot(resolved))),
             frame_req:   Arc::new(Mutex::new(None)),
             manual_move: Arc::new(Mutex::new(None)),
         }
