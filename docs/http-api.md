@@ -747,16 +747,25 @@ the collision grid), and `/v1/move/manual` and `/v1/move/jump`
 character is moving through a world the client has not built, so prefer waiting for `ready`).
 
 **Ungated is not the same as honest during a load, and `/v1/observe/doors` is the case that
-matters.** Zoning empties the door roster (#891), and the records refill from server packets on no
-schedule this client publishes — so during a zone-in the endpoint returns a confident `[]` for a
-zone that does have doors — the same bytes as the true answer "this zone has no doors". That is the
+matters.** Zoning empties the door roster (#891), and it refills only once records have both
+arrived **and been published** — so during a zone-in the endpoint returns a confident `[]` for a
+zone that does have doors, the same bytes as the true answer "this zone has no doors". That is the
 shape #803 removed from [`zone_exits`](#zone-exits--means-exactly-one-thing-803): an empty list
-serving as both a reading of the world and a non-answer. The *cause* differs — there a file read
-had failed, here records have not arrived yet — and that difference is why doors are the harder
-case. A failed read is a terminal fact the client can name in a `503`; "not arrived yet" has no
-terminal moment to report, and unlike the geometry gate there is no `ready` to wait for.
-Treat `[]` from this endpoint as *not yet known*; re-listing is the only recourse. Tracked as
-#939.
+serving as both a reading of the world and a non-answer.
+
+Two distinct things produce that `[]`, and conflating them understates how cheaply one of them
+could be fixed. **During the zone-entry handshake the records have already arrived** — they are
+parsed and applied to game state — but the publish step that would surface them here runs only in
+the gameplay drain, so they sit in hand and unpublished. That is **#937**, a missing publication
+rather than a missing packet. Separately, records the server has not sent yet arrive on no schedule
+this client publishes, which is **#939**.
+
+The *cause* is also where doors differ from `zone_exits`: there a file read had failed, which is a
+terminal fact the client can name in a `503`. "Not published yet" and "not sent yet" have no
+terminal moment to report, and unlike the geometry gate there is no `ready` to wait for. Treat `[]`
+from this endpoint as *not yet known*. Re-listing is the usual recourse; if you need to tell the
+two apart, packet capture (`GET /v1/observe/packets`, opcode `0x7291`) records `OP_SpawnDoor`
+arrivals independently of whether this endpoint has published them.
 
 `POST /v1/move/goto` still accepts the goal, but its response carries a non-null
 **`zone_assets_pending`** note while the assets are missing, and `nav_state` reads `zone_loading`
