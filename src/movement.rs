@@ -2872,7 +2872,9 @@ mod tests {
     /// **The residual, stated rather than hidden.** A `<name>.glb` with none of the three is
     /// indistinguishable from a creature model by anything on disk, and is excluded — printed by
     /// name on the discovery line. That is the boundary of what this can know, not an oversight.
-    /// Widening it needs a source of truth outside the asset directory.
+    /// Widening it needs a source of truth outside the asset directory: a baked-zone manifest, so
+    /// the corpus can ASSERT its population rather than infer it. Filed as #928 with the exact
+    /// corpus and both outputs; not closable by a change to this predicate.
     fn zone_evidence(dir: &std::path::Path, name: &str) -> bool {
         let entry_at = |p: std::path::PathBuf| p.symlink_metadata().is_ok();
         entry_at(dir.join(format!("{name}_doors.glb")))
