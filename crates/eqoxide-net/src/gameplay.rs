@@ -619,6 +619,7 @@ pub async fn run_gameplay_phase(
                     &net_health,
                     &game_state_snapshot,
                     action_loop.controller_slots(),
+                    action_loop.doors_shared(),
                     ZONE_ENTRY_HANDSHAKE_DEADLINE,
                 ).await;
                 if !zoned_in {
@@ -666,6 +667,7 @@ pub async fn run_gameplay_phase(
                         &net_health,
                         &game_state_snapshot,
                         action_loop.controller_slots(),
+                        action_loop.doors_shared(),
                         ZONE_ENTRY_HANDSHAKE_DEADLINE,
                     ).await;
                     if !zoned_in {
@@ -981,6 +983,7 @@ async fn run_zone_entry_handshake(
     net_health:           &eqoxide_ipc::NetHealthShared,
     game_state_snapshot:  &eqoxide_ipc::GameStateSnapshot,
     controller:           &eqoxide_ipc::ControllerSlots,
+    doors:                &eqoxide_ipc::DoorsShared,
     deadline_dur:         Duration,
 ) -> bool {
     // Purge the previous zone's spawns/doors now, before OP_ReqClientSpawn asks for the new zone's
@@ -992,6 +995,22 @@ async fn run_zone_entry_handshake(
     // controller view's disclosures into `gs` unconditionally and would put the departed zone's
     // hold straight back. This clears the view too. See that method's doc.
     controller.begin_zone_in(gs);
+
+    // ...and the PUBLISHED half of the door purge (#934 review B1, #891). `begin_zone_in` empties
+    // `gs.world.doors`; the shared roster mirrored from it is republished only by
+    // `ActionLoop::sync_doors`, whose sole caller is `run_gameplay_phase`'s packet drain — not the
+    // drain below. Without this line the roster keeps the DEPARTED zone's doors for this entire
+    // handshake (up to `ZONE_ENTRY_HANDSHAKE_DEADLINE`), while `publish_snapshot` runs every 10 ms
+    // and keeps the HTTP session live, so GET /v1/observe/doors serves the old zone's list as the
+    // current one and POST /v1/interact/click_door resolves a departed zone's id back to
+    // `200 clicking door N` — the exact #891 falsehood that endpoint was just fixed to stop telling.
+    //
+    // Clear, not republish: this handshake takes shared slots, not the `ActionLoop` (see
+    // `ActionLoop::controller_slots`), and empty is the honest reading mid-zone-in — the client has
+    // no way to know how much of the new zone's OP_SpawnDoor stream has landed, which is what
+    // `http::interact::door_lookup_miss`'s empty-roster body says in as many words. The gameplay
+    // loop republishes on its first drained packet once this returns.
+    doors.lock().unwrap().clear();
 
     // The one and ONLY OP_ZoneEntry for this session (see the fn doc — a second one self-kicks).
     // `poll_resend` retransmits this same datagram if it is lost in flight; nothing here ever issues a
@@ -1694,6 +1713,7 @@ mod zone_entry_handshake_publish_tests {
             run_zone_entry_handshake(
                 &mut stream, &mut net_rx, &mut gs, "Tester", &last_inbound_bg, &snapshot_bg,
                 &eqoxide_ipc::ControllerSlots::default(),
+                &eqoxide_ipc::DoorsShared::default(),
                 Duration::from_secs(30),
             ).await;
         });
@@ -1752,6 +1772,7 @@ mod zone_entry_handshake_publish_tests {
         let ok = run_zone_entry_handshake(
             &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
             &eqoxide_ipc::ControllerSlots::default(),
+            &eqoxide_ipc::DoorsShared::default(),
             Duration::from_millis(3200), // > the 2.5s the KB warns a blind resend could fire at
         ).await;
 
@@ -1783,6 +1804,7 @@ mod zone_entry_handshake_publish_tests {
         let ok = run_zone_entry_handshake(
             &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
             &eqoxide_ipc::ControllerSlots::default(),
+            &eqoxide_ipc::DoorsShared::default(),
             Duration::from_millis(200),  // deadline — never completes
         ).await;
 
@@ -1837,6 +1859,7 @@ mod zone_entry_handshake_publish_tests {
         let _ = run_zone_entry_handshake(
             &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
             &controller,
+            &eqoxide_ipc::DoorsShared::default(),
             Duration::from_millis(50), // deadline — never completes; the clear is at the top
         ).await;
 
@@ -1846,6 +1869,54 @@ mod zone_entry_handshake_publish_tests {
         assert_eq!(controller.controller_view.lock().unwrap().disclosures(), (None, None),
             "and the VIEW half — without it `stream_position`'s next tick mirrors the departed \
              zone's hold straight back into the field an agent reads (#846 review B1)");
+    }
+
+    /// **#934 review B1 — the PUBLISHED half of the door purge (#891).**
+    ///
+    /// `GameState::begin_zone_in` empties `gs.world.doors`, but the roster an agent actually reads
+    /// (`InteractSlots::doors_shared`, served by GET /v1/observe/doors and resolved against by
+    /// POST /v1/interact/click_door) is republished only by `ActionLoop::sync_doors`, whose one
+    /// caller is `run_gameplay_phase`'s packet drain. This handshake runs its OWN drain and never
+    /// reaches that one, so before this fix the roster held the DEPARTED zone's doors for the whole
+    /// handshake — up to `ZONE_ENTRY_HANDSHAKE_DEADLINE` (30 s) — while `publish_snapshot` ran every
+    /// 10 ms and kept the HTTP session live. A `door_id` valid in the zone we just left therefore
+    /// still resolved and still answered `200 clicking door N`: #891's own bug, surviving the fix
+    /// for it.
+    ///
+    /// Note the two seeded doors are the departed zone's — nothing in this test publishes doors for
+    /// the new one, because the point is that they must be GONE, not replaced.
+    ///
+    /// MUTATION CHECK: delete `doors.lock().unwrap().clear();` from the top of
+    /// `run_zone_entry_handshake` → RED here (the roster still holds 2). Wrapping it in a condition
+    /// that does not fire (e.g. `if false { … }`) is the same deletion and is equally RED — this
+    /// asserts the roster's CONTENTS after a real call, not the presence of a line of source.
+    #[tokio::test]
+    async fn a_zone_entry_handshake_clears_the_departed_zones_published_door_roster_891() {
+        let (mut stream, _unused_rx) = test_stream(0, 0).await;
+        let (_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
+        let (mut gs, snapshot, health) = fresh_gs_snapshot();
+
+        let doors: eqoxide_ipc::DoorsShared = Default::default();
+        for (door_id, name) in [(6u8, "HHCELL"), (7u8, "HHDOOR")] {
+            doors.lock().unwrap().push(eqoxide_ipc::DoorView {
+                door_id, name: name.into(),
+                x: 0.0, y: 0.0, z: 0.0, heading: 0.0, opentype: 58, is_open: false,
+            });
+        }
+
+        let _ = run_zone_entry_handshake(
+            &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
+            &eqoxide_ipc::ControllerSlots::default(),
+            &doors,
+            Duration::from_millis(50), // deadline — never completes; the clear is at the top
+        ).await;
+
+        assert!(gs.world.doors.is_empty(),
+            "the GameState half of the door purge (`GameState::begin_zone_in`, #270)");
+        assert!(doors.lock().unwrap().is_empty(),
+            "and the PUBLISHED half — a departed zone's door left in `doors_shared` is served by \
+             GET /v1/observe/doors as the current zone's, and resolves in POST \
+             /v1/interact/click_door back to `200 clicking door N` (#891/#934 review B1)");
     }
 }
 

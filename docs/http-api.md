@@ -249,6 +249,23 @@ contradicts, instead of queueing it and answering `200`. Nothing is queued and n
 | `POST /v1/merchant/sell` | `GET /v1/observe/inventory` | `slot` holds no item |
 | `POST /v1/combat/scribe` | `GET /v1/observe/inventory` | `from` is supplied and holds no item |
 | `POST /v1/interact/read` | `GET /v1/observe/inventory` | `slot` holds no item (`409` if it holds something unreadable) |
+| `POST /v1/interact/click_door` | `GET /v1/observe/doors` | no door in the roster matches the `door_id` **or** the `name` — both forms are looked up, neither is taken on trust |
+
+`click_door` is the one row where a `404` **never** means "contradicted". The roster is not a
+closed set at any size: it grows as further door records arrive, and zoning empties it. So a
+populated roster establishes only that no door it holds *right now* matches — not that the door
+does not exist — and an empty roster does not even distinguish a zone with no doors from a zone
+whose door records have not arrived yet, since a zone-in in progress looks exactly the same. Read
+this `404` as *unknown* in both cases, never as *disproved*. (`503` would claim the session is not
+live and `409` would claim something is pending; neither is true, so the code stays `404` and the
+body carries the distinction.)
+
+**There is no observable that says the roster is complete**, so "re-check once the zone has
+finished loading" is advice this API cannot underwrite for doors specifically: `zone_assets.state`
+reaching `ready` is about geometry, and door records arrive as separate server packets on no
+schedule this client publishes. An earlier revision of this paragraph said a populated roster
+*did* mean contradicted; that reinstated exactly the over-read the `404` body was rewritten to
+remove, and it contradicted both that body and the handler's own rustdoc.
 
 The snapshot these are checked against is the one the network thread publishes. It is refreshed on
 every inbound packet, **and** — since #347 — immediately after the client mirrors a change the server
@@ -723,11 +740,36 @@ of the real zone. Only `ready` means the image shows the zone the character is i
 a PNG body has no room for an in-band field, so the same freshness clock every other endpoint
 carries rides this header instead.
 
-**Endpoints that are deliberately NOT gated**, because they do not read zone geometry or collision
-and are honest during a load: `/v1/observe/doors` and `/v1/observe/zone_entrances` (both are
-server-pushed lists, not derived from the collision grid), and `/v1/move/manual` and `/v1/move/jump`
+**Endpoints that are deliberately NOT gated**, because they do not read zone geometry or collision:
+`/v1/observe/doors` and `/v1/observe/zone_entrances` (both are server-pushed lists, not derived from
+the collision grid), and `/v1/move/manual` and `/v1/move/jump`
 (they drive the controller directly and make no routing claim — though with no collision loaded the
 character is moving through a world the client has not built, so prefer waiting for `ready`).
+
+**Ungated is not the same as honest during a load, and `/v1/observe/doors` is the case that
+matters.** Zoning empties the door roster (#891), and it refills only once records have both
+arrived **and been published** — so during a zone-in the endpoint returns a confident `[]` for a
+zone that does have doors, the same bytes as the true answer "this zone has no doors". That is the
+shape #803 removed from [`zone_exits`](#zone-exits--means-exactly-one-thing-803): an empty list
+serving as both a reading of the world and a non-answer.
+
+Two distinct things produce that `[]`, and conflating them understates how cheaply one of them
+could be fixed. **During the zone-entry handshake the records have already arrived** — they are
+parsed and applied to game state — but the publish step that would surface them here runs only in
+the gameplay drain, so they sit in hand and unpublished. That is **#937**, a missing publication
+rather than a missing packet. Separately, records the server has not sent yet arrive on no schedule
+this client publishes, which is **#939**.
+
+The *cause* is also where doors differ from `zone_exits`: there a file read had failed, which is a
+terminal fact the client can name in a `503`. "Not published yet" and "not sent yet" have no
+terminal moment to report, and unlike the geometry gate there is no `ready` to wait for. Treat `[]`
+from this endpoint as *not yet known*. Re-listing is the usual recourse; if you need to tell the
+two apart, packet capture (`GET /v1/observe/packets`, opcode `0x7291`) records `OP_SpawnDoor`
+arrivals independently of whether this endpoint has published them — but **capture is default-off
+and not retroactive**, so it must already have been enabled when the records landed. Enabling it
+*after* you see `[]` returns `count: 0` with `enabled: true`, which is the same false-negative this
+paragraph is warning you about, wearing a different hat. Check the `enabled` field before reading
+any conclusion into a zero count.
 
 `POST /v1/move/goto` still accepts the goal, but its response carries a non-null
 **`zone_assets_pending`** note while the assets are missing, and `nav_state` reads `zone_loading`

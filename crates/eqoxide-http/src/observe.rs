@@ -2107,6 +2107,27 @@ async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
 }
 
 /// GET /v1/observe/doors — list the current zone's doors (id, name, position, opentype, open state).
+///
+/// **`[]` does NOT mean "this zone has no doors" (#939).** The roster is emptied on zone entry
+/// (#891) and refills from `OP_SpawnDoor` records once they have both **arrived and been
+/// published** — so during a zone-in this endpoint returns a confident empty list for a zone that
+/// does have doors, and nothing served here tells the two apart.
+///
+/// Those are two different failures and only one of them is about the network. During the zone-entry
+/// handshake the records are applied to game state but **not published**: `sync_doors` has exactly
+/// one call site, in the gameplay drain (`eqoxide_net::gameplay`, `run_gameplay_phase`), which the
+/// handshake loop is not. So a record can be in hand and still absent here — that is #937, and it is
+/// a missing publication, not a missing packet. Separately, records genuinely not yet sent arrive on
+/// no schedule this client publishes.
+///
+/// There is no completeness observable to wait on for either: `zone_assets.state` reaching
+/// `"ready"` gates on terrain meshes and collision triangles, so it is about geometry, not about
+/// which door packets have landed.
+///
+/// The same limit binds the other direction, and this is the reason `/v1/interact/click_door`
+/// answers a miss with `404` *unknown* rather than *disproved*: a **populated** roster is not a
+/// closed set either, so "not among the doors held right now" is the strongest claim available at
+/// any roster size. Do not let a non-empty list here read as a complete one.
 async fn get_doors(State(s): State<HttpState>) -> Response {
     // #646: bare array body (backward-compatible shape) — freshness rides `SNAPSHOT_AGE_HEADER`
     // instead of a JSON key. See that const's doc for the clock this reuses.
