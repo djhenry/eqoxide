@@ -524,11 +524,10 @@ fn main() {
         // Offline `--testzone`: no `eq-net` thread is ever started, so there is no server connection
         // and never will be one. Publishing that up front keeps `net_thread_dead` from reading
         // `null` (which means "the Model is running") in a mode where the Model does not exist.
-        *net_thread_dead.lock().unwrap() = Some(
-            "--testzone: the eq-net thread was never started (offline renderer mode). There is no \
-             server connection; every world field is local test data, not the game."
-                .to_string(),
-        );
+        // #890: tagged `NeverStarted` rather than sharing a discriminant with the death paths — the
+        // HTTP server runs in this mode too, so a handler that collapses this to "the net thread
+        // died" will assert things about a session that never existed (`/v1/lifecycle/exit` did).
+        eqoxide::model::publish_never_started(&net_thread_dead);
     }
 
     // HTTP server

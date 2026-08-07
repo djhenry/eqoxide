@@ -969,7 +969,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // TERMINALITY, which no age can: a 5-second-old tick is equally consistent with a busy loop and
     // with a thread that no longer exists. Read them together — age says "is this stale?",
     // `net_thread_dead` says "will it ever un-stale?" (no).
-    let net_thread_dead = s.net_thread_dead.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    // Only the PROSE half of the typed state reaches the wire (#890): the JSON contract is
+    // "`null` while running, a reason string once it has ended", unchanged. The discriminant is
+    // for code that must branch (see `lifecycle::exit_body`), not for an agent to parse.
+    let net_thread_dead = s.net_thread_dead.lock().unwrap_or_else(|e| e.into_inner())
+        .as_ref().map(|d| d.reason().to_string());
     // #816 (agent-honesty): the client-synthesized "to " map-label fallback entries
     // `ActionLoop::sync_zone_points` merges into `zone_points` (`/v1/observe/zone_entrances`) come
     // from a `.txt` file read that can fail the same way `.wtr` region-data reads can (#762/#803):
@@ -5652,16 +5656,20 @@ mod zone_asset_gate_tests {
     async fn debug_surfaces_a_dead_net_thread_alongside_the_frozen_world_it_invalidates() {
         let s = ready_state();
         set_gs(&s, |gs| gs.player_x = 100.0);
-        *s.net_thread_dead.lock().unwrap() = Some(
-            "the eq-net thread PANICKED (boom) — the client is no longer talking to the server."
-                .to_string(),
-        );
+        *s.net_thread_dead.lock().unwrap() = Some(eqoxide_ipc::NetThreadDeath::new(
+            eqoxide_ipc::NetThreadEnd::Panicked,
+            "the eq-net thread PANICKED (boom) — the client is no longer talking to the server.",
+        ));
         let (_, j) = get(s, "/debug").await;
         assert_eq!(j["player"]["zone"], FIXTURE_ZONE, "the stale world is still served, as before");
         assert!(
             j["net_thread_dead"].as_str().unwrap().contains("PANICKED"),
             "…but it is now explicitly marked dead: {}", j["net_thread_dead"]
         );
+        // #890 typed the slot; the WIRE form must not have changed with it. A JSON object here
+        // (`{"end":…,"reason":…}`) would break every agent and every doc paragraph about this field.
+        assert!(j["net_thread_dead"].is_string(),
+            "the served value must stay a plain reason string: {}", j["net_thread_dead"]);
     }
 
     #[tokio::test]

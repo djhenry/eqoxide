@@ -1420,6 +1420,116 @@ pub type ZonePoints = Arc<Mutex<Vec<eqoxide_core::game_state::ZonePoint>>>;
 /// Published only by `sync_zone_points`'s zone-change branch; read by `GET /v1/observe/debug` as
 /// `zone_map_load`.
 pub type ZoneMapLoadShared = Arc<Mutex<Option<eqoxide_core::zone_map::ZoneMapLoadError>>>;
+
+/// Declares [`NetThreadEnd`] and derives [`NetThreadEnd::ALL`] from the SAME token list.
+///
+/// #935 review B3, measured: the exhaustive `match`es in `eqoxide-http` force a new variant to get
+/// an arm, but they do not force it to get a TEST. The suites there iterate "every end", and while
+/// that list was a hand-written `[NetThreadEnd; 5]` in the test module, a sixth variant wired to the
+/// exact silent inheritance those tests exist to forbid shipped fully green — the array simply did
+/// not know about it. A guard that has to be remembered is the bug; this makes the stale state
+/// unrepresentable instead. Add a variant below and it appears in `ALL` automatically, so every loop
+/// keyed on `ALL` covers it on the next build.
+macro_rules! net_thread_end {
+    (
+        $(#[$enum_meta:meta])*
+        pub enum $name:ident { $($(#[$variant_meta:meta])* $variant:ident),+ $(,)? }
+    ) => {
+        $(#[$enum_meta])*
+        pub enum $name { $($(#[$variant_meta])* $variant),+ }
+
+        impl $name {
+            /// Every variant, in declaration order — DERIVED from the enum, never maintained beside
+            /// it (#935 B3). Tests iterate this so a new variant cannot slip past them.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
+net_thread_end! {
+/// WHICH terminal state the `eq-net` thread reached (#890). The reason string alone cannot carry
+/// this: it is prose, and every consumer that wanted the distinction had to either match on its text
+/// (which any reword silently breaks) or collapse it to `is_some()` (which loses it entirely).
+///
+/// The states are NOT interchangeable. `/v1/lifecycle/exit` asserts a specific consequence about the
+/// session — "no camp will be sent, so this ends as a drop, not a camp-out" — and that sentence is
+/// true of [`Panicked`](Self::Panicked) and false of [`NeverStarted`](Self::NeverStarted), where
+/// there is no server session to leave in any state at all. A `bool` cannot tell those apart, which
+/// is how #890's defect class survived its first fix.
+///
+/// Written only by `eqoxide::model::run_net_thread` (the four thread-exit arms) and by
+/// `eqoxide::model::publish_never_started` (the `--testzone` arm, where the thread is never
+/// spawned). See [`NetThreadDeath`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetThreadEnd {
+    /// The thread PANICKED. A session may have been live; whatever the server still holds is now
+    /// unattended and ends on the server's own timer.
+    Panicked,
+    /// The thread returned a fatal `Err` — today only from `run_login_flow`'s two `Err` arms
+    /// (a server-rejected fatal login error, or retries exhausted), both of which are reached
+    /// BEFORE the gameplay phase starts — so on this end there may be no server session at all.
+    /// Kept distinct from [`Panicked`](Self::Panicked) because the reason text differs.
+    Fatal,
+    /// The thread's body returned `Ok(())` **while the shutdown flag was set**.
+    ///
+    /// ⚠️ This is NOT the ordinary `/v1/lifecycle/exit` teardown, despite being the arm one would
+    /// expect it to take. `run_gameplay_phase` handles the shutdown flag by calling
+    /// `perform_clean_shutdown` and then parking in `loop { sleep(200ms) }` forever — it never
+    /// returns on that path, so the thread never unwinds and nothing is published at all. What
+    /// reaches this arm is a gameplay phase that returned for some OTHER reason (a zone-transition
+    /// failure, a server-side session drop) during a window in which a shutdown had also been
+    /// requested. Measured by reading `crates/eqoxide-net/src/gameplay.rs`; not observed live.
+    ReturnedDuringShutdown,
+    /// The thread's body returned `Ok(())` with no shutdown requested — the gameplay phase ended on
+    /// its own (session drop, zone-in failure). Unplanned.
+    ReturnedUnexpectedly,
+    /// `--testzone`: the thread was NEVER SPAWNED (offline renderer mode). There is no server
+    /// connection, no session, and no character logged in — so no observable about "the session"
+    /// may be asserted on this state. The HTTP server runs in this mode, so every handler that
+    /// reads this field can be reached here.
+    NeverStarted,
+}
+}
+
+/// The `eq-net` thread's terminal state: WHICH end it was ([`NetThreadEnd`]) plus the agent-facing
+/// prose that `GET /v1/observe/debug` serves as `net_thread_dead` and `require_live_session` relays
+/// verbatim in its 503. Both halves are load-bearing — the prose is what an agent reads, the
+/// discriminant is what code may branch on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetThreadDeath {
+    end:    NetThreadEnd,
+    reason: String,
+}
+
+impl NetThreadDeath {
+    #[must_use]
+    pub fn new(end: NetThreadEnd, reason: impl Into<String>) -> Self {
+        Self { end, reason: reason.into() }
+    }
+    /// Which terminal state this is — the machine-readable half.
+    #[must_use]
+    pub fn end(&self) -> NetThreadEnd { self.end }
+    /// The agent-facing prose. Served verbatim; never parsed.
+    #[must_use]
+    pub fn reason(&self) -> &str { &self.reason }
+}
+
+/// The `eq-net` thread's terminal-death observable (#634, agent-honesty; typed by #890).
+///
+/// `None` = the thread **has not ended** — which is NOT the same as "is healthy". A wedged,
+/// deadlocked or livelocked net thread has not unwound, so it still reads `None` here while
+/// publishing nothing; cross-check `snapshot_age_ms` for that case. It also reads `None` for the
+/// whole of an ordinary `/v1/lifecycle/exit` teardown, because the gameplay phase parks rather than
+/// returning (see [`NetThreadEnd::ReturnedDuringShutdown`]). This field is deliberately about
+/// TERMINALITY only. `Some(d)` = **the thread is gone and will not come back this session** —
+/// nothing will ever drain a command slot or publish a `GameState` snapshot again.
+///
+/// Same shared-`Arc`-identity discipline as `common_assets_failed` / `model_sync_dead` (#616): the
+/// ONE `Arc` constructed in `main.rs` is cloned into both the thread closure and
+/// `spawn_camera_server`. Constructing a second one on either side severs the two and the endpoint
+/// reads `None` forever.
+pub type NetThreadDeadShared = Arc<Mutex<Option<NetThreadDeath>>>;
+
 /// Native Task-system quest log, published from GameState.tasks each tick (GET /v1/observe/quests/log).
 pub type TaskLog = Arc<Mutex<Vec<eqoxide_core::game_state::ActiveTask>>>;
 

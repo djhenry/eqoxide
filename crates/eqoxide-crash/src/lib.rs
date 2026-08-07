@@ -16,9 +16,10 @@
 //!    `--api-port`s. A shared log or heartbeat file is last-writer-wins, and a post-mortem would
 //!    happily attribute client A's death to client B's still-beating heart. Every path and every
 //!    line carries the pid.
-//! 3. **Every intentional exit is labelled.** A wedged render loop that gets force-exited by the
+//! 3. **Every intentional exit is labelled, and the label is true.** A process force-exited by the
 //!    `/v1/lifecycle/exit` watchdog must not be indistinguishable from an OOM-kill — that would be
-//!    an agent-honesty violation *inside* the agent-honesty fix.
+//!    an agent-honesty violation *inside* the agent-honesty fix. Nor may the label name a subsystem
+//!    that was healthy, which is the way that fix first went wrong (see [`log_exit`], eqoxide#890).
 //!
 //! ## What is covered
 //!
@@ -28,7 +29,7 @@
 //!   These are NOT Rust panics: a GPU-driver fault never runs the panic hook, and this binary has a
 //!   real `SIGSEGV` history (`coredumpctl list eqoxide` — 7 crashes with mesa/wayland-egl frames).
 //! - **Every intentional exit** — [`exit`] / [`log_exit`]. Including the ones that fire precisely
-//!   when something is already wrong (the render-loop watchdog).
+//!   when something is already wrong (`/v1/lifecycle/exit`'s shutdown watchdog).
 //! - **A heartbeat** — so a post-mortem can distinguish an uncatchable `SIGKILL`/OOM-kill from a
 //!   process that was already wedged long before it died.
 //!
@@ -457,11 +458,24 @@ fn install_panic_hook() {
 
 /// Record an intentional exit, with a REASON. Call this at every `process::exit` site.
 ///
-/// The reason matters as much as the record: `/v1/lifecycle/exit`'s 45s watchdog fires exactly when
-/// the render loop is already wedged. If that exit were unlabelled, a post-mortem would see "no
-/// clean-shutdown line, no panic, no signal, fresh heartbeat" — which this module documents as
-/// meaning *OOM-kill*. A wedge would be confidently misreported as an OOM. Labelling it
-/// `render-loop-wedged` keeps that honest.
+/// The reason matters as much as the record. If a watchdog-forced exit were unlabelled, a
+/// post-mortem would see "no clean-shutdown line, no panic, no signal, fresh heartbeat" — which
+/// this module documents as meaning *OOM-kill* — and the forced exit would be confidently
+/// misreported as an OOM. Labelling it is what keeps that honest, and that is unchanged.
+///
+/// The LABEL has to be honest too (eqoxide#890). `/v1/lifecycle/exit`'s 45s watchdog does not fire
+/// only when the render loop is wedged: it fires whenever the shutdown fails to complete, and that
+/// includes every dead-net-thread teardown, where nothing is left to drain the camp while the
+/// render loop keeps drawing (measured at ~46fps across the whole watchdog window). It used to pass
+/// the constant `render-loop-wedged` and so blamed a healthy subsystem in the durable record a
+/// later investigation reads as fact. It now derives the reason from live state — see
+/// `eqoxide_http`'s `watchdog_reason`, which emits `net-thread-dead` / `net-thread-never-started` /
+/// `shutdown-not-completed` / `camp-not-drained` / `watchdog-shutdown-timeout`, one per
+/// distinguishable state. Note that "the net thread has ended" is NOT one state: it covers a panic,
+/// an exit that a requested shutdown asked for, and `--testzone`, where the thread was never
+/// started at all — and `net-thread-dead` would be a false label for the last two. NOT MEASURED:
+/// whether that watchdog ever fires with a genuinely wedged render loop; every #890 measurement
+/// comes from the dead-net-thread path.
 pub fn log_exit(reason: &str, code: i32) {
     let line = format_exit_line(now_epoch_secs(), pid(), reason, code);
     tracing::info!(target: "eqoxide::crash", "{line}");
@@ -906,14 +920,15 @@ mod tests {
     }
 
     #[test]
-    fn exit_reasons_distinguish_a_wedge_from_a_clean_shutdown() {
-        // The whole point of finding 3: a watchdog-forced exit must not look like a clean one, or a
-        // wedge gets misreported as an OOM-kill.
+    fn exit_reasons_distinguish_a_watchdog_kill_from_a_clean_shutdown() {
+        // The whole point of finding 3: a watchdog-forced exit must not look like a clean one, or it
+        // gets misreported as an OOM-kill. The sample reason is one the watchdog really emits
+        // (eqoxide#890 retired the `render-loop-wedged` constant this used to sample).
         let clean = format_exit_line(1, 1, "clean", 0);
-        let wedged = format_exit_line(1, 1, "render-loop-wedged", 0);
-        assert_ne!(clean, wedged);
-        assert!(wedged.contains("render-loop-wedged"));
-        assert!(!wedged.contains("reason=clean"));
+        let forced = format_exit_line(1, 1, "net-thread-dead", 0);
+        assert_ne!(clean, forced);
+        assert!(forced.contains("net-thread-dead"));
+        assert!(!forced.contains("reason=clean"));
     }
 
     #[test]
@@ -1076,10 +1091,10 @@ mod tests {
         let d = TempCrashDir::new("exit");
         reset_globals();
 
-        log_exit("render-loop-wedged", 0);
+        log_exit("net-thread-dead", 0);
 
         let contents = d.log_contents();
-        assert!(contents.contains("EXIT reason=render-loop-wedged"), "got: {contents:?}");
+        assert!(contents.contains("EXIT reason=net-thread-dead"), "got: {contents:?}");
         assert!(!contents.contains("reason=clean"), "got: {contents:?}");
         assert!(!contents.contains("PANIC"), "got: {contents:?}");
     }

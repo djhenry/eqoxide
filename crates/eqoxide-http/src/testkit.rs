@@ -105,7 +105,7 @@ pub fn empty_state_with_net_health(net_health: eqoxide_ipc::NetHealthShared) -> 
 /// something an agent can poll rather than merely landing in an internal field. Same shape, and same
 /// reason, as [`empty_state_with_net_health`] above (#612).
 pub fn empty_state_with_net_thread_dead(
-    net_thread_dead: Arc<Mutex<Option<String>>>,
+    net_thread_dead: eqoxide_ipc::NetThreadDeadShared,
 ) -> HttpState {
     HttpState { net_thread_dead, ..empty_state() }
 }
