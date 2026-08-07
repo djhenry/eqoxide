@@ -684,6 +684,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let prov = player.position_provisional_since;
     let health = s.health();
     let frame_profile = *s.frame_profile.lock().unwrap();
+    // #797 — the STATIC-arm skin-cap downgrades the renderer has recorded so far this session,
+    // keyed by loaded file base name (never a full local path — see `downgrade_key`). Cloned out
+    // from behind the lock so the JSON literal below can move it in without holding the mutex
+    // across serialization.
+    let skin_cap_downgrades = s.skin_cap_downgrades.lock().unwrap().clone();
     let nav = s.nav.nav_state.lock().unwrap().clone();
     // Is nav answering from WINDING-BLIND (inverted-art) ground in this zone? (#375, D-2)
     //
@@ -1208,8 +1213,30 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // Distinct from the zone-lifetime `nav_tight` counter — this is the route being walked now.
         "nav_tier": nav_tier,
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
-        // Render-owned — the one field here the render loop legitimately publishes.
         "frame_profile": frame_profile,
+        // #797 — models whose skin joint count EXCEEDED the renderer's animation cap and were
+        // downgraded to the static (unskinned) render arm this session. Keyed by loaded file base
+        // name. Always present, `{}` rather than `null`, so a caller that greps and finds the key
+        // MISSING knows it is talking to a client too old to report this at all — the same
+        // distinction `nav_local_planner_dead` draws above.
+        //
+        // What `{}` does and does not say (#900 review r1, finding 6): it is an exact mirror of the
+        // renderer's own map, which is written only by `ensure_character_model` (via
+        // `observe_skin_fit`) inside `render_frame`, is insert/update-only, and is published
+        // immediately after that same `render_frame` call — so `{}` is never a STALE non-empty
+        // state going unreported. But it does conflate two situations an agent cannot separate from
+        // this field alone: "every character model loaded so far fits the cap" and "no character
+        // model has been loaded yet" (loading screen, zoning, nothing in view). Read `{}` as "no
+        // downgrade has been recorded so far this session", NOT as "the model you are asking about
+        // animates" — that second reading is only justified once you know the model is on screen.
+        // Each entry is `{joint_count, key_collision}`:
+        //   joint_count   — the joint count that triggered the downgrade (the MOST RECENT one, if
+        //                   this key has been (re)loaded more than once this session).
+        //   key_collision — true iff two files that hash to the SAME base-name key were BOTH loaded
+        //                   this session (eqoxide#848). When true, `joint_count` is not reliably
+        //                   attributable to either file — see docs/http-api.md.
+        // See `eqoxide_renderer::renderer::record_skin_cap_downgrade` for how this map is built.
+        "skin_cap_downgrades": skin_cap_downgrades,
         // EVERY field in this block describes ONE frame — the one named by `drawn_frame` — and not
         // "now" (#867). The render loop publishes the whole struct in a single write, only after
         // `render_frame` has actually encoded a frame; on a tick that returns early from the
@@ -3303,6 +3330,72 @@ mod tests {
             "camera.occluded must say a pull-in fired this frame");
         assert_eq!(cam["still_blocked"], serde_json::json!(true),
             "camera.still_blocked must say the eye is still not fully clear of collision");
+    }
+
+    /// #797 (added in #900's review round 2) — the renderer's skin-cap downgrade report must reach
+    /// a RESPONSE BODY, not merely an `HttpState` field. This is #797's own failure mode one layer
+    /// up: `EqRenderer::skin_cap_downgrades` existed since #795/#820 and was perfectly public, and
+    /// the driving agent still could not read it, because nothing carried it to a response. A
+    /// serving path that quietly stops serving reproduces exactly that, and the round-1 reviewer
+    /// measured that it could: deleting the `"skin_cap_downgrades"` entry from `get_debug`'s JSON
+    /// literal was compile-clean and left the whole workspace green.
+    ///
+    /// Same shape as `camera_eye_reaches_the_debug_json_852` above and
+    /// `hold_reaches_the_debug_json_817` below: drive the REAL router through `debug_json`, parse
+    /// the REAL bytes, and assert on both the empty and the populated case — the empty case pins
+    /// that the key is always PRESENT (an agent that greps and finds nothing cannot tell "nothing
+    /// downgraded" from "this client predates the field"), the populated case pins that a
+    /// downgrade the renderer actually recorded is carried through with both sub-fields intact.
+    ///
+    /// MUTATION CHECK (remote builder, both directions, run for #900 round 2 and reported in that
+    /// PR comment — not reasoned):
+    /// - **DELETE** the `"skin_cap_downgrades": skin_cap_downgrades,` entry from `get_debug`'s JSON
+    ///   literal → RED at the `contains_key` assertion below.
+    /// - **WRAP** the `let skin_cap_downgrades = …lock().unwrap().clone();` read in `if false { … }`
+    ///   (leaving an empty `BTreeMap` behind) → RED at the populated-case assertions. The WRAP is
+    ///   run because DELETE alone does not distinguish "this check runs" from "this check is merely
+    ///   written" — eqoxide#799, eight measured cases in this repo.
+    #[tokio::test]
+    async fn skin_cap_downgrades_reaches_the_debug_json_797() {
+        // ── Empty: an explicit `{}` that IS in the object, never an omitted key. ────────────────
+        let v = debug_json(empty_state()).await;
+        let obj = v.as_object().expect("debug object");
+        assert!(obj.contains_key("skin_cap_downgrades"),
+            "skin_cap_downgrades must be PRESENT in the served body even when empty — an agent \
+             that greps for it and finds nothing cannot tell \"nothing has downgraded\" from \
+             \"this client cannot report downgrades at all\". Top-level keys served: {:?}",
+            obj.keys().collect::<Vec<_>>());
+        assert_eq!(v["skin_cap_downgrades"], serde_json::json!({}),
+            "with nothing recorded it must serialise as an empty OBJECT, not null and not omitted, \
+             got {}", v["skin_cap_downgrades"]);
+
+        // ── Populated: what the renderer recorded, carried through with both sub-fields. ────────
+        let state = empty_state();
+        {
+            let mut recorded = state.skin_cap_downgrades.lock().unwrap();
+            recorded.insert("race_hum.glb".to_string(),
+                eqoxide_ipc::SkinCapDowngradeView { joint_count: 190, key_collision: false });
+            // The #848 case: one key two different files have written. `key_collision` is the only
+            // thing in the response that discloses it, so it has to survive the trip.
+            recorded.insert("race_pcfroglok.glb".to_string(),
+                eqoxide_ipc::SkinCapDowngradeView { joint_count: 204, key_collision: true });
+        }
+        let v = debug_json(state).await;
+        let served = v["skin_cap_downgrades"].as_object()
+            .expect("skin_cap_downgrades must be an OBJECT in the served body");
+        assert_eq!(served.len(), 2,
+            "every recorded downgrade must be served, not just the first — served: {:?}",
+            served.keys().collect::<Vec<_>>());
+        assert_eq!(v["skin_cap_downgrades"]["race_hum.glb"],
+            serde_json::json!({ "joint_count": 190, "key_collision": false }),
+            "the recorded joint count and collision flag must both reach the body verbatim");
+        assert_eq!(v["skin_cap_downgrades"]["race_pcfroglok.glb"]["key_collision"],
+            serde_json::json!(true),
+            "key_collision: true must reach the body — it is the ONLY signal an agent has that this \
+             entry's joint_count is not reliably attributable to one file (eqoxide#848)");
+        assert_eq!(v["skin_cap_downgrades"]["race_pcfroglok.glb"]["joint_count"],
+            serde_json::json!(204),
+            "a colliding entry still carries its joint count; the flag qualifies it, not replaces it");
     }
 
     /// #867 — the camera block's FRESHNESS signal must reach the served body, in both states.

@@ -58,10 +58,22 @@
 //! - **eqoxide#814** — a floor on `JOINT_CAP`'s VALUE, with the measured corpus figures it comes
 //!   from. See `joint_cap_clears_the_widest_shipped_rig`; the primary enforcement is the `const`
 //!   assertion in `renderer.rs`, which makes a too-small cap a compile error.
+//! - **eqoxide#797** — the report is now served over HTTP (`/v1/observe/debug`'s
+//!   `skin_cap_downgrades`, documented in `docs/http-api.md`); that plumbing lives above this crate
+//!   (`src/app.rs`, `crates/eqoxide-http`) and is not covered here, which stays true to the file's
+//!   own "what this file does NOT cover" note above.
+//! - **eqoxide#848** — `record_skin_cap_downgrade`'s map value grew from a bare `usize` to
+//!   [`SkinCapDowngrade`], which adds a `key_collision` flag: two DIFFERENT source files that share
+//!   a base-name key no longer silently overwrite one another (`skin_observation::observe_skin_fit`
+//!   also stopped taking a caller-supplied `model_path`/`label` at all — see that function's own
+//!   doc). `two_roots_with_the_same_basename_collide_into_one_entry` used to accept the silent
+//!   overwrite as expected behavior; it now asserts the flag instead, and
+//!   `key_collision_is_sticky_and_does_not_clear_on_a_later_agreeing_write` pins that the flag
+//!   cannot be cleared once set.
 
 use eqoxide_renderer::renderer::{
-    downgrade_key, record_skin_cap_downgrade, resolve_character_model_path, SkinFit, StaticReason,
-    JOINT_CAP, MAX_MEASURED_CHARACTER_RIG_JOINTS,
+    downgrade_key, record_skin_cap_downgrade, resolve_character_model_path, SkinCapDowngrade,
+    SkinFit, StaticReason, JOINT_CAP, MAX_MEASURED_CHARACTER_RIG_JOINTS,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -193,7 +205,7 @@ impl Drop for ScratchAssets {
 
 #[test]
 fn record_skin_cap_downgrade_only_inserts_for_exceeds_cap() {
-    let mut map: BTreeMap<String, usize> = BTreeMap::new();
+    let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
     let dir = Path::new("/models");
 
     record_skin_cap_downgrade(&mut map, &dir.join("race_ok.glb"), StaticReason::NoSkin);
@@ -204,8 +216,10 @@ fn record_skin_cap_downgrade_only_inserts_for_exceeds_cap() {
 
     record_skin_cap_downgrade(&mut map, &dir.join("race_pcfroglok.glb"),
         StaticReason::ExceedsCap { joint_count: 129 });
-    assert_eq!(map.get("race_pcfroglok.glb"), Some(&129),
+    assert_eq!(map.get("race_pcfroglok.glb").map(|e| e.joint_count), Some(129),
         "an ExceedsCap reason must be recorded under the loaded FILE with its joint count");
+    assert_eq!(map.get("race_pcfroglok.glb").map(|e| e.key_collision), Some(false),
+        "a single file recorded once is not a collision");
     assert_eq!(map.len(), 1);
 }
 
@@ -228,12 +242,12 @@ fn is_downgrade_agrees_with_the_report_gate() {
         StaticReason::EmptySkin,
         StaticReason::ExceedsCap { joint_count: 129 },
     ] {
-        let mut map: BTreeMap<String, usize> = BTreeMap::new();
+        let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
         record_skin_cap_downgrade(&mut map, Path::new("/models/x.glb"), reason);
 
         assert_eq!(map.contains_key("x.glb"), reason.is_downgrade(),
             "{reason:?}: `is_downgrade` disagrees with whether a report entry was written");
-        assert_eq!(map.get("x.glb").copied(), reason.downgrade_joint_count(),
+        assert_eq!(map.get("x.glb").map(|e| e.joint_count), reason.downgrade_joint_count(),
             "{reason:?}: the recorded count must be exactly what the shared predicate yields");
     }
 }
@@ -252,34 +266,42 @@ fn is_downgrade_agrees_with_the_report_gate() {
 // `observation_and_arm_agree_over_the_whole_range`.
 
 /// The documented limit of the file-name key: two files with the same base name under two different
-/// asset roots collapse into ONE entry.
+/// asset roots still share ONE map entry — `downgrade_key` is a pure function of the base name, so
+/// a `BTreeMap` cannot hold two. eqoxide#848's fix is not to make that collision impossible (it
+/// isn't, without keying on something no two real files can share) but to make it **stop being
+/// silent**: before this test existed, `record_skin_cap_downgrade`'s doc claimed the collision could
+/// not happen "because the key IS the file", a reviewer measured that it does, and the entry simply
+/// silently reported whichever load happened last with no sign anything was wrong.
 ///
-/// This is here because `record_skin_cap_downgrade`'s doc used to say the opposite — that two loads
-/// of two files "cannot produce one, because the key IS the file" — and a reviewer pointed out the
-/// key is the *base name*. Rather than restate the limit in prose and leave it unmeasured, this
-/// pins it: the second load overwrites the first, and the report says 190 for a name that also
-/// belonged to a 140-joint rig.
+/// Two rigs keyed alike (`race_a/race_hum.glb` vs `race_b/race_hum.glb`) now leave a
+/// `key_collision: true` flag an agent reading the report can act on — "the joint count you're
+/// looking at under this name may not be either rig's own count" — instead of a bare number that
+/// looks exactly as trustworthy as every other entry.
 ///
-/// It is not reachable in the shipped flow (`EqRenderer` has one `assets_path`, set by
-/// `load_character_models`) and the base name is deliberate — the map is agent-facing over HTTP and
-/// an absolute path is machine-specific noise. If a second root is ever introduced, this test is
-/// where the consequence is already written down.
+/// Not reachable in the shipped flow today (`EqRenderer` has one `assets_path`, set by
+/// `load_character_models`), and the base name is still the right key for an unrelated reason: the
+/// map is agent-facing over HTTP and an absolute path is machine-specific local detail this project
+/// does not publish. If a second root is ever introduced, this is where the consequence is written
+/// down and now detected rather than merely documented.
 #[test]
 fn two_roots_with_the_same_basename_collide_into_one_entry() {
-    let mut map: BTreeMap<String, usize> = BTreeMap::new();
+    let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
     let a = Path::new("/root_a").join("race_hum.glb");
     let b = Path::new("/root_b").join("race_hum.glb");
     assert_ne!(a, b, "precondition: two genuinely different files");
 
     record_skin_cap_downgrade(&mut map, &a, StaticReason::ExceedsCap { joint_count: 140 });
+    let before = map.get("race_hum.glb").cloned().expect("first write must record an entry");
+    assert!(!before.key_collision, "one file loaded once is not yet a collision");
+
     record_skin_cap_downgrade(&mut map, &b, StaticReason::ExceedsCap { joint_count: 190 });
 
-    assert_eq!(map.len(), 1, "same base name under two roots keys the same entry");
-    assert_eq!(
-        map.get("race_hum.glb"),
-        Some(&190),
-        "the later load wins — the 140-joint rig under the other root is not reported at all"
-    );
+    assert_eq!(map.len(), 1, "same base name under two roots still keys the same entry");
+    let after = map.get("race_hum.glb").expect("entry must still exist");
+    assert_eq!(after.joint_count, 190,
+        "the later write's joint count is what's stored — still a real number, just now flagged");
+    assert!(after.key_collision,
+        "two DIFFERENT source files sharing one key must be flagged, not silently overwritten");
 }
 
 /// The key is the loaded file name, not the directory-qualified path: two clients with different
@@ -301,7 +323,7 @@ fn the_downgrade_key_is_the_file_name() {
 #[test]
 fn two_genders_that_load_two_different_files_are_reported_separately() {
     let assets = ScratchAssets::with("two-files", &["race_hum.glb", "race_hum_f.glb"]);
-    let mut map: BTreeMap<String, usize> = BTreeMap::new();
+    let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
     let male   = resolve_character_model_path(assets.path(), "race_hum", 0);
     let female = resolve_character_model_path(assets.path(), "race_hum", 1);
     assert_ne!(male, female, "precondition: an archetype WITH an _f variant loads two files");
@@ -309,8 +331,11 @@ fn two_genders_that_load_two_different_files_are_reported_separately() {
     record_skin_cap_downgrade(&mut map, &male,   StaticReason::ExceedsCap { joint_count: 140 });
     record_skin_cap_downgrade(&mut map, &female, StaticReason::ExceedsCap { joint_count: 190 });
     assert_eq!(map.len(), 2, "two distinct rigs must not collide into one entry");
-    assert_eq!(map.get("race_hum.glb"),   Some(&140));
-    assert_eq!(map.get("race_hum_f.glb"), Some(&190));
+    assert_eq!(map.get("race_hum.glb").map(|e| e.joint_count),   Some(140));
+    assert_eq!(map.get("race_hum_f.glb").map(|e| e.joint_count), Some(190));
+    assert_eq!(map.get("race_hum.glb").map(|e| e.key_collision),   Some(false),
+        "two DIFFERENT keys is not a collision on either key");
+    assert_eq!(map.get("race_hum_f.glb").map(|e| e.key_collision), Some(false));
 }
 
 /// eqoxide#813: two genders that resolve to the SAME file must produce ONE entry.
@@ -328,7 +353,7 @@ fn two_genders_that_load_two_different_files_are_reported_separately() {
 fn two_genders_that_load_the_same_file_are_reported_once() {
     // No `_f` variant on disk — the shape of every archetype but 3.
     let assets = ScratchAssets::with("one-file", &["race_pcfroglok.glb"]);
-    let mut map: BTreeMap<String, usize> = BTreeMap::new();
+    let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
     let male   = resolve_character_model_path(assets.path(), "race_pcfroglok", 0);
     let female = resolve_character_model_path(assets.path(), "race_pcfroglok", 1);
     assert_eq!(male, female, "precondition: an archetype with NO _f variant loads one file");
@@ -337,7 +362,10 @@ fn two_genders_that_load_the_same_file_are_reported_once() {
     record_skin_cap_downgrade(&mut map, &female, StaticReason::ExceedsCap { joint_count: 200 });
     assert_eq!(map.len(), 1,
         "one GLB was downgraded once; reporting it twice would tell the agent two rigs failed");
-    assert_eq!(map.get("race_pcfroglok.glb"), Some(&200));
+    assert_eq!(map.get("race_pcfroglok.glb").map(|e| e.joint_count), Some(200));
+    assert_eq!(map.get("race_pcfroglok.glb").map(|e| e.key_collision), Some(false),
+        "the SAME file loaded twice (male/female resolving identically) is not a collision — the \
+         source path agrees on every write");
 }
 
 /// The universal form of the two tests above: over every combination of labels, genders and
@@ -365,7 +393,7 @@ fn entry_count_always_equals_distinct_file_count() {
         let refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
         let assets = ScratchAssets::with(&format!("combo-{f_variants}"), &refs);
 
-        let mut map: BTreeMap<String, usize> = BTreeMap::new();
+        let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
         let mut distinct = std::collections::BTreeSet::new();
         for label in labels {
             for gender in [0u8, 1u8] {
@@ -402,11 +430,13 @@ fn gender_1_falls_back_to_the_male_glb_when_no_f_variant_exists() {
 /// leaving a stale one behind (relevant if a model is ever reloaded after a rebake).
 #[test]
 fn re_recording_the_same_file_updates_the_joint_count() {
-    let mut map: BTreeMap<String, usize> = BTreeMap::new();
+    let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
     let p = Path::new("/models/race_x.glb");
     record_skin_cap_downgrade(&mut map, p, StaticReason::ExceedsCap { joint_count: 130 });
     record_skin_cap_downgrade(&mut map, p, StaticReason::ExceedsCap { joint_count: 200 });
-    assert_eq!(map.get("race_x.glb"), Some(&200));
+    assert_eq!(map.get("race_x.glb").map(|e| e.joint_count), Some(200));
+    assert_eq!(map.get("race_x.glb").map(|e| e.key_collision), Some(false),
+        "the SAME path recorded twice is not a collision");
     assert_eq!(map.len(), 1);
 }
 
@@ -415,12 +445,51 @@ fn re_recording_the_same_file_updates_the_joint_count() {
 /// re-derives `NoSkin`/`EmptySkin` for an already-downgraded file can't accidentally un-report it.
 #[test]
 fn a_non_downgrade_call_never_removes_an_existing_entry() {
-    let mut map: BTreeMap<String, usize> = BTreeMap::new();
+    let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
     let p = Path::new("/models/race_x.glb");
     record_skin_cap_downgrade(&mut map, p, StaticReason::ExceedsCap { joint_count: 130 });
     record_skin_cap_downgrade(&mut map, p, StaticReason::NoSkin);
-    assert_eq!(map.get("race_x.glb"), Some(&130),
+    assert_eq!(map.get("race_x.glb").map(|e| e.joint_count), Some(130),
         "a non-downgrade call must not clear a prior record");
+}
+
+/// The collision flag is STICKY: once two distinct source files have ever shared a key, no later
+/// write can clear it back to `false` — not even one that agrees with the write immediately before
+/// it.
+///
+/// A naive implementation that recomputes the flag from scratch on every write — "does *this*
+/// write's source disagree with whatever `source` is *currently* stored" — gets writes 1-3 right
+/// here (a, then b disagrees with a: flag set; then a disagrees with the just-stored b: still set)
+/// but goes wrong on write 4: a second `a` write agrees with write 3's `a`, so a from-scratch
+/// recompute would report `false` again, even though `a` and `b` genuinely collided two writes ago.
+/// That would be the flag lying about the one thing it exists to disclose. `record_skin_cap_downgrade`
+/// avoids this by OR-ing into the existing flag rather than recomputing it, which write 4 below pins.
+#[test]
+fn key_collision_is_sticky_and_does_not_clear_on_a_later_agreeing_write() {
+    let mut map: BTreeMap<String, SkinCapDowngrade> = BTreeMap::new();
+    let a = Path::new("/root_a").join("race_hum.glb");
+    let b = Path::new("/root_b").join("race_hum.glb");
+
+    record_skin_cap_downgrade(&mut map, &a, StaticReason::ExceedsCap { joint_count: 100 });
+    assert!(!map.get("race_hum.glb").unwrap().key_collision, "one source: no collision yet");
+
+    record_skin_cap_downgrade(&mut map, &b, StaticReason::ExceedsCap { joint_count: 101 });
+    assert!(map.get("race_hum.glb").unwrap().key_collision, "two DIFFERENT sources: collision");
+
+    // A third write, back to `a` — the same source as write 1, and it now agrees with nothing that
+    // was just written (write 2 was `b`), so this alone doesn't prove stickiness.
+    record_skin_cap_downgrade(&mut map, &a, StaticReason::ExceedsCap { joint_count: 102 });
+    assert!(map.get("race_hum.glb").unwrap().key_collision,
+        "a write disagreeing with the immediately-prior source must still read collided");
+
+    // A fourth write, `a` again — THIS is the one that would clear a naive "current write agrees
+    // with current source" implementation, because write 3 and write 4 are both `a`.
+    record_skin_cap_downgrade(&mut map, &a, StaticReason::ExceedsCap { joint_count: 103 });
+    assert!(map.get("race_hum.glb").unwrap().key_collision,
+        "the flag must stay set forever once two distinct sources have collided, even once every \
+         subsequent write agrees with the one immediately before it");
+    assert_eq!(map.get("race_hum.glb").unwrap().joint_count, 103,
+        "the joint count still reflects the latest write");
 }
 
 // ── eqoxide#814: the cap's VALUE has a floor, and it is not silent ──────────────────────────────

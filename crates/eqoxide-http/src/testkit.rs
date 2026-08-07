@@ -202,6 +202,7 @@ pub fn empty_state() -> HttpState {
         lifecycle,
         guild_slots: Default::default(),
         nav_debug_view: Default::default(),
+        skin_cap_downgrades: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
     }
 }
 
