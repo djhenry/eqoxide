@@ -1397,9 +1397,7 @@ impl CharacterController {
     /// | this branch | 1.050 | 1.037 | 0.920 | 0.743 | 0.708 | 0.801 | 0.899 | 0.949 |
     /// | pre-#870 `ce1d89f` | 0.417 | 0.426 | 0.495 | 0.588 | 0.708 | 0.801 | 0.899 | 0.949 |
     ///
-    /// (`ce1d89f` is the pre-#870 baseline for both tables in this file: `git diff` of it against
-    /// the `origin/main` this branch is merged with touches no production line of this module —
-    /// its only non-comment change is the addition of this file's own citation-guard test.)
+    /// (`ce1d89f` is the pre-#870 baseline for both tables in this file.)
     ///
     /// `is_embedded` still fires from `ndot` 0.866 down — those are the rows whose worst clearance
     /// is inside `PLAYER_RADIUS` = 1.0, and they are the rows with nonzero embedded frames on this
