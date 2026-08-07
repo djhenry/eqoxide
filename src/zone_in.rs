@@ -1458,4 +1458,17 @@ mod tests {
              now outlives the collision on every frame it is false, and a `str::contains` pin \
              (which is what `movement.rs` has) cannot see the difference. See #799.");
     }
+
+    // #867's ordering guarantee is NOT pinned here, deliberately. An earlier revision of this fix
+    // added two scans of `app.rs` asserting the `camera_snapshot` write sat at a higher byte offset
+    // than the `render_frame` call and was not brace-nested behind a condition. Independent review
+    // defeated both while they stayed green: extracting the write into a helper placed later in
+    // `impl App` and calling it from the old pre-draw site satisfies both scans, and so does adding
+    // a second pre-draw write through `Arc::clone(&self.camera_snapshot)` (the `hits.len() == 1`
+    // guard is a substring count over one spelling). Neither is an attack; the first is an ordinary
+    // tidy-up. What a byte-offset scan measures is where characters sit, not when a write executes.
+    // The ordering is now a type fact instead — `CameraState::snapshot` takes the
+    // `eqoxide_renderer::DrawnFrame` that only `render_frame` returns, so a pre-draw publisher has
+    // no argument to pass and does not compile. See #799 for the pattern, and `DrawnFrame`'s own
+    // `compile_fail` doctest for the proof that it cannot be fabricated.
 }

@@ -7,6 +7,15 @@ edition = "2021"
 name = "eqoxide_renderer"
 path = "src/lib.rs"
 
+[features]
+# Exposes `DrawnFrame::for_test` (#867) so a downstream crate's unit tests can build the
+# proof-of-draw token that `CameraState::snapshot` requires. `render_frame` — the only production
+# source of one — needs a real GPU device, so without this no unit test outside this crate could
+# reach a `DrawnFrame`-taking path at all. Enable it as a DEV-dependency feature only: a production
+# build must have exactly one way to mint the token, which is drawing a frame. Same convention as
+# `eqoxide-ipc`/`eqoxide-core`'s `test-fixtures`.
+test-fixtures = []
+
 [dependencies]
 # eqoxide-renderer is the GPU/render core (the View's rendering layer, #544 Step 2n). It is a clean
 # LOWER layer: app.rs and ui/* depend UP on it, and it has ZERO up-refs into the app loop

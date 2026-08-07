@@ -1963,14 +1963,18 @@ impl App {
         }
         let (desired_eye, cam_target) = self.camera.tick(dt, self.scene.player_pos, self.scene.player_heading);
         // Camera collision (#852): resolve the eye ONCE, here, and use that single value both
-        // for the render below and for the published snapshot. Before this fix the pull-in
+        // for the render below and for the published snapshot. Before the #852 fix the pull-in
         // mutated a local `cam_eye` for rendering only — `snapshot()` re-derived its own eye from
         // `radius`/`focus`, which the pull-in never touched, so a pulled-in frame and the
         // observable an agent reads disagreed 88% of the time a pull-in fired. See
         // `camera_state::resolve_camera_eye`'s doc comment.
+        //
+        // The snapshot ITSELF is published later, not here — see the write site right after
+        // `renderer.render_frame(..)` below, and #867. Moving it back up here does not compile:
+        // `CameraState::snapshot` takes an `eqoxide_renderer::DrawnFrame`, and there is no way to
+        // produce one before the draw.
         let resolved = crate::camera_state::resolve_camera_eye(self.collision.as_deref(), cam_target, desired_eye);
         let cam_eye = resolved.eye;
-        if let Ok(mut snap) = self.camera_snapshot.lock() { *snap = self.camera.snapshot(resolved); }
 
         // Nav diagnostics overlay (#608): while toggled on (--nav-debug / F11), attach the
         // walker's PUBLISHED snapshot to the scene — a cheap Arc clone — and the renderer draws
@@ -2003,8 +2007,32 @@ impl App {
         );
 
         let prof_render = crate::profiling::Stopwatch::start();
-        renderer.render_frame(&mut enc, &view, &self.scene, cam_eye, cam_target, dt);
+        let drawn = renderer.render_frame(&mut enc, &view, &self.scene, cam_eye, cam_target, dt);
         let dur_render = prof_render.elapsed();
+
+        // Camera snapshot (#867): published ONLY now that `render_frame` has actually run, and the
+        // ordering is enforced by the type system rather than by this line's position in the file.
+        // Between `resolved` above and here sits the `surface.get_current_texture()` match, three of
+        // whose arms (`Lost`/`Outdated`, `Timeout`) `return` before ever reaching `render_frame`;
+        // publishing earlier meant `camera_snapshot` could hold an eye computed for a frame that was
+        // never drawn, while its docs claimed "the frame this snapshot describes".
+        //
+        // `snapshot` takes the `DrawnFrame` token `render_frame` returns, so moving this call above
+        // the draw — by hand, or by the extract-method refactor that a source-text pin cannot see —
+        // fails to compile: there is no token to pass. That is the whole guarantee; see
+        // `eqoxide_renderer::DrawnFrame` for what it does NOT cover (submit/present, and the #422
+        // off-screen capture path, which mints a token this site never sees).
+        //
+        // On a skipped tick nothing is published and the previous snapshot stays. That snapshot is
+        // then STALE, by an unbounded amount — `about_to_wait` stops requesting redraws 300 ms
+        // (`ACTIVE_LINGER`) after the last activity, so a persistently `Outdated` surface (minimised
+        // or occluded window) freezes it indefinitely. It is NOT claimed here that the on-screen
+        // image is unchanged over that window: `Outdated` usually means the surface was resized or
+        // reconfigured, so what the compositor shows is a stretched/blank presentation, and a
+        // minimised window shows nothing at all. The staleness is made DETECTABLE instead of argued
+        // away: `drawn_frame`/`drawn_age_ms` in the published struct let a reader tell a fresh
+        // snapshot from an ancient one. See `CameraSnapshot`'s doc for the reader-facing side.
+        if let Ok(mut snap) = self.camera_snapshot.lock() { *snap = self.camera.snapshot(resolved, drawn); }
 
         // Cache picking data for the next mouse-click query.
         self.pick_view_proj = renderer.last_view_proj;
@@ -2288,7 +2316,10 @@ impl App {
         // dt=0.0: this is a SECOND `render_frame` call within the same real frame — passing the
         // real dt again would double-advance every entity's animation clock for this tick. 0.0
         // draws the exact same pose the primary pass just drew, from a different angle.
-        renderer.render_frame(&mut ov_enc, &offscreen_view, scene, eye, look, 0.0);
+        // The returned `DrawnFrame` (#867) is deliberately discarded: this draw goes to an
+        // off-screen texture for one PNG, so using its token to publish `camera_snapshot` would
+        // name a frame nobody saw at an angle the live camera never held.
+        let _off_screen_only = renderer.render_frame(&mut ov_enc, &offscreen_view, scene, eye, look, 0.0);
 
         let staging = renderer.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("frame_staging_override"), size: (row_pitch * h) as u64,
