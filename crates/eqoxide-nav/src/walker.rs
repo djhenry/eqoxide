@@ -296,13 +296,19 @@ pub struct Walker {
     /// the way `stuck_ticks` (reset the instant the stall block fires) and `nav_repaths` (reset only
     /// on a 200 u closest-approach improvement) both do.
     ///
-    /// `exec_goal_id` is the `NavStatus::goal_id` the verdict is ABOUT (#349 identity). A verdict is
-    /// a per-goal fact, and this is what resets it: a new goal id means a new journey, so the
-    /// verdict starts fresh. Keying on identity rather than on remembering to reset at each of the
-    /// several places a goal can change is deliberate — a forgotten reset here would report a fresh
-    /// goto as already wedged.
-    pub exec:             crate::steering::RouteExecution,
-    pub exec_goal_id:     u64,
+    /// **The verdict carries the `NavStatus::goal_id` it is ABOUT** (#349 identity), inseparably —
+    /// see [`crate::steering::GoalVerdict`]. A verdict is a per-goal fact, and that is what resets
+    /// it: a new goal id means a new journey, so the verdict starts fresh. Keying on identity rather
+    /// than on remembering to reset at each of the several places a goal can change is deliberate —
+    /// a forgotten reset would report a fresh goto as already wedged.
+    ///
+    /// #851 review round 2, B1: the id used to be a SEPARATE field, consulted only by
+    /// [`Walker::tick_drive_state`]. Every other reader — [`Walker::publish_drive_state`] most of
+    /// all — took the verdict at face value, and a `/follow` chase (which never runs
+    /// `tick_drive_state`) therefore published the previous goto's stall while walking. Two fields
+    /// that had to be read together, and one reader that did not, is the shape; one value whose
+    /// only accessor demands the goal id is the fix.
+    pub exec:             crate::steering::GoalVerdict,
     /// **When the walker last made progress on this goal** — the origin `nav_stall.quiet_ms` is
     /// measured from. `None` only before the first drive tick of a journey.
     ///
@@ -406,8 +412,7 @@ impl Walker {
             nav_best_gdist: f32::MAX,
             nav_best_g3d: f32::MAX,
             nav_progress_at: std::time::Instant::now(),
-            exec: crate::steering::RouteExecution::fresh(),
-            exec_goal_id: 0,
+            exec: crate::steering::GoalVerdict::fresh_for(0),
             last_progress_at: None,
             committed: None,
             backoff_ticks: 0,
@@ -479,10 +484,9 @@ impl Walker {
         self.nav_best_g3d = f32::MAX; // #631 gap 3: closest-approach tracking is per-goal + per-zone
         self.nav_progress_at = std::time::Instant::now();
         // #851: the execution verdict and the committed route's facts are about a route in the
-        // PREVIOUS zone's coordinate space. `exec_goal_id` is left alone on purpose — it is an
-        // identity stamp, and the goal id does not restart at a zone change; `reset_drive_state`
-        // re-stamps it from the live row so the next drive tick does not read this reset as a
-        // goal change and reset again.
+        // PREVIOUS zone's coordinate space. The goal id does not restart at a zone change, so
+        // `reset_drive_state` re-stamps the verdict onto the live row's id — the next drive tick
+        // then reads a fresh verdict about the CURRENT goal, not a goal change to react to.
         self.reset_drive_state();
         self.backoff_ticks = 0;
         self.local_stuck_ticks = 0;
@@ -606,11 +610,11 @@ impl Walker {
     }
 
     /// Forget the execution verdict and the committed route's facts (#851): a new goal, a new zone,
-    /// or a terminated journey. Re-stamps [`Walker::exec_goal_id`] from the live row so the reset
-    /// is not immediately re-triggered by the goal-identity check in [`Walker::tick_drive_state`].
+    /// or a terminated journey. Stamps the fresh verdict with the live row's `goal_id`, so the reset
+    /// is not immediately re-read as a goal change by [`Walker::tick_drive_state`].
     pub fn reset_drive_state(&mut self) {
-        self.exec = crate::steering::RouteExecution::fresh();
-        self.exec_goal_id = self.nav.nav_state.lock().unwrap().goal_id;
+        let goal_id = self.nav.nav_state.lock().unwrap().goal_id;
+        self.exec = crate::steering::GoalVerdict::fresh_for(goal_id);
         // The quiet window starts NOW, not at `None`: a journey that never progresses at all still
         // owes an honest "how long has the body been going nowhere", and its origin is the moment
         // the journey began. (Leaving it `None` would publish `quiet_ms: 0` for exactly that walker
@@ -634,21 +638,22 @@ impl Walker {
     fn tick_drive_state(&mut self, progressed: bool) -> crate::steering::RouteExecution {
         let now = std::time::Instant::now();
         let goal_id = self.nav.nav_state.lock().unwrap().goal_id;
-        if goal_id != self.exec_goal_id {
-            self.exec = crate::steering::RouteExecution::fresh();
-            self.exec_goal_id = goal_id;
-            self.last_progress_at = Some(now); // a new journey's quiet window starts here
-        }
-        self.exec = self.exec.tick(progressed, self.nav_repaths);
+        // The identity RULE lives in `GoalVerdict` (one implementation, used by `tick` and `as_of`
+        // alike). What the walker still owns is the stall CLOCK, which is a walker field, so it asks
+        // whether this tick begins a new journey rather than re-deciding what a new journey is.
+        let new_journey = !self.exec.is_about(goal_id);
+        self.exec = self.exec.tick(goal_id, progressed, self.nav_repaths);
+        let exec = self.exec.as_of(goal_id);
         // [`Walker::last_progress_at`] is the ORIGIN of the window `quiet_ticks` counts — the last
         // tick that reported progress — not the moment the verdict flipped (#851 review round 1,
         // B2c). `tick` resets `quiet_ticks` to 0 on exactly the ticks that progressed, so this reads
         // the machine's own answer rather than re-deriving `progressed`. `is_none()` seeds a journey
-        // whose very first drive tick is already quiet.
-        if self.exec.quiet_ticks() == 0 || self.last_progress_at.is_none() {
+        // whose very first drive tick is already quiet, and `new_journey` restarts the window with
+        // the journey (a new goal's first tick may be quiet, and its clock still starts here).
+        if new_journey || exec.quiet_ticks() == 0 || self.last_progress_at.is_none() {
             self.last_progress_at = Some(now);
         }
-        self.exec
+        exec
     }
 
     /// **Publish the driving `nav_state` row from the verdict (#851) — the one place the walker
@@ -671,13 +676,19 @@ impl Walker {
     /// made non-empty only by the two `apply_plan` arms that set `committed` in the same breath.
     fn publish_drive_state(&self) {
         let Some(facts) = self.committed else { return };
-        let word = crate::steering::driving_nav_state(facts.route, self.exec);
         // ONE lock for the word, the tier and the stall payload — see `write_nav_state_locked` for
         // why they cannot be three separate acquisitions.
         let mut s = self.nav.nav_state.lock().unwrap();
+        // …and the verdict is read AS OF the goal id in that same locked row (#851 review round 2,
+        // B1). This publication is about `s.goal_id`'s journey; a verdict about any other journey is
+        // not evidence about this one, and `GoalVerdict::as_of` is the only way to ask. Reading it
+        // under the same lock that writes the word is what makes the pair inseparable: the row
+        // cannot move to a new goal between deciding the word and writing it.
+        let exec = self.exec.as_of(s.goal_id);
+        let word = crate::steering::driving_nav_state(facts.route, exec);
         Self::write_nav_state_locked(&mut s, word, facts.reason);
         s.tier  = facts.tier;
-        s.stall = match self.exec {
+        s.stall = match exec {
             crate::steering::RouteExecution::Advancing { .. } => None,
             crate::steering::RouteExecution::Stalled { quiet_ticks, repaths } =>
                 Some(eqoxide_ipc::NavStall {
@@ -1631,10 +1642,12 @@ impl Walker {
             // clock here too keeps the window honest across a re-aim.)
             self.nav_best_g3d = f32::MAX;
             self.nav_progress_at = std::time::Instant::now();
-            // #851: a genuinely NEW destination — the route facts describe a route to somewhere
-            // else, and the execution verdict is about a journey that is over. (A new `/goto` also
-            // bumps `goal_id`, which `tick_drive_state` keys off; this covers the routes that
-            // re-aim WITHOUT a new goal id — a `/follow` chase whose leader moved a cell.)
+            // #851: a genuinely NEW destination — `self.path` is cleared six lines up, so the
+            // committed facts must go with it or they would describe a route that no longer exists.
+            // (Round 2, B2: this used to name "a `/follow` chase whose leader moved a cell" as the
+            // case it covers. `replan_decision` computes `reset_route = !is_chase && …`, so a chase
+            // is the one case that cannot reach this branch at all. Nothing about a chase's verdict
+            // is decided here — `publish_drive_state` reads it as of the live goal id instead.)
             self.reset_drive_state();
             self.replan_cooldown = 0;
             self.replan_coarse = false;
@@ -1942,6 +1955,13 @@ impl Walker {
             // every test that drives a walker. The words come from the constants, not from literals,
             // so `the_driving_nav_state_word_is_only_ever_written_through_the_verdict_851` still
             // reads zero driving-word literals in this file's production region.
+            //
+            // ITS REACH, stated because round 2 measured that it was overstated: this sits inside
+            // `if have_path && !following`, so it is an assertion about the FIXED-goal drive path
+            // only. It could not have caught B1 (a chase publishing a stale stall) and no wording of
+            // it can — a chase never reaches this line. The chase side is covered by the type
+            // (`GoalVerdict`) and by
+            // `a_moving_follow_chase_never_publishes_the_previous_goals_851_stall`.
             debug_assert!(!(exec.is_stalled() && {
                     let published = self.nav.nav_state.lock().unwrap().state.clone();
                     published == crate::steering::NAV_STATE_NAVIGATING
@@ -2225,9 +2245,16 @@ mod tests {
              the region that publishes the driving word");
         // NON-DEGENERACY — the one legitimate producer really is in the scanned region. Without
         // this, deleting `publish_drive_state`'s body would leave this test green.
-        assert!(production.contains("driving_nav_state(facts.route, self.exec)"),
+        assert!(production.contains("driving_nav_state(facts.route, exec)"),
             "the verdict→word call is gone from the scanned region: the words are now produced \
              somewhere this guard is not looking");
+        // …and that `exec` is the verdict read AS OF the row's live goal id (#851 review round 2,
+        // B1). This is a non-degeneracy control on the SCANNED REGION, not the enforcement: what
+        // makes a stale verdict unreadable is `GoalVerdict`'s private fields, and what pins the
+        // behaviour is `a_moving_follow_chase_never_publishes_the_previous_goals_851_stall`.
+        assert!(production.contains("self.exec.as_of(s.goal_id)"),
+            "the driving word is computed from a verdict that was not read as of the published \
+             row's goal id — the round-2 B1 shape");
 
         // POSITIVE CONTROLS on the matcher itself, including a multi-line call and a nested-paren
         // one, so `vec![]` and a line-based matcher are both excluded.
@@ -2756,6 +2783,21 @@ mod tests {
             // `debug_assert!`-is-test-time-only fact for the other assertions on this row. Caught by
             // `steering`'s scan on the run that added the citation, not by me.
             a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725,
+            // #851 review round 2, B1: named by the production comment beside `drive_walk`'s
+            // `debug_assert!`, which records that the assert's reach STOPS at the fixed-goal path
+            // and points here for the chase side. That citation is in a `//` comment, which the
+            // scan does not read — this entry is here so a rename is still a compile error.
+            a_moving_follow_chase_never_publishes_the_previous_goals_851_stall,
+            // #851 review round 2, B4: cited by
+            // `a_wedged_follow_chase_is_not_reported_as_stalled_at_all_851`'s rustdoc as the
+            // same-fixture walker that DOES reach `navigating_stalled` — the two differ only by
+            // `goto_entity`, and that comparison is the boundary the doc's limitation paragraph
+            // rests on. A rename that broke the pairing would otherwise be silent.
+            drive_walk_publishes_navigating_stalled_once_the_body_stops_progressing_851,
+            // …and the citing test itself, which `docs/http-api.md` names as the measurement behind
+            // its `/follow` limitation paragraph. That citation is in a tracked doc, not a doc
+            // comment, so no scan in this crate would catch a rename; this line does.
+            a_wedged_follow_chase_is_not_reported_as_stalled_at_all_851,
         ];
     }
 
@@ -5140,8 +5182,8 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// against the previous goto cannot be reported against the next one — the failure mode a latch
     /// invites is telling an agent its brand-new `/move/goto` is already wedged.
     ///
-    /// Mutation check: delete the `goal_id != self.exec_goal_id` reset from `tick_drive_state` and
-    /// this goes RED.
+    /// Mutation check: make [`crate::steering::GoalVerdict::tick`] ignore its `goal_id` argument
+    /// (continue `self.exec` instead of `self.as_of(goal_id)`) and this goes RED.
     #[test]
     fn a_fresh_goal_id_clears_a_latched_851_stall() {
         let (mut w, nav, mut gs, goal) = stalled_walker_fixture();
@@ -5158,5 +5200,141 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
         assert_eq!(s.state, "navigating",
             "#851: a stall latched against goal #1 must not be reported against goal #2");
         assert!(s.stall.is_none(), "and its calibration data must go with it");
+    }
+
+    /// **#851 review round 2, B1 — a `/follow` chase that is WALKING must not publish the previous
+    /// goal's stall.** The inverse-honesty case: a moving walker reading as stalled.
+    ///
+    /// The round-2 reviewer measured this on the branch: after a fixed `/goto` wedged, a `/follow`
+    /// covered 80 u in 8 ticks toward a leader still 220 u away and published `navigating_stalled`
+    /// every tick, carrying the dead goto's `quiet_ticks: 20` / `route: "complete"` — and it was a
+    /// REGRESSION, `main` publishes `navigating` on that path. Three facts composed it: the
+    /// goal-identity reset lived only in `tick_drive_state`, which `if have_path && !following`
+    /// gates out for a chase; `replan_decision`'s `reset_route` is `!is_chase && …`, so the other
+    /// reset site is unreachable for a chase; and `publish_drive_state` read the verdict with no
+    /// identity check of its own. The verdict simply froze at whatever the last fixed goto left.
+    ///
+    /// The fix is the type: `Walker::exec` is a [`crate::steering::GoalVerdict`], and the only way
+    /// to read a [`crate::steering::RouteExecution`] out of it names the goal the caller is
+    /// publishing for. There is no longer a walker path — chase or not, reached or unreached — that
+    /// can publish a verdict belonging to a different journey, so this test pins the ONE trajectory
+    /// that was measured wrong rather than the whole class.
+    ///
+    /// **Mutation checks (run, not reasoned — outputs in the PR comment). BOTH directions:**
+    /// * DELETE the fix: make [`crate::steering::GoalVerdict::as_of`] hand back its stored verdict
+    ///   with no identity comparison at all, which is exactly the pre-fix read → RED here.
+    /// * WRAP the fix: leave the identity comparison written, and unreachable, behind an
+    ///   `if false` → RED here. A source-text pin that only survives deletion has been evaded eight
+    ///   separate times in this repo; the wrap is not optional.
+    #[test]
+    fn a_moving_follow_chase_never_publishes_the_previous_goals_851_stall() {
+        use crate::collision::PlanOutcome;
+        let (mut w, nav, mut gs, goal) = stalled_walker_fixture();
+
+        // (1) A fixed `/goto` wedges and the verdict LATCHES. Without this there is no stale verdict
+        // to leak and the rest of the test would pass for the wrong reason.
+        for _ in 0..NAV_STUCK_TICKS { w.drive_walk(&mut gs, goal); }
+        assert_eq!(nav.nav_state.lock().unwrap().state, "navigating_stalled",
+            "PREMISE: goal #1 must really be latched stalled — otherwise there is nothing to leak");
+
+        // (2) `/follow a_leader`. This is exactly what `CommandState::request_follow` does to the
+        // row — bump `goal_id`, stamp a fresh `pending` — because it touches nothing walker-side.
+        let leader = (300.0, 0.0, 0.0);
+        *nav.goto_entity.lock().unwrap() = Some("a_leader".to_string());
+        {
+            let mut s = nav.nav_state.lock().unwrap();
+            s.goal_id = 2;
+            s.stamp_fresh_goal("pending", None, Some([leader.0, leader.1, leader.2]));
+        }
+        *nav.goto_target.lock().unwrap() = Some(leader);
+        assert!(nav.nav_state.lock().unwrap().stall.is_none(),
+            "PREMISE: the accept itself clears the payload — round 1 closed that writer");
+
+        // (3) The chase's own route lands. `apply_plan` publishes UNCONDITIONALLY, and this is the
+        // publication that used to resurrect goal #1's verdict.
+        w.plan_goal_id = 2;
+        let reply = crate::planner::PlanReply {
+            gen: 1, start: [0.0, 0.0, 0.0], goal: [leader.0, leader.1, leader.2],
+            outcome: PlanOutcome::Route(vec![[100.0, 0.0, 0.0], [200.0, 0.0, 0.0], [300.0, 0.0, 0.0]]),
+            plan_ms: 1, goal_snapped: None, tight: false,
+            trace: crate::diagnostics::SearchTrace::default(),
+        };
+        w.apply_plan(reply, &mut gs, leader);
+        {
+            let s = nav.nav_state.lock().unwrap();
+            assert_eq!(s.state, "navigating",
+                "#851 B1: the chase's FIRST publication must describe the chase, not the dead goto");
+            assert!(s.stall.is_none(),
+                "#851 B1: and it must not carry the dead goto's calibration, got {:?}", s.stall);
+        }
+
+        // (4) …and now the chase actually WALKS, 10 u a tick, straight at the leader.
+        for tick in 0..8 {
+            gs.player_x += 10.0;
+            w.drive_walk(&mut gs, leader);
+            let s = nav.nav_state.lock().unwrap();
+            assert_ne!(s.state, "navigating_stalled",
+                "#851 B1: tick {tick}: the walker has moved {} u toward a leader {} u away and reads \
+                 as stalled. Payload: {:?}",
+                gs.player_x, (leader.0 - gs.player_x).abs(), s.stall);
+            assert!(s.stall.is_none(),
+                "#851 B1: tick {tick}: a moving chase carries a stall payload: {:?}", s.stall);
+        }
+
+        // REACH CONTROL. Two premises the assertions above are worthless without: the body really
+        // moved, and it is nowhere near the follow-hold radius — a chase that had caught up would
+        // publish `following` and never exercise the driving publication at all.
+        assert!(gs.player_x >= 80.0,
+            "reach control: the body only reached x={} — this run never covered the 80 u the \
+             reviewer measured", gs.player_x);
+        assert!((leader.0 - gs.player_x).abs() > 200.0,
+            "reach control: the walker ended {} u from the leader, close enough that `FollowHold` \
+             could have short-circuited the ticks this test is about", (leader.0 - gs.player_x).abs());
+    }
+
+    /// **The BOUNDARY of `navigating_stalled`, measured rather than argued.** `tick_drive_state` is
+    /// gated by `if have_path && !following`, so a chase's verdict is never ticked — which is why
+    /// nothing latches for a chase, and equally why a chase that is genuinely wedged is NOT reported
+    /// as stalled. Round 2's B1 was the lie in one direction (a moving chase reading stalled); this
+    /// is the gap that remains in the other, and `docs/http-api.md` states it as a limitation
+    /// because this test is what it is based on.
+    ///
+    /// This is deliberately not "fixed" here: for a chase the closest-approach channel is excluded
+    /// on purpose and `cursor_advanced` resets on every re-plan, so ticking the verdict for chases
+    /// risks manufacturing the SAME class of lie against a walker that is physically moving. That
+    /// trade needs live measurement of the real re-plan cadence, which this round did not do. Filed
+    /// as #929, which this test is the measurement for.
+    ///
+    /// The fixture body never moves and its closest approach can never improve — identical to the
+    /// walker that reaches `navigating_stalled` in
+    /// [`drive_walk_publishes_navigating_stalled_once_the_body_stops_progressing_851`]. The ONLY
+    /// difference is `goto_entity`, so a passing run here is about the chase gate and nothing else.
+    #[test]
+    fn a_wedged_follow_chase_is_not_reported_as_stalled_at_all_851() {
+        let (mut w, nav, mut gs, _goal) = stalled_walker_fixture();
+        *nav.goto_entity.lock().unwrap() = Some("a_leader".to_string());
+        let leader = (500.0, 0.0, 0.0);
+
+        // Three times the fixed-goal threshold — 60 ticks, ~9 s of a body that has not moved.
+        let mut words: Vec<String> = Vec::new();
+        for _ in 0..(NAV_STUCK_TICKS * 3) {
+            w.drive_walk(&mut gs, leader);
+            let s = nav.nav_state.lock().unwrap();
+            if words.last().map(|last| last != &s.state).unwrap_or(true) {
+                words.push(s.state.clone());
+            }
+            assert!(s.stall.is_none(),
+                "a chase publishes no `nav_stall` payload; got {:?}", s.stall);
+        }
+
+        assert_eq!(words, vec!["navigating".to_string()],
+            "MEASURED, and what the doc's limitation paragraph is based on: a wedged chase reads as \
+             unqualified progress for the whole window. If this list ever changes, the doc changes.");
+        // REACH CONTROLS. The body must really be wedged, and the chase must really still be far
+        // enough out that `FollowHold` never short-circuited the driving publication.
+        assert_eq!(gs.player_x, 0.0, "reach control: the body must not have moved at all");
+        assert!(w.committed.is_some(),
+            "reach control: a route must stay committed — `publish_drive_state` returns early \
+             without one and every tick above would be vacuous");
     }
 }

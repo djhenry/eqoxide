@@ -290,7 +290,7 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `planning` | A route is being computed on the pathfinding worker thread. The character stands still. Normally < 1 s. | — |
 | `navigating` | Walking a **complete route to your goal**. | `goal_z_snapped` (see below) or — |
 | `navigating_partial` | Walking a **partial** route: the search was cut short, so this is *not* a route to your goal — it's progress toward a frontier, and it will re-plan from the far end. Usually resolves to `navigating` or `arrived`. | `search_node_cap` |
-| `navigating_stalled` | **A route is committed and the walker is NOT executing it.** The body has neither advanced its route cursor nor improved its closest approach to the goal for `NAV_STUCK_TICKS` (20) walker ticks — about 3 s. This is **not terminal**: the walker backs off and re-paths, and it returns to `navigating` the moment real progress resumes. It exists because the alternative is worse — before #851 a walker circling under a ledge published plain `navigating` for the whole ~32 s it spent recovering, and an agent polling `nav_state` had no way to tell it apart from a walk that was working. Read **`nav_stall`** (below) for how long and how many re-paths. **The verdict latches:** only real progress clears it, so a re-path or a back-off does not flicker it back to `navigating`. If the walker never recovers you will eventually get `blocked`/`walker_stalled` (8 re-path attempts) or `blocked`/`no_progress` (60 s). | `goal_z_snapped` (see below), `search_node_cap`, or — (it carries whatever reason the committed route carries) |
+| `navigating_stalled` | **A route is committed and the walker is NOT executing it.** The body has neither advanced its route cursor nor improved its closest approach to the goal for `NAV_STUCK_TICKS` (20) walker ticks — about 3 s. **Only fixed-destination goals reach this state** — see the limitation under `nav_stall` below. This is **not terminal** — it is not on the terminal list below, and the walker goes on backing off and re-pathing under it. **The verdict latches:** a re-path or a back-off does not clear it. It exists because the alternative is worse — before #851 a walker circling under a ledge published plain `navigating` for the whole ~32 s it spent recovering, and an agent polling `nav_state` had no way to tell it apart from a walk that was working. Read **`nav_stall`** (below) for how long and how many re-paths. If the walker never recovers you will eventually get `blocked` (`walker_stalled` or `local_no_way_through`, at 8 re-path attempts) or `blocked`/`no_progress` (60 s). | `goal_z_snapped` (see below), `search_node_cap`, or — (it carries whatever reason the committed route carries) |
 | `following` | A `/follow` chase has caught up; holding near the leader, still latched. | — |
 | `arrived` | Reached the goal. | `goal_z_snapped` (see below) or — |
 | `no_path` | **No route was published for this goal — read `nav_reason` before concluding one cannot exist.** For most reasons it is definitive: the planner searched to completion, so do not retry the same goal, pick another. **Not all of them are.** `planner_dead` means the pathfinding worker died, and on `/move/zone_cross` the `region_data_*` reasons (#815) mean the zone's region map could not be read — neither is a completed search, and both are **"I don't know", not "no"** — the same reading `search_exhausted` carries, but reported under this state rather than that one. The state itself is still terminal — nothing will retire it for you — so the retry decision is `nav_reason`'s to make, not this row's. | see below |
@@ -317,9 +317,10 @@ after a dropped `/zone_cross` (#725), and `following` after the followed entity 
 
 `GET /v1/observe/debug` carries **`nav_stall`** (top-level, a sibling of `player`, not under it).
 It is `null` except while `nav_state` is `navigating_stalled`, and the two are written together from
-one verdict under one lock hold — you will never see one without the other. That holds across a new
-goal too: every route out of a nav state clears this payload, so a re-issued `/move/goto` returns
-`pending` with `nav_stall: null`, never the previous goal's numbers.
+one verdict under one lock hold — you will never see one without the other. **Both belong to the goal
+in `nav_goal_id` and to no other:** the walker's stall verdict carries the goal id it was measured
+against, and reading it for a different goal is not something the client can express — so neither
+this payload nor the `navigating_stalled` word can outlive the goal that earned them.
 
 ```json
 "nav_stall": {
@@ -335,13 +336,25 @@ goal too: every route out of a nav state clears this payload, so a re-issued `/m
 |-------|---------|
 | `quiet_ticks` | Consecutive walker ticks (150 ms each) with **no** route-cursor advance and **no** closest-approach improvement. Crosses the threshold at 20, so the smallest value you can ever read here is 20. |
 | `quiet_ms` | The **same window as `quiet_ticks`**, in wall-clock milliseconds: measured from the walker's last progressing tick. So the first `navigating_stalled` you see already reads ≈ 3000, not `0`. It is measured, never computed as `quiet_ticks × 150`, and that is the only reason the two can disagree — the 150 ms nav tick is a floor, not a guarantee, so under load this runs **longer** than the arithmetic (the example above is 34 ticks in 5310 ms). Use `quiet_ticks` as the evidence count and this as the clock. |
-| `repaths` | How many recovery re-paths the walker has spent on this goal. It gives up at 8, which is where `blocked`/`walker_stalled` comes from. |
+| `repaths` | How many recovery re-paths the walker has spent on this goal. It gives up at 8, which is where the terminal `blocked` comes from — reason `local_no_way_through` if the fine planner also says there is no way through at that moment, `walker_stalled` otherwise. |
 | `route` | `complete` (the committed route ends at your goal) or `partial` (it ends short of it). A stall on a `partial` means the walker is not executing even the partial. |
+| `detail` | A prose restatement of the four fields above, for an agent reading the JSON without this document. Present whenever `nav_stall` is. |
 
 **What it does and does not mean.** It means: *a route is committed and the body is not moving along
-it.* It does **not** mean the goal is unreachable — most stalls are recovered by the back-off and
-re-path within a second or two, and the state returns to `navigating`. Treat it as "give this a few
-more seconds, and if it persists, expect a `blocked` verdict rather than an arrival".
+it.* It does **not** mean the goal is unreachable — the walker is still in back-off/re-path recovery
+and may escape it. Treat it as "give this a few more seconds, and if it persists, expect a `blocked`
+verdict rather than an arrival".
+
+**Limitation: this state is only ever published for a fixed destination** — `/move/goto` and
+`/move/zone_cross`. A `/move/follow` chase is driven down a different path that does not run the
+stall verdict at all, so a chase reads `navigating` (or `navigating_partial`, or `following` once it
+has caught up) and **never** `navigating_stalled`, even while it is genuinely wedged. Measured, not
+argued: `a_wedged_follow_chase_is_not_reported_as_stalled_at_all_851` drives the real walker tick
+with a body that does not move for 60 ticks (~9 s) under a chase and reads `navigating` for every one
+of them; the same fixture without the chase reaches `navigating_stalled` at tick 20. So for a
+`/follow`, `nav_state` alone does not distinguish a chase that is walking from one that is stuck —
+poll the character's position. Closing this gap means deciding what "progress" means for a moving
+target, which is a separate change (#929).
 
 **Why it exists.** The stall was always *detected* — the back-off/re-path machinery has fired at 20
 quiet ticks for a long time — it was never *published*. So a walker circling under a ledge for ~32 s

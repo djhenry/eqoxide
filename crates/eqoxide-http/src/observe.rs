@@ -775,9 +775,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                    channel — the route cursor advancing by walking, nor the closest 3-D approach to \
                    the goal improving — has fired for `quiet_ticks` nav ticks. It is still in \
                    stall/back-off/re-path recovery and may escape; it gives up at 8 re-paths with \
-                   `blocked` / `walker_stalled`. Do NOT read this as terminal, and do NOT read it as \
-                   progress. If `route` is `partial` the committed route did not reach your goal in \
-                   the first place.",
+                   `blocked` — reason `local_no_way_through` when the fine planner also says there \
+                   is no way through, `walker_stalled` otherwise. Do NOT read this as terminal, and \
+                   do NOT read it as progress. If `route` is `partial` the committed route did not \
+                   reach your goal in the first place. This payload is about the goal in \
+                   `nav_goal_id` and no other.",
     }));
     // The agent-honesty blockage payload behind a terminal `no_path` (#378 Phase 2). `null` when
     // there is nothing to report (not a terminal no_path, or the diagnosis could not be computed —

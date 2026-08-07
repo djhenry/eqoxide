@@ -126,10 +126,13 @@ impl CommittedRoute {
 /// fields, so `RouteExecution::Stalled { quiet_ticks: 0, repaths: 0 }` and
 /// `Advancing { quiet_ticks: 5_000 }` are both *values* — nonsense ones, contradicting the field
 /// docs below, that the machine cannot reach but the syntax can write. `#[non_exhaustive]` on each
-/// variant confines that to THIS crate (the idiom `zone_assets::ZoneAssetState` uses), and inside
-/// it the only writer of `Walker::exec` is `Walker::tick_drive_state`. So: unreachable in
-/// production, unconstructible downstream, constructible in this crate's own tests — which is where
-/// the fixtures that drive the machine to a named state have to live anyway.
+/// variant confines that to THIS crate (the idiom `zone_assets::ZoneAssetState` uses). Inside the
+/// crate, a hand-written value still cannot reach `Walker::exec`, for a reason the compiler
+/// enforces rather than a convention: that field is a [`GoalVerdict`], whose fields are private to
+/// THIS module, so `walker.rs` cannot build one out of a `RouteExecution` it wrote itself — the
+/// only `GoalVerdict`s it can obtain come from [`GoalVerdict::fresh_for`] and [`GoalVerdict::tick`].
+/// So: unreachable in production, unconstructible downstream, constructible in this module's own
+/// tests — which is where the fixtures that drive the machine to a named state have to live anyway.
 ///
 /// Before #851 the walker's stall knowledge lived in three loose `u32`s
 /// (`stuck_ticks`, `nav_repaths`, `backoff_ticks`), none of which was published anywhere, and the
@@ -206,6 +209,58 @@ impl RouteExecution {
         } else {
             RouteExecution::Advancing { quiet_ticks }
         }
+    }
+}
+
+/// **A [`RouteExecution`] and the journey it is about, as one value (#851 review round 2, B1).**
+///
+/// A verdict is a fact about ONE goal. Round 2 measured what happens when it is kept in a field and
+/// read by a publisher that never asks which goal it belongs to: a `/follow` chase that was
+/// genuinely walking — 80 u covered in 8 ticks, leader still 220 u off — published
+/// `navigating_stalled` on every tick, carrying the *previous* `/goto`'s `nav_stall` numbers. A
+/// moving walker reading as stalled is the same lie #851 exists to remove, pointing the other way.
+///
+/// The remedy is not another check at the publisher — the walker already had an `exec_goal_id`
+/// field and the publisher simply did not consult it. Here verdict and goal id are ONE value with
+/// PRIVATE
+/// fields, and the only way to get a `RouteExecution` back out is [`GoalVerdict::as_of`], which has
+/// to be told which goal the caller is publishing for. Reading a verdict without naming a goal does
+/// not compile.
+///
+/// A verdict about a different goal answers [`RouteExecution::fresh`] — "nothing is known about
+/// THIS journey yet". That is not a default standing in for a missing answer: a machine that never
+/// observed this goal has, correctly, no evidence that this goal is stalled, and `fresh` is the
+/// value that says so. It is what a walker publishes for its first tick on any goal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GoalVerdict {
+    goal_id: u64,
+    exec:    RouteExecution,
+}
+
+impl GoalVerdict {
+    /// The verdict a freshly-aimed `goal_id` starts from. Not `Default`: a verdict is always about
+    /// some goal, and the goal has to be named.
+    pub const fn fresh_for(goal_id: u64) -> Self {
+        GoalVerdict { goal_id, exec: RouteExecution::fresh() }
+    }
+
+    /// Is this verdict about `goal_id`? For callers that must distinguish "a new journey started"
+    /// from "this journey progressed" — [`crate::walker::Walker`]'s stall clock is one.
+    pub fn is_about(self, goal_id: u64) -> bool { self.goal_id == goal_id }
+
+    /// **The only way to read the verdict.** `goal_id` is the goal the caller is about to publish
+    /// for; a verdict about any other goal reads [`RouteExecution::fresh`] (see the type doc).
+    #[must_use]
+    pub fn as_of(self, goal_id: u64) -> RouteExecution {
+        if self.goal_id == goal_id { self.exec } else { RouteExecution::fresh() }
+    }
+
+    /// One nav tick FOR `goal_id`. Ticking a verdict that belongs to another goal starts that
+    /// goal's own journey rather than continuing the old one's count — the identity rule is
+    /// [`GoalVerdict::as_of`]'s, applied here too, so there is exactly one implementation of it.
+    #[must_use]
+    pub fn tick(self, goal_id: u64, progressed: bool, repaths: u32) -> Self {
+        GoalVerdict { goal_id, exec: self.as_of(goal_id).tick(progressed, repaths) }
     }
 }
 
@@ -4427,6 +4482,43 @@ mod tests {
         exec = exec.tick(true, 8);
         assert_eq!(exec, RouteExecution::fresh(), "real progress must clear the verdict immediately");
         assert_eq!(driving_nav_state(CommittedRoute::Complete, exec), NAV_STATE_NAVIGATING);
+    }
+
+    /// **A verdict about one goal is not evidence about another (#851 review round 2, B1) — the
+    /// rule, in isolation from any walker.**
+    ///
+    /// [`GoalVerdict`] exists because the walker kept the verdict and the goal id in two fields and
+    /// one publisher read only the first. Here the whole rule is one function, so there is nothing
+    /// left to forget to consult: every read names a goal. The walker-level trajectory that was
+    /// measured wrong is pinned separately by
+    /// `crate::walker::tests::a_moving_follow_chase_never_publishes_the_previous_goals_851_stall`.
+    ///
+    /// Mutation checks: make [`GoalVerdict::as_of`] ignore its argument → RED here (and RED at the
+    /// walker level); make [`GoalVerdict::tick`] continue the stored verdict instead of
+    /// `self.as_of(goal_id)` → RED on the last block here.
+    #[test]
+    fn a_goal_verdict_is_only_evidence_about_its_own_goal_851() {
+        // Wedge goal #1 all the way to the latch.
+        let mut v = GoalVerdict::fresh_for(1);
+        for _ in 0..NAV_STUCK_TICKS { v = v.tick(1, false, 3); }
+        assert!(v.as_of(1).is_stalled(), "PREMISE: goal #1 really is latched stalled");
+        assert_eq!(driving_nav_state(CommittedRoute::Complete, v.as_of(1)),
+            NAV_STATE_NAVIGATING_STALLED, "and it publishes as such for its OWN goal");
+
+        // The same value, read for a DIFFERENT goal, is not evidence of anything about that goal.
+        assert!(!v.as_of(2).is_stalled(),
+            "#851 B1: goal #1's wedge must not be readable as goal #2's verdict");
+        assert_eq!(v.as_of(2), RouteExecution::fresh(),
+            "…and what it reads instead is the honest 'nothing observed on this journey yet'");
+        assert_eq!(driving_nav_state(CommittedRoute::Complete, v.as_of(2)), NAV_STATE_NAVIGATING);
+        assert!(v.is_about(1) && !v.is_about(2), "the verdict names which journey it is about");
+
+        // Ticking for a new goal starts THAT goal's count — it does not continue goal #1's.
+        let v2 = v.tick(2, false, 0);
+        assert_eq!(v2.as_of(2), RouteExecution::Advancing { quiet_ticks: 1 },
+            "#851 B1: goal #2's first quiet tick is its FIRST, not goal #1's twenty-first");
+        assert!(!v2.as_of(1).is_stalled(),
+            "…and goal #1's verdict is gone, not shadowed — it is one value, not two");
     }
 
     /// **#631 gap 3: the no-progress property — TERMINATE a lap that never closes on the goal, and
