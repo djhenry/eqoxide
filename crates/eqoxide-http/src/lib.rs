@@ -359,14 +359,24 @@ impl PlayerState {
                 held_secs: h.secs,
                 detail: match h.reason {
                     eqoxide_core::game_state::ControllerHoldReason::EmbeddedNoRecovery =>
-                        "the character is EMBEDDED in world geometry. The client's push-out search \
-                         found nowhere it can legally stand, and it has no recovery position to fall \
-                         back to (a position discontinuity — a summon, a large server correction — \
+                        "the character cannot be placed: it is either EMBEDDED in world geometry or \
+                         standing over a VOID with no floor within 200 u below its feet. (The \
+                         client's test is a disjunction of those two and this field cannot tell you \
+                         which; the case reported in #845 was measured to be the void half, so do \
+                         not assume geometry is piercing the body.) The push-out search found \
+                         nowhere it can legally stand, and it has no recovery position to fall back \
+                         to (a position discontinuity — a summon, a large server correction — \
                          supersedes that history, #724). Physics is frozen: every movement command \
-                         will be accepted and produce NO motion, in any direction. This will not \
-                         clear on its own — the client keeps streaming this position and the server \
-                         agrees with it, so no further correction is coming. Ask a GM to move the \
-                         character (#goto/#summon), or zone out.",
+                         will be accepted and produce NO motion, in any direction. Since #845 the \
+                         client also searches the zone out to 512 u, about once a second, for \
+                         anywhere a body could legally stand, and relocates itself there — but a \
+                         SUCCEEDING search never publishes this field at all, so if you are reading \
+                         this, that search has just answered `nowhere`. It will NOT clear on its \
+                         own: in a zone whose geometry does not change the retry keeps failing for \
+                         the same reason (measured: raised at 0.5 s, still held after 60 s, body \
+                         never moved). A GM `#goto`, `#summon` or `#zone` clears it (all three \
+                         measured live on #845, each on the first frame) — but those need GM \
+                         status, so an ordinary character has no client-API exit.",
                     eqoxide_core::game_state::ControllerHoldReason::UnderworldNoRecovery =>
                         "the character fell to the zone's UNDERWORLD floor and the client is holding \
                          it there rather than let it drop out of the world (#150). It has no \
@@ -374,7 +384,10 @@ impl PlayerState {
                          history, #724), so it is hanging in place: not falling, not landing, not \
                          grounded. Horizontal movement still works, but there is probably nothing \
                          under it. This will not clear on its own — ask a GM to move the character, \
-                         or zone out.",
+                         or zone out. (#845 deliberately did NOT extend its zone-wide relocation \
+                         search to this hold: unlike `embedded_no_recovery`, this one leaves \
+                         horizontal movement working, so `/v1/move/manual` may walk the character \
+                         out over a floor that is above the underworld.)",
                 },
             }),
             // #776/#801: the afloat stall, mirrored into `gs` by the same `stream_position` tick as
@@ -671,8 +684,11 @@ fn ser_error_kind<S: serde::Serializer>(
 /// in *age* (`held_secs`), which is measurable from the caller.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlayerHoldView {
-    /// `embedded_no_recovery` — embedded in geometry, push-out found nowhere to go, no recovery
-    /// history: **the body cannot move at all**, in any direction, under any driver.
+    /// `embedded_no_recovery` — the body cannot be placed (geometry pierces its footprint **or**
+    /// there is no floor within 200 u below its feet — the client's test is a disjunction and this
+    /// field cannot tell you which; #845's live casualty was the second), push-out found nowhere to
+    /// go, no recovery history, and since #845 the zone-wide search found nowhere either:
+    /// **the body cannot move at all**, in any direction, under any driver.
     /// `underworld_no_recovery` — a descent below the zone's underworld floor was refused with no
     /// recovery history: the body hangs at the height it reached. Lateral movement still works.
     ///

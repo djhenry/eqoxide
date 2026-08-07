@@ -433,12 +433,67 @@ moved, and every other field read normal.
 
 | `reason` | What is true | Can the character move? |
 |----------|--------------|-------------------------|
-| `embedded_no_recovery` | The body is **embedded in world geometry**. The push-out search found nowhere it can legally stand, and there is no recovery position to fall back to (a position discontinuity — a GM summon, a large server correction — supersedes that history, #724). | **No.** Physics is frozen; every movement command is accepted and produces no motion in any direction. |
+| `embedded_no_recovery` | The body **cannot be placed**: geometry pierces its footprint **or** there is no floor within 200 u below its feet. The push-out search found nowhere it can legally stand, there is no recovery position to fall back to (a position discontinuity — a GM summon, a large server correction — supersedes that history, #724), and the zone-wide last-resort search found nowhere either. | **No.** Physics is frozen; every movement command is accepted and produces no motion in any direction. |
 | `underworld_no_recovery` | The body fell to the zone's **underworld floor** and the client is holding it there rather than let it drop out of the world (#150), with no recovery position to restore. It is hanging: not falling, not landing, not grounded. | Horizontally, yes — but there is probably nothing under it. |
 
-**Neither clears on its own.** The client goes on streaming its own (unchanged) position and the
-server agrees with it, so no further server correction is coming. A GM `#goto`/`#summon`, or zoning
-out, is what ends it.
+⚠️ **`embedded_no_recovery` does not mean geometry is inside the body.** It is the client's
+`is_embedded` predicate, which is a disjunction: pierced footprint *or* an empty column. #845's live
+casualty was measured (against the zone's own baked collision) to be the second — zero triangles
+over the column, nearest ground 133 u away — while this table and the `detail` string both said
+"embedded in world geometry". Nothing in the API distinguishes the two halves; if you need to know
+which, look at the geometry, not at this field.
+
+**Since #845 the client no longer only reports this state — it also tries to leave it.** When both
+the push-out and the recovery ring come up empty, the client searches the zone (out to 512 u,
+retried about once a second) for anywhere a body could legally stand, and relocates itself there.
+
+⚠️ **This does not mean the hold you are looking at is about to clear. It means the opposite.**
+Both directions were measured and both run the other way round:
+
+- **A succeeding search never publishes this field at all.** The relocation happens inside the
+  physics step and returns *before* the hold is raised, so `player.hold` stays `null` throughout —
+  measured at **0 held frames out of 300** in a zone the search can solve. There is no
+  `Some(..) → null` transition to watch for, because there was never a `Some(..)`.
+- **A hold that *is* published does not clear on its own.** In a zone whose geometry does not
+  change, the once-a-second retry keeps failing for the same reason — measured at **1800 frames /
+  60 s, raised at frame 14 and never cleared**, with the body never moving a unit.
+
+So a published `embedded_no_recovery` is the signature of a search that **failed**, and it still
+takes something external to end it. (The contrast, same probe: truncate the search's reach so the
+solvable zone above becomes unsolvable and it reports **286 held frames of 300**.) A `hold` going
+non-null → null means the underlying *condition* ended — a GM moved the body, the character zoned,
+or geometry finished loading in underneath it — which is what it has always meant.
+
+This applies to `embedded_no_recovery` only. `underworld_no_recovery` was left alone deliberately:
+it does not freeze lateral movement, so `/v1/move/manual` may still walk the character out over a
+floor above the underworld, and #724 holds that body where the server put it on purpose. If it has
+nowhere lateral to go, it still needs a GM.
+
+⚠️ **There is currently no reliable way to detect a client-side relocation through this API** —
+including the one #845 introduced, which can move the body up to 512 u without the driver asking.
+There is no dedicated field, and the two that look like they might serve do not:
+
+- **`player.hold` does not**, for the reason above: a succeeding relocation never publishes one.
+- **`player.server_corrections` does not advance for one** — correctly, since it is not a server
+  correction. But that is all it tells you. It has exactly one incrementer, in the network layer's
+  `OP_ClientUpdate` handler, gated on the server-vs-client horizontal delta exceeding 12 u; it is a
+  counter of large *server-driven* snaps, and it is not a function of `player.pos` changing at all.
+  A body standing perfectly still leaves it unchanged, and so does an ordinary `/v1/move/goto` walk
+  (that handler treats sub-12 u deltas as normal sync lag and does not count them). "Unchanged"
+  therefore carries no information about whether anything moved you.
+
+What you will actually see is a bare `pos` jump with nothing to attribute it to. The relocation *is*
+recorded, at `warn`, in the client log — `controller RELOCATED [#845]: … moved N u to …`, with the
+origin and destination — but that channel is not reachable from this API. Tracked as **#925**; do
+not build an agent behaviour on inferring it until there is a field for it.
+
+**A persistent hold still needs an outside push, and an ordinary character has no client-API way to
+produce one.** Every movement endpoint (`/v1/move/manual`, `/v1/move/jump`, `/v1/move/goto`,
+`/v1/move/zone_cross`) is gated on the physics step an `embedded_no_recovery` hold has frozen;
+thirteen such calls were measured live on #845 and moved the body zero units. What did work, each on
+the first frame, was a GM `#goto`, `#summon` or `#zone` — including one issued by the held character
+itself through `POST /v1/interact/say`, since the hold freezes physics and not the command channel.
+All three need GM status.
 
 **`held_secs` is controller frame time as of the last stepped frame, not wall clock since entry.**
 A frozen body's meaningful clock is the physics clock. If the render loop is not stepping, no frames
