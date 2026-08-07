@@ -1011,7 +1011,9 @@ mod tests {
     ///    wrong answer with no error attached, for ~30 frames. Only after that does
     ///    `EmbeddedNoRecovery` appear. This is characterisation, not a fix: closing it means
     ///    editing `movement.rs`, which is out of scope for this change. Filed here so the next
-    ///    person finds it measured rather than having to re-derive it.
+    ///    person finds it measured rather than having to re-derive it. (#845 closed the *permanent*
+    ///    half of this — see the amended block at the end — but NOT this 0.33 s window, which is
+    ///    unchanged: the last resort fires no earlier than `STUCK_FALLBACK_SECS` by design.)
     ///
     /// 2. **Why `ZoneIn`'s settled arm corroborates against the geometry.** `stepped_in_this_zone`
     ///    is true here — `app.rs` really did step the controller against this zone — and
@@ -1059,14 +1061,32 @@ mod tests {
             "the honest state is still-armed: the one-shot has not been able to measure anything \
              yet, and says so by not answering. Outcome was {:?}", h.zone_in.last_outcome());
 
-        // Past the fallback deadline the controller does eventually disclose, on its own channel.
+        // ⚠️ AMENDED (#845). This block used to assert that past the fallback deadline the freeze
+        // is PERMANENT and is disclosed as `EmbeddedNoRecovery` for ever ("after STUCK_FALLBACK_SECS
+        // with an empty ring, `depenetrate` must report EmbeddedNoRecovery"). That was true and was
+        // the bug: the arm it described is an absorbing state of the controller's state machine, and
+        // two live validation runs died in it. #845 makes the empty-ring arm ask the ZONE where a
+        // body could stand before it gives up, and this zone has an answer — its floor, 395 u down.
+        // So the honest end state here is no longer "frozen and disclosed", it is "placed on this
+        // zone's actual ground". What this test was written for is untouched: the 0.33 s window
+        // above, in which the client reports standing-and-fine at the PREVIOUS zone's coordinate
+        // with no hold, is still measured and still a gap.
         h.frames(120);
-        let hold = h.ctrl.hold().expect(
-            "after STUCK_FALLBACK_SECS with an empty ring, `depenetrate` must report \
-             EmbeddedNoRecovery (#724 review B1)");
-        assert_eq!(hold.reason, ControllerHoldReason::EmbeddedNoRecovery);
-        assert_ne!(h.zone_in.last_outcome(), Some(ZoneInOutcome::SettledInThisZone),
-            "and it must still not claim the arrival settled");
+        assert!(h.ctrl.hold().is_none(),
+            "#845: a void arrival must not end in a permanent hold when the zone has a floor to \
+             offer — {:?} at {:?}", h.ctrl.hold(), h.ctrl.pos);
+        assert!((h.ctrl.pos[2] - (-400.0)).abs() < 1.0,
+            "#845: the body must be placed on the NEW zone's floor, got {:?}", h.ctrl.pos);
+        assert_ne!(h.ctrl.pos, stale,
+            "…and specifically not left at the previous zone's coordinate {stale:?}");
+        assert!(h.ctrl.on_ground, "the placement is a grounded one: {:?}", h.ctrl.pos);
+        // The one-shot may now legitimately answer `SettledInThisZone` — the body really is
+        // standing on this zone's geometry — so the assertion that used to sit here ("must still
+        // not claim the arrival settled") would now force the OPPOSITE lie. What must still hold is
+        // that any settled verdict is corroborated by the body's actual state, which the two
+        // assertions above pin. The frozen-body case is covered by
+        // `an_armed_frame_denies_the_recovery_ring_the_previous_zones_coordinate`, whose zone has
+        // no floor above its underworld and so still ends held.
     }
 
     // ── #728's first open question: can the two paths co-occur? ──────────────────────────────────
