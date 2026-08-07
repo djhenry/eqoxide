@@ -2839,14 +2839,124 @@ mod tests {
              it on the slab at z=2, grounded — got {:?} on_ground={}", ctrl.pos, ctrl.on_ground);
     }
 
+    /// Does the asset tree carry any evidence that `<name>.glb` names a ZONE, as opposed to a
+    /// character/creature/prop model sitting in the same directory?
+    ///
+    /// **This deliberately does not ask whether the zone's water map is USABLE** (#850, #879
+    /// round-2 BLOCKING 1). The predicate that stood here was
+    /// `maps/water/<name>.wtr` `is_file()`, and a name that failed it was deleted from the corpus
+    /// before the loop — so it was never opened, never entered the rollup, and could not make
+    /// the rollup incomplete. Measured on four scratch corpora against that code, varying only one
+    /// zone's `.wtr`: a CORRUPT file failed the run RED, while DELETING the same file passed
+    /// `ok … — COMPLETE` over a corpus of one, and a DIRECTORY in its place passed too. Deleting a
+    /// broken file made the build greener than fixing nothing, and the directory case collapsed
+    /// `RegionLoadError::Unreadable` into "no water map" — the substitution
+    /// `every_wtr_load_failure_is_a_distinct_named_value_762` in `region_map.rs` exists to forbid.
+    ///
+    /// So membership of the corpus is decided WITHOUT consulting the water map's contents. Three
+    /// signals, and **any one** of them puts the name in the population, where the loader — not a
+    /// filesystem predicate — classifies it as measured or as `unmeasured` with a named reason:
+    ///
+    /// 1. `<name>_doors.glb` — the doors companion a baked zone ships beside it.
+    /// 2. `maps/<name>.txt` — the EQ map pack `ZoneMap::try_load` reads.
+    /// 3. **Any filesystem entry at all** at `maps/water/<name>.wtr`. This uses
+    ///    `symlink_metadata`, not `is_file()`, so a directory, a dangling symlink and an
+    ///    unreadable file all count as evidence and send the name INTO the corpus to fail loudly.
+    ///
+    /// Measured on the default `$EQZONES` at the time of writing, over the 94 non-furniture `.glb`
+    /// names: each of the three signals splits them the same way, 42 with and 52 without, and the
+    /// 52 are exactly the character/creature/prop models. Three signals rather than one because
+    /// each is a separate asset that a partial sync can drop on its own; only a name with **none**
+    /// of them leaves the population.
+    ///
+    /// **The residual, stated rather than hidden.** A `<name>.glb` with none of the three is
+    /// indistinguishable from a creature model by anything on disk, and is excluded — printed by
+    /// name on the discovery line. That is the boundary of what this can know, not an oversight.
+    /// Widening it needs a source of truth outside the asset directory.
+    fn zone_evidence(dir: &std::path::Path, name: &str) -> bool {
+        let entry_at = |p: std::path::PathBuf| p.symlink_metadata().is_ok();
+        entry_at(dir.join(format!("{name}_doors.glb")))
+            || entry_at(dir.join("maps").join(format!("{name}.txt")))
+            || entry_at(dir.join("maps/water").join(format!("{name}.wtr")))
+    }
+
+    /// **The corpus population may never shrink because a water map got WORSE (#850, #879 round-2
+    /// BLOCKING 1).** The universal, in one sentence: *no state of a zone's water asset may produce
+    /// a verdict greener than a strictly better state of the same asset.*
+    ///
+    /// The way that gets violated is a pre-filter. A name removed from the population before the
+    /// loop is a name the rollup cannot see, so it cannot be counted, named, or reddened — and the
+    /// filter's own signal was the very asset whose failure the run is supposed to announce. The
+    /// four-state table below is the shape of the round-2 defect: `is_file()` admitted only the
+    /// first row, dropped rows 2 and 4 silently, and reddened only row 3 — so the two states that
+    /// are no better than row 3 were the two that passed.
+    ///
+    /// This is a unit test over the population predicate, with no baked assets, so CI runs it. The
+    /// other half — that a name IN the population with a bad water map goes RED — belongs to
+    /// `open_corpus_zone`'s DROP 3 and is pinned by its own tests in `water_grid.rs`.
+    #[test]
+    fn no_state_of_a_water_map_can_shrink_the_corpus_population_850() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("maps/water")).unwrap();
+
+        // ── the universal, as a table over the water asset ───────────────────────────────────
+        // Each row is a state of `maps/water/<zone>.wtr` for a name the tree ALREADY says is a
+        // zone (it has a map pack). Every row must stay in the population; what the water map
+        // says is the LOADER's verdict to give, not a filter's.
+        let states: &[(&str, fn(&std::path::Path))] = &[
+            ("a valid-looking .wtr", |p| std::fs::write(p, b"EQEMUWATER\x02\0\0\0\0\0\0\0").unwrap()),
+            ("absent",               |_| ()),
+            ("corrupt",              |p| std::fs::write(p, b"not region data at all").unwrap()),
+            ("a directory",          |p| std::fs::create_dir(p).unwrap()),
+        ];
+        for (what, make) in states {
+            let zone = format!("zone{}", what.replace(|c: char| !c.is_ascii_alphanumeric(), ""));
+            std::fs::write(dir.join(format!("{zone}.glb")), b"").unwrap();
+            std::fs::write(dir.join(format!("maps/{zone}.txt")), b"").unwrap();
+            make(&dir.join(format!("maps/water/{zone}.wtr")));
+            assert!(zone_evidence(dir, &zone),
+                "#850: a zone whose water map is {what} was dropped from the corpus population. \
+                 Every state of that file must leave the zone IN the corpus so the loader can name \
+                 it — filtering here is how DELETING a corrupt .wtr came to make the run greener \
+                 than leaving it in place");
+        }
+
+        // ── each signal alone is enough ──────────────────────────────────────────────────────
+        // A real zone that lost two of the three assets is still a zone, and still has to be
+        // measured or named. Written as three separate names so one signal cannot cover another.
+        let alone: &[(&str, fn(&std::path::Path, &str))] = &[
+            ("only the doors companion", |d, z| { std::fs::write(d.join(format!("{z}_doors.glb")), b"").unwrap(); }),
+            ("only the map pack",        |d, z| { std::fs::write(d.join(format!("maps/{z}.txt")), b"").unwrap(); }),
+            ("only a .wtr directory",    |d, z| { std::fs::create_dir(d.join(format!("maps/water/{z}.wtr"))).unwrap(); }),
+        ];
+        for (i, (what, make)) in alone.iter().enumerate() {
+            let zone = format!("lone{i}");
+            std::fs::write(dir.join(format!("{zone}.glb")), b"").unwrap();
+            make(dir, &zone);
+            assert!(zone_evidence(dir, &zone),
+                "#850: a zone with {what} must still be in the corpus population — the three \
+                 signals are OR'd precisely so a partial asset sync cannot silently shrink it");
+        }
+
+        // ── and the documented residual, pinned so it stays deliberate ───────────────────────
+        // A `.glb` with none of the three is what `bat` and `weapons` are, and is excluded. This
+        // half of the pin is what the `if false` wrap mutation reddens.
+        std::fs::write(dir.join("bat.glb"), b"").unwrap();
+        assert!(!zone_evidence(dir, "bat"),
+            "a .glb with no doors companion, no map pack and no .wtr entry is indistinguishable \
+             from a creature model, and must be excluded and named — admitting it here would red \
+             the real corpus on all 52 character/creature/prop models");
+    }
+
     /// **THE DEPENETRATION CORPUS — the blast-radius harness, committed so its numbers are
     /// reproducible (#649 review, finding 6).**
     ///
     /// Two things at once, over every baked zone found at `$EQZONES` — where **a zone is a
-    /// `<name>.glb` with a matching `maps/water/<name>.wtr`**, not any `.glb` that is not furniture
-    /// (see the discovery block below: that older predicate admitted 52 character/creature/prop
-    /// models as "zones"). Discovery and the per-zone accounting are both asserted, so the counts
-    /// this prints are the corpus, not the survivors:
+    /// `<name>.glb` the asset tree carries zone evidence for** (see `zone_evidence` and the
+    /// discovery block below), not any `.glb` that is not furniture: that older predicate admitted
+    /// 52 character/creature/prop models as "zones". Discovery and the per-zone accounting are both
+    /// asserted, so the counts this prints are the corpus, not the survivors:
     ///
     /// 1. **An ITERATION invariant, driven through the real controller.** The first cut of the #649
     ///    fix shipped a recovery that was itself embedded, and no one-shot harness could see it —
@@ -2913,16 +3023,18 @@ mod tests {
         // that is 55% not-zones is the same confident falsehood #850 is about, one level up from
         // the drop paths.
         //
-        // The predicate is now `maps/water/<name>.wtr exists`, which is what the rest of the tree
-        // already gates a zone corpus on (#807's DROP 3) and, on the same host, splits the 94
-        // exactly: 42 with, 52 without. It is also the predicate this test NEEDS — its whole bucket
-        // partition is `in_water(feet)` x `in_water(chest)`, so a name with no region data
-        // contributes vacuous dry counts and a vacuously-empty water ladder.
+        // The predicate is `zone_evidence` — see its doc comment for what it reads and why it does
+        // NOT read whether the water map loads. Round 2 of this fix used
+        // `maps/water/<name>.wtr` `is_file()` here, which measurably made a DELETED water map
+        // greener than a corrupt one and collapsed `Unreadable` into "missing"; that is #879's
+        // round-2 blocking finding and `no_state_of_a_water_map_can_shrink_the_corpus_population_850`
+        // is the pin. The narrowing this bucket exists for is still needed: the whole sample
+        // partition is `in_water(feet)` x `in_water(chest)`, so a creature model contributes
+        // vacuous dry counts and an empty water ladder.
         //
         // Every entry `read_dir` yields lands in EXACTLY ONE bucket, and the buckets are asserted
         // against the raw entry count below — so the `e.ok()?` / `to_str()?` swallows the old
         // `filter_map` performed (review N2) are counted and named instead of vanishing.
-        let water_dir = dir.join("maps/water");
         let mut entries = 0usize;
         let mut unreadable: Vec<String> = Vec::new();
         let mut non_glb = 0usize;
@@ -2946,7 +3058,7 @@ mod tests {
             let Some(name) = file.strip_suffix(".glb") else { non_glb += 1; continue };
             if name.ends_with("_doors") || name.ends_with("_obj") {
                 furniture.push(name.to_string());
-            } else if !water_dir.join(format!("{name}.wtr")).is_file() {
+            } else if !zone_evidence(&dir, name) {
                 not_a_zone.push(name.to_string());
             } else {
                 zones.push(name.to_string());
@@ -2956,15 +3068,21 @@ mod tests {
         furniture.sort();
         not_a_zone.sort();
         unreadable.sort();
+        // A FUTURE-EDIT guard, not a check on the filesystem (#879 review N4). As the loop above is
+        // written every path increments `entries` and lands in exactly one bucket, so this cannot
+        // fail on any input — a reader must not take a green run here as evidence that the scan saw
+        // what the directory holds. What it catches is the next `continue` added to that loop
+        // without a bucket, which is the shape #850 is about one level up.
         assert_eq!(entries,
             unreadable.len() + non_glb + furniture.len() + not_a_zone.len() + zones.len(),
             "#850: every entry $EQZONES yielded must land in exactly one discovery bucket — \
              {entries} entries vs {} unreadable + {non_glb} non-glb + {} doors/obj + {} non-zone \
              glb + {} zone glb", unreadable.len(), furniture.len(), not_a_zone.len(), zones.len());
         assert!(!zones.is_empty(),
-            "no baked zones at {dir:?} — a zone here is a `<name>.glb` WITH a matching \
+            "no baked zones at {dir:?} — a zone here is a `<name>.glb` the tree carries zone \
+             evidence for: a `<name>_doors.glb`, a `maps/<name>.txt`, or any entry at \
              `maps/water/<name>.wtr` ({entries} entries scanned, {non_glb} non-glb, {} doors/obj, \
-             {} glb with no .wtr)", furniture.len(), not_a_zone.len());
+             {} glb with no zone evidence)", furniture.len(), not_a_zone.len());
         let discovered = zones.len();
 
         // ── #850 / #879 review B1: the ACCOUNTING, owned by a type instead of by call sites ─────
@@ -3067,12 +3185,17 @@ mod tests {
             // iteration that ran to the bottom; anything else leaves the zone `unaccounted`.
             cover.add(name, &zw.tally());
         }
+        // `accounting:` is ZONE accounting only. The rollup's own water total is structurally 0
+        // here (#879 review N6) because this corpus keeps its water numbers in the plain counters
+        // below — the `changed:`/`unchanged:` buckets — and folds a zero-valued tally per zone. The
+        // "0" on that line is not a measurement of anything; the "over N/M zones" and the
+        // COMPLETE/INCOMPLETE verdict are.
         println!("\nzones: discovered={discovered} covered={} embedded={t_emb}\n  \
-                  accounting: {cover}\n  \
-                  discovery: {entries} $EQZONES entries = {discovered} zone glb (with a matching \
-                  maps/water/<name>.wtr) + {} doors/obj glb + {} glb with no .wtr (NOT sampled) + \
+                  accounting (zones only; the leading 0 is not a water measurement): {cover}\n  \
+                  discovery: {entries} $EQZONES entries = {discovered} zone glb (with zone \
+                  evidence) + {} doors/obj glb + {} glb with no zone evidence (NOT sampled) + \
                   {non_glb} non-glb + {} unreadable\n  \
-                  no .wtr, excluded: {not_a_zone:?}\n  \
+                  no zone evidence, excluded: {not_a_zone:?}\n  \
                   unreadable: {unreadable:?}\n  \
                   no floor: {no_floor} of {t_cols} sampled columns\n  \
                   changed: dry-body={ch_dry} wet-chest-dry-feet={ch_chest} \
@@ -3096,13 +3219,15 @@ mod tests {
             "#850: the rollup saw {} zones but discovery found {discovered} — a zone was never even \
              opened, so the corpus is smaller than its own rollup line says",
             cover.attempted_zones());
-        // Sample-level clean-over-nothing: every zone can be measured and still contribute no
-        // probe (an empty grid that somehow reports cols > 0, a floor probe that always misses).
-        // The two assertions below are both satisfied by an empty sample.
+        // CORPUS-level clean-over-nothing, and only that (#879 review N5): `t_emb` is the total
+        // across every zone, so this catches a corpus that probed nothing at all and NOT a corpus
+        // where all but one zone contributed zero probes. It exists because `drifters.is_empty()`
+        // and `ch_dry == 0` below are both vacuously true on an empty sample. A per-zone version
+        // would be the stronger claim and is not what this is.
         assert!(t_emb > 0,
-            "#850: {discovered} zone(s) measured but ZERO embedded samples were found — \
-             `drifters.is_empty()` and `ch_dry == 0` below are vacuous at this coverage \
-             ({no_floor} of {t_cols} sampled columns found no floor)");
+            "#850: {discovered} zone(s) measured but ZERO embedded samples were found across the \
+             WHOLE corpus — `drifters.is_empty()` and `ch_dry == 0` below are vacuous at this \
+             coverage ({no_floor} of {t_cols} sampled columns found no floor)");
         assert!(drifters.is_empty(),
             "a recovery must never itself be embedded — {} sample(s) were STILL MOVING and STILL \
              EMBEDDED after two input-free seconds (the review's finding-1 drift signature): {:?}",
