@@ -91,6 +91,218 @@ pub fn progress_improved(best: &mut f32, d: f32, eps: f32) -> bool {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// #851 — the published `nav_state` word for a walker that HAS a route, as a function of a type.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Which committed route the walker is executing. Until #851 this fact lived ONLY in the published
+/// `nav_state` string (`navigating` vs `navigating_partial`), which is why the #631 no-progress
+/// detector had to read its own published state back (`nav_state_is("navigating")`) to find out
+/// whether the route it is walking reaches the goal. A published string is the wrong home for a
+/// fact the publication itself depends on: the moment a third driving word exists, that read
+/// silently answers a different question. It is a walker field now, and the string is derived
+/// from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommittedRoute {
+    /// The committed route ENDS at the goal (`PlanOutcome::Route`).
+    Complete,
+    /// The committed route is a partial toward a frontier (`PlanOutcome::Exhausted { progress }`) —
+    /// it is not a route to the goal and will be re-planned from its far end.
+    Partial,
+}
+
+impl CommittedRoute {
+    /// The agent-facing word for this route's completeness, used in the `nav_stall` payload.
+    pub fn as_str(self) -> &'static str {
+        match self { CommittedRoute::Complete => "complete", CommittedRoute::Partial => "partial" }
+    }
+}
+
+/// **The walker's verdict on whether the BODY is executing the committed route (#851).**
+///
+/// This is the type that makes "reports progress while going nowhere" unrepresentable at the
+/// publication site — **for values that came out of [`RouteExecution::tick`]**, which is the
+/// precise claim and worth stating as such (#851 review round 1, N2). The variants carry public
+/// fields, so `RouteExecution::Stalled { quiet_ticks: 0, repaths: 0 }` and
+/// `Advancing { quiet_ticks: 5_000 }` are both *values* — nonsense ones, contradicting the field
+/// docs below, that the machine cannot reach but the syntax can write. `#[non_exhaustive]` on each
+/// variant confines that to THIS crate (the idiom `zone_assets::ZoneAssetState` uses). Inside the
+/// crate, a hand-written value still cannot reach `Walker::exec`, for a reason the compiler
+/// enforces rather than a convention: that field is a [`GoalVerdict`], whose fields are private to
+/// THIS module, so `walker.rs` cannot build one out of a `RouteExecution` it wrote itself — the
+/// only `GoalVerdict`s it can obtain come from [`GoalVerdict::fresh_for`] and [`GoalVerdict::tick`].
+/// So: unreachable in production, unconstructible downstream, constructible in this module's own
+/// tests — which is where the fixtures that drive the machine to a named state have to live anyway.
+///
+/// Before #851 the walker's stall knowledge lived in three loose `u32`s
+/// (`stuck_ticks`, `nav_repaths`, `backoff_ticks`), none of which was published anywhere, and the
+/// published `nav_state` was a `&str` literal written once at plan commit. So the whole
+/// stall/back-off/re-path recovery window — ~32 s of it, measured live at the qcat pocket — read as
+/// an unqualified `navigating`. The detection was not missing; it fired at ~3 s and was simply not
+/// observable. See [`driving_nav_state`], which is the total function from this verdict to the word.
+///
+/// **The latch is the point.** `stuck_ticks` is reset to 0 by the stall block the instant it fires,
+/// and a proactive coarse re-plan (#246) reinstalls a fresh route and resets it again — which is
+/// exactly why neither counter can be published as-is: they read "fine" for most of a wedge. This
+/// machine's `quiet_ticks` is its own, and once it reaches [`NAV_STUCK_TICKS`] the verdict stays
+/// [`RouteExecution::Stalled`] until the walker makes REAL progress. Nothing else clears it — not a
+/// back-off, not a re-path, not a fresh route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RouteExecution {
+    /// The body is executing the route: it has made progress within the last `quiet_ticks` ticks,
+    /// and `quiet_ticks < NAV_STUCK_TICKS`.
+    #[non_exhaustive]
+    Advancing { quiet_ticks: u32 },
+    /// The body has STOPPED executing the route: no progress for `quiet_ticks` consecutive ticks
+    /// (`>= NAV_STUCK_TICKS`), with `repaths` stall-recovery re-paths run in the meantime.
+    #[non_exhaustive]
+    Stalled { quiet_ticks: u32, repaths: u32 },
+}
+
+impl RouteExecution {
+    /// The verdict a freshly-aimed goal starts from. Not `Default`, deliberately: this is the state
+    /// of a goal that has just been accepted, and it should be named at the sites that mean that.
+    pub const fn fresh() -> Self { RouteExecution::Advancing { quiet_ticks: 0 } }
+
+    /// Consecutive ticks since the walker last made progress (either channel).
+    pub fn quiet_ticks(self) -> u32 {
+        match self {
+            RouteExecution::Advancing { quiet_ticks } => quiet_ticks,
+            RouteExecution::Stalled { quiet_ticks, .. } => quiet_ticks,
+        }
+    }
+
+    /// Has the body stopped executing the committed route?
+    pub fn is_stalled(self) -> bool { matches!(self, RouteExecution::Stalled { .. }) }
+
+    /// One nav tick (~150 ms). `progressed` is the walker's TWO-CHANNEL progress signal — the same
+    /// one #631 already computes every tick and, until #851, only ever consulted at the 60 s
+    /// give-up: the route cursor advanced by WALKING, or the closest 3-D approach to the goal
+    /// improved by [`NAV_PROGRESS_EPS`]. `repaths` is the live stall-recovery re-path count, carried
+    /// into the verdict so the published payload can say how hard the walker has already tried.
+    ///
+    /// Total, pure and `#[must_use]`: the only way to move this machine is to take its answer.
+    ///
+    /// **The `Stalled` verdict is a LATCH — nothing but real progress clears it — and that is a
+    /// consequence of the line below, not a separate flag.** `quiet_ticks` is MONOTONE: the early
+    /// return is the only place it ever decreases, so once it reaches [`NAV_STUCK_TICKS`] it stays
+    /// there, and the comparison alone re-derives `Stalled` on every subsequent quiet tick.
+    ///
+    /// That matters because the walker's own recovery machinery resets the signals this replaces:
+    /// `stuck_ticks` is set to 0 at every threshold *before* the back-off, so a state published
+    /// from it would have flickered back to a clean reading every ~3 s with the body in exactly the
+    /// same place — a flicker an agent cannot distinguish from a recovery that worked.
+    ///
+    /// This was written the other way first, as `if self.is_stalled() || quiet_ticks >= …`, and the
+    /// mutation check is what removed it: dropping `self.is_stalled() ||` left every test GREEN,
+    /// because it is redundant given monotonicity. Redundant text that no test can distinguish is a
+    /// liability — it reads like the thing carrying the property when the comparison is. The real
+    /// mutation for the latch is one that breaks monotonicity (reset `quiet_ticks` when
+    /// `repaths > 0`, the shape a "the re-path fixed it" bug would take), and it is RED — see
+    /// `a_repath_and_backoff_cannot_launder_the_851_stall`.
+    #[must_use]
+    pub fn tick(self, progressed: bool, repaths: u32) -> Self {
+        if progressed { return RouteExecution::fresh(); }
+        let quiet_ticks = self.quiet_ticks().saturating_add(1);
+        if quiet_ticks >= NAV_STUCK_TICKS {
+            RouteExecution::Stalled { quiet_ticks, repaths }
+        } else {
+            RouteExecution::Advancing { quiet_ticks }
+        }
+    }
+}
+
+/// **A [`RouteExecution`] and the journey it is about, as one value (#851 review round 2, B1).**
+///
+/// A verdict is a fact about ONE goal. Round 2 measured what happens when it is kept in a field and
+/// read by a publisher that never asks which goal it belongs to: a `/follow` chase that was
+/// genuinely walking — 80 u covered in 8 ticks, leader still 220 u off — published
+/// `navigating_stalled` on every tick, carrying the *previous* `/goto`'s `nav_stall` numbers. A
+/// moving walker reading as stalled is the same lie #851 exists to remove, pointing the other way.
+///
+/// The remedy is not another check at the publisher — the walker already had an `exec_goal_id`
+/// field and the publisher simply did not consult it. Here verdict and goal id are ONE value with
+/// PRIVATE
+/// fields, and the only way to get a `RouteExecution` back out is [`GoalVerdict::as_of`], which has
+/// to be told which goal the caller is publishing for. Reading a verdict without naming a goal does
+/// not compile.
+///
+/// A verdict about a different goal answers [`RouteExecution::fresh`] — "nothing is known about
+/// THIS journey yet". That is not a default standing in for a missing answer: a machine that never
+/// observed this goal has, correctly, no evidence that this goal is stalled, and `fresh` is the
+/// value that says so. It is what a walker publishes for its first tick on any goal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GoalVerdict {
+    goal_id: u64,
+    exec:    RouteExecution,
+}
+
+impl GoalVerdict {
+    /// The verdict a freshly-aimed `goal_id` starts from. Not `Default`: a verdict is always about
+    /// some goal, and the goal has to be named.
+    pub const fn fresh_for(goal_id: u64) -> Self {
+        GoalVerdict { goal_id, exec: RouteExecution::fresh() }
+    }
+
+    /// Is this verdict about `goal_id`? For callers that must distinguish "a new journey started"
+    /// from "this journey progressed" — [`crate::walker::Walker`]'s stall clock is one.
+    pub fn is_about(self, goal_id: u64) -> bool { self.goal_id == goal_id }
+
+    /// **The only way to read the verdict.** `goal_id` is the goal the caller is about to publish
+    /// for; a verdict about any other goal reads [`RouteExecution::fresh`] (see the type doc).
+    #[must_use]
+    pub fn as_of(self, goal_id: u64) -> RouteExecution {
+        if self.goal_id == goal_id { self.exec } else { RouteExecution::fresh() }
+    }
+
+    /// One nav tick FOR `goal_id`. Ticking a verdict that belongs to another goal starts that
+    /// goal's own journey rather than continuing the old one's count — the identity rule is
+    /// [`GoalVerdict::as_of`]'s, applied here too, so there is exactly one implementation of it.
+    #[must_use]
+    pub fn tick(self, goal_id: u64, progressed: bool, repaths: u32) -> Self {
+        GoalVerdict { goal_id, exec: self.as_of(goal_id).tick(progressed, repaths) }
+    }
+}
+
+/// `nav_state` for a walker on a complete route that is executing it.
+pub const NAV_STATE_NAVIGATING: &str = "navigating";
+/// `nav_state` for a walker on a PARTIAL route that is executing it.
+pub const NAV_STATE_NAVIGATING_PARTIAL: &str = "navigating_partial";
+/// `nav_state` for a walker that HAS a route and is NOT executing it (#851) — "route in hand,
+/// execution not progressing, still retrying". IN-PROGRESS, not terminal: the walker is still in
+/// its stall/back-off/re-path recovery and may well escape (and if it does not, it terminates at
+/// `blocked` as before). It is deliberately NOT on [`crate::walker::TERMINAL_NAV_STATES`] — see the
+/// argument on `nav_state_is_terminal` for why an unlisted in-progress word retires honestly while
+/// an unlisted terminal one would be destroyed.
+pub const NAV_STATE_NAVIGATING_STALLED: &str = "navigating_stalled";
+
+/// **THE mapping from (what route is committed, is the body executing it) to the published
+/// `nav_state` word (#851).** Total, and that totality is the guarantee: there is no
+/// (`CommittedRoute`, [`RouteExecution`]) pair that yields `navigating` or `navigating_partial`
+/// while the verdict is [`RouteExecution::Stalled`], because the `Stalled` arm is matched FIRST and
+/// does not look at the route at all. A caller cannot "forget" to check the stall, because there is
+/// no route through this function that does not.
+///
+/// **What that proves, and what it does not.** It proves that every word produced HERE agrees with
+/// the verdict. It does NOT prove that `navigating` is unreachable by other means:
+/// `Walker::set_nav_state_because` takes a `&str`, so any writer in `eqoxide-nav` can still publish
+/// the literal. What #851 changes is that the walker's own driving publication goes through this
+/// function and nothing else — checked by
+/// `walker::tests::the_driving_nav_state_word_is_only_ever_written_through_the_verdict_851`, which
+/// is a source scan (a grep-checkable convention, an alarm on the likely edit) and not a type. The
+/// structural remedy is the workspace-wide typed `state` `NavStatus::retire_to_idle`'s doc already
+/// records as out of scope; this is the strongest version available without it, and the difference
+/// is stated rather than implied.
+pub fn driving_nav_state(route: CommittedRoute, exec: RouteExecution) -> &'static str {
+    match exec {
+        RouteExecution::Stalled { .. } => NAV_STATE_NAVIGATING_STALLED,
+        RouteExecution::Advancing { .. } => match route {
+            CommittedRoute::Complete => NAV_STATE_NAVIGATING,
+            CommittedRoute::Partial  => NAV_STATE_NAVIGATING_PARTIAL,
+        },
+    }
+}
+
 /// The HORIZONTAL distance from the committed route's ENDPOINT to the goal the caller named
 /// (#631 gap 2). `route_end` is the last waypoint of the committed route (`None` for a definitive
 /// no-route). A COMPLETE route ends exactly at the requested XY, so this is `0.0`; a partial route
@@ -4047,6 +4259,266 @@ mod tests {
             "a vertical-only difference is goal_snapped's channel, not a horizontal offset");
         // A DEFINITIVE no-route is not a re-anchoring — there is no committed destination to disclose.
         assert_eq!(route_goal_offset(None, [1.0, 2.0, 3.0]), 0.0);
+    }
+
+    /// **#851 — THE UNIVERSAL: the walker's published driving word NEVER reads as unqualified
+    /// progress while the body has stopped making progress.**
+    ///
+    /// "Never" is a universal, and no finite number of live runs discharges one — a race that
+    /// usually wins is indistinguishable from a race that cannot lose. So this is an EXHAUSTIVE
+    /// MODEL CHECK of the state machine, not a sampled or bounded-length one: it closes, by
+    /// breadth-first search, the whole reachable product of ([`RouteExecution`] × an INDEPENDENT
+    /// oracle) under every input, and asserts the invariant at every reachable pair. Because the
+    /// search CLOSES, the result holds for input sequences of any length, including ones longer than
+    /// any enumeration could reach.
+    ///
+    /// **The oracle is computed from the input history, not from the machine.** It is a single
+    /// number — how many consecutive ticks the caller has reported no progress — advanced by the
+    /// test's own rule (`+1` on no progress, `0` on progress). The invariant is stated over the
+    /// ORACLE: whenever it says the body has been quiet for at least [`NAV_STUCK_TICKS`] ticks, the
+    /// word [`driving_nav_state`] produces must not be `navigating` or `navigating_partial`, for
+    /// EITHER committed route. A machine that cleared its own stall on a re-path, or on a fresh
+    /// route, or on anything other than real progress, is caught, because the oracle does not clear
+    /// on those.
+    ///
+    /// **Why the search is finite, stated rather than assumed.** `RouteExecution::quiet_ticks` grows
+    /// without bound, so the raw product is infinite; the search is run over a QUOTIENT that caps it
+    /// at `NAV_STUCK_TICKS`. That quotient is a bisimulation of the real machine, for two reasons
+    /// that are both *checked below* rather than merely argued:
+    ///   1. [`driving_nav_state`] never reads `quiet_ticks` — checked by the first assertion in the
+    ///      body below (its condition is bound to a named `let` that says so).
+    ///   2. two states the cap identifies step to the SAME capped successor, for every input —
+    ///      checked by the second assertion, as an equality of successors and not merely of
+    ///      `.is_stalled()`. That distinction is the whole premise: successor equality is what a
+    ///      bisimulation needs, and the parity form this test carried first was measurably weaker —
+    ///      a `tick` branching on the SOURCE state's exact `quiet_ticks` into `repaths` breaks the
+    ///      quotient and leaves parity, and the entire model check, green (#851 review round 1). Do
+    ///      not weaken it back. The body below records what this premise does NOT cover, measured
+    ///      rather than assumed. (`Advancing` can never hold `quiet_ticks >= NAV_STUCK_TICKS` by
+    ///      construction, so the cap is a no-op on that variant — asserted inside `cap` itself.)
+    /// So two states identified by the cap have identical futures and identical published words, and
+    /// covering the quotient covers the infinite original.
+    ///
+    /// **What this test does and does not establish.** It establishes the invariant over the
+    /// reachable product of the verdict machine and its oracle: no input sequence, of any length,
+    /// drives [`driving_nav_state`] to a progress word while the body has been quiet for
+    /// [`NAV_STUCK_TICKS`] ticks. It says nothing about whether the WALKER feeds this machine the
+    /// right `progressed` signal, nor about what any other writer of `NavStatus::state` publishes —
+    /// those are `walker.rs`'s tests and the source scan
+    /// `the_driving_nav_state_word_is_only_ever_written_through_the_verdict_851`.
+    ///
+    /// **Three controls, so a vacuously-green run is impossible.** REACH: the search must visit the
+    /// cap. NON-DEGENERACY: all three driving words must be produced somewhere in the reachable set
+    /// (otherwise a `driving_nav_state` gutted to always answer `navigating_stalled` passes
+    /// perfectly). COUNTING: the reachable set must be larger than the threshold.
+    ///
+    /// **Mutation checks, both directions** (run at authoring time — outputs in the PR):
+    ///   * break `quiet_ticks` monotonicity in [`RouteExecution::tick`] by resetting it on a re-path
+    ///     (the shape a "the re-path fixed it" bug takes) → RED on the invariant (the
+    ///     machine un-stalls itself on a re-path while the oracle stays quiet). Dropping the
+    ///     `self.is_stalled() ||` clause the first draft had instead was EQUIVALENT — see
+    ///     [`RouteExecution::tick`], which is why that clause is gone;
+    ///   * WRAP the `Stalled` arm of [`driving_nav_state`] in `if false { … }` so it falls through
+    ///     to the route match → RED on the invariant;
+    ///   * make [`driving_nav_state`] answer `NAV_STATE_NAVIGATING_STALLED` unconditionally → RED on
+    ///     the non-degeneracy control, not silently green.
+    #[test]
+    fn a_stalled_verdict_can_never_be_published_as_unqualified_progress_851() {
+        use std::collections::HashSet;
+        let routes = [CommittedRoute::Complete, CommittedRoute::Partial];
+
+        // Cap `quiet_ticks` at the threshold. Sound by the two premises checked immediately below —
+        // which are stated in terms of this closure, hence its position above them.
+        let cap = |e: RouteExecution| match e {
+            RouteExecution::Advancing { quiet_ticks } => {
+                assert!(quiet_ticks < NAV_STUCK_TICKS,
+                    "an `Advancing` verdict must never hold {quiet_ticks} >= NAV_STUCK_TICKS quiet ticks");
+                e
+            }
+            RouteExecution::Stalled { quiet_ticks, repaths } =>
+                RouteExecution::Stalled { quiet_ticks: quiet_ticks.min(NAV_STUCK_TICKS), repaths },
+        };
+        // The input alphabet. `repaths` is modelled as {0, 1, 8} — never re-pathed, mid-recovery,
+        // and at the walker's give-up cap — because it is carried into the verdict, and a machine
+        // that (wrongly) reset on a re-path must have a re-path to reset on.
+        let inputs: Vec<(bool, u32)> = [false, true].iter()
+            .flat_map(|&p| [0u32, 1, 8].iter().map(move |&r| (p, r))).collect();
+
+        // ── The two bisimulation premises, CHECKED (see the doc above) ────────────────────────
+        // 1. the published word does not depend on `quiet_ticks`…
+        for &r in &routes {
+            let word_ignores_quiet_ticks = (NAV_STUCK_TICKS..NAV_STUCK_TICKS + 50).all(|q|
+                driving_nav_state(r, RouteExecution::Stalled { quiet_ticks: q, repaths: 3 })
+                    == driving_nav_state(r, RouteExecution::Stalled { quiet_ticks: NAV_STUCK_TICKS, repaths: 3 }));
+            assert!(word_ignores_quiet_ticks,
+                "the quotient below is unsound: `driving_nav_state` reads `quiet_ticks`");
+        }
+        // 2. …and the TRANSITION, once stalled, lands two capped-identical states on the SAME capped
+        //    successor — for every input, not merely on the same `is_stalled()` answer.
+        //
+        //    Successor EQUALITY is what a bisimulation needs, and the first draft of this premise
+        //    compared `.is_stalled()` parity instead (#851 review round 1). That is strictly weaker:
+        //    a `tick` that branches on the SOURCE state's exact `quiet_ticks` into any field the
+        //    parity check does not inspect breaks the quotient while satisfying the premise.
+        //
+        //    "Write `repaths: 999` at the cap" has TWO readings, and they do not behave alike. Both
+        //    were RUN, because the difference is exactly the scope of this premise (round-2 outputs
+        //    are in the PR comment):
+        //
+        //      * SOURCE reading — branch on the state being stepped FROM. This is the one that
+        //        breaks the quotient, and it is RED right here, reporting
+        //        `left: Stalled { quiet_ticks: 20, repaths: 0 }` against
+        //        `right: Stalled { quiet_ticks: 20, repaths: 999 }`. Do not weaken this back.
+        //
+        //      * SUCCESSOR reading — branch on the value being written. This premise CANNOT see it,
+        //        and does not claim to: every source state quantified over below already holds
+        //        `quiet_ticks >= NAV_STUCK_TICKS`, so every successor holds one MORE than that, and
+        //        the mutated branch never fires. It fires only on the ENTRY transition, which the
+        //        quotient is not about. Measured GREEN here and across the whole model check, with
+        //        the flip-boundary test below the one that kills it (263 passed / 1 failed over
+        //        `-p eqoxide-nav --lib`). That division of labour is deliberate: this premise is
+        //        about the cap being SOUND, not about the flip being in the right place.
+        for q in NAV_STUCK_TICKS..NAV_STUCK_TICKS + 50 {
+            for (progressed, repaths) in inputs.iter().copied() {
+                let from_q   = cap(RouteExecution::Stalled { quiet_ticks: q, repaths: 3 }
+                                    .tick(progressed, repaths));
+                let from_cap = cap(RouteExecution::Stalled { quiet_ticks: NAV_STUCK_TICKS, repaths: 3 }
+                                    .tick(progressed, repaths));
+                assert_eq!(from_q, from_cap,
+                    "the quotient below is unsound: `tick` branches on the exact `quiet_ticks` ({q}) \
+                     — capped successors differ under (progressed={progressed}, repaths={repaths})");
+            }
+        }
+
+        // The oracle saturates at the same place as `cap`, for the same reason: past the threshold
+        // the invariant's antecedent is already true and cannot become false without a `progressed`.
+        let oracle_cap = NAV_STUCK_TICKS;
+
+        let start = (RouteExecution::fresh(), 0u32);
+        let mut seen: HashSet<(RouteExecution, u32)> = HashSet::new();
+        let mut queue = vec![start];
+        seen.insert(start);
+        let mut reached_saturation = false;
+        let mut words: HashSet<&'static str> = HashSet::new();
+        let mut visited = 0usize;
+
+        while let Some((exec, quiet)) = queue.pop() {
+            visited += 1;
+            if quiet >= oracle_cap { reached_saturation = true; }
+            for route in routes {
+                let word = driving_nav_state(route, exec);
+                words.insert(word);
+                // THE UNIVERSAL, stated over the ORACLE.
+                if quiet >= NAV_STUCK_TICKS {
+                    assert_ne!(word, NAV_STATE_NAVIGATING,
+                        "#851: published `navigating` after {quiet} quiet ticks (verdict {exec:?})");
+                    assert_ne!(word, NAV_STATE_NAVIGATING_PARTIAL,
+                        "#851: published `navigating_partial` after {quiet} quiet ticks (verdict {exec:?})");
+                }
+                // The other direction, so the machine cannot buy the invariant by crying wolf: the
+                // stalled WORD may only come from a stalled VERDICT, and a stalled verdict may never
+                // coexist with an oracle that has just seen real progress.
+                if word == NAV_STATE_NAVIGATING_STALLED {
+                    assert!(exec.is_stalled(), "the stalled WORD must come from a stalled VERDICT");
+                }
+                assert!(!(exec.is_stalled() && quiet == 0),
+                    "#851: the verdict must clear the instant real progress is made (quiet=0)");
+            }
+            for (progressed, repaths) in inputs.iter().copied() {
+                let next = (cap(exec.tick(progressed, repaths)),
+                            if progressed { 0 } else { (quiet + 1).min(oracle_cap) });
+                if seen.insert(next) { queue.push(next); }
+            }
+        }
+
+        // CONTROL 1 (REACH): the search really did explore past the stall threshold.
+        assert!(reached_saturation,
+            "the model check never reached {oracle_cap} quiet ticks — the invariant above was checked \
+             only where it is trivially true (visited {visited} states)");
+        // CONTROL 2 (COUNTING): the reachable set is at least one state per tick up to the threshold.
+        assert!(visited > NAV_STUCK_TICKS as usize,
+            "the reachable product collapsed to {visited} states — the machine is not counting");
+        // CONTROL 3 (NON-DEGENERACY): all three driving words are genuinely produced.
+        for w in [NAV_STATE_NAVIGATING, NAV_STATE_NAVIGATING_PARTIAL, NAV_STATE_NAVIGATING_STALLED] {
+            assert!(words.contains(w),
+                "`{w}` is never produced anywhere in the reachable set — the invariant is vacuous");
+        }
+    }
+
+    /// **The threshold is the walker's own, and it is REACHED — not merely written (#851).**
+    ///
+    /// The model check above proves the machine never contradicts its oracle. It does not pin WHERE
+    /// the machine flips, and a machine that flipped at tick 1 (or at tick 10_000) would satisfy it
+    /// just as well. One of those is a client that shouts `navigating_stalled` at every wall-slide;
+    /// the other is the ~32 s lie #851 exists to remove. This walks the machine tick by tick and
+    /// names the boundary on both sides.
+    #[test]
+    fn the_execution_verdict_flips_at_the_walkers_own_stall_threshold_851() {
+        let mut exec = RouteExecution::fresh();
+        for i in 1..NAV_STUCK_TICKS {
+            exec = exec.tick(false, 0);
+            assert!(!exec.is_stalled(),
+                "flipped at tick {i}, before the walker's own {NAV_STUCK_TICKS}-tick stall line — a \
+                 brief wall-slide would be reported as a wedge");
+            assert_eq!(driving_nav_state(CommittedRoute::Complete, exec), NAV_STATE_NAVIGATING);
+        }
+        exec = exec.tick(false, 0);
+        assert_eq!(exec, RouteExecution::Stalled { quiet_ticks: NAV_STUCK_TICKS, repaths: 0 },
+            "the verdict must flip exactly at NAV_STUCK_TICKS (~{}s at the 150ms nav tick)",
+            NAV_STUCK_TICKS * 150 / 1000);
+        assert_eq!(driving_nav_state(CommittedRoute::Complete, exec), NAV_STATE_NAVIGATING_STALLED);
+        assert_eq!(driving_nav_state(CommittedRoute::Partial,  exec), NAV_STATE_NAVIGATING_STALLED,
+            "a stalled PARTIAL is not `navigating_partial` either — that word is a progress claim too");
+
+        // A re-path does not launder it: eight of them, the walker's whole recovery budget, with the
+        // body never moving. This is the #851 measurement's own shape.
+        for repaths in 1..=8u32 {
+            for _ in 0..(NAV_STUCK_TICKS + NAV_BACKOFF_TICKS) {
+                exec = exec.tick(false, repaths);
+                assert!(exec.is_stalled(), "re-path {repaths} laundered the stall into progress");
+            }
+        }
+        // …and REAL progress clears it on the very next tick.
+        exec = exec.tick(true, 8);
+        assert_eq!(exec, RouteExecution::fresh(), "real progress must clear the verdict immediately");
+        assert_eq!(driving_nav_state(CommittedRoute::Complete, exec), NAV_STATE_NAVIGATING);
+    }
+
+    /// **A verdict about one goal is not evidence about another (#851 review round 2, B1) — the
+    /// rule, in isolation from any walker.**
+    ///
+    /// [`GoalVerdict`] exists because the walker kept the verdict and the goal id in two fields and
+    /// one publisher read only the first. Here the whole rule is one function, so there is nothing
+    /// left to forget to consult: every read names a goal. The walker-level trajectory that was
+    /// measured wrong is pinned separately by
+    /// `crate::walker::tests::a_moving_follow_chase_never_publishes_the_previous_goals_851_stall`.
+    ///
+    /// Mutation checks: make [`GoalVerdict::as_of`] ignore its argument → RED here (and RED at the
+    /// walker level); make [`GoalVerdict::tick`] continue the stored verdict instead of
+    /// `self.as_of(goal_id)` → RED on the last block here.
+    #[test]
+    fn a_goal_verdict_is_only_evidence_about_its_own_goal_851() {
+        // Wedge goal #1 all the way to the latch.
+        let mut v = GoalVerdict::fresh_for(1);
+        for _ in 0..NAV_STUCK_TICKS { v = v.tick(1, false, 3); }
+        assert!(v.as_of(1).is_stalled(), "PREMISE: goal #1 really is latched stalled");
+        assert_eq!(driving_nav_state(CommittedRoute::Complete, v.as_of(1)),
+            NAV_STATE_NAVIGATING_STALLED, "and it publishes as such for its OWN goal");
+
+        // The same value, read for a DIFFERENT goal, is not evidence of anything about that goal.
+        assert!(!v.as_of(2).is_stalled(),
+            "#851 B1: goal #1's wedge must not be readable as goal #2's verdict");
+        assert_eq!(v.as_of(2), RouteExecution::fresh(),
+            "…and what it reads instead is the honest 'nothing observed on this journey yet'");
+        assert_eq!(driving_nav_state(CommittedRoute::Complete, v.as_of(2)), NAV_STATE_NAVIGATING);
+        assert!(v.is_about(1) && !v.is_about(2), "the verdict names which journey it is about");
+
+        // Ticking for a new goal starts THAT goal's count — it does not continue goal #1's.
+        let v2 = v.tick(2, false, 0);
+        assert_eq!(v2.as_of(2), RouteExecution::Advancing { quiet_ticks: 1 },
+            "#851 B1: goal #2's first quiet tick is its FIRST, not goal #1's twenty-first");
+        assert!(!v2.as_of(1).is_stalled(),
+            "…and goal #1's verdict is gone, not shadowed — it is one value, not two");
     }
 
     /// **#631 gap 3: the no-progress property — TERMINATE a lap that never closes on the goal, and
