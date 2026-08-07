@@ -211,7 +211,7 @@ across two reads means nothing was drawn in between.
 | Route | Description |
 |-------|-------------|
 | `POST /v1/lifecycle/camp` | Toggle a camp (start, or cancel one in progress). A completed camp shuts the client down cleanly with no linkdead. |
-| `POST /v1/lifecycle/exit` | Camp out (idempotent `Start`), then cleanly shut the process down (~30s). |
+| `POST /v1/lifecycle/exit` | Camp out (idempotent `Start`), then cleanly shut the process down (~30s). **Deliberately not gated on a live session** — tearing a zombie session down is what it is for. When `net_thread_dead` is non-null the camp cannot be sent (nothing is left to drain it), so the 200 body says so instead of promising a camp-out, and warns that this shutdown leaves a **linkdead** session; the teardown still proceeds (#890). |
 | `POST /v1/lifecycle/respawn` | Revive a slain character at its bind point. On death the client now HOLDS the character dead (no auto-respawn) so an agent can inspect `dead`/`killed_by` in `/v1/observe/debug` and recover its corpse; this releases it. No-op (still 200) if not currently dead. (#284) |
 
 ---
@@ -1406,7 +1406,10 @@ has ended, for any reason:
 When it is non-null, **every world field in the payload is a final frozen snapshot** — position,
 zone, entities, vitals — and it will never change again. Stop polling; do not retry commands.
 Write commands are refused with `503` naming this field (the reason string is relayed verbatim), so
-an agent that ignores it still cannot get a false `200`.
+an agent that ignores it still cannot get a false `200`. **The one deliberate exception is
+`POST /v1/lifecycle/exit`**, which must work on a dead session because tearing one down is its job;
+it answers `200`, and its body says the camp cannot be sent and the shutdown will linkdead rather
+than describing the healthy camp-out path (#890).
 
 **A live socket does not prove a live world — that's what `world_responsive` is for (#371).** A
 wedged zone (its main loop stalled on a script/DB call/deadlock, or merely severely slow) keeps
