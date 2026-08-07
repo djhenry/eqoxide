@@ -765,7 +765,11 @@ terminal fact the client can name in a `503`. "Not published yet" and "not sent 
 terminal moment to report, and unlike the geometry gate there is no `ready` to wait for. Treat `[]`
 from this endpoint as *not yet known*. Re-listing is the usual recourse; if you need to tell the
 two apart, packet capture (`GET /v1/observe/packets`, opcode `0x7291`) records `OP_SpawnDoor`
-arrivals independently of whether this endpoint has published them.
+arrivals independently of whether this endpoint has published them — but **capture is default-off
+and not retroactive**, so it must already have been enabled when the records landed. Enabling it
+*after* you see `[]` returns `count: 0` with `enabled: true`, which is the same false-negative this
+paragraph is warning you about, wearing a different hat. Check the `enabled` field before reading
+any conclusion into a zero count.
 
 `POST /v1/move/goto` still accepts the goal, but its response carries a non-null
 **`zone_assets_pending`** note while the assets are missing, and `nav_state` reads `zone_loading`
