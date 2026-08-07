@@ -211,7 +211,7 @@ across two reads means nothing was drawn in between.
 | Route | Description |
 |-------|-------------|
 | `POST /v1/lifecycle/camp` | Toggle a camp (start, or cancel one in progress). A completed camp shuts the client down cleanly with no linkdead. |
-| `POST /v1/lifecycle/exit` | Camp out (idempotent `Start`), then cleanly shut the process down (~30s). **Deliberately not gated on a live session** — tearing a zombie session down is what it is for. When `net_thread_dead` is non-null no camp can be sent (nothing is left to drain it), so the 200 body says so instead of promising a camp-out, relays the thread's own reason verbatim, and says the process will exit via the 45s watchdog rather than in ~30s. Which body you get depends on WHICH state the thread is in, because the three are not interchangeable: a lost session (panic / fatal error / unexpected return) warns that the server declares a **linkdead** drop on its own timer — this shutdown inherits that, it does not cause it; a shutdown already under way says so and reports that this request changes nothing; and `--testzone`, where the thread was never started, says there is no server session at all and nothing is left linkdead. The teardown proceeds in every case (#890). |
+| `POST /v1/lifecycle/exit` | Camp out (idempotent `Start`), then cleanly shut the process down (~30s). **Deliberately not gated on a live session** — tearing a zombie session down is what it is for. When `net_thread_dead` is non-null no camp can be sent (nothing is left to drain it), so the 200 body says so instead of promising a camp-out and relays the thread's own reason verbatim. Which body you get depends on WHICH state the thread is in, because the three are not interchangeable: a lost session (panic / fatal error / unexpected return) warns that the server declares a **linkdead** drop on its own timer — this shutdown inherits that, it does not cause it; a shutdown already under way says so and reports that this request changes nothing; and `--testzone`, where the thread was never started, says there is no server session at all and nothing is left linkdead. The first and third also say the process will exit via the 45s watchdog rather than in ~30s; the already-shutting-down one does not, because that process exits through its own main loop instead. The teardown proceeds in every case (#890). **Residual:** a net thread that is merely *wedged* has not ended, so `net_thread_dead` is still `null` and this endpoint still answers with the camp-out body even though nothing will drain that camp — cross-check `snapshot_age_ms`. |
 | `POST /v1/lifecycle/respawn` | Revive a slain character at its bind point. On death the client now HOLDS the character dead (no auto-respawn) so an agent can inspect `dead`/`killed_by` in `/v1/observe/debug` and recover its corpse; this releases it. No-op (still 200) if not currently dead. (#284) |
 
 ---
@@ -1496,6 +1496,7 @@ has ended, for any reason:
 | a fatal error (login retries exhausted, server-rejected create) | `"the eq-net thread exited with a fatal error (<e>) — …"` |
 | it returned with no shutdown requested | `"…returned WITHOUT a shutdown being requested — …"` |
 | it returned while a shutdown WAS requested | `"…exited normally after a shutdown was requested — …"` |
+| `--testzone` (offline renderer; no thread was ever started) | `"--testzone: the eq-net thread was never started …"` |
 
 That fourth row is **not** the ordinary `/v1/lifecycle/exit` teardown, despite what an earlier
 revision of this table said. On the ordinary teardown the gameplay loop calls
@@ -1503,8 +1504,6 @@ revision of this table said. On the ordinary teardown the gameplay loop calls
 this field stays `null` for the whole shutdown. Reaching that row needs the gameplay phase to
 return for some other reason (a zone-transition failure, a server-side session drop) inside a
 shutdown window (#890).
-
-| `--testzone` (offline renderer; no thread was ever started) | `"--testzone: the eq-net thread was never started …"` |
 
 **Read it together with `snapshot_age_ms`, not instead of it.** They answer different questions:
 
@@ -1523,10 +1522,11 @@ an agent that ignores it still cannot get a false `200`.
 **`POST /v1/lifecycle/exit` is the deliberate exception among the commands that reach the server**,
 because it must work on a dead session — tearing one down is its job. It answers `200`, and its body
 describes the state the net thread is actually in rather than the healthy camp-out path: the camp
-cannot be sent, so the shutdown cannot end the session with a clean camp-out (#890). (Two other
-`POST`s also skip the guard without being exceptions to the sentence above, because neither reaches
-the server: `/v1/camera` + `/v1/camera/reset`, drained by the render thread, and `/v1/social/friends`,
-which is documented client-local and sends no packet.)
+cannot be sent, so the shutdown cannot end the session with a clean camp-out (#890). (Counted from
+the route table: 58 write routes, of which **4** skip the guard. The other three are not exceptions
+to the sentence above, because none of them reaches the server: `POST /v1/camera` and
+`/v1/camera/reset`, drained by the render thread, and `/v1/social/friends`, which is documented
+client-local and sends no packet.)
 
 **A live socket does not prove a live world — that's what `world_responsive` is for (#371).** A
 wedged zone (its main loop stalled on a script/DB call/deadlock, or merely severely slow) keeps

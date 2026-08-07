@@ -54,7 +54,19 @@ async fn post_camp(State(s): State<HttpState>) -> (StatusCode, String) {
 /// (CAMP_DURATION ≈ 30s) so it never force-kills mid-camp (which WOULD linkdead); 45s gives margin.
 const EXIT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// `post_exit`'s 200 body on the healthy path: a camp really is going to be sent and drained.
+/// `post_exit`'s 200 body when the net thread has NOT published a terminal state.
+///
+/// ⚠️ RESIDUAL, and it is the honest limit of this whole PR (#935 review N2). `None` means "has not
+/// ended", NOT "is healthy" — see [`eqoxide_ipc::NetThreadDeadShared`]. A net thread that is wedged,
+/// deadlocked or livelocked never unwinds, so it publishes nothing and still reads `None` here, and
+/// this body promises it a ~30 s camp-out that nothing will drain. [`watchdog_reason`] is honest
+/// about that same state 45 s later (`camp-not-drained`); this body is not, because nothing at
+/// request time distinguishes a wedged thread from a working one.
+///
+/// Not fixed here on purpose: the signal that WOULD distinguish them is the snapshot-staleness clock
+/// `require_live_session` already computes, and wiring it in is a behaviour change (a 200 that
+/// changes wording on a timer) rather than the wording fix #890 asks for. So this doc states the
+/// limit rather than the constant asserting a drain it cannot know about.
 const EXIT_BODY_CAMPING: &str = "camping out, then shutting down (~30s)";
 
 /// `post_exit`'s 200 body when the net thread ENDED without anyone having asked it to — a panic, a
@@ -266,7 +278,8 @@ async fn post_exit(State(s): State<HttpState>) -> (StatusCode, String) {
 mod tests {
     use super::{
         exit_body, router, run_exit_watchdog, watchdog_reason, watchdog_reason_now,
-        EXIT_BODY_CAMPING, EXIT_WATCHDOG,
+        EXIT_BODY_CAMPING, EXIT_BODY_NO_NET_THREAD, EXIT_BODY_SESSION_LOST,
+        EXIT_BODY_SHUTDOWN_UNDER_WAY, EXIT_WATCHDOG,
     };
     use crate::testkit::empty_state;
     use crate::HttpState;
@@ -275,15 +288,37 @@ mod tests {
     use eqoxide_ipc::{NetThreadDeath, NetThreadEnd};
     use tower::ServiceExt;
 
-    /// Every `NetThreadEnd`, so the loops below cannot silently stop covering one. Written out
-    /// rather than derived: a future variant must break these tests, not slip through them.
-    const ALL_ENDS: [NetThreadEnd; 5] = [
-        NetThreadEnd::Panicked,
-        NetThreadEnd::Fatal,
-        NetThreadEnd::ReturnedDuringShutdown,
-        NetThreadEnd::ReturnedUnexpectedly,
-        NetThreadEnd::NeverStarted,
+    /// Every `NetThreadEnd`, DERIVED from the enum declaration itself (`eqoxide-ipc`'s
+    /// `net_thread_end!`), so the loops below cannot stop covering one.
+    ///
+    /// #935 review B3, measured: this used to be a hand-written `[NetThreadEnd; 5]` beside a comment
+    /// claiming "a future variant must break these tests". It did not. A sixth variant wired to
+    /// `EXIT_BODY_SESSION_LOST` / `"net-thread-dead"` — the exact silent inheritance these tests
+    /// exist to forbid — shipped fully green, because a hand-written array does not change when the
+    /// enum does. The exhaustive `match`es force an author to WRITE an arm; only this forces the
+    /// arm to be TESTED. Pair it with `every_net_thread_end_is_wired_deliberately`, which needs a
+    /// hand-written row per end, so a new variant reds a test until someone states its intent.
+    fn all_ends() -> impl Iterator<Item = NetThreadEnd> {
+        NetThreadEnd::ALL.iter().copied()
+    }
+
+    /// Terms that predict re-login behaviour. #935 review B3(r2), measured: the healthy-path tail of
+    /// `no_exit_body_makes_a_claim_about_logging_back_in` checked only ONE of these, so appending
+    /// "this character will be able to relog straight back in with no linkdead ghost" to
+    /// `EXIT_BODY_CAMPING` shipped fully green — on the one state where a re-login promise is most
+    /// tempting to write. Every body, `None` included, is now checked against the whole list.
+    const RELOGIN_TERMS: [&str; 6] = [
+        "log straight back", "log back in", "logging back in", "re-login", "relog", "linkdead ghost",
     ];
+
+    fn assert_says_nothing_about_relogin(body: &str, what: &str) {
+        let lowered = body.to_lowercase();
+        for forbidden in RELOGIN_TERMS {
+            assert!(!lowered.contains(forbidden),
+                "{what}: the body must not predict re-login behaviour nobody measured \
+                 (found {forbidden:?}): {body:?}");
+        }
+    }
 
     /// Drive the real route (not just the helper) and hand back its 200 body. Going through the
     /// router is the point: a branch that exists but is not wired to the handler would still pass a
@@ -358,23 +393,22 @@ mod tests {
     /// log straight back in the way a camped-out one can". Nobody measured that, from either side —
     /// and `gameplay.rs` states the opposite as tracked fact ("the next login DropClient-kicks the
     /// ghost"). An unverified claim swapped for another unverified claim is not the fix #890 asks
-    /// for, so the body says NOTHING about re-login in any state. Re-add a re-login clause of any
-    /// polarity and this goes RED.
+    /// for, so the body says NOTHING about re-login in ANY state — including the healthy one, which
+    /// this test used to check against a single term while claiming it checked all of them
+    /// (#935 review B2(r2)). Re-add a re-login clause of any polarity, on any state, and this
+    /// goes RED.
     #[tokio::test]
     async fn no_exit_body_makes_a_claim_about_logging_back_in() {
-        for end in ALL_ENDS {
+        for end in all_ends() {
             let state = empty_state();
             publish(&state, end, "synthetic reason for this test");
             let body = post_exit_body(state).await;
-            let lowered = body.to_lowercase();
-            for forbidden in ["log straight back", "log back in", "re-login", "relog"] {
-                assert!(!lowered.contains(forbidden),
-                    "{end:?}: the body must not predict re-login behaviour nobody measured \
-                     (found {forbidden:?}): {body:?}");
-            }
+            assert_says_nothing_about_relogin(&body, &format!("{end:?}"));
         }
+        // The `None` state gets the SAME list, not a subset of it. A promise about relogging is
+        // most tempting exactly here, where a camp really is being sent — and still unmeasured.
         let healthy = post_exit_body(empty_state()).await;
-        assert!(!healthy.to_lowercase().contains("log back in"), "…on the healthy path either");
+        assert_says_nothing_about_relogin(&healthy, "the healthy path (net thread alive)");
     }
 
     /// #935 review N1: the causality was backwards. `impl Drop for EqStream` sends no
@@ -454,20 +488,73 @@ mod tests {
             "whether THIS session camped out was decided by the earlier shutdown: {body:?}");
     }
 
-    /// Every state gets its OWN body: no two ends may share one, or the distinction the type exists
-    /// to carry is not reaching the wire. (The three unplanned-loss ends legitimately share a head,
-    /// so the relayed reason is what separates them — which is the point of relaying it.)
+    /// The RELAYED REASON must reach the wire for every state, so two ends that share a head are
+    /// still told apart by an agent reading the body.
+    ///
+    /// #935 review N3: an earlier name and message ("each state produces a distinguishable body" /
+    /// "reuses another state's body verbatim") overstated this. Three ends share
+    /// `EXIT_BODY_SESSION_LOST` **verbatim** in production and differ ONLY in the reason this
+    /// function relays; the bodies below differ because the fixture injects a per-end reason. What
+    /// is actually pinned is that the relay happens on every state — delete `death.reason()` from
+    /// `exit_body`'s `format!` and this goes RED. Which HEAD each end gets is pinned separately, by
+    /// `every_net_thread_end_is_wired_deliberately`.
     #[tokio::test]
-    async fn each_net_thread_state_produces_a_distinguishable_body() {
+    async fn every_state_relays_its_own_reason_into_the_body() {
         let mut seen: Vec<String> = Vec::new();
-        for end in ALL_ENDS {
+        for end in all_ends() {
             let d = NetThreadDeath::new(end, format!("synthetic reason for {end:?}"));
             let body = exit_body(Some(&d));
-            assert!(!seen.contains(&body), "{end:?} reuses another state's body verbatim: {body:?}");
+            assert!(body.contains(&format!("synthetic reason for {end:?}")),
+                "{end:?}: the thread's own reason must reach the wire — it is the only thing \
+                 separating the ends that share a head: {body:?}");
+            assert!(!seen.contains(&body),
+                "{end:?}: head AND reason both identical to an earlier state's — an agent could \
+                 not tell them apart at all: {body:?}");
             assert_ne!(body, EXIT_BODY_CAMPING, "{end:?} must not reuse the healthy-path promise");
             seen.push(body);
         }
         assert_eq!(exit_body(None), EXIT_BODY_CAMPING, "…and a live thread still camps");
+    }
+
+    /// One hand-written row per `NetThreadEnd`, checked against the DERIVED `NetThreadEnd::ALL`.
+    ///
+    /// #935 review B3, measured: this is the guard the exhaustive `match`es do not provide. They
+    /// force a new variant to get an arm; they do not force anyone to say what that arm SHOULD be,
+    /// and a sixth variant wired to the session-lost body and `net-thread-dead` shipped fully green
+    /// against the whole rest of this module. Here a new variant has no row, so it reds this test
+    /// until an author states its intended body and reason — and if the intent really is "another
+    /// unplanned loss", writing that row down is the whole point.
+    ///
+    /// `undrained` is swept because the camp slot must NOT influence any published end: whichever
+    /// end the thread reached is more specific and terminal than "a camp is still queued".
+    #[test]
+    fn every_net_thread_end_is_wired_deliberately() {
+        // (end, watchdog reason, which body head, does that head name the 45s watchdog)
+        const WIRING: &[(NetThreadEnd, &str, &str, bool)] = &[
+            (NetThreadEnd::Panicked,               "net-thread-dead",           EXIT_BODY_SESSION_LOST,      true),
+            (NetThreadEnd::Fatal,                  "net-thread-dead",           EXIT_BODY_SESSION_LOST,      true),
+            (NetThreadEnd::ReturnedUnexpectedly,   "net-thread-dead",           EXIT_BODY_SESSION_LOST,      true),
+            (NetThreadEnd::ReturnedDuringShutdown, "shutdown-not-completed",    EXIT_BODY_SHUTDOWN_UNDER_WAY, false),
+            (NetThreadEnd::NeverStarted,           "net-thread-never-started",  EXIT_BODY_NO_NET_THREAD,      true),
+        ];
+        assert_eq!(WIRING.len(), NetThreadEnd::ALL.len(),
+            "every end needs a row; the enum has {} and this table has {}",
+            NetThreadEnd::ALL.len(), WIRING.len());
+        for end in all_ends() {
+            let (_, reason, head, waits_for_watchdog) = *WIRING.iter().find(|(e, ..)| *e == end)
+                .unwrap_or_else(|| panic!(
+                    "{end:?} has no row here. A new NetThreadEnd must have its body and its crash \
+                     reason STATED, not inherited from whichever arm was cheapest to extend — that \
+                     inheritance is #890's defect and it shipped green once already (#935 B3)."));
+            for undrained in [true, false] {
+                assert_eq!(watchdog_reason(Some(end), undrained), reason, "{end:?}/{undrained}");
+            }
+            let body = exit_body(Some(&NetThreadDeath::new(end, "synthetic reason")));
+            assert!(body.starts_with(head), "{end:?} must use its own body head: {body:?}");
+            assert_eq!(body.contains("45s watchdog"), waits_for_watchdog,
+                "{end:?}: the body must say whether the process waits out the watchdog, and must \
+                 not say it on the one end that exits through the main loop instead: {body:?}");
+        }
     }
 
     // ── The watchdog reason ─────────────────────────────────────────────────────────────────────
@@ -493,7 +580,7 @@ mod tests {
         assert_eq!(watchdog_reason(None, false), "watchdog-shutdown-timeout");
 
         let mut inputs: Vec<(Option<NetThreadEnd>, bool)> = vec![(None, true), (None, false)];
-        for end in ALL_ENDS { inputs.push((Some(end), true)); inputs.push((Some(end), false)); }
+        for end in all_ends() { inputs.push((Some(end), true)); inputs.push((Some(end), false)); }
         for (end, undrained) in inputs {
             assert_ne!(
                 watchdog_reason(end, undrained), "render-loop-wedged",
@@ -602,14 +689,61 @@ mod tests {
         assert_eq!(reason_at_kill(state).await, "shutdown-not-completed");
     }
 
-    /// Every reason the watchdog can emit is distinct and non-empty (#380: the `kill` closure may
-    /// never be handed an empty label, or the forced exit reads as an OOM-kill). Enumerated over the
-    /// same total input space as the mapping test, so a new arm that duplicates an existing string
-    /// — the cheapest way to lose a distinction — is caught here.
+    /// WHEN the reason is sampled, pinned at the seam (#935 review B1, measured).
+    ///
+    /// `watchdog_reason_now`'s doc and the PR both said the reason is read when the watchdog FIRES
+    /// rather than when the request arrives — asserted twice in prose, pinned zero times. Hoisting
+    /// the sample above the `sleep` in `run_exit_watchdog` shipped fully green, because the only
+    /// test that covered the property called the helper directly and never went through the seam.
+    ///
+    /// What the hoist would produce: `post_exit` writes `CampCmd::Start` immediately before spawning
+    /// the watchdog, so at spawn time `camp_undrained` is unconditionally true — every `/exit`-
+    /// initiated forced exit would record `camp-not-drained`, including a net thread that panics
+    /// during the 45s wait, which is #890's own case. This test sets exactly that up: the spawn-time
+    /// state and the kill-time state are deliberately DIFFERENT reasons, so a sample taken at either
+    /// end is distinguishable.
+    #[tokio::test(start_paused = true)]
+    async fn the_watchdog_samples_the_reason_when_it_fires_not_when_it_is_spawned() {
+        let state = empty_state();
+        state.command.request_camp(eqoxide_ipc::CampCmd::Start);
+        assert_eq!(watchdog_reason_now(&state), "camp-not-drained",
+            "precondition: at spawn time the only stuck thing is the camp slot");
+
+        let killed = std::sync::Arc::new(std::sync::Mutex::new(None::<&'static str>));
+        let sink = killed.clone();
+        let watchdog = tokio::spawn(run_exit_watchdog(
+            state.clone(),
+            EXIT_WATCHDOG,
+            move |reason| { *sink.lock().unwrap() = Some(reason); },
+        ));
+
+        // Partway through the wait the net thread dies — the terminal, more specific state.
+        tokio::time::sleep(EXIT_WATCHDOG / 2).await;
+        mark_net_thread_dead(&state);
+        assert!(killed.lock().unwrap().is_none(), "precondition: the watchdog has not fired yet");
+
+        watchdog.await.expect("the watchdog task must not panic");
+        assert_eq!(
+            killed.lock().unwrap().expect("the watchdog must kill with a reason"),
+            "net-thread-dead",
+            "the crash record must describe what was stuck AT KILL TIME. Sampling at spawn time \
+             would record `camp-not-drained` for every /exit-initiated kill — a constant reached by \
+             moving one line (#799)"
+        );
+    }
+
+    /// No reason the watchdog can emit is empty (#380: the `kill` closure may never be handed an
+    /// empty label, or the forced exit reads as an OOM-kill), and the five labels reachable today
+    /// are five distinct strings.
+    ///
+    /// Scope, stated because the earlier version of this comment implied more: the three
+    /// unplanned-loss ends deliberately SHARE `net-thread-dead`, so this counts distinct LABELS, not
+    /// states. It cannot tell you a new variant was wired to an existing label — that is
+    /// `every_net_thread_end_is_wired_deliberately`'s job (#935 B3).
     #[test]
     fn every_watchdog_reason_is_a_distinct_non_empty_label() {
         let mut inputs: Vec<(Option<NetThreadEnd>, bool)> = vec![(None, true), (None, false)];
-        for end in ALL_ENDS { inputs.push((Some(end), true)); inputs.push((Some(end), false)); }
+        for end in all_ends() { inputs.push((Some(end), true)); inputs.push((Some(end), false)); }
         let mut seen: Vec<&'static str> = Vec::new();
         for (end, undrained) in inputs {
             let r = watchdog_reason(end, undrained);

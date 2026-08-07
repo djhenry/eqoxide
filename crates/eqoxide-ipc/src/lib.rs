@@ -1421,6 +1421,32 @@ pub type ZonePoints = Arc<Mutex<Vec<eqoxide_core::game_state::ZonePoint>>>;
 /// `zone_map_load`.
 pub type ZoneMapLoadShared = Arc<Mutex<Option<eqoxide_core::zone_map::ZoneMapLoadError>>>;
 
+/// Declares [`NetThreadEnd`] and derives [`NetThreadEnd::ALL`] from the SAME token list.
+///
+/// #935 review B3, measured: the exhaustive `match`es in `eqoxide-http` force a new variant to get
+/// an arm, but they do not force it to get a TEST. The suites there iterate "every end", and while
+/// that list was a hand-written `[NetThreadEnd; 5]` in the test module, a sixth variant wired to the
+/// exact silent inheritance those tests exist to forbid shipped fully green — the array simply did
+/// not know about it. A guard that has to be remembered is the bug; this makes the stale state
+/// unrepresentable instead. Add a variant below and it appears in `ALL` automatically, so every loop
+/// keyed on `ALL` covers it on the next build.
+macro_rules! net_thread_end {
+    (
+        $(#[$enum_meta:meta])*
+        pub enum $name:ident { $($(#[$variant_meta:meta])* $variant:ident),+ $(,)? }
+    ) => {
+        $(#[$enum_meta])*
+        pub enum $name { $($(#[$variant_meta])* $variant),+ }
+
+        impl $name {
+            /// Every variant, in declaration order — DERIVED from the enum, never maintained beside
+            /// it (#935 B3). Tests iterate this so a new variant cannot slip past them.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
+net_thread_end! {
 /// WHICH terminal state the `eq-net` thread reached (#890). The reason string alone cannot carry
 /// this: it is prose, and every consumer that wanted the distinction had to either match on its text
 /// (which any reword silently breaks) or collapse it to `is_some()` (which loses it entirely).
@@ -1431,8 +1457,9 @@ pub type ZoneMapLoadShared = Arc<Mutex<Option<eqoxide_core::zone_map::ZoneMapLoa
 /// there is no server session to leave in any state at all. A `bool` cannot tell those apart, which
 /// is how #890's defect class survived its first fix.
 ///
-/// Written only by `eqoxide::model::run_net_thread` (the four thread-exit arms) and by `main.rs`
-/// (the `--testzone` arm, where the thread is never spawned). See [`NetThreadDeath`].
+/// Written only by `eqoxide::model::run_net_thread` (the four thread-exit arms) and by
+/// `eqoxide::model::publish_never_started` (the `--testzone` arm, where the thread is never
+/// spawned). See [`NetThreadDeath`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetThreadEnd {
     /// The thread PANICKED. A session may have been live; whatever the server still holds is now
@@ -1461,6 +1488,7 @@ pub enum NetThreadEnd {
     /// may be asserted on this state. The HTTP server runs in this mode, so every handler that
     /// reads this field can be reached here.
     NeverStarted,
+}
 }
 
 /// The `eq-net` thread's terminal state: WHICH end it was ([`NetThreadEnd`]) plus the agent-facing
