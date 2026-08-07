@@ -244,9 +244,9 @@ impl CameraState {
     ///
     /// `main.rs` publishes one of these before `EventLoop::new()`, so `/v1/camera` and
     /// `/v1/observe/debug` serve a camera block through GPU init, `resumed()`, and the first zone
-    /// load. Before #867 that seed was indistinguishable from a rendered snapshot; `drawn_frame:
-    /// None` makes the pre-first-frame state representable, which is why the docs can say what the
-    /// fields mean without a "never" that startup falsifies.
+    /// load. Before #867 that seed was indistinguishable from a rendered snapshot;
+    /// `drawn_frame: None` makes the pre-first-frame state representable, which is why the docs
+    /// can say what the fields mean without a "never" that startup falsifies.
     pub fn undrawn_snapshot(&self, resolved: ResolvedEye) -> CameraSnapshot {
         CameraSnapshot {
             mode:          self.mode,
