@@ -116,17 +116,57 @@ that target near the player's tracked position; its range check compares linear 
 EQ's built-in quest journal (LDoN+, present in Titanium). Server-pushed for *task* quests only —
 old-style Lua turn-in quests (Rat Whiskers, Gnoll Fangs) send NONE of these. Decoded in
 `packet_handler.rs` into `GameState.tasks` (→ `GET /v1/quests/log`). All are **variable-length, packed**
-(no struct padding) with embedded null-terminated strings; offsets verified vs EQEmu
-`titanium.cpp ENCODE(OP_TaskDescription)` + `eq_packet_structs.h`.
+(no struct padding).
 
-- `OP_TaskDescription` (0x5ef7): `Header{seq:u32, task_id:u32, open_window:u8, task_type:u32,
+Opcodes are the **RoF2** values from `utils/patches/patch_RoF2.conf:592-594`, matching
+`crates/eqoxide-protocol/src/protocol/mod.rs:259-261`. (An earlier revision of this section listed
+the *Titanium* opcodes — `patch_Titanium.conf:480-482` — and derived the layouts from
+`titanium.cpp`. That mismatch is the root cause of #889; the `OP_TaskActivity` and
+`OP_CompletedTasks` layouts below have been re-derived from the RoF2 send path, `OP_TaskDescription`
+has not.)
+
+- `OP_TaskDescription` (0x3714): `Header{seq:u32, task_id:u32, open_window:u8, task_type:u32,
   reward_type:u32}` (17) + `title`(cstr) + `Data1{duration:u32, dur_code:u32, start_time:u32}` (12) +
   `description`(cstr) + `Data2{has_rewards:u8, coin:u32, xp:u32, faction:u32}` (13) + `reward`(cstr) +
   `itemlink`(cstr) + `Trailer{points:u32, has_reward_selection:u8}` (5).
-- `OP_TaskActivity` (0x682d): 8×u32 fixed `{activity_count,id3,taskid,activity_id,unk,activity_type,
-  unk,unk}` + `mob_name`(cstr) + `item_name`(cstr) + `goal_count:u32` + 4×u32 unknown +
-  `activity_name`(cstr) + `done_count:u32` (+u32). `done_count`/`goal_count` = live objective progress.
-- `OP_CompletedTasks` (0x76a2): count:u32 then completed task-id records (we collect the ids).
+  **Not re-derived for RoF2** — unlike `OP_TaskActivity` this opcode *does* have a RoF2 ENCODE
+  (`common/patches/rof2.cpp:3846`, reallocating at `:3899`), so the serialiser output is not the
+  wire format and #889's derivation method does not transfer. Tracked as #949; treat the field list
+  above as the shape `apply_task_description` currently reads, not as a verified RoF2 wire spec.
+- `OP_TaskActivity` (0x08d3): **two** legal wire shapes of different lengths. `grep -rn
+  OP_TaskActivity common/patches/` finds no ENCODE and no DECODE (only a deprecated SoF opcode-list
+  entry), so the emulator's serialiser output *is* the wire format, and
+  `BasePacket(SerializeBuffer&&)` sets `size = m_pos` (`common/base_packet.cpp:36-42`) — the
+  payload is exactly the bytes written, with no padding.
+  - **Short form**, exactly 25 bytes — `TaskManager::SendTaskActivityShort`
+    (`zone/task_manager.cpp:972-987`), sent for activities the player has not unlocked (they show
+    as `???` in the native client, its own comment at `:974`):
+    `0 client_task_index:u32 | 4 task_type:u32 | 8 task_id:u32 | 12 activity_id:u32 |
+    16 list_group:u32 | 20 0xffffffff:u32 (literal, :984) | 24 optional:u8`.
+    It carries **no** activity type, target name or counts at all.
+  - **Long form**, minimum 58 bytes — `TaskManager::SendTaskActivityLong`
+    (`zone/task_manager.cpp:989-1014`) writes the same 5×u32 header and then delegates to
+    `ActivityInformation::SerializeObjective` (`common/tasks.h:141-189`), RoF+ branch:
+    `20 activity_type:i32 (signed — enum class TaskActivityType : int32_t, common/tasks.h:46) |
+    24 optional:i8 (ONE byte on RoF+, common/tasks.h:154-158; the pre-RoF branch wrote i32) |
+    25 request_type:i32 (dead, always 0) | 29 target_name:cstr | item_list:LenStr |
+    goal_count:i32 | skill_list:LenStr | spell_list:LenStr | zones:cstr | dz_switch_id:i32 |
+    description_override:cstr | done_count:i32 | 1:i8 (unknown constant) | zones:cstr (again,
+    "seems unused", common/tasks.h:187)`.
+  - `LenStr` is `SerializeBuffer::WriteLengthString` (`common/serialize_buffer.h:194-203`): a `u32`
+    byte count followed by exactly that many raw bytes with **no NUL**. An empty one is the four
+    bytes `00 00 00 00`. `cstr` is `WriteString` (`:174-181`), NUL-terminated.
+  - The two forms are told apart by **both** the 25-byte length and the `0xffffffff` at offset 20;
+    a payload on which those disagree is reported undecodable rather than decoded under a guess.
+    A long form's offset-20 word comes from a `uint8_t` DB column
+    (`common/repositories/base/base_task_activities_repository.h:43`, `:235`, cast at
+    `zone/task_manager.cpp:216`), so it is always 0..=255 and can never be the sentinel.
+  - `done_count`/`goal_count` are live objective progress and exist **only** in the long form.
+    `GiveCash` activities repurpose them (`common/tasks.h:144-150`): `goal_count` is a literal 1
+    and `done_count` a 0/1 boolean; the cash amount is not on the wire.
+- `OP_CompletedTasks` (0x4eba): `count:u32` then `count` records of
+  `{task_id:u32, title:cstr, completed_time:u32}` (`zone/task_manager.cpp:946-966`) — full records,
+  not a bare id list.
 
 ---
 

@@ -110,7 +110,7 @@ so an accepted goal never hides the fact that the body is hanging out of the wor
 
 | Route | Body | Description |
 |-------|------|-------------|
-| `GET /v1/quests/log` | — | The native EQ Task journal (server-pushed) — active tasks only, with objectives + live progress. |
+| `GET /v1/quests/log` | — | The native EQ Task journal (server-pushed) — active tasks only. Each objective carries `activity_id` + a `state` discriminator: `known` adds `activity_type`/`target`/`description`/`done_count`/`goal_count`/`optional`; `locked` (the server has not unlocked it — `???` in the native client) adds only `optional` and **omits the count keys entirely** rather than serving zeros; `undecodable` adds `reason`. See #889. |
 | `GET /v1/quests/completed` | — | Completed task history: `{task_id, title, completed_time}[]`. |
 | `GET /v1/quests/offers` | — | Pending task offers from an open selector window: `{task_id, npc_id, title, description, has_rewards}[]`. |
 | `POST /v1/quests/accept` | `{"task_id":N}` | Accept one offered task. |

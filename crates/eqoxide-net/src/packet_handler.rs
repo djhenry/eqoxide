@@ -360,8 +360,10 @@ fn try_length_string(r: &mut WireReader) -> Option<String> {
 /// ## Why the trailing fields are required
 ///
 /// A long form is accepted only if all of the fields above are present **and** they consume the
-/// payload exactly. `BasePacket`'s `SerializeBuffer` constructor sets `size = m_pos`
-/// (`common/packet.cpp:36-42`) — the payload is exactly the bytes written, with no padding — and
+/// payload exactly. `BasePacket`'s `SerializeBuffer` constructor sets
+/// `size = static_cast<uint32>(std::exchange(buf.m_pos, 0))`
+/// (`common/base_packet.cpp:36-42`, the assignment itself at `:40`) — the payload is exactly the
+/// bytes written, so the `SerializeBuffer`'s initial capacity never reaches the wire — and
 /// #889's own panic log corroborates that eqoxide delivers it unpadded (`buffer 25 bytes` for the
 /// 25-byte short form). So leftover bytes mean the layout model is wrong somewhere, which is
 /// precisely the failure this issue is about; reporting `Undecodable` is the honest answer, and it
@@ -3218,6 +3220,7 @@ mod tests {
                 parse_begin_cast, apply_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_move_item, apply_spawn_appearance, apply_buff_with, apply_buff_create_with,
                 extract_saylink_text, apply_task_description, apply_task_activity, apply_completed_tasks,
+                parse_task_activity,
                 apply_task_select_window, TASK_ACTIVITY_SHORT_LEN, TASK_ACTIVITY_LONG_MIN_LEN,
                 strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH, SIZE_NEW_ZONE,
                 apply_group_update_b, apply_group_join, apply_group_disband_you,
@@ -7561,56 +7564,279 @@ mod tests {
         assert!(gs.tasks.is_empty(), "task_id 0 is not a task");
     }
 
+    /// Longest payload length the panic sweep probes. Well past `TASK_ACTIVITY_LONG_MIN_LEN` and
+    /// past the 98-byte real fixture, so every family covers "too short for either form", "long
+    /// enough to enter the long parser" and "long enough to be truncated anywhere in the body".
+    const PANIC_SWEEP_MAX_LEN: usize = 300;
+
+    /// Where a probe **actually landed**, read back from `parse_task_activity`'s own output and
+    /// re-derived from the probe bytes — never assumed from how the probe was built.
+    ///
+    /// This exists because a probe *count* is not a reach measurement. Round 1 of #944 measured
+    /// that the original "hostile body" family (`0xFF` from offset 20 onward) reached **nothing**:
+    /// `0xFF` at offset 20 *is* `TASK_ACTIVITY_SHORT_SENTINEL`, so every one of those probes was
+    /// refused at the discriminator and the family engineered to stress the ~4 GiB `LengthString`
+    /// case was the one family structurally incapable of reaching it. The comment claiming
+    /// otherwise had never been run. That is #778's lesson: a guard needs a REACH control, not a
+    /// positive control that passes.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    enum Landing {
+        /// `parse_task_activity` returned `None` — under 20 bytes, or `task_id == 0`.
+        Unattributable,
+        /// Short form accepted; `parse_long_objective` never called.
+        Locked,
+        /// Refused at the length/sentinel discriminator; `parse_long_objective` never called.
+        RefusedAtDiscriminator,
+        /// Entered `parse_long_objective`, but ran out of bytes **before** consuming an
+        /// `item_list` `LengthString` count (typically an unterminated `target_name`).
+        LongParserShallow,
+        /// Entered `parse_long_objective`, consumed the `item_list` `LengthString` count, and that
+        /// count named more bytes than the payload holds — i.e. the `try_bytes` refusal that
+        /// mutant G (`try_bytes` → the panicking `bytes`) turns into a panic. **This is the
+        /// landing site the whole panic property actually rests on.**
+        RefusedAnOversizedItemList,
+        /// Got past the `item_list` count some other way: a short-enough count, a later field
+        /// running out, trailing bytes, or a full decode.
+        LongParserDeep,
+    }
+
+    /// Classify one probe. The only inputs are the parser's public output and the probe bytes, so
+    /// this measures the real code path rather than restating the probe's intent.
+    fn landing_of(probe: &[u8]) -> Landing {
+        let Some((_, act)) = parse_task_activity(probe) else { return Landing::Unattributable };
+        let reason = match &act.progress {
+            ActivityProgress::Locked { .. } => return Landing::Locked,
+            ActivityProgress::Known { .. } => return Landing::LongParserDeep,
+            ActivityProgress::Undecodable { reason } => reason.clone(),
+        };
+        // "N trailing byte(s) after…" means every field decoded. "ran out of bytes at offset P of
+        // L decoding the long form" is the ONLY reason emitted from inside the long parser's
+        // failure path, and it publishes the exact cursor position. Every other reason is a
+        // discriminator refusal raised before `parse_long_objective` was ever called.
+        if reason.contains("trailing byte(s)") { return Landing::LongParserDeep; }
+        let Some(rest) = reason.strip_prefix("ran out of bytes at offset ") else {
+            return Landing::RefusedAtDiscriminator;
+        };
+        let stop: usize = rest.split(' ').next().unwrap().parse().expect("offset in reason");
+
+        // Re-derive where the `item_list` LengthString lives from the BYTES: `target_name` is a
+        // cstr starting at 29, so its NUL is the first zero byte at index >= 29 and the four-byte
+        // count sits immediately after it. No magic offset is written down here.
+        let Some(nul) = probe.iter().skip(29).position(|&b| b == 0).map(|i| i + 29) else {
+            return Landing::LongParserShallow; // no NUL ⇒ try_cstr refused; no count was read
+        };
+        let count_end = nul + 5;
+        if stop < count_end { return Landing::LongParserShallow; }
+        if stop == count_end {
+            let count = u32::from_le_bytes(probe[nul + 1..count_end].try_into().unwrap()) as usize;
+            // The cursor stopped exactly where the count ended, so the failing read was either
+            // `try_bytes(count)` (count > what remains) or the `goal_count` u32 after a zero-byte
+            // payload. Only the former is the oversized-LengthString refusal.
+            if count > probe.len() - count_end { return Landing::RefusedAnOversizedItemList; }
+        }
+        Landing::LongParserDeep
+    }
+
+    /// Hostile body that **enters the long parser and dies on an unterminated `cstr`**: a valid
+    /// 20-byte header, a plausible `activity_type` at 20..24 (so the short-form sentinel does *not*
+    /// fire), then `0xFF` to the end — no NUL exists at or after offset 29, so `target_name` can
+    /// never terminate.
+    fn build_hostile_unterminated(len: usize) -> Vec<u8> {
+        let mut p = build_task_activity_short(5740, 0, false)[..20].to_vec();
+        p.extend_from_slice(&2i32.to_le_bytes()); // 20..24 activity_type — NOT 0xffffffff
+        p.resize(len.max(p.len()), 0xFF);
+        p
+    }
+
+    /// Hostile body that **enters the long parser and makes `item_list` claim ~4 GiB**: valid
+    /// header, plausible `activity_type`, an empty NUL-terminated `target_name` at offset 29, then
+    /// `0xFF` — so the four bytes after the NUL are the count `0xffffffff` and `try_bytes` is asked
+    /// for 4294967295 bytes with at most a few hundred available.
+    ///
+    /// Returns the payload **and the offset at which the parser must stop**, so the reach
+    /// assertion is derived from the construction instead of from a hand-written number.
+    fn build_hostile_oversized_item_list(len: usize) -> (Vec<u8>, usize) {
+        let mut p = build_task_activity_short(5740, 0, false)[..20].to_vec();
+        p.extend_from_slice(&2i32.to_le_bytes());          // 20..24 activity_type
+        p.push(0xFF);                                      // 24     optional
+        p.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // 25..29 dead request_type
+        p.push(0);                                         // 29     target_name = "" (the NUL)
+        let count_at = p.len();                            // 30
+        p.resize(len.max(count_at + 4), 0xFF);             // 30..34 = 0xffffffff, then filler
+        (p, count_at + 4)
+    }
+
+    /// The round-1 finding, kept as an executable record rather than as prose that could rot again.
+    ///
+    /// #944's first revision built its "hostile body" family as a valid 20-byte header followed by
+    /// `0xFF` to the end, with the in-source comment "0xFF everywhere makes every LengthString
+    /// claim ~4 GiB and leaves every cstr unterminated". That was never run. It is false, and
+    /// self-defeatingly so: `0xFF` at offset 20 **is** `TASK_ACTIVITY_SHORT_SENTINEL`, so every
+    /// such probe is refused at the discriminator and the family engineered to stress the ~4 GiB
+    /// `LengthString` case is the one family structurally incapable of reaching it.
+    ///
+    /// This asserts the *zero*, so a future edit that reverts either hostile builder to a plain
+    /// `0xFF` fill goes red here with the reason, instead of silently testing nothing.
+    #[test]
+    fn an_all_0xff_body_reaches_nothing_because_0xff_at_offset_20_is_the_short_form_sentinel() {
+        let mut entered_long_parser: Vec<(usize, Landing)> = Vec::new();
+        for len in 0..=PANIC_SWEEP_MAX_LEN {
+            // Verbatim reconstruction of the round-1 builder.
+            let mut old_hostile = build_task_activity_short(5740, 0, false)[..20].to_vec();
+            old_hostile.resize(len.max(20), 0xFF);
+            let landing = landing_of(&old_hostile);
+            if !matches!(landing,
+                Landing::Unattributable | Landing::Locked | Landing::RefusedAtDiscriminator) {
+                entered_long_parser.push((len, landing));
+            }
+        }
+        assert_eq!(entered_long_parser, Vec::new(),
+            "an all-0xFF body cannot reach the long-form parser: 0xFF at offset 20 is the \
+             short-form sentinel, so it is refused at the discriminator every time");
+        // …and the replacement families do reach, over the same length sweep. Control for the
+        // control: without this, the assertion above is satisfied by a builder that reaches
+        // nothing for an unrelated reason.
+        assert_eq!(landing_of(&build_hostile_unterminated(PANIC_SWEEP_MAX_LEN)),
+            Landing::LongParserShallow);
+        assert_eq!(landing_of(&build_hostile_oversized_item_list(PANIC_SWEEP_MAX_LEN).0),
+            Landing::RefusedAnOversizedItemList);
+    }
+
     /// **Universal:** no OP_TaskActivity payload of any length or content can panic the parser.
     ///
     /// This is the property #889's denial-of-service violated — the net thread died on a packet
-    /// the server sends as a matter of course. It is checked exhaustively over lengths 0..=300
-    /// against several byte patterns (including ones engineered to produce huge length-prefixes
-    /// and unterminated strings), plus every prefix of a real long-form fixture, plus a
-    /// deterministic pseudorandom sweep. `parse_task_activity` uses only non-panicking `try_*`
-    /// reads, which is *why* this holds; the test is what makes a later edit that reintroduces a
-    /// panicking read fail loudly instead of at zone-in.
+    /// the server sends as a matter of course. It is checked exhaustively over lengths
+    /// `0..=PANIC_SWEEP_MAX_LEN` against five constant fills and two deliberately *reaching*
+    /// hostile bodies, plus every prefix of a real long-form fixture, plus a deterministic
+    /// pseudorandom sweep. `parse_task_activity` uses only non-panicking `try_*` reads, which is
+    /// *why* this holds; the test is what makes a later edit that reintroduces a panicking read
+    /// fail loudly instead of at zone-in.
+    ///
+    /// ## Two separate guards, because they check different things
+    ///
+    /// * `checked` is a **probe-count tripwire**: it fails if a sweep silently stops running.
+    /// * The [`Landing`] tallies are the **reach control**: they fail if the probes still run but
+    ///   stop *arriving* where the property needs them to. Round 1 found the difference matters —
+    ///   every constant fill and the then-"hostile" family were refused at the discriminator, so
+    ///   the whole ~4 GiB `LengthString` guarantee was carried by luck of the xorshift RNG. Both
+    ///   hostile families below now land in the long parser by construction, and the
+    ///   `RefusedAnOversizedItemList` count is asserted exactly, not floored at a guess.
+    ///
+    /// Run with `-- --nocapture` to print the measured per-family landing table.
     #[test]
     fn no_payload_length_or_content_can_panic_the_parser() {
         let real = build_task_activity_long(
             5740, 0, 2, false, "Giant Rattlesnakes", "", 5, "-1", "0", "innothule", "x", 3);
 
         let mut checked = 0usize;
-        let probe = |bytes: &[u8]| {
-            let mut gs = GameState::new();
-            apply_task_activity(&mut gs, bytes); // must simply return
-        };
+        let mut reach: std::collections::BTreeMap<(&'static str, Landing), usize> = Default::default();
 
-        // Fixed patterns across every length up to well past the long-form minimum.
-        for len in 0..=300usize {
-            for fill in [0x00u8, 0xFF, 0x41, 0x80, 0x01] {
-                probe(&vec![fill; len]);
+        macro_rules! probe {
+            ($family:expr, $bytes:expr) => {{
+                let b: &[u8] = $bytes;
+                let mut gs = GameState::new();
+                apply_task_activity(&mut gs, b); // must simply return — THIS is the property
+                let landing = landing_of(b);
+                *reach.entry(($family, landing)).or_default() += 1;
                 checked += 1;
-            }
-            // Valid 20-byte header (so it IS attributable) + hostile body: 0xFF everywhere makes
-            // every LengthString claim ~4 GiB and leaves every cstr unterminated.
-            let mut hostile = build_task_activity_short(5740, 0, false)[..20].to_vec();
-            hostile.resize(len.max(20), 0xFF);
-            probe(&hostile);
-            checked += 1;
+                landing
+            }};
         }
+
+        // How many sweep lengths are long enough to reach `parse_long_objective` at all. Derived
+        // from the loop bound and the parser's own minimum, not written down.
+        let reaching_lengths =
+            (0..=PANIC_SWEEP_MAX_LEN).filter(|&l| l >= TASK_ACTIVITY_LONG_MIN_LEN).count();
+
+        // Constant fills across every length. These exercise the discriminator arms; per round 1
+        // they do NOT reach the long-form body, and nothing here claims they do.
+        for len in 0..=PANIC_SWEEP_MAX_LEN {
+            for fill in [0x00u8, 0xFF, 0x41, 0x80, 0x01] {
+                let family = match fill {
+                    0x00 => "fill 0x00", 0xFF => "fill 0xFF", 0x41 => "fill 0x41",
+                    0x80 => "fill 0x80", _ => "fill 0x01",
+                };
+                probe!(family, &vec![fill; len]);
+            }
+        }
+
+        // Hostile family 1 — reaches the long parser and dies on an unterminated `target_name`.
+        let mut unterminated_reached = 0usize;
+        for len in 0..=PANIC_SWEEP_MAX_LEN {
+            let p = build_hostile_unterminated(len);
+            let landing = probe!("hostile: unterminated cstr", &p);
+            if p.len() >= TASK_ACTIVITY_LONG_MIN_LEN {
+                assert_eq!(landing, Landing::LongParserShallow,
+                    "hostile-unterminated len {len} ({} bytes) must ENTER the long parser", p.len());
+                unterminated_reached += 1;
+            }
+        }
+        assert_eq!(unterminated_reached, reaching_lengths,
+            "every long-enough unterminated-cstr probe must enter parse_long_objective");
+
+        // Hostile family 2 — reaches the long parser AND performs the oversized LengthString read
+        // that the panic property is really about. Asserted per probe against the offset the
+        // builder itself reports, so no hand-written offset can drift.
+        let mut oversized_reached = 0usize;
+        for len in 0..=PANIC_SWEEP_MAX_LEN {
+            let (p, must_stop_at) = build_hostile_oversized_item_list(len);
+            let landing = probe!("hostile: 4 GiB item_list", &p);
+            if p.len() >= TASK_ACTIVITY_LONG_MIN_LEN {
+                assert_eq!(landing, Landing::RefusedAnOversizedItemList,
+                    "hostile-oversized len {len} ({} bytes) must refuse an oversized LengthString",
+                    p.len());
+                let ActivityProgress::Undecodable { reason } =
+                    parse_task_activity(&p).expect("attributable").1.progress
+                else { panic!("expected Undecodable") };
+                assert!(reason.contains(&format!("offset {must_stop_at} of {}", p.len())),
+                    "must stop exactly where the builder put the 4 GiB count: {reason}");
+                oversized_reached += 1;
+            }
+        }
+        assert_eq!(oversized_reached, reaching_lengths,
+            "every long-enough 4 GiB-item_list probe must perform the oversized LengthString read");
+
         // Every prefix of a real packet (the truncation family that produced the live panic).
         for n in 0..=real.len() {
-            probe(&real[..n]);
-            checked += 1;
+            probe!("real prefix", &real[..n]);
         }
-        // Deterministic pseudorandom sweep (xorshift64*), so content is not only the patterns above.
+        // Deterministic pseudorandom sweep (xorshift64*), so content is not only the patterns
+        // above. Its reach is incidental — it is a bonus, not the guarantee.
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut next = move || {
             state ^= state << 13; state ^= state >> 7; state ^= state << 17;
             state
         };
-        for len in 0..=300usize {
+        for len in 0..=PANIC_SWEEP_MAX_LEN {
             let bytes: Vec<u8> = (0..len).map(|_| (next() >> 24) as u8).collect();
-            probe(&bytes);
-            checked += 1;
+            probe!("xorshift", &bytes);
         }
-        assert_eq!(checked, 301 * 6 + (real.len() + 1) + 301,
+
+        println!("── measured landing table (family × where the probe actually stopped) ──");
+        for ((family, landing), n) in &reach {
+            println!("REACH  {family:<28} {landing:<28} {n}", landing = format!("{landing:?}"));
+        }
+        let entered_long: usize = reach.iter()
+            .filter(|((_, l), _)| !matches!(*l,
+                Landing::Unattributable | Landing::Locked | Landing::RefusedAtDiscriminator))
+            .map(|(_, n)| *n).sum();
+        let oversized: usize = reach.iter()
+            .filter(|((_, l), _)| *l == Landing::RefusedAnOversizedItemList)
+            .map(|(_, n)| *n).sum();
+        println!("REACH  TOTAL entered parse_long_objective: {entered_long}");
+        println!("REACH  TOTAL oversized-item_list refusals: {oversized}");
+
+        // Reach floors, both derived from the two deliberate families above (each contributes
+        // exactly `reaching_lengths`). Any additional reach from the real-prefix or xorshift
+        // families is a bonus these floors deliberately do not depend on.
+        assert!(entered_long >= 2 * reaching_lengths,
+            "reach control: only {entered_long} probes entered parse_long_objective, but the two \
+             deliberate hostile families alone must contribute {}", 2 * reaching_lengths);
+        assert!(oversized >= reaching_lengths,
+            "reach control: only {oversized} probes performed an oversized LengthString read, but \
+             the 4 GiB-item_list family alone must contribute {reaching_lengths}");
+
+        assert_eq!(checked, 301 * 7 + (real.len() + 1) + 301,
             "every planned payload was probed");
     }
 
