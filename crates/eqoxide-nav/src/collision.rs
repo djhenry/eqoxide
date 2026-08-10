@@ -2602,8 +2602,17 @@ impl Collision {
     /// **`||` short-circuit note.** The controller's `is_embedded` was a `||`, so it could skip the
     /// ground probe when the footprint was already pierced. Naming both halves means both are
     /// evaluated. The extra work lands only in the arm where the footprint IS pierced (in the
-    /// common clear-footprint case the old `||` evaluated the ground probe anyway), and no
-    /// behaviour depends on the order — `Placement::is_embedded` is the same boolean.
+    /// common clear-footprint case the old `||` evaluated the ground probe anyway), and
+    /// `Placement::is_embedded` is the same boolean.
+    ///
+    /// It is **not** a no-op beyond that boolean, and the first draft of this doc wrongly said no
+    /// behaviour depended on the order (#885 review round 1, F10). Running the ground probe on
+    /// pierced-footprint frames reaches `ground_below` → `column_hits` → the `facing_blind_hits`
+    /// counter published as `/v1/observe/debug`'s `nav_support`. Measured by the reviewer on
+    /// inverted-art ground with a pierced footprint: `facing_blind_hits` 0 (old `||`) → 2 (this
+    /// function). That counter is a count of queries answered from down-facing art, and the
+    /// character's own column really was queried, so the new count is the accurate one — but it is
+    /// a published change, not an invisible one.
     pub fn body_placement(&self, p: [f32; 3]) -> crate::diagnostics::Placement {
         use crate::diagnostics::Placement;
         let pierced = !self.footprint_clear(
@@ -2631,8 +2640,12 @@ impl Collision {
     /// produced IDENTICAL `wall_spokes` and `footprint_ok` — all 16 spokes `4.0`, all 8 footprint
     /// directions `true`:
     ///
-    /// 1. open ground (honest);
-    /// 2. a body ringed by walls standing at **exactly** the 4.0 cap — real hits, saturated;
+    /// 1. open ground (honest — sixteen spokes that measured nothing);
+    /// 2. a body ringed by walls standing at **exactly** the 4.0 cap — measured: **4 real hits at
+    ///    4.0** (the axis-aligned spokes 0/4/8/12) and **12 spokes that measured nothing**, because
+    ///    an off-axis spoke faces the same wall plane at `4 / cos θ ≥ 4.33 u`, past the cap. The
+    ///    old seed-at-the-cap encoding wrote `4.0` for both kinds, so this world was
+    ///    byte-identical to (1) while being a mixture of the two things the old float conflated;
     /// 3. a body the controller was refusing to place at all.
     ///
     /// (Their `field_wall` / `field_ground` values did differ — 4/2, 3/2 and 4/0 respectively — but
@@ -10065,8 +10078,13 @@ mod clearance_probe_is_not_lossy_885 {
     /// 1. Honest open ground: a wide floor, nothing else.
     fn open_ground() -> Collision { build(vec![floor(0.0, 100.0)]) }
 
-    /// 2. Four walls standing at **exactly** the 4.0 spoke cap. Every spoke registers a REAL hit,
-    ///    at exactly the saturation distance — the case that used to be byte-identical to (1).
+    /// 2. Four walls standing at **exactly** the 4.0 spoke cap. Measured from the centre: the four
+    ///    AXIS-ALIGNED spokes (0/4/8/12) register real hits at exactly 4.0, and the other twelve
+    ///    measure nothing at all — an off-axis spoke meets the same wall plane at
+    ///    `4 / cos θ ≥ 4.33 u`, past the cap. Under the old seed-at-the-cap encoding both kinds
+    ///    wrote `4.0`, which is what made this fixture byte-identical to (1).
+    ///    (An earlier draft of this comment, and of the PR body, said all sixteen were real hits.
+    ///     That was wrong — #885 review round 1, B3 — and re-measured here as 4 / 12.)
     fn walls_exactly_at_cap() -> Collision {
         build(vec![floor(0.0, 100.0),
             wall_e(4.0, -100.0, 100.0, 0.0, 10.0), wall_e(-4.0, -100.0, 100.0, 0.0, 10.0),
@@ -10077,6 +10095,25 @@ mod clearance_probe_is_not_lossy_885 {
     ///    `(200, 200)` has nothing within `GROUND_DEPTH` beneath it — the second half of the
     ///    controller's embedded disjunction, and #845's live casualty.
     fn void_column() -> Collision { build(vec![floor(0.0, 40.0)]) }
+
+    /// 4. **The scene where the anchor and the character give DIFFERENT placement verdicts**
+    ///    (#885 review round 1, B2 — the reviewer's construction, reproduced).
+    ///
+    ///    A floor at `z = -10` over `|east|,|north| <= 20`, deep ground at `z = -30`, and a slot of
+    ///    walls at `east = ±0.6` spanning height `[-10, -7.6]`. A character at `z = -11`:
+    ///
+    ///    * anchors to the floor 1 u ABOVE it (`nearest_floor(-11, up 3, down 8)` → `-10`);
+    ///    * has its footprint ring cast at `-11 + 3.0 = -8.0`, inside the slot → **pierced**;
+    ///    * would have that ring cast at `-10 + 3.0 = -7.0` if the probe used the ANCHOR's z,
+    ///      which is above the slot top → **clear**.
+    ///
+    ///    So `body_placement` is `FootprintPierced` at the character and `Placeable` at the anchor.
+    ///    Every fixture above happens to agree at both heights, which is why they could not tell a
+    ///    probe that samples the wrong one from a probe that samples the right one.
+    fn slot_below_the_anchor() -> Collision {
+        build(vec![floor(-10.0, 20.0), floor(-30.0, 100.0),
+            wall_e(0.6, -20.0, 20.0, -10.0, -7.6), wall_e(-0.6, -20.0, 20.0, -10.0, -7.6)])
+    }
 
     // ── the hypothesis the issue offered, measured ──────────────────────────────────────────────
 
@@ -10126,6 +10163,15 @@ mod clearance_probe_is_not_lossy_885 {
             assert_eq!(ringed.wall_spokes[i], SpokeReading::Hit { at: 4.0 },
                 "spoke {i} faces a wall at exactly the cap: a HIT at 4.0, not saturation");
         }
+        // The CENSUS, written down because round 1 of the review found the prose claiming all
+        // sixteen spokes were real hits (B3). Measured: 4 hits, 12 that measured nothing. An
+        // off-axis spoke faces the same wall plane at `4 / cos θ`, which is 4.33 u at 22.5° — past
+        // the cap. Both kinds wrote `4.0` before this fix, which is the whole defect.
+        let hits = ringed.wall_spokes.iter().filter(|s| s.hit_at().is_some()).count();
+        let clear = ringed.wall_spokes.iter().filter(|s| s.hit_at().is_none()).count();
+        assert_eq!((hits, clear), (4, 12),
+            "walls at exactly the cap: 4 axis-aligned hits and 12 spokes that measured nothing, \
+             not 16 hits: {:?}", ringed.wall_spokes);
         // The honest empty that must stay green: this is what "open" now looks like, and it is
         // NOT what the ringed fixture reports.
         assert_ne!(open.wall_spokes, ringed.wall_spokes,
@@ -10218,7 +10264,6 @@ mod clearance_probe_is_not_lossy_885 {
         // ...and the payload now says, in the same breath, that the body cannot be there at all.
         assert_eq!(p.body, Placement::NoFloorBelow);
         assert!(p.body.is_embedded());
-        assert_eq!(p.body.as_str(), "no_floor_below");
         // The honest counterpart that must stay green: open ground reports the same wide-open
         // clearance, and `Placeable`. If the fix had been "refuse whenever the spokes saturate",
         // this is the assertion that would have caught it.
@@ -10228,19 +10273,71 @@ mod clearance_probe_is_not_lossy_885 {
         assert_eq!(open.body, Placement::Placeable, "...and only `body` tells the two worlds apart");
     }
 
-    /// The controller and the diagnostic read ONE predicate. `movement::is_embedded` is now
+    /// **The load-bearing property of this fix: `body` is evaluated at the CHARACTER's z, not the
+    /// anchor's** — on a scene where those two answers actually differ (#885 review round 1, B2).
+    ///
+    /// Round 1 measured that mutating the probe's `body:` line from `ref_z` to `anchor.z()`
+    /// compiled and left the whole module GREEN, because every fixture then in the module returned
+    /// the same verdict at both heights. Under that mutant, [`slot_below_the_anchor`] republishes
+    /// exactly the #885 payload — planner half wide open, `body: "placeable"` — for a body the
+    /// controller's own predicate rejects. This is the test that goes RED for it.
+    ///
+    /// Every expectation here is a LITERAL. Nothing is computed by `body_placement`, so this
+    /// cannot pass by agreeing with a `body_placement` that is itself wrong (round 1 found the test
+    /// this replaces doing exactly that).
+    #[test]
+    fn body_is_measured_at_the_character_not_the_anchor_when_the_two_disagree() {
+        let scene = slot_below_the_anchor();
+        let p = scene.clearance_probe(0.0, 0.0, -11.0);
+
+        // The anchor snapped 1 u ABOVE the character — the divergence's entry condition.
+        assert_eq!(p.anchor, ProbeAnchor::Floor { z: -10.0, reference_z: -11.0 });
+        assert_eq!(p.footprint_ring_z, -7.0, "the planner ring: anchor -10.0 + PLAYER_BODY.ring 3.0");
+
+        // The planner half, sampled at the anchor, reads WIDE OPEN. It is not wrong — it is a true
+        // statement about the anchor. This is verbatim the #885 payload shape.
+        assert_eq!(p.wall_spokes, vec![SpokeReading::ClearToCap; 16]);
+        assert_eq!(p.footprint_ok, vec![true; 8]);
+
+        // …and `body` is the CHARACTER's verdict, which is the opposite one.
+        assert_eq!(p.body, Placement::FootprintPierced,
+            "`body` must be the placement verdict at the character's z (-11.0), where the slot \
+             pierces its footprint ring at -8.0");
+
+        // The divergence is real and not an artefact of this fixture reading the same at both
+        // heights: ask the probe about the anchor's own height and the verdict flips. A `body`
+        // sampled at `anchor.z()` would publish THIS value in the assertion above.
+        let from_anchor = scene.clearance_probe(0.0, 0.0, -10.0);
+        assert_eq!(from_anchor.anchor, ProbeAnchor::Floor { z: -10.0, reference_z: -10.0 });
+        assert_eq!(from_anchor.body, Placement::Placeable,
+            "at the anchor's own height the ring clears the slot top (-7.6) — the two verdicts \
+             genuinely disagree in this scene");
+    }
+
+    /// The controller and the diagnostic read ONE predicate: `movement::is_embedded` is now
     /// `body_placement(p).is_embedded()`, and the probe publishes `body_placement` at the
-    /// character's position — so a `clearance.body` of `Placeable` while the controller holds the
-    /// body frozen is not a bug to be guarded against, it is unrepresentable.
+    /// character's position. What that removes is the SECOND COPY of the predicate; the probe still
+    /// has to evaluate it at the right POINT, which is
+    /// `body_is_measured_at_the_character_not_the_anchor_when_the_two_disagree` above.
+    ///
+    /// Expectations here are literals, cross-checked against the two disjuncts recomputed from the
+    /// PRIMITIVES (`footprint_clear` / `ground_below`) at the character's z. The version of this
+    /// test in round 1 asserted `p.body == col.body_placement(...)` — self-grading, and it passed
+    /// under the mutant above (#885 review round 1, B2).
     #[test]
     fn the_probe_reports_the_same_predicate_the_controller_acts_on() {
-        for (name, col, at) in [
-            ("open", open_ground(), [0.0f32, 0.0, 1.0]),
-            ("void", void_column(), [200.0, 200.0, 3.5]),
+        let radius = eqoxide_core::physics::PLAYER_RADIUS;
+        for (name, col, at, want, want_disjuncts) in [
+            ("open",  open_ground(),          [0.0f32, 0.0, 1.0],   Placement::Placeable,       (false, false)),
+            ("void",  void_column(),          [200.0, 200.0, 3.5],  Placement::NoFloorBelow,    (false, true)),
+            ("slot",  slot_below_the_anchor(), [0.0, 0.0, -11.0],   Placement::FootprintPierced, (true, false)),
         ] {
             let p = col.clearance_probe(at[0], at[1], at[2]);
-            assert_eq!(p.body, col.body_placement([at[0], at[1], at[2]]),
-                "{name}: the published verdict IS `body_placement` at the character's position");
+            assert_eq!(p.body, want, "{name}: the published verdict, as a literal");
+            let pierced = !col.footprint_clear(at[0], at[1], at[2], radius, PLACEMENT_RING_DIRS);
+            let no_floor = col.ground_below(at[0], at[1], at[2] + GROUND_ORIGIN, GROUND_DEPTH).is_none();
+            assert_eq!((pierced, no_floor), want_disjuncts,
+                "{name}: the controller's two disjuncts AT THE CHARACTER's z, from the primitives");
         }
     }
 
@@ -10321,6 +10418,7 @@ mod clearance_probe_is_not_lossy_885 {
             a_missing_floor_is_never_served_as_a_floor_height,
             the_anchor_records_the_characters_own_z_when_the_probe_snaps_away_from_it,
             a_body_the_controller_will_not_place_is_named_in_the_payload,
+            body_is_measured_at_the_character_not_the_anchor_when_the_two_disagree,
             the_probe_reports_the_same_predicate_the_controller_acts_on,
             placement_names_which_disjunct_failed,
             the_json_encoding_keeps_the_distinctions,
@@ -10336,6 +10434,15 @@ mod clearance_probe_is_not_lossy_885 {
         let v = serde_json::to_value(&p).expect("the probe serializes");
         assert_eq!(v["body"], serde_json::json!("no_floor_below"));
         assert_eq!(v["anchor"], serde_json::json!({ "kind": "no_floor_in_band", "reference_z": 3.5 }));
+        // #885 review round 1, B5: the served `semantics` string used to tell callers to compare
+        // `anchor.z` against `anchor.reference_z`. There IS no `z` key on this variant, and this is
+        // exactly the "standing over nothing" world #885 was filed from. Pinned so the instruction
+        // and the payload cannot drift apart again.
+        assert!(v["anchor"].get("z").is_none(),
+            "`no_floor_in_band` carries no `z` key — an instruction to read one is unperformable: {}",
+            v["anchor"]);
+        assert_eq!(v["anchor"]["reference_z"], serde_json::json!(3.5),
+            "`reference_z` is the field that IS always present");
         assert_eq!(v["wall_spokes"][0], serde_json::json!("clear_to_cap"),
             "a saturated spoke must not encode as a number");
         assert!(v["wall_spokes"][0].as_f64().is_none(),

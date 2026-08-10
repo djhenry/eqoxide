@@ -570,11 +570,15 @@ async fn get_nav_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                      walker's actual committed routes, verbatim; player is null when the position \
                      was unknown at publish time. clearance is TWO different questions, not one \
                      (#885): clearance.body is the movement controller's own placement verdict at \
-                     the CHARACTER's position and is authoritative for whether it can move at all \
-                     (anything but \"placeable\" means it cannot); clearance.wall_spokes / \
-                     footprint_ok / field_* are the PLANNER's model sampled at clearance.anchor, \
-                     which may be a different height — compare anchor.z against \
-                     anchor.reference_z. A spoke reading of \"clear_to_cap\" is a LOWER BOUND \
+                     the CHARACTER's position, and anything but \"placeable\" means the rest of \
+                     this clearance sample describes a point the character does not occupy. \
+                     clearance.body is NOT a claim about whether the character can move — that is \
+                     player.hold on /v1/observe/debug. clearance.wall_spokes / footprint_ok / \
+                     field_* are the PLANNER's model sampled at clearance.anchor, which may be a \
+                     different height: anchor.reference_z is always the character's own z, while \
+                     anchor.z is present ONLY when anchor.kind == \"floor\" (kind \
+                     \"no_floor_in_band\" means no floor was found in the band and the rays were \
+                     cast from reference_z). A spoke reading of \"clear_to_cap\" is a LOWER BOUND \
                      (nothing within cap), not a distance of cap."));
             }
             Json(v)
@@ -3756,6 +3760,85 @@ mod tests {
         *state.shared_collision.write().unwrap() = ready.collision().cloned();
         let v = nav_debug_json(state).await;
         assert_verbatim(&v);
+    }
+
+    /// **#885 review round 1, B1 + B5 — the `semantics` string must not be a confident falsehood
+    /// about its own payload.**
+    ///
+    /// Round 1 shipped two claims in this string that measurement refuted:
+    ///
+    /// * that `clearance.body` "is authoritative for whether it can move at all (anything but
+    ///   `placeable` means it cannot)". The reviewer drove the real `CharacterController` for 3 s
+    ///   on two `FootprintPierced` scenes: wet travelled 101.10 u, dry 101.01 u, both with
+    ///   `hold() == None`. I re-measured a dry one myself: 131.98 u, `hold() == None`. The verdict
+    ///   is the ENTRY CONDITION to the depenetration net, not a freeze. The sentence is deleted,
+    ///   not qualified;
+    /// * an instruction to "compare `anchor.z` against `anchor.reference_z`" — unperformable on a
+    ///   `no_floor_in_band` anchor, which carries no `z` key at all.
+    ///
+    /// Both are pinned here on the REAL response body, with the second one's payload actually
+    /// present so the instruction is checked against the JSON rather than against prose. The
+    /// negative assertions are the same shape as
+    /// `every_field_the_semantics_string_sends_a_caller_to_exists_in_the_body`'s "need not
+    /// iterate" pin: a re-added overclaim goes RED here.
+    #[tokio::test]
+    async fn the_nav_semantics_string_does_not_overclaim_the_clearance_sample() {
+        use eqoxide_nav::diagnostics::*;
+        let state = empty_state();
+        *state.nav_debug_view.lock().unwrap() = Some(std::sync::Arc::new(NavDebugSnapshot {
+            seq: 1,
+            zone_model_loaded: true,
+            nav_state: "navigating".into(),
+            nav_reason: None,
+            goal_id: 1,
+            player: Some([1.0, 2.0, 3.5]),
+            published_at: std::time::Instant::now(),
+            goal: None,
+            committed_coarse: vec![],
+            committed_fine: vec![],
+            plan: None,
+            pads: vec![],
+            clearance: Some(ClearanceProbe {
+                at: [1.0, 2.0],
+                // The variant the round-1 instruction could not be performed on.
+                anchor: ProbeAnchor::NoFloorInBand { reference_z: 3.5 },
+                body: Placement::NoFloorBelow,
+                wall_spokes: vec![SpokeReading::ClearToCap, SpokeReading::Hit { at: 2.5 }],
+                cap: 4.0,
+                footprint_ok: vec![true],
+                footprint_radius: 1.0,
+                footprint_ring_z: 6.5,
+                field_wall: 3.0,
+                field_ground: 2.0,
+            }),
+            water: None,
+        }));
+        let v = nav_debug_json(state).await;
+        let semantics = v["semantics"].as_str().expect("semantics is served").to_string();
+
+        // B1: the string must not tell an agent a non-`placeable` body means the character is stuck.
+        assert!(!semantics.contains("can move at all"),
+            "B1: `body` is the entry condition to the depenetration net, not a freeze — a dry \
+             FootprintPierced body I drove for 3.0 s travelled 131.98 u with hold() == None. \
+             Deleting this claim, not hedging it, is the fix: {semantics}");
+        assert!(semantics.contains("player.hold"),
+            "the string must send the caller to the field that DOES answer 'can it move': {semantics}");
+
+        // B5: the string's instruction about `anchor.z` must be performable on the payload it is
+        // describing. It is not an unconditional compare — `z` is a `floor`-only key.
+        assert_eq!(v["clearance"]["anchor"]["kind"], "no_floor_in_band");
+        assert!(v["clearance"]["anchor"].get("z").is_none(),
+            "B5: this anchor carries no `z` key, so guidance to read one unconditionally is \
+             unperformable: {}", v["clearance"]["anchor"]);
+        assert_eq!(v["clearance"]["anchor"]["reference_z"], serde_json::json!(3.5));
+        assert!(semantics.contains("anchor.z is present ONLY when anchor.kind == \"floor\""),
+            "the guidance must state the condition, since the key is conditional: {semantics}");
+
+        // The tagged spoke union survives the HTTP layer, not just nav's own serializer.
+        assert_eq!(v["clearance"]["wall_spokes"][0], serde_json::json!("clear_to_cap"));
+        assert_eq!(v["clearance"]["wall_spokes"][1], serde_json::json!({ "hit": { "at": 2.5 } }));
+        assert_eq!(v["clearance"]["at"], serde_json::json!([1.0, 2.0]),
+            "`at` is horizontal-only since #885 — two elements, not three");
     }
 
     /// Publish a nav snapshot whose `pads` are exactly `pads`, and set the walker's nav state.

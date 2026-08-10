@@ -453,6 +453,12 @@ impl SpokeReading {
 /// asked about. It is here because the sample's z is NOT necessarily the character's: a body
 /// embedded 1 u under a slab has a floor 1 u ABOVE it, so the whole sample describes a point in
 /// the open air over the geometry the character is stuck inside. That gap used to be invisible.
+///
+/// **On the wire, `z` is a key only on the `floor` variant.** The JSON is internally tagged, so
+/// `{"kind":"floor","z":…,"reference_z":…}` versus `{"kind":"no_floor_in_band","reference_z":…}` —
+/// there is no `z` key at all in the second. A consumer comparing the sample's height against the
+/// character's must branch on `kind` first; `reference_z` is the one field always present. (Rust
+/// callers can use [`ProbeAnchor::z`], which states the fallback explicitly.)
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ProbeAnchor {
@@ -489,9 +495,20 @@ impl ProbeAnchor {
 ///
 /// This is the movement controller's own `is_embedded` disjunction, not a nav opinion: the
 /// footprint ring is pierced by geometry, **or** there is no floor anywhere within `GROUND_DEPTH`
-/// beneath its feet. `Collision::body_placement` is the single definition —
-/// `movement::is_embedded` reads it, and so does the published clearance probe, so the diagnostic
-/// and the thing being diagnosed cannot disagree.
+/// beneath its feet. `Collision::body_placement` is the single definition — `movement::is_embedded`
+/// reads it, and so does the published clearance probe. One predicate, two readers.
+///
+/// **What that does and does not establish.** It removes the second copy of the predicate; it does
+/// not by itself make the probe evaluate it at the right POINT. The probe must call it at the
+/// character's z rather than the anchor's, and that is a property of one call site, pinned by the
+/// test `body_is_measured_at_the_character_not_the_anchor_when_the_two_disagree` (a scene where the
+/// two verdicts genuinely differ), not by anything the type system enforces.
+///
+/// **This is an entry condition, not a freeze.** A non-`Placeable` verdict is what admits a body to
+/// the depenetration net; the net usually relocates it and the body keeps moving. Measured: a dry
+/// `FootprintPierced` body driven for 3.0 s travelled **131.98 u** with `hold() == None`, because
+/// the push-out ring moved it clear on the first frame. Whether a character can move is
+/// `player.hold` on `/v1/observe/debug`, not this field.
 ///
 /// It is split into named variants rather than a `bool` because the two disjuncts are wildly
 /// different worlds — "wedged in a slot" versus "standing over nothing" — and `EmbeddedNoRecovery`
@@ -515,16 +532,13 @@ impl Placement {
     /// The controller's `is_embedded` verdict — true for every non-`Placeable` variant.
     #[inline]
     pub fn is_embedded(self) -> bool { !matches!(self, Placement::Placeable) }
-    /// Stable machine token for the API. Never reword these — agents match on them.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Placement::Placeable => "placeable",
-            Placement::FootprintPierced => "footprint_pierced",
-            Placement::NoFloorBelow => "no_floor_below",
-            Placement::FootprintPiercedAndNoFloorBelow => "footprint_pierced_and_no_floor_below",
-        }
-    }
 }
+
+// There is deliberately no `as_str` here. #885 review round 1 (F6) found one: it had no production
+// caller — the wire token comes from `#[serde(rename_all = "snake_case")]` above — and two mutants
+// rewording its strings stayed GREEN, so it was a second, unpinned definition of the most
+// agent-visible string in this change. The tokens are pinned where they are actually produced, by
+// `the_json_encoding_keeps_the_distinctions` in `collision.rs`.
 
 /// A live sample of the traversability model around one standing point: the radial wall spokes
 /// (the same rays `ClearanceField::wall_at` aggregates into the hug cost) and the footprint ring
@@ -540,15 +554,17 @@ impl Placement {
 /// a re-derivation; the two halves were simply answering different questions at different points,
 /// unlabelled. So:
 ///
-/// * [`ClearanceProbe::body`] is the authoritative answer to **"can this character be placed
-///   where it is, and therefore move at all"**. It is the controller's own predicate, evaluated at
-///   `anchor.reference_z()` — the character's actual height.
+/// * [`ClearanceProbe::body`] is the authoritative answer to **"does the controller's placement
+///   test pass where this character actually is"**. It is the controller's own predicate, evaluated
+///   at `anchor.reference_z()` — the character's actual height. It is **not** a claim about whether
+///   the character can move: a non-`Placeable` verdict is the ENTRY CONDITION to the depenetration
+///   net, which usually relocates the body and lets it keep going (see [`Placement`] for the
+///   measurement). The published answer to "can it move" is `player.hold` on `/v1/observe/debug`.
 /// * [`ClearanceProbe::wall_spokes`], [`ClearanceProbe::footprint_ok`] and the two `field_*`
 ///   values are the PLANNER's model, sampled at [`ClearanceProbe::anchor`]`.z()`. They answer
 ///   "how much room does the route planner think there is around this standing point". A
 ///   `body` other than [`Placement::Placeable`] means they are describing a point the character
-///   cannot occupy, and they must not be read as a statement about the character's freedom to
-///   move.
+///   does not occupy, and they must not be read as a statement about the character itself.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ClearanceProbe {
     /// The horizontal position the probe was taken at `[east, north]` — exactly the character's,
@@ -559,7 +575,8 @@ pub struct ClearanceProbe {
     pub anchor: ProbeAnchor,
     /// The CONTROLLER's placement verdict at `[at[0], at[1], anchor.reference_z()]` — the
     /// character's real position, not the anchor. **This is the authoritative field** for whether
-    /// the character can move; see the type docs.
+    /// the rest of this sample describes the character's own point; see the type docs. It is not a
+    /// claim about whether the character can move (that is `player.hold` on `/v1/observe/debug`).
     pub body: Placement,
     /// 16 radial wall readings, CCW from +east, cast at `anchor.z()` + the planner's probe
     /// heights. A saturated spoke is [`SpokeReading::ClearToCap`], never the number `cap`.

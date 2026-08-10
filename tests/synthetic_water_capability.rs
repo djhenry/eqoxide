@@ -15,30 +15,23 @@
 mod synthetic_scenes;
 
 use eqoxide::movement::{CharacterController, PLAYER_RADIUS};
-use eqoxide::nav::collision::Collision;
+// `GROUND_ORIGIN` / `GROUND_DEPTH` are the controller's own ground-probe geometry, public in nav
+// since #885. The fixture checks below import them rather than restating their values.
+use eqoxide::nav::collision::{Collision, GROUND_DEPTH, GROUND_ORIGIN};
 use eqoxide::traversability::PLAYER_BODY;
 use eqoxide_ipc::MoveIntent;
 use synthetic_scenes as scenes;
 
-/// Mirrors `movement.rs`'s private `GROUND_ORIGIN` (probe origin above the feet) — that module
-/// keeps it `const`-private, so the fixture checks below (which must ask the exact same question
-/// the depenetration net asks) restate the value here rather than duplicate the whole predicate as
-/// a public API surface just for a test. If `movement.rs`'s value ever changes, the corresponding
-/// in-crate test (`movement::tests::an_afloat_body_with_no_floor_below_is_never_pushed_out_into_a_drift`)
-/// changes with it and this one does not automatically follow — that drift risk is accepted in
-/// exchange for not widening `movement`'s public surface for a test-only constant.
-const GROUND_ORIGIN: f32 = 1.0;
-/// Mirrors `movement.rs`'s private `GROUND_DEPTH` (ground-probe downward range). See `GROUND_ORIGIN` above.
-const GROUND_DEPTH: f32 = 200.0;
-
-/// The depenetration net's own "is this body embedded" question (`movement::is_embedded`,
-/// private), restated here from its two PUBLIC halves (`Collision::footprint_clear`,
-/// `Collision::ground_below`) so the fixture checks and the iteration-invariant assertion below ask
-/// the identical question the net asks, not an approximation of it.
-fn embedded(col: &Collision, p: [f32; 3]) -> bool {
-    !col.footprint_clear(p[0], p[1], p[2], PLAYER_RADIUS, 8)
-        || col.ground_below(p[0], p[1], p[2] + GROUND_ORIGIN, GROUND_DEPTH).is_none()
-}
+/// The depenetration net's own "is this body embedded" question, read from the ONE definition
+/// rather than restated (#885 review round 1, F7).
+///
+/// This used to hand-roll the disjunction from `footprint_clear` / `ground_below` plus private
+/// copies of `GROUND_ORIGIN` and `GROUND_DEPTH`, justified by not wanting to widen `movement`'s
+/// public surface for a test. #885 moved the predicate and both constants down into
+/// `eqoxide_nav::collision` as public items — `movement::is_embedded` is now
+/// `col.body_placement(p).is_embedded()` — so that trade no longer exists, and the copy was pure
+/// drift risk. This calls exactly what the net calls.
+fn embedded(col: &Collision, p: [f32; 3]) -> bool { col.body_placement(p).is_embedded() }
 
 /// Drive the controller from `from` toward the XY of `to` for `secs`, with exactly the intent the
 /// walker sends at a water waypoint: `want_swim`, a horizontal wish, and **no vertical wish** — so

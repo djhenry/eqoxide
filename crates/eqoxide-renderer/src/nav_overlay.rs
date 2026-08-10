@@ -443,6 +443,77 @@ mod tests {
             "a losing call's edges are not part of the answer being drawn");
     }
 
+    /// **The clearance branch, entered (#885 review round 1, F9).** Every other snapshot in this
+    /// module sets `clearance: None`, so the whole `if let Some(c) = &snap.clearance` block was
+    /// unreached by any test — round 1 measured a mutant making `SpokeReading::draw_len` return
+    /// `0.0` for `ClearToCap` and it stayed GREEN.
+    ///
+    /// What is pinned, and why each matters:
+    ///
+    /// * a saturated spoke is drawn out to the **cap** (`draw_len`), a hit to its own distance —
+    ///   the mixed vector below has both, so a `draw_len` that collapses either one is RED;
+    /// * every drawn vertical comes from `anchor.z()`, **not** `anchor.reference_z()`. The two are
+    ///   deliberately different here (5.0 vs 4.0): the overlay draws where the rays were cast.
+    ///
+    /// This is a geometry assertion, not a screenshot. `Placement` is not drawn at all, which is
+    /// why `body` plays no part below.
+    #[test]
+    fn the_clearance_sample_is_drawn_from_the_anchor_and_saturated_spokes_reach_the_cap() {
+        let mut snap = snap_with(SearchTrace::with_budget(8));
+        snap.plan = None;
+        snap.player = None; // no player cross, so every segment below is the clearance sample's
+        snap.clearance = Some(ClearanceProbe {
+            at: [10.0, 20.0],
+            // The anchor sits 1 u ABOVE the character — the #885 divergence, drawn from the anchor.
+            anchor: ProbeAnchor::Floor { z: 5.0, reference_z: 4.0 },
+            body: Placement::FootprintPierced,
+            // Deliberately mixed: two measured hits and two saturations.
+            wall_spokes: vec![
+                SpokeReading::Hit { at: 1.0 }, SpokeReading::ClearToCap,
+                SpokeReading::Hit { at: 3.0 }, SpokeReading::ClearToCap,
+            ],
+            cap: 4.0,
+            footprint_ok: vec![true, false],
+            footprint_radius: 1.5,
+            footprint_ring_z: 8.0,
+            field_wall: 3.0,
+            field_ground: 2.0,
+        });
+        let verts = live_vertices(&snap);
+        assert_eq!(verts.len(), 12, "4 spoke segments + 2 ring segments, as vertex pairs");
+
+        // The spoke segments are the ones that are NOT the two ring colours.
+        let spokes: Vec<_> = verts.chunks(2)
+            .filter(|c| c[0].color != COL_RING_OK && c[0].color != COL_RING_BLOCKED)
+            .collect();
+        assert_eq!(spokes.len(), 4, "one segment per published spoke");
+        let lengths: Vec<f32> = spokes.iter()
+            .map(|c| ((c[1].pos[0] - c[0].pos[0]).powi(2) + (c[1].pos[1] - c[0].pos[1]).powi(2)).sqrt())
+            .collect();
+        for (i, (got, want)) in lengths.iter().zip([1.0f32, 4.0, 3.0, 4.0]).enumerate() {
+            assert!((got - want).abs() < 1e-4,
+                "spoke {i}: drawn length {got}, expected {want} (a saturated spoke draws to the cap)");
+        }
+        // Every spoke vertex sits at `anchor.z() + 1.0`, lifted. `reference_z` (4.0) would put
+        // these at 5.25 — the mutation this number exists to catch.
+        for c in &spokes {
+            for p in c.iter() {
+                assert!((p.pos[2] - (5.0 + 1.0 + Z_LIFT)).abs() < 1e-6,
+                    "spoke vertex z {} must be anchor.z() 5.0 + 1.0 + Z_LIFT", p.pos[2]);
+            }
+        }
+        // The footprint ring: one segment per published direction, coloured by it, at
+        // `anchor.z() + 0.6` (already lifted at the push site).
+        assert_eq!(segments_of(COL_RING_OK, &verts), 1);
+        assert_eq!(segments_of(COL_RING_BLOCKED, &verts), 1);
+        for c in verts.chunks(2).filter(|c| c[0].color == COL_RING_OK || c[0].color == COL_RING_BLOCKED) {
+            for p in c.iter() {
+                assert!((p.pos[2] - (5.0 + 0.6 + Z_LIFT)).abs() < 1e-6,
+                    "ring vertex z {} must be anchor.z() 5.0 + 0.6 + Z_LIFT", p.pos[2]);
+            }
+        }
+    }
+
     /// The committed routes are drawn verbatim from the snapshot — the #246 property on the
     /// consumer side. A fabricated route through nowhere is still drawn: the walker's actual
     /// committed plan is the truth being displayed, not this module's opinion of it.
