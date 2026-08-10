@@ -1227,10 +1227,13 @@ use eqoxide_ipc::MoveIntent;
     ///   from their spacing, and the spacing it asserted was not the spacing they have. Their
     ///   positions are a property of today's `walker.rs` and rot exactly like the line numbers this
     ///   test exists to replace, so no argument is built on them — but they are why the GREEN
-    ///   escapes above stay green: all eight resolve in the first ~40% of the file (measured at
-    ///   #975: at or below line 2049 of 5274), so an instrument blinded past line 2100 still finds
-    ///   every one and the eight positive verdicts say nothing. That is the standing reason the
-    ///   reach control exists and cannot be replaced by the verdicts it guards.
+    ///   escapes above stay green: the LAST of the eight resolves at line 2049 (both the anchor
+    ///   set and that line derived by execution in one pass at #975, sha `cd94a85`), so an
+    ///   instrument blinded past line 2100 still finds every one and the eight positive verdicts
+    ///   say nothing. No file TOTAL is quoted on purpose: it is the term that moves under every
+    ///   future edit, and the argument needs only "the last anchor sits above the blind line".
+    ///   That is the standing reason the reach control exists and cannot be replaced by the
+    ///   verdicts it guards.
     #[test]
     fn walker_source_anchors_cited_in_this_file_still_resolve() {
         // `tests/` sits at the workspace root, which is this package's manifest directory.
@@ -1920,9 +1923,9 @@ fn corner_buffer_blast_radius() {
     let mut cover = WaterRollup::new();
     for zone in &zones {
         // #807 corpus prologue: `open_corpus_zone` owns all three zone-abandoning drop paths and
-        // accounts for each on `cover` — see the first corpus loop in this file for why a bare
-        // `continue` made the totals read as complete, and why the region map matters to the pair
-        // filter even in a dry corpus.
+        // accounts for each on `cover` — see `goal_append_blast_radius`'s copy of this prologue for
+        // why a bare `continue` made the totals read as complete, and why the region map matters to
+        // the pair filter even in a dry corpus.
         let (col, zw) = match open_corpus_zone(&mut cover, std::path::Path::new(&dir), zone, 32.0) {
             Ok(ready) => ready,
             Err(why) => { println!("{zone:<12} ({why})"); continue }
@@ -2092,9 +2095,9 @@ fn descent_guard_blast_radius() {
     let mut cover = WaterRollup::new();
     for zone in &zones {
         // #807 corpus prologue: `open_corpus_zone` owns all three zone-abandoning drop paths and
-        // accounts for each on `cover` — see the first corpus loop in this file for why a bare
-        // `continue` made the totals read as complete, and why the region map matters to the pair
-        // filter even in a dry corpus.
+        // accounts for each on `cover` — see `goal_append_blast_radius`'s copy of this prologue for
+        // why a bare `continue` made the totals read as complete, and why the region map matters to
+        // the pair filter even in a dry corpus.
         let (col, zw) = match open_corpus_zone(&mut cover, std::path::Path::new(&dir), zone, 32.0) {
             Ok(ready) => ready,
             Err(why) => { println!("{zone:<12} ({why})"); continue }
@@ -2245,9 +2248,9 @@ fn parallel_wall_clearance_blast_radius() {
     let mut cover = WaterRollup::new();
     for zone in &zones {
         // #807 corpus prologue: `open_corpus_zone` owns all three zone-abandoning drop paths and
-        // accounts for each on `cover` — see the first corpus loop in this file for why a bare
-        // `continue` made the totals read as complete, and why the region map matters to the pair
-        // filter even in a dry corpus.
+        // accounts for each on `cover` — see `goal_append_blast_radius`'s copy of this prologue for
+        // why a bare `continue` made the totals read as complete, and why the region map matters to
+        // the pair filter even in a dry corpus.
         let (col, zw) = match open_corpus_zone(&mut cover, std::path::Path::new(&dir), zone, 32.0) {
             Ok(ready) => ready,
             Err(why) => { println!("{zone:<12} ({why})"); continue }

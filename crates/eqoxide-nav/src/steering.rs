@@ -462,9 +462,9 @@ pub fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
 /// 400 ticks, and 33 of 288 on the wider 8 u-separation sweep. With `<` it is outside, and both went
 /// to zero.
 ///
-/// **Since #733 that flip is no longer observable, and no test enforces the token** — see the
-/// ⚠️ Correction on `the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced`, which
-/// records the re-run. The second trigger catches the same fixed point, so `<` survives on the
+/// **Since #733 that flip is no longer observable, and no test enforces the token** — see
+/// `the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced`'s rustdoc, which records
+/// the re-run. The second trigger catches the same fixed point, so `<` survives on the
 /// round-2 reasoning alone. Read the counts above as a measurement of this constant's trigger in
 /// isolation, not as a live mutation check.
 ///
@@ -491,7 +491,10 @@ pub fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
 /// loop measures CARROT PINNING soundly — it is pure function composition — but it cannot measure
 /// whether a walker WEDGES. Read them as pinning counts only. (This does not weaken the `<`
 /// finding, which is about the fixed point sitting on the boundary, not about what the loop's
-/// outcome is called.)
+/// outcome is called.) A round-1 review figure — **133/1649 at 8 u** — was retracted by the round-2
+/// reviewer on exactly this ground, being the same 24 u-step model on a denser grid. It is recorded
+/// here because this is the only surviving copy of that retraction; an earlier revision said the
+/// pair was preserved elsewhere, and that pointer was false when written.
 pub const CURSOR_STALE_DIST: f32 = 8.0;
 
 /// The furthest a resync may reach: a candidate segment whose closest point is further than this
@@ -1641,8 +1644,8 @@ mod cursor_resync_tests {
         // settled extents "measure different things, and both are recorded rather than one standing
         // in for the other" — but nothing read `x_min`/`x_max`, which is what the `dead_code` warning
         // on those two fields was reporting: they were computed and then dropped, so the transient
-        // the #727 round-5 correction exists to keep separate was invisible in the output. Printing
-        // them is deliberately NOT an assertion: the transient's width is a diagnostic, and the only
+        // `Run`'s doc exists to keep separate was invisible in the output. Printing them is
+        // deliberately NOT an assertion: the transient's width is a diagnostic, and the only
         // claim this test makes is about the settled band.
         eprintln!(
             "settled span {span:.4}   east of LANDED {:.4}   west of LANDED {:.4}   \
@@ -1748,7 +1751,7 @@ mod cursor_resync_tests {
             every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard,
             unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace,
             the_doc_span_scan_reaches_all_five_citation_files_at_three_depths_each,
-            // #789/#874: the two new tests cited by name in the ⚠️ Correction blocks above and in
+            // #789/#874: the two new tests cited by name in
             // `unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace`'s
             // own doc — caught by this file's own scan on the run that added the citations.
             unbalanced_doc_code_spans_in_the_whole_workspace_are_a_named_shrinking_backlog,
@@ -1872,8 +1875,9 @@ mod cursor_resync_tests {
         /// say so.
         const NOT_A_FN: &[(&str, &str)] = &[
             ("the_resync_clears_the_deadlock_above_the_guard_and_is_inert_below_it",
-             "a test renamed in round 3, quoted verbatim inside a ⚠️ Corrections block so the \
-              retracted name is preserved rather than deleted. Inherently unguardable."),
+             "a test renamed in round 3, quoted verbatim in this fn's own rustdoc (the round-4 \
+              dangling-citation paragraph) so the retracted name is preserved rather than deleted. \
+              Inherently unguardable."),
             ("open_air_ceiling_is_never_returned_as_floor",
              "a fixture RETRACTED at PR-D/D-2 and deleted; the doc that names it IS its retraction \
               note."),
@@ -1900,9 +1904,11 @@ mod cursor_resync_tests {
              "this test's own name before #788 renamed it, quoted in its rustdoc as the retracted \
               name rather than deleted. Inherently unresolvable — that is what renamed means."),
             ("the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it",
-             "the hairpin sweep's name between round 3 of #727 and #733, quoted verbatim inside a \
-              ⚠️ Correction block because the name asserted 'inert below the guard' — which #733 \
-              made false. Retired, so inherently unresolvable."),
+             "the hairpin sweep's name between round 3 of #727 and #733, quoted verbatim under \
+              'Grepping for the retired name' in \
+              `the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured`'s rustdoc, \
+              because the name asserted 'inert below the guard' — which #733 made false. Retired, \
+              so inherently unresolvable."),
         ];
 
         // ── corpus 1: where citations are read from ──────────────────────────────────────────────
@@ -2817,10 +2823,13 @@ mod cursor_resync_tests {
     ///
     /// Parity implies a crossing span only when nothing else on the line contributes an odd count of
     /// its own. No claim is made here about how this check's catch set relates to `doc_citations`':
-    /// one such comparison was written and falsified. What is measured: a wrapped citation's
-    /// truncated leading fragment IS visible to `doc_citations` — it reads each line's chunks
-    /// independently and `:` is in the charset — **when the opening line's own count is odd**, which
-    /// is exactly the case the padding above defeats.
+    /// one such comparison was written and falsified. (#764, disclosed rather than rewritten:
+    /// #727's PR body and two of its review comments carry an earlier version of that
+    /// falsified-claims list which omits one item and double-counts another. Merged history is left
+    /// as merged, so an external artefact still carries the superseded list.) What is measured: a
+    /// wrapped citation's truncated leading fragment IS visible to `doc_citations` — it reads each
+    /// line's chunks independently and `:` is in the charset — **when the opening line's own count
+    /// is odd**, which is exactly the case the padding above defeats.
     ///
     /// The fence test runs on the line with blockquote markers stripped; see
     /// `strip_blockquote_markers` for the live case that forced it.
@@ -3106,7 +3115,8 @@ mod cursor_resync_tests {
         pinned: bool,
         /// Ticks where `carrot_leads` was false AND the body was within `CURSOR_STALE_DIST` of the
         /// segment `cursor` names — the region only the #733 trigger can act in. A NON-VACUITY
-        /// measure of the fixture, not a liveness measure of the guard: see the ⚠️ Correction above.
+        /// measure of the fixture, not a liveness measure of the guard: a nonzero count says the
+        /// fixture reached the region the guard acts in, and says nothing about whether it acted.
         collapse_only_ticks: u32,
     }
 

@@ -2716,10 +2716,6 @@ mod tests {
             // added in round 6 by `steering`'s mechanical citation scan: cited in a doc comment in
             // this file and named in no guard list.
             cancelling_the_goto_while_loading_returns_to_idle,
-            // #766 round 5: cited by `Walker::latch_local_planner_liveness`'s rustdoc, which points
-            // at this test for the B10 hedge on the uncommitted draft. Caught by `steering`'s scan,
-            // not by me — the citation was added and the guard was not.
-            a_dead_fine_planner_stays_visible_after_the_goal_is_retired_766,
             // #787: cited by `NOT_PRODUCTION`'s rustdoc, which points at the guard that decides what
             // the marker means. Caught by `steering`'s scan when the citation was written.
             exactly_one_production_fine_worker_is_built_in_the_tree_787,
@@ -4037,9 +4033,12 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// reported `ok`. Two of the eight are now closed; the rest are not closable by a text scan
     /// without turning it into a Rust parser (#799 catalogues the family).
     ///
-    /// Every row carries the plant that produced its verdict, deliberately: a blanket "every row
+    /// A row carries the plant that produced its verdict wherever one was run: a blanket "every row
     /// below was RUN" was written once and was false for two of them, both written by analogy with
-    /// the rows beside them. Per-row provenance is checkable; a blanket assurance is not.
+    /// the rows beside them. **Not every row carries one, and this paragraph used to say they all
+    /// did.** The qualified-path and `macro_rules!` rows state a verdict with no plant at all, and
+    /// the relogin row argues from the subject mismatch above rather than from a run. Read a row's
+    /// provenance off the row; do not read it off this paragraph.
     ///
     /// | form | status |
     /// |---|---|

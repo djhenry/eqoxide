@@ -55,7 +55,7 @@ pub struct Hit {
 ///
 /// | measurement | status |
 /// |---|---|
-/// | everfrost 1,121,438, no region map — the figure that originally set this cap | MEASURED (pre-#849) |
+/// | everfrost 1,121,438, no region map — the figure that originally set this cap, and the reason it moved: it EXCEEDED the then-shipped `MAX_NODES = 1_000_000`, so `main` was at that point silently converting everfrost's honest `SearchClosed` closes into false `Exhausted` | MEASURED (pre-#849) |
 /// | butcher 352,493, no region map, full workload | MEASURED (#849 review, base) |
 /// | `highpass` 7,229 → 7,394 (+2.3%), full workload both sides, region map the only change | MEASURED (#849 review) |
 /// | butcher **4,583,785** WITH region map, `dev`-confirmed, butcher-only, full workload, 10 h 24 m, exit 0 | MEASURED (#856) |
@@ -92,9 +92,13 @@ pub struct Hit {
 /// leaving its butcher zone ≤ 1,495.82 s — ≤ 2.08 s per pair at the nominal 720, against 4.92 s
 /// for the no-region-map base and 52.02 s for this run. It would have to run at less than half the
 /// per-pair cost of the mapless base while reporting a 13× larger maximum, and profile cannot
-/// rescue that. A commit-range argument does not close it either: the run came from a working tree
-/// whose state was never recorded, and an edit to the probe loop bound prints no distinguishing
-/// string.
+/// rescue that. A commit-range argument does not close it either. The earlier run's stdout bounds
+/// its code to between `99c45b3` and `3eb8e3a`, and across that window the construct-and-search
+/// path is unchanged (`eqoxide-assets` untouched, `water_grid.rs` zero non-comment changes,
+/// `collision.rs`'s forty non-comment changed lines all inside this test's own body) — but that is
+/// a diff over COMMITTED revisions, and the run came from a working tree whose state was never
+/// recorded. An edit to the probe loop bound prints no distinguishing string, so a reduced reach
+/// probe is invisible to every artefact that survives.
 ///
 /// The obvious objection — a reduced sample should undershoot by far more than 0.00081% — has only
 /// a reasoned answer: `Key = (col, row, floor_bucket)` would make the maximum a broad PLATEAU, so
@@ -102,7 +106,10 @@ pub struct Hit {
 ///
 /// **None of that makes 4,583,748 wrong.** The test reports a MAX over sampled pairs, and a max
 /// over any subset is a LOWER BOUND on the max over the whole: 4,583,748 < 4,583,785, the right
-/// way round. Three mechanism stories have been asserted here and three were refuted — state what
+/// way round. Three mechanism stories have been asserted here and three were refuted. One is named
+/// because its inputs survive in this doc and it is therefore re-derivable by the next editor: the
+/// `dev`-vs-`release` story built by dividing the two runs' TOTAL wall times (37,453 / 1,620 =
+/// 23.1×). It is refuted by the per-node figures above and **must not be reinstated**. State what
 /// is excluded, state what is open, and do not supply a fourth.
 ///
 /// # THE DECISION (#856): stays at 8,000,000
@@ -2155,9 +2162,10 @@ impl Collision {
         let step_up = crate::traversability::PLAYER_BODY.step_up;
         let run = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
         let n = (run / PROBE_SPACING).ceil().max(1.0) as i32;
-        // One sub-segment of walkable slope plus one discrete step. NOT `walk_profile_ok`'s envelope
-        // — see the rustdoc's round-5 correction: this is the DESCENT allowance only, and the window
-        // it opens is `[prev_z - allow, prev_z + step_up]`, so uphill is capped at `step_up` alone.
+        // One sub-segment of walkable slope plus one discrete step. NOT `walk_profile_ok`'s envelope:
+        // this is the DESCENT allowance only, and the window it opens is
+        // `[prev_z - allow, prev_z + step_up]`, so uphill is capped at `step_up` alone. The rustdoc's
+        // "NOT symmetric" paragraph derives the resulting ascent-grade cap.
         let allow = (run / n as f32) * MAX_WALK_GRADE + step_up;
         let mut prev_z = from[2];
         for i in 1..=n {
@@ -5897,8 +5905,8 @@ mod tests {
             .ground_continuous([-0.5, 0.0, 0.0], [0.5, 0.0, -drop]);
         assert!(hop(3.1),
             "a 1 u hop accepts a 3.1 u fall — mean grade 3.1, against the 2.2 the rustdoc used to \
-             give as the predicate's cap. If this refuses, the round-5 correction overstates the \
-             hop-length dependence and must be narrowed");
+             give as the predicate's cap. If this refuses, `ground_continuous`'s rustdoc overstates \
+             the hop-length dependence and must be narrowed");
         assert!(!hop(3.3),
             "3.2 = MAX_WALK_GRADE·run + step_up is the analytic allowance at run = 1.0 and 3.3 must \
              be refused; if this passes, the per-probe envelope is not what the code computes");
