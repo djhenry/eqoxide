@@ -670,6 +670,15 @@ impl SpawnInfo {
     /// assert_eq!(info.spawn_id, 7);
     /// ```
     ///
+    /// That example is compiled and run rather than sitting behind an `ignore` fence, so it is a
+    /// live check on this function's name and signature. Its reach is limited, and saying so is
+    /// part of the claim: it only exists in a build where `test-fixtures` is on, which a
+    /// workspace-wide `cargo test --workspace` supplies through dev-dependency feature
+    /// unification. Scoped to this package alone, the whole `impl` is cfg'd away and the example
+    /// does not exist — measured at `1e8c4cb`, `cargo test --doc -p eqoxide-protocol --locked`
+    /// reports **0 tests**, exit 0. It guards the workspace gate; it does not guard a
+    /// package-scoped run.
+    ///
     /// **Why this exists (#913).** `SpawnInfo` was constructed *exhaustively* — no `..` rest — at
     /// every test site in the workspace, so adding a field to it broke tests that assert nothing
     /// about the new field. With `..SpawnInfo::for_test()` as the base, a new field cannot break a
@@ -737,24 +746,31 @@ impl SpawnInfo {
     /// and its mutation result in `tests/entity_pose_643.rs`.
     ///
     /// **The suite does not defend most of these values, and did not before #913 either.**
-    /// Measured by WRAP mutation (`field: if false { <orig> } else { <other> }`) at `66b9531`,
-    /// `--no-fail-fast`. Every figure is `passed/failed/ignored` and is labelled with the command
-    /// shape that produced it, because the two shapes do not report the same targets:
+    /// Measured by WRAP mutation (`field: if false { <orig> } else { <other> }`) at `1e8c4cb`,
+    /// `--no-fail-fast`, every run in one sitting. Each figure is `passed/failed/ignored` and is
+    /// labelled with the command shape that produced it, because the two shapes do not report the
+    /// same targets — an unmutated run is 2027/0/50 plain and 2015/0/47 with `--all-targets`:
     ///   - All **14** agreed-on values mutated together → **RED** under both shapes:
-    ///     `cargo test --workspace --locked` gives 2022/1/50, and adding `--all-targets` gives
-    ///     2010/1/47. The single failure either way is
+    ///     2026/1/50 under `cargo test --workspace --locked`, 2014/1/47 with `--all-targets`
+    ///     added. The single failure either way is
     ///     `packet_handler::tests::register_spawn_lays_down_zone_in_corpses`, and the single
     ///     observed field is `cur_hp`.
     ///   - **Those same 14 minus `cur_hp` — i.e. `last_name`, `class_`, `guild_id`, `guild_rank`,
     ///     `helm`, `show_helm`, `face`, `hairstyle`, `haircolor`, `pet_owner_id`, `player_state`,
     ///     `heading`, `npc_tint_index`** — mutated together → **GREEN** under both shapes:
-    ///     2023/0/50 plain, 2011/0/47 with `--all-targets`, identical to an unmutated run.
+    ///     2027/0/50 plain and 2015/0/47 with `--all-targets`, i.e. byte-identical to an
+    ///     unmutated run.
     ///
-    /// So 13 of the 29 baseline values could all be wrong at once without any test saying so.
-    /// (Note this is *not* "13 of the 15 the literals disagreed on" — that is a different set and
-    /// mutating it is RED.) It is a pre-existing gap this fixture concentrates rather than creates
-    /// — the same 13 values were previously hand-copied, unasserted, into nine literals — but it
-    /// is real: tracked as #969.
+    /// So those 13 of the 29 baseline values could all be wrong at once without any test saying
+    /// so. Read the set from the list above, not from the count: a *different* 13 — the
+    /// non-agreed-on values other than the two placeholders (`level`, `npc`, `gender`, `race`,
+    /// `body_type`, `stand_state`, `flymode`, `x`, `y`, `z`, `animation`, `equipment`,
+    /// `equipment_tint`) — is **RED**, 2025/2/50 plain, failing
+    /// `apply_wear_change_updates_one_slot` as well as the corpse test.
+    ///
+    /// This is a pre-existing gap the fixture concentrates rather than creates — the same 13
+    /// values were previously hand-copied, unasserted, into nine literals — but it is real:
+    /// tracked as #969.
     pub fn for_test() -> Self {
         SpawnInfo {
             spawn_id:       913,
