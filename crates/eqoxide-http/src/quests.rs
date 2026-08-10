@@ -210,6 +210,59 @@ pub(crate) mod tests {
         assert_eq!(json["tasks"][0]["task_id"], 1);
     }
 
+    /// #889, at the surface an agent actually reads. A **locked** activity (RoF2's 25-byte short
+    /// `OP_TaskActivity`, sent for a not-yet-unlocked step) carries no type, no target and no
+    /// counts. `/v1/quests/log` must therefore emit no such keys for it — `"goal_count": 0` would
+    /// be indistinguishable from a real objective with zero progress, and the agent has no second
+    /// channel to catch that. The `known` half of the test is the control: the absence of the keys
+    /// above only means something if the same endpoint does emit them when the server sent them.
+    #[tokio::test]
+    async fn log_omits_count_keys_for_a_locked_objective_and_emits_them_for_a_known_one() {
+        use eqoxide_core::game_state::{ActivityProgress, ActiveTask, TaskActivity};
+        let state = empty_state();
+        state.quest.task_log.lock().unwrap().push(ActiveTask {
+            task_id: 5740,
+            activities: vec![
+                TaskActivity { activity_id: 0, progress: ActivityProgress::Known {
+                    activity_type: 2, target: "Giant Rattlesnakes".into(),
+                    description: String::new(), done_count: 3, goal_count: 5, optional: false,
+                } },
+                TaskActivity { activity_id: 1, progress: ActivityProgress::Locked { optional: true } },
+                TaskActivity { activity_id: 2, progress: ActivityProgress::Undecodable {
+                    reason: "3 trailing byte(s)".into(),
+                } },
+            ],
+            ..Default::default()
+        });
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::get("/log").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let acts = &json["tasks"][0]["activities"];
+
+        // Control: a disclosed objective DOES carry the real numbers and the whole name.
+        assert_eq!(acts[0]["state"], "known");
+        assert_eq!(acts[0]["goal_count"], 5);
+        assert_eq!(acts[0]["done_count"], 3);
+        assert_eq!(acts[0]["target"], "Giant Rattlesnakes");
+
+        // Locked: activity_id and a state label, and NOTHING that reads as progress.
+        assert_eq!(acts[1]["state"], "locked");
+        assert_eq!(acts[1]["activity_id"], 1);
+        assert_eq!(acts[1]["optional"], true, "the one thing the 25 bytes DO carry");
+        for key in ["goal_count", "done_count", "target", "activity_type", "description"] {
+            assert!(acts[1].get(key).is_none(), "locked objective must not carry {key}: {}", acts[1]);
+        }
+
+        // Undecodable: says so, with a reason, and likewise no fabricated progress.
+        assert_eq!(acts[2]["state"], "undecodable");
+        assert_eq!(acts[2]["reason"], "3 trailing byte(s)");
+        for key in ["goal_count", "done_count", "target", "activity_type"] {
+            assert!(acts[2].get(key).is_none(), "undecodable objective must not carry {key}: {}", acts[2]);
+        }
+    }
+
     /// #347 step 2 (review round 1, B1): two accepts inside one undrained tick. Before the fix the
     /// second OVERWROTE the first and BOTH callers were told `200`, so one of the two tasks was
     /// never accepted while the agent believed both were.

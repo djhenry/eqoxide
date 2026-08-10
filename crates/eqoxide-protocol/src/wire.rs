@@ -228,6 +228,17 @@ impl<'a> WireReader<'a> {
         Some(())
     }
 
+    /// Try to borrow the next `n` bytes, advancing past them; `None` (and no advance) if fewer
+    /// than `n` remain. The non-panicking twin of [`Self::bytes`] — needed by length-prefixed
+    /// fields, where the length comes off the wire and so may be arbitrarily large.
+    #[inline]
+    pub fn try_bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        if self.remaining() < n { return None; } // overflow-safe: no `pos + n` before this
+        let s = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Some(s)
+    }
+
     /// Try to read a NUL-terminated string (lossy UTF-8), advancing past the terminator. `None`
     /// (and no advance) if there is no NUL in the remaining buffer.
     #[inline]
@@ -343,6 +354,21 @@ mod tests {
         r.skip(6);
         assert_eq!(r.remaining(), 4);
         assert!(r.has(4) && !r.has(5));
+    }
+
+    /// `try_bytes` must not panic (or wrap) on a length that exceeds the buffer — the length of a
+    /// length-prefixed field is attacker/garbage-controlled data read off the wire.
+    #[test]
+    fn try_bytes_refuses_oversized_length_without_panicking() {
+        let b = [1u8, 2, 3, 4];
+        let mut r = WireReader::new(&b, "test");
+        assert_eq!(r.try_bytes(2), Some(&b[0..2]));
+        assert_eq!(r.try_bytes(3), None, "3 > 2 remaining → None");
+        assert_eq!(r.pos(), 2, "a refused try_bytes must not advance");
+        assert_eq!(r.try_bytes(usize::MAX), None, "no `pos + n` overflow");
+        assert_eq!(r.try_bytes(2), Some(&b[2..4]));
+        assert!(r.at_end());
+        assert_eq!(r.try_bytes(0), Some(&b[4..4]), "zero-length read at end is fine");
     }
 
     #[test]
