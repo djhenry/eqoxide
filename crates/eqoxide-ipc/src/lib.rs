@@ -1,7 +1,7 @@
 //! `eqoxide-ipc` — the "inter-thread contracts" crate: the request-slot types shared between the
 //! HTTP API thread, the network (login/gameplay/navigation) thread, and the render/app loop.
 //!
-//! Extracted as the second member of the Cargo workspace (#544 Step 2c). It sits directly above
+//! It sits directly above
 //! `eqoxide-core` and below everything else — the layering is `core ← ipc ← {net, render, http,
 //! command, …}` — and depends ONLY on `eqoxide-core` plus the low-level channel/serde primitives
 //! (`tokio::sync::oneshot`, `arc-swap`, `serde`) its slot types are literally made of. It never
@@ -9,13 +9,10 @@
 //! `ipc` module (`pub use eqoxide_ipc as ipc`), so existing `crate::ipc::…` paths across the tree
 //! keep resolving unchanged.
 //!
-//! These are `Arc<Mutex<Option<T>>>`-style shared cells an HTTP handler writes a request into and
-//! the network action loop (or, for a few render-owned values, the app loop) drains each tick, plus
-//! the matching "published snapshot" direction (`Arc<Mutex<T>>` / `Arc<ArcSwap<T>>`) the network
-//! thread writes and HTTP/render read. They are neither genuine HTTP types (route state, request/
-//! response bodies — those stay in the app crate's `http`) nor genuine network-protocol types — this
-//! crate is the neutral third party both sides depend on, so the network loop no longer has to reach
-//! into `http` for its own inter-thread plumbing.
+//! They are neither genuine HTTP types (route state, request/response bodies — those stay in the
+//! app crate's `http`) nor genuine network-protocol types — this crate is the neutral third party
+//! both sides depend on, so the network loop no longer has to reach into `http` for its own
+//! inter-thread plumbing.
 //!
 //! ## Relocated shared type definitions (#544 Step 2c)
 //! Several of this crate's slots wrap type *definitions* that used to live in higher app-crate
@@ -55,15 +52,10 @@ pub use asset_sync::{
 };
 
 // ── Relocated shared type definitions (#544 Step 2c) ─────────────────────────────────────────────
-// Pure-data types the slots above/below wrap, moved down out of the app crate so `ipc` no longer
-// up-references `movement`/`camera_state`/`profiling`. Definitions only — the behavior that operates
-// on them (controller stepping, camera update, frame-profile collection) stays in those app modules,
-// which re-export these. Derives/serde attrs/field visibility are byte-identical to the originals.
+// See the module doc for what moved and why.
 
 /// What the driver wants this frame. `wish_dir` is a horizontal direction in server axes
 /// (east, north); magnitude is treated as a throttle (clamped to 1). `speed` is run speed (u/s).
-///
-/// Relocated from `movement` (#544 Step 2c); `movement::CharacterController::step` consumes it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MoveIntent {
     pub wish_dir:    [f32; 2],
@@ -88,8 +80,6 @@ pub struct MoveIntent {
 
 /// A read-only snapshot of the controller the render thread publishes each frame for the nav
 /// thread to stream to the server (design §2 "Threading"). `heading` is EQ-CCW degrees.
-///
-/// Relocated from `movement` (#544 Step 2c); the render thread produces it, the nav thread reads it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ControllerView {
     pub pos:     [f32; 3],
@@ -102,41 +92,35 @@ pub struct ControllerView {
     /// #442). `None` except right after a landing; the nav streamer take-and-clears it exactly once.
     /// Respects the init gate — default `None`, only ever set after `initialized`.
     pub landed_fall_height: Option<f32>,
-    /// #724 review B1: the controller is holding the body still and has no way to resume — see
-    /// [`eqoxide_core::game_state::ControllerHold`]. Republished from
-    /// `CharacterController::hold()` on every RENDERED frame (not latched like
-    /// `landed_fall_height`, which is a one-shot the reader must not miss): this is a level signal,
-    /// so a stale `Some` after the condition ends is the failure mode to avoid, and re-publishing
-    /// the current value is what avoids it. `ActionLoop::stream_position` mirrors it into
-    /// `GameState::player_hold`.
+    /// The controller is holding the body still and has no way to resume — see
+    /// [`eqoxide_core::game_state::ControllerHold`]. A LEVEL signal, not a one-shot latch like
+    /// `landed_fall_height`: a stale `Some` after the condition ends is the failure mode to avoid,
+    /// and republishing the current value is what avoids it. `ActionLoop::stream_position` mirrors
+    /// it into `GameState::player_hold`.
     ///
-    /// "Rendered" is load-bearing (#724 round-3 review, N1 — this said "EVERY frame" flatly).
-    /// `about_to_wait` has an explicit idle branch that renders nothing, and on rendered frames
-    /// where the controller is not stepped (no collision, mid zone-load) the level signal is
-    /// supplied by an explicit `clear_hold`, not by a recompute. Both are pinned by name; see
-    /// `CharacterController::clear_hold`.
+    /// "RENDERED frame" is load-bearing and is the publication term for both this field and
+    /// `afloat_stall`: `about_to_wait` has an idle branch that renders nothing, and on rendered
+    /// frames where the controller is not stepped (no collision, mid zone-load) the level signal is
+    /// supplied by an explicit `CharacterController::clear_hold`, not by a recompute. Both are
+    /// pinned by name.
     hold: Option<eqoxide_core::game_state::ControllerHold>,
-    /// #776/#801: the controller is afloat, being wished at, and going nowhere — see
+    /// The controller is afloat, being wished at, and going nowhere — see
     /// [`eqoxide_core::afloat::AfloatStall`]. **Not a weaker `hold`, and not a stronger one
     /// either: a different claim.** `hold` says the body cannot move at all under any driver;
     /// this says only that *this wish* has produced no motion for this long, which is why they are
     /// two fields and not one enum. A swimmer at the qcat pocket mouth stalls a horizontal wish
     /// forever and still escapes under a driven dive.
     ///
-    /// Published on exactly the same terms as `ControllerView::hold`, by the same statement:
-    /// `app.rs` destructures `CharacterController::disclosures()` into both fields at once, so this
-    /// is a level signal republished every RENDERED frame, and the republish is also the clear. On
-    /// rendered frames that do not step the controller (no collision, mid zone-load) the value comes
-    /// from `CharacterController::clear_hold`, which drops the stall window as well as the hold —
-    /// not from a recompute. `ActionLoop::stream_position` mirrors it into
-    /// `GameState::player_afloat_stall`, which `GameState::begin_zone_in` clears so a departed
-    /// zone's claim cannot survive a zone load during which the render loop published nothing.
+    /// Published on exactly the same terms as `hold`, by the same statement — `app.rs` destructures
+    /// `CharacterController::disclosures()` into both at once. `ActionLoop::stream_position` mirrors
+    /// it into `GameState::player_afloat_stall`, which `GameState::begin_zone_in` clears so a
+    /// departed zone's claim cannot survive a zone load during which the render loop published
+    /// nothing.
     ///
     /// Deliberately NOT the shape the now-deleted `moving` field had (#746): that field recomputed
-    /// `!on_ground` unconditionally on every publish, so on a rendered-but-not-stepped frame (no
-    /// collision, mid zone-load) it republished the PREVIOUS zone's answer as if it were current —
-    /// the reason it was deleted rather than wired to a reader. This field does not have that gap:
-    /// it clears through `CharacterController::clear_hold` on the same not-stepped path.
+    /// `!on_ground` unconditionally on every publish, so on a rendered-but-not-stepped frame it
+    /// republished the PREVIOUS zone's answer as if it were current. This field clears through
+    /// `clear_hold` on that same not-stepped path instead.
     afloat_stall: Option<eqoxide_core::afloat::AfloatStall>,
 }
 
@@ -164,39 +148,30 @@ impl ControllerView {
     /// answering — the #343 `connected: true` shape, where a well-formed field lies in exactly the
     /// window that matters. Nothing recomputes it and nothing looks wrong.
     ///
-    /// This was MEASURED on #801 rather than assumed. With the fields public, replacing `app.rs`'s
-    /// paired write with a `v.hold = self.controller.hold();` that never touches `afloat_stall`
-    /// compiled and left the entire workspace green — 54 targets, 1772 passed, 0 failed. **That
-    /// figure is anchored to commit `efed5e2`, the change that made these fields private, and it
-    /// cannot be re-run at any later head**: the mutation requires the fields to be public, which is
-    /// precisely what that commit removed. Do not read it as a claim about this head's suite. (#810
-    /// round-2 review, N3 — a number in a tracked file with no provenance reads as authority.)
-    /// `app.rs`'s
-    /// frame loop needs a GPU and a window, so no unit test can reach that statement, and this
-    /// repo's `include_str!` source pins have six separately measured evasions. Privacy is the one
-    /// mechanism here that a diff cannot slip past: that mutation is now
-    /// `error[E0616]: field 'hold' of struct 'ControllerView' is private`.
+    /// This was MEASURED, not assumed. With the fields public, replacing `app.rs`'s paired write
+    /// with a `v.hold = self.controller.hold();` that never touches `afloat_stall` compiled and
+    /// left the entire workspace green — 54 targets, 1772 passed, 0 failed. **That figure is
+    /// anchored to commit `efed5e2`, the change that made these fields private, and it cannot be
+    /// re-run at any later head**: the mutation requires the fields to be public, which is
+    /// precisely what that commit removed. Do not read it as a claim about this head's suite. That
+    /// mutation is now `error[E0616]: field 'hold' of struct 'ControllerView' is private`.
     ///
-    /// **What this does NOT do**, stated so nobody reads more into it: it does not prove the
-    /// publisher runs, and it does not stop a caller passing a deliberate `None`. It removes
-    /// exactly one failure — updating one disclosure while silently leaving the other stale — and
-    /// makes writing only one a compile error rather than an omission a reviewer has to notice.
+    /// **What this does NOT do**: it does not prove the publisher runs, and it does not stop a
+    /// caller passing a deliberate `None`. It removes exactly one failure — updating one disclosure
+    /// while silently leaving the other stale.
     ///
-    /// **Say the residual out loud rather than let the paragraph above imply it away (#801 round-2
-    /// review, N1): deleting the whole `v.publish_disclosures(self.controller.disclosures());` call
-    /// in `app.rs`'s stepped arm leaves the workspace fully green** — **re-measured at this head**
-    /// (`ae49d2b`), not carried forward: 54 target headers, 54 `test result:` lines, **1772 passed,
-    /// 0 failed, 47 ignored, 0 filtered out**, identical in every figure to the unmutated run. This
-    /// paragraph previously quoted 1774, which was round 1's total and was stale by two tests; the
-    /// mutation was re-run rather than the number patched, because patching it would have been the
-    /// reasoned-not-measured move (#810 round-2 review, N3). Severing only the mirror one layer down IS caught (`stream_position`'s test goes
-    /// red), and severing one field of two is now a compile error, but *removing the call site* is
-    /// caught by nothing in CI. `app.rs`'s frame loop needs a GPU, a window and a live session, so
-    /// no unit test in this workspace can reach that statement, and this repo has six separately
-    /// measured evasions of `include_str!` source pins — a pin here would assert the line is
-    /// *written*, which is not the property at issue. The honest guard for "the publisher actually
-    /// executes" is the live observation on a running client, and it is a check a human runs, not
-    /// one the suite runs. Treat that call site as unguarded.
+    /// **The residual, said out loud: deleting the whole
+    /// `v.publish_disclosures(self.controller.disclosures());` call in `app.rs`'s stepped arm
+    /// leaves the workspace fully green** — measured at `ae49d2b`: 54 target headers, 54
+    /// `test result:` lines, **1772 passed, 0 failed, 47 ignored, 0 filtered out**, identical in
+    /// every figure to the unmutated run. Severing only the mirror one layer down IS caught
+    /// (`stream_position`'s test goes red), and severing one field of two is now a compile error,
+    /// but *removing the call site* is caught by nothing in CI: `app.rs`'s frame loop needs a GPU,
+    /// a window and a live session, so no unit test in this workspace can reach that statement, and
+    /// this repo has six separately measured evasions of `include_str!` source pins — a pin here
+    /// would assert the line is *written*, which is not the property at issue. The honest guard is
+    /// live observation on a running client, which a human runs and the suite does not. Treat that
+    /// call site as unguarded.
     ///
     /// ```compile_fail
     /// // The measured mutation, denied. A single-field write no longer type-checks.
@@ -235,30 +210,24 @@ impl ControllerView {
     /// reads, or it does not survive contact with the mirror.
     ///
     /// Call it through [`ControllerSlots::begin_zone_in`] rather than directly, so that a caller
-    /// does not perform half of the act.
-    ///
-    /// That is **convention, not a guarantee**, and the earlier wording here ("so the `GameState`
-    /// clear and this one cannot be separated") was simply false — flagged in #846's round-2 review.
-    /// Both this method and `GameState::begin_zone_in` are `pub`; nothing stops a caller from
-    /// running one without the other, and #846's own M10 mutation *demonstrates* the separation by
-    /// making `run_zone_entry_handshake` do exactly that. `ControllerSlots::begin_zone_in`'s doc
-    /// says the same thing correctly, and the reason it cannot be a guarantee is structural:
-    /// `eqoxide-core` sits below this crate, so `GameState::begin_zone_in` has to stay `pub` and
-    /// separately reachable. What the pairing buys is one name for the whole act and a call-site
-    /// test per existing caller — not unrepresentability.
+    /// does not perform half of the act. That is **convention, not a guarantee**: both this method
+    /// and `GameState::begin_zone_in` are `pub` and nothing stops a caller running one without the
+    /// other (#846's own M10 mutation demonstrates the separation). It cannot be a guarantee for a
+    /// structural reason — `eqoxide-core` sits below this crate, so `GameState::begin_zone_in` has
+    /// to stay `pub` and separately reachable. The pairing buys one name for the whole act and a
+    /// call-site test per existing caller, not unrepresentability.
     pub fn invalidate_disclosures(&mut self) {
         self.publish_disclosures((None, None));
     }
 }
 
-/// Which mode the orbit/follow camera is in. Relocated from `camera_state` (#544 Step 2c).
-/// Serialized to the `/v1/camera` JSON — `rename_all = "snake_case"` is part of that wire form.
+/// Which mode the orbit/follow camera is in. Serialized to the `/v1/camera` JSON —
+/// `rename_all = "snake_case"` is part of that wire form.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CameraMode { AutoFollow, ManualOrbit }
 
-/// An HTTP `/camera` command the render loop applies to the `camera_state::CameraState`. Relocated
-/// from `camera_state` (#544 Step 2c).
+/// An HTTP `/camera` command the render loop applies to the `camera_state::CameraState`.
 #[derive(Debug, Clone)]
 pub enum CameraCmd {
     Set {
@@ -270,9 +239,8 @@ pub enum CameraCmd {
     Reset,
 }
 
-/// Snapshot of the current camera state for the HTTP GET `/camera` response. Relocated from
-/// `camera_state` (#544 Step 2c); `camera_state::CameraState::snapshot` produces it. Serde form
-/// preserved verbatim (it is the JSON body).
+/// Snapshot of the current camera state for the HTTP GET `/camera` response, produced by
+/// `camera_state::CameraState::snapshot`. The serde form IS the JSON body.
 ///
 /// # Every field here describes ONE frame — the one named by `drawn_frame` — not "now" (#867)
 ///
@@ -366,12 +334,9 @@ fn serialize_age_ms<S: serde::Serializer>(
 /// (EQ convention: 0=north/+Y, CCW). Camera sits opposite the facing direction:
 ///   az = heading_rad - π/2
 ///
-/// Relocated from `camera_state` (#422): `eqoxide-http`'s `GET /v1/observe/frame` preset resolver
-/// (`observe::resolve_camera_override`) needs this exact formula to turn a preset/yaw override into
-/// an azimuth relative to the character's current heading, but `eqoxide-http` cannot depend on the
-/// `eqoxide` binary crate that owns `camera_state` — moving the (tiny, pure) formula here instead of
-/// duplicating it keeps the two crates' notion of "behind the character" from ever drifting apart.
-/// Re-exported from `camera_state::desired_azimuth` so every existing call site there is unchanged.
+/// Lives here, not in `camera_state`, because `eqoxide-http`'s `GET /v1/observe/frame` preset
+/// resolver needs the same formula and cannot depend on the binary crate (#422). One copy, so the
+/// two crates' notion of "behind the character" cannot drift.
 pub fn desired_azimuth(heading_deg: f32) -> f32 {
     heading_deg.to_radians() - std::f32::consts::FRAC_PI_2
 }
@@ -380,10 +345,8 @@ pub fn desired_azimuth(heading_deg: f32) -> f32 {
 /// frame. Each field is an exponential moving average so the on-screen numbers are readable rather
 /// than flickering frame-to-frame.
 ///
-/// Relocated from `profiling` (#544 Step 2c). Serialized to `/v1/observe/debug` (`frame_profile`) —
-/// the serde form is part of that wire contract. Its `blend` companion + the `FrameSample` it reads
-/// moved with it (an inherent impl must be co-located with its type); the `Stopwatch` collection
-/// helper stayed in `profiling`.
+/// Serialized to `/v1/observe/debug` (`frame_profile`) — the serde form is part of that wire
+/// contract.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct FrameProfile {
     pub update_ms: f32,
@@ -415,7 +378,6 @@ impl FrameProfile {
 }
 
 /// Raw per-phase durations captured during one `render_frame`. Built only when profiling is enabled.
-/// Relocated from `profiling` (#544 Step 2c) alongside `FrameProfile::blend`, which consumes it.
 #[derive(Default)]
 pub struct FrameSample {
     pub update: std::time::Duration,
@@ -439,10 +401,9 @@ impl FrameSample {
     pub fn total_ms(&self)  -> f32 { self.total.as_secs_f32()  * 1000.0 }
 }
 
-/// The `--profile` / `EQ_PROFILE=1` on/off flag. Relocated from `profiling` (#544 Step 2o) — a
-/// process-wide toggle read by both the app crate (`app::render_frame`'s phase timers) and
-/// `eqoxide-ui` (gating its per-window timing log), so it lives beside the `FrameProfile`/
-/// `FrameSample` data it gates rather than forcing either reader to depend on the other.
+/// The `--profile` / `EQ_PROFILE=1` on/off flag — process-wide, read by both the app crate's phase
+/// timers and `eqoxide-ui`'s per-window timing log, so it lives beside the data it gates rather
+/// than forcing either reader to depend on the other.
 static PROFILING_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Turn frame profiling on/off (set once at startup from the `--profile` flag / `EQ_PROFILE` env).
@@ -737,14 +698,12 @@ pub struct NetHealth {
     /// never put on the wire. Since process start; never reset (a zone change does not un-drop a
     /// packet).
     ///
-    /// **`0` IS the expected healthy reading since #641.** History, because the previous text here
-    /// said the opposite and an agent reading it would have learned to ignore this counter: the
-    /// #612 round-2 review measured **283** on a fresh, healthy login into `qeynos` — all
+    /// **`0` IS the expected healthy reading since #641.** Before those recovery paths existed, the
+    /// #612 round-2 review measured **283** here on a fresh, healthy login into `qeynos` — all
     /// `WouldBlock`, all 7-byte session-layer control datagrams (ACKs), in a burst during zone-in
-    /// and then flat. #641 gave those two recovery paths (an immediate direct `send(2)` retry, and
-    /// a deferral queue for control datagrams), and both are counted elsewhere —
-    /// `send_wouldblock_rescued` and `send_deferred`. So this counter now means what its name says:
-    /// the datagram never reached the wire, and nothing will re-send it.
+    /// and then flat. #641 rescues and defers those instead, counted in `send_wouldblock_rescued`
+    /// and `send_deferred`, so this counter now means what its name says: the datagram never reached
+    /// the wire, and nothing will re-send it. A non-zero reading is a real loss, not background noise.
     ///
     /// The TRIGGER is established — CPU starvation of the client's tokio io driver, reproducible by
     /// pinning the client to one core. The MECHANISM is not: see `send_wouldblock_rescued` for why
@@ -771,10 +730,6 @@ pub struct NetHealth {
     /// varies RUN TO RUN, not by zone: `gfaydark` measured 0 rescued / 138 deferred on one run and
     /// 175 / 147 on another, same recipe and same binary; `qeynos` measured 141/107, 166/106 and
     /// 119/114. Nothing observable predicts it.
-    ///
-    /// Before #641 every one of these was a datagram silently dropped on the floor — mostly ACKs,
-    /// which the server then had to re-solicit by retransmitting the packets it had not seen
-    /// acknowledged.
     pub send_wouldblock_rescued: u64,
     /// How many **datagrams** a transient send refusal (`EAGAIN`/`ENOBUFS`) caused to be QUEUED for
     /// retry on a later net-thread tick instead of being dropped (#641). Only session-layer control
@@ -784,20 +739,17 @@ pub struct NetHealth {
     /// **Datagrams, not refusal events.** Counted exactly once, in `defer_control`, at the moment
     /// the datagram is queued. It is *not* incremented again when a queued datagram is re-attempted
     /// and refused again, so the number tracks how many datagrams were delayed, not how long the
-    /// outage lasted. The first cut of #641 got this wrong in the other direction and its docs and
-    /// its code disagreed (#641 review, finding 1).
+    /// outage lasted.
     ///
-    /// **Not a loss counter, and NOT disjoint from `send_failures`** (#641 review, finding 1b). In
-    /// the normal case each of these datagrams goes out on a later tick, ~10ms late. But a deferred
+    /// **Not a loss counter, and NOT disjoint from `send_failures`.** In the normal case each of these datagrams goes out on a later tick, ~10ms late. But a deferred
     /// datagram can still be lost afterwards — the queue overflows, or the session ends while it is
     /// still queued — and that loss is counted in `send_failures`/`send_failures_unretried` too, so
     /// the same datagram appears in both. `send_failures` stays the honest "was anything lost?"
     /// number; this one answers "how many datagrams did the socket make us delay?".
     ///
     /// That holds on EVERY path that ends a session, including the `OP_GMKick` one that parks
-    /// forever without ever unwinding: it calls `abandon_outstanding` explicitly (#641 review R3),
-    /// because a `Drop` that never runs cannot account for anything. A counter that is honest
-    /// "except on one path" decays into a counter nobody trusts.
+    /// forever without ever unwinding: it calls `abandon_outstanding` explicitly, because a `Drop`
+    /// that never runs cannot account for anything.
     ///
     /// A lower bound on genuine kernel refusals, for the reason given on `send_wouldblock_rescued`.
     /// Before #641 every one of these was a silently dropped ACK, which the server answered by
@@ -836,24 +788,11 @@ pub struct NetHealth {
     /// That qualifier is load-bearing (#612 review F1) and this counter must NOT be read as a
     /// complete count of lost payload: when a session ends while reliables are still outstanding,
     /// the next stream's window starts EMPTY and those datagrams are genuinely lost while this
-    /// counter reads 0 for all of them.
-    ///
-    /// **Two different endings, and which counter sees them:**
-    ///   - A zone handoff / world reconnect / clean shutdown — counted by `reliable_abandoned`.
-    ///   - A server-side drop the client OBSERVES (inbound `OP_SessionDisconnect`/`OP_OutOfSession`,
-    ///     or a closed socket) — since #642 this tears the gameplay phase down, dropping the stream,
-    ///     so `reliable_abandoned` counts it too, and `session_drop` names the cause.
-    ///   - **A server drop into TOTAL silence (no disconnect, no OutOfSession, no ICMP) — counted by
-    ///     NOTHING.** No `session_drop` is set, so the stream is not torn down and `reliable_abandoned`
-    ///     does not rise. `connected: false` (15s of link silence) is the only signal for this
-    ///     residual sub-case.
-    ///
-    /// This paragraph has now regenerated the wrong way four times across #612's reviews — most
-    /// recently right here, under a field whose name does not contain "abandoned", which is exactly
-    /// why greps keyed on `reliable_abandoned` kept missing it. `docs/http-api.md` and
-    /// `eqoxide_http::Health` both point readers HERE for the coverage list, so if this doc is wrong
-    /// the whole chain is. If you edit it, grep `resend_timeout` across the workspace, not this
-    /// field's neighbourhood.
+    /// counter reads 0 for all of them. `reliable_abandoned` is the counter for that loss, and its
+    /// doc below carries the CANONICAL list of which session endings are covered and which is
+    /// covered by nothing — read it before relying on a 0 here. That list has regenerated wrong
+    /// four times across #612's reviews; keep exactly one copy of it, and when you edit it grep
+    /// `resend_timeout` across the workspace rather than this field's neighbourhood.
     ///
     /// Do NOT read a nonzero value here as "a command was lost": several of these datagrams have a
     /// recovery path one level up (a fresh position update follows ~50ms later; a lost ACK is
@@ -876,11 +815,8 @@ pub struct NetHealth {
     /// still outstanding at that moment is genuinely lost, and no amount of "it will be
     /// retransmitted" is true of it any more.
     ///
-    /// Without this counter that loss would be exactly the bug #612 fixed, one level up: a
-    /// documented contract telling the agent a class of loss cannot have happened when it can.
     /// `EqStream`'s `Drop` impl adds its outstanding window here, so every path that TEARS THE
-    /// STREAM DOWN is counted without each one remembering to mirror it. See the COVERAGE note
-    /// below for the paths that do not tear it down — one of them is not covered at all.
+    /// STREAM DOWN is counted without each one remembering to mirror it.
     ///
     /// Note this counts abandonment, not necessarily *loss of an unsent packet*: a datagram that
     /// reached the wire and whose ACK simply had not arrived yet when we handed off is also counted.
@@ -889,10 +825,7 @@ pub struct NetHealth {
     ///
     /// **MEASURED (#612 round 2): three consecutive clean zone handoffs (qeynos → qeytoqrg → qeynos
     /// → freportw) left this at 0, with zero abandonment WARNs** — the resend window was empty at
-    /// every handoff. An earlier version of this doc predicted, from reasoning and explicitly
-    /// unmeasured, that a clean handoff "routinely leaves a small number"; that was WRONG and would
-    /// have trained an agent to ignore the counter's most likely true positive. **Treat a nonzero
-    /// value DURING PLAY as signal, not noise.**
+    /// every handoff. **Treat a nonzero value DURING PLAY as signal, not noise.**
     ///
     /// **Clean shutdown is the one measured exception, and it is expected to be nonzero.** Two live
     /// `/v1/lifecycle/exit` runs measured 4 and 8 (#612 round 3/4). It is invisible to an agent
@@ -903,10 +836,8 @@ pub struct NetHealth {
     /// contribute at all, because it is framed by `send_raw` (`SendRetry::None`) and the only
     /// `self.sent.push_back` in the client is in `send_tracked`. What is known empirically: the two
     /// runs INVERT the naive prediction — 4 with reliable traffic injected, 8 on a control run with
-    /// none. An earlier version of this doc asserted the "closing OP_Logout/SessionDisconnect are
-    /// still un-ACKed" mechanism; it was wrong on both counts and is withdrawn. The remaining count
-    /// is most likely reliables left over from earlier in the session, but that is a HYPOTHESIS,
-    /// not a traced fact — do not repeat it as one.
+    /// none. The remaining count is most likely reliables left over from earlier in the session, but
+    /// that is a HYPOTHESIS, not a traced fact — do not repeat it as one.
     ///
     /// **COVERAGE — read this before relying on a 0.** It is written where the abandonment can be
     /// observed, which is not everywhere a session can end:
@@ -1245,9 +1176,7 @@ pub type NavAvoidShared = Arc<Mutex<AggroAvoidOpts>>;
 ///    .insert(..)`, mutation through a temporary guard with no binding at all — and the suite
 ///    stayed green, because the scanner keyed on `let mut` on the same line. It was pinned against
 ///    the bug that had already happened rather than the one that would happen next, which is the
-///    same shape as the original defect. (That scanner had a second, independent hole too: its
-///    "skip test modules" logic latched at the first `#[cfg(test)]` and never reset, so most of
-///    several large production files went unscanned.)
+///    same shape as the original defect.
 ///
 /// So the rule moved into the type system, where a grep does not belong: a third publisher is now
 /// a **compile error**, not a test failure and not a review catch. This is the same
@@ -1280,10 +1209,10 @@ pub type NavAvoidShared = Arc<Mutex<AggroAvoidOpts>>;
 ///   `.github/workflows/test.yml`, keep `cargo build --release` ahead of `cargo test` in one job.
 ///
 /// That residual is deliberate and bounded: closing it entirely would mean giving up in-crate test
-/// fixtures that seed partial rosters on purpose. It is recorded here so nobody has to rediscover
-/// it, and so "a third publisher cannot compile" is read with its one qualification attached.
+/// fixtures that seed partial rosters on purpose.
+///
 /// `Debug`/`PartialEq` only. **Every other derive or impl on this type is deliberately absent** —
-/// see "The sealed surface" in the doc comment above.
+/// see the "The seal" comment block below the `Deref` impl.
 #[derive(Debug, PartialEq)]
 pub struct Roster<V>(HashMap<String, V>);
 
@@ -1315,14 +1244,13 @@ impl<V> std::ops::Deref for Roster<V> {
 // `mem::take(&mut *guard)`, `mem::replace(&mut *guard, ..)` — because each of them has to name a
 // producer, and there is none.
 //
-// It does NOT establish that no `Roster` value can be named or moved, and an earlier revision of
-// this comment claimed that it did. That was false. When `WorldSlots`' fields were `pub`,
-// `publish_entities` was `pub`, and `MutexGuard` supplied `DerefMut`, an outside crate could
-// legitimately populate a SCRATCH `WorldSlots` and then `mem::swap` one of its maps into a live one,
-// MOVING an existing `Roster` without ever constructing one. That compiled clean in release (#665)
-// and desynced `entity_ids` from `entity_positions`, which `combat.rs`'s "is this spawn known?"
-// answers from alone. Closing the producer set was necessary but not sufficient: the remaining leak
-// was that the CONTAINER handed out mutable access to what it protects.
+// It does NOT establish that no `Roster` value can be named or MOVED. When `WorldSlots`' fields were
+// `pub`, `publish_entities` was `pub`, and `MutexGuard` supplied `DerefMut`, an outside crate could
+// populate a SCRATCH `WorldSlots` and then `mem::swap` one of its maps into a live one, moving an
+// existing `Roster` without ever constructing one. That compiled clean in release (#665) and
+// desynced `entity_ids` from `entity_positions`, which `combat.rs`'s "is this spawn known?" answers
+// from alone. Closing the producer set was necessary but not sufficient: the remaining leak was that
+// the CONTAINER handed out mutable access to what it protects.
 //
 // #665 closed that at the container: `WorldSlots`' three roster fields are now PRIVATE and its only
 // read path is [`WorldSlots::entity_positions`] / `entity_ids` / `entity_poses`, which return a
@@ -1860,80 +1788,68 @@ pub struct NavStatus {
     /// goal — which is what an agent needs to decide between waiting, re-issuing and giving up.
     ///
     /// Retired on every state change, for the same reason `tier` is: it is a fact about the route
-    /// being executed now. That is a property of all three exhaustive writers, not of a habit —
-    /// [`NavStatus::retire_to_idle`] (the goal ended), [`NavStatus::stamp_fresh_goal`] (a new goal
-    /// replaced it) and [`NavStatus::transition_within_goal`] (the same journey moved state) each
-    /// destructure this struct with no `..`, so this field could not have been added without a
-    /// decision being recorded in all three. It was, in the first, when this field was introduced;
-    /// the other two were flat lists then and one of them leaked a dead goal's payload under the
-    /// next goal's `pending` (#851 review round 1, B1).
+    /// being executed now. All three exhaustive writers destructure this struct with no `..`, so the
+    /// decision had to be recorded in each of them — before that, one of them leaked a dead goal's
+    /// payload under the next goal's `pending`.
     pub stall:  Option<NavStall>,
-    /// **The fine worker thread has died — latched, and scoped to that WORKER** (#766 review B3/B9).
-    /// Set `true` the instant `LocalPlanner::is_dead()` is observed, and cleared by **nothing on any
-    /// nav route**: no goal, no zone change, no retirement touches it, because the thread does not
-    /// come back and recovering it needs a client restart. The one writer that clears it is
-    /// `Walker::new` (`eqoxide-nav`), which does so as it spawns a REPLACEMENT worker — so what the
-    /// latch describes is the worker, not the process. Those coincide today, exactly one `Walker`
-    /// being built per process — a premise checked, to the limited extent a source scan can check it,
-    /// by `walker::tests::exactly_one_production_fine_worker_is_built_in_the_tree_787` (#787) — which
-    /// is why the agent-facing docs call the field session-scoped; the
-    /// last paragraph here says why the distinction is worth keeping anyway. Published as the
-    /// top-level `nav_local_planner_dead` on GET /v1/observe/debug, always, in both states: an agent
-    /// checking its own health needs to be able to read "alive", not merely fail to read "dead".
+    /// **The fine worker thread has died — latched, and scoped to that WORKER.** Set `true` the
+    /// instant `LocalPlanner::is_dead()` is observed, and cleared by **nothing on any nav route**: no
+    /// goal, no zone change, no retirement touches it, because the thread does not come back. The one
+    /// writer that clears it is `Walker::new` (`eqoxide-nav`), which does so as it spawns a
+    /// REPLACEMENT worker — so what the latch describes is the worker, not the process. Those
+    /// coincide today, exactly one `Walker` being built per process — a premise checked, to the
+    /// limited extent a source scan can check it, by
+    /// `walker::tests::exactly_one_production_fine_worker_is_built_in_the_tree_787` (#787) — which
+    /// is why the agent-facing docs call the field session-scoped. Published as the top-level
+    /// `nav_local_planner_dead` on GET /v1/observe/debug, always, in both states: an agent checking
+    /// its own health needs to be able to read "alive", not merely fail to read "dead".
     ///
-    /// This field exists because `local` could not carry the fact honestly. `NavLocal` is a PER-GOAL
-    /// verdict and #766 retires it with the goal, but `planner_dead` was riding in it as one of its
-    /// three publishable `state` values while being a fact about the *client's fine worker*, not a
-    /// statement about any goal — and `local` was its only publication surface in the tree (the
-    /// `no_path`/`planner_dead` pair on `state`/`reason` comes from the COARSE planner). So
-    /// retirement destroyed it, and the review found the consequence: an agent between goals — exactly
-    /// when it polls `/v1/observe/debug` to decide what to do next — could not learn that its fine
-    /// planner was dead. Splitting the worker fact out of the per-goal row fixes that without a
-    /// carve-out in [`NavStatus::retire_to_idle`], which would have re-opened the very
-    /// clear-`local`-on-every-`idle` uniformity #766 exists to create.
+    /// It is a separate field because `local` could not carry the fact honestly. `NavLocal` is a
+    /// PER-GOAL verdict and #766 retires it with the goal, but `planner_dead` was riding in it as one
+    /// of its three publishable `state` values while being a fact about the *client's fine worker* —
+    /// so retirement destroyed it, and an agent between goals, exactly when it polls
+    /// `/v1/observe/debug` to decide what to do next, could not learn that its fine planner was dead.
+    /// (The `no_path`/`planner_dead` pair on `state`/`reason` comes from the COARSE planner and is a
+    /// different signal.) Splitting the worker fact out fixes that without a carve-out in
+    /// [`NavStatus::retire_to_idle`], which would have re-opened the clear-`local`-on-every-`idle`
+    /// uniformity #766 exists to create.
     ///
     /// **Known limit, stated rather than implied.** `LocalPlanner`'s death is only *discoverable*
     /// through a failed send or a disconnected receive, both of which happen on a tick that has a
     /// committed route. A worker that dies and is never posted to again is not detectable by any
     /// reader, this field included; what the latch guarantees is that once the death HAS been seen it
-    /// stays visible for the rest of that worker's life — which, on today's one-`Walker` process, is
-    /// the rest of the session — instead of dying with the next goal.
+    /// stays visible for the rest of that worker's life instead of dying with the next goal.
     ///
-    /// **Latched for the life of a WORKER, and cleared where one is spawned** (rounds 3–5 review).
-    /// "Session" means PROCESS today: `LocalPlanner::spawn` is reached only through `Walker::new` →
-    /// `ActionLoop::new`, and the one production call site of `ActionLoop::new` is in
-    /// `run_login_flow`, which returns as soon as the gameplay phase ends — so exactly one fine
-    /// worker exists per process and "latched forever" and "latched for this worker" coincide.
-    /// **That premise now has a TRIPWIRE under it, not a pin** (#787):
-    /// `walker::tests::exactly_one_production_fine_worker_is_built_in_the_tree_787` in `eqoxide-nav`
-    /// is a whole-tree source scan that fails — naming THIS sentence and the three others that rest
-    /// on it — when a second *plainly-written* `Walker::new` or `LocalPlanner::spawn` construction
-    /// site appears. Do not read it as stronger than that. It counts construction SITES; the premise
-    /// is about construction EVENTS, and the two come apart on the in-process relogin this comment is
-    /// about — one site, called twice, leaves the scan green. That was measured. Its rustdoc carries
-    /// the full table of what it does and does not see. The B9 test
-    /// below is NOT the pin either, because building a second `Walker` is its method. They
-    /// stop coinciding the moment anything builds a second `Walker` over this row (the shape an
-    /// in-process relogin would take): a NEW, healthy `LocalPlanner` would inherit `true` and the
-    /// client would report a fault it had just repaired, permanently — #343's shape, and a lie in the
-    /// honesty-critical direction. So `Walker::new` clears this flag as it spawns the worker, tying
-    /// the latch's lifetime to the worker's rather than to the row's. That is a no-op on today's
+    /// **Why worker-scoped and not process-scoped.** "Session" means PROCESS today:
+    /// `LocalPlanner::spawn` is reached only through `Walker::new` → `ActionLoop::new`, and the one
+    /// production call site of `ActionLoop::new` is in `run_login_flow`, which returns as soon as the
+    /// gameplay phase ends — so exactly one fine worker exists per process and "latched forever" and
+    /// "latched for this worker" coincide. **That premise has a TRIPWIRE under it, not a pin**
+    /// (#787): `exactly_one_production_fine_worker_is_built_in_the_tree_787` is a whole-tree source
+    /// scan that fails — naming THIS sentence and the three others that rest on it — when a second
+    /// *plainly-written* `Walker::new` or `LocalPlanner::spawn` construction site appears. Do not
+    /// read it as stronger than that: it counts construction SITES, the premise is about construction
+    /// EVENTS, and the two come apart on an in-process relogin — one site, called twice, leaves the
+    /// scan green. That was measured; its rustdoc carries the full table of what it does and does not
+    /// see. The two spans stop coinciding the moment anything builds a second `Walker` over this row:
+    /// a NEW, healthy `LocalPlanner` would inherit `true` and the client would report a fault it had
+    /// just repaired, permanently — #343's shape, and a lie in the honesty-critical direction. So
+    /// `Walker::new` clears this flag as it spawns the worker. That is a no-op on today's
     /// single-`Walker` process and is guarded by
     /// `a_new_walker_does_not_inherit_a_previous_workers_death_766` in `eqoxide-nav`, which
     /// constructs over a dirty row directly — the relogin *scenario* has no route to test through,
-    /// but the *clear* does, and the clear is what carries the guarantee.
+    /// but the *clear* does.
     ///
-    /// **That covers the BIRTH end of a worker's life and nothing covers the death end** (#766 review
-    /// B13). There is no `Drop` for `Walker` or for `LocalPlanner` anywhere, so when the net thread
-    /// ends — `run_net_thread` in `src/model.rs` writes a terminal reason on all four of its exit
-    /// arms — the worker is gone while this row, which the HTTP surface holds its own `Arc` to, goes
-    /// on publishing whatever it last held, `false` included. So do NOT read this field as "the flag
-    /// can never outlive the thread it reports on": a stale `false` after teardown is exactly that.
-    /// It is *disclosed* rather than hidden — `net_thread_dead` is non-null on precisely those paths
-    /// and the endpoint marks the whole payload a frozen final snapshot — which is why the review
-    /// asked for the sentence to be corrected and explicitly did **not** ask for a teardown writer:
-    /// adding one would be a new, untested route to fix something an existing signal already tells
-    /// the agent.
+    /// **That covers the BIRTH end of a worker's life and nothing covers the death end.** There is no
+    /// `Drop` for `Walker` or for `LocalPlanner` anywhere, so when the net thread ends —
+    /// `run_net_thread` in `src/model.rs` writes a terminal reason on all four of its exit arms — the
+    /// worker is gone while this row, which the HTTP surface holds its own `Arc` to, goes on
+    /// publishing whatever it last held, `false` included. So do NOT read this field as "the flag can
+    /// never outlive the thread it reports on": a stale `false` after teardown is exactly that. It is
+    /// *disclosed* rather than hidden — `net_thread_dead` is non-null on precisely those paths and
+    /// the endpoint marks the whole payload a frozen final snapshot — which is why there is
+    /// deliberately no teardown writer: adding one would be a new, untested route to fix something an
+    /// existing signal already tells the agent.
     pub local_planner_dead: bool,
 }
 
@@ -2020,85 +1936,46 @@ impl NavStatus {
     /// it cannot leave a previous goal's fact standing. It is also the only `idle` allowed to carry
     /// `reason: None` (#725 B1) — see the `debug_assert` below.
     ///
-    /// Before #732 the row was documented but not enforced: `Walker::set_nav_state_because` retired
-    /// `blocked_*`/`tier` on a transition and never touched `goal`, so every walker-side route to
-    /// `idle` left the finished goal's `[x, y, z]` published beside it. Across a zone change that is
-    /// the sharp case: coordinates are a per-zone namespace and carry no zone tag, so the pair reads
-    /// as a well-formed answer about a zone the numbers do not belong to.
+    /// The sharp case this exists for is a zone change: coordinates are a per-zone namespace and
+    /// carry no zone tag, so a finished goal's `[x, y, z]` left beside `idle` reads as a well-formed
+    /// answer about a zone the numbers do not belong to.
     ///
-    /// Called unconditionally (never gated on "the state actually changed"): defence in depth, so no
-    /// caller can reintroduce the leak by making a second retirement a no-op. (#732 review N1: under
-    /// the fixed code every route clears `goal`, so an already-`idle` row has nothing left to clear —
-    /// this guards the *shape*, not a scenario I can exhibit.)
+    /// Called unconditionally, never gated on "the state actually changed": defence in depth, so no
+    /// caller can reintroduce the leak by making a second retirement a no-op. Under today's code
+    /// every route clears `goal`, so this guards the *shape*, not an exhibitable scenario.
     ///
     /// **The destructure is exhaustive with no `..` on purpose.** Adding a field to [`NavStatus`]
     /// is an `error[E0027]` here until someone decides whether it survives a goal's retirement —
-    /// the same construction `AssetSyncState::slots()` uses in `eqoxide-ipc::asset_sync`. Note the
+    /// the same construction `AssetSyncState::slots()` uses in `eqoxide-ipc::asset_sync`. All three
+    /// state-changing routes carry that net, not just this one: its siblings are
+    /// [`NavStatus::stamp_fresh_goal`] (a new goal supersedes the old one) and
+    /// [`NavStatus::transition_within_goal`] (the walker moves state inside one journey). Note the
     /// weaker precondition: `NavStatus`'s fields are `pub` and read directly by several crates, so
     /// this pins the *retirement path* only. It does not stop other code writing the fields.
     ///
-    /// **All THREE state-changing routes carry that net now, not just this one** (#851 review round
-    /// 1, B1). Until then `idle` was the only exhaustive writer, and the other two were flat
-    /// assignment lists — which is exactly how `stall` came to be decided here and forgotten there.
-    /// Its siblings are [`NavStatus::stamp_fresh_goal`] (a new goal supersedes the old one) and
-    /// [`NavStatus::transition_within_goal`] (the walker moves state inside one journey). A field
-    /// added to [`NavStatus`] is now force-decided on every route out of a state, not one of three.
-    ///
-    /// **#766 moved `local` from KEPT to retired.** #732 left it standing with a `_keep_local`
-    /// binding on the grounds that the FINE tier is "a different tier" whose clearing
-    /// `Walker::clear_local_plan` owns. That reasoning holds for the tier's *machinery* and it still
-    /// does — this function does not touch `LocalPlanner`, and every NON-`idle` state keeps `local`
-    /// exactly as before, which is what preserves #382's deliberate keep-the-fine-verdict-on-`blocked`
-    /// design (`Walker::stop_nav_blocked` publishes `blocked`/`no_path`, never `idle`, so it does not
-    /// come through here). It does not hold for the published FIELD on an `idle` row: a `NavLocal`
-    /// carrying `no_way_through` or `exhausted` is the fine planner's verdict on threading toward *the
-    /// goal that just ended*, so it is a per-goal fact by the same argument as `tier`.
-    ///
-    /// **That argument covers two of the three publishable states, not all three** (review B3).
-    /// `planner_dead` was never a verdict about a goal — it is a latched client fault, scoped to the
-    /// fine WORKER rather than to any goal (round-6 review B12; the session framing this paragraph
-    /// used to carry is the agent-facing one, and `local_planner_dead`'s own doc says why the two
-    /// coincide today), that happened to be riding in this field as one of its three publishable
-    /// `state` values, and retiring it with the
-    /// goal would hide a dead fine worker from an agent between goals. It is not carved out here;
-    /// it now has its own field, `local_planner_dead`, which this function KEEPS.
-    ///
-    /// Before #766 the routes did not agree with each other. `zoned` — the reported one — and
-    /// `zone_cross_dropped_unhandled` left the verdict standing. The rest already cleared it, by two
-    /// different mechanisms that are RUN here rather than read off the source: `goal_dropped` (and
-    /// `respawned`, which shares its branch) because `Walker::resolve_goal`'s no-goto branch calls
-    /// `clear_local_plan()` on the same tick before it retires — `eqoxide-nav`'s
-    /// `the_goal_dropped_route_already_cleared_the_fine_verdict_before_766`; and the command-side
-    /// ones through an explicit `s.local = None;` in `CommandState::stamp_new_goal`, now deleted as
-    /// redundant — `eqoxide-command`'s
-    /// `every_command_side_retirement_retires_the_fine_tiers_verdict_766`. Routing them all through
-    /// here replaces that agreement-by-coincidence with one writer. (`respawned` is covered by
-    /// reading the shared branch, not by its own test.)
+    /// **Why `local` is retired here but kept on every non-`idle` state** (#766, refining #382): a
+    /// `NavLocal` carrying `no_way_through` or `exhausted` is the fine planner's verdict on
+    /// threading toward *the goal that just ended*, so on an `idle` row it is a per-goal fact by
+    /// the same argument as `tier`. It is only the published FIELD that is retired — this function
+    /// never touches `LocalPlanner`, and `Walker::stop_nav_blocked` publishes `blocked`/`no_path`
+    /// and never comes through here, which is what preserves #382's keep-the-fine-verdict-on-
+    /// `blocked` design. The one thing that argument does NOT cover is `planner_dead`, which was
+    /// never a verdict about a goal: it is a latched fault scoped to the fine WORKER, and it now has
+    /// its own field, `local_planner_dead`, which this function KEEPS.
     ///
     /// **This covers the transition only.** `docs/http-api.md` states `nav_local: null` as a
     /// universal over every `idle` row, and a retirement writer cannot deliver that on its own — the
     /// fine tier publishes from another thread and can land a verdict after the row went `idle`.
-    /// The other half of the guarantee is the coercion in `Walker::set_nav_local`; see its doc
-    /// comment for why that one is a coercion and not an assert.
+    /// The other half of the guarantee is the coercion in `Walker::set_nav_local`.
     ///
     /// **The `stop_nav_blocked` half of the #382 argument is true by convention, not by
     /// construction.** Its `state` is a `&str`, so nothing stops a future caller passing `"idle"`
     /// and routing a terminal `blocked` through this retirement after all. Every call site in the
     /// tree today passes a literal — `blocked`, `no_path`, `search_exhausted` — so the design holds
-    /// now, but it is grep-checkable, not enforced.
-    ///
-    /// The structural remedy is a typed `state` — an enum whose `idle` variant `stop_nav_blocked`
-    /// cannot name — and that is a workspace-wide change, out of this issue's scope. A
-    /// `debug_assert!(state != "idle", …)` would NOT be that remedy, and the earlier draft of this
-    /// paragraph was wrong to call it structural (review B4): `debug_assert!` compiles out under
-    /// `--release`, so it is a test-time instrument. That is not a new opinion: it is the same
-    /// argument `Walker::set_nav_local`'s doc makes for taking a coercion instead of an assert, and
-    /// the repo already says it out loud about the #725 writer guard — the doc on
-    /// `a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725` in
-    /// `eqoxide-nav` calls that `debug_assert!` "a TEST-TIME instrument, not a runtime one". It would
-    /// raise
-    /// the odds of catching a bad call site in CI; it would not make the invariant hold in the shipped
-    /// binary. Recorded as a known limit rather than left implied.
+    /// now, but it is grep-checkable, not enforced. The structural remedy is a typed `state` — an
+    /// enum whose `idle` variant `stop_nav_blocked` cannot name — and that is a workspace-wide
+    /// change. A `debug_assert!` would NOT be that remedy: it compiles out under `--release`, so it
+    /// is a test-time instrument and would not make the invariant hold in the shipped binary.
     pub fn retire_to_idle(&mut self, why: Option<&str>) {
         // The same writer-level guard as `Walker::set_nav_state_because` and
         // `CommandState::stamp_new_goal`: on `idle`, `nav_reason: null` is reserved for boot (#725).
@@ -2377,28 +2254,15 @@ pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 
 // ── Domain slot bundles (M4) ────────────────────────────────────────────────────────────────
 //
-// Everything above this line is an individual slot alias/type. `ActionLoop` (the network/nav
-// thread's per-tick state, `eq_net::action_loop`) and `HttpState` (the HTTP API's per-request
-// state, `http::mod`) each used to hold ~50–60 of these as flat, individually-named fields —
-// duplicated field lists in two structs, two constructors, and two hand-written test builders,
-// with no structure connecting e.g. `attack`/`cast`/`target` as "the combat slots" beyond
-// eyeballing the source.
+// Everything above this line is an individual slot alias/type. The bundles below group those slots
+// BY DOMAIN, one struct per HTTP API group (`/v1/combat`, `/v1/merchant`, `/v1/group`, …), mirroring
+// the router nesting in `http::mod::spawn_camera_server` — that is the seam a future shared
+// "controller verb" (one call both a UI click-handler and an agent HTTP handler go through) would
+// land on, and `TODO(MVC)` markers in `action_loop.rs` mark where.
 //
-// These bundles regroup the same fields BY DOMAIN, one struct per HTTP API group
-// (`/v1/combat`, `/v1/merchant`, `/v1/group`, …) — the router nesting in `http::mod::
-// spawn_camera_server` is the authoritative domain boundary these mirror, since that's already
-// the seam a future shared "controller verb" (one call both a UI click-handler and an agent HTTP
-// handler go through, instead of each independently poking a slot) would need to land on. This
-// is PURE REGROUPING: every field keeps its original name and `Arc`-sharing semantics unchanged
-// — only its home moved from `ActionLoop`/`HttpState` directly to one of these, embedded by
-// whichever of the two structs actually reads it. See `ActionLoop::new` and
-// `http::mod::spawn_camera_server`/`HttpState` for how a bundle is constructed exactly ONCE and
-// then `.clone()`d (a shallow `Arc`-handle clone, not a fresh channel) into each consumer that
-// needs it — never `Default`-constructed twice, which would silently sever the channel.
-//
-// A `TODO(MVC)` marker sits at a handful of representative drain sites in `action_loop.rs` for
-// where that future controller-verb unification would land; these bundles are the plumbing for
-// it, not the verbs themselves (out of scope here — this is a behavior-preserving refactor).
+// **A bundle is constructed exactly ONCE and then `.clone()`d** (a shallow `Arc`-handle clone, not a
+// fresh channel) into each consumer — see `ActionLoop::new` and `http::mod::spawn_camera_server`.
+// `Default`-constructing it a second time compiles and silently severs the channel.
 
 /// `/v1/combat/*`: targeting, auto-attack, consider, spell scribe/memorize/cast, and the one
 /// `/v1/pet/command` slot (small enough on its own that a dedicated `PetSlots` would just be
@@ -2574,29 +2438,10 @@ impl WorldSlots {
     /// `entity_ids` and `entity_poses` from `entities`, holding all three locks for the whole
     /// swap. Returns the number of entities published.
     ///
-    /// # Why this exists (#643 review round 2)
-    ///
-    /// `/v1/observe/entities?labeled=1` promises that `poses` is keyed EXACTLY like `entities`, so
-    /// an agent may write `body["poses"][name]` without a `KeyError`. That promise is only as good
-    /// as its weakest publisher, and it was already broken once: this crate has **two** roster
-    /// publishers — `eqoxide_net::action_loop::sync_entities` (every nav tick) and
-    /// `eqoxide_net::login`'s zone-in seed — and when `entity_poses` was added, only the first one
-    /// was updated. The seed kept writing positions and ids without poses, so every entity's
-    /// `poses` key was missing for the whole window between login and the first nav tick.
-    ///
-    /// The first fix was to add the missing lines to the second loop. That left the invariant as a
-    /// *convention duplicated across two hand-written loops*, which a reviewer falsified by simply
-    /// deleting the new lines again: the entire workspace suite stayed green. A third publisher
-    /// would reintroduce the bug by omission exactly as the second one did.
-    ///
-    /// So the invariant moved into a type, next to the fields it constrains: there is now one
-    /// function that writes these maps, it cannot write one without the others, and a new publisher
-    /// gets the guarantee by construction rather than by remembering. (Same move as `Pose`/`Gait`
-    /// in `eqoxide-core`, one level up: make the broken state unrepresentable rather than
-    /// documenting a rule and hoping.)
-    ///
-    /// A source-scanning test was tried here first and a reviewer defeated it in one line — see
-    /// [`Roster`], which now makes a second publisher a COMPILE ERROR instead.
+    /// It cannot write one map without the others, which is what makes
+    /// `/v1/observe/entities?labeled=1`'s "`poses` is keyed exactly like `entities`" promise hold by
+    /// construction. See [`Roster`] for the defect that motivated it and for why a second publisher
+    /// is a COMPILE ERROR rather than a lint or a review catch.
     ///
     /// # ⚠️ Lock order
     ///
@@ -2614,8 +2459,7 @@ impl WorldSlots {
     /// For the login seed this is **latent hardening, not a bug that was reachable**: on current
     /// control flow the seed runs exactly once against still-empty maps (it sits in the `Ok(..)`
     /// arm, so a failed attempt never seeds and a successful one never returns to the retry loop),
-    /// and `sync_entities` full-replaces from authoritative state on the next tick regardless. An
-    /// earlier revision of this PR described it as a second live bug; that was an overclaim.
+    /// and `sync_entities` full-replaces from authoritative state on the next tick regardless.
     pub fn publish_entities<'a, I>(&self, entities: I) -> usize
     where
         I: IntoIterator<Item = (&'a u32, &'a eqoxide_core::game_state::Entity)>,
