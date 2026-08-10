@@ -82,9 +82,19 @@ Where the guards actually are, counted by mutating the file rather than by readi
   compile-error log yields no proof; case 12 applies both one-edit mutants and shows case 0 failing
   on each.
 * **Downstream** of that decision, three guards must all be removed before the same thing happens:
-  the `proof is None` gate, the type assertion inside `verdict_from_proof`, and that function's use
-  of the proof line as evidence. Wrapping the gate alone turns an `INVALID` into a loud crash, never
-  a verdict — cases 8 and 9.
+  the `proof is None` gate, the type assertion inside `verdict_from_proof`, and that function's read
+  of the proof line. Wrapping the gate alone turns an `INVALID` into a loud crash, never a verdict —
+  cases 8 and 9.
+
+That downstream count holds for **any** log shape only because `verdict_from_proof` reads the proof
+before it branches, and it says so in a comment. It did not always. An independent reviewer mutated
+the file and measured a **two**-edit path: with a `[run] command` that is not cargo, a log can carry
+libtest-shaped failure lines and no sentinel, and the killers branch used to return before anything
+touched the proof — so the gate plus the type assertion were enough to print
+``RED | killed by `tests::is_seven` `` and **exit 0** for a run that built nothing. The fix was to
+move the read above the branches rather than to qualify the sentence; **case 15** replays that exact
+two-edit composition, pins that it now raises, and pins that a third edit is still required to reach
+the false `RED`.
 
 If a future cargo changes the wording of that line, `--self-test` fails loudly: its `RED` and
 `GREEN` cases would stop matching their declared expectations.
@@ -199,19 +209,23 @@ point against it. It exercises the failure modes, not just a happy path:
 | 6 | mutant that compiles and is not caught | `GREEN` |
 | 7 | two edits that each survive alone | `GREEN`, `GREEN`, and `RED` for the pair |
 | 8 | the harness's own sentinel gate wrapped away | loud crash, never a verdict |
-| 9 | that gate, the type assertion, and the evidence line behind it, all wrapped away | only now is a non-compiling mutant printed as `RED` |
+| 9 | that gate, the type assertion, and the proof read behind them, all wrapped away | only now is a non-compiling mutant printed as `RED` |
 | 10 | the harness's restore write corrupted | the sha256 check fires, and the file really is left different |
 | 11 | a real run against a cargo told to colourise (`CARGO_TERM_COLOR=always`) | still `RED`, not `INVALID` |
 | 12 | the two **one-edit** paths to a false `RED` | both really do produce one, and case 0's assertions fail on both |
 | 13 | `CARGO_TERM_QUIET=true`, where cargo omits the `Finished` line | `UNUSABLE`, and the run fails |
-| 14 | the self-test's own check accounting | a case whose body stops running is caught by the count |
+| 14 | the self-test's own check accounting | a case whose body stops running is caught by the count, and a case function missing from the table is caught by introspection |
+| 15 | the gate and the type assertion wrapped away, against a `[run] command` that builds nothing | the two-edit composition **raises**; a third edit is still required before a false `RED` is printed |
+| 16 | `--nocapture --test-threads=1`, where a passing test prints a libtest-shaped decoy | still `RED`, and the evidence names **no** test rather than the innocent one |
 
-Cases 8–10 and 12 mutate a copy of `scripts/mutate.py` using the harness's own edit engine. Case 10
+Cases 8–10, 12 and 15 mutate a copy of `scripts/mutate.py` using the harness's own edit engine. Case 10
 also checks that the alarm is *true* — that the file on disk really does differ — so a restore
 check that fired spuriously would not pass as a demonstration. Cases 11 and 13 carry reach
 controls: each asserts that the environment really did do the thing under test (colour really
-emitted; the sentinel really absent), so neither can pass vacuously. After each case the self-test
-re-hashes the subject file to confirm the tree was restored.
+emitted; the sentinel really absent), so neither can pass vacuously. Cases 15 and 16 carry controls
+too — that the pristine harness really does score the non-cargo run `UNUSABLE`, and that the decoy
+really did land inside libtest's own output line. After each case the self-test re-hashes the
+subject file to confirm the tree was restored.
 
 Case 14 is the reach control for all the others. The number of checks is **derived from the checks
 themselves** — one list, from which both the total and the failure set are read — and both the
@@ -221,9 +235,18 @@ hypothetical bookkeeping: the previous design appended to a separate `failures` 
 at all, and wrapping one case body away lost four checks while still printing `SELF-TEST PASSED`
 with exit 0.
 
-It runs in CI alongside the other guards. It is not cheap — it drives roughly a dozen cargo
-invocations — so it lives in the `test` job, next to cargo, rather than in the dependency-free
-guard job.
+The case *table* is derived from the case functions for the same reason. A row could otherwise be
+dropped in two coordinated edits — the row itself, and the constant — which measurably printed
+`SELF-TEST PASSED — 59 checks across 14 cases` with exit 0, the missing case being the one that
+proves the two one-edit false-`RED` paths are caught. Every module-level `case_<n>_*` function must
+now appear in `CASES` under its own number, so a dropped row leaves its function defined and
+undeclared, and that is a failure no one has to remember a number to catch.
+
+It runs in CI alongside the other guards. It is not cheap — it shells out to cargo for every case
+that needs a real build — so it lives in the `test` job, next to cargo, rather than in the
+dependency-free guard job. No wall-clock figure is quoted anywhere for it: that depends on the
+machine and on cargo's cache, and a stale number in tracked text is the defect class this harness
+exists to catch.
 
 ## Limits — state these rather than over-claiming
 
@@ -231,7 +254,13 @@ guard job.
   it does not say the perturbation is observable at all: a mutant that changes nothing a caller can
   see is `GREEN` and means nothing.
 * A `RED` says *some* test failed. Read the killer test names in the table before claiming the test
-  you meant is the one that fired.
+  you meant is the one that fired — and note the names are **evidence, never the verdict**. They are
+  read from libtest's per-test failure line, matched whole with a whitespace-free name. Under
+  `--nocapture` a test's own stdout is interleaved into libtest's stream and is indistinguishable
+  from it, so a test can print a perfectly-shaped failure line for a test that does not exist; the
+  whole-line match rejects the interleaved shape (measured — case 16) but cannot reject a cleanly
+  forged one. When no line matches, the row falls back to the build line and names nobody, which is
+  the safe direction: a `RED` that names an innocent test is worse than a `RED` that names none.
 * The table is only as strong as `[run] command`. A narrowed command makes `GREEN` a weaker claim,
   and the narrowing is part of what you are asserting.
 * Every mutant costs one full run of that command.

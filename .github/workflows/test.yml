@@ -164,8 +164,10 @@ jobs:
       # not shrink the output silently.
       #
       # Same PATTERN as the check-wrapped-literals `--self-test` in the job above, not the same
-      # cost: that one is in-process and sub-second, this one drives roughly a dozen cargo
-      # invocations and takes tens of seconds. It needs cargo, which is why it lives here and not
-      # in the `no-local-detail` job. See docs/mutation-testing.md.
+      # cost: that one is in-process and sub-second, this one shells out to cargo for every case
+      # that needs a real build. No wall-clock figure is quoted here on purpose — it depends on the
+      # runner and on cargo's cache, and a stale number in tracked text is exactly the defect class
+      # this harness exists to catch. It needs cargo, which is why it lives here and not in the
+      # `no-local-detail` job. See docs/mutation-testing.md.
       - name: mutation harness self-test
         run: python3 scripts/mutate.py --self-test

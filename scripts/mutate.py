@@ -43,12 +43,17 @@ the case numbers below are what each claim rests on:
     stops that is case 0, which fails on both mutants.
   * DOWNSTREAM of that decision, three guards must ALL be removed before the same thing happens:
     the `proof is None` gate, the type assertion inside `verdict_from_proof`, and that function's
-    use of the proof line as evidence. Wrapping the gate alone turns an INVALID into a loud crash,
-    never a verdict (cases 8 and 9).
+    read of the proof line. Wrapping the gate alone turns an INVALID into a loud crash, never a
+    verdict (cases 8 and 9), and the two-edit composition raises rather than reporting (case 15).
 
-That is the whole enumeration, and it was arrived at by mutating the file rather than by reading
-it: an earlier version of this docstring claimed three barriers full stop, and the two one-edit
-paths above are precisely what it missed.
+The downstream claim holds for ANY log shape only because `verdict_from_proof` reads the proof
+before it branches. It did not always: with that read inside the branches, a log carrying
+libtest-shaped failure lines but no sentinel needed only TWO edits — gate plus type assertion — to
+print `RED | killed by <test>` and exit 0 for a run that built nothing, because the killers branch
+returned before anything touched the proof. That was found by an independent reviewer mutating this
+file, after a previous version of this docstring asserted the three-guard claim was "the whole
+enumeration". Case 15 replays that exact two-edit composition and pins that it now raises; the
+sentence above is true because the structure was changed to make it true, not the other way round.
 
 SAFETY RULES BAKED IN
 ---------------------
@@ -129,6 +134,13 @@ COMPILE_SENTINEL_DESC = "Finished `<profile>` profile"
 # see the build result. MEASURED: a type error prints this both normally and under
 # CARGO_TERM_QUIET=true, while a successful build whose test fails never does.
 BUILD_FAILURE_MARKER = "error: could not compile"
+
+# libtest's per-test failure line, matched WHOLE and with a whitespace-free name. Under
+# `--nocapture` a test's own stdout is interleaved into libtest's stream and is indistinguishable
+# from it, so a loose match invents test names — see `killer_tests`. This pattern cannot be made
+# forgery-proof (a test may print a perfectly-shaped line), which is why the killer names are
+# evidence only, never the verdict.
+KILLER_LINE_RE = re.compile(r"^test (\S+) \.\.\. FAILED\r?$", re.MULTILINE)
 
 # Cargo decorates that line in some environments, and BOTH decorations break the search above.
 # Two forms were measured while writing this, not reasoned about:
@@ -215,12 +227,18 @@ def find_compile_proof(output: str) -> CompileProof | None:
 
 
 def killer_tests(output: str, limit: int = 3) -> list[str]:
-    """Names of the tests that failed. Only ever called from the RED branch below."""
-    names = []
-    for line in output.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("test ") and stripped.endswith(" ... FAILED"):
-            names.append(stripped[len("test ") : -len(" ... FAILED")])
+    """Names of the tests that failed. Only ever called from the RED branch below.
+
+    The match is deliberately WHOLE-LINE and the name may not contain whitespace. An earlier
+    version accepted any line that merely started `test ` and ended ` ... FAILED`, which swallowed
+    everything in between. MEASURED under `--nocapture --test-threads=1`: a passing test that
+    prints a decoy while another test genuinely fails produced
+    ``killed by `tests::noisy ... test tests::innocent_bystander` `` — a name that does not exist,
+    attributing the kill to a test that passed and omitting the one that failed. These strings get
+    quoted into reviews as ground truth, so a wrong name is worse than no name: with this pattern
+    the mangled line matches nothing, the RED stands, and the evidence falls back to the build line.
+    """
+    names = [m.group(1) for m in KILLER_LINE_RE.finditer(output)]
     return names[:limit]
 
 
@@ -237,12 +255,19 @@ def verdict_from_proof(proof: CompileProof, returncode: int, output: str) -> tup
     """
     if not isinstance(proof, CompileProof):
         raise AssertionError("verdict_from_proof called without a CompileProof")
+    # Read the proof BEFORE any branching, so that EVERY path out of this function has already
+    # touched it. MEASURED, and the reason this line sits here rather than in the branches: with
+    # the read done inside the branches, the killers branch returned before anything looked at
+    # `proof`, so removing just the gate and the type assertion — two edits — printed
+    # `RED | killed by <test>` and exited 0 for a run that built nothing, given any log carrying
+    # libtest-shaped failure lines. Now a None proof raises here, whatever the log looks like.
+    built = proof.line.strip()
     if returncode == 0:
-        return GREEN, proof.line.strip()
+        return GREEN, built
     killers = killer_tests(output)
     if killers:
         return RED, "killed by " + ", ".join(f"`{k}`" for k in killers)
-    return RED, proof.line.strip()
+    return RED, built
 
 
 def score_run(output: str, returncode: int, timed_out: bool) -> tuple[str, str]:

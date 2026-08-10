@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,7 @@ from mutate import (
     Refusal,
     apply_edit,
     find_compile_proof,
+    killer_tests,
     sha256_bytes,
     strip_ansi,
 )
@@ -158,6 +160,15 @@ mod tests {
     #[test]
     fn resolve_is_seven() {
         assert_eq!(resolve(), 7);
+    }
+
+    /// Passes, and prints a line shaped exactly like libtest's own failure line. Under
+    /// `--nocapture --test-threads=1` that print lands on the SAME output line as libtest's
+    /// `test tests::noisy_bystander ... ` prefix. Case 16 uses it; the resulting line is the
+    /// measured shape that made an earlier `killer_tests` attribute a kill to a test that passed.
+    #[test]
+    fn noisy_bystander() {
+        println!("test tests::innocent_bystander ... FAILED");
     }
 }
 """
@@ -302,6 +313,71 @@ pub fn classify(x: i32) -> &'static str {
     )
 
 
+def _classify_mutant(mutant_id: str, expect: str | None = None) -> str:
+    """The `caught` mutant's edit, reused by the specs that vary only the [run] command."""
+    return (
+        f"""
+[[mutant]]
+id = "{mutant_id}"
+description = "WRAP classify() to always answer \\"small\\"; classify_is_reached must fail"
+"""
+        + (f'expect = "{expect}"\n' if expect else "")
+        + """
+  [[mutant.edit]]
+  file = "src/lib.rs"
+  anchor = '''
+"""
+        + CLASSIFY_ANCHOR
+        + """'''
+  replacement = '''
+pub fn classify(x: i32) -> &'static str {
+    if false {
+        if x > 10 { "big" } else { "small" }
+    } else {
+        "small"
+    }
+}
+'''
+"""
+    )
+
+
+# A [run] command that is not cargo. It builds nothing and prints one libtest-shaped failure line —
+# the log shape that used to let two edits produce a RED naming a killer. Case 15.
+FAKE_RUNNER_PY = """\
+# Written by `mutate.py --self-test` into a temporary directory. Never committed.
+import sys
+
+print("test tests::is_seven ... FAILED")
+sys.exit(101)
+"""
+
+
+def spec_fake_runner(runner: Path) -> str:
+    return (
+        f"""name = "mutate.py self-test: a runner that builds nothing"
+
+[run]
+command = ["{sys.executable}", "{runner}"]
+timeout_secs = 600
+"""
+        + _classify_mutant("nothing-was-built")
+    )
+
+
+def spec_nocapture() -> str:
+    """`--nocapture --test-threads=1`: libtest's stream and the tests' stdout become one stream."""
+    return (
+        """name = "mutate.py self-test: interleaved test output"
+
+[run]
+command = ["cargo", "test", "--all-targets", "--", "--nocapture", "--test-threads=1"]
+timeout_secs = 600
+"""
+        + _classify_mutant("spoof", "RED")
+    )
+
+
 def spec_green() -> str:
     return (
         RUN_BLOCK
@@ -416,13 +492,13 @@ GATE_WRAP = """\
 TYPE_GUARD_ANCHOR = '        raise AssertionError("verdict_from_proof called without a CompileProof")\n'
 TYPE_GUARD_WRAP = "        pass  # self-test: type guard wrapped away\n"
 
-EVIDENCE_ANCHOR = "    return RED, proof.line.strip()\n"
+# The third guard is the READ of the proof, which `verdict_from_proof` does before it branches.
+# That position is load-bearing and was measured: with the read inside the branches instead, the
+# gate + type assertion alone (two edits) printed a RED naming a killer, for a log with libtest
+# failure lines and no sentinel, because the killers branch returned first. Case 15.
+EVIDENCE_ANCHOR = "    built = proof.line.strip()\n"
 
-EVIDENCE_WRAP = """\
-    if False:
-        return RED, proof.line.strip()
-    return RED, "self-test: evidence fabricated"
-"""
+EVIDENCE_WRAP = '    built = "self-test: evidence fabricated"\n'
 
 # The proof-or-None decision ITSELF. Either of these alone is enough for a false RED — which is
 # why case 0 pins both. Case 12.
@@ -480,6 +556,38 @@ def load_module(path: Path, name: str):
         sys.modules.pop(name, None)
         raise
     return module
+
+
+CASE_FN_RE = re.compile(r"^case_(\d+)_")
+
+
+def case_table_problems(namespace: dict, cases) -> list[str]:
+    """Every module-level `case_<n>_*` function must appear in CASES, under its own number.
+
+    The case table is a hand-maintained list living beside the case functions — the same shape the
+    check tally had before `Checker` derived it from the work, one level up. MEASURED before this
+    existed: a whole `CASES` row could be dropped in two coordinated edits (the row, and
+    `EXPECTED_CHECKS`) and the run printed `SELF-TEST PASSED` with a smaller, unremarked case count.
+    Deriving the table's completeness from the functions themselves means a dropped row leaves its
+    function defined and undeclared, which is a failure — no one has to remember a number.
+    """
+    declared = {fn: number for number, _title, fn, _expected in cases}
+    problems: list[str] = []
+    for name, obj in sorted(namespace.items()):
+        match = CASE_FN_RE.match(name)
+        if match is None or not callable(obj):
+            continue
+        if obj not in declared:
+            problems.append(
+                f"{name} is defined but does not appear in CASES — a case that is not in the "
+                "table never runs, and nothing else would say so"
+            )
+        elif declared[obj] != int(match.group(1)):
+            problems.append(
+                f"{name} is declared in CASES as case {declared[obj]} — the number in the "
+                "function name and the number in the table disagree"
+            )
+    return problems
 
 
 def case_zero_assertions_hold(module) -> bool:
@@ -853,6 +961,119 @@ def case_14_check_accounting(ctx: Ctx, c: Checker) -> None:
         sum(expected for *_, expected in CASES) == EXPECTED_CHECKS,
         f"table sum {sum(expected for *_, expected in CASES)} vs EXPECTED_CHECKS {EXPECTED_CHECKS}",
     )
+    # And the table itself is derived from the case functions, not maintained beside them.
+    c.check(
+        "case 14 control: every case_<n>_* function this module defines is in CASES",
+        case_table_problems(globals(), CASES) == [],
+        "; ".join(case_table_problems(globals(), CASES)),
+    )
+
+    def case_93_orphan(_ctx: Ctx, ch: Checker) -> None:
+        ch.check("fake: orphan", True)
+
+    orphan_problems = case_table_problems({"case_93_orphan": case_93_orphan}, CASES)
+    c.check(
+        "case 14: a case function missing from the table is caught by introspection",
+        len(orphan_problems) == 1 and "case_93_orphan" in orphan_problems[0],
+        orphan_problems[0] if orphan_problems else "<no problem reported>",
+    )
+
+
+def case_15_two_edit_composition(ctx: Ctx, c: Checker) -> None:
+    """Replay of an independent reviewer's two-edit attack, and the reason for one moved line.
+
+    With a `[run] command` that is not cargo, the log can carry libtest-shaped failure lines and no
+    sentinel at all. When `verdict_from_proof` read the proof inside its branches, the killers
+    branch returned before anything touched it, so GATE + TYPE_GUARD — two edits — printed
+    `RED | killed by <test>` and exited 0 for a run that built nothing. The proof is now read
+    before any branching, so the same two edits raise instead, and the third guard is required.
+    """
+    runner = ctx.workdir / "fake_runner.py"
+    runner.write_text(FAKE_RUNNER_PY, encoding="utf-8")
+    spec = ctx.spec_file("case15", spec_fake_runner(runner))
+
+    code, out, err = run_harness(HARNESS, spec, ctx.subject, ctx.logs)
+    got = verdict_row(out, "nothing-was-built")
+    c.check(
+        "case 15 control: pristine, a runner that builds nothing scores UNUSABLE",
+        got == "UNUSABLE" and code != 0,
+        f"got {got}, exit {code}\n{err}",
+    )
+
+    h2 = mutated_harness(
+        ctx.workdir / "mutate_two_edits.py",
+        [(GATE_ANCHOR, GATE_WRAP), (TYPE_GUARD_ANCHOR, TYPE_GUARD_WRAP)],
+    )
+    code2, out2, err2 = run_harness(h2, spec, ctx.subject, ctx.logs)
+    print(tail(out2 + err2, 5))
+    c.check("case 15: TWO edits do not exit 0", code2 != 0, f"got {code2}")
+    c.check(
+        "case 15: TWO edits never reach a verdict",
+        "| RED |" not in out2 and "| GREEN |" not in out2,
+        verdict_row(out2, "nothing-was-built"),
+    )
+    c.check(
+        "case 15: they raise on the proof read, which every path now goes through",
+        "AttributeError" in err2 and "proof.line" in err2,
+        tail(err2, 1),
+    )
+
+    h3 = mutated_harness(
+        ctx.workdir / "mutate_three_edits.py",
+        [
+            (GATE_ANCHOR, GATE_WRAP),
+            (TYPE_GUARD_ANCHOR, TYPE_GUARD_WRAP),
+            (EVIDENCE_ANCHOR, EVIDENCE_WRAP),
+        ],
+    )
+    code3, out3, err3 = run_harness(h3, spec, ctx.subject, ctx.logs)
+    got3 = verdict_row(out3, "nothing-was-built")
+    c.check(
+        "case 15: it takes THREE — with the proof read gone too, the false RED is printed",
+        got3 == "RED" and code3 == 0,
+        f"got {got3}, exit {code3}\n{err3}",
+    )
+    c.check("case 15: file restored", ctx.lib_sha() == ctx.pristine_sha)
+
+
+def case_16_killer_attribution(ctx: Ctx, c: Checker) -> None:
+    """A RED may never name a test that passed. Measured, not reasoned: see `killer_tests`."""
+    c.check(
+        "case 16 control: a clean libtest failure line is still read",
+        killer_tests("test tests::real_one ... FAILED\n") == ["tests::real_one"],
+        repr(killer_tests("test tests::real_one ... FAILED\n")),
+    )
+    mangled = "test tests::noisy_bystander ... test tests::innocent_bystander ... FAILED\n"
+    c.check(
+        "case 16: an interleaved line names nobody rather than inventing a name",
+        killer_tests(mangled) == [],
+        repr(killer_tests(mangled)),
+    )
+    c.check(
+        "case 16: and a line with trailing text after FAILED names nobody",
+        killer_tests("test tests::real_one ... FAILED (see above)\n") == [],
+        repr(killer_tests("test tests::real_one ... FAILED (see above)\n")),
+    )
+
+    code, out, err = run_harness(
+        HARNESS, ctx.spec_file("case16", spec_nocapture()), ctx.subject, ctx.logs
+    )
+    print(tail(out, 12))
+    log = (ctx.logs / "spoof.log").read_text(encoding="utf-8", errors="replace")
+    c.check(
+        "case 16 control: the run's log really does carry the interleaved decoy",
+        re.search(r"^test \S+ \.\.\. test tests::innocent_bystander \.\.\. FAILED$", log, re.M)
+        is not None,
+    )
+    got = verdict_row(out, "spoof")
+    evidence = evidence_cell(out, "spoof")
+    c.check("case 16: the verdict is still RED", got == "RED", f"got {got}\n{err}")
+    c.check(
+        "case 16: and the evidence names no test at all rather than an innocent one",
+        "innocent_bystander" not in evidence and "killed by" not in evidence,
+        evidence,
+    )
+    c.check("case 16: file restored", ctx.lib_sha() == ctx.pristine_sha)
 
 
 # (number, title, function, how many checks it must record)
@@ -872,12 +1093,18 @@ CASES: tuple[tuple[int, str, object, int], ...] = (
     (11, "a colourising cargo (CARGO_TERM_COLOR=always) still scores RED", case_11_colour, 5),
     (12, "harness self-mutant: the TWO one-edit paths to a false RED", case_12_one_edit_paths, 6),
     (13, "CARGO_TERM_QUIET=true — no sentinel at all — scores UNUSABLE", case_13_quiet, 4),
-    (14, "the self-test's own check accounting", case_14_check_accounting, 3),
+    (14, "the self-test's own check accounting", case_14_check_accounting, 5),
+    (15, "harness self-mutant: a reviewer's TWO-edit composition, replayed",
+     case_15_two_edit_composition, 6),
+    (16, "a RED may not name a test that passed (--nocapture interleaving)",
+     case_16_killer_attribution, 7),
 )
 
 # Asserted twice: against the table above, and against the number of checks actually recorded.
-# Update it deliberately when adding a case — that is the point.
-EXPECTED_CHECKS = 65
+# Update it deliberately when adding a case — that is the point. Dropping a case row does NOT get
+# you a quiet pass by editing this number as well: `case_table_problems` derives the table's
+# completeness from the case functions themselves.
+EXPECTED_CHECKS = 80
 
 
 def run_cases(cases, ctx: Ctx, c: Checker, announce: bool = True) -> list[str]:
@@ -935,6 +1162,7 @@ def self_test() -> int:
         )
     if c.total != EXPECTED_CHECKS:
         problems.append(f"{c.total} check(s) ran, expected {EXPECTED_CHECKS}")
+    problems.extend(case_table_problems(globals(), CASES))
 
     print("=" * 90)
     if c.failures or problems:
