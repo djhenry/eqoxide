@@ -337,21 +337,23 @@ use eqoxide_ipc::MoveIntent;
         //     `RUN_SPEED` would move a wall. `speed: 35.0` at ~160 is likewise a deliberately
         //     different speed, not a stale copy.
         //   * `MAX_REPATHS` does not exist in `walker.rs`. `grep -rn MAX_REPATHS` hits this file and
-        //     nothing else; production spells the cap as a bare `if self.nav_repaths < 8` at
-        //     `walker.rs:1768`. So it is not a copy of a private const — it MIRRORS AN UNNAMED
+        //     nothing else; production spells the cap as a bare `if self.nav_repaths < 8` inside
+        //     `Walker::drive_walk`. So it is not a copy of a private const — it MIRRORS AN UNNAMED
         //     LITERAL, which is strictly worse, and the fix is to name it there first.
         //
         // So, precisely: everything that HAS a public home is imported at the top of this file and
         // is not restated anywhere in it. The three below have no public home, for two different
         // reasons, and each says which.
-        const LOOK_AHEAD: f32 = 5.0;   // private `const` in walker.rs `drive_walk` (walker.rs:1496)
-        const LOCAL_BOUND: f32 = 40.0; // private `const` in walker.rs `drive_walk` (walker.rs:1507)
-        const MAX_REPATHS: u32 = 8;    // NOT a const anywhere: mirrors the bare `8` at walker.rs:1768
+        //
+        // #919: each cites walker.rs by SOURCE TEXT, not by line number. The line numbers that used
+        // to be here were stale on `main` before they were ever reported, and pointed at unrelated
+        // code by the time they were fixed. `walker_source_anchors_cited_in_this_file_still_resolve`
+        // re-finds each quoted phrase in walker.rs by execution and fails if it is gone.
+        const LOOK_AHEAD: f32 = 5.0;   // walker.rs, private in `drive_walk`: `const LOOK_AHEAD: f32 = 5.0;`
+        const LOCAL_BOUND: f32 = 40.0; // walker.rs, private in `drive_walk`: `const LOCAL_BOUND: f32 = 40.0;`
+        const MAX_REPATHS: u32 = 8;    // NOT a const anywhere: walker.rs spells it `if self.nav_repaths < 8 {`
         const DT: f32 = 1.0 / 100.0;          // ~100 Hz controller, per navigation.rs's fast-steer note
         const FRAMES_PER_TICK: u32 = 15;      // 150 ms / 10 ms
-        // The swim-up vertical wish is `drift_swim_up_wish` (module fn below), mirroring the walker
-        // (walker.rs:819-825) and pinned by `drift_sim_swim_drive_mirrors_walker` so the instrument
-        // can't silently diverge from production.
 
         // The faithful walk. Returns None on arrival, or Some((wedge_pos, aim, route_wet_near_wedge))
         // on a terminal wedge. `route_wet_near_wedge` = did the COMMITTED coarse route carry a water
@@ -421,10 +423,12 @@ use eqoxide_ipc::MoveIntent;
                 if backoff_ticks > 0 {
                     backoff_ticks -= 1;
                     for _ in 0..FRAMES_PER_TICK {
-                        // The real walker's downhill-backoff branch drives want_swim: false
-                        // UNCONDITIONALLY (walker.rs:731-742), even while submerged — the backoff is a
-                        // deliberate non-swim recovery. The sim MUST match, or it recovers (swim-mode
-                        // step) where the client sinks (non-swim step): a false pass.
+                        // The real walker's downhill-backoff branch — `if self.backoff_ticks > 0 {`
+                        // in walker.rs — drives `want_swim: false,` UNCONDITIONALLY, even while
+                        // submerged: the backoff is a deliberate non-swim recovery. The sim MUST
+                        // match, or it recovers (swim-mode step) where the client sinks (non-swim
+                        // step): a false pass. Both quoted phrases are pinned by
+                        // `walker_source_anchors_cited_in_this_file_still_resolve`.
                         ctrl.step(MoveIntent { wish_dir: backoff_dir, wish_vspeed: 0.0, jump: false,
                             want_swim: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
                     }
@@ -1135,6 +1139,96 @@ use eqoxide_ipc::MoveIntent;
     /// this array existed. `aborted_report_content_is_pinned_by_execution`'s doc comment (#831) names
     /// `zone_accounting_fires_before_the_corpus_loop_ends` the same way — added below after the
     /// workspace suite failed on that citation too, for the identical reason.
+    /// **Source-text anchors into `walker.rs`, re-found by execution (#919).**
+    ///
+    /// `faithful_walker_drift_corpus` restates four things that live in `walker.rs` and that an
+    /// integration test cannot name: two `const`s private to `Walker::drive_walk`, an unnamed
+    /// literal re-path cap, and the downhill-backoff branch's non-swim wish. Those comments used to
+    /// cite `walker.rs` by LINE NUMBER. A line number is a coordinate in one commit: all three of
+    /// the numbers #919 reported were already stale on `main` when they were reported, and by the
+    /// commit that fixed them every one pointed at unrelated code. They now quote SOURCE TEXT, and
+    /// this test re-finds each quoted phrase.
+    ///
+    /// `collision.rs` quotes the `LOCAL_BOUND` line for the same reason and is covered by the same
+    /// anchor — the anchor is a property of `walker.rs`, not of one citing file.
+    ///
+    /// **What it does NOT do**, so nobody reads it as more:
+    ///
+    /// * it does not check that a citation is APT, only that the quoted text still exists in
+    ///   `walker.rs` exactly once. A change that leaves the phrase standing while inverting what it
+    ///   means still passes;
+    /// * it does not FIND citations. The list below is hand-written, so a new comment citing
+    ///   `walker.rs` is covered only if someone adds its anchor here. The nav crate's mechanical
+    ///   citation scan cannot help: it reads lines beginning with three slashes, and these
+    ///   citations are ordinary two-slash comments, which that scan structurally never visits;
+    /// * it covers `walker.rs` only. Nothing here claims anything about citations into any other
+    ///   file, in this test file or elsewhere;
+    /// * it pins TEXT, not reachability. A phrase can be present and unreached (#799).
+    ///
+    /// **Reach control.** #778's source scanner silently covered about an eighth of its corpus and
+    /// all twelve mutation probes aimed at it happened to sit inside the window it could still see,
+    /// so twelve green cells proved nothing. So this scan reports how far it got: `lines_scanned` is
+    /// asserted against the file's own line count and against a floor, and every anchor must be
+    /// found. The anchors sit hundreds of lines apart, deep in a file thousands of lines long, so a
+    /// scan that stopped early loses the late ones loudly instead of passing quietly.
+    #[test]
+    fn walker_source_anchors_cited_in_this_file_still_resolve() {
+        // `tests/` sits at the workspace root, which is this package's manifest directory.
+        let walker = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("crates/eqoxide-nav/src/walker.rs");
+        let src = std::fs::read_to_string(&walker)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", walker.display()));
+
+        // Each anchor is the source text a comment quotes, and what that comment claims about it.
+        const ANCHORS: &[(&str, &str)] = &[
+            ("const LOOK_AHEAD: f32 = 5.0;",
+             "the private look-ahead this file's LOOK_AHEAD restates"),
+            ("const LOCAL_BOUND: f32 = 40.0;",
+             "the private fine-search window this file's LOCAL_BOUND restates (collision.rs too)"),
+            ("if self.nav_repaths < 8 {",
+             "the unnamed re-path cap this file's MAX_REPATHS restates"),
+            ("if self.backoff_ticks > 0 {",
+             "the downhill-backoff branch this file's backoff loop mirrors"),
+            ("want_swim: false,",
+             "that branch's unconditional non-swim wish"),
+        ];
+
+        // Interior whitespace is collapsed before matching, so an anchor survives rustfmt
+        // re-aligning a struct literal, but not the code being renamed or deleted.
+        let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut hits = vec![0usize; ANCHORS.len()];
+        let mut lines_scanned = 0usize;
+        for line in src.lines() {
+            lines_scanned += 1;
+            let n = norm(line);
+            for (i, (anchor, _)) in ANCHORS.iter().enumerate() {
+                if n.contains(anchor) { hits[i] += 1; }
+            }
+        }
+
+        // ── reach control, before any anchor verdict is read ──
+        assert_eq!(lines_scanned, src.lines().count(),
+            "the scan stopped before the end of walker.rs — every anchor verdict below is unsound");
+        assert!(lines_scanned >= 1000,
+            "walker.rs read as only {lines_scanned} lines; the source tree is not where this test \
+             thinks it is, and the anchors would fail for the wrong reason");
+
+        let mut problems: Vec<String> = Vec::new();
+        for (i, (anchor, claim)) in ANCHORS.iter().enumerate() {
+            match hits[i] {
+                1 => {}
+                0 => problems.push(format!(
+                    "walker.rs no longer contains `{anchor}`, cited here as {claim}. It was moved, \
+                     renamed or deleted — re-read walker.rs and rewrite the comment that quotes it.")),
+                n => problems.push(format!(
+                    "walker.rs contains `{anchor}` on {n} lines, and it is cited here as {claim}, \
+                     which reads as one site. Quote a longer, unique phrase.")),
+            }
+        }
+        assert!(problems.is_empty(), "{} stale source-text citation(s) into walker.rs:\n  {}",
+            problems.len(), problems.join("\n  "));
+    }
+
     #[test]
     fn doc_comment_citations_in_this_file_are_rename_guarded() {
         let _cited: &[fn()] = &[
