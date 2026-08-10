@@ -24,7 +24,9 @@ NPC, say its keywords, try handing it likely items).
 The one quest surface the client *does* expose is EQ's **native Task-system journal**, and only
 because it is **server-pushed** — the same quest window a human sees in their own client. `GET
 /v1/quests/log` returns active tasks with title, description, reward, and objectives showing live
-progress (`done_count`/`goal_count`); completed tasks move to `GET /v1/quests/completed`; `POST
+progress (`done_count`/`goal_count` — present only when the objective's `state` is `known`; a
+`locked` objective omits those keys rather than reporting a zeroed one, see #889);
+completed tasks move to `GET /v1/quests/completed`; `POST
 /v1/quests/cancel` abandons an active task; `GET /v1/quests/offers` + `POST /v1/quests/accept`/
 `/decline` handle the (rare) case where an NPC presents a choice of tasks instead of auto-granting
 one. Most classic Qeynos quests (Rat Whiskers, Gnoll Fangs, the guild-note hand-in) are emergent
