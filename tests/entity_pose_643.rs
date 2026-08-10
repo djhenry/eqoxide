@@ -11,11 +11,15 @@
 //! (scene projection) and `eqoxide-http` (the router) are three sibling crates that are only in
 //! scope together here.
 //!
-//! **Written to compile and run on `origin/main` too.** Every symbol used in the packet/scene
-//! tests below (`register_spawn`, `SpawnInfo`, `apply_packet`, `encode_position_update`,
-//! `build_spawn_appearance_packet`, `SceneState::from_game_state`, `Billboard.action`) exists
-//! unchanged on `d5fe106` — deliberately, so the RED-on-main claim is checkable by copying this
-//! file onto main rather than by reasoning about it.
+//! **Originally written to compile and run on the pre-fix `main` too** — every symbol the
+//! packet/scene tests used (`register_spawn`, `SpawnInfo`, `apply_packet`,
+//! `encode_position_update`, `build_spawn_appearance_packet`, `SceneState::from_game_state`,
+//! `Billboard.action`) existed unchanged on `d5fe106`, so the RED-on-main claim was checkable by
+//! copying this file onto main rather than by reasoning about it. **That property no longer
+//! holds and the claim is withdrawn:** `npc_spawn` below now builds its `SpawnInfo` from
+//! `SpawnInfo::for_test()`, which was added by #913 and does not exist on `d5fe106`. The #643
+//! RED-on-main evidence stands on the record in that issue; it is not re-derivable by copying
+//! this file backwards.
 
 use eqoxide::eq_net::packet_handler::{apply_packet, register_spawn};
 use eqoxide::eq_net::protocol::{
@@ -30,36 +34,19 @@ fn npc_spawn(spawn_id: u32, name: &str, stand_state: u8) -> SpawnInfo {
     SpawnInfo {
         spawn_id,
         name: name.into(),
-        last_name: String::new(),
-        level: 5,
-        npc: 1,
-        gender: 0,
-        race: 54,
-        class_: 1,
-        guild_id: 0xFFFF_FFFF,
-        guild_rank: 0,
-        body_type: 1,
-        cur_hp: 100,
-        helm: 0,
-        show_helm: false,
-        face: 0,
-        hairstyle: 0,
-        haircolor: 0,
         stand_state,
-        flymode: 0,
-        pet_owner_id: 0,
-        player_state: 64,
         x: 10.0,
         y: 20.0,
         z: 5.0,
-        heading: 0.0,
         // The spawn struct's OWN 10-bit gait field. EQEmu sends 0 here (`ns->spawn.animation = 0`),
         // which is exactly why the two domains were so easy to confuse: at spawn the gait slot is
-        // empty and the pose lives in `stand_state`.
+        // empty and the pose lives in `stand_state`. `for_test()`'s baseline is 100, so this
+        // override is load-bearing and must stay explicit.
         animation: 0,
-        equipment: [0u32; 9],
-        equipment_tint: [[0u8; 3]; 9],
-        npc_tint_index: 0,
+        // #913: the remaining fields come from the test-only baseline rather than being enumerated
+        // here. An exhaustive literal at this exact spot is what put `main` red when #857 added
+        // `npc_tint_index` — this file asserts nothing about tinting, yet had to be edited for it.
+        ..SpawnInfo::for_test()
     }
 }
 

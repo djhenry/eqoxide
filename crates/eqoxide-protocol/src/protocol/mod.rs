@@ -660,6 +660,75 @@ pub struct SpawnInfo {
     pub npc_tint_index:  u32,
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
+impl SpawnInfo {
+    /// A TEST-ONLY baseline spawn, for use as the base of a functional-record-update literal:
+    ///
+    /// ```ignore
+    /// let info = SpawnInfo { spawn_id: 7, name: "Orc".into(), ..SpawnInfo::for_test() };
+    /// ```
+    ///
+    /// **Why this exists (#913).** `SpawnInfo` was constructed *exhaustively* — no `..` rest — at
+    /// every test site in the workspace. Adding a field to it therefore broke tests that assert
+    /// nothing about the new field, in crates the field's author never compiled. That is exactly
+    /// what happened when #857 added `npc_tint_index`: `main` went red in the root crate's
+    /// `tests/entity_pose_643.rs`, which no package-scoped run of the changed crates ever builds
+    /// (#913, #915, #918). With `..SpawnInfo::for_test()` as the base, a new field cannot break a
+    /// test that does not mention it — the compiler fills it in.
+    ///
+    /// **Deliberately not a `Default` impl, and deliberately not reachable from production.**
+    /// The agent-honesty invariant says the client must never report a confident falsehood. If
+    /// production could fill a `SpawnInfo` field it failed to decode with a plausible neutral
+    /// value, a missing wire field would silently become a lie about a spawn instead of a loud
+    /// failure. Two things prevent that:
+    ///   1. This is behind `cfg(any(test, feature = "test-fixtures"))`, and `test-fixtures` is
+    ///      enabled only from `[dev-dependencies]`. It does not exist in the binary's build.
+    ///   2. It is a *named* constructor, not `impl Default`. There is no `Default` for
+    ///      `SpawnInfo`, so no generic `unwrap_or_default()` / `Option::unwrap_or_default` path
+    ///      can conjure one, and every call site is greppable by name.
+    ///
+    /// **`parse_rof2_spawn` stays exhaustive on purpose.** It is the one construction site that
+    /// reads the wire, so it is the one place where "you added a field and did not decode it"
+    /// *should* be a compile error. This fixture removes that pressure from tests only.
+    ///
+    /// The field values below are the ones every pre-#913 test literal already shared: a level-5
+    /// standing NPC with no guild, no equipment and no tint, at the origin. Callers override
+    /// whatever they actually assert on.
+    pub fn for_test() -> Self {
+        SpawnInfo {
+            spawn_id:       1,
+            name:           String::from("a_test_spawn"),
+            last_name:      String::new(),
+            level:          5,
+            npc:            1,
+            gender:         0,
+            race:           54,
+            class_:         1,
+            guild_id:       0xFFFF_FFFF,
+            guild_rank:     0,
+            body_type:      1,
+            cur_hp:         100,
+            helm:           0,
+            show_helm:      false,
+            face:           0,
+            hairstyle:      0,
+            haircolor:      0,
+            stand_state:    100,
+            flymode:        0,
+            pet_owner_id:   0,
+            player_state:   64,
+            x:              0.0,
+            y:              0.0,
+            z:              0.0,
+            heading:        0.0,
+            animation:      100,
+            equipment:      [0u32; 9],
+            equipment_tint: [[0u8; 3]; 9],
+            npc_tint_index: 0,
+        }
+    }
+}
+
 /// Parse one RoF2 spawn record from the front of `buf`.
 /// Returns `Some((info, bytes_consumed))` on success, `None` if the buffer is too
 /// short to hold a complete spawn.

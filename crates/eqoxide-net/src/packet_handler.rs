@@ -5153,12 +5153,9 @@ mod tests {
         use super::register_spawn;
         use crate::protocol::SpawnInfo;
         let mk = |name: &str| SpawnInfo {
-            spawn_id: 7, name: name.into(), last_name: String::new(),
-            level: 5, npc: 0, gender: 0, race: 1, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
-            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
-            flymode: 0, pet_owner_id: 0, player_state: 64,
-            x: 1.0, y: 2.0, z: 3.0, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
+            spawn_id: 7, name: name.into(), npc: 0, race: 1,
+            x: 1.0, y: 2.0, z: 3.0,
+            ..SpawnInfo::for_test()
         };
 
         // Case mismatch: config says "aldric", the server's real character record is "Aldric".
@@ -5201,12 +5198,8 @@ mod tests {
         assert_ne!(gs.player_name, "Aldric", "test premise: config value must NOT already equal the server name");
 
         let info = SpawnInfo {
-            spawn_id: 7, name: "Aldric".into(), last_name: String::new(),
-            level: 5, npc: 0, gender: 0, race: 1, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
-            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
-            flymode: 0, pet_owner_id: 0, player_state: 64,
-            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
+            spawn_id: 7, name: "Aldric".into(), npc: 0, race: 1,
+            ..SpawnInfo::for_test()
         };
         register_spawn(&mut gs, info);
         assert_eq!(gs.player_name, "Aldric", "server-authoritative name must have replaced the config value");
@@ -5327,12 +5320,8 @@ mod tests {
         let mut gs = GameState::new();
         gs.player_name = "Nobody".into();
         let info = SpawnInfo {
-            spawn_id: 42, name: "a".into(), last_name: String::new(),
-            level: 5, npc: 1, gender: 0, race: 54, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
-            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
-            flymode: 0, pet_owner_id: 0, player_state: 64,
-            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
+            spawn_id: 42, name: "a".into(),
+            ..SpawnInfo::for_test()
         };
         register_spawn(&mut gs, info);
 
@@ -5388,12 +5377,8 @@ mod tests {
         use super::register_spawn;
         use crate::protocol::SpawnInfo;
         let mk = |npc: u8, name: &str| SpawnInfo {
-            spawn_id: 7, name: name.into(), last_name: String::new(),
-            level: 2, npc, gender: 0, race: 1, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
-            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
-            stand_state: 100, flymode: 0, pet_owner_id: 0, player_state: 64,
-            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
+            spawn_id: 7, name: name.into(), level: 2, npc, race: 1,
+            ..SpawnInfo::for_test()
         };
         // A PC corpse (npc=2) arriving via the bulk zone-in path (which calls register_spawn directly,
         // NOT apply_new_spawn) must be flagged dead + Lying so the renderer lays it down — the earlier
@@ -5428,13 +5413,9 @@ mod tests {
         use super::register_spawn;
         use crate::protocol::SpawnInfo;
         let mk = |body_type: u32, x: f32, y: f32, z: f32, name: &str| SpawnInfo {
-            spawn_id: 1496, name: name.into(), last_name: String::new(),
-            level: 1, npc: 1, gender: 0, race: 240, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0,
-            body_type,
-            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
-            stand_state: 100, flymode: 0, pet_owner_id: 0, player_state: 64,
-            x, y, z, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
+            spawn_id: 1496, name: name.into(), level: 1, race: 240, body_type,
+            x, y, z,
+            ..SpawnInfo::for_test()
         };
 
         // campday000-style controller (bodytype 11 = NoTarget) at the exact sentinel (0,0,0)
@@ -5498,13 +5479,9 @@ mod tests {
         use crate::protocol::{SpawnInfo, encode_position_update};
         const OFF: f32 = eqoxide_core::coord::WIRE_Z_OFFSET;
         let mk = |spawn_id: u32, flymode: u8| SpawnInfo {
-            spawn_id, name: "a_bat".into(), last_name: String::new(),
-            level: 5, npc: 1, gender: 0, race: 54, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0,
-            body_type: 1,
-            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
-            stand_state: 100, flymode, pet_owner_id: 0, player_state: 64,
-            x: 50.0, y: -60.0, z: 100.0, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
+            spawn_id, name: "a_bat".into(), flymode,
+            x: 50.0, y: -60.0, z: 100.0,
+            ..SpawnInfo::for_test()
         };
 
         let mut gs = GameState::new();
@@ -5541,12 +5518,9 @@ mod tests {
     #[cfg(test)]
     fn mk_flymode_spawn(spawn_id: u32, z: f32, flymode: u8) -> crate::protocol::SpawnInfo {
         crate::protocol::SpawnInfo {
-            spawn_id, name: format!("mob{spawn_id}"), last_name: String::new(),
-            level: 5, npc: 1, gender: 0, race: 54, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0,
-            body_type: 1, cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
-            stand_state: 100, flymode, pet_owner_id: 0, player_state: 64,
-            x: 50.0, y: -60.0, z, heading: 0.0, animation: 100,
-            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9], npc_tint_index: 0,
+            spawn_id, name: format!("mob{spawn_id}"), flymode,
+            x: 50.0, y: -60.0, z,
+            ..crate::protocol::SpawnInfo::for_test()
         }
     }
 
@@ -5688,12 +5662,9 @@ mod tests {
         let mut equipment_tint = [[0u8; 3]; 9];
         equipment_tint[1] = [30, 20, 10]; // RGB (already in RGB order for SpawnInfo)
         let info = SpawnInfo {
-            spawn_id: 7, name: "Orc".into(), last_name: String::new(),
-            level: 10, npc: 1, gender: 1, race: 54, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
-            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
-            flymode: 0, pet_owner_id: 0, player_state: 64,
-            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
-            equipment, equipment_tint, npc_tint_index: 0,
+            spawn_id: 7, name: "Orc".into(), level: 10, gender: 1,
+            equipment, equipment_tint,
+            ..SpawnInfo::for_test()
         };
         register_spawn(&mut gs, info);
         let e = gs.world.entities.get(&7).expect("entity registered");
