@@ -569,9 +569,14 @@ CASE_FN_RE = re.compile(r"^case_(\d+)_")
 def scan_case_functions(namespace: dict) -> dict:
     """The ONLY scan over a namespace for `case_<n>_*` callables. Returns them by name.
 
-    Deliberately the single scanner, so there is exactly one place that can stop early and exactly
-    one place whose output has to be checked for completeness. Callers must not re-walk a namespace
-    themselves: a second walk is a second blind spot.
+    Deliberately the single SCANNER — not the only loop over case data. This check is made of two
+    loops, the one below and one in `case_table_problems`; the second consumes this function's
+    output rather than building it, so of those two, exactly one can stop early IN A WAY THAT
+    SHRINKS THE EXAMINED SET. MEASURED, since that is a structural claim and this file's history is
+    full of ones that read true and were not: truncating the consuming loop leaves the set-equality
+    control passing (`examined-only [], declared-only []`) and fails case 14's orphan probe
+    instead — one check, exit 1. Callers must not re-walk a namespace themselves: a second walk
+    would be a second place that can shrink it.
     """
     found = {}
     for name, obj in sorted(namespace.items()):
@@ -600,6 +605,17 @@ def case_table_problems(namespace: dict, cases) -> list[str]:
 
     So the examined SET is compared against the declared SET, in both directions. A count would not
     do: a count can be satisfied by the wrong members, and only names settle a membership claim.
+
+    LIMIT, stated here because this is where the strength is claimed. The control is read out of the
+    same file it checks, so it can prove the two sets AGREE but cannot pin either one absolutely.
+    MEASURED residual: a targeted name SKIP inside the scanner — an exclusion rather than a
+    truncation — plus the case-12 row plus `EXPECTED_CHECKS` 81 -> 75 exits 0, printing
+    `SELF-TEST PASSED — 75 checks across 16 cases`. Three coordinated edits, and unlike the one-edit
+    hole this replaced it CHANGES THE PRINTED TALLY, which is what a reader would have to ignore.
+    No fourth guard is added for it. This docstring's own history is the argument: the guard
+    added to close the check tally's blind spot re-created the same class one level down, and
+    was itself evaded in one edit. Another scanner would be another thing that cannot check
+    itself, so the residual is written down instead.
     """
     declared_by_fn = {fn: number for number, _title, fn, _expected in cases}
     declared_names = {fn.__name__ for _number, _title, fn, _expected in cases}
@@ -1016,8 +1032,13 @@ def case_14_check_accounting(ctx: Ctx, c: Checker) -> None:
     def case_93_orphan(_ctx: Ctx, ch: Checker) -> None:
         ch.check("fake: orphan", True)
 
-    # The orphan is added to the REAL namespace, not scanned alone: `case_93_orphan` sorts last
-    # among the case functions, so a scan that stops early never reaches it and this check fails.
+    # The orphan is added to the REAL namespace, not scanned alone. MEASURED, because sort order
+    # reads obvious and is not: `case_93_orphan` lands at index 16 of 18 — NOT last — since '3'
+    # (0x33) sorts before '_' (0x5F), so `case_9_all_guards_wrapped` is both the last name and the
+    # last DECLARED one. That position is stronger than "last" would have been: the orphan sorts
+    # before the final declared case, so a truncation that still reached every declared name
+    # necessarily reached the orphan too, and one that missed the orphan also shrank the examined
+    # set, which the never-examined direction reports.
     orphan_problems = case_table_problems({**globals(), "case_93_orphan": case_93_orphan}, CASES)
     c.check(
         "case 14: a case function missing from the table is caught by introspection",

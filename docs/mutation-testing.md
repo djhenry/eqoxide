@@ -261,6 +261,16 @@ the wrong members. Case 14's three probes for this are built on the *real* names
 one-entry fake, so they sit outside the window a truncated scan can still see: measured, the
 reviewer's single edit now fails all three and the run exits 1.
 
+**And the limit of that, stated where the strength is claimed.** The control is read out of the same
+file it checks, so it can prove the two sets *agree* but cannot pin either one absolutely. Measured
+residual: a targeted name **skip** inside the scanner — an exclusion rather than a truncation — plus
+the case-12 row plus `EXPECTED_CHECKS` 81 → 75 exits 0, printing `SELF-TEST PASSED — 75 checks across
+16 cases`. That is three coordinated edits, and unlike the one-edit hole it replaced it **changes the
+printed tally**, which a reader would have to ignore. No fourth guard is added for it, and the
+history above is the argument: the guard added to close the check tally's blind spot re-created the
+same class one level down and was itself evaded in one edit. Another scanner would be another thing
+that cannot check itself, so the residual is written down instead.
+
 It runs in CI alongside the other guards. It is not cheap — it shells out to cargo for every case
 that needs a real build — so it lives in the `test` job, next to cargo, rather than in the
 dependency-free guard job. No wall-clock figure is quoted anywhere for it: that depends on the
