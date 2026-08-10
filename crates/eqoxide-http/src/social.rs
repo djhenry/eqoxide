@@ -31,6 +31,22 @@ async fn post_friends(
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"add\":\"Name\"} or {\"remove\":\"Name\"}".into()),
     };
+    // #952/#956 (agent-honesty): `add` and `remove` are opposite edits to one list, and the
+    // `if`/`else if` below is a precedence chain — `{"add":"Alpha","remove":"Beta"}` used to answer
+    // `200 added Alpha` while Beta stayed on the list, with nothing in the response saying the
+    // removal had not happened. An agent that batches both edits into one call therefore believed a
+    // removal it never got. Refused instead: send two requests.
+    //
+    // Presence here is the handler's OWN notion of "supplied" — a non-empty trimmed name, the same
+    // predicate the two branches use — so a request that already worked (an empty `add` beside a
+    // real `remove`) keeps working. Destructured exhaustively (no `..`).
+    let FriendsBody { add, remove } = &b;
+    let supplied = |v: &Option<String>| v.as_ref().is_some_and(|n| !n.trim().is_empty());
+    if let Some(msg) = crate::req_form::conflicting_forms(
+        "friends-list edit", &[("add", supplied(add)), ("remove", supplied(remove))],
+    ) {
+        return (StatusCode::BAD_REQUEST, msg);
+    }
     let mut list = s.social.friends_list.lock().unwrap();
     if let Some(name) = b.add.as_ref().map(|n| n.trim()).filter(|n| !n.is_empty()) {
         if name.len() >= 64 {

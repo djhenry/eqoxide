@@ -452,6 +452,23 @@ async fn post_follow(
     if let Some(r) = gate.refusal() { return r; }
     let b = body.unwrap_or_default();
 
+    // #952 (agent-honesty): `MoveBody` is shared with `/goto`, and its `avoid_aggro`/`aggro_buffer`
+    // knobs (tagged #242 by this file's own docs on `MoveBody`; the field predates the crate split,
+    // so that attribution is quoted, not re-derived) were read by `/goto` and `/zone_cross` only.
+    // `/follow` deserializes the very same struct and simply never looked at them.
+    // `deny_unknown_fields` could not help: the fields are DECLARED, so `{"name":"x",
+    // "avoid_aggro":false}` was accepted with a 200 and the route was planned with whatever avoidance
+    // setting happened to be in force. `/follow` chases a moving entity through the same planner as
+    // `/goto`, so the knobs mean exactly what they mean there; it now writes the same shared
+    // `nav.nav_avoid` slot, at the same point in the handler, via the same [`apply_avoid_opts`].
+    //
+    // Destructured exhaustively with NO `..`. The coordinate fields are matched and discarded here
+    // because `has_coords()` below is what accounts for them (this route rejects coordinates
+    // outright); the binding exists so that the NEXT field added to `MoveBody` is a compile error in
+    // this handler rather than another silently-ignored knob.
+    let MoveBody { name: _, map_x: _, map_y: _, x: _, y: _, z: _, avoid_aggro, aggro_buffer } = &b;
+    let (avoid_aggro, aggro_buffer) = (*avoid_aggro, *aggro_buffer);
+
     if b.has_coords() {
         return text(StatusCode::BAD_REQUEST,
             "follow requires a name or the current target, not coordinates (use /v1/move/goto)");
@@ -478,6 +495,10 @@ async fn post_follow(
     };
 
     let pos = matched.pos.expect("checked above");
+    // #952: apply the aggro-avoidance knobs HERE, past every 4xx return above and immediately before
+    // the follow is queued — the same position in the handler `/goto` applies them, and for the same
+    // reason: a request that is refused must leave the shared nav setting exactly as it found it.
+    apply_avoid_opts(&s.nav.nav_avoid, avoid_aggro, aggro_buffer);
     // Position first, then the chase key: the nav thread re-resolves the key's live position each
     // tick (eqoxide#88) and homes in as the entity moves.
     let goal_id = s.command.request_follow(matched.key.clone(), pos);
@@ -779,6 +800,88 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(zc.lock().unwrap().is_none(),
             "a typo'd key must not silently fall through to walking to the nearest zone line");
+    }
+
+    /// #952 (agent-honesty): EVERY route that accepts `avoid_aggro`/`aggro_buffer` must actually
+    /// write them to the shared nav slot — not merely deserialize them into a field nobody reads.
+    ///
+    /// `/goto` and `/zone_cross` are the controls: they already did this, and their rows here exist
+    /// so a regression in either is caught by the same assertion rather than going unnoticed while
+    /// the new `/follow` row stays green. `/follow` is the row #952 is about: it deserializes the
+    /// SAME `MoveBody` as `/goto`, so `deny_unknown_fields` accepted both knobs and answered 200,
+    /// and the route was then planned with whatever avoidance setting happened to be in force.
+    ///
+    /// The baseline is deliberately the OPPOSITE of what each request asks for, so "the slot already
+    /// held this value" cannot pass for "the request wrote it".
+    ///
+    /// SCOPE, stated as narrowly as it was verified: this asserts the request reaches
+    /// `nav.nav_avoid`, which is the slot `eqoxide_nav::walker` reads at its two `PlanRequest`
+    /// construction sites (`walker.rs`, `avoid` / `aggro_buffer: av.buffer`). It is a source-level
+    /// claim about where the value lands. It is NOT a claim, and no test here makes one, that a
+    /// followed route visibly detours around a camp — that needs a running client.
+    #[tokio::test]
+    async fn every_route_declaring_the_avoid_knobs_writes_them_to_the_shared_nav_slot() {
+        // (route, body) — each body carries a target form that route accepts, plus both knobs.
+        let cases: [(&str, &str); 3] = [
+            ("/goto",       r#"{"name":"a_rat00","avoid_aggro":false,"aggro_buffer":25.0}"#),
+            ("/zone_cross", r#"{"avoid_aggro":false,"aggro_buffer":25.0}"#),
+            ("/follow",     r#"{"name":"a_rat00","avoid_aggro":false,"aggro_buffer":25.0}"#),
+        ];
+        let mut failures: Vec<String> = Vec::new();
+        for (route, body) in cases {
+            let state = empty_state();
+            state.world.entity_ids_mut().insert_for_test("a_rat00".into(), 42);
+            state.world.entity_positions_mut().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
+            {
+                let mut o = state.nav.nav_avoid.lock().unwrap();
+                o.enabled = true;   // opposite of the request
+                o.buffer  = 0.0;    // opposite of the request
+            }
+            let nav_avoid = state.nav.nav_avoid.clone();
+            let app = router().with_state(state);
+            let req = Request::post(route)
+                .header("content-type", "application/json")
+                .body(Body::from(body)).unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let (enabled, buffer) = { let o = nav_avoid.lock().unwrap(); (o.enabled, o.buffer) };
+            if !status.is_success() {
+                failures.push(format!("{route}: answered {status}, so this row proves nothing — \
+                    fix the fixture, not the assertion. Body: {}", body_text(resp).await));
+            } else if enabled || buffer != 25.0 {
+                failures.push(format!(
+                    "{route}: answered {status} but the shared nav slot still reads \
+                     enabled={enabled} buffer={buffer} — the request declared avoid_aggro=false and \
+                     aggro_buffer=25.0 and the caller was told OK. That 200 is the lie."));
+            }
+        }
+        assert!(failures.is_empty(), "{} of 3 routes:\n  {}", failures.len(), failures.join("\n  "));
+    }
+
+    /// #952: and a REFUSED `/follow` must leave the shared slot exactly as it found it — the knobs
+    /// are applied past every 4xx return, the same place `/goto` applies them. Otherwise a rejected
+    /// request would still have changed how the NEXT accepted one routes.
+    #[tokio::test]
+    async fn a_refused_follow_does_not_write_the_avoid_knobs() {
+        let state = empty_state();
+        {
+            let mut o = state.nav.nav_avoid.lock().unwrap();
+            o.enabled = true;
+            o.buffer  = 0.0;
+        }
+        let nav_avoid = state.nav.nav_avoid.clone();
+        let app = router().with_state(state);
+        // Coordinates are rejected outright by /follow.
+        let req = Request::post("/follow")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0,"avoid_aggro":false,"aggro_buffer":25.0}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let o = nav_avoid.lock().unwrap();
+        assert!(o.enabled && o.buffer == 0.0,
+            "a refused request must change nothing, but the slot now reads enabled={} buffer={}",
+            o.enabled, o.buffer);
     }
 
     // --- goto: a malformed body must not silently fall back to "current target" ----------------
