@@ -63,7 +63,7 @@ breakdown and why.
 | Route | Body | Description |
 |-------|------|-------------|
 | `POST /v1/move/goto` | `{"name":"Guard Phaeton"}` \| `{"x":,"y":,"z":}` \| `{"map_x":,"map_y":}` \| `{}` | Walk to an entity (fuzzy name, one-time snapshot) or coordinates and **stop** on arrival. Empty body → the player's current target. `map_*` are Brewall map coords (= negated server x/y); `z` is optional there (defaults, then the walker snaps to the actual floor) but **required** on the raw `{x,y,z}` form. A body with SOME coordinate field(s) but not a complete `{x,y,z}` or `{map_x,map_y}` — e.g. `{"x":,"y":}` with no `z` — 400s naming exactly which field(s) are missing (`partial target: got {x, y} but missing {z}`), never the "no target; provide a name or coords" message, which is reserved for a body with no coordinate field at all (#886). **Two or more target forms in one body never silently pick a winner** — see [Target-form precedence and `ignored_fields`](#target-form-precedence-and-ignored_fields-901) (#901). **Returns JSON**, including [`matched`](#matched--which-entity-a-name-actually-resolved-to) when the goal came from a name/target. |
-| `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected even alongside `name` (400 — but a freezing hold answers 409 first, #884) — no target-naming field is ever silently dropped here (#901). `avoid_aggro`/`aggro_buffer` are a separate field family: `/follow` shares `MoveBody` with `/goto`, and until #952 it accepted both knobs and never applied them. It now applies them, to the same shared nav setting `/goto` and `/zone_cross` write, and past every 4xx return — so a refused `/follow` changes nothing. **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to). |
+| `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected even alongside `name` (400 — but a freezing hold answers 409 first, #884) — no target-naming field is ever silently dropped here (#901). `avoid_aggro`/`aggro_buffer` are a separate field family: `/follow` shares `MoveBody` with `/goto`, and until #952 it accepted both knobs and never applied them. It now applies them, to the same shared nav setting `/goto` and `/zone_cross` write, and past every 4xx return — so a refused `/follow` changes nothing. (`/zone_cross` is the exception and predates #952: it applies the knobs *before* its own `zone_id … is not reachable` 400, so a refused crossing does still move the shared setting. Measured and pinned by `a_refused_zone_cross_does_write_the_avoid_knobs_pre_existing_divergence`; unchanged here.) **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to). |
 | `POST /v1/move/stop` | — | Cancel any active goto/follow. **Not** subject to the `held` gate below — it is a cancel, its effect is on the nav slots and not on the physics step, so it stays honest and available while the body is frozen. |
 | `POST /v1/move/zone_cross` | `{"zone_id":N}` \| `{}` | Cross a zone line and send OP_ZoneChange (specific zone, or nearest line). |
 
@@ -1014,11 +1014,20 @@ which:
 
 The section above is `/goto`'s instance of a rule that now covers the whole API. Several routes
 accept **more than one way to name the same argument**, and each of them used to resolve the choice
-with a precedence chain that never looked at the losers. Because every request struct carries
-`serde(deny_unknown_fields)`, a field the handler does not reach is **not** rejected — it is
-declared, so it parses, and the request is answered `200`. That is the failure this rule removes:
-the strongest signal the API can send ("your instruction was understood") for an instruction that
-was thrown away.
+with a precedence chain that never looked at the losers. Most request structs carry
+`serde(deny_unknown_fields)`, so a *misspelled* field is rejected. That is exactly what makes a
+*declared but unreached* field quiet: it is not unknown, so it parses, and the request is answered
+`200`. That is the failure this rule removes: the strongest signal the API can send ("your
+instruction was understood") for an instruction that was thrown away.
+
+> **Two routes do not have even the typo protection.** `GET /v1/observe/frame` and
+> `GET /v1/observe/packets` are the 2 of this crate's 35 request structs with **no**
+> `deny_unknown_fields`, so on those two an **unrecognized query key is still silently ignored** —
+> `GET /v1/observe/packets?sicne=1` answers `200` with the typo dropped. This is the same
+> agent-honesty failure one step earlier, it is **not** fixed by this section, and it is tracked as
+> **#971**. The `/frame` behaviour is also stated in
+> [Camera override for `/frame`](#camera-override-for-observeframe-422) above. A source-scanned
+> test asserts exactly these two are the exceptions, so this paragraph cannot quietly go stale.
 
 **The rule.** Where two forms name *the same thing* in different notations (`{map_x,map_y}` and
 `{x,y,z}` for one point), precedence applies and the loser is **reported** in `ignored_fields`.
@@ -1068,13 +1077,41 @@ agent to fix the world when the thing to fix is its own request.
 
 **What is NOT in a group.** Fields that compose rather than compete are unaffected and still combine
 freely — `target_id` beside any of `/cast`'s three forms, `allow_pending` beside `/frame`'s camera
-params, `z` beside `{map_x,map_y}`. Every `Deserialize` request struct in the HTTP crate is
-classified as one or the other by a test that reads the crate's source directory, so a new request
-body cannot be added without that decision being made explicitly.
+params, `z` beside `{map_x,map_y}`.
 
-**Migration note:** a caller that batched two forms into one request — most plausibly
-`{"add":…,"remove":…}` on `/v1/social/friends` — now gets a `400` where it previously got a `200`
-that performed only one of the two edits. Send one request per form.
+**How far the guard actually reaches** — stated precisely, because the natural summary of it is
+broader than the thing it does:
+
+* A test reads the HTTP crate's `src/` directory and requires every `Deserialize` request struct in
+  it — all **35** — to be classified as exclusive or composable. So a **new request struct** cannot
+  be added without that decision being made out loud.
+* A **new field on an existing struct** is a different case, and only **8** of the 35 are protected
+  against it: the eight handlers that destructure their body exhaustively (`let CommandBody { command,
+  name } = &b;`, no `..`), where adding a field is a compile error until someone places it. On the
+  other 27 structs, a new field that no code path reads would compile and ship — which is the
+  original #952 shape. Re-derive both figures:
+  `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-http/src/ | wc -l` and
+  `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-http/src/*.rs`.
+* The 26 `COMPOSABLE` rows carry a one-line reason each ("all three passed to `request_mem_spell`").
+  Those reasons are **read off the source and written down, not executed** — the guard verifies that
+  each struct has been *classified*, not that a classification is *correct*. A struct wrongly filed
+  as composable is invisible to it.
+
+**Migration note:** a caller that batched two forms into one request now gets a `400` where it
+previously got a `200` that performed only one of them. Three routes change answer for bodies that
+were previously accepted:
+
+* `POST /v1/social/friends` `{"add":…,"remove":…}` — previously `200` performing only the add.
+* `POST /v1/trainer/open` `{"name":"Alpha","trainer":"Beta"}` — previously `200` opening Beta.
+* `POST /v1/interact/dialogue` `{"index":0,"text":"bind"}` — previously `200` clicking the index.
+
+Note the presence rule differs by route. `/social/friends` treats a **blank** name as not supplied, so
+`{"add":"","remove":"Beta"}` is still an ordinary removal and is *not* refused (a test seeds Beta and
+asserts `200 removed Beta`). `/trainer/open` and `/interact/dialogue` key on the field being present
+at all, so a blank loser now refuses too — both driven through the router:
+`POST /v1/trainer/open {"name":"","trainer":"Beta"}` and
+`POST /v1/interact/dialogue {"index":0,"text":""}` each answer `400 conflicting …`. Send one request
+per form.
 
 ### `nav_goal_id` and `nav_goal` — goal identity (#349)
 

@@ -1,8 +1,10 @@
 //! #952/#956 (agent-honesty): the ONE place a "you sent more than one mutually exclusive form"
 //! refusal is decided and worded.
 //!
-//! **The defect this exists to remove.** Every request struct in this crate carries
-//! `#[serde(deny_unknown_fields)]`, which is what makes a *typo* loud. It is also what makes a
+//! **The defect this exists to remove.** 33 of this crate's 35 request structs carry
+//! `#[serde(deny_unknown_fields)]` — the exceptions are the two `/v1/observe` query structs listed
+//! in `DENY_UNKNOWN_EXEMPT`, which is asserted against the source so this sentence cannot rot.
+//! Where the attribute IS present it is what makes a *typo* loud. It is also what makes a
 //! *silently ignored* field quiet: a field the struct declares but the handler never reaches is
 //! **accepted**, because it is not unknown — 200, no warning, no disclosure. The agent driving this
 //! client has no independent channel to reality, so a 200 is the strongest signal available that its
@@ -37,6 +39,14 @@
 //! its author decides whether the new field belongs in the exclusive group. That is the property
 //! that was missing when `avoid_aggro`/`aggro_buffer` were added to the shared `MoveBody` and
 //! `post_follow` — which deserializes that same struct — simply never looked at them (#952).
+//!
+//! **How far that reaches, exactly.** It is 8 of the 35 request structs, not all of them: the eight
+//! handlers listed by
+//! `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-http/src/*.rs`. Only those are
+//! protected against a NEW FIELD being added and never read. The source-scan guard below is the
+//! other axis and covers all 35, but it guards STRUCT addition — a struct must be classified — not
+//! field addition. So the honest summary is: adding a request struct forces the decision; adding a
+//! field to one of the other 27 structs does not, and #952's original shape could recur there.
 
 /// Refuse a request that supplied more than one of a set of MUTUALLY EXCLUSIVE form fields.
 ///
@@ -198,6 +208,14 @@ mod tests {
     ///
     /// Adding a struct here is a decision, and it is the decision this whole guard exists to force
     /// someone to make out loud.
+    ///
+    /// **The reasons are READ, not EXECUTED — do not mistake this table for verification.** The
+    /// guard asserts that every struct is *classified*; nothing asserts that a classification is
+    /// *right*. Each justification here was written by reading the handler and checking that every
+    /// field reaches a use on every 2xx path, but no probe drives these 26 routes with all their
+    /// fields set and confirms each one had an effect. A struct wrongly filed here is therefore
+    /// invisible to this module — it is exactly the #952 defect, sitting behind a sentence claiming
+    /// it is not. The `EXCLUSIVE` rows are the ones that ARE executed, through `probe`.
     const COMPOSABLE: &[(&str, &str, &str)] = &[
         ("camera.rs", "CameraSetBody",
          "all four are independent camera axes, copied unconditionally into CameraCmd::Set"),
@@ -252,7 +270,42 @@ mod tests {
     /// predicate below, quoted in source. Every real derive on this surface sits at column 0
     /// (`grep -rn '^[[:space:]]\+#\[derive(.*Deserialize' crates/eqoxide-http/src/` is empty), so
     /// anchoring drops the self-match and nothing else.
+    ///
+    /// One latent divergence, stated rather than left to be discovered: the scanner below matches on
+    /// `line.trim_start()`, so it WOULD count an indented `#[derive(Deserialize)]` — e.g. a struct
+    /// declared inside a function — while the `^`-anchored command above would not. The two agree on
+    /// this corpus today only because no such derive exists (the indented-form grep is empty, as
+    /// above). If one ever appears, the command will read one lower than the scanner and this
+    /// constant, and the scanner is the authority: the whole point is to see structs a hand-written
+    /// or narrowly-anchored view would miss.
     const DECLARED_REQUEST_STRUCTS: usize = 35;
+
+    /// The request structs that do NOT carry `#[serde(deny_unknown_fields)]`, in scan order.
+    ///
+    /// **This exists because the first version of this module opened with "every request struct in
+    /// this crate carries `deny_unknown_fields`", and that was false.** Measured over this same
+    /// corpus: 33 of 35 carry it; these two do not. Both are `/v1/observe` QUERY structs, and on
+    /// both an unrecognized key is still silently dropped — `GET /v1/observe/packets?sicne=1`
+    /// answers `200` with the typo discarded (driven through `v1_router`; the `/frame` equivalent
+    /// could not be driven headless because the renderer-readiness gate answers 503 first, so no
+    /// end-to-end claim is made about it here — the source position is that `FrameQuery` has no
+    /// `deny_unknown_fields` and `parse_frame_query` rejects only DUPLICATED recognized keys).
+    ///
+    /// That is the #952/#956 failure shape — a confident answer for an instruction thrown away —
+    /// on the unreached-field side rather than the reached-but-ignored side. It is NOT fixed here:
+    /// `PacketsQuery` is read through axum's `Query` extractor, whose rejection is a plain-text
+    /// 400, which would break the JSON error contract `/observe/packets` advertises and re-open the
+    /// exact defect #701 closed for `/frame`. Doing it properly means giving `/packets` the
+    /// hand-rolled parse `/frame` already has, and choosing an error code for unknown keys — #701's
+    /// own design surface, not this PR's. Tracked as #971.
+    ///
+    /// The list is asserted exactly, so neither direction can rot silently: adding the attribute to
+    /// one of these, or introducing a new struct without it, turns the corpus guard RED and forces
+    /// the prose to be updated with it.
+    const DENY_UNKNOWN_EXEMPT: &[(&str, &str)] = &[
+        ("observe.rs", "PacketsQuery"),
+        ("observe.rs", "FrameQuery"),
+    ];
 
     /// **Reach control, half 2.** The total number of field names the probes actually LOCATED in the
     /// routes' own refusal bodies, summed over every case. Not a count of cases iterated: the only
@@ -261,6 +314,23 @@ mod tests {
     /// number down together. Hand-written on purpose — computing it from `EXCLUSIVE` would let a row
     /// deleted from the table take its own coverage requirement with it.
     const REFUSAL_NAMED_FIELDS: usize = 23;
+
+    /// **Reach control, half 2b — the SUBJECT of the refusal, not just its field list.**
+    ///
+    /// The number of rows whose refusal body was found to open with `conflicting <what>`, summed the
+    /// same way: incremented only when the phrase is actually located in a body the router returned.
+    ///
+    /// MEASURED, and the reason this exists: the review's RV-M6 changed `/v1/interact/loot`'s handler
+    /// to pass `"spell selection"` — so a caller sending two corpse forms was told its *spell*
+    /// selection conflicted — and the entire crate stayed green (exit 0, 340 passed, 0 failed),
+    /// because the oracle only ever asked which FIELDS were named. Naming the right fields under the
+    /// wrong subject is still a false statement about the request, which is the defect class this
+    /// whole module is about.
+    ///
+    /// 7, not 9: `/goto` and `/frame` word their own refusals (`what: None`) and are excluded.
+    /// Hand-written for the same reason as [`REFUSAL_NAMED_FIELDS`] — deriving it from `EXCLUSIVE`
+    /// would let a deleted row delete its own coverage requirement.
+    const REFUSAL_SUBJECTS: usize = 7;
 
     /// Those of `group` that appear in `body` as WHOLE TOKENS — bounded by something that is not an
     /// identifier character on both sides.
@@ -424,24 +494,39 @@ mod tests {
     /// ("no corpse matching …"), so the load-bearing assertion is the second one: the refusal has to
     /// name the caller's actual fields.
     ///
-    /// MUTATION-CHECK (measured on this tree, not reasoned; WRAP form, never deletion-only):
+    /// MUTATION-CHECK — re-measured on THIS tree after the subject reach control was added, by
+    /// running `cargo test -p eqoxide-http --lib` with each mutant in place and reverting by hand.
+    /// WRAP form throughout, never deletion-only (#799):
     /// * `if present.len() < 2 { return None; }` → `if false { … } else { return None; }`, which
-    ///   disables every refusal this module owns: 7 tests RED, this one reporting 8 findings — the
-    ///   seven rows plus the reach control, which reads 8 of 23. The residual 8 are `/goto`'s and
-    ///   `/frame`'s four fields each: those two refusals are worded in `move_api.rs` and
-    ///   `observe.rs` and are correctly outside this mutant's blast radius.
-    /// * `present.join(", ")` → `if false { … } else { String::new() }`, i.e. still refuse but name
-    ///   nothing: 5 tests RED, reach control 8 of 23. That this lands on the same 8 is the evidence
-    ///   the count tracks *fields actually named*, not rows visited.
-    /// * A single handler's `conflicting_forms` call wrapped to `None`: RED here only, 2 findings —
-    ///   that row plus the reach control at 21 of 23. One route silently regressing moves this
-    ///   number, which is the property a counter maintained beside the loop could not give.
+    ///   disables every refusal this module owns: **8 tests RED**, this one reporting **10
+    ///   findings** — the seven newly-guarded rows plus BOTH reach controls, at 8 of 23 fields and
+    ///   0 of 7 subjects. The residual 8 fields are `/goto`'s and `/frame`'s four each: those two
+    ///   refusals are worded in `move_api.rs` and `observe.rs` and are correctly outside this
+    ///   mutant's blast radius.
+    /// * `present.join(", ")` → `if false { … } else { String::new() }`, i.e. still refuse, still
+    ///   with the right subject, but name no field: **6 tests RED**, 8 findings, field reach 8 of
+    ///   23 — and the subject reach control stays at 7. The two controls moving independently is
+    ///   the evidence they are separate axes rather than one check counted twice.
+    /// * `pet.rs`'s single `conflicting_forms` call wrapped to `None`: RED here only, **3
+    ///   findings** — that row, the field reach control at 21 of 23, and the subject reach control
+    ///   at 6 of 7. One route silently regressing moves both numbers, which is the property a
+    ///   counter maintained beside the loop could not give.
+    /// * The review's RV-M6, replayed: `interact.rs`'s `"corpse selection"` →
+    ///   `if false { "corpse selection" } else { "spell selection" }`, so `/loot` names the right
+    ///   fields under `/cast`'s subject. It **SURVIVED** the whole crate before this control existed
+    ///   (exit 0, 340 passed) and is now **KILLED**: 2 findings, subject reach 6 of 7.
+    /// * INVALID control, so that "every mutant above compiled" carries information:
+    ///   `present.join(", ")` → `if false { present.join(", ") } else { present }` fails with
+    ///   `error[E0308]: `if` and `else` have incompatible types`. That is UNTESTED, not RED — a
+    ///   mutant that does not build says nothing about the guard, and the four results above are
+    ///   only meaningful because this one is visibly different from them.
     #[tokio::test]
     async fn every_declared_mutually_exclusive_form_group_is_refused_not_silently_dropped() {
         // Every row is probed and every verdict reported, rather than panicking on the first — a
         // guard over a whole surface that stops at row 1 tells you about row 1 and hides the rest,
         // which is how a partial fix reads as a complete one.
         let mut located: Vec<&'static str> = Vec::new();
+        let mut subjects: Vec<&'static str> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
         for case in EXCLUSIVE {
             let (status, body, named) = probe(case).await;
@@ -451,6 +536,18 @@ mod tests {
             // guard is about.
             if status.is_client_error() {
                 located.extend(named.iter().copied());
+                if let Some(what) = case.what {
+                    if body.contains(&format!("conflicting {what}")) {
+                        subjects.push(what);
+                    } else {
+                        failures.push(format!(
+                            "{} ({}::{}): refused with {status}, but the refusal does not open with \
+                             \"conflicting {what}\" — the subject the route declares in EXCLUSIVE. \
+                             Naming the caller's fields under someone else's subject still tells the \
+                             agent something untrue about its own request. Body: {body}",
+                            case.route, case.file, case.strukt));
+                    }
+                }
             }
             if !status.is_client_error() {
                 failures.push(format!(
@@ -478,6 +575,14 @@ mod tests {
                  Located: {located:?}",
                 located.len(), REFUSAL_NAMED_FIELDS));
         }
+        if subjects.len() != REFUSAL_SUBJECTS {
+            failures.push(format!(
+                "REACH CONTROL: {} refusals opened with their declared `conflicting <what>` subject, \
+                 expected {}. This is pushed only where the phrase was found in a body the router \
+                 returned, so it drops when a route stops refusing, when the loop covers fewer rows, \
+                 or when a refusal's subject drifts from the one declared here. Located: {subjects:?}",
+                subjects.len(), REFUSAL_SUBJECTS));
+        }
         assert!(failures.is_empty(), "{} finding(s) across {} mutually-exclusive form groups:\n  {}",
             failures.len(), EXCLUSIVE.len(), failures.join("\n  "));
         assert_eq!(
@@ -488,6 +593,56 @@ mod tests {
              cannot be kept green by a counter that runs beside the check. Located: {:?}",
             located.len(), REFUSAL_NAMED_FIELDS, located
         );
+        assert_eq!(
+            subjects.len(), REFUSAL_SUBJECTS,
+            "REACH CONTROL: {} refusals opened with their declared `conflicting <what>` subject, \
+             expected {}. Located: {:?}",
+            subjects.len(), REFUSAL_SUBJECTS, subjects
+        );
+    }
+
+    /// Every `.rs` file at or below `dir`, as paths relative to it — `"observe.rs"`,
+    /// `"observe/frame.rs"`. Top-level files keep their bare name, so the `file` column of
+    /// [`EXCLUSIVE`] and [`COMPOSABLE`] is unaffected by the walk becoming recursive.
+    fn rs_files(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>) {
+        let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+            .map(|e| e.unwrap())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+            if entry.file_type().unwrap().is_dir() {
+                rs_files(&entry.path(), &rel, out);
+            } else if name.ends_with(".rs") {
+                out.push(rel);
+            }
+        }
+    }
+
+    /// [`rs_files`] must descend. This crate has no subdirectory under `src/` today, so running the
+    /// walk over the real corpus cannot distinguish a recursive implementation from a flat one —
+    /// which is exactly how the flat version survived review as far as it did. The tree here is
+    /// synthetic so the assertion has content regardless of the crate's current shape.
+    #[test]
+    fn rs_files_descends_into_subdirectories() {
+        let root = std::env::temp_dir().join(format!("eqoxide-req-form-walk-{}", std::process::id()));
+        let nested = root.join("subprobe").join("deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("top.rs"), "").unwrap();
+        std::fs::write(root.join("notrust.txt"), "").unwrap();
+        std::fs::write(root.join("subprobe").join("mod.rs"), "").unwrap();
+        std::fs::write(nested.join("inner.rs"), "").unwrap();
+
+        let mut found = Vec::new();
+        rs_files(&root, "", &mut found);
+        found.sort();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(found, vec!["subprobe/deeper/inner.rs", "subprobe/mod.rs", "top.rs"],
+            "the walk must reach every depth and must ignore non-`.rs` files; a flat read would \
+             return only [\"top.rs\"] and the corpus guard would silently stop at the top level");
     }
 
     /// **#952/#956 reach control, half 1 — the corpus, not the list.**
@@ -500,14 +655,22 @@ mod tests {
     /// The directory is read at test time rather than through a hand-written `include_str!` list,
     /// because a hand-written list of files is the same failure mode one level up: a new module would
     /// simply not be scanned, and the scan would report a clean corpus it never opened.
+    ///
+    /// The walk is RECURSIVE ([`rs_files`]) and that is load bearing. It was flat in the first
+    /// version of this guard, and the review's RV-M8 killed it: a real compiled
+    /// `src/subprobe/mod.rs` declaring an unclassified two-form body left all of this module's
+    /// tests green with the count still reading 35 — the guard could not see the module, and its
+    /// own reach control could not see the blindness. A flat read also disagrees with the
+    /// re-derivation command documented on [`DECLARED_REQUEST_STRUCTS`], which is `grep -rn` and
+    /// therefore recursive: the doc would have told you to check against a number the scanner
+    /// structurally could not produce. `rs_files_descends_into_subdirectories` pins the recursion
+    /// on a synthetic tree, because this crate happens to have no subdirectory today and a control
+    /// that only passes for that reason proves nothing.
     #[test]
     fn every_deserialize_request_struct_is_classified() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        let mut files: Vec<String> = std::fs::read_dir(dir)
-            .unwrap_or_else(|e| panic!("cannot read {dir}: {e}"))
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".rs"))
-            .collect();
+        let mut files: Vec<String> = Vec::new();
+        rs_files(std::path::Path::new(dir), "", &mut files);
         files.sort();
         assert!(
             files.len() >= 19,
@@ -520,6 +683,7 @@ mod tests {
         // (file, struct) pairs, in file order. `strukt` alone is not an identity — `group.rs` and
         // `guild.rs` each declare a `NameBody`, `move_api.rs` and `inventory.rs` each a `MoveBody`.
         let mut structs: Vec<(String, String)> = Vec::new();
+        let mut unprotected: Vec<(String, String)> = Vec::new();
         for file in &files {
             let src = std::fs::read_to_string(format!("{dir}/{file}")).unwrap();
             let lines: Vec<&str> = src.lines().collect();
@@ -530,14 +694,40 @@ mod tests {
                 if t.starts_with("//") || !t.starts_with("#[derive(") || !line.contains("Deserialize") {
                     continue;
                 }
-                let decl = lines[i + 1..].iter().take(8)
-                    .find_map(|l| l.split("struct ").nth(1))
-                    .unwrap_or_else(|| panic!("{file}:{}: derive(Deserialize) with no struct within \
-                        8 lines — the scan cannot classify what it cannot name", i + 1));
+                // Walk from the derive to the `struct` line, noting whether the attribute block
+                // between them carries `deny_unknown_fields` — see `DENY_UNKNOWN_EXEMPT`.
+                let mut decl: Option<&str> = None;
+                let mut protected = false;
+                for l in lines[i + 1..].iter().take(8) {
+                    if l.contains("deny_unknown_fields") {
+                        protected = true;
+                    }
+                    if let Some(rest) = l.split("struct ").nth(1) {
+                        decl = Some(rest);
+                        break;
+                    }
+                }
+                let decl = decl.unwrap_or_else(|| panic!("{file}:{}: derive(Deserialize) with no \
+                    struct within 8 lines — the scan cannot classify what it cannot name", i + 1));
                 let name: String = decl.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                if !protected {
+                    unprotected.push((file.clone(), name.clone()));
+                }
                 structs.push((file.clone(), name));
             }
         }
+
+        assert_eq!(
+            unprotected, DENY_UNKNOWN_EXEMPT.iter().map(|&(f, s)| (f.to_string(), s.to_string()))
+                .collect::<Vec<_>>(),
+            "the set of Deserialize structs WITHOUT `deny_unknown_fields` changed. This module's \
+             opening paragraph, and `docs/http-api.md`'s section on this rule, both describe which \
+             structs make a typo loud; that description is only true while this list is. If you \
+             ADDED the attribute to one of these, delete its row here and update both texts (the \
+             surface got more honest and the docs should say so). If a NEW struct appears here, it \
+             silently ignores unknown fields — decide whether that is intended and say so in the \
+             docs before adding it. Scanned: {unprotected:?}"
+        );
 
         assert_eq!(
             structs.len(), DECLARED_REQUEST_STRUCTS,

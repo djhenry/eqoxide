@@ -884,6 +884,46 @@ mod tests {
             o.enabled, o.buffer);
     }
 
+    /// The same property does NOT hold on `/zone_cross`, and this test exists so that is on the
+    /// record rather than merely unmentioned.
+    ///
+    /// `/goto` and `/follow` call `apply_avoid_opts` past every 4xx return. `/zone_cross` calls it
+    /// immediately after parsing the body and BEFORE its own `zone_id … is not reachable` 400, so a
+    /// refused crossing still moves the shared `nav.nav_avoid` slot and changes how the next
+    /// ACCEPTED nav request routes. That ordering predates #952 and this PR does not change it —
+    /// re-ordering a state mutation on a route this change set otherwise does not touch is a
+    /// behaviour change that belongs in its own review.
+    ///
+    /// MEASURED here, not reasoned: the assertions below are what the route actually does today.
+    /// A future fix that moves the call past the 400 will turn this RED with the message saying so,
+    /// which is the point — the divergence cannot quietly change in either direction.
+    #[tokio::test]
+    async fn a_refused_zone_cross_does_write_the_avoid_knobs_pre_existing_divergence() {
+        let state = empty_state();
+        {
+            let mut o = state.nav.nav_avoid.lock().unwrap();
+            o.enabled = true;
+            o.buffer  = 0.0;
+        }
+        let nav_avoid = state.nav.nav_avoid.clone();
+        let app = router().with_state(state);
+        // 99999 does not fit a wire u16, so it can never be reachable → the route's own 400.
+        let req = Request::post("/zone_cross")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"zone_id":99999,"avoid_aggro":false,"aggro_buffer":25.0}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {}", body_text(resp).await);
+        let o = nav_avoid.lock().unwrap();
+        assert!(!o.enabled && o.buffer == 25.0,
+            "this test pins a KNOWN divergence: /zone_cross applies the avoid knobs before its own \
+             400, so a refused crossing is expected to have written them. The slot reads \
+             enabled={} buffer={}. If you just moved `apply_avoid_opts` past the 400 — good, that \
+             is the fix; invert this assertion, and update `docs/http-api.md`'s note that /zone_cross \
+             is the exception.",
+            o.enabled, o.buffer);
+    }
+
     // --- goto: a malformed body must not silently fall back to "current target" ----------------
 
     #[tokio::test]
