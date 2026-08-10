@@ -260,7 +260,7 @@ pub enum ActivityProgress {
         /// 2 Kill, 3 Loot, 4 SpeakWith, 5 Explore, 6 TradeSkill, 7 Fish, 8 Forage, 9 CastOn,
         /// 10 SkillOn, 11 Touch, 13 Collect, 100 GiveCash.
         ///
-        /// **Type 100 (GiveCash) repurposes the two counts** (`common/tasks.h:144-150`): the
+        /// **Type 100 (GiveCash) repurposes the two counts** (`common/tasks.h:143-150`): the
         /// server forces `goal_count` to 1 and sends `done_count` as a 0/1 *flag*, not a tally.
         /// The cash amount is not on the wire at all. Read `0/1` there as "not yet delivered",
         /// not as "0 of 1 items".

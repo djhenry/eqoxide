@@ -7,6 +7,12 @@ offsets, and opcodes are cross-checked against:
 
 **Always verify against those files** when adding new packet handling.
 
+> ⚠️ **The client speaks RoF2, not Titanium.** The header above is inherited and is itself a
+> hazard: deriving a layout from the Titanium patch is the root cause of #889. Sections that have
+> been re-derived for RoF2 say so and cite `utils/patches/patch_RoF2.conf` /
+> `common/patches/rof2*`; anything that does not say so is Titanium-era and unverified for this
+> client. Retitling and auditing the rest of this document is tracked as **#954**.
+
 ---
 
 ## Opcode Table (zone server, Titanium)
@@ -130,9 +136,14 @@ has not.)
   `description`(cstr) + `Data2{has_rewards:u8, coin:u32, xp:u32, faction:u32}` (13) + `reward`(cstr) +
   `itemlink`(cstr) + `Trailer{points:u32, has_reward_selection:u8}` (5).
   **Not re-derived for RoF2** — unlike `OP_TaskActivity` this opcode *does* have a RoF2 ENCODE
-  (`common/patches/rof2.cpp:3846`, reallocating at `:3899`), so the serialiser output is not the
-  wire format and #889's derivation method does not transfer. Tracked as #949; treat the field list
-  above as the shape `apply_task_description` currently reads, not as a verified RoF2 wire spec.
+  (`common/patches/rof2.cpp:3846`), which recomputes the size at `:3875-3877` and reallocates at
+  **`:3879`** (`in->pBuffer = new unsigned char[in->size];`), so the serialiser output is not the
+  wire format and #889's derivation method does not transfer. Note that `:3895`–`:3922` of the same
+  function is an `#if 0 // original code` block — the `new EQApplicationPacket(OP_TaskDescription,
+  in->size + 1)` at `:3899` is dead and is **not** the live reallocation. Tracked as #949; treat the
+  field list above as the shape `apply_task_description` currently reads, not as a verified RoF2
+  wire spec. The trailer in particular is disputed three ways (5 here, 4 in the source comment,
+  none actually read) — tracked separately as #955.
 - `OP_TaskActivity` (0x08d3): **two** legal wire shapes of different lengths. `grep -rn
   OP_TaskActivity common/patches/` finds no ENCODE and no DECODE (only a deprecated SoF opcode-list
   entry), so the emulator's serialiser output *is* the wire format, and
@@ -162,7 +173,7 @@ has not.)
     (`common/repositories/base/base_task_activities_repository.h:43`, `:235`, cast at
     `zone/task_manager.cpp:216`), so it is always 0..=255 and can never be the sentinel.
   - `done_count`/`goal_count` are live objective progress and exist **only** in the long form.
-    `GiveCash` activities repurpose them (`common/tasks.h:144-150`): `goal_count` is a literal 1
+    `GiveCash` activities repurpose them (`common/tasks.h:143-150`): `goal_count` is a literal 1
     and `done_count` a 0/1 boolean; the cash amount is not on the wire.
 - `OP_CompletedTasks` (0x4eba): `count:u32` then `count` records of
   `{task_id:u32, title:cstr, completed_time:u32}` (`zone/task_manager.cpp:946-966`) — full records,

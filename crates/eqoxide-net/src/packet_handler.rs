@@ -183,8 +183,24 @@ fn apply_animation(gs: &mut GameState, p: &[u8]) {
 
 // ── Native Task-system quest log (OP_TaskDescription / OP_TaskActivity / OP_CompletedTasks) ──────
 // These are variable-length, packed (no struct padding) wire records with embedded null-terminated
-// strings. Layouts cross-checked against EQEmu titanium.cpp ENCODE(OP_TaskDescription) + the
-// TaskActivity_Struct in eq_packet_structs.h. See docs/protocol-notes.md.
+// strings. See docs/protocol-notes.md.
+//
+// Provenance is PER OPCODE — do not generalise one bullet to another:
+//   * OP_TaskActivity   — re-derived for RoF2 from the send path: `TaskManager::SendTaskActivity*`
+//     (`zone/task_manager.cpp:972-1014`) delegating to `ActivityInformation::SerializeObjective`
+//     (`common/tasks.h:141-189`). See `parse_task_activity` below.
+//   * OP_CompletedTasks — re-derived from `zone/task_manager.cpp:946-966`.
+//   * OP_TaskDescription — NOT re-derived for RoF2. It has a RoF2 ENCODE, so the serialiser output
+//     is not the wire format; see `apply_task_description` and #949.
+//
+// An earlier revision of this banner claimed the layouts here were "cross-checked against EQEmu
+// titanium.cpp ENCODE(OP_TaskDescription) + the TaskActivity_Struct in eq_packet_structs.h". Both
+// authorities are wrong and both are named in #889's root cause. `titanium.cpp` is the Titanium
+// patch, not RoF2. And the line immediately above `struct TaskActivity_Struct` — at
+// `common/eq_packet_structs.h:4551` — reads, verbatim:
+//     // Old structs not used by Task System implentation but left for reference
+// (the misspelling is EQEmu's), so that struct is marked unused by the emulator itself. Deriving a
+// layout from either source is the mistake this file already made once.
 
 /// Extract the display name from an EQ saylink. `EQ::SayLinkEngine::GenerateLink()` (EQEmu
 /// common/say_link.cpp) emits exactly two `\x12` delimiters: `\x12<56-char body><Name>\x12` — the
@@ -203,7 +219,12 @@ fn extract_saylink_text(s: &str) -> String {
 /// OP_TaskDescription — a task's header + title + reward. Upserts into gs.tasks (preserving any
 /// activities already received for it). Layout: Header{seq,task_id,open_window:u8,task_type,
 /// reward_type}(17) + title cstr + Data1{duration,dur_code,start_time}(12) + desc cstr +
-/// Data2{has_rewards:u8,coin,xp,faction}(13) + reward_text cstr + item_link cstr + Trailer(4).
+/// Data2{has_rewards:u8,coin,xp,faction}(13) + reward_text cstr + item_link cstr + a trailer this
+/// function does **not** read (it stops after `item_link`; nothing here needs `Points`). The
+/// trailer's size is disputed — 5 bytes in `common/eq_packet_structs.h:4702-4706`, 4 in
+/// `common/patches/rof2_structs.h:4249-4252` — and has not been derived for RoF2; see #955.
+/// This layout as a whole is **not** re-derived for RoF2 either (this opcode has a RoF2 ENCODE at
+/// `common/patches/rof2.cpp:3846`, so the serialiser output is not the wire format) — see #949.
 /// `sequence_number` (the header's SequenceNumber) is kept — OP_CancelTask addresses a task by it.
 /// `reward_item_text` is the item name extracted from item_link's EQ saylink markup.
 fn apply_task_description(gs: &mut GameState, p: &[u8]) {
@@ -261,6 +282,17 @@ const TASK_ACTIVITY_SHORT_LEN: usize = 25;
 /// there is always 0..=255 and this sentinel identifies the short form unambiguously. It is
 /// checked *in addition to* the length, never instead of it; see [`parse_task_activity`].
 const TASK_ACTIVITY_SHORT_SENTINEL: u32 = 0xffff_ffff;
+
+/// Prefix of the `Undecodable` reason emitted when `parse_long_objective` ran out of bytes. It
+/// publishes the exact cursor position, and the test-side `landing_of` classifier keys on it to
+/// measure how deep a probe reached. Binding the emitter and the classifier to ONE constant means a
+/// reword cannot silently reclassify probes — which is the failure mode the reach control exists to
+/// prevent.
+const UNDECODABLE_RAN_OUT_PREFIX: &str = "ran out of bytes at offset ";
+
+/// Substring of the `Undecodable` reason emitted when every long-form field decoded but bytes
+/// remained. Shared with `landing_of` for the same reason as [`UNDECODABLE_RAN_OUT_PREFIX`].
+const UNDECODABLE_TRAILING_MARKER: &str = "trailing byte(s)";
 
 /// Smallest possible **long** `OP_TaskActivity`, in bytes — every string empty and every
 /// `LengthString` zero-length. Derived from the layout in [`parse_task_activity`]:
@@ -416,13 +448,14 @@ fn parse_task_activity(p: &[u8]) -> Option<(u32, eqoxide_core::game_state::TaskA
             Some(known) if r.at_end() => known,
             Some(_) => ActivityProgress::Undecodable {
                 reason: format!(
-                    "{} trailing byte(s) after the documented RoF2 objective layout ({} total)",
+                    "{} {UNDECODABLE_TRAILING_MARKER} after the documented RoF2 objective layout \
+                     ({} total)",
                     r.remaining(), p.len()
                 ),
             },
             None => ActivityProgress::Undecodable {
                 reason: format!(
-                    "ran out of bytes at offset {} of {} decoding the long form",
+                    "{UNDECODABLE_RAN_OUT_PREFIX}{} of {} decoding the long form",
                     r.pos(), p.len()
                 ),
             },
@@ -7348,9 +7381,19 @@ mod tests {
     }
 
     /// The oracle for the layout: replaying the PRE-#889 field order over a fixture built from the
-    /// emulator's serialiser must reproduce the exact values the issue captured live
-    /// (`goal_count: 83886080` = `0x05000000`, target `"nt Rattlesnakes"`). If this ever stops
-    /// matching, either the fixture or the diagnosis is wrong.
+    /// emulator's serialiser reproduces the values the issue captured live
+    /// (`goal_count: 83886080` = `0x05000000`, target `"nt Rattlesnakes"`).
+    ///
+    /// **Only half of this is a prediction — read the two halves differently.**
+    ///   * The two `goal_count` values ARE a prediction. `0x05000000` and `0x01000000` are
+    ///     structural: a small integer whose least-significant byte has landed in byte 3. No choice
+    ///     of fixture string can produce them, so this half is a real check on the diagnosis.
+    ///   * The two target strings are a **fit, not a prediction**. The fixture names
+    ///     `"Giant Rattlesnakes"` and `"0002"` were chosen *because* losing three leading
+    ///     characters turns them into the issue's `"nt Rattlesnakes"` and `"2"` — and *any* name
+    ///     would yield *some* three-character truncation. Rename the fixture and those two
+    ///     assertions stop matching with neither the fixture nor the diagnosis being wrong. They
+    ///     are regression pins on "three characters were lost from the front", nothing more.
     ///
     /// The old order was 8×u32, then cstr, cstr, u32 — i.e. TWO independent errors, and this test
     /// is what makes the split between them measured rather than argued:
@@ -7370,14 +7413,17 @@ mod tests {
         let mob_name = r.cstr();              // read at offset 32 instead of 29
         let _item_name = r.cstr();
         let goal_count = r.u32();
-        assert_eq!(mob_name, "nt Rattlesnakes", "exactly the issue's captured target");
+        assert_eq!(mob_name, "nt Rattlesnakes",
+            "three leading characters lost — a pin on the skew, NOT a prediction: the fixture name \
+             was chosen to truncate to the issue's string (see this test's doc comment)");
         assert_eq!(goal_count, 83_886_080, "0x05000000 — the issue's captured goal_count");
         assert_eq!(goal_count, 0x0500_0000);
         // And the same skew on a goal count of 1 gives the other value the issue recorded.
         let p1 = build_task_activity_long(5745, 0, 4, false, "0002", "", 1, "-1", "0", "", "", 0);
         let mut r1 = WireReader::new(&p1, "old");
         for _ in 0..8 { r1.u32(); }
-        assert_eq!(r1.cstr(), "2", "the issue's single-character target");
+        assert_eq!(r1.cstr(), "2",
+            "same three-character skew on a 4-char fixture — again a pin, not a prediction");
         let _item = r1.cstr();
         assert_eq!(r1.u32(), 16_777_216, "0x01000000 — the issue's captured goal_count");
 
@@ -7613,15 +7659,29 @@ mod tests {
         // L decoding the long form" is the ONLY reason emitted from inside the long parser's
         // failure path, and it publishes the exact cursor position. Every other reason is a
         // discriminator refusal raised before `parse_long_objective` was ever called.
-        if reason.contains("trailing byte(s)") { return Landing::LongParserDeep; }
-        let Some(rest) = reason.strip_prefix("ran out of bytes at offset ") else {
+        //
+        // Both markers are the parser's OWN constants, not copies of its prose — reword either
+        // message and the emitter and this classifier move together, so a reword cannot silently
+        // downgrade a deep landing to `RefusedAtDiscriminator` and lower the reach floors.
+        if reason.contains(crate::packet_handler::UNDECODABLE_TRAILING_MARKER) {
+            return Landing::LongParserDeep;
+        }
+        let Some(rest) = reason.strip_prefix(crate::packet_handler::UNDECODABLE_RAN_OUT_PREFIX)
+        else {
             return Landing::RefusedAtDiscriminator;
         };
         let stop: usize = rest.split(' ').next().unwrap().parse().expect("offset in reason");
 
         // Re-derive where the `item_list` LengthString lives from the BYTES: `target_name` is a
         // cstr starting at 29, so its NUL is the first zero byte at index >= 29 and the four-byte
-        // count sits immediately after it. No magic offset is written down here.
+        // count sits immediately after it.
+        //
+        // Precisely: the `item_list` offset is derived per-probe and is NOT written down — it
+        // depends on the probe's own name length, which this classifier cannot know in advance.
+        // The start-of-name offset `29` IS written down (twice, below); it is a fixed constant of
+        // the layout — 20 + `activity_type:i32` + `optional:u8` + `request_type:i32` — and is not
+        // derived here. If that part of the layout ever changes, this classifier must change with
+        // it (`long_form_minimum_is_58_bytes` and the round-trip tests pin the layout itself).
         let Some(nul) = probe.iter().skip(29).position(|&b| b == 0).map(|i| i + 29) else {
             return Landing::LongParserShallow; // no NUL ⇒ try_cstr refused; no count was read
         };
