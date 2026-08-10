@@ -429,11 +429,21 @@ mod tests {
     /// list rather than against the length of the loop's own input, because a guard whose expected
     /// set is derived from the same thing it iterates can be truncated on both sides at once and
     /// stay green — #963 re-instantiated exactly that inside a completeness fix.
+    ///
+    /// [`DOC_TOTAL_ATTRIBUTIONS`] is the same idea for the sweep: every whole-token occurrence of
+    /// the total on the page, named by the sentence it belongs to, in page order.
     const COUNT_CLAIM_SITES: &[&str] = &[
         "doc:exempt-of-total", "doc:corpus-total", "doc:destructured-of-total", "doc:remainder",
         "doc:figure-list",
         "self:protected-of-total", "self:destructured-of-total", "self:corpus-total",
         "self:protected-of-total-2",
+    ];
+
+    /// Page-order attribution of every whole-token occurrence of [`DECLARED_REQUEST_STRUCTS`] in
+    /// `docs/http-api.md`. Four of the five pinned sentences write the total; `doc:remainder` says
+    /// `27` and so does not appear here.
+    const DOC_TOTAL_ATTRIBUTIONS: &[&str] = &[
+        "doc:exempt-of-total", "doc:figure-list", "doc:corpus-total", "doc:destructured-of-total",
     ];
 
     /// **Tracked prose may not disagree with [`DECLARED_REQUEST_STRUCTS`].**
@@ -480,6 +490,23 @@ mod tests {
     ///   same input the loop shrank.
     /// * INVALID control, so "they all compiled" has content: `located.push(label.len())` →
     ///   `error[E0308]`. UNTESTED, not RED; re-run in a valid form before believing anything.
+    ///
+    /// SECOND PASS, after this guard was pointed at ITSELF. The first version of the sweep was
+    /// evadable in ONE edit and the evasion was reproduced end to end: with
+    /// `if false { doc_pins.iter().any(…) } else { true }` on the classifier, a `stray`-only
+    /// collector stayed empty, the guard reported PASS, and the new-unpinned-sentence mutant — RED
+    /// a moment earlier — walked straight through. The rebuild attributes every occurrence instead
+    /// of collecting only the bad ones, so no branch produces silence. Re-measured after it:
+    /// * classifier forced to "pinned" (the edit that evaded the old form): **KILLED**
+    /// * sweep input emptied (`"".match_indices(…)`): **KILLED**
+    /// * `doc_pins` never registered, so nothing can be attributed: **KILLED**
+    /// * digit-boundary skip always taken, so every occurrence is skipped: **KILLED**
+    /// * all three earlier mutants replayed on the new form: **KILLED**
+    /// * control — classifier forced to "pinned" AND the attribution assertion WRAPped to compare
+    ///   the expected constant with itself: **GREEN**, and the unpinned-sentence mutant survives
+    ///   again alongside it. That is what shows the attribution assertion, not something adjacent,
+    ///   is doing the killing.
+    /// * INVALID control: `attributed.push(0u8, …)` → `error[E0061]`. UNTESTED.
     #[test]
     fn docs_http_api_md_may_not_disagree_with_this_modules_struct_counts() {
         let doc_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/http-api.md");
@@ -521,49 +548,74 @@ mod tests {
              format!("corpus: {protected} of {total} carry it")),
         ];
 
+        // ONE assertion per half, each fed by the half's own product. There is deliberately no
+        // per-site `assert!` inside the loop: an assertion that fires BEFORE the bookkeeping leaves
+        // the bookkeeping intact when the assertion is neutered, which is how a count decouples
+        // from the check it is supposed to measure. Here a label reaches `located` only by the pin
+        // succeeding, so anything that stops the pin working shortens the list the reach control
+        // compares.
         let mut located: Vec<&str> = Vec::new();
-        let mut doc_pins: Vec<(usize, usize)> = Vec::new();
+        let mut doc_pins: Vec<(usize, usize, &str)> = Vec::new();
+        let mut why: Vec<String> = Vec::new();
         for (label, path, frag) in &sites {
             let hay = if *path == doc_path { &doc } else { &me };
             let hits: Vec<usize> = hay.match_indices(frag.as_str()).map(|(at, _)| at).collect();
-            assert_eq!(hits.len(), 1,
-                "{label}: expected exactly one occurrence of {frag:?} in {path}, found {}. This \
-                 sentence is rebuilt from the constants, so a mismatch means either a constant \
-                 moved and the prose did not, or the prose was reworded past its pin. Fix the text \
-                 or move the pin — do NOT delete the site, since deleting it here is how the number \
-                 goes back to being unread.", hits.len());
-            if *path == doc_path {
-                doc_pins.push((hits[0], hits[0] + frag.len()));
+            if hits.len() == 1 {
+                located.push(label);
+                if *path == doc_path {
+                    doc_pins.push((hits[0], hits[0] + frag.len(), label));
+                }
+            } else {
+                why.push(format!("{label}: {} occurrence(s) of {frag:?} in {path}", hits.len()));
             }
-            located.push(label);
         }
         assert_eq!(located, COUNT_CLAIM_SITES,
-            "REACH CONTROL: the sites actually located are {located:?}, expected \
-             {COUNT_CLAIM_SITES:?}. This list is a PRODUCT of the loop above — a label is pushed \
-             only after its pin passed — and it is compared against a separately declared set of \
-             NAMES, not against the length of the loop's own input, so truncating `sites` names the \
-             sites that went missing instead of quietly shrinking both sides.");
+            "REACH CONTROL (pins): located {located:?}, expected {COUNT_CLAIM_SITES:?}; \
+             failures: {why:?}. Each sentence is rebuilt from the constants and must appear exactly \
+             once, so a missing label means either a constant moved and the prose did not, or the \
+             prose was reworded past its pin. Fix the text or move the pin — do NOT drop the site, \
+             since dropping it is how the number goes back to being unread.");
 
-        // Sweep: no unpinned occurrence of the total anywhere on the page.
+        // Sweep. Every whole-token occurrence of the total on the page is ATTRIBUTED to the pinned
+        // sentence containing it, or to `UNPINNED`, and the whole attribution list is asserted by
+        // NAME against a constant.
+        //
+        // MEASURED, and the reason it is shaped this way: the first version collected only the
+        // UNPINNED ones into a `stray` vector and asserted that vector empty. That is evadable in
+        // ONE edit — `if false { doc_pins.iter().any(…) } else { true }` on the classifier makes
+        // every occurrence count as pinned, `stray` stays empty, the guard reports PASS, and the
+        // mutant it exists to kill (a new unpinned sentence quoting the count) walks straight
+        // through. Verified, both halves. An "everything is fine" verdict computed from a filter
+        // that examined nothing is indistinguishable from a clean page — #778's shape, and #963
+        // re-instantiated it one level down inside its own fix for the class.
+        //
+        // Attributing EVERY occurrence removes the asymmetry: there is no branch whose output is
+        // silence. Neuter the classifier and four names turn into `UNPINNED`; empty the input and
+        // the list is empty; drop the digit-boundary skip and extra entries appear. All three are
+        // the same RED, and it names the sentences.
         let tok = total.to_string();
         let bytes = doc.as_bytes();
-        let mut stray: Vec<usize> = Vec::new();
+        let mut attributed: Vec<&str> = Vec::new();
+        let mut at_lines: Vec<usize> = Vec::new();
         for (at, _) in doc.match_indices(tok.as_str()) {
             let digit_before = at > 0 && bytes[at - 1].is_ascii_digit();
             let digit_after = bytes.get(at + tok.len()).is_some_and(u8::is_ascii_digit);
             if digit_before || digit_after {
                 continue; // part of a longer number, e.g. `1035`
             }
-            if doc_pins.iter().any(|&(s, e)| at >= s && at < e) {
-                continue;
-            }
-            stray.push(doc[..at].matches('\n').count() + 1);
+            attributed.push(
+                doc_pins.iter().find(|&&(s, e, _)| at >= s && at < e).map_or("UNPINNED", |&(_, _, l)| l),
+            );
+            at_lines.push(doc[..at].matches('\n').count() + 1);
         }
-        assert!(stray.is_empty(),
-            "{doc_path} states `{tok}` at line(s) {stray:?} outside every pinned sentence. If that \
-             is another claim about how many request structs this crate declares, add it to \
-             `COUNT_CLAIM_SITES` and to `sites` so it moves with the constant; if it is an unrelated \
-             {tok}, reword it — an unpinned copy of this number is exactly what went stale before.");
+        assert_eq!(attributed, DOC_TOTAL_ATTRIBUTIONS,
+            "REACH CONTROL (sweep): the whole-token `{tok}`s on {doc_path} attribute to \
+             {attributed:?} at line(s) {at_lines:?}, expected {DOC_TOTAL_ATTRIBUTIONS:?}. An \
+             `UNPINNED` entry is a claim about this crate's struct count that nothing keeps honest: \
+             add it to `COUNT_CLAIM_SITES`, `DOC_TOTAL_ATTRIBUTIONS` and `sites` so it moves with \
+             the constant, or reword it. A SHORTER list than expected means the sweep stopped \
+             seeing occurrences it used to see, which is the guard going blind rather than the page \
+             getting cleaner — do not fix that by shortening the constant.");
     }
 
     /// The refusal template and every `what` it is given must contain NO word that is also a field
