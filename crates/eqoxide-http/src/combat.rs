@@ -213,6 +213,27 @@ struct CastBody { gem: Option<u8>, spell_id: Option<u32>, target_id: Option<u32>
 async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<CastBody>) -> Response {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     let b = body.unwrap_or_default();
+    // #952/#956 (agent-honesty): `gem`, `spell_id` and `item_slot` are three ways to name ONE thing
+    // to cast, resolved below by a precedence chain that never looks at the losers — `item_slot`
+    // builds `CastRequest { gem: 0, .. }` without reading `gem` or `spell_id` at all, and `gem`
+    // short-circuits `spell_id`. Measured consequence of the second case, on the pre-fix tree:
+    // `{"gem":0,"spell_id":202}` with spell 202 memorized in gem 5 and gem 0 empty answered
+    // `409 spell gem 0 is empty — memorize a spell into it first` — a refusal about a gem the caller
+    // never asked to cast, for a spell that was memorized and castable. The `item_slot` branch is
+    // consulted FIRST, so a body carrying it beside either other form resolves to the item clicky
+    // regardless of what they said; that ordering is read off the code below and was not separately
+    // driven, because that path parks and awaits.
+    //
+    // `target_id` is NOT in this group — it is read on both paths and composes with all three.
+    // Destructured exhaustively (no `..`) so a fourth way to name a spell cannot be added without
+    // deciding this.
+    let CastBody { gem, spell_id, target_id: _, item_slot } = &b;
+    if let Some(msg) = crate::req_form::conflicting_forms(
+        "spell selection",
+        &[("gem", gem.is_some()), ("spell_id", spell_id.is_some()), ("item_slot", item_slot.is_some())],
+    ) {
+        return text(StatusCode::BAD_REQUEST, msg);
+    }
     // Resolve the CastRequest with the same pre-send validation as before (a clear 4xx before we ever
     // park/await). Item clicky cast: validate the slot holds a clickable item.
     let req = if let Some(slot) = b.item_slot {
@@ -532,6 +553,46 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(command.take_target(), Some(42));
+    }
+
+    /// #952/#956 (agent-honesty), the executable demonstration for `/v1/combat/cast`.
+    ///
+    /// `gem`, `spell_id` and `item_slot` are three ways to name one thing to cast, and `post_cast`
+    /// resolved them with a precedence chain that never looked at the losers. This is the case that
+    /// can be driven without the park-and-await path, so it is the one that shows the consequence
+    /// directly.
+    ///
+    /// MEASURED on this branch before the fix, with exactly this state: `{"gem":0,"spell_id":202}`
+    /// answered `409 spell gem 0 is empty — memorize a spell into it first`. Spell 202 WAS
+    /// memorized, in gem 5, and was castable; `gem` won the chain, `spell_id` was discarded without
+    /// a word, and the caller was handed a refusal about a gem it had no interest in. An agent
+    /// reading that would go memorize a spell it already had.
+    ///
+    /// The refusal must therefore name BOTH fields, and must not be the 409 about gem 0.
+    #[tokio::test]
+    async fn cast_gem_beside_spell_id_names_both_rather_than_reporting_the_wrong_gem_empty() {
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.mem_spells = [eqoxide_core::game_state::EMPTY_GEM; 9];
+            gs.mem_spells[5] = 202; // spell 202 IS memorized — just not in gem 0
+        });
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/cast")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"gem":0,"spell_id":202}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let text = body_text(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST,
+            "two spell-selection forms in one body must be refused as a malformed request, not \
+             resolved to one of them. Body was: {text}");
+        assert!(text.contains("gem, spell_id"),
+            "the refusal must name both conflicting fields, in declaration order: {text}");
+        assert!(!text.contains("is empty"),
+            "and must NOT be the empty-gem 409 — that message describes a gem the caller never \
+             chose, and sends an agent to memorize a spell it already has: {text}");
+        assert!(command.take_cast().is_none(), "a refused cast must not be queued");
     }
 
     // ── #348: /combat/cast on an EMPTY gem must fail loudly, not 200-then-silence ────────────────

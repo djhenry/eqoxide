@@ -37,8 +37,21 @@ async fn post_open(
     body: Result<Json<OpenBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
+    // #952/#956 (agent-honesty): `trainer` and `name` are two spellings of ONE trainer, and
+    // `.or` is a precedence chain — `{"name":"Alpha","trainer":"Beta"}` used to answer
+    // `200 opening training with Beta`, silently discarding Alpha. Two names are two different
+    // NPCs, so the request is refused rather than resolved to one of them. Destructured
+    // exhaustively (no `..`) so a new field on `OpenBody` cannot slip past this decision.
     let name = match body {
-        Ok(Json(b)) => b.trainer.or(b.name),
+        Ok(Json(b)) => {
+            let OpenBody { name, trainer } = &b;
+            if let Some(msg) = crate::req_form::conflicting_forms(
+                "guildmaster selection", &[("name", name.is_some()), ("trainer", trainer.is_some())],
+            ) {
+                return (StatusCode::BAD_REQUEST, msg);
+            }
+            b.trainer.or(b.name)
+        }
         Err(_) => None,
     };
     let Some(name) = name else {
