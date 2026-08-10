@@ -472,14 +472,60 @@ pub enum ProbeAnchor {
     NoFloorInBand { reference_z: f32 },
 }
 
+/// The height a [`ClearanceProbe`]'s rays were cast from — **a type, not an `f32`** (#885 review
+/// round 2, R2-N1).
+///
+/// The whole of #885 is that `clearance.body` must be evaluated at the CHARACTER's z while the
+/// planner half of the same payload is sampled at the ANCHOR's z. Round 1 shipped that as a
+/// comment on one line of `clearance_probe`, and the reviewer's mutation — swapping that line's
+/// `ref_z` for `anchor.z()` — compiled and stayed green, republishing exactly the #885 payload.
+/// Round 2 pinned it with a test. This closes it one tier higher: `z()` hands back a `CastZ`, which
+/// is not an `f32`, so `body_placement([east, north, anchor.z()])` is `error[E0308]` rather than a
+/// silent wrong answer. The local the probe actually uses is a `CastZ` for the same reason — a bare
+/// `f32` local would have re-admitted the mutant under a different spelling.
+///
+/// **Its honest limit.** This is a raised bar, not a closed hole: the field is private and there is
+/// no `From`/`Deref`, but [`CastZ::raw`] exists (the published JSON needs a number, and so do the
+/// tests), so a mutation that *deliberately* writes `.raw()` still compiles. It is stopped by the
+/// tier-2 test, not by the type. `Add<f32>`/`Sub<f32>` are provided because every legitimate use of
+/// a cast height is "offset it and cast from there"; both yield a plain `f32`, so the result cannot
+/// be mistaken for another anchor height.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct CastZ(f32);
+
+impl CastZ {
+    /// Wrap a raw height. Only [`ProbeAnchor`] should need this.
+    #[inline]
+    pub fn new(z: f32) -> Self { CastZ(z) }
+    /// The raw height, for publishing and for comparing against a literal in a test. Reaching for
+    /// this to feed a placement query is the mutation this type exists to make visible.
+    #[inline]
+    pub fn raw(self) -> f32 { self.0 }
+}
+
+impl std::ops::Add<f32> for CastZ {
+    type Output = f32;
+    #[inline]
+    fn add(self, rhs: f32) -> f32 { self.0 + rhs }
+}
+impl std::ops::Sub<f32> for CastZ {
+    type Output = f32;
+    #[inline]
+    fn sub(self, rhs: f32) -> f32 { self.0 - rhs }
+}
+
 impl ProbeAnchor {
     /// The height the rays were actually cast relative to (`Floor`'s floor, or the fallback).
+    ///
+    /// Returns a [`CastZ`] rather than an `f32` on purpose — see that type. A caller that wants to
+    /// ask a question *about the character* must not reach for this value at all; the character's
+    /// own height is [`ProbeAnchor::reference_z`].
     #[inline]
-    pub fn z(self) -> f32 {
-        match self {
+    pub fn z(self) -> CastZ {
+        CastZ(match self {
             ProbeAnchor::Floor { z, .. } => z,
             ProbeAnchor::NoFloorInBand { reference_z } => reference_z,
-        }
+        })
     }
     /// The z the caller asked about — the character's own height at sample time.
     #[inline]
@@ -502,13 +548,20 @@ impl ProbeAnchor {
 /// not by itself make the probe evaluate it at the right POINT. The probe must call it at the
 /// character's z rather than the anchor's, and that is a property of one call site, pinned by the
 /// test `body_is_measured_at_the_character_not_the_anchor_when_the_two_disagree` (a scene where the
-/// two verdicts genuinely differ), not by anything the type system enforces.
+/// two verdicts genuinely differ). Since #885 review round 2 (R2-N1) the type system carries part
+/// of it too: [`ProbeAnchor::z`] hands back a [`CastZ`], so feeding the anchor's height to this
+/// predicate is `error[E0308]` — measured, both as a substitution and as a wrap. That is a raised
+/// bar, not a closed hole; `CastZ::raw` still compiles, and the test is what kills that.
 ///
 /// **This is an entry condition, not a freeze.** A non-`Placeable` verdict is what admits a body to
-/// the depenetration net; the net usually relocates it and the body keeps moving. Measured: a dry
-/// `FootprintPierced` body driven for 3.0 s travelled **131.98 u** with `hold() == None`, because
-/// the push-out ring moved it clear on the first frame. Whether a character can move is
-/// `player.hold` on `/v1/observe/debug`, not this field.
+/// the depenetration net; the net usually relocates it and the body keeps moving. Measured on a dry
+/// `FootprintPierced` start (real ground, a slot of walls piercing the footprint ring): driving the
+/// real `CharacterController` north at a constant 44 u/s wish for 180 steps of 1/60 s — a **132.00 u
+/// ceiling** — moved it **131.28 u** with `hold() == None`, and its placement read `Placeable` by
+/// the end, because the push-out ring moved it clear on the first frame. That figure is a property
+/// of the DRIVER (it ran flat out for the whole run), not of the scene; the only thing it
+/// establishes is that this verdict is not a freeze. Whether a character can move is `player.hold`
+/// on `/v1/observe/debug`, not this field.
 ///
 /// It is split into named variants rather than a `bool` because the two disjuncts are wildly
 /// different worlds — "wedged in a slot" versus "standing over nothing" — and `EmbeddedNoRecovery`

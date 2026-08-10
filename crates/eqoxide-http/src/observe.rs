@@ -3763,24 +3763,44 @@ mod tests {
     }
 
     /// **#885 review round 1, B1 + B5 — the `semantics` string must not be a confident falsehood
-    /// about its own payload.**
+    /// about its own payload; and round 2, R2-B2/R2-B3 — this doc must not overclaim what the
+    /// assertions pin, nor juxtapose figures of different quantities.**
     ///
     /// Round 1 shipped two claims in this string that measurement refuted:
     ///
     /// * that `clearance.body` "is authoritative for whether it can move at all (anything but
-    ///   `placeable` means it cannot)". The reviewer drove the real `CharacterController` for 3 s
-    ///   on two `FootprintPierced` scenes: wet travelled 101.10 u, dry 101.01 u, both with
-    ///   `hold() == None`. I re-measured a dry one myself: 131.98 u, `hold() == None`. The verdict
-    ///   is the ENTRY CONDITION to the depenetration net, not a freeze. The sentence is deleted,
-    ///   not qualified;
+    ///   `placeable` means it cannot)". Measured on a dry `FootprintPierced` start (real ground
+    ///   plus a slot of walls piercing the footprint ring): the real `CharacterController` driven
+    ///   north at a constant 44 u/s wish for 180 steps of 1/60 s — a **132.00 u ceiling** — moved
+    ///   **131.28 u** with `hold() == None`, ending `Placeable`. The verdict is the ENTRY CONDITION
+    ///   to the depenetration net, not a freeze. The sentence is deleted, not qualified;
     /// * an instruction to "compare `anchor.z` against `anchor.reference_z`" — unperformable on a
     ///   `no_floor_in_band` anchor, which carries no `z` key at all.
     ///
-    /// Both are pinned here on the REAL response body, with the second one's payload actually
-    /// present so the instruction is checked against the JSON rather than against prose. The
-    /// negative assertions are the same shape as
-    /// `every_field_the_semantics_string_sends_a_caller_to_exists_in_the_body`'s "need not
-    /// iterate" pin: a re-added overclaim goes RED here.
+    /// **What that distance does and does not measure** (R2-B3). It bounds the DRIVER, not the
+    /// body: it ran essentially flat out for the whole 3 s. Round 2 printed it beside a pair of
+    /// 101 u figures as though the three measured one quantity, attributed to the reviewer. They
+    /// did not — a driver that stops steering once it is within 0.2 u of its goal reports the
+    /// distance to its TARGET. Re-derived on the scene above: steered at a target 101 u away the
+    /// same run reports **101.01 u**; steered at one 3000 u away it reports **131.28 u**, the
+    /// unsteered figure again. Only the unsteered number is kept, and the single thing it
+    /// establishes is that a non-`placeable` body is not frozen.
+    ///
+    /// Both refuted claims are pinned here on the REAL response body, with the second one's payload
+    /// actually present so the instruction is checked against the JSON rather than against prose.
+    ///
+    /// **What these assertions pin** (R2-B2). Round 2's version of this paragraph said "a re-added
+    /// overclaim goes RED here" while asserting only `!contains("can move at all")` plus
+    /// `contains("player.hold")`. The reviewer walked a REWORDED overclaim past both — one that also
+    /// inverted the pointer ("the character is stuck … Consult clearance.body, not player.hold") —
+    /// and it ran GREEN, because the first guard keys on a single literal substring the reword
+    /// avoids and the second is satisfied by a sentence telling the caller *not* to use the field.
+    /// So the served string is now pinned VERBATIM against the literal at the end of this test: any
+    /// edit to it fails here, in any phrasing, which is what makes the claim true. The substring
+    /// assertions are kept in front of it because their failure messages say WHY each clause exists.
+    /// The honest limit of a verbatim pin: it detects CHANGE, it does not recognise falsehood — it
+    /// forces the golden copy to be updated deliberately; it cannot stop that update from blessing
+    /// a bad sentence.
     #[tokio::test]
     async fn the_nav_semantics_string_does_not_overclaim_the_clearance_sample() {
         use eqoxide_nav::diagnostics::*;
@@ -3819,10 +3839,17 @@ mod tests {
         // B1: the string must not tell an agent a non-`placeable` body means the character is stuck.
         assert!(!semantics.contains("can move at all"),
             "B1: `body` is the entry condition to the depenetration net, not a freeze — a dry \
-             FootprintPierced body I drove for 3.0 s travelled 131.98 u with hold() == None. \
-             Deleting this claim, not hedging it, is the fix: {semantics}");
-        assert!(semantics.contains("player.hold"),
-            "the string must send the caller to the field that DOES answer 'can it move': {semantics}");
+             FootprintPierced body driven north at 44 u/s for 180 steps of 1/60 s (132.00 u \
+             ceiling) travelled 131.28 u with hold() == None. Deleting this claim, not hedging \
+             it, is the fix: {semantics}");
+        // R2-B2: `contains("player.hold")` alone is satisfied by a sentence that names the field in
+        // order to send the caller AWAY from it, which is how the reviewer's near-miss survived. The
+        // clause that carries the DIRECTION is what must be present.
+        assert!(semantics.contains(
+                "clearance.body is NOT a claim about whether the character can move — that is \
+                 player.hold on /v1/observe/debug."),
+            "the string must send the caller to the field that DOES answer 'can it move', and must \
+             say which way round: {semantics}");
 
         // B5: the string's instruction about `anchor.z` must be performable on the payload it is
         // describing. It is not an unconditional compare — `z` is a `floor`-only key.
@@ -3839,6 +3866,31 @@ mod tests {
         assert_eq!(v["clearance"]["wall_spokes"][1], serde_json::json!({ "hit": { "at": 2.5 } }));
         assert_eq!(v["clearance"]["at"], serde_json::json!([1.0, 2.0]),
             "`at` is horizontal-only since #885 — two elements, not three");
+
+        // R2-B2: the GOLDEN COPY. The assertions above key on substrings, and a reworded overclaim
+        // that avoids those substrings walked past them GREEN. This pins the whole served string, so
+        // ANY edit — including a paraphrased overclaim, or a re-inverted pointer — fails here and
+        // has to be re-justified against this test's rustdoc before the copy below is updated.
+        assert_eq!(semantics,
+            "plan.trace records what the planner EVALUATED, with per-edge verdicts \
+             (accepted kind / rejected reason). Absence means UNEVALUATED — never walkable, \
+             never blocked. trace.outcome_calls marks the DECIDING call; calls outside it \
+             are tier/anchor retries that lost. A call with truncated:true stopped RECORDING \
+             (not searching) at its edge budget. committed_coarse/committed_fine are the \
+             walker's actual committed routes, verbatim; player is null when the position \
+             was unknown at publish time. clearance is TWO different questions, not one \
+             (#885): clearance.body is the movement controller's own placement verdict at \
+             the CHARACTER's position, and anything but \"placeable\" means the rest of \
+             this clearance sample describes a point the character does not occupy. \
+             clearance.body is NOT a claim about whether the character can move — that is \
+             player.hold on /v1/observe/debug. clearance.wall_spokes / footprint_ok / \
+             field_* are the PLANNER's model sampled at clearance.anchor, which may be a \
+             different height: anchor.reference_z is always the character's own z, while \
+             anchor.z is present ONLY when anchor.kind == \"floor\" (kind \
+             \"no_floor_in_band\" means no floor was found in the band and the rays were \
+             cast from reference_z). A spoke reading of \"clear_to_cap\" is a LOWER BOUND \
+             (nothing within cap), not a distance of cap.",
+            "the served guidance changed; see this test's rustdoc before updating the copy above");
     }
 
     /// Publish a nav snapshot whose `pads` are exactly `pads`, and set the walker's nav state.

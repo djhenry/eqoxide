@@ -2610,10 +2610,22 @@ impl Collision {
     /// pierced-footprint frames reaches `ground_below` → `column_hits` → the `facing_blind_hits`
     /// counter published as `/v1/observe/debug`'s `nav_support`. Measured on inverted-art ground
     /// with a pierced footprint: `facing_blind_hits` **0** (old `||`) → **2** (this function), and
-    /// pinned by `evaluating_both_disjuncts_moves_the_published_facing_blind_counter`. That counter
-    /// is a count of queries answered from down-facing art, and the character's own column really
-    /// was queried, so the new count is the accurate one — but it is a published change, not an
-    /// invisible one.
+    /// pinned by `evaluating_both_disjuncts_moves_the_published_facing_blind_counter`.
+    ///
+    /// **What that 2 is, and is not** (#885 review round 2, R2-B1 — an earlier draft of this
+    /// sentence called the counter "a count of queries", which measurement refutes). The counter
+    /// advances once per DOWN-FACING TRIANGLE that `column_hits` admits as standing ground, per
+    /// call — not once per query. The 2 is a property of this fixture's column, not a rate: the
+    /// probed column sits exactly on the shared diagonal of the inverted floor quad's two
+    /// triangles, so both are admitted. Measured on the same quad one unit north, off that
+    /// diagonal, the same single call publishes **1**; both numbers are asserted in that test. So
+    /// what this function changes is that the counter now advances on pierced-footprint frames it
+    /// previously skipped, by however many down-facing triangles that column's art happens to
+    /// carry — a published change, not an invisible one, and not a per-query rate.
+    ///
+    /// (The `nav_support.queries` field name and its "each query" wording on `/v1/observe/debug`
+    /// and in `docs/http-api.md` predate #885 and describe the same counter the same wrong way.
+    /// That is a separate, pre-existing defect, filed as #960; this PR does not change them.)
     pub fn body_placement(&self, p: [f32; 3]) -> crate::diagnostics::Placement {
         use crate::diagnostics::Placement;
         let pierced = !self.footprint_clear(
@@ -2712,15 +2724,19 @@ impl Collision {
         crate::diagnostics::ClearanceProbe {
             at: [east, north],
             anchor,
-            // At the CHARACTER's height (`ref_z`), not the anchor's — the whole point.
+            // At the CHARACTER's height (`ref_z`), not the anchor's — the whole point. `floor_z` is
+            // a `CastZ`, not an `f32`, precisely so that substituting it here is a compile error
+            // rather than a silently republished #885 payload (review round 2, R2-N1).
             body: self.body_placement([east, north, ref_z]),
             wall_spokes,
             cap: CAP,
             footprint_ok,
             footprint_radius: radius,
             footprint_ring_z: ring_z,
-            field_wall: self.wall_clearance(east, north, floor_z),
-            field_ground: self.ground_clearance(east, north, floor_z),
+            // `.raw()` is the documented escape hatch on `CastZ`: these two take a plain height
+            // and are questions ABOUT the anchor, which is exactly what the type permits.
+            field_wall: self.wall_clearance(east, north, floor_z.raw()),
+            field_ground: self.ground_clearance(east, north, floor_z.raw()),
         }
     }
 
@@ -10168,10 +10184,19 @@ mod clearance_probe_is_not_lossy_885 {
     /// probe runs `column_hits`, which increments `facing_blind_hits` for every DOWN-facing surface
     /// it admits as ground — and that counter is published as `nav_support` on `/v1/observe/debug`.
     ///
-    /// Measured here rather than quoted, on two freshly-built copies of the same scene so the
-    /// counters start at zero and the only difference is which calls were made. The new count is the
-    /// accurate one — the character's column really was queried — but it is a change an agent can
+    /// Measured here rather than quoted, on freshly-built copies of the same scene so the counters
+    /// start at zero and the only difference is which calls were made. It is a change an agent can
     /// see, and this test exists so it stays disclosed.
+    ///
+    /// **The size of the jump is per-TRIANGLE, not per-query** (#885 review round 2, R2-B1). Round
+    /// 2's rustdoc called this counter "a count of queries", which would make the 2 mean two
+    /// queries. It does not. `column_hits` increments once for every retained surface whose normal
+    /// points down, so ONE call publishes as many increments as that column's art has admitted
+    /// down-facing triangles. The 2 here is this fixture's column sitting exactly on the shared
+    /// diagonal of the inverted floor quad's two triangles; the third assertion below moves one
+    /// unit north on the SAME quad, off that diagonal, and the same single call publishes 1. Both
+    /// are literals, so a change that made the counter per-query would fail here. (The published
+    /// field is still *named* `nav_support.queries` — pre-existing, #960, deliberately untouched.)
     #[test]
     fn evaluating_both_disjuncts_moves_the_published_facing_blind_counter() {
         let radius = eqoxide_core::physics::PLAYER_RADIUS;
@@ -10191,6 +10216,18 @@ mod clearance_probe_is_not_lossy_885 {
         assert_eq!(new.facing_blind_hits(), 2,
             "the ground probe admitted the down-facing floor and counted it — this is the published \
              side effect the round-1 rustdoc wrongly denied");
+
+        // R2-B1: the 2 is TWO TRIANGLES, not two queries. `inverted_floor`'s quad triangulates
+        // across the diagonal `north == -east`, and `at` sits exactly on it, so both triangles are
+        // admitted for that column. One unit north — same quad, same fixture, same ONE call —
+        // only one triangle spans the column, and the counter moves by 1.
+        let off_diagonal = inverted_ground_with_pierced_footprint();
+        assert_eq!(off_diagonal.body_placement([0.0, 1.0, 0.0]), Placement::FootprintPierced,
+            "the off-diagonal column must still be pierced, or it is not the same comparison");
+        assert_eq!(off_diagonal.facing_blind_hits(), 1,
+            "ONE ground query over ONE down-facing triangle moves the counter by ONE — so the 2 \
+             above is a count of admitted TRIANGLES, not of queries, and the jump this function \
+             causes is whatever that column's tessellation happens to carry");
     }
 
     // ── defect 1: a saturated spoke and a cap-distance hit ───────────────────────────────────────
@@ -10276,7 +10313,7 @@ mod clearance_probe_is_not_lossy_885 {
         let p = open_ground().clearance_probe(0.0, 0.0, 50.0);
         assert_eq!(p.anchor, ProbeAnchor::NoFloorInBand { reference_z: 50.0 },
             "no floor in the band is an ANSWER, not a floor at the character's own height");
-        assert_eq!(p.anchor.z(), 50.0, "the rays were still cast somewhere, and it is stated");
+        assert_eq!(p.anchor.z().raw(), 50.0, "the rays were still cast somewhere, and it is stated");
     }
 
     /// **The half of defect 2 that survives even when a floor IS found.** A body embedded 1 u under
@@ -10331,6 +10368,13 @@ mod clearance_probe_is_not_lossy_885 {
     /// the same verdict at both heights. Under that mutant, [`slot_below_the_anchor`] republishes
     /// exactly the #885 payload — planner half wide open, `body: "placeable"` — for a body the
     /// controller's own predicate rejects. This is the test that goes RED for it.
+    ///
+    /// Since round 3 that exact mutant no longer compiles: [`crate::diagnostics::ProbeAnchor::z`]
+    /// returns a [`crate::diagnostics::CastZ`], so `body_placement([east, north, anchor.z()])` is
+    /// `error[E0308]` (measured, both as a substitution and as an `if false { … } else { … }`
+    /// wrap). This test is still the load-bearing pin, because the type is a raised bar and not a
+    /// closed hole: writing `anchor.z().raw()` or `floor_z.raw()` compiles, and both were measured
+    /// RED here (`10 passed; 2 failed`).
     ///
     /// Every expectation here is a LITERAL. Nothing is computed by `body_placement`, so this
     /// cannot pass by agreeing with a `body_placement` that is itself wrong (round 1 found the test
