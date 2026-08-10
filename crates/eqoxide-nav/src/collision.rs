@@ -2623,13 +2623,14 @@ impl Collision {
     /// previously skipped, by however many down-facing triangles that column's art happens to
     /// carry — a published change, not an invisible one, and not a per-query rate.
     ///
-    /// (What is left for **#960** is the `nav_support.queries` FIELD NAME, which says "queries" on
-    /// the wire for a number that is not one. That predates #885, and renaming a published JSON
-    /// field does not belong here. The PROSE that repeated the wrong semantics — `observe.rs`'s
-    /// comments above the serialization site, and `docs/http-api.md`'s two sentences — was corrected
-    /// in this PR, at #885 review rounds 3 and 4. An earlier draft of this parenthetical said the
-    /// prose was untouched; that was true when it was written and this PR's own later commits made
-    /// it false, which is the same defect in the opposite direction.)
+    /// (What stays with **#960**: the field is published as `queries`, and this PR does not rename
+    /// it — a rename is a breaking wire change. That is the whole of what this parenthetical
+    /// claims. Two earlier drafts also described the state of the REST OF THE TREE — first "this
+    /// PR does not change that wording", then "the field name is all that is left" — and #885
+    /// review rounds 4 and 5 falsified both, the second with another accessor's rustdoc in this
+    /// very file. So this draft says nothing about how many places the refuted wording survives.
+    /// That is not checkable from inside a doc comment; three drafts is enough evidence that
+    /// guessing at it does not work, and what it wants is a guard, not a fourth sentence.)
     pub fn body_placement(&self, p: [f32; 3]) -> crate::diagnostics::Placement {
         use crate::diagnostics::Placement;
         let pierced = !self.footprint_clear(
