@@ -1421,9 +1421,12 @@ mod tests {
     /// is `Some(5)`, where the pristine build answers `None` to both. Two individually-inert
     /// mutations composing into a live one is precisely what a per-row matrix cannot see.
     ///
-    /// **What bounds the residue is the call site, not the gate.** [`escape_end`] is reached only
-    /// from [`char_literal_end`], i.e. only for a `\` already inside a character or byte literal,
-    /// and in Rust that `\` is always one of the nine bytes in [`ESCAPE_OPENERS`]. A stray arm can
+    /// **What bounds the residue is the call site, not the gate.** The lexer reaches [`escape_end`]
+    /// only from [`char_literal_end`] — one call site — i.e. only for a `\` already inside a
+    /// character or byte literal, and in Rust that `\` is always one of the nine bytes in
+    /// [`ESCAPE_OPENERS`]. (The *tests* call it directly as well, at the 256-byte sweep and eight
+    /// assertions; that is deliberate and cannot move a mask, but it is why this sentence says "the
+    /// lexer reaches it" and not "it is reached".) A stray arm can
     /// therefore only change this lexer's answer for text `rustc` itself rejects — and the corpus
     /// is source `rustc` has already compiled. That is the honest limit: not "widening cannot
     /// happen silently", but "a silent widening cannot reach the corpus". Keying such an arm on `#`
