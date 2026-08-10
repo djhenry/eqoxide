@@ -130,9 +130,12 @@ const CORRECTION_SQ: f32 = 144.0;
 /// While a trade is in flight a NEW give is refused (awaited → `Refused`) or dropped (fire-and-forget)
 /// — never allowed to start a second, racing trade that would make a later finish ambiguous. Clearing
 /// at accept (the pre-review bug) let a late finish from a just-completed give resolve a DIFFERENT
-/// give that had since reached phase 2 — a fabricated 200. The `Sender` deliberately lives ONLY here —
-/// never in `GameState`, which is `Clone`d into the ArcSwap snapshot every tick and a `oneshot::Sender`
-/// is not `Clone`. See `eqoxide_command::result` for the full flow.
+/// give that had since reached phase 2 — a fabricated 200.
+///
+/// **Where the parked `Sender` lives, and why (applies to every parked-command struct in this
+/// module — [`PendingBuy`], [`PendingOpen`], [`PendingCast`] as well).** It lives ONLY in the
+/// `ActionLoop`, never in `GameState`, which is `Clone`d into the ArcSwap snapshot every tick and a
+/// `oneshot::Sender` is not `Clone`. See `eqoxide_command::result` for the full flow.
 struct GiveState {
     npc_id:        u32,
     ticks_waiting: u32,
@@ -224,9 +227,8 @@ const ECHO_QUARANTINE: Duration = Duration::from_secs(30);
 /// buy was for, so a fulfil can CORRELATE the OP_ShopPlayerBuy echo (rejecting a stray shop echo
 /// for a different buy) before it `send`s `Resolved`. `sent_at` is the park time — the authoritative
 /// timeout is still HTTP-side, but `reap_expired_pending` (#492) uses it to drop a slot the server
-/// never resolved (`SHOP_PENDING_REAP`) so a later buy isn't stranded behind it. The `Sender`
-/// deliberately lives ONLY here — never in `GameState`, which is `Clone`d into the ArcSwap snapshot
-/// every tick and a `oneshot::Sender` is not `Clone`. See `eqoxide_command::result`.
+/// never resolved (`SHOP_PENDING_REAP`) so a later buy isn't stranded behind it. For why the
+/// `Sender` is parked here and not in `GameState`, see [`GiveState`].
 struct PendingBuy {
     tx:          tokio::sync::oneshot::Sender<eqoxide_command::CommandResult<eqoxide_command::BuyOk>>,
     merchant_id: u32,
@@ -242,9 +244,7 @@ struct PendingBuy {
 /// timeout is HTTP-side, but `reap_expired_pending` (#492) uses it to drop a slot the server never
 /// resolved (`SHOP_PENDING_REAP`) — the non-merchant/out-of-range open sends NO echo at all, so
 /// without the reap it would strand this `Sender` and 409-block every later open until a zone
-/// change. The `Sender` deliberately lives ONLY here — never in `GameState`, which is `Clone`d into
-/// the ArcSwap snapshot every tick and a `oneshot::Sender` is not `Clone`. See
-/// `eqoxide_command::result` for the full flow.
+/// change. For why the `Sender` is parked here and not in `GameState`, see [`GiveState`].
 struct PendingOpen {
     tx:          tokio::sync::oneshot::Sender<eqoxide_command::CommandResult<eqoxide_command::OpenOk>>,
     merchant_id: u32,
@@ -259,9 +259,8 @@ struct PendingOpen {
 /// the one whose `CastOutcome::at` is strictly AFTER we parked (a stale prior outcome carries an
 /// earlier `at`, and `begin_cast` clears `last_cast` to `None` on our OP_BeginCast echo), so
 /// `fulfill_cast` fires on the `last_cast` TRANSITION rather than on any single opcode — the 3-opcode
-/// cast-end path is de-duped in `GameState`, so keying one opcode would double-fire or miss. The
-/// `Sender` lives ONLY here, never in `GameState` (it is `Clone`d into the ArcSwap snapshot every
-/// tick and a `oneshot::Sender` is not `Clone`). See `eqoxide_command::result` for the flow.
+/// cast-end path is de-duped in `GameState`, so keying one opcode would double-fire or miss. For
+/// why the `Sender` is parked here and not in `GameState`, see [`GiveState`].
 struct PendingCast {
     tx:      tokio::sync::oneshot::Sender<eqoxide_command::CommandResult<eqoxide_command::CastEnd>>,
     sent_at: Instant,
@@ -817,9 +816,12 @@ impl ActionLoop {
     /// itemslot@8 must both match, so a stray shop echo (e.g. a UI fire-and-forget buy of a
     /// DIFFERENT slot) can't resolve THIS awaited buy. On a match it sends `Resolved(BuyOk{..})`
     /// read from the applied `gs` (item name from the open ware list, server-recomputed price from
-    /// the echo, coin AFTER the local deduction). The send is non-blocking and never `.await`s, so
-    /// the net tick is never stalled; a dropped receiver (HTTP already timed out) is ignored. No-op
-    /// when nothing is parked or the echo doesn't correlate — leaving an unrelated buy still parked.
+    /// the echo, coin AFTER the local deduction). No-op when nothing is parked or the echo doesn't
+    /// correlate — leaving an unrelated buy still parked.
+    ///
+    /// **Every `fulfill_*`/`reap_*` in this impl sends the same way, for the same reason:** a
+    /// `oneshot` send is non-blocking and never `.await`s, so a net tick is never stalled on an HTTP
+    /// caller, and `let _ =` swallows the dropped-receiver case (HTTP already timed out).
     pub fn fulfill_buy_ok(&mut self, gs: &GameState, payload: &[u8]) {
         if payload.len() < 32 { return; }
         let echo_merchant = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
@@ -850,7 +852,7 @@ impl ActionLoop {
     /// Refuse a parked awaited-buy on OP_ShopEndConfirm (A3 Migration 1, #448). That packet is a
     /// 0-byte body with no correlation data, but for this client it is unambiguously a buy refusal
     /// (see `packet_handler::apply_shop_end_confirm`), so a refusal while a buy is parked resolves
-    /// THAT buy as `Refused`. No-op when nothing is parked. Non-blocking send; never `.await`s.
+    /// THAT buy as `Refused`. No-op when nothing is parked.
     pub fn fulfill_buy_refused(&mut self) {
         if let Some(pb) = self.pending_buy.take() {
             let _ = pb.tx.send(eqoxide_command::CommandResult::Refused("merchant refused".into()));
@@ -886,9 +888,8 @@ impl ActionLoop {
     /// never reaches this function; it resolves to `Unconfirmed` via the HTTP timeout / a
     /// zone-change reaper instead, exactly the honest signal eqoxide#479 asks for.
     ///
-    /// The send is non-blocking and never `.await`s, so the net tick is never stalled; a dropped
-    /// receiver (HTTP already timed out) is ignored. No-op when nothing is parked or the echo
-    /// doesn't correlate — leaving an unrelated open still parked.
+    /// No-op when nothing is parked or the echo doesn't correlate — leaving an unrelated open still
+    /// parked.
     pub fn fulfill_open(&mut self, payload: &[u8]) {
         if payload.len() < 12 { return; }
         let echo_npc = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
@@ -939,10 +940,9 @@ impl ActionLoop {
     ///                         reached us AFTER we parked; the cast definitively did not happen → 409)
     ///   • `cast_ended_unexplained` (or anything else) → `Unconfirmed` (the server ended the cast and
     ///                         never said why — genuinely UNKNOWN, never rendered as success → 202)
-    /// The send is non-blocking and never `.await`s; a dropped receiver (HTTP already timed out) is
-    /// ignored. No-op when nothing is parked or no fresh outcome is present. Fizzle/interrupt are 200
-    /// (the cast RESOLVED — we know what happened), but `outcome` carries the truth so a 200 can never
-    /// be misread as "the spell took hold". See `eqoxide_command::result`.
+    /// No-op when nothing is parked or no fresh outcome is present. Fizzle/interrupt are 200 (the
+    /// cast RESOLVED — we know what happened), but `outcome` carries the truth so a 200 can never be
+    /// misread as "the spell took hold". See `eqoxide_command::result`.
     pub fn fulfill_cast(&mut self, gs: &GameState) {
         // #492/#475: after a cast is TIME-reaped, cast echoes carry NO content key (`fulfill_cast`
         // keys only on `outcome.at`), so ANY cast outcome within the resend window could belong to the
@@ -1010,14 +1010,10 @@ impl ActionLoop {
     /// `GIVE_FINISH_TIMEOUT_TICKS` in `tick_give`, resolving the awaited `Sender` to `Unconfirmed` and
     /// clearing `give_state` — so a stranded give cannot occur.
     ///
-    /// QUARANTINE (#492/#475): dropping a `pending_*` slot on a NON-session-ending timeout re-opens the
-    /// echo-misattribution class #475 closed — the reaped command's request is still alive on the wire
-    /// and its delayed echo can land up to the transport's ~30s `resend_timeout` later, long after a
-    /// same-key command has been re-admitted. So on each reap we record the reaped command's
-    /// correlation key (buy: merchant_id+slot; open: merchant_id; cast: a key-less time gate) for
-    /// `ECHO_QUARANTINE`; `fulfill_buy_ok`/`fulfill_open`/`fulfill_cast` then DROP any matching echo
-    /// during the window rather than credit it — a re-admitted same-key command reaps to an honest
-    /// `Unconfirmed` instead of stealing the reaped command's outcome (a silent wrong `Resolved`).
+    /// QUARANTINE (#492/#475): each reap records the reaped command's correlation key (buy:
+    /// merchant_id+slot; open: merchant_id; cast: a key-less time gate) for `ECHO_QUARANTINE` —
+    /// see that const for why a non-session-ending timeout re-opens the echo-misattribution class
+    /// #475 closed, and what the `fulfill_*` side does about it.
     fn reap_expired_pending(&mut self) {
         let now = Instant::now();
         if self.pending_buy.as_ref().is_some_and(|p| p.sent_at.elapsed() >= SHOP_PENDING_REAP) {
@@ -1547,33 +1543,24 @@ impl ActionLoop {
             // stays false); it only makes an agent-driven crossing actually fire (#266).
             //
             // **#713 review round 2, B2 — this probe runs EVERY TICK, deliberately OUTSIDE both the
-            // cooldown and the dead guard below.** It used to sit inside them, which meant the
-            // "have I left every zone-line region?" question — the one the client TELLS the agent to
-            // answer by stepping off the line — was only asked once per 10 s cooldown, and the
-            // bound-reaching attempt itself stamps that cooldown (`cross_unresolved`, below), so the
-            // probe was dormant for the entire window right after the client said "step off and back
-            // on to try again". A walk-off/walk-on shorter than the cooldown was sampled ON the line
-            // at both ends and cleared NOTHING — the documented recovery did nothing at all, and the
-            // agent had no way to tell "you did it wrong" from "it didn't work". That is the
-            // agent-honesty failure mode (a confident false statement about the client's own
-            // recoverability), so the fix is to make the sentence TRUE rather than to hedge it.
+            // cooldown and the dead guard below.** Inside them, "have I left every zone-line
+            // region?" — the question the client TELLS the agent to answer by stepping off the line
+            // — was asked once per 10 s cooldown, and the bound-reaching attempt itself stamps that
+            // cooldown (`cross_unresolved`, below); so a walk-off/walk-on shorter than the cooldown
+            // was sampled ON the line at both ends and cleared NOTHING. The documented recovery did
+            // nothing, which is the agent-honesty failure mode (a confident false statement about
+            // the client's own recoverability). It also un-gates the re-arm from `is_player_dead`: a
+            // corpse off every zone line has ended its stand like anyone else.
             //
-            // It also un-gates the re-arm from `is_player_dead`: a corpse that is off every zone line
-            // has ended its stand like anyone else, and leaving a dead character permanently blocked
-            // was an accident of where the reset sat, not a decision.
+            // This does NOT re-open the refire storm the bound exists to close: every path that
+            // SENDS is still inside the cooldown guard AND behind `blocks()`; only an observation
+            // plus the two resets it licenses were hoisted.
             //
-            // This does NOT re-open the refire storm the bound exists to close. Every path that
-            // SENDS is still inside the cooldown guard AND still behind `blocks()`; the only thing
-            // hoisted is an observation plus the two resets it licenses, and those fire whenever the
-            // standing probe finds no zone-line region — which never happens during the continuous
-            // stand the bound is stated over. That is not the same claim as "the character is
-            // physically off every zone line": `zone_line_at_standing` also reads `None` when
-            // `self.collision` is absent (no grid loaded yet) or the zone has no `.wtr` (a v1 map, no
-            // water/region layer) — both indistinguishable from "off the line" to this probe. Benign
-            // here (the hoisted statements only ever CLEAR), but not a physics guarantee. Cost: one
-            // BSP leaf descent per ~1 u of body height per net tick (~100 Hz), against a `RwLock`
-            // read — the same query the block already made, just no longer rate-limited by an
-            // unrelated packet cooldown.
+            // LIMIT: "no zone-line region here" is not the same claim as "the character is
+            // physically off every zone line". `zone_line_at_standing` also reads `None` when
+            // `self.collision` is absent (no grid loaded yet) or the zone has no `.wtr` (a v1 map,
+            // no water/region layer). Benign here (the hoisted statements only ever CLEAR), but not
+            // a physics guarantee.
             //
             // The `eqoxide-core` property test (`auto_cross_attempts_are_bounded_per_stand_713`)
             // already modelled it this way — its `Tick::Off` arm clears the tally on EVERY off tick.
@@ -1667,51 +1654,40 @@ impl ActionLoop {
     /// **The ticket is taken BY VALUE, and that is the point.** The obligation it carries is
     /// settled when this function returns — which is before the standing auto-cross in
     /// [`Self::drain_zone_cross`] runs, because the ticket is not in scope there and cannot be
-    /// moved into it. The previous shape kept the ticket alive in `drain_zone_cross` and relied on
-    /// a hand-placed `drop()` statement sitting above the auto-cross; moving that one statement to
-    /// the end of the function was a mutation the ENTIRE SUITE passed, so the ordering was a
-    /// convention held by a comment, not a fact. Now it is a fact about scope.
+    /// moved into it. The previous shape relied on a hand-placed `drop()` statement above the
+    /// auto-cross; moving that one statement to the end of the function was a mutation the ENTIRE
+    /// SUITE passed, so the ordering was a convention held by a comment. Now it is a fact about
+    /// scope: measured, the same one-line statement move is `E0308`.
     ///
-    /// Why the ordering matters at all, stated precisely — the comment this replaces overstated it.
-    /// Of the three auto-cross outcomes, only `perform_cross`'s SAME-ZONE branch publishes anything
-    /// (`request_stop()`), so it is the only one that could pay off a ticket the resolution had in
-    /// fact dropped: an unrelated crossing firing from physical position, with no request behind
-    /// it, silently discharging one. The cross-zone branch and `cross_unresolved` publish NOTHING,
-    /// which is the hazard running the other way: a ticket dropped after either of them would see
-    /// `moved == false` and stamp `idle`/`zone_cross_dropped_unhandled` over a crossing that is
-    /// genuinely in flight — the backstop itself publishing the falsehood it exists to prevent.
-    /// Both hazards disappear when the ticket simply does not exist down there.
+    /// Why the ordering matters at all, stated precisely. Of the three auto-cross outcomes, only
+    /// `perform_cross`'s SAME-ZONE branch publishes anything (`request_stop()`), so it is the only
+    /// one that could pay off a ticket the resolution had in fact dropped. The cross-zone branch
+    /// and `cross_unresolved` publish NOTHING, which is the hazard running the other way: a ticket
+    /// dropped after either of them would see `moved == false` and stamp an idle /
+    /// `zone_cross_dropped_unhandled` verdict over a crossing that is genuinely in flight — the
+    /// backstop publishing the falsehood it exists to prevent. Both hazards disappear when the
+    /// ticket simply does not exist down there.
     ///
     /// Takes no `stream`: resolution never sends a packet. It walks the character onto the line and
     /// the standing auto-cross does the sending, from physical position.
     ///
-    /// **Do not change `ticket` to a reference.** The by-value parameter is the whole guarantee: it
-    /// is what makes "settle the ticket after the auto-cross" fail to compile rather than merely be
-    /// discouraged. Measured: as a one-line statement move it is now `E0308`.
-    ///
-    /// # AMENDED in review round 3 — the escape hatch is easier to reach than round 2 disclosed
-    ///
-    /// Round 2 disclosed the surviving mutation as *"a deliberate two-part refactor (signature
-    /// changed to `&ZoneCrossTicket`, plus a late `drop`)"*. **That overstated how deliberate it has
-    /// to be, and the round-3 reviewer corrected it in the unhelpful direction: no late `drop()` is
-    /// needed at all.** The caller's binding is a local of `drain_zone_cross`, so it already outlives
-    /// the auto-cross on its own. Two edits suffice, and both read as ordinary "avoid a move" tidying:
+    /// **Do not change `ticket` to a reference.** The escape hatch needs no late `drop()` and no
+    /// deliberate refactor — the caller's binding is a local of `drain_zone_cross` and already
+    /// outlives the auto-cross, so two edits that read as ordinary "avoid a move" tidying suffice:
     ///
     /// ```ignore
     /// let held = self.command.take_zone_cross();
     /// if let Some(ref ticket) = held { self.resolve_zone_cross(ticket, gs); }
     /// ```
     ///
-    /// Reproduced in round 3: that shape compiles and left the whole suite GREEN (39 / 175 / 372).
-    /// It is now caught — not by a test that can observe the wrong outcome (round 2 was right that
-    /// one cannot be written: it needs a resolution arm that publishes nothing, which is what the
-    /// ticket exists to prevent, and both orderings leave the same final state) but by the
-    /// `debug_assert_eq!` on `CommandState::zone_cross_outstanding()` at the top of the auto-cross
-    /// block in [`Self::drain_zone_cross`]. Measured against exactly the two-edit shape above: RED
-    /// in 6 existing `eqoxide-net` tests; GREEN with no false positives on the unmutated branch.
-    /// That is a dynamic backstop for a static fact, and it is deliberately weaker than the type —
-    /// keep the by-value parameter, which is what makes the accidental case impossible rather than
-    /// merely detected.
+    /// Measured (#725 round 3): that shape compiles and left the whole suite GREEN (39 / 175 / 372).
+    /// No test can observe the wrong outcome — that needs a resolution arm publishing nothing, which
+    /// is what the ticket prevents, and both orderings leave the same final state — so it is caught
+    /// instead by the `debug_assert_eq!` on `CommandState::zone_cross_outstanding()` at the top of
+    /// the auto-cross block in [`Self::drain_zone_cross`]: against exactly the two-edit shape above,
+    /// RED in 6 existing `eqoxide-net` tests, GREEN with no false positives on the unmutated branch.
+    /// That is a dynamic backstop for a static fact, deliberately weaker than the type — keep the
+    /// by-value parameter.
     fn resolve_zone_cross(&mut self, ticket: eqoxide_command::ZoneCrossTicket, gs: &mut GameState) {
         let want_zone = ticket.zone_id();
         // #713 item 2 — the best-effort marker describes THE LAST RESOLUTION, so every resolution
@@ -3041,9 +3017,9 @@ impl ActionLoop {
             // Withdraw both instead. This is NOT the net thread inventing an answer: `pos_correction`
             // has just been handed to `CharacterController::teleport`, which drops the hold and
             // resets the afloat window UNCONDITIONALLY, on every path through it — the function is
-            // straight-line with no early return. (Round 2 corrected "as its FIRST act", which was
-            // literally wrong: `forget_recovery_history()` is first, `self.hold = None` second and
-            // the afloat reset last. "On every path" is both true and the stronger statement.)
+            // straight-line with no early return. (Not "as its FIRST act":
+            // `forget_recovery_history()` is first, `self.hold = None` second, the afloat reset
+            // last.)
             //
             // So the withdrawal publishes the disclosure the controller itself will hold the moment
             // it adopts. It is NOT a promise about the render thread's next publication: if the
@@ -3933,13 +3909,10 @@ mod tests {
     /// invisible to every other target in the repo (42 headers / 42 `test result:` lines, 1856
     /// passed, 0 failed, 45 ignored, 2 filtered — the clean baseline is 1858 passed). The round-1
     /// property test beside this one passes under all three latch mutations below, which is what
-    /// made B2 a real gap and not a stylistic one. A hold that is never
-    /// withdrawn is the exact failure `ControllerView::hold`'s own doc names: a body that has been
-    /// freed keeps reporting wedged, indefinitely, in a well-formed field, and nothing looks wrong.
-    /// The afloat half of the same statement has had this axis since #801
-    /// (`stream_position_mirrors_and_withdraws_the_afloat_stall_801`); this is its missing twin, so
-    /// the "published on exactly the same terms" symmetry the docs assert is now true of the
-    /// coverage as well as of the code.
+    /// made B2 a real gap and not a stylistic one. The never-withdrawn hold is the failure
+    /// `ControllerView::hold`'s own doc names. The afloat half of the same statement has had this
+    /// axis since #801 (`stream_position_mirrors_and_withdraws_the_afloat_stall_801`); this is its
+    /// missing twin.
     ///
     /// **Axes varied:** every ordered transition between four published values — absent, two
     /// DIFFERENT `Some`s with different reasons, and a third `Some` differing from one of them only
@@ -4062,14 +4035,13 @@ mod tests {
     ///
     /// — a confident "you are wedged" about geometry in a zone the character has left, served on
     /// `GET /v1/observe/debug` with nothing to distinguish it from a live one. The mirror is not at
-    /// fault: it faithfully republishes what the render thread last published, and what the render
-    /// thread last published is exactly the stale thing. The clear therefore has to reach the VIEW,
-    /// which is what `ControllerSlots::begin_zone_in` does and what the two net-thread zone-in call
-    /// sites (`gameplay::run_zone_entry_handshake`, `login.rs`'s zone reconnect) now call.
+    /// fault: what the render thread last published is exactly the stale thing. So the clear has to
+    /// reach the VIEW, which is what `ControllerSlots::begin_zone_in` does and what the two
+    /// net-thread zone-in call sites (`gameplay::run_zone_entry_handshake`, `login.rs`'s zone
+    /// reconnect) now call.
     ///
     /// The render loop is modelled by never republishing after the wedge: not one frame across the
-    /// entire load. That is the case under test, and the case the pre-existing pairing claimed to
-    /// cover.
+    /// entire load.
     ///
     /// **What that model is and is not (round-2 correction).** It is NOT a claim that the render
     /// thread falls silent when `begin_zone_in` runs — it does not. `controller.begin_zone_in(gs)`
@@ -5605,12 +5577,10 @@ mod tests {
     /// The set is the whole point of the row: **`nav_reason: null` on `idle` is only the boot
     /// state**, so every other route to `idle` must be named here and named in the docs.
     ///
-    /// # AMENDED in review round 3 — this comment claimed a guarantee this test does not give
+    /// # What this test does NOT catch — measured, not reasoned
     ///
-    /// The first bullet above used to read *"add a new way to reach `idle` and forget the docs …
-    /// (This is #725's own defect class: a doc sentence the code quietly falsified.)"* **That was
-    /// measured false, twice, by the round-3 reviewer, and the correction is kept here rather than
-    /// deleted — a deleted wrong claim is how a wrong claim comes back.**
+    /// It binds *docs ↔ constants*, NOT "any new way to reach `idle`". Twice measured in #725
+    /// round 3:
     ///
     /// * Reinstating B1's original defect verbatim (`Walker::reset_for_zone_change` back to
     ///   `set_nav_state("idle")`) leaves THIS TEST GREEN. Only the separate hand-written
@@ -5621,11 +5591,11 @@ mod tests {
     ///   `/v1/move/zone_cross` success path, the same crossing B1's original defect lived on — left
     ///   the entire suite GREEN (39 / 175 / 372), reproduced in round 3 before the fix below.
     ///
-    /// **The rule, not the example.** `published` is a hand-maintained array of constants, so this
-    /// test binds *docs ↔ constants*. It cannot see any code path that publishes no constant: such
-    /// a path adds nothing to the array, so both directions are vacuously satisfied. That is a
-    /// structural ceiling, not a gap in the assertions — a second, third or hundredth reasonless
-    /// `idle` is equally invisible to it, and so is any future `nav_reason: null` on any other
+    /// **The rule, not the example.** `published` is a hand-maintained array of constants, so a code
+    /// path that publishes no constant adds nothing to the array and both directions are vacuously
+    /// satisfied. That is a structural ceiling, not a gap in the assertions — a second, third or
+    /// hundredth reasonless `idle` is equally invisible to it, and so is any future
+    /// `nav_reason: null` on any other
     /// state. **What covers that is the `debug_assert!` in `Walker::set_nav_state_because` and
     /// `CommandState::stamp_new_goal`** — the only two production writers that take a reason
     /// argument (the third, `ZoneCrossTicket::drop`, always supplies one), so the universal is
@@ -5700,27 +5670,9 @@ mod tests {
     /// **Mutation check, and the honest limit of it.** Moving the ticket's settlement past the
     /// auto-cross as a one-line statement move — the mutation the previous shape lost — no longer
     /// compiles (`E0308`), because the ticket is owned by `resolve_zone_cross` and is not in scope
-    /// down there.
-    ///
-    /// # AMENDED in review round 3
-    ///
-    /// This paragraph used to end: *"**Measured, and not caught:** doing it as a deliberate two-part
-    /// refactor (signature changed to `&ZoneCrossTicket`, plus a late `drop`) leaves this test and
-    /// the whole `eqoxide-net` suite GREEN … so the accidental case is prevented by the type and the
-    /// deliberate case rests on this comment."* Two corrections, both measured in round 3:
-    ///
-    /// 1. **It is easier to reach than that said** — the late `drop` is not needed, because the
-    ///    caller's binding is a local of `drain_zone_cross` and already outlives the auto-cross.
-    ///    Two edits, both looking like "avoid a move" tidying. Reproduced: suite GREEN.
-    /// 2. **It is no longer uncaught.** `drain_zone_cross` now `debug_assert_eq!`s that no drained
-    ///    ticket is alive when it reaches the auto-cross block. Against the two-edit shape that is
-    ///    RED in 6 `eqoxide-net` tests including this one; on the unmutated branch it is GREEN.
-    ///
-    /// What round 2 got RIGHT and round 3 confirmed: no test can catch it by observing a wrong
-    /// OUTCOME. That needs a resolution arm that publishes nothing, which is what the ticket exists
-    /// to make impossible, and both orderings leave the same final state. The guard therefore checks
-    /// the ticket's LIFETIME directly rather than its effect — which is also why it stays a backstop
-    /// and not the mechanism: the by-value parameter is what makes the accidental case impossible.
+    /// down there. The remaining two-edit escape hatch, the `debug_assert_eq!` that now catches it
+    /// (RED in 6 `eqoxide-net` tests including this one), and why no test can catch it by observing
+    /// a wrong OUTCOME, are all measured and written up on [`ActionLoop::resolve_zone_cross`].
     #[tokio::test]
     async fn a_cross_requested_from_inside_the_region_walks_and_crosses_in_one_tick_725() {
         use eqoxide_nav::zone_assets;

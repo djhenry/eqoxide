@@ -165,13 +165,10 @@ pub(crate) fn build_zone_collision(
 /// below can tell the two forms apart. The compiler is the whole guard. Do not collapse these arms
 /// back into `_`.
 ///
-/// Same class of fix as #826/#837 on `ZoneAssetState::collision()`. That one is in
-/// `crates/eqoxide-nav/`, and its `E0004` probe did not name this site — but **not** because the
-/// wildcard absorbed the new variant, which is what an earlier draft of this paragraph asserted
-/// without running it. The measurement above falsifies that: a probe scoped to `eqoxide-nav` never
-/// compiles the crate this file lives in, so this `match` is never type-checked and a wildcard here
-/// and four explicit arms here are indistinguishable to it. The wildcard's danger is real; that
-/// particular probe simply was not the thing that failed to see it.
+/// Same class of fix as #826/#837 on `ZoneAssetState::collision()`, which lives in
+/// `crates/eqoxide-nav/`. Its `E0004` probe did not name this site — not because a wildcard
+/// absorbed the variant, but because a probe scoped to `eqoxide-nav` never compiles this crate at
+/// all (see the measurement above).
 fn lost_load_zone(any_loader_alive: bool, st: &crate::nav::zone_assets::ZoneAssetState) -> Option<String> {
     use crate::nav::zone_assets::ZoneAssetState as S;
     if any_loader_alive { return None; }
@@ -930,18 +927,16 @@ impl App {
             // `/v1/observe/debug`, see that function's doc): a rendering nicety with no HTTP-observed
             // claim riding on it.
             //
-            // #873: this used to discard the failure outright with `.ok()`. That reproduced the same
-            // silent-partial shape #816 fixed on the API one level down, in visual form: a
-            // present-but-unreadable detail layer (#816 round 2) now fails the WHOLE `try_load` — even
-            // though the base file read fine — so the minimap went from "draws whatever it could" to
-            // "renders wordlessly empty", as an unplanned side effect of that loader change rather
-            // than a decision anyone made. Kept the whole-load-refusal itself (drawing map art with no
-            // indication some of it is missing would just be the same lie one layer further down), but
-            // the reason is no longer thrown away: the WHOLE `Result` is handed on, and
-            // `hud_zone_map_view` decides at render time what the minimap says about it — for the two
-            // present-but-BROKEN causes, a short "map data unavailable: …" line instead of an
-            // unexplained blank canvas; for a zone that simply ships no map, the same quiet blank
-            // canvas it has always had (see that function's doc).
+            // #873: this used to discard the failure outright with `.ok()`. A present-but-unreadable
+            // detail layer (#816 round 2) fails the WHOLE `try_load` even though the base file read
+            // fine, so the minimap went from "draws whatever it could" to "renders wordlessly empty"
+            // as an unplanned side effect of that loader change. Kept the whole-load refusal itself
+            // (drawing map art with no indication some of it is missing would be the same lie one
+            // layer further down), but the reason is no longer thrown away: the WHOLE `Result` is
+            // handed on and `hud_zone_map_view` decides at render time what the minimap says about
+            // it — a short "map data unavailable: …" line for the two present-but-BROKEN causes, and
+            // for a zone that simply ships no map, the same quiet blank canvas as always (see that
+            // function's doc).
             //
             // #877 round 3: the load is `ZoneMapLoad::attempt` rather than two lines written out
             // here, for the reason `build_zone_collision` above is a named function — while it was
@@ -955,8 +950,7 @@ impl App {
             // asset sync and a GPU upload, and the same is true of the `build_zone_collision` call
             // three lines up. What is pinned is what it calls, and what is prevented is keeping the
             // map while dropping the reason; substituting `ZoneMapLoad::not_attempted()` here, or
-            // passing the wrong directory, would still pass the suite. Said plainly rather than
-            // left to be inferred, because round 2's version of this claim was measured false.
+            // passing the wrong directory, would still pass the suite.
             let zone_map = zone_map::ZoneMapLoad::attempt(&maps_dir, &zone_name);
 
             set_status("Uploading to GPU…");
@@ -2691,17 +2685,15 @@ fn winit_to_egui_key(code: KeyCode) -> Option<egui::Key> {
 /// reload at all. `usability` is what stays honest there — it reads `player_zone`, not `scene_zone`,
 /// and refuses an empty one outright with `PlayerZoneUnknown` (#837 review, N1).
 ///
-/// A case-only divergence between the two sides also cannot arise from the current data flow at
-/// all: `scene.zone` and the `player_zone` handed to `usability` are both copies of the single
-/// `gs.world.zone_name`, and `current_zone` is itself a copy of `scene.zone`. That makes the
-/// eagerness a margin against a scenario one source already excludes — cheap insurance, which is
-/// why keeping it costs nothing (#837 review, attack 5).
+/// A case-only divergence cannot arise from the current data flow anyway: `scene.zone` and the
+/// `player_zone` handed to `usability` are both copies of the single `gs.world.zone_name`, and
+/// `current_zone` is itself a copy of `scene.zone` — so the eagerness is a free margin against a
+/// scenario one source already excludes (#837 review, attack 5).
 ///
 /// So do NOT "fix" the inconsistency by making this comparison case-insensitive as well. That does
 /// not tighten anything; it drops the pair to exact parity and makes the safety argument depend on
-/// the extra assumption that two zone shortnames differing only in ASCII case are always the same
-/// zone. Today they are, which is why this is a margin and not a live bug — but the margin is free
-/// and the assumption is not enforced anywhere. More seriously, the same edit taken one step
+/// the unenforced assumption that two zone shortnames differing only in ASCII case are always the
+/// same zone. More seriously, the same edit taken one step
 /// further — any comparison here that is *more lenient* than `usability`'s — silently breaks the
 /// rule: a real zone change would fail to start a reload while `usability` went on blessing the
 /// previous zone's collision grid, which is precisely the stale-ready lie `NotUsable::

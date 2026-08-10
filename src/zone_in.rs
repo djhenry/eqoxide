@@ -1788,9 +1788,8 @@ mod tests {
     /// those with the balance assert GREEN**. That last cell is the one that matters: green *and*
     /// wrong.
     ///
-    /// **697 is a union of two failures, not one quantity**, and is broken out here because an
-    /// earlier revision wrote it as a single "false answer" figure and a reader re-deriving that
-    /// phrase as "confidently wrong block head" gets 665 and reports the number as unreproducible:
+    /// **697 is a union of two failures, not one quantity** — broken out because re-deriving it as
+    /// "confidently wrong block head" alone gets 665, not 697:
     ///
     /// * **665** — the pin names a block head that is not the statement's, a confident falsehood.
     ///   91 of those name `fn render_frame(&mut self)`, so #892's quoted failure reproduces
@@ -1807,10 +1806,8 @@ mod tests {
     ///
     /// **Which guard does the work, since two look like they might.** The equality between
     /// `sites.len()` and the site count re-derived from `SITE` is the operative one: it is what
-    /// kills a `.take(n)` on the site list, measured.
-    /// The `>= 20` floor below is NOT doing that job and should not be read as
-    /// if it were — it only catches an `app.rs` that has genuinely shrunk to a handful of methods,
-    /// which is a much narrower hole than a bare threshold suggests.
+    /// kills a `.take(n)` on the site list, measured. The `>= 20` floor below only catches an
+    /// `app.rs` that has genuinely shrunk to a handful of methods.
     ///
     /// **What this does NOT establish:** that no construct whatever can desynchronise the mask.
     /// It exercises the forms named in [`CodeScan`]'s doc at many positions; a literal form that
@@ -2108,12 +2105,9 @@ mod tests {
     ///    and including `render_frame`'s own body, is introduced by something that cannot skip its
     ///    body. Wrapping the call in `if false { … }`, in a closure or in a match arm reds this
     ///    test. `an_unconditional_statement_check_tells_a_live_call_from_dead_code`
-    ///    demonstrates that on synthetic sources; `the_app_rs_scan_reads_a_balanced_file` is the
+    ///    demonstrates that on synthetic sources; `the_app_rs_scan_reads_the_whole_file` is the
     ///    reach control that stops a mis-parse from making it vacuous.
-    /// 3. The call is handed the five live values it needs, by name. (A round-3 review pass over
-    ///    this doc found the previous version said "four" while checking only four of the five
-    ///    non-`controller` arguments — silently excluding `zone_underworld`. Fixed by adding the
-    ///    fifth check rather than narrowing the sentence to match the gap.)
+    /// 3. The call is handed the five live values it needs, by name.
     ///
     /// # What this does NOT establish — and cannot
     ///
@@ -2136,10 +2130,6 @@ mod tests {
     /// invocation's discarded arguments live inside `(`/`)`, which `open_braces` does not track.
     /// A text scan cannot see whether the compiler kept a statement; only the compiler's own
     /// warnings can.
-    ///
-    /// This paragraph replaces a sentence in the previous version of this test that said nothing in
-    /// the harness "can see whether `app.rs` still calls it" — which reads as an execution claim,
-    /// and was false of a mechanism that only checked a substring (#791 round-1 review, blocking).
     ///
     /// # Why there is only one call site left to pin
     ///
