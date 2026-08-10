@@ -1402,8 +1402,14 @@ mod tests {
             "name + a complete coordinate triple must be rejected, not silently routed to the name");
         let text = body_text(resp).await;
         assert!(text.contains("conflicting"), "message must name the conflict: {text}");
-        assert!(text.contains('x') && text.contains('y') && text.contains('z'),
-            "message must name the discarded coordinate fields: {text}");
+        // Whole-token match on the rendered field list, not a bare `contains('x')` — that check
+        // is satisfied by the 'x' in the message's own "exactly" and so pins nothing (measured:
+        // blanking `coord_fields` before formatting left this GREEN). "{x, y, z}" is the literal
+        // substring `parse_target` renders (`coord_fields.join(", ")` inside the `{…}` braces), so
+        // this can only pass if all three field names actually made it into the message.
+        assert!(text.contains("{x, y, z}"),
+            "message must name the discarded coordinate fields by their real names, not merely \
+             contain stray letters that happen to appear elsewhere in the sentence: {text}");
         assert!(goto_target.lock().unwrap().is_none(), "a conflicting request must not queue a nav goal");
     }
 
@@ -1489,7 +1495,14 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let text = body_text(resp).await;
-        assert!(text.contains("conflicting") && text.contains('x'), "message: {text}");
+        assert!(text.contains("conflicting"), "message: {text}");
+        // Whole-token match, not `contains('x')` — that bare check is satisfied by the 'x' in this
+        // message's own "exactly" and pins nothing (measured: a reviewer mutant that blanked
+        // `coord_fields` before formatting left the old assertion GREEN). "{x}" is the literal
+        // substring `parse_target` renders for a single-field conflict.
+        assert!(text.contains("{x}"),
+            "message must name the discarded field `x` by name, not merely contain a stray 'x' \
+             elsewhere in the sentence: {text}");
         assert!(goto_target.lock().unwrap().is_none());
     }
 

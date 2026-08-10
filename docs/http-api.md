@@ -63,7 +63,7 @@ breakdown and why.
 | Route | Body | Description |
 |-------|------|-------------|
 | `POST /v1/move/goto` | `{"name":"Guard Phaeton"}` \| `{"x":,"y":,"z":}` \| `{"map_x":,"map_y":}` \| `{}` | Walk to an entity (fuzzy name, one-time snapshot) or coordinates and **stop** on arrival. Empty body → the player's current target. `map_*` are Brewall map coords (= negated server x/y); `z` is optional there (defaults, then the walker snaps to the actual floor) but **required** on the raw `{x,y,z}` form. A body with SOME coordinate field(s) but not a complete `{x,y,z}` or `{map_x,map_y}` — e.g. `{"x":,"y":}` with no `z` — 400s naming exactly which field(s) are missing (`partial target: got {x, y} but missing {z}`), never the "no target; provide a name or coords" message, which is reserved for a body with no coordinate field at all (#886). **Two or more target forms in one body never silently pick a winner** — see [Target-form precedence and `ignored_fields`](#target-form-precedence-and-ignored_fields-901) (#901). **Returns JSON**, including [`matched`](#matched--which-entity-a-name-actually-resolved-to) when the goal came from a name/target. |
-| `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected (400) — unconditionally, even alongside `name`, so `/follow` never has #901's silent-discard problem: any coordinate field always 400s instead of being picked over or dropped. **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to). |
+| `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected (400) unconditionally, even alongside `name` — no target-naming field is ever silently dropped here (#901). `avoid_aggro`/`aggro_buffer` are a separate field family: `/follow` accepts them (shares `MoveBody` with `/goto`) but never applies them, so they ARE silently ignored — tracked as #952, not fixed by #901. **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to). |
 | `POST /v1/move/stop` | — | Cancel any active goto/follow. **Not** subject to the `held` gate below — it is a cancel, its effect is on the nav slots and not on the physics step, so it stays honest and available while the body is frozen. |
 | `POST /v1/move/zone_cross` | `{"zone_id":N}` \| `{}` | Cross a zone line and send OP_ZoneChange (specific zone, or nearest line). |
 
@@ -1003,6 +1003,11 @@ which:
    ```
 3. **A body with SOME coordinate field(s) but not enough to complete either form** still 400s
    naming the missing field(s) — see the `/goto` row above (#886) — this is unchanged by #901.
+
+> **Migration note:** before #901, case (1) above (`name` beside a coordinate field) answered
+> `200` and silently routed to the name, dropping the coordinates with no trace. It now answers
+> `400`. A caller that was relying on that silent routing (rather than sending one target form)
+> must stop sending both fields in the same request.
 
 ### `nav_goal_id` and `nav_goal` — goal identity (#349)
 
