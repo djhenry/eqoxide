@@ -346,9 +346,11 @@ use eqoxide_ipc::MoveIntent;
         // reasons, and each says which.
         //
         // #919: each cites walker.rs by SOURCE TEXT, not by line number. The line numbers that used
-        // to be here were stale on `main` before they were ever reported, and pointed at unrelated
-        // code by the time they were fixed. `walker_source_anchors_cited_in_this_file_still_resolve`
-        // re-finds each quoted phrase in walker.rs by execution and fails if it is gone.
+        // to be here were EXACTLY RIGHT at the commit that wrote them — `7428809` put these three at
+        // 1496, 1507 and 1768 — and had drifted to 1509 / 1520 / 1781 by the time #919 measured
+        // them, purely from insertions above; by the commit that fixed them they pointed at
+        // unrelated code. `walker_source_anchors_cited_in_this_file_still_resolve` re-finds each
+        // quoted phrase in walker.rs by execution and fails if it is gone.
         const LOOK_AHEAD: f32 = 5.0;   // walker.rs, private in `drive_walk`: `const LOOK_AHEAD: f32 = 5.0;`
         const LOCAL_BOUND: f32 = 40.0; // walker.rs, private in `drive_walk`: `const LOCAL_BOUND: f32 = 40.0;`
         const MAX_REPATHS: u32 = 8;    // NOT a const anywhere: walker.rs spells it `if self.nav_repaths < 8 {`
@@ -407,7 +409,9 @@ use eqoxide_ipc::MoveIntent;
                 // stops modelling the walker. This is an integration test, so it cannot name the
                 // `pub(crate)` constant; the in-crate sim in `steering.rs` references it directly and
                 // does not have this gap. Until this file can too, the coincidence is disclosed here
-                // rather than asserted away.
+                // rather than asserted away. #919: that definition is quoted verbatim as an anchor in
+                // `walker_source_anchors_cited_in_this_file_still_resolve`, so changing it turns this
+                // paragraph RED instead of quietly false.
                 {
                     let walked_to = path_i;
                     path_i = eqoxide::nav::steering::resync_cursor(
@@ -508,7 +512,9 @@ use eqoxide_ipc::MoveIntent;
                         let d = (dx * dx + dy * dy).sqrt().max(1e-3);
                         [dx / d, dy / d]
                     });
-                    // The REAL walker's swim rule (walker.rs §8.2), driving the SAME controller:
+                    // The REAL walker's swim rule — walker.rs defers to the DESIGN DOCUMENT's §8.2
+                    // there, in a comment ending `(design §8.2)`; that phrase, not a walker.rs
+                    // section number, is what is anchored (#919) — driving the SAME controller:
                     // body-probe want_swim, and the water-nav Slice 3 depth controller `swim_vspeed`
                     // toward the active waypoint's DEPTH. CRITICAL faithfulness point (#1b): the
                     // vertical-wish target z must come from the SAME path the walker steers —
@@ -1130,27 +1136,25 @@ use eqoxide_ipc::MoveIntent;
                 on to report a water column with a hole in it, which is #762's exhibit");
     }
 
-    /// **Rename guard for this file's doc-comment citations.** `open_zone_checked`'s rustdoc names
-    /// `faithful_walker_drift_corpus`; listing it here as a `fn` value makes a rename a COMPILE
-    /// error instead of a citation that rots silently. The nav crate's citation scan
-    /// (`every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard`) requires
-    /// exactly this and reads this file — measured, not assumed: the workspace suite failed with
-    /// "`faithful_walker_drift_corpus` … no `_cited`/`_helpers` guard in this file names it" until
-    /// this array existed. `aborted_report_content_is_pinned_by_execution`'s doc comment (#831) names
-    /// `zone_accounting_fires_before_the_corpus_loop_ends` the same way — added below after the
-    /// workspace suite failed on that citation too, for the identical reason.
     /// **Source-text anchors into `walker.rs`, re-found by execution (#919).**
     ///
-    /// `faithful_walker_drift_corpus` restates four things that live in `walker.rs` and that an
-    /// integration test cannot name: two `const`s private to `Walker::drive_walk`, an unnamed
-    /// literal re-path cap, and the downhill-backoff branch's non-swim wish. Those comments used to
-    /// cite `walker.rs` by LINE NUMBER. A line number is a coordinate in one commit: all three of
-    /// the numbers #919 reported were already stale on `main` when they were reported, and by the
-    /// commit that fixed them every one pointed at unrelated code. They now quote SOURCE TEXT, and
-    /// this test re-finds each quoted phrase.
+    /// This file restates things that live in `walker.rs` and that an integration test cannot name:
+    /// `const`s private to `Walker::drive_walk`, an unnamed literal re-path cap, the
+    /// downhill-backoff branch's non-swim wish, a `pub(crate)` clearance, and a corner buffer.
+    /// Those comments used to cite `walker.rs` by LINE NUMBER.
     ///
-    /// `collision.rs` quotes the `LOCAL_BOUND` line for the same reason and is covered by the same
-    /// anchor — the anchor is a property of `walker.rs`, not of one citing file.
+    /// **The mechanism, measured, because the mechanism is the whole argument.** Every one of those
+    /// numbers was EXACTLY RIGHT at the commit that wrote it: at `7428809` the look-ahead was on
+    /// line 1496, the fine-search window on 1507 and the re-path cap on 1768 — the three numbers
+    /// that were written. By `ce1d89f`, where #919 measured them, they had drifted to 1509 / 1520 /
+    /// 1781, and by the commit that fixed them every one pointed at unrelated code. Nobody wrote
+    /// them wrong. A line number is a coordinate in one commit, and the coordinate system moves
+    /// under it — which is why the citations quote SOURCE TEXT now, and why this test re-finds each
+    /// quoted phrase instead of trusting it. (The same holds for `collision.rs`'s copy of the
+    /// fine-search-window citation, introduced correct at `0497f6b`, line 1507 exactly.)
+    ///
+    /// `collision.rs` quotes that line for the same reason and is covered by the same anchor — an
+    /// anchor is a property of `walker.rs`, not of one citing file.
     ///
     /// **What it does NOT do**, so nobody reads it as more:
     ///
@@ -1159,18 +1163,48 @@ use eqoxide_ipc::MoveIntent;
     ///   means still passes;
     /// * it does not FIND citations. The list below is hand-written, so a new comment citing
     ///   `walker.rs` is covered only if someone adds its anchor here. The nav crate's mechanical
-    ///   citation scan cannot help: it reads lines beginning with three slashes, and these
-    ///   citations are ordinary two-slash comments, which that scan structurally never visits;
+    ///   citation scan cannot help, on two independent counts: it reads only lines whose trimmed
+    ///   form starts with `///` or `//!`, and these citations are plain `//` comments; and what it
+    ///   extracts is a TEST NAME — a backticked run of lowercase, digits, `_` and `:` carrying at
+    ///   least three underscores — so a `file.rs:` line reference is not a degraded input to it, it
+    ///   is not an input at all. That scan's green result has never meant anything about a line
+    ///   number. Both gaps are filed as #959 and are not addressed here;
+    /// * **the hand-written list has already been wrong once.** #919's first revision carried five
+    ///   anchors, because the citations were enumerated with a single regex over one spelling —
+    ///   `file.rs:` followed by a digit. Review found two more citations into `walker.rs` in this
+    ///   very file that no such regex can match: one naming a design-document section, one naming a
+    ///   bare `const`. Both are anchored below. Enumerate the CONCEPT, not one of its spellings;
     /// * it covers `walker.rs` only. Nothing here claims anything about citations into any other
     ///   file, in this test file or elsewhere;
-    /// * it pins TEXT, not reachability. A phrase can be present and unreached (#799).
+    /// * it pins TEXT, not reachability. A phrase can be present and unreached (#799); a WRAP
+    ///   mutation that leaves the anchored branch written but dead passes this test, by execution.
     ///
-    /// **Reach control.** #778's source scanner silently covered about an eighth of its corpus and
-    /// all twelve mutation probes aimed at it happened to sit inside the window it could still see,
-    /// so twelve green cells proved nothing. So this scan reports how far it got: `lines_scanned` is
-    /// asserted against the file's own line count and against a floor, and every anchor must be
-    /// found. The anchors sit hundreds of lines apart, deep in a file thousands of lines long, so a
-    /// scan that stopped early loses the late ones loudly instead of passing quietly.
+    /// **Reach control, and what it can and cannot see.** #778's source scanner silently covered
+    /// about an eighth of its corpus, and all twelve mutation probes aimed at it sat inside the
+    /// window it could still see, so twelve green cells proved nothing. So the unit counted here is
+    /// the COMPARISON, not the line: the counter moves once per (line, anchor) pair, in the same
+    /// statement sequence that tests the anchor, and is checked against `lines × anchors` derived
+    /// separately. A scan that walks the whole file while comparing only part of it fails.
+    ///
+    /// That took three attempts, which is the finding worth keeping. Counting lines ITERATED was
+    /// defeated by a mutant that iterated everything and compared the first 2100 lines. Moving the
+    /// counter into the same CALL as the match was defeated by the SAME mutant, because the call
+    /// still ran on every line — it was the comparison inside it that was skipped. A reach counter
+    /// is only sound at the granularity of the work it claims.
+    ///
+    /// Its limits, stated rather than discovered a round later:
+    ///
+    /// * on unmutated code the equality is IDENTICALLY TRUE and can only fire on an edit to this
+    ///   loop. That is deliberate — an edit to this loop is where #778's defect class lives — but it
+    ///   is evidence about this scanner and no other. A mutant that moves the counter itself, rather
+    ///   than the comparison, defeats it; nothing short of a type can stop that;
+    /// * the `>= 1000` floor is a corpus-PRESENCE check ("the tree is where this test thinks it
+    ///   is"), not an anchor-reach check. It sits below the first anchor, so on its own it would
+    ///   admit a scan that found no anchor at all; the per-anchor verdicts are what refuse that;
+    /// * nothing here constrains WHERE in the file the anchors sit. #919's first revision argued
+    ///   from their spacing, and the spacing it asserted was not the spacing they have. Their
+    ///   positions are a property of today's `walker.rs` and rot exactly like the line numbers this
+    ///   test exists to replace, so no argument is built on them.
     #[test]
     fn walker_source_anchors_cited_in_this_file_still_resolve() {
         // `tests/` sits at the workspace root, which is this package's manifest directory.
@@ -1191,26 +1225,48 @@ use eqoxide_ipc::MoveIntent;
              "the downhill-backoff branch this file's backoff loop mirrors"),
             ("want_swim: false,",
              "that branch's unconditional non-swim wish"),
+            // The two the first revision's regex could not see (#919 review, non-blocking 6).
+            ("pub(crate) const STEER_LOS_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS;",
+             "the clearance this file's resync comment discloses as equal to PLAYER_RADIUS only by \
+              coincidence — the whole disclosure is void if this definition changes"),
+            ("const CORNER_BUFFER: f32 = 2.0;",
+             "the corner buffer this file's inflation fixture restates by value"),
+            ("(design §8.2)",
+             "the design-document section this file's swim-rule comment defers to"),
         ];
+        // A silently emptied list would make every verdict below vacuous.
+        assert!(!ANCHORS.is_empty(), "the anchor list is empty; this test would pass on anything");
 
         // Interior whitespace is collapsed before matching, so an anchor survives rustfmt
         // re-aligning a struct literal, but not the code being renamed or deleted.
         let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // Reach is counted BY the comparison, not beside it: `comparisons` moves in the same
+        // statement sequence that tests an anchor, once per (line, anchor) pair, and is checked
+        // against a total derived independently below. A scan that iterates the file but skips the
+        // anchor test — a line ceiling, a skipped prefix, a parity, a region — loses exactly those
+        // comparisons and fails. (#919 review B3: the first revision counted lines ITERATED, so a
+        // mutant that compared only the first 2100 of 5340 lines passed GREEN with the rest never
+        // tested; a second revision moved the counter into the same CALL as the match, and the same
+        // mutant, re-run, passed GREEN again — the call is not the comparison. This is the third.)
         let mut hits = vec![0usize; ANCHORS.len()];
-        let mut lines_scanned = 0usize;
+        let mut comparisons = 0usize;
         for line in src.lines() {
-            lines_scanned += 1;
             let n = norm(line);
             for (i, (anchor, _)) in ANCHORS.iter().enumerate() {
+                comparisons += 1;
                 if n.contains(anchor) { hits[i] += 1; }
             }
         }
 
-        // ── reach control, before any anchor verdict is read ──
-        assert_eq!(lines_scanned, src.lines().count(),
-            "the scan stopped before the end of walker.rs — every anchor verdict below is unsound");
-        assert!(lines_scanned >= 1000,
-            "walker.rs read as only {lines_scanned} lines; the source tree is not where this test \
+        // ── reach control, read BEFORE any anchor verdict ──
+        let total_lines = src.lines().count();
+        let expected = total_lines * ANCHORS.len();
+        assert_eq!(comparisons, expected,
+            "the anchor match did not cover walker.rs: {comparisons} of {expected} (line, anchor) \
+             comparisons ran across {total_lines} lines. Every anchor verdict below is unsound.");
+        assert!(total_lines >= 1000,
+            "walker.rs read as only {total_lines} lines; the source tree is not where this test \
              thinks it is, and the anchors would fail for the wrong reason");
 
         let mut problems: Vec<String> = Vec::new();
@@ -1229,6 +1285,15 @@ use eqoxide_ipc::MoveIntent;
             problems.len(), problems.join("\n  "));
     }
 
+    /// **Rename guard for this file's doc-comment citations.** `open_zone_checked`'s rustdoc names
+    /// `faithful_walker_drift_corpus`; listing it here as a `fn` value makes a rename a COMPILE
+    /// error instead of a citation that rots silently. The nav crate's citation scan
+    /// (`every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard`) requires
+    /// exactly this and reads this file — measured, not assumed: the workspace suite failed with
+    /// "`faithful_walker_drift_corpus` … no `_cited`/`_helpers` guard in this file names it" until
+    /// this array existed. `aborted_report_content_is_pinned_by_execution`'s doc comment (#831) names
+    /// `zone_accounting_fires_before_the_corpus_loop_ends` the same way — added below after the
+    /// workspace suite failed on that citation too, for the identical reason.
     #[test]
     fn doc_comment_citations_in_this_file_are_rename_guarded() {
         let _cited: &[fn()] = &[
@@ -1236,8 +1301,8 @@ use eqoxide_ipc::MoveIntent;
             faithful_walker_drift_corpus,
             // cited by `aborted_report_content_is_pinned_by_execution`'s rustdoc (#831)
             zone_accounting_fires_before_the_corpus_loop_ends,
-            // #919: named by two `//` comments in `faithful_walker_drift_corpus`, which the nav
-            // crate's scan cannot see (it reads `///` and `//!` only), so it is pinned by hand here.
+            // #919: named by plain `//` comments elsewhere in this file, which the nav crate's scan
+            // cannot see (it reads `///` and `//!` only), so it is pinned by hand here.
             walker_source_anchors_cited_in_this_file_still_resolve,
         ];
     }
@@ -1683,7 +1748,7 @@ fn corner_buffer_blast_radius() {
     const DT: f32 = 1.0 / 100.0;
     const FRAMES_PER_TICK: u32 = 15;
     const MAX_TICKS: u32 = 300; // ~45 s of sim per journey — generous headroom over any real route
-    const CORNER_BUFFER: f32 = 2.0; // must match walker.rs CORNER_BUFFER
+    const CORNER_BUFFER: f32 = 2.0; // restates walker.rs's `const CORNER_BUFFER: f32 = 2.0;` (#919 anchor)
     let pairs_per_zone: usize = std::env::var("PAIRS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
 
     // Drive the REAL controller along `route` with LOS-clamped pure pursuit (shipped config). Returns
