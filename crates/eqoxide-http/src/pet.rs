@@ -44,6 +44,18 @@ async fn post_command(
     let Ok(Json(b)) = body else {
         return (StatusCode::BAD_REQUEST, "provide {\"command\":N} or {\"name\":\"attack|backoff|follow|guard|sit\"}".into());
     };
+    // #952/#956 (agent-honesty): `command` and `name` are two spellings of ONE command, and the
+    // `.or_else` below is a precedence chain — `{"command":2,"name":"sit"}` used to answer
+    // `200 pet command 2 queued`, discarding "sit" with nothing in the response saying so. Those are
+    // two DIFFERENT pet commands, not an ambiguous one, so the request is refused outright.
+    // Destructured exhaustively (no `..`): a new field on `CommandBody` is a compile error here
+    // until someone decides whether it joins this group.
+    let CommandBody { command, name } = &b;
+    if let Some(msg) = crate::req_form::conflicting_forms(
+        "pet action", &[("command", command.is_some()), ("name", name.is_some())],
+    ) {
+        return (StatusCode::BAD_REQUEST, msg);
+    }
     let cmd: Option<u8> = b.command.or_else(|| {
         b.name.as_deref().map(str::to_ascii_lowercase).and_then(|n| match n.as_str() {
             "attack"            => Some(PET_ATTACK as u8),

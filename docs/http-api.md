@@ -63,7 +63,7 @@ breakdown and why.
 | Route | Body | Description |
 |-------|------|-------------|
 | `POST /v1/move/goto` | `{"name":"Guard Phaeton"}` \| `{"x":,"y":,"z":}` \| `{"map_x":,"map_y":}` \| `{}` | Walk to an entity (fuzzy name, one-time snapshot) or coordinates and **stop** on arrival. Empty body → the player's current target. `map_*` are Brewall map coords (= negated server x/y); `z` is optional there (defaults, then the walker snaps to the actual floor) but **required** on the raw `{x,y,z}` form. A body with SOME coordinate field(s) but not a complete `{x,y,z}` or `{map_x,map_y}` — e.g. `{"x":,"y":}` with no `z` — 400s naming exactly which field(s) are missing (`partial target: got {x, y} but missing {z}`), never the "no target; provide a name or coords" message, which is reserved for a body with no coordinate field at all (#886). **Two or more target forms in one body never silently pick a winner** — see [Target-form precedence and `ignored_fields`](#target-form-precedence-and-ignored_fields-901) (#901). **Returns JSON**, including [`matched`](#matched--which-entity-a-name-actually-resolved-to) when the goal came from a name/target. |
-| `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected even alongside `name` (400 — but a freezing hold answers 409 first, #884) — no target-naming field is ever silently dropped here (#901). `avoid_aggro`/`aggro_buffer` are a separate field family: `/follow` accepts them (shares `MoveBody` with `/goto`) but never applies them, so they ARE silently ignored — tracked as #952, not fixed by #901. **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to). |
+| `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected even alongside `name` (400 — but a freezing hold answers 409 first, #884) — no target-naming field is ever silently dropped here (#901). `avoid_aggro`/`aggro_buffer` are a separate field family: `/follow` shares `MoveBody` with `/goto`, and until #952 it accepted both knobs and never applied them. It now applies them, to the same shared nav setting `/goto` and `/zone_cross` write, and past every 4xx return — so a refused `/follow` changes nothing. (`/zone_cross` is the exception and predates #952: it applies the knobs *before* its own `zone_id … is not reachable` 400, so a refused crossing does still move the shared setting. Measured and pinned by `a_refused_zone_cross_does_write_the_avoid_knobs_pre_existing_divergence`; unchanged here.) **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to). |
 | `POST /v1/move/stop` | — | Cancel any active goto/follow. **Not** subject to the `held` gate below — it is a cancel, its effect is on the nav slots and not on the physics step, so it stays honest and available while the body is frozen. |
 | `POST /v1/move/zone_cross` | `{"zone_id":N}` \| `{}` | Cross a zone line and send OP_ZoneChange (specific zone, or nearest line). |
 
@@ -86,7 +86,7 @@ so an accepted goal never hides the fact that the body is hanging out of the wor
 | `POST /v1/combat/attack` | — | Enable auto-attack. |
 | `DELETE /v1/combat/attack` | — | Disable auto-attack. |
 | `POST /v1/combat/consider` | `{"id":N}` (default current target) | Consider a spawn (difficulty tier + faction attitude). Result: `target_con`/`target_attitude`/`target_level` on `/observe/debug` if the spawn IS the current target, always `last_consider` regardless — see [Consider results](#consider-results). |
-| `POST /v1/combat/cast` | `{"gem":0-8}` \| `{"spell_id":N,"target_id":M?}` | Cast a memorized gem (on target, else current, else self). |
+| `POST /v1/combat/cast` | `{"gem":0-8}` \| `{"spell_id":N,"target_id":M?}` \| `{"item_slot":N}` | Cast a memorized gem, a memorized spell by id, or an item clicky (on target, else current, else self). `gem`/`spell_id`/`item_slot` are **mutually exclusive** — two or more in one body is a `400`, never a silent pick (#952/#956, see [Mutually exclusive request forms](#mutually-exclusive-request-forms-952956)). `target_id` composes with all three. |
 | `POST /v1/combat/memorize` | `{"spell_id":N,"gem":0-8}` | Memorize a known spell into a gem. |
 | `POST /v1/combat/scribe` | `{"spell_id":N,"slot":B?}` | Scribe a spell scroll into the spellbook. |
 
@@ -98,9 +98,10 @@ so an accepted goal never hides the fact that the body is hanging out of the wor
 |-------|------|-------------|
 | `POST /v1/interact/hail` | `{"name":"NPC"}` \| `{}` | Say "Hail, <name>" so an NPC fires its hail/quest script (nearest if no name). |
 | `POST /v1/interact/say` | `{"text":"..."}` | Say arbitrary text on Say (quest keyword follow-ups). |
-| `POST /v1/interact/loot` | `{"id":N}` \| `{"name":"..."}` \| `{}` | Loot a corpse (specific id, fuzzy name, or nearest). |
+| `POST /v1/interact/loot` | `{"id":N}` \| `{"name":"..."}` \| `{}` | Loot a corpse (specific id, fuzzy name, or nearest). `id` and `name` are **mutually exclusive** — both in one body is a `400` (#952/#956). |
 | `POST /v1/interact/give` | `{"npc":"Name","from":N}` | Hand inventory slot N to an NPC (quest turn-in trade flow). |
-| `POST /v1/interact/click_door` | `{"door_id":N}` \| `{"name":"DOOR1"}` | Click a door (server-authoritative open). |
+| `POST /v1/interact/click_door` | `{"door_id":N}` \| `{"name":"DOOR1"}` | Click a door (server-authoritative open). `door_id` and `name` are **mutually exclusive** — both in one body is a `400`, answered before the roster is consulted (#952/#956). |
+| `POST /v1/interact/dialogue` | `{"index":N}` \| `{"text":"..."}` | Click one of `GET /v1/observe/dialogue`'s choices. `index` and `text` are **mutually exclusive** — both in one body is a `400`, answered before the "no dialogue choices available" `409` (#952/#956). |
 | `POST /v1/interact/sit` | — | Sit (regen). |
 | `POST /v1/interact/stand` | — | Stand. |
 
@@ -1008,6 +1009,124 @@ which:
 > `200` and silently routed to the name, dropping the coordinates with no trace. It now answers
 > `400`. A caller that was relying on that silent routing (rather than sending one target form)
 > must stop sending both fields in the same request.
+
+### Mutually exclusive request forms (#952/#956)
+
+The section above is `/goto`'s instance of a rule that now covers the whole API. Several routes
+accept **more than one way to name the same argument**, and each of them used to resolve the choice
+with a precedence chain that never looked at the losers. Most request structs carry
+`serde(deny_unknown_fields)`, so a *misspelled* field is rejected. That is exactly what makes a
+*declared but unreached* field quiet: it is not unknown, so it parses, and the request is answered
+`200`. That is the failure this rule removes: the strongest signal the API can send ("your
+instruction was understood") for an instruction that was thrown away.
+
+> **Two routes do not have even the typo protection.** `GET /v1/observe/frame` and
+> `GET /v1/observe/packets` are the 2 of this crate's 35 request structs with **no**
+> `deny_unknown_fields`, so on those two an **unrecognized query key is still silently ignored** —
+> both driven:
+>
+> * `GET /v1/observe/packets?sicne=1` → `200`, the typo dropped rather than refused. Its
+>   discriminator is `?since=notanumber` → `4xx`: a *recognized* key with an unusable value **is**
+>   refused, so the `200` is about the unknown key and not about a route that validates nothing.
+> * `GET /v1/observe/frame?allow_pending=1&prset=top_down&pitch=10` → `200`, and the capture is taken
+>   with an override built from the surviving `pitch` **alone**, `azimuth` and `radius` left at their
+>   defaults — the caller asked for a top-down preset, the key carrying that request was discarded,
+>   and the image comes back at an angle nobody asked for, with a `200`.
+>
+> This is the same agent-honesty failure one step earlier, it is **not** fixed by this section, and it
+> is tracked as **#971**. See also
+> [Camera override for `/frame`](#camera-override-for-observeframe-422) above. The status codes and
+> override values above are asserted by
+> `req_form::tests::an_unrecognized_query_key_is_silently_dropped_on_both_exempt_routes`, exactly
+> these two being the exceptions by `every_deserialize_request_struct_is_classified`, and
+> the `2` and `35` on this page against that module's constants by
+> `docs_http_api_md_may_not_disagree_with_this_modules_struct_counts`. That test also holds the `8`
+> and the `27` fixed relative to those two, but neither is derived from the code — re-derive them
+> with the `grep` commands under "How far the guard actually reaches" below.
+
+**The rule.** Where two forms name *the same thing* in different notations (`{map_x,map_y}` and
+`{x,y,z}` for one point), precedence applies and the loser is **reported** in `ignored_fields`.
+Where two forms name *different things* — two spawns, two commands, two spells — no reading of the
+request makes both correct, so the request is **refused** with a `400` that names every conflicting
+field it received, in the order the route declares them. Nothing is queued and no state changes.
+
+```jsonc
+POST /v1/pet/command {"command": 2, "name": "sit"}
+400 "conflicting pet action: this request supplied command, name — mutually exclusive forms of one
+     argument, of which exactly one may be sent. They denote different things, so there is no reading
+     under which both were meant and nothing was chosen for you: this request was REFUSED, nothing
+     was queued, and no state changed. Re-send with a single form."
+```
+
+That example is not a paraphrase: a test unwraps it out of this file and asserts the router produces
+exactly it, so it cannot drift from the code.
+
+**The groups, and what each used to answer.** Every row was driven through the real router on the
+pre-fix tree by one guard test, and the "was" column is that run's response — with one marked
+exception where the probe body happened to fail for an unrelated reason and a second body was needed
+to expose the discard.
+
+| Route | Mutually exclusive fields | Was |
+|-------|---------------------------|-----|
+| `POST /v1/move/goto` | `name` vs any coordinate field | already `400` (#901) |
+| `GET /v1/observe/frame` | `preset` vs `pitch`/`yaw`/`distance` | already `400` (#422) |
+| `POST /v1/pet/command` | `command`, `name` | `200 pet command 2 queued` |
+| `POST /v1/trainer/open` | `name`, `trainer` | `200 opening training with Beta (spawn_id=102)` |
+| `POST /v1/social/friends` | `add`, `remove` | `200 added Alpha` (the removal never happened) |
+| `POST /v1/interact/loot` | `id`, `name` | `200 looting <the id's corpse>` |
+| `POST /v1/interact/click_door` | `door_id`, `name` | `200 clicking door 7` |
+| `POST /v1/interact/dialogue` | `index`, `text` | `200 clicking '<choice at index>'` |
+| `POST /v1/combat/cast` | `gem`, `spell_id`, `item_slot` | see below † |
+
+† `/cast` is the marked exception. The guard's probe body (`gem` + `spell_id` + `item_slot`) drew a
+`400 no item at slot 23` — a refusal, but for an unrelated missing-item reason, naming none of the
+conflicting fields. The discard itself was measured with a second body: `{"gem":0,"spell_id":202}`
+with spell 202 memorized in a *different* gem answered `409 spell gem 0 is empty — memorize a spell
+into it first`. `spell_id` lost the precedence chain silently and the caller was told its problem
+was an empty gem. That case is pinned by `cast_gem_beside_spell_id_names_both_rather_than_reporting_the_wrong_gem_empty`.
+
+**Where the check sits.** After the session/liveness gates, and **before** anything that inspects
+world state. A body carrying two forms is malformed whatever the world looks like, so answering a
+state error first (`409 no dialogue choices available`, `404 no door matching …`) would send an
+agent to fix the world when the thing to fix is its own request.
+
+**What is NOT in a group.** Fields that compose rather than compete are unaffected and still combine
+freely — `target_id` beside any of `/cast`'s three forms, `allow_pending` beside `/frame`'s camera
+params, `z` beside `{map_x,map_y}`.
+
+**How far the guard actually reaches** — stated precisely, because the natural summary of it is
+broader than the thing it does:
+
+* A test reads the HTTP crate's `src/` directory and requires every `Deserialize` request struct in
+  it — all **35** — to be classified as exclusive or composable. So a **new request struct** cannot
+  be added without that decision being made out loud.
+* A **new field on an existing struct** is a different case, and only **8** of the 35 are protected
+  against it: the eight handlers that destructure their body exhaustively (`let CommandBody { command,
+  name } = &b;`, no `..`), where adding a field is a compile error until someone places it. On the
+  other 27 structs, a new field that no code path reads would compile and ship — which is the
+  original #952 shape. Re-derive both figures:
+  `grep -rn '^#\[derive(.*Deserialize' crates/eqoxide-http/src/ | wc -l` and
+  `grep -rnE '^\s*let [A-Za-z]+Body \{[^}]*\} = ' crates/eqoxide-http/src/*.rs`.
+* The 26 `COMPOSABLE` rows carry a one-line reason each ("all three passed to `request_mem_spell`").
+  Those reasons are **read off the source and written down, not executed** — the guard verifies that
+  each struct has been *classified*, not that a classification is *correct*. A struct wrongly filed
+  as composable is invisible to it.
+
+**Migration note:** a caller that batched two forms into one request now gets a `400` where it
+previously got a `200` that performed only one of them. Three routes change answer for bodies that
+were previously accepted:
+
+* `POST /v1/social/friends` `{"add":…,"remove":…}` — previously `200` performing only the add.
+* `POST /v1/trainer/open` `{"name":"Alpha","trainer":"Beta"}` — previously `200` opening Beta.
+* `POST /v1/interact/dialogue` `{"index":0,"text":"bind"}` — previously `200` clicking the index.
+
+Note the presence rule differs by route. `/social/friends` treats a **blank** name as not supplied, so
+`{"add":"","remove":"Beta"}` is still an ordinary removal and is *not* refused (a test seeds Beta and
+asserts `200 removed Beta`). `/trainer/open` and `/interact/dialogue` key on the field being present
+at all, so a blank loser now refuses too — both driven through the router:
+`POST /v1/trainer/open {"name":"","trainer":"Beta"}` and
+`POST /v1/interact/dialogue {"index":0,"text":""}` each answer `400 conflicting …`. Send one request
+per form.
 
 ### `nav_goal_id` and `nav_goal` — goal identity (#349)
 

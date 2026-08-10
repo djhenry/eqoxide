@@ -75,6 +75,9 @@ mod camera;
 mod lifecycle;
 // #347/B1: the single polarity site for "queued or refused" — see `refusal.rs`.
 mod refusal;
+// #952/#956: the single site for "you sent two mutually exclusive forms of one argument" — plus the
+// guard that makes every Deserialize request struct in this crate declare which kind it is.
+mod req_form;
 
 // Shared test fixtures (`HttpState` builder + snapshot-seeding helpers). Available to this crate's
 // own unit tests and, via the `test-fixtures` feature, to the app crate's integration tests — see
@@ -1340,6 +1343,33 @@ impl MoveGate {
     }
 }
 
+/// The whole agent-facing surface: versioned + grouped routes, `/v1/<group>/<action>`. Each group's
+/// `router()` defines relative paths; nesting prefixes them. State is applied by the caller.
+///
+/// Extracted out of [`spawn_camera_server`] (#952/#956) so a test can drive the SAME router
+/// production serves, under the SAME `/v1/...` paths an agent calls — see
+/// `req_form::tests::every_declared_mutually_exclusive_form_group_is_refused_not_silently_dropped`.
+/// A per-module `router()` would have let that test assert against a path shape no agent ever uses.
+pub(crate) fn v1_router() -> Router<HttpState> {
+    Router::new()
+        .nest("/v1/observe",   observe::router())
+        .nest("/v1/quests",    quests::router())
+        .nest("/v1/group",     group::router())
+        .nest("/v1/guild",     guild::router())
+        .nest("/v1/move",      move_api::router())
+        .nest("/v1/trainer",   trainer::router())
+        .nest("/v1/pet",       pet::router())
+        .nest("/v1/combat",    combat::router())
+        .nest("/v1/interact",  interact::router())
+        .nest("/v1/merchant",  merchant::router())
+        .nest("/v1/inventory", inventory::router())
+        .nest("/v1/chat",      chat::router())
+        .nest("/v1/events",    events::router())
+        .nest("/v1/social",    social::router())
+        .nest("/v1/camera",    camera::router())
+        .nest("/v1/lifecycle", lifecycle::router())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_camera_server(
     camera:          eqoxide_ipc::CameraSlots,
@@ -1389,26 +1419,7 @@ pub fn spawn_camera_server(
                 inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
                 quest, group_slots, lifecycle, guild_slots, nav_debug_view, skin_cap_downgrades,
             };
-            // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
-            // relative paths; nesting prefixes them. Shared state is applied once at the end.
-            let app = Router::new()
-                .nest("/v1/observe",   observe::router())
-                .nest("/v1/quests",    quests::router())
-                .nest("/v1/group",     group::router())
-                .nest("/v1/guild",     guild::router())
-                .nest("/v1/move",      move_api::router())
-                .nest("/v1/trainer",   trainer::router())
-                .nest("/v1/pet",       pet::router())
-                .nest("/v1/combat",    combat::router())
-                .nest("/v1/interact",  interact::router())
-                .nest("/v1/merchant",  merchant::router())
-                .nest("/v1/inventory", inventory::router())
-                .nest("/v1/chat",      chat::router())
-                .nest("/v1/events",    events::router())
-                .nest("/v1/social",    social::router())
-                .nest("/v1/camera",    camera::router())
-                .nest("/v1/lifecycle", lifecycle::router())
-                .with_state(state);
+            let app = v1_router().with_state(state);
             let (listener, bound_port) = if let Some(std_l) = exact_listener {
                 // --api-port: use the listener main already bound to the exact requested port.
                 std_l.set_nonblocking(true).expect("set api-port listener non-blocking");

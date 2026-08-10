@@ -140,6 +140,24 @@ async fn post_dialogue(
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"index\":N} or {\"text\":\"...\"}".into()),
     };
+    // #952/#956 (agent-honesty): `index` and `text` are two ways to name ONE choice, and the
+    // `if let`/`else if let` below is a precedence chain: `index` is consulted first and `text` is
+    // reached only when `index` is absent, so a body carrying both always resolves to the INDEX and
+    // the text is discarded with nothing in the response saying so. Measured on the pre-fix tree,
+    // `{"index":0,"text":"bind"}` answered `200 clicking 'bind'` — the fixture's choice 0 happened
+    // to BE "bind", which is exactly how this defect hides: the two forms agreeing is the common
+    // case, and the response looks identical when they do not. A saylink click is a reply to an NPC;
+    // the wrong one advances the wrong dialogue.
+    //
+    // Deliberately BEFORE the empty-roster 409: with both forms sent the request is malformed
+    // whether or not choices exist, and `409 no dialogue choices available` would point an agent at
+    // the NPC when the thing to fix is its own body. Destructured exhaustively (no `..`).
+    let DialogueBody { index, text } = &b;
+    if let Some(msg) = crate::req_form::conflicting_forms(
+        "dialogue choice", &[("index", index.is_some()), ("text", text.is_some())],
+    ) {
+        return (StatusCode::BAD_REQUEST, msg);
+    }
     let choices = s.interact.dialogue.lock().unwrap().clone();
     if choices.is_empty() {
         return (StatusCode::CONFLICT, "no dialogue choices available".into());
@@ -284,6 +302,17 @@ async fn post_loot(
 ) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     let b = body.unwrap_or_default();
+    // #952/#956 (agent-honesty): `id` and `name` are two ways to name ONE corpse, and the id branch
+    // below `return`s before the name branch is ever reached — `{"id":7,"name":"a_rat00"}` used to
+    // answer `200 looting <the id's corpse>` even when the name pointed at a different corpse
+    // entirely, with nothing in the response saying the name had been discarded. Refused, because a
+    // wrong corpse is a wrong loot session. Destructured exhaustively (no `..`).
+    let LootBody { id, name } = &b;
+    if let Some(msg) = crate::req_form::conflicting_forms(
+        "corpse selection", &[("id", id.is_some()), ("name", name.is_some())],
+    ) {
+        return (StatusCode::BAD_REQUEST, msg);
+    }
     if let Some(id) = b.id {
         let ids = s.world.entity_ids();
         let found = ids.iter().find(|(_, &v)| v == id).map(|(k, _)| k.clone());
@@ -521,6 +550,21 @@ async fn post_door_click(
     body: axum::extract::Json<DoorClickBody>,
 ) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
+    // #952/#956 (agent-honesty): `door_id` and `name` are two ways to name ONE door, and the
+    // `if`/`else if` below is a precedence chain — `{"door_id":7,"name":"HHCELL"}` used to answer
+    // `200 clicking door 7` whether or not HHCELL *was* door 7, discarding the name silently. #891
+    // already established for this endpoint that both forms must resolve against the same roster
+    // before anything is queued, and that a miss must be named as a miss rather than answered `200`;
+    // a discarded second form is the same failure one step earlier. Checked BEFORE the roster snapshot: the request
+    // is malformed regardless of what the roster holds, so answering `404 no door matching …` first
+    // would send an agent to re-list doors when the thing to fix is its own body. Destructured
+    // exhaustively (no `..`).
+    let DoorClickBody { door_id, name } = &*body;
+    if let Some(msg) = crate::req_form::conflicting_forms(
+        "door selection", &[("door_id", door_id.is_some()), ("name", name.is_some())],
+    ) {
+        return (StatusCode::BAD_REQUEST, msg);
+    }
     // Snapshot the roster ONCE so the resolution and the "N doors known" figure in any failure body
     // describe the same list — a second `lock()` could report a count the lookup never saw.
     let roster = s.interact.doors_shared.lock().unwrap().clone();
