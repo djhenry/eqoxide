@@ -1236,6 +1236,9 @@ use eqoxide_ipc::MoveIntent;
             faithful_walker_drift_corpus,
             // cited by `aborted_report_content_is_pinned_by_execution`'s rustdoc (#831)
             zone_accounting_fires_before_the_corpus_loop_ends,
+            // #919: named by two `//` comments in `faithful_walker_drift_corpus`, which the nav
+            // crate's scan cannot see (it reads `///` and `//!` only), so it is pinned by hand here.
+            walker_source_anchors_cited_in_this_file_still_resolve,
         ];
     }
 
