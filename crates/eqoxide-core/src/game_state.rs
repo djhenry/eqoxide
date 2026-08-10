@@ -234,16 +234,70 @@ pub struct ZoneFog {
     pub density: f32,
 }
 
-/// One objective/step of a Task-system quest (from OP_TaskActivity). `done_count`/`goal_count`
-/// are the live progress (e.g. "kill 4 gnolls" -> goal 4, done 2).
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+/// How much the server has actually disclosed about one task objective.
+///
+/// RoF2 sends `OP_TaskActivity` in **two different shapes that carry different amounts of truth**
+/// (EQEmu `zone/task_manager.cpp:972` `SendTaskActivityShort` vs `zone/task_manager.cpp:989`
+/// `SendTaskActivityLong` → `common/tasks.h:141` `SerializeObjective`). The short form is exactly
+/// 25 bytes and contains **no** activity type, **no** target name and **no** counts at all — it is
+/// what the real client renders as `???` for an activity that has not been unlocked yet.
+///
+/// Flattening both shapes into one struct with zeroed counts (what eqoxide did before #889) makes
+/// an *undisclosed* objective indistinguishable from a real `0 of 0` one, and an agent reading
+/// `/v1/quests/log` has no second channel to catch that. These variants make the confusion
+/// unrepresentable: there is no `goal_count` field to read unless the server sent one.
+///
+/// Serialises flattened into the enclosing [`TaskActivity`] with a `"state"` discriminator, so a
+/// locked objective is `{"activity_id":2,"state":"locked"}` — the count keys are *absent*, not
+/// zero.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ActivityProgress {
+    /// Long form: the server disclosed the objective and its live progress.
+    Known {
+        /// EQEmu `TaskActivityType` (`common/tasks.h:46`) — declared `: int32_t`, and written with
+        /// `WriteInt32` (`common/tasks.h:152`), so it is **signed** here too. 0 None, 1 Deliver,
+        /// 2 Kill, 3 Loot, 4 SpeakWith, 5 Explore, 6 TradeSkill, 7 Fish, 8 Forage, 9 CastOn,
+        /// 10 SkillOn, 11 Touch, 13 Collect, 100 GiveCash.
+        ///
+        /// **Type 100 (GiveCash) repurposes the two counts** (`common/tasks.h:143-150`): the
+        /// server forces `goal_count` to 1 and sends `done_count` as a 0/1 *flag*, not a tally.
+        /// The cash amount is not on the wire at all. Read `0/1` there as "not yet delivered",
+        /// not as "0 of 1 items".
+        activity_type: i32,
+        /// `target_name` — the mob / item / location the step names.
+        target:        String,
+        /// `description_override` — server-authored replacement for the client's auto-generated
+        /// objective sentence. Empty for most content.
+        description:   String,
+        done_count:    u32,
+        goal_count:    u32,
+        /// `ActivityInformation::optional` — an optional objective does not gate task completion.
+        optional:      bool,
+    },
+    /// Short form (25 bytes): the activity exists but has not been unlocked. The server sent no
+    /// type, no target and no counts, so neither does this — `optional` is genuinely all the
+    /// 25 bytes carry beyond the ids.
+    Locked {
+        optional: bool,
+    },
+    /// The payload did not decode under either documented RoF2 form. Reported as such rather than
+    /// guessed at, and never fatal — see `apply_task_activity`.
+    Undecodable {
+        /// Human-readable reason (which field ran out, or how many bytes were left over).
+        reason: String,
+    },
+}
+
+/// One objective/step of a Task-system quest (from `OP_TaskActivity`).
+///
+/// `activity_id` is always known (it is in both wire forms); everything else lives in
+/// [`ActivityProgress`] because the short form does not carry it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TaskActivity {
-    pub activity_id:   u32,
-    pub activity_type: u32,
-    /// The objective text — activity_name if present, else the mob/item the step targets.
-    pub target:        String,
-    pub done_count:    u32,
-    pub goal_count:    u32,
+    pub activity_id: u32,
+    #[serde(flatten)]
+    pub progress:    ActivityProgress,
 }
 
 /// Lifecycle state of a Task-system quest, from `OP_TaskDescription`'s implicit "active" arrival

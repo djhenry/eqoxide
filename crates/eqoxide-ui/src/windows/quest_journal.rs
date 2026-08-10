@@ -6,7 +6,7 @@
 //! surface in a highlighted "Offered" strip with Accept/Decline — decline is
 //! the accept slot with task_id 0, mirroring POST /v1/quests/decline.
 
-use eqoxide_core::game_state::TaskActivity;
+use eqoxide_core::game_state::{ActivityProgress, TaskActivity};
 use crate::{theme, widgets, UiCtx};
 
 /// Objective-complete green (matches the old HUD task window).
@@ -14,19 +14,43 @@ const DONE_GREEN: egui::Color32 = egui::Color32::from_rgb(120, 220, 120);
 
 /// Format one objective as "target  done/goal" (e.g. "Kill a rat  3/10").
 /// Single-step objectives (goal ≤ 1, e.g. "Speak to X") show just the target;
-/// completion is conveyed by color. Pure/unit-testable.
+/// completion is conveyed by color. A *locked* objective renders as `???` —
+/// the same thing the real RoF2 client shows, and the truthful rendering of a
+/// short-form OP_TaskActivity, which carries no target and no counts (#889).
+/// Pure/unit-testable.
 fn objective_label(a: &TaskActivity) -> String {
-    if a.goal_count > 1 {
-        format!("{}  {}/{}", a.target, a.done_count.min(a.goal_count), a.goal_count)
-    } else {
-        a.target.clone()
+    match &a.progress {
+        ActivityProgress::Known { target, description, done_count, goal_count, .. } => {
+            let text = if description.is_empty() { target } else { description };
+            if *goal_count > 1 {
+                format!("{}  {}/{}", text, done_count.min(goal_count), goal_count)
+            } else {
+                text.clone()
+            }
+        }
+        ActivityProgress::Locked { .. } => "???".to_string(),
+        ActivityProgress::Undecodable { .. } => "(objective could not be read)".to_string(),
     }
 }
 
 /// An objective is complete once its done-count reaches its goal (a
-/// single-step objective has goal 1). Pure/unit-testable.
+/// single-step objective has goal 1). Pure/unit-testable. An objective whose
+/// progress the server has not disclosed is never reported as done.
 fn objective_done(a: &TaskActivity) -> bool {
-    a.done_count >= a.goal_count.max(1)
+    match &a.progress {
+        ActivityProgress::Known { done_count, goal_count, .. } => *done_count >= (*goal_count).max(1),
+        ActivityProgress::Locked { .. } | ActivityProgress::Undecodable { .. } => false,
+    }
+}
+
+/// The progress fraction to draw a gauge for, or `None` when there is no
+/// honest one to draw (single-step, locked, or undecodable).
+fn objective_fraction(a: &TaskActivity) -> Option<f32> {
+    match &a.progress {
+        ActivityProgress::Known { done_count, goal_count, .. } if *goal_count > 1 =>
+            Some(*done_count.min(goal_count) as f32 / *goal_count as f32),
+        _ => None,
+    }
 }
 
 /// Format a unix-epoch second as a `YYYY-MM-DD` UTC date (no date-lib
@@ -180,8 +204,7 @@ fn draw_active(ui: &mut egui::Ui, cx: &mut UiCtx) {
                         .size(11.0)
                         .color(if done { DONE_GREEN } else { theme::TEXT }),
                     );
-                    if a.goal_count > 1 {
-                        let frac = a.done_count.min(a.goal_count) as f32 / a.goal_count as f32;
+                    if let Some(frac) = objective_fraction(a) {
                         ui.indent(("task_act", t.task_id, a.activity_id), |ui| {
                             widgets::gauge(
                                 ui,
@@ -237,11 +260,20 @@ mod tests {
 
     fn act(target: &str, done: u32, goal: u32) -> TaskActivity {
         TaskActivity {
-            target: target.into(),
-            done_count: done,
-            goal_count: goal,
-            ..Default::default()
+            activity_id: 0,
+            progress: ActivityProgress::Known {
+                activity_type: 2,
+                target: target.into(),
+                description: String::new(),
+                done_count: done,
+                goal_count: goal,
+                optional: false,
+            },
         }
+    }
+
+    fn locked() -> TaskActivity {
+        TaskActivity { activity_id: 1, progress: ActivityProgress::Locked { optional: false } }
     }
 
     #[test]
@@ -258,6 +290,49 @@ mod tests {
         assert!(objective_done(&act("x", 1, 1)));
         assert!(objective_done(&act("x", 1, 0))); // goal 0 treated as 1
         assert!(!objective_done(&act("x", 3, 10)));
+    }
+
+    /// #889: a short-form (locked) activity carries NO target and NO counts. It must render as
+    /// the client's own `???`, never as a completed or zero-progress real objective, and it must
+    /// not draw a progress gauge it has no numbers for.
+    #[test]
+    fn locked_objective_renders_as_unknown_and_is_never_done() {
+        assert_eq!(objective_label(&locked()), "???");
+        assert!(!objective_done(&locked()));
+        assert_eq!(objective_fraction(&locked()), None);
+    }
+
+    #[test]
+    fn undecodable_objective_says_so_and_is_never_done() {
+        let a = TaskActivity {
+            activity_id: 2,
+            progress: ActivityProgress::Undecodable { reason: "test".into() },
+        };
+        assert_eq!(objective_label(&a), "(objective could not be read)");
+        assert!(!objective_done(&a));
+        assert_eq!(objective_fraction(&a), None);
+    }
+
+    #[test]
+    fn objective_fraction_only_for_multi_step_known() {
+        assert_eq!(objective_fraction(&act("x", 3, 10)), Some(0.3));
+        assert_eq!(objective_fraction(&act("x", 30, 10)), Some(1.0), "done clamps at goal");
+        assert_eq!(objective_fraction(&act("x", 0, 1)), None, "single-step has no gauge");
+    }
+
+    /// `description_override` is the server's own wording for the objective; when it is set the
+    /// client's auto-generated target text is not what the player sees.
+    #[test]
+    fn description_override_wins_over_target() {
+        let a = TaskActivity {
+            activity_id: 0,
+            progress: ActivityProgress::Known {
+                activity_type: 4, target: "Guard Hollings".into(),
+                description: "Report to the guard at the gate".into(),
+                done_count: 0, goal_count: 1, optional: false,
+            },
+        };
+        assert_eq!(objective_label(&a), "Report to the guard at the gate");
     }
 
     #[test]
