@@ -1023,11 +1023,19 @@ instruction was understood") for an instruction that was thrown away.
 > **Two routes do not have even the typo protection.** `GET /v1/observe/frame` and
 > `GET /v1/observe/packets` are the 2 of this crate's 35 request structs with **no**
 > `deny_unknown_fields`, so on those two an **unrecognized query key is still silently ignored** —
-> `GET /v1/observe/packets?sicne=1` answers `200` with the typo dropped. This is the same
-> agent-honesty failure one step earlier, it is **not** fixed by this section, and it is tracked as
-> **#971**. The `/frame` behaviour is also stated in
-> [Camera override for `/frame`](#camera-override-for-observeframe-422) above. A source-scanned
-> test asserts exactly these two are the exceptions, so this paragraph cannot quietly go stale.
+> both driven:
+>
+> * `GET /v1/observe/packets?sicne=1` → `200`, the typo dropped and the unfiltered list returned.
+> * `GET /v1/observe/frame?allow_pending=1&prset=top_down&pitch=10` → `200` with a PNG, and the
+>   capture is taken with an override built from the surviving `pitch` **alone** — the caller asked
+>   for a top-down preset, the key carrying that request was discarded, and the image comes back at
+>   an angle nobody asked for, with a `200`.
+>
+> This is the same agent-honesty failure one step earlier, it is **not** fixed by this section, and it
+> is tracked as **#971**. See also
+> [Camera override for `/frame`](#camera-override-for-observeframe-422) above. Both bullets are
+> asserted by a test that drives the two routes, and a source-scanned test asserts exactly these two
+> are the exceptions — so neither this paragraph nor the count above can quietly go stale.
 
 **The rule.** Where two forms name *the same thing* in different notations (`{map_x,map_y}` and
 `{x,y,z}` for one point), precedence applies and the loser is **reported** in `ignored_fields`.

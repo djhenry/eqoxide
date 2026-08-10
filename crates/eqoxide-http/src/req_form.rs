@@ -285,11 +285,13 @@ mod tests {
     /// **This exists because the first version of this module opened with "every request struct in
     /// this crate carries `deny_unknown_fields`", and that was false.** Measured over this same
     /// corpus: 33 of 35 carry it; these two do not. Both are `/v1/observe` QUERY structs, and on
-    /// both an unrecognized key is still silently dropped — `GET /v1/observe/packets?sicne=1`
-    /// answers `200` with the typo discarded (driven through `v1_router`; the `/frame` equivalent
-    /// could not be driven headless because the renderer-readiness gate answers 503 first, so no
-    /// end-to-end claim is made about it here — the source position is that `FrameQuery` has no
-    /// `deny_unknown_fields` and `parse_frame_query` rejects only DUPLICATED recognized keys).
+    /// both an unrecognized key is still silently dropped. Both halves are DRIVEN, in
+    /// `an_unrecognized_query_key_is_silently_dropped_on_both_exempt_routes`:
+    /// `GET /v1/observe/packets?sicne=1` answers `200` with the typo discarded, and
+    /// `GET /v1/observe/frame?allow_pending=1&prset=top_down&pitch=10` answers `200` with a PNG and
+    /// a camera override built from the surviving `pitch` alone — the caller asked for a top-down
+    /// preset, the key carrying that request was dropped, and the capture happened at an angle
+    /// nobody asked for.
     ///
     /// That is the #952/#956 failure shape — a confident answer for an instruction thrown away —
     /// on the unreached-field side rather than the reached-but-ignored side. It is NOT fixed here:
@@ -299,9 +301,19 @@ mod tests {
     /// hand-rolled parse `/frame` already has, and choosing an error code for unknown keys — #701's
     /// own design surface, not this PR's. Tracked as #971.
     ///
-    /// The list is asserted exactly, so neither direction can rot silently: adding the attribute to
-    /// one of these, or introducing a new struct without it, turns the corpus guard RED and forces
-    /// the prose to be updated with it.
+    /// The list is asserted exactly and in order, so both of the directions the prose can rot in are
+    /// covered: adding the attribute to one of these, or introducing a new struct without it, turns
+    /// the corpus guard RED and forces the prose to move with it.
+    ///
+    /// **What that does NOT cover, stated because a guard's limit is part of its claim.** The scan
+    /// reads what is WRITTEN, not what serde APPLIES. It requires the words to sit on an attribute
+    /// line and refuses a `cfg_attr` outright (both narrowings came from review, where
+    /// `#[cfg_attr(any(), serde(deny_unknown_fields))]` was measured to read as protected while
+    /// being inert), but no source-text scan can be sure the attribute it reads is the one the
+    /// compiler applied. The behavioural version of this claim is
+    /// `an_unrecognized_query_key_is_silently_dropped_on_both_exempt_routes`, which drives the two
+    /// exempt routes and does not read source at all; between them the text scan says *which*
+    /// structs and the driver says *what actually happens* to the two that matter.
     const DENY_UNKNOWN_EXEMPT: &[(&str, &str)] = &[
         ("observe.rs", "PacketsQuery"),
         ("observe.rs", "FrameQuery"),
@@ -537,7 +549,7 @@ mod tests {
             if status.is_client_error() {
                 located.extend(named.iter().copied());
                 if let Some(what) = case.what {
-                    if body.contains(&format!("conflicting {what}")) {
+                    if body.starts_with(&format!("conflicting {what}")) {
                         subjects.push(what);
                     } else {
                         failures.push(format!(
@@ -601,6 +613,114 @@ mod tests {
         );
     }
 
+    /// **The two `DENY_UNKNOWN_EXEMPT` structs really do drop an unrecognized key and answer 2xx.**
+    /// EXECUTED, both of them — the doc on `DENY_UNKNOWN_EXEMPT` states this as measured fact, and a
+    /// stated measurement with nothing in the tree performing it is the defect class this PR is about.
+    ///
+    /// The `/frame` half needs the render thread's part played, exactly as
+    /// `observe.rs`'s `frame_duplicate_unrecognized_key_is_still_silently_ignored` does: `get_frame`
+    /// parses the query, then parks on the frame-request hand-off. A driver that never answers the
+    /// hand-off reads back the CAPTURE TIMEOUT (`503 renderer not ready`), which is downstream of the
+    /// query parse and says nothing about it — this test exists partly because an earlier round of
+    /// this PR mistook that 503 for a gate that runs BEFORE the query and wrote the mistake down.
+    /// The `tokio::select!` against the handle is not decoration: an unbounded poll loop would HANG
+    /// rather than fail if a change made this input return early (#701/#710).
+    #[tokio::test]
+    async fn an_unrecognized_query_key_is_silently_dropped_on_both_exempt_routes() {
+        // ── /v1/observe/packets ─────────────────────────────────────────────────────────────────
+        let case = Case { file: "observe.rs", strukt: "PacketsQuery",
+                          route: "/v1/observe/packets?sicne=1", post_body: None,
+                          fields: &[], what: None };
+        let (status, body, _) = probe(&case).await;
+        assert_eq!(status, StatusCode::OK,
+            "a misspelled `since` must still be dropped and answered 200 — if this is now a 4xx the \
+             route grew the protection #971 asks for, and DENY_UNKNOWN_EXEMPT and both prose \
+             descriptions must lose their PacketsQuery row. Body: {body}");
+        assert!(body.contains("\"packets\":"),
+            "expected the ordinary packets payload, i.e. the typo dropped rather than turned into an \
+             error: {body}");
+        // Discriminator, so the 200 above means "unknown key dropped" and not merely "this route
+        // validates nothing". A RECOGNIZED key with an unparseable value IS rejected. Deliberately
+        // not an assertion about WHICH packets came back: `eqoxide_telemetry`'s buffer is a
+        // process-global that sibling tests write to, so any claim about the contents is a
+        // cross-test coupling rather than a fact about this request.
+        let malformed = Case { route: "/v1/observe/packets?since=notanumber", ..case };
+        let (status, body, _) = probe(&malformed).await;
+        assert!(status.is_client_error(),
+            "a recognized key with a bad value must be refused — if this is 2xx, the 200 above is \
+             evidence of nothing. Got {status}: {body}");
+
+        // ── /v1/observe/frame ───────────────────────────────────────────────────────────────────
+        let state = crate::testkit::empty_state();
+        state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
+        crate::testkit::set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
+        let frame_req = state.camera.frame_req.clone();
+        let app = crate::v1_router().with_state(state);
+        let mut handle = tokio::spawn(async move {
+            let req = Request::get("/v1/observe/frame?allow_pending=1&prset=top_down&pitch=10")
+                .body(Body::empty()).unwrap();
+            app.oneshot(req).await.unwrap()
+        });
+        let req = tokio::select! {
+            req = async {
+                loop {
+                    if let Some(req) = frame_req.lock().unwrap().take() { return req; }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            } => req,
+            res = &mut handle => panic!(
+                "expected the typo'd key to be dropped and the request to reach the frame-request \
+                 hand-off, but the handler returned early with status {} — if that is a 4xx, \
+                 `FrameQuery` gained `deny_unknown_fields` (or an equivalent hand-rolled check) and \
+                 this module's prose about it is now wrong", res.expect("handler panicked").status()),
+        };
+        // The load-bearing assertion, and the one a mere `200` would not make: an override WAS
+        // built, from `pitch` alone. The caller asked for a top-down preset, the key carrying that
+        // request was discarded, and the capture proceeds at an angle nobody asked for.
+        let ov = req.camera_override.expect(
+            "expected an override built from the surviving `pitch=10`; None would mean the whole \
+             override was discarded, which is a different (and louder) behaviour than the one the \
+             DENY_UNKNOWN_EXEMPT doc describes");
+        assert_eq!((ov.azimuth, ov.radius), (0.0, 0.0),
+            "the dropped `prset=top_down` contributed nothing, so azimuth/radius stay at their \
+             defaults: {ov:?}");
+        assert!((ov.elevation - 10f32.to_radians()).abs() < 1e-6,
+            "elevation must come from `pitch=10` alone: {ov:?}");
+        req.tx.send(vec![0x89, b'P', b'N', b'G']).unwrap();
+        let resp = handle.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK,
+            "…and the caller is told 200, with no mention of the key that was thrown away");
+    }
+
+    /// **The blank-loser refusals in `docs/http-api.md`'s migration note, EXECUTED.**
+    ///
+    /// The note tells callers that `/trainer/open` and `/interact/dialogue` refuse a body whose
+    /// losing form is present but EMPTY, while `/social/friends` does not. `social.rs` owns the
+    /// exemption side; this owns the other two, because the presence rule differing by route is
+    /// exactly the kind of thing a later change "simplifies" to one predicate — and the `EXCLUSIVE`
+    /// probe would not notice, since it only ever sends two NON-blank forms.
+    #[tokio::test]
+    async fn a_blank_losing_form_still_refuses_on_the_routes_the_migration_note_names() {
+        for (case, subject) in [
+            (Case { file: "trainer.rs", strukt: "OpenBody", route: "/v1/trainer/open",
+                    post_body: Some(r#"{"name":"","trainer":"Beta"}"#),
+                    fields: &["name", "trainer"], what: Some("guildmaster selection") },
+             "guildmaster selection"),
+            (Case { file: "interact.rs", strukt: "DialogueBody", route: "/v1/interact/dialogue",
+                    post_body: Some(r#"{"index":0,"text":""}"#),
+                    fields: &["index", "text"], what: Some("dialogue choice") },
+             "dialogue choice"),
+        ] {
+            let (status, body, named) = probe(&case).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST,
+                "{}: a blank losing form is still a SUPPLIED form on this route — the migration note \
+                 says so. If this is now 2xx the note is wrong and callers were told the opposite. \
+                 Body: {body}", case.route);
+            assert_eq!(named, case.fields, "{}: the refusal must still name both: {body}", case.route);
+            assert!(body.contains(&format!("conflicting {subject}")), "{}: {body}", case.route);
+        }
+    }
+
     /// Every `.rs` file at or below `dir`, as paths relative to it — `"observe.rs"`,
     /// `"observe/frame.rs"`. Top-level files keep their bare name, so the `file` column of
     /// [`EXCLUSIVE`] and [`COMPOSABLE`] is unaffected by the walk becoming recursive.
@@ -627,7 +747,13 @@ mod tests {
     /// synthetic so the assertion has content regardless of the crate's current shape.
     #[test]
     fn rs_files_descends_into_subdirectories() {
-        let root = std::env::temp_dir().join(format!("eqoxide-req-form-walk-{}", std::process::id()));
+        // Keyed by more than the pid: pids are recycled, and a leftover tree from a crashed
+        // run under a recycled pid would silently JOIN this assertion (review R2-N4). The nanos
+        // make collision require the same pid at the same instant.
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before the epoch").as_nanos();
+        let root = std::env::temp_dir()
+            .join(format!("eqoxide-req-form-walk-{}-{stamp}", std::process::id()));
         let nested = root.join("subprobe").join("deeper");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(root.join("top.rs"), "").unwrap();
@@ -666,6 +792,19 @@ mod tests {
     /// structurally could not produce. `rs_files_descends_into_subdirectories` pins the recursion
     /// on a synthetic tree, because this crate happens to have no subdirectory today and a control
     /// that only passes for that reason proves nothing.
+    ///
+    /// MUTATION-CHECK on the `deny_unknown_fields` half, measured after review round 2 found this
+    /// guard was a naive `contains` over the window and could be walked past:
+    /// * `quests.rs`'s real attribute → `#[cfg_attr(any(), serde(deny_unknown_fields))]` (text
+    ///   present, attribute inert): **KILLED** — refused by name at `quests.rs:54` with the
+    ///   cfg-can't-be-evaluated message. It **SURVIVED** before the narrowing.
+    /// * The same attribute replaced by a doc comment *mentioning* the words: **KILLED** —
+    ///   `Scanned: [… ("quests.rs", "TaskIdBody")]`, i.e. correctly reported as unprotected.
+    /// * Control for that second one, so the narrowing is shown to be what kills it rather than
+    ///   something else: with the doc-comment mutant still in place, WRAP the attribute-line test
+    ///   off (`if false { lt.starts_with("#[") } else { true }`) and this test goes back to
+    ///   **GREEN** — a struct silently stripped of its protection, with every prose claim about
+    ///   "2 of 35" still passing. That is the evasion, reproduced and then closed.
     #[test]
     fn every_deserialize_request_struct_is_classified() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
@@ -696,10 +835,30 @@ mod tests {
                 }
                 // Walk from the derive to the `struct` line, noting whether the attribute block
                 // between them carries `deny_unknown_fields` — see `DENY_UNKNOWN_EXEMPT`.
+                //
+                // This is a source-TEXT test, and this repo has been fooled by source-text tests
+                // eight times (#799). Instance nine was found in review: a plain
+                // `l.contains("deny_unknown_fields")` credits the words wherever they appear, so
+                // `#[cfg_attr(any(), serde(deny_unknown_fields))]` — text present, attribute inert —
+                // read as protected while the struct genuinely lost its protection, and a doc
+                // comment merely MENTIONING the words did the same. Two narrowings, both cheap:
+                // the line must be an ATTRIBUTE (`#[…]`, so a comment cannot vote), and any
+                // `cfg_attr` in the window is refused outright rather than guessed at, because
+                // deciding whether a conditional attribute is active needs cfg evaluation this
+                // scanner does not do. What remains outside the guard is stated on
+                // `DENY_UNKNOWN_EXEMPT`: it reads what is WRITTEN, not what serde APPLIES.
                 let mut decl: Option<&str> = None;
                 let mut protected = false;
-                for l in lines[i + 1..].iter().take(8) {
-                    if l.contains("deny_unknown_fields") {
+                for (off, l) in lines[i + 1..].iter().take(8).enumerate() {
+                    let lt = l.trim_start();
+                    assert!(!lt.starts_with("#[cfg_attr") || !l.contains("deny_unknown_fields"),
+                        "{file}:{}: `deny_unknown_fields` appears inside a `cfg_attr`. This scanner \
+                         reads source text and cannot evaluate cfg predicates, so it would have to \
+                         GUESS whether the attribute is active — and guessing 'yes' is how \
+                         `#[cfg_attr(any(), serde(deny_unknown_fields))]` reads as protected while \
+                         being inert. Write the attribute unconditionally, or teach this scan the \
+                         cfg and add the reasoning here.", i + 2 + off);
+                    if lt.starts_with("#[") && l.contains("deny_unknown_fields") {
                         protected = true;
                     }
                     if let Some(rest) = l.split("struct ").nth(1) {
