@@ -37,204 +37,116 @@ pub struct Hit {
 
 /// The DETERMINISTIC runaway bound for a whole plan: a maximum number of node expansions (#394).
 ///
-/// # This REPLACES a wall-clock budget, and that is the whole point
+/// # A node cap, not a wall clock
 ///
-/// The coarse worker used to carry `WORKER_PLAN_BUDGET_MS = 5_000` — a five-second wall clock. A wall
-/// clock makes the planner's answer **a function of how fast the machine is**: on a loaded runner the
-/// 5 s expired before a big zone's frontier closed, so a genuinely-unreachable goal came back
-/// `Exhausted(Deadline)` ("I don't know") on a slow box and `Unreachable(SearchClosed)` ("no route") on
-/// a fast one. That is not a lie — `Exhausted` is honest — but it is **nondeterministic**, and it is
-/// why `main`'s CI was intermittently red (`an_unreachable_goal_reports_unreachable_not_a_partial_route`
-/// failing under load). #377's claim that the budget was "deleted" and the planner "deterministic" was
-/// simply false: the budget was raised 150 ms → 5 s and moved off the net thread, not removed.
+/// This replaced `WORKER_PLAN_BUDGET_MS = 5_000`. A wall clock makes the planner's answer a
+/// function of how fast the machine is: on a loaded runner the 5 s expired before a big zone's
+/// frontier closed, so a genuinely-unreachable goal came back `Exhausted(Deadline)` ("I don't
+/// know") on a slow box and `Unreachable(SearchClosed)` ("no route") on a fast one — which is why
+/// `main`'s CI was intermittently red on
+/// `an_unreachable_goal_reports_unreachable_not_a_partial_route`. A node cap has the identical
+/// runaway protection and is machine-independent. (#377's claim that the budget was "deleted" was
+/// false: it was raised 150 ms → 5 s and moved off the net thread, not removed.)
 ///
-/// A NODE cap has the identical runaway protection — it stops a pathological search from pinning a
-/// core — but it is **machine-independent**: the same query expands the same nodes and returns the
-/// same `PlanOutcome` on my box, on CI, and on the user's, whatever the load. Hitting it yields
-/// `Exhausted(NodeCap)`, an honest and *reproducible* "I stopped looking".
+/// It is the cap for the ENTIRE plan (`plan_path` makes up to 13 A* calls sharing one `PlanCtx`
+/// budget), so a plan is bounded by one budget, not one-per-call (#340).
 ///
-/// **Chosen by measurement** (`worst_case_reachable_component`, over the biggest baked zones in the
-/// test corpus). That corpus measures the worst legitimate whole-zone "no route" the cap must let
-/// through as `SearchClosed`. The cap was originally set from a figure of **everfrost, 1,121,438
-/// nodes**, which already EXCEEDED the previous `MAX_NODES = 1_000_000` — so main was at that point
-/// silently truncating everfrost's honest closes into false `Exhausted`, which is why the cap moved.
-///
-/// **CORRECTION, #849 — the "~7× headroom" this doc used to claim was never a fact about the shipped
-/// client, and the binding zone is not everfrost.** The figure above was measured with a `Collision`
-/// that had **no region data attached**. `build_zone_collision` (`src/app.rs`) is the client's ONE
-/// production construction of a zone's collision grid and it ALWAYS calls `set_region_data`, so a
-/// grid without one is a configuration the client never builds. With the region map attached — i.e.
-/// in the production configuration — `astar`'s water-descent, haul-out and surface-crossing edge
-/// families are live; on a mapless grid they are gated off entirely (that gating is a source fact,
-/// checked at the `self.region_map()` tests those families sit behind). How much that grows the
-/// flooded component is strongly **zone-dependent**, and both ends of the observed range are now
-/// measured: `highpass` 7,229 -> 7,394 (**+2.3%**), `butcher` 352,493 -> **13.0×** (the ratio is
-/// 13.0× against either of the two butcher figures below).
-///
-/// **The production-config figure for `butcher` is 4,583,785 — 57.3% of this cap, i.e. 1.75×
-/// headroom.** Measured full workload under the `dev` profile on a butcher-only corpus, 10 h 24 m,
-/// exit 0.
-///
-/// **Two measurements exist and they do not quite agree.** An independent earlier run, over the
-/// three-zone corpus, reported **4,583,748** for the same zone — **37 nodes (0.00081%)** apart. That
-/// difference is **NOT explained**, and it is tracked as its own issue rather than resolved here.
-/// **Both figures round to 57.3% and 1.75×**, so nothing this constant rests on depends on which is
-/// right — only the last two digits of one input do.
-///
-/// **What the earlier run WAS cannot be fully established, and that is a fact about its artefacts.**
-/// Its stderr was never captured, so it has no compile sentinel and **its profile is unknown** — it
-/// must not be described as `dev` or as `release`.
-///
-/// THREE mechanisms are excluded. The list is NOT complete, and the leading candidate is open:
-///
-/// * **profile** — the #849 determinism audit found no profile-sensitive mechanism in the search; and
-///   the earlier run's slowest search ran at 151.7 µs/node against this run's `dev`-confirmed 123.7,
-///   so it shows no release-like speed. (Per-node cost is NOT a profile signature here — the two
-///   `dev`-confirmed runs themselves differ by 1.87×, 66.0 against 123.7. What it excludes is a
-///   *faster* build, since `release` cannot be slower than `dev` on the same work.)
-/// * **corpus composition** — `let mut seed: u64 = 99;` is re-seeded INSIDE `for zone in &zones`, over
-///   five corners plus one random draw, so butcher draws the identical pairs whether it is one zone of
-///   three or the only zone. Excluded at source. Note what this fixes: **WHICH pairs, not HOW MANY.**
-/// * **the grid and the assets** — all three runs print `xy_cells@8u = 751120` for butcher. That is
-///   derived from the loaded geometry, so it is CONTENT evidence that they built the same grid from
-///   the same assets — strictly stronger than the file mtimes an earlier revision of this doc relied
-///   on, and mtime is the method that already misled once on this branch.
-///
-/// **OPEN, and the leading candidate: the earlier run executed FEWER SEARCHES.** Its own wall time
-/// says so, using only `dev`-confirmed anchors. Its total was 1,620.16 s, of which everfrost's and
-/// gfaydark's figure-setting searches alone are 124.34 s, leaving its butcher zone **≤ 1,495.82 s**:
-///
-/// | run | butcher zone, per pair at the nominal 720 | butcher `MAX_closed` |
-/// |---|---|---|
-/// | earlier run | **≤ 2.08 s** | 4,583,748 |
-/// | base, no region map (`dev`) | 4.92 s | 352,493 |
-/// | this run (`dev`) | 52.02 s | 4,583,785 |
-///
-/// It would have to have run at **less than half the per-pair cost of the no-region-map base** while
-/// reporting a **13× larger** maximum — and profile cannot rescue that, since it is the *slower* of the
-/// pair per node. So the nominal sample count is the thing its wall time will not support.
-///
-/// **Why the code-window argument does not close this.** The earlier run's stdout bounds its code to
-/// between `99c45b3` and `3eb8e3a`, and across that window the construct-and-search path is unchanged
-/// (`eqoxide-assets` untouched, `water_grid.rs` zero non-comment changes, `collision.rs`'s forty
-/// non-comment changed lines all inside this test's own body). But that is a diff over **committed**
-/// revisions, and the run came from a working tree whose state was never recorded. **An edit to the
-/// probe loop bound prints no distinguishing string**, so a reduced reach probe is invisible to every
-/// artefact that survives. The bound is sound for what it bounds; it does not bound this.
-///
-/// **The obvious objection, and the only answer anyone has:** a reduced sample should undershoot by
-/// far more than 0.00081%. The proposed answer is that `Key = (col, row, floor_bucket)` makes the
-/// maximum a broad PLATEAU rather than a sharp peak — many pairs flood nearly the same component — so
-/// 37 nodes is endpoint jitter between two different winning pairs. **That is reasoning from the key
-/// type, NOT a measurement.** It is recorded because *any* explanation of a gap this small needs a
-/// plateau of some kind, not because it has been shown.
-///
-/// **None of that makes 4,583,748 wrong.** This test reports a MAX over sampled pairs, and a max over
-/// any subset is a LOWER BOUND on the max over the whole — and 4,583,748 < 4,583,785, the right way
-/// round. A prior revision of this block withdrew it as "must not be quoted"; **that withdrawal was
-/// right that the run could not be reconciled and wrong to call the number unusable.** A later
-/// revision replaced it with a `dev`-vs-`release` story built by dividing the two runs' *total* wall
-/// times (37,453 / 1,620 = 23.1×); that story is refuted by the per-node figures above and must not
-/// be reinstated. A third revision listed the sample count as EXCLUDED; that was wrong too, and it is
-/// now the leading open candidate. Three mechanisms have been asserted here and three were refuted —
-/// state what is excluded, state what is open, and do not supply a fourth.
+/// # The measurements this constant rests on
 ///
 /// | measurement | status |
 /// |---|---|
-/// | everfrost 1,121,438, no region map — the figure that set this cap | MEASURED (pre-#849) |
+/// | everfrost 1,121,438, no region map — the figure that originally set this cap | MEASURED (pre-#849) |
 /// | butcher 352,493, no region map, full workload | MEASURED (#849 review, base) |
-/// | `highpass` 7,229 → 7,394 (**+2.3%**), full workload on BOTH sides, region map the only change | MEASURED (#849 review) |
-/// | butcher **4,583,785** WITH region map, `dev`-confirmed, butcher-only, full workload | MEASURED (#856) |
-/// | butcher **4,583,748** WITH region map, three-zone — profile NOT captured, wall time inconsistent with the other two runs; valid as a LOWER BOUND | MEASURED (#849 review) |
-/// | why those two differ by 37 nodes | **UNRESOLVED** — profile/composition/grid excluded; sample COUNT open |
+/// | `highpass` 7,229 → 7,394 (+2.3%), full workload both sides, region map the only change | MEASURED (#849 review) |
+/// | butcher **4,583,785** WITH region map, `dev`-confirmed, butcher-only, full workload, 10 h 24 m, exit 0 | MEASURED (#856) |
+/// | butcher 4,583,748 WITH region map, three-zone — profile NOT captured, wall time inconsistent with the other two runs; valid as a LOWER BOUND | MEASURED (#849 review) |
+/// | why those two differ by 37 nodes | **UNRESOLVED** — see below |
 ///
-/// The old "~7× headroom" claim is retired on measurement, not inference: it was taken on a
-/// `Collision` with **no region data attached**, and `build_zone_collision` (`src/app.rs`) is the
+/// The old "~7× headroom" claim is retired **on measurement, not inference**: it was taken on a
+/// `Collision` with no region data attached, and `build_zone_collision` (`src/app.rs`) is the
 /// client's ONE production construction of a zone's collision grid and ALWAYS calls
-/// `set_region_data`, so that number describes a configuration the client never builds.
+/// `set_region_data`. With the map attached, `astar`'s water-descent, haul-out and
+/// surface-crossing edge families are live; the growth is strongly zone-dependent and both ends of
+/// the observed range are in the table (+2.3% for `highpass`, 13.0× for `butcher`).
 ///
-/// Whether 8M should MOVE is a production-constant decision that #849 deliberately does not take —
-/// it is tracked as **#856**, which now carries the measured figure. Two things make the residual
-/// risk bounded rather than latent at a 1.75× margin: the failure
-/// mode below is honest-but-imprecise rather than wrong, and `worst_case_reachable_component` now
-/// asserts `worst < MAX_NODES` and prints the percentage, so a zone that eats the remaining margin
-/// makes that corpus say so instead of a human noticing.
+/// **The production-config figure for `butcher` is 4,583,785 — 57.3% of this cap, 1.75× headroom.**
 ///
-/// **Caveat, stated honestly:** butcher is the worst zone *in the corpus*, NOT the worst in RoF2 —
-/// larger and wetter outdoor zones exist and are unmeasured. The margin is now measured, and it is
-/// **1.75×** — a zone only 75% heavier than butcher exceeds the cap,
-/// so **a future zone joining this corpus is a live possibility, not a theoretical one, and the
-/// assert in `worst_case_reachable_component` is what turns it into a RED run instead of a silent
-/// imprecision.** The residual risk is still bounded, for two reasons that did not change: (1) a
-/// REACHABLE goal is found by goal-directed A* long before the cap (the admissible heuristic pulls the
-/// search toward the goal, so it does not explore the whole component), so a bigger zone does not make
-/// a reachable goal false-`Exhausted`; (2) the only failure is an UNREACHABLE goal in a >8M-node
-/// component reporting `Exhausted(NodeCap)` ("I don't know") instead of `Unreachable(SearchClosed)`
-/// ("no") — which is still HONEST, just less precise. So 8M is a precision floor, not a safety floor.
-/// That is also why a thin margin is reportable rather than blocking: exceeding the cap costs
-/// precision, not correctness, and the assert makes the crossing loud when it happens.
+/// ## The unresolved 37 nodes (0.00081%)
 ///
-/// It is the cap for the ENTIRE plan (`plan_path` makes up to 13 A* calls sharing one `PlanCtx`
-/// budget), so the plan is bounded by one budget, not one-per-call (#340).
+/// Three mechanisms are EXCLUDED, and the list is not complete:
 ///
-/// **THE DECISION (#856): stays at 8,000,000 — Option 1, not Option 2.** #856 existed to decide
-/// whether this constant should move now that the production-config margin over `butcher` is
-/// measured at 1.75×, not the ~7× a mapless corpus used to claim. It stays put, for three reasons:
+/// * **profile** — the #849 determinism audit found no profile-sensitive mechanism in the search,
+///   and the earlier run's slowest search ran at 151.7 µs/node against this run's `dev`-confirmed
+///   123.7, so it shows no release-like speed. (Per-node cost is not itself a profile signature:
+///   the two `dev`-confirmed runs differ by 1.87×, 66.0 vs 123.7. It excludes only a *faster*
+///   build.)
+/// * **corpus composition** — `let mut seed: u64 = 99;` is re-seeded INSIDE `for zone in &zones`,
+///   so butcher draws identical pairs whether it is one zone of three or the only zone. Excluded
+///   at source. This fixes WHICH pairs, not HOW MANY.
+/// * **the grid and the assets** — all three runs print `xy_cells@8u = 751120` for butcher, which
+///   is derived from the loaded geometry: content evidence that they built the same grid from the
+///   same assets, stronger than the file mtimes an earlier revision relied on.
 ///
-/// 1. **The failure mode does not call for a pre-emptive raise.** Exceeding the cap costs precision
-///    (`Exhausted(NodeCap)`, "I don't know"), never correctness (never a false
-///    `Unreachable(SearchClosed)`, "no route") — see the two numbered reasons above. There is no
-///    open honesty bug here that raising the number would fix.
-/// 2. **Raising it has a cost nobody has measured.** `MAX_NODES` is also the runaway bound this
-///    whole doc opens with — the full 120-start × 6-probe workload on a `ZONES=butcher` corpus
-///    already runs **10h24m** at the CURRENT cap in a `dev` build. Moving the cap moves that bound
-///    too, and by how much wall time is unmeasured. Spending an unmeasured cost to buy margin
-///    against a risk whose size is *also* unmeasured (next point) is not a considered change — it is
-///    a guess with the shape of a decision.
-/// 3. **1.75× is a fact about `butcher`, not about RoF2.** #856 asked for two things: measure the
-///    production-config figure (done, #859), and widen the corpus with the wet Kunark/Velious ocean
-///    and lake zones most likely to stress the water edge families this cap gates (**not done** —
-///    no such zone is baked and measured as of this writing; tracked as **#888**). Picking a raised
-///    target before that second half lands would be sizing the cap to satisfy a margin nobody has
-///    measured the need for.
+/// **OPEN, and the leading candidate: the earlier run executed FEWER SEARCHES.** Its total was
+/// 1,620.16 s, of which everfrost's and gfaydark's figure-setting searches alone are 124.34 s,
+/// leaving its butcher zone ≤ 1,495.82 s — ≤ 2.08 s per pair at the nominal 720, against 4.92 s
+/// for the no-region-map base and 52.02 s for this run. It would have to run at less than half the
+/// per-pair cost of the mapless base while reporting a 13× larger maximum, and profile cannot
+/// rescue that. A commit-range argument does not close it either: the run came from a working tree
+/// whose state was never recorded, and an edit to the probe loop bound prints no distinguishing
+/// string.
 ///
-/// So margin erosion stays a **watched** risk rather than an acted-on one — and it is worth being
-/// exact about what watches it, because **the "~7×" claim this issue replaced was never a drift
-/// between two numbers.** 8,000,000 / 1,121,438 = 7.13: that claim was arithmetically consistent
-/// with its own constant for its entire life, and false about the WORLD (measured on a grid with no
-/// region data). No test comparing two constants in this file could have caught it. Demonstrated by
-/// execution in #880's review, which rebuilt the pin below around 1,121,438 with `14.0`/`7.13`
-/// literals and got a GREEN run. Two mechanisms watch this constant, and they watch different
-/// things:
+/// The obvious objection is that a reduced sample should undershoot by far more than 0.00081%. The
+/// proposed answer — `Key = (col, row, floor_bucket)` makes the maximum a broad PLATEAU, so 37
+/// nodes is endpoint jitter between two winning pairs — is **reasoning from the key type, not a
+/// measurement**, and is recorded only because any explanation of a gap this small needs a plateau
+/// of some kind.
 ///
-/// * **`max_nodes_headroom_claim_stays_true`** — fast, on every `cargo test`, no assets. It checks
-///   `MEASURED_WORST_BUTCHER_PRODUCTION` against this constant using the two-decimal figures
-///   hand-transcribed into its own body, not the prose above: editing `57.3%`/`1.75×` there without
-///   also editing those transcribed literals leaves it green. It pins this constant at 8,000,000 so
-///   THE DECISION recorded here is a check rather than only a sentence. It guarantees **nothing**
-///   about whether the measured figure still describes the client: change what `astar` admits
-///   (`can_traverse`, `ground_continuous`, the ray-hit acceptance window, water-edge admission),
-///   rebake butcher, or edit the corpus, and it stays green while the figures above go false.
-/// * **`worst_case_reachable_component`** — the `#[ignore]`d ~10h corpus run, the only thing that
-///   can re-derive the number. It asserts `worst < MAX_NODES` (a truncation detector), and since
-///   #880 it also asserts its freshly measured `butcher` close against
-///   `MEASURED_WORST_BUTCHER_PRODUCTION` instead of only printing it. **That is the only comparison
-///   between this constant and the world, and it exists only when someone performs the run** —
-///   nothing in CI or a normal `cargo test` does. Between such runs the figures above rest on a
-///   measurement, not on a guard.
+/// **None of that makes 4,583,748 wrong.** The test reports a MAX over sampled pairs, and a max
+/// over any subset is a LOWER BOUND on the max over the whole: 4,583,748 < 4,583,785, the right
+/// way round. Three mechanism stories have been asserted here and three were refuted — state what
+/// is excluded, state what is open, and do not supply a fourth.
 ///
-/// If the corpus-widening half of #856 lands a wetter zone with a materially thinner margin, THAT
-/// measurement is what should reopen this decision — butcher's own number is settled. That campaign
-/// is tracked as **#888**, so it is not only a sentence inside the constant it would revise.
+/// # THE DECISION (#856): stays at 8,000,000
+///
+/// 1. **The failure mode does not call for a pre-emptive raise.** Exceeding the cap costs
+///    precision (`Exhausted(NodeCap)`, "I don't know"), never correctness (never a false
+///    `Unreachable(SearchClosed)`). A REACHABLE goal is found by goal-directed A* long before the
+///    cap, so a bigger zone cannot make a reachable goal false-`Exhausted`. 8M is a precision
+///    floor, not a safety floor.
+/// 2. **Raising it has an unmeasured cost.** `MAX_NODES` is also the runaway bound: the full
+///    120-start × 6-probe workload on a `ZONES=butcher` corpus already runs 10 h 24 m at the
+///    current cap in a `dev` build.
+/// 3. **1.75× is a fact about `butcher`, not about RoF2.** #856's second half — widen the corpus
+///    with the wet Kunark/Velious ocean and lake zones that stress the water edge families this
+///    cap gates — is NOT done; no such zone is baked and measured. Tracked as **#888**, which is
+///    what should reopen this decision.
+///
+/// So margin erosion is a WATCHED risk. Two mechanisms watch it, and they watch different things:
+///
+/// * **`max_nodes_headroom_claim_stays_true`** — fast, every `cargo test`, no assets. It checks
+///   `MEASURED_WORST_BUTCHER_PRODUCTION` against this constant using two-decimal figures
+///   hand-transcribed into its own body, not the prose above: editing `57.3%`/`1.75×` here without
+///   editing those literals leaves it green. It guarantees **nothing** about whether the measured
+///   figure still describes the client — change what `astar` admits, rebake butcher, or edit the
+///   corpus and it stays green while the figures above go false.
+/// * **`worst_case_reachable_component`** — the `#[ignore]`d ~10 h corpus run, the only thing that
+///   can re-derive the number. It asserts `worst < MAX_NODES` and, since #880, its freshly measured
+///   `butcher` close against `MEASURED_WORST_BUTCHER_PRODUCTION`. **That is the only comparison
+///   between this constant and the world, and it exists only when someone performs the run.**
+///
+/// Neither could have caught the "~7×" claim: 8,000,000 / 1,121,438 = 7.13 was arithmetically
+/// consistent with its own constant for its entire life and false about the WORLD. Demonstrated by
+/// execution in #880's review, which rebuilt the pin around 1,121,438 with `14.0`/`7.13` literals
+/// and got a GREEN run.
 pub const MAX_NODES: usize = 8_000_000;
 
 /// Deterministic node cap for the FINE local tier (#394).
 ///
 /// The fine search is bounded SPATIALLY — a 40 u window at 2 u cells, ~1257 XY cells × a few z-tiers —
 /// so its frontier genuinely closes at ~800–3700 nodes in practice (measured). This cap is therefore a
-/// pure runaway backstop that a real fine plan never hits; it exists so a pathological zone cannot spin
-/// the search unboundedly, and — like the coarse cap — it is a node count, not a clock, so the outcome
-/// is the same on every machine.
+/// pure runaway backstop that a real fine plan never hits. Node count rather than clock for the
+/// reason [`MAX_NODES`] gives.
 ///
 /// **Why #382 moves this tier off the net thread even though it is already deterministic:** the fine
 /// search's cost is dominated by PER-NODE collision work (`column_floors` + capsule sweeps), NOT by node
@@ -277,13 +189,9 @@ pub struct PlanCtx {
     /// ring), and `search_tiered` makes up to 2 clearance passes inside each — this is the budget for
     /// ALL of them together, not one each.
     ///
-    /// **This is a NODE COUNT, not a wall clock, and it deliberately CANNOT be a wall clock (#394).**
-    /// A wall-clock deadline made the planner's answer depend on machine speed: a genuinely-unreachable
-    /// goal in a big zone came back `Unreachable(SearchClosed)` on a fast box and `Exhausted(Deadline)`
-    /// on a slow/loaded one — the same question, two answers, which is what made CI intermittently red.
-    /// A node cap is reproducible: the same query expands the same nodes and returns the same
-    /// `PlanOutcome` on every machine. There is no `Option<Instant>` field here, and there is no method
-    /// that builds one, so a clock-dependent search is not merely discouraged — it is unrepresentable.
+    /// A node count, not a wall clock, for the reason [`MAX_NODES`] gives — and deliberately
+    /// UNREPRESENTABLE as one: there is no `Option<Instant>` field here and no method that builds
+    /// one, so a clock-dependent search is not merely discouraged (#394).
     ///
     /// `None` = the global `MAX_NODES` backstop. A caller may set a TIGHTER cap (the tiers do — see
     /// [`NET_TIER_NODE_CAP`]). Whichever bites, the outcome is `Exhausted(NodeCap)` — an honest
@@ -291,14 +199,11 @@ pub struct PlanCtx {
     pub node_cap: Option<usize>,
     /// The plan-wide RUNNING TOTAL of node expansions, shared by every A* call in the plan (#394 review).
     ///
-    /// This is what makes `node_cap` a WHOLE-PLAN bound rather than a per-call one. On `main` the
-    /// wall-clock version got plan-wide bounding for free: `deadline` was a single absolute `Instant`,
-    /// so all 13 calls checked the *same* moment. A node count has no absolute reference — expansions
-    /// accumulate — so the running total must be shared explicitly. Every `astar` increments this
-    /// counter and stops the plan when it passes `node_cap`; a plan that fans out to 13 calls therefore
-    /// still costs at most `node_cap` expansions total, not `node_cap × 13`. The first plan owner
+    /// This is what makes `node_cap` a WHOLE-PLAN bound rather than a per-call one. The wall-clock
+    /// version got that for free — one absolute `Instant`, checked by all 13 calls — but expansions
+    /// accumulate, so the running total must be shared explicitly. The first plan owner
     /// (`plan_path`, or a standalone `find_path_ex`/`find_path_res`) materialises it via
-    /// [`PlanCtx::ensure_budget`]; every call it spawns clones the same `Arc` and so shares the count.
+    /// [`PlanCtx::ensure_budget`]; every call it spawns clones the same `Arc`.
     ///
     /// `None` only in a `PlanCtx` that has not yet entered a plan (e.g. `PlanCtx::worker()` before it
     /// reaches `find_path_ex`); the plan owner fills it in before the first search runs.
@@ -384,12 +289,9 @@ impl PlanCtx {
 /// Why a search stopped WITHOUT closing its frontier: it hit its node cap. Means "I don't know",
 /// never "no".
 ///
-/// **This used to have a second variant, `Deadline` (a wall-clock timeout), and it was deleted on
-/// purpose (#394).** A wall-clock limit made the planner's answer machine-speed-dependent — the same
-/// unreachable goal reported `Unreachable` on a fast box and `Exhausted(Deadline)` on a slow one. There
-/// is now only ONE way a search can be cut short, it is a deterministic node count, and a wall clock
-/// cannot be reintroduced because `PlanCtx` can no longer hold one. Keeping the enum (rather than
-/// folding it away) leaves `PlanOutcome::Exhausted` a clean place to name future *deterministic* limits.
+/// A second variant, `Deadline` (a wall-clock timeout), was deleted on purpose (#394 — see
+/// [`MAX_NODES`]). The one-variant enum is kept rather than folded away so `PlanOutcome::Exhausted`
+/// has a clean place to name future *deterministic* limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanLimit {
     /// The node cap (`PlanCtx::node_cap`, or the global `MAX_NODES`) was hit.
@@ -805,30 +707,14 @@ pub const NAV_AGENT_HEIGHT: f32 = crate::traversability::PLAYER_BODY.agent_heigh
 /// `if false` at `6` returns the whole suite to GREEN, so it is the case doing the catching and
 /// not a pre-existing assertion.
 ///
-/// **This paragraph used to say the opposite, and the history is worth being exact about.** Before
-/// #866 round 2 added that case, dropping to `6` left `-p eqoxide-nav --lib` and `-p eqoxide --lib`
-/// both GREEN, and the only test that went RED was the corpus one — which is `#[ignore]`d and needs
-/// `EQOXIDE_ZONE_ASSETS`, so a default `cargo test` never runs it. That unguarded window was real,
-/// but it existed **on #866's branch between review rounds, not on `main`**: this constant and its
-/// pin landed in the same squash commit (`acd0743`), so no commit on `main` has ever carried the
-/// constant without the pin. Checked against the log rather than assumed — `git log -S` for the
-/// constant and for the pin both return exactly `acd0743` (#876 review round 2). Read the RED above
-/// as "guarded from the moment it shipped", and read this paragraph as the reason the guard exists
-/// at all.
-///
-/// One limit on that RED, so it is not over-read: the pin's own cliff sits between `6` and `12`,
-/// not at this doc's corpus cliff of `7` — see the next paragraph. And note the catch is
-/// **local to this crate**: `-p eqoxide --lib` is still GREEN at `6` (re-measured after the pin
-/// landed, #876 review), so the root crate's suite does not guard this constant and never did.
-///
-/// **A narrower, CI-runnable pin does exist now** (`#866` round-2 review, PR comment 5201986822
-/// §5): the last case in
-/// `tests::a_floor_z_the_module_just_reported_always_has_a_floor_under_it` uses a smaller quad
-/// (`h = 10`) sampled over a tighter span than the REGIMES fixtures above, which raises the ULPs
-/// the constant must cover and goes RED between `6` and `12`. That is not this doc's cliff of `7`
-/// — it is a different, synthetic fixture, and it pins only that the shipped `32` is not
-/// order-of-magnitude wrong (~2.7× margin over its own cliff), not that the blind band this
-/// constant bounds is closed. See the next paragraph for what "bounds" means here.
+/// LIMITS on that RED, so it is not over-read. The pin is the last case in
+/// `tests::a_floor_z_the_module_just_reported_always_has_a_floor_under_it`, a synthetic quad
+/// (`h = 10`) sampled over a tighter span than the REGIMES fixtures above; **its own cliff sits
+/// between `6` and `12`, not at this doc's corpus cliff of `7`**, so it pins only that the shipped
+/// `32` is not order-of-magnitude wrong (~2.7× margin over its own cliff). And the catch is local
+/// to this crate: `-p eqoxide --lib` is still GREEN at `6`, so the root crate's suite does not
+/// guard this constant and never did (#876 review). No commit on `main` has carried the constant
+/// without the pin — `git log -S` for both returns exactly `acd0743`.
 ///
 /// **This constant bounds the blind band; it does not close it.** #866 round-2 review densely
 /// sampled 94 baked zones near the world origin (599,875 columns within ±24 u of `(0,0)`) and
@@ -861,12 +747,10 @@ pub fn axis_scale(p: [f32; 3]) -> f32 { p[0].abs().max(p[1].abs()).max(p[2].abs(
 /// touched: `CONTACT_TOL_ULPS` ULPs of `scale`, the largest coordinate involved in the test (ray
 /// origin AND triangle vertices — see the call sites).
 ///
-/// **Why any slack is needed, MEASURED — and it is not the mechanism round-1 review proposed.**
-/// The review's diagnosis was `f32` cancellation in `tvec = from − v0` scaling with the world
-/// coordinate, predicting that relocating an origin fixture to `tox`'s `(2081, 2320, −87)` would
-/// reproduce the residual. It does not: an axis-aligned synthetic quad at those coordinates
-/// measures a blind band of `0` even with this slack removed. The real driver is one step
-/// earlier, and it fires at the origin too.
+/// **Why any slack is needed, MEASURED — and it is not `f32` cancellation in `tvec = from − v0`
+/// scaling with the world coordinate**, which round-1 review proposed: an axis-aligned synthetic
+/// quad at `tox`'s `(2081, 2320, −87)` measures a blind band of `0` even with this slack removed.
+/// The real driver is one step earlier, and it fires at the origin too.
 ///
 /// A floor query does not return a coordinate from the mesh — it returns a *reconstructed* one,
 /// `gather_top + t·dir_z` (`column_hits`). That `f32` does not generally lie on the triangle's
@@ -1157,11 +1041,8 @@ impl Collision {
             clearance: Default::default(), water_grid: None }
     }
 
-    /// How many times the floor-normal filter's empty-column fallback has fired since zone load, i.e.
-    /// how many nav queries have been answered from INVERTED (mis-wound) art rather than from a
-    /// properly up-facing floor. `0` = the filter is doing its job everywhere it has been asked.
-    /// Non-zero = this zone has mis-wound ground and nav is running degraded there. Reported to the
-    /// agent as `nav_degraded` on `/v1/observe/debug` — a degraded mode must never be silent.
+    /// Routes that only existed at the MINIMUM clearance, surfaced as `nav_tight` — see the
+    /// `tight_plans` field doc.
     pub fn tight_plans(&self) -> u64 {
         self.tight_plans.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -1722,12 +1603,9 @@ impl Collision {
     /// standing capsule span `[feet, feet + height]`; feet+1 lies within that span, so a footprint
     /// accepted here is one the mover will fire on when the character stands on it — the two agree.
     ///
-    /// (History, #266: the mover formerly probed `zone_line_at` at the FEET only. A DRNTP volume
-    /// whose lower face floats just above the floor — the qeynos2 KoT waterfall — is above the feet,
-    /// so validation (feet+1, inside) and the mover (feet, below) DISAGREED: the disclosed footprint
-    /// validated but standing on it never crossed; only a jump did. The capsule-span mover probe
-    /// closed that gap. An earlier version of this comment wrongly claimed the two already mirrored
-    /// each other at "the character's STANDING height" — they did not.)
+    /// That agreement is load-bearing and was once absent (#266): while the mover probed the FEET
+    /// only, a DRNTP volume whose lower face floats just above the floor — the qeynos2 KoT waterfall
+    /// — validated here at feet+1 but never crossed when stood on; only a jump did.
     ///
     /// It scans the footprint's whole COLUMN for a walkable floor (not the tight 2u probe
     /// `zone_line_floor_point` uses — that helper serves a zone-line GOAL, and its ±2u window can
@@ -2119,16 +1997,14 @@ impl Collision {
     pub fn footprint_clear(&self, east: f32, north: f32, foot_z: f32, radius: f32, n: usize) -> bool {
         if self.cols == 0 { return true; }
         // ANY spoke hit within the ring means blocked — a wall AT the radius counts as embedded for
-        // the footprint. Acceptance is `nearest_hit_t`'s, i.e. `hit_accepted`; this comment used to
-        // name the deleted `(1e-3, 1.0]` window, which #855 replaced. The change this caller sees is
-        // that a wall flush with the ring CENTRE is now reported (it was inside the old band and read
-        // as clear); a body already that embedded is the depenetration net's own subject, so the
-        // direction is toward "recover", not away from it. Round-1 review measured this caller and
-        // `path_clear` on a sloped fixture at production probe heights and found no other answer
-        // changed; that was measured against round 1's `t >= 0`, and round 2 widens the lower bound
-        // by `contact_tol` — a few ULPs of the coordinate — so it is REASONED, not re-measured, that
-        // the same holds. `line_of_sight_does_not_see_through_a_wall_it_is_almost_touching` is the
-        // pin that would catch it going the wrong way.
+        // the footprint. Since #855 a wall flush with the ring CENTRE is reported too (it was inside
+        // the old `(1e-3, 1.0]` band and read as clear); a body already that embedded is the
+        // depenetration net's own subject, so the direction is toward "recover". Round-1 review
+        // measured this caller and `path_clear` on a sloped fixture at production probe heights and
+        // found no other answer changed — measured against `t >= 0`, so for round 2's extra
+        // `contact_tol` of slack it is REASONED, not re-measured, that the same holds.
+        // `line_of_sight_does_not_see_through_a_wall_it_is_almost_touching` is the pin that would
+        // catch it going the wrong way.
         self.ring_nearest_hit(east, north, foot_z + crate::traversability::PLAYER_BODY.ring, radius, n)
             .is_none()
     }
@@ -2232,21 +2108,7 @@ impl Collision {
     /// coverage — the cursor resync simply declines to advance and the walker keeps the cursor it
     /// had — whereas widening the window widens what a resync may adopt, which is the direction
     /// every #727 safety argument runs against. Correcting it is a live-behaviour change and wants
-    /// its own measurement, not a documentation round; filed as **gap 4 on #734**
-    /// (`issuecomment-5097268224`, 2026-07-27), with the measured band and the reason it is being
-    /// left alone.
-    ///
-    /// ⚠️ **Correction (#727 round 6 review, B-3).** Rounds 5 and earlier ended that sentence with
-    /// "see the tracking issue" while **#734 said nothing about ascent, uphill or asymmetry** — the
-    /// pointer was dangling in the direction that mattered, and a reader of the rustdoc was told a
-    /// gap was tracked that a reader of the issue could not find. The issue is now updated and named
-    /// by number here, so the pointer is checkable instead of atmospheric.
-    ///
-    /// ⚠️ **Correction (#727 round 5).** Every round of this doc up to round 4 ended the paragraph
-    /// above with "*the same envelope [`Self::walk_profile_ok`] applies to a planned edge*". That
-    /// was false uphill, and the false-negative class it hid was undisclosed. Nothing measured it;
-    /// it was asserted from the shape of the `allow` expression without reading the window the
-    /// expression is used to open.
+    /// its own measurement; filed as **gap 4 on #734** (`issuecomment-5097268224`, 2026-07-27).
     ///
     /// **Necessary, not sufficient — this is NOT a walkability oracle.** It samples a line, so a
     /// hole narrower than the spacing can fall between probes, and it says nothing about the
@@ -2274,29 +2136,15 @@ impl Collision {
     /// sub-segment whose mean-grade cap `1.2 + 2.0/run` is unbounded as `run → 0` — though there
     /// the ABSOLUTE fall stays inside `run * 1.2 + step_up`, i.e. one ordinary step down.
     /// `ground_continuous_the_grade_cap_is_a_function_of_the_hop_length_not_a_constant` pins the
-    /// short-hop end: a 1 u hop accepts a 3.1 u fall — mean grade **3.1**, 41% past the 2.2 this
-    /// doc used to state as *the* cap. Note which way all of this moves: the cap gets **worse** if
-    /// `PROBE_SPACING` is ever reduced, because the discrete `step_up` term is divided by it.
-    ///
-    /// ⚠️ **Correction (#727 round 5).** Rounds 3–4 wrote 2.2 as the predicate's cap without the
-    /// `run/n == PROBE_SPACING` qualifier that the code block itself carried, and the pinning test
-    /// chose the one hop length (24 u) that makes the qualifier vacuous. The 2.2 measurement stands
-    /// for that hop; the unqualified *claim* is withdrawn and replaced by the formula above. **The
-    /// same unqualified 2.2 was written into #734** and is retracted there too (round 6) — a
-    /// correction that lands only in the file and not in the issue the file points at is how a
-    /// retracted number comes back.
+    /// short-hop end: a 1 u hop accepts a 3.1 u fall — mean grade **3.1**. Note which way all of
+    /// this moves: the cap gets **worse** if `PROBE_SPACING` is ever reduced, because the discrete
+    /// `step_up` term is divided by it.
     ///
     /// That is deliberate to the extent that a long walkable ramp must not be refused for being long,
     /// and unbounded to the extent that nothing re-checks the aggregate. Disclosed as **gap 3 on
-    /// #734** — in that issue's comments, not its body, whose "what is still not established" list is
-    /// only the spacing and width gaps and predates this one; the caller's hop bound
+    /// #734** — in that issue's comments, not its body; the caller's hop bound
     /// ([`crate::steering::CURSOR_RESYNC_MAX_HOP`]) is currently the only thing limiting how much can
     /// compound.
-    ///
-    /// ⚠️ **Correction (#727 round 4).** Round 3 wrote this gap as "a mean grade of ~1.83". That was
-    /// the round-2 reviewer's measurement, adopted here in good faith, and the reviewer has since
-    /// retracted it: 1.83 understates the envelope by ~18% (it is the *ratio* to `MAX_WALK_GRADE`,
-    /// not the grade). The correct figure is 2.2, derived above and measured.
     ///
     /// Returns `true` when the zone has no geometry, matching [`Self::carrot_los_clear`]'s own
     /// documented no-geometry behaviour — a client with no world model must not silently answer
@@ -2612,25 +2460,18 @@ impl Collision {
     /// with a pierced footprint: `facing_blind_hits` **0** (old `||`) → **2** (this function), and
     /// pinned by `evaluating_both_disjuncts_moves_the_published_facing_blind_counter`.
     ///
-    /// **What that 2 is, and is not** (#885 review round 2, R2-B1 — an earlier draft of this
-    /// sentence called the counter "a count of queries", which measurement refutes). The counter
-    /// advances once per DOWN-FACING TRIANGLE that `column_hits` admits as standing ground, per
-    /// call — not once per query. The 2 is a property of this fixture's column, not a rate: the
-    /// probed column sits exactly on the shared diagonal of the inverted floor quad's two
-    /// triangles, so both are admitted. Measured on the same quad one unit north, off that
-    /// diagonal, the same single call publishes **1**; both numbers are asserted in that test. So
-    /// what this function changes is that the counter now advances on pierced-footprint frames it
-    /// previously skipped, by however many down-facing triangles that column's art happens to
-    /// carry — a published change, not an invisible one, and not a per-query rate.
+    /// **What that 2 is, and is not** (#885 review round 2, R2-B1). The counter advances once per
+    /// DOWN-FACING TRIANGLE that `column_hits` admits as standing ground, per call — **not once per
+    /// query**, which measurement refutes. The 2 is a property of this fixture's column: the probed
+    /// column sits exactly on the shared diagonal of the inverted floor quad's two triangles, so
+    /// both are admitted. Measured on the same quad one unit north, off that diagonal, the same
+    /// single call publishes **1**; both numbers are asserted in that test. So what this function
+    /// changes is that the counter advances on pierced-footprint frames it previously skipped, by
+    /// however many down-facing triangles that column's art carries — published, not invisible.
     ///
-    /// (What stays with **#960**: the field is published as `queries`, and this PR does not rename
-    /// it — a rename is a breaking wire change. That is the whole of what this parenthetical
-    /// claims. Two earlier drafts also described the state of the REST OF THE TREE — first "this
-    /// PR does not change that wording", then "the field name is all that is left" — and #885
-    /// review rounds 4 and 5 falsified both, the second with another accessor's rustdoc in this
-    /// very file. So this draft says nothing about how many places the refuted wording survives.
-    /// That is not checkable from inside a doc comment; three drafts is enough evidence that
-    /// guessing at it does not work, and what it wants is a guard, not a fourth sentence.)
+    /// (The field is still published as `queries` — a rename is a breaking wire change, left to
+    /// **#960**. How many other sites carry that refuted wording is not checkable from inside a doc
+    /// comment and wants a guard, not a sentence: three drafts have tried and been falsified.)
     pub fn body_placement(&self, p: [f32; 3]) -> crate::diagnostics::Placement {
         use crate::diagnostics::Placement;
         let pierced = !self.footprint_clear(
