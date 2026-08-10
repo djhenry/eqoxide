@@ -8531,7 +8531,9 @@ mod tests {
         //
         // LOCAL_BOUND is NOT imported here: unlike LOCAL_REACH/LOCAL_CELL, it has no promoted `pub`
         // home — `walker::Walker::drive_walk` still declares it as a private `const` local to that
-        // function (walker.rs:1507), the same way every other site that needs it (steering.rs's own
+        // function, verbatim `const LOCAL_BOUND: f32 = 40.0;` (#919: was a walker.rs line number,
+        // exact at the commit that wrote it and rotted by later insertions above the const), the
+        // same way every other site that needs it (steering.rs's own
         // `fixture_run` corpus, `tests/walker_sim.rs`) restates the literal with a comment pointing
         // back to walker.rs. So this is a private-copy-of-a-private-value, not the shape #819 is
         // about; there is nothing shared to import it from without a design decision this issue does
