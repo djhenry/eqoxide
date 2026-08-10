@@ -64,8 +64,16 @@ breakdown and why.
 |-------|------|-------------|
 | `POST /v1/move/goto` | `{"name":"Guard Phaeton"}` \| `{"x":,"y":,"z":}` \| `{"map_x":,"map_y":}` \| `{}` | Walk to an entity (fuzzy name, one-time snapshot) or coordinates and **stop** on arrival. Empty body → the player's current target. `map_*` are Brewall map coords (= negated server x/y); `z` is optional there (defaults, then the walker snaps to the actual floor) but **required** on the raw `{x,y,z}` form. A body with SOME coordinate field(s) but not a complete `{x,y,z}` or `{map_x,map_y}` — e.g. `{"x":,"y":}` with no `z` — 400s naming exactly which field(s) are missing (`partial target: got {x, y} but missing {z}`), never the "no target; provide a name or coords" message, which is reserved for a body with no coordinate field at all (#886). **Returns JSON**, including [`matched`](#matched--which-entity-a-name-actually-resolved-to) when the goal came from a name/target. |
 | `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected (400). **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to). |
-| `POST /v1/move/stop` | — | Cancel any active goto/follow. |
+| `POST /v1/move/stop` | — | Cancel any active goto/follow. **Not** subject to the `held` gate below — it is a cancel, its effect is on the nav slots and not on the physics step, so it stays honest and available while the body is frozen. |
 | `POST /v1/move/zone_cross` | `{"zone_id":N}` \| `{}` | Cross a zone line and send OP_ZoneChange (specific zone, or nearest line). |
+
+**All five of `goto`/`follow`/`zone_cross`/`manual`/`jump` answer `409 Conflict` with JSON
+`{"status":"held", "hold":{…}, "message":…}` while the character is physics-held in a way that
+freezes the controller's step (`player.hold.reason == "embedded_no_recovery"`) — nothing is queued
+and no `nav_goal_id` is stamped.** See [`hold`](#hold--the-character-is-physically-stuck-and-the-client-cannot-free-it-724).
+`goto` and `follow` additionally carry a `hold` key on their **200**: `null` for a healthy body, and
+the same object when a hold is in force that does *not* freeze the step (`underworld_no_recovery`) —
+so an accepted goal never hides the fact that the body is hanging out of the world (#884).
 
 ---
 
@@ -314,7 +322,7 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_node_cap` |
 | `blocked` | A route exists, but the walker **could not follow it** (wedged after 8 recovery attempts). Not a routing failure. | `walker_stalled`, `local_no_way_through`, `fall_would_be_lethal` |
 | `zone_loading` | **This client has no *usable* model of the zone the character is in yet** — its terrain/collision are still loading, their load failed, or the loaded grid still belongs to the zone the character just LEFT (the stale window, #600). No search was run and no route exists to report; the goal is kept and planned for real once the correct zone's assets land. Since #600 the walker refuses through the SAME `zone_assets::usability` predicate the HTTP world endpoints use, so the reason is that predicate's own verdict — read `zone_assets` (below) for the matching detail. | `zone_assets_pending`, `zone_assets_failed`, `zone_assets_idle`, `zone_assets_stale_for_previous_zone`, `player_zone_unknown` |
-| `dead` | **The character is slain** — navigation was abandoned because a corpse cannot move (#238, #644). Terminal and honest: an agent that issued a goto and then polled must be able to tell "you died and went nowhere" from the ambiguous `idle` (which also means "ready for work"). Clears back to `idle` with `nav_reason: "respawned"` on respawn. **A movement command issued *while* dead is not accepted at all** — `POST /v1/move/{goto,follow,zone_cross,manual,jump}` returns **`409 Conflict`** with a machine token `dead` (JSON `"status":"dead"` on `/goto` and `/follow`; the text body names `dead` on the others), so you never get a `200 … navigating` for a goal a corpse can never reach. Respawn (`POST /v1/lifecycle/respawn`) before reissuing. | `player_dead` |
+| `dead` | **The character is slain** — navigation was abandoned because a corpse cannot move (#238, #644). Terminal and honest: an agent that issued a goto and then polled must be able to tell "you died and went nowhere" from the ambiguous `idle` (which also means "ready for work"). Clears back to `idle` with `nav_reason: "respawned"` on respawn. **A movement command issued *while* dead is not accepted at all** — `POST /v1/move/{goto,follow,zone_cross,manual,jump}` returns **`409 Conflict`** with a machine token `dead` (JSON `"status":"dead"` on `/goto` and `/follow`; the text body names `dead` on the others), so you never get a `200 … navigating` for a goal a corpse can never reach. Respawn (`POST /v1/lifecycle/respawn`) before reissuing. **A physics-held character is refused the same way but under a different token** — `409` with `"status":"held"` when `player.hold.reason` is `embedded_no_recovery` (#884); see [`hold`](#hold--the-character-is-physically-stuck-and-the-client-cannot-free-it-724). The two are independent gates and `dead` is checked first, so a dead *and* held character reports `dead`. | `player_dead` |
 
 ### Why an in-progress `nav_state` can never stick (#725)
 
@@ -428,7 +436,9 @@ It exists because those two states were indistinguishable through this API. `pos
 both. `nav_state` is `idle` in both. `nav_state.stuck_ticks` is the *walker's* counter and only
 advances while a `/goto` is actively driving, so a character that was summoned into a rock and is
 standing there produced **no observable at all** — every movement command returned `200`, nothing
-moved, and every other field read normal.
+moved, and every other field read normal. (Those commands no longer answer `200` under an
+`embedded_no_recovery` hold — they return `409 "status":"held"`, described later in this section
+(#884) — but they did when this field was introduced, which is why it exists.)
 
 ```jsonc
 "hold": {
@@ -440,7 +450,7 @@ moved, and every other field read normal.
 
 | `reason` | What is true | Can the character move? |
 |----------|--------------|-------------------------|
-| `embedded_no_recovery` | The body **cannot be placed**: geometry pierces its footprint **or** there is no floor within 200 u below its feet. The push-out search found nowhere it can legally stand, there is no recovery position to fall back to (a position discontinuity — a GM summon, a large server correction — supersedes that history, #724), and the zone-wide last-resort search found nowhere either. | **No.** Physics is frozen; every movement command is accepted and produces no motion in any direction. |
+| `embedded_no_recovery` | The body **cannot be placed**: geometry pierces its footprint **or** there is no floor within 200 u below its feet. The push-out search found nowhere it can legally stand, there is no recovery position to fall back to (a position discontinuity — a GM summon, a large server correction — supersedes that history, #724), and the zone-wide last-resort search found nowhere either. | **No.** Physics is frozen: the controller's step returns before it reads driver input, so no wish of any shape moves the body. Since #884 the movement endpoints **refuse** (`409`, `"status":"held"`) rather than accept — before #884 they answered `200` and produced no motion. |
 | `underworld_no_recovery` | The body fell to the zone's **underworld floor** and the client is holding it there rather than let it drop out of the world (#150), with no recovery position to restore. It is hanging: not falling, not landing, not grounded. | Horizontally, yes — but there is probably nothing under it. |
 
 ⚠️ **`embedded_no_recovery` does not mean geometry is inside the body.** It is the client's
@@ -496,11 +506,38 @@ not build an agent behaviour on inferring it until there is a field for it.
 
 **A persistent hold still needs an outside push, and an ordinary character has no client-API way to
 produce one.** Every movement endpoint (`/v1/move/manual`, `/v1/move/jump`, `/v1/move/goto`,
-`/v1/move/zone_cross`) is gated on the physics step an `embedded_no_recovery` hold has frozen;
-thirteen such calls were measured live on #845 and moved the body zero units. What did work, each on
-the first frame, was a GM `#goto`, `#summon` or `#zone` — including one issued by the held character
-itself through `POST /v1/interact/say`, since the hold freezes physics and not the command channel.
-All three need GM status.
+`/v1/move/follow`, `/v1/move/zone_cross`) depends on the physics step an `embedded_no_recovery` hold
+has frozen; thirteen such calls were measured live on #845 and moved the body zero units. What did
+work, each on the first frame, was a GM `#goto`, `#summon` or `#zone` — including one issued by the
+held character itself through `POST /v1/interact/say`, since the hold freezes physics and not the
+command channel. All three need GM status.
+
+**Since #884 those five endpoints say so instead of answering `200`.** While
+`player.hold.reason == "embedded_no_recovery"` each of them returns **`409 Conflict`** with
+
+```jsonc
+{
+  "status":  "held",                    // machine token — match on this, not on the prose
+  "hold":    { "reason": "embedded_no_recovery", "held_secs": 41.7, "detail": "…" },
+  "message": "…"
+}
+```
+
+and **nothing is queued**: no goto/follow target is latched, no zone-cross request is enqueued, no
+manual-move wish is set, and `nav_goal_id` is not advanced — the refusal is decided before any of
+that, the same shape as the `dead` gate above. The embedded `hold` object is the same one
+`/v1/observe/debug` serves under `player.hold`, so a caller that only ever sees the `409` still gets
+the full reason, `held_secs` and `detail` without a second request.
+
+`POST /v1/move/stop` is deliberately **not** gated: it is a cancel, its effect is on the nav slots
+rather than on the physics step, and "the goal is cleared" is true of a frozen body.
+
+`underworld_no_recovery` is deliberately **not** refused, for the reason above — lateral wishes still
+reach the body there, and `/v1/move/manual` walking out is that state's only client-API exit, so
+refusing it would be the same lie in the opposite direction. Instead, `/v1/move/goto` and
+`/v1/move/follow` carry a `hold` key on their **200** body: `null` when there is no hold, and the
+same hold object when one is in force that does not freeze the step. An accepted goal therefore never
+hides the fact that the body is hanging under the world.
 
 **`held_secs` is controller frame time as of the last stepped frame, not wall clock since entry.**
 A frozen body's meaningful clock is the physics clock. If the render loop is not stepping, no frames

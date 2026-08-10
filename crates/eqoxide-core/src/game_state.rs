@@ -834,6 +834,28 @@ pub struct WorldState {
     pub zone_points: Vec<ZonePoint>,
 }
 
+/// Declares [`ControllerHoldReason`] and derives [`ControllerHoldReason::ALL`] from the SAME token
+/// list — the [`crate::game_state::ControllerHoldReason`] doc explains why it is not a hand-written
+/// array. Mirrors `eqoxide_ipc`'s `net_thread_end!` (#890 B3), which is where the measurement that
+/// motivates it was taken.
+macro_rules! controller_hold_reason {
+    (
+        $(#[$enum_meta:meta])*
+        pub enum $name:ident { $($(#[$variant_meta:meta])* $variant:ident),+ $(,)? }
+    ) => {
+        $(#[$enum_meta])*
+        pub enum $name { $($(#[$variant_meta])* $variant),+ }
+
+        impl $name {
+            /// Every variant, in declaration order — DERIVED from the enum, never maintained
+            /// beside it. #884's HTTP suites iterate this so a new hold reason cannot ship with
+            /// its movement-endpoint behaviour unasserted.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
+controller_hold_reason! {
 /// Why the render `CharacterController` is holding the body still — a predicament it cannot leave
 /// under its own power, and which no other published field reveals (#724 review, B1).
 ///
@@ -869,6 +891,15 @@ pub struct WorldState {
 /// This is deliberately NOT "am I stuck?" in general — a character walking into a wall is blocked
 /// and is not this. It is specifically "the controller has stopped the body and has no way to
 /// resume", which is the state an agent would otherwise read as a perfectly healthy stand-still.
+///
+/// # `ALL` is derived from this declaration, not maintained beside it
+///
+/// The [`controller_hold_reason!`] wrapper below emits the enum and [`ControllerHoldReason::ALL`]
+/// from one token stream. #890 measured why that matters: a hand-written `[NetThreadEnd; 5]` in a
+/// test module did not know about a sixth variant, so a variant wired to exactly the silent
+/// inheritance those tests exist to forbid shipped fully green. #884's `every_movement_endpoint_…`
+/// suites iterate `ALL`, and a hold reason they do not iterate is a hold reason whose HTTP
+/// behaviour is unasserted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerHoldReason {
     /// The body cannot be placed: the client's embedded test is a DISJUNCTION — geometry pierces
@@ -885,6 +916,37 @@ pub enum ControllerHoldReason {
     /// not landing. Lateral movement still works; the body is out of the world vertically.
     UnderworldNoRecovery,
 }
+}
+
+/// **What a [`ControllerHoldReason`] does to DRIVEN motion (#884).** Not "how bad is this hold" —
+/// the single question every movement endpoint has to answer before it may claim it accepted work:
+/// *can the driver input this request produces reach the body at all?*
+///
+/// It is a type rather than a `bool` on the hold, and rather than prose in a `detail` string, for
+/// the reason #890 recorded about `NetThreadEnd`: a consumer that wants the distinction from prose
+/// must either match on the text (which any reword silently breaks) or collapse it to `is_some()`
+/// (which loses it entirely, and answers "no motion" for a hold under which lateral motion works).
+/// The `match` in [`ControllerHoldReason::motion`] is exhaustive, so a third hold reason cannot be
+/// added without its author stating which of these it is.
+///
+/// **Both mappings are read off the controller's own control flow, not inferred from the reason's
+/// name.** See `src/movement.rs`: `step` calls `depenetrate` first and `return`s immediately if it
+/// handled the frame, while the #150 fall-through guard that raises `UnderworldNoRecovery` runs
+/// *after* collide-and-slide has already applied the frame's lateral wish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldMotion {
+    /// **No driver input reaches the body.** `depenetrate` returns `true` on every frame of this
+    /// hold and `step` returns before it reads `intent` at all, so a wish of any shape — lateral,
+    /// vertical, jump, from WASD or from any HTTP endpoint — produces no motion. Measured live on
+    /// #845/#884: thirteen client-API calls, position byte-identical throughout.
+    AllFrozen,
+    /// **A lateral wish still reaches the body.** The hold is raised at the end of a frame that ran
+    /// collide-and-slide, so `/v1/move/manual` can walk this body out from under the hold — which
+    /// is exactly why `last_resort_placement` was deliberately NOT extended to this arm. Says
+    /// nothing about vertical wishes or jumps: this variant is the warrant for *not refusing* a
+    /// movement request, never a promise that a particular one will work.
+    LateralStillReaches,
+}
 
 impl ControllerHoldReason {
     /// Stable machine token for the API. Never reword these — agents match on them.
@@ -892,6 +954,15 @@ impl ControllerHoldReason {
         match self {
             ControllerHoldReason::EmbeddedNoRecovery   => "embedded_no_recovery",
             ControllerHoldReason::UnderworldNoRecovery => "underworld_no_recovery",
+        }
+    }
+
+    /// What this hold does to driven motion (#884). See [`HeldMotion`] for where each answer comes
+    /// from; adding a variant to [`ControllerHoldReason`] is a compile error until this states it.
+    pub fn motion(self) -> HeldMotion {
+        match self {
+            ControllerHoldReason::EmbeddedNoRecovery   => HeldMotion::AllFrozen,
+            ControllerHoldReason::UnderworldNoRecovery => HeldMotion::LateralStillReaches,
         }
     }
 }
@@ -2140,8 +2211,8 @@ mod pose_tests_643 {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{ControllerHold, ControllerHoldReason, Door, GameState, MerchantItem, ZonePoint,
-                make_entity};
+    use super::{ControllerHold, ControllerHoldReason, Door, GameState, HeldMotion, MerchantItem,
+                ZonePoint, make_entity};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
     /// including the FULL-SNAPSHOT (`resync_from_snapshot`) path that carries the real mid-zone
@@ -3038,6 +3109,62 @@ pub(crate) mod tests {
             "a hold describes geometry the zone-in just dropped, and nothing recomputes it while \
              the new zone loads — a zone-in must clear it so the load window reads honestly \
              \"no hold\" instead of a confident wedge alarm about the zone we left");
+    }
+
+    /// #884 — `ALL` is DERIVED, so it cannot go stale, and every variant answers `motion()`.
+    ///
+    /// The derivation is what is under test here, not the two rows: `controller_hold_reason!` emits
+    /// the enum and `ALL` from one token stream, so a third variant appears in `ALL` on the next
+    /// build without anyone remembering to add it, and `motion()`'s exhaustive `match` refuses to
+    /// compile until its author says which [`HeldMotion`] it is. The `as_str` distinctness assert is
+    /// the anti-inheritance half: a new variant that silently copies an existing token would make
+    /// the machine-branchable name ambiguous, which is the same defect shape #890 measured.
+    ///
+    /// MUTATION-CHECK (both directions): drop a variant from the `ALL` list and the macro no longer
+    /// compiles (the list IS the declaration). Wrap the body of `motion` so that it is neutered and
+    /// always answers `HeldMotion::AllFrozen`, and the literal-valued anchor below —
+    /// `hold_motion_matches_the_controllers_control_flow_884` — goes RED on the underworld row.
+    #[test]
+    fn controller_hold_reason_all_is_derived_and_total_884() {
+        assert_eq!(ControllerHoldReason::ALL.len(), 2,
+            "update this count deliberately when a hold reason is added — and check that #884's \
+             HTTP suites still say the right thing about the new one: {:?}",
+            ControllerHoldReason::ALL);
+        let mut tokens: Vec<&str> = ControllerHoldReason::ALL.iter().map(|r| r.as_str()).collect();
+        let n = tokens.len();
+        tokens.sort_unstable();
+        tokens.dedup();
+        assert_eq!(tokens.len(), n,
+            "two hold reasons share an `as_str` token — agents branch on these, so they must be \
+             distinct: {tokens:?}");
+        // Every variant answers; `motion()` is exhaustive, so this cannot panic — it exists to
+        // prove the call is reachable for each of them from `ALL` alone.
+        for r in ControllerHoldReason::ALL {
+            let _: HeldMotion = r.motion();
+        }
+    }
+
+    /// #884 — each hold reason's [`HeldMotion`] must match what `src/movement.rs` actually does with
+    /// driver input on that arm. Read off the control flow, and re-checked at the source when this
+    /// test is touched:
+    ///
+    /// * `EmbeddedNoRecovery` is raised inside `depenetrate`, and `step`'s first statement after
+    ///   the hold-take is `if self.depenetrate(..) { … return self.pos; }` — the frame ends before
+    ///   `intent` is read. `AllFrozen`.
+    /// * `UnderworldNoRecovery` is raised by the #150 fall-through guard, which runs *after* the
+    ///   collide-and-slide block has already written the frame's lateral wish into `self.pos`.
+    ///   `LateralStillReaches`.
+    ///
+    /// This is the whole warrant for #884's HTTP gate refusing one and not the other, so it is
+    /// asserted rather than left in prose. Refusing `/v1/move/manual` on the underworld arm would
+    /// remove that body's ONLY client-API exit (`last_resort_placement`'s doc) and would itself be a
+    /// false "you cannot move" — the mirror-image honesty bug.
+    #[test]
+    fn hold_motion_matches_the_controllers_control_flow_884() {
+        assert_eq!(ControllerHoldReason::EmbeddedNoRecovery.motion(), HeldMotion::AllFrozen,
+            "`depenetrate` returning true makes `step` return before it reads `intent`");
+        assert_eq!(ControllerHoldReason::UnderworldNoRecovery.motion(), HeldMotion::LateralStillReaches,
+            "the #150 fall-through guard runs after collide-and-slide has applied the lateral wish");
     }
 
     /// #801 — the previous zone's afloat stall must NOT survive a zone-in either.
