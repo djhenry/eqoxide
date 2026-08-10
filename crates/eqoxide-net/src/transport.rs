@@ -428,19 +428,10 @@ fn is_transient(e: &std::io::Error) -> bool {
 /// kernel when `try_send`/`try_io` would not: both consult tokio's cached readiness bit first and
 /// short-circuit on an empty one without issuing the syscall.
 ///
-/// **It does NOT prove which mechanism refused the original `try_send`** (#641 review, finding 3).
-/// An earlier version of this comment claimed it was "the only way to tell tokio's synthetic
-/// `WouldBlock` from a real kernel `EAGAIN`", and that claim is withdrawn — it survived three
-/// rounds of review here, on the very function that implements the discrimination it overstates.
-/// A `try_send` that returns `WouldBlock` may have short-circuited on an empty readiness bit, OR
-/// issued the syscall and been refused by the kernel (which also clears the bit). If this call then
-/// succeeds microseconds later, both stories fit — a burst is exactly when the transmit buffer is
-/// full and draining hard. So a success here is an UPPER bound on the synthetic case, not a
-/// measurement of it. A FAILURE here is the hard evidence: this is a real syscall, so its `EAGAIN`
-/// is genuinely the kernel's answer. See `NetHealth::send_wouldblock_rescued`.
-///
-/// None of that changes what this function is FOR: recovering a datagram that would otherwise be
-/// dropped. The fix does not depend on knowing which mechanism refused it.
+/// **It does NOT prove which mechanism refused the original `try_send`** (#641 review, finding 3) —
+/// a success here is an UPPER bound on the synthetic case, not a measurement of it; only a FAILURE
+/// here is hard evidence, because this is a real syscall. The bounds argument in full is at
+/// `NetHealth::send_wouldblock_rescued`, and `EqStream::transmit` says what the rescue is for.
 ///
 /// The fd is borrowed, never owned: `ManuallyDrop` means the temporary `std::net::UdpSocket` is not
 /// closed when it drops, so tokio keeps sole ownership of the descriptor. The socket is non-blocking
@@ -569,10 +560,8 @@ impl EqStream {
         //     rate roughly 60-90/100 depending on machine and load (three independent measurements: two
         //     in the 84-90 range, one at 67, one clustered 63-68; worker-count sensitivity pushed it as
         //     low as 35/100 at 2 workers in one run) — i.e. in production this send was sometimes already
-        //     reaching the wire, not reliably, but not never either; the earlier claim that this line
-        //     "never" worked and the loop did "100%" of the work was itself an overstated universal,
-        //     corrected here. Don't treat any single number above as precise — the point is that it's a
-        //     RACE, not a constant, and no fixed percentage is true across machines.
+        //     reaching the wire, not reliably, but not never either. Don't treat any single number above
+        //     as precise: it is a RACE, not a constant, and no fixed percentage is true across machines.
         // Either way the outcome the code wants — the datagram genuinely on the wire — was never
         // guaranteed, only sometimes true by luck of scheduling. Awaiting `writable()` once removes the
         // luck: it forces a real readiness event to be observed before the send, converting the
@@ -909,8 +898,8 @@ impl EqStream {
     /// including the ones the kernel would happily have taken.
     ///
     /// So on `WouldBlock` we re-attempt the datagram once through `send(2)` on the same fd,
-    /// bypassing the readiness cache. That is the fix. **It is NOT a discriminator** — an earlier
-    /// version of this comment called it one and that claim is withdrawn (#641 review, finding 3):
+    /// bypassing the readiness cache. That is the fix. **It is NOT a discriminator** (#641 review,
+    /// finding 3):
     ///   - the raw send succeeds → the datagram is genuinely on the wire now, and it is counted in
     ///     `send_wouldblock_rescued` (not in `send_failures`, which means "never reached the wire"
     ///     and must not be inflated by a send that did). This does NOT establish that the original
@@ -1588,10 +1577,6 @@ impl EqStream {
     }
 }
 
-/// Build an EqStream wired to a dummy UDP peer for driving the receive path in a test. Its outbound
-/// ACKs go nowhere (try_send to a closed local port is a harmless no-op). `pub(crate)` (rather than
-/// nested in `mod tests`) so other modules' tests — e.g. `eq_net::gameplay`'s zone-handshake
-/// publish-cadence test (#324) — can drive a real `EqStream` without a live UDP session handshake.
 /// #612 (review F1): account for reliable datagrams abandoned when a session ends.
 ///
 /// `send_failures_unretried` excludes the reliable stream because `poll_resend` re-sends a failed
@@ -1694,10 +1679,8 @@ impl EqStream {
     /// reordered past it. It does NOT make an unreachable call detectable — see the guard's own
     /// doc for the residual `if false { … }` hole (#641 review N1-c).
     ///
-    /// NOTE this is a separate function from `abandon_outstanding` above, which `Drop` and
-    /// `perform_clean_shutdown` call directly and which must keep its own #612 rationale. An earlier
-    /// revision spliced this one INTO that doc comment, leaving `abandon_outstanding` undocumented
-    /// and this function claiming "Called from `Drop`", which is false of it (#641 review R5-a).
+    /// Deliberately a SEPARATE function from `abandon_outstanding` above, which `Drop` and
+    /// `perform_clean_shutdown` call directly: this one is never called from `Drop`.
     pub(crate) async fn abandon_and_park(&mut self) -> ! {
         self.abandon_outstanding();
         loop {
@@ -1706,6 +1689,10 @@ impl EqStream {
     }
 }
 
+/// Build an EqStream wired to a dummy UDP peer for driving the receive path in a test. Its outbound
+/// ACKs go nowhere (try_send to a closed local port is a harmless no-op). `pub(crate)` (rather than
+/// nested in `mod tests`) so other modules' tests — e.g. `eq_net::gameplay`'s zone-handshake
+/// publish-cadence test (#324) — can drive a real `EqStream` without a live UDP session handshake.
 #[cfg(test)]
 pub(crate) async fn test_stream(pass1: u8, key: u32) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>) {
     test_stream_with_health(pass1, key, Default::default()).await

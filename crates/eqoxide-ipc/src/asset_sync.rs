@@ -82,10 +82,9 @@
 //!
 //! `sync_set` and `AssetSync::login` are both **private to the app crate's `asset_sync` module**, so
 //! the wrappers are the only way to reach them **from anywhere else in the workspace** — an
-//! unobserved sync or login added at any other call site does not compile. The limit, stated because
-//! the stronger phrasing was here first (#743 review N5): code added *inside that one file* is
-//! within the privacy boundary and can still call them directly. The compiler enforces the rule for
-//! every caller outside it; inside it, review does.
+//! unobserved sync or login added at any other call site does not compile. Stated limit: code added
+//! *inside that one file* is within the privacy boundary and can still call them directly. The
+//! compiler enforces the rule for every caller outside it; inside it, review does.
 //!
 //! Each guard removes its own entry in `Drop`, so the "published but never cleared"
 //! failure (an endpoint confidently reporting a long-finished sync as if it were live) cannot happen
@@ -344,11 +343,10 @@ impl LastLoginByOutcome {
     /// 2. the returned array's length is `ConnectOutcome::ALL.len()`, so listing a new slot below
     ///    without adding its outcome to `ALL` fails to compile here too.
     ///
-    /// ⚠️ **[EDIT, round 5 (#755 review): the two sentences that used to stand here were false, and
-    /// the counterexample is rustc's own suggested fix for the very error this function raises.]**
-    /// The previous wording said an outcome given its own slot "cannot reach the wire without being
-    /// in `ALL`, and cannot be in this struct while silently missing from `ALL`". Both halves are
-    /// false, measured:
+    /// ⚠️ **Do not read those two checks as "an outcome cannot reach the wire without being in
+    /// `ALL`", nor as "an outcome cannot sit in this struct while missing from `ALL`".** Both were
+    /// written here once and both are false, measured — the counterexample is rustc's own suggested
+    /// fix for the very error this function raises:
     ///
     /// - **What the pin actually guarantees:** a new field added to this struct forces the author to
     ///   *name it in the destructure pattern* — check 1 above — because there is no `..` to fall
@@ -458,23 +456,19 @@ impl LoginOutcomeTally {
     /// any login this process could not complete", for a caller that does not want to add two fields
     /// and risk forgetting the second.
     ///
-    /// ⚠️ **Disclosed residual (round 5, #755 review, N3 — measured, not just reasoned about).**
-    /// This sum is hand-written and **not** covered by [`ConnectOutcome::ALL`] or
-    /// [`LastLoginByOutcome::slots`] the way `login_outcomes`' own fields are. A fourth non-success
-    /// outcome correctly wired everywhere — its own field, its own counter, all five exhaustive
-    /// matches, and listed in `ALL` — still contributes **zero** here unless this line is also
-    /// edited by hand. Measured: adding such a variant and calling this function returns `0` for a
-    /// login that ended that way, while the dedicated counter for it is `1`.
+    /// ⚠️ **Disclosed residual (measured, not just reasoned about).** This sum is hand-written and
+    /// **not** covered by [`ConnectOutcome::ALL`] or [`LastLoginByOutcome::slots`] the way
+    /// `login_outcomes`' own fields are. A fourth non-success outcome correctly wired everywhere —
+    /// its own field, its own counter, all five exhaustive matches, and listed in `ALL` — still
+    /// contributes **zero** here unless this line is also edited by hand. Measured: adding such a
+    /// variant and calling this function returns `0` for a login that ended that way, while the
+    /// dedicated counter for it is `1`.
     ///
-    /// ⚠️ **[EDIT, round 6 (#755 review): "neither the compiler nor any existing test catches the
-    /// omission" overstated what was measured.]** Wiring the new variant in fully (own field, own
-    /// counter, all five exhaustive matches, listed in `ALL`) does trip diagnostics — four
-    /// pre-existing test sites construct `LoginOutcomeTally { succeeded, failed, unknown }`
-    /// positionally and fail `E0063` (missing field), and once those are patched the run reports
-    /// `220 passed; 3 failed` (eqoxide-http) / `53 passed; 1 failed` (eqoxide-ipc). None of those 8
-    /// diagnostics is *about* `unsuccessful()` — they fire on unrelated struct literals and
-    /// assertions that were never testing this sum. The accurate claim is narrower: **nothing points
-    /// at this sum**, not "nothing catches the omission."
+    /// The precise claim is **nothing points at this sum**, not "nothing catches the omission":
+    /// wiring the variant in fully does trip 8 diagnostics — four pre-existing sites construct
+    /// `LoginOutcomeTally { succeeded, failed, unknown }` positionally and fail `E0063`, and once
+    /// patched the run reports `220 passed; 3 failed` (eqoxide-http) / `53 passed; 1 failed`
+    /// (eqoxide-ipc) — but none of them is *about* `unsuccessful()`.
     pub fn unsuccessful(self) -> u64 {
         self.failed + self.unknown
     }
@@ -523,96 +517,43 @@ impl ConnectOutcome {
     ///
     /// ## What keeps this array complete — and what does not
     ///
-    /// Written from mutations that were run, because the previous version of this paragraph was a
-    /// false safety-net claim that #743's round-3 review falsified by measurement.
+    /// Every claim below was measured by running the mutation, because the reasoned version of this
+    /// paragraph was falsified twice.
     ///
     /// **Adding a variant to this enum fails to compile in five exhaustive matches:**
     /// [`ConnectOutcome::as_str`], [`LastLoginByOutcome::get`], [`LastLoginByOutcome::slot_mut`],
     /// [`LoginOutcomeTally::count`] and [`LoginOutcomeTally::count_mut`]. Note what is *not* in that
-    /// list: this array. Fixing all five and leaving `ALL` alone used to compile and ship a fully
-    /// green suite — the review added a fourth variant, wired those sites, left it out of `ALL`, and
-    /// measured `223 passed; 0 failed` / `52 passed; 0 failed`.
+    /// list: this array. Fixing all five and leaving `ALL` alone compiles and ships a fully green
+    /// suite — measured by adding a fourth variant, wiring those sites, leaving it out of `ALL`:
+    /// `223 passed; 0 failed` / `52 passed; 0 failed`.
     ///
-    /// ⚠️ **[EDIT, round 6 (#755 review): the paragraph that stood here restated, un-retracted, the
-    /// same false claim already corrected at [`LastLoginByOutcome::slots`] and at the HTTP
-    /// encoder — in the most-authoritative spot a reader lands, since it sits directly on `ALL`
-    /// itself.]** It read:
-    ///
-    /// > *"That hole is closed by `LastLoginByOutcome::slots`, at compile time. A new outcome means
-    /// > a new retained slot; that function destructures the slot struct exhaustively and returns an
-    /// > array of length `ALL.len()`, so the new slot must be listed there (check 1) and its outcome
-    /// > must be in `ALL` (check 2) before the crate builds."*
-    ///
-    /// Check 1 is real — a new field must be *named* at `slots()`'s destructure, or E0027 stops the
-    /// library build. "Before the crate builds" is not: rustc's own suggested fix for that same
-    /// E0027, `refused: _`, satisfies check 1 while never adding the slot to the returned array or to
-    /// `ALL` — the crate builds clean, zero warnings, and the outcome is unserved. See
-    /// [`LastLoginByOutcome::slots`]'s rustdoc for the corrected claim and its full measurement
-    /// (MX-c); it is intentionally not restated here a third time.
-    ///
-    /// ⚠️ **[EDIT, round 7 (#755 review): "so it cannot drift from that copy again" was false the
-    /// moment it was written.]** A fourth copy of the same completeness claim, compressed and
-    /// un-retracted, was already sitting in this file's tests, at
-    /// `the_slot_enumeration_and_all_are_the_same_list_in_the_same_order`'s rustdoc — not a new
-    /// drift caused by this edit, just one this edit did not find. Not restating the correction here
-    /// does not, by itself, stop a *different* sentence elsewhere from asserting the same false thing
-    /// in its own words; only a grep and a retraction do that, and that fourth copy is now also
-    /// retracted (see its own rustdoc). As of this commit a tree-wide grep for the completeness
-    /// claim's phrasings turns up no **un-retracted** copy outside [`LastLoginByOutcome::slots`]'s
-    /// rustdoc — stated as a measured fact about this commit, not a guarantee about the next one.
-    ///
-    /// ⚠️ **[EDIT answering the round-8 review, N1 (#755): "turns up none" was the wrong word, and
-    /// the review's own re-grep is why — and #782 found that re-grep's own report was itself
-    /// wrong in three more ways, corrected below rather than re-measured into a fourth stale
-    /// number.]** Run with the review's wider pattern set (`completeness pin`,
-    /// `compile[- ]time pin`, `before the crate builds`, `does not build if`, `hole is closed`,
-    /// `cannot reach the wire`, `fails to compile here`, `keeps .*ALL.* complete`; `*.rs`/`*.md`,
-    /// `target/` excluded), every hit outside `slots()`'s own rustdoc, as of this commit, is a
-    /// retraction, a quotation inside one, or unrelated prose the pattern happens to catch — for
-    /// example, the old claim quoted in this doc's own round-6 retraction, the same claim quoted
-    /// again in the round-7 retraction on
-    /// `the_slot_enumeration_and_all_are_the_same_list_in_the_same_order`'s rustdoc, the round-5
-    /// retraction in `eqoxide-http`'s login-outcomes encoder, and unrelated prose in
-    /// `eqoxide-renderer`'s pose-matching comment.
-    ///
-    /// **Deliberately not a count.** The pattern list above is itself a hit for seven of its
-    /// eight patterns — quoting a literal phrase matches it — but not for `compile[- ]time pin`:
-    /// its bracket-and-space character class has no literal match in the text
-    /// `compile[- ]time pin`, which quotes the pattern's own source rather than either
-    /// alternative it matches. A case-sensitive sweep also does not agree with a case-insensitive
-    /// one: the round-6 correction two EDITs up re-quotes one phrase with different
-    /// capitalization, which only `grep -i` catches. This inventory is what a grep against the
-    /// *current* text turns up, not a promise about the next edit — the pattern list above will
-    /// keep matching itself, and the count this EDIT gave when it first ran ("four hits") was
-    /// wrong when it was written: the same sweep at the commit that wrote it already returned
-    /// twelve hits, eight of them outside `slots()`'s own rustdoc. What is true, and was
-    /// measured for this commit, is that no *un-retracted* assertion of the completeness claim
-    /// survives outside `slots()`'s own rustdoc and this inventory — re-run the grep to check;
-    /// do not trust a cached number, including one that isn't given here.
+    /// **`LastLoginByOutcome::slots` does NOT close that hole "before the crate builds".** It does
+    /// force a new slot field to be *named* in its destructure (E0027, on the library). But rustc's
+    /// own suggested fix for that same E0027, `refused: _`, satisfies the destructure while never
+    /// adding the slot to the returned array or to `ALL` — the crate builds clean, zero warnings, and
+    /// the outcome is unserved. See [`LastLoginByOutcome::slots`]'s rustdoc, which is the one place
+    /// this measurement is written down; do not restate it elsewhere.
     ///
     /// **The residual, stated rather than glossed, and measured too.** A variant whose match arms
     /// are pointed at an *existing* slot and counter adds no field, so `slots` is unchanged and
-    /// nothing fires. Run: that shape compiles and the suite is `223 passed; 0 failed` /
+    /// nothing fires: that shape compiles and the suite is `223 passed; 0 failed` /
     /// `53 passed; 0 failed`. It is not a new category, it is an alias of one — the #743 B3 defect
-    /// [`LastLoginByOutcome`] exists to make unrepresentable — but neither the compiler nor any test
-    /// catches it here, and this doc does not claim otherwise.
-    ///
-    /// ⚠️ **[EDIT, round 5 (#755 review): the consequence is sharper than "nothing fires."]** A
-    /// login that ends with the aliased variant produces a **self-contradicting** body, not merely a
-    /// missing category. Measured by aliasing a `Refused` outcome onto `Failed`'s slot/counter
-    /// (leaving [`ConnectOutcome::as_str`]'s own arm honest, since that path is independent — see
-    /// below): `login_outcomes.failed == 1` and `last_login_failed.connecting.outcome == "failed"`
-    /// for a login that actually ended `Refused`, while `last_ended.connecting.outcome == "refused"`
-    /// for the *same* login. Two fields, both present, both confidently wrong about each other.
+    /// [`LastLoginByOutcome`] exists to make unrepresentable — and the consequence is sharper than
+    /// "nothing fires". Measured by aliasing a `Refused` outcome onto `Failed`'s slot/counter (with
+    /// [`ConnectOutcome::as_str`]'s own arm left honest, since that path is independent):
+    /// `login_outcomes.failed == 1` and `last_login_failed.connecting.outcome == "failed"` for a
+    /// login that actually ended `Refused`, while `last_ended.connecting.outcome == "refused"` for
+    /// the *same* login. Two fields, both present, both confidently wrong about each other. Neither
+    /// the compiler nor any test catches it.
     ///
     /// **What the test does and does not cover.**
     /// `every_outcome_is_in_all_so_no_category_can_go_unserved` has no power over a variant that is
     /// added and left out, because nothing constructs one, so it contributes zero to both sides of
-    /// its sum. The doc here used to claim it did. Its real power is over the *opposite* mutation —
-    /// an outcome **removed** from this array — and even that is now the compiler's job rather than
-    /// its own: shrinking `ALL` changes the length `slots` must return, so it stops the build
+    /// its sum. Its real power is over the *opposite* mutation — an outcome **removed** from this
+    /// array — and even that is now the compiler's job rather than its own: shrinking `ALL` changes
+    /// the length `slots` must return, so it stops the build
     /// (`expected an array with a size of 2, found one with a size of 3`) before any test runs.
-    /// Measured on both trees; see the review-correction note in the PR body.
+    /// Measured on both trees.
     pub const ALL: [ConnectOutcome; 3] =
         [ConnectOutcome::Succeeded, ConnectOutcome::Failed, ConnectOutcome::Unknown];
 
@@ -1335,11 +1276,9 @@ mod tests {
     /// filing it as a success by omission is the same falsehood at smaller scale. It is kept
     /// SEPARATE from `failed` because "neither Ok nor Err" is not the same claim as "returned Err".
     ///
-    /// **Scope, stated because round 2's version of this test was cited as coverage it did not
-    /// provide (#743 review B3):** the later activity here is a *success*, and a success has its own
-    /// slot, so this shows retention against something that was never going to disturb it. The
-    /// interesting neighbour — a non-success of the OTHER kind, which under round 2's single shared
-    /// slot really did destroy this one — is
+    /// **Scope:** the later activity here is a *success*, and a success has its own slot, so this
+    /// shows retention against something that was never going to disturb it. The interesting
+    /// neighbour — a non-success of the OTHER kind — is
     /// [`a_failure_and_a_panic_never_compete_for_a_slot_so_neither_can_hide_the_other`].
     #[test]
     fn a_panic_through_a_login_is_retained_as_a_non_success_but_not_as_a_failure() {
@@ -1425,15 +1364,11 @@ mod tests {
 
     /// **#743 round-3 review B1.**
     ///
-    /// ⚠️ **[EDIT, round 7 (#755 review): this used to open "[`LastLoginByOutcome::slots`] is the
-    /// compile-time pin that keeps [`ConnectOutcome::ALL`] complete" — a fourth, compressed,
-    /// un-retracted copy of the same completeness claim already corrected at `slots()`'s own
-    /// rustdoc, at the HTTP encoder, and at `ALL` itself. Found by a round-7 tree-wide grep, after
-    /// round 6 had claimed the correction was down to one copy — it was not; see
-    /// [`ConnectOutcome::ALL`]'s rustdoc for that correction.]** See [`LastLoginByOutcome::slots`]'s
-    /// own rustdoc for what is actually true, and measured, about completeness.
+    /// ⚠️ This test is NOT a completeness pin for [`ConnectOutcome::ALL`]; see
+    /// [`LastLoginByOutcome::slots`]'s own rustdoc for what is actually true, and measured, about
+    /// completeness.
     ///
-    /// What still holds: `slots()` IS what the HTTP encoder walks, and it is a second enumeration of
+    /// What it does pin: `slots()` IS what the HTTP encoder walks, and it is a second enumeration of
     /// the outcomes — independent of whether either enumeration is *complete*, two enumerations that
     /// can disagree in *contents or order* are how the defect this PR is about got in. The compiler
     /// pins their *length*; this test pins their *contents and order*, so `slots()[i]` and `ALL[i]`
@@ -1499,14 +1434,10 @@ mod tests {
     /// the round-7 head `5df7099`, so which run produced which number below is measured rather than
     /// inferred. Commit SHAs, not "this head" — this very edit moves HEAD past `55ecbff`.
     ///
-    /// ⚠️ **[EDIT, round 7 (#755 review, B2): "every other test in this module and in `eqoxide-http`
-    /// stayed green; this one alone went RED" was false.]** ⚠️ **[EDIT answering the round-8 review,
-    /// B1-r8 (#755): this block used to cite "the round-7 review's own re-run (`52 passed; 2 failed`)" as the proof
-    /// of the two bullets below. That is a collapsed referent. Both runs print `52 passed; 2 failed`
-    /// — 54 tests, two red either way — which hides the seam, but the round-7 review's second red was
-    /// a **different assertion at a different line**; see the adjudication below.]** The two bullets
-    /// are this round's own re-run of **variant A** at `55ecbff`, `eqoxide-ipc`,
-    /// `test result: FAILED. 52 passed; 2 failed`:
+    /// ⚠️ Do NOT read this as "this test alone goes RED". Two tests do, and `52 passed; 2 failed` is
+    /// printed by more than one of the cells in the table below, which hides the seam — which red
+    /// landed where is what distinguishes them. The bullets are the re-run of **variant A** at
+    /// `55ecbff`, `eqoxide-ipc`, `test result: FAILED. 52 passed; 2 failed`:
     ///
     /// - this test, exactly as designed — `left: 3, right: 4` distinct tokens
     ///   (`["failed", "succeeded", "failed", "unknown"]`). The claim this test itself makes is
@@ -1816,11 +1747,9 @@ mod tests {
                     // The contract, modelled independently of the code under test: a tally, and ONE
                     // most-recent purpose PER OUTCOME.
                     let mut tally = LoginOutcomeTally::default();
-                    // ⚠️ [EDIT, round 6 (#755 review): this used to be a hard-coded `[Option<String>; 3]`
-                    // — an un-enumerated restatement of the alphabet's size, in this property test's
-                    // own model. An outcome added to `ALL` would have made `idx(o)` return 3+ and
-                    // panicked here with "index out of bounds" before ever reaching this test's own
-                    // `unsuccessful()` assertion, rather than failing informatively.]
+                    // Sized from `ALL`, never a literal `3`: an outcome added to `ALL` makes `idx(o)`
+                    // return 3+, which as a fixed array panicked "index out of bounds" here before
+                    // ever reaching this test's own `unsuccessful()` assertion.
                     let mut slots_model: Vec<Option<String>> = vec![None; ConnectOutcome::ALL.len()];
                     for &k in &order {
                         match held[k].take() {
@@ -1868,34 +1797,15 @@ mod tests {
                 }
             }
         }
-        // ⚠️ [EDIT, round 7 (#755 review): this used to be the literal `2520 * 9 * 8` — 9 = 3², the
-        // same un-enumerated alphabet-size restatement `slots_model` had twelve lines above, in the
-        // same test. The review named it as a live bug: add a variant and `ALL.len()` grows from 3
-        // to 4, so the *actual* pair count the two nested `for … in ConnectOutcome::ALL` loops walk
-        // grows to 16 while the hard-coded `9` stays put, so `checked` (322560) and the literal
-        // (181440) diverge.
-        //
-        // ⚠️ [EDIT answering the round-8 review, B1-r8 (#755): the clause that stood here said "in the round-7
-        // MX-E2 re-run this line was never reached — an earlier, unrelated, already-disclosed gap
-        // fired first". That is false about the run it names, and self-contradicting on its face:
-        // the two numbers quoted one line above can only be produced by a run that DID reach this
-        // line. Corrected, and re-measured at round 9 rather than reasoned about — all four cells of
-        // the 2×2 are in the MUTATION-CHECK table on
-        // `as_str_is_injective_over_all_so_no_two_outcomes_in_all_collide_on_one_wire_token`:
-        //
-        //   * the round-7 review's mutation ALSO wired `LoginOutcomeTally::unsuccessful()`, so the
-        //     per-iteration `unsuccessful()` check above passed, the loop ran to completion, and this
-        //     line WAS reached and DID fire `322560 vs 181440` at the round-7 head. That is the
-        //     direct measurement that this literal was a live bug, not merely a derivation from
-        //     `ALL.len()` — which makes the case for the fix stronger, not weaker.
-        //   * the mutation described in that MUTATION-CHECK leaves `unsuccessful()` unwired, so the
-        //     per-iteration check panics on the first verdict pair and this line is not reached.
-        //
-        // Whether it is reached is therefore a property of the mutation, not of this defect: the
-        // divergence is real either way. Derived from `ALL.len()` so the count self-scales with the
-        // alphabet the loops actually walk, regardless of which assertion a given mutation trips
-        // first — and at `55ecbff`, with `unsuccessful()` wired, that test is GREEN under the same
-        // mutation that reddened it at the round-7 head `5df7099`.]
+        // ⚠️ Derived from `ALL.len()`, never a literal. As `2520 * 9 * 8` this was a live bug, not a
+        // style point: add a variant and the pair count the two nested `for … in ConnectOutcome::ALL`
+        // loops walk grows from 9 to 16 while the hard-coded `9` stays put. MEASURED at the round-7
+        // head `5df7099` with a fourth variant added and `LoginOutcomeTally::unsuccessful()` wired
+        // (so the loop runs to completion and reaches this line): `checked` 322560 vs the literal's
+        // 181440. Green at `55ecbff` under the same mutation. Whether this line is REACHED depends on
+        // whether the mutation also wires `unsuccessful()` — see the 2×2 table on
+        // `as_str_is_injective_over_all_so_no_two_outcomes_in_all_collide_on_one_wire_token` — but
+        // the divergence is real either way.
         assert_eq!(checked, 2520 * ConnectOutcome::ALL.len().pow(2) * 8,
             "2520 orderings × ALL.len()² outcome pairs × 8 steps must each have been asserted; a \
              shrunken enumeration is how this property stops covering the ordering it exists for");
