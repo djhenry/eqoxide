@@ -1199,35 +1199,56 @@ use eqoxide_ipc::MoveIntent;
     ///
     /// So the tally is now an OUTPUT of the work. The scan produces one `probe::Verdict` per
     /// (line, anchor) pair and records nothing else; `Verdict`'s fields are private to its module,
-    /// so the only way to obtain one is `Verdict::test`, which performs `hay.contains(needle)` and
-    /// records a digest of both strings it was handed. The control then checks that sequence of
-    /// (haystack, needle) digests, pairwise and in order, against one derived by an independent
-    /// second traversal, BEFORE any anchor verdict is read. A comparison that is skipped leaves no
-    /// verdict, so the sequence is short; a comparison fed substituted input — an empty line, a
-    /// needle that is not the anchor — leaves a verdict whose digests disagree. Every entry is
-    /// therefore evidence that THIS line was tested against THAT anchor, rather than a number
-    /// asserting it.
+    /// so the only way to obtain one is `Verdict::test`, which runs the match and records a digest
+    /// of the two strings it was handed. The control then checks that sequence of (raw line,
+    /// needle) digests, pairwise and in order, against one derived by a second traversal, BEFORE
+    /// any anchor verdict is read. A comparison the scan skips leaves no verdict, so the sequence
+    /// is short; a comparison the scan feeds substituted input leaves a verdict whose digests
+    /// disagree.
+    ///
+    /// State the scope exactly, because a fourth escape was found by overstating it. Each entry is
+    /// evidence that the SCAN handed this raw line and that anchor to the instrument, once, in
+    /// order. It is not evidence about what the instrument then did with them. The control cannot
+    /// cross-check the instrument, because it is not independent of it — both traversals call
+    /// `probe::digest`, and until round 4 both also called a `norm` closure in this test body,
+    /// through which review defeated the control a fourth time: an order-synchronised ceiling
+    /// inside `norm` blanked the same 3240 lines in both sequences, the digests agreed, and the
+    /// test was GREEN with 60.7% of the file never really compared. Normalisation moved inside
+    /// `Verdict::test` as a result, so every remaining escape of this class is an edit to `probe`
+    /// — one named place instead of two.
     ///
     /// Its limits, stated rather than discovered a round later:
     ///
-    /// * it proves each comparison was REACHED with the right two strings. It cannot prove the
-    ///   comparison was HONEST. Measured, not reasoned: the same 2100-comparison ceiling moved
-    ///   INSIDE `Verdict::test` — behind a static counter, still digesting both inputs, returning a
-    ///   fabricated `false` past the ceiling — is GREEN. No tally of any design can distinguish a
-    ///   fabricated miss from a real one; what has changed is that the escape is now an edit to the
-    ///   instrument, not an edit to the scan, and the scan can no longer skip a comparison at all.
-    ///   Fabricating a `Verdict` outside `probe` does not compile (`error[E0451]`, private fields),
+    /// * it proves the SCAN performed one comparison per (line, anchor) on the strings it was
+    ///   handed, and that the scan can neither skip one nor substitute one unilaterally. It proves
+    ///   nothing about the INSTRUMENT. Both escapes that remain are inside `probe`, and both were
+    ///   run rather than reasoned about: a 2100-comparison ceiling in `Verdict::test`, behind a
+    ///   static counter with both inputs still digested, is GREEN whether it gates the collapse or
+    ///   the match; and `digest` neutered to a constant is GREEN too, disarming the control
+    ///   silently, because both traversals share it — GREEN again with a substituted raw line in
+    ///   the scan beside it, which is the pair that actually loses comparisons. No control of this
+    ///   shape can distinguish a fabricated miss from a real one. What has changed across four
+    ///   rounds is where the escape has to live: it is now an edit inside `probe`, and
+    ///   fabricating a `Verdict` outside `probe` does not compile (`error[E0451]`, private fields),
     ///   which is measured too — as an INVALID row, not a pass;
     /// * like any reach control it is satisfied trivially by unmutated code and fires only on an
     ///   edit to this scan. That is deliberate — this scan is where #778's defect class lives — but
     ///   it is evidence about this scanner and no other;
     /// * the `>= 1000` floor is a corpus-PRESENCE check ("the tree is where this test thinks it
-    ///   is"), not an anchor-reach check. It sits below the first anchor, so on its own it would
-    ///   admit a scan that found no anchor at all; the per-anchor verdicts are what refuse that;
+    ///   is"), not an anchor-reach check: it constrains how many lines the file has and nothing
+    ///   else, so on its own it would admit a scan that found no anchor at all. The per-anchor
+    ///   verdicts are what refuse that. (An earlier revision justified this bullet with "it sits
+    ///   below the first anchor", true of the five anchors then and false of the eight now — two
+    ///   sit at lines 43 and 51. A reach argument built on a position rots exactly like the line
+    ///   numbers this test exists to replace.)
     /// * nothing here constrains WHERE in the file the anchors sit. #919's first revision argued
     ///   from their spacing, and the spacing it asserted was not the spacing they have. Their
     ///   positions are a property of today's `walker.rs` and rot exactly like the line numbers this
-    ///   test exists to replace, so no argument is built on them.
+    ///   test exists to replace, so no argument is built on them — but they are why the GREEN
+    ///   escapes above stay green. Measured today, all eight resolve at or below line 2090 of 5340,
+    ///   so an instrument blinded past 2100 still finds every one and the eight positive verdicts
+    ///   say nothing. That is the standing reason the reach control exists and cannot be replaced
+    ///   by the verdicts it guards.
     #[test]
     fn walker_source_anchors_cited_in_this_file_still_resolve() {
         // `tests/` sits at the workspace root, which is this package's manifest directory.
@@ -1261,10 +1282,6 @@ use eqoxide_ipc::MoveIntent;
         // A silently emptied list would make every verdict below vacuous.
         assert!(!ANCHORS.is_empty(), "the anchor list is empty; this test would pass on anything");
 
-        // Interior whitespace is collapsed before matching, so an anchor survives rustfmt
-        // re-aligning a struct literal, but not the code being renamed or deleted.
-        let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-
         // ── the instrument ──
         //
         // There is no reach COUNTER here, on purpose. Three revisions of this control kept one —
@@ -1277,20 +1294,38 @@ use eqoxide_ipc::MoveIntent;
         //
         // So the scan's only product is one `Verdict` per (line, anchor) pair, and a `Verdict` can
         // only be obtained by performing that comparison: the fields are private to `probe`, whose
-        // single constructor runs `hay.contains(needle)` and records a digest of both strings it was
-        // handed. A comparison that is skipped leaves NO verdict (the sequence comes up short); a
-        // comparison performed on substituted input leaves a verdict whose digests do not match.
+        // single constructor runs the match and records a digest of the two strings it was handed.
+        // A comparison the scan skips leaves NO verdict (the sequence comes up short); a comparison
+        // the scan feeds substituted input leaves a verdict whose digests do not match.
+        //
+        // Whitespace normalisation happens INSIDE the instrument, on the raw line. It used to be a
+        // `norm` closure in this test body, called once per line by the scan AND once per line by
+        // the control below — and review defeated the control through it: an order-synchronised
+        // ceiling inside `norm` blanked lines 2101.. in BOTH traversals, so the digests agreed and
+        // the test was GREEN with 60.7% of walker.rs never really compared (measured on the round-3
+        // head, and reproduced here before this change). Two traversals cannot cross-check each
+        // other through a component they share, so they now share none: the control digests the RAW
+        // line and never normalises.
         mod probe {
             /// The result of one anchor comparison. Fields are private, so the scan below cannot
             /// fabricate one — the only way to obtain a `Verdict` is to run [`Verdict::test`].
             pub struct Verdict { hit: bool, hay: u64, needle: u64 }
 
             impl Verdict {
-                pub fn test(hay: &str, needle: &str) -> Verdict {
-                    Verdict { hit: hay.contains(needle), hay: digest(hay), needle: digest(needle) }
+                /// `line` is the RAW source line. Interior whitespace is collapsed here, so an
+                /// anchor survives rustfmt re-aligning a struct literal but not the code being
+                /// renamed or deleted — and the digest recorded is of the line as it was HANDED
+                /// IN, which is what the control can check without normalising anything itself.
+                pub fn test(line: &str, needle: &str) -> Verdict {
+                    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+                    Verdict {
+                        hit: collapsed.contains(needle),
+                        hay: digest(line),
+                        needle: digest(needle),
+                    }
                 }
                 pub fn hit(&self) -> bool { self.hit }
-                /// What this verdict was computed FROM: `(digest(haystack), digest(needle))`.
+                /// What this verdict was handed: `(digest(raw line), digest(needle))`.
                 pub fn inputs(&self) -> (u64, u64) { (self.hay, self.needle) }
             }
 
@@ -1308,19 +1343,19 @@ use eqoxide_ipc::MoveIntent;
         // The scan. Nothing is recorded but the verdicts themselves.
         let mut verdicts: Vec<probe::Verdict> = Vec::new();
         for line in src.lines() {
-            let n = norm(line);
             for (anchor, _) in ANCHORS.iter() {
-                verdicts.push(probe::Verdict::test(&n, anchor));
+                verdicts.push(probe::Verdict::test(line, anchor));
             }
         }
 
         // ── reach control, read BEFORE any anchor verdict ──
-        // What the scan must have compared, derived by a SECOND, independent traversal: one
-        // (haystack, needle) digest pair per (line, anchor), in order.
+        // What the scan must have been handed, derived by a SECOND traversal that shares nothing
+        // with the scan but `digest`: one (raw line, needle) digest pair per (line, anchor), in
+        // order.
         let total_lines = src.lines().count();
         let mut expected: Vec<(u64, u64)> = Vec::new();
         for line in src.lines() {
-            let hay = probe::digest(&norm(line));
+            let hay = probe::digest(line);
             for (anchor, _) in ANCHORS.iter() { expected.push((hay, probe::digest(anchor))); }
         }
         assert_eq!(expected.len(), total_lines * ANCHORS.len(),
