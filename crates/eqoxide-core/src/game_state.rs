@@ -1603,6 +1603,20 @@ impl GameState {
         // reports a full-HP target from the OLD zone (a confident falsehood an agent may attack /
         // consider). Clear the whole target (id + name + hp + con) here, not just the entity map (#408).
         self.clear_target();
+        // #883: `last_consider` is the SAME hazard as the target fields just above, for the same
+        // reason (#270's `entities` purge does not touch it — it has its own field, not an entities
+        // lookup), but it is NOT touched by `clear_target()` — deliberately, per that field's own
+        // doc: "it is spawn-scoped, not target-scoped … never touched by set_target/clear_target",
+        // so a plain target-loss (walking away, `#target clear`) does not erase the last consider
+        // read. That is correct for a target-loss, but `clear_target()` was consequently the ONLY
+        // place anyone would have thought to look for a last_consider clear, and it deliberately
+        // excludes it — which is exactly how this stayed missing since #336 added the field: a
+        // zone-in cannot reuse `clear_target()`, and no one added a sibling call here. Left
+        // uncleared, `spawn_id`/`con_name`/`attitude`/`level` name a spawn in the zone we just left
+        // — spawn ids are a per-zone namespace, so the same id in the new zone is a different mob
+        // at a different difficulty — while `ago_secs` (derived from `at` at read time) keeps
+        // counting normally and does not itself disclose that the record predates the zone change.
+        self.last_consider = None;
         self.world.new_zone_applied = false;
         // #683 review (F2): the previous zone's advertised zone points are meaningless — and
         // actively dangerous — in the new zone. Left in place they persist through the
@@ -2211,8 +2225,8 @@ mod pose_tests_643 {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{ControllerHold, ControllerHoldReason, Door, GameState, HeldMotion, MerchantItem,
-                ZonePoint, make_entity};
+    use super::{CastState, ControllerHold, ControllerHoldReason, Door, GameState, HeldMotion,
+                LastConsider, MerchantItem, ZonePoint, make_entity};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
     /// including the FULL-SNAPSHOT (`resync_from_snapshot`) path that carries the real mid-zone
@@ -3286,6 +3300,148 @@ pub(crate) mod tests {
              /v1/observe/debug reporting a degraded-destination crossing for a request the new \
              zone never made — a zone-in must clear it so that disclosure reads null until this \
              zone resolves a crossing of its own");
+    }
+
+    /// #883 — the previous zone's `last_consider` must NOT survive a zone-in.
+    ///
+    /// `last_consider` is spawn-scoped exactly like `target_id`/`target_con*` (cleared just above by
+    /// `clear_target()`, pinned by #408), but it is deliberately NOT touched by `clear_target()` —
+    /// see that field's own doc comment — so a target-loss that is NOT a zone change (walking away,
+    /// `#target clear`) correctly leaves it in place. That correct exclusion is exactly why this was
+    /// missed: `clear_target()` was the only place anyone would have thought to add a sibling clear,
+    /// and it deliberately does not touch this field, so `begin_zone_in` needed — and lacked — its
+    /// own explicit clear. Left uncleared, `spawn_id` names a spawn in the zone we just left, and
+    /// spawn ids are a per-zone namespace: the SAME id in the new zone is ordinarily a different mob
+    /// at a different difficulty, so `/v1/observe/debug` answers a fresh-looking, well-formed
+    /// question about a mob that is not in this zone — and `ago_secs`, derived from `at` at read
+    /// time, keeps counting normally and does not itself disclose that the record predates the zone
+    /// change. Measured live on `main` @ `d63776d`, both directions (qcat↔qeynos2), three
+    /// transitions — see the #883 issue body for the exact before/after JSON.
+    ///
+    /// Mutation check: drop `self.last_consider = None;` from `begin_zone_in` → RED here.
+    #[test]
+    fn begin_zone_in_clears_the_previous_zones_last_consider_883() {
+        let mut gs = GameState::new();
+        gs.last_consider = Some(LastConsider {
+            spawn_id: 18,
+            name: "a_large_rat000".into(),
+            con_name: "gray".into(),
+            attitude: "indifferent".into(),
+            level: Some(1),
+            at: std::time::Instant::now(),
+        });
+
+        gs.begin_zone_in();
+
+        assert!(gs.last_consider.is_none(),
+            "last_consider names a spawn_id in the zone we just left — spawn ids are a per-zone \
+             namespace, so the same id in the new zone is ordinarily a different mob at a different \
+             difficulty; a zone-in must clear it so /observe/debug reads null (\"nothing considered \
+             in this zone yet\") instead of a confident, freshly-timestamped answer about a mob \
+             that isn't here");
+    }
+
+    /// #883 review — exhaustive/combined variant of the individual clears above (#408/#660/#724/
+    /// #801/#757/#883). Each of those pins ONE field in isolation; this populates EVERY field
+    /// `begin_zone_in` currently owns — the complete documented clear-list, including
+    /// `last_consider` — in a single `GameState`, calls `begin_zone_in()` exactly once, and asserts
+    /// every one of them came back cleared. This is what actually backs the universal claim ("no
+    /// spawn-scoped field this function owns survives a zone-in"): the per-field tests above would
+    /// all still pass individually even if a future edit reordered the clears so an EARLIER one
+    /// undid a LATER one's precondition (e.g. one clear rebuilding a value another clear reads) —
+    /// this test is the one place that would catch that class of regression, because it is the only
+    /// one exercising all of them together from one populated state.
+    ///
+    /// It does NOT claim coverage of every spawn-scoped field in `GameState` — only the ones
+    /// `begin_zone_in` is documented (by the comments on each clear, above) to own. The #883 PR body
+    /// records a broader audit that found additional spawn-scoped fields (`merchant_open`,
+    /// `trainer_open`, `pet_id`, the loot-session fields, `dialogue_choices`, `combat_anims`,
+    /// `recent_attackers`) that `begin_zone_in` does NOT yet own; those are out of scope here and
+    /// tracked in a follow-up issue, so this test intentionally does not populate or assert them —
+    /// asserting them would be a false claim about what this function does today.
+    #[test]
+    fn begin_zone_in_clears_every_field_it_owns_at_once_883() {
+        use crate::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
+        use crate::afloat::{AfloatFrame, AfloatStallClock, AFLOAT_STALL_SECS};
+
+        let mut gs = GameState::new();
+
+        gs.world.entities.insert(7, make_entity(7, "a rat", 0.0, 0.0, 0.0, true));
+        gs.world.doors.insert(3, Door {
+            door_id: 3, name: "DOOR1".into(), x: 0.0, y: 0.0, z: 0.0, heading: 0.0,
+            incline: 0, size: 100, opentype: 5, door_param: 0, invert_state: false, is_open: false,
+        });
+        gs.player_pos_known = true;
+        gs.position_provisional_since = Some(std::time::Instant::now());
+        let mut tally = None;
+        for index in 0..MAX_CROSS_ATTEMPTS as i32 {
+            tally = Some(CrossAttempts::record(tally, index));
+        }
+        gs.zone_cross_attempts = tally;
+        gs.zone_cross_plan = Some(ZoneCrossPlan {
+            requested_zone_id: Some(181),
+            index: 3,
+            resolution: ZoneCrossResolution::ServerResolved,
+        });
+        gs.player_hold = Some(ControllerHold {
+            reason: ControllerHoldReason::EmbeddedNoRecovery,
+            secs: 9.5,
+        });
+        let anchor = [-812.5_f32, 43.0, -119.75];
+        let mut clock = AfloatStallClock::default();
+        for _ in 0..((AFLOAT_STALL_SECS / 0.05).ceil() as usize + 3) {
+            clock.observe(AfloatFrame::Wished, anchor, 0.05);
+        }
+        gs.player_afloat_stall = Some(clock.stall().expect("fixture must reach the stall threshold"));
+        gs.target_id = Some(18);
+        gs.target_name = Some("Guard_Drath000".into());
+        gs.target_hp_pct = Some(100.0);
+        gs.target_con = Some([1, 2, 3]);
+        gs.target_con_name = Some("yellow".into());
+        gs.target_attitude = Some("indifferent".into());
+        gs.last_consider = Some(LastConsider {
+            spawn_id: 18,
+            name: "a_large_rat000".into(),
+            con_name: "gray".into(),
+            attitude: "indifferent".into(),
+            level: Some(1),
+            at: std::time::Instant::now(),
+        });
+        gs.world.new_zone_applied = true;
+        gs.world.zone_points.push(ZonePoint {
+            iterator: 7, zone_id: 181,
+            server_x: 1790.0, server_y: 1315.0, server_z: -13.0, heading: 0.0,
+        });
+        gs.world.zone_in_failed = true;
+        gs.pending_cast_end = Some(std::time::Instant::now());
+        gs.ended_cast_spell = Some((202, std::time::Instant::now()));
+        gs.suppress_cast_end = true;
+        gs.casting = Some(CastState { spell_id: 202, started: std::time::Instant::now(), cast_ms: 3000 });
+
+        gs.begin_zone_in();
+
+        assert!(gs.world.entities.is_empty(), "entities");
+        assert!(gs.world.doors.is_empty(), "doors");
+        assert!(!gs.player_pos_known, "player_pos_known");
+        assert!(gs.position_provisional_since.is_none(), "position_provisional_since");
+        assert!(gs.zone_cross_attempts.is_none(), "zone_cross_attempts");
+        assert!(gs.zone_cross_plan.is_none(), "zone_cross_plan");
+        assert!(gs.player_hold.is_none(), "player_hold");
+        assert!(gs.player_afloat_stall.is_none(), "player_afloat_stall");
+        assert!(gs.target_id.is_none(), "target_id");
+        assert!(gs.target_name.is_none(), "target_name");
+        assert!(gs.target_hp_pct.is_none(), "target_hp_pct");
+        assert!(gs.target_con.is_none(), "target_con");
+        assert!(gs.target_con_name.is_none(), "target_con_name");
+        assert!(gs.target_attitude.is_none(), "target_attitude");
+        assert!(gs.last_consider.is_none(), "last_consider");
+        assert!(!gs.world.new_zone_applied, "new_zone_applied");
+        assert!(gs.world.zone_points.is_empty(), "zone_points");
+        assert!(!gs.world.zone_in_failed, "zone_in_failed");
+        assert!(gs.pending_cast_end.is_none(), "pending_cast_end");
+        assert!(gs.ended_cast_spell.is_none(), "ended_cast_spell");
+        assert!(!gs.suppress_cast_end, "suppress_cast_end");
+        assert!(gs.casting.is_none(), "casting");
     }
 
 }
