@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -98,6 +99,27 @@ from pathlib import Path
 # the ONLY reliable evidence that the mutant compiled: a compile failure and a test failure both
 # exit 101. Keep this string in sync with cargo; `--self-test` fails loudly if it stops appearing.
 COMPILE_SENTINEL = "Finished `test` profile"
+
+# Cargo decorates that line in some environments, and BOTH decorations break a literal search.
+# Two forms were measured while writing this, not reasoned about:
+#   * colour (this repo's CI runner):  \x1b[1m\x1b[92m    Finished\x1b[0m `test` profile […]
+#     — the reset sequence sits between `Finished` and the profile name.
+#   * an OSC-8 hyperlink (a local run with CARGO_TERM_COLOR=always): the profile name is wrapped
+#     in \x1b]8;;<url>\x1b\ … \x1b]8;;\x1b\, which puts a whole URL inside the sentinel.
+# Either way the literal is absent, every mutant scores INVALID, and a whole table silently
+# downgrades to "untested". Captured output is therefore stripped of ANSI escapes — CSI, OSC and
+# the two-character forms — before anything looks at it, and the stripped text is what gets
+# written to the log file. `--self-test` case 0 pins both measured lines verbatim, and case 11
+# runs a real mutant under CARGO_TERM_COLOR=always with a control that the output was decorated.
+ANSI_ESCAPE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI: colour, cursor moves
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: hyperlinks, title sets (BEL- or ST-terminated)
+    r"|\x1b[@-Z\\-_]"  # two-character escapes
+)
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE.sub("", text)
 
 RED = "RED"
 GREEN = "GREEN"
@@ -141,7 +163,10 @@ class CompileProof:
 
 def find_compile_proof(output: str) -> CompileProof | None:
     """Return proof that the build finished, or None. The whole log is in memory, so this can
-    never read a partially written file — a hazard that has produced wrong counts before."""
+    never read a partially written file — a hazard that has produced wrong counts before.
+
+    `output` must already be ANSI-stripped; `run_command` is the only producer and does that.
+    """
     for line in output.splitlines():
         if COMPILE_SENTINEL in line:
             return CompileProof(line)
@@ -354,8 +379,8 @@ def run_command(argv: tuple[str, ...], cwd: Path, timeout: int) -> tuple[str, in
         )
     except subprocess.TimeoutExpired as exc:
         partial = exc.output or b""
-        return partial.decode("utf-8", "replace"), -1, True
-    return completed.stdout.decode("utf-8", "replace"), completed.returncode, False
+        return strip_ansi(partial.decode("utf-8", "replace")), -1, True
+    return strip_ansi(completed.stdout.decode("utf-8", "replace")), completed.returncode, False
 
 
 @dataclass

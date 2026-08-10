@@ -8,6 +8,8 @@ replace, so this exercises the FAILURE modes, not a happy path. It builds a thro
 in a temporary directory (never inside this repo, never part of the workspace) and drives the real
 command-line entry point against it:
 
+  0  sentinel recognition, including the COLOURISED line cargo emits on CI (where the literal
+     sentinel is absent from the raw bytes) and a log with no sentinel at all
   1  anchor occurs ZERO times                  -> refuse, exit 2
   2  anchor occurs TWICE                       -> refuse, exit 2
   3  replacement identical to the anchor       -> refuse, exit 2 (a no-op mutant always scores
@@ -24,6 +26,7 @@ command-line entry point against it:
      present in the file (#799)
  10  the harness's restore write, corrupted    -> the sha256 verification fires, loudly, and the
      file really is left different (so the alarm is true, not spurious)
+ 11  the same caught mutant with CARGO_TERM_COLOR=always -> still RED, end to end, not INVALID
 
 Cases 8-10 mutate a COPY of `scripts/mutate.py` using the harness's own edit engine. Nothing in
 this file writes to a tracked path.
@@ -31,12 +34,39 @@ this file writes to a tracked path.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-from mutate import Refusal, apply_edit, sha256_bytes
+from mutate import (
+    COMPILE_SENTINEL,
+    Refusal,
+    apply_edit,
+    find_compile_proof,
+    sha256_bytes,
+    strip_ansi,
+)
+
+# Two decorated `Finished` lines, both captured verbatim rather than imagined. In each the literal
+# sentinel is ABSENT from the raw bytes, so an unstripped search scores a mutant that compiled and
+# ran as INVALID — the whole table silently downgraded to "untested".
+#
+# As emitted by cargo on this repo's CI runner (colour only): the reset sits between `Finished`
+# and the profile name.
+CI_COLOURED_FINISHED = (
+    "\x1b[1m\x1b[92m    Finished\x1b[0m `test` profile "
+    "[unoptimized + debuginfo] target(s) in 42.57s"
+)
+
+# As emitted by a local `CARGO_TERM_COLOR=always` run: the profile name is additionally wrapped in
+# an OSC-8 hyperlink, which puts an entire URL inside the sentinel.
+CARGO_HYPERLINK_FINISHED = (
+    "\x1b[1m\x1b[92m    Finished\x1b[0m "
+    "\x1b]8;;https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles\x1b\\"
+    "`test` profile [unoptimized + debuginfo]\x1b]8;;\x1b\\ target(s) in 0.26s"
+)
 
 HARNESS = Path(__file__).resolve().parent / "mutate.py"
 
@@ -427,11 +457,14 @@ def write_subject(root: Path) -> Path:
     return lib
 
 
-def run_harness(harness: Path, spec: Path, root: Path, logs: Path) -> tuple[int, str, str]:
+def run_harness(
+    harness: Path, spec: Path, root: Path, logs: Path, env: dict[str, str] | None = None
+) -> tuple[int, str, str]:
     completed = subprocess.run(
         [sys.executable, str(harness), str(spec), "--root", str(root), "--logs", str(logs)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=None if env is None else {**os.environ, **env},
         check=False,
     )
     return (
@@ -471,6 +504,32 @@ def self_test() -> int:
     print()
 
     c = Checker()
+
+    # ---- 0: sentinel recognition, including the colourised form CI actually emits -----------
+    print("CASE 0  sentinel recognition")
+    for label, raw_line in (
+        ("colourised (CI runner)", CI_COLOURED_FINISHED),
+        ("OSC-8 hyperlinked", CARGO_HYPERLINK_FINISHED),
+    ):
+        c.check(
+            f"case 0: the raw {label} cargo line does NOT contain the literal sentinel "
+            "(this is why the log is stripped)",
+            COMPILE_SENTINEL not in raw_line,
+        )
+        c.check(
+            f"case 0: after stripping, the {label} line is recognised as proof",
+            find_compile_proof(strip_ansi(raw_line)) is not None,
+        )
+    c.check(
+        "case 0: plain (uncoloured) cargo output is recognised",
+        find_compile_proof("    Finished `test` profile [unoptimized + debuginfo] in 0.3s")
+        is not None,
+    )
+    c.check(
+        "case 0: a log without the sentinel yields no proof",
+        find_compile_proof("error[E0308]: mismatched types\nerror: could not compile `x`") is None,
+    )
+    print()
 
     def spec_file(name: str, body: str) -> Path:
         path = specs / f"{name}.toml"
@@ -573,6 +632,31 @@ def self_test() -> int:
         sha256_bytes(lib.read_bytes()) != pristine_sha,
     )
     lib.write_bytes(pristine)  # our own cleanup; the corrupted copy is in a temporary directory
+    print()
+
+    # ---- 11: end-to-end with a colourising cargo, the way CI emits it -----------------------
+    print("CASE 11  a colourising cargo (CARGO_TERM_COLOR=always) still scores RED, not INVALID")
+    # Control first: without this, case 11 could pass vacuously because nothing was colourised.
+    raw = subprocess.run(
+        ["cargo", "test", "--all-targets"],
+        cwd=str(subject),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "CARGO_TERM_COLOR": "always"},
+        check=False,
+    ).stdout.decode("utf-8", "replace")
+    c.check("case 11 control: cargo really did colourise", "\x1b[" in raw)
+    c.check(
+        "case 11 control: and the literal sentinel is absent from the raw output",
+        COMPILE_SENTINEL not in raw and find_compile_proof(strip_ansi(raw)) is not None,
+    )
+    code, out, err = run_harness(
+        HARNESS, red_spec, subject, logs, env={"CARGO_TERM_COLOR": "always"}
+    )
+    got = verdict_row(out, "caught")
+    c.check("case 11: still RED with colour in the log", got == "RED", f"got {got}")
+    c.check("case 11: exit 0", code == 0, f"got {code}\n{err}")
+    c.check("case 11: file restored", sha256_bytes(lib.read_bytes()) == pristine_sha)
     print()
 
     print("=" * 90)

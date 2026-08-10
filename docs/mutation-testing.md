@@ -47,7 +47,13 @@ agent-honesty invariant that ranks a confident falsehood above a loud crash.
 So the verdict is derived from a **compile sentinel** first and the exit code only afterwards:
 
 * the sentinel is the line ``Finished `test` profile`` that cargo prints once the requested unit
-  graph has built;
+  graph has built — searched in output that has first been stripped of ANSI escapes, because cargo
+  decorates that line in some environments and every decoration breaks a literal match (measured:
+  colour on the CI runner puts a reset between `Finished` and the profile name; a local
+  `CARGO_TERM_COLOR=always` run additionally wraps the profile name in an OSC-8 hyperlink, putting
+  a whole URL inside the sentinel). Unstripped, a mutant that compiled and ran scores `INVALID`,
+  which silently downgrades an entire table to "untested" — the exact failure this file is about,
+  in the direction that under-claims;
 * `RED` and `GREEN` are produced at exactly one place in `scripts/mutate.py`, inside a function
   that cannot be called without a `CompileProof`;
 * a `CompileProof` cannot be constructed from a line that does not contain the sentinel.
@@ -154,6 +160,7 @@ against it. It exercises the failure modes, not just a happy path:
 
 | case | scenario | required outcome |
 |---|---|---|
+| 0 | verbatim decorated `Finished` lines, both measured forms | recognised as proof after stripping, and *not* before |
 | 1 | anchor occurs zero times | refuse, exit 2 |
 | 2 | anchor occurs twice | refuse, exit 2 |
 | 3 | replacement identical to anchor | refuse, exit 2 |
@@ -164,11 +171,14 @@ against it. It exercises the failure modes, not just a happy path:
 | 8 | the harness's own sentinel gate wrapped away | loud crash, never a verdict |
 | 9 | that gate, the type assertion, and the proof's use, all wrapped away | only now is a non-compiling mutant printed as `RED` |
 | 10 | the harness's restore write corrupted | the sha256 check fires, and the file really is left different |
+| 11 | a real run against a cargo told to colourise (`CARGO_TERM_COLOR=always`) | still `RED`, not `INVALID` |
 
 Cases 8–10 mutate a copy of `scripts/mutate.py` using the harness's own edit engine. Case 10 also
 checks that the alarm is *true* — that the file on disk really does differ — so a restore check
-that fired spuriously would not pass as a demonstration. After each case the self-test re-hashes
-the subject file to confirm the tree was restored.
+that fired spuriously would not pass as a demonstration. Case 11 carries a reach control: it
+asserts the run really did produce escape sequences and that the raw log really does *not* contain
+the literal sentinel, so it cannot pass by the colour never having happened. After each case the
+self-test re-hashes the subject file to confirm the tree was restored.
 
 It runs in CI alongside the other guards.
 
