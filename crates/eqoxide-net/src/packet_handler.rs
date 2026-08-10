@@ -183,8 +183,24 @@ fn apply_animation(gs: &mut GameState, p: &[u8]) {
 
 // ── Native Task-system quest log (OP_TaskDescription / OP_TaskActivity / OP_CompletedTasks) ──────
 // These are variable-length, packed (no struct padding) wire records with embedded null-terminated
-// strings. Layouts cross-checked against EQEmu titanium.cpp ENCODE(OP_TaskDescription) + the
-// TaskActivity_Struct in eq_packet_structs.h. See docs/protocol-notes.md.
+// strings. See docs/protocol-notes.md.
+//
+// Provenance is PER OPCODE — do not generalise one bullet to another:
+//   * OP_TaskActivity   — re-derived for RoF2 from the send path: `TaskManager::SendTaskActivity*`
+//     (`zone/task_manager.cpp:972-1014`) delegating to `ActivityInformation::SerializeObjective`
+//     (`common/tasks.h:141-189`). See `parse_task_activity` below.
+//   * OP_CompletedTasks — re-derived from `zone/task_manager.cpp:946-966`.
+//   * OP_TaskDescription — NOT re-derived for RoF2. It has a RoF2 ENCODE, so the serialiser output
+//     is not the wire format; see `apply_task_description` and #949.
+//
+// An earlier revision of this banner claimed the layouts here were "cross-checked against EQEmu
+// titanium.cpp ENCODE(OP_TaskDescription) + the TaskActivity_Struct in eq_packet_structs.h". Both
+// authorities are wrong and both are named in #889's root cause. `titanium.cpp` is the Titanium
+// patch, not RoF2. And the line immediately above `struct TaskActivity_Struct` — at
+// `common/eq_packet_structs.h:4551` — reads, verbatim:
+//     // Old structs not used by Task System implentation but left for reference
+// (the misspelling is EQEmu's), so that struct is marked unused by the emulator itself. Deriving a
+// layout from either source is the mistake this file already made once.
 
 /// Extract the display name from an EQ saylink. `EQ::SayLinkEngine::GenerateLink()` (EQEmu
 /// common/say_link.cpp) emits exactly two `\x12` delimiters: `\x12<56-char body><Name>\x12` — the
@@ -203,7 +219,12 @@ fn extract_saylink_text(s: &str) -> String {
 /// OP_TaskDescription — a task's header + title + reward. Upserts into gs.tasks (preserving any
 /// activities already received for it). Layout: Header{seq,task_id,open_window:u8,task_type,
 /// reward_type}(17) + title cstr + Data1{duration,dur_code,start_time}(12) + desc cstr +
-/// Data2{has_rewards:u8,coin,xp,faction}(13) + reward_text cstr + item_link cstr + Trailer(4).
+/// Data2{has_rewards:u8,coin,xp,faction}(13) + reward_text cstr + item_link cstr + a trailer this
+/// function does **not** read (it stops after `item_link`; nothing here needs `Points`). The
+/// trailer's size is disputed — 5 bytes in `common/eq_packet_structs.h:4702-4706`, 4 in
+/// `common/patches/rof2_structs.h:4249-4252` — and has not been derived for RoF2; see #955.
+/// This layout as a whole is **not** re-derived for RoF2 either (this opcode has a RoF2 ENCODE at
+/// `common/patches/rof2.cpp:3846`, so the serialiser output is not the wire format) — see #949.
 /// `sequence_number` (the header's SequenceNumber) is kept — OP_CancelTask addresses a task by it.
 /// `reward_item_text` is the item name extracted from item_link's EQ saylink markup.
 fn apply_task_description(gs: &mut GameState, p: &[u8]) {
@@ -241,33 +262,246 @@ fn apply_task_description(gs: &mut GameState, p: &[u8]) {
     gs.log_msg("quest", &format!("Quest accepted: {}", title_for_log));
 }
 
-/// OP_TaskActivity — one objective + live progress for a task. Layout: 8×u32 fixed
-/// (activity_count,id3,taskid,activity_id,unk,activity_type,unk,unk) + mob_name cstr + item_name
-/// cstr + goal_count u32 + 4×u32 unknown + activity_name cstr + done_count u32 (+ unknown).
-fn apply_task_activity(gs: &mut GameState, p: &[u8]) {
+/// Length of the RoF2 **short** `OP_TaskActivity` form, in bytes.
+///
+/// EQEmu `TaskManager::SendTaskActivityShort` (`zone/task_manager.cpp:972-987`) allocates the
+/// packet as `EQApplicationPacket(OP_TaskActivity, 25)` and writes 6×`u32` + 1×`u8` = exactly 25
+/// bytes:
+/// ```text
+///  0 u32 client_task_index | 4 u32 task_type | 8 u32 task_id | 12 u32 activity_id
+/// 16 u32 list_group        | 20 u32 0xffffffff (literal)     | 24 u8  optional
+/// ```
+/// Its own comment (`:974`) says it is "sent for activities that have not yet been unlocked and
+/// appear as ??? in the client". There is no activity type, target name or count in it at all.
+const TASK_ACTIVITY_SHORT_LEN: usize = 25;
+
+/// The literal `WriteUInt32(0xffffffff)` at offset 20 of the short form
+/// (`zone/task_manager.cpp:984`). In the long form that offset holds `activity_type`, and EQEmu
+/// loads `activitytype` as a **`uint8_t`** (`common/repositories/base/base_task_activities_repository.h:43`,
+/// assigned at `:235`) before casting it at `zone/task_manager.cpp:216` — so a long form's value
+/// there is always 0..=255 and this sentinel identifies the short form unambiguously. It is
+/// checked *in addition to* the length, never instead of it; see [`parse_task_activity`].
+const TASK_ACTIVITY_SHORT_SENTINEL: u32 = 0xffff_ffff;
+
+/// Prefix of the `Undecodable` reason emitted when `parse_long_objective` ran out of bytes. It
+/// publishes the exact cursor position, and the test-side `landing_of` classifier keys on it to
+/// measure how deep a probe reached. Binding the emitter and the classifier to ONE constant means a
+/// reword cannot silently reclassify probes — which is the failure mode the reach control exists to
+/// prevent.
+const UNDECODABLE_RAN_OUT_PREFIX: &str = "ran out of bytes at offset ";
+
+/// Substring of the `Undecodable` reason emitted when every long-form field decoded but bytes
+/// remained. Shared with `landing_of` for the same reason as [`UNDECODABLE_RAN_OUT_PREFIX`].
+const UNDECODABLE_TRAILING_MARKER: &str = "trailing byte(s)";
+
+/// Smallest possible **long** `OP_TaskActivity`, in bytes — every string empty and every
+/// `LengthString` zero-length. Derived from the layout in [`parse_task_activity`]:
+/// `20 + 4 + 1 + 4 + 1 + 4 + 4 + 4 + 4 + 1 + 4 + 1 + 4 + 1 + 1`. Pinned by
+/// `long_form_minimum_is_58_bytes`: 58 > 25, so the two forms cannot collide on length.
+const TASK_ACTIVITY_LONG_MIN_LEN: usize = 58;
+
+/// Read an EQEmu RoF+ `LengthString` — `SerializeBuffer::WriteLengthString`
+/// (`common/serialize_buffer.h:194-203`): a `u32` byte count followed by exactly that many raw
+/// bytes, with **no** NUL terminator. (The pre-RoF branch of `SerializeObjective` wrote these same
+/// fields as plain C strings, which is the second layout error behind #889.)
+///
+/// Non-panicking: the count comes off the wire, so it can name more bytes than exist.
+fn try_length_string(r: &mut WireReader) -> Option<String> {
+    let len = r.try_u32()? as usize;
+    let raw = r.try_bytes(len)?;
+    Some(String::from_utf8_lossy(raw).into_owned())
+}
+
+/// Decode one `OP_TaskActivity` payload into `(task_id, activity)`.
+///
+/// Returns `None` only when the packet cannot even be *attributed* — fewer than the 20 header
+/// bytes that carry `task_id`/`activity_id`, or `task_id == 0`. Anything else yields a
+/// [`TaskActivity`], possibly [`ActivityProgress::Undecodable`].
+///
+/// **This function cannot panic.** Every read goes through a non-panicking `try_*` path. That is
+/// deliberate and is half of #889: `OP_TaskActivity` has *two* legal wire shapes of different
+/// lengths, so "a short read means the sender is broken" — the premise behind `WireReader`'s
+/// panicking reads — is simply false for this opcode. Before this, a stock 25-byte short form ran
+/// the parser off the end and killed the `eq-net` thread on every zone-in.
+///
+/// ## Wire layout (RoF2), derived from the emulator's own serialiser
+///
+/// `TaskManager::SendTaskActivityLong` (`zone/task_manager.cpp:989-1014`) writes a 5×`u32` header
+/// and then delegates to `ActivityInformation::SerializeObjective` (`common/tasks.h:141-189`),
+/// taking its `client_version >= RoF` branch. `WriteString` emits a NUL-terminated cstr
+/// (`common/serialize_buffer.h:174-181`); `WriteLengthString` emits `u32 len` + raw bytes
+/// (`:194-203`). Byte offsets:
+///
+/// ```text
+///  0 u32  client_task_index      ("TaskSequenceNumber")
+///  4 u32  task_type
+///  8 u32  task_id
+/// 12 u32  activity_id
+/// 16 u32  list_group
+/// ── SerializeObjective starts here ──
+/// 20 i32  activity_type
+/// 24 i8   optional               <-- RoF+ writes ONE byte (tasks.h:154-158); pre-RoF wrote i32
+/// 25 i32  0                      (dead solo/group/raid request type)
+/// 29 cstr target_name            <-- the string eqoxide used to start reading at offset 32
+///    LenStr item_list
+///    i32    goal_count
+///    LenStr skill_list
+///    LenStr spell_list
+///    cstr   zones
+///    i32    dz_switch_id
+///    cstr   description_override
+///    i32    done_count
+///    i8     1                    (unknown constant)
+///    cstr   zones                (serialised a second time; unused by the client)
+/// ```
+///
+/// ## The two independent layout errors behind #889 — and which symptom each one caused
+///
+/// It is worth separating them, because "shift everything by three" fixes only one:
+///
+/// 1. **`optional` read as a `u32`.** That put the cursor at 32 when `target_name` starts at 29,
+///    so the name lost its first three characters: a target of `"Giant Rattlesnakes"` was served
+///    as `"nt Rattlesnakes"`. A `cstr` read **re-syncs at its own NUL**, so this error stops
+///    propagating right there — it does *not* explain the corrupted counts.
+/// 2. **`item_list` read as a C string instead of a `LengthString`.** An empty `item_list` is the
+///    four bytes `00 00 00 00` (a zero count and no payload). Reading that as a `cstr` consumes
+///    **one** byte, leaving the cursor three bytes early, so the next `u32` picks up
+///    `00 00 00 || LSB(goal_count)` — `0x01000000` for a goal of 1, `0x05000000` for a goal of 5.
+///    *This* is what produced `goal_count: 16777216`.
+///
+/// Consequence worth keeping written down: correcting only the header would have left
+/// `goal_count` reading `0x01000000` and could easily be mistaken for "the offset is still wrong".
+/// `pre_fix_layout_reproduces_the_issue_889_values` replays the old field order over a fixture
+/// built from the emulator's serialiser and asserts the issue's captured values come back out, so
+/// this attribution is measured rather than argued.
+///
+/// (The old parser's `r.skip(16)` corresponds to no run of fields in `SerializeObjective` at all;
+/// it is simply gone.)
+///
+/// ## The two forms are told apart by BOTH length and the offset-20 sentinel
+///
+/// Two independent derivations of this layout were made for #889 and they proposed *different*
+/// discriminators — length (`== 25`) and the `0xffffffff` at offset 20. Against EQEmu they are
+/// equivalent: `SendTaskActivityShort` is the only writer of that sentinel
+/// (`zone/task_manager.cpp:984`), and a long form's `activity_type` comes from a `uint8_t` DB
+/// column (see [`TASK_ACTIVITY_SHORT_SENTINEL`]) so it can never be `0xffffffff`. Rather than pick
+/// a winner, both are required to agree; a packet on which they disagree is reported
+/// `Undecodable` instead of being decoded under a guess. (`TaskActivityType::Unknown = -1` exists
+/// in the enum at `common/tasks.h:48`, but the `uint8_t` DB path cannot produce it.)
+///
+/// ## Why the trailing fields are required
+///
+/// A long form is accepted only if all of the fields above are present **and** they consume the
+/// payload exactly. `BasePacket`'s `SerializeBuffer` constructor sets
+/// `size = static_cast<uint32>(std::exchange(buf.m_pos, 0))`
+/// (`common/base_packet.cpp:36-42`, the assignment itself at `:40`) — the payload is exactly the
+/// bytes written, so the `SerializeBuffer`'s initial capacity never reaches the wire — and
+/// #889's own panic log corroborates that eqoxide delivers it unpadded (`buffer 25 bytes` for the
+/// 25-byte short form). So leftover bytes mean the layout model is wrong somewhere, which is
+/// precisely the failure this issue is about; reporting `Undecodable` is the honest answer, and it
+/// says how many bytes were left.
+fn parse_task_activity(p: &[u8]) -> Option<(u32, eqoxide_core::game_state::TaskActivity)> {
+    use eqoxide_core::game_state::{ActivityProgress, TaskActivity};
+
     let mut r = WireReader::new(p, "OP_TaskActivity");
-    let _activity_count = r.u32();
-    let _id3 = r.u32();
-    let task_id = r.u32();
-    let activity_id = r.u32();
-    let _unk16 = r.u32();
-    let activity_type = r.u32();
-    let _unk24 = r.u32();
-    let _unk28 = r.u32();
-    let mob_name = r.cstr();
-    let item_name = r.cstr();
-    let goal_count = r.u32();
-    r.skip(16); // 4 unknown u32s
-    let activity_name = r.cstr();
-    let done_count = r.u32();
-    if task_id == 0 { return; }
-    // Objective text: prefer the explicit name, else the mob/item the step targets.
-    let target = if !activity_name.is_empty() { activity_name }
-        else if !mob_name.is_empty() { mob_name }
-        else { item_name };
+    let _client_task_index = r.try_u32()?;
+    let _task_type = r.try_u32()?;
+    let task_id = r.try_u32()?;
+    let activity_id = r.try_u32()?;
+    let _list_group = r.try_u32()?;
+    if task_id == 0 { return None; }
+
+    // Peek the offset-20 word WITHOUT consuming it — parse_long_objective re-reads it as
+    // activity_type. `p` is known to hold at least 20 bytes here; 24 is not guaranteed.
+    let sentinel_at_20 = p.get(20..24).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let is_short_len = p.len() == TASK_ACTIVITY_SHORT_LEN;
+    let has_sentinel = sentinel_at_20 == Some(TASK_ACTIVITY_SHORT_SENTINEL);
+
+    let progress = match (is_short_len, has_sentinel) {
+        (true, true) => {
+            // 6×u32 + optional u8; the u8 is the last byte and is guaranteed present at len 25.
+            ActivityProgress::Locked { optional: p[24] != 0 }
+        }
+        // The two discriminators disagree — do not pick one and decode under it.
+        (true, false) => ActivityProgress::Undecodable {
+            reason: format!(
+                "{TASK_ACTIVITY_SHORT_LEN}-byte payload without the 0xffffffff short-form marker \
+                 at offset 20 (found {:#010x})",
+                sentinel_at_20.unwrap_or(0)
+            ),
+        },
+        (false, true) => ActivityProgress::Undecodable {
+            reason: format!(
+                "0xffffffff short-form marker at offset 20 but the payload is {} bytes, not \
+                 {TASK_ACTIVITY_SHORT_LEN}",
+                p.len()
+            ),
+        },
+        (false, false) if p.len() < TASK_ACTIVITY_LONG_MIN_LEN => ActivityProgress::Undecodable {
+            reason: format!(
+                "{} bytes is neither the {TASK_ACTIVITY_SHORT_LEN}-byte short form nor a long \
+                 form (minimum {TASK_ACTIVITY_LONG_MIN_LEN} bytes)",
+                p.len()
+            ),
+        },
+        (false, false) => match parse_long_objective(&mut r) {
+            Some(known) if r.at_end() => known,
+            Some(_) => ActivityProgress::Undecodable {
+                reason: format!(
+                    "{} {UNDECODABLE_TRAILING_MARKER} after the documented RoF2 objective layout \
+                     ({} total)",
+                    r.remaining(), p.len()
+                ),
+            },
+            None => ActivityProgress::Undecodable {
+                reason: format!(
+                    "{UNDECODABLE_RAN_OUT_PREFIX}{} of {} decoding the long form",
+                    r.pos(), p.len()
+                ),
+            },
+        },
+    };
+    Some((task_id, TaskActivity { activity_id, progress }))
+}
+
+/// The `SerializeObjective` body (RoF+ branch), read from a cursor already positioned at offset 20.
+/// `None` if any field runs off the end. See [`parse_task_activity`] for the layout and citations.
+fn parse_long_objective(r: &mut WireReader) -> Option<eqoxide_core::game_state::ActivityProgress> {
+    // SIGNED: `enum class TaskActivityType : int32_t` (common/tasks.h:46), written with
+    // `WriteInt32` (common/tasks.h:152). Reading it unsigned would turn any negative type into a
+    // ~4-billion "type id" in /v1/quests/log.
+    let activity_type = r.try_i32()?;      // 20..24  i32 activity_type
+    let optional = r.try_u8()? != 0;       // 24      i8  optional — ONE byte on RoF+
+    let _request_type = r.try_u32()?;      // 25..29  i32 0 (dead)
+    let target = r.try_cstr()?;            // 29..    cstr target_name
+    let _item_list = try_length_string(r)?;
+    let goal_count = r.try_u32()?;
+    let _skill_list = try_length_string(r)?;
+    let _spell_list = try_length_string(r)?;
+    let _zones = r.try_cstr()?;
+    let _dz_switch_id = r.try_u32()?;
+    let description = r.try_cstr()?;       // description_override
+    let done_count = r.try_u32()?;
+    let _unknown_one = r.try_u8()?;        // WriteInt8(1)
+    let _zones_again = r.try_cstr()?;      // RoF+ only, serialised a second time
+    Some(eqoxide_core::game_state::ActivityProgress::Known {
+        activity_type, target, description, done_count, goal_count, optional,
+    })
+}
+
+/// OP_TaskActivity — one objective (and, in the long form, its live progress) for a task.
+/// Parsing lives in [`parse_task_activity`], which documents the two RoF2 wire forms and cannot
+/// panic; this only upserts the result into `gs.tasks`.
+fn apply_task_activity(gs: &mut GameState, p: &[u8]) {
+    let Some((task_id, act)) = parse_task_activity(p) else {
+        // Too short to name a task/activity, or task_id 0 — nothing can be honestly recorded, and
+        // guessing an owner would attach a bogus objective to a real task.
+        gs.log_msg("quest", "Ignored an unattributable OP_TaskActivity packet");
+        return;
+    };
+    let activity_id = act.activity_id;
     let task = gs.tasks.entry(task_id).or_default();
     task.task_id = task_id;
-    let act = eqoxide_core::game_state::TaskActivity { activity_id, activity_type, target, done_count, goal_count };
     if let Some(existing) = task.activities.iter_mut().find(|a| a.activity_id == activity_id) {
         *existing = act; // progress update
     } else {
@@ -3018,12 +3252,15 @@ mod tests {
     use super::{apply_emote, apply_death, apply_who_all, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, apply_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_move_item, apply_spawn_appearance, apply_buff_with, apply_buff_create_with,
-                extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
+                extract_saylink_text, apply_task_description, apply_task_activity, apply_completed_tasks,
+                parse_task_activity,
+                apply_task_select_window, TASK_ACTIVITY_SHORT_LEN, TASK_ACTIVITY_LONG_MIN_LEN,
                 strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH, SIZE_NEW_ZONE,
                 apply_group_update_b, apply_group_join, apply_group_disband_you,
                 apply_group_disband_other, apply_group_leader_change, apply_group_invite, apply_group_acknowledge};
     use crate::protocol::enc_eq19;
-    use eqoxide_core::game_state::{GameState, Entity, TaskStatus};
+    use crate::wire::WireReader;
+    use eqoxide_core::game_state::{ActivityProgress, GameState, Entity, TaskStatus};
 
     /// Build a RoF2 saylink: 0x12 + 56-char body + display text + 0x12.
     fn saylink(body_seed: char, text: &str) -> String {
@@ -7000,6 +7237,667 @@ mod tests {
         // A valid header needs seq(4)+task_id(4)+open(1)+type(4)+reward(4)=17 bytes before the title
         // cstr; give it only 6 so the second u32 read runs off the end.
         apply_task_description(&mut gs, &[1, 0, 0, 0, 2, 0]);
+    }
+
+    // ── #889: OP_TaskActivity, both RoF2 wire forms ─────────────────────────────────────────
+    // The two builders below are transcriptions of the emulator's own serialisers. Keeping them
+    // as *encoders* (rather than a hex blob) is what makes the decoder's layout falsifiable: a
+    // wrong offset here would have to be wrong in the same direction in both files to pass.
+
+    /// `SerializeBuffer::WriteLengthString` (`common/serialize_buffer.h:194-203`) — u32 count then
+    /// raw bytes, NO NUL.
+    fn ser_length_string(p: &mut Vec<u8>, s: &str) {
+        p.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        p.extend_from_slice(s.as_bytes());
+    }
+    /// `SerializeBuffer::WriteString` (`common/serialize_buffer.h:174-181`) — NUL-terminated.
+    fn ser_cstr(p: &mut Vec<u8>, s: &str) {
+        p.extend_from_slice(s.as_bytes());
+        p.push(0);
+    }
+
+    /// `TaskManager::SendTaskActivityLong` (`zone/task_manager.cpp:989-1014`) followed by
+    /// `ActivityInformation::SerializeObjective` (`common/tasks.h:141-189`), RoF+ branch.
+    #[allow(clippy::too_many_arguments)]
+    fn build_task_activity_long(
+        task_id: u32, activity_id: u32, activity_type: i32, optional: bool,
+        target_name: &str, item_list: &str, goal_count: u32,
+        skill_list: &str, spell_list: &str, zones: &str,
+        description_override: &str, done_count: u32,
+    ) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&7u32.to_le_bytes());            //  0 client_task_index
+        p.extend_from_slice(&2u32.to_le_bytes());            //  4 task_type (Quest)
+        p.extend_from_slice(&task_id.to_le_bytes());         //  8
+        p.extend_from_slice(&activity_id.to_le_bytes());     // 12
+        p.extend_from_slice(&1u32.to_le_bytes());            // 16 list_group
+        // ── SerializeObjective ──
+        p.extend_from_slice(&activity_type.to_le_bytes());   // 20 i32 activity_type
+        p.push(u8::from(optional));                          // 24 i8  optional  (RoF+: ONE byte)
+        p.extend_from_slice(&0u32.to_le_bytes());            // 25 i32 0 (dead request type)
+        ser_cstr(&mut p, target_name);                       // 29 cstr target_name
+        ser_length_string(&mut p, item_list);
+        p.extend_from_slice(&goal_count.to_le_bytes());
+        ser_length_string(&mut p, skill_list);
+        ser_length_string(&mut p, spell_list);
+        ser_cstr(&mut p, zones);
+        p.extend_from_slice(&0u32.to_le_bytes());            // dz_switch_id
+        ser_cstr(&mut p, description_override);
+        p.extend_from_slice(&done_count.to_le_bytes());
+        p.push(1);                                           // WriteInt8(1), unknown
+        ser_cstr(&mut p, zones);                             // zones again (RoF+ only)
+        p
+    }
+
+    /// `TaskManager::SendTaskActivityShort` (`zone/task_manager.cpp:972-987`) — 6×u32 + 1×u8.
+    fn build_task_activity_short(task_id: u32, activity_id: u32, optional: bool) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&7u32.to_le_bytes());        //  0 client_task_index
+        p.extend_from_slice(&2u32.to_le_bytes());        //  4 task_type
+        p.extend_from_slice(&task_id.to_le_bytes());     //  8
+        p.extend_from_slice(&activity_id.to_le_bytes()); // 12
+        p.extend_from_slice(&1u32.to_le_bytes());        // 16 list_group
+        p.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // 20 literal sentinel
+        p.push(u8::from(optional));                      // 24 optional
+        p
+    }
+
+    fn only_activity(gs: &GameState, task_id: u32) -> ActivityProgress {
+        let t = gs.tasks.get(&task_id).expect("task inserted");
+        assert_eq!(t.activities.len(), 1, "exactly one activity expected");
+        t.activities[0].progress.clone()
+    }
+
+    /// The fixture builder agrees with the emulator on the SHORT form's length — 25 bytes is
+    /// `EQApplicationPacket(OP_TaskActivity, 25)` at `zone/task_manager.cpp:978`, and it is the
+    /// `buffer 25 bytes` in #889's panic log.
+    #[test]
+    fn short_form_is_exactly_25_bytes() {
+        assert_eq!(build_task_activity_short(5740, 2, false).len(), TASK_ACTIVITY_SHORT_LEN);
+        assert_eq!(TASK_ACTIVITY_SHORT_LEN, 25);
+    }
+
+    /// The claim that licenses dispatching on LENGTH: the smallest possible long form (every
+    /// string empty, every LengthString zero-length) is 58 bytes, so it can never be mistaken for
+    /// the 25-byte short form. Measured from the serialiser transcription, not asserted by hand.
+    #[test]
+    fn long_form_minimum_is_58_bytes() {
+        let minimal = build_task_activity_long(1, 0, 0, false, "", "", 0, "", "", "", "", 0);
+        assert_eq!(minimal.len(), TASK_ACTIVITY_LONG_MIN_LEN);
+        assert_eq!(TASK_ACTIVITY_LONG_MIN_LEN, 58);
+        assert!(TASK_ACTIVITY_LONG_MIN_LEN > TASK_ACTIVITY_SHORT_LEN);
+        // …and it still decodes, so "minimum" is a real packet, not an impossible one.
+        let mut gs = GameState::new();
+        apply_task_activity(&mut gs, &minimal);
+        assert!(matches!(only_activity(&gs, 1), ActivityProgress::Known { .. }));
+    }
+
+    /// #889 regression, direction 1 — the long form decodes to the REAL numbers and the WHOLE
+    /// target name (previously `goal_count: 83886080` and `"nt Rattlesnakes"`).
+    #[test]
+    fn long_form_decodes_real_goal_count_and_whole_target_name() {
+        let mut gs = GameState::new();
+        let p = build_task_activity_long(
+            5740, 0, 2, false, "Giant Rattlesnakes", "", 5, "-1", "0", "innothule", "", 3,
+        );
+        apply_task_activity(&mut gs, &p);
+        match only_activity(&gs, 5740) {
+            ActivityProgress::Known { activity_type, target, description, done_count, goal_count, optional } => {
+                assert_eq!(goal_count, 5, "the real goal count, not 0x05000000");
+                assert_eq!(done_count, 3, "the real done count, not string bytes");
+                assert_eq!(target, "Giant Rattlesnakes", "whole name, not truncated by 3 chars");
+                assert_eq!(activity_type, 2);
+                assert_eq!(description, "");
+                assert!(!optional);
+            }
+            other => panic!("expected Known, got {other:?}"),
+        }
+    }
+
+    /// The `LengthString` reader must consume `u32 len` + exactly `len` bytes. A NON-empty
+    /// `item_list` is the case that separates it from a `cstr` read most sharply: a cstr would
+    /// scan for a NUL that is not there and swallow the rest of the packet. Empty and non-empty
+    /// item lists must both leave `goal_count` correct.
+    #[test]
+    fn length_strings_are_consumed_by_count_not_by_nul() {
+        for (item_list, skill_list, spell_list) in
+            [("", "-1", "0"), ("13005|13006", "-1", "0"), ("", "42;43", "1234;1235")]
+        {
+            let mut gs = GameState::new();
+            let p = build_task_activity_long(
+                5740, 0, 1, false, "Priestess Ghanlia", item_list, 7,
+                skill_list, spell_list, "innothule", "", 2,
+            );
+            apply_task_activity(&mut gs, &p);
+            match only_activity(&gs, 5740) {
+                ActivityProgress::Known { goal_count, done_count, target, .. } => {
+                    assert_eq!(goal_count, 7, "item_list {item_list:?}");
+                    assert_eq!(done_count, 2, "item_list {item_list:?}");
+                    assert_eq!(target, "Priestess Ghanlia", "item_list {item_list:?}");
+                }
+                other => panic!("expected Known for item_list {item_list:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The oracle for the layout: replaying the PRE-#889 field order over a fixture built from the
+    /// emulator's serialiser reproduces the values the issue captured live
+    /// (`goal_count: 83886080` = `0x05000000`, target `"nt Rattlesnakes"`).
+    ///
+    /// **Only half of this is a prediction — read the two halves differently.**
+    ///   * The two `goal_count` values ARE a prediction. `0x05000000` and `0x01000000` are
+    ///     structural: a small integer whose least-significant byte has landed in byte 3. No choice
+    ///     of fixture string can produce them, so this half is a real check on the diagnosis.
+    ///   * The two target strings are a **fit, not a prediction**. The fixture names
+    ///     `"Giant Rattlesnakes"` and `"0002"` were chosen *because* losing three leading
+    ///     characters turns them into the issue's `"nt Rattlesnakes"` and `"2"` — and *any* name
+    ///     would yield *some* three-character truncation. Rename the fixture and those two
+    ///     assertions stop matching with neither the fixture nor the diagnosis being wrong. They
+    ///     are regression pins on "three characters were lost from the front", nothing more.
+    ///
+    /// The old order was 8×u32, then cstr, cstr, u32 — i.e. TWO independent errors, and this test
+    /// is what makes the split between them measured rather than argued:
+    ///   * the 8th u32 put `target_name` at offset 32 instead of 29 (the RoF+ 1-byte `optional`
+    ///     read as a u32) — that alone truncates the NAME by three characters and then re-syncs at
+    ///     the string's NUL;
+    ///   * the second `cstr` read the `LengthString` `item_list` (`00 00 00 00` when empty) as a
+    ///     C string, consuming ONE byte instead of four — that alone is what shifted `goal_count`.
+    /// Fixing only the header would have left `goal_count` reading `0x05000000`.
+    #[test]
+    fn pre_fix_layout_reproduces_the_issue_889_values() {
+        let p = build_task_activity_long(
+            5740, 0, 2, false, "Giant Rattlesnakes", "", 5, "-1", "0", "innothule", "", 3,
+        );
+        let mut r = WireReader::new(&p, "old");
+        for _ in 0..8 { r.u32(); }            // the old 32-byte "header"
+        let mob_name = r.cstr();              // read at offset 32 instead of 29
+        let _item_name = r.cstr();
+        let goal_count = r.u32();
+        assert_eq!(mob_name, "nt Rattlesnakes",
+            "three leading characters lost — a pin on the skew, NOT a prediction: the fixture name \
+             was chosen to truncate to the issue's string (see this test's doc comment)");
+        assert_eq!(goal_count, 83_886_080, "0x05000000 — the issue's captured goal_count");
+        assert_eq!(goal_count, 0x0500_0000);
+        // And the same skew on a goal count of 1 gives the other value the issue recorded.
+        let p1 = build_task_activity_long(5745, 0, 4, false, "0002", "", 1, "-1", "0", "", "", 0);
+        let mut r1 = WireReader::new(&p1, "old");
+        for _ in 0..8 { r1.u32(); }
+        assert_eq!(r1.cstr(), "2",
+            "same three-character skew on a 4-char fixture — again a pin, not a prediction");
+        let _item = r1.cstr();
+        assert_eq!(r1.u32(), 16_777_216, "0x01000000 — the issue's captured goal_count");
+
+        // The half-fix trap, measured: correct the 29-byte header but keep reading item_list as a
+        // cstr, and the NAME comes back whole while goal_count is STILL 0x05000000. A fixer who
+        // stopped here would see a plausible name and conclude the offset was still wrong.
+        let mut half = WireReader::new(&p, "header-fixed-only");
+        for _ in 0..6 { half.u32(); }         // 0..24, incl. activity_type
+        half.u8();                            // 24 optional — correctly ONE byte now
+        half.u32();                           // 25..29 dead i32
+        assert_eq!(half.cstr(), "Giant Rattlesnakes", "header fix alone repairs the NAME");
+        let _item_name_as_cstr = half.cstr(); // the LengthString bug, still present
+        assert_eq!(half.u32(), 83_886_080, "…but goal_count is unchanged at 0x05000000");
+    }
+
+    /// #889 regression, direction 2 — the 25-byte short form. Before the fix this PANICKED the
+    /// `eq-net` thread ("required u32 read at offset 24 needs 4 byte(s) but only 1 remain
+    /// (buffer 25 bytes)") on every zone-in. It must now decode, and it must decode to something
+    /// that CANNOT be read as a real objective with zero progress.
+    #[test]
+    fn short_form_decodes_as_locked_and_never_panics() {
+        let mut gs = GameState::new();
+        let p = build_task_activity_short(5740, 2, false);
+        assert_eq!(p.len(), 25);
+        apply_task_activity(&mut gs, &p); // pre-#889: panic here
+        assert_eq!(only_activity(&gs, 5740), ActivityProgress::Locked { optional: false });
+    }
+
+    /// Two independent derivations of this layout proposed two different short/long
+    /// discriminators — payload length and the `0xffffffff` at offset 20. Neither is trusted
+    /// alone: a packet on which they DISAGREE is `Undecodable`, in both directions. Neither of
+    /// these packets is something EQEmu emits; the point is that if one derivation is wrong the
+    /// result is a visible refusal, not a confidently mis-decoded objective.
+    #[test]
+    fn the_two_short_form_discriminators_must_agree() {
+        // Right length, wrong marker.
+        let mut short_no_marker = build_task_activity_short(5740, 1, false);
+        short_no_marker[20..24].copy_from_slice(&2u32.to_le_bytes());
+        let mut gs = GameState::new();
+        apply_task_activity(&mut gs, &short_no_marker);
+        match only_activity(&gs, 5740) {
+            ActivityProgress::Undecodable { reason } =>
+                assert!(reason.contains("without the 0xffffffff"), "{reason}"),
+            other => panic!("expected Undecodable, got {other:?}"),
+        }
+
+        // Right marker, wrong length. (`activity_type` cannot be 0xffffffff from EQEmu — the DB
+        // column is a uint8_t — so this shape is a contradiction, not a real long form.)
+        let long_with_marker = build_task_activity_long(
+            5741, 1, -1, false, "Something Hidden", "", 4, "-1", "0", "", "", 1);
+        assert_ne!(long_with_marker.len(), TASK_ACTIVITY_SHORT_LEN);
+        apply_task_activity(&mut gs, &long_with_marker);
+        match only_activity(&gs, 5741) {
+            ActivityProgress::Undecodable { reason } =>
+                assert!(reason.contains("not 25"), "{reason}"),
+            other => panic!("expected Undecodable, got {other:?}"),
+        }
+    }
+
+    /// `activity_type` is `enum class TaskActivityType : int32_t` (`common/tasks.h:46`) written
+    /// with `WriteInt32` (`:152`). Reading it unsigned would report any negative type as a
+    /// ~4-billion id in `/v1/quests/log` — the same class of confident-nonsense number #889 is
+    /// about. (EQEmu's own `uint8_t` DB column means the live range is 0..=255, so this pins the
+    /// *declared* wire contract, not an observed packet.)
+    #[test]
+    fn activity_type_is_read_as_signed() {
+        let mut gs = GameState::new();
+        // -2 rather than -1, so the short-form sentinel is not involved at all.
+        let p = build_task_activity_long(5740, 0, -2, false, "X", "", 1, "-1", "0", "", "", 0);
+        apply_task_activity(&mut gs, &p);
+        match only_activity(&gs, 5740) {
+            ActivityProgress::Known { activity_type, .. } => assert_eq!(activity_type, -2),
+            other => panic!("expected Known, got {other:?}"),
+        }
+    }
+
+    /// `TaskActivityType::None` (0). `SerializeObjective` has no branch on the type except
+    /// GiveCash, so the server still writes the whole body — this pins that eqoxide reads it
+    /// rather than treating type 0 as a second early-terminating form. See the PR discussion:
+    /// what the *native* client does with a type-0 row is not established here.
+    #[test]
+    fn activity_type_zero_still_carries_a_full_body() {
+        let mut gs = GameState::new();
+        let p = build_task_activity_long(
+            5740, 0, 0, false, "Cleared Step", "", 2, "-1", "0", "", "", 1);
+        assert!(p.len() >= TASK_ACTIVITY_LONG_MIN_LEN);
+        apply_task_activity(&mut gs, &p);
+        match only_activity(&gs, 5740) {
+            ActivityProgress::Known { activity_type, target, goal_count, done_count, .. } => {
+                assert_eq!(activity_type, 0);
+                assert_eq!(target, "Cleared Step");
+                assert_eq!((done_count, goal_count), (1, 2));
+            }
+            other => panic!("expected Known, got {other:?}"),
+        }
+    }
+
+    /// `optional` is the one field BOTH wire forms carry beyond the ids, and it is the single byte
+    /// whose mis-sizing (u32 instead of i8) caused the 3-byte header skew. Pin it in both forms.
+    #[test]
+    fn optional_flag_is_decoded_in_both_forms() {
+        let mut gs = GameState::new();
+        apply_task_activity(&mut gs, &build_task_activity_short(5740, 0, true));
+        assert_eq!(only_activity(&gs, 5740), ActivityProgress::Locked { optional: true });
+        let mut gs = GameState::new();
+        apply_task_activity(&mut gs, &build_task_activity_short(5740, 0, false));
+        assert_eq!(only_activity(&gs, 5740), ActivityProgress::Locked { optional: false });
+        let mut gs = GameState::new();
+        apply_task_activity(&mut gs, &build_task_activity_long(
+            5740, 0, 2, true, "Rats", "", 3, "-1", "0", "", "", 0));
+        match only_activity(&gs, 5740) {
+            ActivityProgress::Known { optional, goal_count, .. } => {
+                assert!(optional);
+                assert_eq!(goal_count, 3, "the optional byte did not shift the fields after it");
+            }
+            other => panic!("expected Known, got {other:?}"),
+        }
+    }
+
+    /// A progress update replaces the same activity_id in place rather than appending, and
+    /// activities stay sorted by id.
+    #[test]
+    fn activities_upsert_by_id_and_stay_sorted() {
+        let mut gs = GameState::new();
+        apply_task_activity(&mut gs, &build_task_activity_long(
+            5740, 2, 2, false, "Sand Scarabs", "", 5, "-1", "0", "", "", 0));
+        apply_task_activity(&mut gs, &build_task_activity_short(5740, 1, false));
+        apply_task_activity(&mut gs, &build_task_activity_long(
+            5740, 2, 2, false, "Sand Scarabs", "", 5, "-1", "0", "", "", 4));
+        let t = &gs.tasks[&5740];
+        assert_eq!(t.activities.len(), 2, "the update replaced, it did not append");
+        assert_eq!(t.activities.iter().map(|a| a.activity_id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(t.activities[0].progress, ActivityProgress::Locked { optional: false });
+        match &t.activities[1].progress {
+            ActivityProgress::Known { done_count, .. } => assert_eq!(*done_count, 4),
+            other => panic!("expected Known, got {other:?}"),
+        }
+    }
+
+    /// A packet that names a task but whose objective body is malformed is reported as
+    /// undecodable — not dropped silently, not guessed at, and not fatal.
+    #[test]
+    fn malformed_long_form_is_recorded_as_undecodable() {
+        let mut gs = GameState::new();
+        let full = build_task_activity_long(
+            5740, 0, 2, false, "Giant Rattlesnakes", "", 5, "-1", "0", "", "", 3);
+        // Truncated mid-objective: header intact, long enough to be a long form, body cut short.
+        let cut = full.len() - 5;
+        assert!(cut > TASK_ACTIVITY_LONG_MIN_LEN);
+        apply_task_activity(&mut gs, &full[..cut]);
+        match only_activity(&gs, 5740) {
+            ActivityProgress::Undecodable { reason } => assert!(reason.contains("ran out"), "{reason}"),
+            other => panic!("expected Undecodable, got {other:?}"),
+        }
+        // Between the two forms: attributable, but matching neither documented layout.
+        apply_task_activity(&mut gs, &full[..30]);
+        match only_activity(&gs, 5740) {
+            ActivityProgress::Undecodable { reason } =>
+                assert!(reason.contains("neither"), "{reason}"),
+            other => panic!("expected Undecodable, got {other:?}"),
+        }
+        // Trailing junk: every field present but the payload is not consumed exactly.
+        let mut extra = full.clone();
+        extra.extend_from_slice(&[0xAA; 3]);
+        apply_task_activity(&mut gs, &extra);
+        match only_activity(&gs, 5740) {
+            ActivityProgress::Undecodable { reason } => assert!(reason.contains("trailing"), "{reason}"),
+            other => panic!("expected Undecodable, got {other:?}"),
+        }
+    }
+
+    /// A packet too short to even say WHICH task it is about is dropped, not attributed to a
+    /// guess. `task_id == 0` likewise (it is the "no task" sentinel the old code also rejected).
+    #[test]
+    fn unattributable_packets_are_dropped_not_guessed() {
+        let mut gs = GameState::new();
+        for len in 0..20usize {
+            apply_task_activity(&mut gs, &vec![0xEEu8; len]);
+        }
+        assert!(gs.tasks.is_empty(), "no task invented from a headerless packet");
+        let mut zero = build_task_activity_short(0, 0, false);
+        zero[8..12].copy_from_slice(&0u32.to_le_bytes());
+        apply_task_activity(&mut gs, &zero);
+        assert!(gs.tasks.is_empty(), "task_id 0 is not a task");
+    }
+
+    /// Longest payload length the panic sweep probes. Well past `TASK_ACTIVITY_LONG_MIN_LEN` and
+    /// past the 98-byte real fixture, so every family covers "too short for either form", "long
+    /// enough to enter the long parser" and "long enough to be truncated anywhere in the body".
+    const PANIC_SWEEP_MAX_LEN: usize = 300;
+
+    /// Where a probe **actually landed**, read back from `parse_task_activity`'s own output and
+    /// re-derived from the probe bytes — never assumed from how the probe was built.
+    ///
+    /// This exists because a probe *count* is not a reach measurement. Round 1 of #944 measured
+    /// that the original "hostile body" family (`0xFF` from offset 20 onward) reached **nothing**:
+    /// `0xFF` at offset 20 *is* `TASK_ACTIVITY_SHORT_SENTINEL`, so every one of those probes was
+    /// refused at the discriminator and the family engineered to stress the ~4 GiB `LengthString`
+    /// case was the one family structurally incapable of reaching it. The comment claiming
+    /// otherwise had never been run. That is #778's lesson: a guard needs a REACH control, not a
+    /// positive control that passes.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    enum Landing {
+        /// `parse_task_activity` returned `None` — under 20 bytes, or `task_id == 0`.
+        Unattributable,
+        /// Short form accepted; `parse_long_objective` never called.
+        Locked,
+        /// Refused at the length/sentinel discriminator; `parse_long_objective` never called.
+        RefusedAtDiscriminator,
+        /// Entered `parse_long_objective`, but ran out of bytes **before** consuming an
+        /// `item_list` `LengthString` count (typically an unterminated `target_name`).
+        LongParserShallow,
+        /// Entered `parse_long_objective`, consumed the `item_list` `LengthString` count, and that
+        /// count named more bytes than the payload holds — i.e. the `try_bytes` refusal that
+        /// mutant G (`try_bytes` → the panicking `bytes`) turns into a panic. **This is the
+        /// landing site the whole panic property actually rests on.**
+        RefusedAnOversizedItemList,
+        /// Got past the `item_list` count some other way: a short-enough count, a later field
+        /// running out, trailing bytes, or a full decode.
+        LongParserDeep,
+    }
+
+    /// Classify one probe. The only inputs are the parser's public output and the probe bytes, so
+    /// this measures the real code path rather than restating the probe's intent.
+    fn landing_of(probe: &[u8]) -> Landing {
+        let Some((_, act)) = parse_task_activity(probe) else { return Landing::Unattributable };
+        let reason = match &act.progress {
+            ActivityProgress::Locked { .. } => return Landing::Locked,
+            ActivityProgress::Known { .. } => return Landing::LongParserDeep,
+            ActivityProgress::Undecodable { reason } => reason.clone(),
+        };
+        // "N trailing byte(s) after…" means every field decoded. "ran out of bytes at offset P of
+        // L decoding the long form" is the ONLY reason emitted from inside the long parser's
+        // failure path, and it publishes the exact cursor position. Every other reason is a
+        // discriminator refusal raised before `parse_long_objective` was ever called.
+        //
+        // Both markers are the parser's OWN constants, not copies of its prose — reword either
+        // message and the emitter and this classifier move together, so a reword cannot silently
+        // downgrade a deep landing to `RefusedAtDiscriminator` and lower the reach floors.
+        if reason.contains(crate::packet_handler::UNDECODABLE_TRAILING_MARKER) {
+            return Landing::LongParserDeep;
+        }
+        let Some(rest) = reason.strip_prefix(crate::packet_handler::UNDECODABLE_RAN_OUT_PREFIX)
+        else {
+            return Landing::RefusedAtDiscriminator;
+        };
+        let stop: usize = rest.split(' ').next().unwrap().parse().expect("offset in reason");
+
+        // Re-derive where the `item_list` LengthString lives from the BYTES: `target_name` is a
+        // cstr starting at 29, so its NUL is the first zero byte at index >= 29 and the four-byte
+        // count sits immediately after it.
+        //
+        // Precisely: the `item_list` offset is derived per-probe and is NOT written down — it
+        // depends on the probe's own name length, which this classifier cannot know in advance.
+        // The start-of-name offset `29` IS written down (twice, below); it is a fixed constant of
+        // the layout — 20 + `activity_type:i32` + `optional:u8` + `request_type:i32` — and is not
+        // derived here. If that part of the layout ever changes, this classifier must change with
+        // it (`long_form_minimum_is_58_bytes` and the round-trip tests pin the layout itself).
+        let Some(nul) = probe.iter().skip(29).position(|&b| b == 0).map(|i| i + 29) else {
+            return Landing::LongParserShallow; // no NUL ⇒ try_cstr refused; no count was read
+        };
+        let count_end = nul + 5;
+        if stop < count_end { return Landing::LongParserShallow; }
+        if stop == count_end {
+            let count = u32::from_le_bytes(probe[nul + 1..count_end].try_into().unwrap()) as usize;
+            // The cursor stopped exactly where the count ended, so the failing read was either
+            // `try_bytes(count)` (count > what remains) or the `goal_count` u32 after a zero-byte
+            // payload. Only the former is the oversized-LengthString refusal.
+            if count > probe.len() - count_end { return Landing::RefusedAnOversizedItemList; }
+        }
+        Landing::LongParserDeep
+    }
+
+    /// Hostile body that **enters the long parser and dies on an unterminated `cstr`**: a valid
+    /// 20-byte header, a plausible `activity_type` at 20..24 (so the short-form sentinel does *not*
+    /// fire), then `0xFF` to the end — no NUL exists at or after offset 29, so `target_name` can
+    /// never terminate.
+    fn build_hostile_unterminated(len: usize) -> Vec<u8> {
+        let mut p = build_task_activity_short(5740, 0, false)[..20].to_vec();
+        p.extend_from_slice(&2i32.to_le_bytes()); // 20..24 activity_type — NOT 0xffffffff
+        p.resize(len.max(p.len()), 0xFF);
+        p
+    }
+
+    /// Hostile body that **enters the long parser and makes `item_list` claim ~4 GiB**: valid
+    /// header, plausible `activity_type`, an empty NUL-terminated `target_name` at offset 29, then
+    /// `0xFF` — so the four bytes after the NUL are the count `0xffffffff` and `try_bytes` is asked
+    /// for 4294967295 bytes with at most a few hundred available.
+    ///
+    /// Returns the payload **and the offset at which the parser must stop**, so the reach
+    /// assertion is derived from the construction instead of from a hand-written number.
+    fn build_hostile_oversized_item_list(len: usize) -> (Vec<u8>, usize) {
+        let mut p = build_task_activity_short(5740, 0, false)[..20].to_vec();
+        p.extend_from_slice(&2i32.to_le_bytes());          // 20..24 activity_type
+        p.push(0xFF);                                      // 24     optional
+        p.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // 25..29 dead request_type
+        p.push(0);                                         // 29     target_name = "" (the NUL)
+        let count_at = p.len();                            // 30
+        p.resize(len.max(count_at + 4), 0xFF);             // 30..34 = 0xffffffff, then filler
+        (p, count_at + 4)
+    }
+
+    /// The round-1 finding, kept as an executable record rather than as prose that could rot again.
+    ///
+    /// #944's first revision built its "hostile body" family as a valid 20-byte header followed by
+    /// `0xFF` to the end, with the in-source comment "0xFF everywhere makes every LengthString
+    /// claim ~4 GiB and leaves every cstr unterminated". That was never run. It is false, and
+    /// self-defeatingly so: `0xFF` at offset 20 **is** `TASK_ACTIVITY_SHORT_SENTINEL`, so every
+    /// such probe is refused at the discriminator and the family engineered to stress the ~4 GiB
+    /// `LengthString` case is the one family structurally incapable of reaching it.
+    ///
+    /// This asserts the *zero*, so a future edit that reverts either hostile builder to a plain
+    /// `0xFF` fill goes red here with the reason, instead of silently testing nothing.
+    #[test]
+    fn an_all_0xff_body_reaches_nothing_because_0xff_at_offset_20_is_the_short_form_sentinel() {
+        let mut entered_long_parser: Vec<(usize, Landing)> = Vec::new();
+        for len in 0..=PANIC_SWEEP_MAX_LEN {
+            // Verbatim reconstruction of the round-1 builder.
+            let mut old_hostile = build_task_activity_short(5740, 0, false)[..20].to_vec();
+            old_hostile.resize(len.max(20), 0xFF);
+            let landing = landing_of(&old_hostile);
+            if !matches!(landing,
+                Landing::Unattributable | Landing::Locked | Landing::RefusedAtDiscriminator) {
+                entered_long_parser.push((len, landing));
+            }
+        }
+        assert_eq!(entered_long_parser, Vec::new(),
+            "an all-0xFF body cannot reach the long-form parser: 0xFF at offset 20 is the \
+             short-form sentinel, so it is refused at the discriminator every time");
+        // …and the replacement families do reach, over the same length sweep. Control for the
+        // control: without this, the assertion above is satisfied by a builder that reaches
+        // nothing for an unrelated reason.
+        assert_eq!(landing_of(&build_hostile_unterminated(PANIC_SWEEP_MAX_LEN)),
+            Landing::LongParserShallow);
+        assert_eq!(landing_of(&build_hostile_oversized_item_list(PANIC_SWEEP_MAX_LEN).0),
+            Landing::RefusedAnOversizedItemList);
+    }
+
+    /// **Universal:** no OP_TaskActivity payload of any length or content can panic the parser.
+    ///
+    /// This is the property #889's denial-of-service violated — the net thread died on a packet
+    /// the server sends as a matter of course. It is checked exhaustively over lengths
+    /// `0..=PANIC_SWEEP_MAX_LEN` against five constant fills and two deliberately *reaching*
+    /// hostile bodies, plus every prefix of a real long-form fixture, plus a deterministic
+    /// pseudorandom sweep. `parse_task_activity` uses only non-panicking `try_*` reads, which is
+    /// *why* this holds; the test is what makes a later edit that reintroduces a panicking read
+    /// fail loudly instead of at zone-in.
+    ///
+    /// ## Two separate guards, because they check different things
+    ///
+    /// * `checked` is a **probe-count tripwire**: it fails if a sweep silently stops running.
+    /// * The [`Landing`] tallies are the **reach control**: they fail if the probes still run but
+    ///   stop *arriving* where the property needs them to. Round 1 found the difference matters —
+    ///   every constant fill and the then-"hostile" family were refused at the discriminator, so
+    ///   the whole ~4 GiB `LengthString` guarantee was carried by luck of the xorshift RNG. Both
+    ///   hostile families below now land in the long parser by construction, and the
+    ///   `RefusedAnOversizedItemList` count is asserted exactly, not floored at a guess.
+    ///
+    /// Run with `-- --nocapture` to print the measured per-family landing table.
+    #[test]
+    fn no_payload_length_or_content_can_panic_the_parser() {
+        let real = build_task_activity_long(
+            5740, 0, 2, false, "Giant Rattlesnakes", "", 5, "-1", "0", "innothule", "x", 3);
+
+        let mut checked = 0usize;
+        let mut reach: std::collections::BTreeMap<(&'static str, Landing), usize> = Default::default();
+
+        macro_rules! probe {
+            ($family:expr, $bytes:expr) => {{
+                let b: &[u8] = $bytes;
+                let mut gs = GameState::new();
+                apply_task_activity(&mut gs, b); // must simply return — THIS is the property
+                let landing = landing_of(b);
+                *reach.entry(($family, landing)).or_default() += 1;
+                checked += 1;
+                landing
+            }};
+        }
+
+        // How many sweep lengths are long enough to reach `parse_long_objective` at all. Derived
+        // from the loop bound and the parser's own minimum, not written down.
+        let reaching_lengths =
+            (0..=PANIC_SWEEP_MAX_LEN).filter(|&l| l >= TASK_ACTIVITY_LONG_MIN_LEN).count();
+
+        // Constant fills across every length. These exercise the discriminator arms; per round 1
+        // they do NOT reach the long-form body, and nothing here claims they do.
+        for len in 0..=PANIC_SWEEP_MAX_LEN {
+            for fill in [0x00u8, 0xFF, 0x41, 0x80, 0x01] {
+                let family = match fill {
+                    0x00 => "fill 0x00", 0xFF => "fill 0xFF", 0x41 => "fill 0x41",
+                    0x80 => "fill 0x80", _ => "fill 0x01",
+                };
+                probe!(family, &vec![fill; len]);
+            }
+        }
+
+        // Hostile family 1 — reaches the long parser and dies on an unterminated `target_name`.
+        let mut unterminated_reached = 0usize;
+        for len in 0..=PANIC_SWEEP_MAX_LEN {
+            let p = build_hostile_unterminated(len);
+            let landing = probe!("hostile: unterminated cstr", &p);
+            if p.len() >= TASK_ACTIVITY_LONG_MIN_LEN {
+                assert_eq!(landing, Landing::LongParserShallow,
+                    "hostile-unterminated len {len} ({} bytes) must ENTER the long parser", p.len());
+                unterminated_reached += 1;
+            }
+        }
+        assert_eq!(unterminated_reached, reaching_lengths,
+            "every long-enough unterminated-cstr probe must enter parse_long_objective");
+
+        // Hostile family 2 — reaches the long parser AND performs the oversized LengthString read
+        // that the panic property is really about. Asserted per probe against the offset the
+        // builder itself reports, so no hand-written offset can drift.
+        let mut oversized_reached = 0usize;
+        for len in 0..=PANIC_SWEEP_MAX_LEN {
+            let (p, must_stop_at) = build_hostile_oversized_item_list(len);
+            let landing = probe!("hostile: 4 GiB item_list", &p);
+            if p.len() >= TASK_ACTIVITY_LONG_MIN_LEN {
+                assert_eq!(landing, Landing::RefusedAnOversizedItemList,
+                    "hostile-oversized len {len} ({} bytes) must refuse an oversized LengthString",
+                    p.len());
+                let ActivityProgress::Undecodable { reason } =
+                    parse_task_activity(&p).expect("attributable").1.progress
+                else { panic!("expected Undecodable") };
+                assert!(reason.contains(&format!("offset {must_stop_at} of {}", p.len())),
+                    "must stop exactly where the builder put the 4 GiB count: {reason}");
+                oversized_reached += 1;
+            }
+        }
+        assert_eq!(oversized_reached, reaching_lengths,
+            "every long-enough 4 GiB-item_list probe must perform the oversized LengthString read");
+
+        // Every prefix of a real packet (the truncation family that produced the live panic).
+        for n in 0..=real.len() {
+            probe!("real prefix", &real[..n]);
+        }
+        // Deterministic pseudorandom sweep (xorshift64*), so content is not only the patterns
+        // above. Its reach is incidental — it is a bonus, not the guarantee.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            state
+        };
+        for len in 0..=PANIC_SWEEP_MAX_LEN {
+            let bytes: Vec<u8> = (0..len).map(|_| (next() >> 24) as u8).collect();
+            probe!("xorshift", &bytes);
+        }
+
+        println!("── measured landing table (family × where the probe actually stopped) ──");
+        for ((family, landing), n) in &reach {
+            println!("REACH  {family:<28} {landing:<28} {n}", landing = format!("{landing:?}"));
+        }
+        let entered_long: usize = reach.iter()
+            .filter(|((_, l), _)| !matches!(*l,
+                Landing::Unattributable | Landing::Locked | Landing::RefusedAtDiscriminator))
+            .map(|(_, n)| *n).sum();
+        let oversized: usize = reach.iter()
+            .filter(|((_, l), _)| *l == Landing::RefusedAnOversizedItemList)
+            .map(|(_, n)| *n).sum();
+        println!("REACH  TOTAL entered parse_long_objective: {entered_long}");
+        println!("REACH  TOTAL oversized-item_list refusals: {oversized}");
+
+        // Reach floors, both derived from the two deliberate families above (each contributes
+        // exactly `reaching_lengths`). Any additional reach from the real-prefix or xorshift
+        // families is a bonus these floors deliberately do not depend on.
+        assert!(entered_long >= 2 * reaching_lengths,
+            "reach control: only {entered_long} probes entered parse_long_objective, but the two \
+             deliberate hostile families alone must contribute {}", 2 * reaching_lengths);
+        assert!(oversized >= reaching_lengths,
+            "reach control: only {oversized} probes performed an oversized LengthString read, but \
+             the 4 GiB-item_list family alone must contribute {reaching_lengths}");
+
+        assert_eq!(checked, 301 * 7 + (real.len() + 1) + 301,
+            "every planned payload was probed");
     }
 
     fn build_completed_tasks(entries: &[(u32, &str, u32)]) -> Vec<u8> {
