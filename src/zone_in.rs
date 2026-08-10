@@ -1369,9 +1369,14 @@ mod tests {
     /// dispatching, so the accepted opener set is this constant *by construction* rather than by
     /// inspection of the arms below it, and
     /// `the_char_literal_escape_grammar_is_enumerated_not_approximated` asserts its contents
-    /// against a literal list. Widening the lexer's escape grammar therefore cannot happen
-    /// silently: an arm whose opener is not here is unreachable, and putting the opener here reds
-    /// that test.
+    /// against a literal list.
+    ///
+    /// Stated at the strength it was measured at: **while this gate is in force**, an arm whose
+    /// opener is not here is unreachable, and putting the opener here reds that test. It does not
+    /// follow that widening the grammar cannot happen silently, and an earlier revision of this
+    /// paragraph said it did. Disabling the gate and adding an arm in the *same* edit survives the
+    /// whole module — measured, and recorded as the fifth row of [`escape_end`]'s survivor table.
+    /// What bounds that residue is where this function is called from, not this constant.
     ///
     /// Sorted by byte value, which is the order the 256-byte sweep collects in.
     const ESCAPE_OPENERS: &[u8] = b"\"'0\\nrtux";
@@ -1382,9 +1387,10 @@ mod tests {
     ///
     /// # How the arm set is kept honest, and how an earlier claim about that was false
     ///
-    /// The gate on [`ESCAPE_OPENERS`] is what makes the enumeration checkable. An arm whose opener
-    /// is absent from that table is dead code and cannot move a mask; an arm whose opener is
-    /// present reds the sweep, which asserts the table byte for byte.
+    /// The gate on [`ESCAPE_OPENERS`] is what makes the enumeration checkable. So long as the gate
+    /// itself is intact, an arm whose opener is absent from that table is dead code and cannot move
+    /// a mask; an arm whose opener is present reds the sweep, which asserts the table byte for
+    /// byte. The "so long as" is load-bearing and is measured below, not assumed.
     ///
     /// An earlier revision credited the 256-byte sweep alone with that, and said an arm added
     /// without a fixture "reds here". It did not. #892's round-2 review added
@@ -1394,24 +1400,35 @@ mod tests {
     /// over those two bodies; the gate is what extends it to every body. Both are needed and
     /// neither is the other.
     ///
-    /// # Two SURVIVING mutants here, labelled rather than hidden
+    /// # Three SURVIVING mutants here, labelled rather than hidden
     ///
     /// The gate does not make every edit to this function loud, and saying otherwise would repeat
-    /// the defect above. The four-mutant matrix that was actually run:
+    /// the defect above. The five-mutant matrix that was actually run:
     ///
     /// | Mutation | Result |
     /// | --- | --- |
-    /// | that `b'z'` arm added, gate untouched | **SURVIVES** — and is unreachable, so it cannot move a mask |
+    /// | that `b'z'` arm added, gate untouched | **SURVIVES** — unreachable, so it cannot move a mask |
     /// | that `b'z'` arm added *and* `b'z'` added to [`ESCAPE_OPENERS`] | KILLED by the sweep |
     /// | `b'z'` added to [`ESCAPE_OPENERS`] with no arm | KILLED by the sweep |
-    /// | the gate line deleted, nothing else changed | **SURVIVES** — and changes no behaviour, because the arms below already cover exactly the table |
+    /// | the gate line deleted, nothing else changed | **SURVIVES** — no behaviour change, because the arms below already cover exactly the table |
+    /// | **composed:** the gate wrapped inert *and* an arm keyed on `!` added in the same edit | **SURVIVES**, and the arm is REACHABLE |
     ///
-    /// So two of the four survive, and neither survivor is a hole: the first is dead code and the
-    /// second is a no-op *given the arms as written today*. What the gate buys is that those two
-    /// are only ever inert **together with** the third row — reaching a new opener requires the
-    /// table edit, and the table edit is what reds. Deleting the gate re-opens the round-2 defect
-    /// for whoever edits next, which is why it is a tripwire worth its two lines and not a check
-    /// the suite can kill.
+    /// The fifth row is #892's round-3 finding and the reason the first four are written out
+    /// individually rather than summarised. Rows 1 and 4 survive separately for opposite reasons —
+    /// dead code, and a no-op — and an earlier revision inferred from that pair that reaching a new
+    /// opener requires the table edit. It does not. Composed, they survive together and the arm
+    /// runs: in that build `escape_end(b"z!", 0)` is `Some(2)` and `char_literal_end(b"'\z!'", 0)`
+    /// is `Some(5)`, where the pristine build answers `None` to both. Two individually-inert
+    /// mutations composing into a live one is precisely what a per-row matrix cannot see.
+    ///
+    /// **What bounds the residue is the call site, not the gate.** [`escape_end`] is reached only
+    /// from [`char_literal_end`], i.e. only for a `\` already inside a character or byte literal,
+    /// and in Rust that `\` is always one of the nine bytes in [`ESCAPE_OPENERS`]. A stray arm can
+    /// therefore only change this lexer's answer for text `rustc` itself rejects — and the corpus
+    /// is source `rustc` has already compiled. That is the honest limit: not "widening cannot
+    /// happen silently", but "a silent widening cannot reach the corpus". Keying such an arm on `#`
+    /// specifically is killed by the `'\z#'` fixture below; the class is not, and is not claimed to
+    /// be.
     fn escape_end(b: &[u8], esc: usize) -> Option<usize> {
         let c = *b.get(esc)?;
         // THE GATE. Everything below is unreachable for an opener outside the table.
