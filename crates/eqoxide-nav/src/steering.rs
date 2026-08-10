@@ -462,9 +462,9 @@ pub fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
 /// 400 ticks, and 33 of 288 on the wider 8 u-separation sweep. With `<` it is outside, and both went
 /// to zero.
 ///
-/// **Since #733 that flip is no longer observable, and no test enforces the token** — see the
-/// ⚠️ Correction on `the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced`, which
-/// records the re-run. The second trigger catches the same fixed point, so `<` survives on the
+/// **Since #733 that flip is no longer observable, and no test enforces the token** — see
+/// `the_deadlock_fixed_point_exactly_on_the_guard_boundary_is_resynced`'s rustdoc, which records
+/// the re-run. The second trigger catches the same fixed point, so `<` survives on the
 /// round-2 reasoning alone. Read the counts above as a measurement of this constant's trigger in
 /// isolation, not as a live mutation check.
 ///
@@ -486,32 +486,15 @@ pub fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
 /// from a later one, whose carrot still leads and whose cursor must not move). The two triggers
 /// answer different questions and the sweep counts above are what this one, alone, is worth.
 ///
-/// > ## ⚠️ Corrections
-/// >
-/// > * *"1 of 8 swept starts still **wedged**"*, *"(**wedged** starts / total)"*, *"0 **wedged**"* —
-/// >   **retracted (round 3, swept here round 5).** Every count on this page comes from
-/// >   `hairpin_carrot_stops_leading`, a loop that steps the body straight at `local_goal` (24 u).
-/// >   That is not how `drive_walk` moves, so the loop can measure CARROT PINNING soundly — it is
-/// >   pure function composition — but it cannot measure whether a walker wedges. The counts are
-/// >   unchanged and were re-run; only the noun is. The correction was made in round 3 on the tests'
-/// >   own docs and missed here, which is the whole of round-4 finding B-B: the sweep was scoped by
-/// >   memory instead of by grepping the concept.
-/// > * *"…and is inert below it" cited as
-/// >   `the_resync_clears_the_deadlock_above_the_guard_and_is_inert_below_it`* — **that test no
-/// >   longer exists.** Round 3 renamed it *precisely because* the old name asserted the retracted
-/// >   "deadlock" reading of these counts. So this doc was citing the retracted claim by its
-/// >   retracted name, as evidence for itself. **#733 renamed it a second time**, for the second
-/// >   time because the name asserted something the code had stopped doing — "inert below the
-/// >   guard" — and it is now
-/// >   `the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured`.
-/// > * *"The round-1 review measured 133/1649 at 8 u…"* — **removed.** The round-2 reviewer retracted
-/// >   that figure on the same grounds (it was the same 24 u-step model on a denser grid), and it is
-/// >   preserved with its retraction on
-/// >   `the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured` rather than
-/// >   repeated here.
-/// >
-/// > None of this weakens the `<` finding, which is about the fixed point sitting on the boundary
-/// > and is independent of what the loop's outcome is called.
+/// **The LIMIT on every count above.** They all come from `hairpin_carrot_stops_leading`, a loop
+/// that steps the body straight at `local_goal` (24 u). That is not how `drive_walk` moves, so the
+/// loop measures CARROT PINNING soundly — it is pure function composition — but it cannot measure
+/// whether a walker WEDGES. Read them as pinning counts only. (This does not weaken the `<`
+/// finding, which is about the fixed point sitting on the boundary, not about what the loop's
+/// outcome is called.) A round-1 review figure — **133/1649 at 8 u** — was retracted by the round-2
+/// reviewer on exactly this ground, being the same 24 u-step model on a denser grid. It is recorded
+/// here because this is the only surviving copy of that retraction; an earlier revision said the
+/// pair was preserved elsewhere, and that pointer was false when written.
 pub const CURSOR_STALE_DIST: f32 = 8.0;
 
 /// The furthest a resync may reach: a candidate segment whose closest point is further than this
@@ -745,42 +728,16 @@ pub fn resync_reachable(col: &crate::collision::Collision, from: [f32; 3], to: [
 /// `walker_stalled` at `[-534.4, 144.4, -6.0]` on 6 of 8 attempts; reproduced offline from the
 /// captured live route by the three `#673 step N of 3` tests in `steering::cursor_resync_tests`.)
 ///
-/// > ## ⚠️ Corrections — read these before quoting this doc
+/// > ## ⚠️ The LIMITS of the figures above
 /// >
-/// > This paragraph was written at round 1 and left untouched while the claims in it were retracted
-/// > one at a time elsewhere in the PR. It is the `cargo doc` page for the #673 fix, so the retracted
-/// > text is preserved here rather than deleted — a silently deleted wrong claim is how a wrong claim
-/// > comes back.
-/// >
-/// > * *"the carrot lands essentially ON TOP of the character"* — **retracted (round 3).** True of
-/// >   `local_goal` at `LOCAL_REACH`; false of the carrot the walker steers with. Measured on the
-/// >   captured fixture: 0.21 u at 24 u reach, **17.06 u** at `LOOK_AHEAD`. Replaced by the
-/// >   four-step chain above; measured by
-/// >   `the_stale_cursor_reaches_the_steering_aim_through_the_fine_plan_not_the_coarse_carrot`.
-/// > * *"flipping to the opposite side each **tick**"* — **retracted (round 3).** The flip is per
-/// >   controller FRAME (~10 ms), not per nav tick (150 ms).
-/// > * *"oscillates over ~0.4 u"* — **retracted (round 4, restated round 5, corrected round 6).**
-/// >   Measured settled band in `fixture_run` is **1.32 u**; over the whole run including the
-/// >   transient the body covers 8.13 u and reaches 6.60 u from where it landed. The round-3
-/// >   reviewer's production `drive_walk` log matches the *transient* figures (its three tick
-/// >   positions are what the 8.13 u and 6.60 u extremes are attained at) and does **not** match the
-/// >   settled width: production oscillates over ~2.6 u against this harness's 1.32 u.
-/// >   **Round 5 wrote 0.88 u here and blamed round 4's "1.32 u" on dropped frames. Both were
-/// >   wrong** — 0.88 u was the settled band sampled once per nav tick, and 1.32 u is what the same
-/// >   window measures per frame. See the correction on
-/// >   `the_simulated_stall_is_a_bounded_overshoot_cycle_a_few_frames_wide` for the A/B that
-/// >   settles it.
-/// > * *"exhausts its re-paths and stops with `blocked` / `walker_stalled`"* — **retracted
-/// >   (round 4).** This exact sentence was struck from `crate::walker::Walker`'s `advance_cursor`
-/// >   rustdoc because no offline instrument on this branch contains the stall detector,
-/// >   `NAV_STUCK_TICKS` backoff or re-plan that decide it. Driven through the **production**
-/// >   `drive_walk` on this fixture the walker sits in the cycle ~22 nav ticks, re-plans, and
-/// >   **arrives**; #673 is terminal on real terrain, which is a property of the terrain and not of
-/// >   this mechanism.
-/// > * *"see `walker_cursor_resync` tests"* — **no such module has ever existed.** The tests are in
-/// >   `steering::cursor_resync_tests`. Test items are `#[cfg(test)]` and so cannot be intra-doc
-/// >   linked from public rustdoc; `every_test_name_cited_in_a_doc_comment_still_exists` stands in
-/// >   for the link, naming each cited test as a value so a rename is a COMPILE error.
+/// > * **The offline fixture is not production.** `fixture_run`'s settled band is **1.32 u**
+/// >   per frame (0.88 u sampled once per nav tick); the production `drive_walk` log oscillates
+/// >   over **~2.6 u** on the same fixture. Use these as evidence for the MECHANISM, not for
+/// >   production amplitudes.
+/// > * **The cycle is not terminal here.** No offline instrument on this branch contains the stall
+/// >   detector, `NAV_STUCK_TICKS` backoff or re-plan. Driven through the production `drive_walk`
+/// >   the walker sits in the cycle ~22 nav ticks, re-plans, and **arrives**. #673 is terminal on
+/// >   real terrain, which is a property of the terrain and not of this mechanism.
 ///
 /// This moves the cursor toward its invariant — *`path_i` names the segment the character is
 /// actually on* — under three hard guards that keep it strictly conservative:
@@ -1204,18 +1161,14 @@ mod cursor_resync_tests {
 
     /// **#673 step 1 of 3 — the stale cursor collapses the FINE PLANNER'S GOAL onto the character.**
     ///
-    /// ⚠️ **Correction (round 3).** Through round 2 this test was documented as measuring "the
-    /// walker's carrot", and the reach below was commented `// the walker's LOCAL_REACH` as though
-    /// 24 u were a steering target. It is not. `drive_walk` steers with `LOOK_AHEAD = 5.0`;
-    /// `LOCAL_REACH = 24.0` is only the *goal it hands the fine planner*. The round-2 review was
-    /// right that at 5 u off the coarse route this carrot does **not** collapse (17.06 u ahead on
-    /// this very fixture). The collapse measured here is real, but it is a collapse of `local_goal`,
-    /// and it reaches the steering aim by a different route — see the two tests that follow, which
-    /// carry that chain the rest of the way. ⚠️ **Correction (round 5).** That sentence used to end
-    /// "…and are the ones that measure a wedge". They do not: they measure the STEERING LOOP having
-    /// no escaping trajectory. Whether that is a wedge is decided by the stall detector, backoff and
-    /// re-plan, none of which any instrument on this branch contains — round-4's blocking finding 1,
-    /// and the same retracted noun as the `CURSOR_STALE_DIST` sweep counts.
+    /// **Read the reach literally: 24 u is NOT a steering target.** `drive_walk` steers with
+    /// `LOOK_AHEAD = 5.0`; `LOCAL_REACH = 24.0` is only the *goal it hands the fine planner*. At 5 u
+    /// off the coarse route this carrot does **not** collapse — 17.06 u ahead on this very fixture.
+    /// So what collapses here is `local_goal`, and it reaches the steering aim by a different route:
+    /// the two tests that follow carry that chain the rest of the way. What they measure is the
+    /// STEERING LOOP having no escaping trajectory, **not** a wedge — whether it is a wedge is
+    /// decided by the stall detector, backoff and re-plan, none of which any instrument on this
+    /// branch contains.
     #[test]
     fn a_stale_cursor_collapses_the_fine_planners_goal_onto_the_character() {
         // Not a steering carrot: this is `drive_walk`'s `local_goal`, the point handed to
@@ -1271,15 +1224,13 @@ mod cursor_resync_tests {
     /// inside [`fixture_run`]'s `step`. Not per nav tick. The single exception is `head`, which is
     /// defined as a tick-boundary quantity and says so on its own line.
     ///
-    /// ⚠️ **Correction (#727 round 5 review, B-1).** Round 5 sampled `x_min`/`x_max` per frame and
-    /// `late_x_min`/`late_x_max` per **tick**, then printed both in one table as "the same
-    /// measurement at two times". They were two different measurements. The settled cycle flips the
-    /// aim **every frame** — that is this PR's own root-cause mechanism — so a once-per-15-frames
-    /// sampler is structurally incapable of seeing its width: it understated the settled span by
-    /// **50%** (0.880 u tick-sampled vs 1.320 u frame-sampled over the identical `tick >= 100`
-    /// window). The fix is not to sample the two bands the same way by hand, which is how they drifted
-    /// apart in the first place; it is that there is now exactly ONE place a position is recorded, so
-    /// a future extent cannot pick a different rate.
+    /// **Why the one rule is enforced by construction rather than by care (#727 round 5, B-1).** The
+    /// two bands were once sampled at different rates and printed in one table as "the same
+    /// measurement at two times". The settled cycle flips the aim **every frame** — the root-cause
+    /// mechanism itself — so a once-per-15-frames sampler is structurally incapable of seeing its
+    /// width: it understated the settled span by **50%** (0.880 u tick-sampled vs 1.320 u
+    /// frame-sampled over the identical `tick >= 100` window). Hand-matching the rates is how they
+    /// drifted apart in the first place; there is now exactly ONE place a position is recorded.
     struct Run {
         arrived: bool,
         ticks: u32,
@@ -1472,14 +1423,12 @@ mod cursor_resync_tests {
             // So on a tick with NO fine plan the controller integrates the tick's own MoveIntent for
             // all 15 frames.
             //
-            // ⚠️ **Correction (#727 round 4 review, B-C).** This loop used to `break` on a tick with
-            // no fine plan, advancing the body **1 frame of the 15**. That is not a physics
-            // simplification, it is the harness declining to move the body, and it manufactured a
-            // lateral bound the character does not have: the eastern extreme of the whole run was
-            // set on tick 0 (`t0 cursor 2 local.len 0 moved 0.440 u`) purely because 14 frames were
-            // dropped. The round-3 reviewer's production `drive_walk` loop reached `x = -528.39` at
-            // t1 — 5.9 u east — on this same fixture. Fixed here rather than disclosed, because a
-            // bound derived from dropped frames cannot say anything about the character.
+            // DO NOT `break` here on an empty fine plan (#727 round 4, B-C). Doing so advances the
+            // body 1 frame of the 15 — not a physics simplification but the harness declining to
+            // move the body — and it manufactures a lateral bound the character does not have: the
+            // whole run's eastern extreme was once set on tick 0 purely because 14 frames were
+            // dropped, while production `drive_walk` reached `x = -528.39` at t1, 5.9 u east, on
+            // this same fixture.
             for _ in 0..FRAMES {
                 if !local.is_empty() {
                     if let Some((w, _)) = fast_steer_aim(&local, &mut local_i, p, LOOK_AHEAD, |_, _| true) {
@@ -1567,39 +1516,24 @@ mod cursor_resync_tests {
     /// less than one 8 u leg of the route it is standing on. With the resync it walks the fixture out
     /// in **4** nav ticks.
     ///
-    /// ⚠️ **Correction (#727 round 5).** Through round 4 the figures here were "0.02 u net" and
-    /// "5 nav ticks". Those were measured on a harness that stopped moving the body for 14 frames of
-    /// every 15 whenever the fine plan was empty (round-4 review, B-C); [`fixture_run`] now carries
-    /// `wish_dir` across frames the way the controller does. The numbers moved to 0.04 u / 4 ticks.
-    /// Nothing about the conclusion changed — but the OLD numbers were partly an artifact of dropped
-    /// frames and should not be quoted.
-    ///
-    /// ⚠️ **Correction (#727 round 4).** Through round 3 this test was named
-    /// `..._wedges_the_walker_...` and its doc said "pre-#727 the character never leaves the spot".
-    /// **That was a claim about the walker made by an instrument that does not contain the walker.**
-    /// [`fixture_run`] has no stall detector, no `NAV_STUCK_TICKS` backoff and no re-plan — the exact
-    /// machinery that decides whether a limit cycle is a wedge or a hiccup. The round-3 reviewer
-    /// drove the **production** `drive_walk` + `apply_fast_steering` loop on this same fixture with
-    /// the resync mutated out and measured the walker sitting in this cycle for ~22 nav ticks
-    /// (~3.3 s), then escaping via its own backoff + re-plan and **arriving** at t27. So on this
-    /// featureless floor the pre-#727 cost is a wasted re-plan lap, not a permanent stop.
+    /// **THE LIMIT: this instrument does not contain the walker**, so it cannot say the walker
+    /// WEDGES. [`fixture_run`] has no stall detector, no `NAV_STUCK_TICKS` backoff and no re-plan —
+    /// the exact machinery that decides whether a limit cycle is a wedge or a hiccup. Driven through
+    /// the **production** `drive_walk` + `apply_fast_steering` loop on this same fixture with the
+    /// resync mutated out, the walker sits in the cycle ~22 nav ticks (~3.3 s), escapes via its own
+    /// backoff + re-plan and **arrives** at t27. On this featureless floor the pre-#727 cost is a
+    /// wasted re-plan lap, not a permanent stop.
     ///
     /// **What the defect is, then.** The steering loop having no escaping trajectory is the
     /// mechanism; whether that is terminal is decided outside this sim, by whether the re-plan
     /// reproduces the state. Live on qcat it did: #673 records `blocked` / `walker_stalled` at
     /// `[-534.4, 144.4, -6.0]` on **6 of 8** attempts. The terminal state itself is what carries that
-    /// — the walker stopped, on a route it was standing on.
-    ///
-    /// ⚠️ **Correction (#727 round 5).** This paragraph used to add "and `walker.rs` only emits
-    /// `walker_stalled` after `nav_repaths` reaches 8 — i.e. eight backoff-and-re-plan attempts ran
-    /// and none escaped". That over-reads the counter. `drive_walk` resets `nav_repaths` to 0
-    /// whenever `gdist < nav_best_gdist - REPATH_RESET_DIST` (200 u) and on `decision.reset_route`,
-    /// so `nav_repaths == 8` at the emission site
-    /// (`walker.rs`'s `stop_nav(gs, "blocked", "walker_stalled", …)`)
-    /// establishes *at least eight stall-triggered re-plans since the walker
-    /// last closed 200 u on the goal* — not eight attempts **at this spot**. Nothing in the live
-    /// record places all eight there. The conclusion is unchanged and rests on the `blocked` outcome
-    /// itself, not on the count.
+    /// — the walker stopped, on a route it was standing on. Do **not** additionally read
+    /// `nav_repaths == 8` at the emission site as eight failed attempts AT THAT SPOT: `drive_walk`
+    /// resets the counter whenever `gdist < nav_best_gdist - REPATH_RESET_DIST` (200 u) and on
+    /// `decision.reset_route`, so it establishes only *at least eight stall-triggered re-plans since
+    /// the walker last closed 200 u on the goal*. The conclusion rests on the `blocked` outcome, not
+    /// on the count.
     ///
     /// The residual #673 defect therefore ranges from ~22 wasted ticks plus a re-plan lap (measured,
     /// featureless floor) to a terminal stop (observed, real terrain). *Reasoned, not measured:* the
@@ -1646,124 +1580,56 @@ mod cursor_resync_tests {
     /// one frame of travel (`RUN_SPEED * 0.01 = 0.44 u`) is overshot, the direction flips, and the
     /// body orbits the stub instead of following the route.
     ///
-    /// ⚠️ **Correction (#727 round 4) — the corroboration claim is WITHDRAWN.** Through round 3 this
-    /// test was named `..._oscillates_in_the_band_the_live_capture_recorded` and asserted
-    /// `|x_min − (−534.73)| < 0.05` against the live capture, with the doc claiming "the sim was not
-    /// fitted to those numbers … the agreement is evidence that it reproduces the live defect rather
-    /// than a similar-looking one". The round-3 reviewer showed that was an **identity, not
-    /// evidence**:
-    ///
-    /// ```text
-    /// LANDED[0]                  = -534.285_583   <- the capture's east end: a harness INPUT
-    /// RUN_SPEED * 0.01           =    0.440_000   <- a code constant
-    /// LANDED[0] - RUN_SPEED*0.01 = -534.725_586   <- what the assertion was matching
-    /// ```
-    ///
-    /// Any harness seeded at `LANDED` that aims west and steps a full frame produces that number,
-    /// whatever the mechanism, so the assertion discriminated "oscillates at the start" from "moves"
-    /// and nothing finer. Two further corrections on the same point: the round-4 harness (one
-    /// `steer_target` + 14 [`fast_steer_aim`] frames, one tick of planner latency) puts `x_min` at
-    /// **-535.185**, so even the identity no longer holds; and the band is **not** reproduced — the
-    /// reviewer's production `drive_walk` loop oscillates over roughly `[-536.5, -533.0]` (~2.6 u)
-    /// against this sim's 1.32 u, so the sim's width is a property of the harness, not of the defect.
-    /// The capture's −534.73 lies inside this sim's band and is *consistent* with an overshoot cycle;
-    /// it is **not** independent evidence of one.
-    ///
-    /// ⚠️ **Correction (#727 round 5) — the round-4 replacement assertion is WITHDRAWN and the band
-    /// figure is restated.** Round 4 replaced the identity above with three assertions, one of them
-    /// `run.x_max <= LANDED[0] + 2.0 * FRAME` (0.88 u) under the message *"the character must never
-    /// get materially EAST of where it landed"*. The round-4 review showed that bound was **earned by
-    /// the harness dropping frames**, not by the character: with no fine plan the old [`fixture_run`]
-    /// `break`ed out of its fast loop, so tick 0 advanced the body 1 frame of 15 and set the eastern
-    /// extreme right there. Production keeps integrating the last `MoveIntent`, and the round-3
-    /// reviewer's production run reached `x = -528.39` — **5.9 u east**, ~6.7× that budget. ~~Round
-    /// 4's quoted band, "1.32 u in the sim", is retracted for the same reason.~~
-    ///
-    /// [`fixture_run`] now carries `wish_dir` across frames, and the picture that comes back is
-    /// **two-phase**, which is why one number could not describe it:
+    /// The run is **two-phase**, which is why no single number describes it:
     ///
     /// ```text
     /// whole run    x ∈ [-536.524, -528.391]   span 8.13 u   max 6.60 u from LANDED
     /// ticks ≥ 100  x ∈ [-535.204, -533.884]   span 1.32 u = 3 frames of travel
-    ///                                         0.40 u east of LANDED, 0.92 u west
+    ///                                         0.4011 u east of LANDED, 0.9189 u west
     /// ```
-    ///
-    /// ⚠️ **Correction (#727 round 6 review, B-1) — the round-5 retraction above is struck, and its
-    /// two numbers are restated. Measured, not reasoned.** Two independent defects:
-    ///
-    /// 1. **The 0.88 u was a sampling artifact of round 5's own making.** Round 5 recorded
-    ///    `x_min`/`x_max` per *frame* but `late_x_min`/`late_x_max` per *nav tick*, then printed both
-    ///    in one table as though they were one measurement at two times. The settled cycle flips the
-    ///    aim **every frame** — this PR's own root-cause mechanism — so a once-per-15-frames sampler
-    ///    cannot see its width. Over the identical `tick >= 100` window: **0.880 u tick-sampled,
-    ///    1.320 u frame-sampled**, a 50% understatement. Every extent on `Run` is now recorded in one
-    ///    place, inside `step`; see `Run`'s own "one sampling rate" note.
-    /// 2. **"Retracted for the same reason" was false, and the reason was never measured.** The
-    ///    frame drop did not change the cycle's width at all. Round 4's harness was reconstructed on
-    ///    this branch (its `None => break` restored, everything else left alone) and re-run under
-    ///    per-frame sampling:
-    ///
-    /// ```text
-    /// harness            whole-run band              settled band (ticks >= 100)   net      fixed
-    /// round 4 (break)    [-535.185, -533.865] 1.320  [-535.185, -533.865] 1.320    0.0197   5 ticks
-    /// round 5/6 (carry)  [-536.524, -528.391] 8.134  [-535.204, -533.884] 1.320    0.0389   4 ticks
-    /// ```
-    ///
-    /// The reconstruction reproduces round 4's reported `[-535.185, -533.865]`, its `0.0197 u` net
-    /// and its 5-tick arrival exactly, so it is the round-4 harness and not a lookalike. Read across:
-    /// the frame drop left the settled width **identical to three decimal places** (1.320 vs 1.320,
-    /// the band shifted 0.019 u west) and collapsed the *whole-run* band from 8.134 u to 1.320 u by
-    /// suppressing the transient — which is why round 4's whole-run figure happened to equal the
-    /// settled width. So **1.32 u was a correct settled-cycle width mislabelled as a whole-run band**,
-    /// not an artifact of dropped frames. The figures the frame drop *did* earn are `net` and the
-    /// arrival tick count (0.0197 → 0.0389 u, 5 → 4 ticks), and those are corrected on
-    /// `the_stale_cursor_leaves_the_steering_loop_no_escaping_trajectory_and_the_resync_clears_it`.
-    ///
-    /// The assertions below were re-checked against per-frame sampling and all three still hold with
-    /// headroom: span 1.3200 < 2.2000; east excursion 0.4011; west excursion 0.9189 (2.3× what
-    /// round 5 reported for it, and still inside the 2.200 bound). Nothing here was a green test that
-    /// should have been red — it was a reporting defect, and a retraction whose stated cause was
-    /// untested.
-    ///
-    /// ⚠️ **Correction (#727 round 7 review, non-blocking 4).** Round 6 wrote those two excursions as
-    /// `0.402` and `0.918`. Those are what you get by subtracting the **printed 3-decimal band**
-    /// above from a 3-decimal `LANDED[0]` — arithmetic on rounded endpoints, sitting under a heading
-    /// that reads *"Measured, not reasoned."* The heading makes the precision a claim, and the claim
-    /// was not paid for: measured in `f32` off `Run`, they are **0.4011** and **0.9189**, each 0.001
-    /// out and in *opposite* directions. Immaterial to every assertion, which is exactly why it
-    /// survived — a figure nothing depends on is a figure nobody re-derives. The test now prints all
-    /// three (`cargo test … -- --nocapture`), so the next person to quote them reads them off a run.
     ///
     /// Ticks 0–2 are a transient: no fine plan has arrived, so the walker steers the *healthy* ~17 u
-    /// coarse carrot and lunges back up the route — real motion, and the reason "never gets east" was
-    /// never true of the character. From tick 3 on the degenerate stub is in hand and the cycle
-    /// closes. **The settled cycle is what "a few frames wide" was always about**, and that is what
-    /// the assertions below now measure.
+    /// coarse carrot and lunges back up the route — real motion. From tick 3 on the degenerate stub
+    /// is in hand and the cycle closes. **The settled cycle is what "a few frames wide" is about**,
+    /// and that is what the assertions below measure. The test prints all three figures
+    /// (`cargo test … -- --nocapture`) so the next person to quote them reads them off a run rather
+    /// than doing arithmetic on this table's rounded endpoints.
     ///
-    /// **On the production agreement.** Fixing the frame drop was motivated by B-C, not by chasing
-    /// these numbers — and the harness now reproduces the round-3 reviewer's production `drive_walk`
-    /// log tick for tick: `(-528.39, 147.34)`, `(-534.33, 144.46)`, `(-536.52, 144.37)`.
+    /// ## What this test does NOT establish — three measured traps (#727 rounds 3–7)
     ///
-    /// ⚠️ **Correction (#727 round 6 review, non-blocking 2) — the anti-identity argument was
-    /// overstated, in exactly the position it leaned on.** This paragraph used to say "three 2-D
-    /// positions including a north excursion are not something any west-stepping harness produces by
-    /// construction", and pointed at tick 0's north excursion as the reason. Measured:
-    /// `|head[0] − LANDED| = 6.5997` against `15 × RUN_SPEED × 0.01 = 6.6000`. Tick 0's endpoint lies
-    /// on the circle of one nav tick's travel around a harness INPUT — its *magnitude* is a code
-    /// constant times a loop count and discriminates nothing, exactly the round-3 identity's shape.
-    /// What position 0 contributes is one number, its **direction**, and both instruments compute
-    /// that from the same `carrot_along` on the same fixture. The agreements that do discriminate are
-    /// `head[1]` (0.091 u from `LANDED`) and `head[2]` (2.239 u), which depend on the stub geometry
-    /// and the aim flip and are not derivable from a constant. Three positions are still not the
-    /// round-3 identity — but the honest count is **two independent agreements plus one direction**,
-    /// not three, and no sentence here should be quotable as more.
+    /// 1. **The live capture cannot corroborate this sim.** An earlier version asserted
+    ///    `|x_min − (−534.73)| < 0.05` against the live capture and called the agreement evidence.
+    ///    It is an **identity**: `LANDED[0] = -534.285_583` is a harness INPUT and
+    ///    `RUN_SPEED * 0.01 = 0.44` is a code constant, so any harness seeded at `LANDED` that aims
+    ///    west and steps one frame produces `-534.725_586`, whatever the mechanism. The capture's
+    ///    −534.73 is *consistent* with an overshoot cycle; it is not independent evidence of one.
+    /// 2. **The sim's WIDTH is a property of the harness, not of the defect.** Production
+    ///    `drive_walk` oscillates over roughly `[-536.5, -533.0]` (~2.6 u) against this sim's
+    ///    1.32 u. Do not quote the sim's band as production's.
+    /// 3. **Sample per FRAME, not per nav tick.** The settled cycle flips the aim every frame — the
+    ///    root-cause mechanism itself — so a once-per-15-frames sampler cannot see its width. Over
+    ///    the identical `tick >= 100` window: **0.880 u tick-sampled, 1.320 u frame-sampled**, a 50%
+    ///    understatement that read as a real result for two rounds. Every extent on `Run` is now
+    ///    recorded in one place, inside `step`; see `Run`'s own "one sampling rate" note.
     ///
-    /// Be precise about what even that is worth: both
-    /// instruments run the *same* production `steer_target` / `carrot_along` / `find_path_local` on
-    /// the *same* fixture, so this is two faithful instruments agreeing — evidence about the
-    /// harness's fidelity, **not** independent evidence about the live defect. Those three positions
-    /// are quoted from the round-3 review and were not re-measured here; the assertion below is what
-    /// keeps this branch honest about continuing to match them.
+    /// **A separately measured non-result:** whether [`fixture_run`] carries `wish_dir` across
+    /// frames (it now does; it used to `break` out of the fast loop with no fine plan) leaves the
+    /// settled width **identical to three decimal places** — 1.320 either way, band shifted 0.019 u.
+    /// What the frame carry does change is the whole-run band (1.320 → 8.134 u, by no longer
+    /// suppressing the transient), `net` (0.0197 → 0.0389 u) and arrival (5 → 4 ticks). So a
+    /// "1.32 u" quoted from before the fix is a correct SETTLED width mislabelled as a whole-run
+    /// band, not a dropped-frame artifact.
+    ///
+    /// **On the production agreement below.** The harness reproduces the production `drive_walk`
+    /// log tick for tick — but tick 0's *magnitude* is another identity
+    /// (`|head[0] − LANDED| = 6.5997` against `15 × RUN_SPEED × 0.01 = 6.6000`), so position 0
+    /// contributes only its direction. The agreements that discriminate are `head[1]` (0.091 u from
+    /// `LANDED`) and `head[2]` (2.239 u), which depend on the stub geometry and the aim flip. Honest
+    /// count: **two independent agreements plus one direction**, not three. And both instruments run
+    /// the *same* production `steer_target` / `carrot_along` / `find_path_local` on the *same*
+    /// fixture, so even that is evidence about the HARNESS'S FIDELITY, not independent evidence
+    /// about the live defect. The three positions are quoted from the round-3 review and were not
+    /// re-measured here.
     #[test]
     fn the_simulated_stall_is_a_bounded_overshoot_cycle_a_few_frames_wide() {
         const FRAME: f32 = eqoxide_core::physics::RUN_SPEED * 0.01;
@@ -1778,8 +1644,8 @@ mod cursor_resync_tests {
         // settled extents "measure different things, and both are recorded rather than one standing
         // in for the other" — but nothing read `x_min`/`x_max`, which is what the `dead_code` warning
         // on those two fields was reporting: they were computed and then dropped, so the transient
-        // the #727 round-5 correction exists to keep separate was invisible in the output. Printing
-        // them is deliberately NOT an assertion: the transient's width is a diagnostic, and the only
+        // `Run`'s doc exists to keep separate was invisible in the output. Printing them is
+        // deliberately NOT an assertion: the transient's width is a diagnostic, and the only
         // claim this test makes is about the settled band.
         eprintln!(
             "settled span {span:.4}   east of LANDED {:.4}   west of LANDED {:.4}   \
@@ -1828,12 +1694,10 @@ mod cursor_resync_tests {
     /// nearest-segment snap would skip the entire outbound leg and quietly cut the route; some
     /// staleness guard means a walker still on its segment is never touched.
     ///
-    /// ⚠️ **Correction (#727 round 2).** This doc used to open *"Why the `CURSOR_STALE_DIST` guard is
-    /// load-bearing"*, which read as pinning the constant. It does not: the round-1 review mutated
-    /// `CURSOR_STALE_DIST` to both **2.0** and **16.0** and this test survived both (1.5 u is inside
-    /// either guard). What it kills is REMOVING the guard entirely. The constant is unpinned over at
-    /// least [2, 16] and is a judgement call, not a measurement — see the constant's own doc for the
-    /// one thing about it that *is* measured (the `<` boundary).
+    /// Measured: `CURSOR_STALE_DIST` mutated to both **2.0** and **16.0** leaves this test green
+    /// (1.5 u is inside either guard). What it kills is REMOVING the guard entirely. The constant is
+    /// unpinned over at least [2, 16] and is a judgement call, not a measurement — see the
+    /// constant's own doc for the one thing about it that *is* measured (the `<` boundary).
     #[test]
     fn a_walker_cutting_a_tight_switchback_keeps_its_cursor() {
         let switchback = [[0.0f32, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 2.0, 0.0], [0.0, 2.0, 0.0]];
@@ -1857,16 +1721,14 @@ mod cursor_resync_tests {
     /// `every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard`,
     /// which reads the source and fails if a doc comment cites a test this array does not name.
     ///
-    /// ⚠️ **Correction (#727 round 7 review, non-blocking 1).** Round 6 wrote that first sentence
-    /// without the qualifier, and it was **false for two shapes at once**: `::`-qualified paths
-    /// failed the scan's charset filter, and a citation hand-wrapped across two lines never appears
-    /// whole on any line. Both were live — the review found
-    /// `zone_assets::no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone` in `walker.rs`
-    /// hitting *both*, inside the scan's own corpus. Round 7 extended the scan to cover both (the
-    /// charset now admits `:` and resolves on the tail; unbalanced spans are rejected outright), so
-    /// the sentence is true again — but it is true of a **stated rule**, not of "any citation", and
-    /// the rule's remaining blind spots are written down in "What it does NOT do" below. A guard
-    /// that claims coverage it does not have is worse than no guard.
+    /// Read the qualifier literally: the completeness claim is about a **stated rule**, not about
+    /// "any citation". Written once without it, it was false for two live shapes at once —
+    /// `::`-qualified paths failed the charset filter, and a hand-wrapped citation never appears
+    /// whole on any line, both hit by
+    /// `zone_assets::no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone` in `walker.rs`,
+    /// inside the scan's own corpus. Both are covered now; the rule's remaining blind spots are
+    /// written down in "What it does NOT do" below, because a guard that claims coverage it does
+    /// not have is worse than no guard.
     #[test]
     fn every_test_name_cited_in_a_doc_comment_still_exists() {
         let _cited: &[fn()] = &[
@@ -1889,7 +1751,7 @@ mod cursor_resync_tests {
             every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard,
             unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace,
             the_doc_span_scan_reaches_all_five_citation_files_at_three_depths_each,
-            // #789/#874: the two new tests cited by name in the ⚠️ Correction blocks above and in
+            // #789/#874: the two new tests cited by name in
             // `unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace`'s
             // own doc — caught by this file's own scan on the run that added the citations.
             unbalanced_doc_code_spans_in_the_whole_workspace_are_a_named_shrinking_backlog,
@@ -1920,19 +1782,17 @@ mod cursor_resync_tests {
     /// **The citation guard's ALPHABET is now mechanical, not remembered (#727 round 6 review,
     /// non-blocking 1).**
     ///
-    /// The round-5 review accepted that the `fn()` guard *bites* — it renamed a cited test and got a
-    /// compile error — and then made the obvious next point: the guard's list is hand-maintained, so
-    /// it is the memory-scoped act this PR has spent five rounds failing at, one level down. A
-    /// twenty-line scan found two misses in seconds: a real test cited in a doc comment in the guard's
-    /// own file and named in no list, and a citation in `collision.rs` that resolved to nothing
-    /// anywhere in the workspace. Both are fixed; this test is what stops the third.
+    /// The `fn()` guard above bites — rename a cited test and you get a compile error — but its list
+    /// is hand-maintained, i.e. the same memory-scoped act one level down. A twenty-line scan found
+    /// two misses in seconds: a real test cited in a doc comment in the guard's own file and named in
+    /// no list, and a citation in `collision.rs` that resolved to nothing anywhere in the workspace.
+    /// This test is what stops the third.
     ///
-    /// **The two corpora, named — because a sweep is (terms × corpus) and this PR's recurring defect
+    /// **The two corpora, named — because a sweep is (terms × corpus) and the recurring defect here
     /// has been running the right terms over the wrong corpus.**
     ///
-    /// * **Citations are READ from** the four files #727 touches. Widening this to the whole crate is
-    ///   a follow-up, not a silent assumption: files outside it are not scanned and this test claims
-    ///   nothing about them.
+    /// * **Citations are READ from** whatever [`citation_corpus`] returns — today five files. Files
+    ///   outside it are not scanned and this test claims nothing about them.
     /// * **Names are RESOLVED against** every `.rs` in the whole workspace (`crates/`, `tests/`,
     ///   `src/`, minus any `target/`) — deliberately wider than the citation corpus, so a citation
     ///   that points at another crate's test resolves instead of being reported as rot. `walker.rs`
@@ -1957,13 +1817,14 @@ mod cursor_resync_tests {
     /// added and not guarded; and on the paragraph you are reading, whose quoted mutation name it
     /// flagged as unresolvable — correctly — forcing the `NOT_A_FN` entry below.
     ///
-    /// **Round 7 added two more halves and both were verified the same way** (mutation applied → run
-    /// → reverted, `md5sum -c` clean). Re-wrapping `walker.rs`'s `zone_assets::…` citation back
-    /// across two lines reports *"a code span opens on this line and closes on another"* on **both**
-    /// lines, and — because `:` is now in the charset — the truncated leading fragment additionally
-    /// reports *"resolves to NO fn"*; retyping a `::`-qualified citation to a name that does not
-    /// exist (`steering::route_goal_offset_reports_vertical_shortfall_only`) reports the same. Four
-    /// problems from two mutations, one run, `0 passed; 1 failed`.
+    /// **The two harder shapes were verified the same way** (mutation applied → run → reverted,
+    /// `md5sum -c` clean). Re-wrapping `walker.rs`'s `zone_assets::…` citation back across two lines
+    /// reports *"a code span opens on this line and closes on another"* on **both** lines, and —
+    /// because `:` is in the charset — the truncated leading fragment additionally reports *"resolves
+    /// to NO fn"*; retyping a `::`-qualified citation to a name that does not exist
+    /// (`steering::route_goal_offset_reports_vertical_shortfall_only`) reports the same. Two of those
+    /// four reports now arrive on the span test's result line rather than this one's, since #788
+    /// split the halves.
     ///
     /// **What it does NOT do**, so nobody reads it as more:
     ///
@@ -1974,92 +1835,36 @@ mod cursor_resync_tests {
     /// * for a `::`-qualified path it resolves the **tail only** (`resolution_name`). A citation
     ///   whose module prefix is wrong but whose final identifier exists elsewhere in the workspace
     ///   resolves and is not reported. Prefixes are prose here, not links;
-    /// * lines inside a triple-backtick fence are exempt from the **unbalanced-span check only**;
-    ///   `doc_citations` does not skip fences, so a citation written inside a fenced example is
+    /// * lines inside a triple-backtick fence are exempt from the **unbalanced-span check only**.
+    ///   `doc_citations` has no fence check at all, so a citation written inside a fenced example is
     ///   still resolved (rule 2/3) and, if it is a same-file `#[test]`, still required to be in the
-    ///   `_cited`/`_helpers` guard (rule 1) — only the *parity* balance check is fence-exempt;
-    /// * the citation corpus is still the four files #727 touches. Nothing here claims anything
-    ///   about the other `.rs` files in the workspace;
-    /// * backtick parity is not span-crossing (round 8): escaping a literal backtick in prose (the
-    ///   standard CommonMark double-backtick escape) both false-fails the balance check on its own
-    ///   line, and — applied the same way on both sides of a genuine wrap — can make both lines land
-    ///   on an even count and hide it from `unbalanced_doc_spans` entirely. The same padding evades
-    ///   `doc_citations` too, and for a distinct reason: that scan selects citation text by its
-    ///   position in the line's backtick-split (`skip(1).step_by(2)`, only odd indices read), and
-    ///   the padding shifts the citation's fragment off an odd index onto an even one, where nothing
-    ///   ever reads it. Demonstrated by execution against this exact corpus.
+    ///   `_cited`/`_helpers` guard (rule 1) — verified by execution, both halves;
+    /// * **backtick parity is not span-crossing.** Escaping a literal backtick in prose (the standard
+    ///   CommonMark double-backtick escape) both false-fails the balance check on its own line, and —
+    ///   applied the same way on both sides of a genuine wrap — can make both lines land on an even
+    ///   count and hide it from `unbalanced_doc_spans` entirely. The same padding evades
+    ///   `doc_citations` too, for a distinct reason: that scan selects citation text by its position
+    ///   in the line's backtick-split (`skip(1).step_by(2)`, only odd indices read), and the padding
+    ///   shifts the citation's fragment off an odd index onto an even one, where nothing ever reads
+    ///   it. Demonstrated by execution against this exact corpus.
     ///
-    /// ⚠️ **Correction (#727 round 7 review, non-blocking 1).** The first two bullets are all round 6
-    /// listed, and the round-6 review demonstrated the list was incomplete by finding a live citation
-    /// that two *unlisted* blind spots hid. The third and fourth bullets exist because the round-7
-    /// fix for those two introduced blind spots of its own: widening the charset to `:` buys nothing
-    /// about the prefix, and skipping fences to avoid false positives is a real exemption. Both are
-    /// stated rather than discovered next round.
+    /// **Why the name is this long.** It used to be
+    /// `every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard`; "every doc comment" reads
+    /// as the workspace, and the name is what a `cargo test` result line shows. #788 also split the
+    /// unbalanced-code-span half out into
+    /// `unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace` for the
+    /// same reason: it ran inside this test's loop and its green was read as workspace coverage by
+    /// three independent readers in two days.
     ///
-    /// ⚠️ **Correction (#727 round 8 review, blocking).** The fourth bullet was wrong: it said a
-    /// fenced citation is "neither balance-checked nor guarded". Only the first half is true.
-    /// Verified by execution on this head: a nonexistent name and an unguarded same-file `#[test]`
-    /// name, both cited from inside a triple-backtick-fenced example, are still reported by rules
-    /// 2/3 and rule 1 respectively — `doc_citations` has no fence check at all, only
-    /// `unbalanced_doc_spans` does. Corrected above, and the sixth bullet (parity ≠ span-crossing)
-    /// is the blind spot this list was actually missing. The fifth bullet's file count was also
-    /// stale (151 → 154, drift from
-    /// unrelated merges, not a mechanism error) and is corrected in the same pass.
-    ///
-    /// ⚠️ **Correction (#727 round 9 review, non-blocking).** Two more cleanups, same pass as the
-    /// causal-claim fix on `unbalanced_doc_spans` below. First: the fifth bullet's count is deleted,
-    /// not re-counted — it went stale within a single round (154 correct at `d01d338`; `origin/main`
-    /// moved to 159 tracked files one round later, true figure 155 on landing), which is exactly the
-    /// "measurement with an expiry date" the round-7 correction below, on a different test's doc,
-    /// already warns about, just not yet applied to this number. The sentence needs no number to
-    /// make its point. Second:
-    /// the sixth bullet's closing cross-reference pointed at `unbalanced_doc_spans`'s doc for "the
-    /// counts" — that doc states no counts and never did; removed. Its attribution was also
-    /// incomplete: the false pass on this exact padded example is not parity alone, `doc_citations`
-    /// misses it independently, verified by tracing `skip(1).step_by(2)` against the literal text —
-    /// the citation's fragment lands at split index 6 on the 6-backtick line, and only odd indices
-    /// (1, 3, 5, …) are ever read.
-    ///
-    /// ⚠️ **Correction (#788).** Two changes, both about what a reader of the RESULT can tell, and
-    /// neither of them changes which files are scanned.
-    ///
-    /// * **This test was renamed.** It used to be
-    ///   `every_doc_comment_test_citation_resolves_and_is_listed_in_a_guard`. "Every doc comment"
-    ///   reads as the workspace; the corpus is the four files in `citation_corpus`. The name now
-    ///   says so, because the name is what a `cargo test` result line shows and the fifth bullet
-    ///   above — which says the same thing correctly — is not.
-    /// * **The unbalanced-code-span half moved out**, into
-    ///   `unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace`,
-    ///   with a reach control of its own. It ran inside this test's `cited_in` loop and its green
-    ///   was read as workspace coverage by three independent readers in two days, twice by the same
-    ///   one. Same four files, same check, its own result line.
-    ///
-    /// Consequence for the round-7 paragraph above: its "four problems from two mutations, one run,
-    /// `0 passed; 1 failed`" was measured when both halves were one test. Two of those four problems
-    /// now arrive on the span test's result line instead. Left as written, corrected here.
-    ///
-    /// **What #788 deliberately did NOT do.** The span check was not widened to the resolution
-    /// corpus. It was run over that corpus once, by execution, and the workspace outside these four
-    /// files is not clean by it. The count is recorded in #789 (filed by #788, not fixed by it) and
-    /// deliberately not repeated here — a count in a comment is the "measurement with an expiry
-    /// date" the round-9 block above already had to delete once.
-    ///
-    /// ⚠️ **Correction (#789/#874).** Two things changed above this test, not in it:
-    ///
-    /// * **The corpus grew from four files to five.** #874 added `src/movement.rs` to
-    ///   `citation_corpus` — where `CharacterController` lives and where `MUTATION-CHECK` blocks
-    ///   cite test names by name, previously read by nothing mechanical. Every "four" above is
-    ///   preserved as it was written, describing #727's and #788's corpus at the time; the current
-    ///   corpus is whatever `citation_corpus` returns, which is the only claim this doc makes going
-    ///   forward.
-    /// * **The span check WAS widened**, contrary to the paragraph just above: a second test,
-    ///   `unbalanced_doc_code_spans_in_the_whole_workspace_are_a_named_shrinking_backlog`,
-    ///   runs the same `scan_doc_spans` over the full resolution corpus and holds it to zero NEW
-    ///   offenders — pre-existing ones are named individually in that test's `KNOWN_VIOLATIONS`,
-    ///   which must shrink as they are fixed (a stale entry fails the build) and cannot silently
-    ///   grow (an unlisted offender fails the build). This test and
-    ///   `unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace`
-    ///   still hold their five files to exactly zero, unconditionally.
+    /// **The workspace outside these five files is NOT clean by the span check.** #789 named that
+    /// backlog rather than fixing it: `unbalanced_doc_code_spans_in_the_whole_workspace_are_a_named_shrinking_backlog`
+    /// runs the same `scan_doc_spans` over the full resolution corpus and holds it to zero NEW
+    /// offenders — pre-existing ones are listed individually in that test's `KNOWN_VIOLATIONS`, which
+    /// must shrink as they are fixed (a stale entry fails the build) and cannot silently grow (an
+    /// unlisted offender fails the build). The five citation files are held to exactly zero,
+    /// unconditionally. Deliberately no COUNT is quoted anywhere here: a count in a comment is a
+    /// measurement with an expiry date, and this doc has already had to delete one that went stale
+    /// inside a single review round.
     #[test]
     fn every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard() {
         use std::collections::{HashMap, HashSet};
@@ -2070,8 +1875,12 @@ mod cursor_resync_tests {
         /// say so.
         const NOT_A_FN: &[(&str, &str)] = &[
             ("the_resync_clears_the_deadlock_above_the_guard_and_is_inert_below_it",
-             "a test renamed in round 3, quoted verbatim inside a ⚠️ Corrections block so the \
-              retracted name is preserved rather than deleted. Inherently unguardable."),
+             "a test renamed in round 3, quoted verbatim in the SIBLING guard \
+              `every_test_name_cited_in_a_doc_comment_still_exists`'s rustdoc — its round-4 \
+              dangling-citation paragraph — so the retracted name is preserved rather than \
+              deleted. NOT in this fn's own rustdoc: an earlier locator said the blockquote on \
+              `CURSOR_STALE_DIST` and a later one said this fn, and both were wrong. Inherently \
+              unguardable."),
             ("open_air_ceiling_is_never_returned_as_floor",
              "a fixture RETRACTED at PR-D/D-2 and deleted; the doc that names it IS its retraction \
               note."),
@@ -2098,9 +1907,11 @@ mod cursor_resync_tests {
              "this test's own name before #788 renamed it, quoted in its rustdoc as the retracted \
               name rather than deleted. Inherently unresolvable — that is what renamed means."),
             ("the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it",
-             "the hairpin sweep's name between round 3 of #727 and #733, quoted verbatim inside a \
-              ⚠️ Correction block because the name asserted 'inert below the guard' — which #733 \
-              made false. Retired, so inherently unresolvable."),
+             "the hairpin sweep's name between round 3 of #727 and #733, quoted verbatim under \
+              'Grepping for the retired name' in \
+              `the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured`'s rustdoc, \
+              because the name asserted 'inert below the guard' — which #733 made false. Retired, \
+              so inherently unresolvable."),
         ];
 
         // ── corpus 1: where citations are read from ──────────────────────────────────────────────
@@ -2210,35 +2021,20 @@ mod cursor_resync_tests {
     /// say "five_citation_files", and the length in this signature is one place a reader is forced
     /// to edit, and to see the number, when the corpus grows.
     ///
-    /// ⚠️ **Correction (#882 round 2, blocking).** This used to claim the array length makes adding
-    /// a sixth file "a **compile error** at every call site". **Measured, and false.** Grown to
-    /// `[PathBuf; 6]` with a sixth path, `cargo test -p eqoxide-nav --lib --no-run` builds the test
-    /// executable with **zero errors**: no call site binds the length —
-    /// `citation_corpus().to_vec()`, `let files = citation_corpus()`, `&citation_corpus()` and
-    /// `.len()` are all length-agnostic. The only edit the compiler forces is the one in this
-    /// signature. Nothing mechanical catches the three `…_five_citation_files…` names drifting; they
-    /// are renamed by hand, which is exactly what #874 had to do for 4 → 5. This is a
-    /// reasoned-not-measured mechanism claim that survived to the first change ever to perform the
-    /// growth — the change that could have run the experiment and did not.
+    /// **THE LIMIT of that, measured (#882 round 2).** The length does *not* make growth "a compile
+    /// error at every call site" — grown to `[PathBuf; 6]` with a sixth path,
+    /// `cargo test -p eqoxide-nav --lib --no-run` builds the test executable with **zero errors**.
+    /// No call site binds the length: `citation_corpus().to_vec()`, `let files = citation_corpus()`,
+    /// `&citation_corpus()` and `.len()` are all length-agnostic. The only edit the compiler forces
+    /// is the one in this signature, and nothing mechanical catches the three
+    /// `…_five_citation_files…` names drifting — they are renamed by hand, as #874 had to for 4 → 5.
     ///
-    /// ⚠️ **Correction (#874).** This was `[PathBuf; 4]` — `steering.rs`, `walker.rs`,
-    /// `collision.rs`, `tests/walker_sim.rs` — and did not include `src/movement.rs`, where
-    /// `CharacterController` lives and where `MUTATION-CHECK` blocks cite test names by name. #866
+    /// **Why `src/movement.rs` is in the corpus (#874).** `CharacterController` lives there and its
+    /// `MUTATION-CHECK` blocks cite test names by name, previously read by nothing mechanical: #866
     /// found two doc defects there by hand (a `MUTATION-CHECK` quoting a message its own assertion
     /// cannot produce, and an "either of two" claim where there are three) that a mechanical check
-    /// would have caught if it read the file at all. Grown to five deliberately. `movement.rs`'s
-    /// own pre-existing unbalanced doc spans were fixed before it was added, so the corpus starts
-    /// clean rather than landing the guard already red.
-    ///
-    /// ⚠️ **Correction (#882 round 2, blocking).** This block used to say "every reference to
-    /// 'four' in this module's test names and docs was renamed in the same change, not left to
-    /// drift", which contradicted the `⚠️ Correction (#789/#874)` block on
-    /// `every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard` — written
-    /// in the same commit — saying every "four" above it is *preserved as it was written*. The
-    /// second one is what actually happened: only the three test names were renamed, and the
-    /// corpus-descriptive "four"s in the older `⚠️ Correction` blocks are still there, deliberately,
-    /// as history of what #727's and #788's corpus was at the time. So a remaining "four" in this
-    /// module is not evidence of drift, and this doc no longer says it is.
+    /// would have caught if it read the file at all. Its pre-existing unbalanced doc spans were
+    /// fixed before it was added, so the corpus started clean rather than landing the guard red.
     fn citation_corpus() -> [std::path::PathBuf; 5] {
         let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let ws = workspace_root();
@@ -2255,18 +2051,15 @@ mod cursor_resync_tests {
     /// anything under a `target/` directory — generated sources, where a stale build artifact could
     /// vouch for a citation. Sorted, so a failure message is stable between runs.
     ///
-    /// ⚠️ **Correction (#882 round 2, blocking).** `tools/` was missing. It is a first-class
-    /// `[workspace] members` entry in the root `Cargo.toml`, and leaving it out made this fn cover
-    /// strictly fewer files than the workspace, while every doc built on top of it said "the full
-    /// resolution corpus" and "the workspace". `tools/src/main.rs` carried two genuine unbalanced
-    /// doc spans that nothing was holding. That is the #788 defect class — a corpus
-    /// narrower than its name — inside the PR whose whole subject is corpus reach. Added to the
-    /// walk; the two spans are now named in `KNOWN_VIOLATIONS` like every other pre-existing one.
+    /// **`tools/` is in the walk on purpose (#882 round 2).** It is a first-class
+    /// `[workspace] members` entry in the root `Cargo.toml`, and leaving it out once made this fn
+    /// cover strictly fewer files than the workspace while every doc built on top of it said "the
+    /// full resolution corpus" — the #788 defect class, a corpus narrower than its name, inside the
+    /// PR whose whole subject was corpus reach. `tools/src/main.rs` carried two genuine unbalanced
+    /// doc spans nothing was holding.
     ///
     /// This is the resolution corpus for the citation scan AND, since #789, the corpus the
-    /// doc-span backlog test scans for defects. (Until #789 it was resolution-only, and this doc
-    /// said so; that sentence is deleted rather than qualified, because it stopped being true in
-    /// the same commit that widened the span check onto these files.)
+    /// doc-span backlog test scans for defects.
     fn workspace_rs_files() -> Vec<std::path::PathBuf> {
         let ws = workspace_root();
         let mut out: Vec<std::path::PathBuf> = Vec::new();
@@ -2386,21 +2179,15 @@ mod cursor_resync_tests {
     /// instead of an unclaimed pile.**
     ///
     /// The guard above holds the five citation files to zero. #789 measured that the workspace
-    /// outside them is not clean by the same check — 105 offenders across 30 files at #788's
-    /// original measurement, which had already drifted by the time this landed, and drifts again
-    /// with every merge. `KNOWN_VIOLATIONS` below is the list as re-measured for this change, and
-    /// the live totals are **printed by this test at run time** (see its `println!`) rather than
-    /// restated here.
+    /// outside them is not clean by the same check. `KNOWN_VIOLATIONS` below is the list as
+    /// re-measured for that change, and the live totals are **printed by this test at run time**
+    /// (see its `println!`) rather than restated here — any count written here drifts with every
+    /// merge.
     ///
-    /// ⚠️ **Correction (#882 round 2, blocking).** This block used to carry a hard-coded
-    /// "170-file, 125,394-line resolution corpus". That line count matched no tree — neither `main`
-    /// nor this branch — while the test printed the true one twelve lines below it. Deleted rather
-    /// than corrected: a corpus-size figure written into a doc comment inside the corpus it
-    /// measures is self-invalidating, since editing this very sentence changes it. The same
-    /// correction deletes a second false clause, "movement.rs's own 10 are already fixed and
-    /// excluded": eight of those ten were fixed, two were blockquote-fence false positives that
-    /// were never real defects, and `movement.rs` is *included* in this corpus (scanned, and clean),
-    /// not excluded.
+    /// **Do not write a corpus-size figure into this doc.** One was, and it matched no tree —
+    /// neither `main` nor the branch — while the test printed the true one twelve lines below it. A
+    /// corpus-size figure inside the corpus it measures is self-invalidating: editing the sentence
+    /// changes it.
     ///
     /// **What this test does NOT do: bulk-fix or silently bless the backlog.** Every entry is named
     /// individually, by file and by the text of the offending line. Two things keep the list honest
@@ -2438,21 +2225,17 @@ mod cursor_resync_tests {
     ///   4 NEW and 4 DEAD — a red build, from a merge that changed no doc comment this list
     ///   names. Under text keys the offender multiset is unchanged: **0 NEW, 0 DEAD**.
     ///
-    /// A later merge of `origin/main` at `6ca5ab7` moved nothing and is **not** evidence either
-    /// way: all three files it touched are citation-corpus files held to zero offenders, so no
-    /// entry could have shifted under either keying. Recorded here so the 0/0 is not misread as
-    /// a third confirmation.
+    /// (A later merge of `origin/main` at `6ca5ab7` moved nothing, but is **not** a fourth
+    /// data point: every file it touched is a citation-corpus file held to zero offenders, so no
+    /// entry could have shifted under either keying.)
     ///
     /// Every one of those edits would be forced on an author who did nothing but insert a line
     /// somewhere above, and would arrive as a red `main` naming a file whose author did nothing
-    /// wrong. A guard that fails on innocent edits is a guard people switch off, and a predicate
-    /// stricter than the thing it models produces false refusals — dishonest in the same direction
-    /// as a false pass. Keyed on `(file, normalized line text)` both directions above still bite
-    /// (proved by mutation, both ways, on this head) and the only thing that reopens an entry is
-    /// somebody actually touching that doc line. The line number is not stored at all — not even as
-    /// a trailing comment, because a comment nobody is forced to update is the stale-figure defect
-    /// this module keeps re-learning; the failure message prints the live line number instead,
-    /// which is always right.
+    /// wrong. Keyed on `(file, normalized line text)` both directions above still bite (proved by
+    /// mutation, both ways) and the only thing that reopens an entry is somebody actually touching
+    /// that doc line. The line number is not stored at all — not even as a trailing comment, since a
+    /// comment nobody is forced to update is the stale-figure defect this module keeps re-learning;
+    /// the failure message prints the live line number instead.
     ///
     /// The mechanism for the backlog going to zero is: fix a wrap, delete its entry from
     /// `KNOWN_VIOLATIONS` in the same change (the dead-entry check requires it). Nothing here
@@ -3030,54 +2813,29 @@ mod cursor_resync_tests {
     /// backtick count is odd. Round 7: this is what caught the round-6 review's surviving
     /// citation, once the hand-wrap made the opening line's count odd.
     ///
-    /// ⚠️ **Correction (#727 round 8 review, blocking).** This doc used to call the odd-count check
-    /// "i.e. a code span that opens on one line and closes on another" — an equivalence. It is false
-    /// in both directions, demonstrated by execution. Escaping a literal backtick in prose (the
-    /// standard CommonMark double-backtick escape) puts an odd backtick count on one line with
-    /// nothing crossing anything — a FALSE FAILURE, and this check hard-fails it, reporting a defect
-    /// that is not there. And a citation genuinely wrapped across two lines, padded with the same
-    /// escape so each line's count comes out even, passes this check silently — a FALSE PASS, and
-    /// the exact shape it exists to catch. Parity implies a crossing span only when nothing else on
-    /// the line contributes an odd backtick count of its own; it is not equivalent to it. See "What
-    /// it does NOT do" above for the sixth bullet this forces.
+    /// **PARITY IS NOT "a code span that opens on one line and closes on another".** That
+    /// equivalence is false in BOTH directions, demonstrated by execution, and three review rounds
+    /// running wrote an absolute here that turned out false — so this doc states what the check does
+    /// and stops:
     ///
-    /// ⚠️ **Correction (#727 round 9 review, blocking).** Round 8's rewrite struck the `i.e.`
-    /// equivalence above but left a second, stronger absolute standing: "no amount of widening the
-    /// charset would have caught it, because the name never appears whole on any line." Falsified
-    /// by execution: `doc_citations` reads each line's chunks independently, so a wrapped
-    /// citation's truncated leading fragment IS visible to it, and — once `:` was added to the
-    /// charset (round 7) — resolves to nothing and is reported by the citation half. Verified by
-    /// re-wrapping the exact round-6 citation, and separately a plain citation with no `::` at all;
-    /// both fire the citation-half diagnostic in the same run as this check's own, on this head. The
-    /// round-6 citation survived because `:` was not yet in the charset, not because a wrapped name
-    /// is inherently invisible to citation resolution. No further mechanism claim is made here.
+    /// * **FALSE FAILURE.** Escaping a literal backtick in prose (the standard CommonMark
+    ///   double-backtick escape) puts an odd count on a line with nothing crossing anything. This
+    ///   check hard-fails it, reporting a defect that is not there.
+    /// * **FALSE PASS.** A citation genuinely wrapped across two lines, padded with the same escape
+    ///   so each line's count comes out even, passes silently — the exact shape it exists to catch.
     ///
-    /// ⚠️ **Correction (#727 round 10 review, blocking).** The paragraph at the top of this doc
-    /// used to close with a comparison between this check and `doc_citations`: "They catch
-    /// overlapping but different subsets of wrapped citations; neither subsumes the other." Found
-    /// false in one direction and deleted, not repaired — this is the third round running in which
-    /// a single absolute claim in this doc turned out to be false: round 8's `i.e.` equivalence
-    /// above (a claim about this check alone, not a comparison), round 9's causal claim that no
-    /// amount of charset widening could have caught the round-6 citation, and now this one. (#764:
-    /// #727's PR body, the round-10 edit block on its round-7 reply comment, and its round-10
-    /// response comment carry an earlier list with the same intent that omits the round-9 item and
-    /// double-counts this one; left as merged history, not rewritten.)
-    /// No replacement sentence is written. What this check does
-    /// is stated in the paragraph above, on its own terms; what `doc_citations` does is stated in
-    /// its own doc, on its own terms.
+    /// Parity implies a crossing span only when nothing else on the line contributes an odd count of
+    /// its own. No claim is made here about how this check's catch set relates to `doc_citations`':
+    /// one such comparison was written and falsified. (#764, disclosed rather than rewritten:
+    /// #727's PR body and two of its review comments carry an earlier version of that
+    /// falsified-claims list which omits one item and double-counts another. Merged history is left
+    /// as merged, so an external artefact still carries the superseded list.) What is measured: a
+    /// wrapped citation's truncated leading fragment IS visible to `doc_citations` — it reads each
+    /// line's chunks independently and `:` is in the charset — **when the opening line's own count
+    /// is odd**, which is exactly the case the padding above defeats.
     ///
-    /// ⚠️ **Correction (#727 round 10 review, non-blocking).** The round-9 block above says the
-    /// wrapped fragment "IS visible" to `doc_citations`, unqualified. Left as originally written,
-    /// as history — but for the reader, it holds only when the opening line's own backtick count
-    /// is odd; the sixth bullet above (padding onto an even count) is the case where it does not.
-    ///
-    /// ⚠️ **Correction (#789/#874).** The fence check below used to test the raw line for a
-    /// triple-backtick prefix, so a fence quoted inside a blockquote marker never toggled
-    /// `in_fence`, and both its delimiter lines — each carrying a bare triple-backtick, an odd
-    /// count on its own — were reported as false positives. Found live widening the corpus for
-    /// #874: `movement.rs` quotes exactly this shape in a `⚠️ Correction` block. Fixed via
-    /// `strip_blockquote_markers`, which both this fn and `fence_safe_insertion_points` now call
-    /// before the fence test, so the two stay mirrored as their doc requires.
+    /// The fence test runs on the line with blockquote markers stripped; see
+    /// `strip_blockquote_markers` for the live case that forced it.
     fn unbalanced_doc_spans(src: &str) -> Vec<usize> {
         let mut out = Vec::new();
         let mut in_fence = false;
@@ -3191,12 +2949,9 @@ mod cursor_resync_tests {
     /// chosen. Properties (ii) and (iii) are stated as OUTCOMES and checked against an independent
     /// scan — not by re-implementing the function.
     ///
-    /// ⚠️ **Correction (#727 round 2).** The round-1 version of this test asserted only `i >= start_i`
-    /// and `i + 1 < len`. The round-1 review pointed out that **both are true of the identity
-    /// function**, so it passed under the `resync_cursor ≡ identity` mutation and pinned nothing
-    /// about the fix. The retracted assertions are still here — they are correct, just not
-    /// sufficient — with (ii)/(iii) added, plus a premise counter so the sweep cannot go green by
-    /// never exercising a resync at all.
+    /// Assertions (i) alone (`i >= start_i`, `i + 1 < len`) are **true of the identity function**,
+    /// so they pin nothing about the fix; they are kept because they are correct, with (ii)/(iii)
+    /// added and a premise counter so the sweep cannot go green by never exercising a resync.
     ///
     /// **Mutation-checked by execution (#727 round 2; count re-measured round 7):** with
     /// `resync_cursor` replaced by the identity function this test now FAILS (it panics on the
@@ -3209,20 +2964,16 @@ mod cursor_resync_tests {
     /// `an_on_route_walker_is_left_alone_without_consulting_geometry`,
     /// `a_walker_cutting_a_tight_switchback_keeps_its_cursor`,
     /// `walker`'s `a_resync_must_not_cross_a_wall_and_it_uses_the_real_clearance`.
-    /// (Round 6: those six names were previously hand-wrapped *inside* their backticks, so
-    /// `cargo doc` rendered them with a space in the middle and three of them were elided to `...`
-    /// — a citation that cannot be grepped and cannot be checked. One identifier, one line.)
-    /// An identity mutant satisfying a "must not move" test is
-    /// not a gap in the test; the movement claims are the ones that had to be pinned, and are.
+    /// An identity mutant satisfying a "must not move" test is not a gap in the test; the movement
+    /// claims are the ones that had to be pinned, and are. (One identifier, one line: hand-wrapping
+    /// a name inside its backticks makes `cargo doc` render a space in the middle and elide it to
+    /// `...` — a citation that can neither be grepped nor checked.)
     ///
-    /// ⚠️ **Correction (#727 round 7 review, non-blocking 3).** This said *"together with 9 others"*
-    /// and the PR body said *"11 tests in total"*. Both were wrong, and wrong in the safe direction:
-    /// re-run on `4cc217f` the mutant gives `test result: FAILED. 191 passed; 12 failed`, so the
-    /// honest figure is **12**. Nothing eroded — rounds 3–6 *added* tests over `resync_cursor` and
-    /// nobody re-ran the mutant, because the number reads like prose. **An enumerated count is a
-    /// measurement with an expiry date:** it is invalidated by every test added anywhere near the
-    /// mutated function, which is precisely the kind of change nobody thinks of as touching a doc.
-    /// If you add a test here, re-run the mutant or delete the count; do not update it by reasoning.
+    /// **The 12 is measured at `4cc217f`** — `test result: FAILED. 191 passed; 12 failed` — and was
+    /// written as 9, then 11, before anyone re-ran it. **An enumerated count is a measurement with
+    /// an expiry date:** every test added anywhere near the mutated function invalidates it, which
+    /// is precisely the kind of change nobody thinks of as touching a doc. If you add a test here,
+    /// re-run the mutant or delete the count; do not update it by reasoning.
     #[test]
     fn resync_always_returns_the_nearest_admissible_forward_segment() {
         let d = |p: [f32; 3], i: usize| seg_closest(HAIRPIN[i], HAIRPIN[i + 1], p).1.sqrt();
@@ -3273,13 +3024,11 @@ mod cursor_resync_tests {
     /// the parallel return leg, with an always-clear predicate: the cursor must not move.
     #[test]
     fn resync_refuses_a_segment_beyond_the_reach_band() {
-        // ⚠️ **Correction (round 3).** Through round 2 the far leg here sat at n = 60, putting the
-        // body 30 u from segment 0 *and* 30 u from segment 2. Segment 2 was then refused by the
-        // strict `d_sq < best_sq` tie, not by the band at all, so deleting `&& d_sq <= hop_sq`
-        // survived this test — it looked sensitive only because of its own premise line. The far leg
-        // is now at n = 59 so segment 2 is strictly NEARER than segment 0 and would be adopted on
-        // proximity alone; the band is the only thing that can refuse it. Retracted text: "30 u from
-        // segment 0 and 30 u from segment 2".
+        // n = 59, not 60, and that is load-bearing. At 60 the body sits 30 u from segment 0 *and*
+        // 30 u from segment 2, so segment 2 is refused by the strict `d_sq < best_sq` tie rather
+        // than by the band — measured: deleting `&& d_sq <= hop_sq` SURVIVED this test. At 59
+        // segment 2 is strictly nearer and would be adopted on proximity alone, so the band is the
+        // only thing that can refuse it.
         let far = [[0.0f32, 0.0, 0.0], [80.0, 0.0, 0.0], [80.0, 59.0, 0.0], [0.0, 59.0, 0.0]];
         let body = [40.0f32, 30.0, 0.0];
         let d = |i: usize, path: &[[f32; 3]]| seg_closest(path[i], path[i + 1], body).1.sqrt();
@@ -3321,15 +3070,12 @@ mod cursor_resync_tests {
     /// advance (verbatim), then [`resync_cursor`], then [`carrot_along`] at `LOCAL_REACH`, then one
     /// 150 ms step at `RUN_SPEED` straight at that point.
     ///
-    /// ⚠️ **Correction (round 3) — read the name literally.** Through round 2 this was called
-    /// `hairpin_wedges` and its results were reported as walker outcomes, on the stated grounds that
-    /// 24 u is "the walker's own carrot reach". It is not: `drive_walk` steers with
-    /// `LOOK_AHEAD = 5.0`, and 24 u is only the goal it hands the fine planner. A body that steps
-    /// straight at `local_goal` is therefore **not the walker's motion**, and the round-2 review was
-    /// right to reject arrival claims measured this way. What this loop does measure — soundly — is
-    /// whether the CURSOR/CARROT arithmetic can reach a fixed point, because that is pure function
-    /// composition and does not depend on how the body is propelled. The tables below are kept for
-    /// that, and only that. Arrival is measured instead by
+    /// **Read the name literally: this is NOT the walker's motion.** `drive_walk` steers with
+    /// `LOOK_AHEAD = 5.0`; 24 u is only the goal it hands the fine planner, so a body that steps
+    /// straight at `local_goal` moves like nothing in production and NO ARRIVAL CLAIM may be
+    /// measured this way. What this loop does measure, soundly, is whether the CURSOR/CARROT
+    /// arithmetic can reach a fixed point — pure function composition, independent of how the body
+    /// is propelled. The tables below are kept for that and only that. Arrival is measured instead by
     /// `the_stale_cursor_leaves_the_steering_loop_no_escaping_trajectory_and_the_resync_clears_it`,
     /// which drives the production [`steer_target`] and [`fast_steer_aim`] at `LOOK_AHEAD` (and which
     /// carries its own disclosure that it models the steering loop, not the whole walker).
@@ -3343,23 +3089,18 @@ mod cursor_resync_tests {
     /// catching. A zero there means the sweep never reached the defect and its green rows are
     /// vacuous, so the sub-guard rows assert it is non-zero.
     ///
-    /// ⚠️ **Correction (#733 review) — what this counter does NOT prove, measured.** It used to be
-    /// documented as a reach control: *"without that counter a green sweep cannot distinguish 'the
-    /// new trigger cleared the cycle' from 'the old trigger did, and the new one never fired', which
-    /// is exactly how a guard ships dead."* **That claim is false and was falsified by running it.**
-    /// The counter calls [`carrot_leads`] itself, so it observes the PREDICATE, never whether
-    /// [`resync_cursor`]'s gate consults it. Wrapping the gate's *call site* — leaving `carrot_leads`
-    /// intact, so the guard is genuinely dead while the counter still reads a live predicate — does
-    /// not zero this counter. **It raises it, on every row, 7 of 7.** The magnitude splits with the
-    /// row, and only the first claim below is load-bearing: on the three sub-guard rows the body
-    /// stays parked in the collapsed state for all 400 ticks, so the count goes up ~286×/351×/395×
-    /// (4 u: 144 → 41141; 6 u: 216 → 75818; 7 u: 252 → 99469); on the four rows at or above the
-    /// guard the body is not pinned and the rise is small — 1.8×/1.7×/1.5×/1.2×. An earlier draft of
-    /// this correction said "two to three orders of magnitude" without qualification, which is true
-    /// of 3 rows and false of 4. A reader who took a non-zero value as
+    /// **What this counter does NOT prove, measured (#733 review).** It is NOT a reach control for
+    /// the new trigger: it calls [`carrot_leads`] itself, so it observes the PREDICATE, never
+    /// whether [`resync_cursor`]'s gate consults it. Wrapping the gate's *call site* — leaving
+    /// `carrot_leads` intact, so the guard is genuinely dead while the counter still reads a live
+    /// predicate — does not zero this counter. **It raises it, on every row, 7 of 7.** On the three
+    /// sub-guard rows the body stays parked in the collapsed state for all 400 ticks, so the count
+    /// goes up ~286×/351×/395× (4 u: 144 → 41141; 6 u: 216 → 75818; 7 u: 252 → 99469); on the four
+    /// rows at or above the guard the rise is small — 1.8×/1.7×/1.5×/1.2×. (So "two to three orders
+    /// of magnitude" is true of 3 rows and false of 4.) A reader who took a non-zero value as
     /// evidence the guard is live would be reading a confident falsehood; the run tables are in
-    /// #818. The original PR's own mutation wrapped the *body* of `carrot_leads`, which does zero it
-    /// — but tautologically, since predicate and counter are the same call.
+    /// #818. Wrapping the *body* of `carrot_leads` does zero it — but tautologically, since
+    /// predicate and counter are then the same call.
     ///
     /// **The generalizable rule, written down because this cost a round: mutate at the CALL SITE,
     /// not inside the function body.** A body-wrap cannot tell "the guard is dead" from "the
@@ -3377,7 +3118,8 @@ mod cursor_resync_tests {
         pinned: bool,
         /// Ticks where `carrot_leads` was false AND the body was within `CURSOR_STALE_DIST` of the
         /// segment `cursor` names — the region only the #733 trigger can act in. A NON-VACUITY
-        /// measure of the fixture, not a liveness measure of the guard: see the ⚠️ Correction above.
+        /// measure of the fixture, not a liveness measure of the guard: a nonzero count says the
+        /// fixture reached the region the guard acts in, and says nothing about whether it acted.
         collapse_only_ticks: u32,
     }
 
@@ -3441,13 +3183,13 @@ mod cursor_resync_tests {
     /// [`the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured`] from 0/288 to
     /// 33/288.
     ///
-    /// ⚠️ **Correction (round 3).** These counts are of *carrot pinning*, not of a walker failing to
-    /// arrive — see [`hairpin_carrot_stops_leading`]. Round 2 reported them as wedged walkers.
+    /// These counts are of *carrot pinning*, not of a walker failing to arrive — see
+    /// [`hairpin_carrot_stops_leading`].
     ///
-    /// ⚠️ **Correction (#733) — the mutation check this doc claimed is DEAD, measured.** The line
-    /// *"Mutation check: flip it back to `<=` and this test goes RED"* was true while the distance
-    /// trigger was the only trigger. It is now false, and the mutation was run rather than reasoned
-    /// about: with `d0_sq <= CURSOR_STALE_DIST²` on this branch the whole crate is still green
+    /// **The `<` token has NO live mutation check, measured (#733).** *"Flip it back to `<=` and
+    /// this test goes RED"* was true while the distance trigger was the only trigger. It is now
+    /// false, and the mutation was run rather than reasoned about: with
+    /// `d0_sq <= CURSOR_STALE_DIST²` on this branch the whole crate is still green
     /// (`223 passed; 0 failed`) and every row of the sweep still reads 0 pinned, 8 u included. The
     /// reason is not that the `<` finding was wrong — it was a real round-2 measurement, and the
     /// counts above stand as a measurement OF THE DISTANCE TRIGGER ALONE. It is that #733's second
@@ -3489,25 +3231,23 @@ mod cursor_resync_tests {
     /// 12 u     0/432                                0/432
     /// ```
     ///
-    /// ⚠️ **Correction (#733).** This test was called
-    /// `the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it` and its doc said
-    /// *"the resync is inert below `CURSOR_STALE_DIST` by construction … the residual `<= 7 u` class
-    /// is a real, open defect"*. Both were true of the distance trigger alone and are now false of
-    /// the function: #733 added a second trigger that fires on the collapse itself. The old name is
-    /// retired rather than left asserting a claim the code no longer makes — the same reason round 3
-    /// renamed it off "deadlock".
+    /// Grepping for the retired name: this was
+    /// `the_resync_clears_the_carrot_pinning_above_the_guard_and_is_inert_below_it`, retired because
+    /// "inert below the guard" became false of the function when #733 added the collapse trigger.
     ///
-    /// **What these counts are, unchanged from round 3.** They count *carrot pinning*, not walker
-    /// outcomes: [`hairpin_carrot_stops_leading`] steps the body straight at `local_goal`, which is
-    /// not how `drive_walk` moves, so the loop measures whether the cursor/carrot arithmetic reaches
-    /// a fixed point (pure function composition) and nothing about stall detection, backoff or
-    /// re-planning. #733's own statement of the cost stands: at least a wasted backoff-and-re-plan
-    /// lap, at worst terminal — not "always wedges".
+    /// **THE LIMIT: these are counts of CARROT PINNING, not walker outcomes.**
+    /// [`hairpin_carrot_stops_leading`] steps the body straight at `local_goal`, which is not how
+    /// `drive_walk` moves, so the loop measures whether the cursor/carrot arithmetic reaches a fixed
+    /// point (pure function composition) and nothing about stall detection, backoff or re-planning.
+    /// #733's statement of the cost stands: at least a wasted backoff-and-re-plan lap, at worst
+    /// terminal — not "always wedges".
     ///
-    /// **The premise counter is the reach control.** A sweep that goes green because the OLD trigger
-    /// did all the work would be indistinguishable from a fix, so each sub-guard separation must also
-    /// record at least one tick on which the collapse trigger fired *while the body was inside*
-    /// `CURSOR_STALE_DIST` — a tick #727's trigger structurally cannot see.
+    /// **The premise counter is a PREMISE control, not a reach control.** Each sub-guard separation
+    /// must record at least one tick on which the carrot was collapsed *while the body was inside*
+    /// `CURSOR_STALE_DIST`, so a green row cannot be vacuous. It does **not** establish that the
+    /// gate consults `carrot_leads` — see the measured falsification on
+    /// [`hairpin_carrot_stops_leading`], where wrapping the gate's call site RAISES this counter on
+    /// 7 of 7 rows. The `before` column above is what carries that, and it is a call-site mutation.
     #[test]
     fn the_resync_clears_the_carrot_pinning_at_every_leg_separation_measured() {
         let count = |sep: f32| {
@@ -3539,7 +3279,7 @@ mod cursor_resync_tests {
                  (collapse-only trigger ticks: {c})");
         }
         for (sep, w, t, c) in &rows {
-            // "carrot-pinned", NOT "wedged" — see the correction block on this test.
+            // "carrot-pinned", NOT "wedged" — see this test's THE LIMIT paragraph.
             assert_eq!(*w, 0,
                 "carrot pinning must be cleared at {sep} u separation, got {w}/{t} carrot-pinned");
             if *sep < CURSOR_STALE_DIST {

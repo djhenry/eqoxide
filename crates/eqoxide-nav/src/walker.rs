@@ -738,18 +738,14 @@ impl Walker {
     /// Mirror the fine worker's death into `NavStatus::local_planner_dead` (#766 review B3). Latched
     /// for the life of the WORKER — `LocalPlanner::is_dead()` is itself latched, and this only ever
     /// sets; the single clear lives in [`Walker::new`], which runs when a REPLACEMENT worker is
-    /// spawned (round-6 review B12: this line used to call the field SESSION-scoped, which is the
-    /// agent-facing name for the same span on today's one-`Walker` process, not the internal rule).
+    /// spawned. (On today's one-`Walker` process that span is the session, but the rule is the
+    /// worker's life, not the session's.)
     ///
     /// Called from the `is_dead()` branch in [`Walker::drive_walk`], beside the per-goal
     /// `nav_local` publication it backs up. **That is the DISCOVERY site, and discovery is the
     /// constraint.** The tempting alternative is to call this earlier in the walk tick,
-    /// "unconditionally", so that it cannot be missed. (An uncommitted draft of mine did; that draft
-    /// is in no commit, ref or reflog, so treat any account of it — including
-    /// [`a_dead_fine_planner_stays_visible_after_the_goal_is_retired_766`]'s — as recollection rather
-    /// than history, review B10. The argument below does not rest on it.) Two independent things kill
-    /// that placement, and review B7 is right that the ORDERING one is decisive while the
-    /// reachability one is merely additional:
+    /// "unconditionally", so that it cannot be missed. Two independent things kill that placement;
+    /// the ORDERING one is decisive and the reachability one merely additional:
     ///
     /// 1. **Ordering — structural, and by itself sufficient.** `LocalPlanner.dead` is written at
     ///    exactly two places, the failed send in `post_if_idle` and the disconnected receive in
@@ -769,8 +765,7 @@ impl Walker {
     /// Latching at the discovery site therefore records the fault on the very tick it becomes
     /// knowable, and because the record is on the shared row rather than in the per-goal verdict, the
     /// later retirement cannot take it away. What changes is not WHEN the fault is seen but how long
-    /// it stays visible: for the rest of the worker's life — which, one `Walker` being built per
-    /// process today, is the rest of the session — instead of until the next goal ends.
+    /// it stays visible: the rest of the worker's life, instead of until the next goal ends.
     ///
     /// The residual limit is stated on the field: a worker that dies and is never posted to again is
     /// not discoverable by any reader, this one included.
@@ -888,11 +883,9 @@ impl Walker {
     ///    1.0 — so rule 1 can never fire again. The cursor then names a segment the character is
     ///    nowhere near, and that lie reaches the steering aim by the route below.
     ///
-    ///    ⚠️ **Correction (#727 round 3).** Earlier revisions of this comment said simply that "the
-    ///    carrot lands ON the character". That is not what happens at the reach `drive_walk` actually
-    ///    steers with, and the round-2 review was right to reject it: at `LOOK_AHEAD = 5.0` the
-    ///    *coarse* carrot off a stale cursor leads by ~17 u on the captured #673 fixture. The chain
-    ///    is one step longer:
+    ///    The carrot does NOT simply land on the character: at `LOOK_AHEAD = 5.0` the *coarse* carrot
+    ///    off a stale cursor still leads by ~17 u on the captured #673 fixture. The chain that
+    ///    strands the walker is one step longer (#727 round 3):
     ///
     ///    * [`crate::steering::carrot_along`] measures arclength from a projection onto the stale
     ///      segment, so `local_goal` — the `LOCAL_REACH` (24 u) point handed to the FINE planner —
@@ -911,59 +904,41 @@ impl Walker {
     ///    `LOOK_AHEAD` on a featureless floor: 0.04 u of net displacement over 200 nav ticks
     ///    (30 s), and never more than 6.6 u from where it landed — less than one 8 u route leg.
     ///
-    ///    ⚠️ **Correction (#727 round 5).** This line read "0.02 u" from round 2 until now. The
-    ///    figure was not wrong when written, but the harness that produced it was: it dropped 14 of
-    ///    every 15 controller frames on a tick with no fine plan, where the production controller
-    ///    keeps integrating the last `MoveIntent`. The harness was fixed this round (round-4 review
-    ///    finding B-C) and every figure it produces moved; the sibling number in
-    ///    [`crate::steering`]'s test doc was restated to 0.04 u and this one was not swept with it.
-    ///    That miss is the same defect the round-5 review named: correcting by memory instead of by
-    ///    grepping the concept.
+    ///    That sim does NOT contain the walker's stall detector, `NAV_STUCK_TICKS` backoff or
+    ///    re-plan, so it cannot say what happens next. Driven through the **production** `drive_walk`
+    ///    loop on the same fixture, the walker sits in the cycle ~22 nav ticks (~3.3 s), backs off,
+    ///    re-plans from the body, and **arrives** (#727 round-3 review, measured). What makes #673
+    ///    terminal is the re-plan reproducing the state — a property of the terrain, not of this
+    ///    mechanism: live on qcat it did, and the walker stopped `blocked` / `walker_stalled` on 6 of
+    ///    8 attempts. Cost of a stale cursor: *at least* a wasted backoff-and-re-plan lap, at worst a
+    ///    terminal stop on a route the character could have walked.
     ///
-    ///    ⚠️ **Correction (#727 round 4).** This paragraph used to continue "…and the walker
-    ///    exhausts its re-paths and stops with `blocked` / `walker_stalled`", citing that sim. The
-    ///    sim does not contain the walker's stall detector, `NAV_STUCK_TICKS` backoff or re-plan, so
-    ///    it cannot say that. Driven through the **production** `drive_walk` loop on that same
-    ///    fixture, the walker sits in the cycle for ~22 nav ticks (~3.3 s), then backs off, re-plans
-    ///    from the body, and **arrives** (#727 round-3 review, measured). What makes #673 terminal
-    ///    rather than a hiccup is the re-plan reproducing the state, which is a property of the
-    ///    terrain and not of this mechanism: live on qcat it did, and the walker stopped with
-    ///    `blocked` / `walker_stalled` on 6 of 8 attempts. The cost of a stale cursor is therefore
-    ///    *at least* a wasted backoff-and-re-plan lap per occurrence, and at worst a terminal stop on
-    ///    a route the character could have walked.
-    ///
-    ///    ⚠️ **Correction (#727 round 5).** This used to add "and that reason code is only emitted
-    ///    once `nav_repaths` has reached 8, so all eight re-plans failed to escape". The counter does
-    ///    not support that: `nav_repaths` is reset to 0 whenever
-    ///    `gdist < nav_best_gdist - REPATH_RESET_DIST` (200 u) and on `decision.reset_route`, so
-    ///    reaching 8 means *at least
-    ///    eight stall-triggered re-plans since the walker last closed 200 u on the goal* — not eight
-    ///    attempts at one spot. The live record does not place all eight at `[-534.4, 144.4, -6.0]`.
-    ///    The "terminal on real terrain" conclusion stands on the `blocked` outcome itself.
+    ///    A limit on that reason code: `nav_repaths` reaching 8 does NOT mean eight re-plans at one
+    ///    spot. It resets to 0 whenever `gdist < nav_best_gdist - REPATH_RESET_DIST` (200 u) and on
+    ///    `decision.reset_route`, so it means *at least eight stall-triggered re-plans since the
+    ///    walker last closed 200 u on the goal*. The live record does not place all eight at
+    ///    `[-534.4, 144.4, -6.0]`; "terminal on real terrain" stands on the `blocked` outcome itself.
     ///
     /// ## A resync is NOT progress, and the walker says so (#727 round 2)
     ///
-    /// `path_i` has two readers with different needs. STEERING needs it to name the segment the body
-    /// is on — that is what rule 2 restores. The two HONEST-TERMINATION channels
-    /// (`drive_walk`'s stall detector, and #631 channel (a) `advancing_complete_route`) instead need
-    /// it to mean *"the walker got here by walking"*; channel (a)'s comment justifies its verdict
-    /// "by construction" on exactly that premise, which held only while rule 1 was the sole way the
-    /// cursor moved.
+    /// `path_i` has two readers. STEERING needs it to name the segment the body is on — that is what
+    /// rule 2 restores. The two HONEST-TERMINATION channels (`drive_walk`'s stall detector, and #631
+    /// channel (a) `advancing_complete_route`, which justifies its verdict "by construction" on this)
+    /// instead need it to mean *"the walker got here by walking"* — true only while rule 1 was the
+    /// sole way the cursor moved.
     ///
-    /// Rule 2 breaks that premise, so rather than leave the premise false this raises `stuck_i` to
-    /// the resynced cursor. A resync jump is then invisible to both channels: it can neither reset
-    /// the stall clock nor refresh `nav_progress_at`, and `path_i > stuck_i` can still only arise
-    /// from rule 1. This costs #673's fix nothing — the resync's value is that the walker starts
-    /// MOVING again, and the movement then advances the cursor by rule 1, which does count. It is
-    /// deliberately conservative in the honest direction: in a tick where both rules fire, the
-    /// genuine rule-1 step is swallowed with the jump (under-reporting progress, never over-).
+    /// So rule 2 also raises `stuck_i` to the resynced cursor, making the jump invisible to both
+    /// channels: it can neither reset the stall clock nor refresh `nav_progress_at`, and
+    /// `path_i > stuck_i` can still only arise from rule 1. This costs #673's fix nothing — the
+    /// resync's value is that the walker starts MOVING again, and that movement advances the cursor
+    /// by rule 1. It errs in the honest direction: when both rules fire in one tick the genuine
+    /// rule-1 step is swallowed with the jump (under-reporting progress, never over-).
     ///
-    /// **This is measured, not reasoned.** Delete the `stuck_i` raise below and
+    /// **Measured, not reasoned.** Delete the `stuck_i` raise below and
     /// `a_resync_jump_must_not_reset_the_no_progress_clock` goes RED: it drives the real
     /// [`Walker::drive_walk`] over a route where a resync jump happens, and without the raise the
-    /// walker keeps reporting itself as making progress. The reviewer's question was whether a false
-    /// cursor advance actually reaches a consumer in a way that misleads. It does, and that test is
-    /// the execution-level proof.
+    /// walker keeps reporting itself as making progress — a false cursor advance does reach a
+    /// consumer in a way that misleads.
     ///
     /// The reachability predicate is [`crate::steering::resync_reachable`] — a conjunction of a
     /// chest-height LOS ray (walls) and a floor-column probe (voids/drops) — because the LOS ray
@@ -1361,42 +1336,24 @@ impl Walker {
                 // (`CommandState::request_stop`) DOES clear `nav.zone_cross` (round-3 fix), so after a
                 // stop `zone_cross_pending` is false and this branch retires `zone_loading`→`idle` on
                 // the very next tick — the cross is genuinely cancelled, not left to fire post-load.
-                // (Only `zone_loading` is guarded — navigating/planning/dead never coexist with an
-                // unresolved queued cross.)
                 //
-                // #725: the retirement rule is INVERTED — retire everything that is not in the
-                // closed [`TERMINAL_NAV_STATES`] set, rather than everything on an opt-in list.
+                // #725: the retirement rule is INVERTED — retire everything NOT in the closed
+                // [`TERMINAL_NAV_STATES`] set, rather than everything on an opt-in list. The old
+                // opt-in form left any unlisted state standing forever once its goal vanished. Two
+                // did, and both were live agent-visible lies: `pending` (stamped by
+                // `request_zone_cross`, whose one-shot request `drain_zone_cross` then DRAINED —
+                // measured at `nav_state: "pending"` / `nav_reason: null` for 45 s / 48 s / 75 s
+                // while `docs/http-api.md` told the agent that meant "in flight"), and `following`
+                // (left standing after `drive_chase` cleared both nav slots on a despawned leader).
+                // Listing those two fixes those two; inverting fixes the CLASS — a state invented
+                // tomorrow retires by default.
                 //
-                // The old form listed the states to retire (`navigating`, `navigating_partial`,
-                // `planning`, `zone_loading`, `dead`), so any state NOT on the list stuck forever
-                // once its goal vanished. Two did, and both were live agent-visible lies:
-                //
-                //   * `pending` — stamped by `request_zone_cross`, whose one-shot request
-                //     `drain_zone_cross` then DRAINED. With the slot empty and no goto goal, nothing
-                //     could ever retire it: measured `nav_state: "pending"` with `nav_reason: null`
-                //     for 45 s / 48 s / 75 s while `docs/http-api.md` told the agent that meant "your
-                //     goal is genuinely in flight" (#725).
-                //   * `following` — published by the `FollowHold` arm while a chase holds near its
-                //     leader. When that leader despawns, `drive_chase` clears BOTH nav slots, and
-                //     `following` was left standing over a chase with nothing left to chase.
-                //
-                // Listing those two would fix those two. Inverting the rule fixes the CLASS: an
-                // in-progress state invented tomorrow retires by default, and only a deliberate
-                // addition to the terminal set can make a word survive with no goal behind it.
-                // The one thing that legitimately outlives a goto goal: a `/zone_cross` request that
-                // is STILL QUEUED. It has no concrete goal yet by construction — the concrete
-                // zone-line goal only exists after `drain_zone_cross` resolves it — so "no goal ⇒
-                // retire" would be wrong for exactly as long as the request sits in its slot, and
-                // wrong in the OTHER direction: `idle` while a crossing the client fully intends to
-                // perform is queued reads as "your request was dropped", and the character then
-                // crosses anyway. That was #600's `zone_loading` case; writing this test found that
-                // `pending` (what `request_zone_cross` itself stamps) has it too, in the window
-                // between the accept on the HTTP thread and the drain on the net thread. Gate on the
-                // REQUEST, not on the state word — the queued request is the thing that makes an
-                // in-progress state true, and the word it happens to carry is not.
-                //
-                // This cannot resurrect #725: the slot is emptied by the drain, so from that instant
-                // `held_for_cross` is false and the very next tick retires anything non-terminal.
+                // Gate on the REQUEST, not the state word: a still-QUEUED `/zone_cross` has no
+                // concrete goal by construction, so "no goal ⇒ retire" would publish `idle` over a
+                // crossing the client fully intends to perform — and it then crosses anyway. #600
+                // hit that as `zone_loading`; `pending` has it too, in the window between the HTTP
+                // accept and the net-thread drain. This cannot resurrect #725: the drain empties the
+                // slot, so from that instant the next tick retires anything non-terminal.
                 let zone_cross_pending = self.nav.zone_cross.lock().unwrap().is_some();
                 let current = self.nav.nav_state.lock().unwrap().state.clone();
                 if !zone_cross_pending && !nav_state_is_terminal(&current) {
@@ -2759,10 +2716,6 @@ mod tests {
             // added in round 6 by `steering`'s mechanical citation scan: cited in a doc comment in
             // this file and named in no guard list.
             cancelling_the_goto_while_loading_returns_to_idle,
-            // #766 round 5: cited by `Walker::latch_local_planner_liveness`'s rustdoc, which points
-            // at this test for the B10 hedge on the uncommitted draft. Caught by `steering`'s scan,
-            // not by me — the citation was added and the guard was not.
-            a_dead_fine_planner_stays_visible_after_the_goal_is_retired_766,
             // #787: cited by `NOT_PRODUCTION`'s rustdoc, which points at the guard that decides what
             // the marker means. Caught by `steering`'s scan when the citation was written.
             exactly_one_production_fine_worker_is_built_in_the_tree_787,
@@ -3582,32 +3535,21 @@ mod tests {
     /// `nav_state` comes from the COARSE planner, a different object).
     ///
     /// The fix is a separate field outliving the goal, not a carve-out in `retire_to_idle` — that
-    /// would have re-opened the clear-on-every-`idle` uniformity #766 exists to create. (Its
-    /// lifetime is the fine WORKER's; round-6 review B12 corrected an earlier "session-scoped" here.
-    /// Nothing this test does turns on the difference — it retires a goal, and retiring a goal does
-    /// not replace a worker.)
+    /// would have re-opened the clear-on-every-`idle` uniformity #766 exists to create. Its lifetime
+    /// is the fine WORKER's, not the session's — though nothing this test does turns on the
+    /// difference: retiring a goal does not replace a worker.
     ///
-    /// **This test is driven end-to-end by production `drive_walk`, and an earlier draft that was not
-    /// is why.** My recollection of that draft — pre-forcing `is_dead()` in a loop, calling
-    /// `drive_walk` with an EMPTY path, latching from above `let have_path` — is **recollection, not
-    /// history**: the review established that the draft survives in no commit, ref or reflog entry,
-    /// so nobody can reproduce it and no account of its internals, mine included, is checkable
-    /// (round-5 review B10). Treat it the way this branch treats any un-run claim.
+    /// **This test is driven end-to-end by production `drive_walk`.** Two independent reasons a test
+    /// must not shortcut the latch: an empty path returns at `awaiting_first_plan`, one of the FIVE
+    /// early returns above `let have_path`, so no latch placed after `advance_cursor` is reached at
+    /// all (reachability); and `dead` is only ever written inside `have_path`, so an earlier latch is
+    /// a tick late by construction even where it IS reached (ordering — the decisive defect, argued
+    /// in full on [`Walker::latch_local_planner_liveness`]). Below: no forcing loop, no direct latch
+    /// call, and a committed route so production discovers the death itself.
     ///
-    /// What IS checkable is on the tree in front of you, and it is the part that matters. An empty
-    /// path returns at `awaiting_first_plan`, one of the FIVE early returns above `let have_path`, so
-    /// no latch placed after `advance_cursor` can fire in that fixture at all — reachability. And
-    /// independently of any draft, `dead` is only ever written inside `have_path`, so an earlier latch
-    /// is a tick late by construction even where it IS reached — ordering, which is the decisive
-    /// defect and is argued in full on [`Walker::latch_local_planner_liveness`]. The two are separate
-    /// failures with separate evidence; earlier rounds on both sides collapsed them into one story
-    /// and got the attribution wrong in both directions. Below, the test avoids the whole question:
-    /// no forcing loop, no direct latch call, and a committed route so production discovers the death
-    /// itself.
-    ///
-    /// Mutation checks, both RUN, reported by ASSERTION rather than by line number — a re-measured
-    /// line number is correct only until the next edit above it, and reads more trustworthy than it
-    /// is (review B8). Delete the `latch_local_planner_liveness()` call from `drive_walk` → the
+    /// Mutation checks, both RUN, reported by ASSERTION rather than by line number (a line number is
+    /// correct only until the next edit above it). Delete the `latch_local_planner_liveness()` call
+    /// from `drive_walk` → the
     /// discovery assertion here goes RED, `eqoxide-nav` `214 passed; 1 failed; 16 ignored`. Clear
     /// `local_planner_dead` in `retire_to_idle` instead of keeping it → the post-retirement assertion
     /// here goes RED (`eqoxide-nav` `214 passed; 1 failed`) **and** so does the endpoint test in
@@ -4079,34 +4021,24 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// premise without adding a `Walker`.
     ///
     /// **Why a source scan and not a runtime counter.** A process-global `AtomicUsize` in
-    /// `Walker::new` grades the property rather than the text and would be the stronger instrument —
-    /// except that there is no `cfg` that separates "the production process" from "a downstream
-    /// crate's test binary". `cfg(test)` is per-compilation: when `eqoxide-nav` is built as a
-    /// dependency of `eqoxide-net`, `cfg(test)` is FALSE for this crate, so a `#[cfg(not(test))]`
-    /// trip fires inside `eqoxide-net`'s own suite, which builds two `ActionLoop`s (and therefore two
-    /// `Walker`s) in one process. That was measured, not reasoned — see the PR body. A release-only
-    /// trip avoids the false fire but is never exercised in CI and turns a prose-decay problem into a
-    /// new field failure mode. So the instrument that can fail at AUTHORING time wins here.
+    /// `Walker::new` would grade the property rather than the text, but no `cfg` separates "the
+    /// production process" from "a downstream crate's test binary". `cfg(test)` is per-compilation:
+    /// built as a dependency of `eqoxide-net` it is FALSE here, so a `#[cfg(not(test))]` trip fires
+    /// inside `eqoxide-net`'s own suite, which builds two `ActionLoop`s (hence two `Walker`s) in one
+    /// process — measured, not reasoned. A release-only trip is never exercised in CI and turns a
+    /// prose-decay problem into a new field failure mode.
     ///
     /// **MEASURED evasions. This list is the honest description of the instrument** — round-1 review
     /// of #836 planted eight production fine-worker constructions simultaneously and this test
     /// reported `ok`. Two of the eight are now closed; the rest are not closable by a text scan
     /// without turning it into a Rust parser (#799 catalogues the family).
     ///
-    /// A round-3 draft of this comment said "**every** row below was RUN … not reasoned about".
-    /// Round-3 review found that false for two rows and it was: the `LocalPlanner::spawn` fn-pointer
-    /// row and the `Default`/`Clone` row were written by analogy with rows next to them. Both have
-    /// since been run (the spawn fn-pointer row survived exactly as claimed; the `Default` row did
-    /// **not** and has been rewritten to what the run showed). Every row now carries the plant that
-    /// produced its verdict, so the claim is checkable per row rather than as a blanket assurance —
-    /// which is the form the false one took.
-    ///
-    /// A round-2 draft of this comment claimed the marker hole was *narrower* than review recorded —
-    /// that the opt-out could only relocate the production site within its own file. **That was
-    /// wrong and round-2 review refuted it by construction**: a marked second construction in a
-    /// different file, original untouched, leaves the guard green. Two rows in this very table (the
-    /// marker row and the macro row) are instances of the form that claim said could not exist. The
-    /// narrowing is withdrawn; what follows is what was measured, nothing inferred from it.
+    /// A row carries the plant that produced its verdict wherever one was run: a blanket "every row
+    /// below was RUN" was written once and was false for two of them, both written by analogy with
+    /// the rows beside them. **Not every row carries one, and this paragraph used to say they all
+    /// did.** The qualified-path and `macro_rules!` rows state a verdict with no plant at all, and
+    /// the relogin row argues from the subject mismatch above rather than from a run. Read a row's
+    /// provenance off the row; do not read it off this paragraph.
     ///
     /// | form | status |
     /// |---|---|
@@ -4123,30 +4055,26 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// | a `Default`/`Clone` impl for `Walker` | **CAUGHT in the direct form — the round-3 "NOT caught" here was reasoned and it was wrong.** Run in round 4: an `impl Default for Walker` whose body is a struct literal went **RED** (`found 2 site(s)`), because to be a fine worker at all the literal has to fill `local_planner`, and the only plain spelling of that is `LocalPlanner::spawn(` — which is the second needle. The same impl reaching the worker through a fn-pointer binding went GREEN, so this evades only *via* the fn-pointer row above, not on its own. Both plants were text-level: the guard is a text scan, and a full `Walker` literal does not compile outside this module |
     /// | the needle inside a `/* … */` block comment, or inside a string literal | **false RED** (measured). The two passes are combined by MAX per line so that two constructions on one line still count as two; the cost is that the raw pass's hit survives even where the blanked pass correctly sees none. Harmless direction, disclosed rather than left to be tripped over |
     ///
-    /// **The balance, corrected.** An earlier draft of this comment argued that the residual holes
-    /// push into a false RED — the safe direction — because #799's `if false` / `#[cfg(any())]` /
-    /// shadowing evasions make a *written* call *unreached*. That argument was **falsified by
-    /// measurement**: the residual is dominated by invisible-to-the-scan misses (the table above),
-    /// not by false REDs. Those false-RED forms are real and they are the harmless direction, but
-    /// they are not the balance. **This is a tripwire for the common case, not a pin**, and the
-    /// argument that a source scan was the right mechanism here is correspondingly weaker than it
-    /// was written to be. What survives of it is narrower and still true: the instrument fails at
-    /// AUTHORING time, which is when this premise decays, and a runtime counter cannot be built here
-    /// at all (next paragraph).
+    /// **The balance does NOT fall on the safe side.** It is tempting to argue that the residual
+    /// holes push into a false RED, because #799's `if false` / `#[cfg(any())]` / shadowing evasions
+    /// make a *written* call *unreached*. Measurement falsifies it: the residual is dominated by
+    /// invisible-to-the-scan MISSES (the table above), not by false REDs. Those false-RED forms are
+    /// real and harmless, but they are not the balance. **This is a tripwire for the common case,
+    /// not a pin.** What survives of the case for a source scan is narrower and still true: the
+    /// instrument fails at AUTHORING time, which is when this premise decays, and a runtime counter
+    /// cannot be built here at all (next paragraph).
     ///
     /// **Reach.** #778 found an existing source-scanning guard silently covering a fraction of its
     /// corpus, which is indistinguishable from a passing one — and round-1 review reproduced exactly
     /// that inside THIS guard's first draft (see [`git_tracked_rs_787`] for the measurement). The
     /// corpus is therefore the git index, not a tolerance band, and the filesystem walk is asserted
     /// EQUAL to it rather than merely large. Untracked `.rs` files are scanned too (the corpus is the
-    /// union), so a stray scratch file is a false RED — the safe direction, disclosed here rather
-    /// than left to be discovered.
+    /// union), so a stray scratch file is a false RED — the safe direction.
     ///
     /// **The reach control is not the same strength everywhere, and this guard says which one ran.**
-    /// The index equality check needs a git checkout. The remote builder that compiles and runs this
-    /// workspace receives an rsync'd copy with no `.git`, and the first version of this fix turned
-    /// that into a hard failure of the entire suite — a missing index reported as if it were evidence
-    /// about workers, which is the same class of dishonesty #787 is about. So:
+    /// The index equality check needs a git checkout, and the remote builder that compiles this
+    /// workspace receives an rsync'd copy with no `.git`. Reporting that as a hard failure would be a
+    /// missing index dressed up as evidence about workers — the same dishonesty #787 is about. So:
     ///
     ///   * git present (any developer or agent worktree, and CI — the workflow uses
     ///     `actions/checkout@v4`, so **the merge gate runs index equality**) — per FILE;
@@ -4155,43 +4083,39 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     ///     actually measured, because that failure was a whole crate directory dropping out of the
     ///     walk; it cannot catch one missing file.
     ///
-    /// **And the member LIST is itself asserted, because round-3 review broke it.** That list used to
-    /// be parsed and printed and never compared to anything. A `default-members` key in the manifest
-    /// armed the old suffix match, the list collapsed to ONE member, 29 `.rs` files went dark with a
-    /// planted production construction among them, and the guard passed while printing
+    /// **And the member LIST is itself asserted, because round-3 review broke it.** The list used to
+    /// be parsed and printed and never compared to anything: a `default-members` key armed the old
+    /// suffix match, the list collapsed to ONE member, 29 `.rs` files went dark with a planted
+    /// production construction among them, and the guard passed while printing
     /// `workspace members checked = 1`. **A number that is printed and never checked is not a
-    /// control** — it is the #778 shape one level up, in the reach control's own input. So the parsed
-    /// list is now asserted EQUAL to the set of directories that actually contain a `Cargo.toml`
-    /// ([`crate_dirs_787`]), which needs no git and does not depend on this parser being right. Both
-    /// halves were measured in round 4: with the anchor deliberately removed the parser still
-    /// collapses to `{"tools"}`, and the tree is **RED anyway** — `Parsed 1 … on disk 13`.
+    /// control** — the #778 shape one level up, in the reach control's own input. So the parsed list
+    /// is now asserted EQUAL to the set of directories that actually contain a `Cargo.toml`
+    /// ([`crate_dirs_787`]), which needs no git and does not depend on this parser being right.
+    /// Measured in round 4: with the anchor removed the parser still collapses to `{"tools"}`, and
+    /// the tree is **RED anyway** — `Parsed 1 … on disk 13`.
     ///
     /// **How weak the degraded control is, in numbers.** A corpus satisfying every git-absent check
     /// needs 13 member representatives, plus a 14th file because `eqoxide-nav` carries TWO named
     /// anchors (`walker.rs` and `planner.rs`) and one representative cannot be both, plus the two
     /// anchors that live outside any member (`src/app.rs`, `tests/walker_sim.rs`): **16 of 172
-    /// files. Up to 156 — 90.7% — could be dark and every control would still pass.** (A round-3
-    /// draft said 15 / 157 / 91%; it counted `eqoxide-nav` once.) That is far worse than the 11.6%
-    /// tolerance band round-1 review made me delete, and it is the honest ceiling on what a
-    /// builder-only run proves.
+    /// files. Up to 156 — 90.7% — could be dark and every control would still pass.** That is far
+    /// worse than the 11.6% tolerance band round-1 review made me delete, and it is the honest
+    /// ceiling on what a builder-only run proves.
     ///
-    /// Two things bound it in practice, and neither is a fix. The merge gate has git, so nothing
-    /// reaches `main` on the weak path — it is every pre-merge run a developer or agent sees that
-    /// takes it. And the guard now prints its mode and its file count **unconditionally, before any
-    /// finding**, to the process's real stderr handle — so it appears in a plain `cargo test` log of
-    /// a PASSING run, with no `--nocapture` (that flag would be needed only for the `println!` form,
-    /// which is exactly the form this deliberately does not use; see the comment at the write site).
-    /// A degraded run therefore states its own coverage rather than looking identical to a strong
-    /// one. Round-2 review found that disclosure on the failure path
-    /// only, which is the #778 property reproduced inside this guard's own reporting: it told the
-    /// truth exactly when it was already failing.
+    /// Two things bound it in practice, neither a fix. The merge gate has git, so nothing reaches
+    /// `main` on the weak path — it is every pre-merge run a developer or agent sees that takes it.
+    /// And the guard prints its mode and file count **unconditionally, before any finding**, to the
+    /// process's real stderr handle, so it appears in a plain `cargo test` log of a PASSING run with
+    /// no `--nocapture` (needed only for the `println!` form, which this deliberately does not use;
+    /// see the comment at the write site). **Unconditionally** is the load-bearing word: the
+    /// disclosure was once on the failure path only — the #778 property reproduced inside this
+    /// guard's own reporting, telling the truth exactly when it was already failing.
     ///
     /// **Why the corpus is still cross-checked against git rather than being the walk alone.**
     /// Measured on two trees that have both: `git ls-files '*.rs'` and the walk produce the **same
-    /// 172 files, identical by name**, not merely the same count. So the corpus is already the walk
-    /// either way — the union adds nothing — and dropping the index would not simplify the corpus,
-    /// it would only delete the one per-FILE reach control the merge gate actually runs. The two
-    /// modes are a difference in CHECKING, not in what gets scanned.
+    /// 172 files, identical by name**, not merely the same count. The corpus is already the walk
+    /// either way; dropping the index would only delete the one per-FILE reach control the merge gate
+    /// actually runs. The two modes differ in CHECKING, not in what gets scanned.
     #[test]
     fn exactly_one_production_fine_worker_is_built_in_the_tree_787() {
         let root = repo_root_787();
