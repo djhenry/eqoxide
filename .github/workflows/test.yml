@@ -99,13 +99,23 @@ jobs:
       #
       # Do NOT "improve" this to `--all-targets`: that would be a REGRESSION here. The repo has no
       # `benches/` and no `examples/`, so `--all-targets` adds zero coverage, and it silently DROPS
-      # the doc-test targets. MEASURED back-to-back on one clean tree (#950): both commands run the
-      # SAME 42 test binaries — the `Running` target lists diff empty, including all 23 integration
-      # targets under `tests/` — while this command additionally runs 13 `Doc-tests` targets
-      # carrying 14 doctests (11 passed, 3 ignored) that `--all-targets` reports as 0. So
-      # `--workspace --locked` is a strict superset: 55 headers / 2008 passed / 50 ignored versus
-      # 42 / 1997 / 47. (An earlier version of this comment said no Rust doctest existed yet; that
-      # is no longer true, and the conclusion is stronger than it was, not weaker.)
+      # the doc-test targets. MEASURED at `245baeb` (#974): both commands run the byte-identical
+      # set of 42 non-doctest test binaries — the `Running` target list diff is empty, including
+      # all 23 integration targets under `tests/` — while `--workspace` alone additionally runs 13
+      # `Doc-tests` targets carrying 15 doctests (12 passed, 3 ignored) that `--all-targets`
+      # reports as 0. So `--workspace --locked` is a strict superset by that delta.
+      #
+      # Pass/header TOTALS are deliberately not quoted here. An earlier version of this comment
+      # quoted five — `55`/`2008`/`50` versus `42`/`1997`/`47` — sourced to "one clean tree (#950)"
+      # with no sha; three were already stale by the very next PR (#974). A total is a predicate
+      # over the whole mutable suite: the next merged `#[test]` anywhere falsifies it and nothing
+      # re-evaluates a comment. Even the counts above will drift eventually — they are pinned to a
+      # sha for that reason, not claimed current. Re-derive with `cargo test --workspace --locked`
+      # vs `cargo test --workspace --all-targets --locked`, diffing the `Running` lines and
+      # `Doc-tests` sections, if you need today's numbers.
+      #
+      # (An earlier version of this comment said no Rust doctest existed yet; that is no longer
+      # true, and the conclusion is stronger than it was, not weaker.)
       #
       # Headless-safety still holds under `--workspace`: no test in any crate constructs a
       # `wgpu::Instance` or a `winit::EventLoop` (those call sites are `src/app.rs:772` — in the
