@@ -99,9 +99,13 @@ jobs:
       #
       # Do NOT "improve" this to `--all-targets`: that would be a REGRESSION here. The repo has no
       # `benches/` and no `examples/`, so `--all-targets` adds zero coverage, and it silently DROPS
-      # the doc-test targets. (Those targets do run today and report 0 tests — all 22 doc fences in
-      # the repo are ```text/```bash, so no Rust doctest exists yet. The targets are what would
-      # catch the first real one.)
+      # the doc-test targets. MEASURED back-to-back on one clean tree (#950): both commands run the
+      # SAME 42 test binaries — the `Running` target lists diff empty, including all 23 integration
+      # targets under `tests/` — while this command additionally runs 13 `Doc-tests` targets
+      # carrying 14 doctests (11 passed, 3 ignored) that `--all-targets` reports as 0. So
+      # `--workspace --locked` is a strict superset: 55 headers / 2008 passed / 50 ignored versus
+      # 42 / 1997 / 47. (An earlier version of this comment said no Rust doctest existed yet; that
+      # is no longer true, and the conclusion is stronger than it was, not weaker.)
       #
       # Headless-safety still holds under `--workspace`: no test in any crate constructs a
       # `wgpu::Instance` or a `winit::EventLoop` (those call sites are `src/app.rs:772` — in the
@@ -150,14 +154,18 @@ jobs:
       # The shared mutation harness (#950) is how a PR body substantiates a "this check is
       # load-bearing" claim, so a harness that has quietly stopped discriminating would devalue
       # every such claim without anything going red. `--self-test` builds a throwaway crate in a
-      # temporary directory (never inside the repo, never part of the workspace) and drives the
-      # real entry point through its FAILURE modes: an anchor that matches zero times and one that
-      # matches twice (both must be refused), a mutant that does not compile (must score INVALID —
-      # never RED, since a compile failure and a test failure both exit 101), a caught mutant, a
-      # surviving one, a multi-edit mutant, and a deliberately corrupted restore. It also mutates
-      # the harness itself to confirm the compile-sentinel gate is reached rather than merely
-      # present. Same precedent as the check-wrapped-literals `--self-test` in the job above.
-      # It needs cargo, which is why it lives here and not in the `no-local-detail` job.
-      # See docs/mutation-testing.md.
+      # temporary directory (never part of any eqoxide workspace, wherever TMPDIR points) and
+      # drives the real entry point through its FAILURE modes: an anchor that matches zero times
+      # and one that matches twice (both must be refused), a mutant that does not compile (must
+      # score INVALID — never RED, since a compile failure and a test failure both exit 101), a
+      # caught mutant, a surviving one, a multi-edit mutant, and a deliberately corrupted restore.
+      # It also mutates the harness itself to confirm those guards are reached rather than merely
+      # present, and asserts how many checks ran — a case that stops running must fail the step,
+      # not shrink the output silently.
+      #
+      # Same PATTERN as the check-wrapped-literals `--self-test` in the job above, not the same
+      # cost: that one is in-process and sub-second, this one drives roughly a dozen cargo
+      # invocations and takes tens of seconds. It needs cargo, which is why it lives here and not
+      # in the `no-local-detail` job. See docs/mutation-testing.md.
       - name: mutation harness self-test
         run: python3 scripts/mutate.py --self-test

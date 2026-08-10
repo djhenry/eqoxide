@@ -22,17 +22,33 @@ THE VERDICTS
            be reported as one: an INVALID mutant leaves its claim UNTESTED, and calling it RED is
            a false claim of evidence.
   TIMEOUT  the test command hit its timeout. Also untested.
+  UNUSABLE the log contained neither the compile sentinel nor a build failure, so the harness
+           could not see whether cargo built anything. No spec may declare this; it always fails
+           the run. It exists so that "the harness is blind" is never printed as "the mutant did
+           not build".
 
 The INVALID/RED distinction is the whole reason for the compile sentinel below. `cargo test` exits
 101 both when the crate fails to compile and when a test fails, so **the exit code cannot tell the
 two apart**. The verdict is therefore derived from the sentinel first and the exit code only
-afterwards; see `score_run`, `find_compile_proof` and `verdict_from_proof`. RED and GREEN are
-produced at exactly one place in this file, inside a function that cannot be called without a
-`CompileProof`, and a `CompileProof` cannot be constructed without a line containing the sentinel.
-`--self-test` mutates *this file* to show those guards are reached rather than merely present:
-wrapping the sentinel gate away turns an INVALID into a loud crash, and it takes wrapping away the
-gate, the type assertion behind it, AND the report's use of the proof object before a mutant that
-never compiled can be printed as RED.
+afterwards; see `score_run`, `find_compile_proof` and `verdict_from_proof`. A verdict's *evidence*
+is produced by the same call that produces the verdict, so an evidence cell cannot describe a state
+its own verdict denies.
+
+`--self-test` mutates *this file* to show those guards are reached rather than merely present, and
+the case numbers below are what each claim rests on:
+
+  * `find_compile_proof` and the sentinel pattern are the actual proof-or-None decision. MEASURED:
+    ONE edit to either — wrapping the `return None` away, or changing the pattern to something a
+    compile-error log contains — is enough to print a never-compiled mutant as RED (case 12). What
+    stops that is case 0, which fails on both mutants.
+  * DOWNSTREAM of that decision, three guards must ALL be removed before the same thing happens:
+    the `proof is None` gate, the type assertion inside `verdict_from_proof`, and that function's
+    use of the proof line as evidence. Wrapping the gate alone turns an INVALID into a loud crash,
+    never a verdict (cases 8 and 9).
+
+That is the whole enumeration, and it was arrived at by mutating the file rather than by reading
+it: an earlier version of this docstring claimed three barriers full stop, and the two one-edit
+paths above are precisely what it missed.
 
 SAFETY RULES BAKED IN
 ---------------------
@@ -43,11 +59,14 @@ SAFETY RULES BAKED IN
     would read as evidence of an uncovered behaviour that was never actually perturbed.
   * The original bytes are held in memory and written back verbatim; the restore is then re-read
     from disk and verified by sha256. A failed restore aborts the whole run, loudly.
+  * A spec's file paths are resolved under `--root` and refused if they escape it, and a mutant id
+    is refused if it could name a path (it becomes a log filename).
   * This harness NEVER invokes git. `git checkout` / `git restore` / `git stash` are repo-global
-    and would destroy other worktrees' uncommitted work. `run_command` — the only place this tool
-    spawns a subprocess — refuses an argv that names the git executable. That stops the accident,
-    which is the realistic failure; it inspects argv, so it would not stop a deliberate
-    `sh -c 'git …'`, and it does not constrain a future second call site.
+    and would destroy other worktrees' uncommitted work. `run_command` — the only place THIS
+    MODULE spawns a subprocess — refuses an argv that names the git executable. That stops the
+    accident, which is the realistic failure; it inspects argv, so it would not stop a deliberate
+    `sh -c 'git …'`, and it does not constrain a future second call site. (`mutate_selftest.py`
+    spawns cargo and python directly and is not covered by that check; it takes no spec input.)
 
 WRAP, DON'T DELETE
 ------------------
@@ -76,8 +95,8 @@ the current directory. (This is deliberately not derived from git — see the sa
 EXIT CODES
 ----------
     0  every mutant ran, and every declared `expect` matched
-    1  a verdict did not match its declared `expect`, or a mutant was INVALID/TIMEOUT with no
-       declared expectation — i.e. a row of the table proves nothing
+    1  a verdict did not match its declared `expect`, a mutant was INVALID/TIMEOUT with no
+       declared expectation, or any mutant was UNUSABLE — i.e. a row of the table proves nothing
     2  the harness refused to act, or a restore could not be verified
 
 SPEC FORMAT — see docs/mutation-testing.md for the annotated version.
@@ -97,17 +116,31 @@ from pathlib import Path
 
 # The line `cargo test` prints once the whole requested unit graph has been built. Its presence is
 # the ONLY reliable evidence that the mutant compiled: a compile failure and a test failure both
-# exit 101. Keep this string in sync with cargo; `--self-test` fails loudly if it stops appearing.
-COMPILE_SENTINEL = "Finished `test` profile"
+# exit 101. Keep this pattern in sync with cargo; `--self-test` fails loudly if it stops matching.
+#
+# The profile name is matched, not hard-coded. MEASURED on a throwaway crate: `cargo test` prints
+# `` Finished `test` profile `` and `cargo test --release` prints `` Finished `release` profile ``,
+# so a spec whose [run] command carries --release or --profile <x> would otherwise turn EVERY
+# mutant INVALID while looking like a real table.
+COMPILE_SENTINEL_RE = re.compile(r"Finished `[^`]+` profile")
+COMPILE_SENTINEL_DESC = "Finished `<profile>` profile"
 
-# Cargo decorates that line in some environments, and BOTH decorations break a literal search.
+# Positive evidence that cargo failed to BUILD, as opposed to the harness simply not being able to
+# see the build result. MEASURED: a type error prints this both normally and under
+# CARGO_TERM_QUIET=true, while a successful build whose test fails never does.
+BUILD_FAILURE_MARKER = "error: could not compile"
+
+# Cargo decorates that line in some environments, and BOTH decorations break the search above.
 # Two forms were measured while writing this, not reasoned about:
 #   * colour (this repo's CI runner):  \x1b[1m\x1b[92m    Finished\x1b[0m `test` profile […]
 #     — the reset sequence sits between `Finished` and the profile name.
 #   * an OSC-8 hyperlink (a local run with CARGO_TERM_COLOR=always): the profile name is wrapped
 #     in \x1b]8;;<url>\x1b\ … \x1b]8;;\x1b\, which puts a whole URL inside the sentinel.
-# Either way the literal is absent, every mutant scores INVALID, and a whole table silently
-# downgrades to "untested". Captured output is therefore stripped of ANSI escapes — CSI, OSC and
+# Either way an escape sequence lands inside the sentinel, so it no longer matches, every mutant
+# scores as unbuilt, and a whole table silently downgrades to "untested" — the failure this file
+# exists to prevent, in the direction that under-claims rather than over-claims. Note the escapes
+# arrive between `Finished` and the profile name, i.e. inside the matched span, so a more permissive
+# pattern would not have helped. Captured output is therefore stripped of ANSI escapes — CSI, OSC and
 # the two-character forms — before anything looks at it, and the stripped text is what gets
 # written to the log file. `--self-test` case 0 pins both measured lines verbatim, and case 11
 # runs a real mutant under CARGO_TERM_COLOR=always with a control that the output was decorated.
@@ -125,6 +158,11 @@ RED = "RED"
 GREEN = "GREEN"
 INVALID = "INVALID"
 TIMEOUT = "TIMEOUT"
+UNUSABLE = "UNUSABLE"
+
+# What a spec may declare in `expect`. UNUSABLE is deliberately absent: it means the harness could
+# not see cargo's build result at all, so it is never a legitimate expectation and always fails the
+# run. See `score_run`.
 VERDICTS = (RED, GREEN, INVALID, TIMEOUT)
 
 # Deliberately the same command the `test` CI job gates on, so a mutation table is scored against
@@ -133,6 +171,9 @@ VERDICTS = (RED, GREEN, INVALID, TIMEOUT)
 # is spelled out at the `cargo test --workspace` step in .github/workflows/test.yml.
 DEFAULT_COMMAND = ["cargo", "test", "--workspace", "--locked"]
 DEFAULT_TIMEOUT_SECS = 1800
+
+# A mutant id names a row of the table and a log file, in that order of importance.
+MUTANT_ID_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
 class Refusal(Exception):
@@ -148,14 +189,14 @@ class Refusal(Exception):
 class CompileProof:
     """Evidence that the mutant built: the actual sentinel line from the log.
 
-    Constructing one requires a line containing the sentinel, so a `CompileProof` cannot be
+    Constructing one requires a line matching the sentinel, so a `CompileProof` cannot be
     conjured from a log that lacks it.
     """
 
     line: str
 
     def __post_init__(self) -> None:
-        if COMPILE_SENTINEL not in self.line:
+        if COMPILE_SENTINEL_RE.search(self.line) is None:
             raise AssertionError(
                 "CompileProof built from a line without the compile sentinel: " + repr(self.line)
             )
@@ -168,36 +209,63 @@ def find_compile_proof(output: str) -> CompileProof | None:
     `output` must already be ANSI-stripped; `run_command` is the only producer and does that.
     """
     for line in output.splitlines():
-        if COMPILE_SENTINEL in line:
+        if COMPILE_SENTINEL_RE.search(line) is not None:
             return CompileProof(line)
     return None
 
 
-def verdict_from_proof(proof: CompileProof, returncode: int) -> str:
-    """The ONLY place RED or GREEN is produced. It cannot run without a CompileProof."""
-    if not isinstance(proof, CompileProof):
-        raise AssertionError("verdict_from_proof called without a CompileProof")
-    return GREEN if returncode == 0 else RED
-
-
-def score_run(output: str, returncode: int, timed_out: bool) -> tuple[str, str]:
-    """Score one mutant run. Returns (verdict, one-line evidence)."""
-    if timed_out:
-        return TIMEOUT, "the test command hit its timeout — nothing was tested"
-    proof = find_compile_proof(output)
-    if proof is None:
-        return INVALID, "no compile sentinel in the log — the mutant did not build, nothing was tested"
-    return verdict_from_proof(proof, returncode), proof.line.strip()
-
-
 def killer_tests(output: str, limit: int = 3) -> list[str]:
-    """Names of the tests that failed, as evidence for a RED. Cosmetic, not load-bearing."""
+    """Names of the tests that failed. Only ever called from the RED branch below."""
     names = []
     for line in output.splitlines():
         stripped = line.strip()
         if stripped.startswith("test ") and stripped.endswith(" ... FAILED"):
             names.append(stripped[len("test ") : -len(" ... FAILED")])
     return names[:limit]
+
+
+def verdict_from_proof(proof: CompileProof, returncode: int, output: str) -> tuple[str, str]:
+    """The ONLY place RED or GREEN is produced, AND the only place their evidence is produced.
+
+    It cannot run without a `CompileProof`. The two are returned together on purpose: an earlier
+    version of this file carried the killer test names in a field alongside the verdict, and
+    `report()` substituted them into the evidence column whenever they were non-empty — with no
+    verdict guard. That printed rows saying `INVALID` (did not build, nothing was tested) next to
+    `killed by <test>` in the same row: a verdict and an evidence cell describing states that
+    cannot both be true. A field maintained *alongside* a verdict can always drift from it, so the
+    evidence is an OUTPUT of the verdict here, and there is no killer-name field to drift.
+    """
+    if not isinstance(proof, CompileProof):
+        raise AssertionError("verdict_from_proof called without a CompileProof")
+    if returncode == 0:
+        return GREEN, proof.line.strip()
+    killers = killer_tests(output)
+    if killers:
+        return RED, "killed by " + ", ".join(f"`{k}`" for k in killers)
+    return RED, proof.line.strip()
+
+
+def score_run(output: str, returncode: int, timed_out: bool) -> tuple[str, str]:
+    """Score one mutant run. Returns (verdict, one-line evidence) — always as a pair."""
+    if timed_out:
+        return TIMEOUT, "the test command hit its timeout — nothing was tested"
+    proof = find_compile_proof(output)
+    if proof is None:
+        if BUILD_FAILURE_MARKER in output:
+            return INVALID, (
+                f"no compile sentinel, and cargo reported `{BUILD_FAILURE_MARKER}` — the mutant "
+                "did not build, nothing was tested"
+            )
+        # No sentinel and no build failure either: the harness cannot see cargo's build result, so
+        # it does not know whether anything was tested. MEASURED cause: CARGO_TERM_QUIET=true
+        # suppresses the `Finished` line entirely. Reporting this as INVALID would be a guess
+        # dressed as a finding, and "every row INVALID" is indistinguishable from "the harness is
+        # broken" — so it gets its own verdict, which no spec may declare and which always fails.
+        return UNUSABLE, (
+            "no compile sentinel AND no build failure in the log — the harness cannot see whether "
+            "cargo built anything, so this row proves nothing either way"
+        )
+    return verdict_from_proof(proof, returncode, output)
 
 
 # --------------------------------------------------------------------------------------------
@@ -311,6 +379,12 @@ def load_spec(path: Path) -> Spec:
     for index, entry in enumerate(raw_mutants):
         where = f"{path}: mutant #{index + 1}"
         ident = str(_require(entry, "id", where))
+        # The id becomes a log filename, so it must not be able to name a path.
+        if not MUTANT_ID_RE.fullmatch(ident):
+            raise Refusal(
+                f"{where}: id '{ident}' must match {MUTANT_ID_RE.pattern} — it is used as a log "
+                "filename, so it may not contain a path separator"
+            )
         if ident in seen:
             raise Refusal(f"{where}: duplicate id '{ident}'")
         seen.add(ident)
@@ -388,8 +462,21 @@ class Result:
     mutant: Mutant
     verdict: str
     evidence: str
-    killers: tuple[str, ...]
     log_path: Path
+
+
+def resolve_inside(root: Path, relative: str, where: str) -> Path:
+    """Resolve a spec's file path under `root`, refusing anything that escapes it.
+
+    `Path.__truediv__` lets an absolute component replace the root outright, and `../` walks out of
+    it, so without this a spec could mutate-and-restore a file the reviewer never looked at.
+    """
+    if Path(relative).is_absolute():
+        raise Refusal(f"{where}: file '{relative}' is absolute; spec paths are relative to --root")
+    target = (root / relative).resolve()
+    if target != root.resolve() and root.resolve() not in target.parents:
+        raise Refusal(f"{where}: file '{relative}' resolves outside --root ({target})")
+    return target
 
 
 def run_mutant(mutant: Mutant, spec: Spec, root: Path, log_dir: Path) -> Result:
@@ -400,7 +487,7 @@ def run_mutant(mutant: Mutant, spec: Spec, root: Path, log_dir: Path) -> Result:
     # Phase 1: resolve and check EVERY edit in memory. Nothing is written until all anchors have
     # been confirmed unique, so a multi-edit mutant with one bad anchor never half-mutates a file.
     for index, edit in enumerate(mutant.edits):
-        target = (root / edit.file).resolve()
+        target = resolve_inside(root, edit.file, f"mutant '{mutant.id}' edit #{index + 1}")
         if not target.is_file():
             raise Refusal(f"mutant '{mutant.id}' edit #{index + 1}: no such file: {target}")
         if target not in guards:
@@ -425,13 +512,7 @@ def run_mutant(mutant: Mutant, spec: Spec, root: Path, log_dir: Path) -> Result:
     verdict, evidence = score_run(output, returncode, timed_out)
     log_path = log_dir / f"{mutant.id}.log"
     log_path.write_text(output, encoding="utf-8")
-    return Result(
-        mutant=mutant,
-        verdict=verdict,
-        evidence=evidence,
-        killers=tuple(killer_tests(output)),
-        log_path=log_path,
-    )
+    return Result(mutant=mutant, verdict=verdict, evidence=evidence, log_path=log_path)
 
 
 # --------------------------------------------------------------------------------------------
@@ -445,14 +526,19 @@ def report(spec: Spec, results: list[Result], log_dir: Path) -> int:
     print()
     print(f"Spec: `{spec.path}`  ")
     print(f"Command: `{' '.join(spec.command)}`  ")
-    print(f"Compile sentinel: `` {COMPILE_SENTINEL} `` (a missing sentinel is INVALID, not RED)")
+    print(f"Compile sentinel: `` {COMPILE_SENTINEL_DESC} `` (a missing sentinel is never a RED)")
     print()
     print("| mutant | edits | verdict | expected | outcome | evidence |")
     print("|---|---|---|---|---|---|")
     status = 0
     for result in results:
         expect = result.mutant.expect or "—"
-        if result.mutant.expect is None:
+        if result.verdict == UNUSABLE:
+            # No spec can declare this, so it is always a failure of the run, never a row of
+            # evidence. It short-circuits the expectation logic so it cannot be "satisfied".
+            outcome = "**UNUSABLE**"
+            status = 1
+        elif result.mutant.expect is None:
             outcome = "untested" if result.verdict in (INVALID, TIMEOUT) else "reported"
             if result.verdict in (INVALID, TIMEOUT):
                 status = 1
@@ -461,14 +547,30 @@ def report(spec: Spec, results: list[Result], log_dir: Path) -> int:
         else:
             outcome = "**MISMATCH**"
             status = 1
-        evidence = result.evidence
-        if result.killers:
-            evidence = "killed by " + ", ".join(f"`{k}`" for k in result.killers)
+        # The evidence cell is whatever the verdict produced. Nothing is substituted here: the
+        # only way an evidence string can contradict its verdict is for `score_run` to have
+        # produced the pair that way.
         print(
             f"| `{result.mutant.id}` | {len(result.mutant.edits)} | {result.verdict} | "
-            f"{expect} | {outcome} | {evidence} |"
+            f"{expect} | {outcome} | {result.evidence} |"
         )
     print()
+    if results and all(r.verdict == UNUSABLE for r in results):
+        print(
+            f"**Every mutant scored {UNUSABLE}.** The harness never saw a "
+            f"`` {COMPILE_SENTINEL_DESC} `` line, so it could not tell a build failure from a "
+            "successful build. Known causes, all measured: `CARGO_TERM_QUIET=true` (cargo omits "
+            "the line entirely), a `[run] command` that is not cargo, or cargo changing that "
+            "line's wording. Fix the command or the environment and re-run — this table is not "
+            "evidence of anything."
+        )
+        print()
+    elif results and all(r.verdict in (INVALID, TIMEOUT) for r in results):
+        print(
+            "**Every mutant was untested** (INVALID/TIMEOUT). Nothing here supports a claim about "
+            "coverage; check the anchors and the build before pasting this table anywhere."
+        )
+        print()
     for result in results:
         if result.mutant.description:
             print(f"* `{result.mutant.id}` — {result.mutant.description}")
@@ -479,7 +581,9 @@ def report(spec: Spec, results: list[Result], log_dir: Path) -> int:
         "Legend: RED = mutant compiled and a test failed (behaviour is covered). "
         "GREEN = mutant compiled and the suite still passed (behaviour is NOT covered). "
         "INVALID = the mutant did not compile, so **nothing was tested** — it is not a RED. "
-        "TIMEOUT = the run did not finish, also untested."
+        "TIMEOUT = the run did not finish, also untested. "
+        "UNUSABLE = the harness could not see cargo's build result at all, so the row is not "
+        "evidence in either direction; it always fails the run."
     )
     return status
 

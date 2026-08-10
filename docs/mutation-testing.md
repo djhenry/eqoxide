@@ -37,6 +37,12 @@ re-implementation, and the re-implementations differ.
 | `GREEN` | the mutant compiled, and every test passed | the perturbed behaviour is **not** covered by this command's suite |
 | `INVALID` | the mutant did not compile | **nothing.** The claim is untested. This is not a RED |
 | `TIMEOUT` | the run did not finish | nothing. Also untested |
+| `UNUSABLE` | the log had neither the sentinel nor a build failure | nothing, in either direction — the harness could not see whether cargo built anything. No spec may declare it, and any occurrence fails the run |
+
+`UNUSABLE` exists because "every row is `INVALID`" is indistinguishable from "the harness is
+broken", and the second must not be able to masquerade as the first. Measured cause:
+`CARGO_TERM_QUIET=true` makes cargo omit the `Finished` line entirely, so a mutant that built and
+was caught would otherwise be scored as one that never built.
 
 `INVALID` is the reason this script exists in the form it does. `cargo test` exits `101` **both**
 when the crate fails to compile and when a test fails, so the exit code cannot distinguish them
@@ -46,24 +52,42 @@ agent-honesty invariant that ranks a confident falsehood above a loud crash.
 
 So the verdict is derived from a **compile sentinel** first and the exit code only afterwards:
 
-* the sentinel is the line ``Finished `test` profile`` that cargo prints once the requested unit
-  graph has built — searched in output that has first been stripped of ANSI escapes, because cargo
-  decorates that line in some environments and every decoration breaks a literal match (measured:
-  colour on the CI runner puts a reset between `Finished` and the profile name; a local
+* the sentinel is the line ``Finished `<profile>` profile`` that cargo prints once the requested
+  unit graph has built. The profile name is matched rather than hard-coded, because
+  `cargo test --release` prints ``Finished `release` profile`` — measured — so a `[run] command`
+  carrying `--release` or `--profile` would otherwise turn every mutant unbuilt while still looking
+  like a real table;
+* it is searched in output that has first been stripped of ANSI escapes, because cargo decorates
+  that line in some environments and the escapes land *inside* the sentinel (measured: colour on
+  the CI runner puts a reset between `Finished` and the profile name; a local
   `CARGO_TERM_COLOR=always` run additionally wraps the profile name in an OSC-8 hyperlink, putting
-  a whole URL inside the sentinel). Unstripped, a mutant that compiled and ran scores `INVALID`,
-  which silently downgrades an entire table to "untested" — the exact failure this file is about,
-  in the direction that under-claims;
+  a whole URL inside it). Unstripped, a mutant that compiled and ran is scored as one that never
+  built, which silently downgrades an entire table to "untested" — the exact failure this file is
+  about, in the direction that under-claims;
 * `RED` and `GREEN` are produced at exactly one place in `scripts/mutate.py`, inside a function
   that cannot be called without a `CompileProof`;
-* a `CompileProof` cannot be constructed from a line that does not contain the sentinel.
+* a `CompileProof` cannot be constructed from a line that does not match the sentinel;
+* **a verdict's evidence is produced by the same call that produces the verdict.** An earlier
+  version carried the killer test names in a field beside the verdict and substituted them into the
+  evidence column whenever they were non-empty, with no verdict guard — which printed rows saying
+  `INVALID` (did not build, nothing was tested) next to ``killed by `some::test` `` in the same row.
+  A field maintained *alongside* a verdict can always drift from it, so there is no such field.
 
-`--self-test` case 8 wraps that gate away and shows the harness crashes loudly rather than
-emitting a verdict; case 9 has to wrap away the gate, the type assertion behind it, **and** the
-report's use of the proof object before a mutant that never compiled can be printed as `RED`.
+Where the guards actually are, counted by mutating the file rather than by reading it:
+
+* `find_compile_proof` and the sentinel pattern are the proof-or-None decision itself, and **one
+  edit to either is enough to print a never-compiled mutant as `RED`** — forging the `return None`,
+  or changing the pattern to something a compile-error log contains. What catches both is
+  `--self-test` **case 0**, which asserts that plain cargo output is recognised *and* that a
+  compile-error log yields no proof; case 12 applies both one-edit mutants and shows case 0 failing
+  on each.
+* **Downstream** of that decision, three guards must all be removed before the same thing happens:
+  the `proof is None` gate, the type assertion inside `verdict_from_proof`, and that function's use
+  of the proof line as evidence. Wrapping the gate alone turns an `INVALID` into a loud crash, never
+  a verdict — cases 8 and 9.
 
 If a future cargo changes the wording of that line, `--self-test` fails loudly: its `RED` and
-`GREEN` cases would score `INVALID` and mismatch their declared expectations.
+`GREEN` cases would stop matching their declared expectations.
 
 ## Prefer WRAP mutants to deletion
 
@@ -117,7 +141,7 @@ description = "WRAP the arm check so it never fires"
 expect = "RED"                # optional; a mismatch fails the run
 
   [[mutant.edit]]
-  file = "crates/eqoxide-nav/src/example.rs"
+  file = "crates/<crate>/src/<module>.rs"   # a placeholder — this example is not runnable as-is
   anchor = '''
         if self.armed {
             self.reset();
@@ -134,7 +158,8 @@ expect = "RED"                # optional; a mismatch fails the run
 
 Commit the spec you actually ran as `scripts/mutants/<issue-number>.toml` and reference it from the
 PR body, or paste it into the body verbatim. Either way the reviewer reproduces the table with one
-command.
+command. (`scripts/mutants/` is a convention, not an existing directory — the first spec creates
+it.)
 
 ## Safety
 
@@ -146,17 +171,22 @@ These rules are enforced by the script, not by reviewer vigilance:
   would read as evidence that a behaviour is uncovered when nothing was perturbed.
 * **The restore is verified by sha256.** The original bytes are held in memory, written back, then
   re-read from disk and hashed. A mismatch aborts the whole run, loudly.
+* **A spec cannot reach outside `--root`.** An absolute `file`, or one that resolves out of the
+  root via `../`, is refused; so is a mutant `id` that could name a path, since the id becomes a
+  log filename.
 * **The harness never invokes git.** `git checkout`, `git restore` and `git stash` are repo-global:
   in this repo a stash from one worktree has swallowed another worktree's uncommitted work. The one
-  place the script spawns a subprocess refuses an argv naming the git executable. That catches the
-  accident — a spec whose `command` reaches for git — not a deliberate `sh -c 'git …'`. If a
-  restore ever does fail, fix the file by hand; do not reach for git.
+  place `scripts/mutate.py` spawns a subprocess refuses an argv naming the git executable. That
+  catches the accident — a spec whose `command` reaches for git — not a deliberate `sh -c 'git …'`.
+  (`scripts/mutate_selftest.py` spawns cargo and python of its own, deliberately, and is not
+  covered by that check; it takes no spec input.) If a restore ever does fail, fix the file by
+  hand; do not reach for git.
 
 ## The self-test
 
 `scripts/mutate.py --self-test` builds a throwaway cargo crate in a temporary directory — never
-inside this repo, never part of the workspace — and drives the real command-line entry point
-against it. It exercises the failure modes, not just a happy path:
+part of any eqoxide workspace, wherever `TMPDIR` points — and drives the real command-line entry
+point against it. It exercises the failure modes, not just a happy path:
 
 | case | scenario | required outcome |
 |---|---|---|
@@ -169,18 +199,31 @@ against it. It exercises the failure modes, not just a happy path:
 | 6 | mutant that compiles and is not caught | `GREEN` |
 | 7 | two edits that each survive alone | `GREEN`, `GREEN`, and `RED` for the pair |
 | 8 | the harness's own sentinel gate wrapped away | loud crash, never a verdict |
-| 9 | that gate, the type assertion, and the proof's use, all wrapped away | only now is a non-compiling mutant printed as `RED` |
+| 9 | that gate, the type assertion, and the evidence line behind it, all wrapped away | only now is a non-compiling mutant printed as `RED` |
 | 10 | the harness's restore write corrupted | the sha256 check fires, and the file really is left different |
 | 11 | a real run against a cargo told to colourise (`CARGO_TERM_COLOR=always`) | still `RED`, not `INVALID` |
+| 12 | the two **one-edit** paths to a false `RED` | both really do produce one, and case 0's assertions fail on both |
+| 13 | `CARGO_TERM_QUIET=true`, where cargo omits the `Finished` line | `UNUSABLE`, and the run fails |
+| 14 | the self-test's own check accounting | a case whose body stops running is caught by the count |
 
-Cases 8–10 mutate a copy of `scripts/mutate.py` using the harness's own edit engine. Case 10 also
-checks that the alarm is *true* — that the file on disk really does differ — so a restore check
-that fired spuriously would not pass as a demonstration. Case 11 carries a reach control: it
-asserts the run really did produce escape sequences and that the raw log really does *not* contain
-the literal sentinel, so it cannot pass by the colour never having happened. After each case the
-self-test re-hashes the subject file to confirm the tree was restored.
+Cases 8–10 and 12 mutate a copy of `scripts/mutate.py` using the harness's own edit engine. Case 10
+also checks that the alarm is *true* — that the file on disk really does differ — so a restore
+check that fired spuriously would not pass as a demonstration. Cases 11 and 13 carry reach
+controls: each asserts that the environment really did do the thing under test (colour really
+emitted; the sentinel really absent), so neither can pass vacuously. After each case the self-test
+re-hashes the subject file to confirm the tree was restored.
 
-It runs in CI alongside the other guards.
+Case 14 is the reach control for all the others. The number of checks is **derived from the checks
+themselves** — one list, from which both the total and the failure set are read — and both the
+per-case count and the overall total are asserted against a declared constant. Adding or removing a
+check therefore fails the self-test until the constant is updated deliberately. This is not
+hypothetical bookkeeping: the previous design appended to a separate `failures` list with no total
+at all, and wrapping one case body away lost four checks while still printing `SELF-TEST PASSED`
+with exit 0.
+
+It runs in CI alongside the other guards. It is not cheap — it drives roughly a dozen cargo
+invocations — so it lives in the `test` job, next to cargo, rather than in the dependency-free
+guard job.
 
 ## Limits — state these rather than over-claiming
 
@@ -192,5 +235,9 @@ It runs in CI alongside the other guards.
 * The table is only as strong as `[run] command`. A narrowed command makes `GREEN` a weaker claim,
   and the narrowing is part of what you are asserting.
 * Every mutant costs one full run of that command.
+* The harness reads cargo's output, so cargo's output is part of its trust boundary. Handled and
+  covered by the self-test: colour, OSC-8 hyperlinks, and `CARGO_TERM_QUIET`. Under
+  `CARGO_TERM_QUIET` libtest also changes shape, so the killer test names are lost as well — which
+  is moot, because the run scores `UNUSABLE` and fails.
 * Nothing here establishes that a function is *called* in the shipping binary — see the residual
   recorded on #799.

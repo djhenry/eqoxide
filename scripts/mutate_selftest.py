@@ -5,11 +5,11 @@ Run it as `scripts/mutate.py --self-test`.
 
 A harness whose only evidence is that it worked once is exactly the artifact issue #950 exists to
 replace, so this exercises the FAILURE modes, not a happy path. It builds a throwaway cargo crate
-in a temporary directory (never inside this repo, never part of the workspace) and drives the real
-command-line entry point against it:
+in a temporary directory (never part of any eqoxide workspace, wherever TMPDIR points) and drives
+the real command-line entry point against it:
 
-  0  sentinel recognition, including the COLOURISED line cargo emits on CI (where the literal
-     sentinel is absent from the raw bytes) and a log with no sentinel at all
+  0  sentinel recognition, including the COLOURISED line cargo emits on CI (where the sentinel is
+     unmatchable in the raw bytes) and a log with no sentinel at all
   1  anchor occurs ZERO times                  -> refuse, exit 2
   2  anchor occurs TWICE                       -> refuse, exit 2
   3  replacement identical to the anchor       -> refuse, exit 2 (a no-op mutant always scores
@@ -20,28 +20,38 @@ command-line entry point against it:
   7  multi-edit mutant: two edits that each SURVIVE alone but are CAUGHT together — the
      demonstration that a guarantee does not rest on an unrelated accident
   8  the harness's own compile-sentinel gate, WRAPPED away  -> loud crash, still not a RED
-  9  that gate, the type assertion behind it, and the report's use of the proof object, all
-     three wrapped away -> only now does a mutant that never compiled get printed as RED. The
+  9  that gate, the type assertion behind it, and the evidence line behind that, all three
+     wrapped away -> only now does a mutant that never compiled get printed as RED. The
      counterfactual proving those guards are reached and load-bearing rather than merely
      present in the file (#799)
  10  the harness's restore write, corrupted    -> the sha256 verification fires, loudly, and the
      file really is left different (so the alarm is true, not spurious)
  11  the same caught mutant with CARGO_TERM_COLOR=always -> still RED, end to end, not INVALID
+ 12  the two ONE-EDIT paths to a false RED — forging `find_compile_proof`'s None, and changing the
+     sentinel pattern to something a compile-error log contains. Both really do produce a false
+     RED; case 0 is what catches them. This case exists because an earlier draft of the docstring
+     claimed three barriers and missed these two
+ 13  CARGO_TERM_QUIET=true, where cargo omits the `Finished` line entirely -> UNUSABLE, which
+     cannot be declared in a spec and always fails the run, rather than a silent all-INVALID table
+ 14  the self-test's own check accounting: a case whose body stops running must be caught by the
+     count, not by anyone noticing. Reach control for the 100+ checks above
 
-Cases 8-10 mutate a COPY of `scripts/mutate.py` using the harness's own edit engine. Nothing in
-this file writes to a tracked path.
+Cases 8-10 and 12 mutate a COPY of `scripts/mutate.py` using the harness's own edit engine.
+Nothing in this file writes to a tracked path.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from mutate import (
-    COMPILE_SENTINEL,
+    COMPILE_SENTINEL_RE,
     Refusal,
     apply_edit,
     find_compile_proof,
@@ -49,9 +59,10 @@ from mutate import (
     strip_ansi,
 )
 
-# Two decorated `Finished` lines, both captured verbatim rather than imagined. In each the literal
-# sentinel is ABSENT from the raw bytes, so an unstripped search scores a mutant that compiled and
-# ran as INVALID — the whole table silently downgraded to "untested".
+# Two decorated `Finished` lines, both captured verbatim rather than imagined. In each, an escape
+# sequence lands between `Finished` and the profile name — inside the sentinel — so an unstripped
+# search scores a mutant that compiled and ran as unbuilt, and the whole table silently downgrades
+# to "untested".
 #
 # As emitted by cargo on this repo's CI runner (colour only): the reset sits between `Finished`
 # and the profile name.
@@ -66,6 +77,11 @@ CARGO_HYPERLINK_FINISHED = (
     "\x1b[1m\x1b[92m    Finished\x1b[0m "
     "\x1b]8;;https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles\x1b\\"
     "`test` profile [unoptimized + debuginfo]\x1b]8;;\x1b\\ target(s) in 0.26s"
+)
+
+PLAIN_FINISHED = "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.3s"
+COMPILE_ERROR_LOG = (
+    "error[E0308]: mismatched types\nerror: could not compile `x` (lib test) due to 1 error\n"
 )
 
 HARNESS = Path(__file__).resolve().parent / "mutate.py"
@@ -385,30 +401,47 @@ expect = "RED"
 # Mutants of the harness itself.
 # --------------------------------------------------------------------------------------------
 
+# Downstream of the proof-or-None decision: the gate, the type assertion behind it, and the
+# evidence line behind that. Cases 8 and 9.
 GATE_ANCHOR = """\
     proof = find_compile_proof(output)
     if proof is None:
-        return INVALID, "no compile sentinel in the log — the mutant did not build, nothing was tested"
 """
 
 GATE_WRAP = """\
     proof = find_compile_proof(output)
     if False:
-        if proof is None:
-            return INVALID, "no compile sentinel in the log — the mutant did not build, nothing was tested"
 """
 
 TYPE_GUARD_ANCHOR = '        raise AssertionError("verdict_from_proof called without a CompileProof")\n'
 TYPE_GUARD_WRAP = "        pass  # self-test: type guard wrapped away\n"
 
-EVIDENCE_ANCHOR = "    return verdict_from_proof(proof, returncode), proof.line.strip()\n"
+EVIDENCE_ANCHOR = "    return RED, proof.line.strip()\n"
 
 EVIDENCE_WRAP = """\
     if False:
-        return verdict_from_proof(proof, returncode), proof.line.strip()
-    else:
-        return verdict_from_proof(proof, returncode), "self-test: evidence fabricated"
+        return RED, proof.line.strip()
+    return RED, "self-test: evidence fabricated"
 """
+
+# The proof-or-None decision ITSELF. Either of these alone is enough for a false RED — which is
+# why case 0 pins both. Case 12.
+FINDPROOF_ANCHOR = """\
+        if COMPILE_SENTINEL_RE.search(line) is not None:
+            return CompileProof(line)
+    return None
+"""
+
+FINDPROOF_WRAP = """\
+        if COMPILE_SENTINEL_RE.search(line) is not None:
+            return CompileProof(line)
+    if False:
+        return None
+    return CompileProof("Finished `test` profile [self-test: forged]")
+"""
+
+SENTINEL_ANCHOR = 'COMPILE_SENTINEL_RE = re.compile(r"Finished `[^`]+` profile")\n'
+SENTINEL_WRAP = 'COMPILE_SENTINEL_RE = re.compile(r"error")  # self-test: matches a compile error\n'
 
 RESTORE_ANCHOR = """\
     def restore_and_verify(self) -> None:
@@ -433,20 +466,93 @@ def mutated_harness(dest: Path, edits: list[tuple[str, str]]) -> Path:
     return dest
 
 
+def load_module(path: Path, name: str):
+    """Import a mutated copy of the harness so its functions can be probed directly."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # @dataclass resolves annotations through sys.modules, so the module has to be registered
+    # before it is executed. Registered under a private name; the real `mutate` is untouched.
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def case_zero_assertions_hold(module) -> bool:
+    """Case 0's two load-bearing assertions, run against an arbitrary copy of the harness.
+
+    Case 12 applies this to mutated copies to show that case 0 is what catches them.
+    """
+    return (
+        module.find_compile_proof(PLAIN_FINISHED) is not None
+        and module.find_compile_proof(COMPILE_ERROR_LOG) is None
+    )
+
+
 # --------------------------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------------------------
 
 
 class Checker:
-    def __init__(self) -> None:
-        self.failures: list[str] = []
+    """Records every check. The total and the failure list are derived from ONE list.
+
+    That is deliberate: the pass/fail decision used to be a separate `failures` list appended to
+    beside the work, with no total at all, so a whole case could stop running and the run still
+    printed SELF-TEST PASSED (measured: wrapping one case body away lost four checks silently).
+    A tally maintained next to the work can be severed from the work; a tally *derived* from it
+    cannot, and `run_cases` asserts the count per case and `self_test` asserts it overall.
+    """
+
+    def __init__(self, quiet: bool = False) -> None:
+        self.results: list[tuple[str, bool]] = []
+        self.quiet = quiet
 
     def check(self, label: str, ok: bool, detail: str = "") -> None:
-        mark = "PASS" if ok else "FAIL"
-        print(f"    [{mark}] {label}" + (f" — {detail}" if detail else ""))
-        if not ok:
-            self.failures.append(label)
+        recorded = bool(ok)
+        self.results.append((label, recorded))
+        if not self.quiet:
+            mark = "PASS" if recorded else "FAIL"
+            print(f"    [{mark}] {label}" + (f" — {detail}" if detail else ""))
+
+    @property
+    def total(self) -> int:
+        return len(self.results)
+
+    @property
+    def failures(self) -> list[str]:
+        return [label for label, ok in self.results if not ok]
+
+
+@dataclass
+class Ctx:
+    workdir: Path
+    subject: Path
+    lib: Path
+    pristine: bytes
+    pristine_sha: str
+    specs: Path
+    logs: Path
+
+    def spec_file(self, name: str, body: str) -> Path:
+        path = self.specs / f"{name}.toml"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    @property
+    def invalid_spec(self) -> Path:
+        return self.specs / "case4.toml"
+
+    @property
+    def red_spec(self) -> Path:
+        return self.specs / "case5.toml"
+
+    def lib_sha(self) -> str:
+        return sha256_bytes(self.lib.read_bytes())
 
 
 def write_subject(root: Path) -> Path:
@@ -486,35 +592,27 @@ def verdict_row(stdout: str, mutant_id: str) -> str:
     return "<no row>"
 
 
-def self_test() -> int:
-    workdir = Path(tempfile.mkdtemp(prefix="mutate-selftest-"))
-    subject = workdir / "subject"
-    lib = write_subject(subject)
-    pristine = lib.read_bytes()
-    pristine_sha = sha256_bytes(pristine)
-    specs = workdir / "specs"
-    specs.mkdir()
-    logs = workdir / "logs"
-    logs.mkdir()
+def evidence_cell(stdout: str, mutant_id: str) -> str:
+    for line in stdout.splitlines():
+        if line.startswith(f"| `{mutant_id}` |"):
+            return line.split("|")[6].strip()
+    return "<no row>"
 
-    print("mutate.py --self-test")
-    print(f"  harness  : {HARNESS}")
-    print(f"  workdir  : {workdir}")
-    print(f"  subject  : src/lib.rs sha256 {pristine_sha}")
-    print()
 
-    c = Checker()
+# --------------------------------------------------------------------------------------------
+# The cases
+# --------------------------------------------------------------------------------------------
 
-    # ---- 0: sentinel recognition, including the colourised form CI actually emits -----------
-    print("CASE 0  sentinel recognition")
+
+def case_0_sentinel(ctx: Ctx, c: Checker) -> None:
     for label, raw_line in (
         ("colourised (CI runner)", CI_COLOURED_FINISHED),
         ("OSC-8 hyperlinked", CARGO_HYPERLINK_FINISHED),
     ):
         c.check(
-            f"case 0: the raw {label} cargo line does NOT contain the literal sentinel "
+            f"case 0: the raw {label} cargo line does NOT match the sentinel "
             "(this is why the log is stripped)",
-            COMPILE_SENTINEL not in raw_line,
+            COMPILE_SENTINEL_RE.search(raw_line) is None,
         )
         c.check(
             f"case 0: after stripping, the {label} line is recognised as proof",
@@ -522,67 +620,87 @@ def self_test() -> int:
         )
     c.check(
         "case 0: plain (uncoloured) cargo output is recognised",
-        find_compile_proof("    Finished `test` profile [unoptimized + debuginfo] in 0.3s")
+        find_compile_proof(PLAIN_FINISHED) is not None,
+    )
+    c.check(
+        "case 0: a --release build is recognised too (the profile name is matched, not hard-coded)",
+        find_compile_proof("    Finished `release` profile [optimized] target(s) in 0.19s")
         is not None,
     )
     c.check(
         "case 0: a log without the sentinel yields no proof",
-        find_compile_proof("error[E0308]: mismatched types\nerror: could not compile `x`") is None,
+        find_compile_proof(COMPILE_ERROR_LOG) is None,
     )
-    print()
 
-    def spec_file(name: str, body: str) -> Path:
-        path = specs / f"{name}.toml"
-        path.write_text(body, encoding="utf-8")
-        return path
 
-    # ---- refusals: these must never reach cargo at all -------------------------------------
-    for case, body, needle in (
-        ("1  anchor occurs ZERO times", spec_anchor_zero(), "anchor occurs 0 time(s)"),
-        ("2  anchor occurs TWICE", spec_anchor_twice(), "anchor occurs 2 time(s)"),
-        ("3  no-op mutant", spec_noop(), "identical to the anchor"),
-    ):
-        name = case.split()[0]
-        print(f"CASE {case}")
-        code, out, err = run_harness(HARNESS, spec_file(f"case{name}", body), subject, logs)
-        c.check(f"case {name}: exit 2 (refusal)", code == 2, f"got {code}")
-        reason = next((ln for ln in err.splitlines() if needle in ln), "<needle not in stderr>")
-        c.check(f"case {name}: says why", needle in err, reason.strip())
-        c.check(f"case {name}: no verdict was printed", "| RED |" not in out and "| GREEN |" not in out)
-        c.check(f"case {name}: file untouched", sha256_bytes(lib.read_bytes()) == pristine_sha)
-        print()
+def _refusal_case(ctx: Ctx, c: Checker, name: str, body: str, needle: str) -> None:
+    code, out, err = run_harness(HARNESS, ctx.spec_file(f"case{name}", body), ctx.subject, ctx.logs)
+    c.check(f"case {name}: exit 2 (refusal)", code == 2, f"got {code}")
+    reason = next((ln for ln in err.splitlines() if needle in ln), "<needle not in stderr>")
+    c.check(f"case {name}: says why", needle in err, reason.strip())
+    c.check(f"case {name}: no verdict was printed", "| RED |" not in out and "| GREEN |" not in out)
+    c.check(f"case {name}: file untouched", ctx.lib_sha() == ctx.pristine_sha)
 
-    # ---- scored mutants --------------------------------------------------------------------
-    for case, body, ids in (
-        ("4  non-compiling mutant", spec_invalid(), {"does-not-compile": "INVALID"}),
-        ("5  compiles and is caught", spec_red(), {"caught": "RED"}),
-        ("6  compiles and is not caught", spec_green(), {"survives": "GREEN"}),
-        (
-            "7  multi-edit mutant",
-            spec_multi(),
-            {"primary-alone": "GREEN", "fallback-alone": "GREEN", "both": "RED"},
-        ),
-    ):
-        name = case.split()[0]
-        print(f"CASE {case}")
-        code, out, err = run_harness(HARNESS, spec_file(f"case{name}", body), subject, logs)
-        print(out.rstrip())
-        c.check(f"case {name}: exit 0 (all expectations met)", code == 0, f"got {code}\n{err}")
-        for mutant_id, want in ids.items():
-            got = verdict_row(out, mutant_id)
-            c.check(f"case {name}: {mutant_id} scored {want}", got == want, f"got {got}")
-        if name == "4":
-            c.check("case 4: no row of the table says RED", "| RED |" not in out)
-        c.check(f"case {name}: file restored", sha256_bytes(lib.read_bytes()) == pristine_sha)
-        print()
 
-    invalid_spec = specs / "case4.toml"
-    red_spec = specs / "case5.toml"
+def case_1_anchor_zero(ctx: Ctx, c: Checker) -> None:
+    _refusal_case(ctx, c, "1", spec_anchor_zero(), "anchor occurs 0 time(s)")
 
-    # ---- 8: wrap the compile-sentinel gate away -------------------------------------------
-    print("CASE 8  harness self-mutant: the compile-sentinel gate WRAPPED away")
-    h8 = mutated_harness(workdir / "mutate_gate_wrapped.py", [(GATE_ANCHOR, GATE_WRAP)])
-    code, out, err = run_harness(h8, invalid_spec, subject, logs)
+
+def case_2_anchor_twice(ctx: Ctx, c: Checker) -> None:
+    _refusal_case(ctx, c, "2", spec_anchor_twice(), "anchor occurs 2 time(s)")
+
+
+def case_3_noop(ctx: Ctx, c: Checker) -> None:
+    _refusal_case(ctx, c, "3", spec_noop(), "identical to the anchor")
+
+
+def _scored_case(ctx: Ctx, c: Checker, name: str, body: str, ids: dict[str, str]) -> str:
+    code, out, err = run_harness(HARNESS, ctx.spec_file(f"case{name}", body), ctx.subject, ctx.logs)
+    print(out.rstrip())
+    c.check(f"case {name}: exit 0 (all expectations met)", code == 0, f"got {code}\n{err}")
+    for mutant_id, want in ids.items():
+        got = verdict_row(out, mutant_id)
+        c.check(f"case {name}: {mutant_id} scored {want}", got == want, f"got {got}")
+    c.check(f"case {name}: file restored", ctx.lib_sha() == ctx.pristine_sha)
+    return out
+
+
+def case_4_invalid(ctx: Ctx, c: Checker) -> None:
+    out = _scored_case(ctx, c, "4", spec_invalid(), {"does-not-compile": "INVALID"})
+    c.check("case 4: no row of the table says RED", "| RED |" not in out)
+    c.check(
+        "case 4: and the INVALID row carries no killer-test evidence",
+        "killed by" not in evidence_cell(out, "does-not-compile"),
+        evidence_cell(out, "does-not-compile"),
+    )
+
+
+def case_5_red(ctx: Ctx, c: Checker) -> None:
+    out = _scored_case(ctx, c, "5", spec_red(), {"caught": "RED"})
+    c.check(
+        "case 5: the RED row names the test that killed it",
+        "killed by" in evidence_cell(out, "caught"),
+        evidence_cell(out, "caught"),
+    )
+
+
+def case_6_green(ctx: Ctx, c: Checker) -> None:
+    _scored_case(ctx, c, "6", spec_green(), {"survives": "GREEN"})
+
+
+def case_7_multi(ctx: Ctx, c: Checker) -> None:
+    _scored_case(
+        ctx,
+        c,
+        "7",
+        spec_multi(),
+        {"primary-alone": "GREEN", "fallback-alone": "GREEN", "both": "RED"},
+    )
+
+
+def case_8_gate_wrapped(ctx: Ctx, c: Checker) -> None:
+    h8 = mutated_harness(ctx.workdir / "mutate_gate_wrapped.py", [(GATE_ANCHOR, GATE_WRAP)])
+    code, out, err = run_harness(h8, ctx.invalid_spec, ctx.subject, ctx.logs)
     print(tail(out + err, 8))
     c.check("case 8: does not exit 0", code != 0, f"got {code}")
     c.check("case 8: never reports a verdict", "| RED |" not in out and "| GREEN |" not in out)
@@ -590,20 +708,19 @@ def self_test() -> int:
         "case 8: fails on the type guard behind the gate",
         "verdict_from_proof called without a CompileProof" in err,
     )
-    c.check("case 8: file restored", sha256_bytes(lib.read_bytes()) == pristine_sha)
-    print()
+    c.check("case 8: file restored", ctx.lib_sha() == ctx.pristine_sha)
 
-    # ---- 9: wrap away ALL THREE things that stand between a missing sentinel and a RED ------
-    print("CASE 9  harness self-mutant: all three guards wrapped away (3-edit)")
+
+def case_9_all_guards_wrapped(ctx: Ctx, c: Checker) -> None:
     h9 = mutated_harness(
-        workdir / "mutate_all_guards_wrapped.py",
+        ctx.workdir / "mutate_all_guards_wrapped.py",
         [
             (GATE_ANCHOR, GATE_WRAP),
             (TYPE_GUARD_ANCHOR, TYPE_GUARD_WRAP),
             (EVIDENCE_ANCHOR, EVIDENCE_WRAP),
         ],
     )
-    code, out, err = run_harness(h9, invalid_spec, subject, logs)
+    code, out, err = run_harness(h9, ctx.invalid_spec, ctx.subject, ctx.logs)
     print(out.rstrip())
     got = verdict_row(out, "does-not-compile")
     c.check(
@@ -611,35 +728,36 @@ def self_test() -> int:
         got == "RED",
         f"got {got}",
     )
-    c.check("case 9: and the spec's expect=INVALID catches it as a mismatch", code == 1, f"got {code}")
-    c.check("case 9: file restored", sha256_bytes(lib.read_bytes()) == pristine_sha)
-    print("    (cases 8+9 are the reach proof. The sentinel gate, the type assertion in")
-    print("     verdict_from_proof, and the report's use of the proof object must ALL be removed")
-    print("     before a mutant that never compiled can be printed as RED; wrapping the gate")
-    print("     alone changes INVALID into a loud crash, never into a verdict.)")
-    print()
+    c.check(
+        "case 9: and the spec's expect=INVALID catches it as a mismatch", code == 1, f"got {code}"
+    )
+    c.check("case 9: file restored", ctx.lib_sha() == ctx.pristine_sha)
+    print("    (cases 8+9 cover the guards DOWNSTREAM of the proof-or-None decision. The decision")
+    print("     itself — find_compile_proof and the sentinel pattern — is case 12, and it falls to")
+    print("     a single edit, which is why case 0 pins it.)")
 
-    # ---- 10: corrupt the restore ------------------------------------------------------------
-    print("CASE 10  harness self-mutant: the restore write corrupted")
-    h10 = mutated_harness(workdir / "mutate_restore_corrupted.py", [(RESTORE_ANCHOR, RESTORE_WRAP)])
-    code, out, err = run_harness(h10, red_spec, subject, logs)
+
+def case_10_restore_corrupted(ctx: Ctx, c: Checker) -> None:
+    h10 = mutated_harness(
+        ctx.workdir / "mutate_restore_corrupted.py", [(RESTORE_ANCHOR, RESTORE_WRAP)]
+    )
+    code, out, err = run_harness(h10, ctx.red_spec, ctx.subject, ctx.logs)
     print(tail(out + err, 6))
     c.check("case 10: exit 2 (refusal)", code == 2, f"got {code}")
     c.check("case 10: the sha256 verification fires", "RESTORE VERIFICATION FAILED" in err)
     c.check("case 10: no verdict is reported for the aborted run", "| RED |" not in out)
     c.check(
         "case 10: and the alarm is TRUE — the file really is left different",
-        sha256_bytes(lib.read_bytes()) != pristine_sha,
+        ctx.lib_sha() != ctx.pristine_sha,
     )
-    lib.write_bytes(pristine)  # our own cleanup; the corrupted copy is in a temporary directory
-    print()
+    ctx.lib.write_bytes(ctx.pristine)  # our own cleanup; the corrupted copy is in a temp directory
 
-    # ---- 11: end-to-end with a colourising cargo, the way CI emits it -----------------------
-    print("CASE 11  a colourising cargo (CARGO_TERM_COLOR=always) still scores RED, not INVALID")
+
+def case_11_colour(ctx: Ctx, c: Checker) -> None:
     # Control first: without this, case 11 could pass vacuously because nothing was colourised.
     raw = subprocess.run(
         ["cargo", "test", "--all-targets"],
-        cwd=str(subject),
+        cwd=str(ctx.subject),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env={**os.environ, "CARGO_TERM_COLOR": "always"},
@@ -647,26 +765,193 @@ def self_test() -> int:
     ).stdout.decode("utf-8", "replace")
     c.check("case 11 control: cargo really did colourise", "\x1b[" in raw)
     c.check(
-        "case 11 control: and the literal sentinel is absent from the raw output",
-        COMPILE_SENTINEL not in raw and find_compile_proof(strip_ansi(raw)) is not None,
+        "case 11 control: and the sentinel is unmatchable in the raw output",
+        COMPILE_SENTINEL_RE.search(raw) is None and find_compile_proof(strip_ansi(raw)) is not None,
     )
     code, out, err = run_harness(
-        HARNESS, red_spec, subject, logs, env={"CARGO_TERM_COLOR": "always"}
+        HARNESS, ctx.red_spec, ctx.subject, ctx.logs, env={"CARGO_TERM_COLOR": "always"}
     )
     got = verdict_row(out, "caught")
     c.check("case 11: still RED with colour in the log", got == "RED", f"got {got}")
     c.check("case 11: exit 0", code == 0, f"got {code}\n{err}")
-    c.check("case 11: file restored", sha256_bytes(lib.read_bytes()) == pristine_sha)
+    c.check("case 11: file restored", ctx.lib_sha() == ctx.pristine_sha)
+
+
+def case_12_one_edit_paths(ctx: Ctx, c: Checker) -> None:
+    c.check(
+        "case 12 control: case 0's assertions hold on the real harness",
+        case_zero_assertions_hold(load_module(HARNESS, "mutate_pristine_probe")),
+    )
+    for label, filename, edit in (
+        ("forged find_compile_proof", "mutate_forged_proof.py", (FINDPROOF_ANCHOR, FINDPROOF_WRAP)),
+        ("sentinel pattern changed", "mutate_sentinel_changed.py", (SENTINEL_ANCHOR, SENTINEL_WRAP)),
+    ):
+        mutated = mutated_harness(ctx.workdir / filename, [edit])
+        code, out, _err = run_harness(mutated, ctx.invalid_spec, ctx.subject, ctx.logs)
+        got = verdict_row(out, "does-not-compile")
+        c.check(
+            f"case 12: ONE edit ({label}) is enough to print a never-compiled mutant as RED",
+            got == "RED",
+            f"got {got} — exit {code}, evidence: {evidence_cell(out, 'does-not-compile')}",
+        )
+        c.check(
+            "case 12: and case 0's assertions FAIL on that mutant, which is what catches it",
+            not case_zero_assertions_hold(load_module(mutated, filename[:-3])),
+        )
+    c.check("case 12: file restored", ctx.lib_sha() == ctx.pristine_sha)
+
+
+def case_13_quiet(ctx: Ctx, c: Checker) -> None:
+    # Control: cargo really does omit the line under CARGO_TERM_QUIET, so this case is not vacuous.
+    raw = subprocess.run(
+        ["cargo", "test", "--all-targets"],
+        cwd=str(ctx.subject),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "CARGO_TERM_QUIET": "true"},
+        check=False,
+    ).stdout.decode("utf-8", "replace")
+    c.check(
+        "case 13 control: under CARGO_TERM_QUIET cargo emits no sentinel at all",
+        find_compile_proof(strip_ansi(raw)) is None,
+    )
+    code, out, err = run_harness(
+        HARNESS, ctx.red_spec, ctx.subject, ctx.logs, env={"CARGO_TERM_QUIET": "true"}
+    )
+    got = verdict_row(out, "caught")
+    c.check(
+        "case 13: a log the harness cannot read scores UNUSABLE, not INVALID",
+        got == "UNUSABLE",
+        f"got {got}",
+    )
+    c.check("case 13: and the run fails rather than shipping the table", code == 1, f"got {code}\n{err}")
+    c.check("case 13: file restored", ctx.lib_sha() == ctx.pristine_sha)
+
+
+def case_14_check_accounting(ctx: Ctx, c: Checker) -> None:
+    """Reach control for every other case: prove a case that stops running is caught by the count."""
+
+    def two_checks(_ctx: Ctx, ch: Checker) -> None:
+        ch.check("fake: one", True)
+        ch.check("fake: two", True)
+
+    def wrapped_away(_ctx: Ctx, ch: Checker) -> None:
+        pass  # what `if False:` around a case body looks like from here
+
+    intact = run_cases(((91, "fake intact", two_checks, 2),), ctx, Checker(quiet=True), announce=False)
+    c.check("case 14 control: an intact case reports no accounting problem", intact == [])
+    vanished = run_cases(
+        ((92, "fake vanished", wrapped_away, 3),), ctx, Checker(quiet=True), announce=False
+    )
+    c.check(
+        "case 14: a case whose body stops running is caught by the count",
+        len(vanished) == 1 and "92" in vanished[0],
+        vanished[0] if vanished else "<no problem reported>",
+    )
+    c.check(
+        "case 14: the declared total matches the sum of the case table",
+        sum(expected for *_, expected in CASES) == EXPECTED_CHECKS,
+        f"table sum {sum(expected for *_, expected in CASES)} vs EXPECTED_CHECKS {EXPECTED_CHECKS}",
+    )
+
+
+# (number, title, function, how many checks it must record)
+CASES: tuple[tuple[int, str, object, int], ...] = (
+    (0, "sentinel recognition", case_0_sentinel, 7),
+    (1, "anchor occurs ZERO times", case_1_anchor_zero, 4),
+    (2, "anchor occurs TWICE", case_2_anchor_twice, 4),
+    (3, "no-op mutant", case_3_noop, 4),
+    (4, "non-compiling mutant", case_4_invalid, 5),
+    (5, "compiles and is caught", case_5_red, 4),
+    (6, "compiles and is not caught", case_6_green, 3),
+    (7, "multi-edit mutant", case_7_multi, 5),
+    (8, "harness self-mutant: the compile-sentinel gate WRAPPED away", case_8_gate_wrapped, 4),
+    (9, "harness self-mutant: all three downstream guards wrapped away (3-edit)",
+     case_9_all_guards_wrapped, 3),
+    (10, "harness self-mutant: the restore write corrupted", case_10_restore_corrupted, 4),
+    (11, "a colourising cargo (CARGO_TERM_COLOR=always) still scores RED", case_11_colour, 5),
+    (12, "harness self-mutant: the TWO one-edit paths to a false RED", case_12_one_edit_paths, 6),
+    (13, "CARGO_TERM_QUIET=true — no sentinel at all — scores UNUSABLE", case_13_quiet, 4),
+    (14, "the self-test's own check accounting", case_14_check_accounting, 3),
+)
+
+# Asserted twice: against the table above, and against the number of checks actually recorded.
+# Update it deliberately when adding a case — that is the point.
+EXPECTED_CHECKS = 65
+
+
+def run_cases(cases, ctx: Ctx, c: Checker, announce: bool = True) -> list[str]:
+    """Run each case and account for its checks. Returns the accounting problems, if any."""
+    problems: list[str] = []
+    for number, title, fn, expected in cases:
+        if announce:
+            print(f"CASE {number}  {title}")
+        before = c.total
+        fn(ctx, c)
+        recorded = c.total - before
+        if recorded != expected:
+            problems.append(
+                f"case {number} ({title}) recorded {recorded} check(s), expected {expected} — "
+                "a check that did not run cannot be reported as passing"
+            )
+        if announce:
+            print()
+    return problems
+
+
+def self_test() -> int:
+    workdir = Path(tempfile.mkdtemp(prefix="mutate-selftest-"))
+    subject = workdir / "subject"
+    lib = write_subject(subject)
+    specs = workdir / "specs"
+    specs.mkdir()
+    logs = workdir / "logs"
+    logs.mkdir()
+    ctx = Ctx(
+        workdir=workdir,
+        subject=subject,
+        lib=lib,
+        pristine=lib.read_bytes(),
+        pristine_sha=sha256_bytes(lib.read_bytes()),
+        specs=specs,
+        logs=logs,
+    )
+
+    print("mutate.py --self-test")
+    print(f"  harness  : {HARNESS}")
+    print(f"  workdir  : {workdir}")
+    print(f"  subject  : src/lib.rs sha256 {ctx.pristine_sha}")
+    print(f"  cases    : {len(CASES)}, expecting {EXPECTED_CHECKS} checks")
     print()
 
+    c = Checker()
+    problems = run_cases(CASES, ctx, c)
+
+    if sum(expected for *_, expected in CASES) != EXPECTED_CHECKS:
+        problems.append(
+            f"the case table declares {sum(expected for *_, expected in CASES)} checks but "
+            f"EXPECTED_CHECKS is {EXPECTED_CHECKS} — a case row was added or removed without "
+            "updating the total"
+        )
+    if c.total != EXPECTED_CHECKS:
+        problems.append(f"{c.total} check(s) ran, expected {EXPECTED_CHECKS}")
+
     print("=" * 90)
-    if c.failures:
-        print(f"SELF-TEST FAILED — {len(c.failures)} check(s) did not hold:")
+    if c.failures or problems:
+        print(
+            f"SELF-TEST FAILED — {len(c.failures)} check(s) did not hold, "
+            f"{len(problems)} accounting problem(s), {c.total} check(s) ran:"
+        )
         for failure in c.failures:
             print(f"  - {failure}")
+        for problem in problems:
+            print(f"  ! {problem}")
         print(f"workdir kept for inspection: {workdir}")
         return 1
-    print("SELF-TEST PASSED — every failure mode above was demonstrated, not assumed.")
+    print(
+        f"SELF-TEST PASSED — {c.total} checks across {len(CASES)} cases, every failure mode "
+        "demonstrated rather than assumed."
+    )
     print(f"workdir: {workdir}")
     return 0
 
