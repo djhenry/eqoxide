@@ -80,6 +80,12 @@ eqoxide-http = { path = "crates/eqoxide-http", features = ["test-fixtures"] }
 # tests call `CameraState::snapshot`, which now requires the proof-of-draw token that only a real
 # `render_frame` (i.e. a real GPU device) can mint in a production build.
 eqoxide-renderer = { path = "crates/eqoxide-renderer", features = ["test-fixtures"] }
+# Same reasoning as eqoxide-core above, for `SpawnInfo::for_test()` (#913): `tests/entity_pose_643.rs`
+# builds `SpawnInfo` literals, and an exhaustive literal there was half of what put `main` red when
+# #857 added a field. CI does build this target (`cargo test --workspace --locked` since c7ecf8c) —
+# it just never reported this half, because cargo stopped scheduling after the other half failed
+# first, and that red run was merged over anyway. See the `for_test` doc comment and #968.
+eqoxide-protocol = { path = "crates/eqoxide-protocol", features = ["test-fixtures"] }
 # `test-util` (not in tokio's `full`) enables `#[tokio::test(start_paused = true)]` so the A3
 # merchant-buy timeout test (#448) exercises the real 4s elapse in virtual time — instantly.
 tokio = { version = "1", features = ["full", "test-util"] }
