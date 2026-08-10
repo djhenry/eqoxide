@@ -1781,9 +1781,10 @@ mod tests {
     /// not cover — and inserts each dangerous token at each one. The site count is asserted against
     /// the same derivation so it cannot silently shrink and leave the loop vacuous (#778).
     ///
-    /// **Which guard does the work, since two look like they might.** `assert_eq!(sites.len(),
-    /// APP_RS.matches(SITE).count())` is the operative one: it is what kills a `.take(n)` on the
-    /// site list, measured. The `>= 20` floor below is NOT doing that job and should not be read as
+    /// **Which guard does the work, since two look like they might.** The equality between
+    /// `sites.len()` and the site count re-derived from `SITE` is the operative one: it is what
+    /// kills a `.take(n)` on the site list, measured.
+    /// The `>= 20` floor below is NOT doing that job and should not be read as
     /// if it were — it only catches an `app.rs` that has genuinely shrunk to a handful of methods,
     /// which is a much narrower hole than a bare threshold suggests.
     ///
