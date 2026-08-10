@@ -1,17 +1,8 @@
-//! Zone-in orchestration — the glue that drives the #712 one-shot reground, lifted out of
-//! [`crate::app::App`] so it can be run without a device.
-//!
-//! # Why this module exists
-//!
-//! #728: *"there is no harness that runs a zone-in from arrival through correction to the first
-//! grounded frame."* The three pieces of that sequence that lived in `app.rs` — the asset-load
-//! throttle, the `on_ground` early return, and the `on_ground = true` after a
-//! [`crate::movement::Reground::Lift`] — were untested, because `App::update` owns a window, a GPU
-//! and an event loop and cannot be constructed in a test. #720's own commit message says so in as
-//! many words ("Not covered by any test: the `app.rs` half"). The answer to that is not two unit
-//! tests bolted onto `App`; it is a seam. This module is the seam, and its test module is the
-//! harness — `ZoneInHarness::frame` performs, in `app.rs`'s order, the two things `App::update`
-//! does with the controller.
+//! Zone-in orchestration — the #712 one-shot reground, lifted out of [`crate::app::App`] so it can
+//! be run without a window, a GPU or an event loop. That seam is #728's whole content: `App::update`
+//! cannot be constructed in a test, so the `app.rs` half of a zone-in was untested. The test module
+//! is the harness — `ZoneInHarness::frame` performs, in `app.rs`'s order, the two things
+//! `App::update` does with the controller.
 //!
 //! # What a zone-in looks like, in order
 //!
@@ -27,29 +18,17 @@
 //!
 //! # The wiring, and why there is only one call
 //!
-//! `app.rs` has exactly **one** statement that reaches this module: the per-frame
-//! [`ZoneIn::on_frame`]. Nothing else. That is a deliberate consequence of #791's round-2 review,
-//! which demonstrated the limit of the source-scan pins this module used to lean on: wrapping a
-//! pinned call in `if false { … }` left every test in this file green, because `str::contains`
-//! sees that a call is *written* and cannot see that it is *reached*. Three separate call sites
-//! meant three separate chances to lose the orchestration silently.
+//! `app.rs` reaches this module through exactly **one** statement, the per-frame
+//! [`ZoneIn::on_frame`]. The other two — an `arm()` and a `note_stepped()` — were deleted rather
+//! than pinned harder, because #791's round-2 review showed a source-text pin cannot tell a call
+//! that is *written* from one that is *reached*: wrapping a pinned call in `if false { … }` left
+//! every test in this file green. Arming is now derived from a change in the zone name `on_frame`
+//! is already handed; "the controller has been stepped in this zone" is derived from the same
+//! call's `stepping` and `collision` arguments. A caller cannot forget, misplace or fake either.
 //!
-//! So the other two were removed rather than pinned harder — the fix is a type, not a guard
-//! (verification hierarchy, tier 1):
-//!
-//! * **Arming.** There is no `arm()` call. `on_frame` is handed the zone `app.rs` is loading and
-//!   arms itself the frame that name changes. A caller cannot forget to arm, arm the wrong zone,
-//!   or arm twice, because it does not arm at all.
-//! * **"The controller has been stepped in this zone."** There is no `note_stepped()` call.
-//!   `on_frame` derives it from the arguments it is already given — the caller stepped the
-//!   controller since the last call exactly when the last call was handed a collision and was told
-//!   the caller was stepping. A caller cannot promise a step it did not take.
-//!
-//! What that does **not** reach is the last statement itself: whether `App::render_frame` runs at
-//! all is outside any test in this workspace (that is #728's own premise — it owns a window, a GPU
-//! and an event loop). `the_app_rs_call_into_this_module_is_an_unconditional_statement` closes as
-//! much of the remaining distance as a source scan can — see its doc for exactly what it does and
-//! does not establish, and #799 for the residual.
+//! Whether `App::render_frame` runs at all is outside every test in this workspace — #728's own
+//! premise. `the_app_rs_call_into_this_module_is_an_unconditional_statement` closes as much of
+//! that distance as a source scan can; see its doc and #799 for the residual.
 
 use crate::movement::{zone_in_reground, CharacterController, Reground};
 use crate::nav::collision::Collision;
@@ -102,43 +81,28 @@ impl ZoneInOutcome {
 #[derive(Clone, Debug, Default)]
 pub struct ZoneIn {
     /// The zone this orchestration is currently following — `app.rs`'s `current_zone`, i.e. the
-    /// zone whose geometry it last started loading.
+    /// zone whose geometry it last started loading. A change in it is the arm (see the module doc).
     ///
-    /// **This field is what replaced the `arm()` call site.** [`ZoneIn::on_frame`] is handed the
-    /// caller's zone name every frame and arms itself the frame it changes, so there is no
-    /// separate arm statement in `app.rs` that could be deleted, misplaced, or wrapped in a
-    /// never-taken branch. Empty until the first zone loads, which matches `zone_needs_reload`'s
-    /// own "an empty name means nothing is loaded" convention — the first real zone name is a
-    /// change and arms, exactly as the old explicit call did.
+    /// Empty until the first zone loads, matching `zone_needs_reload`'s own "an empty name means
+    /// nothing is loaded" convention, so the first real zone name is a change and arms.
     zone: String,
     /// A zone change has happened and the reground has not yet reached a verdict.
     armed: bool,
-    /// The controller has been stepped at least once against THIS zone's collision.
-    ///
-    /// This is the #728 N1 fix. `CharacterController::on_ground` is a *carried* field: nothing
-    /// clears it at a zone change, and the controller is not stepped for the whole asset load, so
-    /// on the first post-load frame it still holds the answer computed against the PREVIOUS zone's
-    /// geometry. Reading it there is reading another zone's world, and this flag is what stops
-    /// that.
+    /// The controller has been stepped at least once against THIS zone's collision — the #728 N1
+    /// fix, since `CharacterController::on_ground` is a *carried* field that nothing clears at a
+    /// zone change (see [`ZoneIn::on_frame`]'s #593 section).
     ///
     /// It is a **necessary** condition for reading `on_ground`, not a sufficient one: a step that
     /// takes `depenetrate`'s early return re-derives nothing, so `on_ground` can still be the
     /// previous zone's answer even with this flag set. [`ZoneIn::on_frame`]'s settled arm adds the
     /// geometry check that covers the difference.
     stepped_in_this_zone: bool,
-    /// Will the caller step the controller between this [`ZoneIn::on_frame`] call and the next one?
-    ///
-    /// **This field is what replaced the `note_stepped()` call site.** `app.rs` steps the
-    /// controller after `on_frame`, and exactly when two things it already passes in are true: the
-    /// camera has been initialised (`stepping`) and a collision is loaded. So the step does not
-    /// need to be reported back — it is derivable from this call's own arguments, and read on the
-    /// next call. A promise a caller cannot make is a promise a caller cannot break.
-    ///
-    /// Meaning, precisely: `stepping && collision.is_some()` as of the last call. That is the same
-    /// weaker, exactly-true claim `note_stepped` carried — "the controller has been stepped
-    /// against THIS zone's collision at least once", never "`on_ground` now describes this zone".
-    /// `step`'s depenetration early return can leave `on_ground` untouched and stale, which is why
-    /// [`ZoneIn::on_frame`]'s settled arm also corroborates against the geometry.
+    /// `stepping && collision.is_some()` as of the last [`ZoneIn::on_frame`] call — i.e. will the
+    /// caller step the controller before the next one? Read on that next call, which is what
+    /// replaced the `note_stepped()` call site: a promise a caller cannot make is a promise a
+    /// caller cannot break. It carries the same weaker, exactly-true claim `note_stepped` did —
+    /// "the controller has been stepped against THIS zone's collision at least once", never
+    /// "`on_ground` now describes this zone".
     stepped_pending: bool,
     /// Why the one-shot last stopped being armed; `None` while armed, and before the first zone
     /// change of the session.
@@ -211,15 +175,10 @@ impl ZoneIn {
             self.stepped_in_this_zone = false;
             self.outcome = None;
             // The previous zone's recovery ring goes with the previous zone (#712, #724, #745).
-            //
-            // `app.rs` also clears it, in its `zone_needs_reload` block, earlier in this same
-            // frame and before anything can step or consult the ring — that call is the one
-            // `movement::forget_recovery_history`'s doc calls load-bearing, and it stays. This one
-            // is not a second-guessing of it: it is what makes the invariant hold *by
-            // construction* rather than by a call site nobody executes in a test. Arming and
-            // dropping the old zone's samples are now the same statement and cannot come apart,
-            // which is #745's actual content — the round-1 pin on `app.rs`'s call could only see
-            // that the call was written. Pinned behaviourally by
+            // `app.rs` clears it too, earlier in the same frame, and that call stays — this one is
+            // not a second-guessing of it. Putting the clear in the SAME statement as the arm is
+            // what makes them unable to come apart, which is #745's actual content: the round-1 pin
+            // on `app.rs`'s call could only see that the call was written. Pinned behaviourally by
             // `arming_for_a_new_zone_drops_the_previous_zones_recovery_ring`.
             controller.forget_recovery_history();
             tracing::info!("zone-in: armed for zone {zone:?}");
@@ -234,50 +193,37 @@ impl ZoneIn {
         if loading { return; }
         let Some(col) = collision else { return };
 
-        // The previous zone's recovery ring must not survive into this zone (#712, #724, #745).
-        //
-        // The arm above already dropped it, in the same frame `app.rs` dropped the old collision.
-        // This is the per-armed-frame repeat, and it is not redundant — see the paragraph below on
-        // re-banking. The ring's samples are untagged coordinates from another
-        // zone, and either recovery path in `step` (the #150 fall-through guard, the depenetration
-        // stuck fallback) will restore one into THIS zone's coordinate space and ground the body
-        // there — a confident wrong answer with a perfectly plausible-looking position, which is
-        // exactly what #712 recorded live. Pinned by
-        // `a_zone_in_never_grounds_the_body_on_a_previous_zones_recovery_coordinate`.
-        //
-        // Every armed frame, not once: `depenetrate` banks a fresh good sample whenever
-        // `on_ground && good_timer >= GOOD_SAMPLE_SECS`, and `on_ground` on the first stepped frames
-        // of a new zone is the PREVIOUS zone's answer (the same staleness #728 N1 is about) — so a
-        // single clear can be undone one frame later by a re-bank of the very coordinate it just
-        // dropped. While this one-shot is armed the body is by definition not yet confirmed settled
-        // here, so no sample taken in that window is worth keeping; the frame the body genuinely
-        // lands, the `stepped_in_this_zone && on_ground` arm below retires and the clearing stops.
+        // The per-armed-frame repeat of the arm's ring clear, and it is not redundant with it:
+        // `depenetrate` re-banks a good sample whenever `on_ground && good_timer >=
+        // GOOD_SAMPLE_SECS`, and `on_ground` on the first stepped frames of a new zone is still the
+        // PREVIOUS zone's answer (#728 N1) — so a single clear can be undone one frame later by a
+        // re-bank of the very coordinate it just dropped, which the #150 fall-through guard or the
+        // depenetration stuck fallback then grounds the body on (#712's live record: a confident
+        // wrong answer at a perfectly plausible-looking position). While this one-shot is armed the
+        // body is by definition not confirmed settled here, so no sample from that window is worth
+        // keeping; the clearing stops the frame the settled arm below retires. Pinned by
+        // `an_armed_frame_denies_the_recovery_ring_the_previous_zones_coordinate`.
         controller.forget_recovery_history();
 
         let p = controller.pos;
 
         // The arrival is over once the body has come to rest — but ONLY once `on_ground` is this
-        // zone's answer, AND only once this zone's geometry corroborates it.
+        // zone's answer AND this zone's geometry corroborates it.
         //
-        // `stepped_in_this_zone` is the first half; see the field's doc and the #593 note above.
-        // It is not sufficient on its own, which I found by reading `step` rather than by
-        // reasoning about it: `step` opens with `if self.depenetrate(dt, col, prev_hold) { return
-        // self.pos; }`, and that early return re-derives NOTHING — not the position, not
-        // `on_ground`. A body that arrives somewhere `is_embedded` calls embedded (which includes
-        // "no floor at all within `GROUND_DEPTH` below", i.e. a void arrival) takes that early
-        // return on every frame of the depenetration attempt, so it has been stepped against this
-        // zone and STILL carries the previous zone's `on_ground`. Retiring on that would emit
-        // `SettledInThisZone` for a body frozen in a void — precisely the confident falsehood
-        // (#728's agent-honesty framing) this module exists to remove.
+        // `stepped_in_this_zone` alone is not sufficient: `step` opens with `if self.depenetrate(dt,
+        // col, prev_hold) { return self.pos; }`, and that early return re-derives NOTHING — not the
+        // position, not `on_ground`. A void arrival (`is_embedded` counts "no floor within
+        // `GROUND_DEPTH` below" as embedded) takes it on every frame, so the body has been stepped
+        // against this zone and STILL carries the previous zone's `on_ground`. Retiring there would
+        // report `SettledInThisZone` for a body frozen in a void.
         //
         // So corroborate with the world: re-ask `zone_in_reground` with **no** underworld, which
         // reduces it to "is the body in water, or is there anything at all under its feet in THIS
-        // zone" — `Retire` iff yes. Asking the same function rather than probing by hand keeps the
-        // probe origin/depth constants in `movement.rs` where they are defined (they are private
-        // there, and `movement.rs` is out of scope for this change). The real `underworld` is
-        // deliberately NOT passed: a zone whose baked underworld sits at or above its arrival floor
-        // makes the real-underworld answer `Wait` for ever even though the body is genuinely
-        // standing on geometry — measured, 20 of the 144 arrivals in
+        // zone" — `Retire` iff yes. Re-using that function keeps the probe origin/depth constants
+        // private to `movement.rs`. The real `underworld` is deliberately NOT passed: a zone whose
+        // baked underworld sits at or above its arrival floor makes the real-underworld answer
+        // `Wait` for ever even though the body is genuinely standing on geometry — measured, 20 of
+        // the 144 arrivals in
         // `the_one_shot_never_leaves_the_armed_state_without_saying_why`'s matrix are that shape.
         if self.stepped_in_this_zone
             && controller.on_ground
@@ -1221,65 +1167,45 @@ mod tests {
     ///
     /// # What it does not handle
     ///
-    /// **This list is best-effort, and is not itself checked for completeness.** An earlier
-    /// revision headed it *"stated, not implied"* while omitting `\xNN` — a construct that already
-    /// existed in this workspace and that made the constructor return `Ok` with a wrong mask. A
-    /// disclosure section that reads as exhaustive but is not invites the reader to treat the gap
-    /// as closed, so the heading no longer claims exhaustiveness. What IS checkable, and is
-    /// checked, is narrower and stated where it lives: the escape enumeration in [`escape_end`]
-    /// (exhaustive over all 256 opener bytes, asserted in the test named above).
-    ///
-    /// Known, at the time of writing:
+    /// **This list is best-effort, and is not itself checked for completeness** — `\xNN` sat in it
+    /// unnoticed until a reviewer wrote an independent reference lexer and differentialled the two
+    /// over the workspace's tracked `.rs` files. Known, at the time of writing:
     ///
     /// * **A lifetime immediately followed by `'`.** [`char_literal_end`] classifies `'` as a char
     ///   literal whenever a closing `'` sits exactly one character (or one escape) later, so the
     ///   two-byte text `'a'` is read as a char literal regardless of what it means. Rust never
-    ///   writes a lifetime that way — a lifetime name is always followed by whitespace, `,`, `>`,
-    ///   `)`, `{` or an identifier — but that is REASONED from the grammar, not measured, and
+    ///   writes a lifetime that way, but that is REASONED from the grammar, not measured, and
     ///   nothing here checks it.
     /// * **Anything about whether the file compiles.** This is a lexer, not a parser. `#[cfg]`,
     ///   macro expansion and dead-code elimination are all invisible to it; see the "What this does
     ///   NOT establish" section on
     ///   `the_app_rs_call_into_this_module_is_an_unconditional_statement`.
-    /// * **Anything the lexer gets wrong that nothing here has thought to look for.** That is not a
-    ///   rhetorical hedge: `\xNN` sat in this position until a reviewer wrote an independent
-    ///   reference lexer and differentialled the two over the workspace's tracked `.rs` files. The
-    ///   backstop for the unknown remainder is the brace-balance refusal below, and its residual is
-    ///   stated at the end of this doc rather than argued away.
+    /// * **Anything the lexer gets wrong that nothing here has thought to look for.**
     ///
     /// # Why the constructor is fallible (#892)
     ///
-    /// The previous version of this helper documented *"two known limits, both checked rather than
-    /// assumed"* — raw strings and char literals, allegedly caught by a whole-file brace-balance
-    /// assert. That claim was false in both directions, and both were measured in this worktree:
+    /// A whole-file brace-balance *assert* was previously relied on to catch the two literal forms
+    /// this lexer did not handle. Measured in this worktree, it caught neither:
     ///
-    /// * `let _probe_a = (b'{', b'}');` inserted into `app.rs` — the balance assert stayed **green**
-    ///   (19 passed, 0 failed). The two literal braces cancel, so a *pair* of the exact construct
-    ///   the doc named as covered was not caught at all. Only an *unbalanced* one fired: a lone
-    ///   `let _probe_a1 = b'{';` did red the balance assert.
-    /// * `let _probe_b = b'"';` inserted at the top of `render_frame` — a quote char literal does
-    ///   not perturb the depth count directly; it desynchronises the *mask*, because the old lexer
-    ///   entered its string-copy branch at that bare `"` and marked everything up to the next `"`
-    ///   in the file as non-code. Whether the balance assert then fires depends on whether the
-    ///   mis-masked span happens to be brace-balanced. That is a coincidence, not a check.
+    /// * `let _probe_a = (b'{', b'}');` inserted into `app.rs` — the assert stayed **green**
+    ///   (19 passed, 0 failed): the two literal braces cancel. Only an *unbalanced* one fired.
+    /// * `let _probe_b = b'"';` at the top of `render_frame` — a quote char literal desynchronises
+    ///   the *mask* rather than the depth count, because the old lexer entered its string-copy
+    ///   branch at that bare `"`. Whether the assert then fires depends on whether the mis-masked
+    ///   span happens to be brace-balanced. That is a coincidence, not a check.
     ///
-    /// So the quote case is now **handled** rather than relied upon to be caught, and the balance
-    /// invariant has moved out of a test and into this constructor. A `CodeScan` cannot be
-    /// obtained at all unless the walk consumed every byte of the source and the code-position
-    /// braces balanced — brace balance being a genuine property of any file rustc can tokenise,
-    /// since Rust's token trees must be delimiter-balanced.
+    /// So both forms are now **handled**, and the balance invariant moved out of a test and into
+    /// this constructor: a `CodeScan` cannot be obtained unless the walk consumed every byte and
+    /// the code-position braces balanced (a genuine property of any file rustc can tokenise, since
+    /// token trees must be delimiter-balanced).
     ///
     /// **The residual, plainly, and it is not a corner case.** A mis-lex that happens to leave the
     /// braces balanced still returns `Ok`, and the consumer then draws a confident conclusion from
-    /// a desynchronised mask. An earlier revision of this doc claimed here that there was
-    /// "therefore no way" for that to happen; the claim was false when it was written, and #892's
-    /// review produced the counterexample from a construct already in this workspace —
+    /// a desynchronised mask — measured on a construct already in this workspace:
     /// `['\x12','{','}']` returned `Ok` with the literal braces exposed as code, and the `app.rs`
-    /// pin then reported a false block head. The sentence is deleted rather than qualified: the
-    /// balance refusal is a backstop with a known hole, not a proof.
-    ///
-    /// What the honest statement is: **the forms listed under "What the lexer handles" are handled
-    /// outright**, at many positions in the real `app.rs`
+    /// pin reported a false block head. The balance refusal is a backstop with a known hole, not a
+    /// proof. The honest statement is that **the forms listed under "What the lexer handles" are
+    /// handled outright**, at many positions in the real `app.rs`
     /// (`a_quote_char_literal_can_no_longer_blind_the_app_rs_scan`,
     /// `an_escaped_char_literal_around_the_ring_clear_cannot_move_its_block_head`) and case by case
     /// on the escape grammar (`the_char_literal_escape_grammar_is_enumerated_not_approximated`);
@@ -1303,16 +1229,14 @@ mod tests {
     ///
     /// # The escape grammar, enumerated rather than approximated
     ///
-    /// The previous version of this function said *"`\u{…}` runs to its `}`; everything else is one
-    /// character"* and advanced by one. That is false for `\xNN`, which is **two** hex digits — the
-    /// walk landed on the first hex digit instead of the closing `'`, returned `None`, and the `'`
-    /// fell through as a lifetime, shifting the mask. `'\x12'` is not hypothetical: it already
-    /// occurs in this workspace (`crates/eqoxide-net/src/packet_handler.rs`, `s.split('\x12')`),
-    /// and `['\x12','{','}']` made `CodeScan::of` return **`Ok` with a wrong mask** — literal braces
-    /// exposed as code — which then made the `app.rs` pin state a false fact. See #892's review.
-    ///
-    /// So the whole grammar is spelled out in [`escape_end`], and anything outside it returns
-    /// `None` rather than guessing a length.
+    /// Approximating it as *"`\u{…}` runs to its `}`; everything else is one character"* is false
+    /// for `\xNN`, which is **two** hex digits: the walk lands on the first hex digit instead of the
+    /// closing `'`, returns `None`, and the `'` falls through as a lifetime, shifting the mask.
+    /// `'\x12'` is not hypothetical — it already occurs in this workspace
+    /// (`crates/eqoxide-net/src/packet_handler.rs`, `s.split('\x12')`) — and `['\x12','{','}']` made
+    /// `CodeScan::of` return **`Ok` with a wrong mask**, which then made the `app.rs` pin state a
+    /// false fact (#892). So the whole grammar is spelled out in [`escape_end`], and anything
+    /// outside it returns `None` rather than guessing a length.
     ///
     /// | Reference production | Form | Length after the `\` |
     /// | --- | --- | --- |
@@ -1323,30 +1247,21 @@ mod tests {
     ///
     /// # The enumeration is the UNION of two Reference rules, deliberately
     ///
-    /// Spelled out because the table above is easy to misread as conformance to one rule, and an
-    /// earlier revision of this doc did claim exactly that — *"one arm per production of the Rust
-    /// Reference's character-literal rule"*. It is not.
-    ///
-    /// This function lexes `b'…'` as well as `'…'`: the `b` is ordinary code and the quoted part
-    /// arrives here unchanged. So it must accept `b'\x80'`, which is legal Rust. The Reference
-    /// separates the two rules by literal kind:
-    ///
-    /// * `ASCII_ESCAPE`, for character literals, takes `\x OCT_DIGIT HEX_DIGIT`;
-    /// * `BYTE_ESCAPE`, for byte literals, takes `\x HEX_DIGIT HEX_DIGIT`.
-    ///
-    /// The arm below implements the byte form, so it accepts `'\x80'`, which rustc rejects with
-    /// *"out of range hex escape"*. `UNICODE_ESCAPE` runs the other way: valid in a character
-    /// literal, rejected in a byte one, accepted here for both.
+    /// The table is NOT conformance to one Reference rule. This function lexes `b'…'` as well as
+    /// `'…'` (the `b` is ordinary code and the quoted part arrives here unchanged), so it must
+    /// accept `b'\x80'`, which is legal Rust. The Reference separates the two by literal kind:
+    /// `ASCII_ESCAPE` (character literals) takes `\x OCT_DIGIT HEX_DIGIT`; `BYTE_ESCAPE` (byte
+    /// literals) takes `\x HEX_DIGIT HEX_DIGIT`. The arm below implements the byte form, so it also
+    /// accepts `'\x80'`, which rustc rejects with *"out of range hex escape"*. `UNICODE_ESCAPE`
+    /// runs the other way: valid in a character literal, rejected in a byte one, accepted here for
+    /// both.
     ///
     /// **Why that asymmetry is safe, which is the only thing that makes over-acceptance tolerable
     /// anywhere in this lexer:** it is pointed exclusively at source rustc has already compiled.
-    /// Accepting too *little* desynchronises the mask — that is the #892 defect, and it is the one
-    /// direction that can produce a confident false fact. Accepting too *much* can only change the
-    /// answer for text that cannot occur in the corpus. The standard this function is held to is
-    /// therefore **"never narrower than rustc"**, not "exactly rustc", and it is written down here
-    /// rather than left for a reader to infer a conformance that was never delivered.
-    ///
-    /// There is no fifth production.
+    /// Accepting too *little* desynchronises the mask — the #892 defect, and the one direction that
+    /// can produce a confident false fact. Accepting too *much* can only change the answer for text
+    /// that cannot occur in the corpus. The standard here is **"never narrower than rustc"**, not
+    /// "exactly rustc". There is no fifth production.
     fn char_literal_end(b: &[u8], i: usize) -> Option<usize> {
         if b.get(i) != Some(&b'\'') { return None; }
         if b.get(i + 1) == Some(&b'\\') {
@@ -1372,11 +1287,10 @@ mod tests {
     /// against a literal list.
     ///
     /// Stated at the strength it was measured at: **while this gate is in force**, an arm whose
-    /// opener is not here is unreachable, and putting the opener here reds that test. It does not
-    /// follow that widening the grammar cannot happen silently, and an earlier revision of this
-    /// paragraph said it did. Disabling the gate and adding an arm in the *same* edit survives the
-    /// whole module — measured, and recorded as the fifth row of [`escape_end`]'s survivor table.
-    /// What bounds that residue is where this function is called from, not this constant.
+    /// opener is not here is unreachable, and putting the opener here reds that test. It does NOT
+    /// follow that widening the grammar cannot happen silently — disabling the gate and adding an
+    /// arm in the *same* edit survives the whole module (measured; the fifth row of [`escape_end`]'s
+    /// survivor table). What bounds that residue is where this function is called from.
     ///
     /// Sorted by byte value, which is the order the 256-byte sweep collects in.
     const ESCAPE_OPENERS: &[u8] = b"\"'0\\nrtux";
@@ -1385,25 +1299,23 @@ mod tests {
     /// first character (`n`, `x`, `u`, …). `None` for anything outside the union of Rust's
     /// character-escape and byte-escape productions; see [`char_literal_end`]'s table.
     ///
-    /// # How the arm set is kept honest, and how an earlier claim about that was false
+    /// # How the arm set is kept honest
     ///
     /// The gate on [`ESCAPE_OPENERS`] is what makes the enumeration checkable. So long as the gate
     /// itself is intact, an arm whose opener is absent from that table is dead code and cannot move
     /// a mask; an arm whose opener is present reds the sweep, which asserts the table byte for
     /// byte. The "so long as" is load-bearing and is measured below, not assumed.
     ///
-    /// An earlier revision credited the 256-byte sweep alone with that, and said an arm added
-    /// without a fixture "reds here". It did not. #892's round-2 review added
-    /// `b'z' => { if b.get(esc + 1) == Some(&b'#') { Some(esc + 2) } else { None } }` and the whole
-    /// module stayed green, because the sweep only ever offers each opener **two** probe bodies and
-    /// that arm's language contains neither. The sweep proves each opener's accept/reject decision
-    /// over those two bodies; the gate is what extends it to every body. Both are needed and
-    /// neither is the other.
+    /// The 256-byte sweep does NOT do that on its own. Measured (#892 round 2): adding
+    /// `b'z' => { if b.get(esc + 1) == Some(&b'#') { Some(esc + 2) } else { None } }` left the whole
+    /// module green, because the sweep only ever offers each opener **two** probe bodies and that
+    /// arm's language contains neither. The sweep proves each opener's accept/reject decision over
+    /// those two bodies; the gate is what extends it to every body.
     ///
     /// # Three SURVIVING mutants here, labelled rather than hidden
     ///
-    /// The gate does not make every edit to this function loud, and saying otherwise would repeat
-    /// the defect above. The five-mutant matrix that was actually run:
+    /// The gate does not make every edit to this function loud. The five-mutant matrix that was
+    /// actually run:
     ///
     /// | Mutation | Result |
     /// | --- | --- |
@@ -1414,12 +1326,12 @@ mod tests {
     /// | **composed:** the gate wrapped inert *and* an arm keyed on `!` added in the same edit | **SURVIVES**, and the arm is REACHABLE |
     ///
     /// The fifth row is #892's round-3 finding and the reason the first four are written out
-    /// individually rather than summarised. Rows 1 and 4 survive separately for opposite reasons —
-    /// dead code, and a no-op — and an earlier revision inferred from that pair that reaching a new
-    /// opener requires the table edit. It does not. Composed, they survive together and the arm
-    /// runs: in that build `escape_end(b"z!", 0)` is `Some(2)` and `char_literal_end(b"'\z!'", 0)`
-    /// is `Some(5)`, where the pristine build answers `None` to both. Two individually-inert
-    /// mutations composing into a live one is precisely what a per-row matrix cannot see.
+    /// individually rather than summarised. Rows 1 and 4 survive for opposite reasons — dead code,
+    /// and a no-op — from which it does NOT follow that reaching a new opener requires the table
+    /// edit. Composed, they survive together and the arm runs: in that build `escape_end(b"z!", 0)`
+    /// is `Some(2)` and `char_literal_end(b"'\z!'", 0)` is `Some(5)`, where the pristine build
+    /// answers `None` to both. Two individually-inert mutations composing into a live one is
+    /// precisely what a per-row matrix cannot see.
     ///
     /// **What bounds the residue is the call site, not the gate.** The lexer reaches [`escape_end`]
     /// only from [`char_literal_end`] — one call site — i.e. only for a `\` already inside a
