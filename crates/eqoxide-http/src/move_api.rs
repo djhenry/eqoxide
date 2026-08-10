@@ -176,6 +176,89 @@ impl MoveBody {
             present.join(", "), missing.join(", ")
         ))
     }
+
+    /// #901 (agent-honesty): resolve `/goto`'s several target forms — `name`, a complete
+    /// `{map_x,map_y}` pair, a complete raw `{x,y,z}` triple, or none at all — into ONE
+    /// [`ParsedTarget`], so the rest of `post_goto` only ever sees the single form that won.
+    ///
+    /// Before this, `post_goto` picked a winner with a chain of `if let`s that simply never looked
+    /// at whatever else the body contained: a `name` beside coordinates, or `map_x`/`map_y` beside
+    /// a complete raw triple, silently vanished behind a `200` with nothing in the response saying
+    /// so. Two disciplines fix that, chosen per form:
+    ///
+    /// - `name` beside ANY coordinate field is REJECTED (`Conflict`), not reported. Coordinates
+    ///   never disambiguate a name match — [`resolve_in_world`] never reads them — so there is no
+    ///   reading under which an agent's "I sent coordinates to narrow the name" belief is honored by
+    ///   this endpoint; the two forms can never sensibly co-occur, and #901 asks to prefer 400 over
+    ///   silent-discard-with-disclosure exactly in that case.
+    /// - Between the two COORDINATE forms, a stray field from the LOSING one is REPORTED via
+    ///   `ignored`, not rejected: sending both a Brewall-derived `{map_x,map_y}` and a
+    ///   server-derived `{x,y,z}` description of the same point is a plausible, non-contradictory
+    ///   caller pattern (e.g. a client that always populates both), so precedence (map beats raw)
+    ///   still applies but the loser is now named in the response instead of disappearing.
+    fn parse_target(&self) -> ParsedTarget {
+        let coord_fields: Vec<&'static str> = [
+            ("map_x", self.map_x.is_some()), ("map_y", self.map_y.is_some()),
+            ("x", self.x.is_some()), ("y", self.y.is_some()), ("z", self.z.is_some()),
+        ].into_iter().filter(|&(_, present)| present).map(|(field, _)| field).collect();
+
+        if let Some(name) = &self.name {
+            if !coord_fields.is_empty() {
+                return ParsedTarget::Conflict {
+                    message: format!(
+                        "conflicting target: \"name\" ({name:?}) and coordinate field(s) {{{}}} \
+                         were both provided — coordinates never disambiguate a name match, so send \
+                         exactly one target form (a name, or coordinates, not both)",
+                        coord_fields.join(", ")),
+                };
+            }
+            return ParsedTarget::ByName(name.clone());
+        }
+
+        let map_complete = self.map_x.is_some() && self.map_y.is_some();
+        let raw_complete = self.x.is_some() && self.y.is_some() && self.z.is_some();
+
+        if map_complete {
+            // map_x = -server_x, map_y = -server_y (Brewall map coords). `z`, if present, is
+            // genuinely CONSUMED here (an override of the default), never one of the ignored losers.
+            let mut ignored = Vec::new();
+            if self.x.is_some() { ignored.push("x"); }
+            if self.y.is_some() { ignored.push("y"); }
+            return ParsedTarget::ByMap {
+                x: -self.map_x.unwrap(), y: -self.map_y.unwrap(),
+                z: self.z.unwrap_or(3.75), ignored,
+            };
+        }
+        if raw_complete {
+            // Reachable with a LONE `map_x` or `map_y` present (not both, or `map_complete` above
+            // would have won) — that stray field would otherwise vanish with no trace at all.
+            let mut ignored = Vec::new();
+            if self.map_x.is_some() { ignored.push("map_x"); }
+            if self.map_y.is_some() { ignored.push("map_y"); }
+            return ParsedTarget::ByRaw { x: self.x.unwrap(), y: self.y.unwrap(), z: self.z.unwrap(), ignored };
+        }
+        if let Some(message) = self.partial_coords_message() {
+            return ParsedTarget::PartialCoords { message };
+        }
+        ParsedTarget::Default
+    }
+}
+
+/// The single resolved target `/goto` acts on — see [`MoveBody::parse_target`] for why this exists
+/// and the precedence/disclosure rule for each variant.
+enum ParsedTarget {
+    /// `name` plus one or more coordinate fields were both present in the same request.
+    Conflict { message: String },
+    ByName(String),
+    /// A complete `{map_x,map_y}` pair won. `ignored` names any `x`/`y` present alongside it.
+    ByMap { x: f32, y: f32, z: f32, ignored: Vec<&'static str> },
+    /// A complete raw `{x,y,z}` triple won (no complete `{map_x,map_y}` pair was present). `ignored`
+    /// names a lone `map_x`/`map_y` present alongside it.
+    ByRaw { x: f32, y: f32, z: f32, ignored: Vec<&'static str> },
+    /// Some coordinate field(s) present but not enough to complete EITHER form (#886).
+    PartialCoords { message: String },
+    /// No name, no coordinate field at all — default to the current target.
+    Default,
 }
 
 /// Resolve the player's current target (the player's `target_id`) to its (key, position).
@@ -237,6 +320,12 @@ fn current_target_match(
 /// name match, always preferred over any nearer partial one) or `"fuzzy"` (only a substring match
 /// existed — the agent should verify before trusting it). For a raw-coordinate goal there is no
 /// entity, so `matched` is `null`.
+///
+/// #901 (agent-honesty): when the body supplies MORE than one target form, `name` beside any
+/// coordinate field is REJECTED with `400` naming the conflict (coordinates never disambiguate a
+/// name — see [`MoveBody::parse_target`]); between the two coordinate forms, `map_x`/`map_y` beats
+/// a complete raw `{x,y,z}` triple and the LOSING form's field(s) are named in the response's
+/// `ignored_fields` array (empty when nothing was ignored) — never silently dropped.
 async fn post_goto(
     State(s): State<HttpState>,
     OptionalJson(body): OptionalJson<MoveBody>,
@@ -256,44 +345,49 @@ async fn post_goto(
     let b = body.unwrap_or_default();
     let player_pos = s.player_pos();
 
-    // Resolve the goal to `(coords, Option<NameMatch>)`. The matched entity (when any) is the SAME
-    // value the goal coordinates come from, so the disclosure can't drift from the routed target.
-    let (target, matched): ((f32, f32, f32), Option<NameMatch>) = if let Some(name) = &b.name {
-        match resolve_in_world(&s.world, name, player_pos) {
-            Some(m) => match m.pos {
-                Some(pos) => (pos, Some(m)),
-                // Matched an entity that has an id but no known position — can't navigate to it.
-                // Honest failure rather than a bogus goal (lockstep tables make this unreachable in
-                // practice, but never silently invent coordinates).
+    // Resolve the goal to `(coords, Option<NameMatch>, ignored_fields)` via the SINGLE ParsedTarget
+    // this body reduces to (#901) — the matched entity (when any) is the SAME value the goal
+    // coordinates come from, so the disclosure can't drift from the routed target, and whatever
+    // OTHER field(s) the body carried but the winning form didn't consume are surfaced honestly
+    // instead of vanishing.
+    let (target, matched, ignored_fields): ((f32, f32, f32), Option<NameMatch>, Vec<&'static str>) =
+        match b.parse_target() {
+            ParsedTarget::Conflict { message } => return text(StatusCode::BAD_REQUEST, message),
+            ParsedTarget::ByName(name) => match resolve_in_world(&s.world, &name, player_pos) {
+                Some(m) => match m.pos {
+                    Some(pos) => (pos, Some(m), Vec::new()),
+                    // Matched an entity that has an id but no known position — can't navigate to it.
+                    // Honest failure rather than a bogus goal (lockstep tables make this unreachable
+                    // in practice, but never silently invent coordinates).
+                    None => return json(StatusCode::NOT_FOUND, serde_json::json!({
+                        "status": "not_found",
+                        "message": format!("entity {:?} has no known position to navigate to", m.name),
+                    })),
+                },
                 None => return json(StatusCode::NOT_FOUND, serde_json::json!({
                     "status": "not_found",
-                    "message": format!("entity {:?} has no known position to navigate to", m.name),
+                    "message": format!("No entity named {name:?}"),
                 })),
             },
-            None => return json(StatusCode::NOT_FOUND, serde_json::json!({
-                "status": "not_found",
-                "message": format!("No entity named {name:?}"),
-            })),
-        }
-    } else if let (Some(mx), Some(my)) = (b.map_x, b.map_y) {
-        // map_x = -server_x, map_y = -server_y (Brewall map coords). Raw coords → no matched entity.
-        ((-mx, -my, b.z.unwrap_or(3.75)), None)
-    } else if let (Some(x), Some(y), Some(z)) = (b.x, b.y, b.z) {
-        ((x, y, z), None)
-    } else if let Some(msg) = b.partial_coords_message() {
-        // #886: a PARTIAL target (e.g. {"x":..,"y":..} with no z) is not the same failure as no
-        // target at all — say which field(s) are missing instead of the misleading "no target;
-        // provide a name or coords", which reads as "you sent nothing" and sends an agent back to
-        // resend the SAME x/y forever.
-        return text(StatusCode::BAD_REQUEST, msg);
-    } else {
-        // No name/coords → default to the player's current target (one-time snapshot). Disclose it
-        // too: the agent should still be able to confirm WHICH spawn "the current target" resolved to.
-        match current_target_match(&s, player_pos) {
-            Ok(m) => (m.pos.expect("current_target_match always carries a position"), Some(m)),
-            Err((code, msg)) => return text(code, msg),
-        }
-    };
+            ParsedTarget::ByMap { x, y, z, ignored } => ((x, y, z), None, ignored),
+            ParsedTarget::ByRaw { x, y, z, ignored } => ((x, y, z), None, ignored),
+            ParsedTarget::PartialCoords { message } => {
+                // #886: a PARTIAL target (e.g. {"x":..,"y":..} with no z) is not the same failure as
+                // no target at all — say which field(s) are missing instead of the misleading "no
+                // target; provide a name or coords", which reads as "you sent nothing" and sends an
+                // agent back to resend the SAME x/y forever.
+                return text(StatusCode::BAD_REQUEST, message);
+            }
+            ParsedTarget::Default => {
+                // No name/coords → default to the player's current target (one-time snapshot).
+                // Disclose it too: the agent should still be able to confirm WHICH spawn "the
+                // current target" resolved to.
+                match current_target_match(&s, player_pos) {
+                    Ok(m) => (m.pos.expect("current_target_match always carries a position"), Some(m), Vec::new()),
+                    Err((code, msg)) => return text(code, msg),
+                }
+            }
+        };
 
     // Apply aggro-avoidance knobs for this route (#242).
     apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
@@ -322,6 +416,10 @@ async fn post_goto(
         "goal": [target.0, target.1, target.2],
         "goal_id": goal_id,
         "matched": matched.map(|m| m.to_json()),
+        // #901: field(s) the body supplied but the winning target form didn't use — e.g. a stray
+        // `x`/`y` beside a complete `map_x`/`map_y` pair. Always present; empty when nothing was
+        // discarded, so an agent can check `.length == 0` without special-casing a missing key.
+        "ignored_fields": ignored_fields,
         "zone_assets_pending": assets_pending,
         // #884: `null` for a healthy body. Non-null means a hold IS in force and it is one that
         // still lets driver input reach the body (a frozen one never reaches this line — it was
@@ -501,7 +599,7 @@ async fn post_zone_cross(
 
 #[cfg(test)]
 mod tests {
-    use super::{reachable_zone_ids, resolve_current_target, router};
+    use super::{reachable_zone_ids, resolve_current_target, router, MoveBody, ParsedTarget};
     use axum::http::StatusCode;
     use axum::body::Body;
     use axum::http::Request;
@@ -1221,6 +1319,191 @@ mod tests {
         let text = body_text(resp).await;
         assert!(text.contains("malformed JSON body"),
             "message should name the real cause, not the unrelated \"provide a direction\" default-validation text: {text}");
+    }
+
+    // ── #901 (agent-honesty): a losing target field must never vanish silently ────────────────────
+
+    /// Exhaustive PROPERTY test over all 2^6 presence combinations of the 6 target-shaped fields
+    /// (`name`, `map_x`, `map_y`, `x`, `y`, `z`): for EVERY combination, whichever field(s)
+    /// `parse_target` does not consume for the winning form must be named EITHER in that variant's
+    /// `ignored` list (the observable-discard path) or in the `Conflict`/`PartialCoords` message
+    /// (the reject path). No combination may pick a winner while a field that was present in the
+    /// body disappears with no trace anywhere in the result — that silent disappearance is exactly
+    /// #901. This is exhaustive (not sampled), so it is a stronger check than a randomized property
+    /// test over the same claim.
+    ///
+    /// MUTATION CHECK (delete): removing either `ignored.push(...)` line in the `ByMap`/`ByRaw` arms
+    /// of `parse_target` makes this go RED (the stray field is no longer accounted for). MUTATION
+    /// CHECK (wrap, #799): wrapping either `ignored.push(...)` call in `if false { .. }` ALSO makes
+    /// this go RED, for the same reason — the line is present but never reached either way.
+    #[test]
+    fn parse_target_never_silently_drops_a_provided_field() {
+        for mask in 0u8..64 {
+            let name  = mask & 1  != 0;
+            let map_x = mask & 2  != 0;
+            let map_y = mask & 4  != 0;
+            let x     = mask & 8  != 0;
+            let y     = mask & 16 != 0;
+            let z     = mask & 32 != 0;
+            let b = MoveBody {
+                name: name.then(|| "probe".to_string()),
+                map_x: map_x.then_some(1.0),
+                map_y: map_y.then_some(2.0),
+                x: x.then_some(3.0),
+                y: y.then_some(4.0),
+                z: z.then_some(5.0),
+                avoid_aggro: None,
+                aggro_buffer: None,
+            };
+            let present = [("name", name), ("map_x", map_x), ("map_y", map_y),
+                           ("x", x), ("y", y), ("z", z)];
+
+            // (fields the winning variant CONSUMES, fields it explicitly names as IGNORED)
+            let (consumed, ignored): (Vec<&str>, Vec<&str>) = match b.parse_target() {
+                ParsedTarget::Conflict { .. } => (vec!["name", "map_x", "map_y", "x", "y", "z"], vec![]),
+                ParsedTarget::ByName(_) => (vec!["name"], vec![]),
+                ParsedTarget::ByMap { ignored, .. } => (vec!["map_x", "map_y", "z"], ignored),
+                ParsedTarget::ByRaw { ignored, .. } => (vec!["x", "y", "z"], ignored),
+                ParsedTarget::PartialCoords { .. } => {
+                    // Every present coordinate field belongs to whichever group (raw/map) triggered
+                    // this branch, and `partial_coords_message` always folds a WHOLE group in once
+                    // any member of it is present — so every present field here is accounted for.
+                    (vec!["map_x", "map_y", "x", "y", "z"], vec![])
+                }
+                ParsedTarget::Default => (vec![], vec![]),
+            };
+
+            for (field, was_present) in present {
+                if !was_present { continue; }
+                let accounted = consumed.contains(&field) || ignored.contains(&field);
+                assert!(accounted,
+                    "mask {mask:06b}: field {field:?} was present but not accounted for \
+                     (consumed={consumed:?} ignored={ignored:?})");
+            }
+        }
+    }
+
+    /// The exact repro from #901 case 2: `name` beside a coordinate field must be REJECTED (400,
+    /// naming the conflict) rather than silently routing to `name` and discarding the coordinates.
+    /// MUTATION CHECK (delete): remove the `!coord_fields.is_empty()` check in `parse_target` and
+    /// this goes RED (200, routed to the name, `x`/`y`/`z` vanish with no trace).
+    #[tokio::test]
+    async fn goto_name_and_complete_raw_coords_is_conflict_400() {
+        let state = empty_state();
+        state.world.entity_ids_mut().insert_for_test("a_rat00".into(), 42);
+        state.world.entity_positions_mut().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a rat","x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+            "name + a complete coordinate triple must be rejected, not silently routed to the name");
+        let text = body_text(resp).await;
+        assert!(text.contains("conflicting"), "message must name the conflict: {text}");
+        // Whole-token match on the rendered field list, not a bare `contains('x')` — that check
+        // is satisfied by the 'x' in the message's own "exactly" and so pins nothing (measured:
+        // blanking `coord_fields` before formatting left this GREEN). "{x, y, z}" is the literal
+        // substring `parse_target` renders (`coord_fields.join(", ")` inside the `{…}` braces), so
+        // this can only pass if all three field names actually made it into the message.
+        assert!(text.contains("{x, y, z}"),
+            "message must name the discarded coordinate fields by their real names, not merely \
+             contain stray letters that happen to appear elsewhere in the sentence: {text}");
+        assert!(goto_target.lock().unwrap().is_none(), "a conflicting request must not queue a nav goal");
+    }
+
+    /// #901 case 1: `map_x`/`map_y` beat a complete raw `{x,y,z}` triple — but the loser is now
+    /// REPORTED via `ignored_fields`, not silently dropped. MUTATION CHECK (delete): remove the
+    /// `ignored.push("x")`/`push("y")` lines in the `ByMap` arm and `ignored_fields` reads `[]` even
+    /// though `x`/`y` were discarded — RED.
+    #[tokio::test]
+    async fn goto_map_coords_beat_raw_coords_and_reports_the_discarded_raw_fields() {
+        let state = empty_state();
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"map_x":10.0,"map_y":20.0,"x":999.0,"y":888.0,"z":777.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        // map_x=10,map_y=20 => goal = (-10,-20,z); z=777 (shared field, genuinely consumed, not lost).
+        assert_eq!(*goto_target.lock().unwrap(), Some((-10.0, -20.0, 777.0)),
+            "map coords must win over the raw triple, per the documented precedence");
+        let ignored: Vec<String> = j["ignored_fields"].as_array().expect("array")
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(ignored.contains(&"x".to_string()) && ignored.contains(&"y".to_string()),
+            "the discarded raw x/y must be named in ignored_fields: {j}");
+        assert!(!ignored.contains(&"z".to_string()),
+            "z is shared/consumed by the map form, not one of the losers: {j}");
+    }
+
+    /// The "third form" the issue didn't name explicitly: a LONE `map_x` (not a complete pair)
+    /// alongside a complete raw `{x,y,z}` triple used to vanish with no trace at all — `map_complete`
+    /// was false so the map branch never even ran, and the OLD code's `partial_coords_message` was
+    /// only reached when the raw triple was ALSO incomplete, so this combination fell straight
+    /// through to the raw branch with the stray `map_x` unmentioned anywhere. MUTATION CHECK
+    /// (delete): remove the `ignored.push("map_x")` line in the `ByRaw` arm and this goes RED.
+    #[tokio::test]
+    async fn goto_lone_map_x_beside_complete_raw_coords_reports_the_discarded_map_x() {
+        let state = empty_state();
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"map_x":10.0,"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(*goto_target.lock().unwrap(), Some((1.0, 2.0, 3.0)),
+            "raw coords win when map_y is absent (map form never became complete)");
+        let ignored: Vec<String> = j["ignored_fields"].as_array().expect("array")
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(ignored.contains(&"map_x".to_string()),
+            "the stray map_x must be named, not silently dropped: {j}");
+    }
+
+    /// A request with only ONE target form present must report an empty `ignored_fields` — nothing
+    /// was actually discarded, so the field must not be misleadingly non-empty.
+    #[tokio::test]
+    async fn goto_single_target_form_reports_no_ignored_fields() {
+        let state = empty_state();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["ignored_fields"].as_array().unwrap().len(), 0, "nothing was discarded: {j}");
+    }
+
+    /// `name` beside only a PARTIAL coordinate field (not even a complete alternate target) is still
+    /// a conflict, not a silently-ignored stray: an agent that sent `x` alongside `name` believing it
+    /// would help must be told, not have `x` vanish quietly.
+    #[tokio::test]
+    async fn goto_name_and_partial_coords_is_conflict_400() {
+        let state = empty_state();
+        state.world.entity_ids_mut().insert_for_test("a_rat00".into(), 42);
+        state.world.entity_positions_mut().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a rat","x":1.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert!(text.contains("conflicting"), "message: {text}");
+        // Whole-token match, not `contains('x')` — that bare check is satisfied by the 'x' in this
+        // message's own "exactly" and pins nothing (measured: a reviewer mutant that blanked
+        // `coord_fields` before formatting left the old assertion GREEN). "{x}" is the literal
+        // substring `parse_target` renders for a single-field conflict.
+        assert!(text.contains("{x}"),
+            "message must name the discarded field `x` by name, not merely contain a stray 'x' \
+             elsewhere in the sentence: {text}");
+        assert!(goto_target.lock().unwrap().is_none());
     }
 
     // --- #884: no movement endpoint may report progress while the physics step is frozen --------
