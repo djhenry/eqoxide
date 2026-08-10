@@ -3524,7 +3524,10 @@ mod tests {
     /// REAL request and parses the REAL bytes, for the same reason the afloat_stall test does.
     ///
     /// Both `ControllerHoldReason` variants are exercised (not just one), so the `reason`/`detail`
-    /// match arms in `PlayerState::from_game_state` aren't covered by a single fluke case.
+    /// match arms aren't covered by a single fluke case. Those arms live in `PlayerHoldView::of`
+    /// since #884 moved them out of `PlayerState::from_game_state`, which is the whole point of
+    /// that move: one constructor, one text, read by both this endpoint and the `/v1/move/*`
+    /// held-refusal.
     ///
     /// MUTATION CHECK reported live in the #817 PR body (build + run on the remote builder, not
     /// reasoned): delete the `player.insert("hold".into(), …)` line from `get_debug` and confirm
