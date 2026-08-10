@@ -165,6 +165,7 @@ See [`docs/http-api.md`](docs/http-api.md) for the full endpoint reference and
 - [`docs/architecture.md`](docs/architecture.md) — thread model, shared types, data flow
 - [`docs/http-api.md`](docs/http-api.md) — REST API reference (port discovery, `/v1/lifecycle/exit`, all endpoints)
 - [`docs/dev-workflow.md`](docs/dev-workflow.md) — building, running, multi-instance, verify loop
+- [`docs/mutation-testing.md`](docs/mutation-testing.md) — `scripts/mutate.py`: reproducible mutation tables, and why a mutant that did not compile is never a RED
 - [`docs/autonomous-play.md`](docs/autonomous-play.md) — playing as a real character
 - [`docs/protocol-notes.md`](docs/protocol-notes.md) — EQ/Titanium wire protocol notes
 - [`docs/collision-system.md`](docs/collision-system.md), [`docs/zone-rendering.md`](docs/zone-rendering.md),
