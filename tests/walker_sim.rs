@@ -1245,10 +1245,10 @@ use eqoxide_ipc::MoveIntent;
     ///   from their spacing, and the spacing it asserted was not the spacing they have. Their
     ///   positions are a property of today's `walker.rs` and rot exactly like the line numbers this
     ///   test exists to replace, so no argument is built on them — but they are why the GREEN
-    ///   escapes above stay green. Measured today, all eight resolve at or below line 2090 of 5340,
-    ///   so an instrument blinded past 2100 still finds every one and the eight positive verdicts
-    ///   say nothing. That is the standing reason the reach control exists and cannot be replaced
-    ///   by the verdicts it guards.
+    ///   escapes above stay green: all eight resolve in the first ~40% of the file (measured at
+    ///   #975: at or below line 2049 of 5274), so an instrument blinded past line 2100 still finds
+    ///   every one and the eight positive verdicts say nothing. That is the standing reason the
+    ///   reach control exists and cannot be replaced by the verdicts it guards.
     #[test]
     fn walker_source_anchors_cited_in_this_file_still_resolve() {
         // `tests/` sits at the workspace root, which is this package's manifest directory.
