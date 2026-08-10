@@ -568,7 +568,18 @@ async fn get_nav_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                      are tier/anchor retries that lost. A call with truncated:true stopped RECORDING \
                      (not searching) at its edge budget. committed_coarse/committed_fine are the \
                      walker's actual committed routes, verbatim; player is null when the position \
-                     was unknown at publish time."));
+                     was unknown at publish time. clearance is TWO different questions, not one \
+                     (#885): clearance.body is the movement controller's own placement verdict at \
+                     the CHARACTER's position, and anything but \"placeable\" means the rest of \
+                     this clearance sample describes a point the character does not occupy. \
+                     clearance.body is NOT a claim about whether the character can move — that is \
+                     player.hold on /v1/observe/debug. clearance.wall_spokes / footprint_ok / \
+                     field_* are the PLANNER's model sampled at clearance.anchor, which may be a \
+                     different height: anchor.reference_z is always the character's own z, while \
+                     anchor.z is present ONLY when anchor.kind == \"floor\" (kind \
+                     \"no_floor_in_band\" means no floor was found in the band and the rays were \
+                     cast from reference_z). A spoke reading of \"clear_to_cap\" is a LOWER BOUND \
+                     (nothing within cap), not a distance of cap."));
             }
             Json(v)
         }
@@ -697,7 +708,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // ground from INVERTED (down-facing) art (the qcat live wedge stood on exactly such a walkway,
     // which the old facing filter deleted). That is correct, but it means nav can no longer VERIFY a
     // floor's facing there — it is standing on unverified-winding ground. `facing_blind_hits` counts
-    // each query answered from a down-facing surface, so the agent can SEE it.
+    // encounters with down-facing standing ground, so the agent can SEE it.
     //
     // (This REPLACES the old `nav_degraded`/`inverted_floor_art` signal, which counted the
     // `column_bottom` recovery valve firing. D-2 deleted that valve — so if this were left reading the
@@ -706,8 +717,17 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // neriakc/qcat) where nav is now on winding-blind ground. A degraded/unverified mode must never be
     // silent, so the signal moves with the mechanism.)
     //
-    // `null` = every standable surface answered so far faced UP (properly wound). Non-null = nav has
-    // answered `queries` times from down-facing (inverted-art) ground since zone load.
+    // `null` = no down-facing standing ground has been admitted since zone load. Non-null = some has.
+    //
+    // The `queries` KEY NAME IS WRONG and the number under it is not a query count: the counter
+    // advances once per DOWN-FACING TRIANGLE that `column_hits` admits as standing ground, per call,
+    // so a single query over a column carrying two such triangles publishes 2 (measured; see
+    // `Collision::body_placement`'s rustdoc in `eqoxide-nav`, which states the same semantics). That
+    // mismatch predates #885 and is filed as **#960** — fixing it means renaming a published JSON
+    // field or changing `column_hits`, neither of which belongs in #885. Read the value as "how much
+    // winding-blind ground nav has leaned on", not as a rate. Do NOT restore the "N queries" wording
+    // here without doing #960: this comment sits immediately above the serialization site, and #885
+    // review round 3 found it contradicting the corrected rustdoc.
     let nav_support = s.shared_collision.read().unwrap().as_ref().and_then(|col| {
         let hits = col.facing_blind_hits();
         (hits > 0).then(|| serde_json::json!({
@@ -3749,6 +3769,140 @@ mod tests {
         *state.shared_collision.write().unwrap() = ready.collision().cloned();
         let v = nav_debug_json(state).await;
         assert_verbatim(&v);
+    }
+
+    /// **#885 review round 1, B1 + B5 — the `semantics` string must not be a confident falsehood
+    /// about its own payload; and round 2, R2-B2/R2-B3 — this doc must not overclaim what the
+    /// assertions pin, nor juxtapose figures of different quantities.**
+    ///
+    /// Round 1 shipped two claims in this string that measurement refuted:
+    ///
+    /// * that `clearance.body` "is authoritative for whether it can move at all (anything but
+    ///   `placeable` means it cannot)". Measured on a dry `FootprintPierced` start (real ground
+    ///   plus a slot of walls piercing the footprint ring): the real `CharacterController` driven
+    ///   north at a constant 44 u/s wish for 180 steps of 1/60 s — a **132.00 u ceiling** — moved
+    ///   **131.28 u** with `hold() == None`, ending `Placeable`. The verdict is the ENTRY CONDITION
+    ///   to the depenetration net, not a freeze. The sentence is deleted, not qualified;
+    /// * an instruction to "compare `anchor.z` against `anchor.reference_z`" — unperformable on a
+    ///   `no_floor_in_band` anchor, which carries no `z` key at all.
+    ///
+    /// **What that distance does and does not measure** (R2-B3). It bounds the DRIVER, not the
+    /// body: it ran essentially flat out for the whole 3 s. Round 2 printed it beside a pair of
+    /// 101 u figures as though the three measured one quantity, attributed to the reviewer. They
+    /// did not — a driver that stops steering once it is within 0.2 u of its goal reports the
+    /// distance to its TARGET. Re-derived on the scene above: steered at a target 101 u away the
+    /// same run reports approximately that target distance; steered at one 3000 u away it reports
+    /// **131.28 u**, the unsteered figure again. The steered figure's exact value varies with the
+    /// slot geometry (round 3 measured a spread across five scenes all matching this description),
+    /// so it is deliberately NOT quoted here — an earlier draft quoted one scene's value as though
+    /// the description determined it. Nothing rests on it. Only the unsteered number is kept, and
+    /// the single thing it establishes is that a non-`placeable` body is not frozen.
+    ///
+    /// Both refuted claims are pinned here on the REAL response body, with the second one's payload
+    /// actually present so the instruction is checked against the JSON rather than against prose.
+    ///
+    /// **What these assertions pin** (R2-B2). Round 2's version of this paragraph said "a re-added
+    /// overclaim goes RED here" while asserting only `!contains("can move at all")` plus
+    /// `contains("player.hold")`. The reviewer walked a REWORDED overclaim past both — one that also
+    /// inverted the pointer ("the character is stuck … Consult clearance.body, not player.hold") —
+    /// and it ran GREEN, because the first guard keys on a single literal substring the reword
+    /// avoids and the second is satisfied by a sentence telling the caller *not* to use the field.
+    /// So the served string is now pinned VERBATIM against the literal at the end of this test: any
+    /// edit to it fails here, in any phrasing, which is what makes the claim true. The substring
+    /// assertions are kept in front of it because their failure messages say WHY each clause exists.
+    /// The honest limit of a verbatim pin: it detects CHANGE, it does not recognise falsehood — it
+    /// forces the golden copy to be updated deliberately; it cannot stop that update from blessing
+    /// a bad sentence.
+    #[tokio::test]
+    async fn the_nav_semantics_string_does_not_overclaim_the_clearance_sample() {
+        use eqoxide_nav::diagnostics::*;
+        let state = empty_state();
+        *state.nav_debug_view.lock().unwrap() = Some(std::sync::Arc::new(NavDebugSnapshot {
+            seq: 1,
+            zone_model_loaded: true,
+            nav_state: "navigating".into(),
+            nav_reason: None,
+            goal_id: 1,
+            player: Some([1.0, 2.0, 3.5]),
+            published_at: std::time::Instant::now(),
+            goal: None,
+            committed_coarse: vec![],
+            committed_fine: vec![],
+            plan: None,
+            pads: vec![],
+            clearance: Some(ClearanceProbe {
+                at: [1.0, 2.0],
+                // The variant the round-1 instruction could not be performed on.
+                anchor: ProbeAnchor::NoFloorInBand { reference_z: 3.5 },
+                body: Placement::NoFloorBelow,
+                wall_spokes: vec![SpokeReading::ClearToCap, SpokeReading::Hit { at: 2.5 }],
+                cap: 4.0,
+                footprint_ok: vec![true],
+                footprint_radius: 1.0,
+                footprint_ring_z: 6.5,
+                field_wall: 3.0,
+                field_ground: 2.0,
+            }),
+            water: None,
+        }));
+        let v = nav_debug_json(state).await;
+        let semantics = v["semantics"].as_str().expect("semantics is served").to_string();
+
+        // B1: the string must not tell an agent a non-`placeable` body means the character is stuck.
+        assert!(!semantics.contains("can move at all"),
+            "B1: `body` is the entry condition to the depenetration net, not a freeze — a dry \
+             FootprintPierced body driven north at 44 u/s for 180 steps of 1/60 s (132.00 u \
+             ceiling) travelled 131.28 u with hold() == None. Deleting this claim, not hedging \
+             it, is the fix: {semantics}");
+        // R2-B2: `contains("player.hold")` alone is satisfied by a sentence that names the field in
+        // order to send the caller AWAY from it, which is how the reviewer's near-miss survived. The
+        // clause that carries the DIRECTION is what must be present.
+        assert!(semantics.contains(
+                "clearance.body is NOT a claim about whether the character can move — that is \
+                 player.hold on /v1/observe/debug."),
+            "the string must send the caller to the field that DOES answer 'can it move', and must \
+             say which way round: {semantics}");
+
+        // B5: the string's instruction about `anchor.z` must be performable on the payload it is
+        // describing. It is not an unconditional compare — `z` is a `floor`-only key.
+        assert_eq!(v["clearance"]["anchor"]["kind"], "no_floor_in_band");
+        assert!(v["clearance"]["anchor"].get("z").is_none(),
+            "B5: this anchor carries no `z` key, so guidance to read one unconditionally is \
+             unperformable: {}", v["clearance"]["anchor"]);
+        assert_eq!(v["clearance"]["anchor"]["reference_z"], serde_json::json!(3.5));
+        assert!(semantics.contains("anchor.z is present ONLY when anchor.kind == \"floor\""),
+            "the guidance must state the condition, since the key is conditional: {semantics}");
+
+        // The tagged spoke union survives the HTTP layer, not just nav's own serializer.
+        assert_eq!(v["clearance"]["wall_spokes"][0], serde_json::json!("clear_to_cap"));
+        assert_eq!(v["clearance"]["wall_spokes"][1], serde_json::json!({ "hit": { "at": 2.5 } }));
+        assert_eq!(v["clearance"]["at"], serde_json::json!([1.0, 2.0]),
+            "`at` is horizontal-only since #885 — two elements, not three");
+
+        // R2-B2: the GOLDEN COPY. The assertions above key on substrings, and a reworded overclaim
+        // that avoids those substrings walked past them GREEN. This pins the whole served string, so
+        // ANY edit — including a paraphrased overclaim, or a re-inverted pointer — fails here and
+        // has to be re-justified against this test's rustdoc before the copy below is updated.
+        assert_eq!(semantics,
+            "plan.trace records what the planner EVALUATED, with per-edge verdicts \
+             (accepted kind / rejected reason). Absence means UNEVALUATED — never walkable, \
+             never blocked. trace.outcome_calls marks the DECIDING call; calls outside it \
+             are tier/anchor retries that lost. A call with truncated:true stopped RECORDING \
+             (not searching) at its edge budget. committed_coarse/committed_fine are the \
+             walker's actual committed routes, verbatim; player is null when the position \
+             was unknown at publish time. clearance is TWO different questions, not one \
+             (#885): clearance.body is the movement controller's own placement verdict at \
+             the CHARACTER's position, and anything but \"placeable\" means the rest of \
+             this clearance sample describes a point the character does not occupy. \
+             clearance.body is NOT a claim about whether the character can move — that is \
+             player.hold on /v1/observe/debug. clearance.wall_spokes / footprint_ok / \
+             field_* are the PLANNER's model sampled at clearance.anchor, which may be a \
+             different height: anchor.reference_z is always the character's own z, while \
+             anchor.z is present ONLY when anchor.kind == \"floor\" (kind \
+             \"no_floor_in_band\" means no floor was found in the band and the rays were \
+             cast from reference_z). A spoke reading of \"clear_to_cap\" is a LOWER BOUND \
+             (nothing within cap), not a distance of cap.",
+            "the served guidance changed; see this test's rustdoc before updating the copy above");
     }
 
     /// Publish a nav snapshot whose `pads` are exactly `pads`, and set the walker's nav state.

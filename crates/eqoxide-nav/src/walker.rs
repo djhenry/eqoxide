@@ -854,7 +854,9 @@ impl Walker {
     /// Refresh the live clearance sample at a throttled cadence: the probe is ~48 raycasts, and
     /// the walker ticks on the net thread, so it is sampled every [`CLEARANCE_REFRESH_TICKS`]th
     /// tick rather than every tick — a diagnostic must not perturb the behaviour it observes. The
-    /// sample carries its own `at`, so a consumer always knows where it was taken.
+    /// sample carries its own horizontal `at` and its own `anchor` (which states both the height
+    /// the rays were cast from and the character's `reference_z`, #885), so a consumer always knows
+    /// where it was taken — including when the two verticals differ.
     fn refresh_clearance(&mut self, player: [f32; 3]) {
         if self.clearance_countdown > 0 {
             self.clearance_countdown -= 1;
