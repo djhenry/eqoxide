@@ -1311,21 +1311,42 @@ mod tests {
     /// and `['\x12','{','}']` made `CodeScan::of` return **`Ok` with a wrong mask** — literal braces
     /// exposed as code — which then made the `app.rs` pin state a false fact. See #892's review.
     ///
-    /// So the whole grammar is spelled out below, one arm per production of the Rust Reference's
-    /// character-literal rule, and anything outside it returns `None` rather than guessing a
-    /// length. `escape_end` is exercised case-by-case by
-    /// `the_char_literal_escape_grammar_is_enumerated_not_approximated`, whose fixture list is
-    /// asserted against this same enumeration so the two cannot drift apart.
+    /// So the whole grammar is spelled out in [`escape_end`], and anything outside it returns
+    /// `None` rather than guessing a length.
     ///
-    /// | Reference production | Form | Length after `\` |
+    /// | Reference production | Form | Length after the `\` |
     /// | --- | --- | --- |
-    /// | Quote escapes | `\'` `\"` | 1 |
-    /// | ASCII escapes | `\n` `\r` `\t` `\\` `\0` | 1 |
-    /// | ASCII escapes | `\xNN` | 3 (`x` + **two** hex digits) |
-    /// | Unicode escapes | `\u{NNNNNN}` | to the `}`, 1–6 hex digits, `_` permitted |
+    /// | `QUOTE_ESCAPE` | `\'` `\"` | 1 |
+    /// | `ASCII_ESCAPE` and `BYTE_ESCAPE` | `\n` `\r` `\t` `\\` `\0` | 1 |
+    /// | `BYTE_ESCAPE` | `\xNN` | 3 — `x` plus **two HEX** digits |
+    /// | `UNICODE_ESCAPE` | `\u{…}` | to the `}` |
     ///
-    /// There is no fifth production. A `\` followed by anything else is not a valid escape and
-    /// cannot appear in a file rustc accepts.
+    /// # The enumeration is the UNION of two Reference rules, deliberately
+    ///
+    /// Spelled out because the table above is easy to misread as conformance to one rule, and an
+    /// earlier revision of this doc did claim exactly that — *"one arm per production of the Rust
+    /// Reference's character-literal rule"*. It is not.
+    ///
+    /// This function lexes `b'…'` as well as `'…'`: the `b` is ordinary code and the quoted part
+    /// arrives here unchanged. So it must accept `b'\x80'`, which is legal Rust. The Reference
+    /// separates the two rules by literal kind:
+    ///
+    /// * `ASCII_ESCAPE`, for character literals, takes `\x OCT_DIGIT HEX_DIGIT`;
+    /// * `BYTE_ESCAPE`, for byte literals, takes `\x HEX_DIGIT HEX_DIGIT`.
+    ///
+    /// The arm below implements the byte form, so it accepts `'\x80'`, which rustc rejects with
+    /// *"out of range hex escape"*. `UNICODE_ESCAPE` runs the other way: valid in a character
+    /// literal, rejected in a byte one, accepted here for both.
+    ///
+    /// **Why that asymmetry is safe, which is the only thing that makes over-acceptance tolerable
+    /// anywhere in this lexer:** it is pointed exclusively at source rustc has already compiled.
+    /// Accepting too *little* desynchronises the mask — that is the #892 defect, and it is the one
+    /// direction that can produce a confident false fact. Accepting too *much* can only change the
+    /// answer for text that cannot occur in the corpus. The standard this function is held to is
+    /// therefore **"never narrower than rustc"**, not "exactly rustc", and it is written down here
+    /// rather than left for a reader to infer a conformance that was never delivered.
+    ///
+    /// There is no fifth production.
     fn char_literal_end(b: &[u8], i: usize) -> Option<usize> {
         if b.get(i) != Some(&b'\'') { return None; }
         if b.get(i + 1) == Some(&b'\\') {
@@ -1342,28 +1363,78 @@ mod tests {
         if b.get(i + 1 + len) == Some(&b'\'') { Some(i + len + 2) } else { None }
     }
 
-    /// One past the end of the escape whose `\` sits at `esc - 1` — so `esc` indexes the escape's
-    /// first character (`n`, `x`, `u`, …). `None` for anything that is not one of Rust's four
-    /// character-escape productions; see [`char_literal_end`]'s table.
+    /// Every byte that may open an escape, and the whole of that set.
     ///
-    /// Every byte value this accepts is asserted, by exhaustive sweep over all 256 of them, in
-    /// `the_char_literal_escape_grammar_is_enumerated_not_approximated`. That is what makes the
-    /// enumeration *checkable* rather than merely stated: adding an arm here without adding it to
-    /// that test's expected set reds, and so does removing one.
+    /// This is a **gate, not documentation**. [`escape_end`] rejects anything outside it before
+    /// dispatching, so the accepted opener set is this constant *by construction* rather than by
+    /// inspection of the arms below it, and
+    /// `the_char_literal_escape_grammar_is_enumerated_not_approximated` asserts its contents
+    /// against a literal list. Widening the lexer's escape grammar therefore cannot happen
+    /// silently: an arm whose opener is not here is unreachable, and putting the opener here reds
+    /// that test.
+    ///
+    /// Sorted by byte value, which is the order the 256-byte sweep collects in.
+    const ESCAPE_OPENERS: &[u8] = b"\"'0\\nrtux";
+
+    /// One past the end of the escape whose `\` sits at `esc - 1` — so `esc` indexes the escape's
+    /// first character (`n`, `x`, `u`, …). `None` for anything outside the union of Rust's
+    /// character-escape and byte-escape productions; see [`char_literal_end`]'s table.
+    ///
+    /// # How the arm set is kept honest, and how an earlier claim about that was false
+    ///
+    /// The gate on [`ESCAPE_OPENERS`] is what makes the enumeration checkable. An arm whose opener
+    /// is absent from that table is dead code and cannot move a mask; an arm whose opener is
+    /// present reds the sweep, which asserts the table byte for byte.
+    ///
+    /// An earlier revision credited the 256-byte sweep alone with that, and said an arm added
+    /// without a fixture "reds here". It did not. #892's round-2 review added
+    /// `b'z' => { if b.get(esc + 1) == Some(&b'#') { Some(esc + 2) } else { None } }` and the whole
+    /// module stayed green, because the sweep only ever offers each opener **two** probe bodies and
+    /// that arm's language contains neither. The sweep proves each opener's accept/reject decision
+    /// over those two bodies; the gate is what extends it to every body. Both are needed and
+    /// neither is the other.
+    ///
+    /// # Two SURVIVING mutants here, labelled rather than hidden
+    ///
+    /// The gate does not make every edit to this function loud, and saying otherwise would repeat
+    /// the defect above. The four-mutant matrix that was actually run:
+    ///
+    /// | Mutation | Result |
+    /// | --- | --- |
+    /// | that `b'z'` arm added, gate untouched | **SURVIVES** — and is unreachable, so it cannot move a mask |
+    /// | that `b'z'` arm added *and* `b'z'` added to [`ESCAPE_OPENERS`] | KILLED by the sweep |
+    /// | `b'z'` added to [`ESCAPE_OPENERS`] with no arm | KILLED by the sweep |
+    /// | the gate line deleted, nothing else changed | **SURVIVES** — and changes no behaviour, because the arms below already cover exactly the table |
+    ///
+    /// So two of the four survive, and neither survivor is a hole: the first is dead code and the
+    /// second is a no-op *given the arms as written today*. What the gate buys is that those two
+    /// are only ever inert **together with** the third row — reaching a new opener requires the
+    /// table edit, and the table edit is what reds. Deleting the gate re-opens the round-2 defect
+    /// for whoever edits next, which is why it is a tripwire worth its two lines and not a check
+    /// the suite can kill.
     fn escape_end(b: &[u8], esc: usize) -> Option<usize> {
-        match *b.get(esc)? {
-            // Quote escapes (`\'`, `\"`) and the one-character ASCII escapes.
+        let c = *b.get(esc)?;
+        // THE GATE. Everything below is unreachable for an opener outside the table.
+        if !ESCAPE_OPENERS.contains(&c) { return None; }
+        match c {
+            // Quote escapes (`\'`, `\"`) and the escapes `ASCII_ESCAPE` and `BYTE_ESCAPE` share.
             b'\'' | b'"' | b'\\' | b'n' | b'r' | b't' | b'0' => Some(esc + 1),
-            // `\xNN` — exactly TWO hex digits. Treating this as "one character like the rest" is
-            // the defect #892's review found: it returned `None`, the `'` was read as a lifetime,
-            // and `CodeScan::of` handed back `Ok` with a desynchronised mask.
+            // `\xNN` — `BYTE_ESCAPE`'s two HEX digits, deliberately wider than `ASCII_ESCAPE`'s
+            // `\x OCT_DIGIT HEX_DIGIT`, because this same function lexes `b'\x80'`. See
+            // [`char_literal_end`]'s "union of two Reference rules" section. Treating the whole
+            // form as "one character like the rest" is the defect #892's review found: it returned
+            // `None`, the `'` was read as a lifetime, and `CodeScan::of` handed back `Ok` with a
+            // desynchronised mask.
             b'x' => {
                 let hex = |k: usize| b.get(k).is_some_and(u8::is_ascii_hexdigit);
                 if hex(esc + 1) && hex(esc + 2) { Some(esc + 3) } else { None }
             }
-            // `\u{…}` — 1 to 6 hex digits, `_` separators permitted, closed by `}`.
+            // `\u{…}` — `UNICODE_ESCAPE` is `\u{ ( HEX_DIGIT _* ){1,6} }`, so a `_` may FOLLOW a
+            // hex digit but may not lead: `\u{_41}` is not an escape, and rustc says so with
+            // "invalid start of unicode escape".
             b'u' => {
                 if b.get(esc + 1) != Some(&b'{') { return None; }
+                if !b.get(esc + 2).is_some_and(u8::is_ascii_hexdigit) { return None; }
                 let mut j = esc + 2;
                 let mut digits = 0usize;
                 while let Some(&c) = b.get(j) {
@@ -1374,6 +1445,7 @@ mod tests {
                 if digits == 0 || digits > 6 || b.get(j) != Some(&b'}') { return None; }
                 Some(j + 1)
             }
+            // Unreachable: the gate above admits only the bytes the arms above cover.
             _ => None,
         }
     }
@@ -1384,10 +1456,19 @@ mod tests {
     /// The `c` prefix (C strings, stable since Rust 1.77) is accepted alongside `b` because
     /// `cr#"…"#` otherwise falls through to the ordinary-string branch, which reads the token's
     /// FIRST `"` as an opener and the next `"` as a closer — a mask desync of exactly the #892
-    /// shape. Measured, by deleting the `c` from this line: inserting `let _p = cr#"a " { b"#;`
-    /// into `app.rs` drove the code-position brace depth NEGATIVE, i.e. the mask desynchronised.
-    /// It refused rather than lying in that instance, but a desync is only refused when it also
-    /// happens to unbalance the braces, which is not a property this lexer can arrange.
+    /// shape.
+    ///
+    /// **What deleting the `c` actually costs, measured across the whole site set rather than at
+    /// one insertion point.** With it removed, `let _p = cr#"a " { b"#;` inserted at each of the
+    /// 63 [`SITE`] positions of `app.rs` gives: **19 `Ok`, 10 refused for negative code-position
+    /// brace depth, 34 refused for another reason — and at all 19 `Ok` sites the ring-clear pin's
+    /// answer is still correct.** With the `c` present, all 63 are `Ok` with a correct pin.
+    ///
+    /// So this fix is not, at these sites, the difference between a lie and the truth: it is the
+    /// difference between reading the file and refusing it, and the honest reason to make it is
+    /// that a desync only refuses when it *also* happens to unbalance the braces — which is a
+    /// coincidence of the surrounding text, not something this lexer arranges. Stated at its true
+    /// strength because overstating it would be the same defect as the doc claim #892 began with.
     fn raw_string_open(b: &[u8], i: usize) -> Option<(usize, usize)> {
         if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') { return None; }
         let mut j = i;
@@ -1771,11 +1852,22 @@ mod tests {
     /// noticed depended on whether the mis-masked span happened to be brace-balanced, so a single
     /// insertion site proves nothing. Swept over every line-start position of `app.rs` with
     /// `let _probe_b = b'"';` — 3,861 sites — `origin/main`'s scanner left the balance assert GREEN
-    /// at 636 of them and RED at 3,225, while the ring-clear pin gave a **false answer at 697
-    /// sites, 138 of those with the balance assert GREEN**. That last cell is the one that matters:
-    /// green *and* lying. 91 of the false answers name `fn render_frame(&mut self)`, so #892's
-    /// quoted failure reproduces verbatim. (Measured twice: by #892's round-1 review, and
-    /// re-derived independently for round 2.)
+    /// at 636 of them and RED at 3,225, while the ring-clear pin was **wrong at 697 sites, 138 of
+    /// those with the balance assert GREEN**. That last cell is the one that matters: green *and*
+    /// wrong.
+    ///
+    /// **697 is a union of two failures, not one quantity**, and is broken out here because an
+    /// earlier revision wrote it as a single "false answer" figure and a reader re-deriving that
+    /// phrase as "confidently wrong block head" gets 665 and reports the number as unreproducible:
+    ///
+    /// * **665** — the pin names a block head that is not the statement's, a confident falsehood.
+    ///   91 of those name `fn render_frame(&mut self)`, so #892's quoted failure reproduces
+    ///   verbatim rather than approximately.
+    /// * **32** — the pin cannot find the statement at all and reds with *"Found 0"*, which is also
+    ///   a false statement about `app.rs`, but a visible one.
+    ///
+    /// (Measured three times: #892's round-1 review, re-derived independently for round 2, and the
+    /// 665/32 split re-derived for round 3 after the round-2 review pointed out the conflation.)
     ///
     /// This walks a DERIVED set of sites — [`SITE`], see its doc for what that anchor does and does
     /// not cover — and inserts each dangerous token at each one. The site count is asserted against
@@ -1874,44 +1966,77 @@ mod tests {
     /// Three separate things are asserted, because "I fixed the case that was reported" is how an
     /// enumeration stops early twice:
     ///
-    /// 1. **Completeness of the arm set, mechanically.** All 256 possible opener bytes are fed to
-    ///    [`escape_end`]; the accepted set must be exactly the nine of Rust's grammar. An arm added
-    ///    without a fixture reds here, and so does one deleted.
-    /// 2. **Per-form end offsets.** Each escape's closing `'` must be found at the right place.
+    /// 1. **The opener set.** [`ESCAPE_OPENERS`] is asserted against a literal list, and all 256
+    ///    possible opener bytes are then fed to [`escape_end`] to pin what that table does. Stated
+    ///    precisely, because an earlier revision overstated it: the sweep offers each opener byte
+    ///    **two** probe bodies, so on its own it pins each byte's accept/reject decision *for those
+    ///    two bodies* and nothing more — #892's round 2 added an arm the sweep could not see. What
+    ///    makes the set complete is the gate in [`escape_end`], which an opener must be in
+    ///    [`ESCAPE_OPENERS`] to pass; the assertion on that table is what this test contributes.
+    /// 2. **Per-form end offsets, including both ends of the `\x` digit grammar.** `x1z` must be
+    ///    rejected and `x8f` accepted, or the arm's accepted language is pinned at neither end —
+    ///    round 2 killed the module with two mutants that moved it and nothing noticed.
     /// 3. **Per-form mask correctness under `CodeScan::of`** — the case the balance refusal cannot
     ///    catch, because the fixture is brace-balanced as written.
     #[test]
     fn the_char_literal_escape_grammar_is_enumerated_not_approximated() {
-        // (1) The accepting set, swept exhaustively rather than read off the source.
+        // (1a) The GATE, asserted against a literal. This is the assertion that makes the opener
+        // set complete, because `escape_end` cannot dispatch to an arm outside this table.
+        let expected: Vec<u8> = vec![b'"', b'\'', b'0', b'\\', b'n', b'r', b't', b'u', b'x'];
+        assert_eq!(ESCAPE_OPENERS, expected.as_slice(),
+            "#892 round 2: `ESCAPE_OPENERS` is {:?}, not the expected {:?}. That constant gates \
+             `escape_end`, so this list IS the lexer's escape grammar — widening it is widening \
+             what the scanner will consume, and it must not happen without a fixture below.",
+            ESCAPE_OPENERS.iter().map(|&c| c as char).collect::<Vec<_>>(),
+            expected.iter().map(|&c| c as char).collect::<Vec<_>>());
+
+        // (1b) …and what that table does, swept over every possible opener byte. NOTE the honest
+        // limit: two probe bodies per byte, so alone this pins accept/reject for those two bodies
+        // and not for every body. Round 2 demonstrated the gap by adding an arm keyed on `#`.
         let accepted: Vec<u8> = (0u8..=255).filter(|&c| {
-            // Two probe bodies, because `\u` and `\x` want different ones: `{41}` serves the
-            // unicode form, `41` the two-hex-digit form. A candidate counts as accepted if either
-            // body gets it through, so no arm can hide behind an unlucky probe.
             escape_end(&[c, b'{', b'4', b'1', b'}'], 0).is_some()
                 || escape_end(&[c, b'4', b'1'], 0).is_some()
         }).collect();
-        let expected: Vec<u8> = vec![b'"', b'\'', b'0', b'\\', b'n', b'r', b't', b'u', b'x'];
         assert_eq!(accepted, expected,
-            "#892: the escape arms of `escape_end` are {:?}, not the expected {:?}. This test IS \
-             the completeness check the `CodeScan` doc points at — if an arm was added or removed \
-             deliberately, add or remove its fixture below in the same commit.",
+            "#892: over the sweep's two probe bodies `escape_end` accepts {:?}, not the expected \
+             {:?}. Either an arm was added or removed, or the `ESCAPE_OPENERS` gate above no \
+             longer governs dispatch.",
             accepted.iter().map(|&c| c as char).collect::<Vec<_>>(),
             expected.iter().map(|&c| c as char).collect::<Vec<_>>());
+
+        // The `\x` digit grammar, pinned at BOTH ends — round 2 broke it in both directions with
+        // no test noticing, because every `\x` fixture then present had an octal first digit and a
+        // hex second, which no mutant of either bound can separate.
         assert_eq!(escape_end(b"x1", 0), None, "`\\x` with one hex digit is not a valid escape");
         assert_eq!(escape_end(b"x1f", 0), Some(3), "`\\xNN` consumes exactly two hex digits");
         assert_eq!(escape_end(b"xzz", 0), None, "`\\x` demands HEX digits");
+        assert_eq!(escape_end(b"x1z", 0), None,
+            "#892 round 2: the SECOND `\\x` digit must be hex. `x1z` is not an escape, and an arm \
+             that stops requiring it consumes one byte too many on the next `'\\x1'` it meets.");
+        assert_eq!(escape_end(b"x8f", 0), Some(3),
+            "#892 round 2: the FIRST `\\x` digit is HEX, not octal. `b'\\x8f'` is legal Rust and \
+             this same function lexes byte literals, so narrowing this arm to the Reference's \
+             `ASCII_ESCAPE` would UNDER-accept — the direction that desynchronises a mask.");
 
-        // (2) End offsets, one row per production of the Reference's character-literal rule.
+        // `UNICODE_ESCAPE` is `\u{ ( HEX_DIGIT _* ){1,6} }`: `_` follows a digit, never leads.
+        assert_eq!(escape_end(b"u{_41}", 0), None, "a LEADING `_` is not a separator");
+        assert_eq!(escape_end(b"u{4_1}", 0), Some(6), "`_` between digits is a separator");
+        assert_eq!(escape_end(b"u{41_}", 0), Some(6), "`_` after the last digit is still allowed");
+
+        // (2) End offsets. `'\x8f'` is here because it is legal only in a BYTE literal — this
+        // function accepts the union deliberately, and the union is what must not regress.
         for (src, want) in [
             ("'\\''", 4usize), ("'\\\"'", 4), ("'\\\\'", 4), ("'\\n'", 4), ("'\\r'", 4),
-            ("'\\t'", 4), ("'\\0'", 4), ("'\\x12'", 6), ("'\\x7f'", 6), ("'\\u{7f}'", 8),
+            ("'\\t'", 4), ("'\\0'", 4), ("'\\x12'", 6), ("'\\x7f'", 6), ("'\\x8f'", 6),
+            ("'\\u{7f}'", 8),
             ("'\\u{1F600}'", 11), ("'\\u{1_f_6_0_0}'", 15), ("'a'", 3), ("'\u{00e9}'", 4),
         ] {
             assert_eq!(char_literal_end(src.as_bytes(), 0), Some(want),
                 "#892: `char_literal_end` does not end {src} at {want}. An escape whose length is \
                  guessed rather than parsed is exactly how the mask desynchronised.");
         }
-        for src in ["'a", "'static", "'\\q'", "'\\u7f'", "'\\u{}'", "'\\u{1234567}'", "'\\x1'"] {
+        for src in ["'a", "'static", "'\\q'", "'\\u7f'", "'\\u{}'", "'\\u{1234567}'", "'\\x1'",
+                    "'\\x1z'", "'\\u{_41}'", "'\\z#'"] {
             assert_eq!(char_literal_end(src.as_bytes(), 0), None,
                 "#892: `{src}` is not a char literal and must not be consumed as one");
         }
