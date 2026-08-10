@@ -36,3 +36,7 @@ tools/target/
 .opencode/
 opencode.json
 --out
+
+# Python bytecode cache. `scripts/mutate.py --self-test` imports `scripts/mutate_selftest.py`,
+# which makes CPython write `scripts/__pycache__/`.
+__pycache__/

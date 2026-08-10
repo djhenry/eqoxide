@@ -146,3 +146,18 @@ jobs:
       # command back down to make it green — that is exactly the failure #605 documents.
       - name: cargo test --workspace
         run: cargo test --workspace --locked
+
+      # The shared mutation harness (#950) is how a PR body substantiates a "this check is
+      # load-bearing" claim, so a harness that has quietly stopped discriminating would devalue
+      # every such claim without anything going red. `--self-test` builds a throwaway crate in a
+      # temporary directory (never inside the repo, never part of the workspace) and drives the
+      # real entry point through its FAILURE modes: an anchor that matches zero times and one that
+      # matches twice (both must be refused), a mutant that does not compile (must score INVALID —
+      # never RED, since a compile failure and a test failure both exit 101), a caught mutant, a
+      # surviving one, a multi-edit mutant, and a deliberately corrupted restore. It also mutates
+      # the harness itself to confirm the compile-sentinel gate is reached rather than merely
+      # present. Same precedent as the check-wrapped-literals `--self-test` in the job above.
+      # It needs cargo, which is why it lives here and not in the `no-local-detail` job.
+      # See docs/mutation-testing.md.
+      - name: mutation harness self-test
+        run: python3 scripts/mutate.py --self-test
