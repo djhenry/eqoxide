@@ -575,31 +575,19 @@ impl CharacterController {
     /// yields a [`Recovery`], and the 0.5 s stuck fallback restored that same point every 0.5 s
     /// indefinitely — while the nav planner, correctly, reported `start_isolated`.
     ///
-    /// > ### ⚠️ Correction (#724)
-    /// > This paragraph used to say the clear is "deliberately NOT folded into [`Self::teleport`]",
-    /// > on the ground that a same-zone correction leaves the ring naming positions in the CURRENT
-    /// > zone, so restoring one "is not nonsense the way a cross-zone restore is". The first half is
-    /// > still true and the conclusion drawn from it was wrong: not-nonsense is not correct, and
-    /// > #724's controller-level tests measure the same-zone failure end to end
-    /// > (`a_large_same_zone_relocation_forgets_the_pre_relocation_recovery_ring` and the stuck
-    /// > -fallback twin). `teleport` now clears the ring itself. The retracted reasoning is kept
-    /// > here rather than deleted, because it is the reasoning that would otherwise be re-derived.
-    /// >
-    /// > That same paragraph also said the stale window lasts "for a few seconds". That is wrong —
-    /// > the window is unbounded, and it is not `GOOD_SAMPLE_SECS`-shaped. The MECHANISM first
-    /// > written here was wrong too; see the amendment below.
+    /// A SAME-zone relocation is not safe either, even though the ring then names points in the
+    /// current zone: not-nonsense is not correct, and #724's controller-level tests measure the
+    /// same-zone failure end to end
+    /// (`a_large_same_zone_relocation_forgets_the_pre_relocation_recovery_ring` and the
+    /// stuck-fallback twin). [`Self::teleport`] therefore clears the ring itself.
     ///
-    /// > ### ⚠️ Correction to the correction (#724 round-2 review, B2)
-    /// > The paragraph above originally read, under a **"Measured:"** label:
-    /// >
-    /// > > *the ring banks ONLY while `on_ground`, so a body relocated into a column it can only
-    /// > > fall out of never banks again and the window is unbounded.*
-    /// >
-    /// > **That mechanism was measured FALSE**, and the "Measured" label was unearned — it was
-    /// > reasoned from the banking site's `on_ground` gate and never instrumented. Round-2 review
-    /// > instrumented the pre-fix behaviour (this method's own `zone_with_a_hole` fixture, driven by
-    /// > a `teleport` that does not clear, printing the ring every 30 frames) and I re-ran it and
-    /// > got the same numbers:
+    /// > ### ⚠️ Correction (#724 round-2 review, B2)
+    /// > The stale window is **unbounded**, but not for the reason first written here. The claim
+    /// > was "the ring banks ONLY while `on_ground`, so a body relocated into a column it can only
+    /// > fall out of never banks again" — reasoned from the banking site's `on_ground` gate under a
+    /// > **"Measured:"** label it had not earned. Instrumenting the pre-fix behaviour (this method's
+    /// > own `zone_with_a_hole` fixture, driven by a `teleport` that does not clear, printing the
+    /// > ring every 30 frames) measured it FALSE:
     /// >
     /// > ```text
     /// > f0 : pos=[80.0, 0.0, -114.53]  on_ground=false ring_len=4
@@ -612,18 +600,13 @@ impl CharacterController {
     /// > mechanism is the fall-through guard's recovering arm in [`Self::step`]: it does
     /// > `self.pos = g; self.on_ground = true;` — it re-grounds the body **onto the stale sample**,
     /// > so every fresh bank is a copy of that same stale point. The window is unbounded because the
-    /// > loop **self-reinforces**, not because banking stops. (The old sentence's "the ring still
-    /// > holds only pre-relocation *samples*" was true of the values and false of the count, which
-    /// > is why it read as evidence for a claim it did not support.)
+    /// > loop **self-reinforces**, not because banking stops.
     /// >
-    /// > The conclusion is unchanged and still holds: the stale window is unbounded, so #724's
-    /// > framing of a 0.5 s race the descent has to win is wrong. Only the reason is different.
-    /// >
-    /// > This was not an inert error. It is what hid the hold disclosure now implemented as
-    /// > [`ControllerHold`]: had `step`'s recovering arm been read instead of reasoned about, the
-    /// > obvious next question was what its `None` arm does *after* the fix — leave `on_ground`
-    /// > false for ever — and what the depenetration twin of that arm does, which is nothing at all,
-    /// > silently. "Never grounded again" made the hold look self-announcing when it was mute.
+    /// > Not an inert error: it is what hid the hold disclosure now implemented as
+    /// > [`ControllerHold`]. Had `step`'s recovering arm been read instead of reasoned about, the
+    /// > next question was what its `None` arm does *after* the fix — leave `on_ground` false for
+    /// > ever — and what the depenetration twin does, which is nothing at all, silently. "Never
+    /// > grounded again" made the hold look self-announcing when it was mute.
     ///
     /// **The `app.rs` zone-change call is NOT made redundant by the fold, and must not be deleted.**
     /// A zone change must drop the ring whether or not a [`Self::teleport`] happens to accompany it,
@@ -634,11 +617,10 @@ impl CharacterController {
     /// `app.rs` also calls this at the moment the old zone's collision is dropped — earlier than,
     /// and independent of, the arrival reground.
     ///
-    /// *Label, because this PR was reviewed for exactly this:* that #593 gap is **read off the
-    /// branch structure, not measured on the wire** — the note reasons about what `stream_position`
-    /// does when `cd² <= CORRECTION_SQ`, and no run has been captured landing in it. The
-    /// independent reason above (the collision-drop clear happens earlier than any arrival, so it
-    /// cannot be the arrival's job) needs no measurement and is the one to lean on.
+    /// That #593 gap is **read off the branch structure, not measured on the wire** — no run has
+    /// been captured landing in it. The independent reason above (the collision-drop clear happens
+    /// earlier than any arrival, so it cannot be the arrival's job) needs no measurement and is the
+    /// one to lean on.
     ///
     /// Round-2 review (N4) measured that the call site had no test holding it in place: deleting it
     /// from `app.rs`, together with the #712 test's own direct call and `is_empty` assert, left the
@@ -837,17 +819,13 @@ impl CharacterController {
         // relocation, neither recovery path has anything to restore, so a body that lands somewhere
         // unrecoverable HOLDS rather than rubber-bands. The restore is a wrong answer the client
         // reports as success, and #712's live record is that it "wedged permanently" — so the hold
-        // is the better of the two. (An earlier draft of this sentence said #712 *measured* the
-        // wrong answer "re-firing every 0.5 s". It did not: #712's measured record, quoted verbatim
-        // in `zone_in_reground`'s doc above, is the stale PREVIOUS-zone recovery and the permanent
-        // wedge, with no cadence in it. 0.5 s is `GOOD_SAMPLE_SECS`, this file's ring-BANKING
-        // interval, which I had silently promoted into a re-fire rate for the server. Retracted
-        // here rather than deleted because the audit that caught it — #724 round-2 review's "audit
-        // every Measured label" — is the reason it is gone.) The hold is NOT free, and the first
-        // draft of this comment said something false about that too:
+        // is the better of the two. (#712's record carries NO cadence — it is the stale
+        // PREVIOUS-zone recovery and the permanent wedge. 0.5 s is `GOOD_SAMPLE_SECS`, this file's
+        // ring-BANKING interval, not a server re-fire rate; a draft here once promoted it into one.)
+        // The hold is NOT free:
         //
-        //   ⚠️ RETRACTED (#724 round-2 review, B1). This comment used to justify the trade with
-        //   "holding is a visible failure a further server correction can fix". Both halves were
+        //   ⚠️ RETRACTED (#724 round-2 review, B1). "Holding is a visible failure a further server
+        //   correction can fix" was the old justification. Both halves were
         //   wrong on the depenetration path, and measured wrong. (a) NOT VISIBLE: `depenetrate`'s
         //   only `tracing::info!` sat inside `if let Some(&g) = self.good.back()`, so with the ring
         //   cleared — which this very fix makes the normal post-relocation state — the branch
@@ -1146,29 +1124,12 @@ impl CharacterController {
             // inside a water volume we cannot measure would drive the body down onto the #150
             // underworld guard for no reason.
             //
-            // ⚠️ CORRECTED (#724 round-2 review B2; the STATED GROUND corrected again in round 3
-            // review B2). This used to read "(a server correction or the #150 underworld guard would
-            // otherwise have to recover us)". The server-correction half is dropped.
-            //
-            // Why, precisely — because the first attempt at this correction got the reason wrong and
-            // the reason is itself a claim. The retracted parenthetical is a COUNTERFACTUAL about
-            // the branch we do not take: *if* we free-fell, one of those two would have to recover
-            // us. Round 3 justified dropping it with "a swimmer holding altitude streams a position
-            // the server agrees with, so no correction is generated" — which is a fact about the
-            // branch we DO take, and so cannot bear on the counterfactual at all. That was a
-            // category error, and shipping it inside a correction is the same defect wearing the
-            // fix's clothes. It is retracted here rather than silently rewritten.
-            //
-            // The ground that does reach it: whether a free-falling swimmer sinking past the world
-            // would in fact draw a server-side relocation is SERVER behaviour. No run in this PR or
-            // in any of its review rounds measured it, and the review that raised this said the same
-            // in as many words. It is not established FALSE — it is not established. Naming an
-            // unmeasured server rescue as a known consequence, in a comment that a future reader
-            // will lean on, is exactly the habit #724 exists to break (see `forget_recovery_history`
-            // and `teleport`: the client had been treating "the server will put us back" as a
-            // mechanism it could rely on). So the half we cannot check is dropped, and the half we
-            // can — the #150 underworld guard, which is our own code — is kept, above, in the same
-            // counterfactual form it always had.
+            // The stated reason names only OUR code, deliberately. An earlier form added "a server
+            // correction … would otherwise have to recover us": whether a free-falling swimmer
+            // sinking past the world draws a server-side relocation is SERVER behaviour, unmeasured
+            // here — not established false, just not established. Naming an unmeasured server rescue
+            // as a known consequence is the habit #724 exists to break (see
+            // `forget_recovery_history` and `teleport`).
             //
             // Residual, labelled: the retained "would drive the body down onto the #150 underworld
             // guard" is REASONED FROM THE BRANCH STRUCTURE, not captured in a run. It is a claim
@@ -1261,18 +1222,12 @@ impl CharacterController {
                 // linkdead. Recover to the last good grounded position instead; if we have none yet,
                 // just stop sinking and hold above the underworld. (#150)
                 //
-                // ⚠️ CORRECTED (#724 round-2 review, B2). This line used to end "…and let a server
-                // correction sort it". That was WRONG, and it was wrong about the exact branch #724
-                // now labels `UnderworldNoRecovery`: the held body goes on streaming its own
-                // unchanged position, the server agrees with it, and so nothing generates a further
-                // correction. Nothing sorts it. The hold is terminal until a GM `#goto`/`#summon`
-                // moves the character or it zones out — which is why the branch below now reports a
-                // `ControllerHold` instead of relying on a rescue that was never coming. Retracted
-                // in place rather than deleted: `forget_recovery_history` retracts the same claim in
-                // this file, `docs/http-api.md` states the opposite in bold, and this comment is the
-                // FIRST thing a reader of the underworld hold meets. (Found by the reviewer grepping
-                // the CONCEPT, "server correction", not the #724 label — my own audit was scoped to
-                // what this PR wrote and could not reach a pre-existing line.)
+                // NO server correction sorts this out (#724, the branch labelled
+                // `UnderworldNoRecovery`): the held body goes on streaming its own unchanged
+                // position, the server agrees with it, and so nothing generates a further
+                // correction. The hold is terminal until a GM `#goto`/`#summon` moves the character
+                // or it zones out — which is why the branch below reports a `ControllerHold` instead
+                // of relying on a rescue that was never coming.
                 let landing_valid = |f: f32| cand <= f && f > self.underworld;
                 match floor {
                     Some(f) if landing_valid(f) => {

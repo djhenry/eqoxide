@@ -96,11 +96,9 @@ pub struct Hit {
 /// whose state was never recorded, and an edit to the probe loop bound prints no distinguishing
 /// string.
 ///
-/// The obvious objection is that a reduced sample should undershoot by far more than 0.00081%. The
-/// proposed answer — `Key = (col, row, floor_bucket)` makes the maximum a broad PLATEAU, so 37
-/// nodes is endpoint jitter between two winning pairs — is **reasoning from the key type, not a
-/// measurement**, and is recorded only because any explanation of a gap this small needs a plateau
-/// of some kind.
+/// The obvious objection — a reduced sample should undershoot by far more than 0.00081% — has only
+/// a reasoned answer: `Key = (col, row, floor_bucket)` would make the maximum a broad PLATEAU, so
+/// 37 nodes is endpoint jitter. That is reasoning from the key type, not a measurement.
 ///
 /// **None of that makes 4,583,748 wrong.** The test reports a MAX over sampled pairs, and a max
 /// over any subset is a LOWER BOUND on the max over the whole: 4,583,748 < 4,583,785, the right
@@ -8041,63 +8039,23 @@ mod tests {
         // surface crossing, floating-start anchoring — so with a region map attached the "reachable
         // component" this floods includes navigable water volume, and without one it does not.
         //
-        // An earlier draft of this comment claimed the corpus "has no water dependency at all". That
-        // was FALSE and it was load-bearing: the predicate actually measured was "zero `in_water`
-        // calls in the function body", which does not entail "no water dependency" when the
-        // dependency lives inside the `astar` this body calls.
+        // A draft of this comment claimed the corpus "has no water dependency at all". FALSE, and
+        // load-bearing: the predicate actually measured was "zero `in_water` calls in the function
+        // body", which does not entail "no water dependency" when the dependency lives inside the
+        // `astar` this body calls.
         //
-        // Which configuration is the honest one to measure is settled by `build_zone_collision`
-        // (`src/app.rs`), documented as "the client's ONE production construction of a zone's
-        // collision grid": it ALWAYS calls `set_region_data`, with the loaded map or with the
-        // loader's `Err`. There is exactly one production construction site and it always attaches.
-        // So a grid with no region data attached is a configuration the shipped client never
-        // builds, and a component size measured on one is not the worst case `MAX_NODES` has to
-        // clear in the field — it is a smaller number about a grid that does not exist.
+        // Which configuration is honest to measure is settled by `build_zone_collision`
+        // (`src/app.rs`), the client's ONE production construction of a zone's collision grid: it
+        // ALWAYS calls `set_region_data`. A grid with no region data attached is a configuration the
+        // shipped client never builds, so a component size measured on one is a smaller number about
+        // a grid that does not exist.
         //
         // MAGNITUDE, on `butcher`, MEASURED: with the region map attached **4,583,785** nodes;
         // without it 352,493. **13.0x.** The attached arm is a full-workload `dev`-profile run over
-        // a `ZONES=butcher` corpus (10h24m, exit 0) — 57.3% of `MAX_NODES`, 1.75x headroom.
-        //
-        // TWO measurements exist and they do not quite agree. An independent earlier run over the
-        // three-zone default corpus reported **4,583,748** for this zone — 37 nodes apart
-        // (0.00081%), filed as its own issue. Both round to 57.3% and 1.75x, so the cap's
-        // conclusion is unaffected either way.
-        //
-        // That earlier run's PROFILE IS UNKNOWN — its stderr was never captured, so there is no
-        // compile sentinel for it and it must not be called `dev` or `release`.
-        //
-        // THREE mechanisms are excluded, and the list is NOT complete. PROFILE (the #849 audit found
-        // none in the search, and that run's slowest search was 151.7 us/node against this run's
-        // dev-confirmed 123.7 — no release-like speed; note 66.0 vs 123.7 between two dev-confirmed
-        // runs, so per-node cost is not a profile signature, only a bound on speed). COMPOSITION
-        // (`seed` is re-seeded inside `for zone in &zones`, so butcher draws the identical pairs
-        // either way — that fixes WHICH pairs, not HOW MANY). GRID AND ASSETS (all three runs print
-        // xy_cells@8u = 751120, which is derived from the loaded geometry — content evidence, not
-        // the file mtimes an earlier revision leaned on).
-        //
-        // OPEN, and the leading candidate: the earlier run executed FEWER SEARCHES. Its total was
-        // 1620.16s, minus 124.34s for everfrost's and gfaydark's figure-setting searches, so its
-        // butcher zone had <= 1495.82s -- <= 2.08s per pair at the nominal 720, against 4.92s for
-        // the no-region-map base and 52.02s here (both dev-confirmed). It would have to be under
-        // HALF the per-pair cost of the mapless base while reporting a 13x larger maximum, and
-        // profile cannot rescue that since it is the slower of the pair per node.
-        //
-        // The code-window bound does NOT close this: it is a diff over COMMITTED revisions, and that
-        // run came from a working tree never recorded. An edit to this loop's bound prints no
-        // distinguishing string, so a reduced reach probe leaves no trace in any surviving artefact.
-        //
-        // Objection: a reduced sample should undershoot by far more than 0.00081%. The proposed
-        // answer is that `Key = (col, row, floor_bucket)` makes the maximum a PLATEAU rather than a
-        // peak, so 37 nodes is endpoint jitter between two winning pairs. That is reasoning from the
-        // key type, NOT a measurement -- recorded because any explanation of a gap this small needs
-        // a plateau of some kind, not because it has been shown.
-        //
-        // THREE explanations have now been asserted in this comment and three were refuted: that the
-        // run was impossible and its number unusable; that it was `release` against this one's `dev`
-        // (from dividing TOTAL wall times, 37,453/1,620 = 23.1x); and that the sample count was
-        // excluded. What is true and mechanism-free: this test reports a MAX OVER SAMPLES, a max
-        // over any subset is a LOWER BOUND on the max over the whole, and 4,583,748 < 4,583,785 is
-        // the right way round. State what is excluded and what is open; do not supply a fourth.
+        // a `ZONES=butcher` corpus (10h24m, exit 0) — 57.3% of `MAX_NODES`, 1.75x headroom. An
+        // independent earlier run reported 4,583,748 for this zone; that 37-node gap is unresolved
+        // and is analysed once, on `MAX_NODES`'s own rustdoc — do not restate it here. Both
+        // round to 57.3% and 1.75x, so the cap's conclusion is unaffected either way.
         //
         // The other measured points, kept because they bound how zone-dependent this is: on
         // `highpass`, full workload both sides with the attachment as the only difference, the close
@@ -8554,29 +8512,17 @@ mod tests {
 
         println!("\n{:<12} {:>6} {:>10} {:>10} {:>9} {:>9} {:>10} {:>10}",
             "zone", "pairs", "old ok", "new ok", "new-only", "old-only", "old mean", "new mean");
-        // #839: a missing `.glb` or an empty collision grid used to drop a zone through a bare
-        // `continue` that printed a message and touched no ledger, so the FINE-TIER CORPUS totals
-        // below read as complete over whatever subset of `zones` happened to load.
-        // `open_corpus_zone` is the SAME single-owner prologue #807's other five corpora use; this
+        // #839 prologue: `open_corpus_zone` is the single-owner corpus prologue — see
+        // `worst_case_reachable_component` for the bare-`continue` accounting bug it replaced, and
+        // for why attaching the region map is what makes a measurement about production. This
         // corpus reports no water NUMBER, so it still closes through `cover.add(zone, &zw.tally())`.
         //
-        // #849: an earlier draft said "this corpus has no water dependency (no `in_water` call
-        // anywhere in it)". The parenthetical was measured; the sentence it supported was false.
-        // `open_corpus_zone` attaches the region map, and `astar` gates its water-descent, haul-out
-        // and surface-crossing edge families on `self.region_map()` — so this corpus now routes with
-        // those families live. That is DELIBERATE: `build_zone_collision` (`src/app.rs`) is the
-        // client's only production construction of a nav grid and always attaches region data, so
-        // "attached" is the configuration a fine-tier route-success number should be measured in.
-        // MEASURED (#849 review): over a 4-zone reduced-budget run this corpus produced identical
-        // pair counts and success rates on both sides (23 pairs, 100%/100%), so no change was
-        // demonstrated here — which is NOT the same as demonstrating there is none. The full 10-zone
-        // default at full budget was not run on either side. The size of the attachment's effect is
-        // a property of the zone, and the measured spread is enormous: `butcher` 352,493 ->
-        // 4,583,785 (13.0x, see `worst_case_reachable_component`), `highpass` 7,229 -> 7,394
-        // (+2.3%), and two of the four converted corpora printed byte-identical tables either way —
-        // a change of exactly nothing. So a 13x elsewhere predicts nothing here: the "no change was
-        // demonstrated" above stands on its own reduced-budget run, and what THIS corpus's full
-        // default would do is still unmeasured.
+        // MEASURED here (#849 review): over a 4-zone reduced-budget run this corpus produced
+        // identical pair counts and success rates on both sides (23 pairs, 100%/100%). No change was
+        // demonstrated, which is NOT the same as demonstrating there is none — the full 10-zone
+        // default at full budget was not run on either side, and the attachment's effect is a
+        // property of the zone (13.0x on `butcher`, +2.3% on `highpass`, exactly nothing on two of
+        // the four converted corpora), so a figure from elsewhere predicts nothing here.
         let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
             let (col, zw) = match crate::water_grid::open_corpus_zone(
@@ -8703,12 +8649,8 @@ mod tests {
         // #839: the accounting assert fires BEFORE `tot_pairs > 0` — a run that dropped every zone
         // is still RED either way, but this ordering names which zones dropped and why instead of
         // only saying the corpus produced no pairs.
-        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus reports no water
-        // NUMBER, so that total is a `tally()` zero by construction, not a finding — label it, or a
-        // reader takes "0" for "0 wet things found here". #849: it does NOT mean the search ran dry.
-        // `open_corpus_zone` attaches the region map (deliberately — that is what production does),
-        // so `astar`'s water edge families are live here. "Reports no water number" is the claim;
-        // "has no water dependency" was the earlier claim and it was false.
+        // #839/#849: the leading 0 is a `tally()` zero by construction, not a finding, and it does
+        // NOT mean the search ran dry — same note as in `worst_case_reachable_component`.
         println!("zone coverage [leading 0 = water total; this corpus reports no water number — \
                   but it DOES search with the region map attached]: {cover}");
         assert!(cover.is_complete(),
@@ -9401,19 +9343,11 @@ mod tests {
         let mut seed: u64 = 0x0155_EA1D;
         let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
         println!("\n{:<12} {:>10} {:>10} {:>12} {:>10}", "zone", "fits", "recovered", "headroom-rej", "steep-rej");
-        // #839: a missing `.glb` or an empty collision grid used to drop a zone through a bare
-        // `continue` that printed nothing (the `cols == 0` arm) or a message nobody accounted for,
-        // so the Q1 numbers above read as a complete seal measurement over whatever subset of
-        // `zones` happened to load. Same single-owner prologue as the other four corpora in this
-        // family.
-        //
-        // #849: an earlier draft said "this corpus has no water dependency (no `in_water` call)".
-        // The grep was real; the conclusion was not — `open_corpus_zone` attaches the region map and
-        // `astar`'s water edge families gate on it, so the dependency is inside the search this body
-        // calls, not in the body. Attaching is deliberate and matches `build_zone_collision`, the
-        // client's only production nav-grid construction. MEASURED (#849 review): this corpus printed
-        // a BYTE-IDENTICAL table with and without the attachment, so here the old sentence's
-        // CONCLUSION happens to hold empirically even though its reasoning did not.
+        // #839 prologue: the same single-owner `open_corpus_zone` as the other four corpora in this
+        // family — see `worst_case_reachable_component` for the accounting bug it replaced and for
+        // why the region map is attached. Without it, the Q1 numbers above read as a complete seal
+        // measurement over whatever subset of `zones` happened to load. MEASURED (#849 review):
+        // this corpus printed a BYTE-IDENTICAL table with and without the attachment.
         let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
             let (col, zw) = match crate::water_grid::open_corpus_zone(
@@ -9451,12 +9385,8 @@ mod tests {
             below body height (correct). Route-success held, BUT the corpus cannot distinguish a rejected \
             ceiling from a sealed pocket (it samples via nearest_floor, so a sealed pocket is invisible \
             to it) — this is NOT proof every reject is a ceiling. ===");
-        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus reports no water
-        // NUMBER, so that total is a `tally()` zero by construction, not a finding — label it, or a
-        // reader takes "0" for "0 wet things found here". #849: it does NOT mean the search ran dry.
-        // `open_corpus_zone` attaches the region map (deliberately — that is what production does),
-        // so `astar`'s water edge families are live here. "Reports no water number" is the claim;
-        // "has no water dependency" was the earlier claim and it was false.
+        // #839/#849: the leading 0 is a `tally()` zero by construction, not a finding, and it does
+        // NOT mean the search ran dry — same note as in `worst_case_reachable_component`.
         println!("zone coverage [leading 0 = water total; this corpus reports no water number — \
                   but it DOES search with the region map attached]: {cover}");
         assert!(cover.is_complete(),
@@ -9525,18 +9455,11 @@ mod tests {
         let mut tot_pts = 0usize;
         let mut tot_drift = 0usize;
         println!("\n{:<12} {:>10} {:>12} {:>8}", "zone", "sampled", "drift-pts", "%");
-        // #839: a missing `.glb` or an empty collision grid used to drop a zone through a `continue`
-        // that printed a message and touched no ledger, so the FLOOR-MODEL DISAGREEMENT total below
-        // read as complete over whatever subset of `zones` happened to load. Same single-owner
-        // prologue as the other four corpora in this family.
-        //
-        // #849: an earlier draft said "this corpus has no water dependency (no `in_water` call)".
-        // The grep was real; the conclusion was not — `open_corpus_zone` attaches the region map and
-        // `astar`'s water edge families gate on it, so the dependency is inside the search this body
-        // calls, not in the body. Attaching is deliberate and matches `build_zone_collision`, the
-        // client's only production nav-grid construction. MEASURED (#849 review): this corpus printed
-        // a BYTE-IDENTICAL table with and without the attachment, so here the old sentence's
-        // CONCLUSION happens to hold empirically even though its reasoning did not.
+        // #839 prologue: the same single-owner `open_corpus_zone` as the other four corpora in this
+        // family — see `worst_case_reachable_component` for the accounting bug it replaced and for
+        // why the region map is attached. Without it, the FLOOR-MODEL DISAGREEMENT total below read
+        // as complete over whatever subset of `zones` happened to load. MEASURED (#849 review):
+        // this corpus printed a BYTE-IDENTICAL table with and without the attachment.
         let mut cover = crate::water_grid::WaterRollup::new();
         for zone in &zones {
             let (col, zw) = match crate::water_grid::open_corpus_zone(
@@ -9580,12 +9503,8 @@ mod tests {
             see HONEST LIMIT). D-2 gate: → 0 by construction (both sides share is_standable). ===");
         // #839: the accounting assert fires BEFORE `tot_pts > 0` — a run that dropped every zone is
         // still RED either way, but this ordering names which zones dropped and why.
-        // #839: `WaterRollup`'s Display leads with its water TOTAL. This corpus reports no water
-        // NUMBER, so that total is a `tally()` zero by construction, not a finding — label it, or a
-        // reader takes "0" for "0 wet things found here". #849: it does NOT mean the search ran dry.
-        // `open_corpus_zone` attaches the region map (deliberately — that is what production does),
-        // so `astar`'s water edge families are live here. "Reports no water number" is the claim;
-        // "has no water dependency" was the earlier claim and it was false.
+        // #839/#849: the leading 0 is a `tally()` zero by construction, not a finding, and it does
+        // NOT mean the search ran dry — same note as in `worst_case_reachable_component`.
         println!("zone coverage [leading 0 = water total; this corpus reports no water number — \
                   but it DOES search with the region map attached]: {cover}");
         assert!(cover.is_complete(),

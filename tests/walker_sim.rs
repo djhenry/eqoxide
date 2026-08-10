@@ -898,41 +898,23 @@ use eqoxide_ipc::MoveIntent;
     ///   but for THIS gate's own check, that push never even needs to run: the `panic!` below fires
     ///   first, on the transient view, every time.
     ///
-    ///   **The revision that replaced it — "a per-zone refusal could never fire where the terminal
-    ///   one would not" (#830) — is also not quite right, read literally**, for a simpler reason than
-    ///   bucket monotonicity: `faithful_walker_drift_corpus`'s own `assert!(tot_walked > 0)` runs
-    ///   BEFORE the terminal completeness assert, so a run that is all-`skipped` (never checked by
-    ///   this gate at all) or a single unmeasured zone with nothing opened after it (this gate only
-    ///   re-checks a zone's holes when the NEXT zone opens — the corpus's own terminal-assert
-    ///   comment, above, already notes this for "the last zone opened") dies at `tot_walked > 0` and
-    ///   the terminal assert never runs, full stop. And whenever THIS gate itself panics, that panic
-    ///   unwinds past both asserts, so in every run where the per-zone refusal actually fires, the
-    ///   terminal one provably does NOT run in that same execution — the opposite of "could never
-    ///   fire where the terminal one would not." The corrected claim is narrower: no NEW false
-    ///   positive — a hole this gate catches was always a real one (its zone was truly abandoned, or
-    ///   truly failed to load) — not that the terminal check is somehow redundant with this one.
+    ///   **Do NOT claim this gate "could never fire where the terminal one would not" (#830).** Read
+    ///   literally that is false: `faithful_walker_drift_corpus`'s own `assert!(tot_walked > 0)` runs
+    ///   BEFORE the terminal completeness assert, and whenever THIS gate panics the panic unwinds
+    ///   past both, so in every run where the per-zone refusal fires the terminal one provably does
+    ///   NOT run. The claim that holds is narrower: no NEW false positive — a hole this gate catches
+    ///   was always a real one.
     ///
-    ///   **Why `skipped` is the one bucket exempt, restated because the old rationale overstated its
-    ///   scope (#830).** Not because it is rarer than the other two — #762's own motivating exhibit
-    ///   (the `unmeasured` bullet, above) is a build host holding only 2 of 497 `.wtr` files, so
-    ///   "`skipped` is the common state" is not a fact that distinguishes it from `unmeasured`, and no
-    ///   comparably-measured count exists here for how often each `skipped` cause fires on a real
-    ///   corpus — this file has no baked `$ZONE_DIR` to run that measurement against, so that piece
-    ///   of the asymmetry is left unmeasured, not assumed clean. What DOES distinguish them is what
-    ///   a hole SIGNALS, not how often it occurs:
-    ///   `no glb`/`no grid` (two of `skipped`'s three causes) mean the zone was never in scope for
-    ///   this run at all — the ROUTINE, expected shape of a `$ZONE_DIR` that only holds a
-    ///   caller-chosen subset of zones. `unmeasured` means
-    ///   the zone WAS in scope — its `.glb` and grid loaded, so someone deliberately provided it — and
-    ///   specifically its paired `.wtr` failed, which is a claim about a broken delivery for a zone
-    ///   you asked for; #762 was filed as a bug for exactly that reason, not treated as routine.
-    ///   Measured on a two-zone run (`ZONES=akanon,crushbone`) against real baked GLBs: akanon skipped
-    ///   for "no routable pairs" (`skipped`'s third cause, unrelated to asset absence, and itself not
-    ///   measured against the other two here) at zone 1 of 2, so gating `skipped` here would have
-    ///   killed the run before crushbone's 60 journeys ever ran. That cost is paid for a bucket the
-    ///   table already prints per zone (`(no glb — skipped)`), so it buys little. `skipped` stays out
-    ///   of this gate. That is a judgement call about what a hole signals, not a frequency claim, and
-    ///   not a wall.
+    ///   **Why `skipped` is the one bucket exempt.** Not because it is rarer: #762's motivating
+    ///   exhibit is a host holding 2 of 497 `.wtr` files, and no measured per-cause frequency exists
+    ///   here (this file has no baked `$ZONE_DIR` to run it against — left unmeasured, not assumed
+    ///   clean). What distinguishes them is what a hole SIGNALS. `no glb`/`no grid` mean the zone was
+    ///   never in scope — the routine shape of a `$ZONE_DIR` holding a caller-chosen subset.
+    ///   `unmeasured` means the zone WAS in scope and its paired `.wtr` failed, i.e. a broken
+    ///   delivery for a zone you asked for. Measured on `ZONES=akanon,crushbone` against real baked
+    ///   GLBs: akanon skipped for "no routable pairs" at zone 1 of 2, so gating `skipped` here would
+    ///   have killed the run before crushbone's 60 journeys. A judgement call about what a hole
+    ///   signals, not a frequency claim.
     ///
     /// **What an abort here costs (N4).** This panics mid-loop, so the zones AFTER `zone` are never
     /// opened and their holes are never seen: the message is a partial picture and names only the
@@ -1937,18 +1919,10 @@ fn corner_buffer_blast_radius() {
     // itself complete while any zone was dropped for any of the three reasons.
     let mut cover = WaterRollup::new();
     for zone in &zones {
-        // #807: `open_corpus_zone` owns ALL THREE of this loop's zone-abandoning drop paths — no
-        // baked `.glb`, an empty collision grid, a `.wtr` that did not load — and accounts for each
-        // of them on `cover` before it returns. `cover.add(...)` at the bottom of the body closes
-        // the zone; anything that leaves the body without reaching it is recorded as `unaccounted`
-        // by the rollup itself. Before this, only the third was refused: the first two were bare
-        // `continue`s that touched no ledger, so a host missing one zone's glb printed a clean
-        // TOTAL over a smaller corpus than the one this test names.
-        //
-        // Water matters here even though this is not a water corpus: it is this corpus' PAIR FILTER
-        // (`in_water(s) || in_water(g) → skip`). With no region map the filter silently passes
-        // everything and wet pairs get scored as dry land, so the table would describe a different
-        // corpus than the one it names — the zone is UNMEASURED, never a zone with no water (#762).
+        // #807 corpus prologue: `open_corpus_zone` owns all three zone-abandoning drop paths and
+        // accounts for each on `cover` — see the first corpus loop in this file for why a bare
+        // `continue` made the totals read as complete, and why the region map matters to the pair
+        // filter even in a dry corpus.
         let (col, zw) = match open_corpus_zone(&mut cover, std::path::Path::new(&dir), zone, 32.0) {
             Ok(ready) => ready,
             Err(why) => { println!("{zone:<12} ({why})"); continue }
@@ -2117,18 +2091,10 @@ fn descent_guard_blast_radius() {
     // itself complete while any zone was dropped for any of the three reasons.
     let mut cover = WaterRollup::new();
     for zone in &zones {
-        // #807: `open_corpus_zone` owns ALL THREE of this loop's zone-abandoning drop paths — no
-        // baked `.glb`, an empty collision grid, a `.wtr` that did not load — and accounts for each
-        // of them on `cover` before it returns. `cover.add(...)` at the bottom of the body closes
-        // the zone; anything that leaves the body without reaching it is recorded as `unaccounted`
-        // by the rollup itself. Before this, only the third was refused: the first two were bare
-        // `continue`s that touched no ledger, so a host missing one zone's glb printed a clean
-        // TOTAL over a smaller corpus than the one this test names.
-        //
-        // Water matters here even though this is not a water corpus: it is this corpus' PAIR FILTER
-        // (`in_water(s) || in_water(g) → skip`). With no region map the filter silently passes
-        // everything and wet pairs get scored as dry land, so the table would describe a different
-        // corpus than the one it names — the zone is UNMEASURED, never a zone with no water (#762).
+        // #807 corpus prologue: `open_corpus_zone` owns all three zone-abandoning drop paths and
+        // accounts for each on `cover` — see the first corpus loop in this file for why a bare
+        // `continue` made the totals read as complete, and why the region map matters to the pair
+        // filter even in a dry corpus.
         let (col, zw) = match open_corpus_zone(&mut cover, std::path::Path::new(&dir), zone, 32.0) {
             Ok(ready) => ready,
             Err(why) => { println!("{zone:<12} ({why})"); continue }
@@ -2278,18 +2244,10 @@ fn parallel_wall_clearance_blast_radius() {
     // itself complete while any zone was dropped for any of the three reasons.
     let mut cover = WaterRollup::new();
     for zone in &zones {
-        // #807: `open_corpus_zone` owns ALL THREE of this loop's zone-abandoning drop paths — no
-        // baked `.glb`, an empty collision grid, a `.wtr` that did not load — and accounts for each
-        // of them on `cover` before it returns. `cover.add(...)` at the bottom of the body closes
-        // the zone; anything that leaves the body without reaching it is recorded as `unaccounted`
-        // by the rollup itself. Before this, only the third was refused: the first two were bare
-        // `continue`s that touched no ledger, so a host missing one zone's glb printed a clean
-        // TOTAL over a smaller corpus than the one this test names.
-        //
-        // Water matters here even though this is not a water corpus: it is this corpus' PAIR FILTER
-        // (`in_water(s) || in_water(g) → skip`). With no region map the filter silently passes
-        // everything and wet pairs get scored as dry land, so the table would describe a different
-        // corpus than the one it names — the zone is UNMEASURED, never a zone with no water (#762).
+        // #807 corpus prologue: `open_corpus_zone` owns all three zone-abandoning drop paths and
+        // accounts for each on `cover` — see the first corpus loop in this file for why a bare
+        // `continue` made the totals read as complete, and why the region map matters to the pair
+        // filter even in a dry corpus.
         let (col, zw) = match open_corpus_zone(&mut cover, std::path::Path::new(&dir), zone, 32.0) {
             Ok(ready) => ready,
             Err(why) => { println!("{zone:<12} ({why})"); continue }
