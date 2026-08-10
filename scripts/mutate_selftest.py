@@ -33,10 +33,15 @@ the real command-line entry point against it:
      claimed three barriers and missed these two
  13  CARGO_TERM_QUIET=true, where cargo omits the `Finished` line entirely -> UNUSABLE, which
      cannot be declared in a spec and always fails the run, rather than a silent all-INVALID table
- 14  the self-test's own check accounting: a case whose body stops running must be caught by the
-     count, not by anyone noticing. Reach control for the 100+ checks above
+ 14  the self-test's own accounting: a case whose body stops running must be caught by the count,
+     not by anyone noticing; and the scan that checks the case table for completeness must itself
+     be checked for completeness, by NAME. Reach control for every case above, and for itself
+ 15  an independent reviewer's TWO-edit composition against `verdict_from_proof`, replayed: it must
+     raise rather than reach a verdict, for a log shape cargo never produces
+ 16  a RED may not name a test that PASSED: under `--nocapture` libtest interleaves a test's own
+     stdout into its stream, so a passing test can print a perfectly shaped failure line
 
-Cases 8-10 and 12 mutate a COPY of `scripts/mutate.py` using the harness's own edit engine.
+Cases 8-10, 12, 15 and 16 mutate a COPY of `scripts/mutate.py` using the harness's own edit engine.
 Nothing in this file writes to a tracked path.
 """
 
@@ -561,6 +566,20 @@ def load_module(path: Path, name: str):
 CASE_FN_RE = re.compile(r"^case_(\d+)_")
 
 
+def scan_case_functions(namespace: dict) -> dict:
+    """The ONLY scan over a namespace for `case_<n>_*` callables. Returns them by name.
+
+    Deliberately the single scanner, so there is exactly one place that can stop early and exactly
+    one place whose output has to be checked for completeness. Callers must not re-walk a namespace
+    themselves: a second walk is a second blind spot.
+    """
+    found = {}
+    for name, obj in sorted(namespace.items()):
+        if CASE_FN_RE.match(name) and callable(obj):
+            found[name] = obj
+    return found
+
+
 def case_table_problems(namespace: dict, cases) -> list[str]:
     """Every module-level `case_<n>_*` function must appear in CASES, under its own number.
 
@@ -570,21 +589,41 @@ def case_table_problems(namespace: dict, cases) -> list[str]:
     `EXPECTED_CHECKS`) and the run printed `SELF-TEST PASSED` with a smaller, unremarked case count.
     Deriving the table's completeness from the functions themselves means a dropped row leaves its
     function defined and undeclared, which is a failure — no one has to remember a number.
+
+    REACH CONTROL, and the reason this function reports two directions rather than one. The first
+    version of it was a source-scanning guard with no control over its own scan: an independent
+    reviewer truncated the loop to its first element (`sorted(namespace.items())[:1]`, ONE edit) and
+    the run still printed `SELF-TEST PASSED — 80 checks across 17 cases`, with this very check
+    printed as `[PASS]` while the scan had examined a single name. That is issue #778's shape
+    verbatim — a scanner that stops early is indistinguishable from a clean run — and it was
+    re-instantiated by the fix written to close the same class one level up.
+
+    So the examined SET is compared against the declared SET, in both directions. A count would not
+    do: a count can be satisfied by the wrong members, and only names settle a membership claim.
     """
-    declared = {fn: number for number, _title, fn, _expected in cases}
+    declared_by_fn = {fn: number for number, _title, fn, _expected in cases}
+    declared_names = {fn.__name__ for _number, _title, fn, _expected in cases}
+    found = scan_case_functions(namespace)
     problems: list[str] = []
-    for name, obj in sorted(namespace.items()):
-        match = CASE_FN_RE.match(name)
-        if match is None or not callable(obj):
-            continue
-        if obj not in declared:
+
+    never_examined = sorted(declared_names - set(found))
+    if never_examined:
+        problems.append(
+            f"the scan examined {len(found)} case function(s), but CASES declares "
+            f"{len(declared_names)} and these were never examined: {', '.join(never_examined)} — a "
+            "source scan that stops early is indistinguishable from a clean one (#778), so the "
+            "examined set is compared against the declared set by NAME, not counted"
+        )
+
+    for name, obj in found.items():
+        if obj not in declared_by_fn:
             problems.append(
                 f"{name} is defined but does not appear in CASES — a case that is not in the "
                 "table never runs, and nothing else would say so"
             )
-        elif declared[obj] != int(match.group(1)):
+        elif declared_by_fn[obj] != int(CASE_FN_RE.match(name).group(1)):
             problems.append(
-                f"{name} is declared in CASES as case {declared[obj]} — the number in the "
+                f"{name} is declared in CASES as case {declared_by_fn[obj]} — the number in the "
                 "function name and the number in the table disagree"
             )
     return problems
@@ -961,21 +1000,39 @@ def case_14_check_accounting(ctx: Ctx, c: Checker) -> None:
         sum(expected for *_, expected in CASES) == EXPECTED_CHECKS,
         f"table sum {sum(expected for *_, expected in CASES)} vs EXPECTED_CHECKS {EXPECTED_CHECKS}",
     )
-    # And the table itself is derived from the case functions, not maintained beside them.
+    # And the table itself is derived from the case functions, not maintained beside them. The
+    # three checks below all live OUTSIDE the window a truncated scan would still see: each one
+    # fails under the reviewer's one-edit `sorted(namespace.items())[:1]`, which the first version
+    # of this probe survived because it passed a single-entry namespace.
+    declared_names = {fn.__name__ for _n, _t, fn, _e in CASES}
+    examined_names = set(scan_case_functions(globals()))
     c.check(
-        "case 14 control: every case_<n>_* function this module defines is in CASES",
-        case_table_problems(globals(), CASES) == [],
-        "; ".join(case_table_problems(globals(), CASES)),
+        "case 14 control: the scan's examined SET equals the set CASES declares",
+        examined_names == declared_names,
+        f"examined-only {sorted(examined_names - declared_names)}, "
+        f"declared-only {sorted(declared_names - examined_names)}",
     )
 
     def case_93_orphan(_ctx: Ctx, ch: Checker) -> None:
         ch.check("fake: orphan", True)
 
-    orphan_problems = case_table_problems({"case_93_orphan": case_93_orphan}, CASES)
+    # The orphan is added to the REAL namespace, not scanned alone: `case_93_orphan` sorts last
+    # among the case functions, so a scan that stops early never reaches it and this check fails.
+    orphan_problems = case_table_problems({**globals(), "case_93_orphan": case_93_orphan}, CASES)
     c.check(
         "case 14: a case function missing from the table is caught by introspection",
         len(orphan_problems) == 1 and "case_93_orphan" in orphan_problems[0],
-        orphan_problems[0] if orphan_problems else "<no problem reported>",
+        "; ".join(orphan_problems) if orphan_problems else "<no problem reported>",
+    )
+
+    victim = sorted(declared_names)[0]
+    missed_problems = case_table_problems(
+        {name: obj for name, obj in globals().items() if name != victim}, CASES
+    )
+    c.check(
+        "case 14: a declared case the scan never examined is caught by name, not by count",
+        len(missed_problems) == 1 and f"never examined: {victim} —" in missed_problems[0],
+        "; ".join(missed_problems) if missed_problems else "<no problem reported>",
     )
 
 
@@ -1093,7 +1150,7 @@ CASES: tuple[tuple[int, str, object, int], ...] = (
     (11, "a colourising cargo (CARGO_TERM_COLOR=always) still scores RED", case_11_colour, 5),
     (12, "harness self-mutant: the TWO one-edit paths to a false RED", case_12_one_edit_paths, 6),
     (13, "CARGO_TERM_QUIET=true — no sentinel at all — scores UNUSABLE", case_13_quiet, 4),
-    (14, "the self-test's own check accounting", case_14_check_accounting, 5),
+    (14, "the self-test's own check accounting", case_14_check_accounting, 6),
     (15, "harness self-mutant: a reviewer's TWO-edit composition, replayed",
      case_15_two_edit_composition, 6),
     (16, "a RED may not name a test that passed (--nocapture interleaving)",
@@ -1104,7 +1161,7 @@ CASES: tuple[tuple[int, str, object, int], ...] = (
 # Update it deliberately when adding a case — that is the point. Dropping a case row does NOT get
 # you a quiet pass by editing this number as well: `case_table_problems` derives the table's
 # completeness from the case functions themselves.
-EXPECTED_CHECKS = 80
+EXPECTED_CHECKS = 81
 
 
 def run_cases(cases, ctx: Ctx, c: Checker, announce: bool = True) -> list[str]:

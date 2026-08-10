@@ -81,20 +81,26 @@ Where the guards actually are, counted by mutating the file rather than by readi
   `--self-test` **case 0**, which asserts that plain cargo output is recognised *and* that a
   compile-error log yields no proof; case 12 applies both one-edit mutants and shows case 0 failing
   on each.
-* **Downstream** of that decision, three guards must all be removed before the same thing happens:
-  the `proof is None` gate, the type assertion inside `verdict_from_proof`, and that function's read
-  of the proof line. Wrapping the gate alone turns an `INVALID` into a loud crash, never a verdict —
-  cases 8 and 9.
+* **Downstream** of that decision sit three guards — the `proof is None` gate, the type assertion
+  inside `verdict_from_proof`, and that function's read of the proof line — and each one is
+  **reached**: removing it changes what the harness prints. Wrapping the gate alone turns an
+  `INVALID` into a loud crash, never a verdict (cases 8 and 9); removing the gate *and* the type
+  assertion together still raises rather than reporting, whatever shape the log has, because the
+  proof is read before any branching (case 15).
 
-That downstream count holds for **any** log shape only because `verdict_from_proof` reads the proof
-before it branches, and it says so in a comment. It did not always. An independent reviewer mutated
-the file and measured a **two**-edit path: with a `[run] command` that is not cargo, a log can carry
-libtest-shaped failure lines and no sentinel, and the killers branch used to return before anything
-touched the proof — so the gate plus the type assertion were enough to print
-``RED | killed by `tests::is_seven` `` and **exit 0** for a run that built nothing. The fix was to
-move the read above the branches rather than to qualify the sentence; **case 15** replays that exact
-two-edit composition, pins that it now raises, and pins that a third edit is still required to reach
-the false `RED`.
+**No minimum edit count is claimed here, and two earlier versions of this section claimed one.** The
+first said three guards, full stop. An independent reviewer mutated the file and measured **two**:
+with a `[run] command` that is not cargo, a log can carry libtest-shaped failure lines and no
+sentinel, and the killers branch used to return before anything touched the proof — so the gate plus
+the type assertion printed ``RED | killed by `tests::is_seven` `` and **exit 0** for a run that built
+nothing. The read was moved above the branches rather than the sentence qualified, and **case 15**
+replays that composition. The same reviewer then falsified the repaired sentence too, with **one**
+edit somewhere else entirely — `return INVALID` → `return RED` in `score_run`. Measured on that
+mutant rather than taken on report: exactly three checks fail and all three are **case 4's**; cases
+13 and 15 pass, because neither run reaches the `INVALID` branch at all. One case catches it, which
+is enough. An edit count is a predicate over the whole mutable file: the next commit that adds a
+branch falsifies it and nothing re-checks it, so the claim is narrowed to reached-ness, which
+`--self-test` does re-check.
 
 If a future cargo changes the wording of that line, `--self-test` fails loudly: its `RED` and
 `GREEN` cases would stop matching their declared expectations.
@@ -214,7 +220,7 @@ point against it. It exercises the failure modes, not just a happy path:
 | 11 | a real run against a cargo told to colourise (`CARGO_TERM_COLOR=always`) | still `RED`, not `INVALID` |
 | 12 | the two **one-edit** paths to a false `RED` | both really do produce one, and case 0's assertions fail on both |
 | 13 | `CARGO_TERM_QUIET=true`, where cargo omits the `Finished` line | `UNUSABLE`, and the run fails |
-| 14 | the self-test's own check accounting | a case whose body stops running is caught by the count, and a case function missing from the table is caught by introspection |
+| 14 | the self-test's own accounting, and the scan that checks it | a case whose body stops running is caught by the count; a case function missing from the table is caught by introspection; and a scan that stops early is caught by comparing the examined **set** against the declared set, by name |
 | 15 | the gate and the type assertion wrapped away, against a `[run] command` that builds nothing | the two-edit composition **raises**; a third edit is still required before a false `RED` is printed |
 | 16 | `--nocapture --test-threads=1`, where a passing test prints a libtest-shaped decoy | still `RED`, and the evidence names **no** test rather than the innocent one |
 
@@ -241,6 +247,19 @@ dropped in two coordinated edits — the row itself, and the constant — which 
 proves the two one-edit false-`RED` paths are caught. Every module-level `case_<n>_*` function must
 now appear in `CASES` under its own number, so a dropped row leaves its function defined and
 undeclared, and that is a failure no one has to remember a number to catch.
+
+**And that derivation needed a reach control of its own**, because it is a source-scanning guard,
+and a scanner that stops early is indistinguishable from a clean run — issue #778's shape. The
+first version had none: an independent reviewer truncated the scan to its first element in **one**
+edit (`sorted(namespace.items())[:1]`) and the run still printed `SELF-TEST PASSED — 80 checks
+across 17 cases`, with the completeness check itself printed as `[PASS]` while the scan had examined
+a single name. Two further edits then dropped a case silently again. A fix for a completeness
+problem that has no completeness check is the same bug one level down. So the scan lives in one
+function, `scan_case_functions`, and its examined **set** is compared against the set `CASES`
+declares, **by name in both directions** — a count would not do, because a count can be satisfied by
+the wrong members. Case 14's three probes for this are built on the *real* namespace rather than a
+one-entry fake, so they sit outside the window a truncated scan can still see: measured, the
+reviewer's single edit now fails all three and the run exits 1.
 
 It runs in CI alongside the other guards. It is not cheap — it shells out to cargo for every case
 that needs a real build — so it lives in the `test` job, next to cargo, rather than in the

@@ -41,19 +41,27 @@ the case numbers below are what each claim rests on:
     ONE edit to either — wrapping the `return None` away, or changing the pattern to something a
     compile-error log contains — is enough to print a never-compiled mutant as RED (case 12). What
     stops that is case 0, which fails on both mutants.
-  * DOWNSTREAM of that decision, three guards must ALL be removed before the same thing happens:
-    the `proof is None` gate, the type assertion inside `verdict_from_proof`, and that function's
-    read of the proof line. Wrapping the gate alone turns an INVALID into a loud crash, never a
-    verdict (cases 8 and 9), and the two-edit composition raises rather than reporting (case 15).
+  * DOWNSTREAM of that decision sit three guards — the `proof is None` gate, the type assertion
+    inside `verdict_from_proof`, and that function's read of the proof line — and each one is
+    REACHED, which is the only property the self-test can keep true: removing it changes what the
+    harness prints. Wrapping the gate alone turns an INVALID into a loud crash, never a verdict
+    (cases 8 and 9). Removing the gate AND the type assertion together still raises rather than
+    reporting, whatever shape the log has, because the proof is read before any branching
+    (case 15).
 
-The downstream claim holds for ANY log shape only because `verdict_from_proof` reads the proof
-before it branches. It did not always: with that read inside the branches, a log carrying
-libtest-shaped failure lines but no sentinel needed only TWO edits — gate plus type assertion — to
-print `RED | killed by <test>` and exit 0 for a run that built nothing, because the killers branch
-returned before anything touched the proof. That was found by an independent reviewer mutating this
-file, after a previous version of this docstring asserted the three-guard claim was "the whole
-enumeration". Case 15 replays that exact two-edit composition and pins that it now raises; the
-sentence above is true because the structure was changed to make it true, not the other way round.
+NOTHING HERE CLAIMS A MINIMUM EDIT COUNT, and two earlier versions of this docstring did. The
+first said three guards, full stop; an independent reviewer measured TWO — with the proof read
+inside the branches, a log carrying libtest-shaped failure lines but no sentinel let the killers
+branch return before anything touched the proof, so gate plus type assertion printed
+`RED | killed by <test>` and exited 0 for a run that built nothing. The read was moved above the
+branches rather than the sentence qualified, and case 15 replays that composition. The same
+reviewer then falsified the repaired sentence too, with ONE edit somewhere else entirely:
+`return INVALID` → `return RED` in `score_run`. MEASURED on that mutant, because the count of
+catching cases was quoted to me and a quoted figure becomes the quoter's claim — exactly THREE
+checks fail and all three are case 4's; cases 13 and 15 pass, since neither run reaches the INVALID
+branch. One case catches it, and that is enough. An edit count is a
+predicate over the whole mutable file: the next commit that adds a branch falsifies it, and nothing
+re-checks it. So the claim is narrowed to reached-ness, which the self-test does re-check.
 
 SAFETY RULES BAKED IN
 ---------------------
@@ -666,6 +674,12 @@ def main(argv: list[str]) -> int:
         if args.self_test:
             # The self-test lives beside this file so the honesty-critical logic above stays
             # readable. It is only ever imported on this path.
+            #
+            # Suppress the bytecode write BEFORE the import. Otherwise CPython creates
+            # `scripts/__pycache__/`, and this repo has a source-scanning guard that walks the
+            # repo root and would descend into it — a directory this harness created. A guard's
+            # corpus should not depend on whether someone has run the harness.
+            sys.dont_write_bytecode = True
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             from mutate_selftest import self_test
 
