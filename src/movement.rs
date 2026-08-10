@@ -31,10 +31,11 @@ use eqoxide_core::physics::GRAVITY;
 
 /// Skin width kept between the cylinder and the surface after a swept hit.
 const SKIN: f32 = 0.05;
-/// Ground-probe origin above the feet.
-const GROUND_ORIGIN: f32 = 1.0;
-/// Ground-probe downward range.
-const GROUND_DEPTH: f32 = 200.0;
+// The ground-probe geometry moved DOWN into `eqoxide-nav::collision` (#885) so that
+// `Collision::body_placement` — the ONE definition of "can a body be placed here", read by
+// `is_embedded` below AND by the published `/v1/observe/nav_debug` clearance probe — is stated
+// once. Imported under the same names, so every use site in this module is unchanged.
+use eqoxide_nav::collision::{GROUND_DEPTH, GROUND_ORIGIN};
 const MAX_FALL: f32 = 128.0;
 
 /// Vertical impulse for a nav auto-hop over a low fence/cart rail. Peak height = v²/(2·GRAVITY);
@@ -98,6 +99,10 @@ const HOLD_LOG_SECS: f32 = 5.0;
 const PUSHOUT_RADII: [f32; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 /// Directions sampled per push-out ring.
 const PUSHOUT_DIRS: usize = 16;
+/// The placement test's ring is half this, and lives in nav now (#885). Static-asserted rather than
+/// re-derived, so a change to either number is a compile error and not a silent divergence between
+/// what the controller refuses and what the diagnostic reports.
+const _: () = assert!(PUSHOUT_DIRS / 2 == eqoxide_nav::collision::PLACEMENT_RING_DIRS);
 
 /// #845 — reach of the LAST-RESORT placement search ([`nearest_standing_place`]), in units.
 ///
@@ -299,9 +304,14 @@ fn body_in_water(col: &Collision, p: [f32; 3]) -> bool {
 /// The `floor.is_none()` half is how that happened — a swimmer in deep water with a CLEAR footprint
 /// and no floor within `GROUND_DEPTH` below is "embedded" by this predicate, and every ring candidate
 /// around it is equally so.
+///
+/// #885 moved the disjunction itself DOWN to [`Collision::body_placement`], which names the two
+/// halves instead of or-ing them into a bool. This function is now a thin read of that verdict, and
+/// so is `/v1/observe/nav_debug`'s `clearance.body` — one predicate, two readers. Before, the
+/// diagnostic never asked this question at all and published "open in every direction" for a body
+/// this function was returning `true` for.
 fn is_embedded(col: &Collision, p: [f32; 3]) -> bool {
-    !col.footprint_clear(p[0], p[1], p[2], PLAYER_RADIUS, PUSHOUT_DIRS / 2)
-        || col.ground_below(p[0], p[1], p[2] + GROUND_ORIGIN, GROUND_DEPTH).is_none()
+    col.body_placement(p).is_embedded()
 }
 
 /// #845 — **the nearest place in THIS zone where this body could legally stand**, or `None` if the

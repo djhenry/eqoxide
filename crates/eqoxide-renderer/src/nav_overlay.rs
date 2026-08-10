@@ -194,13 +194,19 @@ pub fn live_vertices(snap: &NavDebugSnapshot) -> Vec<OverlayVertex> {
     //    really taken, which may lag the player by a few ticks): wall spokes shaded by distance
     //    (red = wall at touch range, green = roomy), and the footprint ring per direction.
     if let Some(c) = &snap.clearance {
+        // #885: the probe's vertical now lives on its `anchor`, because it is not always a floor.
+        // The overlay draws from wherever the rays were actually cast, which is `anchor.z()` —
+        // exactly the value the old `at[2]` held, so the geometry drawn is unchanged.
+        let az = c.anchor.z();
         let n = c.wall_spokes.len().max(1);
-        for (i, &d) in c.wall_spokes.iter().enumerate() {
+        for (i, &s) in c.wall_spokes.iter().enumerate() {
             let a = (i as f32) / (n as f32) * std::f32::consts::TAU;
+            // A saturated spoke has no distance; it is drawn out to the cap, as before.
+            let d = s.draw_len(c.cap);
             let t = (d / c.cap).clamp(0.0, 1.0);
             let color = [1.0 - t * 0.8, t, 0.15, 0.85];
-            let from = lift([c.at[0], c.at[1], c.at[2] + 1.0]);
-            let to = lift([c.at[0] + a.cos() * d, c.at[1] + a.sin() * d, c.at[2] + 1.0]);
+            let from = lift([c.at[0], c.at[1], az + 1.0]);
+            let to = lift([c.at[0] + a.cos() * d, c.at[1] + a.sin() * d, az + 1.0]);
             push_line(&mut v, from, to, color);
         }
         let rn = c.footprint_ok.len().max(1);
@@ -208,7 +214,7 @@ pub fn live_vertices(snap: &NavDebugSnapshot) -> Vec<OverlayVertex> {
             let a0 = (i as f32) / (rn as f32) * std::f32::consts::TAU;
             let a1 = ((i as f32) + 1.0) / (rn as f32) * std::f32::consts::TAU;
             let color = if ok { COL_RING_OK } else { COL_RING_BLOCKED };
-            let z = c.at[2] + 0.6;
+            let z = az + 0.6;
             push_line(&mut v,
                 [c.at[0] + a0.cos() * c.footprint_radius, c.at[1] + a0.sin() * c.footprint_radius, z + Z_LIFT],
                 [c.at[0] + a1.cos() * c.footprint_radius, c.at[1] + a1.sin() * c.footprint_radius, z + Z_LIFT],

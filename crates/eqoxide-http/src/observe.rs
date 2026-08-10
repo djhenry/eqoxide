@@ -568,7 +568,14 @@ async fn get_nav_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                      are tier/anchor retries that lost. A call with truncated:true stopped RECORDING \
                      (not searching) at its edge budget. committed_coarse/committed_fine are the \
                      walker's actual committed routes, verbatim; player is null when the position \
-                     was unknown at publish time."));
+                     was unknown at publish time. clearance is TWO different questions, not one \
+                     (#885): clearance.body is the movement controller's own placement verdict at \
+                     the CHARACTER's position and is authoritative for whether it can move at all \
+                     (anything but \"placeable\" means it cannot); clearance.wall_spokes / \
+                     footprint_ok / field_* are the PLANNER's model sampled at clearance.anchor, \
+                     which may be a different height — compare anchor.z against \
+                     anchor.reference_z. A spoke reading of \"clear_to_cap\" is a LOWER BOUND \
+                     (nothing within cap), not a distance of cap."));
             }
             Json(v)
         }
