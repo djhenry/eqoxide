@@ -1875,9 +1875,12 @@ mod cursor_resync_tests {
         /// say so.
         const NOT_A_FN: &[(&str, &str)] = &[
             ("the_resync_clears_the_deadlock_above_the_guard_and_is_inert_below_it",
-             "a test renamed in round 3, quoted verbatim in this fn's own rustdoc (the round-4 \
-              dangling-citation paragraph) so the retracted name is preserved rather than deleted. \
-              Inherently unguardable."),
+             "a test renamed in round 3, quoted verbatim in the SIBLING guard \
+              `every_test_name_cited_in_a_doc_comment_still_exists`'s rustdoc — its round-4 \
+              dangling-citation paragraph — so the retracted name is preserved rather than \
+              deleted. NOT in this fn's own rustdoc: an earlier locator said the blockquote on \
+              `CURSOR_STALE_DIST` and a later one said this fn, and both were wrong. Inherently \
+              unguardable."),
             ("open_air_ceiling_is_never_returned_as_floor",
              "a fixture RETRACTED at PR-D/D-2 and deleted; the doc that names it IS its retraction \
               note."),
@@ -3276,7 +3279,7 @@ mod cursor_resync_tests {
                  (collapse-only trigger ticks: {c})");
         }
         for (sep, w, t, c) in &rows {
-            // "carrot-pinned", NOT "wedged" — see the correction block on this test.
+            // "carrot-pinned", NOT "wedged" — see this test's THE LIMIT paragraph.
             assert_eq!(*w, 0,
                 "carrot pinning must be cleared at {sep} u separation, got {w}/{t} carrot-pinned");
             if *sep < CURSOR_STALE_DIST {
