@@ -1168,36 +1168,59 @@ use eqoxide_ipc::MoveIntent;
     ///   extracts is a TEST NAME — a backticked run of lowercase, digits, `_` and `:` carrying at
     ///   least three underscores — so a `file.rs:` line reference is not a degraded input to it, it
     ///   is not an input at all. That scan's green result has never meant anything about a line
-    ///   number. Both gaps are filed as #959 and are not addressed here;
+    ///   number. #959 is the home for both, alongside a third axis it also carries — the scan's
+    ///   corpus is five files — which does not bite here, since `tests/walker_sim.rs` is one of the
+    ///   five. This PR does not widen `doc_citations`: it adds a hand-written anchor list BESIDE
+    ///   that scan, so the `///`/`//!` prefix test survives this change untouched and #959 stays
+    ///   its only home;
     /// * **the hand-written list has already been wrong once.** #919's first revision carried five
     ///   anchors, because the citations were enumerated with a single regex over one spelling —
-    ///   `file.rs:` followed by a digit. Review found two more citations into `walker.rs` in this
-    ///   very file that no such regex can match: one naming a design-document section, one naming a
-    ///   bare `const`. Both are anchored below. Enumerate the CONCEPT, not one of its spellings;
+    ///   `file.rs:` followed by a digit. Three more citations into `walker.rs` live in this very
+    ///   file and no such regex can match any of them: a design-document section, a private `const`
+    ///   restated by value, and a `pub(crate) const` whose definition a `//` paragraph discloses.
+    ///   All three are anchored below, and the count is why the lesson is worth keeping — review
+    ///   found the first two, and the third survived the widening pass that added them, turning up
+    ///   only on a later re-read. Enumerate the CONCEPT, not one of its spellings;
     /// * it covers `walker.rs` only. Nothing here claims anything about citations into any other
     ///   file, in this test file or elsewhere;
     /// * it pins TEXT, not reachability. A phrase can be present and unreached (#799); a WRAP
     ///   mutation that leaves the anchored branch written but dead passes this test, by execution.
     ///
-    /// **Reach control, and what it can and cannot see.** #778's source scanner silently covered
-    /// about an eighth of its corpus, and all twelve mutation probes aimed at it sat inside the
-    /// window it could still see, so twelve green cells proved nothing. So the unit counted here is
-    /// the COMPARISON, not the line: the counter moves once per (line, anchor) pair, in the same
-    /// statement sequence that tests the anchor, and is checked against `lines × anchors` derived
-    /// separately. A scan that walks the whole file while comparing only part of it fails.
+    /// **Reach control: there is no counter, because a counter kept losing.** #778's source scanner
+    /// silently covered about an eighth of its corpus, and all twelve mutation probes aimed at it
+    /// sat inside the window it could still see, so twelve green cells proved nothing. Three
+    /// revisions of the control here tried to answer that with a tally, and the SAME 2100-line
+    /// ceiling mutant beat all three: counting lines ITERATED (it iterated everything and compared
+    /// a prefix); counting inside the matching CALL (the call still ran on every line — the
+    /// comparison inside it was what got skipped); and one increment per (line, anchor) pair, which
+    /// review defeated by leaving the increment exactly where it was and wrapping only the
+    /// comparison next to it, 60.9% of the file counted and never compared, GREEN. The lesson is
+    /// structural: a tally maintained ALONGSIDE the work can always be separated from the work.
     ///
-    /// That took three attempts, which is the finding worth keeping. Counting lines ITERATED was
-    /// defeated by a mutant that iterated everything and compared the first 2100 lines. Moving the
-    /// counter into the same CALL as the match was defeated by the SAME mutant, because the call
-    /// still ran on every line — it was the comparison inside it that was skipped. A reach counter
-    /// is only sound at the granularity of the work it claims.
+    /// So the tally is now an OUTPUT of the work. The scan produces one `probe::Verdict` per
+    /// (line, anchor) pair and records nothing else; `Verdict`'s fields are private to its module,
+    /// so the only way to obtain one is `Verdict::test`, which performs `hay.contains(needle)` and
+    /// records a digest of both strings it was handed. The control then checks that sequence of
+    /// (haystack, needle) digests, pairwise and in order, against one derived by an independent
+    /// second traversal, BEFORE any anchor verdict is read. A comparison that is skipped leaves no
+    /// verdict, so the sequence is short; a comparison fed substituted input — an empty line, a
+    /// needle that is not the anchor — leaves a verdict whose digests disagree. Every entry is
+    /// therefore evidence that THIS line was tested against THAT anchor, rather than a number
+    /// asserting it.
     ///
     /// Its limits, stated rather than discovered a round later:
     ///
-    /// * on unmutated code the equality is IDENTICALLY TRUE and can only fire on an edit to this
-    ///   loop. That is deliberate — an edit to this loop is where #778's defect class lives — but it
-    ///   is evidence about this scanner and no other. A mutant that moves the counter itself, rather
-    ///   than the comparison, defeats it; nothing short of a type can stop that;
+    /// * it proves each comparison was REACHED with the right two strings. It cannot prove the
+    ///   comparison was HONEST. Measured, not reasoned: the same 2100-comparison ceiling moved
+    ///   INSIDE `Verdict::test` — behind a static counter, still digesting both inputs, returning a
+    ///   fabricated `false` past the ceiling — is GREEN. No tally of any design can distinguish a
+    ///   fabricated miss from a real one; what has changed is that the escape is now an edit to the
+    ///   instrument, not an edit to the scan, and the scan can no longer skip a comparison at all.
+    ///   Fabricating a `Verdict` outside `probe` does not compile (`error[E0451]`, private fields),
+    ///   which is measured too — as an INVALID row, not a pass;
+    /// * like any reach control it is satisfied trivially by unmutated code and fires only on an
+    ///   edit to this scan. That is deliberate — this scan is where #778's defect class lives — but
+    ///   it is evidence about this scanner and no other;
     /// * the `>= 1000` floor is a corpus-PRESENCE check ("the tree is where this test thinks it
     ///   is"), not an anchor-reach check. It sits below the first anchor, so on its own it would
     ///   admit a scan that found no anchor at all; the per-anchor verdicts are what refuse that;
@@ -1225,7 +1248,8 @@ use eqoxide_ipc::MoveIntent;
              "the downhill-backoff branch this file's backoff loop mirrors"),
             ("want_swim: false,",
              "that branch's unconditional non-swim wish"),
-            // The two the first revision's regex could not see (#919 review, non-blocking 6).
+            // The three the first revision's regex could not see: review found the first two
+            // (#919 review, non-blocking 6), the third turned up on a re-read afterwards.
             ("pub(crate) const STEER_LOS_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS;",
              "the clearance this file's resync comment discloses as equal to PLAYER_RADIUS only by \
               coincidence — the whole disclosure is void if this definition changes"),
@@ -1241,33 +1265,87 @@ use eqoxide_ipc::MoveIntent;
         // re-aligning a struct literal, but not the code being renamed or deleted.
         let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        // Reach is counted BY the comparison, not beside it: `comparisons` moves in the same
-        // statement sequence that tests an anchor, once per (line, anchor) pair, and is checked
-        // against a total derived independently below. A scan that iterates the file but skips the
-        // anchor test — a line ceiling, a skipped prefix, a parity, a region — loses exactly those
-        // comparisons and fails. (#919 review B3: the first revision counted lines ITERATED, so a
-        // mutant that compared only the first 2100 of 5340 lines passed GREEN with the rest never
-        // tested; a second revision moved the counter into the same CALL as the match, and the same
-        // mutant, re-run, passed GREEN again — the call is not the comparison. This is the third.)
-        let mut hits = vec![0usize; ANCHORS.len()];
-        let mut comparisons = 0usize;
+        // ── the instrument ──
+        //
+        // There is no reach COUNTER here, on purpose. Three revisions of this control kept one —
+        // lines iterated, then a count inside the matching call, then one increment per
+        // (line, anchor) pair — and the same 2100-line ceiling defeated all three, the last time by
+        // leaving `comparisons += 1;` exactly where it was and wrapping only the comparison beside
+        // it (#919 review, round 2: 60.9% of walker.rs counted, never compared, all eight anchors
+        // still found, GREEN). Any tally maintained ALONGSIDE the work can be separated from the
+        // work; the fix is to make the tally an OUTPUT of the work.
+        //
+        // So the scan's only product is one `Verdict` per (line, anchor) pair, and a `Verdict` can
+        // only be obtained by performing that comparison: the fields are private to `probe`, whose
+        // single constructor runs `hay.contains(needle)` and records a digest of both strings it was
+        // handed. A comparison that is skipped leaves NO verdict (the sequence comes up short); a
+        // comparison performed on substituted input leaves a verdict whose digests do not match.
+        mod probe {
+            /// The result of one anchor comparison. Fields are private, so the scan below cannot
+            /// fabricate one — the only way to obtain a `Verdict` is to run [`Verdict::test`].
+            pub struct Verdict { hit: bool, hay: u64, needle: u64 }
+
+            impl Verdict {
+                pub fn test(hay: &str, needle: &str) -> Verdict {
+                    Verdict { hit: hay.contains(needle), hay: digest(hay), needle: digest(needle) }
+                }
+                pub fn hit(&self) -> bool { self.hit }
+                /// What this verdict was computed FROM: `(digest(haystack), digest(needle))`.
+                pub fn inputs(&self) -> (u64, u64) { (self.hay, self.needle) }
+            }
+
+            /// FNV-1a, so a verdict can name its own two inputs in 16 bytes.
+            pub fn digest(s: &str) -> u64 {
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                for b in s.as_bytes() {
+                    h ^= u64::from(*b);
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                h
+            }
+        }
+
+        // The scan. Nothing is recorded but the verdicts themselves.
+        let mut verdicts: Vec<probe::Verdict> = Vec::new();
         for line in src.lines() {
             let n = norm(line);
-            for (i, (anchor, _)) in ANCHORS.iter().enumerate() {
-                comparisons += 1;
-                if n.contains(anchor) { hits[i] += 1; }
+            for (anchor, _) in ANCHORS.iter() {
+                verdicts.push(probe::Verdict::test(&n, anchor));
             }
         }
 
         // ── reach control, read BEFORE any anchor verdict ──
+        // What the scan must have compared, derived by a SECOND, independent traversal: one
+        // (haystack, needle) digest pair per (line, anchor), in order.
         let total_lines = src.lines().count();
-        let expected = total_lines * ANCHORS.len();
-        assert_eq!(comparisons, expected,
-            "the anchor match did not cover walker.rs: {comparisons} of {expected} (line, anchor) \
-             comparisons ran across {total_lines} lines. Every anchor verdict below is unsound.");
+        let mut expected: Vec<(u64, u64)> = Vec::new();
+        for line in src.lines() {
+            let hay = probe::digest(&norm(line));
+            for (anchor, _) in ANCHORS.iter() { expected.push((hay, probe::digest(anchor))); }
+        }
+        assert_eq!(expected.len(), total_lines * ANCHORS.len(),
+            "the reach control's own expectation is malformed: {} pairs for {total_lines} lines × \
+             {} anchors", expected.len(), ANCHORS.len());
+
+        let performed: Vec<(u64, u64)> = verdicts.iter().map(probe::Verdict::inputs).collect();
+        assert_eq!(performed.len(), expected.len(),
+            "the anchor match did not cover walker.rs: {} of {} (line, anchor) comparisons were \
+             performed across {total_lines} lines — the missing ones produced no verdict. Every \
+             anchor verdict below is unsound.", performed.len(), expected.len());
+        if let Some(k) = performed.iter().zip(&expected).position(|(a, b)| a != b) {
+            panic!("the anchor match ran on substituted input: comparison {k} — walker.rs line {}, \
+                    anchor #{} — was not performed on that line's text against that anchor. Every \
+                    anchor verdict below is unsound.", k / ANCHORS.len() + 1, k % ANCHORS.len());
+        }
+
         assert!(total_lines >= 1000,
             "walker.rs read as only {total_lines} lines; the source tree is not where this test \
              thinks it is, and the anchors would fail for the wrong reason");
+
+        // Anchor `i`'s verdicts are every `i`-th one, by the construction asserted above.
+        let hits: Vec<usize> = (0..ANCHORS.len())
+            .map(|i| verdicts.iter().skip(i).step_by(ANCHORS.len()).filter(|v| v.hit()).count())
+            .collect();
 
         let mut problems: Vec<String> = Vec::new();
         for (i, (anchor, claim)) in ANCHORS.iter().enumerate() {
