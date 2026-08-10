@@ -765,8 +765,10 @@ impl SpawnInfo {
     /// so. Read the set from the list above, not from the count: a *different* 13 — the
     /// non-agreed-on values other than the two placeholders (`level`, `npc`, `gender`, `race`,
     /// `body_type`, `stand_state`, `flymode`, `x`, `y`, `z`, `animation`, `equipment`,
-    /// `equipment_tint`) — is **RED**, 2025/2/50 plain, failing
-    /// `apply_wear_change_updates_one_slot` as well as the corpse test.
+    /// `equipment_tint`) — is **RED**, and with `npc` mutated to 0 it is 2025/2/50 plain, failing
+    /// `apply_wear_change_updates_one_slot` as well as the corpse test. The RED verdict holds
+    /// whatever alternates you pick; that exact figure and failure list do not, so they are quoted
+    /// with the alternate that produced them.
     ///
     /// This is a pre-existing gap the fixture concentrates rather than creates — the same 13
     /// values were previously hand-copied, unasserted, into nine literals — but it is real:
