@@ -911,36 +911,26 @@ macro_rules! controller_hold_reason {
 
 controller_hold_reason! {
 /// Why the render `CharacterController` is holding the body still — a predicament it cannot leave
-/// under its own power, and which no other published field reveals (#724 review, B1).
+/// under its own power, and which no other published field reveals (#724).
 ///
 /// Both variants are the SAME shape: a recovery path decided it must not let the body go where the
 /// physics was taking it, looked for a banked "last good" position to put it at instead, and found
-/// none. Before #724 the ring was almost never empty, so these branches were rare; #724 clears the
-/// ring on every position discontinuity, which makes an empty ring the NORMAL post-relocation state
-/// and these holds an ordinary outcome of a GM summon into rock.
+/// none. #724 clears the banked ring on every position discontinuity, which makes an empty ring the
+/// NORMAL post-relocation state and these holds an ordinary outcome of a GM summon into rock.
 ///
-/// ⚠️ AMENDED (#845), for `EmbeddedNoRecovery` ONLY. This doc used to continue "the frame then
-/// changes nothing and re-runs identically next frame, so the body is frozen until something
-/// external moves it". That was an accurate description of an ABSORBING state, which is what made
-/// the embedded branch a bug rather than a disclosure, and #845 removed it there: that branch now
-/// falls through to a zone-wide search for anywhere a body could stand before it raises a hold, so
-/// the hold means the ZONE has nowhere, not that this body has no memory. It is still a frozen body
-/// while it lasts, and it can still last indefinitely — what changed is when it is raised, not how
-/// it ends.
+/// For `EmbeddedNoRecovery` (#845) the hold means **the ZONE has nowhere to stand**, not that this
+/// body has no memory: that branch first falls through to a zone-wide search. It is not, however, a
+/// hold that clears itself — both directions were measured. A SUCCEEDING search never publishes this
+/// at all, because the search arm returns before the hold is raised (0 held frames of 300, in a zone
+/// the search solves); a hold that IS published does not clear on its own, because in a zone whose
+/// geometry does not change the once-a-second retry keeps failing for the same reason (1800 frames /
+/// 60 s, raised and never cleared). So a published hold is the signature of a FAILED search and it
+/// still takes something external to end it. See `movement.rs`'s `nearest_standing_place`; that
+/// nothing published marks the relocation is #925.
 ///
-/// ⚠️ Do not read the amendment as "these clear themselves now"; both directions were measured and
-/// both run the other way. A SUCCEEDING search never publishes this at all — the search arm returns
-/// before the hold is raised, so the relocation happens with the field `None` throughout (0 held
-/// frames of 300, in a zone the search solves). A hold that IS published does not clear on its own:
-/// in a zone whose geometry does not change, the once-a-second retry keeps failing for the same
-/// reason (1800 frames / 60 s, raised and never cleared). So a published hold is the signature of a
-/// FAILED search, and it still takes something external to end it. See `movement.rs`'s
-/// `nearest_standing_place`; that nothing published marks the relocation is #925.
-///
-/// The sentence still stands, unamended, for `UnderworldNoRecovery`. That branch was left alone on
-/// purpose: it runs after collide-and-slide, so lateral driver input still reaches the body and the
-/// state is not absorbing — see `last_resort_placement`'s doc for why extending the search there was
-/// reverted.
+/// `UnderworldNoRecovery` has no such search, on purpose: it runs after collide-and-slide, so
+/// lateral driver input still reaches the body and the state is not absorbing — see
+/// `last_resort_placement`'s doc for why extending the search there was reverted.
 ///
 /// This is deliberately NOT "am I stuck?" in general — a character walking into a wall is blocked
 /// and is not this. It is specifically "the controller has stopped the body and has no way to
@@ -1113,12 +1103,9 @@ pub struct GameState {
     ///     IS the position authority, so its published position is real by definition.
     ///   - the controller mirror in `ActionLoop::stream_position` (`action_loop.rs`) — the
     ///     controller's own PREDICTED position, on the normal (non-correction) path, once the
-    ///     controller has actually been placed in this zone. (An earlier version of this flag was
-    ///     keyed ONLY on self `OP_ClientUpdate`, which the server rarely sends — that made
-    ///     `distance` omitted ALWAYS instead of only while genuinely unknown; live E2E caught it.
-    ///     Setting it from the controller mirror too is deliberate, not a regression: the
-    ///     player_x/y/z doc above already establishes that these fields are legitimately
-    ///     controller-predicted, not exclusively server-authoritative.)
+    ///     controller has actually been placed in this zone. This one is deliberate, not a leak:
+    ///     keying the flag on self `OP_ClientUpdate` alone was measured live to omit `distance`
+    ///     ALWAYS rather than only while genuinely unknown, because the server rarely sends it.
     ///
     /// A genuine server correction inside `stream_position` hands the new position to the
     /// controller and returns WITHOUT setting this flag — within `stream_position`, it only flips
@@ -1162,14 +1149,10 @@ pub struct GameState {
     ///
     /// Cleared on the FIRST net-thread tick on which the standing probe finds the character off
     /// every zone-line region, and by [`GameState::begin_zone_in`] (region indices are a per-zone
-    /// namespace).
-    ///
-    /// *(An earlier revision of this doc said the probe only runs once per auto-cross cooldown, so
-    /// the terminal disclosure "can outlive the stand by up to one cooldown". That was true of the
-    /// code and understated it: the attempt that reaches the bound stamps the cooldown itself, so a
-    /// walk-off/walk-on shorter than the cooldown was sampled ON the line at both ends and cleared
-    /// nothing at all — the documented escape hatch did not work. The reset was hoisted out of the
-    /// cooldown guard in the #713 review round 2 (B2); see `ActionLoop::drain_zone_cross`.)*
+    /// namespace). That reset sits OUTSIDE the auto-cross cooldown guard on purpose: inside it, the
+    /// attempt that reaches the bound stamps the cooldown itself, so a walk-off/walk-on shorter than
+    /// the cooldown was sampled ON the line at both ends and cleared nothing at all. See
+    /// `ActionLoop::drain_zone_cross`.
     pub zone_cross_attempts: Option<crate::zone_cross::CrossAttempts>,
     /// #713 item 2 — what the most recently drained `POST /v1/move/zone_cross` decided to do, and
     /// in particular whether it degraded to the #683 best-effort fallback (walk to a line whose
@@ -1202,19 +1185,15 @@ pub struct GameState {
     ///    position beside an old predicament. The withdrawal is not the net thread inventing an
     ///    answer: the correction it just handed over is consumed by `CharacterController::teleport`,
     ///    which drops the hold and the afloat window UNCONDITIONALLY, on every path through it (the
-    ///    function is straight-line with no early return — "as its first act", written in round 2,
-    ///    was literally wrong and is retracted). So the withdrawal publishes the disclosure the
-    ///    controller itself holds the moment it adopts. It is not a promise about the render
-    ///    thread's next publication — a summon into geometry publishes `Some(..)` next frame, about
-    ///    the NEW position — and the argument that carries it is the direction: withdrawing can only
-    ///    lose a warning for a tick. Pinned, on BOTH halves of the pair since #846's round-2 review
-    ///    put a real matured `AfloatStall` into the fixture, by
+    ///    function is straight-line, with no early return). So the withdrawal publishes the
+    ///    disclosure the controller itself holds the moment it adopts. It is not a promise about the
+    ///    render thread's next publication — a summon into geometry publishes `Some(..)` next frame,
+    ///    about the NEW position — and the argument that carries it is the direction: withdrawing
+    ///    can only lose a warning for a tick. Pinned, on BOTH halves of the pair, by
     ///    `a_re_asserted_summon_never_pairs_a_fresh_pos_with_a_stale_hold_846` in `eqoxide-net`.
-    ///    (An earlier revision of this paragraph called the mismatch a ONE-tick, ~10 ms window. That
-    ///    was measured against a server asserting the correction once; against one that re-asserts
-    ///    it every tick while the render loop idles, it recurred on every other tick indefinitely —
-    ///    "until the render loop wakes" after all. The claim was wrong, not merely imprecise, so the
-    ///    branch was changed rather than the sentence.)
+    ///    Do NOT read the mismatch this closes as a bounded ~10 ms window: measured against a server
+    ///    that re-asserts the correction every tick while the render loop idles, it recurred on every
+    ///    other tick indefinitely, which is why the branch withdraws rather than waits.
     /// 2. **A zone-in.** [`GameState::begin_zone_in`] below clears this field on the net thread,
     ///    because a hold describes collision geometry the zone-in has just dropped. That clear only
     ///    works when it also reaches the `ControllerView` the mirror reads — see that method's doc
@@ -1614,42 +1593,26 @@ impl GameState {
         // distance from it must report an honest unknown until then, not a figure measured from
         // the old zone's numbers or the origin.
         self.player_pos_known = false;
-        // #543/#660 B2: a crossing marks the position PROVISIONAL (the advertised guess). When the
-        // crossing turned out to be a real zone change, we are now zoning in and the new zone's
-        // handshake will bring an authoritative position — the prior guess is moot, and the
-        // provisional state is `player_pos_known = false` (unknown), not "provisional guess". Clear
-        // the marker so it does not stick `true` across the reconnect (a false marker is as much a
-        // lie as a missing one — verified live that without this it stayed true in the new zone for
-        // 30s+ while `pos` was actually the correct zone-in point).
+        // #543/#660: a crossing marks the position PROVISIONAL (the advertised guess); once the
+        // crossing turns out to be a real zone change that guess is moot and the honest state is
+        // `player_pos_known = false`, not "provisional". Verified live that without this clear the
+        // marker stayed `true` in the new zone for 30s+ while `pos` was already correct.
         self.position_provisional_since = None;
-        // #713: both zone-cross bookkeeping facts are about the zone we are LEAVING. A zone-line
-        // region index is a per-zone namespace (index 0 is the universal unresolvable index), and
-        // an advertised destination zone id is only meaningful against the zone that advertised it
-        // — so carrying either across a crossing would make the client report the previous zone's
-        // attempt history / crossing plan as if it were this zone's. Same reasoning as the #683
-        // round-3 re-arm of the gated-refusal latch in `sync_zone_points`.
+        // #713: both zone-cross facts are about the zone we are LEAVING, and both key on per-zone
+        // namespaces (region index, advertised destination zone id). See their field docs.
         self.zone_cross_attempts = None;
         self.zone_cross_plan = None;
-        // #724 review B1: a hold describes the body's predicament in geometry that is about to be
-        // dropped. The controller stops being stepped while the new zone loads, so without this the
-        // last mirrored value would sit here — a confident "you are wedged" about a zone we have
-        // left — until the first frame after the new collision lands. Unknown, not false-positive.
+        // #724/#776/#801: a hold and an afloat stall both describe collision geometry — the stall
+        // by naming an ANCHOR in the departed zone's coordinate frame — that this zone-in drops.
         //
-        // #846 review B1: THIS CLEAR IS NOT SUFFICIENT ON ITS OWN, and could not be — the value it
-        // is racing lives in `ControllerView`, in a crate that sits above this one.
-        // `ActionLoop::stream_position` mirrors that view into this field on every ~10 ms net tick,
-        // unconditionally, so a caller that clears here and nowhere else gets the departed zone's
-        // hold back on the very next tick (measured). Net-thread callers must go through
-        // `eqoxide_ipc::ControllerSlots::begin_zone_in`, which pairs this with the view clear.
+        // ⚠️ NEITHER CLEAR IS SUFFICIENT ON ITS OWN, and could not be: the values they race live in
+        // `ControllerView`, above this crate, and `ActionLoop::stream_position` mirrors that view
+        // into these fields unconditionally every ~10 ms net tick, so clearing only here was
+        // measured to get the departed zone's hold back on the very next tick. Net-thread callers
+        // must go through `eqoxide_ipc::ControllerSlots::begin_zone_in`, which pairs these with the
+        // view clear. (`clear_hold` on `app.rs`'s not-stepped frames covers the render loop that
+        // keeps rendering through the load; this covers the one that publishes nothing at all.)
         self.player_hold = None;
-        // #776/#801: and the afloat stall, for the identical reason and with a sharper edge — a
-        // stall names an ANCHOR, a specific position in the departed zone's coordinate frame that
-        // the body failed to get away from. Carried across a crossing it would report a trapped
-        // swimmer at a point in a zone we are no longer in. `clear_hold` on `app.rs`'s not-stepped
-        // frames covers the case where the render loop keeps rendering through the load; this covers
-        // the case where it does not publish at all. Neither alone is sufficient — and, per the
-        // note above, this half only actually covers its case when paired with the `ControllerView`
-        // clear in `ControllerSlots::begin_zone_in` (#846 review B1 measured it not covering it).
         self.player_afloat_stall = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
@@ -1657,19 +1620,11 @@ impl GameState {
         // reports a full-HP target from the OLD zone (a confident falsehood an agent may attack /
         // consider). Clear the whole target (id + name + hp + con) here, not just the entity map (#408).
         self.clear_target();
-        // #883: `last_consider` is the SAME hazard as the target fields just above, for the same
-        // reason (#270's `entities` purge does not touch it — it has its own field, not an entities
-        // lookup), but it is NOT touched by `clear_target()` — deliberately, per that field's own
-        // doc: "it is spawn-scoped, not target-scoped … never touched by set_target/clear_target",
-        // so a plain target-loss (walking away, `#target clear`) does not erase the last consider
-        // read. That is correct for a target-loss, but `clear_target()` was consequently the ONLY
-        // place anyone would have thought to look for a last_consider clear, and it deliberately
-        // excludes it — which is exactly how this stayed missing since #336 added the field: a
-        // zone-in cannot reuse `clear_target()`, and no one added a sibling call here. Left
-        // uncleared, `spawn_id`/`con_name`/`attitude`/`level` name a spawn in the zone we just left
-        // — spawn ids are a per-zone namespace, so the same id in the new zone is a different mob
-        // at a different difficulty — while `ago_secs` (derived from `at` at read time) keeps
-        // counting normally and does not itself disclose that the record predates the zone change.
+        // #883: `last_consider` is the SAME hazard as the target fields above — spawn ids are a
+        // per-zone namespace, so the same id in the new zone is a different mob at a different
+        // difficulty, while `ago_secs` keeps counting normally and discloses nothing. It needs its
+        // own line because `clear_target()` deliberately does NOT touch it (it is spawn-scoped, not
+        // target-scoped), which is how the clear stayed missing from #336 to #883.
         self.last_consider = None;
         self.world.new_zone_applied = false;
         // #683 review (F2): the previous zone's advertised zone points are meaningless — and
@@ -3143,25 +3098,14 @@ pub(crate) mod tests {
 
     /// #724 round-3 review (B1) — the previous zone's hold must NOT survive a zone-in.
     ///
-    /// A [`ControllerHold`] describes the body's predicament in specific collision geometry. A
-    /// zone-in drops that geometry, and the controller stops being stepped while the new zone
-    /// loads, so nothing recomputes the value. Left in place, the last mirrored hold sits in
-    /// `player_hold` — and `/v1/observe/debug` reports *"the character is EMBEDDED in world
-    /// geometry … ask a GM to move the character"* about a zone the character has already left —
-    /// until the first frame after the new collision lands. The honest state for that window is
-    /// `None` (no hold in force), not a stale alarm.
+    /// The field has exactly two writers — this clear, and `ActionLoop::stream_position`'s mirror of
+    /// `ControllerView::hold` — so while the zone-entry handshake runs, this clear is the only thing
+    /// that can make the field honest. (#724's review also traced the net tick loop as *suspended*
+    /// across the handshake, so the mirror cannot even race it; that is a reviewer's code trace of an
+    /// async call graph, not measured, and this test does not depend on it.)
     ///
-    /// This field has exactly two writers — this clear, and `ActionLoop::stream_position`'s mirror
-    /// of `ControllerView::hold` (`git grep player_hold`, verified for this test). So while the
-    /// zone-entry handshake runs, this clear is the only thing that can make the field honest.
-    /// Round-3 review additionally traced that the net tick loop is *suspended* across the
-    /// handshake, so the mirror cannot even race it — that is the REVIEWER'S CODE TRACE of an async
-    /// call graph, recorded here as attribution, not re-derived and not measured at runtime. This
-    /// test does not depend on it: the two-writer fact alone is enough reason for the clear to
-    /// exist, and the test pins the clear directly.
-    ///
-    /// Round-3 review MEASURED this clear unpinned: deleting it (with `app.rs`'s `clear_hold` call)
-    /// left the whole workspace green, 158 passed / 0 failed. Mutation check: drop the
+    /// MEASURED unpinned before this test existed: deleting the clear (with `app.rs`'s `clear_hold`
+    /// call) left the whole workspace green, 158 passed / 0 failed. Mutation check: drop
     /// `player_hold = None` from `begin_zone_in` → RED here.
     #[test]
     fn begin_zone_in_clears_the_previous_zones_hold_724() {
@@ -3237,28 +3181,18 @@ pub(crate) mod tests {
 
     /// #801 — the previous zone's afloat stall must NOT survive a zone-in either.
     ///
-    /// The sibling of `..._hold_724` above, and the case for it is *sharper*. A `ControllerHold`
-    /// names a predicament; an [`AfloatStall`](crate::afloat::AfloatStall) names an **anchor** — a
-    /// specific `[east, north, up]` in the departed zone's coordinate frame. Carried across a
-    /// crossing, `/v1/observe/debug` would answer an agent with "you have been unable to swim away
-    /// from (-812.5, 43.0, -119.75) for 7.5 seconds" about a point in a zone the character is no
-    /// longer in, and about water that may not exist here. That is not a stale number, it is a
-    /// confident falsehood with coordinates attached, and the agent's reasonable response — dive,
-    /// or route around — would be aimed at nothing.
+    /// The sibling of `..._hold_724` above, and the case for it is *sharper*: an
+    /// [`AfloatStall`](crate::afloat::AfloatStall) names an **anchor**, a specific
+    /// `[east, north, up]` in the departed zone's coordinate frame, so carried across a crossing it
+    /// is not a stale number but a confident falsehood with coordinates attached.
     ///
-    /// This field has exactly the same two writers as `player_hold`: this clear, and
-    /// `ActionLoop::stream_position`'s mirror of `ControllerView::afloat_stall`. `app.rs`'s
-    /// `clear_hold()` on frames that render without stepping drops the window on the render side and
-    /// covers the case where the loop keeps rendering through the load; this covers the case where it
-    /// does not publish at all. Neither alone is sufficient, which is why both exist.
-    ///
-    /// **#846 review B1 corrected the second half of that sentence, which was measurably false when
-    /// written.** This clear did NOT cover "the render loop does not publish at all": the mirror is
-    /// unconditional, so it restored the departed zone's value on the next net tick and the clear
-    /// survived about 10 ms. It covers that case now because the net-thread zone-in path goes
-    /// through `eqoxide_ipc::ControllerSlots::begin_zone_in`, which invalidates the `ControllerView`
-    /// as well — see `a_zone_in_clears_the_departed_zones_hold_for_good_846` in `eqoxide-net`, which
-    /// is the test that would have caught it (this one cannot: it never runs a mirror tick).
+    /// **This clear alone does NOT cover "the render loop publishes nothing at all"** — measured: the
+    /// mirror in `ActionLoop::stream_position` is unconditional, so it restored the departed zone's
+    /// value on the next net tick and the clear survived about 10 ms. That case is covered because
+    /// the net-thread zone-in path goes through `eqoxide_ipc::ControllerSlots::begin_zone_in`, which
+    /// invalidates the `ControllerView` as well — see
+    /// `a_zone_in_clears_the_departed_zones_hold_for_good_846` in `eqoxide-net`, which is the test
+    /// that would have caught it (this one cannot: it never runs a mirror tick).
     ///
     /// The fixture uses a REAL matured stall from the real clock, not a hand-built value — the type
     /// has no public constructor, by design (see `crates/eqoxide-core/tests/afloat_unconstructible.rs`),
@@ -3292,27 +3226,15 @@ pub(crate) mod tests {
 
     /// #757 — `zone_cross_attempts` and `zone_cross_plan` must NOT survive a zone-in.
     ///
-    /// Both fields are per-zone-namespace facts: a zone-line region index is only meaningful
-    /// against the zone that baked it, and an advertised destination `zone_id` is only meaningful
-    /// against the zone that advertised it (see the fields' doc comments). Left in place across a
-    /// zone-in, a BLOCKED `zone_cross_attempts` tally would leave the new zone's auto-cross gate
-    /// refusing to retry for a limit the OLD zone's stand reached, and a BEST-EFFORT
-    /// `zone_cross_plan` would let `GET /v1/observe/debug` keep reporting a degraded-destination
-    /// crossing for a request the new zone never made — a confident answer to a question about the
-    /// new zone, built from the old zone's data. The fixture below is built to actually reach both
-    /// of those states (see the setup assertions), not merely a `Some(..)` that happens to clear.
+    /// Both fields are per-zone-namespace facts — see their doc comments. The fixture below is built
+    /// to actually REACH the blocking / best-effort states, not merely a `Some(..)` that happens to
+    /// clear.
     ///
-    /// #757's own issue body states the asymmetry precisely: `begin_zone_in`'s third sibling clear
-    /// (`player_hold`, pinned by `begin_zone_in_clears_the_previous_zones_hold_724` above) was
-    /// ADDED by #744 while #750 was independently adding these two, and `git` resolved the merge
-    /// as an ordinary text conflict — keeping three independent clears arriving from two
-    /// directions. Dropping either of THESE TWO still compiles and passes the suite — `player_hold`
-    /// is the one exception, because it already had a test guarding it (round-1 review of this PR
-    /// measured that directly: reverting `player_hold`'s clear alone turns `..._hold_724` RED).
-    /// This test closes the gap for the other two. Mutation check (each run independently, see the
-    /// #757 PR body for the verbatim output): drop `self.zone_cross_attempts = None;` from
-    /// `begin_zone_in` → RED at the first assertion; restore it, then drop
-    /// `self.zone_cross_plan = None;` → RED at the second.
+    /// Before this test, dropping either clear still compiled and passed the whole suite;
+    /// `player_hold`'s sibling clear was the one exception, because `..._hold_724` above already
+    /// guarded it. Mutation check (each run independently, verbatim output in the #757 PR body):
+    /// drop `self.zone_cross_attempts = None;` from `begin_zone_in` → RED at the first assertion;
+    /// restore it, then drop `self.zone_cross_plan = None;` → RED at the second.
     #[test]
     fn begin_zone_in_clears_the_previous_zones_cross_attempts_and_plan_757() {
         use crate::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
@@ -3358,19 +3280,11 @@ pub(crate) mod tests {
 
     /// #883 — the previous zone's `last_consider` must NOT survive a zone-in.
     ///
-    /// `last_consider` is spawn-scoped exactly like `target_id`/`target_con*` (cleared just above by
-    /// `clear_target()`, pinned by #408), but it is deliberately NOT touched by `clear_target()` —
-    /// see that field's own doc comment — so a target-loss that is NOT a zone change (walking away,
-    /// `#target clear`) correctly leaves it in place. That correct exclusion is exactly why this was
-    /// missed: `clear_target()` was the only place anyone would have thought to add a sibling clear,
-    /// and it deliberately does not touch this field, so `begin_zone_in` needed — and lacked — its
-    /// own explicit clear. Left uncleared, `spawn_id` names a spawn in the zone we just left, and
-    /// spawn ids are a per-zone namespace: the SAME id in the new zone is ordinarily a different mob
-    /// at a different difficulty, so `/v1/observe/debug` answers a fresh-looking, well-formed
-    /// question about a mob that is not in this zone — and `ago_secs`, derived from `at` at read
-    /// time, keeps counting normally and does not itself disclose that the record predates the zone
-    /// change. Measured live on `main` @ `d63776d`, both directions (qcat↔qeynos2), three
-    /// transitions — see the #883 issue body for the exact before/after JSON.
+    /// `last_consider` is spawn-scoped exactly like `target_id`/`target_con*`, but it is deliberately
+    /// NOT touched by `clear_target()` (see that field's own doc), which is why the clear was missed:
+    /// `clear_target()` was the only place anyone would have thought to add a sibling. Measured live
+    /// on `main` @ `d63776d`, both directions (qcat↔qeynos2), three transitions — see the #883 issue
+    /// body for the exact before/after JSON.
     ///
     /// Mutation check: drop `self.last_consider = None;` from `begin_zone_in` → RED here.
     #[test]
