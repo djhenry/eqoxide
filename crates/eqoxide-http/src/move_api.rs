@@ -69,35 +69,40 @@ struct ManualBody {
 async fn post_manual(
     State(s): State<HttpState>,
     OptionalJson(body): OptionalJson<ManualBody>,
-) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    if let Err(e) = require_alive(&s) { return e; } // #644: a corpse cannot be driven manually
+) -> Response {
+    if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
+    // #644: a corpse cannot be driven manually
+    if let Err((code, msg)) = require_alive(&s) { return text(code, msg); }
+    // #884: refuse while the controller is frozen, BEFORE the manual-move slot is written — an
+    // accepted `ManualMove` the controller will never read is a queued action with no outcome.
+    if let Some(r) = crate::MoveGate::read(&s).refusal() { return r; }
     let b = body.unwrap_or_default();
     let dir = [b.east.unwrap_or(0.0), b.north.unwrap_or(0.0)];
     let up = b.up.unwrap_or(0.0).clamp(-1.0, 1.0);
     let jump = b.jump.unwrap_or(false);
     let ms = b.duration_ms.unwrap_or(400).min(5000);
     if dir[0] == 0.0 && dir[1] == 0.0 && up == 0.0 && !jump {
-        return (StatusCode::BAD_REQUEST, "provide a direction {east,north}, {up:-1..1} (swim), and/or {\"jump\":true}".into());
+        return text(StatusCode::BAD_REQUEST, "provide a direction {east,north}, {up:-1..1} (swim), and/or {\"jump\":true}");
     }
     s.camera.request_manual_move(ManualMove {
         dir, up, jump,
         until: std::time::Instant::now() + std::time::Duration::from_millis(ms),
     });
-    (StatusCode::OK, format!("manual move dir=({:.1},{:.1}) up={up:.1} jump={jump} for {ms}ms", dir[0], dir[1]))
+    text(StatusCode::OK, format!("manual move dir=({:.1},{:.1}) up={up:.1} jump={jump} for {ms}ms", dir[0], dir[1]))
 }
 
 /// POST /v1/move/jump — a single hop in place (a discrete convenience over `/manual` with only
 /// `jump`). Clears any `/goto` and pops the character up — on land it's a jump; in water it swims
 /// upward toward the surface (#207), e.g. to lift off a pool floor.
-async fn post_jump(State(s): State<HttpState>) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    if let Err(e) = require_alive(&s) { return e; } // #644: a corpse cannot jump
+async fn post_jump(State(s): State<HttpState>) -> Response {
+    if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
+    if let Err((code, msg)) = require_alive(&s) { return text(code, msg); } // #644: a corpse cannot jump
+    if let Some(r) = crate::MoveGate::read(&s).refusal() { return r; } // #884
     s.camera.request_manual_move(ManualMove {
         dir: [0.0, 0.0], up: 0.0, jump: true,
         until: std::time::Instant::now() + std::time::Duration::from_millis(400),
     });
-    (StatusCode::OK, "jump".into())
+    text(StatusCode::OK, "jump")
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -242,6 +247,12 @@ async fn post_goto(
     if let Err((code, msg)) = require_alive(&s) {
         return json(code, serde_json::json!({ "status": "dead", "message": msg }));
     }
+    // #884 (agent-honesty): a frozen controller cannot walk anywhere, so refuse BEFORE a goal id is
+    // stamped — the same position in the handler, and for the same reason, as #644's `dead` gate
+    // above. `gate` is kept for the acceptance body below: a hold that does NOT freeze the step
+    // (`underworld_no_recovery`) proceeds, but is disclosed beside the `navigating` it earns.
+    let gate = crate::MoveGate::read(&s);
+    if let Some(r) = gate.refusal() { return r; }
     let b = body.unwrap_or_default();
     let player_pos = s.player_pos();
 
@@ -312,6 +323,11 @@ async fn post_goto(
         "goal_id": goal_id,
         "matched": matched.map(|m| m.to_json()),
         "zone_assets_pending": assets_pending,
+        // #884: `null` for a healthy body. Non-null means a hold IS in force and it is one that
+        // still lets driver input reach the body (a frozen one never reaches this line — it was
+        // refused above), so this goal was really accepted AND the body is in an abnormal state the
+        // caller would otherwise have had to read a different endpoint to learn about.
+        "hold": gate.disclosure(),
         "note": "poll GET /v1/observe/debug; nav_state is honest only for this nav_goal_id (goal_id)",
     }))
 }
@@ -334,6 +350,8 @@ async fn post_follow(
     if let Err((code, msg)) = require_alive(&s) {
         return json(code, serde_json::json!({ "status": "dead", "message": msg }));
     }
+    let gate = crate::MoveGate::read(&s); // #884 — see /goto
+    if let Some(r) = gate.refusal() { return r; }
     let b = body.unwrap_or_default();
 
     if b.has_coords() {
@@ -371,11 +389,20 @@ async fn post_follow(
         "status": "following",
         "goal_id": goal_id,
         "matched": matched.to_json(),
+        "hold": gate.disclosure(), // #884 — see /goto
     }))
 }
 
 /// POST /v1/move/stop — cancel any active goto/follow. Idempotent. Clears goto_target and
 /// goto_entity; the nav thread then clears nav_intent next tick via its "no goto ⇒ no nav" invariant.
+///
+/// **Deliberately NOT gated by [`crate::MoveGate`] (#884), for the same reason it is not gated by
+/// #644's `require_alive`:** this is a CANCEL. Its whole effect is on the nav slots, which the HTTP
+/// thread writes directly — nothing about it is gated on the physics step, so "navigation stopped"
+/// is true of a held body exactly as it is of a free one, and refusing it would take away the one
+/// movement verb that still does what it says. #884's live transcript lists `/stop` among the calls
+/// that "moved the character zero units"; that is correct and is not a lie, because `/stop` never
+/// claimed it would move anything.
 async fn post_stop(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     // Reset nav_state to `idle` under a fresh goal id SYNCHRONOUSLY (#349): before this, `/stop`
@@ -419,12 +446,23 @@ fn reachable_zone_ids(zps: &[eqoxide_core::game_state::ZonePoint]) -> Vec<u16> {
 /// list of reachable zone_ids) instead of silently doing nothing / crossing a nearby line — so the
 /// caller knows the destination wasn't honored (eqoxide#47). NOTE this only checks that a zone LINE
 /// exists, not that the walker can physically reach it.
+///
+/// #884 (agent-honesty): the "walking to the zone line" text below was the issue's headline
+/// falsehood — it was answered verbatim to a character whose controller had stopped reading driver
+/// input. It is now unreachable in that state: [`crate::MoveGate`] refuses with `409` +
+/// `"status":"held"` first. What the text still does NOT promise is arrival; that remains
+/// `nav_state`'s job, and a walker can still wedge for reasons no gate can see.
 async fn post_zone_cross(
     State(s): State<HttpState>,
     OptionalJson(body): OptionalJson<ZoneCrossBody>,
-) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
-    if let Err(e) = require_alive(&s) { return e; } // #644: a corpse cannot cross a zone line
+) -> Response {
+    if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
+    // #644: a corpse cannot cross a zone line
+    if let Err((code, msg)) = require_alive(&s) { return text(code, msg); }
+    // #884: THE issue's headline case. This endpoint's 200 asserts an activity — "walking to the
+    // zone line" — and a frozen controller is not walking anywhere. Refuse before `request_zone_cross`
+    // so nothing is queued and no goal_id is stamped.
+    if let Some(r) = crate::MoveGate::read(&s).refusal() { return r; }
     let b = body.unwrap_or_default();
     apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     let zone_id = b.zone_id.unwrap_or(0);
@@ -442,7 +480,7 @@ async fn post_zone_cross(
                 format!("zone_id {zone_id} is not reachable from the current zone; reachable zone_ids: {reachable:?}")
             };
             tracing::info!("zone_cross: rejected unreachable zone_id={zone_id} (reachable={reachable:?})");
-            return (StatusCode::BAD_REQUEST, msg);
+            return text(StatusCode::BAD_REQUEST, msg);
         }
     }
     let zone_id = zone_id as u16; // safe: either 0, or validated above to fit u16 and be reachable
@@ -453,7 +491,7 @@ async fn post_zone_cross(
     // Honest, async-aware response (#267): the client WALKS to the zone line, it does not teleport, so
     // this 200 means "accepted", not "arrived". Tell the caller how to observe the real outcome — a bare
     // "queued" read as success while a wedged character went nowhere.
-    (StatusCode::OK, format!(
+    text(StatusCode::OK, format!(
         "zone_cross to zone_id={zone_id} accepted [goal_id={goal_id}] — walking to the zone line (async, not a teleport). \
          Poll GET /v1/observe/debug: the `zone` field changes on success. Every failure is now reported \
          honestly in `nav_state` (+`nav_reason`): `no_path` = no route to the line EXISTS (definitive), \
@@ -1183,5 +1221,327 @@ mod tests {
         let text = body_text(resp).await;
         assert!(text.contains("malformed JSON body"),
             "message should name the real cause, not the unrelated \"provide a direction\" default-validation text: {text}");
+    }
+
+    // --- #884: no movement endpoint may report progress while the physics step is frozen --------
+
+    use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason, HeldMotion};
+
+    /// Put a hold of `reason` in force, as `ActionLoop::stream_position` mirrors it.
+    fn held(state: &crate::HttpState, reason: ControllerHoldReason) {
+        set_gs(state, |gs| gs.player_hold = Some(ControllerHold { reason, secs: 88.15 }));
+    }
+
+    /// Every `/v1/move/*` verb whose effect is gated on the physics step, with a REQUEST THAT WOULD
+    /// OTHERWISE SUCCEED and a probe that reports whether the client queued anything for it.
+    ///
+    /// `/stop` is absent on purpose — it is a cancel whose whole effect is on the nav slots and is
+    /// not gated on the step, so it must keep answering `200 navigation stopped` while held. That
+    /// deliberate absence is itself asserted, by `stop_is_not_gated_by_the_hold_884` below; a table
+    /// is only a universal over what it lists.
+    #[allow(clippy::type_complexity)]
+    fn gated_movement_endpoints() -> Vec<(&'static str, &'static str, fn(&crate::HttpState) -> bool)> {
+        vec![
+            ("/goto",       r#"{"x":1.0,"y":2.0,"z":3.0}"#,
+                (|s| s.nav.goto_target.lock().unwrap().is_some()) as fn(&crate::HttpState) -> bool),
+            ("/follow",     r#"{"name":"a rat"}"#,
+                |s| s.nav.goto_entity.lock().unwrap().is_some()),
+            ("/zone_cross", "",
+                |s| s.nav.zone_cross.lock().unwrap().is_some()),
+            ("/manual",     r#"{"east":1.0}"#,
+                |s| s.camera.manual_move.lock().unwrap().is_some()),
+            ("/jump",       "",
+                |s| s.camera.manual_move.lock().unwrap().is_some()),
+        ]
+    }
+
+    fn seeded_state() -> crate::HttpState {
+        let state = empty_state();
+        // `/follow` needs a resolvable entity; `/zone_cross` with no body takes the nearest line and
+        // needs nothing. Seeding both here keeps every row's request one that WOULD succeed, so a
+        // refusal in the matrix below can only be the hold.
+        state.world.entity_ids_mut().insert_for_test("a_rat00".into(), 42);
+        state.world.entity_positions_mut().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
+        state
+    }
+
+    /// **#884 REACH CONTROL for the matrix below.** The exhaustiveness over hold reasons is real —
+    /// `ControllerHoldReason::ALL` is derived from the enum. The exhaustiveness over *endpoints* was
+    /// not: `gated_movement_endpoints()` is a hand-written list, and a hand-written list of variants
+    /// going stale beside the thing it claims to cover is exactly the defect #890 measured. A seventh
+    /// `/v1/move/*` verb could ship ungated and every assertion here would still pass, because a
+    /// table is only a universal over what it lists.
+    ///
+    /// So derive the endpoint set from `router()`'s own source instead of trusting the list: every
+    /// route this module registers must be either in the gated table or in the one-item excused set.
+    /// A new verb is then RED until its author classifies it, which is the decision that must not be
+    /// made by default.
+    ///
+    /// The marker is built with `concat!` so the string this scan searches for does not itself occur
+    /// in this test — the scan would otherwise find its own text and could pass while reading the
+    /// wrong region (#778's scanner silently covered ~12% of its corpus). The `assert!`s on the
+    /// marker count and on the extracted count ARE the reach control: they fail loudly if the scan
+    /// ever stops matching the code, rather than vacuously finding nothing to complain about.
+    #[test]
+    fn every_move_route_is_classified_gated_or_excused_884() {
+        const SRC: &str = include_str!("move_api.rs");
+        let marker = concat!("fn ", "router() -> Router<HttpState> {");
+
+        assert_eq!(
+            SRC.matches(marker).count(),
+            1,
+            "#884 reach control: the router signature this scan keys on occurs {} times, not once — \
+             the scan is reading an unknown region and its verdict means nothing. Re-point it.",
+            SRC.matches(marker).count()
+        );
+        let body = SRC
+            .split_once(marker)
+            .expect("marker counted once above")
+            .1;
+        let body = body
+            .split_once("\n}\n")
+            .expect("#884 reach control: router() has no closing brace at column 0")
+            .0;
+
+        let registered: Vec<&str> = body
+            .match_indices(".route(\"")
+            .map(|(i, m)| {
+                let rest = &body[i + m.len()..];
+                &rest[..rest.find('"').expect("route literal is terminated")]
+            })
+            .collect();
+
+        assert_eq!(
+            registered.len(),
+            6,
+            "#884 reach control: extracted {} routes from router(), expected 6 ({:?}). Either a \
+             route was added/removed — in which case classify it below and update this count — or \
+             the extraction broke and the classification assert underneath is vacuous.",
+            registered.len(),
+            registered
+        );
+
+        // The ONE endpoint deliberately not gated. It is a cancel: its effect is on the nav slots,
+        // not on the physics step, so "navigation stopped" stays true of a frozen body. Pinned by
+        // `stop_is_not_gated_by_the_hold_884`.
+        const EXCUSED: &[&str] = &["/stop"];
+
+        let gated: Vec<&str> = gated_movement_endpoints().iter().map(|(p, ..)| *p).collect();
+        for path in &registered {
+            assert!(
+                gated.contains(path) || EXCUSED.contains(path),
+                "#884: `/v1/move{path}` is registered by router() but is neither in \
+                 gated_movement_endpoints() nor in the excused set. Decide which it is. If it can \
+                 drive the body, it must refuse while the controller's step is frozen — an \
+                 unclassified movement verb defaults to answering 200 for motion that cannot happen, \
+                 which is the bug this issue is about."
+            );
+        }
+        for path in &gated {
+            assert!(
+                registered.contains(path),
+                "#884: gated_movement_endpoints() lists `{path}`, which router() does not register. \
+                 The matrix below is asserting against a route that no longer exists."
+            );
+        }
+    }
+
+    /// **#884, the universal.** Exhaustive over `ControllerHoldReason::ALL` × every gated movement
+    /// endpoint — not three examples. The claim being pinned is *"no movement endpoint ever answers
+    /// success for motion that cannot happen"*, which quantifies over hold reasons, and
+    /// `ControllerHoldReason::ALL` is derived from the enum declaration (see
+    /// `controller_hold_reason!`), so a third hold reason enters this matrix on the next build
+    /// rather than when someone remembers to add it.
+    ///
+    /// Both directions are asserted from ONE rule — `reason.motion()` — so the test cannot be
+    /// satisfied by a gate that refuses everything:
+    ///
+    /// * `AllFrozen` ⇒ `409`, `"status":"held"`, the hold named, **and nothing queued**. An accepted
+    ///   goal that can never progress is the same falsehood one step later.
+    /// * `LateralStillReaches` ⇒ NOT refused, and the request really is queued. Refusing here would
+    ///   remove an `underworld_no_recovery` body's only client-API exit (`/v1/move/manual` walking
+    ///   it out) and would be its own false "you cannot move".
+    ///
+    /// MUTATION-CHECK (both directions, run before merge):
+    /// * revert — delete the `MoveGate::read(&s).refusal()` line from any one handler → RED on that
+    ///   row of the `AllFrozen` half;
+    /// * WRAP — `if false { … } else { None }` inside `MoveGate::refusal` → RED on all five
+    ///   `AllFrozen` rows (deletion-only mutation has been evaded eight times in this repo, #799).
+    #[tokio::test]
+    async fn no_movement_endpoint_reports_progress_while_the_step_is_frozen_884() {
+        for &reason in ControllerHoldReason::ALL {
+            for (path, body, queued) in gated_movement_endpoints() {
+                let state = seeded_state();
+                held(&state, reason);
+                let app = router().with_state(state.clone());
+                let mut rb = Request::post(path);
+                if !body.is_empty() { rb = rb.header("content-type", "application/json"); }
+                let resp = app.oneshot(rb.body(Body::from(body)).unwrap()).await.unwrap();
+                let status = resp.status();
+                let text = body_text(resp).await;
+                match reason.motion() {
+                    HeldMotion::AllFrozen => {
+                        assert_eq!(status, StatusCode::CONFLICT,
+                            "POST {path} under `{}` must be REFUSED, not answered as accepted \
+                             work: got {status} {text}", reason.as_str());
+                        let j: serde_json::Value = serde_json::from_str(&text)
+                            .unwrap_or_else(|e| panic!("POST {path} refusal must be JSON an agent \
+                                 can branch on, not prose: {e} in {text:?}"));
+                        assert_eq!(j["status"], "held",
+                            "POST {path} needs a machine-branchable `held` token: {j}");
+                        assert_eq!(j["hold"]["reason"], reason.as_str(),
+                            "POST {path} must name WHICH hold: {j}");
+                        assert!(!queued(&state),
+                            "POST {path} refused under `{}` but still queued the work — an \
+                             accepted-and-inert request is the same lie one step later",
+                            reason.as_str());
+                    }
+                    HeldMotion::LateralStillReaches => {
+                        assert_ne!(status, StatusCode::CONFLICT,
+                            "POST {path} under `{}` must NOT be refused — a lateral wish still \
+                             reaches this body, and `/v1/move/manual` walking it out is its only \
+                             client-API exit: got {status} {text}", reason.as_str());
+                        assert_eq!(status, StatusCode::OK, "POST {path}: {status} {text}");
+                        assert!(queued(&state),
+                            "POST {path} answered 200 under `{}` but queued nothing",
+                            reason.as_str());
+                    }
+                }
+            }
+        }
+    }
+
+    /// The under-fire control for the matrix above: with NO hold in force every one of the same
+    /// requests is accepted and queued. Without this, a gate that refused unconditionally — or a
+    /// fixture that silently failed to clear the hold — would satisfy the `AllFrozen` half and look
+    /// like a pass.
+    #[tokio::test]
+    async fn every_gated_movement_endpoint_still_works_with_no_hold_884() {
+        for (path, body, queued) in gated_movement_endpoints() {
+            let state = seeded_state();
+            assert!(state.game_state.load().player_hold.is_none(), "fixture starts unheld");
+            let app = router().with_state(state.clone());
+            let mut rb = Request::post(path);
+            if !body.is_empty() { rb = rb.header("content-type", "application/json"); }
+            let resp = app.oneshot(rb.body(Body::from(body)).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "POST {path} unheld: {}", body_text(resp).await);
+            assert!(queued(&state), "POST {path} unheld must queue the work");
+        }
+    }
+
+    /// **The issue's literal repro.** #884 measured `POST /v1/move/zone_cross` answering
+    /// `200 … accepted — walking to the zone line` at `[-2190.5, 902.125, 3.5]` in steamfont while
+    /// the body was `embedded_no_recovery` and moved zero units. The affirmative sentence must not
+    /// merely be softened — it must be unreachable in that state, and the reply must carry the
+    /// hold.
+    #[tokio::test]
+    async fn zone_cross_while_embedded_is_held_not_walking_to_the_zone_line_884() {
+        let state = empty_state();
+        state.world.zone_points.lock().unwrap().extend([zp(1), zp(2), zp(38)]);
+        held(&state, ControllerHoldReason::EmbeddedNoRecovery);
+        let zc = state.nav.zone_cross.clone();
+        let goal_id_before = state.nav.nav_state.lock().unwrap().goal_id;
+        let app = router().with_state(state.clone());
+        let req = Request::post("/zone_cross")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"zone_id":2}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let text = body_text(resp).await;
+        assert!(!text.contains("walking to the zone line"),
+            "the frozen body must not be told it is walking anywhere: {text}");
+        let j: serde_json::Value = serde_json::from_str(&text).expect("JSON refusal");
+        assert_eq!(j["status"], "held");
+        assert_eq!(j["hold"]["reason"], "embedded_no_recovery");
+        assert_eq!(j["hold"]["held_secs"], serde_json::json!(88.15_f32));
+        assert!(zc.lock().unwrap().is_none(), "nothing may be queued");
+        assert_eq!(state.nav.nav_state.lock().unwrap().goal_id, goal_id_before,
+            "no goal_id may be stamped for a request that was not accepted (#349/#644 shape)");
+    }
+
+    /// **The matrix above grades itself, and this is the anchor that stops it.**
+    /// `no_movement_endpoint_reports_progress_while_the_step_is_frozen_884` derives its expectation
+    /// from `reason.motion()` — the SAME function the gate consults — so a wrong `motion()` mapping
+    /// would satisfy it in both directions and look green. Two tests are keyed to literal values
+    /// instead: `hold_motion_matches_the_controllers_control_flow_884` in `eqoxide-core` pins the
+    /// mapping to the controller's control flow, and this one pins the HTTP consequence of the arm
+    /// the matrix would otherwise be free to invert. Flip `UnderworldNoRecovery`'s `motion()` to
+    /// `AllFrozen` and the matrix stays green; this goes RED.
+    #[tokio::test]
+    async fn manual_under_an_underworld_hold_is_still_accepted_884() {
+        let state = empty_state();
+        held(&state, ControllerHoldReason::UnderworldNoRecovery);
+        let app = router().with_state(state.clone());
+        let resp = app.oneshot(Request::post("/manual")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"east":1.0}"#)).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK,
+            "refusing /manual here would remove this body's ONLY client-API exit (movement.rs's \
+             `last_resort_placement` doc) and would itself be a false \"you cannot move\": {}",
+            body_text(resp).await);
+        assert!(state.camera.manual_move.lock().unwrap().is_some(),
+            "…and it must really be queued, not merely 200'd");
+    }
+
+    /// `/stop` is a CANCEL and is deliberately outside the gate: its effect is on the nav slots, not
+    /// on the physics step, so `navigation stopped` is true of a held body. Gating it would remove
+    /// the one movement verb that still does what it says.
+    #[tokio::test]
+    async fn stop_is_not_gated_by_the_hold_884() {
+        for &reason in ControllerHoldReason::ALL {
+            let state = empty_state();
+            held(&state, reason);
+            let app = router().with_state(state);
+            let resp = app.oneshot(Request::post("/stop").body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK,
+                "/stop must stay honest and available under `{}`", reason.as_str());
+        }
+    }
+
+    /// A hold that does NOT freeze the step is disclosed BESIDE the acceptance, not left for the
+    /// agent to find on an endpoint it had no reason to poll — that "the only thing that ever told
+    /// it otherwise was a `hold` field on a different endpoint" is #884's own framing of the
+    /// defect. `null`, never absent, when there is nothing to disclose.
+    #[tokio::test]
+    async fn goto_and_follow_disclose_a_driveable_hold_on_their_200_884() {
+        for (path, body) in [("/goto", r#"{"x":1.0,"y":2.0,"z":3.0}"#), ("/follow", r#"{"name":"a rat"}"#)] {
+            let clear = seeded_state();
+            let app = router().with_state(clear);
+            let resp = app.oneshot(Request::post(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body)).unwrap()).await.unwrap();
+            let j = body_json(resp).await;
+            assert!(j.get("hold").is_some(), "{path}: `hold` must be PRESENT and null when clear: {j}");
+            assert_eq!(j["hold"], serde_json::Value::Null, "{path}: {j}");
+
+            let state = seeded_state();
+            held(&state, ControllerHoldReason::UnderworldNoRecovery);
+            let app = router().with_state(state);
+            let resp = app.oneshot(Request::post(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body)).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let j = body_json(resp).await;
+            assert_eq!(j["hold"]["reason"], "underworld_no_recovery",
+                "{path} accepted the goal, so it must say the body is hanging out of the world: {j}");
+        }
+    }
+
+    /// The refusal's `hold` object and `GET /v1/observe/debug`'s `player.hold` must be the SAME
+    /// text, because they are the same fact. Two hand-built disclosures drift, and an agent told one
+    /// thing when it polls and another when it is refused has no way to know which is current —
+    /// which is why `PlayerHoldView::of` is the only constructor.
+    #[tokio::test]
+    async fn the_refusal_and_the_debug_endpoint_publish_one_hold_disclosure_884() {
+        let state = empty_state();
+        held(&state, ControllerHoldReason::EmbeddedNoRecovery);
+        let from_debug = serde_json::to_value(
+            crate::PlayerState::from_game_state(&state.game_state.load()).hold.expect("hold set")
+        ).unwrap();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/jump").body(Body::empty()).unwrap()).await.unwrap();
+        let j = body_json(resp).await;
+        assert_eq!(j["hold"], from_debug,
+            "the 409's hold and player.hold must be byte-identical: {j} vs {from_debug}");
     }
 }

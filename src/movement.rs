@@ -1889,6 +1889,16 @@ impl CharacterController {
                 // `last_resort_placement` has asked the ZONE whether there is anywhere to stand,
                 // rather than only asking this body's own erased history. See
                 // `nearest_standing_place`.
+                //
+                // AMENDED AGAIN (#884): the freeze this comment describes is UNCHANGED — this arm is
+                // still absorbing and no driver input still reaches it. What changed is the HTTP
+                // answer above it. `/v1/move/{goto,follow,zone_cross,manual,jump}` now read
+                // `player_hold` and return `409 {"status":"held"}` instead of `200` while
+                // `EmbeddedNoRecovery` is published, because the measured `200`s quoted above were
+                // the client asserting an acceptance it could not honour. `/v1/move/stop` is
+                // deliberately still `200`: it cancels a goal, which is true of a frozen body.
+                // `UnderworldNoRecovery` is NOT gated — that arm runs after collide-and-slide, so
+                // lateral wishes do reach the body and walking out is its only client-API exit.
                 None if self.last_resort_placement(col, dt) => {}
                 None => self.enter_hold(ControllerHoldReason::EmbeddedNoRecovery, dt, prev_hold),
             }
