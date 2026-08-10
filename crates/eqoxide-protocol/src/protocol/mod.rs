@@ -684,8 +684,10 @@ impl SpawnInfo {
     /// `E0063: missing field npc_tint_index in initializer of` **`Entity`** at `src/model.rs:430`,
     /// in `could not compile eqoxide (lib test)`. Cargo then stopped scheduling — it printed
     /// `warning: build failed, waiting for other jobs to finish...` — so the *second* half of the
-    /// break — this struct, in `tests/entity_pose_643.rs` — was compiled by that command but never
-    /// reported: the strings `entity_pose_643` and `SpawnInfo` appear zero times in the run's log.
+    /// break — this struct, in `tests/entity_pose_643.rs` — was never scheduled, and so was never
+    /// reported. The strings `entity_pose_643` and `SpawnInfo` appear zero times anywhere in that
+    /// run's logs, which is only possible if the unit was never compiled: compiling it necessarily
+    /// emits the `E0063`. The command would have built it; the run never got that far.
     /// #896 was merged 36 minutes later with that check still red, and the follow-up push run on
     /// `main` (`31125615041`) never executed at all — both jobs are annotated "The job was not
     /// acquired by Runner of type hosted". It took #915 (`Entity`) and #918 (`SpawnInfo`) to get
@@ -735,12 +737,24 @@ impl SpawnInfo {
     /// and its mutation result in `tests/entity_pose_643.rs`.
     ///
     /// **The suite does not defend most of these values, and did not before #913 either.**
-    /// WRAP-mutating all 14 agreed-on values at once leaves 1996 passed / 1 failed; the one
-    /// observed field is `cur_hp`. Mutating the remaining 13 together leaves the whole workspace
-    /// GREEN — 1997/0/47 under `--all-targets`, 2008/0/51 under the plain CI shape. So 13 of the
-    /// 29 baseline values could be wrong without any test saying so. That is a pre-existing gap
-    /// this fixture concentrates rather than creates (the same 13 values were previously
-    /// hand-copied, unasserted, into nine literals), but it is real: tracked as #969.
+    /// Measured by WRAP mutation (`field: if false { <orig> } else { <other> }`) at `66b9531`,
+    /// `--no-fail-fast`. Every figure is `passed/failed/ignored` and is labelled with the command
+    /// shape that produced it, because the two shapes do not report the same targets:
+    ///   - All **14** agreed-on values mutated together → **RED** under both shapes:
+    ///     `cargo test --workspace --locked` gives 2022/1/50, and adding `--all-targets` gives
+    ///     2010/1/47. The single failure either way is
+    ///     `packet_handler::tests::register_spawn_lays_down_zone_in_corpses`, and the single
+    ///     observed field is `cur_hp`.
+    ///   - **Those same 14 minus `cur_hp` — i.e. `last_name`, `class_`, `guild_id`, `guild_rank`,
+    ///     `helm`, `show_helm`, `face`, `hairstyle`, `haircolor`, `pet_owner_id`, `player_state`,
+    ///     `heading`, `npc_tint_index`** — mutated together → **GREEN** under both shapes:
+    ///     2023/0/50 plain, 2011/0/47 with `--all-targets`, identical to an unmutated run.
+    ///
+    /// So 13 of the 29 baseline values could all be wrong at once without any test saying so.
+    /// (Note this is *not* "13 of the 15 the literals disagreed on" — that is a different set and
+    /// mutating it is RED.) It is a pre-existing gap this fixture concentrates rather than creates
+    /// — the same 13 values were previously hand-copied, unasserted, into nine literals — but it
+    /// is real: tracked as #969.
     pub fn for_test() -> Self {
         SpawnInfo {
             spawn_id:       913,
