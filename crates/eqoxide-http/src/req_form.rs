@@ -459,10 +459,14 @@ mod tests {
     ///
     /// * **Pins.** Each site's sentence is rebuilt from the constants and must appear EXACTLY ONCE.
     ///   Changing the constant, or editing a number in prose, breaks the site that moved.
-    /// * **Sweep, over the doc only.** Every whole-token occurrence of the total anywhere in
-    ///   `docs/http-api.md` must fall inside a pinned fragment. A NEW sentence quoting the count is
+    /// * **Sweep, over the doc only.** Every whole-token occurrence of the total in
+    ///   `docs/http-api.md` is attributed to the pinned fragment containing it, or to `UNPINNED`, and
+    ///   the resulting list must equal `DOC_TOTAL_ATTRIBUTIONS`. A NEW sentence quoting the count is
     ///   therefore RED until it is pinned here, which is what makes this a guard over the page rather
-    ///   than over four sentences someone once listed.
+    ///   than over four sentences someone once listed. "The page" is itself asserted: the swept text
+    ///   is compared against the file's size ON DISK, because an attribution list reports what was
+    ///   found and can never report what was never read — see the third pass below, where that was
+    ///   measured rather than argued.
     ///
     /// **Limits, stated because a guard's reach is part of its claim.**
     /// * The sweep does NOT run over this module's own source. Two of its `35`s
@@ -474,7 +478,12 @@ mod tests {
     ///   `"only 9 are protected"` — is invisible to both halves.
     /// * `8` is not a constant of this module — it is the exhaustive-destructure figure re-derived
     ///   by the `grep -rnE` command in the module doc. It is written here so the pins can tie its
-    ///   ARITHMETIC to the total: `27` is computed, never typed.
+    ///   ARITHMETIC to the total: `27` is computed, never typed. The doc sentence promising which
+    ///   figures are asserted names only `2` and `35` for that reason; `8` and `27` are held fixed
+    ///   RELATIVE to them and nothing more.
+    /// * The corpus assertion compares a LENGTH. Swapping the swept text for a different string of
+    ///   the same size would pass it — it closes truncation, which is the one-edit form, not every
+    ///   conceivable substitution.
     ///
     /// MUTATION-CHECK, all measured on this tree and reverted by hand-edit against a pre-mutation
     /// `sha256sum`:
@@ -496,7 +505,9 @@ mod tests {
     /// `if false { doc_pins.iter().any(…) } else { true }` on the classifier, a `stray`-only
     /// collector stayed empty, the guard reported PASS, and the new-unpinned-sentence mutant — RED
     /// a moment earlier — walked straight through. The rebuild attributes every occurrence instead
-    /// of collecting only the bad ones, so no branch produces silence. Re-measured after it:
+    /// of collecting only the bad ones, so no branch of the CLASSIFIER produces silence — which is
+    /// narrower than "no branch", and the third pass below is about the branch it left out.
+    /// Re-measured after it:
     /// * classifier forced to "pinned" (the edit that evaded the old form): **KILLED**
     /// * sweep input emptied (`"".match_indices(…)`): **KILLED**
     /// * `doc_pins` never registered, so nothing can be attributed: **KILLED**
@@ -507,6 +518,29 @@ mod tests {
     ///   again alongside it. That is what shows the attribution assertion, not something adjacent,
     ///   is doing the killing.
     /// * INVALID control: `attributed.push(0u8, …)` → `error[E0061]`. UNTESTED.
+    ///
+    /// THIRD PASS, from review round 4, which found the hole the second pass left: the classifier
+    /// could no longer be silenced, but the sweep's INPUT could. All four expected sites sit in the
+    /// first half of the page, so truncating the swept text removes nothing the constant expects and
+    /// both sides agree with NO constant edited on either side. Measured, not argued:
+    /// * The probe: an unpinned count sentence appended at the page's EOF. Unmutated it is **RED**,
+    ///   named as `UNPINNED` at its line — so it is a live detector, not a hopeful one.
+    /// * `let swept = &doc[..doc.len() / 2];` with that probe present: **KILLED**, and the failure
+    ///   is the corpus assertion naming the bytes read against the bytes on disk, not a shorter
+    ///   attribution list. The list is byte-identical to the clean one, which is the whole point.
+    /// * Control, which is also the reproduction of the pre-fix hole: the same mutant with the
+    ///   corpus assertion WRAPped to compare `on_disk` with itself. **GREEN** — the probe survives,
+    ///   half the page is unread, and nothing complains. The corpus assertion is what kills it.
+    /// * The DEEPER form of the same edit, which is why the expectation is `fs::metadata` and not
+    ///   `doc.len()`: truncate at read time (`let doc = doc[..doc.len() / 2].to_string();`) and any
+    ///   comparison between the swept text and the variable it was sliced from still holds. Against
+    ///   the size on disk it is **KILLED**.
+    /// * All three second-pass mutants replayed on this tree: doc `35`→`36` **KILLED** at
+    ///   `doc:exempt-of-total`; the appended unpinned sentence **KILLED**, reported as `UNPINNED`
+    ///   with its line number; the pins loop truncated to 4 of 9 sites **KILLED**, naming the five
+    ///   missing labels. The classifier-forced mutant is **KILLED** as well.
+    /// * INVALID control for this pass: a non-existent method in the corpus assertion's message →
+    ///   `error: format argument must be a string literal`. UNTESTED, not RED.
     #[test]
     fn docs_http_api_md_may_not_disagree_with_this_modules_struct_counts() {
         let doc_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/http-api.md");
@@ -533,11 +567,12 @@ mod tests {
              format!("only **{destructured}** of the {total} are protected")),
             ("doc:remainder", doc_path,
              format!("other {remainder} structs")),
-            // Added because the sweep below caught this sentence the moment it was written: it
-            // names all four figures while telling callers they are pinned, which would have been
-            // the same unread claim one sentence later.
+            // Added because the sweep below caught this sentence the moment it was written. It
+            // originally listed all four figures and said they were pinned; only two of them are
+            // derived from anything, so review round 4 narrowed both the sentence and this fragment
+            // to those two rather than leave the promise wider than the guard.
             ("doc:figure-list", doc_path,
-             format!("(`{exempt}`, `{destructured}`, `{remainder}`, `{total}`)")),
+             format!("the `{exempt}` and `{total}` on this page")),
             ("self:protected-of-total", self_path,
              format!("{protected} of this crate's {total} request structs carry")),
             ("self:destructured-of-total", self_path,
@@ -589,15 +624,27 @@ mod tests {
         // that examined nothing is indistinguishable from a clean page — #778's shape, and #963
         // re-instantiated it one level down inside its own fix for the class.
         //
-        // Attributing EVERY occurrence removes the asymmetry: there is no branch whose output is
-        // silence. Neuter the classifier and four names turn into `UNPINNED`; empty the input and
-        // the list is empty; drop the digit-boundary skip and extra entries appear. All three are
-        // the same RED, and it names the sentences.
+        // Attributing EVERY occurrence removes the asymmetry the `stray` version had: neuter the
+        // classifier and four names turn into `UNPINNED`, empty the input and the list is empty,
+        // drop the digit-boundary skip and extra entries appear. All three are the same RED, and it
+        // names the sentences.
+        //
+        // That is not sufficient on its own, and the round that measured it is why the corpus is
+        // asserted below. A classification list says what was FOUND; it never says how much was
+        // READ. Truncating the swept text to `&doc[..doc.len()/2]` blinds the sweep to every byte
+        // past the page's midpoint while leaving all four expected sites inside the window, so the
+        // attribution list comes back UNCHANGED and green — with no constant edited on either side,
+        // so this needs no coordination at all. Pinning the line numbers does not close it either:
+        // the four are identical under truncation. So the corpus is an ITEM like every occurrence
+        // is — it gets a name and an assertion, and its expected size comes from the file on DISK,
+        // not from `doc`, because comparing the swept text against the variable it was sliced from
+        // is satisfied by anything that shortens both.
         let tok = total.to_string();
-        let bytes = doc.as_bytes();
+        let swept: &str = &doc;
+        let bytes = swept.as_bytes();
         let mut attributed: Vec<&str> = Vec::new();
         let mut at_lines: Vec<usize> = Vec::new();
-        for (at, _) in doc.match_indices(tok.as_str()) {
+        for (at, _) in swept.match_indices(tok.as_str()) {
             let digit_before = at > 0 && bytes[at - 1].is_ascii_digit();
             let digit_after = bytes.get(at + tok.len()).is_some_and(u8::is_ascii_digit);
             if digit_before || digit_after {
@@ -606,16 +653,27 @@ mod tests {
             attributed.push(
                 doc_pins.iter().find(|&&(s, e, _)| at >= s && at < e).map_or("UNPINNED", |&(_, _, l)| l),
             );
-            at_lines.push(doc[..at].matches('\n').count() + 1);
+            at_lines.push(swept[..at].matches('\n').count() + 1);
         }
+        let on_disk = std::fs::metadata(doc_path)
+            .unwrap_or_else(|e| panic!("cannot stat {doc_path}: {e}")).len() as usize;
+        assert_eq!(swept.len(), on_disk,
+            "REACH CONTROL (corpus): the sweep read {} of {doc_path}'s {on_disk} bytes. The \
+             attribution below reports what was FOUND and cannot report what was never LOOKED AT, \
+             so this is the assertion that separates a clean page from a blinded scan. The expected \
+             size is the file's size on disk and not `doc.len()`, because a comparison against the \
+             text the sweep was sliced from is satisfied by anything that shortens both.",
+            swept.len());
         assert_eq!(attributed, DOC_TOTAL_ATTRIBUTIONS,
             "REACH CONTROL (sweep): the whole-token `{tok}`s on {doc_path} attribute to \
              {attributed:?} at line(s) {at_lines:?}, expected {DOC_TOTAL_ATTRIBUTIONS:?}. An \
              `UNPINNED` entry is a claim about this crate's struct count that nothing keeps honest: \
              add it to `COUNT_CLAIM_SITES`, `DOC_TOTAL_ATTRIBUTIONS` and `sites` so it moves with \
-             the constant, or reword it. A SHORTER list than expected means the sweep stopped \
-             seeing occurrences it used to see, which is the guard going blind rather than the page \
-             getting cleaner — do not fix that by shortening the constant.");
+             the constant, or reword it. Any other difference means the sweep read a different page \
+             than this constant describes: the corpus assertion above has already passed, so the \
+             whole file WAS read, and this is the page changing rather than the scan shrinking. Do \
+             not reconcile it by editing the constant to match what was found — that is the repair \
+             loop that let the count go unread in the first place.");
     }
 
     /// The refusal template and every `what` it is given must contain NO word that is also a field

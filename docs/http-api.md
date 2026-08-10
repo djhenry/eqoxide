@@ -1038,9 +1038,11 @@ instruction was understood") for an instruction that was thrown away.
 > [Camera override for `/frame`](#camera-override-for-observeframe-422) above. The status codes and
 > override values above are asserted by
 > `req_form::tests::an_unrecognized_query_key_is_silently_dropped_on_both_exempt_routes`, exactly
-> these two being the exceptions by `every_deserialize_request_struct_is_classified`, and the
-> struct-count figures on this page (`2`, `8`, `27`, `35`) by
-> `docs_http_api_md_may_not_disagree_with_this_modules_struct_counts`.
+> these two being the exceptions by `every_deserialize_request_struct_is_classified`, and
+> the `2` and `35` on this page against that module's constants by
+> `docs_http_api_md_may_not_disagree_with_this_modules_struct_counts`. That test also holds the `8`
+> and the `27` fixed relative to those two, but neither is derived from the code — re-derive them
+> with the `grep` commands under "How far the guard actually reaches" below.
 
 **The rule.** Where two forms name *the same thing* in different notations (`{map_x,map_y}` and
 `{x,y,z}` for one point), precedence applies and the loser is **reported** in `ignored_fields`.
