@@ -1025,17 +1025,22 @@ instruction was understood") for an instruction that was thrown away.
 > `deny_unknown_fields`, so on those two an **unrecognized query key is still silently ignored** —
 > both driven:
 >
-> * `GET /v1/observe/packets?sicne=1` → `200`, the typo dropped and the unfiltered list returned.
-> * `GET /v1/observe/frame?allow_pending=1&prset=top_down&pitch=10` → `200` with a PNG, and the
->   capture is taken with an override built from the surviving `pitch` **alone** — the caller asked
->   for a top-down preset, the key carrying that request was discarded, and the image comes back at
->   an angle nobody asked for, with a `200`.
+> * `GET /v1/observe/packets?sicne=1` → `200`, the typo dropped rather than refused. Its
+>   discriminator is `?since=notanumber` → `4xx`: a *recognized* key with an unusable value **is**
+>   refused, so the `200` is about the unknown key and not about a route that validates nothing.
+> * `GET /v1/observe/frame?allow_pending=1&prset=top_down&pitch=10` → `200`, and the capture is taken
+>   with an override built from the surviving `pitch` **alone**, `azimuth` and `radius` left at their
+>   defaults — the caller asked for a top-down preset, the key carrying that request was discarded,
+>   and the image comes back at an angle nobody asked for, with a `200`.
 >
 > This is the same agent-honesty failure one step earlier, it is **not** fixed by this section, and it
 > is tracked as **#971**. See also
-> [Camera override for `/frame`](#camera-override-for-observeframe-422) above. Both bullets are
-> asserted by a test that drives the two routes, and a source-scanned test asserts exactly these two
-> are the exceptions — so neither this paragraph nor the count above can quietly go stale.
+> [Camera override for `/frame`](#camera-override-for-observeframe-422) above. The status codes and
+> override values above are asserted by
+> `req_form::tests::an_unrecognized_query_key_is_silently_dropped_on_both_exempt_routes`, exactly
+> these two being the exceptions by `every_deserialize_request_struct_is_classified`, and the
+> struct-count figures on this page (`2`, `8`, `27`, `35`) by
+> `docs_http_api_md_may_not_disagree_with_this_modules_struct_counts`.
 
 **The rule.** Where two forms name *the same thing* in different notations (`{map_x,map_y}` and
 `{x,y,z}` for one point), precedence applies and the loser is **reported** in `ignored_fields`.

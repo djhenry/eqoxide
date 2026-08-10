@@ -1544,7 +1544,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
             "name + a complete coordinate triple must be rejected, not silently routed to the name");
         let text = body_text(resp).await;
-        assert!(text.contains("conflicting"), "message must name the conflict: {text}");
+        assert!(text.starts_with("conflicting "), "message must OPEN with the conflict: {text}");
         // Whole-token match on the rendered field list, not a bare `contains('x')` — that check
         // is satisfied by the 'x' in the message's own "exactly" and so pins nothing (measured:
         // blanking `coord_fields` before formatting left this GREEN). "{x, y, z}" is the literal
@@ -1638,7 +1638,7 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let text = body_text(resp).await;
-        assert!(text.contains("conflicting"), "message: {text}");
+        assert!(text.starts_with("conflicting "), "message must OPEN with the conflict: {text}");
         // Whole-token match, not `contains('x')` — that bare check is satisfied by the 'x' in this
         // message's own "exactly" and pins nothing (measured: a reviewer mutant that blanked
         // `coord_fields` before formatting left the old assertion GREEN). "{x}" is the literal

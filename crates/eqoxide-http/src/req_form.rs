@@ -288,10 +288,12 @@ mod tests {
     /// both an unrecognized key is still silently dropped. Both halves are DRIVEN, in
     /// `an_unrecognized_query_key_is_silently_dropped_on_both_exempt_routes`:
     /// `GET /v1/observe/packets?sicne=1` answers `200` with the typo discarded, and
-    /// `GET /v1/observe/frame?allow_pending=1&prset=top_down&pitch=10` answers `200` with a PNG and
-    /// a camera override built from the surviving `pitch` alone — the caller asked for a top-down
-    /// preset, the key carrying that request was dropped, and the capture happened at an angle
-    /// nobody asked for.
+    /// `GET /v1/observe/frame?allow_pending=1&prset=top_down&pitch=10` answers `200` with a camera
+    /// override built from the surviving `pitch` alone — the caller asked for a top-down preset, the
+    /// key carrying that request was dropped, and the capture happened at an angle nobody asked for.
+    /// What that test asserts is the two STATUS codes, the `/packets` discriminator, and the three
+    /// override values; the image bytes are the four this test injects while playing the render
+    /// thread's part, so nothing here is a claim about a real PNG.
     ///
     /// That is the #952/#956 failure shape — a confident answer for an instruction thrown away —
     /// on the unreached-field side rather than the reached-but-ignored side. It is NOT fixed here:
@@ -421,6 +423,147 @@ mod tests {
 
         assert_eq!(unwrap_ws(quoted), unwrap_ws(&rendered),
             "docs/http-api.md quotes a refusal body that this code no longer produces");
+    }
+
+    /// The count-claim sites, by NAME. The reach control below asserts the located set against this
+    /// list rather than against the length of the loop's own input, because a guard whose expected
+    /// set is derived from the same thing it iterates can be truncated on both sides at once and
+    /// stay green — #963 re-instantiated exactly that inside a completeness fix.
+    const COUNT_CLAIM_SITES: &[&str] = &[
+        "doc:exempt-of-total", "doc:corpus-total", "doc:destructured-of-total", "doc:remainder",
+        "doc:figure-list",
+        "self:protected-of-total", "self:destructured-of-total", "self:corpus-total",
+        "self:protected-of-total-2",
+    ];
+
+    /// **Tracked prose may not disagree with [`DECLARED_REQUEST_STRUCTS`].**
+    ///
+    /// MEASURED, and the reason this exists: review round 3 changed all three `35`s in
+    /// `docs/http-api.md` to `36` and the full `cargo test --workspace --locked` stayed **exit 0,
+    /// 2043 passed, 0 failed**. Nothing read the doc's number. The corpus guard's own count assertion
+    /// names only its constant, so the repair loop for a 36th struct was: RED → bump the const →
+    /// green → **doc silently stale**. A sentence claiming a number is pinned when nothing reads it
+    /// is the defect this whole PR is about, one level up.
+    ///
+    /// Two mechanisms, because a pin and a sweep fail in different directions:
+    ///
+    /// * **Pins.** Each site's sentence is rebuilt from the constants and must appear EXACTLY ONCE.
+    ///   Changing the constant, or editing a number in prose, breaks the site that moved.
+    /// * **Sweep, over the doc only.** Every whole-token occurrence of the total anywhere in
+    ///   `docs/http-api.md` must fall inside a pinned fragment. A NEW sentence quoting the count is
+    ///   therefore RED until it is pinned here, which is what makes this a guard over the page rather
+    ///   than over four sentences someone once listed.
+    ///
+    /// **Limits, stated because a guard's reach is part of its claim.**
+    /// * The sweep does NOT run over this module's own source. Two of its `35`s
+    ///   (`"the count still reading 35"`, `"'2 of 35' still passing"`) quote PAST measurements and
+    ///   must not move when the constant does, so a blanket sweep here would force those quotes to
+    ///   be falsified on purpose. This module's four live count sentences are pinned individually
+    ///   instead; a fifth one added later is not caught.
+    /// * A new doc sentence that states a wrong count WITHOUT writing the current total — say
+    ///   `"only 9 are protected"` — is invisible to both halves.
+    /// * `8` is not a constant of this module — it is the exhaustive-destructure figure re-derived
+    ///   by the `grep -rnE` command in the module doc. It is written here so the pins can tie its
+    ///   ARITHMETIC to the total: `27` is computed, never typed.
+    ///
+    /// MUTATION-CHECK, all measured on this tree and reverted by hand-edit against a pre-mutation
+    /// `sha256sum`:
+    /// * The review's own mutant — every `35` in `docs/http-api.md` rewritten to `36`, which left
+    ///   the whole workspace gate green before this guard existed: **KILLED**, at the
+    ///   `doc:exempt-of-total` pin.
+    /// * A NEW unpinned sentence quoting the count, inserted mid-page: **KILLED** by the sweep,
+    ///   reported at the inserted line and nowhere else.
+    /// * Reach control, WRAP: `if false { sites.clone() } else { sites[..4].to_vec() }`, i.e. the
+    ///   loop silently covers half its sites: **KILLED**, and the failure NAMES the five that went
+    ///   missing rather than reporting a smaller number. That is the property the assertion exists
+    ///   for: the expected set is a separately declared list of names, not a length taken from the
+    ///   same input the loop shrank.
+    /// * INVALID control, so "they all compiled" has content: `located.push(label.len())` →
+    ///   `error[E0308]`. UNTESTED, not RED; re-run in a valid form before believing anything.
+    #[test]
+    fn docs_http_api_md_may_not_disagree_with_this_modules_struct_counts() {
+        let doc_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/http-api.md");
+        let self_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/req_form.rs");
+        let doc = std::fs::read_to_string(doc_path)
+            .unwrap_or_else(|e| panic!("cannot read {doc_path}: {e}"));
+        let me = std::fs::read_to_string(self_path)
+            .unwrap_or_else(|e| panic!("cannot read {self_path}: {e}"));
+
+        let total = DECLARED_REQUEST_STRUCTS;
+        let exempt = DENY_UNKNOWN_EXEMPT.len();
+        let protected = total - exempt;
+        // See the doc comment: a documented re-derivation, not a constant, written here only so the
+        // remainder below is computed rather than typed.
+        let destructured = 8usize;
+        let remainder = total - destructured;
+
+        let sites: Vec<(&str, &str, String)> = vec![
+            ("doc:exempt-of-total", doc_path,
+             format!("are the {exempt} of this crate's {total} request structs")),
+            ("doc:corpus-total", doc_path,
+             format!("all **{total}** — to be classified")),
+            ("doc:destructured-of-total", doc_path,
+             format!("only **{destructured}** of the {total} are protected")),
+            ("doc:remainder", doc_path,
+             format!("other {remainder} structs")),
+            // Added because the sweep below caught this sentence the moment it was written: it
+            // names all four figures while telling callers they are pinned, which would have been
+            // the same unread claim one sentence later.
+            ("doc:figure-list", doc_path,
+             format!("(`{exempt}`, `{destructured}`, `{remainder}`, `{total}`)")),
+            ("self:protected-of-total", self_path,
+             format!("{protected} of this crate's {total} request structs carry")),
+            ("self:destructured-of-total", self_path,
+             format!("It is {destructured} of the {total} request structs")),
+            ("self:corpus-total", self_path,
+             format!("covers all {total},")),
+            ("self:protected-of-total-2", self_path,
+             format!("corpus: {protected} of {total} carry it")),
+        ];
+
+        let mut located: Vec<&str> = Vec::new();
+        let mut doc_pins: Vec<(usize, usize)> = Vec::new();
+        for (label, path, frag) in &sites {
+            let hay = if *path == doc_path { &doc } else { &me };
+            let hits: Vec<usize> = hay.match_indices(frag.as_str()).map(|(at, _)| at).collect();
+            assert_eq!(hits.len(), 1,
+                "{label}: expected exactly one occurrence of {frag:?} in {path}, found {}. This \
+                 sentence is rebuilt from the constants, so a mismatch means either a constant \
+                 moved and the prose did not, or the prose was reworded past its pin. Fix the text \
+                 or move the pin — do NOT delete the site, since deleting it here is how the number \
+                 goes back to being unread.", hits.len());
+            if *path == doc_path {
+                doc_pins.push((hits[0], hits[0] + frag.len()));
+            }
+            located.push(label);
+        }
+        assert_eq!(located, COUNT_CLAIM_SITES,
+            "REACH CONTROL: the sites actually located are {located:?}, expected \
+             {COUNT_CLAIM_SITES:?}. This list is a PRODUCT of the loop above — a label is pushed \
+             only after its pin passed — and it is compared against a separately declared set of \
+             NAMES, not against the length of the loop's own input, so truncating `sites` names the \
+             sites that went missing instead of quietly shrinking both sides.");
+
+        // Sweep: no unpinned occurrence of the total anywhere on the page.
+        let tok = total.to_string();
+        let bytes = doc.as_bytes();
+        let mut stray: Vec<usize> = Vec::new();
+        for (at, _) in doc.match_indices(tok.as_str()) {
+            let digit_before = at > 0 && bytes[at - 1].is_ascii_digit();
+            let digit_after = bytes.get(at + tok.len()).is_some_and(u8::is_ascii_digit);
+            if digit_before || digit_after {
+                continue; // part of a longer number, e.g. `1035`
+            }
+            if doc_pins.iter().any(|&(s, e)| at >= s && at < e) {
+                continue;
+            }
+            stray.push(doc[..at].matches('\n').count() + 1);
+        }
+        assert!(stray.is_empty(),
+            "{doc_path} states `{tok}` at line(s) {stray:?} outside every pinned sentence. If that \
+             is another claim about how many request structs this crate declares, add it to \
+             `COUNT_CLAIM_SITES` and to `sites` so it moves with the constant; if it is an unrelated \
+             {tok}, reword it — an unpinned copy of this number is exactly what went stale before.");
     }
 
     /// The refusal template and every `what` it is given must contain NO word that is also a field
@@ -670,9 +813,13 @@ mod tests {
             } => req,
             res = &mut handle => panic!(
                 "expected the typo'd key to be dropped and the request to reach the frame-request \
-                 hand-off, but the handler returned early with status {} — if that is a 4xx, \
-                 `FrameQuery` gained `deny_unknown_fields` (or an equivalent hand-rolled check) and \
-                 this module's prose about it is now wrong", res.expect("handler panicked").status()),
+                 hand-off, but the handler returned early with status {}. A 4xx here has at least \
+                 two causes and this test cannot tell them apart from the status alone: `FrameQuery` \
+                 may have gained `deny_unknown_fields` (or a hand-rolled unknown-key check), in \
+                 which case this module's prose about it is now wrong — or `prset` may now be \
+                 RECOGNIZED, in which case `preset` and `pitch` are both supplied and the route \
+                 refuses the conflict, which would mean this fixture stopped testing the typo. Read \
+                 the body before deciding which", res.expect("handler panicked").status()),
         };
         // The load-bearing assertion, and the one a mere `200` would not make: an override WAS
         // built, from `pitch` alone. The caller asked for a top-down preset, the key carrying that
@@ -717,7 +864,9 @@ mod tests {
                  says so. If this is now 2xx the note is wrong and callers were told the opposite. \
                  Body: {body}", case.route);
             assert_eq!(named, case.fields, "{}: the refusal must still name both: {body}", case.route);
-            assert!(body.contains(&format!("conflicting {subject}")), "{}: {body}", case.route);
+            assert!(body.starts_with(&format!("conflicting {subject}")),
+                "{}: the refusal must OPEN with its declared subject, which is what \
+                 `docs/http-api.md` tells callers to key on: {body}", case.route);
         }
     }
 
@@ -805,6 +954,21 @@ mod tests {
     ///   off (`if false { lt.starts_with("#[") } else { true }`) and this test goes back to
     ///   **GREEN** — a struct silently stripped of its protection, with every prose claim about
     ///   "2 of 35" still passing. That is the evasion, reproduced and then closed.
+    ///
+    /// Instance TEN, found in review round 3 and measured here the same way: the narrowing above was
+    /// `starts_with("#[")`, and `#[doc = "protected by serde(deny_unknown_fields)"]` IS an attribute
+    /// line, so a SENTENCE could still vote the struct protected.
+    /// * That attribute in place of `quests.rs`'s real one: **KILLED** — the scan reported
+    ///   `TaskIdBody` as unprotected. It survived under the old `#[` test.
+    /// * Control, WRAP the narrowing back off — `if false` on the `#[serde(` test, `else` the old
+    ///   `#[` one — with the mutant still in place: **GREEN**. The `#[serde(` opener is what kills
+    ///   it.
+    /// * Inertness re-derived rather than assumed, by driving `POST /v1/quests/accept` with
+    ///   `{"task_id":999,"bogus":1}` through `v1_router()`: with the mutant the answer is
+    ///   `400 no pending task offer with task_id=999` (parsed, `bogus` discarded); with the real
+    ///   attribute it is `400 provide {"task_id":N}` (refused at deserialization). Note what that
+    ///   also shows: NO behavioural test in this crate covers unknown-field rejection on that route,
+    ///   so this scan was the only thing standing between that mutant and a green suite.
     #[test]
     fn every_deserialize_request_struct_is_classified() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
@@ -841,11 +1005,16 @@ mod tests {
                 // `l.contains("deny_unknown_fields")` credits the words wherever they appear, so
                 // `#[cfg_attr(any(), serde(deny_unknown_fields))]` — text present, attribute inert —
                 // read as protected while the struct genuinely lost its protection, and a doc
-                // comment merely MENTIONING the words did the same. Two narrowings, both cheap:
-                // the line must be an ATTRIBUTE (`#[…]`, so a comment cannot vote), and any
-                // `cfg_attr` in the window is refused outright rather than guessed at, because
-                // deciding whether a conditional attribute is active needs cfg evaluation this
-                // scanner does not do. What remains outside the guard is stated on
+                // comment merely MENTIONING the words did the same. Instance TEN, found in the next
+                // round, walked past the first narrowing the same way: `#[doc = "…
+                // deny_unknown_fields …"]` IS an attribute line, so requiring `#[` still let a
+                // sentence vote. So the line must open the attribute serde itself reads —
+                // `#[serde(` — and any `cfg_attr` in the window is refused outright rather than
+                // guessed at, because deciding whether a conditional attribute is active needs cfg
+                // evaluation this scanner does not do. All 33 protected structs in this crate write
+                // it as exactly `#[serde(deny_unknown_fields)]`; a struct that splits it across
+                // lines or nests it differently will read as UNPROTECTED, which is the safe
+                // direction to be wrong in. What remains outside the guard is stated on
                 // `DENY_UNKNOWN_EXEMPT`: it reads what is WRITTEN, not what serde APPLIES.
                 let mut decl: Option<&str> = None;
                 let mut protected = false;
@@ -858,7 +1027,7 @@ mod tests {
                          `#[cfg_attr(any(), serde(deny_unknown_fields))]` reads as protected while \
                          being inert. Write the attribute unconditionally, or teach this scan the \
                          cfg and add the reasoning here.", i + 2 + off);
-                    if lt.starts_with("#[") && l.contains("deny_unknown_fields") {
+                    if lt.starts_with("#[serde(") && l.contains("deny_unknown_fields") {
                         protected = true;
                     }
                     if let Some(rest) = l.split("struct ").nth(1) {
