@@ -62,8 +62,8 @@ breakdown and why.
 
 | Route | Body | Description |
 |-------|------|-------------|
-| `POST /v1/move/goto` | `{"name":"Guard Phaeton"}` \| `{"x":,"y":,"z":}` \| `{"map_x":,"map_y":}` \| `{}` | Walk to an entity (fuzzy name, one-time snapshot) or coordinates and **stop** on arrival. Empty body → the player's current target. `map_*` are Brewall map coords (= negated server x/y); `z` is optional there (defaults, then the walker snaps to the actual floor) but **required** on the raw `{x,y,z}` form. A body with SOME coordinate field(s) but not a complete `{x,y,z}` or `{map_x,map_y}` — e.g. `{"x":,"y":}` with no `z` — 400s naming exactly which field(s) are missing (`partial target: got {x, y} but missing {z}`), never the "no target; provide a name or coords" message, which is reserved for a body with no coordinate field at all (#886). **Returns JSON**, including [`matched`](#matched--which-entity-a-name-actually-resolved-to) when the goal came from a name/target. |
-| `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected (400). **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to). |
+| `POST /v1/move/goto` | `{"name":"Guard Phaeton"}` \| `{"x":,"y":,"z":}` \| `{"map_x":,"map_y":}` \| `{}` | Walk to an entity (fuzzy name, one-time snapshot) or coordinates and **stop** on arrival. Empty body → the player's current target. `map_*` are Brewall map coords (= negated server x/y); `z` is optional there (defaults, then the walker snaps to the actual floor) but **required** on the raw `{x,y,z}` form. A body with SOME coordinate field(s) but not a complete `{x,y,z}` or `{map_x,map_y}` — e.g. `{"x":,"y":}` with no `z` — 400s naming exactly which field(s) are missing (`partial target: got {x, y} but missing {z}`), never the "no target; provide a name or coords" message, which is reserved for a body with no coordinate field at all (#886). **Two or more target forms in one body never silently pick a winner** — see [Target-form precedence and `ignored_fields`](#target-form-precedence-and-ignored_fields-901) (#901). **Returns JSON**, including [`matched`](#matched--which-entity-a-name-actually-resolved-to) when the goal came from a name/target. |
+| `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected even alongside `name` (400 — but a freezing hold answers 409 first, #884) — no target-naming field is ever silently dropped here (#901). `avoid_aggro`/`aggro_buffer` are a separate field family: `/follow` accepts them (shares `MoveBody` with `/goto`) but never applies them, so they ARE silently ignored — tracked as #952, not fixed by #901. **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to). |
 | `POST /v1/move/stop` | — | Cancel any active goto/follow. **Not** subject to the `held` gate below — it is a cancel, its effect is on the nav slots and not on the physics step, so it stays honest and available while the body is frozen. |
 | `POST /v1/move/zone_cross` | `{"zone_id":N}` \| `{}` | Cross a zone line and send OP_ZoneChange (specific zone, or nearest line). |
 
@@ -967,6 +967,47 @@ matches nothing at all — not even fuzzily — is an honest **404**, never a di
 > **Content type:** `/v1/move/goto`, `/v1/move/follow` and `/v1/combat/target/name` return
 > `application/json`. The other `move` routes (`/stop`, `/zone_cross`, `/manual`, `/jump`) still
 > return `text/plain`.
+
+### Target-form precedence and `ignored_fields` (#901)
+
+`POST /v1/move/goto`'s body accepts **four** ways to say where to go: a `name`, a complete
+`{map_x,map_y}` pair, a complete raw `{x,y,z}` triple, or nothing at all (the current target). A
+body that supplies more than one of these no longer picks a winner and silently drops the rest —
+every loser is either **named in the response** or the whole request is **rejected**, depending on
+which:
+
+1. **`name` beside ANY coordinate field (complete or not) is a `400`.** Coordinates never
+   disambiguate a name match — the fuzzy-match resolver never reads `x`/`y`/`z`/`map_x`/`map_y` —
+   so a caller that sent both, believing the coordinates would narrow a duplicated name, is
+   necessarily wrong to expect that. There is no reading under which the two belong in the same
+   request, so this is rejected outright rather than reported:
+   ```jsonc
+   POST /v1/move/goto {"name": "a rat", "x": 10, "y": 20, "z": 3}
+   400 "conflicting target: \"name\" (\"a rat\") and coordinate field(s) {x, y, z} were both
+        provided — coordinates never disambiguate a name match, so send exactly one target form
+        (a name, or coordinates, not both)"
+   ```
+2. **Between the two coordinate forms, a complete `{map_x,map_y}` pair beats a complete raw
+   `{x,y,z}` triple.** Unlike (1), sending both is a plausible non-contradictory pattern (e.g. a
+   caller that always populates a Brewall-derived AND a server-derived description of the same
+   point), so the precedence still applies but the loser is now **named**, not dropped: a `200`
+   response always carries an `ignored_fields` array listing every field the winning form didn't
+   consume (empty when nothing was discarded). `z` is shared between the two forms (it overrides
+   the map form's default z when present) and is never listed as ignored. This also covers the
+   form the two confirmed cases above didn't name explicitly: a **lone** `map_x` or `map_y` (not a
+   complete pair) beside a complete raw triple used to vanish with no trace at all — it is now
+   named in `ignored_fields` too.
+   ```jsonc
+   POST /v1/move/goto {"map_x": 10, "map_y": 20, "x": 999, "y": 888, "z": 777}
+   200 {"status": "navigating", "goal": [-10, -20, 777], "ignored_fields": ["x", "y"], ...}
+   ```
+3. **A body with SOME coordinate field(s) but not enough to complete either form** still 400s
+   naming the missing field(s) — see the `/goto` row above (#886) — this is unchanged by #901.
+
+> **Migration note:** before #901, case (1) above (`name` beside a coordinate field) answered
+> `200` and silently routed to the name, dropping the coordinates with no trace. It now answers
+> `400`. A caller that was relying on that silent routing (rather than sending one target form)
+> must stop sending both fields in the same request.
 
 ### `nav_goal_id` and `nav_goal` — goal identity (#349)
 
