@@ -354,42 +354,7 @@ impl PlayerState {
             // `ActionLoop::stream_position` tick that mirrors the position, so this is as fresh as
             // `pos_east/north/up`. `detail` is attached here rather than stored, like every other
             // agent-facing explanation in this crate.
-            hold: gs.player_hold.map(|h| PlayerHoldView {
-                reason:    h.reason.as_str(),
-                held_secs: h.secs,
-                detail: match h.reason {
-                    eqoxide_core::game_state::ControllerHoldReason::EmbeddedNoRecovery =>
-                        "the character cannot be placed: it is either EMBEDDED in world geometry or \
-                         standing over a VOID with no floor within 200 u below its feet. (The \
-                         client's test is a disjunction of those two and this field cannot tell you \
-                         which; the case reported in #845 was measured to be the void half, so do \
-                         not assume geometry is piercing the body.) The push-out search found \
-                         nowhere it can legally stand, and it has no recovery position to fall back \
-                         to (a position discontinuity — a summon, a large server correction — \
-                         supersedes that history, #724). Physics is frozen: every movement command \
-                         will be accepted and produce NO motion, in any direction. Since #845 the \
-                         client also searches the zone out to 512 u, about once a second, for \
-                         anywhere a body could legally stand, and relocates itself there — but a \
-                         SUCCEEDING search never publishes this field at all, so if you are reading \
-                         this, that search has just answered `nowhere`. It will NOT clear on its \
-                         own: in a zone whose geometry does not change the retry keeps failing for \
-                         the same reason (measured: raised at 0.5 s, still held after 60 s, body \
-                         never moved). A GM `#goto`, `#summon` or `#zone` clears it (all three \
-                         measured live on #845, each on the first frame) — but those need GM \
-                         status, so an ordinary character has no client-API exit.",
-                    eqoxide_core::game_state::ControllerHoldReason::UnderworldNoRecovery =>
-                        "the character fell to the zone's UNDERWORLD floor and the client is holding \
-                         it there rather than let it drop out of the world (#150). It has no \
-                         recovery position to restore (a position discontinuity supersedes that \
-                         history, #724), so it is hanging in place: not falling, not landing, not \
-                         grounded. Horizontal movement still works, but there is probably nothing \
-                         under it. This will not clear on its own — ask a GM to move the character, \
-                         or zone out. (#845 deliberately did NOT extend its zone-wide relocation \
-                         search to this hold: unlike `embedded_no_recovery`, this one leaves \
-                         horizontal movement working, so `/v1/move/manual` may walk the character \
-                         out over a floor that is above the underworld.)",
-                },
-            }),
+            hold: gs.player_hold.map(PlayerHoldView::of),
             // #776/#801: the afloat stall, mirrored into `gs` by the same `stream_position` tick as
             // the hold above and the position above that. A view of its own — folding it into `hold`
             // would publish "this body cannot move at all" about a body a driven dive can free.
@@ -723,6 +688,63 @@ pub struct PlayerHoldView {
     pub held_secs: f32,
     /// Plain-language statement of what is true and what an agent can do about it.
     pub detail: &'static str,
+}
+
+impl PlayerHoldView {
+    /// The ONE place a [`ControllerHold`](eqoxide_core::game_state::ControllerHold) becomes an
+    /// agent-facing view (#884).
+    ///
+    /// Before #884 the `detail` prose was written inline in `PlayerState::from_game_state`, which
+    /// was fine while `GET /v1/observe/debug` was its only reader. It is not fine now: the
+    /// held-refusal that `/v1/move/*` returns carries the same object, and two hand-built copies of
+    /// a disclosure are two copies that drift — the agent would then be told one thing when it polls
+    /// and another when it is refused, with no way to know which is current. One constructor, one
+    /// text.
+    pub fn of(h: eqoxide_core::game_state::ControllerHold) -> Self {
+        use eqoxide_core::game_state::ControllerHoldReason as R;
+        PlayerHoldView {
+            reason:    h.reason.as_str(),
+            held_secs: h.secs,
+            detail: match h.reason {
+                R::EmbeddedNoRecovery =>
+                    "the character cannot be placed: it is either EMBEDDED in world geometry or \
+                     standing over a VOID with no floor within 200 u below its feet. (The \
+                     client's test is a disjunction of those two and this field cannot tell you \
+                     which; the case reported in #845 was measured to be the void half, so do \
+                     not assume geometry is piercing the body.) The push-out search found \
+                     nowhere it can legally stand, and it has no recovery position to fall back \
+                     to (a position discontinuity — a summon, a large server correction — \
+                     supersedes that history, #724). Physics is frozen: no driver input of any \
+                     shape reaches the body, so since #884 POST /v1/move/{goto,follow,zone_cross,\
+                     manual,jump} REFUSE while this is in force — 409 with \"status\":\"held\" \
+                     and nothing queued — rather than answer 200 about motion that cannot happen. \
+                     Since #845 the client also searches the zone out to 512 u, about once a \
+                     second, for anywhere a body could legally stand, and relocates itself there \
+                     — but a SUCCEEDING search never publishes this field at all, so if you are \
+                     reading this, that search has just answered `nowhere`. It will NOT clear on \
+                     its own: in a zone whose geometry does not change the retry keeps failing \
+                     for the same reason (measured: raised at 0.5 s, still held after 60 s, body \
+                     never moved). A GM `#goto`, `#summon` or `#zone` clears it (all three \
+                     measured live on #845, each on the first frame) — but those need GM \
+                     status, so an ordinary character has no client-API exit. The command \
+                     channel is NOT frozen: POST /v1/interact/say still reaches the server, which \
+                     is how a held GM character issued its own `#goto`.",
+                R::UnderworldNoRecovery =>
+                    "the character fell to the zone's UNDERWORLD floor and the client is holding \
+                     it there rather than let it drop out of the world (#150). It has no \
+                     recovery position to restore (a position discontinuity supersedes that \
+                     history, #724), so it is hanging in place: not falling, not landing, not \
+                     grounded. Horizontal movement still works, but there is probably nothing \
+                     under it. This will not clear on its own — ask a GM to move the character, \
+                     or zone out. (#845 deliberately did NOT extend its zone-wide relocation \
+                     search to this hold: unlike `embedded_no_recovery`, this one leaves \
+                     horizontal movement working, so `/v1/move/manual` may walk the character \
+                     out over a floor that is above the underworld. For the same reason #884's \
+                     movement gate does NOT refuse while this hold is in force — refusing would \
+                     be its own false claim, and would remove this body's only client-API exit.)",
+            },
+        }
+    }
 }
 
 /// **#776/#801 (agent-honesty): this character is afloat, is being asked to swim somewhere, and is
@@ -1209,6 +1231,113 @@ pub(crate) fn require_alive(s: &HttpState) -> Result<(), (axum::http::StatusCode
         ));
     }
     Ok(())
+}
+
+/// #884 (agent-honesty): **what a `/v1/move/*` request may honestly claim, given the controller
+/// hold in force.**
+///
+/// The bug: while `player.hold` was `embedded_no_recovery` — a state in which the character
+/// controller's step returns before it reads the driver intent at all — `POST /v1/move/zone_cross`
+/// still answered `200 … accepted — walking to the zone line`. Measured live on #845/#884: thirteen
+/// client-API calls, all 200-or-documented-success, position byte-identical across all of them,
+/// while `held_secs` advanced 78.10 → 88.15 over 10.02 s of wall clock (so the client was live and
+/// republishing, not merely stale). The agent has no independent channel to reality; it read an
+/// affirmative body and waited for a transit that structurally could not begin.
+///
+/// # Why this is an enum and not `Option<PlayerHoldView>` plus an `if`
+///
+/// The gate is NOT "is a hold in force". `underworld_no_recovery` is a hold under which a lateral
+/// wish still reaches the body — the #150 fall-through guard runs *after* collide-and-slide — and
+/// `/v1/move/manual` walking such a body out is the ONLY client-API exit it has (see
+/// `movement.rs`'s `last_resort_placement`, which was deliberately not extended to that arm for
+/// exactly this reason). A gate keyed on `hold.is_some()` would refuse it, which is the
+/// mirror-image lie: "you cannot move" told to a body that can. The distinction is carried by
+/// [`eqoxide_core::game_state::HeldMotion`], read off the controller's control flow and asserted in
+/// `hold_motion_matches_the_controllers_control_flow_884`, so a third hold reason cannot be added
+/// without its author deciding which side of this gate it falls on.
+///
+/// # What it does NOT claim
+///
+/// [`Self::Clear`] is not a promise the request will succeed — the walker can still wedge, find no
+/// path, or be superseded; that is what `nav_state` is for. [`Self::HeldButDriveable`] is not a
+/// promise that *this particular* wish will move the body, only that the controller has not stopped
+/// reading wishes; a vertical wish or a jump on that arm may well do nothing, and this type
+/// deliberately makes no claim about them. Only [`Self::Frozen`] is a positive statement, and it is
+/// the one the controller's own early `return` makes for it.
+pub(crate) enum MoveGate {
+    /// No hold is in force. Proceed; disclose `hold: null` on the way out.
+    Clear,
+    /// A hold is in force but it does not stop the controller reading driver input. Proceed, and
+    /// disclose the hold beside the acceptance so the caller is not left to discover it on another
+    /// endpoint it had no reason to read.
+    HeldButDriveable(PlayerHoldView),
+    /// The physics step every movement endpoint depends on is frozen. REFUSE, and queue nothing:
+    /// an accepted-but-inert goal is the same falsehood one step later (and #644 already settled
+    /// that shape for a dead character — decide before any `goal_id` is stamped).
+    Frozen(PlayerHoldView),
+}
+
+impl MoveGate {
+    /// Read the gate from the live snapshot. `player_hold` is mirrored by the same
+    /// `ActionLoop::stream_position` tick that mirrors `player_x/y/z`, so this is exactly as fresh
+    /// as the position an agent reads beside it — and per [`PlayerHoldView`]'s staleness analysis
+    /// (#846) an idle render loop cannot *manufacture* a hold, only freeze `held_secs`, so this
+    /// gate cannot refuse a body that has already been freed.
+    pub(crate) fn read(s: &HttpState) -> MoveGate {
+        use eqoxide_core::game_state::HeldMotion;
+        match s.game_state.load().player_hold {
+            None    => MoveGate::Clear,
+            Some(h) => match h.reason.motion() {
+                HeldMotion::AllFrozen           => MoveGate::Frozen(PlayerHoldView::of(h)),
+                HeldMotion::LateralStillReaches => MoveGate::HeldButDriveable(PlayerHoldView::of(h)),
+            },
+        }
+    }
+
+    /// The refusal to return, or `None` to proceed. **The single place the `409 held` body is
+    /// built**, so all five movement endpoints answer in the same shape by construction rather than
+    /// by five authors remembering to — including `/manual`, `/jump` and `/zone_cross`, whose 200s
+    /// are `text/plain` and which would otherwise each have invented their own wording.
+    ///
+    /// `409 Conflict` and the machine token `held` deliberately mirror #644's `dead`: same status,
+    /// same "decided before anything is queued" position in the handler, same reason — a caller
+    /// must be able to branch on the state without reading prose.
+    pub(crate) fn refusal(&self) -> Option<axum::response::Response> {
+        let hold = match self {
+            MoveGate::Frozen(h) => h,
+            MoveGate::Clear | MoveGate::HeldButDriveable(_) => return None,
+        };
+        let body = serde_json::json!({
+            "status":  "held",
+            "hold":    serde_json::to_value(hold).expect("PlayerHoldView serialises"),
+            "message": format!(
+                "the character is physics-held ({}, {:.1}s) — this movement command was NOT \
+                 accepted, nothing was queued, and no goal_id was stamped. The controller's step \
+                 returns before it reads driver input while this hold is in force, so retrying \
+                 will not help until it clears. See `hold.detail` here (same text as \
+                 `player.hold.detail` on GET /v1/observe/debug) for what does.",
+                hold.reason, hold.held_secs),
+        });
+        Some(
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::CONFLICT)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("static response builder"),
+        )
+    }
+
+    /// The hold to DISCLOSE alongside a 200, as a JSON value (`null` when clear). `None` is
+    /// impossible for [`Self::Frozen`] in practice — that arm never reaches a 200 — but it maps to
+    /// `null` rather than panicking, because a disclosure helper must not be able to take down the
+    /// process it exists to make honest.
+    pub(crate) fn disclosure(&self) -> serde_json::Value {
+        match self {
+            MoveGate::HeldButDriveable(h) =>
+                serde_json::to_value(h).expect("PlayerHoldView serialises"),
+            MoveGate::Clear | MoveGate::Frozen(_) => serde_json::Value::Null,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
