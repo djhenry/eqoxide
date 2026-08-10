@@ -1172,6 +1172,18 @@ mod tests {
 
     const APP_RS: &str = include_str!("app.rs");
 
+    /// The anchor the `app.rs` sweeps derive their sites from: a four-space-indented `fn` at the
+    /// start of a line.
+    ///
+    /// **What this is and is not.** It matches most, but deliberately not all, of `app.rs`'s method
+    /// starts. Any qualifier between the indent and the `fn` — `pub`, `async`, `const`, `unsafe` —
+    /// breaks the anchor, and a free function at column 0 is not four-space-indented at all.
+    /// Calling it "every method start" (an earlier revision did) is a near-universal stated as a
+    /// universal, which is the defect class this module exists to catch. No count is asserted here,
+    /// because any count of another file's contents rots the moment that file changes; what the
+    /// sweeps need is a large derived sample of insertion positions, and that is all this is.
+    const SITE: &str = "\n    fn ";
+
     /// Why a [`CodeScan`] could not be built. **Never a claim about what the scanned file
     /// contains** — only about the scanner's ability to read it.
     ///
@@ -1200,13 +1212,26 @@ mod tests {
     /// # What the lexer handles
     ///
     /// `//` to end of line; `/* … */`, **nested**, as Rust nests them; `"…"` with `\` escapes, and
-    /// the byte form `b"…"`; raw strings `r"…"`, `r#"…"#` and `br#"…"#` at any hash count; char
-    /// literals `'x'`, `'\n'`, `'\''`, `'\u{1F600}'`, non-ASCII `'é'`, and the byte forms `b'x'` —
+    /// the prefixed forms `b"…"` and `c"…"`; raw strings `r"…"`, `r#"…"#`, `br#"…"#` and `cr#"…"#`
+    /// at any hash count; char literals `'x'`, non-ASCII `'é'`, the byte form `b'x'`, and **every**
+    /// escape in Rust's character-literal grammar — `\'` `\"` `\\` `\n` `\r` `\t` `\0` `\xNN`
+    /// `\u{…}`, enumerated in [`escape_end`] and swept byte-exhaustively by
+    /// `the_char_literal_escape_grammar_is_enumerated_not_approximated`. Char literals are
     /// distinguished from LIFETIMES, which are left as ordinary code.
     ///
-    /// # What it does not handle — stated, not implied
+    /// # What it does not handle
     ///
-    /// * **A lifetime immediately followed by `'`.** `char_literal_end` classifies `'` as a char
+    /// **This list is best-effort, and is not itself checked for completeness.** An earlier
+    /// revision headed it *"stated, not implied"* while omitting `\xNN` — a construct that already
+    /// existed in this workspace and that made the constructor return `Ok` with a wrong mask. A
+    /// disclosure section that reads as exhaustive but is not invites the reader to treat the gap
+    /// as closed, so the heading no longer claims exhaustiveness. What IS checkable, and is
+    /// checked, is narrower and stated where it lives: the escape enumeration in [`escape_end`]
+    /// (exhaustive over all 256 opener bytes, asserted in the test named above).
+    ///
+    /// Known, at the time of writing:
+    ///
+    /// * **A lifetime immediately followed by `'`.** [`char_literal_end`] classifies `'` as a char
     ///   literal whenever a closing `'` sits exactly one character (or one escape) later, so the
     ///   two-byte text `'a'` is read as a char literal regardless of what it means. Rust never
     ///   writes a lifetime that way — a lifetime name is always followed by whitespace, `,`, `>`,
@@ -1216,6 +1241,11 @@ mod tests {
     ///   macro expansion and dead-code elimination are all invisible to it; see the "What this does
     ///   NOT establish" section on
     ///   `the_app_rs_call_into_this_module_is_an_unconditional_statement`.
+    /// * **Anything the lexer gets wrong that nothing here has thought to look for.** That is not a
+    ///   rhetorical hedge: `\xNN` sat in this position until a reviewer wrote an independent
+    ///   reference lexer and differentialled the two over the workspace's tracked `.rs` files. The
+    ///   backstop for the unknown remainder is the brace-balance refusal below, and its residual is
+    ///   stated at the end of this doc rather than argued away.
     ///
     /// # Why the constructor is fallible (#892)
     ///
@@ -1237,14 +1267,23 @@ mod tests {
     /// invariant has moved out of a test and into this constructor. A `CodeScan` cannot be
     /// obtained at all unless the walk consumed every byte of the source and the code-position
     /// braces balanced — brace balance being a genuine property of any file rustc can tokenise,
-    /// since Rust's token trees must be delimiter-balanced. There is therefore no way to hand a
-    /// consumer a desynchronised mask and have it draw a confident conclusion from it.
+    /// since Rust's token trees must be delimiter-balanced.
     ///
-    /// **The residual, plainly:** a mis-lex that happens to leave the braces balanced would still
-    /// pass. That is why the constructs above are handled outright instead of being left to the
-    /// balance check, and it is why
-    /// `a_quote_char_literal_can_no_longer_blind_the_app_rs_scan` exercises the real `app.rs` at
-    /// many insertion sites rather than trusting the invariant to notice.
+    /// **The residual, plainly, and it is not a corner case.** A mis-lex that happens to leave the
+    /// braces balanced still returns `Ok`, and the consumer then draws a confident conclusion from
+    /// a desynchronised mask. An earlier revision of this doc claimed here that there was
+    /// "therefore no way" for that to happen; the claim was false when it was written, and #892's
+    /// review produced the counterexample from a construct already in this workspace —
+    /// `['\x12','{','}']` returned `Ok` with the literal braces exposed as code, and the `app.rs`
+    /// pin then reported a false block head. The sentence is deleted rather than qualified: the
+    /// balance refusal is a backstop with a known hole, not a proof.
+    ///
+    /// What the honest statement is: **the forms listed under "What the lexer handles" are handled
+    /// outright**, at many positions in the real `app.rs`
+    /// (`a_quote_char_literal_can_no_longer_blind_the_app_rs_scan`,
+    /// `an_escaped_char_literal_around_the_ring_clear_cannot_move_its_block_head`) and case by case
+    /// on the escape grammar (`the_char_literal_escape_grammar_is_enumerated_not_approximated`);
+    /// everything outside that list is left to a backstop that can be evaded.
     struct CodeScan {
         /// The source with comments removed, everything else verbatim so failure messages stay
         /// readable.
@@ -1261,19 +1300,37 @@ mod tests {
 
     /// If `b[i]` opens a CHAR LITERAL, the offset one past its closing `'`; `None` if it is a
     /// lifetime (or nothing this understands).
+    ///
+    /// # The escape grammar, enumerated rather than approximated
+    ///
+    /// The previous version of this function said *"`\u{…}` runs to its `}`; everything else is one
+    /// character"* and advanced by one. That is false for `\xNN`, which is **two** hex digits — the
+    /// walk landed on the first hex digit instead of the closing `'`, returned `None`, and the `'`
+    /// fell through as a lifetime, shifting the mask. `'\x12'` is not hypothetical: it already
+    /// occurs in this workspace (`crates/eqoxide-net/src/packet_handler.rs`, `s.split('\x12')`),
+    /// and `['\x12','{','}']` made `CodeScan::of` return **`Ok` with a wrong mask** — literal braces
+    /// exposed as code — which then made the `app.rs` pin state a false fact. See #892's review.
+    ///
+    /// So the whole grammar is spelled out below, one arm per production of the Rust Reference's
+    /// character-literal rule, and anything outside it returns `None` rather than guessing a
+    /// length. `escape_end` is exercised case-by-case by
+    /// `the_char_literal_escape_grammar_is_enumerated_not_approximated`, whose fixture list is
+    /// asserted against this same enumeration so the two cannot drift apart.
+    ///
+    /// | Reference production | Form | Length after `\` |
+    /// | --- | --- | --- |
+    /// | Quote escapes | `\'` `\"` | 1 |
+    /// | ASCII escapes | `\n` `\r` `\t` `\\` `\0` | 1 |
+    /// | ASCII escapes | `\xNN` | 3 (`x` + **two** hex digits) |
+    /// | Unicode escapes | `\u{NNNNNN}` | to the `}`, 1–6 hex digits, `_` permitted |
+    ///
+    /// There is no fifth production. A `\` followed by anything else is not a valid escape and
+    /// cannot appear in a file rustc accepts.
     fn char_literal_end(b: &[u8], i: usize) -> Option<usize> {
         if b.get(i) != Some(&b'\'') { return None; }
         if b.get(i + 1) == Some(&b'\\') {
-            // An escape. `\u{…}` runs to its `}`; everything else is one character.
-            let mut j = i + 2;
-            if b.get(j) == Some(&b'u') && b.get(j + 1) == Some(&b'{') {
-                j += 2;
-                while j < b.len() && b[j] != b'}' { j += 1; }
-                j += 1;
-            } else {
-                j += 1;
-            }
-            return if b.get(j) == Some(&b'\'') { Some(j + 1) } else { None };
+            let after = escape_end(b, i + 2)?;
+            return if b.get(after) == Some(&b'\'') { Some(after + 1) } else { None };
         }
         // One character, which may be multi-byte UTF-8. Length comes from the leading byte.
         let lead = *b.get(i + 1)?;
@@ -1285,12 +1342,56 @@ mod tests {
         if b.get(i + 1 + len) == Some(&b'\'') { Some(i + len + 2) } else { None }
     }
 
-    /// If a RAW STRING opens at `b[i]` (`r"`, `r#"`, `br#"`, …), its hash count and the offset of
-    /// the byte after the opening quote.
+    /// One past the end of the escape whose `\` sits at `esc - 1` — so `esc` indexes the escape's
+    /// first character (`n`, `x`, `u`, …). `None` for anything that is not one of Rust's four
+    /// character-escape productions; see [`char_literal_end`]'s table.
+    ///
+    /// Every byte value this accepts is asserted, by exhaustive sweep over all 256 of them, in
+    /// `the_char_literal_escape_grammar_is_enumerated_not_approximated`. That is what makes the
+    /// enumeration *checkable* rather than merely stated: adding an arm here without adding it to
+    /// that test's expected set reds, and so does removing one.
+    fn escape_end(b: &[u8], esc: usize) -> Option<usize> {
+        match *b.get(esc)? {
+            // Quote escapes (`\'`, `\"`) and the one-character ASCII escapes.
+            b'\'' | b'"' | b'\\' | b'n' | b'r' | b't' | b'0' => Some(esc + 1),
+            // `\xNN` — exactly TWO hex digits. Treating this as "one character like the rest" is
+            // the defect #892's review found: it returned `None`, the `'` was read as a lifetime,
+            // and `CodeScan::of` handed back `Ok` with a desynchronised mask.
+            b'x' => {
+                let hex = |k: usize| b.get(k).is_some_and(u8::is_ascii_hexdigit);
+                if hex(esc + 1) && hex(esc + 2) { Some(esc + 3) } else { None }
+            }
+            // `\u{…}` — 1 to 6 hex digits, `_` separators permitted, closed by `}`.
+            b'u' => {
+                if b.get(esc + 1) != Some(&b'{') { return None; }
+                let mut j = esc + 2;
+                let mut digits = 0usize;
+                while let Some(&c) = b.get(j) {
+                    if c.is_ascii_hexdigit() { digits += 1; j += 1; }
+                    else if c == b'_' { j += 1; }
+                    else { break; }
+                }
+                if digits == 0 || digits > 6 || b.get(j) != Some(&b'}') { return None; }
+                Some(j + 1)
+            }
+            _ => None,
+        }
+    }
+
+    /// If a RAW STRING opens at `b[i]` (`r"`, `r#"`, `br#"`, `cr#"`, …), its hash count and the
+    /// offset of the byte after the opening quote.
+    ///
+    /// The `c` prefix (C strings, stable since Rust 1.77) is accepted alongside `b` because
+    /// `cr#"…"#` otherwise falls through to the ordinary-string branch, which reads the token's
+    /// FIRST `"` as an opener and the next `"` as a closer — a mask desync of exactly the #892
+    /// shape. Measured, by deleting the `c` from this line: inserting `let _p = cr#"a " { b"#;`
+    /// into `app.rs` drove the code-position brace depth NEGATIVE, i.e. the mask desynchronised.
+    /// It refused rather than lying in that instance, but a desync is only refused when it also
+    /// happens to unbalance the braces, which is not a property this lexer can arrange.
     fn raw_string_open(b: &[u8], i: usize) -> Option<(usize, usize)> {
         if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') { return None; }
         let mut j = i;
-        if b.get(j) == Some(&b'b') { j += 1; }
+        if b.get(j) == Some(&b'b') || b.get(j) == Some(&b'c') { j += 1; }
         if b.get(j) != Some(&b'r') { return None; }
         j += 1;
         let first_hash = j;
@@ -1385,10 +1486,13 @@ mod tests {
             // **This particular check is a SURVIVING mutant and is labelled as one.** Deleting it
             // leaves the whole module green, because as the loop above is written today the
             // identity cannot fail: every byte is either pushed onto `text` or added to
-            // `comment_bytes`. It is kept as a tripwire for a future early exit inside the loop —
-            // `the_app_rs_scan_reads_the_whole_file` asserts the same identity from outside, and
-            // the mutant that truncates the walk (`if i > b.len() / 2 { break; }`) does red that
-            // one — but nothing in the suite kills THIS line, so do not read it as tested.
+            // `comment_bytes`. It is kept as a tripwire for a future early exit inside the loop.
+            // What actually catches a short walk from outside is
+            // `the_app_rs_scan_reads_the_whole_file`, which asserts the same identity against
+            // `app.rs`'s own length rather than against `b.len()`; #892 measured that a walk
+            // truncated at a top-level item boundary — short but still brace-balanced, so no
+            // refusal fires — reds that assert and, with it removed too, that test's tail probe.
+            // Nothing in the suite kills THIS line, so do not read it as tested.
             let code_bytes = code.iter().filter(|c| **c).count();
             let literal_bytes = text.len() - code_bytes;
             if code_bytes + literal_bytes + comment_bytes != b.len() {
@@ -1520,6 +1624,21 @@ mod tests {
     /// reaching this line at all already means it held — and, more importantly, means no other pin
     /// in this module could have run without it. That move is #892's first ask: the previous
     /// version of this test was the doc's evidence for a guarantee it did not deliver.
+    ///
+    /// **Which of these assertions can actually fail, stated rather than left to look uniform.**
+    /// The first two are pure restatements of the constructor's own bookkeeping — mask length
+    /// against text length, recomputed code bytes against the reported tally — and nothing but a
+    /// self-inconsistent [`CodeScan::of`] can make them red. They are a cross-check on the
+    /// constructor's self-report, not reach coverage, and #892's round-2 review measured that a
+    /// crudely truncated walk is caught by the constructor's own refusal before either is reached.
+    ///
+    /// The third assert and the **tail probe** are different, and this was measured rather than
+    /// reasoned. A walk that stops half way is refused, but a walk that stops at a top-level item
+    /// boundary is still brace-balanced, so [`CodeScan::of`] returns `Ok` and the refusal never
+    /// fires. Under exactly that mutant the third assert is what reds; delete it as well and the
+    /// tail probe is the only thing left that reds, naming the last method of `app.rs` as missing
+    /// from the scan. Notably the ring-clear pin stays GREEN through both — a short-but-balanced
+    /// scan is invisible to it, which is why this test exists separately from the pins.
     #[test]
     fn the_app_rs_scan_reads_the_whole_file() {
         let scan = app_rs_scan();
@@ -1542,6 +1661,21 @@ mod tests {
         // …and the file it read is the real one, not an empty include.
         assert!(APP_RS.len() > 50_000, "app.rs came back implausibly small ({} bytes) — the \
                                         include is not resolving to the source file", APP_RS.len());
+
+        // The tail probe. Derived from the file, not written down here: the name of the LAST
+        // four-space method in app.rs must appear at a CODE position in the scan. Measured: with
+        // the byte-accounting assert above ALSO deleted, a walk that stops at a top-level item
+        // boundary — balanced, so not refused — is caught here and nowhere else in this module.
+        let last_fn = APP_RS.rfind(SITE).expect("app.rs has at least one four-space method start");
+        let name: String = APP_RS[last_fn + SITE.len()..].chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        assert!(!name.is_empty(),
+            "fixture: could not derive a method name from the last `{}` in app.rs", SITE.escape_debug());
+        assert!(!code_occurrences(&scan.text, &scan.code, &name).is_empty(),
+            "REACH: `{name}`, the last four-space method in app.rs (byte {last_fn} of {}), does \
+             not appear at a code position in the scan — the walk did not reach the end of the \
+             file, which is the #778 failure and is invisible to the accounting asserts above.",
+            APP_RS.len());
     }
 
     /// **#892's negative control: the scan must go RED, not confident, when it cannot read.**
@@ -1570,6 +1704,12 @@ mod tests {
              "fn f() { }\n/* oops\n"),
             ("an unterminated raw string masks the rest of the file",
              "fn f() { let s = r#\"oops; }\n"),
+            // Balanced-braces variant, third of the same pattern. Added in #892's round 2: the
+            // review mutated the raw-string refusal from `return Err(…)` to `break j;` and it
+            // SURVIVED, because every unterminated-raw-string case in this list also happened to
+            // unbalance the file. Measured: with this case present the same mutant dies.
+            ("an unterminated raw string that leaves the braces balanced",
+             "fn f() { }\nconst S: &str = r#\"oops\n"),
             ("a stray closing brace takes the depth negative",
              "fn f() { }\n}\n"),
             // The depth goes negative and comes BACK to zero, so the end-of-file equality alone
@@ -1592,8 +1732,12 @@ mod tests {
         // `app.rs`'s contents (measured: "its innermost enclosing block is introduced by
         // `fn render_frame(&mut self)`", of a statement that was plainly inside
         // `if zone_needs_reload(…)`).
-        // This deliberately panics, so the gate log carries one "THE app.rs SCAN IS UNRELIABLE"
-        // block from a test that PASSES. That is the message being exhibited, not a failure.
+        // This deliberately panics and catches, so the message is exercised rather than merely
+        // written. It is NOT visible in the gate log: libtest captures a passing test's output, so
+        // "THE app.rs SCAN IS UNRELIABLE" occurs zero times in an ordinary `cargo test` log and
+        // only appears under `--nocapture`. An earlier revision of this comment asserted the
+        // opposite — measured at 0 occurrences across all 8 gate logs by #892's review. The
+        // assertions below are what hold the wording, not a reader's eye on the log.
         let panicked = std::panic::catch_unwind(|| {
             scan_or_refuse("fn f() { let s = \"oops; }\n", "app.rs");
         }).expect_err("scan_or_refuse must panic on a source it cannot lex");
@@ -1623,12 +1767,25 @@ mod tests {
     ///   #745 clear's innermost enclosing block was `fn render_frame(&mut self)` — a false fact
     ///   about `app.rs`, which still had the statement directly inside `if zone_needs_reload(…)`.
     ///
-    /// **Position-dependence is the point.** Whether the old scan noticed depended on whether the
-    /// mis-masked span happened to be brace-balanced, so a single insertion site proves nothing.
-    /// This walks a DERIVED set of sites — every method start in the real `app.rs`, counted from
-    /// the file rather than written down here — and inserts each dangerous token at each one. The
-    /// site count is asserted against the same derivation so it cannot silently shrink to nothing
-    /// and leave the loop vacuous (#778).
+    /// **Position-dependence is the point, and it is worse than "sometimes".** Whether the old scan
+    /// noticed depended on whether the mis-masked span happened to be brace-balanced, so a single
+    /// insertion site proves nothing. Swept over every line-start position of `app.rs` with
+    /// `let _probe_b = b'"';` — 3,861 sites — `origin/main`'s scanner left the balance assert GREEN
+    /// at 636 of them and RED at 3,225, while the ring-clear pin gave a **false answer at 697
+    /// sites, 138 of those with the balance assert GREEN**. That last cell is the one that matters:
+    /// green *and* lying. 91 of the false answers name `fn render_frame(&mut self)`, so #892's
+    /// quoted failure reproduces verbatim. (Measured twice: by #892's round-1 review, and
+    /// re-derived independently for round 2.)
+    ///
+    /// This walks a DERIVED set of sites — [`SITE`], see its doc for what that anchor does and does
+    /// not cover — and inserts each dangerous token at each one. The site count is asserted against
+    /// the same derivation so it cannot silently shrink and leave the loop vacuous (#778).
+    ///
+    /// **Which guard does the work, since two look like they might.** `assert_eq!(sites.len(),
+    /// APP_RS.matches(SITE).count())` is the operative one: it is what kills a `.take(n)` on the
+    /// site list, measured. The `>= 20` floor below is NOT doing that job and should not be read as
+    /// if it were — it only catches an `app.rs` that has genuinely shrunk to a handful of methods,
+    /// which is a much narrower hole than a bare threshold suggests.
     ///
     /// **What this does NOT establish:** that no construct whatever can desynchronise the mask.
     /// It exercises the forms named in [`CodeScan`]'s doc at many positions; a literal form that
@@ -1641,26 +1798,33 @@ mod tests {
         let baseline = ring_clear_block_head(&app_rs_scan())
             .expect("fixture: the #745 ring clear must resolve in the pristine app.rs");
 
-        // Derived, not listed: one site per method in app.rs.
-        const SITE: &str = "\n    fn ";
+        // Derived, not listed. See [`SITE`] for what the anchor covers.
         let sites: Vec<usize> = APP_RS.match_indices(SITE).map(|(i, _)| i + SITE.len()).collect();
         assert_eq!(sites.len(), APP_RS.matches(SITE).count(),
             "the site list and its own derivation disagree");
+        // NOT the operative reach guard — the equality above is. See this test's doc.
         assert!(sites.len() >= 20,
             "REACH: only {} insertion site(s) were derived from app.rs — the loop below is close \
              to vacuous, which is how a scanning control silently stops covering its corpus (#778)",
             sites.len());
 
         // The tokens. `b'\"'` is the issue's probe B; the rest are the neighbouring shapes the old
-        // lexer was equally blind to, plus two raw strings carrying an unbalanced brace and a bare
+        // lexer was equally blind to, plus raw strings carrying an unbalanced brace and a bare
         // quote — the other construct the retired doc named.
+        // `['\x12','{','}']` is #892 round 2's: it is BRACE-BALANCED as written, so the balance
+        // refusal cannot see it, and before `escape_end` existed it returned `Ok` with the two
+        // literal braces exposed as code. `cr#"a " { b"#` is the same shape for the `c` raw-string
+        // prefix, which `raw_string_open` did not recognise.
         // The last entry is a NESTED block comment whose stray `}` sits after the inner `*/`: a
         // stripper that does not nest ends the comment early and hands that brace to the depth
         // walk. It is here rather than in the refusal list because the correct reading is that the
         // whole thing is a comment and the file is unchanged — which only a nesting stripper gets.
         let tokens = ["let _p = b'\"';", "let _p = '\"';", "let _p = b'{';", "let _p = '}';",
                       "let _p = '\\'';", "let _p = '\\\\';", "let _p = '\u{00e9}';",
+                      "let _p = ['\\x12','{','}'];", "let _p = ['\\x7b','{','}'];",
+                      "let _p = matches!(c, '\\x12'|'{'|'}');",
                       "let _p = r\"a { b\";", "let _p = r#\"a \" { b\"#;",
+                      "let _p = cr#\"a \" { b\"#;",
                       "let _p = br#\"}\"#;", "let _p = b\"{\";",
                       "/* /* */ } */"];
 
@@ -1691,6 +1855,137 @@ mod tests {
         assert_eq!(checked, tokens.len() * sites.len(),
             "REACH: {checked} of {} planned (token, site) pairs were actually checked",
             tokens.len() * sites.len());
+    }
+
+    /// **#892 round 2: the escape grammar is enumerated, and the enumeration is checkable.**
+    ///
+    /// The defect this replaces was not "one escape was missed"; it was that the code *approximated*
+    /// the grammar (*"`\u{…}` runs to its `}`; everything else is one character"*) and the doc
+    /// repeated the approximation as if it were the rule. `\xNN` is two hex digits, so the walk
+    /// stopped short, [`char_literal_end`] returned `None`, the `'` was read as a lifetime, and
+    /// `CodeScan::of` returned **`Ok` with a desynchronised mask** — the worst outcome available,
+    /// because the whole point of the fallible constructor is that a bad mask should not be
+    /// representable as a success. Measured on `origin/fix-892`'s head before this fix:
+    /// `['\x12','{','}']` scanned `Ok` with both literal braces at code positions, and inserting
+    /// `['\x12','{']` before the #745 ring clear made the pin report its enclosing block as
+    /// ``let _p = ['\x12','``.
+    ///
+    /// Three separate things are asserted, because "I fixed the case that was reported" is how an
+    /// enumeration stops early twice:
+    ///
+    /// 1. **Completeness of the arm set, mechanically.** All 256 possible opener bytes are fed to
+    ///    [`escape_end`]; the accepted set must be exactly the nine of Rust's grammar. An arm added
+    ///    without a fixture reds here, and so does one deleted.
+    /// 2. **Per-form end offsets.** Each escape's closing `'` must be found at the right place.
+    /// 3. **Per-form mask correctness under `CodeScan::of`** — the case the balance refusal cannot
+    ///    catch, because the fixture is brace-balanced as written.
+    #[test]
+    fn the_char_literal_escape_grammar_is_enumerated_not_approximated() {
+        // (1) The accepting set, swept exhaustively rather than read off the source.
+        let accepted: Vec<u8> = (0u8..=255).filter(|&c| {
+            // Two probe bodies, because `\u` and `\x` want different ones: `{41}` serves the
+            // unicode form, `41` the two-hex-digit form. A candidate counts as accepted if either
+            // body gets it through, so no arm can hide behind an unlucky probe.
+            escape_end(&[c, b'{', b'4', b'1', b'}'], 0).is_some()
+                || escape_end(&[c, b'4', b'1'], 0).is_some()
+        }).collect();
+        let expected: Vec<u8> = vec![b'"', b'\'', b'0', b'\\', b'n', b'r', b't', b'u', b'x'];
+        assert_eq!(accepted, expected,
+            "#892: the escape arms of `escape_end` are {:?}, not the expected {:?}. This test IS \
+             the completeness check the `CodeScan` doc points at — if an arm was added or removed \
+             deliberately, add or remove its fixture below in the same commit.",
+            accepted.iter().map(|&c| c as char).collect::<Vec<_>>(),
+            expected.iter().map(|&c| c as char).collect::<Vec<_>>());
+        assert_eq!(escape_end(b"x1", 0), None, "`\\x` with one hex digit is not a valid escape");
+        assert_eq!(escape_end(b"x1f", 0), Some(3), "`\\xNN` consumes exactly two hex digits");
+        assert_eq!(escape_end(b"xzz", 0), None, "`\\x` demands HEX digits");
+
+        // (2) End offsets, one row per production of the Reference's character-literal rule.
+        for (src, want) in [
+            ("'\\''", 4usize), ("'\\\"'", 4), ("'\\\\'", 4), ("'\\n'", 4), ("'\\r'", 4),
+            ("'\\t'", 4), ("'\\0'", 4), ("'\\x12'", 6), ("'\\x7f'", 6), ("'\\u{7f}'", 8),
+            ("'\\u{1F600}'", 11), ("'\\u{1_f_6_0_0}'", 15), ("'a'", 3), ("'\u{00e9}'", 4),
+        ] {
+            assert_eq!(char_literal_end(src.as_bytes(), 0), Some(want),
+                "#892: `char_literal_end` does not end {src} at {want}. An escape whose length is \
+                 guessed rather than parsed is exactly how the mask desynchronised.");
+        }
+        for src in ["'a", "'static", "'\\q'", "'\\u7f'", "'\\u{}'", "'\\u{1234567}'", "'\\x1'"] {
+            assert_eq!(char_literal_end(src.as_bytes(), 0), None,
+                "#892: `{src}` is not a char literal and must not be consumed as one");
+        }
+
+        // (3) The mask, per form. Each fixture is BRACE-BALANCED, so the balance refusal inside
+        // `CodeScan::of` cannot see a mis-lex here — only this assertion can. The two braces are
+        // inside char literals, so exactly one `{` and one `}` (the function's own) may be code.
+        for esc in ["\\'", "\\\"", "\\\\", "\\n", "\\r", "\\t", "\\0", "\\x12", "\\x7b", "\\x7d",
+                    "\\u{7f}", "\\u{1F600}", "a", "\u{00e9}"] {
+            let src = format!("fn f() {{ let _c = ['{esc}','{{','}}']; }}\n");
+            let scan = CodeScan::of(&src).unwrap_or_else(|why| panic!(
+                "#892: `CodeScan::of` refused a source containing the char literal `'{esc}'`: {why}"));
+            let (mut open, mut close) = (0usize, 0usize);
+            for i in 0..scan.text.len() {
+                if !scan.code[i] { continue; }
+                if scan.text[i] == b'{' { open += 1; }
+                if scan.text[i] == b'}' { close += 1; }
+            }
+            assert_eq!((open, close), (1, 1),
+                "#892: with `'{esc}'` in the source, `CodeScan::of` returned Ok but put {open} \
+                 `{{` and {close} `}}` at CODE positions where only the function's own pair \
+                 belongs. The braces inside the char literals leaked into the mask — an `Ok` with \
+                 a wrong mask, which is the failure the fallible constructor exists to make \
+                 impossible. Source was:\n{src}");
+        }
+    }
+
+    /// **#892 round 2's end-to-end control: the false fact, at the place it was measured.**
+    ///
+    /// The sweep above inserts one token at a time at a method start. This does the sharper thing
+    /// the reviewer did: it opens a brace-carrying char literal on the line BEFORE the #745 ring
+    /// clear and closes it on the line AFTER. Under a correct lexer both braces are literal
+    /// content, nothing moves, and the pin's answer is unchanged. Under a lexer that mis-lexes the
+    /// escape, the `{` becomes code, opens a block immediately above the statement, and the pin
+    /// announces a block head that does not exist in the file — measured verbatim as
+    /// ``let _p = ['\x12','`` before [`escape_end`] existed.
+    ///
+    /// The pair is brace-balanced across the file, so the balance refusal cannot substitute for
+    /// this: that is why it is a separate test rather than another token in the list above.
+    #[test]
+    fn an_escaped_char_literal_around_the_ring_clear_cannot_move_its_block_head() {
+        const NEEDLE: &str = "self.controller.forget_recovery_history();";
+        let baseline = ring_clear_block_head(&app_rs_scan())
+            .expect("fixture: the #745 ring clear must resolve in the pristine app.rs");
+
+        let at = APP_RS.find(NEEDLE).expect("fixture: app.rs must still contain the #745 clear");
+        let line_start = APP_RS[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let after = at + NEEDLE.len();
+
+        let mut checked = 0usize;
+        let escapes = ["\\x12", "\\x7b", "\\u{7f}", "\\0", "\\n", "\\r", "\\t", "\\\\", "\\'",
+                       "\\\"", "a"];
+        for esc in escapes {
+            let mut m = String::with_capacity(APP_RS.len() + 64);
+            m.push_str(&APP_RS[..line_start]);
+            m.push_str(&format!("let _p = ['{esc}','{{'];\n"));
+            m.push_str(&APP_RS[line_start..after]);
+            m.push_str(&format!("\nlet _q = ['{esc}','}}'];"));
+            m.push_str(&APP_RS[after..]);
+
+            let scan = CodeScan::of(&m).unwrap_or_else(|why| panic!(
+                "#892: bracketing the #745 clear with `'{esc}'` char literals made the scan \
+                 unlexable: {why}"));
+            let head = ring_clear_block_head(&scan).unwrap_or_else(|why| panic!(
+                "#892: with `'{esc}'` char literals around the #745 clear, the scan could no \
+                 longer locate it ({why})"));
+            assert_eq!(head, baseline,
+                "#892: with `'{esc}'` char literals bracketing the #745 ring clear, the scan \
+                 reports its innermost enclosing block as `{head}` instead of `{baseline}`. \
+                 Nothing about the statement's nesting changed — only the mask did. This is the \
+                 confident-false-fact failure, reproduced at the exact site the issue names.");
+            checked += 1;
+        }
+        assert_eq!(checked, escapes.len(),
+            "REACH: {checked} of {} escape forms were actually exercised", escapes.len());
     }
 
     /// The scan bites. Fed synthetic sources rather than `app.rs`, so it proves the MECHANISM
