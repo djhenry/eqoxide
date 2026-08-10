@@ -675,7 +675,7 @@ impl SpawnInfo {
     /// part of the claim: it only exists in a build where `test-fixtures` is on, which a
     /// workspace-wide `cargo test --workspace` supplies through dev-dependency feature
     /// unification. Scoped to this package alone, the whole `impl` is cfg'd away and the example
-    /// does not exist — measured at `1e8c4cb`, `cargo test --doc -p eqoxide-protocol --locked`
+    /// does not exist — measured at `2532925`, `cargo test --doc -p eqoxide-protocol --locked`
     /// reports **0 tests**, exit 0. It guards the workspace gate; it does not guard a
     /// package-scoped run.
     ///
@@ -746,7 +746,7 @@ impl SpawnInfo {
     /// and its mutation result in `tests/entity_pose_643.rs`.
     ///
     /// **The suite does not defend most of these values, and did not before #913 either.**
-    /// Measured by WRAP mutation (`field: if false { <orig> } else { <other> }`) at `1e8c4cb`,
+    /// Measured by WRAP mutation (`field: if false { <orig> } else { <other> }`) at `2532925`,
     /// `--no-fail-fast`, every run in one sitting. Each figure is `passed/failed/ignored` and is
     /// labelled with the command shape that produced it, because the two shapes do not report the
     /// same targets — an unmutated run is 2027/0/50 plain and 2015/0/47 with `--all-targets`:
