@@ -1172,50 +1172,283 @@ mod tests {
 
     const APP_RS: &str = include_str!("app.rs");
 
-    /// `app.rs` with comments removed, plus a parallel mask marking which bytes are CODE — i.e.
-    /// **not** inside a string literal.
+    /// Why a [`CodeScan`] could not be built. **Never a claim about what the scanned file
+    /// contains** — only about the scanner's ability to read it.
+    ///
+    /// That distinction is the whole of #892's third ask. The previous scanner had no way to say
+    /// "I cannot read this", so when its string mask desynchronised it went on to report confident
+    /// facts about `app.rs` that were false — measured: a `b'"'` char literal inserted into
+    /// `render_frame` made the ring-clear pin announce that the #745 clear's innermost enclosing
+    /// block was `fn render_frame(&mut self)`, when the file plainly still had it inside
+    /// `if zone_needs_reload(…)`.
+    #[derive(Debug)]
+    struct ScanUnreliable(String);
+
+    impl std::fmt::Display for ScanUnreliable {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+    }
+
+    /// A Rust source file reduced to the bytes a text pin may reason about: comments removed, plus
+    /// a parallel mask marking which surviving bytes are CODE — i.e. outside every literal.
     ///
     /// Both halves matter. Stripping comments is what stops a call that has been commented out from
-    /// satisfying a scan (#721 A2b's evasion was a trailing comment). The string mask is what stops
+    /// satisfying a scan (#721 A2b's evasion was a trailing comment). The literal mask is what stops
     /// `app.rs`'s many `"{:.2}"`-style format literals from being counted as braces, which would
     /// desynchronise every depth measurement below and make the whole scan meaningless while still
     /// passing.
     ///
-    /// Deliberately not a Rust parser, and it does not need to be. It handles `//`, `/* */`,
-    /// `"…"` with `\` escapes, and nothing else. Two known limits, both checked rather than assumed:
-    /// it does not understand raw strings (`r"…"`) or char literals (`'{'`), so
-    /// `the_app_rs_scan_reads_a_balanced_file` asserts the brace count comes out balanced over the
-    /// whole file — which is what either construct would break.
-    fn strip_comments(src: &str) -> (Vec<u8>, Vec<bool>) {
-        let b = src.as_bytes();
-        let (mut text, mut code) = (Vec::with_capacity(b.len()), Vec::with_capacity(b.len()));
-        let mut i = 0;
-        while i < b.len() {
-            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
-                while i < b.len() && b[i] != b'\n' { i += 1; }
-            } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
-                i += 2;
-                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') { i += 1; }
-                i = (i + 2).min(b.len());
-            } else if b[i] == b'"' {
-                // Copy the literal verbatim so failure messages stay readable, but mark it non-code
-                // so neither the brace walk nor the needle search can see inside it.
-                text.push(b[i]); code.push(true); i += 1;         // the opening quote IS code
-                while i < b.len() && b[i] != b'"' {
-                    if b[i] == b'\\' && i + 1 < b.len() {
-                        text.push(b[i]); code.push(false); i += 1;
-                    }
-                    text.push(b[i]); code.push(false); i += 1;
-                }
-                if i < b.len() { text.push(b[i]); code.push(true); i += 1; } // the closing quote
-            } else {
-                text.push(b[i]); code.push(true); i += 1;
-            }
-        }
-        (text, code)
+    /// # What the lexer handles
+    ///
+    /// `//` to end of line; `/* … */`, **nested**, as Rust nests them; `"…"` with `\` escapes, and
+    /// the byte form `b"…"`; raw strings `r"…"`, `r#"…"#` and `br#"…"#` at any hash count; char
+    /// literals `'x'`, `'\n'`, `'\''`, `'\u{1F600}'`, non-ASCII `'é'`, and the byte forms `b'x'` —
+    /// distinguished from LIFETIMES, which are left as ordinary code.
+    ///
+    /// # What it does not handle — stated, not implied
+    ///
+    /// * **A lifetime immediately followed by `'`.** `char_literal_end` classifies `'` as a char
+    ///   literal whenever a closing `'` sits exactly one character (or one escape) later, so the
+    ///   two-byte text `'a'` is read as a char literal regardless of what it means. Rust never
+    ///   writes a lifetime that way — a lifetime name is always followed by whitespace, `,`, `>`,
+    ///   `)`, `{` or an identifier — but that is REASONED from the grammar, not measured, and
+    ///   nothing here checks it.
+    /// * **Anything about whether the file compiles.** This is a lexer, not a parser. `#[cfg]`,
+    ///   macro expansion and dead-code elimination are all invisible to it; see the "What this does
+    ///   NOT establish" section on
+    ///   `the_app_rs_call_into_this_module_is_an_unconditional_statement`.
+    ///
+    /// # Why the constructor is fallible (#892)
+    ///
+    /// The previous version of this helper documented *"two known limits, both checked rather than
+    /// assumed"* — raw strings and char literals, allegedly caught by a whole-file brace-balance
+    /// assert. That claim was false in both directions, and both were measured in this worktree:
+    ///
+    /// * `let _probe_a = (b'{', b'}');` inserted into `app.rs` — the balance assert stayed **green**
+    ///   (19 passed, 0 failed). The two literal braces cancel, so a *pair* of the exact construct
+    ///   the doc named as covered was not caught at all. Only an *unbalanced* one fired: a lone
+    ///   `let _probe_a1 = b'{';` did red the balance assert.
+    /// * `let _probe_b = b'"';` inserted at the top of `render_frame` — a quote char literal does
+    ///   not perturb the depth count directly; it desynchronises the *mask*, because the old lexer
+    ///   entered its string-copy branch at that bare `"` and marked everything up to the next `"`
+    ///   in the file as non-code. Whether the balance assert then fires depends on whether the
+    ///   mis-masked span happens to be brace-balanced. That is a coincidence, not a check.
+    ///
+    /// So the quote case is now **handled** rather than relied upon to be caught, and the balance
+    /// invariant has moved out of a test and into this constructor. A `CodeScan` cannot be
+    /// obtained at all unless the walk consumed every byte of the source and the code-position
+    /// braces balanced — brace balance being a genuine property of any file rustc can tokenise,
+    /// since Rust's token trees must be delimiter-balanced. There is therefore no way to hand a
+    /// consumer a desynchronised mask and have it draw a confident conclusion from it.
+    ///
+    /// **The residual, plainly:** a mis-lex that happens to leave the braces balanced would still
+    /// pass. That is why the constructs above are handled outright instead of being left to the
+    /// balance check, and it is why
+    /// `a_quote_char_literal_can_no_longer_blind_the_app_rs_scan` exercises the real `app.rs` at
+    /// many insertion sites rather than trusting the invariant to notice.
+    struct CodeScan {
+        /// The source with comments removed, everything else verbatim so failure messages stay
+        /// readable.
+        text: Vec<u8>,
+        /// Per byte of [`Self::text`]: is this byte CODE, i.e. outside every literal?
+        code: Vec<bool>,
+        /// Byte accounting over the ORIGINAL source. `code_bytes + literal_bytes + comment_bytes`
+        /// is checked to equal the source length by [`CodeScan::of`] — an exact derived total,
+        /// which is what stops the walk silently covering part of its corpus (#778).
+        code_bytes: usize,
+        literal_bytes: usize,
+        comment_bytes: usize,
     }
 
-    /// Every offset at which `needle` appears as CODE (see [`strip_comments`]).
+    /// If `b[i]` opens a CHAR LITERAL, the offset one past its closing `'`; `None` if it is a
+    /// lifetime (or nothing this understands).
+    fn char_literal_end(b: &[u8], i: usize) -> Option<usize> {
+        if b.get(i) != Some(&b'\'') { return None; }
+        if b.get(i + 1) == Some(&b'\\') {
+            // An escape. `\u{…}` runs to its `}`; everything else is one character.
+            let mut j = i + 2;
+            if b.get(j) == Some(&b'u') && b.get(j + 1) == Some(&b'{') {
+                j += 2;
+                while j < b.len() && b[j] != b'}' { j += 1; }
+                j += 1;
+            } else {
+                j += 1;
+            }
+            return if b.get(j) == Some(&b'\'') { Some(j + 1) } else { None };
+        }
+        // One character, which may be multi-byte UTF-8. Length comes from the leading byte.
+        let lead = *b.get(i + 1)?;
+        let len = if lead < 0x80 { 1 }
+                  else if lead >> 5 == 0b110 { 2 }
+                  else if lead >> 4 == 0b1110 { 3 }
+                  else if lead >> 3 == 0b11110 { 4 }
+                  else { return None };
+        if b.get(i + 1 + len) == Some(&b'\'') { Some(i + len + 2) } else { None }
+    }
+
+    /// If a RAW STRING opens at `b[i]` (`r"`, `r#"`, `br#"`, …), its hash count and the offset of
+    /// the byte after the opening quote.
+    fn raw_string_open(b: &[u8], i: usize) -> Option<(usize, usize)> {
+        if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') { return None; }
+        let mut j = i;
+        if b.get(j) == Some(&b'b') { j += 1; }
+        if b.get(j) != Some(&b'r') { return None; }
+        j += 1;
+        let first_hash = j;
+        while b.get(j) == Some(&b'#') { j += 1; }
+        let hashes = j - first_hash;
+        if b.get(j) != Some(&b'"') { return None; }
+        Some((hashes, j + 1))
+    }
+
+    impl CodeScan {
+        /// Lex `src`, or refuse. See the type doc for what "refuse" is for.
+        fn of(src: &str) -> Result<CodeScan, ScanUnreliable> {
+            let b = src.as_bytes();
+            let (mut text, mut code) = (Vec::with_capacity(b.len()), Vec::with_capacity(b.len()));
+            let mut comment_bytes = 0usize;
+            let mut i = 0usize;
+            while i < b.len() {
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
+                    let start = i;
+                    while i < b.len() && b[i] != b'\n' { i += 1; }
+                    comment_bytes += i - start;
+                } else if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                    let start = i;
+                    let mut depth = 1usize;
+                    i += 2;
+                    while i + 1 < b.len() && depth > 0 {
+                        if b[i] == b'/' && b[i + 1] == b'*' { depth += 1; i += 2; }
+                        else if b[i] == b'*' && b[i + 1] == b'/' { depth -= 1; i += 2; }
+                        else { i += 1; }
+                    }
+                    if depth > 0 {
+                        return Err(ScanUnreliable(format!(
+                            "a `/*` block comment opened at byte {start} is never closed, so the \
+                             rest of the file was swallowed")));
+                    }
+                    comment_bytes += i - start;
+                } else if let Some((hashes, body)) = raw_string_open(b, i) {
+                    // Whole token non-code: nothing a pin searches for may live inside a raw string.
+                    let start = i;
+                    let mut j = body;
+                    let end = loop {
+                        if j >= b.len() {
+                            return Err(ScanUnreliable(format!(
+                                "a raw string opened at byte {start} is never closed")));
+                        }
+                        if b[j] == b'"' && j + 1 + hashes <= b.len()
+                            && b[j + 1..j + 1 + hashes].iter().all(|&c| c == b'#') {
+                            break j + 1 + hashes;
+                        }
+                        j += 1;
+                    };
+                    for &byte in &b[start..end] { text.push(byte); code.push(false); }
+                    i = end;
+                } else if b[i] == b'\'' && char_literal_end(b, i).is_some() {
+                    // #892: the construct that used to blind the whole scan. Consumed atomically,
+                    // so neither its `"` nor its `{` can reach the mask or the depth walk.
+                    let end = char_literal_end(b, i).expect("just checked");
+                    for &byte in &b[i..end] { text.push(byte); code.push(false); }
+                    i = end;
+                } else if b[i] == b'"' {
+                    // Copy the literal verbatim so failure messages stay readable, but mark it
+                    // non-code so neither the brace walk nor the needle search can see inside it.
+                    let start = i;
+                    text.push(b[i]); code.push(true); i += 1;     // the opening quote IS code
+                    let mut closed = false;
+                    while i < b.len() {
+                        if b[i] == b'"' {
+                            text.push(b[i]); code.push(true); i += 1; // the closing quote
+                            closed = true;
+                            break;
+                        }
+                        if b[i] == b'\\' && i + 1 < b.len() {
+                            text.push(b[i]); code.push(false); i += 1;
+                        }
+                        text.push(b[i]); code.push(false); i += 1;
+                    }
+                    if !closed {
+                        return Err(ScanUnreliable(format!(
+                            "a string literal opened at byte {start} is never closed, so every \
+                             byte after it is masked as literal")));
+                    }
+                } else {
+                    text.push(b[i]); code.push(true); i += 1;
+                }
+            }
+
+            // ── the invariants that make a `CodeScan` worth having ──────────────────────────────
+            //
+            // Reach, as an exact derived total rather than a threshold (#778): every byte of the
+            // source landed in exactly one bucket. A walk that stopped early cannot satisfy this.
+            //
+            // **This particular check is a SURVIVING mutant and is labelled as one.** Deleting it
+            // leaves the whole module green, because as the loop above is written today the
+            // identity cannot fail: every byte is either pushed onto `text` or added to
+            // `comment_bytes`. It is kept as a tripwire for a future early exit inside the loop —
+            // `the_app_rs_scan_reads_the_whole_file` asserts the same identity from outside, and
+            // the mutant that truncates the walk (`if i > b.len() / 2 { break; }`) does red that
+            // one — but nothing in the suite kills THIS line, so do not read it as tested.
+            let code_bytes = code.iter().filter(|c| **c).count();
+            let literal_bytes = text.len() - code_bytes;
+            if code_bytes + literal_bytes + comment_bytes != b.len() {
+                return Err(ScanUnreliable(format!(
+                    "the walk accounted for {} of {} source bytes ({code_bytes} code + \
+                     {literal_bytes} literal + {comment_bytes} comment) — it did not read the \
+                     whole file",
+                    code_bytes + literal_bytes + comment_bytes, b.len())));
+            }
+
+            // Brace balance, at CODE positions. Any file rustc can tokenise has balanced
+            // delimiters, so a mis-lex is the only way this fails — which makes it a scanner
+            // check, not a claim about the author's braces.
+            let mut depth = 0i32;
+            for i in 0..text.len() {
+                if !code[i] { continue; }
+                if text[i] == b'{' { depth += 1; }
+                else if text[i] == b'}' {
+                    depth -= 1;
+                    if depth < 0 {
+                        return Err(ScanUnreliable(format!(
+                            "code-position brace depth went NEGATIVE at byte {i} of the stripped \
+                             text — the mask is desynchronised (a construct this lexer does not \
+                             understand), not the file's braces")));
+                    }
+                }
+            }
+            if depth != 0 {
+                return Err(ScanUnreliable(format!(
+                    "code-position braces do not balance (depth {depth} at end of file) — the \
+                     mask is desynchronised, most likely a literal form this lexer does not \
+                     understand")));
+            }
+
+            Ok(CodeScan { text, code, code_bytes, literal_bytes, comment_bytes })
+        }
+    }
+
+    /// The scan of `app.rs` that every pin below rests on — or a refusal that says so.
+    ///
+    /// #892's third ask, in one function: when the scan's own invariants are violated it must say
+    /// **the scan is unreliable**, never make a confident claim about what the file contains.
+    fn app_rs_scan() -> CodeScan {
+        scan_or_refuse(APP_RS, "app.rs")
+    }
+
+    /// [`app_rs_scan`]'s body, taking its source so the refusal path can itself be tested.
+    fn scan_or_refuse(src: &str, label: &str) -> CodeScan {
+        CodeScan::of(src).unwrap_or_else(|why| panic!(
+            "THE {label} SCAN IS UNRELIABLE: {why}.\n\
+             \n\
+             This is a statement about the SCANNER, not about {label}. It says nothing whatever \
+             about whether the calls the pins in this module are about are still present, still \
+             correctly nested, or still correctly spelled — the text could not be lexed, so every \
+             conclusion those pins would have drawn is void rather than negative. Do not read it \
+             as \"the call is gone\", and do not edit {label} to suit the scanner: fix \
+             `CodeScan::of`, or narrow what this module claims. See #892."))
+    }
+
+    /// Every offset at which `needle` appears as CODE (see [`CodeScan`]).
     fn code_occurrences(text: &[u8], code: &[bool], needle: &str) -> Vec<usize> {
         let n = needle.as_bytes();
         if n.is_empty() || text.len() < n.len() { return Vec::new(); }
@@ -1258,28 +1491,206 @@ mod tests {
             .any(|w| matches!(w, "if" | "else" | "while" | "for" | "loop" | "match"))
     }
 
-    /// The scan's own reach control. If [`strip_comments`] ever mis-parses `app.rs` — a raw string,
-    /// a `'{'` char literal, an unbalanced construct — every depth measurement below silently
-    /// becomes noise, and a noisy scan is a scan that passes.
+    /// The #745 ring clear's innermost enclosing block head, as this module's scan reads it.
+    ///
+    /// Factored out so the real pin
+    /// (`the_zone_change_blocks_ring_clear_is_not_nested_behind_a_condition`) and the #892
+    /// mutation control (`a_quote_char_literal_can_no_longer_blind_the_app_rs_scan`) ask the same
+    /// question of the same code. The mutation control's whole point is that this answer must not
+    /// change when a quote char literal is added to the file, so the two must not be able to drift.
+    fn ring_clear_block_head(scan: &CodeScan) -> Result<String, String> {
+        let hits = code_occurrences(&scan.text, &scan.code,
+                                    "self.controller.forget_recovery_history();");
+        if hits.len() != 1 { return Err(format!("{} occurrence(s), expected 1", hits.len())); }
+        let chain = open_braces(&scan.text, &scan.code, hits[0]);
+        let innermost = *chain.last().ok_or_else(|| "not inside any block at all".to_string())?;
+        Ok(block_head(&scan.text, &scan.code, innermost).trim().to_string())
+    }
+
+    /// The scan's own reach control, as an exact derived total rather than a threshold.
+    ///
+    /// The #778 lesson is that a source-scanning guard needs a control proving it covered its
+    /// corpus: that scanner silently stopped at ~12% of its own, and every probe happened to sit
+    /// inside the visible window. So this asserts the byte accounting closes against
+    /// `APP_RS.len()` — a number derived from the file, not guessed — recomputed here from the
+    /// returned mask rather than taken on the constructor's word. A walk that stopped early, or a
+    /// mask that lost bytes, cannot satisfy it.
+    ///
+    /// Brace balance is no longer asserted here. It is a precondition of [`CodeScan::of`], so
+    /// reaching this line at all already means it held — and, more importantly, means no other pin
+    /// in this module could have run without it. That move is #892's first ask: the previous
+    /// version of this test was the doc's evidence for a guarantee it did not deliver.
     #[test]
-    fn the_app_rs_scan_reads_a_balanced_file() {
-        let (text, code) = strip_comments(APP_RS);
-        let mut depth = 0i32;
-        for i in 0..text.len() {
-            if !code[i] { continue; }
-            if text[i] == b'{' { depth += 1; }
-            if text[i] == b'}' { depth -= 1; }
-            assert!(depth >= 0, "brace depth went negative at byte {i} of app.rs — the scan in \
-                                 this module is mis-parsing the file, and every check that rests \
-                                 on it is meaningless");
-        }
-        assert_eq!(depth, 0, "app.rs's braces do not balance under this module's scan — most \
-                              likely a raw string or a char literal containing a brace, which \
-                              `strip_comments` does not understand. Fix the scan, do not delete \
-                              the tests that use it.");
+    fn the_app_rs_scan_reads_the_whole_file() {
+        let scan = app_rs_scan();
+
+        assert_eq!(scan.text.len(), scan.code.len(),
+            "the mask and the stripped text must be the same length, or every `code[i]` lookup \
+             below is reading the wrong byte");
+        let recomputed_code = scan.code.iter().filter(|c| **c).count();
+        assert_eq!(recomputed_code, scan.code_bytes,
+            "the scan's own code-byte tally ({}) disagrees with the mask it returned \
+             ({recomputed_code}) — its accounting is not describing its output",
+            scan.code_bytes);
+        assert_eq!(scan.code_bytes + scan.literal_bytes + scan.comment_bytes, APP_RS.len(),
+            "REACH: the scan accounted for {} of app.rs's {} bytes ({} code + {} literal + {} \
+             comment). Some of the file was never classified, so any pin below could be passing \
+             over unread text — the #778 failure exactly.",
+            scan.code_bytes + scan.literal_bytes + scan.comment_bytes, APP_RS.len(),
+            scan.code_bytes, scan.literal_bytes, scan.comment_bytes);
+
         // …and the file it read is the real one, not an empty include.
         assert!(APP_RS.len() > 50_000, "app.rs came back implausibly small ({} bytes) — the \
                                         include is not resolving to the source file", APP_RS.len());
+    }
+
+    /// **#892's negative control: the scan must go RED, not confident, when it cannot read.**
+    ///
+    /// A positive control that passes is not evidence. Every source here is one the lexer cannot
+    /// honestly reduce, and the only acceptable outcome is `Err` — a statement about the scanner.
+    /// If any of these ever returns `Ok`, the mask is desynchronised and silent again, which is
+    /// the whole defect #892 is about.
+    #[test]
+    fn the_scan_refuses_a_source_it_cannot_lex() {
+        for (why, src) in [
+            ("an unterminated string masks the rest of the file",
+             "fn f() { let s = \"oops; }\n"),
+            // …and one whose masking leaves the BRACES balanced, so the balance invariant cannot
+            // see it and the `!closed` check is the only thing that can. Added because the mutant
+            // deleting that check survived a list where every unterminated string also happened to
+            // unbalance the file — measured, #892.
+            ("an unterminated string that leaves the braces balanced",
+             "fn f() { }\nconst S: &str = \"oops\n"),
+            ("an unterminated block comment swallows the rest of the file",
+             "fn f() { /* oops\n    let x = 1;\n}\n"),
+            // Balanced-braces variant, for the same reason as the string pair above: the mutant
+            // deleting the unterminated-block-comment check survived until this case existed,
+            // because every earlier one also happened to unbalance the file.
+            ("an unterminated block comment that leaves the braces balanced",
+             "fn f() { }\n/* oops\n"),
+            ("an unterminated raw string masks the rest of the file",
+             "fn f() { let s = r#\"oops; }\n"),
+            ("a stray closing brace takes the depth negative",
+             "fn f() { }\n}\n"),
+            // The depth goes negative and comes BACK to zero, so the end-of-file equality alone
+            // cannot see it. Added because the mutant that deletes only the running `depth < 0`
+            // guard survived the rest of this list — measured, #892.
+            ("the depth dips negative in the middle and recovers by the end",
+             "fn f() { }\n}\n{\n"),
+            ("an unclosed block leaves the depth positive",
+             "fn f() { let x = 1;\n"),
+        ] {
+            let got = CodeScan::of(src);
+            assert!(got.is_err(),
+                "#892: `CodeScan::of` returned Ok for a source it cannot lex — {why}. A scan that \
+                 cannot say \"I could not read this\" reports false facts about the file instead; \
+                 that is the defect, not a cosmetic one. Source was:\n{src}");
+        }
+
+        // …and the refusal a consumer sees must talk about the SCANNER. The previous design had no
+        // way to express that, so a desynchronised mask surfaced as a confident claim about
+        // `app.rs`'s contents (measured: "its innermost enclosing block is introduced by
+        // `fn render_frame(&mut self)`", of a statement that was plainly inside
+        // `if zone_needs_reload(…)`).
+        // This deliberately panics, so the gate log carries one "THE app.rs SCAN IS UNRELIABLE"
+        // block from a test that PASSES. That is the message being exhibited, not a failure.
+        let panicked = std::panic::catch_unwind(|| {
+            scan_or_refuse("fn f() { let s = \"oops; }\n", "app.rs");
+        }).expect_err("scan_or_refuse must panic on a source it cannot lex");
+        let msg = panicked.downcast_ref::<String>().cloned()
+            .or_else(|| panicked.downcast_ref::<&str>().map(|s| s.to_string()))
+            .expect("the panic payload should be a string");
+        assert!(msg.contains("SCAN IS UNRELIABLE"),
+            "#892: the refusal must name the SCANNER as the thing that failed. Got:\n{msg}");
+        assert!(msg.contains("statement about the SCANNER, not about app.rs"),
+            "#892: the refusal must say explicitly that it is not a claim about the file, because \
+             the failure this replaces read as exactly such a claim. Got:\n{msg}");
+    }
+
+    /// **#892's regression test: a quote char literal in `app.rs` can no longer blind the scan.**
+    ///
+    /// The measured defect, reproduced in this worktree against the pre-fix code before it was
+    /// touched:
+    ///
+    /// * `let _probe_a = (b'{', b'}');` at the top of `render_frame` — whole module GREEN,
+    ///   19 passed / 0 failed. The doc claimed the balance assert covered char literals; a
+    ///   *balanced pair* of the exact named construct sailed through. (A lone `b'{'` did red it,
+    ///   which is why the claim looked true.)
+    /// * `let _probe_b = b'"';` at the same place — the old lexer read that bare `"` as a string
+    ///   opener and masked everything to the next `"` in the file. Two tests went red, and one of
+    ///   them,
+    ///   `the_zone_change_blocks_ring_clear_is_not_nested_behind_a_condition`, reported that the
+    ///   #745 clear's innermost enclosing block was `fn render_frame(&mut self)` — a false fact
+    ///   about `app.rs`, which still had the statement directly inside `if zone_needs_reload(…)`.
+    ///
+    /// **Position-dependence is the point.** Whether the old scan noticed depended on whether the
+    /// mis-masked span happened to be brace-balanced, so a single insertion site proves nothing.
+    /// This walks a DERIVED set of sites — every method start in the real `app.rs`, counted from
+    /// the file rather than written down here — and inserts each dangerous token at each one. The
+    /// site count is asserted against the same derivation so it cannot silently shrink to nothing
+    /// and leave the loop vacuous (#778).
+    ///
+    /// **What this does NOT establish:** that no construct whatever can desynchronise the mask.
+    /// It exercises the forms named in [`CodeScan`]'s doc at many positions; a literal form that
+    /// doc does not list is not covered by it. The backstop for those is the balance invariant
+    /// inside [`CodeScan::of`], and the residual there — a mis-lex that happens to leave the
+    /// braces balanced — is stated in that doc rather than argued away.
+    #[test]
+    fn a_quote_char_literal_can_no_longer_blind_the_app_rs_scan() {
+        // The answer every insertion must leave unchanged, taken from the pristine file.
+        let baseline = ring_clear_block_head(&app_rs_scan())
+            .expect("fixture: the #745 ring clear must resolve in the pristine app.rs");
+
+        // Derived, not listed: one site per method in app.rs.
+        const SITE: &str = "\n    fn ";
+        let sites: Vec<usize> = APP_RS.match_indices(SITE).map(|(i, _)| i + SITE.len()).collect();
+        assert_eq!(sites.len(), APP_RS.matches(SITE).count(),
+            "the site list and its own derivation disagree");
+        assert!(sites.len() >= 20,
+            "REACH: only {} insertion site(s) were derived from app.rs — the loop below is close \
+             to vacuous, which is how a scanning control silently stops covering its corpus (#778)",
+            sites.len());
+
+        // The tokens. `b'\"'` is the issue's probe B; the rest are the neighbouring shapes the old
+        // lexer was equally blind to, plus two raw strings carrying an unbalanced brace and a bare
+        // quote — the other construct the retired doc named.
+        // The last entry is a NESTED block comment whose stray `}` sits after the inner `*/`: a
+        // stripper that does not nest ends the comment early and hands that brace to the depth
+        // walk. It is here rather than in the refusal list because the correct reading is that the
+        // whole thing is a comment and the file is unchanged — which only a nesting stripper gets.
+        let tokens = ["let _p = b'\"';", "let _p = '\"';", "let _p = b'{';", "let _p = '}';",
+                      "let _p = '\\'';", "let _p = '\\\\';", "let _p = '\u{00e9}';",
+                      "let _p = r\"a { b\";", "let _p = r#\"a \" { b\"#;",
+                      "let _p = br#\"}\"#;", "let _p = b\"{\";",
+                      "/* /* */ } */"];
+
+        let mut checked = 0usize;
+        for tok in tokens {
+            for &at in &sites {
+                let mut mutated = String::with_capacity(APP_RS.len() + tok.len() + 1);
+                mutated.push_str(&APP_RS[..at]);
+                mutated.push_str(tok);
+                mutated.push_str(&APP_RS[at..]);
+
+                let scan = CodeScan::of(&mutated).unwrap_or_else(|why| panic!(
+                    "#892: inserting `{tok}` at byte {at} of app.rs made the scan unlexable: \
+                     {why}. That construct is listed as handled in `CodeScan`'s doc, so either the \
+                     lexer or the doc is wrong."));
+                let head = ring_clear_block_head(&scan).unwrap_or_else(|why| panic!(
+                    "#892: with `{tok}` inserted at byte {at}, the scan could no longer locate the \
+                     #745 ring clear ({why}) — the mask desynchronised, which is the defect this \
+                     test exists for."));
+                assert_eq!(head, baseline,
+                    "#892: with `{tok}` inserted at byte {at} of app.rs, the scan reports the #745 \
+                     ring clear's innermost enclosing block as `{head}` instead of `{baseline}`. \
+                     That is the false-fact failure probe B produced: the file did not change \
+                     around that statement, only the mask did.");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, tokens.len() * sites.len(),
+            "REACH: {checked} of {} planned (token, site) pairs were actually checked",
+            tokens.len() * sites.len());
     }
 
     /// The scan bites. Fed synthetic sources rather than `app.rs`, so it proves the MECHANISM
@@ -1311,7 +1722,8 @@ mod tests {
                               A => { self.zone_in.on_frame(); }\n        }\n    }\n}\n";
 
         let verdict = |src: &str| -> Result<(), String> {
-            let (text, code) = strip_comments(src);
+            let scan = CodeScan::of(src).map_err(|e| format!("unlexable fixture: {e}"))?;
+            let (text, code) = (scan.text, scan.code);
             let hits = code_occurrences(&text, &code, "self.zone_in.on_frame(");
             let at = *hits.first().ok_or_else(|| "not written at all".to_string())?;
             for b in open_braces(&text, &code, at) {
@@ -1391,20 +1803,21 @@ mod tests {
     /// change IS the arm.
     #[test]
     fn the_app_rs_call_into_this_module_is_an_unconditional_statement() {
-        let (text, code) = strip_comments(APP_RS);
+        let scan = app_rs_scan();
+        let (text, code) = (&scan.text, &scan.code);
 
-        let hits = code_occurrences(&text, &code, "self.zone_in.");
+        let hits = code_occurrences(text, code, "self.zone_in.");
         assert_eq!(hits.len(), 1,
             "app.rs must reach this module through exactly ONE statement, and it must be \
              `on_frame`. Found {} call(s). If a second one has been added, it is a second chance \
              to lose the wiring silently — derive it inside `ZoneIn` instead (see the module doc).",
             hits.len());
         let at = hits[0];
-        assert_eq!(code_occurrences(&text, &code, "self.zone_in.on_frame(").first(), Some(&at),
+        assert_eq!(code_occurrences(text, code, "self.zone_in.on_frame(").first(), Some(&at),
             "app.rs's single call into this module is no longer `on_frame` — see #712 / #728");
 
-        for b in open_braces(&text, &code, at) {
-            let head = block_head(&text, &code, b);
+        for b in open_braces(text, code, at) {
+            let head = block_head(text, code, b);
             assert!(!is_conditional(&head),
                 "the zone-in one-shot must run on EVERY rendered frame, but its call sits inside a \
                  block that can be skipped: `{}`. A source scan cannot tell a call that never runs \
@@ -1462,16 +1875,14 @@ mod tests {
     #[test]
     fn the_zone_change_blocks_ring_clear_is_not_nested_behind_a_condition() {
         const RELOAD_HEAD: &str = "if zone_needs_reload(&self.scene.zone, &self.current_zone)";
-        let (text, code) = strip_comments(APP_RS);
+        // A refusal, not a verdict, if the file cannot be lexed — see [`scan_or_refuse`]. Before
+        // #892 this line could not fail that way, and the assertion below is exactly the one that
+        // was measured announcing a false fact about `app.rs` when the mask desynchronised.
+        let scan = app_rs_scan();
 
-        let hits = code_occurrences(&text, &code, "self.controller.forget_recovery_history();");
-        assert_eq!(hits.len(), 1,
+        let head = ring_clear_block_head(&scan).unwrap_or_else(|why| panic!(
             "app.rs should clear the controller's recovery ring in exactly one place, the \
-             zone-change reload block (#712/#745). Found {}.", hits.len());
-
-        let chain = open_braces(&text, &code, hits[0]);
-        let innermost = *chain.last().expect("the call is not inside any block at all");
-        let head = block_head(&text, &code, innermost).trim().to_string();
+             zone-change reload block (#712/#745) — {why}."));
         assert_eq!(head, RELOAD_HEAD,
             "the #745 ring clear must sit directly in the zone-change reload block. Its innermost \
              enclosing block is introduced by `{head}` instead — if that is a condition, the ring \
