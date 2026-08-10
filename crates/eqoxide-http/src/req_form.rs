@@ -463,10 +463,9 @@ mod tests {
     ///   `docs/http-api.md` is attributed to the pinned fragment containing it, or to `UNPINNED`, and
     ///   the resulting list must equal `DOC_TOTAL_ATTRIBUTIONS`. A NEW sentence quoting the count is
     ///   therefore RED until it is pinned here, which is what makes this a guard over the page rather
-    ///   than over four sentences someone once listed. "The page" is itself asserted: the swept text
-    ///   is compared against the file's size ON DISK, because an attribution list reports what was
-    ///   found and can never report what was never read — see the third pass below, where that was
-    ///   measured rather than argued.
+    ///   than over four sentences someone once listed. The page's SIZE is asserted too: the swept
+    ///   text is compared against the file's size ON DISK, because an attribution list reports what
+    ///   was found and can never report what was never read.
     ///
     /// **Limits, stated because a guard's reach is part of its claim.**
     /// * The sweep does NOT run over this module's own source. Two of its `35`s
@@ -481,9 +480,9 @@ mod tests {
     ///   ARITHMETIC to the total: `27` is computed, never typed. The doc sentence promising which
     ///   figures are asserted names only `2` and `35` for that reason; `8` and `27` are held fixed
     ///   RELATIVE to them and nothing more.
-    /// * The corpus assertion compares a LENGTH. Swapping the swept text for a different string of
-    ///   the same size would pass it — it closes truncation, which is the one-edit form, not every
-    ///   conceivable substitution.
+    /// * The corpus assertion bounds the text READ, and nothing about what the loop then does with
+    ///   it. It compares a LENGTH, so a same-size substitution passes; and a skip added inside the
+    ///   loop leaves every byte read and some of them never examined. Neither is caught here.
     ///
     /// MUTATION-CHECK, all measured on this tree and reverted by hand-edit against a pre-mutation
     /// `sha256sum`:
@@ -659,21 +658,18 @@ mod tests {
             .unwrap_or_else(|e| panic!("cannot stat {doc_path}: {e}")).len() as usize;
         assert_eq!(swept.len(), on_disk,
             "REACH CONTROL (corpus): the sweep read {} of {doc_path}'s {on_disk} bytes. The \
-             attribution below reports what was FOUND and cannot report what was never LOOKED AT, \
-             so this is the assertion that separates a clean page from a blinded scan. The expected \
-             size is the file's size on disk and not `doc.len()`, because a comparison against the \
-             text the sweep was sliced from is satisfied by anything that shortens both.",
+             attribution below reports what was FOUND and cannot report what was never LOOKED AT. \
+             The expected size is the file's size on disk and not `doc.len()`, because a comparison \
+             against the text the sweep was sliced from is satisfied by anything that shortens both.",
             swept.len());
         assert_eq!(attributed, DOC_TOTAL_ATTRIBUTIONS,
             "REACH CONTROL (sweep): the whole-token `{tok}`s on {doc_path} attribute to \
              {attributed:?} at line(s) {at_lines:?}, expected {DOC_TOTAL_ATTRIBUTIONS:?}. An \
              `UNPINNED` entry is a claim about this crate's struct count that nothing keeps honest: \
              add it to `COUNT_CLAIM_SITES`, `DOC_TOTAL_ATTRIBUTIONS` and `sites` so it moves with \
-             the constant, or reword it. Any other difference means the sweep read a different page \
-             than this constant describes: the corpus assertion above has already passed, so the \
-             whole file WAS read, and this is the page changing rather than the scan shrinking. Do \
-             not reconcile it by editing the constant to match what was found — that is the repair \
-             loop that let the count go unread in the first place.");
+             the constant, or reword it. Do not reconcile any difference by editing the constant to \
+             match what was found — that is the repair loop that let the count go unread in the \
+             first place.");
     }
 
     /// The refusal template and every `what` it is given must contain NO word that is also a field
