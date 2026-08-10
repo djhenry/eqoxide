@@ -660,6 +660,154 @@ pub struct SpawnInfo {
     pub npc_tint_index:  u32,
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
+impl SpawnInfo {
+    /// A TEST-ONLY baseline spawn, for use as the base of a functional-record-update literal:
+    ///
+    /// ```
+    /// # use eqoxide_protocol::protocol::SpawnInfo;
+    /// let info = SpawnInfo { spawn_id: 7, name: "Orc".into(), ..SpawnInfo::for_test() };
+    /// assert_eq!(info.spawn_id, 7);
+    /// ```
+    ///
+    /// That example is compiled and run rather than sitting behind an `ignore` fence, so it is a
+    /// live check on this function's name and signature. Its reach is limited, and saying so is
+    /// part of the claim: it only exists in a build where `test-fixtures` is on, which a
+    /// workspace-wide `cargo test --workspace` supplies through dev-dependency feature
+    /// unification. Scoped to this package alone, the whole `impl` is cfg'd away and the example
+    /// does not exist — measured at `2532925`, `cargo test --doc -p eqoxide-protocol --locked`
+    /// reports **0 tests**, exit 0. It guards the workspace gate; it does not guard a
+    /// package-scoped run.
+    ///
+    /// **Why this exists (#913).** `SpawnInfo` was constructed *exhaustively* — no `..` rest — at
+    /// every test site in the workspace, so adding a field to it broke tests that assert nothing
+    /// about the new field. With `..SpawnInfo::for_test()` as the base, a new field cannot break a
+    /// test that does not mention it — the compiler fills it in.
+    ///
+    /// **How #857's addition of `npc_tint_index` actually reached `main` red**, read off the
+    /// Actions record rather than reconstructed. It was *not* a package-scoped or `--lib` gate:
+    /// `.github/workflows/test.yml` has run `cargo build --release --workspace --locked` followed
+    /// by `cargo test --workspace --locked` since `c7ecf8c` (#605/#606, 2026-07-21), sixteen days
+    /// before #857 merged, and `cargo test --workspace` does build `tests/entity_pose_643.rs`.
+    /// What happened instead: PR #896 had exactly one CI run, `31123248406`, and it FAILED — on
+    /// `E0063: missing field npc_tint_index in initializer of` **`Entity`** at `src/model.rs:430`,
+    /// in `could not compile eqoxide (lib test)`. Cargo then stopped scheduling — it printed
+    /// `warning: build failed, waiting for other jobs to finish...` — so the *second* half of the
+    /// break — this struct, in `tests/entity_pose_643.rs` — was never scheduled, and so was never
+    /// reported. The strings `entity_pose_643` and `SpawnInfo` appear zero times anywhere in that
+    /// run's logs, which is only possible if the unit was never compiled: compiling it necessarily
+    /// emits the `E0063`. The command would have built it; the run never got that far.
+    /// #896 was merged 36 minutes later with that check still red, and the follow-up push run on
+    /// `main` (`31125615041`) never executed at all — both jobs are annotated "The job was not
+    /// acquired by Runner of type hosted". It took #915 (`Entity`) and #918 (`SpawnInfo`) to get
+    /// `main` green again.
+    ///
+    /// So there were two independent failures, and this fixture addresses neither directly — it
+    /// removes the *class* of break instead:
+    ///   - **Cargo stops after the first failing unit.** A run that reports one error may be
+    ///     hiding others in units it never scheduled. `--keep-going` would have surfaced both
+    ///     halves in that same run; CI does not pass it. (Same effect measured again while
+    ///     building this fixture: adding a probe field to `SpawnInfo` on `0895c1e` reports 1 of 9
+    ///     broken sites without `--keep-going` and all 9 with it.)
+    ///   - **A red required check was merged over.** Nothing in this crate can prevent that; it is
+    ///     a branch-protection matter, filed separately as #968.
+    ///
+    /// **Deliberately not a `Default` impl, and deliberately not reachable from production.**
+    /// The agent-honesty invariant says the client must never report a confident falsehood. If
+    /// production could fill a `SpawnInfo` field it failed to decode with a plausible neutral
+    /// value, a missing wire field would silently become a lie about a spawn instead of a loud
+    /// failure. Two things prevent that:
+    ///   1. This is behind `cfg(any(test, feature = "test-fixtures"))`, and `test-fixtures` is
+    ///      enabled only from `[dev-dependencies]`. It does not exist in the binary's build.
+    ///   2. It is a *named* constructor, not `impl Default`. There is no `Default` for
+    ///      `SpawnInfo`, so no generic `unwrap_or_default()` / `Option::unwrap_or_default` path
+    ///      can conjure one, and every call site is greppable by name.
+    ///
+    /// **`parse_rof2_spawn` stays exhaustive on purpose.** It is the one construction site that
+    /// reads the wire, so it is the one place where "you added a field and did not decode it"
+    /// *should* be a compile error. This fixture removes that pressure from tests only.
+    ///
+    /// **Where the values below come from — measured, not assumed.** Of the 29 fields, **14**
+    /// carry the value that all nine pre-#913 exhaustive literals already agreed on. The other
+    /// **15** do not: the nine literals disagreed among themselves, and the baseline picks one
+    /// plausible option. Callers override whatever they actually assert on, and a caller who
+    /// asserts on a field must set it rather than inherit it.
+    ///
+    /// Two fields — `spawn_id` and `name` — deliberately match *none* of the nine. They are
+    /// placeholders, chosen to fail loudly rather than plausibly if a caller forgets to override
+    /// them. `spawn_id` is 913 and not 1 because tests set `player_id = 1` (17 sites across the
+    /// workspace) and `GameState::set_target` short-circuits on `id == player_id`, so a baseline
+    /// of 1 would let a forgotten override silently resolve to the player. It also stays inside
+    /// `u16` because `encode_position_update` takes a `u16` spawn id.
+    ///
+    /// One value is worth flagging because it is *not* wire truth: `animation` is 100 here,
+    /// matching eight of the nine literals, whereas EQEmu sends 0 on a spawn record. A test that
+    /// cares about the spawn struct's own gait field must set it explicitly — see the override
+    /// and its mutation result in `tests/entity_pose_643.rs`.
+    ///
+    /// **The suite does not defend most of these values, and did not before #913 either.**
+    /// Measured by WRAP mutation (`field: if false { <orig> } else { <other> }`) at `2532925`,
+    /// `--no-fail-fast`, every run in one sitting. Each figure is `passed/failed/ignored` and is
+    /// labelled with the command shape that produced it, because the two shapes do not report the
+    /// same targets — an unmutated run is 2027/0/50 plain and 2015/0/47 with `--all-targets`:
+    ///   - All **14** agreed-on values mutated together → **RED** under both shapes:
+    ///     2026/1/50 under `cargo test --workspace --locked`, 2014/1/47 with `--all-targets`
+    ///     added. The single failure either way is
+    ///     `packet_handler::tests::register_spawn_lays_down_zone_in_corpses`, and the single
+    ///     observed field is `cur_hp`.
+    ///   - **Those same 14 minus `cur_hp` — i.e. `last_name`, `class_`, `guild_id`, `guild_rank`,
+    ///     `helm`, `show_helm`, `face`, `hairstyle`, `haircolor`, `pet_owner_id`, `player_state`,
+    ///     `heading`, `npc_tint_index`** — mutated together → **GREEN** under both shapes:
+    ///     2027/0/50 plain and 2015/0/47 with `--all-targets`, i.e. byte-identical to an
+    ///     unmutated run.
+    ///
+    /// So those 13 of the 29 baseline values could all be wrong at once without any test saying
+    /// so. Read the set from the list above, not from the count: a *different* 13 — the
+    /// non-agreed-on values other than the two placeholders (`level`, `npc`, `gender`, `race`,
+    /// `body_type`, `stand_state`, `flymode`, `x`, `y`, `z`, `animation`, `equipment`,
+    /// `equipment_tint`) — is **RED**, and with `npc` mutated to 0 it is 2025/2/50 plain, failing
+    /// `apply_wear_change_updates_one_slot` as well as the corpse test. The RED verdict holds
+    /// whatever alternates you pick; that exact figure and failure list do not, so they are quoted
+    /// with the alternate that produced them.
+    ///
+    /// This is a pre-existing gap the fixture concentrates rather than creates — the same 13
+    /// values were previously hand-copied, unasserted, into nine literals — but it is real:
+    /// tracked as #969.
+    pub fn for_test() -> Self {
+        SpawnInfo {
+            spawn_id:       913,
+            name:           String::from("a_for_test_placeholder"),
+            last_name:      String::new(),
+            level:          5,
+            npc:            1,
+            gender:         0,
+            race:           54,
+            class_:         1,
+            guild_id:       0xFFFF_FFFF,
+            guild_rank:     0,
+            body_type:      1,
+            cur_hp:         100,
+            helm:           0,
+            show_helm:      false,
+            face:           0,
+            hairstyle:      0,
+            haircolor:      0,
+            stand_state:    100,
+            flymode:        0,
+            pet_owner_id:   0,
+            player_state:   64,
+            x:              0.0,
+            y:              0.0,
+            z:              0.0,
+            heading:        0.0,
+            animation:      100,
+            equipment:      [0u32; 9],
+            equipment_tint: [[0u8; 3]; 9],
+            npc_tint_index: 0,
+        }
+    }
+}
+
 /// Parse one RoF2 spawn record from the front of `buf`.
 /// Returns `Some((info, bytes_consumed))` on success, `None` if the buffer is too
 /// short to hold a complete spawn.

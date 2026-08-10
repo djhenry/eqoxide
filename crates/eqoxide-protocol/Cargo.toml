@@ -7,6 +7,17 @@ edition = "2021"
 name = "eqoxide_protocol"
 path = "src/lib.rs"
 
+[features]
+# Exposes `SpawnInfo::for_test()` — the test-only baseline spawn that lets a test literal write
+# `..SpawnInfo::for_test()` instead of enumerating all 29 fields (#913) — to DOWNSTREAM test
+# builds. Otherwise it is `#[cfg(test)]`, so invisible across the crate boundary, and the sites
+# that need it most (eqoxide-net's unit tests, the app crate's `tests/entity_pose_643.rs`) are all
+# in other crates. Enable it as a DEV-dependency feature ONLY: production must never be able to
+# fill a spawn field it failed to decode with a plausible neutral value — that would turn a
+# missing wire field into a lie about a spawn rather than a loud failure. Same convention as
+# `eqoxide-core`/`eqoxide-ipc`/`eqoxide-renderer`'s `test-fixtures`.
+test-fixtures = []
+
 [dependencies]
 # eqoxide-protocol is the wire-format decode layer, sitting directly above eqoxide-core
 # (core ← protocol, #544 Step 2j). It bundles `wire` (the `WireReader` cursor) and `protocol`

@@ -41,6 +41,10 @@ eqoxide-nav = { path = "../eqoxide-nav", features = ["test-fixtures"] }
 # `game_state::make_entity` — a `#[cfg(test)]` fixture constructor in eqoxide-core, exposed to this
 # crate's test build via `test-fixtures`. packet_handler's loot/target tests seed entities with it.
 eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }
+# `SpawnInfo::for_test()` — the test-only baseline spawn (#913), gated behind `test-fixtures` in
+# eqoxide-protocol so production cannot reach it. packet_handler's register_spawn / wear-change /
+# flymode tests build their `SpawnInfo`s from it instead of enumerating all 29 fields.
+eqoxide-protocol = { path = "../eqoxide-protocol", features = ["test-fixtures"] }
 # TEST-ONLY. Two eq_net tests deliberately reference the REAL http-side constants instead of magic
 # literals so a future edit to either side of a cross-layer timing invariant is caught here:
 #   - transport.rs `connect_keeps_last_tick_fresh_across_a_silent_handshake` → `SESSION_STALE_TICK_MS`
