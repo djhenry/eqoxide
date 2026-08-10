@@ -2360,7 +2360,7 @@ Since **D-2 (#375)** nav's floor predicate `is_standable` is **facing-blind**: a
 its flatness + headroom, whichever way its art is wound — because some zones bake real, walkable
 ground from **inverted (down-facing) art** (the qcat live wedge stood on exactly such a walkway, which
 the old up-facing-only filter deleted). Those surfaces ARE walkable, but nav can no longer *verify*
-their facing, so `nav_support` counts each query answered from one.
+their facing, so `nav_support` reports that it has been standing on some.
 
 > **Renamed from `nav_degraded`/`inverted_floor_art`.** That older signal counted a `column_bottom`
 > recovery valve, which D-2 removed. Had it been left reading the dead counter it would report `null`
@@ -2368,8 +2368,14 @@ their facing, so `nav_support` counts each query answered from one.
 > neriakc/qcat) where nav is now on winding-blind ground — a confident falsehood. The signal moved
 > with the mechanism so it stays honest.
 
-`queries` counts how many nav queries have been answered from down-facing ground since the zone
-loaded. Read `nav_support != null` as *"footing here is unverified-winding"* — not an error and not a
+**`queries` is misnamed and is not a query count** (#960). The counter advances once per **down-facing
+triangle** that nav admits as standing ground, per call — so one query over a column carrying two such
+triangles adds **2**, and the number is not a rate you can divide by anything. Do not derive a
+frequency from it. Treat it as an unscaled "how much winding-blind ground nav has leaned on since
+zone load", and treat the field NAME as a known defect: renaming it is a breaking wire change, so it
+is tracked separately in #960 rather than done silently.
+
+Read `nav_support != null` as *"footing here is unverified-winding"* — not an error and not a
 routing failure (the ground is walkable), just an honest "this footing's facing is unconfirmed."
 
 ## Consider results

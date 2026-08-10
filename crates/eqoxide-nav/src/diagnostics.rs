@@ -484,14 +484,17 @@ pub enum ProbeAnchor {
 /// silent wrong answer. The local the probe actually uses is a `CastZ` for the same reason — a bare
 /// `f32` local would have re-admitted the mutant under a different spelling.
 ///
-/// **Its honest limit.** This is a raised bar, not a closed hole. THREE routes from a `CastZ` back
-/// to a plain `f32` compile: [`CastZ::raw`], and the degenerate `+ 0.0` / `- 0.0` forms of the
-/// `Add<f32>`/`Sub<f32>` impls (which exist because every legitimate use of a cast height is
-/// "offset it and cast from there" — see the spoke loop in `clearance_probe`). All three were
-/// measured RED on the tier-2 test (#885 review round 3, re-derived in round 4), so that test is
-/// what keeps `body` at the character's z. What the type contributes is narrower: the bare
-/// `anchor.z()` substitution is `error[E0308]`, so taking one of the three routes has to be written
-/// out deliberately.
+/// **Its honest limit.** This is a raised bar, not a closed hole. From OUTSIDE this module — which
+/// includes `clearance_probe`, the call site that matters — THREE routes back to a plain `f32`
+/// compile: [`CastZ::raw`], and the degenerate `+ 0.0` / `- 0.0` forms of the `Add<f32>`/`Sub<f32>`
+/// impls (which exist because every legitimate use of a cast height is "offset it and cast from
+/// there" — see the spoke loop). All three were measured RED on the tier-2 test (#885 review round
+/// 3, re-derived in round 4), so that test is what keeps `body` at the character's z. What the type
+/// contributes is narrower: the bare `anchor.z()` substitution is `error[E0308]`, so taking one of
+/// the three routes has to be written out deliberately.
+///
+/// Inside this module the tuple field is a fourth route — ordinary newtype behaviour, and out of
+/// reach from the call site: `floor_z.0` in `clearance_probe` is `error[E0616]` (measured).
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct CastZ(f32);
 

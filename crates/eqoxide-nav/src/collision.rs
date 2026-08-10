@@ -2623,9 +2623,13 @@ impl Collision {
     /// previously skipped, by however many down-facing triangles that column's art happens to
     /// carry — a published change, not an invisible one, and not a per-query rate.
     ///
-    /// (The `nav_support.queries` field name and its "each query" wording on `/v1/observe/debug`
-    /// and in `docs/http-api.md` predate #885 and describe the same counter the same wrong way.
-    /// That is a separate, pre-existing defect, filed as #960; this PR does not change them.)
+    /// (What is left for **#960** is the `nav_support.queries` FIELD NAME, which says "queries" on
+    /// the wire for a number that is not one. That predates #885, and renaming a published JSON
+    /// field does not belong here. The PROSE that repeated the wrong semantics — `observe.rs`'s
+    /// comments above the serialization site, and `docs/http-api.md`'s two sentences — was corrected
+    /// in this PR, at #885 review rounds 3 and 4. An earlier draft of this parenthetical said the
+    /// prose was untouched; that was true when it was written and this PR's own later commits made
+    /// it false, which is the same defect in the opposite direction.)
     pub fn body_placement(&self, p: [f32; 3]) -> crate::diagnostics::Placement {
         use crate::diagnostics::Placement;
         let pierced = !self.footprint_clear(
