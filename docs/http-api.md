@@ -2391,10 +2391,56 @@ Top-level shape (`available: false` + a `note` until the walker first publishes)
   **advertised, not verified**) / `advertised_unusable` (advertised but refused by the gate) /
   `learned_same_zone` / `learned_cross_zone` (reserved for the #543 learning loop). "Not yet
   observed" is first-class and never collapses into an answer.
-- **`clearance`** — a throttled live sample of nav's own traversability model at `at` (which may
-  lag the player a few ticks): 16 radial `wall_spokes` (saturating at `cap`), the 8-direction
-  `footprint_ok` ring at `footprint_radius`, and the zone-lifetime field values `field_wall` /
-  `field_ground` the planner's hug-cost/margin actually consult.
+- **`clearance`** — a throttled live sample of nav's own traversability model (which may lag the
+  player a few ticks). Fields:
+
+  ```json
+  "clearance": {
+    "at": [128.5, -64.0],
+    "anchor": {"kind": "floor", "z": -10.0, "reference_z": -11.0},
+    "body": "footprint_pierced",
+    "wall_spokes": ["clear_to_cap", {"hit": {"at": 2.75}}, "..."],
+    "cap": 4.0,
+    "footprint_ok": [true, true, false, "..."],
+    "footprint_radius": 1.0,
+    "footprint_ring_z": -7.0,
+    "field_wall": 3.0,
+    "field_ground": 2.0
+  }
+  ```
+
+  - **`at`** — the horizontal `[east, north]` the sample was taken at. **Two elements, not three:**
+    the vertical is no longer here, because there is more than one of them (see `anchor`).
+  - **`anchor`** — WHERE the vertical came from, internally tagged on `kind`:
+    - `{"kind": "floor", "z": …, "reference_z": …}` — a floor was found in the search band and the
+      rays were cast from `z`;
+    - `{"kind": "no_floor_in_band", "reference_z": …}` — **no floor was found**, and the rays were
+      cast from `reference_z`. There is **no `z` key at all** on this variant; a consumer must
+      branch on `kind` before reaching for one.
+
+    `reference_z` is the character's own height and is present on both variants. It is not always
+    equal to `z`: a body embedded under a slab has its nearest floor *above* it, so the rest of the
+    sample can describe a point in open air over the geometry the character is inside.
+  - **`body`** — the movement controller's placement verdict **at the character's own position**:
+    `placeable` | `footprint_pierced` | `no_floor_below` | `footprint_pierced_and_no_floor_below`.
+    Anything but `placeable` means the rest of this sample describes a point the character does not
+    occupy. It is **not** a claim about whether the character can move — a non-`placeable` verdict
+    is the entry condition to the depenetration net, which usually relocates the body and it keeps
+    moving. The published answer to "can it move" is `player.hold` on `/v1/observe/debug`.
+  - **`wall_spokes`** — 16 radial readings, each either the string `"clear_to_cap"` (nothing was hit
+    anywhere within `cap` — a **lower bound**, not a distance of `cap`) or `{"hit": {"at": <f32>}}`
+    (a measured distance in `0 ..= cap`).
+  - **`cap`**, **`footprint_ok`** (8-direction ring), **`footprint_radius`**, **`footprint_ring_z`**
+    (the z the planner's ring was tested at — the anchor plus the body's ring offset), and the
+    zone-lifetime field values **`field_wall`** / **`field_ground`** the planner's hug-cost and
+    margin actually consult.
+
+  > **Breaking change (#885)** for any consumer written against the previous shape:
+  > `at` went from **3 elements to 2**; `wall_spokes[i]` went from a bare **float** to the tagged
+  > union above, so `as_f64()` on a saturated spoke now returns `None` rather than `cap`; and
+  > `anchor` / `body` / `footprint_ring_z` are new. The old encoding wrote `cap` for both "hit at
+  > exactly the cap" and "measured nothing", and wrote the fallback `reference_z` into `at[2]` under
+  > a field documented as a floor height — both are why the shape changed.
 - **`water`** — the swim state the walker acted on this tick (`swimming`, `swim_plane`), i.e. the
   values that went into its MoveIntent — not a recomputation.
 
@@ -2418,7 +2464,7 @@ Since **D-2 (#375)** nav's floor predicate `is_standable` is **facing-blind**: a
 its flatness + headroom, whichever way its art is wound — because some zones bake real, walkable
 ground from **inverted (down-facing) art** (the qcat live wedge stood on exactly such a walkway, which
 the old up-facing-only filter deleted). Those surfaces ARE walkable, but nav can no longer *verify*
-their facing, so `nav_support` counts each query answered from one.
+their facing, so `nav_support` reports that it has been standing on some.
 
 > **Renamed from `nav_degraded`/`inverted_floor_art`.** That older signal counted a `column_bottom`
 > recovery valve, which D-2 removed. Had it been left reading the dead counter it would report `null`
@@ -2426,8 +2472,14 @@ their facing, so `nav_support` counts each query answered from one.
 > neriakc/qcat) where nav is now on winding-blind ground — a confident falsehood. The signal moved
 > with the mechanism so it stays honest.
 
-`queries` counts how many nav queries have been answered from down-facing ground since the zone
-loaded. Read `nav_support != null` as *"footing here is unverified-winding"* — not an error and not a
+**`queries` is misnamed and is not a query count** (#960). The counter advances once per **down-facing
+triangle** that nav admits as standing ground, per call — so one query over a column carrying two such
+triangles adds **2**, and the number is not a rate you can divide by anything. Do not derive a
+frequency from it. Treat it as an unscaled "how much winding-blind ground nav has leaned on since
+zone load", and treat the field NAME as a known defect: renaming it is a breaking wire change, so it
+is tracked separately in #960 rather than done silently.
+
+Read `nav_support != null` as *"footing here is unverified-winding"* — not an error and not a
 routing failure (the ground is walkable), just an honest "this footing's facing is unconfirmed."
 
 ## Consider results
