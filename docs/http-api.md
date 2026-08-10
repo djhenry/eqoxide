@@ -2262,6 +2262,10 @@ both, on two different fields depending on whether the considered spawn IS your 
   considered spawn, target or not**. This is what makes a *standalone* consider (a spawn deliberately
   NOT your target) readable: `POST /v1/combat/consider {"id":N}` for a non-target spawn always
   populates this, even though it leaves `target_con`/`target_attitude`/`target_level` untouched.
+  **Zone-scoped** (#883): `spawn_id` is a per-zone namespace, so a zone change clears this back to
+  `null` — the same id in the new zone is ordinarily a different spawn at a different difficulty, and
+  `ago_secs` (derived from `at` at read time) would otherwise keep counting normally without
+  disclosing that the record predates the zone change. Consider again after zoning to repopulate it.
 
 ```json
 "last_consider": {
