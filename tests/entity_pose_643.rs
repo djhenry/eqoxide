@@ -40,8 +40,11 @@ fn npc_spawn(spawn_id: u32, name: &str, stand_state: u8) -> SpawnInfo {
         z: 5.0,
         // The spawn struct's OWN 10-bit gait field. EQEmu sends 0 here (`ns->spawn.animation = 0`),
         // which is exactly why the two domains were so easy to confuse: at spawn the gait slot is
-        // empty and the pose lives in `stand_state`. `for_test()`'s baseline is 100, so this
-        // override is load-bearing and must stay explicit.
+        // empty and the pose lives in `stand_state`. Kept explicit because `for_test()`'s baseline
+        // is 100 (the value the pre-#913 unit-test literals used) and this fixture should carry the
+        // wire truth. It is documentation, not an assertion input: MEASURED — mutating this to 100
+        // leaves the whole `cargo test --workspace --all-targets` suite green, so no test in this
+        // file depends on it.
         animation: 0,
         // #913: the remaining fields come from the test-only baseline rather than being enumerated
         // here. An exhaustive literal at this exact spot is what put `main` red when #857 added
