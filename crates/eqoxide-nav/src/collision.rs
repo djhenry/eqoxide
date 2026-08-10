@@ -2608,11 +2608,12 @@ impl Collision {
     /// It is **not** a no-op beyond that boolean, and the first draft of this doc wrongly said no
     /// behaviour depended on the order (#885 review round 1, F10). Running the ground probe on
     /// pierced-footprint frames reaches `ground_below` → `column_hits` → the `facing_blind_hits`
-    /// counter published as `/v1/observe/debug`'s `nav_support`. Measured by the reviewer on
-    /// inverted-art ground with a pierced footprint: `facing_blind_hits` 0 (old `||`) → 2 (this
-    /// function). That counter is a count of queries answered from down-facing art, and the
-    /// character's own column really was queried, so the new count is the accurate one — but it is
-    /// a published change, not an invisible one.
+    /// counter published as `/v1/observe/debug`'s `nav_support`. Measured on inverted-art ground
+    /// with a pierced footprint: `facing_blind_hits` **0** (old `||`) → **2** (this function), and
+    /// pinned by `evaluating_both_disjuncts_moves_the_published_facing_blind_counter`. That counter
+    /// is a count of queries answered from down-facing art, and the character's own column really
+    /// was queried, so the new count is the accurate one — but it is a published change, not an
+    /// invisible one.
     pub fn body_placement(&self, p: [f32; 3]) -> crate::diagnostics::Placement {
         use crate::diagnostics::Placement;
         let pierced = !self.footprint_clear(
@@ -10115,6 +10116,22 @@ mod clearance_probe_is_not_lossy_885 {
             wall_e(0.6, -20.0, 20.0, -10.0, -7.6), wall_e(-0.6, -20.0, 20.0, -10.0, -7.6)])
     }
 
+    /// A DOWN-facing floor at height `z` — the same quad as [`floor`] with its winding reversed.
+    /// Real zones bake walkable ground this way (D-2/#375), and `is_standable` admits it while
+    /// counting the admission into `facing_blind_hits`.
+    fn inverted_floor(z: f32, half: f32) -> MeshData {
+        quad([[half, z, -half], [half, z, half], [-half, z, half], [-half, z, -half]])
+    }
+
+    /// 5. **Inverted-art ground with a pierced footprint** (#885 review round 1, F10). A down-facing
+    ///    floor at `z = 0`, plus a slot of walls at `east = ±0.6` spanning `[0, 6]` so that a body
+    ///    at `z = 0` has its ring (cast at `0 + PLAYER_BODY.ring = 3.0`) inside the slot. This is
+    ///    the one shape where the old `||` short-circuit and `body_placement` differ observably.
+    fn inverted_ground_with_pierced_footprint() -> Collision {
+        build(vec![inverted_floor(0.0, 100.0),
+            wall_e(0.6, -20.0, 20.0, 0.0, 6.0), wall_e(-0.6, -20.0, 20.0, 0.0, 6.0)])
+    }
+
     // ── the hypothesis the issue offered, measured ──────────────────────────────────────────────
 
     /// **The issue's proposed mechanism, refuted by measurement.** "The cast starts inside solid
@@ -10141,6 +10158,39 @@ mod clearance_probe_is_not_lossy_885 {
         // planner's probe heights above the anchor.
         assert_eq!(crate::traversability::PLAYER_BODY.planner_probes(), [2.5, 4.0],
             "the spokes are cast 2.5 and 4.0 u above the anchor — #854's blind band is the bottom 0.5 u");
+    }
+
+    /// **The `||` short-circuit removal is PUBLISHED, not invisible** (#885 review round 1, F10).
+    ///
+    /// The controller's old `is_embedded` was `pierced || no_floor`, so a pierced footprint skipped
+    /// the ground probe entirely. `body_placement` names both disjuncts, so both are evaluated. The
+    /// first draft of its rustdoc said no behaviour depended on the order. That is false: the ground
+    /// probe runs `column_hits`, which increments `facing_blind_hits` for every DOWN-facing surface
+    /// it admits as ground — and that counter is published as `nav_support` on `/v1/observe/debug`.
+    ///
+    /// Measured here rather than quoted, on two freshly-built copies of the same scene so the
+    /// counters start at zero and the only difference is which calls were made. The new count is the
+    /// accurate one — the character's column really was queried — but it is a change an agent can
+    /// see, and this test exists so it stays disclosed.
+    #[test]
+    fn evaluating_both_disjuncts_moves_the_published_facing_blind_counter() {
+        let radius = eqoxide_core::physics::PLAYER_RADIUS;
+        let at = [0.0f32, 0.0, 0.0];
+
+        // The old `||`: the footprint is pierced, so the ground probe is short-circuited away.
+        let old = inverted_ground_with_pierced_footprint();
+        let pierced = !old.footprint_clear(at[0], at[1], at[2], radius, PLACEMENT_RING_DIRS);
+        assert!(pierced, "the fixture must pierce the footprint, or there is nothing to short-circuit");
+        assert_eq!(old.facing_blind_hits(), 0,
+            "the short-circuited form never reached the ground probe, so nothing was counted");
+
+        // `body_placement`: both disjuncts, so the ground probe runs on this frame.
+        let new = inverted_ground_with_pierced_footprint();
+        assert_eq!(new.body_placement(at), Placement::FootprintPierced,
+            "same verdict as the old boolean — the BOOLEAN is unchanged; the counter is not");
+        assert_eq!(new.facing_blind_hits(), 2,
+            "the ground probe admitted the down-facing floor and counted it — this is the published \
+             side effect the round-1 rustdoc wrongly denied");
     }
 
     // ── defect 1: a saturated spoke and a cap-distance hit ───────────────────────────────────────
@@ -10422,6 +10472,7 @@ mod clearance_probe_is_not_lossy_885 {
             the_probe_reports_the_same_predicate_the_controller_acts_on,
             placement_names_which_disjunct_failed,
             the_json_encoding_keeps_the_distinctions,
+            evaluating_both_disjuncts_moves_the_published_facing_blind_counter,
         ];
     }
 
