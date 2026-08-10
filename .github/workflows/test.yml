@@ -106,12 +106,15 @@ jobs:
       # reports as 0. So `--workspace --locked` is a strict superset by that delta.
       #
       # Pass/header TOTALS are deliberately not quoted here. An earlier version of this comment
-      # quoted five — `55`/`2008`/`50` versus `42`/`1997`/`47` — sourced to "one clean tree (#950)"
-      # with no sha; three were already stale by the very next PR (#974). A total is a predicate
-      # over the whole mutable suite: the next merged `#[test]` anywhere falsifies it and nothing
-      # re-evaluates a comment. Even the counts above will drift eventually — they are pinned to a
-      # sha for that reason, not claimed current. Re-derive with `cargo test --workspace --locked`
-      # vs `cargo test --workspace --all-targets --locked`, diffing the `Running` lines and
+      # quoted six — `55`/`2008`/`50` versus `42`/`1997`/`47` — sourced to "one clean tree (#950)"
+      # with no sha. MEASURED at `245baeb` against `143cc84` (the commit that wrote them): exactly
+      # two had already drifted — both PASSED totals (`2008` plain, `1997` under `--all-targets`).
+      # The other four — both header counts and both IGNORED counts — were unchanged. That is not
+      # a coincidence: a total is falsified by the next merged `#[test]` anywhere, while a header
+      # or ignored count only moves when a target or an `#[ignore]` is added or removed, which is
+      # rarer. Even the doctest counts above will drift eventually — they are pinned to a sha for
+      # that reason, not claimed current. Re-derive with `cargo test --workspace --locked` vs
+      # `cargo test --workspace --all-targets --locked`, diffing the `Running` lines and
       # `Doc-tests` sections, if you need today's numbers.
       #
       # (An earlier version of this comment said no Rust doctest existed yet; that is no longer
