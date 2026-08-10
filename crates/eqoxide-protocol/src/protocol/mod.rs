@@ -664,17 +664,42 @@ pub struct SpawnInfo {
 impl SpawnInfo {
     /// A TEST-ONLY baseline spawn, for use as the base of a functional-record-update literal:
     ///
-    /// ```ignore
+    /// ```
+    /// # use eqoxide_protocol::protocol::SpawnInfo;
     /// let info = SpawnInfo { spawn_id: 7, name: "Orc".into(), ..SpawnInfo::for_test() };
+    /// assert_eq!(info.spawn_id, 7);
     /// ```
     ///
     /// **Why this exists (#913).** `SpawnInfo` was constructed *exhaustively* — no `..` rest — at
-    /// every test site in the workspace. Adding a field to it therefore broke tests that assert
-    /// nothing about the new field, in crates the field's author never compiled. That is exactly
-    /// what happened when #857 added `npc_tint_index`: `main` went red in the root crate's
-    /// `tests/entity_pose_643.rs`, which no package-scoped run of the changed crates ever builds
-    /// (#913, #915, #918). With `..SpawnInfo::for_test()` as the base, a new field cannot break a
+    /// every test site in the workspace, so adding a field to it broke tests that assert nothing
+    /// about the new field. With `..SpawnInfo::for_test()` as the base, a new field cannot break a
     /// test that does not mention it — the compiler fills it in.
+    ///
+    /// **How #857's addition of `npc_tint_index` actually reached `main` red**, read off the
+    /// Actions record rather than reconstructed. It was *not* a package-scoped or `--lib` gate:
+    /// `.github/workflows/test.yml` has run `cargo build --release --workspace --locked` followed
+    /// by `cargo test --workspace --locked` since `c7ecf8c` (#605/#606, 2026-07-21), sixteen days
+    /// before #857 merged, and `cargo test --workspace` does build `tests/entity_pose_643.rs`.
+    /// What happened instead: PR #896 had exactly one CI run, `31123248406`, and it FAILED — on
+    /// `E0063: missing field npc_tint_index in initializer of` **`Entity`** at `src/model.rs:430`,
+    /// in `could not compile eqoxide (lib test)`. Cargo then stopped scheduling — it printed
+    /// `warning: build failed, waiting for other jobs to finish...` — so the *second* half of the
+    /// break — this struct, in `tests/entity_pose_643.rs` — was compiled by that command but never
+    /// reported: the strings `entity_pose_643` and `SpawnInfo` appear zero times in the run's log.
+    /// #896 was merged 36 minutes later with that check still red, and the follow-up push run on
+    /// `main` (`31125615041`) never executed at all — both jobs are annotated "The job was not
+    /// acquired by Runner of type hosted". It took #915 (`Entity`) and #918 (`SpawnInfo`) to get
+    /// `main` green again.
+    ///
+    /// So there were two independent failures, and this fixture addresses neither directly — it
+    /// removes the *class* of break instead:
+    ///   - **Cargo stops after the first failing unit.** A run that reports one error may be
+    ///     hiding others in units it never scheduled. `--keep-going` would have surfaced both
+    ///     halves in that same run; CI does not pass it. (Same effect measured again while
+    ///     building this fixture: adding a probe field to `SpawnInfo` on `0895c1e` reports 1 of 9
+    ///     broken sites without `--keep-going` and all 9 with it.)
+    ///   - **A red required check was merged over.** Nothing in this crate can prevent that; it is
+    ///     a branch-protection matter, filed separately as #968.
     ///
     /// **Deliberately not a `Default` impl, and deliberately not reachable from production.**
     /// The agent-honesty invariant says the client must never report a confident falsehood. If
@@ -691,13 +716,35 @@ impl SpawnInfo {
     /// reads the wire, so it is the one place where "you added a field and did not decode it"
     /// *should* be a compile error. This fixture removes that pressure from tests only.
     ///
-    /// The field values below are the ones every pre-#913 test literal already shared: a level-5
-    /// standing NPC with no guild, no equipment and no tint, at the origin. Callers override
-    /// whatever they actually assert on.
+    /// **Where the values below come from — measured, not assumed.** Of the 29 fields, **14**
+    /// carry the value that all nine pre-#913 exhaustive literals already agreed on. The other
+    /// **15** do not: the nine literals disagreed among themselves, and the baseline picks one
+    /// plausible option. Callers override whatever they actually assert on, and a caller who
+    /// asserts on a field must set it rather than inherit it.
+    ///
+    /// Two fields — `spawn_id` and `name` — deliberately match *none* of the nine. They are
+    /// placeholders, chosen to fail loudly rather than plausibly if a caller forgets to override
+    /// them. `spawn_id` is 913 and not 1 because tests set `player_id = 1` (17 sites across the
+    /// workspace) and `GameState::set_target` short-circuits on `id == player_id`, so a baseline
+    /// of 1 would let a forgotten override silently resolve to the player. It also stays inside
+    /// `u16` because `encode_position_update` takes a `u16` spawn id.
+    ///
+    /// One value is worth flagging because it is *not* wire truth: `animation` is 100 here,
+    /// matching eight of the nine literals, whereas EQEmu sends 0 on a spawn record. A test that
+    /// cares about the spawn struct's own gait field must set it explicitly — see the override
+    /// and its mutation result in `tests/entity_pose_643.rs`.
+    ///
+    /// **The suite does not defend most of these values, and did not before #913 either.**
+    /// WRAP-mutating all 14 agreed-on values at once leaves 1996 passed / 1 failed; the one
+    /// observed field is `cur_hp`. Mutating the remaining 13 together leaves the whole workspace
+    /// GREEN — 1997/0/47 under `--all-targets`, 2008/0/51 under the plain CI shape. So 13 of the
+    /// 29 baseline values could be wrong without any test saying so. That is a pre-existing gap
+    /// this fixture concentrates rather than creates (the same 13 values were previously
+    /// hand-copied, unasserted, into nine literals), but it is real: tracked as #969.
     pub fn for_test() -> Self {
         SpawnInfo {
-            spawn_id:       1,
-            name:           String::from("a_test_spawn"),
+            spawn_id:       913,
+            name:           String::from("a_for_test_placeholder"),
             last_name:      String::new(),
             level:          5,
             npc:            1,
