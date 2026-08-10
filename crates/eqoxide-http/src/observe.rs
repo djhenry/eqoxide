@@ -708,7 +708,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // ground from INVERTED (down-facing) art (the qcat live wedge stood on exactly such a walkway,
     // which the old facing filter deleted). That is correct, but it means nav can no longer VERIFY a
     // floor's facing there — it is standing on unverified-winding ground. `facing_blind_hits` counts
-    // each query answered from a down-facing surface, so the agent can SEE it.
+    // encounters with down-facing standing ground, so the agent can SEE it.
     //
     // (This REPLACES the old `nav_degraded`/`inverted_floor_art` signal, which counted the
     // `column_bottom` recovery valve firing. D-2 deleted that valve — so if this were left reading the
@@ -717,8 +717,17 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // neriakc/qcat) where nav is now on winding-blind ground. A degraded/unverified mode must never be
     // silent, so the signal moves with the mechanism.)
     //
-    // `null` = every standable surface answered so far faced UP (properly wound). Non-null = nav has
-    // answered `queries` times from down-facing (inverted-art) ground since zone load.
+    // `null` = no down-facing standing ground has been admitted since zone load. Non-null = some has.
+    //
+    // The `queries` KEY NAME IS WRONG and the number under it is not a query count: the counter
+    // advances once per DOWN-FACING TRIANGLE that `column_hits` admits as standing ground, per call,
+    // so a single query over a column carrying two such triangles publishes 2 (measured; see
+    // `Collision::body_placement`'s rustdoc in `eqoxide-nav`, which states the same semantics). That
+    // mismatch predates #885 and is filed as **#960** — fixing it means renaming a published JSON
+    // field or changing `column_hits`, neither of which belongs in #885. Read the value as "how much
+    // winding-blind ground nav has leaned on", not as a rate. Do NOT restore the "N queries" wording
+    // here without doing #960: this comment sits immediately above the serialization site, and #885
+    // review round 3 found it contradicting the corrected rustdoc.
     let nav_support = s.shared_collision.read().unwrap().as_ref().and_then(|col| {
         let hits = col.facing_blind_hits();
         (hits > 0).then(|| serde_json::json!({
@@ -3782,9 +3791,12 @@ mod tests {
     /// 101 u figures as though the three measured one quantity, attributed to the reviewer. They
     /// did not — a driver that stops steering once it is within 0.2 u of its goal reports the
     /// distance to its TARGET. Re-derived on the scene above: steered at a target 101 u away the
-    /// same run reports **101.01 u**; steered at one 3000 u away it reports **131.28 u**, the
-    /// unsteered figure again. Only the unsteered number is kept, and the single thing it
-    /// establishes is that a non-`placeable` body is not frozen.
+    /// same run reports approximately that target distance; steered at one 3000 u away it reports
+    /// **131.28 u**, the unsteered figure again. The steered figure's exact value varies with the
+    /// slot geometry (round 3 measured a spread across five scenes all matching this description),
+    /// so it is deliberately NOT quoted here — an earlier draft quoted one scene's value as though
+    /// the description determined it. Nothing rests on it. Only the unsteered number is kept, and
+    /// the single thing it establishes is that a non-`placeable` body is not frozen.
     ///
     /// Both refuted claims are pinned here on the REAL response body, with the second one's payload
     /// actually present so the instruction is checked against the JSON rather than against prose.

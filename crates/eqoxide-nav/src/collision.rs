@@ -2725,8 +2725,10 @@ impl Collision {
             at: [east, north],
             anchor,
             // At the CHARACTER's height (`ref_z`), not the anchor's — the whole point. `floor_z` is
-            // a `CastZ`, not an `f32`, precisely so that substituting it here is a compile error
-            // rather than a silently republished #885 payload (review round 2, R2-N1).
+            // a `CastZ`, not an `f32`, so substituting it here BARE is `error[E0308]` rather than a
+            // silently republished #885 payload (review round 2, R2-N1). Spelled-out escapes —
+            // `.raw()`, `+ 0.0`, `- 0.0` — still compile; the test named on `CastZ` is what stops
+            // those (review round 3).
             body: self.body_placement([east, north, ref_z]),
             wall_spokes,
             cap: CAP,
@@ -10375,8 +10377,9 @@ mod clearance_probe_is_not_lossy_885 {
     /// returns a [`crate::diagnostics::CastZ`], so `body_placement([east, north, anchor.z()])` is
     /// `error[E0308]` (measured, both as a substitution and as an `if false { … } else { … }`
     /// wrap). This test is still the load-bearing pin, because the type is a raised bar and not a
-    /// closed hole: writing `anchor.z().raw()` or `floor_z.raw()` compiles, and both were measured
-    /// RED here (`10 passed; 2 failed`).
+    /// closed hole: `anchor.z().raw()`, `floor_z.raw()`, and — round 3's finding — the degenerate
+    /// `floor_z + 0.0` / `floor_z - 0.0` / `anchor.z() + 0.0` forms of `CastZ`'s `Add`/`Sub` impls
+    /// all compile, and every one of them was measured RED here (`10 passed; 2 failed` each).
     ///
     /// Every expectation here is a LITERAL. Nothing is computed by `body_placement`, so this
     /// cannot pass by agreeing with a `body_placement` that is itself wrong (round 1 found the test

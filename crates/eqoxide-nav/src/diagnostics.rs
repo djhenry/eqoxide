@@ -484,19 +484,25 @@ pub enum ProbeAnchor {
 /// silent wrong answer. The local the probe actually uses is a `CastZ` for the same reason — a bare
 /// `f32` local would have re-admitted the mutant under a different spelling.
 ///
-/// **Its honest limit.** This is a raised bar, not a closed hole: the field is private and there is
-/// no `From`/`Deref`, but [`CastZ::raw`] exists (the published JSON needs a number, and so do the
-/// tests), so a mutation that *deliberately* writes `.raw()` still compiles. It is stopped by the
-/// tier-2 test, not by the type. `Add<f32>`/`Sub<f32>` are provided because every legitimate use of
-/// a cast height is "offset it and cast from there"; both yield a plain `f32`, so the result cannot
-/// be mistaken for another anchor height.
+/// **Its honest limit.** This is a raised bar, not a closed hole. THREE routes from a `CastZ` back
+/// to a plain `f32` compile: [`CastZ::raw`], and the degenerate `+ 0.0` / `- 0.0` forms of the
+/// `Add<f32>`/`Sub<f32>` impls (which exist because every legitimate use of a cast height is
+/// "offset it and cast from there" — see the spoke loop in `clearance_probe`). All three were
+/// measured RED on the tier-2 test (#885 review round 3, re-derived in round 4), so that test is
+/// what keeps `body` at the character's z. What the type contributes is narrower: the bare
+/// `anchor.z()` substitution is `error[E0308]`, so taking one of the three routes has to be written
+/// out deliberately.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct CastZ(f32);
 
 impl CastZ {
-    /// Wrap a raw height. Only [`ProbeAnchor`] should need this.
-    #[inline]
-    pub fn new(z: f32) -> Self { CastZ(z) }
+    // No `new`. Round 3 reported the `pub fn new(z: f32)` this had as dead API, and round 4 removed
+    // it outright: `cargo check --workspace --all-targets --locked` is exit 0 with 0 warnings
+    // without it, so there was no call site anywhere, tests included. A public constructor is a
+    // FOURTH way to mint a `CastZ` from an arbitrary height — including from `reference_z`, the
+    // exact confusion this type exists to prevent. `ProbeAnchor::z` uses the tuple constructor,
+    // which is module-private.
+
     /// The raw height, for publishing and for comparing against a literal in a test. Reaching for
     /// this to feed a placement query is the mutation this type exists to make visible.
     #[inline]
@@ -551,7 +557,8 @@ impl ProbeAnchor {
 /// two verdicts genuinely differ). Since #885 review round 2 (R2-N1) the type system carries part
 /// of it too: [`ProbeAnchor::z`] hands back a [`CastZ`], so feeding the anchor's height to this
 /// predicate is `error[E0308]` — measured, both as a substitution and as a wrap. That is a raised
-/// bar, not a closed hole; `CastZ::raw` still compiles, and the test is what kills that.
+/// bar, not a closed hole; `CastZ::raw` and the degenerate `+ 0.0` / `- 0.0` forms still compile,
+/// and the test is what kills them.
 ///
 /// **This is an entry condition, not a freeze.** A non-`Placeable` verdict is what admits a body to
 /// the depenetration net; the net usually relocates it and the body keeps moving. Measured on a dry
