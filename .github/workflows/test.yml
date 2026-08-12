@@ -107,9 +107,9 @@ jobs:
     # 14 `test` job runs at and before run 31644425489 (`36ea882`/#993, 2026-08-12) — a fixed run-id
     # window, not "the 14 most recent" (that phrase names a different set of runs every day) —
     # (`gh api repos/djhenry/eqoxide/actions/runs/<id>/jobs`, `started_at`/`completed_at` deltas):
-    # 173s-220s wall (2m53s-3m40s), avg ~3m20s. (An earlier version of this line said "~1.5
-    # minutes", stale by roughly 2x; re-derive with the same API call, same run-id ceiling, if this
-    # has drifted again.) 20 minutes is still generous headroom
+    # 173s-220s wall (2m53s-3m40s). (An earlier version of this line said "~1.5 minutes", stale by
+    # roughly 2x; re-derive with the same API call, same run-id ceiling, if this has drifted
+    # again.) 20 minutes is still generous headroom
     # while still catching a wedged process (e.g. a reintroduced lock-order deadlock, #593) in
     # minutes instead of silently burning most of a day and reporting nothing.
     timeout-minutes: 20
@@ -295,17 +295,21 @@ jobs:
       #         `walker_sim.rs`), `$EQZONES` (5 in `water_capability.rs` via its shared loader, 1 in
       #         `src/movement.rs`). MEASURED at `36ea882` with all five vars unset:
       #         `collision::fix_700_coarse_agrees_with_fine_at_canal_lip` still runs — `ok. 1
-      #         passed` in ~19s off that fallback path, not a panic. The var is not a gate for this
-      #         group; a populated dev-machine cache is.
+      #         passed`, tens of seconds of real work off that fallback path, not a 0.00s panic.
+      #         The var is not a gate for this group; a populated dev-machine cache is.
       #       - 1, `worst_case_reachable_component`, hardcodes that same fallback path with NO
       #         override at all (`$ZONES` there only picks which zone NAMES to scan).
-      #     So for 23 of the 31 (22 + the 1 hardcoded) the thing standing between the test and a
-      #     baked asset is a populated `~/.local/share/eqoxide/assets/models`, not an environment
-      #     variable — CI has neither, which is why all 31 still stay ignored here. All 31 are
-      #     absent on a fresh clone because every path they resolve to — an env-var value, or the
-      #     `~/.local/share` fallback — is outside the repo; no `.gitignore` rule is involved for
-      #     any of them (`.gitignore`'s one rule, root-anchored `/assets`, does not reach any path
-      #     in this list).
+      #     So for 23 of the 31 (22 + the 1 hardcoded) what has to exist is a populated asset
+      #     directory — the `~/.local/share/eqoxide/assets/models` fallback by default, or wherever
+      #     the var points when one is set instead (MEASURED: with `HOME` empty and `$ZONE_DIR` set
+      #     to the real cache, the same test still passes) — not the presence or absence of the
+      #     variable itself. CI sets none of the five and has no such directory, which is why all 31
+      #     still stay ignored here. On a fresh clone none of the five is set: the 8 REQUIRED tests
+      #     fail at the variable itself, with no fallback and no path resolved; the other 23 resolve
+      #     to the default `~/.local/share` fallback, which is outside the repo — no `.gitignore`
+      #     rule is involved for that default path. That is a claim about the defaults nobody
+      #     overrides, not about every value a var could hold: a `$ZONE_DIR` pointed inside the repo
+      #     (e.g. `assets/zones/...`) would match the root-anchored `/assets` rule.
       #     Breakdown: 3 in `eqoxide-assets/src/lib.rs`, 16 in
       #     `crates/eqoxide-nav/src/collision.rs`, 2 in `src/movement.rs`, 5 in
       #     `tests/water_capability.rs`, 5 in `tests/walker_sim.rs`
