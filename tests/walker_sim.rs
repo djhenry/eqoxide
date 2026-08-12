@@ -1805,7 +1805,7 @@ use eqoxide_ipc::MoveIntent;
         let mut ctrl = CharacterController::new([36.0, 36.0, 0.0]);
         ctrl.on_ground = true;
         for _ in 0..600 {
-            ctrl.step(MoveIntent { wish_dir: [0.7071, 0.7071], speed: RUN_SPEED, ..Default::default() },
+            ctrl.step(MoveIntent { wish_dir: [std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2], speed: RUN_SPEED, ..Default::default() },
                       1.0 / 60.0, &c);
         }
         assert!(ctrl.pos[2] < 6.0,
@@ -1860,7 +1860,7 @@ use eqoxide_ipc::MoveIntent;
         ctrl.on_ground = true;
         let mut topped = false;
         for _ in 0..900 {
-            ctrl.step(MoveIntent { wish_dir: [0.7071, 0.7071], speed: RUN_SPEED, ..Default::default() },
+            ctrl.step(MoveIntent { wish_dir: [std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2], speed: RUN_SPEED, ..Default::default() },
                       1.0 / 60.0, &c);
             if ctrl.on_ground && ctrl.pos[2] > 12.0 {
                 topped = true;
