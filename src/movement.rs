@@ -2681,7 +2681,10 @@ mod tests {
         // one on the FIRST run. It has to be two, not one: 1 × 1134 = 1134 and the old control is
         // a STRICT `>`, so one frame per run already fails it.
         const MIN_RUN_BAND_FRAMES: usize = 300;
-        // ⚠️ **The lips start at 2.51, and the gap below it is a DIFFERENT, STILL-OPEN bug.**
+        // ⚠️ **The lips start at 2.51, and the gap below it is a DIFFERENT, STILL-OPEN bug —
+        // tracked by #917, which is OPEN.** Its FAMILY is #854 (probe heights), but #854 is CLOSED
+        // as completed, so it is not where this band's fix is owed; cite it for the mechanism and
+        // #917 for the work.
         // A lip in `(STEP_UP, STEP_UP + Body::foot]` = (2.00, 2.50] is passable, and #870's fix
         // does not touch it: `try_step_up` raises the body by `STEP_UP` and sweeps again, and that
         // raised sweep's own foot ray sits `Body::foot` = 0.5 ABOVE the raised feet, so a lip
@@ -2690,13 +2693,14 @@ mod tests {
         // smooth 0.333 u/frame walk THROUGH the barrier, `is_embedded` false the whole way — and
         // byte-identical on unmodified `main` and on this branch, which is what makes it a
         // separate bug and not a regression. It is excluded here rather than fixed because the fix
-        // is #854's (probe heights), not this one's (ray length), and asserting a barrier that low
-        // holds would be asserting something no code in this PR makes true. It is also a LATERAL
+        // is a probe-HEIGHT one — #854's family, owed on #917 — not this one's (ray length), and
+        // asserting a barrier that low holds would be asserting something no code in this PR makes
+        // true. It is also a LATERAL
         // teleport, not merely a pass-through: at lip 2.5000 under a due-EAST drive the body ends
         // at north 99.72–99.95 across the four speed/dt pairs
         // `the_blind_step_up_band_is_closed_at_its_upper_bound` uses — ~99.7 u of displacement the
         // body never made, which is the same wrong-position class #870 is about, in the band this
-        // block hands off to #854.
+        // block hands off to #917.
         //
         // #931: the true boundary is 2.50 — `the_blind_step_up_band_is_closed_at_its_upper_bound`
         // below pins 2.5000 as still passable and 2.5001 as already blocking. So 2.51 is NOT the
@@ -2900,8 +2904,9 @@ mod tests {
         // particular not on the far tread by some other route. Deliberately NOT asserted here: the
         // east it rests at. This riser is exactly `STEP_UP` tall, which is BELOW `Body::ring` = 3.0,
         // so `is_embedded` structurally cannot see it and the body ends flush against the face
-        // (measured: east 5.4e-7). Whether that is right is #854's band, not #870's ray length, and
-        // asserting a back-off here would be asserting something no code in this PR makes true.
+        // (measured: east 5.4e-7). Whether that is right is a probe-height question — #854's family,
+        // open on #917 — not #870's ray length, and asserting a back-off here would be asserting
+        // something no code in this PR makes true.
         let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, 2.0), floor(2.0, 4.0, 100.0)]);
         let mut ctrl = CharacterController::new([-20.0, 0.0, 0.0]);
         ctrl.on_ground = true;
@@ -6133,8 +6138,8 @@ mod tests {
     /// else, which is not what "passable" means. Measured, the 2.5000 leg ends at east
     /// 99.39–100.00 across the four pairs, so `east > 0` has ~99 u of headroom and is not a
     /// tautology. This test deliberately does NOT pin the ~99.7 u of north drift that accompanies
-    /// the crossing — that figure is recorded in the ⚠️ block above, and it belongs to #854's
-    /// blind band, not to the boundary this test is about.
+    /// the crossing — that figure is recorded in the ⚠️ block above, and it belongs to the blind
+    /// band tracked by #917 (#854's family, one storey up), not to the boundary this test is about.
     #[test]
     fn the_blind_step_up_band_is_closed_at_its_upper_bound() {
         let radius = crate::traversability::PLAYER_BODY.radius;
