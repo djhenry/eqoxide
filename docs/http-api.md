@@ -1014,34 +1014,32 @@ which:
 
 The section above is `/goto`'s instance of a rule that now covers the whole API. Several routes
 accept **more than one way to name the same argument**, and each of them used to resolve the choice
-with a precedence chain that never looked at the losers. Most request structs carry
+with a precedence chain that never looked at the losers. Every request struct carries
 `serde(deny_unknown_fields)`, so a *misspelled* field is rejected. That is exactly what makes a
 *declared but unreached* field quiet: it is not unknown, so it parses, and the request is answered
 `200`. That is the failure this rule removes: the strongest signal the API can send ("your
 instruction was understood") for an instruction that was thrown away.
 
-> **Two routes do not have even the typo protection.** `GET /v1/observe/frame` and
-> `GET /v1/observe/packets` are the 2 of this crate's 35 request structs with **no**
-> `deny_unknown_fields`, so on those two an **unrecognized query key is still silently ignored** —
-> both driven:
+> **#971 closed the last two gaps.** `GET /v1/observe/frame` and `GET /v1/observe/packets` were the
+> only request structs without `deny_unknown_fields`; all 35 of this crate's request structs carry it
+> now, so an unrecognized query key is **refused** rather than dropped — both driven:
 >
-> * `GET /v1/observe/packets?sicne=1` → `200`, the typo dropped rather than refused. Its
->   discriminator is `?since=notanumber` → `4xx`: a *recognized* key with an unusable value **is**
->   refused, so the `200` is about the unknown key and not about a route that validates nothing.
-> * `GET /v1/observe/frame?allow_pending=1&prset=top_down&pitch=10` → `200`, and the capture is taken
->   with an override built from the surviving `pitch` **alone**, `azimuth` and `radius` left at their
->   defaults — the caller asked for a top-down preset, the key carrying that request was discarded,
->   and the image comes back at an angle nobody asked for, with a `200`.
+> * `GET /v1/observe/packets?sicne=1` → `400 {"error":"invalid_query_param"}`, the message naming
+>   `sicne` and listing the recognized keys. `/packets` gained the hand-rolled query parse `/frame`
+>   already had, so this is JSON like every other error on the route, not axum's plain-text 400.
+> * `GET /v1/observe/frame?allow_pending=1&prset=top_down&pitch=10` → `400
+>   {"error":"invalid_query_param"}`. It used to answer `200` with an override built from the
+>   surviving `pitch` **alone**, `azimuth` and `radius` left at their defaults — a PNG taken at an
+>   angle nobody asked for, returned with the strongest "understood" signal the API has.
 >
-> This is the same agent-honesty failure one step earlier, it is **not** fixed by this section, and it
-> is tracked as **#971**. See also
-> [Camera override for `/frame`](#camera-override-for-observeframe-422) above. The status codes and
-> override values above are asserted by
-> `req_form::tests::an_unrecognized_query_key_is_silently_dropped_on_both_exempt_routes`, exactly
-> these two being the exceptions by `every_deserialize_request_struct_is_classified`, and
-> the `2` and `35` on this page against that module's constants by
+> **Breaking change:** a caller sending a key this API does not recognize now gets a `4xx` where it
+> got a `200`. That is the point; the `200` was never evidence the key did anything. See also
+> [Camera override for `/frame`](#camera-override-for-observeframe-422) above. The status codes are
+> asserted by `req_form::tests::an_unrecognized_query_key_is_refused_on_both_observe_routes`, the now
+> empty exception set by `every_deserialize_request_struct_is_classified`, and the `35` on this page
+> against that module's constants by
 > `docs_http_api_md_may_not_disagree_with_this_modules_struct_counts`. That test also holds the `8`
-> and the `27` fixed relative to those two, but neither is derived from the code — re-derive them
+> and the `27` fixed relative to that figure, but neither is derived from the code — re-derive them
 > with the `grep` commands under "How far the guard actually reaches" below.
 
 **The rule.** Where two forms name *the same thing* in different notations (`{map_x,map_y}` and
@@ -2469,9 +2467,9 @@ faced UP** (properly wound); an object means nav has answered from a down-facing
 
 ```json
 "nav_support": {
-  "reason":  "facing_blind_ground",
-  "queries": 412,
-  "detail":  "parts of this zone's collision mesh are wound INVERTED ..."
+  "reason":   "facing_blind_ground",
+  "surfaces": 412,
+  "detail":   "parts of this zone's collision mesh are wound INVERTED ..."
 }
 ```
 
@@ -2487,12 +2485,15 @@ their facing, so `nav_support` reports that it has been standing on some.
 > neriakc/qcat) where nav is now on winding-blind ground — a confident falsehood. The signal moved
 > with the mechanism so it stays honest.
 
-**`queries` is misnamed and is not a query count** (#960). The counter advances once per **down-facing
-triangle** that nav admits as standing ground, per call — so one query over a column carrying two such
-triangles adds **2**, and the number is not a rate you can divide by anything. Do not derive a
-frequency from it. Treat it as an unscaled "how much winding-blind ground nav has leaned on since
-zone load", and treat the field NAME as a known defect: renaming it is a breaking wire change, so it
-is tracked separately in #960 rather than done silently.
+> **Breaking change (#960): the count field is `surfaces`; it used to be spelled `queries`.** It never
+> was a per-request count, so the old spelling stated a quantity the client does not measure. A
+> consumer keyed on the old name now gets `undefined`/`None` rather than a plausible wrong number.
+
+**`surfaces` is an unscaled total, not a rate.** It advances once per **down-facing triangle** nav
+admits as standing ground, per call — so one ground probe over a column carrying two such triangles
+adds **2**, and the value scales with how the zone's art happens to be tessellated. Do not derive a
+frequency from it, and do not compare it across zones. Read it as "how much winding-blind ground nav
+has leaned on since zone load".
 
 Read `nav_support != null` as *"footing here is unverified-winding"* — not an error and not a
 routing failure (the ground is walkable), just an honest "this footing's facing is unconfirmed."

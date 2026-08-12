@@ -57,10 +57,29 @@ pub struct Hit {
 /// |---|---|
 /// | everfrost 1,121,438, no region map — the figure that originally set this cap, and the reason it moved: it EXCEEDED the then-shipped `MAX_NODES = 1_000_000`, so `main` was at that point silently converting everfrost's honest `SearchClosed` closes into false `Exhausted` | MEASURED (pre-#849) |
 /// | butcher 352,493, no region map, full workload | MEASURED (#849 review, base) |
-/// | `highpass` 7,229 → 7,394 (+2.3%), full workload both sides, region map the only change | MEASURED (#849 review) |
+/// | `highpass` 7,229 → 7,393 (+2.3%), full workload both sides, region map the only change — **the two arms are measured at DIFFERENT code states**, see below | MEASURED (mapless #849 review; mapped re-measured #907) |
 /// | butcher **4,583,785** WITH region map, `dev`-confirmed, butcher-only, full workload, 10 h 24 m, exit 0 | MEASURED (#856) |
 /// | butcher 4,583,748 WITH region map, three-zone — profile NOT captured, wall time inconsistent with the other two runs; valid as a LOWER BOUND | MEASURED (#849 review) |
 /// | why those two differ by 37 nodes | **UNRESOLVED** — see below |
+///
+/// ## The `highpass` pair's two code states (#907)
+///
+/// The mapped arm read **7,394** when #849 measured it and **7,393** when #907 re-measured it on
+/// this branch. #855 changed `nearest_floor`'s ray-hit acceptance window, which feeds this
+/// corpus's start/goal sampling, so both figures were right at the code state they were taken
+/// against. 7,393 is re-measured here
+/// (`ZONES=highpass`, `worst_case_reachable_component`, reproduced twice, **`dev` profile: at
+/// `0c37ca0` the `--release` form of that command did not compile — #990; #994 is the fix and
+/// was open at that sha**); the mapless **7,229** is the original pre-#855 figure and was NOT
+/// re-run, because
+/// `open_corpus_zone` always attaches the region map, so the mapless arm cannot be reproduced
+/// without editing the corpus. Read the pair as "same zone, region map the only *intended*
+/// difference, arms taken either side of #855". The ratio survives that: 7393/7229 = +2.27%, which
+/// is what the +2.3% above rounds from.
+///
+/// `water_grid.rs` restates this pair for its own argument, and #907 found the two files
+/// disagreeing after only one was corrected. `both_files_state_the_same_re_measured_highpass_figure`
+/// now pins them to each other, so the next re-measurement cannot update one and miss the other.
 ///
 /// The old "~7× headroom" claim is retired **on measurement, not inference**: it was taken on a
 /// `Collision` with no region data attached, and `build_zone_collision` (`src/app.rs`) is the
@@ -557,14 +576,15 @@ pub struct Collision {
     z_min:     f32,
     // `pub` for the same relocated corpus integration test (it scans from the mesh's top z downward).
     pub z_max:     f32,
-    /// How many times `is_standable` has admitted a **DOWN-facing** (inverted-art) surface as ground
-    /// since zone load — i.e. answered a nav query from winding-blind ground whose true facing the
-    /// mesh does not confirm (D-2, #375). It is not wrong (qcat proves inverted-art floor is walkable),
-    /// but it is *unverified*, so an agent must be able to SEE that it is pathing on such ground rather
-    /// than be quietly handed it. Surfaced as `nav_support` on `/v1/observe/debug`. This REPLACES the
-    /// old `column_bottom`-fallback counter (that valve was deleted in D-2); the honesty signal did not
+    /// How many **DOWN-facing** (inverted-art) TRIANGLES `column_hits` has admitted as standing
+    /// ground since zone load (D-2, #375). One ground probe adds as many as that column's art
+    /// carries, so this is an unscaled total, never a rate — the name says `surfaces` because that
+    /// is the unit (#960). Such ground is not wrong (qcat proves inverted-art floor is walkable) but
+    /// it is *unverified*, so an agent must be able to SEE it is pathing there rather than be quietly
+    /// handed it. Surfaced as `nav_support` on `/v1/observe/debug`. This REPLACES the old
+    /// `column_bottom`-fallback counter (that valve was deleted in D-2); the honesty signal did not
     /// go with it. Relaxed: a diagnostic counter, never read for control flow.
-    facing_blind_hits: std::sync::atomic::AtomicU64,
+    facing_blind_surfaces: std::sync::atomic::AtomicU64,
     /// How many routes only existed at the MINIMUM clearance (`PLAYER_RADIUS`) — i.e. threaded a
     /// narrow door or a tight bridge with no margin to spare. Surfaced as `nav_tight` so an agent is
     /// never silently handed a riskier path than it thinks (`search_tiered`).
@@ -1012,7 +1032,7 @@ impl Collision {
             return Collision { water_grid_lazy: std::sync::OnceLock::new(), tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
                 #[cfg(test)]
                 z_min: 0.0,
-                z_max: 0.0, facing_blind_hits: Default::default(), tight_plans: Default::default(),
+                z_max: 0.0, facing_blind_surfaces: Default::default(), tight_plans: Default::default(),
                 clearance: Default::default(), water_grid: None,
                 water: Err(eqoxide_core::region_map::RegionDataAbsent::NotAttached),
                 from_collision_mesh, zone_line_regions: Vec::new() };
@@ -1040,7 +1060,7 @@ impl Collision {
             #[cfg(test)]
             z_min,
             z_max,
-            facing_blind_hits: Default::default(), tight_plans: Default::default(),
+            facing_blind_surfaces: Default::default(), tight_plans: Default::default(),
             water: Err(eqoxide_core::region_map::RegionDataAbsent::NotAttached),
             from_collision_mesh, zone_line_regions: Vec::new(),
             clearance: Default::default(), water_grid: None }
@@ -1052,12 +1072,16 @@ impl Collision {
         self.tight_plans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Count of nav queries answered from a DOWN-facing (inverted-art) surface since zone load — the
-    /// `nav_support` honesty signal (D-2, #375). Zero = every standable surface answered so far faced
-    /// UP (properly wound); non-zero = this zone's ground is partly inverted art and pathing there is
-    /// on winding-blind (unverified-facing) ground.
-    pub fn facing_blind_hits(&self) -> u64 {
-        self.facing_blind_hits.load(std::sync::atomic::Ordering::Relaxed)
+    /// DOWN-facing (inverted-art) TRIANGLES admitted as standing ground since zone load — the
+    /// `nav_support` honesty signal (D-2, #375), published as `nav_support.surfaces`. Zero = every
+    /// standable surface so far faced UP (properly wound); non-zero = this zone's ground is partly
+    /// inverted art and pathing there is on winding-blind (unverified-facing) ground.
+    ///
+    /// **Per TRIANGLE, per call — not per probe** (#960/#973), so it is a total and not a rate; a
+    /// single call over a densely tessellated column adds several. Pinned with both literals by
+    /// `evaluating_both_disjuncts_moves_the_published_facing_blind_counter`.
+    pub fn facing_blind_surfaces(&self) -> u64 {
+        self.facing_blind_surfaces.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// **The one writer of this grid's region data**: attach the zone's `.wtr` map, or record WHY
@@ -1778,7 +1802,7 @@ impl Collision {
             // `/v1/observe/debug` can surface `nav_support` — a degraded/unverified mode must never be
             // silent. (Correct per qcat, but the agent must be able to SEE it is on such ground.)
             if nz < 0.0 {
-                self.facing_blind_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.facing_blind_surfaces.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             keep.push((z, nz));
         }
@@ -2461,23 +2485,22 @@ impl Collision {
     ///
     /// It is **not** a no-op beyond that boolean, and the first draft of this doc wrongly said no
     /// behaviour depended on the order (#885 review round 1, F10). Running the ground probe on
-    /// pierced-footprint frames reaches `ground_below` → `column_hits` → the `facing_blind_hits`
+    /// pierced-footprint frames reaches `ground_below` → `column_hits` → the `facing_blind_surfaces`
     /// counter published as `/v1/observe/debug`'s `nav_support`. Measured on inverted-art ground
-    /// with a pierced footprint: `facing_blind_hits` **0** (old `||`) → **2** (this function), and
+    /// with a pierced footprint: `facing_blind_surfaces` **0** (old `||`) → **2** (this function), and
     /// pinned by `evaluating_both_disjuncts_moves_the_published_facing_blind_counter`.
     ///
-    /// **What that 2 is, and is not** (#885 review round 2, R2-B1). The counter advances once per
-    /// DOWN-FACING TRIANGLE that `column_hits` admits as standing ground, per call — **not once per
-    /// query**, which measurement refutes. The 2 is a property of this fixture's column: the probed
-    /// column sits exactly on the shared diagonal of the inverted floor quad's two triangles, so
-    /// both are admitted. Measured on the same quad one unit north, off that diagonal, the same
-    /// single call publishes **1**; both numbers are asserted in that test. So what this function
-    /// changes is that the counter advances on pierced-footprint frames it previously skipped, by
-    /// however many down-facing triangles that column's art carries — published, not invisible.
+    /// **What that 2 is** (#885 review round 2, R2-B1). The counter advances once per DOWN-FACING
+    /// TRIANGLE `column_hits` admits as standing ground, per call. The 2 is a property of this
+    /// fixture's column: it sits exactly on the shared diagonal of the inverted floor quad's two
+    /// triangles, so both are admitted. One unit north, off that diagonal, the same single call
+    /// publishes **1**; both numbers are asserted in that test. So what this function changes is
+    /// that the counter advances on pierced-footprint frames it previously skipped, by however many
+    /// down-facing triangles that column's art carries — published, not invisible.
     ///
-    /// (The field is still published as `queries` — a rename is a breaking wire change, left to
-    /// **#960**. How many other sites carry that refuted wording is not checkable from inside a doc
-    /// comment and wants a guard, not a sentence: three drafts have tried and been falsified.)
+    /// (#960 renamed the counter and its wire field to say `surfaces`; the refuted wording is now
+    /// guarded by `no_tracked_text_calls_the_facing_blind_counter_a_query_count` rather than
+    /// re-enumerated by hand.)
     pub fn body_placement(&self, p: [f32; 3]) -> crate::diagnostics::Placement {
         use crate::diagnostics::Placement;
         let pierced = !self.footprint_clear(
@@ -4654,7 +4677,7 @@ mod tests {
     /// z=73.97; native Katie at (-138.5,-17.5) reporting z=77.0). Decides fork (a) controller
     /// floor-selection bug vs (b) collision-model error.
     /// Run: ZONE_GLB=~/.local/share/eqoxide/assets/models/gfaydark.glb \
-    ///      cargo test --lib diagnose_522_kelethin_plank_columns -- --ignored --nocapture
+    ///      cargo test -p eqoxide-nav --lib diagnose_522_kelethin_plank_columns -- --ignored --nocapture
     #[test]
     #[ignore = "requires the cached gfaydark glb at $ZONE_GLB"]
     fn diagnose_522_kelethin_plank_columns() {
@@ -6222,7 +6245,7 @@ mod tests {
     // `the_fallback_reports_itself_so_nav_degraded_is_never_silent` is removed with the `column_bottom`
     // valve it tested; the honesty signal is REPLACED IN THIS PR (folded from D-3, review Fix A):
     // `nav_degraded/inverted_floor_art` → `nav_support/facing_blind_ground`, now driven by
-    // `facing_blind_hits` (a down-facing surface admitted as ground), so there is no dead-signal window
+    // `facing_blind_surfaces` (a down-facing surface admitted as ground), so there is no dead-signal window
     // where the client falsely reports "properly wound" while on inverted-art ground.
     //
     // The two tests below that assert inverted GROUND is still found (`column_whose_only_surface_is_
@@ -8001,8 +8024,25 @@ mod tests {
     /// Run with a HIGH cap so nothing truncates.
     ///
     /// ```text
-    /// cargo test --release --lib worst_case_reachable_component -- --ignored --nocapture
+    /// cargo test -p eqoxide-nav --release --lib worst_case_reachable_component -- --ignored --nocapture
     /// ```
+    ///
+    /// **#990: at `0c37ca0` that `--release` form did not compile.** `walker.rs`'s `_cited` array
+    /// is ungated and names a `#[cfg(debug_assertions)]` test, so under `--release` that name does
+    /// not exist and the whole `eqoxide-nav` lib-test target failed to build there, before any
+    /// measurement ran. #994 is the fix and was open at that sha. Whether you must drop `--release`
+    /// therefore depends on whether #994 is in the tree you are reading — which this sentence
+    /// cannot tell you, so check `walker.rs` for the gate rather than trusting this line. The #907
+    /// re-measurement above was taken on the `dev` profile for that reason, which is why its wall
+    /// times are what they are. (Not a claim about every row of the table: one `butcher` run's
+    /// profile was never captured, and that row says so.)
+    ///
+    /// **`-p eqoxide-nav` is load-bearing, not decoration** (#994 review). Without it, run from the
+    /// workspace root, `--lib` resolves to the ROOT package's lib target — which holds none of this
+    /// file's tests — and the run prints `running 0 tests`, `241 filtered out` and exits 0. That is
+    /// a vacuous green an exit code cannot distinguish from a measurement. Measured from the repo
+    /// root before the flag was added. `every_documented_repro_command_in_this_file_names_its_package`
+    /// holds every `--lib` recipe in this file to it.
     #[test]
     #[ignore = "requires baked zone glbs; measurement for the #394 node cap"]
     fn worst_case_reachable_component() {
@@ -8066,9 +8106,10 @@ mod tests {
         // round to 57.3% and 1.75x, so the cap's conclusion is unaffected either way.
         //
         // The other measured points, kept because they bound how zone-dependent this is: on
-        // `highpass`, full workload both sides with the attachment as the only difference, the close
-        // count went 7,229 -> 7,394 (+2.3%) — three orders of magnitude smaller a move than
-        // butcher's. And a ZERO move is not merely conceivable, it is OBSERVED: under this same
+        // `highpass` the close count went 7,229 -> 7,393 (+2.3%) — three orders of magnitude smaller
+        // a move than butcher's. The two arms straddle #855 and only the mapped one has been
+        // re-measured; `MAX_NODES`' own rustdoc carries that caveat once (#907) — do not restate it
+        // here. And a ZERO move is not merely conceivable, it is OBSERVED: under this same
         // attachment two of the four converted corpora (`q1_headroom_seal_measurement`,
         // `floor_model_disagreement_scan`) printed BYTE-IDENTICAL tables either way. The size of the
         // effect is a property of the zone, not of the attachment.
@@ -8381,7 +8422,7 @@ mod tests {
     ///
     /// ```text
     /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
-    ///   cargo test --lib fine_tier_corpus -- --ignored --nocapture
+    ///   cargo test -p eqoxide-nav --lib fine_tier_corpus -- --ignored --nocapture
     /// ```
     /// SLICE-1 MEASUREMENT HARNESS (3D-water-volume nav design §5.4 / §11): for the gate zones, report
     /// the water-span grid's wet-column count, total span count, ESTIMATED MEMORY (bytes, design §5.4
@@ -8394,7 +8435,7 @@ mod tests {
     ///
     /// ```text
     /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
-    ///   cargo test --lib water_grid_budget_measurement -- --ignored --nocapture
+    ///   cargo test -p eqoxide-nav --lib water_grid_budget_measurement -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "requires baked zone glbs + .wtr at $ZONE_DIR"]
@@ -8866,7 +8907,7 @@ mod tests {
     /// **CI note:** the coordinator asked to "un-ignore" this so it runs live. It is asset-gated (needs
     /// the qcat glb, absent on the CI runner — #357), and `from_glb().unwrap()` would panic there, so
     /// it stays `#[ignore]`d like every other baked-asset test. It is verified GREEN locally at D-2
-    /// (`ZONE_DIR=… cargo test --release --lib qcat_support_floor_is_visible -- --ignored`). Literal
+    /// (`ZONE_DIR=… cargo test -p eqoxide-nav --release --lib qcat_support_floor_is_visible -- --ignored`). Literal
     /// un-ignoring is not possible without bundling the asset into CI; flagged in the PR.
     #[test]
     #[ignore = "requires the cached qcat glb at $ZONE_DIR (#357); GREEN at D-2 — proves the support-axis FIX (#375)"]
@@ -9265,7 +9306,7 @@ mod tests {
 
     /// **THE `nav_support` HONESTY SIGNAL (D-2, review Fix A).** Admitting a DOWN-facing (inverted-art)
     /// surface as ground is correct (qcat proves it walkable) but UNVERIFIED — so it must be visible,
-    /// not silent. `facing_blind_hits` counts it; `/v1/observe/debug` surfaces it as `nav_support`. This
+    /// not silent. `facing_blind_surfaces` counts it; `/v1/observe/debug` surfaces it as `nav_support`. This
     /// pins: a cleanly-wound (up-facing) floor NEVER trips it; an inverted (down-facing) floor DOES —
     /// so `nav_support` can never read `null` ("all properly wound") while nav is on inverted ground
     /// (the confident-falsehood the review caught when the old `column_bottom` counter went dead).
@@ -9275,7 +9316,7 @@ mod tests {
         let clean = Collision::build(&ZoneAssets {
             terrain: vec![floor_up(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
         assert!(clean.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0).is_some(), "the clean floor is standable");
-        assert_eq!(clean.facing_blind_hits(), 0,
+        assert_eq!(clean.facing_blind_surfaces(), 0,
             "a properly-wound floor must NOT trip nav_support — else it cries wolf everywhere");
 
         // Inverted zone: a lone DOWN-facing floor (open above → standable per qcat). Answering from it
@@ -9284,7 +9325,7 @@ mod tests {
             terrain: vec![ceiling_down(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
         assert!(inverted.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0).is_some(),
             "the inverted floor is standable (facing-blind, the #375 fix)");
-        assert!(inverted.facing_blind_hits() > 0,
+        assert!(inverted.facing_blind_surfaces() > 0,
             "admitting a down-facing surface as ground MUST be counted — nav_support cannot read null \
              while pathing on inverted-art ground (the net-new lie deleting column_bottom would create)");
     }
@@ -9338,7 +9379,7 @@ mod tests {
     ///
     /// ```text
     /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
-    ///   cargo test --release --lib q1_headroom_seal_measurement -- --ignored --nocapture
+    ///   cargo test -p eqoxide-nav --release --lib q1_headroom_seal_measurement -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "requires baked zone glbs at $ZONE_DIR; the Q1 seal measurement (#375)"]
@@ -9437,7 +9478,7 @@ mod tests {
     ///
     /// ```text
     /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
-    ///   cargo test --release --lib floor_model_disagreement_scan -- --ignored --nocapture
+    ///   cargo test -p eqoxide-nav --release --lib floor_model_disagreement_scan -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "requires baked zone glbs at $ZONE_DIR; the D-2 floor-model-disagreement breadth signal (#375)"]
@@ -9528,7 +9569,7 @@ mod tests {
 
     /// Deterministic offline reproduction of the qeynos2 path-following stalls reported on #2,
     /// using the REAL baked collision mesh. Point `ZONE_GLB` at the cached qeynos2 glb, e.g.
-    /// `ZONE_GLB=~/.local/share/eqoxide/assets/models/qeynos2.glb cargo test --lib diagnose_qeynos2_stall -- --ignored --nocapture`
+    /// `ZONE_GLB=~/.local/share/eqoxide/assets/models/qeynos2.glb cargo test -p eqoxide-nav --lib diagnose_qeynos2_stall -- --ignored --nocapture`
     #[test]
     #[ignore = "requires the cached qeynos2 glb at $ZONE_GLB"]
     fn diagnose_qeynos2_stall() {
@@ -9911,7 +9952,7 @@ mod clearance_probe_is_not_lossy_885 {
 
     /// A DOWN-facing floor at height `z` — the same quad as [`floor`] with its winding reversed.
     /// Real zones bake walkable ground this way (D-2/#375), and `is_standable` admits it while
-    /// counting the admission into `facing_blind_hits`.
+    /// counting the admission into `facing_blind_surfaces`.
     fn inverted_floor(z: f32, half: f32) -> MeshData {
         quad([[half, z, -half], [half, z, half], [-half, z, half], [-half, z, -half]])
     }
@@ -9958,22 +9999,20 @@ mod clearance_probe_is_not_lossy_885 {
     /// The controller's old `is_embedded` was `pierced || no_floor`, so a pierced footprint skipped
     /// the ground probe entirely. `body_placement` names both disjuncts, so both are evaluated. The
     /// first draft of its rustdoc said no behaviour depended on the order. That is false: the ground
-    /// probe runs `column_hits`, which increments `facing_blind_hits` for every DOWN-facing surface
+    /// probe runs `column_hits`, which increments `facing_blind_surfaces` for every DOWN-facing surface
     /// it admits as ground — and that counter is published as `nav_support` on `/v1/observe/debug`.
     ///
     /// Measured here rather than quoted, on freshly-built copies of the same scene so the counters
     /// start at zero and the only difference is which calls were made. It is a change an agent can
     /// see, and this test exists so it stays disclosed.
     ///
-    /// **The size of the jump is per-TRIANGLE, not per-query** (#885 review round 2, R2-B1). Round
-    /// 2's rustdoc called this counter "a count of queries", which would make the 2 mean two
-    /// queries. It does not. `column_hits` increments once for every retained surface whose normal
-    /// points down, so ONE call publishes as many increments as that column's art has admitted
-    /// down-facing triangles. The 2 here is this fixture's column sitting exactly on the shared
-    /// diagonal of the inverted floor quad's two triangles; the third assertion below moves one
-    /// unit north on the SAME quad, off that diagonal, and the same single call publishes 1. Both
-    /// are literals, so a change that made the counter per-query would fail here. (The published
-    /// field is still *named* `nav_support.queries` — pre-existing, #960, deliberately untouched.)
+    /// **The size of the jump is per-TRIANGLE** (#885 review round 2, R2-B1; #960/#973).
+    /// `column_hits` increments once for every retained surface whose normal points down, so ONE
+    /// call publishes as many increments as that column's art has admitted down-facing triangles.
+    /// The 2 here is this fixture's column sitting exactly on the shared diagonal of the inverted
+    /// floor quad's two triangles; the third assertion below moves one unit north on the SAME quad,
+    /// off that diagonal, and the same single call publishes 1. Both are literals, so a change that
+    /// made the counter advance once per CALL would fail here.
     #[test]
     fn evaluating_both_disjuncts_moves_the_published_facing_blind_counter() {
         let radius = eqoxide_core::physics::PLAYER_RADIUS;
@@ -9983,28 +10022,337 @@ mod clearance_probe_is_not_lossy_885 {
         let old = inverted_ground_with_pierced_footprint();
         let pierced = !old.footprint_clear(at[0], at[1], at[2], radius, PLACEMENT_RING_DIRS);
         assert!(pierced, "the fixture must pierce the footprint, or there is nothing to short-circuit");
-        assert_eq!(old.facing_blind_hits(), 0,
+        assert_eq!(old.facing_blind_surfaces(), 0,
             "the short-circuited form never reached the ground probe, so nothing was counted");
 
         // `body_placement`: both disjuncts, so the ground probe runs on this frame.
         let new = inverted_ground_with_pierced_footprint();
         assert_eq!(new.body_placement(at), Placement::FootprintPierced,
             "same verdict as the old boolean — the BOOLEAN is unchanged; the counter is not");
-        assert_eq!(new.facing_blind_hits(), 2,
+        assert_eq!(new.facing_blind_surfaces(), 2,
             "the ground probe admitted the down-facing floor and counted it — this is the published \
              side effect the round-1 rustdoc wrongly denied");
 
-        // R2-B1: the 2 is TWO TRIANGLES, not two queries. `inverted_floor`'s quad triangulates
-        // across the diagonal `north == -east`, and `at` sits exactly on it, so both triangles are
-        // admitted for that column. One unit north — same quad, same fixture, same ONE call —
-        // only one triangle spans the column, and the counter moves by 1.
+        // R2-B1: the 2 is TWO TRIANGLES. `inverted_floor`'s quad triangulates across the diagonal
+        // `north == -east`, and `at` sits exactly on it, so both triangles are admitted for that
+        // column. One unit north — same quad, same fixture, same ONE call — only one triangle spans
+        // the column, and the counter moves by 1.
         let off_diagonal = inverted_ground_with_pierced_footprint();
         assert_eq!(off_diagonal.body_placement([0.0, 1.0, 0.0]), Placement::FootprintPierced,
             "the off-diagonal column must still be pierced, or it is not the same comparison");
-        assert_eq!(off_diagonal.facing_blind_hits(), 1,
-            "ONE ground query over ONE down-facing triangle moves the counter by ONE — so the 2 \
-             above is a count of admitted TRIANGLES, not of queries, and the jump this function \
-             causes is whatever that column's tessellation happens to carry");
+        assert_eq!(off_diagonal.facing_blind_surfaces(), 1,
+            "ONE probe over ONE down-facing triangle moves the counter by ONE — so the 2 above \
+             counts admitted TRIANGLES, and the jump this function causes is whatever that \
+             column's tessellation happens to carry");
+    }
+
+    // ── #960/#972/#973: the two diagnostic counters may not be described as each other ───────────
+
+    /// Phrasings that state the facing-blind counter is a per-request count. Every one of these has
+    /// been WRITTEN in this tree and refuted by measurement. Hand enumeration of the sites has been
+    /// attempted four times (#960's list, #948's rustdoc twice, #972's analysis) and missed at least
+    /// one every time, which is why this is a scan.
+    ///
+    /// Each is spelled with `concat!` so this array's own source text does not contain the phrase
+    /// it forbids — `src/collision.rs` is in the scanned corpus, and a scanner that flags its own
+    /// predicate can never report clean.
+    const REFUTED_QUERY_COUNT_PHRASES: [&str; 8] = [
+        concat!("count of ", "quer", "ies"),
+        concat!("count of nav ", "quer", "ies"),
+        concat!("counts each ", "quer", "y"),
+        concat!("each ", "quer", "y"),
+        concat!("quer", "ies", " answered"),
+        concat!("quer", "y", " count"),
+        concat!("nav_support.", "quer", "ies"),
+        concat!("\"", "quer", "ies", "\""),
+    ];
+
+    /// Every [`REFUTED_QUERY_COUNT_PHRASES`] hit in `text`, as `(1-based line, phrase)`. Pure, so
+    /// the reach control can drive it over a corpus whose violation is KNOWN.
+    fn refuted_query_count_hits(text: &str) -> Vec<(usize, &'static str)> {
+        let mut out = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            let l = line.to_ascii_lowercase();
+            for p in REFUTED_QUERY_COUNT_PHRASES {
+                if l.contains(p) { out.push((i + 1, p)); }
+            }
+        }
+        out
+    }
+
+    /// The `///` block immediately above `signature` in `src`. Panics if the signature is gone —
+    /// a renamed accessor must fail loudly, not silently stop being checked.
+    fn rustdoc_above<'a>(src: &'a str, signature: &str) -> String {
+        let at = src.find(signature)
+            .unwrap_or_else(|| panic!("signature {signature:?} is no longer in this file"));
+        // Back up to the START of the signature's own line, or the partial indent left in `src[..at]`
+        // is a non-`///` line and the block reads empty.
+        let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let mut doc: Vec<&'a str> = Vec::new();
+        for line in src[..line_start].lines().rev() {
+            let t = line.trim_start();
+            if t.starts_with("///") { doc.push(t); } else { break; }
+        }
+        doc.reverse();
+        doc.join("\n")
+    }
+
+    /// **#960/#973: no tracked text may call the facing-blind counter a per-request count.**
+    ///
+    /// The counter advances once per DOWN-FACING TRIANGLE admitted as standing ground, per call —
+    /// pinned two tests up. Saying otherwise is the agent-honesty defect this guard exists for, and
+    /// it survived three rounds of hand enumeration.
+    ///
+    /// **Reach, stated rather than implied.** It scans four whole files for eight literal phrasings.
+    /// It does NOT understand the concept: a fresh wording ("one increment per request") passes.
+    /// What it does guarantee is that the phrasings that have actually shipped cannot come back, and
+    /// that all four files were really read — the planted control below fails a scanner that stops
+    /// early, and the per-file subject check fails a file that moved or read short.
+    #[test]
+    fn no_tracked_text_calls_the_facing_blind_counter_a_query_count() {
+        // REACH CONTROL, executed: 5,000 clean lines with the only violation on the last one. A
+        // scanner that quit early reports nothing here AND nothing on the real corpus, and the two
+        // outcomes are indistinguishable without this.
+        let mut planted = "a clean line with no forbidden phrasing on it\n".repeat(5_000);
+        planted.push_str(REFUTED_QUERY_COUNT_PHRASES[0]);
+        assert_eq!(refuted_query_count_hits(&planted), vec![(5_001, REFUTED_QUERY_COUNT_PHRASES[0])],
+            "the scanner must find a violation planted past 5,000 lines — if it does not, a clean \
+             report over the real corpus means nothing");
+
+        const CORPUS: [&str; 4] = [
+            "src/collision.rs", "src/zone_assets.rs",
+            "../eqoxide-http/src/observe.rs", "../../docs/http-api.md",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut findings: Vec<String> = Vec::new();
+        for rel in CORPUS {
+            let text = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("corpus file {rel} is unreadable: {e}"));
+            // Second half of the reach control: every corpus file must still carry the SUBJECT, so
+            // a moved/renamed/truncated file fails instead of scanning clean.
+            let subject = text.matches("facing_blind").count() + text.matches("facing-blind").count();
+            assert!(subject > 0,
+                "corpus file {rel} no longer mentions the facing-blind counter at all — this guard \
+                 was scanning a file that does not carry its subject");
+            for (line, phrase) in refuted_query_count_hits(&text) {
+                findings.push(format!("  {rel}:{line}: {phrase:?}"));
+            }
+        }
+        assert!(findings.is_empty(),
+            "the facing-blind counter is per TRIANGLE, per call — never per request. These sites \
+             say otherwise (#960/#973):\n{}", findings.join("\n"));
+    }
+
+    /// **#972: the two adjacent counter accessors must not describe each other's signal.**
+    ///
+    /// `tight_plans`' rustdoc once described the inverted-art signal and named a `nav_degraded`
+    /// field that no longer exists; `facing_blind_surfaces` sits directly below it. Both docs are
+    /// read out of this file by signature — a stable anchor, not a line number.
+    #[test]
+    fn the_two_counter_accessors_do_not_describe_each_others_signal() {
+        let src = include_str!("collision.rs");
+
+        // Control for `rustdoc_above` itself: it must return the block, and only the block.
+        assert_eq!(rustdoc_above("/// a\n/// b\nlet x = 1;\n/// c\npub fn f()", "pub fn f()"),
+            "/// c", "rustdoc_above must take the CONTIGUOUS block above the signature");
+
+        let tight = rustdoc_above(src, "pub fn tight_plans(&self) -> u64");
+        assert!(tight.contains("nav_tight"),
+            "tight_plans' rustdoc must name where it surfaces: {tight}");
+        for wrong in ["nav_degraded", "inverted", "wound", "winding", "facing"] {
+            assert!(!tight.to_ascii_lowercase().contains(wrong),
+                "tight_plans counts the MINIMUM-clearance fallback, not the inverted-art signal, \
+                 but its rustdoc says {wrong:?}: {tight}");
+        }
+
+        let blind = rustdoc_above(src, "pub fn facing_blind_surfaces(&self) -> u64");
+        assert!(blind.contains("TRIANGLES"),
+            "facing_blind_surfaces' rustdoc must state its unit: {blind}");
+        assert!(refuted_query_count_hits(&blind).is_empty(),
+            "facing_blind_surfaces' own rustdoc calls it a per-request count: {blind}");
+        for wrong in ["nav_tight", "clearance"] {
+            assert!(!blind.contains(wrong),
+                "facing_blind_surfaces is not the clearance-fallback signal, but its rustdoc says \
+                 {wrong:?}: {blind}");
+        }
+    }
+
+    /// **#907: the `highpass` pair is written in two files, so pin them to each other.**
+    ///
+    /// The measurement lives in `MAX_NODES`' rustdoc AND is restated in `water_grid.rs`'s
+    /// attachment-cost argument. Nothing tied them together, so #907's re-measurement corrected one
+    /// file and left the other asserting the superseded figure — the tree then carried two numbers
+    /// for one measurement. A reader has no way to tell which file is stale.
+    ///
+    /// Every statement of the pair must therefore name the SAME re-measured figure. Both literals
+    /// are spelled through `concat!` so this guard is not itself a corpus hit — its corpus contains
+    /// its own source, and a scanner that matches its own text can never report clean (#973).
+    ///
+    /// **Reach.** The tree writes this pair in more than one NOTATION, and round 2 of review caught
+    /// this guard reading only the first of them:
+    ///
+    ///  * **spelling** — with and without the thousands comma. Commas are stripped before matching,
+    ///    so both spellings are one token. Keying on the comma form alone left the ratio sentence
+    ///    in `MAX_NODES`' own rustdoc unchecked, four lines below a site that WAS checked. (No
+    ///    figure is written in this rustdoc: with commas stripped it would be a corpus hit, and the
+    ///    guard reported itself as one on the run that added this paragraph.)
+    ///  * **order** — the re-measured figure follows the baseline after an arrow (`A -> B`) in the
+    ///    tables and the `water_grid.rs` prose, but PRECEDES it in the ratio sentence (`B/A`). Both
+    ///    are checked, from the same expected value.
+    ///
+    /// **What the scan matches — stated as a token, not as coverage.** It reads the two files
+    /// named in `corpus` and looks for the BASELINE figure spelled in ASCII digits with optional
+    /// `,` separators (commas are stripped from each line first, so the comma and comma-less
+    /// spellings are one token). Every occurrence it FINDS is classified arrowed, ratio or prose;
+    /// arrowed and ratio sites carry the other half of the pair and are value-checked, while the
+    /// prose site is the bare mapless mention, which names no pair to disagree with. The `3/1/1`
+    /// totals are asserted because a scan reporting only exceptions cannot distinguish "nothing
+    /// wrong" from "nothing looked at" — but they pin THAT SPELLING ONLY. A count over found
+    /// occurrences has no term for one that never matched, so no total here is evidence about
+    /// anything below.
+    ///
+    /// UNMATCHED — each measured GREEN with a deliberately-wrong pair planted in the rustdoc above:
+    ///
+    ///  * the baseline separated by `_`, by a plain space, by a thin space (`U+2009`), or by `.`.
+    ///    The underscore form is not hypothetical in this file: the table's first row writes the
+    ///    then-shipped cap as `MAX_NODES = 1_000_000`, so that notation is already in use in the
+    ///    very rustdoc this guard reads.
+    ///  * any sentence naming ONLY the re-measured figure. The scan is anchored on the baseline, so
+    ///    such a sentence is not an occurrence at all — including both of them in `MAX_NODES`' "two
+    ///    code states" paragraph, one of which exists precisely to give the superseded and
+    ///    re-measured figures side by side.
+    ///  * the pair restated in any file outside `corpus`. Corpus completeness is not asserted, and
+    ///    cannot be from inside a guard whose corpus is a literal list.
+    ///
+    /// Widening a third time was considered in review round 3 and declined: a widening closes the
+    /// notation that was just planted and says nothing about the next one. Naming the token is
+    /// checkable by a reader against any sentence; claiming the corpus is covered is not.
+    #[test]
+    fn both_files_state_the_same_re_measured_highpass_figure() {
+        // Commas stripped, so one spelling of each figure covers both (review round 2).
+        let bare = |s: &str| s.replace(',', "");
+        let baseline = bare(concat!("7,2", "29"));
+        let re_measured = bare(concat!("7,3", "93"));
+        let corpus = [("collision.rs", include_str!("collision.rs")),
+                      ("water_grid.rs", include_str!("water_grid.rs"))];
+
+        let (mut arrowed, mut ratio, mut prose) = (Vec::new(), Vec::new(), Vec::new());
+        for (file, src) in corpus {
+            let lines: Vec<String> = src.lines().map(bare).collect();
+            for (i, line) in lines.iter().enumerate() {
+                let next = lines.get(i + 1).map(String::as_str).unwrap_or("");
+                for (col, _) in line.match_indices(&baseline) {
+                    let site = format!("{file}:{}", i + 1);
+                    let before = &line[..col];
+                    // The pair can wrap a rustdoc line break, so read into the next line too.
+                    let after: String = format!("{} {next}", &line[col + baseline.len()..])
+                        .chars().take(40).collect();
+                    if let Some(a) = after.find("->").or_else(|| after.find('\u{2192}')) {
+                        arrowed.push((site, digit_run(after[a..].chars())));
+                    } else if let Some(head) = before.strip_suffix('/') {
+                        let behind: String = digit_run(head.chars().rev()).chars().rev().collect();
+                        ratio.push((site, behind));
+                    } else {
+                        prose.push(site);
+                    }
+                }
+            }
+        }
+
+        for (site, figure) in arrowed.iter().chain(&ratio) {
+            assert_eq!(figure, &re_measured,
+                "{site} states the `highpass` pair as {baseline}/{figure}, but #907 re-measured the \
+                 mapped arm at {re_measured}. Two tracked statements disagreeing about one \
+                 measurement is the #907 defect itself — fix the site, do not relax this guard.");
+        }
+        assert_eq!(arrowed.len(), 3,
+            "expected 3 arrowed statements of the pair (2 in collision.rs, 1 in water_grid.rs), \
+             found {}: {arrowed:?}. If a site was added or deleted, weigh it — a scan that silently \
+             stopped reaching them would otherwise pass by finding nothing.", arrowed.len());
+        assert_eq!(ratio.len(), 1,
+            "expected 1 ratio statement (`MAX_NODES`' rustdoc), found {}: {ratio:?}", ratio.len());
+        assert_eq!(prose.len(), 1,
+            "expected exactly 1 bare mention (the mapless arm at `MAX_NODES`), found {}: \
+             {prose:?}", prose.len());
+    }
+
+    /// The first run of ASCII digits in `it`, as a string. Fed reversed for a look-BEHIND, so the
+    /// caller reverses the result back.
+    fn digit_run(it: impl Iterator<Item = char>) -> String {
+        let mut seen_digit = false;
+        let mut out: Vec<char> = Vec::new();
+        for c in it {
+            if c.is_ascii_digit() {
+                seen_digit = true;
+                out.push(c);
+            } else if seen_digit {
+                break;
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// **#994 review: a documented repro command that selects NOTHING is worse than a broken one.**
+    ///
+    /// This file's `--ignored` measurements are documented as `cargo test … --lib <name>`. Run from
+    /// the workspace root — the repo's default cwd — `--lib` without `-p` selects the ROOT package's
+    /// lib target, which contains none of these tests, so the run prints `running 0 tests`,
+    /// `241 filtered out` and **exits 0**. Green, no rows, no error: indistinguishable from a pass
+    /// by the exit code, and it is the exit code an agent reads. Measured, then fixed by adding
+    /// `-p eqoxide-nav`.
+    ///
+    /// **What this matches — a token, not coverage.** A line is a RECIPE if it contains the
+    /// `cargo`-`test` invocation AND ` --lib ` with its trailing space, followed immediately by a
+    /// `[a-z0-9_]` test-name character. Both halves do work in this file, and neutering the second
+    /// half measured which does which: the two bare prose mentions fail the SPLIT (nothing follows
+    /// `--lib` but a backtick), while the `--workspace --lib --no-fail-fast` line and this
+    /// rustdoc's own `--lib <name>` sketch pass the split and are rejected by the first-character
+    /// test. A prose line that put a lowercase word straight after ` --lib ` WOULD be a false
+    /// positive; none does at this head, and the count assertion below is what would surface one.
+    /// Every recipe so classified must carry `-p eqoxide-nav`, and the total is asserted, because a
+    /// scan reporting only exceptions cannot tell "nothing wrong"
+    /// from "nothing looked at".
+    ///
+    /// **`-p` is the right remedy HERE because of what these recipes name, not in general.** All
+    /// nine resolve to `fn` definitions in this file — the `eqoxide-nav` LIB target — and this
+    /// crate has no `tests/` directory, so there is no integration target a recipe could have
+    /// meant. `-p` does NOT rescue an integration test: `-p <pkg> --lib <name>` against a test
+    /// living in `tests/*.rs` still selects the lib target, finds nothing, and exits 0. Such a
+    /// recipe needs `--test <file-stem>`, and this guard would wave it through.
+    ///
+    /// NOT matched, and none of these is claimed: a recipe wrapped across two lines; one written
+    /// `--package` instead of `-p`; `--test`/`--bin`/`--bins` targets; and any file other than this
+    /// one — the corpus is this source alone. A recipe in `walker.rs` or `movement.rs` has the same
+    /// defect and this guard is silent about it.
+    #[test]
+    fn every_documented_repro_command_in_this_file_names_its_package() {
+        // Split so this guard is not itself a corpus hit — its corpus is its own source.
+        let invocation = concat!("cargo ", "test ");
+        let src = include_str!("collision.rs");
+        let (mut recipes, mut missing) = (0usize, Vec::new());
+        for (i, line) in src.lines().enumerate() {
+            if !line.contains(invocation) {
+                continue;
+            }
+            let Some(rest) = line.split(" --lib ").nth(1) else { continue };
+            // A recipe names a test after `--lib`; the prose mentions and the `--workspace` line
+            // do not, which is the whole discriminator.
+            if !rest.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+                continue;
+            }
+            recipes += 1;
+            if !line.contains("-p eqoxide-nav") {
+                missing.push(format!("collision.rs:{}", i + 1));
+            }
+        }
+        assert!(missing.is_empty(),
+            "these documented repro commands omit `-p eqoxide-nav`, so from the workspace root they \
+             select the ROOT package's lib target, print `running 0 tests` and exit 0 — a vacuous \
+             green, not a measurement: {missing:?}");
+        assert_eq!(recipes, 9,
+            "expected 9 documented `--lib` repro commands in this file, found {recipes}. If one was \
+             added or deleted, weigh it — a scan that stopped reaching them would otherwise pass by \
+             finding nothing.");
     }
 
     // ── defect 1: a saturated spoke and a cap-distance hit ───────────────────────────────────────
@@ -10295,6 +10643,12 @@ mod clearance_probe_is_not_lossy_885 {
             placement_names_which_disjunct_failed,
             the_json_encoding_keeps_the_distinctions,
             evaluating_both_disjuncts_moves_the_published_facing_blind_counter,
+            no_tracked_text_calls_the_facing_blind_counter_a_query_count,
+            the_two_counter_accessors_do_not_describe_each_others_signal,
+            // cited by `MAX_NODES`' "two code states" section (#907 review round 1)
+            both_files_state_the_same_re_measured_highpass_figure,
+            // #994 review: cited by `worst_case_reachable_component`'s rustdoc
+            every_documented_repro_command_in_this_file_names_its_package,
         ];
     }
 

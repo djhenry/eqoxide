@@ -470,8 +470,9 @@ impl<T: std::fmt::Display> std::fmt::Display for WaterMeasurement<T> {
 /// needs no benchmark.
 ///
 /// What the attachment DOES to a measurement is a separate question, and the honest answer is
-/// narrow. MEASURED (#849): on `highpass`, with full workload on both sides and the attachment as
-/// the only difference, the close count went 7,229 -> 7,394 (**+2.3%**). That is one zone, and it is
+/// narrow. MEASURED (#849, re-measured for #907): on `highpass` the close count went 7,229 ->
+/// **7,393** (**+2.3%**) — the two arms come from DIFFERENT code states, not from the attachment
+/// alone; `MAX_NODES`' rustdoc in `collision.rs` carries that caveat. That is one zone, and it is
 /// not the zone that binds `worst_case_reachable_component` — `highpass` is not in that corpus's
 /// default set. On `butcher`, which IS that zone, the same attachment takes 352,493 -> **4,583,785**
 /// (**13.0x**, full workload, `dev`, `ZONES=butcher`). So the effect is a property of the ZONE and

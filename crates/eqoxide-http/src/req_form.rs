@@ -1,9 +1,9 @@
 //! #952/#956 (agent-honesty): the ONE place a "you sent more than one mutually exclusive form"
 //! refusal is decided and worded.
 //!
-//! **The defect this exists to remove.** 33 of this crate's 35 request structs carry
-//! `#[serde(deny_unknown_fields)]` — the exceptions are the two `/v1/observe` query structs listed
-//! in `DENY_UNKNOWN_EXEMPT`, which is asserted against the source so this sentence cannot rot.
+//! **The defect this exists to remove.** All 35 of this crate's request structs carry
+//! `#[serde(deny_unknown_fields)]` — `DENY_UNKNOWN_EXEMPT` is now empty and is asserted against the
+//! source, so this sentence cannot rot. (It held two `/v1/observe` query structs until #971.)
 //! Where the attribute IS present it is what makes a *typo* loud. It is also what makes a
 //! *silently ignored* field quiet: a field the struct declares but the handler never reaches is
 //! **accepted**, because it is not unknown — 200, no warning, no disclosure. The agent driving this
@@ -282,30 +282,30 @@ mod tests {
 
     /// The request structs that do NOT carry `#[serde(deny_unknown_fields)]`, in scan order.
     ///
-    /// **This exists because the first version of this module opened with "every request struct in
-    /// this crate carries `deny_unknown_fields`", and that was false.** Measured over this same
-    /// corpus: 33 of 35 carry it; these two do not. Both are `/v1/observe` QUERY structs, and on
-    /// both an unrecognized key is still silently dropped. Both halves are DRIVEN, in
-    /// `an_unrecognized_query_key_is_silently_dropped_on_both_exempt_routes`:
-    /// `GET /v1/observe/packets?sicne=1` answers `200` with the typo discarded, and
-    /// `GET /v1/observe/frame?allow_pending=1&prset=top_down&pitch=10` answers `200` with a camera
-    /// override built from the surviving `pitch` alone — the caller asked for a top-down preset, the
-    /// key carrying that request was dropped, and the capture happened at an angle nobody asked for.
-    /// What that test asserts is the two STATUS codes, the `/packets` discriminator, and the three
-    /// override values; the image bytes are the four this test injects while playing the render
-    /// thread's part, so nothing here is a claim about a real PNG.
+    /// **Empty since #971**, which is the whole claim.
+    /// Measured over this same corpus: all 35 carry it, 0 do not.
+    /// The second figure is written out because "no exceptions" is exactly the sentence that used to
+    /// be false here, and a `0` the pin below moves with is harder to leave behind than an absence.
+    /// It held
+    /// `("observe.rs", "PacketsQuery")` and `("observe.rs", "FrameQuery")` from #952 until then,
+    /// and the reason for the delay is recorded because it is the thing that changed —
+    /// `PacketsQuery` was read through axum's `Query` extractor, whose rejection is plain text, so
+    /// adding the attribute alone would have answered one input class outside the JSON error
+    /// contract `/observe/packets` advertises. #971 gave `/packets` the hand-rolled parse `/frame`
+    /// already had (`parse_packets_query`), so both now refuse an unknown key as
+    /// `400 {"error":"invalid_query_param"}` with serde's message naming it.
     ///
-    /// That is the #952/#956 failure shape — a confident answer for an instruction thrown away —
-    /// on the unreached-field side rather than the reached-but-ignored side. It is NOT fixed here:
-    /// `PacketsQuery` is read through axum's `Query` extractor, whose rejection is a plain-text
-    /// 400, which would break the JSON error contract `/observe/packets` advertises and re-open the
-    /// exact defect #701 closed for `/frame`. Doing it properly means giving `/packets` the
-    /// hand-rolled parse `/frame` already has, and choosing an error code for unknown keys — #701's
-    /// own design surface, not this PR's. Tracked as #971.
+    /// Driven, not merely written: `an_unrecognized_query_key_is_refused_on_both_observe_routes`
+    /// sends `GET /v1/observe/packets?sicne=1` and
+    /// `GET /v1/observe/frame?allow_pending=1&prset=top_down&pitch=10` through the real router. The
+    /// `/frame` case is the one worth keeping: it used to answer `200` with a camera override built
+    /// from the surviving `pitch` alone — a PNG shot at an angle nobody asked for, which is the
+    /// #952/#956 shape (a confident answer for an instruction thrown away) on the unreached-field
+    /// side.
     ///
     /// The list is asserted exactly and in order, so both of the directions the prose can rot in are
-    /// covered: adding the attribute to one of these, or introducing a new struct without it, turns
-    /// the corpus guard RED and forces the prose to move with it.
+    /// covered: dropping the attribute from any struct, or introducing a new struct without it,
+    /// turns the corpus guard RED and forces the prose to move with it.
     ///
     /// **What that does NOT cover, stated because a guard's limit is part of its claim.** The scan
     /// reads what is WRITTEN, not what serde APPLIES. It requires the words to sit on an attribute
@@ -313,13 +313,12 @@ mod tests {
     /// `#[cfg_attr(any(), serde(deny_unknown_fields))]` was measured to read as protected while
     /// being inert), but no source-text scan can be sure the attribute it reads is the one the
     /// compiler applied. The behavioural version of this claim is
-    /// `an_unrecognized_query_key_is_silently_dropped_on_both_exempt_routes`, which drives the two
-    /// exempt routes and does not read source at all; between them the text scan says *which*
-    /// structs and the driver says *what actually happens* to the two that matter.
-    const DENY_UNKNOWN_EXEMPT: &[(&str, &str)] = &[
-        ("observe.rs", "PacketsQuery"),
-        ("observe.rs", "FrameQuery"),
-    ];
+    /// `an_unrecognized_query_key_is_refused_on_both_observe_routes`, which drives the two
+    /// formerly-exempt routes and does not read source at all; between them the text scan says
+    /// *which* structs and the driver says *what actually happens* to the two that used to differ.
+    /// With the list empty the driver carries more of the weight than it used to, because "no
+    /// exceptions" is the kind of claim a scan can satisfy while the compiler disagrees.
+    const DENY_UNKNOWN_EXEMPT: &[(&str, &str)] = &[];
 
     /// **Reach control, half 2.** The total number of field names the probes actually LOCATED in the
     /// routes' own refusal bodies, summed over every case. Not a count of cases iterated: the only
@@ -433,7 +432,7 @@ mod tests {
     /// [`DOC_TOTAL_ATTRIBUTIONS`] is the same idea for the sweep: every whole-token occurrence of
     /// the total on the page, named by the sentence it belongs to, in page order.
     const COUNT_CLAIM_SITES: &[&str] = &[
-        "doc:exempt-of-total", "doc:corpus-total", "doc:destructured-of-total", "doc:remainder",
+        "doc:protected-of-total", "doc:corpus-total", "doc:destructured-of-total", "doc:remainder",
         "doc:figure-list",
         "self:protected-of-total", "self:destructured-of-total", "self:corpus-total",
         "self:protected-of-total-2",
@@ -443,7 +442,7 @@ mod tests {
     /// `docs/http-api.md`. Four of the five pinned sentences write the total; `doc:remainder` says
     /// `27` and so does not appear here.
     const DOC_TOTAL_ATTRIBUTIONS: &[&str] = &[
-        "doc:exempt-of-total", "doc:figure-list", "doc:corpus-total", "doc:destructured-of-total",
+        "doc:protected-of-total", "doc:figure-list", "doc:corpus-total", "doc:destructured-of-total",
     ];
 
     /// **Tracked prose may not disagree with [`DECLARED_REQUEST_STRUCTS`].**
@@ -478,8 +477,9 @@ mod tests {
     /// * `8` is not a constant of this module — it is the exhaustive-destructure figure re-derived
     ///   by the `grep -rnE` command in the module doc. It is written here so the pins can tie its
     ///   ARITHMETIC to the total: `27` is computed, never typed. The doc sentence promising which
-    ///   figures are asserted names only `2` and `35` for that reason; `8` and `27` are held fixed
-    ///   RELATIVE to them and nothing more.
+    ///   figures are asserted names only `35` for that reason; `8` and `27` are held fixed
+    ///   RELATIVE to it and nothing more. (It named `2` as well until #971 emptied
+    ///   `DENY_UNKNOWN_EXEMPT`; `2` is no longer a figure of this module.)
     /// * The corpus assertion bounds the text READ, and nothing about what the loop then does with
     ///   it. It compares a LENGTH, so a same-size substitution passes; and a skip added inside the
     ///   loop leaves every byte read and some of them never examined. Neither is caught here.
@@ -488,7 +488,7 @@ mod tests {
     /// `sha256sum`:
     /// * The review's own mutant — every `35` in `docs/http-api.md` rewritten to `36`, which left
     ///   the whole workspace gate green before this guard existed: **KILLED**, at the
-    ///   `doc:exempt-of-total` pin.
+    ///   `doc:protected-of-total` pin.
     /// * A NEW unpinned sentence quoting the count, inserted mid-page: **KILLED** by the sweep,
     ///   reported at the inserted line and nowhere else.
     /// * Reach control, WRAP: `if false { sites.clone() } else { sites[..4].to_vec() }`, i.e. the
@@ -535,7 +535,7 @@ mod tests {
     ///   comparison between the swept text and the variable it was sliced from still holds. Against
     ///   the size on disk it is **KILLED**.
     /// * All three second-pass mutants replayed on this tree: doc `35`→`36` **KILLED** at
-    ///   `doc:exempt-of-total`; the appended unpinned sentence **KILLED**, reported as `UNPINNED`
+    ///   `doc:protected-of-total`; the appended unpinned sentence **KILLED**, reported as `UNPINNED`
     ///   with its line number; the pins loop truncated to 4 of 9 sites **KILLED**, naming the five
     ///   missing labels. The classifier-forced mutant is **KILLED** as well.
     /// * INVALID control for this pass: a non-existent method in the corpus assertion's message →
@@ -558,8 +558,8 @@ mod tests {
         let remainder = total - destructured;
 
         let sites: Vec<(&str, &str, String)> = vec![
-            ("doc:exempt-of-total", doc_path,
-             format!("are the {exempt} of this crate's {total} request structs")),
+            ("doc:protected-of-total", doc_path,
+             format!("all {protected} of this crate's request structs carry")),
             ("doc:corpus-total", doc_path,
              format!("all **{total}** — to be classified")),
             ("doc:destructured-of-total", doc_path,
@@ -571,15 +571,15 @@ mod tests {
             // derived from anything, so review round 4 narrowed both the sentence and this fragment
             // to those two rather than leave the promise wider than the guard.
             ("doc:figure-list", doc_path,
-             format!("the `{exempt}` and `{total}` on this page")),
+             format!("the `{total}` on this page")),
             ("self:protected-of-total", self_path,
-             format!("{protected} of this crate's {total} request structs carry")),
+             format!("All {protected} of this crate's request structs carry")),
             ("self:destructured-of-total", self_path,
              format!("It is {destructured} of the {total} request structs")),
             ("self:corpus-total", self_path,
              format!("covers all {total},")),
             ("self:protected-of-total-2", self_path,
-             format!("corpus: {protected} of {total} carry it")),
+             format!("corpus: all {protected} carry it, {exempt} do not")),
         ];
 
         // ONE assertion per half, each fed by the half's own product. There is deliberately no
@@ -862,42 +862,52 @@ mod tests {
         );
     }
 
-    /// **The two `DENY_UNKNOWN_EXEMPT` structs really do drop an unrecognized key and answer 2xx.**
-    /// EXECUTED, both of them — the doc on `DENY_UNKNOWN_EXEMPT` states this as measured fact, and a
-    /// stated measurement with nothing in the tree performing it is the defect class this PR is about.
+    /// **#971: the two formerly-exempt `/v1/observe` query structs REFUSE an unrecognized key.**
+    /// EXECUTED, both of them, through the real router. This test used to assert the opposite and is
+    /// kept rather than replaced, because the pair of statuses it reads is the whole difference #971
+    /// made and a fresh test would not carry that history.
     ///
-    /// The `/frame` half needs the render thread's part played, exactly as
-    /// `observe.rs`'s `frame_duplicate_unrecognized_key_is_still_silently_ignored` does: `get_frame`
-    /// parses the query, then parks on the frame-request hand-off. A driver that never answers the
-    /// hand-off reads back the CAPTURE TIMEOUT (`503 renderer not ready`), which is downstream of the
-    /// query parse and says nothing about it — this test exists partly because an earlier round of
-    /// this PR mistook that 503 for a gate that runs BEFORE the query and wrote the mistake down.
-    /// The `tokio::select!` against the handle is not decoration: an unbounded poll loop would HANG
-    /// rather than fail if a change made this input return early (#701/#710).
+    /// Both halves check the JSON error SHAPE, not just the status class. That is the part #971 could
+    /// most easily have got wrong: `deny_unknown_fields` alone would have made axum's `Query`
+    /// extractor answer `/packets` with a `text/plain` 400, so an agent that parses this API's
+    /// `{"error","message"}` bodies would trade a silently-wrong 200 for an unparseable 400.
+    ///
+    /// The `/frame` half no longer needs the render thread's part played — the query parse now
+    /// short-circuits before the frame-request hand-off. It DID need it while this route answered
+    /// 200, and the reason is recorded because it is a live trap for the next person here: a driver
+    /// that never answers the hand-off reads back the CAPTURE TIMEOUT (`503 renderer not ready`),
+    /// which is downstream of the query parse and says nothing about it. So the 400 below is
+    /// asserted together with its body — a bare `is_client_error()` would also accept that 503.
     #[tokio::test]
-    async fn an_unrecognized_query_key_is_silently_dropped_on_both_exempt_routes() {
+    async fn an_unrecognized_query_key_is_refused_on_both_observe_routes() {
         // ── /v1/observe/packets ─────────────────────────────────────────────────────────────────
         let case = Case { file: "observe.rs", strukt: "PacketsQuery",
                           route: "/v1/observe/packets?sicne=1", post_body: None,
                           fields: &[], what: None };
         let (status, body, _) = probe(&case).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST,
+            "a misspelled `since` must be REFUSED (#971). A 200 here means the struct lost its \
+             `deny_unknown_fields` or the route went back to axum's `Query` extractor, and \
+             DENY_UNKNOWN_EXEMPT plus both prose descriptions are then wrong. Body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!(
+            "the refusal must be JSON, not axum's text/plain rejection — that is the reason #971 \
+             gave this route a hand-rolled parse instead of just the attribute: {e}. Body: {body}"));
+        assert_eq!(v["error"], "invalid_query_param", "body: {body}");
+        assert!(v["message"].as_str().unwrap_or("").contains("sicne"),
+            "the message must NAME the key the caller got wrong; an agent cannot fix a typo it is \
+             not shown: {body}");
+        assert!(!body.contains("\"packets\":"),
+            "a refused request must not also return the payload: {body}");
+        // Discriminator, unchanged in purpose: a RECOGNIZED key with an unparseable value is still
+        // refused, so the 400 above is not merely "this route refuses everything". Deliberately not
+        // an assertion about WHICH packets come back: `eqoxide_telemetry`'s buffer is a
+        // process-global that sibling tests write to.
+        let good = Case { route: "/v1/observe/packets?since=1", ..case };
+        let (status, body, _) = probe(&good).await;
         assert_eq!(status, StatusCode::OK,
-            "a misspelled `since` must still be dropped and answered 200 — if this is now a 4xx the \
-             route grew the protection #971 asks for, and DENY_UNKNOWN_EXEMPT and both prose \
-             descriptions must lose their PacketsQuery row. Body: {body}");
-        assert!(body.contains("\"packets\":"),
-            "expected the ordinary packets payload, i.e. the typo dropped rather than turned into an \
-             error: {body}");
-        // Discriminator, so the 200 above means "unknown key dropped" and not merely "this route
-        // validates nothing". A RECOGNIZED key with an unparseable value IS rejected. Deliberately
-        // not an assertion about WHICH packets came back: `eqoxide_telemetry`'s buffer is a
-        // process-global that sibling tests write to, so any claim about the contents is a
-        // cross-test coupling rather than a fact about this request.
-        let malformed = Case { route: "/v1/observe/packets?since=notanumber", ..case };
-        let (status, body, _) = probe(&malformed).await;
-        assert!(status.is_client_error(),
-            "a recognized key with a bad value must be refused — if this is 2xx, the 200 above is \
-             evidence of nothing. Got {status}: {body}");
+            "a RECOGNIZED key must still be served — otherwise the 400 above is evidence of \
+             nothing. Got {status}: {body}");
+        assert!(body.contains("\"packets\":"), "expected the ordinary packets payload: {body}");
 
         // ── /v1/observe/frame ───────────────────────────────────────────────────────────────────
         let state = crate::testkit::empty_state();
@@ -905,44 +915,25 @@ mod tests {
         crate::testkit::set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
         let frame_req = state.camera.frame_req.clone();
         let app = crate::v1_router().with_state(state);
-        let mut handle = tokio::spawn(async move {
-            let req = Request::get("/v1/observe/frame?allow_pending=1&prset=top_down&pitch=10")
-                .body(Body::empty()).unwrap();
-            app.oneshot(req).await.unwrap()
-        });
-        let req = tokio::select! {
-            req = async {
-                loop {
-                    if let Some(req) = frame_req.lock().unwrap().take() { return req; }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            } => req,
-            res = &mut handle => panic!(
-                "expected the typo'd key to be dropped and the request to reach the frame-request \
-                 hand-off, but the handler returned early with status {}. A 4xx here has at least \
-                 two causes and this test cannot tell them apart from the status alone: `FrameQuery` \
-                 may have gained `deny_unknown_fields` (or a hand-rolled unknown-key check), in \
-                 which case this module's prose about it is now wrong — or `prset` may now be \
-                 RECOGNIZED, in which case `preset` and `pitch` are both supplied and the route \
-                 refuses the conflict, which would mean this fixture stopped testing the typo. Read \
-                 the body before deciding which", res.expect("handler panicked").status()),
-        };
-        // The load-bearing assertion, and the one a mere `200` would not make: an override WAS
-        // built, from `pitch` alone. The caller asked for a top-down preset, the key carrying that
-        // request was discarded, and the capture proceeds at an angle nobody asked for.
-        let ov = req.camera_override.expect(
-            "expected an override built from the surviving `pitch=10`; None would mean the whole \
-             override was discarded, which is a different (and louder) behaviour than the one the \
-             DENY_UNKNOWN_EXEMPT doc describes");
-        assert_eq!((ov.azimuth, ov.radius), (0.0, 0.0),
-            "the dropped `prset=top_down` contributed nothing, so azimuth/radius stay at their \
-             defaults: {ov:?}");
-        assert!((ov.elevation - 10f32.to_radians()).abs() < 1e-6,
-            "elevation must come from `pitch=10` alone: {ov:?}");
-        req.tx.send(vec![0x89, b'P', b'N', b'G']).unwrap();
-        let resp = handle.await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK,
-            "…and the caller is told 200, with no mention of the key that was thrown away");
+        let req = Request::get("/v1/observe/frame?allow_pending=1&prset=top_down&pitch=10")
+            .body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+            "`prset` is not a `FrameQuery` field and must be refused (#971). This used to be a 200 \
+             carrying a PNG shot from the live camera angle.");
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!(
+            "/frame's refusals are JSON (#701) and this one must be too: {e}. Body: {body}"));
+        assert_eq!(v["error"], "invalid_query_param",
+            "an unknown KEY is not a camera-override problem — `invalid_camera_override` would send \
+             an agent hunting through pitch/yaw/preset/distance: {body}");
+        assert!(v["message"].as_str().unwrap_or("").contains("prset"), "body: {body}");
+        // The load-bearing assertion, and the one the status alone would not make: NO capture was
+        // registered. The old behaviour's real cost was not the 200, it was the image.
+        assert!(frame_req.lock().unwrap().is_none(),
+            "a refused query must not register a frame request — the pre-#971 failure was a capture \
+             taken at an angle nobody asked for, and a 400 that still captures has only hidden it");
     }
 
     /// **The blank-loser refusals in `docs/http-api.md`'s migration note, EXECUTED.**
