@@ -49,23 +49,35 @@ labelled RoF2 is strictly worse than one honestly labelled Titanium.
 
 **Provenance: Titanium (superseded).**
 
-This document used to carry a 24-row zone opcode table. **Every value in it was a Titanium
-opcode**, and RoF2 differs on all of them — e.g. `OP_NewZone` was listed as `0x0920` where RoF2 is
-`0x1795`, and `OP_ClientUpdate` as `0x14cb` where RoF2 is `0x7dfc`
-(`crates/eqoxide-protocol/src/protocol/mod.rs:127`, `:150`). The table has been deleted rather than
+This document used to carry a 24-row zone opcode table, and RoF2 differs on every row — e.g.
+`OP_NewZone` was listed as `0x0920` where RoF2's `OP_NEW_ZONE` is `0x1795`, and `OP_ClientUpdate` as
+`0x14cb` where RoF2's `OP_CLIENT_UPDATE` is `0x7dfc`
+(`crates/eqoxide-protocol/src/protocol/mod.rs`). The table has been deleted rather than
 transcribed, because a second hand-maintained copy of the opcode map is exactly what let the
 Titanium values sit here undetected while the client shipped the right ones.
 
-**The single source of truth is `crates/eqoxide-protocol/src/protocol/mod.rs`**, where each
-constant carries its RoF2 name in a trailing comment, and the handshake-critical subset is pinned
-against `patch_RoF2.conf` by `rof2_handshake_opcodes_match_conf`
-(`crates/eqoxide-protocol/src/protocol/mod.rs:1155-1164`). When a packet type never fires,
-cross-check `patch_RoF2.conf` — **not** `patch_Titanium.conf`.
+It was in fact worse than "all Titanium". Checked row by row against `patch_Titanium.conf`, **23 of
+the 24 values were genuine Titanium opcodes and one matched no shipped client at all**:
+`OP_CHANNEL_MESSAGE` was listed as `0x4126`, where Titanium's `OP_ChannelMessage` is `0x1004` and
+`0x4126` appears in no shipped patch config. So the table was not even reliably wrong in one
+direction — the reason to delete it is that a hand-copied table has no mechanism that would ever
+tell you which rows drifted. (An earlier revision of this section claimed every value *was* a
+Titanium opcode; that overstated its consistency.)
+
+**The single source of truth is `crates/eqoxide-protocol/src/protocol/mod.rs`**, and the
+handshake-critical subset is pinned against `patch_RoF2.conf` by the test
+`rof2_handshake_opcodes_match_conf` in that same file. When a packet type never fires, cross-check
+`patch_RoF2.conf` — **not** `patch_Titanium.conf`.
+
+Most constants also carry their RoF2 name in a trailing comment, but treat that as a convenience,
+not a guarantee: a minority carry no comment or a non-RoF2 one (the login-stream opcodes near the
+top are shared with SoD/Titanium and are annotated as such). The comments are unpinned prose; only
+the values are pinned by the test above.
 
 (The table's own "critical past bug" note — that `OP_SPECIAL_MESG` should be `0x2372` "from
 `patch_Titanium.conf`" — is a fine illustration of the failure mode: the fix was real, and it fixed
 the packet to the wrong client version's value. RoF2's `OP_SpecialMesg` is `0x0083`,
-`mod.rs:337`.)
+the `OP_SPECIAL_MESG` constant in `mod.rs`.)
 
 ---
 
@@ -73,8 +85,8 @@ the packet to the wrong client version's value. RoF2's `OP_SpecialMesg` is `0x00
 
 **Provenance: RoF2 (re-derived)** — from `rof2_structs.h`'s
 `PlayerPositionUpdateServer_Struct`, transcribed and pinned in
-`crates/eqoxide-protocol/src/protocol/mod.rs:1625-1640` (`decode_position_update`) with
-`SIZE_SPAWN_POSITION_UPDATE = 24` at `:1104`.
+`decode_position_update` (`crates/eqoxide-protocol/src/protocol/mod.rs`) with
+`SIZE_SPAWN_POSITION_UPDATE = 24` in the same file.
 
 `OP_ClientUpdate` carries a bit-packed position struct. On RoF2 it is **24 bytes**, and both its
 size and its field order differ from Titanium — there is a `vehicle_id` after `spawn_id`, and `x`
@@ -90,8 +102,20 @@ bytes[16..20] word3: deltaHeading:10, z:19, pad:3
 bytes[20..24] word4: animation:10, deltaY:13, pad:9
 ```
 
-Coords are EQ19 fixed-point (wire value / 8). Heading is an unsigned 12-bit CW value where
-512 = a full circle: `heading_deg = heading_units * 360 / 512`.
+Coords are EQ19 fixed-point (wire value / 8). Heading is an unsigned 12-bit CW value on a
+**2048-per-circle** scale — `heading_deg = wire_heading * 360 / 2048`. Decoded by
+`eq12_server_to_deg_cw` (`raw * (360.0 / 2048.0)`) and encoded by `deg_cw_to_eq12_server`
+(`* (2048.0 / 360.0)`), both in `crates/eqoxide-protocol/src/protocol/mod.rs`, and pinned by
+`eq12_server_to_deg_cw_uses_2048_not_512_scale` and
+`parse_rof2_spawn_heading_uses_2048_scale_not_aliased`.
+
+> **Never apply a 360/512 scale to this wire field (#521).** A 512-per-circle scale is real, but it
+> belongs *only* to the legacy Titanium decoder `s12_to_degrees_cw` (same file) and to EQEmu's
+> internal `Mob::m_Position.w`, which `FloatToEQ12` converts before it ever reaches the wire.
+> Nothing on the wire is 0..511. An earlier revision of this section said
+> `heading_deg = heading_units * 360 / 512`; that was correct only while it carried a
+> `/4.0 → 0-512 units` bridge that converted the wire value to EQ units first. Applied to the raw
+> field the one-step form aliases: wire 1024 (due SOUTH) computes 720 → mod 360 = 0, due NORTH.
 
 > **Superseded (Titanium):** this section previously documented a **22**-byte struct laid out
 > `spawn_id | word1:x | word2:y | word3:z | word4:heading` with no `vehicle_id`. Do not use it; it
@@ -100,16 +124,17 @@ Coords are EQ19 fixed-point (wire value / 8). Heading is an unsigned 12-bit CW v
 
 ### Sending heading (critical past bug — broke all melee)
 
-**Provenance: RoF2 (re-derived)** — the `2048/360` scale is live and shipped at
-`crates/eqoxide-protocol/src/protocol/mod.rs:522` and `:533`.
+**Provenance: RoF2 (re-derived)** — the `2048/360` scale is live and shipped in
+`deg_cw_to_eq12_server` and `deg_cw_to_eq12_client`
+(`crates/eqoxide-protocol/src/protocol/mod.rs`).
 When the client SENDS a position update, the wire heading must be `deg_cw * 2048/360`
-(= `EQ_units * 4`), to match the server's decode `EQ12toFloat = wire/4`. The client used to send
+(= `EQ_units * 4`, the same scale the decode paragraph above states), to match the server's decode
+`EQ12toFloat = wire/4`. The client used to send
 `deg_cw * 4096/360` — **exactly 2×** — so the server saw the player facing the wrong way. Movement
 (x/y/z) and the local visual were unaffected, but **every melee swing silently missed** because
-EQEmu gates swings on `IsFacingMob` (see Combat below). Fixed in
-`crates/eqoxide-net/src/action_loop.rs:3089` (`send_position_update`), which packs through the
-`2048.0/360.0` encoders cited above. Internal heading is CCW (0=N, 90=W); `ccw_to_cw` converts
-before packing.
+EQEmu gates swings on `IsFacingMob` (see Combat below). Fixed in `send_position_update`
+(`crates/eqoxide-net/src/action_loop.rs`), which packs through the `2048.0/360.0` encoders cited
+above. Internal heading is CCW (0=N, 90=W); `ccw_to_cw` converts before packing.
 
 ---
 
@@ -136,8 +161,8 @@ Implications for any client-driven combat:
 ## Zone Crossing (OP_ZoneChange)
 
 **Provenance: RoF2 (re-derived)** — size and offsets from the shipped `ZoneChange_Struct` builders
-`build_zone_change` (`crates/eqoxide-protocol/src/protocol/mod.rs:1116-1134`, with
-`SIZE_ZONE_CHANGE = 100` at `:1114`) and `send_zone_change_packet`
+`build_zone_change` (`crates/eqoxide-protocol/src/protocol/mod.rs`, with
+`SIZE_ZONE_CHANGE = 100` in the same file) and `send_zone_change_packet`
 (`crates/eqoxide-net/src/action_loop.rs`), which annotates the full RoF2 field list.
 
 RoF2 `ZoneChange_Struct` is **100 bytes**:
@@ -176,7 +201,7 @@ triggers.
 ## Merchant structs (buying)
 
 **Provenance: RoF2 (re-derived)** — `MerchantClick_Struct` from the shipped builder
-`crates/eqoxide-protocol/src/protocol/merchant.rs:4-16` (`merchant_click`), whose own comment
+`merchant_click` (`crates/eqoxide-protocol/src/protocol/merchant.rs`), whose own comment
 records the Titanium delta: Titanium was **16** bytes with no `tab_display`, and without
 `tab_display` set the RoF2 server opens the window but sends **no** merchant inventory — so it must
 be 1. `Merchant_Sell_Struct` and the `USE_NPC_RANGE2` gate are EQEmu `zone/` behaviour
@@ -199,7 +224,8 @@ old-style Lua turn-in quests (Rat Whiskers, Gnoll Fangs) send NONE of these. Dec
 
 **Provenance: RoF2 (re-derived)** — all three opcodes and all three layouts. Opcodes are the RoF2
 values from `utils/patches/patch_RoF2.conf:592-594`, matching
-`crates/eqoxide-protocol/src/protocol/mod.rs:259-261`. (An earlier revision of this section listed
+the `OP_TASK_DESCRIPTION`, `OP_TASK_ACTIVITY` and `OP_COMPLETED_TASKS` constants in
+`crates/eqoxide-protocol/src/protocol/mod.rs`. (An earlier revision of this section listed
 the *Titanium* opcodes — `patch_Titanium.conf:480-482` — and derived the layouts from
 `titanium.cpp`. That mismatch is the root cause of #889.)
 
@@ -255,7 +281,7 @@ the *Titanium* opcodes — `patch_Titanium.conf:480-482` — and derived the lay
   payload is exactly the bytes written, with no padding.
   - **Short form**, exactly 25 bytes — `TaskManager::SendTaskActivityShort`
     (`zone/task_manager.cpp:972-987`), sent for activities the player has not unlocked (they show
-    as `???` in the native client, its own comment at `:974`):
+    as `???` in the client, its own comment at `:974`):
     `0 client_task_index:u32 | 4 task_type:u32 | 8 task_id:u32 | 12 activity_id:u32 |
     16 list_group:u32 | 20 0xffffffff:u32 (literal, :984) | 24 optional:u8`.
     It carries **no** activity type, target name or counts at all.
@@ -289,9 +315,9 @@ the *Titanium* opcodes — `patch_Titanium.conf:480-482` — and derived the lay
 
 **Provenance: RoF2 (re-derived)** — from `ENCODE(OP_ZoneSpawns)` in `common/patches/rof2.cpp` plus
 `rof2_structs.h`'s `Spawn_Struct_Position`, transcribed in the shipped parser
-`crates/eqoxide-protocol/src/protocol/mod.rs:811-840` (`parse_rof2_spawn`) and pinned by
-`parse_rof2_spawn_npc_round_trip` (`:1445`), `parse_rof2_spawn_captures_flymode` (`:1473`) and
-`parse_rof2_spawn_rejects_truncated` (`:1483`).
+`parse_rof2_spawn` (`crates/eqoxide-protocol/src/protocol/mod.rs`) and pinned by
+`parse_rof2_spawn_npc_round_trip`, `parse_rof2_spawn_captures_flymode` and
+`parse_rof2_spawn_rejects_truncated` in that file's test module.
 
 **There is no fixed-offset table for RoF2, and there cannot be one.** RoF2's `Spawn_Struct` is
 **variable-length and bit-packed**: NUL-terminated `name`/`lastName`/`title`/`suffix`, an equipment
@@ -300,13 +326,17 @@ bytes for NPCs), optional `title`/`suffix` gated on an `OtherData` bitmask, and 
 `Spawn_Struct_Position` of five bit-packed `u32`s. Do not index into it — read it with the parser,
 which returns the consumed length so the next spawn in the packet can be found.
 
-> **Superseded (Titanium):** this section used to give "total ~383 bytes" with `spawn_id`@0,
-> `name`@4 and `is_npc`@0x115. Those offsets are Titanium's and are meaningless on RoF2.
+> **Superseded (wrong for every client):** this section used to give "total ~383 bytes" with
+> `spawn_id`@0, `name`@4 and `is_npc`@0x115 (=277). Those are **not** Titanium's offsets — an
+> earlier revision of this note said they were, which mislabelled them as merely out-of-date.
+> Titanium's own `Spawn_Struct` (`common/patches/titanium_structs.h`) has `name`@7, `NPC`@83 and
+> `spawnId`@340, total **385**. So the old numbers matched neither client and were never usable;
+> they are recorded only so a reader who remembers them can recognise them.
 
 **Still true on RoF2:** `curHp` in the spawn record is a **percentage** (0–100), not a raw HP value
-— register the spawn with `hp_pct = cur_hp as f32` directly. Confirmed at
-`crates/eqoxide-protocol/src/protocol/mod.rs:611` and pinned by `parse_rof2_spawn_npc_round_trip`
-(`:1384`, `:1455`). It lives in a 7×`u8` block (`curHp haircolor beardcolor eyecolor1 eyecolor2
+— register the spawn with `hp_pct = cur_hp as f32` directly. Confirmed by `SpawnInfo::cur_hp`
+(declared `u8` and commented "HP percent (100 = full)") and its read in `parse_rof2_spawn`, both in
+`crates/eqoxide-protocol/src/protocol/mod.rs`, and pinned by `parse_rof2_spawn_npc_round_trip`. It lives in a 7×`u8` block (`curHp haircolor beardcolor eyecolor1 eyecolor2
 hairstyle beard`), at no fixed offset.
 
 ---
@@ -314,8 +344,9 @@ hairstyle beard`), at no fixed offset.
 ## OP_ChannelMessage (Say channel)
 
 **Provenance: RoF2 (re-derived)** — from `DECODE(OP_ChannelMessage)` in `common/patches/rof2.cpp`,
-transcribed and pinned in `crates/eqoxide-protocol/src/protocol/chat.rs:11-33`
-(`build_channel_message`) with a layout test at `:40`.
+transcribed and pinned in `build_channel_message`
+(`crates/eqoxide-protocol/src/protocol/chat.rs`) with the layout test
+`build_say_packet_matches_rof2_layout` in the same file.
 
 RoF2 uses a **variable-length, NUL-terminated** wire format — **not** a fixed `ChannelMessage_Struct`
 with 64-byte name fields:
@@ -339,16 +370,26 @@ empty for broadcasts.
 
 ## Consider_Struct (OP_Consider)
 
-**Provenance: RoF2 (re-derived)** — request size from `SIZE_CONSIDER`
-(`crates/eqoxide-protocol/src/protocol/mod.rs:1110`); reply offsets from `apply_consider` in
-`crates/eqoxide-net/src/packet_handler.rs` and pinned by
+**Provenance: RoF2 (re-derived)** — request size from the live send path `build_consider_packet`
+(`crates/eqoxide-protocol/src/protocol/combat.rs`), pinned by `build_consider_packet_layout`; reply
+offsets from `apply_consider` (`crates/eqoxide-net/src/packet_handler.rs`) and pinned by
 `apply_consider_parses_20byte_reply_and_logs_attitude`.
 
-The client sends a **32**-byte request (`playerid`@0, `targetid`@4, remainder zeroed). The server
-ENCODEs its reply as the **20**-byte RoF2 `Consider_Struct`: `targetid`@4, `faction`@8, `level`@12.
-`apply_consider` requires only the first 16 bytes.
+Request and reply are the **same 20-byte** RoF2 `Consider_Struct`: `playerid`@0, `targetid`@4,
+`faction`@8, `level`@12, `pvpcon`@16 + 3 pad. The client fills only `playerid`/`targetid` and zeroes
+the rest; the server ENCODEs its reply into the same shape, and `apply_consider` requires only the
+first 16 bytes. RoF2 dropped Titanium's `cur_hp`/`max_hp`, which is why it is 20 and not 28.
 
 > **Superseded (Titanium):** "client sends 28 bytes" — and the reply size was never stated at all.
+>
+> **Also retracted (this document's own error):** a previous revision of this section said the
+> request is **32** bytes, sourced from a `SIZE_CONSIDER` constant. 32 was neither client's struct;
+> the constant was dead code — zero call sites, so nothing ever contradicted it — and it has been
+> deleted rather than corrected, precisely so there is no second copy of this number to drift again.
+> The size that matters is the one `build_consider_packet` actually allocates. Getting it wrong is
+> not a cosmetic error: EQEmu applies `DECODE_LENGTH_EXACT` here, so a wrong-sized request is
+> **silently dropped with no reply at all** (#273) — the client cannot tell that from "the server
+> has no answer", which is the agent-honesty failure mode this document exists to prevent.
 
 The `ConsiderColor` enum (**version-independent**, EQEmu `common/`): `Ally=1, Warmly=2, Kindly=3,
 Amiably=4, Indifferent=5, Apprehensive=6, Dubious=7, Threatning=8, DeathlyAfraid=9` (the
@@ -374,7 +415,7 @@ Race IDs come from EQEmu's [`common/races.h`](https://github.com/EQEmu/Server/bl
 | 75 | Spectre | spectre |
 
 The full mapping is `race_to_archetype()` in
-`crates/eqoxide-renderer/src/models.rs:792`. If you see weird model substitutions (wolf showing as
+`crates/eqoxide-renderer/src/models.rs`. If you see weird model substitutions (wolf showing as
 bear, etc.), cross-check that function against `races.h`.
 
 ---
@@ -404,6 +445,6 @@ struct. (The opcodes that carry a `string_id` are patch-specific; take them from
 
 `OP_FormattedMessage` carries a `string_id` + up to 9 `%1`..`%9` argument strings.
 `crates/eqoxide-core/src/eqstr.rs` loads `assets/eqstr_us.txt` at startup into a process-global map
-(`src/main.rs:220`). `format_id(string_id, args)` resolves the template
-(`crates/eqoxide-core/src/eqstr.rs:154`). If the file is missing the client still runs — system
+(the `eqstr::load` call in `src/main.rs`). `format_id(string_id, args)` resolves the template
+(same `eqstr` module). If the file is missing the client still runs — system
 messages just show "[string_id]" instead.

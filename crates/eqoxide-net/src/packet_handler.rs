@@ -1163,7 +1163,18 @@ fn apply_task_select_window(gs: &mut GameState, p: &[u8]) {
     // empty title/description and then push the result — `gs.task_offers` is published verbatim on
     // `GET /v1/quests/offers`, so a truncated packet minted a plausible-looking offer that never
     // existed. That is a silent wrong answer to the driving agent, which has no other channel to the
-    // wire. A short read is now indistinguishable-from-nothing rather than indistinguishable-from-0.
+    // wire. A short read now publishes NO fabricated offer, where before it published one.
+    //
+    // Be precise about what that does and does not buy, because the difference is itself an
+    // agent-honesty claim. Bailing leaves `gs.task_offers` EXACTLY AS IT WAS, which is only
+    // "indistinguishable from nothing" when it was already empty. If a previous
+    // OP_TaskSelectWindow had published offers, those STALE offers survive the discard and keep
+    // being served by `GET /v1/quests/offers`, which carries no error or staleness field — so the
+    // agent sees last-window data with nothing marking that a later packet failed to parse. That
+    // is strictly better than the old behaviour (stale-but-real beats fabricated), and it is still
+    // not a fully honest surface; the residual gap is the leftover of #981, not something this
+    // comment may claim is solved. Do not upgrade this to "the agent can tell" without a
+    // staleness/parse-failure field on the endpoint to back it.
     let mut r = WireReader::new(p, "OP_TaskSelectWindow");
     // Each entry is at least 23 bytes (task_id u32 + reward_multiplier f32 + duration u32 +
     // duration_code u32 + title cstr≥1 + desc cstr≥1 + has_rewards u8 + element_count u32).
@@ -7363,14 +7374,26 @@ mod tests {
     }
 
     /// The body ends exactly `TASK_DESCRIPTION_TRAILER_LEN` bytes before the end of a well-formed
-    /// packet — stated as an independent arithmetic check on the whole layout, so a body-field size
-    /// error cannot be absorbed by the trailer read and vice versa.
+    /// packet — a *net-length* check on the body, independent of the trailer read, so neither can
+    /// absorb the other's error.
+    ///
+    /// **What the length check alone does NOT catch, measured.** A fixed-field size error that sits
+    /// immediately before a NUL-terminated field is absorbed by that field's terminator scan: the
+    /// cursor lands one byte late, the `cstr` stops at the same NUL, and the net body length is
+    /// unchanged. Widening `open_window`'s `skip(1)` to `skip(2)` in [`parse_task_description`]
+    /// leaves every length assertion here green. The string equality assertions below are what make
+    /// that mutant RED, so they are load-bearing, not decoration — do not "simplify" them away.
     #[test]
     fn task_description_body_ends_five_bytes_before_end() {
-        let full = build_task_description(7, 501, "T", "D", 1, 2, "R", "");
+        let full = build_task_description(7, 501, "Slay Gnolls", "Slay 5 gnolls", 1, 2, "R", "");
         let body_only = &full[..full.len() - TASK_DESCRIPTION_TRAILER_LEN];
         let f = parse_task_description(body_only);
         assert_eq!(f.task_id, 501, "the body alone must still decode");
+        // Field alignment, not just field count: a cstr absorbs a preceding size error silently.
+        assert_eq!(f.title, "Slay Gnolls", "title must start on the byte the header ends on");
+        assert_eq!(f.description, "Slay 5 gnolls", "description must start where Data1 ends");
+        assert_eq!(f.coin_reward, 1, "Data2 must be read at its own offset, not a shifted one");
+        assert_eq!(f.xp_reward, 2);
         assert_eq!(f.trailer, None);
         assert_eq!(f.trailing_bytes, 0, "body consumes the payload exactly up to the trailer");
     }
