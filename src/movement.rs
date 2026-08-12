@@ -2107,7 +2107,7 @@ mod tests {
         ctrl.on_ground = true;
         // Drive diagonally into the wall (north-east). East is blocked at 5; the controller should
         // slide north rather than stop dead.
-        ctrl.step(walk(35.0, [0.7071, 0.7071]), 0.1, &c);
+        ctrl.step(walk(35.0, [std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2]), 0.1, &c);
         assert!(ctrl.pos[0] < 4.1, "should be stopped short of the wall (no penetration, east<4.1): {}", ctrl.pos[0]);
         assert!(ctrl.pos[1] > 0.5, "should have slid north along the wall: {}", ctrl.pos[1]);
     }
