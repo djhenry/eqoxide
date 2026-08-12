@@ -36,9 +36,12 @@ pub fn pick_combat_target(
     nearest_trash
 }
 
-/// OP_Consider payload: Consider_Struct (28 bytes). The client fills playerid+targetid;
+/// OP_Consider payload: RoF2 `Consider_Struct` (**20 bytes**). The client fills playerid+targetid;
 /// the server replies with the same opcode carrying faction (con standing) + level
-/// (con color). Size must be exactly 28 or EQEmu rejects it.
+/// (con color). Size must be exactly 20 or EQEmu's `DECODE_LENGTH_EXACT` rejects it — see the body
+/// for why a rejected consider is invisible rather than loud. This header said 28 (Titanium's size)
+/// long after the body was fixed to 20; the authoritative figure is the `vec![0u8; 20]` below,
+/// pinned by `build_consider_packet_layout`.
 pub fn build_consider_packet(player_id: u32, target_id: u32) -> Vec<u8> {
     // RoF2 Consider_Struct is 20 bytes (rof2_structs.h): playerid(u32)@0, targetid(u32)@4,
     // faction(u32)@8, level(u32)@12, pvpcon(u8)@16, pad[3]. (RoF2 dropped Titanium's cur_hp/max_hp,
