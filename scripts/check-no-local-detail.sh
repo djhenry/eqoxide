@@ -4,37 +4,64 @@
 # content reappears in a TRACKED file. The repo is public; this guard is the durable defense
 # against re-introducing the categories that a one-time scrub removed.
 #
-# It flags (by PATTERN, so it never itself contains a real secret value):
+# It flags (never a credential or secret value; see the pattern file's note on the one class that
+# has no shape and must therefore be enumerated):
 #   - absolute home paths            (a local-system path leak)
 #   - the local container-name shape (deployment-specific infrastructure detail)
 #   - an inline DB password flag     (the `-u<user> -p<pass>` credential antipattern)
 #   - references to a decompiled commercial client and RE tooling
 #     (ghidra / capstone / the client exe / a `decompiled/` path / lifted `FUN_xxxxxx` symbols)
 #
+# ITS PATTERN SET IS AN ALLOWLIST. A green run means "no KNOWN shape matched", NOT "no local detail
+# is present" — those differ by whatever nobody has thought of yet, which is not a hypothetical:
+# eqoxide#995 was a tracked comment naming deployment infrastructure that this script exited 0 on
+# for months. The comment is scrubbed; the CLASS is still not covered here, deliberately, because a
+# host name has no shape and enumerating literal names would make this guard's own pattern file the
+# only tracked instance of the class. See the pattern file's header and #995 for the remaining
+# option. When a class IS coverable by shape, fix both halves at once — scrub the instance and add
+# the pattern.
+#
 # Run locally with:  scripts/check-no-local-detail.sh
 # Exit 0 = clean, exit 1 = a forbidden pattern was found (prints file:line).
+#
+# WHAT THIS DOES NOT SEE (eqoxide#980): tracked files, and nothing else. PR bodies, issue bodies
+# and comments are public artifacts of this repo that this script structurally cannot reach, and
+# they have carried absolute home paths with this check green. `scripts/check-pr-text.sh` covers
+# that surface; the two share one pattern list (`scripts/local-detail-patterns.sh`) so they cannot
+# drift apart.
 
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-# One regex per category. Kept generic on purpose: we detect the *shape* of a leaked credential,
-# never a literal value, so this script is safe to keep in a public repo.
-patterns=(
-  '/home/[a-z]'                 # absolute home-directory path (use ~/ or a placeholder instead)
-  'eqemu_[a-z]+_[0-9]'          # local container name (parameterise it)
-  '-u[a-z]+ +-p[A-Za-z0-9]'     # inline DB user+password (read the password from the environment)
-  'ghidra'                      # decompilation / RE tooling
-  'capstone'                    # disassembly tooling
-  'eqgame\.exe'                 # the decompiled commercial client binary
-  'decompiled/'                 # a path into decompiled output
-  'FUN_[0-9a-fA-F]{6}'          # internal symbol name lifted from the binary
-)
+# One regex per category, defined once and shared with scripts/check-pr-text.sh. The path is
+# overridable so `check-pr-text.sh --self-test` can point THIS script at an empty pattern list and
+# assert that it refuses — an assertion that runs the real guard instead of re-deriving it.
+# shellcheck source=scripts/local-detail-patterns.sh
+patterns_file="${LOCAL_DETAIL_PATTERNS_FILE:-$(git rev-parse --show-toplevel)/scripts/local-detail-patterns.sh}"
+source "$patterns_file"
+# A pattern file that defines nothing at all must reach the refusal below, not crash on an unbound
+# variable with an exit code indistinguishable from a real finding.
+declare -p LOCAL_DETAIL_PATTERNS >/dev/null 2>&1 || LOCAL_DETAIL_PATTERNS=()
+patterns=("${LOCAL_DETAIL_PATTERNS[@]:-}")
 
-# Paths excluded from the scan:
-#   - this script itself (it necessarily contains the patterns it searches for)
-#   - the CI workflow (references the script)
+# Reach guard. This script reports only EXCEPTIONS, so with an empty pattern list it would print
+# OK having looked at nothing — indistinguishable from a clean tree. Refuse that state loudly.
+if [ "${#LOCAL_DETAIL_PATTERNS[@]}" -eq 0 ]; then
+  echo "::error::check-no-local-detail: pattern list is EMPTY — the scan looked at nothing."
+  echo "This is a guard failure, not a clean tree. Patterns were read from: ${patterns_file}"
+  exit 1
+fi
+
+# Paths excluded from the scan. Every exclusion is a permanent blind spot in the one guard that is
+# a PREVENTER, so the list is kept as short as the patterns allow:
+#   - this script itself and the shared pattern file (each necessarily contains the patterns, and
+#     the pattern file also holds the dirty samples the guards are tested against)
+#   - the CI workflow (references the scripts)
+# `scripts/check-pr-text.sh` is deliberately NOT excluded: its dirty samples were moved into the
+# pattern file above precisely so the 300-line scanner stays inside this scan's reach.
 excludes=(
   ":(exclude)scripts/check-no-local-detail.sh"
+  ":(exclude)scripts/local-detail-patterns.sh"
   ":(exclude).github/workflows/test.yml"
 )
 
@@ -57,4 +84,11 @@ if [ "$status" -ne 0 ]; then
   exit 1
 fi
 
-echo "check-no-local-detail: OK — no forbidden patterns in tracked files."
+# Report the corpus, not just the (empty) exception list: "0 findings" and "0 files scanned" print
+# the same word otherwise. The count is the file set `git grep` above actually searched.
+scanned=$(git grep --files-with-matches -I -E -e '' -- . "${excludes[@]}" 2>/dev/null | wc -l || true)
+echo "check-no-local-detail: OK — ${#patterns[@]} patterns x ${scanned} tracked text files, no matches."
+echo "check-no-local-detail: reach — tracked files only. PR/issue bodies and comments are NOT"
+echo "covered here; scripts/check-pr-text.sh is the scanner for that surface (eqoxide#980)."
+echo "check-no-local-detail: the pattern set is an ALLOWLIST of shapes someone already thought of,"
+echo "so OK means 'no KNOWN shape matched', not 'no local detail is present' (eqoxide#995)."
