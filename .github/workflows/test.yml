@@ -289,22 +289,27 @@ jobs:
       #       - 8 REQUIRE a var and panic without it: `$ZONE_GLB` (2 in `eqoxide-assets/src/lib.rs`,
       #         4 in `collision.rs`), `$DOORS_GLB` (1, `eqoxide-assets/src/lib.rs`),
       #         `$EQOXIDE_ZONE_ASSETS` (1, `src/movement.rs`). MEASURED: unsetting `$ZONE_GLB` and
-      #         running `from_glb_links_meshes_to_textures` panics — `NotPresent` — in 0.00s.
+      #         running `b2_glb_tests::from_glb_links_meshes_to_textures` panics — `NotPresent` —
+      #         in 0.00s.
       #       - 22 treat it as an OPTIONAL OVERRIDE of a hardcoded fallback,
       #         `~/.local/share/eqoxide/assets/models`: `$ZONE_DIR` (11 in `collision.rs`, 5 in
       #         `walker_sim.rs`), `$EQZONES` (5 in `water_capability.rs` via its shared loader, 1 in
       #         `src/movement.rs`). MEASURED at `36ea882` with all five vars unset:
-      #         `collision::fix_700_coarse_agrees_with_fine_at_canal_lip` still runs — `ok. 1
-      #         passed`, tens of seconds of real work off that fallback path, not a 0.00s panic.
+      #         `collision::tests::fix_700_coarse_agrees_with_fine_at_canal_lip` still runs — `ok.
+      #         1 passed`, tens of seconds of real work off that fallback path, not a 0.00s panic.
       #         The var is not a gate for this group; a populated dev-machine cache is.
       #       - 1, `worst_case_reachable_component`, hardcodes that same fallback path with NO
       #         override at all (`$ZONES` there only picks which zone NAMES to scan).
       #     So for 23 of the 31 (22 + the 1 hardcoded) what has to exist is a populated asset
       #     directory — the `~/.local/share/eqoxide/assets/models` fallback by default, or wherever
-      #     the var points when one is set instead (MEASURED: with `HOME` empty and `$ZONE_DIR` set
-      #     to the real cache, the same test still passes) — not the presence or absence of the
-      #     variable itself. CI sets none of the five and has no such directory, which is why all 31
-      #     still stay ignored here. On a fresh clone none of the five is set: the 8 REQUIRED tests
+      #     the var points when one is set instead (MEASURED at `36ea882` with `env -u HOME
+      #     ZONE_DIR=<cache> cargo test -p eqoxide-nav --lib -- --ignored --exact
+      #     collision::tests::fix_700_coarse_agrees_with_fine_at_canal_lip`: passes with `HOME`
+      #     UNSET ENTIRELY, not just empty — the fallback's `unwrap_or_else` is lazy, so once
+      #     `$ZONE_DIR` is set that closure never runs and `HOME` is never consulted on this path at
+      #     all) — not the presence or absence of the variable itself. CI sets none of the five and
+      #     has no such directory, which is why all 31 still stay ignored here. On a fresh clone
+      #     none of the five is set: the 8 REQUIRED tests
       #     fail at the variable itself, with no fallback and no path resolved; the other 23 resolve
       #     to the default `~/.local/share` fallback, which is outside the repo — no `.gitignore`
       #     rule is involved for that default path. That is a claim about the defaults nobody
