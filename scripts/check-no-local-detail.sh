@@ -13,28 +13,37 @@
 #
 # Run locally with:  scripts/check-no-local-detail.sh
 # Exit 0 = clean, exit 1 = a forbidden pattern was found (prints file:line).
+#
+# WHAT THIS DOES NOT SEE (eqoxide#980): tracked files, and nothing else. PR bodies, issue bodies
+# and comments are public artifacts of this repo that this script structurally cannot reach, and
+# they have carried absolute home paths with this check green. `scripts/check-pr-text.sh` covers
+# that surface; the two share one pattern list (`scripts/local-detail-patterns.sh`) so they cannot
+# drift apart.
 
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-# One regex per category. Kept generic on purpose: we detect the *shape* of a leaked credential,
-# never a literal value, so this script is safe to keep in a public repo.
-patterns=(
-  '/home/[a-z]'                 # absolute home-directory path (use ~/ or a placeholder instead)
-  'eqemu_[a-z]+_[0-9]'          # local container name (parameterise it)
-  '-u[a-z]+ +-p[A-Za-z0-9]'     # inline DB user+password (read the password from the environment)
-  'ghidra'                      # decompilation / RE tooling
-  'capstone'                    # disassembly tooling
-  'eqgame\.exe'                 # the decompiled commercial client binary
-  'decompiled/'                 # a path into decompiled output
-  'FUN_[0-9a-fA-F]{6}'          # internal symbol name lifted from the binary
-)
+# One regex per category, defined once and shared with scripts/check-pr-text.sh.
+# shellcheck source=scripts/local-detail-patterns.sh
+source "$(git rev-parse --show-toplevel)/scripts/local-detail-patterns.sh"
+patterns=("${LOCAL_DETAIL_PATTERNS[@]:-}")
+
+# Reach guard. This script reports only EXCEPTIONS, so with an empty pattern list it would print
+# OK having looked at nothing — indistinguishable from a clean tree. Refuse that state loudly.
+if [ "${#LOCAL_DETAIL_PATTERNS[@]}" -eq 0 ]; then
+  echo "::error::check-no-local-detail: pattern list is EMPTY — the scan looked at nothing."
+  echo "This is a guard failure, not a clean tree. Check scripts/local-detail-patterns.sh."
+  exit 1
+fi
 
 # Paths excluded from the scan:
-#   - this script itself (it necessarily contains the patterns it searches for)
-#   - the CI workflow (references the script)
+#   - this script itself, the shared pattern file, and the PR-text scanner (each necessarily
+#     contains the patterns it searches for)
+#   - the CI workflow (references the scripts)
 excludes=(
   ":(exclude)scripts/check-no-local-detail.sh"
+  ":(exclude)scripts/local-detail-patterns.sh"
+  ":(exclude)scripts/check-pr-text.sh"
   ":(exclude).github/workflows/test.yml"
 )
 
@@ -57,4 +66,9 @@ if [ "$status" -ne 0 ]; then
   exit 1
 fi
 
-echo "check-no-local-detail: OK — no forbidden patterns in tracked files."
+# Report the corpus, not just the (empty) exception list: "0 findings" and "0 files scanned" print
+# the same word otherwise. The count is the file set `git grep` above actually searched.
+scanned=$(git grep --files-with-matches -I -E -e '' -- . "${excludes[@]}" 2>/dev/null | wc -l || true)
+echo "check-no-local-detail: OK — ${#patterns[@]} patterns x ${scanned} tracked text files, no matches."
+echo "check-no-local-detail: reach — tracked files only. PR/issue bodies and comments are NOT"
+echo "covered here; scripts/check-pr-text.sh is the scanner for that surface (eqoxide#980)."

@@ -191,6 +191,43 @@ when adding a fifth.
 This is a naming convenience with no runtime meaning: if a name does not have a specific word whose
 capitalisation carries information, use plain `snake_case` and no `allow`.
 
+### Writing provenance without leaking a path (#980)
+
+This repo is public, and so is every PR body, issue body and comment on it. Those are a *different*
+surface from tracked files, and until #980 nothing scanned them: `scripts/check-no-local-detail.sh`
+scans tracked files only. Two PRs in the #975 wave shipped absolute home-directory paths in their
+bodies with the `no-local-detail` check green throughout.
+
+It is not carelessness. Every change here is expected to prove where it was built and that it did
+not disturb a shared checkout, and the natural way to write that proof is to paste the command that
+was run — path and all. The more rigorous the provenance, the likelier the leak, which is the wrong
+incentive gradient.
+
+**The convention: name the tree, do not paste its path.**
+
+| instead of | write |
+| --- | --- |
+| `` `git -C <absolute path to the shared checkout> status --porcelain` `` is empty | `` `git status --porcelain` `` in the shared checkout is empty — it was never touched |
+| gated in `<absolute path to a worktree>` | gated in the `<branch-name>` worktree |
+| built on `<hostname>` at `<absolute path>` | built from the `<branch-name>` worktree at `<sha>` |
+
+The proof value is in the command and its result. The absolute path adds nothing to the claim and
+is the entire leak. The same holds for host names, container names, and any `-u<user> -p<pass>`
+form. Pasted `ps` output and build-host detail are out for the same reason.
+
+Two scanners enforce this, sharing one pattern list (`scripts/local-detail-patterns.sh`) so they
+cannot drift:
+
+```sh
+scripts/check-no-local-detail.sh              # tracked files — a preventer, runs before merge
+scripts/check-pr-text.sh <pr-or-issue-number> # PR/issue title, body, comments, review comments
+scripts/check-pr-text.sh --self-test          # offline; proves the scanner still discriminates
+```
+
+`check-pr-text.sh` is a **detector, not a preventer**: GitHub has published the text before any
+check can read it, and keeps the edit history after it is scrubbed. Read a green run as "the
+current text is clean", never as "nothing was ever exposed".
+
 Key test modules:
 - `src/assets.rs` — collision grid (floor_z, segment_blocked, path_clear)
 - `src/eq_net/navigation.rs` — the nav walker/planner loop, packet builders (say, target, consider)

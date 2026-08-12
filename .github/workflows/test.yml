@@ -17,6 +17,10 @@ jobs:
   # a decompiled commercial client / RE tooling) reappears in a tracked file. This is the durable
   # defense that keeps a one-time scrub from silently regressing on a public repo. See the script
   # for the exact patterns and the (temporary) exclusions.
+  #
+  # Its reach is TRACKED FILES and nothing else — see the `pr-text` job below for the other public
+  # surface (#980). Both jobs read one shared pattern list, `scripts/local-detail-patterns.sh`, so
+  # the two scanners cannot drift apart.
   no-local-detail:
     runs-on: ubuntu-latest
     # A ~5-second script — this is generous headroom for consistency with the `test` job below,
@@ -35,6 +39,45 @@ jobs:
         run: |
           python3 scripts/check-wrapped-literals.py --self-test
           python3 scripts/check-wrapped-literals.py
+
+  # The other public surface (#980). `check-no-local-detail.sh` above scans TRACKED FILES ONLY, so
+  # PR bodies, issue bodies and comments — every one of them public on this public repo — were
+  # never looked at by anything. Two PRs in the #975 wave shipped absolute home paths in their
+  # bodies with that check GREEN throughout, which is not a bug in the check: it structurally
+  # cannot see that text.
+  #
+  # THIS JOB IS A DETECTOR, NOT A PREVENTER, and the script says so in its own output. GitHub has
+  # already published the body and every comment before any workflow can read them. A red run here
+  # means "go scrub it now"; a green run means "the current text is clean", NOT "nothing was ever
+  # exposed" — the edit history keeps the first version either way.
+  #
+  # It runs on `pull_request` only: on a `push` to `main` there is no PR number to scan, and
+  # silently scanning nothing is exactly the state the script refuses (an empty corpus is an error
+  # there, not a pass). `GH_TOKEN` gets the default read-only workflow token, which is enough for
+  # every endpoint the script calls; a fork PR is fine because the script only reads.
+  pr-text:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+      # `--self-test` first, same pattern as check-wrapped-literals above: a scanner that has
+      # stopped discriminating must fail loudly rather than pass everything. It runs offline and
+      # drives the classifier through one deliberately-dirty item per pattern, three clean items,
+      # a reach control (empty the pattern list — nothing may flag, and every item must still be
+      # classified), the empty-pattern-list refusal, the empty-corpus case, and an assertion on how
+      # many checks ran, so a case that stops running fails the step instead of shrinking the
+      # output.
+      - name: check-pr-text self-test
+        run: bash scripts/check-pr-text.sh --self-test
+      - name: scan this PR's body and comments for local-system detail
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: bash scripts/check-pr-text.sh "${{ github.event.pull_request.number }}"
 
   test:
     runs-on: ubuntu-latest
@@ -86,8 +129,65 @@ jobs:
       # release-built by CI: `tools` (the `s3d_to_gltf`/`validate_glb`/`diagnose_glb` binaries) and
       # `crates/eqoxide-crash`'s `crash_probe` bin. `--workspace` covers every member's every
       # target. See #605.
+      #
+      # `--keep-going` (#968): report EVERY unit that fails to compile, not just the first. Without
+      # it cargo prints `warning: build failed, waiting for other jobs to finish...` and stops
+      # scheduling, so a run that shows one error may be hiding others in units it never built.
       - name: cargo build --release --workspace
-        run: cargo build --release --workspace --locked
+        run: cargo build --release --workspace --locked --keep-going
+
+      # Compile every TEST target before running any of them, with `--keep-going` (#968).
+      #
+      # WHAT THIS IS FOR, measured off the Actions record rather than reconstructed. PR #896's only
+      # CI run (`31123248406`) failed on `E0063: missing field npc_tint_index in initializer of
+      # Entity` at `src/model.rs:430`, in `could not compile eqoxide (lib test)`. Cargo then stopped
+      # scheduling, so the SECOND half of the same break — `SpawnInfo` in `tests/entity_pose_643.rs`
+      # — was never compiled and never reported: the strings `entity_pose_643` and `SpawnInfo`
+      # appear zero times in that entire run log. It took two follow-up PRs (#915, #918) to get
+      # `main` green. The release build above would not have caught either half: it does not build
+      # test targets at all.
+      #
+      # MEASURED at `fddcb89` on cargo 1.97.1, one sitting, by appending an identical `const
+      # _PROBE_968: u32 = "not a u32";` (E0308) to ALL 23 integration targets under `tests/` — the
+      # same class of leaf unit as #896's `tests/entity_pose_643.rs` — then reverting it:
+      #   cargo test --workspace --locked                          -> exit 101, 1  of 23 units named
+      #   cargo build --workspace --all-targets --locked           -> exit 101, 2  of 23 units named
+      #   cargo build --workspace --all-targets --locked --keep-going -> exit 101, 23 of 23 named
+      # The first two both print `warning: build failed, waiting for other jobs to finish...`. Note
+      # the middle line: `--all-targets` alone is NOT what makes the report complete — the flag is.
+      # Unmutated, all three exit 0.
+      #
+      # `cargo test` CANNOT take `--keep-going` — MEASURED on cargo 1.97.1 stable:
+      # `cargo test --keep-going` exits 1 with `error: unexpected argument '--keep-going' found`
+      # and the tip `use --no-fail-fast`, which is a different mechanism (it keeps RUNNING tests
+      # after a failure; it does not keep COMPILING after a compile error). `cargo build` does take
+      # it, and `--all-targets` is what pulls the test targets into a `build`. Hence this step.
+      # Re-derive with `cargo test --keep-going --no-run` in any crate.
+      #
+      # Small added cost: this is the dev profile, so the artifacts are the same ones `cargo test
+      # --workspace` below reuses from the shared target dir — it moves the compile earlier rather
+      # than duplicating it. MEASURED on this branch's tree, run immediately after a full `cargo
+      # test --workspace --locked`: 6.59s, all of it the few `tools` bin targets `cargo test` does
+      # not build; a second, fully warm run of the same command is 0.42s. Both are dev-box figures
+      # on a warm target dir, not runner figures — the runner's cost depends on the rust-cache hit.
+      #
+      # WHAT IT DOES NOT COVER, so nobody reads it as more than it is:
+      #   - DOCTESTS. `--all-targets` does not include them (that is the same fact the test step
+      #     below relies on), so a doctest that fails to COMPILE still surfaces only in `cargo
+      #     test`, and still fails fast there.
+      #   - TEST FAILURES. This step only compiles. `cargo test` below still stops after the first
+      #     failing test binary; `--no-fail-fast` is the flag for that and is deliberately not set
+      #     here, because a run that reports every failing binary is a separate change from one
+      #     that reports every failing COMPILATION UNIT.
+      #   - MERGING OVER A RED CHECK, which is the other half of #968 and cannot be fixed by any
+      #     file in this repo. MEASURED 2026-08-12: `gh api repos/djhenry/eqoxide/branches/main/
+      #     protection` returns 404 `Branch not protected`, and `gh api repos/djhenry/eqoxide/
+      #     rulesets` returns `[]` — so NO check is required on `main`, and #896 was merged 36
+      #     minutes after its only run went red with nothing to stop it. Making `test` a required
+      #     status check is a repository-admin setting, not a workflow one; re-derive the current
+      #     state with those two API calls rather than trusting this dated line.
+      - name: cargo build --workspace --all-targets (compile every test target, keep going)
+        run: cargo build --workspace --all-targets --locked --keep-going
 
       # `cargo test --workspace` — NOT `--lib`. This is the #605 fix, and the reason it matters is
       # worth stating plainly: `--lib` runs only the ROOT package's lib target. That was correct
