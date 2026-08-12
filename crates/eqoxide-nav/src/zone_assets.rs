@@ -344,8 +344,9 @@ impl NotUsable {
 /// the current zone's. What does NOT go through it, deliberately (each verified to make no
 /// route/geometry claim about the current zone):
 ///   * the two per-zone DIAGNOSTIC COUNTERS `nav_support` and `nav_tight` read `shared_collision`
-///     directly, but publish only cumulative metadata (facing-blind / minimum-clearance query counts
-///     since zone load) and ride the SAME `/observe/debug` response as the honest `zone_assets`
+///     directly, but publish only cumulative metadata (facing-blind surfaces admitted /
+///     minimum-clearance routes planned since zone load) and ride the SAME `/observe/debug` response
+///     as the honest `zone_assets`
 ///     verdict beside them — never a route/geometry answer; and
 ///   * the other `action_loop` collision reads (combat line-of-sight, swim probing, the physical
 ///     auto-cross that fires from the character's real position) drive PHYSICAL movement/crossing,

@@ -1159,6 +1159,31 @@ mod tests {
 
     // ── #886: a PARTIAL target must name the missing field, not be told "no target" ─────────────
 
+    /// The `got {…}` and `missing {…}` field lists out of a `partial target:` message, as ordered
+    /// token vectors.
+    ///
+    /// **#902 exists because substring checks cannot do this job.** `map_x` CONTAINS `x`, so
+    /// `text.contains('x')` is true for a message that names only map fields, and every assertion in
+    /// this section was of that shape — which means nothing here could distinguish "named the form
+    /// the caller used" from "named the union of both forms". Splitting the groups makes the
+    /// negative assertion (`missing` does NOT mention the other form) expressible at all.
+    ///
+    /// Panics rather than returning an `Option`: a message this cannot parse is a message whose
+    /// shape changed under the tests, and that must be loud.
+    fn partial_groups(text: &str) -> (Vec<&str>, Vec<&str>) {
+        let group = |after: &str| -> Vec<&str> {
+            let at = text.find(after)
+                .unwrap_or_else(|| panic!("no {after:?} in partial-target message {text:?}"));
+            let rest = &text[at + after.len()..];
+            let open = rest.find('{')
+                .unwrap_or_else(|| panic!("no {{…}} group after {after:?} in {text:?}"));
+            let close = rest[open..].find('}')
+                .unwrap_or_else(|| panic!("unterminated {{…}} group in {text:?}"));
+            rest[open + 1..open + close].split(", ").collect()
+        };
+        (group("got "), group("missing "))
+    }
+
     /// The exact repro from #886: `{"x":..,"y":..}` with no `z` and no current target set must
     /// name `z` as missing — NOT answer the "no target; provide a name or coords" message, which
     /// falsely describes the request as empty and sends the caller to resend the x/y it already
@@ -1177,8 +1202,11 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let text = body_text(resp).await;
-        assert!(text.contains("missing"), "message must name what's missing: {text}");
-        assert!(text.contains('z'), "message must name z specifically: {text}");
+        // #902: EXACT sets, both directions. The old substring asserts could not tell this message
+        // apart from one that also dragged in `map_x`/`map_y` — the caller sent the raw form, so the
+        // map form's gaps are not its problem and naming them sends the retry after the wrong field.
+        assert_eq!(partial_groups(&text), (vec!["x", "y"], vec!["z"]),
+            "the raw form's gap is `z` and nothing else: {text}");
         assert!(!text.contains("no target; provide a name or coords"),
             "must not fall back to the misleading empty-request message when coords WERE given: {text}");
         assert!(goto_target.lock().unwrap().is_none(), "a partial target must not queue a nav goal");
@@ -1197,7 +1225,11 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let text = body_text(resp).await;
-        assert!(text.contains("map_y"), "message must name map_y specifically: {text}");
+        // #902, the direction that matters most here: `map_x` alone must NOT be answered with the
+        // raw triple's gaps. Brewall map coordinates are inherently 2D, so telling this caller it is
+        // missing `z` would name a field the form it chose does not have.
+        assert_eq!(partial_groups(&text), (vec!["map_x"], vec!["map_y"]),
+            "the map form's only gap is `map_y`: {text}");
         assert!(!text.contains("no target; provide a name or coords"), "message: {text}");
         assert!(goto_target.lock().unwrap().is_none());
     }
@@ -1213,7 +1245,7 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let text = body_text(resp).await;
-        assert!(text.contains('x') && text.contains('y'), "message: {text}");
+        assert_eq!(partial_groups(&text), (vec!["z"], vec!["x", "y"]), "message: {text}");
     }
 
     /// A gap in the MIDDLE of the raw triple — `x` and `z` present, `y` missing — must still name
@@ -1232,10 +1264,8 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let text = body_text(resp).await;
-        assert!(text.contains("missing"), "message must name what's missing: {text}");
-        assert!(text.contains('y'), "message must name y specifically as missing: {text}");
-        assert!(text.contains("got") && text.contains('x') && text.contains('z'),
-            "message must acknowledge x and z were both received: {text}");
+        assert_eq!(partial_groups(&text), (vec!["x", "z"], vec!["y"]),
+            "x and z received, only y missing, and no map field in either group: {text}");
         assert!(!text.contains("no target; provide a name or coords"),
             "must not fall back to the misleading empty-request message when coords WERE given: {text}");
         assert!(goto_target.lock().unwrap().is_none());
@@ -1258,8 +1288,12 @@ mod tests {
         let text = body_text(resp).await;
         assert!(!text.contains("no target; provide a name or coords"),
             "must not lie that nothing was sent when map_x and y WERE given: {text}");
-        assert!(text.contains("map_x") && text.contains('y'),
-            "message must acknowledge both map_x and y were received: {text}");
+        // #902's DISCRIMINATOR. The union here is correct — the caller really did touch both forms —
+        // and it is what makes the single-form tests above mean something: without a case that DOES
+        // list both, "names only one form" could just as well be a message that can only ever name
+        // one. Raw is folded in first, matching `partial_coords_message`'s group order.
+        assert_eq!(partial_groups(&text), (vec!["y", "map_x"], vec!["x", "z", "map_y"]),
+            "a genuinely mixed request gets both forms' gaps: {text}");
         assert!(goto_target.lock().unwrap().is_none());
     }
 
@@ -1277,8 +1311,8 @@ mod tests {
         let text = body_text(resp).await;
         assert!(!text.contains("no target; provide a name or coords"),
             "must not lie that nothing was sent when x and map_y WERE given: {text}");
-        assert!(text.contains('x') && text.contains("map_y"),
-            "message must acknowledge both x and map_y were received: {text}");
+        assert_eq!(partial_groups(&text), (vec!["x", "map_y"], vec!["y", "z", "map_x"]),
+            "the mirror mix, same rule: {text}");
         assert!(goto_target.lock().unwrap().is_none());
     }
 

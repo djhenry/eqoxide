@@ -99,30 +99,33 @@ fn zone_assets_refusal(
 /// is indistinguishable from the true, common reading "this zone has no zone lines" — and since
 /// exits are the only way out of a zone, an agent reads it as *sealed in*, off a success response.
 ///
-/// Deliberately NOT folded into `NotUsable`/`zone_assets_not_ready`. **`usability()` has THREE
-/// direct non-test consumers, plus one that reaches it one call indirect.** By call site:
-///   * `observe.rs:38` / `:67` / `:1574` — every `/observe/*` endpoint, plus `/debug`'s zone block;
-///   * `move_api.rs:260` — `POST /v1/move/goto`, which turns the verdict into its
-///     `zone_assets_pending` note (**not** an `/observe/*` route, which is why it was missed);
-///   * `walker.rs:1400` — the nav path-walker's `drive_walk` gate; and, indirectly,
-///   * `action_loop.rs` — `ActionLoop::resolve_zone_cross`, which since #827 gates on
-///     [`eqoxide_nav::zone_assets::usable_collision`]; that function's first statement calls
-///     `usability` and returns its verdict as `Err`, so a new variant still reaches zone-crossing.
+/// Deliberately NOT folded into `NotUsable`/`zone_assets_not_ready`. **`usability()` is reached
+/// from SEVEN non-test call sites across four files**, named below by their enclosing FUNCTION.
 ///
-/// **On the count, because the history is easy to misread** (#821 review round 2, B2; #840): an
-/// early revision of this comment said three and omitted `move_api.rs`, which made this argument
-/// *understate* the blast radius, and it was corrected to four. The direct count is three again for
-/// an unrelated reason — #827 turned `action_loop.rs` from a direct caller into an indirect one —
-/// **not** because that omission returned; `move_api.rs` is the bullet that was once missing.
-/// Re-deriving this list by grep needs care in both directions: `usability(` still matches in
-/// `action_loop.rs`, but the only hit there is #827's test asserting its own premise, not a call
-/// site; and no grep for `usability(` alone will find the `resolve_zone_cross` consumer at all.
+/// Not by `file:line` (#958): this census used to carry five such citations and three of them had
+/// rotted through unrelated merges, so the comment pointed confidently at whatever code had since
+/// moved into those lines. A name survives an edit above it; a line number does not, and it fails
+/// silently, which is the worse property. `usability_consumers_are_exactly_the_ones_this_comment_names`
+/// re-derives the list from source on every run.
 ///
-/// So a new `NotUsable` variant would stop routing, stop `/v1/move/goto`, stop zone-crossing
-/// (through `usable_collision`, per the bullet above) AND stop rendering frames in any zone with a
-/// missing `.wtr` — far past what a region-map failure actually invalidates. The refusal belongs to the questions whose answer really does come out of
-/// that file. (Confirmed live in the PR's forced-failure run: with the `.wtr` broken and the zone
-/// otherwise `ready`, `/frame`, `/zone_entrances` and `/debug` all still answered `200`.)
+/// Calling it directly:
+///   * `zone_assets_json_of` and `zone_assets_not_ready` (this file) — every `/observe/*` endpoint;
+///   * `get_frame` (this file) — the `X-Zone-Assets-State` word on a PNG capture;
+///   * `post_goto` (`move_api.rs`) — turns the verdict into its `zone_assets_pending` note. **Not**
+///     an `/observe/*` route, which is why an early revision of this census omitted it entirely.
+///   * `drive_walk` (`walker.rs`) — the nav path-walker's gate.
+///
+/// Reaching it one call indirect, via [`eqoxide_nav::zone_assets::usable_collision`], whose first
+/// statement calls `usability` and returns the verdict as `Err`:
+///   * `get_zone_exits` (this file);
+///   * `ActionLoop::resolve_zone_cross` (`action_loop.rs`) — zone-crossing, since #827.
+///
+/// So a new `NotUsable` variant would stop routing, stop `/v1/move/goto`, stop path-walking, stop
+/// zone-crossing AND stop rendering frames in any zone with a missing `.wtr` — far past what a
+/// region-map failure actually invalidates. The refusal belongs to the questions whose answer really
+/// does come out of that file. (Confirmed live in the PR's forced-failure run: with the `.wtr`
+/// broken and the zone otherwise `ready`, `/frame`, `/zone_entrances` and `/debug` all still
+/// answered `200`.)
 ///
 /// `reason` is [`eqoxide_core::region_map::RegionDataAbsent::as_str`] — distinct per cause, so an
 /// agent (or an operator reading its log) can tell "the asset pack never delivered this file" from
@@ -598,7 +601,13 @@ async fn get_item_text(State(s): State<HttpState>) -> Json<serde_json::Value> {
 
 /// Query params for GET /v1/observe/packets. All optional; every value arrives as a string and is
 /// parsed leniently so an agent can hand-write the URL.
+///
+/// #971: `deny_unknown_fields`, so a misspelled key is a 4xx naming it rather than a 200 computed
+/// from the filters that happened to survive. Lenient VALUES and a strict KEY SET are the same
+/// policy, not opposite ones: an agent can guess how to spell `1`, it cannot guess that `sicne`
+/// silently did nothing.
 #[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct PacketsQuery {
     /// Only records with capture index `n >= since` (page-forward cursor).
     since: Option<u64>,
@@ -638,8 +647,17 @@ fn parse_op(v: &str) -> Option<u16> {
 /// the opcode histogram + reliable-sequence-gap analysis (the #463 diagnostic) instead of raw
 /// records. `?clear=1` resets the buffer. Controls apply BEFORE the read, so
 /// `?enable=1` on a first call just turns capture on (the buffer is still empty).
-async fn get_packets(State(s): State<HttpState>, Query(q): Query<PacketsQuery>) -> Json<serde_json::Value> {
+///
+/// #971: an unrecognized key is refused with a JSON 400, not dropped — see [`parse_packets_query`].
+async fn get_packets(State(s): State<HttpState>, RawQuery(raw): RawQuery) -> Response {
     use eqoxide_telemetry as pkt;
+    let q = match parse_packets_query(raw.as_deref().unwrap_or("")) {
+        Ok(q) => q,
+        Err((error, message)) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error, "message": message })),
+        ).into_response(),
+    };
     // #646: capture itself runs inside the same `eq-net` thread loop as `NetHealth::last_tick` —
     // see `SNAPSHOT_AGE_HEADER`'s doc. A dead thread stops capturing AND stops bumping this clock
     // in the same instant, so a large value here means "no new packets are coming", not merely
@@ -676,15 +694,29 @@ async fn get_packets(State(s): State<HttpState>, Query(q): Query<PacketsQuery>) 
             "enabled": pkt::enabled(),
             "summary": analysis,
             "snapshot_age_ms": snapshot_age_ms,
-        }))
+        })).into_response()
     } else {
         Json(serde_json::json!({
             "enabled": pkt::enabled(),
             "count": records.len(),
             "packets": records,
             "snapshot_age_ms": snapshot_age_ms,
-        }))
+        })).into_response()
     }
+}
+
+/// Parse `GET /packets`'s raw query string into a [`PacketsQuery`], by hand rather than through
+/// axum's `Query<PacketsQuery>` extractor (#971).
+///
+/// `PacketsQuery` now carries `deny_unknown_fields`, so `?sicne=1` is refused. Axum renders that
+/// rejection as `text/plain`, which on a route whose every other body is JSON hands an agent a
+/// second response grammar for one input class. This calls the same `serde_urlencoded::from_str`
+/// axum would and dresses the failure in this API's `{"error","message"}` shape. Serde's message
+/// already names the offending key and lists the recognized ones, so it is passed through rather
+/// than rewritten.
+fn parse_packets_query(raw: &str) -> Result<PacketsQuery, (&'static str, String)> {
+    serde_urlencoded::from_str::<PacketsQuery>(raw)
+        .map_err(|e| ("invalid_query_param", format!("could not parse query string: {e}")))
 }
 
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
@@ -707,32 +739,26 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // flatness + headroom, whichever way its art is wound — because some zones bake real, walkable
     // ground from INVERTED (down-facing) art (the qcat live wedge stood on exactly such a walkway,
     // which the old facing filter deleted). That is correct, but it means nav can no longer VERIFY a
-    // floor's facing there — it is standing on unverified-winding ground. `facing_blind_hits` counts
-    // encounters with down-facing standing ground, so the agent can SEE it.
+    // floor's facing there — it is standing on unverified-winding ground.
+    // `Collision::facing_blind_surfaces` counts it, so the agent can SEE it.
     //
     // (This REPLACES the old `nav_degraded`/`inverted_floor_art` signal, which counted the
-    // `column_bottom` recovery valve firing. D-2 deleted that valve — so if this were left reading the
-    // dead counter it would always be `null`, i.e. "every nav query answered from PROPERLY WOUND
-    // floors," which is a confident falsehood in exactly the inverted-art zones (permafrost/highpass/
-    // neriakc/qcat) where nav is now on winding-blind ground. A degraded/unverified mode must never be
-    // silent, so the signal moves with the mechanism.)
+    // `column_bottom` recovery valve firing. D-2 deleted that valve, so left reading the dead counter
+    // this would always be `null` — "all pathing on PROPERLY WOUND floors" — a confident falsehood in
+    // exactly the inverted-art zones (permafrost/highpass/neriakc/qcat) where nav is now on
+    // winding-blind ground. A degraded/unverified mode must never be silent, so the signal moves with
+    // the mechanism.)
     //
     // `null` = no down-facing standing ground has been admitted since zone load. Non-null = some has.
     //
-    // The `queries` KEY NAME IS WRONG and the number under it is not a query count: the counter
-    // advances once per DOWN-FACING TRIANGLE that `column_hits` admits as standing ground, per call,
-    // so a single query over a column carrying two such triangles publishes 2 (measured; see
-    // `Collision::body_placement`'s rustdoc in `eqoxide-nav`, which states the same semantics). That
-    // mismatch predates #885 and is filed as **#960** — fixing it means renaming a published JSON
-    // field or changing `column_hits`, neither of which belongs in #885. Read the value as "how much
-    // winding-blind ground nav has leaned on", not as a rate. Do NOT restore the "N queries" wording
-    // here without doing #960: this comment sits immediately above the serialization site, and #885
-    // review round 3 found it contradicting the corrected rustdoc.
+    // #960: the key is `surfaces` because the counter advances once per DOWN-FACING TRIANGLE admitted
+    // as standing ground, per call — an unscaled total, never a rate. It was published as `queries`
+    // until #960 renamed it; `nav_support_publishes_surfaces_never_queries` pins the wire.
     let nav_support = s.shared_collision.read().unwrap().as_ref().and_then(|col| {
-        let hits = col.facing_blind_hits();
-        (hits > 0).then(|| serde_json::json!({
+        let admitted = col.facing_blind_surfaces();
+        (admitted > 0).then(|| serde_json::json!({
             "reason": "facing_blind_ground",
-            "queries": hits,
+            "surfaces": admitted,
             "detail": "parts of this zone's collision mesh are wound INVERTED (down-facing where \
                        ground should face up). Since D-2 (#375) nav accepts such surfaces as floor on \
                        flatness + headroom (they ARE walkable — the qcat wedge proved it), but their \
@@ -1527,7 +1553,12 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
 
 /// GET /v1/observe/frame — returns the current rendered frame as a PNG.
 /// Query params for GET /v1/observe/frame.
+///
+/// #971: `deny_unknown_fields`. A dropped key here is worse than on most routes — `?prset=top_down`
+/// used to return a 200 PNG shot from the LIVE camera angle, a well-formed image of the wrong thing,
+/// which is the failure class this project ranks above a crash.
 #[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FrameQuery {
     /// Opt in to a frame captured while the zone's assets are still loading (#579). Without it, a
     /// mid-load capture is refused with 503 rather than handed over as if it were the zone — a
@@ -1558,9 +1589,9 @@ struct FrameQuery {
 
 /// The `FrameQuery` field names that must each appear at most once — used by
 /// [`parse_frame_query`]'s duplicate-key check (#701). This is exactly the recognized-field set;
-/// a duplicated *unrecognized* key (e.g. `?foo=1&foo=2`) is unaffected by this change and keeps
-/// its pre-#701 behavior of being silently ignored (`FrameQuery` has no `deny_unknown_fields`,
-/// unlike `MessagesQuery`/`EntitiesQuery`).
+/// an *unrecognized* key never reaches this loop's `Err` — since #971 `FrameQuery` carries
+/// `deny_unknown_fields`, so `?foo=1` (duplicated or not) is refused by the fall-through parse
+/// below with serde's own message naming `foo`.
 ///
 /// NOTE this is a mix of two different subsystems (#701 review, B1): `allow_pending` is the #579
 /// zone-assets-readiness bypass flag, not a camera parameter, unlike the other four. It's still
@@ -1619,8 +1650,9 @@ fn duplicate_field_error(key: &str) -> (&'static str, String) {
 /// [`FRAME_QUERY_FIELDS`] — and turns it into a JSON-shaped error via [`duplicate_field_error`]
 /// (which also picks the *correct* error code — see B1 there), then falls through to
 /// `serde_urlencoded::from_str` (byte-for-byte the same deserialization axum's `Query` would have
-/// done) for everything else, so every OTHER malformed-value case (unparseable numbers,
-/// out-of-range numbers, unknown presets, unrecognized keys) is completely unchanged.
+/// done) for everything else — unparseable numbers, out-of-range numbers, unknown presets, and
+/// since #971 unrecognized KEYS, which `deny_unknown_fields` turns into a deserialize error here
+/// and so into the same JSON 400 as the rest, naming the key.
 ///
 /// Scoped to `/frame` only: no other route's extractor is touched, so no other endpoint's 400/200
 /// boundary can move because of this change.
@@ -1637,10 +1669,9 @@ fn parse_frame_query(raw: &str) -> Result<FrameQuery, (&'static str, String)> {
             }
         }
     }
-    // Defensive fallback: with every duplicate among the recognized fields already caught above,
-    // and every `FrameQuery` field an `Option<String>` (so almost any input deserializes), this is
-    // not expected to trigger in practice. It isn't guaranteed to be camera-specific either (it
-    // isn't tied to any particular field), so — same honesty reasoning as B1 above — it gets the
+    // #971 made this a LOAD-BEARING arm, not the defensive fallback it was: `deny_unknown_fields`
+    // means an unrecognized key fails here, and that is now the route's only rejection of one.
+    // It isn't tied to any particular field, so — same honesty reasoning as B1 above — it gets the
     // field-agnostic `invalid_query_param` code rather than assuming `invalid_camera_override`.
     serde_urlencoded::from_str::<FrameQuery>(raw)
         .map_err(|e| ("invalid_query_param", format!("could not parse query string: {e}")))
@@ -4957,6 +4988,133 @@ mod tests {
         app.oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap()
     }
 
+    /// Every non-test call site of `usability(` or `usable_collision(` in `text`, given as the name
+    /// of the enclosing `fn`, in file order and without consecutive repeats.
+    ///
+    /// Three exclusions, each of which the reach control below drives over a corpus where the answer
+    /// is known:
+    ///  * `//`-prefixed lines. `zone_assets_refusal`'s census names `usability(` several times, and a
+    ///    scanner that counted the census as a call site would be reporting the claim as its own
+    ///    evidence.
+    ///  * everything at or below the file's first COLUMN-ZERO `#[cfg(test)]`. Tests call these
+    ///    functions constantly and none of them is a consumer whose behaviour a new `NotUsable`
+    ///    variant would change.
+    ///  * the definitions themselves — they live in `zone_assets.rs`, which is not in the corpus.
+    fn usability_consumers(text: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut current = "<file scope>".to_string();
+        for line in text.lines() {
+            if line.starts_with("#[cfg(test)]") { break; }
+            let t = line.trim_start();
+            if t.starts_with("//") { continue; }
+            if let Some(after) = t.split_once("fn ") {
+                let name: String =
+                    after.1.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                if !name.is_empty() { current = name; }
+            }
+            if (t.contains("usability(") || t.contains("usable_collision("))
+                && out.last() != Some(&current)
+            {
+                out.push(current.clone());
+            }
+        }
+        out
+    }
+
+    /// **#958: the `usability()` census in [`zone_assets_refusal`]'s doc is re-derived, not trusted.**
+    ///
+    /// That census is a blast-radius argument — it is the reason a `.wtr` failure gets its own 503
+    /// instead of being folded into `NotUsable` — so a consumer missing from it is a consumer nobody
+    /// weighed. It was written as `file:line`, and by #958 three of its five citations had drifted.
+    /// Re-deriving it caught a seventh consumer (`get_zone_exits`, in its own file) that the prose had
+    /// never named.
+    ///
+    /// **Reach, stated as a limit.** This keys on the two call TEXTS in four named files. It does not
+    /// follow calls: a third wrapper around `usability` would be invisible here exactly as
+    /// `usable_collision` was until someone read it. It cannot see a consumer in a file not listed.
+    /// What it does guarantee is that these four files never quietly gain or lose one.
+    #[test]
+    fn usability_consumers_are_exactly_the_ones_this_comment_names() {
+        // ── REACH CONTROL, executed. Each exclusion is driven over a corpus with a KNOWN answer. ──
+        let mut deep = "fn decoy() {}\n".to_string();
+        deep.push_str(&"    let _ = 1;\n".repeat(5_000));
+        deep.push_str("fn planted_far_down() {\n    usability(&st, &z);\n");
+        assert_eq!(usability_consumers(&deep), ["planted_far_down"],
+            "a call 5,000 lines in must be found — otherwise a clean report over the real files \
+             only means the scan stopped early");
+        assert_eq!(usability_consumers("fn f() {\n    /// usability(&a, &b)\n    // usable_collision(x)\n"),
+            Vec::<String>::new(), "prose naming the call is not a call site");
+        assert_eq!(usability_consumers("fn real() {\n usability(&a);\n}\n#[cfg(test)]\nmod t {\n fn t1() { usability(&a); }\n}"),
+            ["real"], "the test module must be cut off");
+        assert_eq!(usability_consumers("fn a() { usability(&x); usability(&y); }\nfn b() { usability(&z); }"),
+            ["a", "b"], "consecutive hits in one fn collapse; a later fn does not");
+
+        // ── The real corpus. ──────────────────────────────────────────────────────────────────────
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let corpus: [(&str, &[&str]); 4] = [
+            ("src/observe.rs",
+             &["zone_assets_json_of", "zone_assets_not_ready", "get_frame", "get_zone_exits"]),
+            ("src/move_api.rs",            &["post_goto"]),
+            ("../eqoxide-nav/src/walker.rs",     &["drive_walk"]),
+            ("../eqoxide-net/src/action_loop.rs", &["resolve_zone_cross"]),
+        ];
+        let mut found: Vec<(&str, Vec<String>)> = Vec::new();
+        for (rel, _) in corpus {
+            let text = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("corpus file {rel} is unreadable: {e}"));
+            found.push((rel, usability_consumers(&text)));
+        }
+        let expected: Vec<(&str, Vec<String>)> = corpus.iter()
+            .map(|(rel, fns)| (*rel, fns.iter().map(|s| s.to_string()).collect()))
+            .collect();
+        assert_eq!(found, expected,
+            "the `usability()` consumer census changed. `zone_assets_refusal`'s doc argues from this \
+             exact list — if a consumer appeared, weigh it there before adding it here; if one \
+             vanished, the argument got weaker and the prose must say so. Do NOT edit only this \
+             array: that is how the census went stale in the first place (#958).");
+    }
+
+    /// **#960: `/v1/observe/debug` publishes `nav_support.surfaces`, and not the per-request spelling
+    /// it used before.**
+    ///
+    /// The field carried a per-request name for a per-TRIANGLE count, so a consumer reading it as one
+    /// tick per nav request read an inflated number with no way to tell. The rename is the fix; this
+    /// is the wire half of it, driven through the real router rather than asserted about the source.
+    ///
+    /// The old key is spelled with `concat!` below for the same reason
+    /// `REFUTED_QUERY_COUNT_PHRASES` is: this file is inside that scanner's corpus, so writing the
+    /// refuted spelling out — even to forbid it — would make the scanner permanently RED.
+    ///
+    /// The counter is moved through the real admission path — `nav_support` is emitted only once it
+    /// has — so a fixture that failed to move it would take the `null` branch and vacuously satisfy
+    /// a "no `queries` key" assertion. That is why `surfaces` is asserted to be PRESENT and equal to
+    /// the accessor, not merely that `queries` is absent.
+    #[tokio::test]
+    async fn nav_support_publishes_surfaces_never_queries() {
+        let state = empty_state();
+        let ready = eqoxide_nav::zone_assets::ZoneAssetState::test_ready_with_water(None);
+        let col = ready.collision().cloned().expect("the ready fixture owns a grid");
+        // The fixture's ground is wound DOWN-facing, so one ordinary ground probe goes through the
+        // #375 facing-blind admission and counts. `Arc`, so this is the same atomic the handler reads.
+        col.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0)
+            .expect("the fixture floor must be standable, or nothing is admitted and nothing counted");
+        let admitted = col.facing_blind_surfaces();
+        assert!(admitted > 0,
+            "fixture did not reach the facing-blind admission path — the assertions below would then \
+             be reading the `null` branch and proving nothing");
+        *state.shared_collision.write().unwrap() = Some(col);
+
+        let v = debug_json(state).await;
+        let support = &v["nav_support"];
+        assert_eq!(support["surfaces"], serde_json::json!(admitted),
+            "the wire must carry the counter under `surfaces` (#960): {support}");
+        let pre_960_key = concat!("quer", "ies");
+        assert!(support[pre_960_key].is_null(),
+            "the pre-#960 spelling stated a quantity this client does not measure; a consumer keyed \
+             on it must get `undefined`, not a plausible wrong number: {support}");
+        assert_eq!(support["reason"], "facing_blind_ground", "{support}");
+    }
+
     /// eqoxide#363: a typo'd query param (`?kidn=npc` instead of `?kind=npc`) must be rejected with
     /// an explicit 400 naming the bad field, NOT silently ignored so `kind` falls back to `None`
     /// (no filter) and the caller gets the whole message log back looking like a normal 200.
@@ -5316,44 +5474,32 @@ mod tests {
         assert!(v["message"].as_str().unwrap().contains("preset"));
     }
 
-    /// Blast-radius control: a duplicated key that is NOT one of `FRAME_QUERY_FIELDS` is untouched
-    /// by #701 — it keeps behaving exactly like before (silently ignored, 200), since it was never
-    /// part of the failure this issue is about and `FrameQuery` has no `deny_unknown_fields`.
+    /// #971 flipped this one. `?foo=1&foo=2` used to be silently ignored with a 200 — #701 left it
+    /// alone deliberately, because the failure #701 was about was duplicated RECOGNIZED keys. Now
+    /// `FrameQuery` carries `deny_unknown_fields`, so it is refused before the duplicate check ever
+    /// looks at it.
+    ///
+    /// It still earns its place as the DUPLICATED-unknown case: `parse_frame_query` walks the query
+    /// itself before deserializing, and the walk must not mistake two `foo`s for a duplicate of a
+    /// field it recognizes. The `invalid_query_param` assertion is what pins that — a
+    /// `duplicate_field_error` verdict here would carry `invalid_camera_override` and name `foo` as
+    /// a camera parameter.
     #[tokio::test]
-    async fn frame_duplicate_unrecognized_key_is_still_silently_ignored() {
+    async fn frame_duplicate_unrecognized_key_is_refused_as_unknown_not_as_duplicate() {
         let state = empty_state();
         state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
         set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
         let frame_req = state.camera.frame_req.clone();
-        let mut handle = tokio::spawn({
-            let state = state.clone();
-            async move { get(state, "/frame?foo=1&foo=2").await }
-        });
-        // Hardened during #701 review round 2: a naive unbounded poll-loop here would hang forever
-        // (rather than fail) under any mutation that makes this input a 400 before ever
-        // registering a frame_req — that exact pattern jammed the shared remote builder for
-        // several minutes during this review round. Racing against `handle` bounds it.
-        let req = tokio::select! {
-            req = async {
-                loop {
-                    if let Some(req) = frame_req.lock().unwrap().take() { return req; }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            } => req,
-            res = &mut handle => {
-                let resp = res.expect("handler task panicked");
-                panic!(
-                    "expected an unrecognized duplicated key to be silently ignored and reach the \
-                     frame-request hand-off, but the handler returned early with status {} instead",
-                    resp.status()
-                );
-            }
-        };
-        assert_eq!(req.camera_override, None,
-            "an unrecognized duplicated key is not a camera-override field — no override, no 400");
-        req.tx.send(vec![0x89, b'P', b'N', b'G']).unwrap();
-        let resp = handle.await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = get(state, "/frame?foo=1&foo=2").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "invalid_query_param",
+            "an unknown key is not a camera field, duplicated or not: {v}");
+        assert!(v["message"].as_str().unwrap_or("").contains("foo"), "{v}");
+        assert!(!v["message"].as_str().unwrap_or("").contains("duplicate"),
+            "this must be refused as UNKNOWN, not as a duplicate of a recognized field: {v}");
+        assert!(frame_req.lock().unwrap().is_none(),
+            "no capture may be registered for a refused query");
     }
 
     /// Regression pin for the B1 rework of `parse_frame_query`: a bare `?` (empty query string,

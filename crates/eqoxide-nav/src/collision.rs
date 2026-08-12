@@ -57,10 +57,21 @@ pub struct Hit {
 /// |---|---|
 /// | everfrost 1,121,438, no region map — the figure that originally set this cap, and the reason it moved: it EXCEEDED the then-shipped `MAX_NODES = 1_000_000`, so `main` was at that point silently converting everfrost's honest `SearchClosed` closes into false `Exhausted` | MEASURED (pre-#849) |
 /// | butcher 352,493, no region map, full workload | MEASURED (#849 review, base) |
-/// | `highpass` 7,229 → 7,394 (+2.3%), full workload both sides, region map the only change | MEASURED (#849 review) |
+/// | `highpass` 7,229 → 7,393 (+2.3%), full workload both sides, region map the only change — **the two arms are measured at DIFFERENT code states**, see below | MEASURED (mapless #849 review; mapped re-measured #907) |
 /// | butcher **4,583,785** WITH region map, `dev`-confirmed, butcher-only, full workload, 10 h 24 m, exit 0 | MEASURED (#856) |
 /// | butcher 4,583,748 WITH region map, three-zone — profile NOT captured, wall time inconsistent with the other two runs; valid as a LOWER BOUND | MEASURED (#849 review) |
 /// | why those two differ by 37 nodes | **UNRESOLVED** — see below |
+///
+/// ## The `highpass` pair's two code states (#907)
+///
+/// The mapped arm read **7,394** when #849 measured it and reads **7,393** today. #855 changed
+/// `nearest_floor`'s ray-hit acceptance window, which feeds this corpus's start/goal sampling, so
+/// both figures were right at the code state they were taken against. 7,393 is re-measured here
+/// (`ZONES=highpass`, `worst_case_reachable_component`, reproduced twice); the mapless **7,229** is
+/// the original pre-#855 figure and was NOT re-run — `open_corpus_zone` always attaches the region
+/// map, so the mapless arm cannot be reproduced without editing the corpus. Read the pair as
+/// "same zone, region map the only *intended* difference, arms taken either side of #855". The
+/// ratio survives that: 7393/7229 = +2.27%, which is what the +2.3% above rounds from.
 ///
 /// The old "~7× headroom" claim is retired **on measurement, not inference**: it was taken on a
 /// `Collision` with no region data attached, and `build_zone_collision` (`src/app.rs`) is the
@@ -557,14 +568,15 @@ pub struct Collision {
     z_min:     f32,
     // `pub` for the same relocated corpus integration test (it scans from the mesh's top z downward).
     pub z_max:     f32,
-    /// How many times `is_standable` has admitted a **DOWN-facing** (inverted-art) surface as ground
-    /// since zone load — i.e. answered a nav query from winding-blind ground whose true facing the
-    /// mesh does not confirm (D-2, #375). It is not wrong (qcat proves inverted-art floor is walkable),
-    /// but it is *unverified*, so an agent must be able to SEE that it is pathing on such ground rather
-    /// than be quietly handed it. Surfaced as `nav_support` on `/v1/observe/debug`. This REPLACES the
-    /// old `column_bottom`-fallback counter (that valve was deleted in D-2); the honesty signal did not
+    /// How many **DOWN-facing** (inverted-art) TRIANGLES `column_hits` has admitted as standing
+    /// ground since zone load (D-2, #375). One ground probe adds as many as that column's art
+    /// carries, so this is an unscaled total, never a rate — the name says `surfaces` because that
+    /// is the unit (#960). Such ground is not wrong (qcat proves inverted-art floor is walkable) but
+    /// it is *unverified*, so an agent must be able to SEE it is pathing there rather than be quietly
+    /// handed it. Surfaced as `nav_support` on `/v1/observe/debug`. This REPLACES the old
+    /// `column_bottom`-fallback counter (that valve was deleted in D-2); the honesty signal did not
     /// go with it. Relaxed: a diagnostic counter, never read for control flow.
-    facing_blind_hits: std::sync::atomic::AtomicU64,
+    facing_blind_surfaces: std::sync::atomic::AtomicU64,
     /// How many routes only existed at the MINIMUM clearance (`PLAYER_RADIUS`) — i.e. threaded a
     /// narrow door or a tight bridge with no margin to spare. Surfaced as `nav_tight` so an agent is
     /// never silently handed a riskier path than it thinks (`search_tiered`).
@@ -1012,7 +1024,7 @@ impl Collision {
             return Collision { water_grid_lazy: std::sync::OnceLock::new(), tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
                 #[cfg(test)]
                 z_min: 0.0,
-                z_max: 0.0, facing_blind_hits: Default::default(), tight_plans: Default::default(),
+                z_max: 0.0, facing_blind_surfaces: Default::default(), tight_plans: Default::default(),
                 clearance: Default::default(), water_grid: None,
                 water: Err(eqoxide_core::region_map::RegionDataAbsent::NotAttached),
                 from_collision_mesh, zone_line_regions: Vec::new() };
@@ -1040,7 +1052,7 @@ impl Collision {
             #[cfg(test)]
             z_min,
             z_max,
-            facing_blind_hits: Default::default(), tight_plans: Default::default(),
+            facing_blind_surfaces: Default::default(), tight_plans: Default::default(),
             water: Err(eqoxide_core::region_map::RegionDataAbsent::NotAttached),
             from_collision_mesh, zone_line_regions: Vec::new(),
             clearance: Default::default(), water_grid: None }
@@ -1052,12 +1064,16 @@ impl Collision {
         self.tight_plans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Count of nav queries answered from a DOWN-facing (inverted-art) surface since zone load — the
-    /// `nav_support` honesty signal (D-2, #375). Zero = every standable surface answered so far faced
-    /// UP (properly wound); non-zero = this zone's ground is partly inverted art and pathing there is
-    /// on winding-blind (unverified-facing) ground.
-    pub fn facing_blind_hits(&self) -> u64 {
-        self.facing_blind_hits.load(std::sync::atomic::Ordering::Relaxed)
+    /// DOWN-facing (inverted-art) TRIANGLES admitted as standing ground since zone load — the
+    /// `nav_support` honesty signal (D-2, #375), published as `nav_support.surfaces`. Zero = every
+    /// standable surface so far faced UP (properly wound); non-zero = this zone's ground is partly
+    /// inverted art and pathing there is on winding-blind (unverified-facing) ground.
+    ///
+    /// **Per TRIANGLE, per call — not per probe** (#960/#973), so it is a total and not a rate; a
+    /// single call over a densely tessellated column adds several. Pinned with both literals by
+    /// `evaluating_both_disjuncts_moves_the_published_facing_blind_counter`.
+    pub fn facing_blind_surfaces(&self) -> u64 {
+        self.facing_blind_surfaces.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// **The one writer of this grid's region data**: attach the zone's `.wtr` map, or record WHY
@@ -1778,7 +1794,7 @@ impl Collision {
             // `/v1/observe/debug` can surface `nav_support` — a degraded/unverified mode must never be
             // silent. (Correct per qcat, but the agent must be able to SEE it is on such ground.)
             if nz < 0.0 {
-                self.facing_blind_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.facing_blind_surfaces.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             keep.push((z, nz));
         }
@@ -2461,23 +2477,22 @@ impl Collision {
     ///
     /// It is **not** a no-op beyond that boolean, and the first draft of this doc wrongly said no
     /// behaviour depended on the order (#885 review round 1, F10). Running the ground probe on
-    /// pierced-footprint frames reaches `ground_below` → `column_hits` → the `facing_blind_hits`
+    /// pierced-footprint frames reaches `ground_below` → `column_hits` → the `facing_blind_surfaces`
     /// counter published as `/v1/observe/debug`'s `nav_support`. Measured on inverted-art ground
-    /// with a pierced footprint: `facing_blind_hits` **0** (old `||`) → **2** (this function), and
+    /// with a pierced footprint: `facing_blind_surfaces` **0** (old `||`) → **2** (this function), and
     /// pinned by `evaluating_both_disjuncts_moves_the_published_facing_blind_counter`.
     ///
-    /// **What that 2 is, and is not** (#885 review round 2, R2-B1). The counter advances once per
-    /// DOWN-FACING TRIANGLE that `column_hits` admits as standing ground, per call — **not once per
-    /// query**, which measurement refutes. The 2 is a property of this fixture's column: the probed
-    /// column sits exactly on the shared diagonal of the inverted floor quad's two triangles, so
-    /// both are admitted. Measured on the same quad one unit north, off that diagonal, the same
-    /// single call publishes **1**; both numbers are asserted in that test. So what this function
-    /// changes is that the counter advances on pierced-footprint frames it previously skipped, by
-    /// however many down-facing triangles that column's art carries — published, not invisible.
+    /// **What that 2 is** (#885 review round 2, R2-B1). The counter advances once per DOWN-FACING
+    /// TRIANGLE `column_hits` admits as standing ground, per call. The 2 is a property of this
+    /// fixture's column: it sits exactly on the shared diagonal of the inverted floor quad's two
+    /// triangles, so both are admitted. One unit north, off that diagonal, the same single call
+    /// publishes **1**; both numbers are asserted in that test. So what this function changes is
+    /// that the counter advances on pierced-footprint frames it previously skipped, by however many
+    /// down-facing triangles that column's art carries — published, not invisible.
     ///
-    /// (The field is still published as `queries` — a rename is a breaking wire change, left to
-    /// **#960**. How many other sites carry that refuted wording is not checkable from inside a doc
-    /// comment and wants a guard, not a sentence: three drafts have tried and been falsified.)
+    /// (#960 renamed the counter and its wire field to say `surfaces`; the refuted wording is now
+    /// guarded by `no_tracked_text_calls_the_facing_blind_counter_a_query_count` rather than
+    /// re-enumerated by hand.)
     pub fn body_placement(&self, p: [f32; 3]) -> crate::diagnostics::Placement {
         use crate::diagnostics::Placement;
         let pierced = !self.footprint_clear(
@@ -6222,7 +6237,7 @@ mod tests {
     // `the_fallback_reports_itself_so_nav_degraded_is_never_silent` is removed with the `column_bottom`
     // valve it tested; the honesty signal is REPLACED IN THIS PR (folded from D-3, review Fix A):
     // `nav_degraded/inverted_floor_art` → `nav_support/facing_blind_ground`, now driven by
-    // `facing_blind_hits` (a down-facing surface admitted as ground), so there is no dead-signal window
+    // `facing_blind_surfaces` (a down-facing surface admitted as ground), so there is no dead-signal window
     // where the client falsely reports "properly wound" while on inverted-art ground.
     //
     // The two tests below that assert inverted GROUND is still found (`column_whose_only_surface_is_
@@ -8066,9 +8081,10 @@ mod tests {
         // round to 57.3% and 1.75x, so the cap's conclusion is unaffected either way.
         //
         // The other measured points, kept because they bound how zone-dependent this is: on
-        // `highpass`, full workload both sides with the attachment as the only difference, the close
-        // count went 7,229 -> 7,394 (+2.3%) — three orders of magnitude smaller a move than
-        // butcher's. And a ZERO move is not merely conceivable, it is OBSERVED: under this same
+        // `highpass` the close count went 7,229 -> 7,393 (+2.3%) — three orders of magnitude smaller
+        // a move than butcher's. The two arms straddle #855 and only the mapped one has been
+        // re-measured; `MAX_NODES`' own rustdoc carries that caveat once (#907) — do not restate it
+        // here. And a ZERO move is not merely conceivable, it is OBSERVED: under this same
         // attachment two of the four converted corpora (`q1_headroom_seal_measurement`,
         // `floor_model_disagreement_scan`) printed BYTE-IDENTICAL tables either way. The size of the
         // effect is a property of the zone, not of the attachment.
@@ -9265,7 +9281,7 @@ mod tests {
 
     /// **THE `nav_support` HONESTY SIGNAL (D-2, review Fix A).** Admitting a DOWN-facing (inverted-art)
     /// surface as ground is correct (qcat proves it walkable) but UNVERIFIED — so it must be visible,
-    /// not silent. `facing_blind_hits` counts it; `/v1/observe/debug` surfaces it as `nav_support`. This
+    /// not silent. `facing_blind_surfaces` counts it; `/v1/observe/debug` surfaces it as `nav_support`. This
     /// pins: a cleanly-wound (up-facing) floor NEVER trips it; an inverted (down-facing) floor DOES —
     /// so `nav_support` can never read `null` ("all properly wound") while nav is on inverted ground
     /// (the confident-falsehood the review caught when the old `column_bottom` counter went dead).
@@ -9275,7 +9291,7 @@ mod tests {
         let clean = Collision::build(&ZoneAssets {
             terrain: vec![floor_up(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
         assert!(clean.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0).is_some(), "the clean floor is standable");
-        assert_eq!(clean.facing_blind_hits(), 0,
+        assert_eq!(clean.facing_blind_surfaces(), 0,
             "a properly-wound floor must NOT trip nav_support — else it cries wolf everywhere");
 
         // Inverted zone: a lone DOWN-facing floor (open above → standable per qcat). Answering from it
@@ -9284,7 +9300,7 @@ mod tests {
             terrain: vec![ceiling_down(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
         assert!(inverted.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0).is_some(),
             "the inverted floor is standable (facing-blind, the #375 fix)");
-        assert!(inverted.facing_blind_hits() > 0,
+        assert!(inverted.facing_blind_surfaces() > 0,
             "admitting a down-facing surface as ground MUST be counted — nav_support cannot read null \
              while pathing on inverted-art ground (the net-new lie deleting column_bottom would create)");
     }
@@ -9911,7 +9927,7 @@ mod clearance_probe_is_not_lossy_885 {
 
     /// A DOWN-facing floor at height `z` — the same quad as [`floor`] with its winding reversed.
     /// Real zones bake walkable ground this way (D-2/#375), and `is_standable` admits it while
-    /// counting the admission into `facing_blind_hits`.
+    /// counting the admission into `facing_blind_surfaces`.
     fn inverted_floor(z: f32, half: f32) -> MeshData {
         quad([[half, z, -half], [half, z, half], [-half, z, half], [-half, z, -half]])
     }
@@ -9958,22 +9974,20 @@ mod clearance_probe_is_not_lossy_885 {
     /// The controller's old `is_embedded` was `pierced || no_floor`, so a pierced footprint skipped
     /// the ground probe entirely. `body_placement` names both disjuncts, so both are evaluated. The
     /// first draft of its rustdoc said no behaviour depended on the order. That is false: the ground
-    /// probe runs `column_hits`, which increments `facing_blind_hits` for every DOWN-facing surface
+    /// probe runs `column_hits`, which increments `facing_blind_surfaces` for every DOWN-facing surface
     /// it admits as ground — and that counter is published as `nav_support` on `/v1/observe/debug`.
     ///
     /// Measured here rather than quoted, on freshly-built copies of the same scene so the counters
     /// start at zero and the only difference is which calls were made. It is a change an agent can
     /// see, and this test exists so it stays disclosed.
     ///
-    /// **The size of the jump is per-TRIANGLE, not per-query** (#885 review round 2, R2-B1). Round
-    /// 2's rustdoc called this counter "a count of queries", which would make the 2 mean two
-    /// queries. It does not. `column_hits` increments once for every retained surface whose normal
-    /// points down, so ONE call publishes as many increments as that column's art has admitted
-    /// down-facing triangles. The 2 here is this fixture's column sitting exactly on the shared
-    /// diagonal of the inverted floor quad's two triangles; the third assertion below moves one
-    /// unit north on the SAME quad, off that diagonal, and the same single call publishes 1. Both
-    /// are literals, so a change that made the counter per-query would fail here. (The published
-    /// field is still *named* `nav_support.queries` — pre-existing, #960, deliberately untouched.)
+    /// **The size of the jump is per-TRIANGLE** (#885 review round 2, R2-B1; #960/#973).
+    /// `column_hits` increments once for every retained surface whose normal points down, so ONE
+    /// call publishes as many increments as that column's art has admitted down-facing triangles.
+    /// The 2 here is this fixture's column sitting exactly on the shared diagonal of the inverted
+    /// floor quad's two triangles; the third assertion below moves one unit north on the SAME quad,
+    /// off that diagonal, and the same single call publishes 1. Both are literals, so a change that
+    /// made the counter advance once per CALL would fail here.
     #[test]
     fn evaluating_both_disjuncts_moves_the_published_facing_blind_counter() {
         let radius = eqoxide_core::physics::PLAYER_RADIUS;
@@ -9983,28 +9997,159 @@ mod clearance_probe_is_not_lossy_885 {
         let old = inverted_ground_with_pierced_footprint();
         let pierced = !old.footprint_clear(at[0], at[1], at[2], radius, PLACEMENT_RING_DIRS);
         assert!(pierced, "the fixture must pierce the footprint, or there is nothing to short-circuit");
-        assert_eq!(old.facing_blind_hits(), 0,
+        assert_eq!(old.facing_blind_surfaces(), 0,
             "the short-circuited form never reached the ground probe, so nothing was counted");
 
         // `body_placement`: both disjuncts, so the ground probe runs on this frame.
         let new = inverted_ground_with_pierced_footprint();
         assert_eq!(new.body_placement(at), Placement::FootprintPierced,
             "same verdict as the old boolean — the BOOLEAN is unchanged; the counter is not");
-        assert_eq!(new.facing_blind_hits(), 2,
+        assert_eq!(new.facing_blind_surfaces(), 2,
             "the ground probe admitted the down-facing floor and counted it — this is the published \
              side effect the round-1 rustdoc wrongly denied");
 
-        // R2-B1: the 2 is TWO TRIANGLES, not two queries. `inverted_floor`'s quad triangulates
-        // across the diagonal `north == -east`, and `at` sits exactly on it, so both triangles are
-        // admitted for that column. One unit north — same quad, same fixture, same ONE call —
-        // only one triangle spans the column, and the counter moves by 1.
+        // R2-B1: the 2 is TWO TRIANGLES. `inverted_floor`'s quad triangulates across the diagonal
+        // `north == -east`, and `at` sits exactly on it, so both triangles are admitted for that
+        // column. One unit north — same quad, same fixture, same ONE call — only one triangle spans
+        // the column, and the counter moves by 1.
         let off_diagonal = inverted_ground_with_pierced_footprint();
         assert_eq!(off_diagonal.body_placement([0.0, 1.0, 0.0]), Placement::FootprintPierced,
             "the off-diagonal column must still be pierced, or it is not the same comparison");
-        assert_eq!(off_diagonal.facing_blind_hits(), 1,
-            "ONE ground query over ONE down-facing triangle moves the counter by ONE — so the 2 \
-             above is a count of admitted TRIANGLES, not of queries, and the jump this function \
-             causes is whatever that column's tessellation happens to carry");
+        assert_eq!(off_diagonal.facing_blind_surfaces(), 1,
+            "ONE probe over ONE down-facing triangle moves the counter by ONE — so the 2 above \
+             counts admitted TRIANGLES, and the jump this function causes is whatever that \
+             column's tessellation happens to carry");
+    }
+
+    // ── #960/#972/#973: the two diagnostic counters may not be described as each other ───────────
+
+    /// Phrasings that state the facing-blind counter is a per-request count. Every one of these has
+    /// been WRITTEN in this tree and refuted by measurement. Hand enumeration of the sites has been
+    /// attempted four times (#960's list, #948's rustdoc twice, #972's analysis) and missed at least
+    /// one every time, which is why this is a scan.
+    ///
+    /// Each is spelled with `concat!` so this array's own source text does not contain the phrase
+    /// it forbids — `src/collision.rs` is in the scanned corpus, and a scanner that flags its own
+    /// predicate can never report clean.
+    const REFUTED_QUERY_COUNT_PHRASES: [&str; 8] = [
+        concat!("count of ", "quer", "ies"),
+        concat!("count of nav ", "quer", "ies"),
+        concat!("counts each ", "quer", "y"),
+        concat!("each ", "quer", "y"),
+        concat!("quer", "ies", " answered"),
+        concat!("quer", "y", " count"),
+        concat!("nav_support.", "quer", "ies"),
+        concat!("\"", "quer", "ies", "\""),
+    ];
+
+    /// Every [`REFUTED_QUERY_COUNT_PHRASES`] hit in `text`, as `(1-based line, phrase)`. Pure, so
+    /// the reach control can drive it over a corpus whose violation is KNOWN.
+    fn refuted_query_count_hits(text: &str) -> Vec<(usize, &'static str)> {
+        let mut out = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            let l = line.to_ascii_lowercase();
+            for p in REFUTED_QUERY_COUNT_PHRASES {
+                if l.contains(p) { out.push((i + 1, p)); }
+            }
+        }
+        out
+    }
+
+    /// The `///` block immediately above `signature` in `src`. Panics if the signature is gone —
+    /// a renamed accessor must fail loudly, not silently stop being checked.
+    fn rustdoc_above<'a>(src: &'a str, signature: &str) -> String {
+        let at = src.find(signature)
+            .unwrap_or_else(|| panic!("signature {signature:?} is no longer in this file"));
+        // Back up to the START of the signature's own line, or the partial indent left in `src[..at]`
+        // is a non-`///` line and the block reads empty.
+        let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let mut doc: Vec<&'a str> = Vec::new();
+        for line in src[..line_start].lines().rev() {
+            let t = line.trim_start();
+            if t.starts_with("///") { doc.push(t); } else { break; }
+        }
+        doc.reverse();
+        doc.join("\n")
+    }
+
+    /// **#960/#973: no tracked text may call the facing-blind counter a per-request count.**
+    ///
+    /// The counter advances once per DOWN-FACING TRIANGLE admitted as standing ground, per call —
+    /// pinned two tests up. Saying otherwise is the agent-honesty defect this guard exists for, and
+    /// it survived three rounds of hand enumeration.
+    ///
+    /// **Reach, stated rather than implied.** It scans four whole files for eight literal phrasings.
+    /// It does NOT understand the concept: a fresh wording ("one increment per request") passes.
+    /// What it does guarantee is that the phrasings that have actually shipped cannot come back, and
+    /// that all four files were really read — the planted control below fails a scanner that stops
+    /// early, and the per-file subject check fails a file that moved or read short.
+    #[test]
+    fn no_tracked_text_calls_the_facing_blind_counter_a_query_count() {
+        // REACH CONTROL, executed: 5,000 clean lines with the only violation on the last one. A
+        // scanner that quit early reports nothing here AND nothing on the real corpus, and the two
+        // outcomes are indistinguishable without this.
+        let mut planted = "a clean line with no forbidden phrasing on it\n".repeat(5_000);
+        planted.push_str(REFUTED_QUERY_COUNT_PHRASES[0]);
+        assert_eq!(refuted_query_count_hits(&planted), vec![(5_001, REFUTED_QUERY_COUNT_PHRASES[0])],
+            "the scanner must find a violation planted past 5,000 lines — if it does not, a clean \
+             report over the real corpus means nothing");
+
+        const CORPUS: [&str; 4] = [
+            "src/collision.rs", "src/zone_assets.rs",
+            "../eqoxide-http/src/observe.rs", "../../docs/http-api.md",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut findings: Vec<String> = Vec::new();
+        for rel in CORPUS {
+            let text = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("corpus file {rel} is unreadable: {e}"));
+            // Second half of the reach control: every corpus file must still carry the SUBJECT, so
+            // a moved/renamed/truncated file fails instead of scanning clean.
+            let subject = text.matches("facing_blind").count() + text.matches("facing-blind").count();
+            assert!(subject > 0,
+                "corpus file {rel} no longer mentions the facing-blind counter at all — this guard \
+                 was scanning a file that does not carry its subject");
+            for (line, phrase) in refuted_query_count_hits(&text) {
+                findings.push(format!("  {rel}:{line}: {phrase:?}"));
+            }
+        }
+        assert!(findings.is_empty(),
+            "the facing-blind counter is per TRIANGLE, per call — never per request. These sites \
+             say otherwise (#960/#973):\n{}", findings.join("\n"));
+    }
+
+    /// **#972: the two adjacent counter accessors must not describe each other's signal.**
+    ///
+    /// `tight_plans`' rustdoc once described the inverted-art signal and named a `nav_degraded`
+    /// field that no longer exists; `facing_blind_surfaces` sits directly below it. Both docs are
+    /// read out of this file by signature — a stable anchor, not a line number.
+    #[test]
+    fn the_two_counter_accessors_do_not_describe_each_others_signal() {
+        let src = include_str!("collision.rs");
+
+        // Control for `rustdoc_above` itself: it must return the block, and only the block.
+        assert_eq!(rustdoc_above("/// a\n/// b\nlet x = 1;\n/// c\npub fn f()", "pub fn f()"),
+            "/// c", "rustdoc_above must take the CONTIGUOUS block above the signature");
+
+        let tight = rustdoc_above(src, "pub fn tight_plans(&self) -> u64");
+        assert!(tight.contains("nav_tight"),
+            "tight_plans' rustdoc must name where it surfaces: {tight}");
+        for wrong in ["nav_degraded", "inverted", "wound", "winding", "facing"] {
+            assert!(!tight.to_ascii_lowercase().contains(wrong),
+                "tight_plans counts the MINIMUM-clearance fallback, not the inverted-art signal, \
+                 but its rustdoc says {wrong:?}: {tight}");
+        }
+
+        let blind = rustdoc_above(src, "pub fn facing_blind_surfaces(&self) -> u64");
+        assert!(blind.contains("TRIANGLES"),
+            "facing_blind_surfaces' rustdoc must state its unit: {blind}");
+        assert!(refuted_query_count_hits(&blind).is_empty(),
+            "facing_blind_surfaces' own rustdoc calls it a per-request count: {blind}");
+        for wrong in ["nav_tight", "clearance"] {
+            assert!(!blind.contains(wrong),
+                "facing_blind_surfaces is not the clearance-fallback signal, but its rustdoc says \
+                 {wrong:?}: {blind}");
+        }
     }
 
     // ── defect 1: a saturated spoke and a cap-distance hit ───────────────────────────────────────
@@ -10295,6 +10440,8 @@ mod clearance_probe_is_not_lossy_885 {
             placement_names_which_disjunct_failed,
             the_json_encoding_keeps_the_distinctions,
             evaluating_both_disjuncts_moves_the_published_facing_blind_counter,
+            no_tracked_text_calls_the_facing_blind_counter_a_query_count,
+            the_two_counter_accessors_do_not_describe_each_others_signal,
         ];
     }
 

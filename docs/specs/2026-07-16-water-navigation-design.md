@@ -389,7 +389,7 @@ silent wedge, never a false `no_path`, never a confident route into water it can
   collision.rs:701-703]; keep it, but surface it — a plan refused at a waterline in a zone with
   no water map should say so (`nav_support`-style counter or a `nav_reason` qualifier), so an
   agent is TOLD it is navigating water-blind rather than being quietly handed dry-land answers.
-  (Same principle as `facing_blind_hits` [cited collision.rs:424-428].)
+  (Same principle as `Collision::facing_blind_surfaces`.)
 * **Provenance in the plan log.** The `find_path` anchor log already tags floating starts
   ("WATER SURFACE — floating") [cited collision.rs:2337-2341]; extend to floating goals.
 
