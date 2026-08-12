@@ -10168,59 +10168,97 @@ mod clearance_probe_is_not_lossy_885 {
     ///
     /// The measurement lives in `MAX_NODES`' rustdoc AND is restated in `water_grid.rs`'s
     /// attachment-cost argument. Nothing tied them together, so #907's re-measurement corrected one
-    /// file and left the other asserting the superseded `7,394` — the tree then carried both numbers
+    /// file and left the other asserting the superseded figure — the tree then carried two numbers
     /// for one measurement. A reader has no way to tell which file is stale.
     ///
-    /// Every arrowed occurrence of the baseline must therefore name the SAME re-measured figure.
-    /// Both literals are spelled through `concat!` so this guard is not itself a corpus hit — its
-    /// corpus contains its own source, and a scanner that matches its own text can never report
-    /// clean (#973).
+    /// Every statement of the pair must therefore name the SAME re-measured figure. Both literals
+    /// are spelled through `concat!` so this guard is not itself a corpus hit — its corpus contains
+    /// its own source, and a scanner that matches its own text can never report clean (#973).
     ///
-    /// **Reach, stated as a limit.** This keys on the arrow, so the bare mapless mention at
-    /// `MAX_NODES` is deliberately classified PROSE, not checked. Every site is classified and the
-    /// totals are asserted: a scan reporting only exceptions cannot distinguish "nothing wrong"
-    /// from "nothing looked at".
+    /// **Reach.** The tree writes this pair in more than one NOTATION, and round 2 of review caught
+    /// this guard reading only the first of them:
+    ///
+    ///  * **spelling** — with and without the thousands comma. Commas are stripped before matching,
+    ///    so both spellings are one token. Keying on the comma form alone left the ratio sentence
+    ///    in `MAX_NODES`' own rustdoc unchecked, four lines below a site that WAS checked. (No
+    ///    figure is written in this rustdoc: with commas stripped it would be a corpus hit, and the
+    ///    guard reported itself as one on the run that added this paragraph.)
+    ///  * **order** — the re-measured figure follows the baseline after an arrow (`A -> B`) in the
+    ///    tables and the `water_grid.rs` prose, but PRECEDES it in the ratio sentence (`B/A`). Both
+    ///    are checked, from the same expected value.
+    ///
+    /// Every occurrence of the baseline in the corpus is classified — arrowed, ratio, or prose —
+    /// and all three totals are asserted, because a scan reporting only exceptions cannot
+    /// distinguish "nothing wrong" from "nothing looked at". The one PROSE site is the bare mapless
+    /// mention, which names no pair to disagree with.
+    ///
+    /// Out of scope, deliberately: the sentence at `MAX_NODES` that gives the superseded and
+    /// re-measured figures side by side to explain the pair's two code states. It names both
+    /// numbers on purpose, so it is the one place the corpus rule cannot apply.
     #[test]
     fn both_files_state_the_same_re_measured_highpass_figure() {
-        let baseline = concat!("7,2", "29");
-        let re_measured = concat!("7,3", "93");
+        // Commas stripped, so one spelling of each figure covers both (review round 2).
+        let bare = |s: &str| s.replace(',', "");
+        let baseline = bare(concat!("7,2", "29"));
+        let re_measured = bare(concat!("7,3", "93"));
         let corpus = [("collision.rs", include_str!("collision.rs")),
                       ("water_grid.rs", include_str!("water_grid.rs"))];
 
-        let (mut paired, mut prose) = (Vec::new(), Vec::new());
-        for (name, src) in corpus {
-            // Line breaks fall between the baseline and its pair (rustdoc wraps), so normalise.
-            let flat: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
-            for (i, _) in flat.match_indices(baseline) {
-                let after = &flat[i + baseline.len()..];
-                let window = &after[..after.len().min(24)];
-                match window.find("->").or_else(|| window.find('\u{2192}')) {
-                    None => prose.push(name),
-                    Some(at) => {
-                        let figure: String = after[at..]
-                            .chars()
-                            .skip_while(|c| !c.is_ascii_digit())
-                            .take_while(|c| c.is_ascii_digit() || *c == ',')
-                            .collect();
-                        paired.push((name, figure));
+        let (mut arrowed, mut ratio, mut prose) = (Vec::new(), Vec::new(), Vec::new());
+        for (file, src) in corpus {
+            let lines: Vec<String> = src.lines().map(bare).collect();
+            for (i, line) in lines.iter().enumerate() {
+                let next = lines.get(i + 1).map(String::as_str).unwrap_or("");
+                for (col, _) in line.match_indices(&baseline) {
+                    let site = format!("{file}:{}", i + 1);
+                    let before = &line[..col];
+                    // The pair can wrap a rustdoc line break, so read into the next line too.
+                    let after: String = format!("{} {next}", &line[col + baseline.len()..])
+                        .chars().take(40).collect();
+                    if let Some(a) = after.find("->").or_else(|| after.find('\u{2192}')) {
+                        arrowed.push((site, digit_run(after[a..].chars())));
+                    } else if before.ends_with('/') {
+                        let behind: String = digit_run(before[..before.len() - 1].chars().rev())
+                            .chars().rev().collect();
+                        ratio.push((site, behind));
+                    } else {
+                        prose.push(site);
                     }
                 }
             }
         }
 
-        for (name, figure) in &paired {
-            assert_eq!(figure, re_measured,
-                "{name} states the `highpass` pair as {baseline} -> {figure}, but #907 re-measured \
-                 the mapped arm at {re_measured}. Two tracked files disagreeing about one \
-                 measurement is the #907 defect itself — fix the file, do not relax this guard.");
+        for (site, figure) in arrowed.iter().chain(&ratio) {
+            assert_eq!(figure, &re_measured,
+                "{site} states the `highpass` pair as {baseline}/{figure}, but #907 re-measured the \
+                 mapped arm at {re_measured}. Two tracked statements disagreeing about one \
+                 measurement is the #907 defect itself — fix the site, do not relax this guard.");
         }
-        assert_eq!(paired.len(), 3,
+        assert_eq!(arrowed.len(), 3,
             "expected 3 arrowed statements of the pair (2 in collision.rs, 1 in water_grid.rs), \
-             found {}: {paired:?}. If a site was added or deleted, weigh it — a scan that silently \
-             stopped reaching them would otherwise pass by finding nothing.", paired.len());
+             found {}: {arrowed:?}. If a site was added or deleted, weigh it — a scan that silently \
+             stopped reaching them would otherwise pass by finding nothing.", arrowed.len());
+        assert_eq!(ratio.len(), 1,
+            "expected 1 ratio statement (`MAX_NODES`' rustdoc), found {}: {ratio:?}", ratio.len());
         assert_eq!(prose.len(), 1,
-            "expected exactly 1 unarrowed mention (the mapless arm at `MAX_NODES`), found {}: \
+            "expected exactly 1 bare mention (the mapless arm at `MAX_NODES`), found {}: \
              {prose:?}", prose.len());
+    }
+
+    /// The first run of ASCII digits in `it`, as a string. Fed reversed for a look-BEHIND, so the
+    /// caller reverses the result back.
+    fn digit_run(it: impl Iterator<Item = char>) -> String {
+        let mut seen_digit = false;
+        let mut out: Vec<char> = Vec::new();
+        for c in it {
+            if c.is_ascii_digit() {
+                seen_digit = true;
+                out.push(c);
+            } else if seen_digit {
+                break;
+            }
+        }
+        out.into_iter().collect()
     }
 
     // ── defect 1: a saturated spoke and a cap-distance hit ───────────────────────────────────────
