@@ -1107,7 +1107,10 @@ pub const SIZE_MOB_HEALTH: usize = 3;   // MobHealth_S (SpawnHPUpdate_Struct2)
 pub const SIZE_DEATH: usize = 32;       // Death_S
 pub const SIZE_ZONE_POINT_ENTRY: usize = 32; // RoF2 ZonePoint_Entry (was 24 — misaligned)
 pub const SIZE_SPAWN_APPEARANCE: usize = 8; // SpawnAppearance_S
-pub const SIZE_CONSIDER: usize = 32;     // Consider_S
+// NOTE: there is deliberately no `SIZE_CONSIDER` here. It existed, said 32 — neither RoF2's 20 nor
+// Titanium's 28 — and had zero call sites, so nothing ever contradicted it; docs/protocol-notes.md
+// then cited it as ground truth for the request size. The only size for OP_Consider is the one
+// `combat::build_consider_packet` allocates, pinned by `build_consider_packet_layout`.
 pub const SIZE_EXP_UPDATE: usize = 8;   // ExpUpdate_S (exp + aaxp)
 pub const SIZE_LEVEL_UPDATE: usize = 12; // LevelUpdate_S
 pub const SIZE_MONEY_ON_CORPSE: usize = 20; // MoneyOnCorpse_S
