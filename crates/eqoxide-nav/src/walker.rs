@@ -2706,6 +2706,29 @@ mod tests {
     /// Add a name here whenever a doc comment — in this module OR in another that cites `walker` by
     /// name, as `collision::ground_continuous` and `steering::resync_cursor` both do — starts
     /// citing a test that lives here.
+    ///
+    /// **A gated citee goes in the gated array, and its protection is scoped to that cfg (#990).**
+    /// An `fn()` reference only resolves in a configuration where the citee is actually compiled, so
+    /// naming a `#[cfg(…)]`-gated test from an ungated array does not merely weaken the guard — it
+    /// breaks the build in every configuration where the gate is off. That is not hypothetical: this
+    /// array named `a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725`
+    /// (which is `#[cfg(debug_assertions)]`, because it `#[should_panic]`s on a `debug_assert!`)
+    /// unconditionally, and the workspace sets no `[profile.release] debug-assertions`, so
+    /// `cargo check --release -p eqoxide-nav --lib --tests` failed to resolve the name and took the
+    /// crate's WHOLE lib-test target down with it — silently, since CI only builds the debug profile.
+    ///
+    /// So the list is split by configuration rather than gated as a whole: gating this `fn` with
+    /// `#[cfg(debug_assertions)]` would have compiled equally well and dropped every OTHER name's
+    /// rename-protection under `--release` too, trading a loud error for a silent hole. Ungating the
+    /// citee is not available either — under `--release` its `debug_assert!` compiles out and a
+    /// `#[should_panic]` test that does not panic FAILS. What is left is protection scoped exactly to
+    /// where the citee exists, which is all a compile-time check can offer: names below are pinned in
+    /// every profile; names in the `debug_assertions` array are pinned only in that profile, and a
+    /// rename of one under `--release` alone would not be caught here.
+    ///
+    /// Both arrays stay visible to `steering`'s mechanical citation scan, which requires a cited
+    /// same-file `#[test]` to appear in a guard: that scan reads the SOURCE TEXT for declarations
+    /// beginning `let _cited`, so it sees a gated entry regardless of the profile it runs under.
     #[test]
     fn every_walker_test_name_cited_in_a_doc_comment_still_exists() {
         let _cited: &[fn()] = &[
@@ -2732,12 +2755,6 @@ mod tests {
             // including when the cited test is the guard. A rename is now a compile error, which is
             // the whole point: the instruction must not be able to point at a fn that moved.
             every_walker_test_name_cited_in_a_doc_comment_still_exists,
-            // #851 review round 1, N1: cited by
-            // `the_driving_nav_state_word_is_only_ever_written_through_the_verdict_851`'s rustdoc,
-            // which points at it as the prior reading that already recorded the same
-            // `debug_assert!`-is-test-time-only fact for the other assertions on this row. Caught by
-            // `steering`'s scan on the run that added the citation, not by me.
-            a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725,
             // #851 review round 2, B1: named by the production comment beside `drive_walk`'s
             // `debug_assert!`, which records that the assert's reach STOPS at the fixed-goal path
             // and points here for the chase side. That citation is in a `//` comment, which the
@@ -2753,6 +2770,21 @@ mod tests {
             // its `/follow` limitation paragraph. That citation is in a tracked doc, not a doc
             // comment, so no scan in this crate would catch a rename; this line does.
             a_wedged_follow_chase_is_not_reported_as_stalled_at_all_851,
+        ];
+
+        // Citees that are themselves `#[cfg(debug_assertions)]`. This array carries the SAME cfg as
+        // the tests it names, so the two appear and disappear together and the reference can never
+        // outlive its referent (#990). Anything added here is pinned against renaming in a debug
+        // build only — see this fn's rustdoc for why that is the honest ceiling.
+        #[cfg(debug_assertions)]
+        let _cited_when_debug_assertions_are_on: &[fn()] = &[
+            // #851 review round 1, N1: cited by
+            // `the_driving_nav_state_word_is_only_ever_written_through_the_verdict_851`'s rustdoc,
+            // which points at it as the prior reading that already recorded the same
+            // `debug_assert!`-is-test-time-only fact for the other assertions on this row. Caught by
+            // `steering`'s scan on the run that added the citation, not by me. Gated because the
+            // citee is: it `#[should_panic]`s on a `debug_assert!`.
+            a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725,
         ];
     }
 
