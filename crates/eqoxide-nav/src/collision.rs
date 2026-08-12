@@ -69,8 +69,9 @@ pub struct Hit {
 /// corpus's start/goal sampling, so both figures were right at the code state they were taken
 /// against. 7,393 is re-measured here
 /// (`ZONES=highpass`, `worst_case_reachable_component`, reproduced twice, **`dev` profile: at
-/// `0c37ca0` the `--release` form of that command did not compile — #990, fix in flight as
-/// #994**); the mapless **7,229** is the original pre-#855 figure and was NOT re-run, because
+/// `0c37ca0` the `--release` form of that command did not compile — #990; #994 is the fix and
+/// was open at that sha**); the mapless **7,229** is the original pre-#855 figure and was NOT
+/// re-run, because
 /// `open_corpus_zone` always attaches the region map, so the mapless arm cannot be reproduced
 /// without editing the corpus. Read the pair as "same zone, region map the only *intended*
 /// difference, arms taken either side of #855". The ratio survives that: 7393/7229 = +2.27%, which
