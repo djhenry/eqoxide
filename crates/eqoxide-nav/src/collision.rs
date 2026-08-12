@@ -67,12 +67,13 @@ pub struct Hit {
 /// The mapped arm read **7,394** when #849 measured it and reads **7,393** today. #855 changed
 /// `nearest_floor`'s ray-hit acceptance window, which feeds this corpus's start/goal sampling, so
 /// both figures were right at the code state they were taken against. 7,393 is re-measured here
-/// (`ZONES=highpass`, `worst_case_reachable_component`, reproduced twice, **`dev` profile — the
-/// `--release` form of that command does not build today, see #990**); the mapless **7,229** is
-/// the original pre-#855 figure and was NOT re-run — `open_corpus_zone` always attaches the region
-/// map, so the mapless arm cannot be reproduced without editing the corpus. Read the pair as
-/// "same zone, region map the only *intended* difference, arms taken either side of #855". The
-/// ratio survives that: 7393/7229 = +2.27%, which is what the +2.3% above rounds from.
+/// (`ZONES=highpass`, `worst_case_reachable_component`, reproduced twice, **`dev` profile: at
+/// `0c37ca0` the `--release` form of that command did not compile — #990, fix in flight as
+/// #994**); the mapless **7,229** is the original pre-#855 figure and was NOT re-run, because
+/// `open_corpus_zone` always attaches the region map, so the mapless arm cannot be reproduced
+/// without editing the corpus. Read the pair as "same zone, region map the only *intended*
+/// difference, arms taken either side of #855". The ratio survives that: 7393/7229 = +2.27%, which
+/// is what the +2.3% above rounds from.
 ///
 /// `water_grid.rs` restates this pair for its own argument, and #907 found the two files
 /// disagreeing after only one was corrected. `both_files_state_the_same_re_measured_highpass_figure`
@@ -4674,7 +4675,7 @@ mod tests {
     /// z=73.97; native Katie at (-138.5,-17.5) reporting z=77.0). Decides fork (a) controller
     /// floor-selection bug vs (b) collision-model error.
     /// Run: ZONE_GLB=~/.local/share/eqoxide/assets/models/gfaydark.glb \
-    ///      cargo test --lib diagnose_522_kelethin_plank_columns -- --ignored --nocapture
+    ///      cargo test -p eqoxide-nav --lib diagnose_522_kelethin_plank_columns -- --ignored --nocapture
     #[test]
     #[ignore = "requires the cached gfaydark glb at $ZONE_GLB"]
     fn diagnose_522_kelethin_plank_columns() {
@@ -8021,15 +8022,25 @@ mod tests {
     /// Run with a HIGH cap so nothing truncates.
     ///
     /// ```text
-    /// cargo test --release --lib worst_case_reachable_component -- --ignored --nocapture
+    /// cargo test -p eqoxide-nav --release --lib worst_case_reachable_component -- --ignored --nocapture
     /// ```
     ///
-    /// **#990: that `--release` form does not build today.** `walker.rs`'s ungated `_cited` array
-    /// names a `#[cfg(debug_assertions)]` test, so the whole `eqoxide-nav` lib-test target fails to
-    /// compile under `--release` before any measurement runs. Drop `--release` until #990
-    /// lands — the #907 re-measurement above was taken on the `dev` profile for this reason, which
-    /// is why its wall times are what they are. (Not a claim about every row of the table: one
-    /// `butcher` run's profile was never captured, and that row says so.)
+    /// **#990: at `0c37ca0` that `--release` form did not compile.** `walker.rs`'s `_cited` array
+    /// is ungated and names a `#[cfg(debug_assertions)]` test, so under `--release` that name does
+    /// not exist and the whole `eqoxide-nav` lib-test target failed to build there, before any
+    /// measurement ran. #994 is the fix and was open at that sha. Whether you must drop `--release`
+    /// therefore depends on whether #994 is in the tree you are reading — which this sentence
+    /// cannot tell you, so check `walker.rs` for the gate rather than trusting this line. The #907
+    /// re-measurement above was taken on the `dev` profile for that reason, which is why its wall
+    /// times are what they are. (Not a claim about every row of the table: one `butcher` run's
+    /// profile was never captured, and that row says so.)
+    ///
+    /// **`-p eqoxide-nav` is load-bearing, not decoration** (#994 review). Without it, run from the
+    /// workspace root, `--lib` resolves to the ROOT package's lib target — which holds none of this
+    /// file's tests — and the run prints `running 0 tests`, `241 filtered out` and exits 0. That is
+    /// a vacuous green an exit code cannot distinguish from a measurement. Measured from the repo
+    /// root before the flag was added. `every_documented_repro_command_in_this_file_names_its_package`
+    /// holds every `--lib` recipe in this file to it.
     #[test]
     #[ignore = "requires baked zone glbs; measurement for the #394 node cap"]
     fn worst_case_reachable_component() {
@@ -8409,7 +8420,7 @@ mod tests {
     ///
     /// ```text
     /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
-    ///   cargo test --lib fine_tier_corpus -- --ignored --nocapture
+    ///   cargo test -p eqoxide-nav --lib fine_tier_corpus -- --ignored --nocapture
     /// ```
     /// SLICE-1 MEASUREMENT HARNESS (3D-water-volume nav design §5.4 / §11): for the gate zones, report
     /// the water-span grid's wet-column count, total span count, ESTIMATED MEMORY (bytes, design §5.4
@@ -8422,7 +8433,7 @@ mod tests {
     ///
     /// ```text
     /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
-    ///   cargo test --lib water_grid_budget_measurement -- --ignored --nocapture
+    ///   cargo test -p eqoxide-nav --lib water_grid_budget_measurement -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "requires baked zone glbs + .wtr at $ZONE_DIR"]
@@ -8894,7 +8905,7 @@ mod tests {
     /// **CI note:** the coordinator asked to "un-ignore" this so it runs live. It is asset-gated (needs
     /// the qcat glb, absent on the CI runner — #357), and `from_glb().unwrap()` would panic there, so
     /// it stays `#[ignore]`d like every other baked-asset test. It is verified GREEN locally at D-2
-    /// (`ZONE_DIR=… cargo test --release --lib qcat_support_floor_is_visible -- --ignored`). Literal
+    /// (`ZONE_DIR=… cargo test -p eqoxide-nav --release --lib qcat_support_floor_is_visible -- --ignored`). Literal
     /// un-ignoring is not possible without bundling the asset into CI; flagged in the PR.
     #[test]
     #[ignore = "requires the cached qcat glb at $ZONE_DIR (#357); GREEN at D-2 — proves the support-axis FIX (#375)"]
@@ -9366,7 +9377,7 @@ mod tests {
     ///
     /// ```text
     /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
-    ///   cargo test --release --lib q1_headroom_seal_measurement -- --ignored --nocapture
+    ///   cargo test -p eqoxide-nav --release --lib q1_headroom_seal_measurement -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "requires baked zone glbs at $ZONE_DIR; the Q1 seal measurement (#375)"]
@@ -9465,7 +9476,7 @@ mod tests {
     ///
     /// ```text
     /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
-    ///   cargo test --release --lib floor_model_disagreement_scan -- --ignored --nocapture
+    ///   cargo test -p eqoxide-nav --release --lib floor_model_disagreement_scan -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "requires baked zone glbs at $ZONE_DIR; the D-2 floor-model-disagreement breadth signal (#375)"]
@@ -9556,7 +9567,7 @@ mod tests {
 
     /// Deterministic offline reproduction of the qeynos2 path-following stalls reported on #2,
     /// using the REAL baked collision mesh. Point `ZONE_GLB` at the cached qeynos2 glb, e.g.
-    /// `ZONE_GLB=~/.local/share/eqoxide/assets/models/qeynos2.glb cargo test --lib diagnose_qeynos2_stall -- --ignored --nocapture`
+    /// `ZONE_GLB=~/.local/share/eqoxide/assets/models/qeynos2.glb cargo test -p eqoxide-nav --lib diagnose_qeynos2_stall -- --ignored --nocapture`
     #[test]
     #[ignore = "requires the cached qeynos2 glb at $ZONE_GLB"]
     fn diagnose_qeynos2_stall() {
@@ -10187,14 +10198,33 @@ mod clearance_probe_is_not_lossy_885 {
     ///    tables and the `water_grid.rs` prose, but PRECEDES it in the ratio sentence (`B/A`). Both
     ///    are checked, from the same expected value.
     ///
-    /// Every occurrence of the baseline in the corpus is classified — arrowed, ratio, or prose —
-    /// and all three totals are asserted, because a scan reporting only exceptions cannot
-    /// distinguish "nothing wrong" from "nothing looked at". The one PROSE site is the bare mapless
-    /// mention, which names no pair to disagree with.
+    /// **What the scan matches — stated as a token, not as coverage.** It reads the two files
+    /// named in `corpus` and looks for the BASELINE figure spelled in ASCII digits with optional
+    /// `,` separators (commas are stripped from each line first, so the comma and comma-less
+    /// spellings are one token). Every occurrence it FINDS is classified arrowed, ratio or prose;
+    /// arrowed and ratio sites carry the other half of the pair and are value-checked, while the
+    /// prose site is the bare mapless mention, which names no pair to disagree with. The `3/1/1`
+    /// totals are asserted because a scan reporting only exceptions cannot distinguish "nothing
+    /// wrong" from "nothing looked at" — but they pin THAT SPELLING ONLY. A count over found
+    /// occurrences has no term for one that never matched, so no total here is evidence about
+    /// anything below.
     ///
-    /// Out of scope, deliberately: the sentence at `MAX_NODES` that gives the superseded and
-    /// re-measured figures side by side to explain the pair's two code states. It names both
-    /// numbers on purpose, so it is the one place the corpus rule cannot apply.
+    /// UNMATCHED — each measured GREEN with a deliberately-wrong pair planted in the rustdoc above:
+    ///
+    ///  * the baseline separated by `_`, by a plain space, by a thin space (`U+2009`), or by `.`.
+    ///    The underscore form is not hypothetical in this file: the table's first row writes the
+    ///    then-shipped cap as `MAX_NODES = 1_000_000`, so that notation is already in use in the
+    ///    very rustdoc this guard reads.
+    ///  * any sentence naming ONLY the re-measured figure. The scan is anchored on the baseline, so
+    ///    such a sentence is not an occurrence at all — including both of them in `MAX_NODES`' "two
+    ///    code states" paragraph, one of which exists precisely to give the superseded and
+    ///    re-measured figures side by side.
+    ///  * the pair restated in any file outside `corpus`. Corpus completeness is not asserted, and
+    ///    cannot be from inside a guard whose corpus is a literal list.
+    ///
+    /// Widening a third time was considered in review round 3 and declined: a widening closes the
+    /// notation that was just planted and says nothing about the next one. Naming the token is
+    /// checkable by a reader against any sentence; claiming the corpus is covered is not.
     #[test]
     fn both_files_state_the_same_re_measured_highpass_figure() {
         // Commas stripped, so one spelling of each figure covers both (review round 2).
@@ -10258,6 +10288,61 @@ mod clearance_probe_is_not_lossy_885 {
             }
         }
         out.into_iter().collect()
+    }
+
+    /// **#994 review: a documented repro command that selects NOTHING is worse than a broken one.**
+    ///
+    /// This file's `--ignored` measurements are documented as `cargo test … --lib <name>`. Run from
+    /// the workspace root — the repo's default cwd — `--lib` without `-p` selects the ROOT package's
+    /// lib target, which contains none of these tests, so the run prints `running 0 tests`,
+    /// `241 filtered out` and **exits 0**. Green, no rows, no error: indistinguishable from a pass
+    /// by the exit code, and it is the exit code an agent reads. Measured, then fixed by adding
+    /// `-p eqoxide-nav`.
+    ///
+    /// **What this matches — a token, not coverage.** A line is a RECIPE if it contains the
+    /// `cargo`-`test` invocation AND ` --lib ` with its trailing space, followed immediately by a
+    /// `[a-z0-9_]` test-name character. Both halves do work in this file, and neutering the second
+    /// half measured which does which: the two bare prose mentions fail the SPLIT (nothing follows
+    /// `--lib` but a backtick), while the `--workspace --lib --no-fail-fast` line and this
+    /// rustdoc's own `--lib <name>` sketch pass the split and are rejected by the first-character
+    /// test. A prose line that put a lowercase word straight after ` --lib ` WOULD be a false
+    /// positive; none does today. Every recipe so classified must carry `-p eqoxide-nav`, and the
+    /// total is asserted, because a scan reporting only exceptions cannot tell "nothing wrong"
+    /// from "nothing looked at".
+    ///
+    /// NOT matched, and none of these is claimed: a recipe wrapped across two lines; one written
+    /// `--package` instead of `-p`; `--test`/`--bin`/`--bins` targets; and any file other than this
+    /// one — the corpus is this source alone. A recipe in `walker.rs` or `movement.rs` has the same
+    /// defect and this guard is silent about it.
+    #[test]
+    fn every_documented_repro_command_in_this_file_names_its_package() {
+        // Split so this guard is not itself a corpus hit — its corpus is its own source.
+        let invocation = concat!("cargo ", "test ");
+        let src = include_str!("collision.rs");
+        let (mut recipes, mut missing) = (0usize, Vec::new());
+        for (i, line) in src.lines().enumerate() {
+            if !line.contains(invocation) {
+                continue;
+            }
+            let Some(rest) = line.split(" --lib ").nth(1) else { continue };
+            // A recipe names a test after `--lib`; the prose mentions and the `--workspace` line
+            // do not, which is the whole discriminator.
+            if !rest.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+                continue;
+            }
+            recipes += 1;
+            if !line.contains("-p eqoxide-nav") {
+                missing.push(format!("collision.rs:{}", i + 1));
+            }
+        }
+        assert!(missing.is_empty(),
+            "these documented repro commands omit `-p eqoxide-nav`, so from the workspace root they \
+             select the ROOT package's lib target, print `running 0 tests` and exit 0 — a vacuous \
+             green, not a measurement: {missing:?}");
+        assert_eq!(recipes, 9,
+            "expected 9 documented `--lib` repro commands in this file, found {recipes}. If one was \
+             added or deleted, weigh it — a scan that stopped reaching them would otherwise pass by \
+             finding nothing.");
     }
 
     // ── defect 1: a saturated spoke and a cap-distance hit ───────────────────────────────────────
@@ -10552,6 +10637,8 @@ mod clearance_probe_is_not_lossy_885 {
             the_two_counter_accessors_do_not_describe_each_others_signal,
             // cited by `MAX_NODES`' "two code states" section (#907 review round 1)
             both_files_state_the_same_re_measured_highpass_figure,
+            // #994 review: cited by `worst_case_reachable_component`'s rustdoc
+            every_documented_repro_command_in_this_file_names_its_package,
         ];
     }
 
