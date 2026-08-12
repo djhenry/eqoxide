@@ -994,6 +994,260 @@ use eqoxide_ipc::MoveIntent;
                 caught the abandoned zone — which is exactly the #805 defect");
     }
 
+    // ── #897: quoting a subprocess's captured output so a log audit cannot read it as this
+    //    binary's own ────────────────────────────────────────────────────────────────────────────
+    //
+    // The pinned test below re-runs one test as a SUBPROCESS and, on its RED path only,
+    // interpolates the child's captured stdout/stderr into an assert! message. libtest's own
+    // per-process bookkeeping lines — the "running N tests" header and the "test result:" trailer —
+    // are in that capture verbatim, so a failing assertion injected a MATCHED header/trailer pair
+    // straight into the PARENT binary's log. Matched is the dangerous half: this project's
+    // lost-binary check counts headers against trailers, so a matched pair balances, nothing is
+    // flagged, and the audit reads fabricated per-binary numbers while looking clean.
+    //
+    // Fixed at the point of QUOTING, not at the point of auditing. #897's second option — teach the
+    // audit tooling to exclude nested lines — is weaker by its own description: it has to be got
+    // right again in every future script, and nothing here can enforce that. Two independent
+    // measures are applied, because the audit's exact pattern is not this file's to control:
+    //
+    //   1. every quoted line is PREFIXED, so no child line ever begins a line of the parent's
+    //      output — that defeats a line-anchored scan; and
+    //   2. the two bookkeeping phrases are REDACTED in place — that defeats an unanchored one.
+    //
+    // Prefixing alone would leave an unanchored `grep -c` counting the child's pair; redaction alone
+    // would leave a child line at column 0. Neither is sufficient on its own, so both are applied.
+    // Redaction rewrites only those two phrases and keeps their numbers and the rest of the line:
+    // the capture is evidence a reader of a real failure needs, so nothing is dropped or truncated.
+    //
+    // EDITING NOTE: no text this file puts INTO a failure message may spell out either phrase, or
+    // the quoting would reintroduce exactly what it exists to prevent. That is why the banner in
+    // `quote_child_output` describes them in prose and why the redaction markers are worded as they
+    // are. The regression test at the bottom of this block measures the result either way.
+
+    /// What a redacted per-process header phrase is replaced BY. Deliberately contains neither
+    /// bookkeeping phrase. See the #897 banner above.
+    const HEADER_REDACTION: &str = "<libtest-header-redacted-#897>";
+    /// What a redacted per-process result-trailer phrase is replaced BY. See the #897 banner above.
+    const TRAILER_REDACTION: &str = "<libtest-trailer-redacted-#897>";
+    /// Prefixed onto every quoted child line, so none of them starts a line of the parent's output.
+    const CHILD_LINE_PREFIX: &str = "    child| ";
+
+    /// Rewrites libtest's two per-process bookkeeping phrases out of one captured child line.
+    ///
+    /// The header phrase is rewritten only where libtest could actually have written it — the word,
+    /// a decimal count, then `test` — so ordinary child prose using the same word survives intact.
+    /// Only the word itself is replaced, so the count and the remainder of the line stay readable.
+    fn redact_libtest_bookkeeping(line: &str) -> String {
+        const RUN: &str = "running ";
+        let mut out = line.replace("test result:", TRAILER_REDACTION);
+        let mut from = 0usize;
+        while let Some(rel) = out[from..].find(RUN) {
+            let at = from + rel;
+            let rest = &out[at + RUN.len()..];
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            // `test` SINGULAR for a one-test run — matching only the plural would miss the exact
+            // shape this fix exists to neutralise.
+            if digits > 0 && rest[digits..].starts_with(" test") {
+                out.replace_range(at..at + RUN.len() - 1, HEADER_REDACTION);
+                from = at + HEADER_REDACTION.len();
+            } else {
+                from = at + RUN.len();
+            }
+        }
+        out
+    }
+
+    /// Renders captured child-process output for interpolation into an assert! failure message:
+    /// every line prefixed, every bookkeeping phrase redacted. See the #897 banner above.
+    fn quote_child_output(label: &str, text: &str) -> String {
+        let mut out = format!(
+            "{label} (quoted below from the inner test binary — every line is prefixed, and \
+             libtest's own per-process header and result-trailer lines are redacted, so a log \
+             audit that counts them cannot read the child's bookkeeping as this binary's own; \
+             #897)\n");
+        let mut any = false;
+        for line in text.lines() {
+            any = true;
+            out.push_str(CHILD_LINE_PREFIX);
+            out.push_str(&redact_libtest_bookkeeping(line.trim_end_matches('\r')));
+            out.push('\n');
+        }
+        if !any {
+            out.push_str(CHILD_LINE_PREFIX);
+            out.push_str("<the child wrote nothing to this stream>\n");
+        }
+        out
+    }
+
+    /// Re-runs the #805 fixture as a subprocess with `--nocapture` and returns its raw output.
+    /// Shared by the #831 pin below and by the #897 regression test, so the regression measures the
+    /// same genuine libtest output the pin would have leaked.
+    fn run_inner_fixture_capturing_output() -> std::process::Output {
+        let exe = std::env::current_exe().expect("test binary path (for the subprocess re-run)");
+        std::process::Command::new(&exe)
+            .arg("zone_accounting_fires_before_the_corpus_loop_ends")
+            .arg("--exact")
+            .arg("--nocapture")
+            .output()
+            .expect("failed to spawn the inner test as a subprocess")
+    }
+
+    /// The three content checks the #831 pin makes on the child's captured stdout. Factored out of
+    /// `aborted_report_content_is_pinned_by_execution` so the #897 regression test can drive the
+    /// REAL failing branch and read the REAL message it formats, rather than assert about source
+    /// text — which would prove the quoting is WRITTEN, not that it RUNS (#799).
+    fn assert_aborted_report_is_in(stdout: &str) {
+        assert!(stdout.contains("[ABORTED while opening zone_c_never_terminates]"),
+            "the [ABORTED …] tag naming the zone the run died on is missing from the captured \
+             stdout — the report was deleted, unreached, or renamed.\n{}",
+            quote_child_output("captured stdout", stdout));
+        assert!(stdout.contains("PARTIAL"),
+            "the PARTIAL tag is missing from the captured stdout.\n{}",
+            quote_child_output("captured stdout", stdout));
+        assert!(stdout.contains("this is not a corpus score"),
+            "the \"this is not a corpus score\" disclaimer is missing from the captured stdout.\n{}",
+            quote_child_output("captured stdout", stdout));
+    }
+
+    /// Where a lost-binary scan is allowed to match. A real audit may be written either way — an
+    /// anchored `^running` grep or a bare unanchored one — and the #897 quoting has to defeat both,
+    /// so the regression test measures both.
+    #[derive(Clone, Copy)]
+    enum Anchor { LineStart, Anywhere }
+
+    /// Counts libtest's per-process header phrase the way a lost-binary audit does: the word, a
+    /// decimal count, then `test`. SINGULAR is included on purpose — a plural-only scan silently
+    /// under-counts a one-test binary, which is the exact shape #897 is about.
+    fn count_libtest_headers(text: &str, anchor: Anchor) -> usize {
+        const RUN: &str = "running ";
+        let mut n = 0;
+        for line in text.lines() {
+            let mut from = 0usize;
+            while let Some(rel) = line[from..].find(RUN) {
+                let at = from + rel;
+                let rest = &line[at + RUN.len()..];
+                let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                let hit = digits > 0 && rest[digits..].starts_with(" test");
+                if hit && (matches!(anchor, Anchor::Anywhere) || at == 0) {
+                    n += 1;
+                }
+                from = at + RUN.len();
+            }
+        }
+        n
+    }
+
+    /// Counts libtest's per-process result-trailer phrase, the other half of the pair a
+    /// lost-binary check balances.
+    fn count_libtest_trailers(text: &str, anchor: Anchor) -> usize {
+        let mut n = 0;
+        for line in text.lines() {
+            match anchor {
+                Anchor::LineStart => if line.starts_with("test result:") { n += 1 },
+                Anchor::Anywhere => n += line.matches("test result:").count(),
+            }
+        }
+        n
+    }
+
+    /// **#897 — the RED path's failure message cannot forge libtest bookkeeping into the parent
+    /// log.** The pinned test below leaked a MATCHED header/trailer pair into its own binary's
+    /// captured output whenever its assertion failed; matched, so the count-based lost-binary check
+    /// balanced and flagged nothing while the audit read fabricated numbers.
+    ///
+    /// This test measures the fix on the path that has it, using the substrate that had the defect:
+    /// it runs the same subprocess the pin runs, so the text is GENUINE libtest output, renames the
+    /// tag the first content check looks for, and drives the real check into a real panic. What it
+    /// scans is the message that assertion actually formatted.
+    ///
+    /// Four things are asserted, in this order:
+    ///
+    /// 1. **reach control (#778).** The scan must find both phrases in the RAW child output,
+    ///    anchored AND unanchored. Without it, "zero after quoting" cannot be told apart from a
+    ///    scan that matches nothing anywhere — a positive-only check is not evidence.
+    /// 2. **the fix.** The same scan over the real failure message finds ZERO of each, both ways.
+    /// 3. **redaction is what did it**, not an absence of bookkeeping in the child.
+    /// 4. **not vacuous.** The message still carries the child's own words, so a "sanitiser" that
+    ///    simply threw the capture away — which would also score zero — does not pass here.
+    ///
+    /// Mutation-checked in both directions; see the PR for #897.
+    #[test]
+    fn a_red_path_failure_message_cannot_forge_libtest_bookkeeping() {
+        let out = run_inner_fixture_capturing_output();
+        let raw = String::from_utf8_lossy(&out.stdout).into_owned();
+
+        // 1. REACH CONTROL. Every one of these must be non-zero on the raw capture, or the zeroes
+        //    asserted further down measure the scan rather than the quoting.
+        for (what, n) in [
+            ("header, at line start", count_libtest_headers(&raw, Anchor::LineStart)),
+            ("header, anywhere in a line", count_libtest_headers(&raw, Anchor::Anywhere)),
+            ("trailer, at line start", count_libtest_trailers(&raw, Anchor::LineStart)),
+            ("trailer, anywhere in a line", count_libtest_trailers(&raw, Anchor::Anywhere)),
+        ] {
+            assert!(n >= 1,
+                "reach control: the RAW captured child output must contain libtest's own \
+                 bookkeeping ({what}), and the scan found {n}. Either the child emitted none — so \
+                 nothing below is testing the quoting — or this scan matches nothing at all.");
+        }
+
+        // 2. Force the real failing branch: rename the tag the first content check greps for, and
+        //    leave everything else — including the child's bookkeeping — exactly as libtest wrote
+        //    it. The panic payload is the message that assert! itself formatted.
+        let poisoned = raw.replace(
+            "[ABORTED while opening zone_c_never_terminates]",
+            "[ABORTED while opening a_zone_this_fixture_never_opens]");
+        // NOT `assert_ne!`. Round-2 review measured that one reintroducing #897 inside the very
+        // test that exists to catch it: `assert_ne!` Debug-formats BOTH operands into its message,
+        // so when the fixture's tag moves this dumps the raw capture into the parent log TWICE —
+        // and twice is a MATCHED pair, so a header-vs-trailer balance check stays quiet while the
+        // numbers are wrong. Measured by renaming the tag to `[HALTED …]`: unanchored counts went
+        // 3/3 against true binary counts of 1/1 (anchored stayed 1/1 and saw nothing). Routing
+        // `raw` through the quoting instead restores 1/1 unanchored with both tests still RED.
+        assert!(poisoned != raw,
+            "the fixture's report tag has moved, so this test can no longer force the failing \
+             branch it exists to observe.\n{}",
+            quote_child_output("captured stdout", &raw));
+        let payload = std::panic::catch_unwind(|| assert_aborted_report_is_in(&poisoned))
+            .expect_err("the first content check must FAIL once its tag is renamed — otherwise no \
+                         failure message is produced and every count below is vacuously zero");
+        let message = payload.downcast_ref::<String>().cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .expect("the assert! panic payload should be the formatted message");
+
+        // The anchored count is a strict subset of the unanchored one; both are asserted so the
+        // pass/fail shape mirrors the control above exactly.
+        assert_eq!(count_libtest_headers(&message, Anchor::Anywhere), 0,
+            "a real failure message still carries a countable per-process header — a log audit \
+             would read the child's binary as one of this run's");
+        assert_eq!(count_libtest_trailers(&message, Anchor::Anywhere), 0,
+            "a real failure message still carries a countable per-process result trailer");
+        assert_eq!(count_libtest_headers(&message, Anchor::LineStart), 0,
+            "a child header still starts a line of this binary's output");
+        assert_eq!(count_libtest_trailers(&message, Anchor::LineStart), 0,
+            "a child result trailer still starts a line of this binary's output");
+
+        // 3. …and it is redaction that produced those zeroes.
+        //
+        // `message` is interpolated here through the quoting too, as defence in depth. Round-2
+        // review could not reproduce a leak from this line and that is right: all four counts above
+        // must already read 0 to reach it, and `Anchor::Anywhere` counts every occurrence in the
+        // whole string, so a zero there means the phrase is absent outright. But that safety is a
+        // property of the ORDER these assertions sit in, and nothing enforces the order — move this
+        // line above the counts and the leak is back, silently. #897's whole lesson is that a red
+        // path should not depend on an invariant a future editor has to re-derive, so the invariant
+        // is made local instead of argued.
+        assert!(message.contains(HEADER_REDACTION) && message.contains(TRAILER_REDACTION),
+            "neither bookkeeping phrase was redacted, so the zeroes above say nothing about the \
+             quoting.\n{}",
+            quote_child_output("the failure message under test", &message));
+
+        // 4. …while the child's own evidence is still there to read.
+        assert!(message.contains(CHILD_LINE_PREFIX), "the capture was not quoted at all");
+        assert!(message.contains("PARTIAL") && message.contains("this is not a corpus score"),
+            "quoting dropped the child's own output; a reader of a real failure needs it, and a \
+             sanitiser that discards everything would score zero above for the wrong reason");
+    }
+
     /// **#831 — the `[ABORTED …]` report's CONTENT is pinned by an execution-observable, not source
     /// text.** `open_zone_checked` prints a `[ABORTED while opening {zone}]` block before it panics
     /// (see its doc's N4 paragraph) — that block, not the panic message, is the honesty affordance:
@@ -1021,31 +1275,25 @@ use eqoxide_ipc::MoveIntent;
     /// 3. Restore the call → GREEN.
     #[test]
     fn aborted_report_content_is_pinned_by_execution() {
-        let exe = std::env::current_exe().expect("test binary path (for the subprocess re-run)");
-        let out = std::process::Command::new(&exe)
-            .arg("zone_accounting_fires_before_the_corpus_loop_ends")
-            .arg("--exact")
-            .arg("--nocapture")
-            .output()
-            .expect("failed to spawn the inner test as a subprocess");
+        let out = run_inner_fixture_capturing_output();
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         // The inner test is `#[should_panic(...)]`; libtest reports it "ok" and the process exits 0
         // when the expected panic occurred. A non-zero exit here means the FIXTURE broke — a
         // different failure from the one this test exists to catch — so fail loudly with both
         // streams rather than let a fixture regression masquerade as a report regression.
+        //
+        // #897: both streams go through `quote_child_output`, never straight into the message. Raw
+        // interpolation put libtest's own header/trailer pair into THIS binary's log on every red
+        // run, where a count-based lost-binary audit read it as this run's own — and balanced.
         assert!(out.status.success(),
             "fixture broke: zone_accounting_fires_before_the_corpus_loop_ends did not pass as a \
              subprocess (status {:?}) — this test cannot judge the report until that fixture is \
-             healthy again.\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
-        assert!(stdout.contains("[ABORTED while opening zone_c_never_terminates]"),
-            "the [ABORTED …] tag naming the zone the run died on is missing from the captured \
-             stdout — the report was deleted, unreached, or renamed.\ncaptured stdout:\n{stdout}");
-        assert!(stdout.contains("PARTIAL"),
-            "the PARTIAL tag is missing from the captured stdout.\ncaptured stdout:\n{stdout}");
-        assert!(stdout.contains("this is not a corpus score"),
-            "the \"this is not a corpus score\" disclaimer is missing from the captured stdout.\n\
-             captured stdout:\n{stdout}");
+             healthy again.\n{}{}",
+            out.status,
+            quote_child_output("captured stdout", &stdout),
+            quote_child_output("captured stderr", &stderr));
+        assert_aborted_report_is_in(&stdout);
     }
 
     /// **#805 — GREEN direction, and the pin on `skipped` being exempt.** Every zone here is CLOSED,
@@ -1399,6 +1647,10 @@ use eqoxide_ipc::MoveIntent;
             faithful_walker_drift_corpus,
             // cited by `aborted_report_content_is_pinned_by_execution`'s rustdoc (#831)
             zone_accounting_fires_before_the_corpus_loop_ends,
+            // cited by `assert_aborted_report_is_in`'s rustdoc (#897), which is where that test's
+            // content checks now live — listed as a value so the rename is a compile error rather
+            // than an identifier that happens to appear in the comment two lines above.
+            aborted_report_content_is_pinned_by_execution,
             // #919: named by plain `//` comments elsewhere in this file, which the nav crate's scan
             // cannot see (it reads `///` and `//!` only), so it is pinned by hand here.
             walker_source_anchors_cited_in_this_file_still_resolve,
