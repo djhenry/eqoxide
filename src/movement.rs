@@ -1340,7 +1340,10 @@ impl CharacterController {
     /// ring candidate up to `PUSHOUT_RADII` away. On `ce1d89f` (pre-#870) that teleport fired on
     /// alternate frames and dragged a grounded walker sideways along the wall it was merely leaning
     /// on: +99.7 u at a north half-extent of 100, +342.9 u at a half-extent of 1000, in the same
-    /// 15 s (900-frame, dt 1/60) drive.
+    /// 15 s (900-frame, dt 1/60) drive. (The "1000" READS #870's "2000 u one" as a full span — the
+    /// original fixture was produced off-tree during #870's review and exists at no sha, so this is
+    /// an interpretation, not a recovered measurement. It is immaterial: the figure is
+    /// drive-bounded, so half-extents 1000, 2000 and 4000 are bit-identical here — see below.)
     ///
     /// **The drag is bounded by whichever is SMALLER, the wall's north half-extent or the drive —
     /// and only the +99.7 figure is extent-bounded.** RE-DERIVED here (#987 review round 2) by
@@ -6213,6 +6216,13 @@ mod tests {
             (0.500, 0.7084, 0.7086), (0.342, 0.8005, 0.8005),
             (0.174, 0.8985, 2.2375), (0.087, 0.9493, 11.2202),
         ];
+        // Reach control for the CORPUS, the same treatment the #933 grid gets ~3,500 lines above
+        // ("the corpus is an item too"). `reproduce_at_100` below pins the NUMERATOR; without this
+        // the DENOMINATOR is free, and three pieces of tracked prose say eight. MEASURED (#987
+        // round 3): deleting the most divergent row, `(0.087, 0.9493, 11.2202)`, left this test
+        // GREEN at seven columns with four still reproducing — so the doc's "four of eight" could
+        // silently become "four of seven" behind a passing suite. It cannot now.
+        assert_eq!(cases.len(), 8, "the doc's denominator is eight columns");
         let mut reproduce_at_100 = 0_usize;
         for &(ndot, want, want_at_100) in &cases {
             let got = residual_clearance(ndot, 500.0);
