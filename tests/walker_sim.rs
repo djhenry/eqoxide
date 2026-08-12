@@ -307,7 +307,7 @@ use eqoxide_ipc::MoveIntent;
     ///
     /// ```text
     /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
-    ///   cargo test --release --lib faithful_walker_drift_corpus -- --ignored --nocapture
+    ///   cargo test --release --test walker_sim faithful_walker_drift_corpus -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "requires baked zone glbs at $ZONE_DIR; the faithful per-tick-recovery drift baseline"]
