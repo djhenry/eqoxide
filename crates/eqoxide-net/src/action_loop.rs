@@ -1155,6 +1155,15 @@ impl ActionLoop {
     /// `run_gameplay_phase`'s drain, and served by GET /v1/merchant/list.
     pub fn merchant_shared(&self) -> &eqoxide_ipc::MerchantShared { &self.merchant_slots.merchant }
 
+    /// The published task-offer list, for the zone-entry handshake to CLEAR (#1004 review — the
+    /// ninth #941 field, misclassified NOT ZONE-SCOPED in the original PR). Same shape and same
+    /// reason as [`Self::dialogue_shared`]: each offer names the OFFERING NPC's spawn id (`npc_id`,
+    /// per `TaskOffer`'s own doc), it is published only by [`Self::sync_tasks`] from
+    /// `run_gameplay_phase`'s drain — not the handshake's own drain — and it is served by
+    /// GET /v1/quests/offers *and acted on* by POST /v1/quests/accept, which resolves
+    /// `task_master_id` from this list and sends OP_AcceptNewTask to it.
+    pub fn task_offers_shared(&self) -> &eqoxide_ipc::TaskOffersShared { &self.quest.task_offers_shared }
+
     /// Sync zone exit points from `gs` into the shared zone_points map.
     /// On zone change, also loads map-label exits from disk as fallback zone points.
     pub fn sync_zone_points(&mut self, gs: &GameState) {

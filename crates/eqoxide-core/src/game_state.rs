@@ -1652,14 +1652,15 @@ impl GameState {
         // NPC's disappearance has already closed. See `zone_scoped_state_941` on the class guard
         // test for the question each was audited against.
         //
-        // ⚠️ Two of these have a PUBLISHED copy this function cannot reach, the same way
+        // ⚠️ Three of these have a PUBLISHED copy this function cannot reach, the same way
         // `world.doors` does (#891/#934 review B1): `dialogue_choices` is mirrored into
-        // `InteractSlots::dialogue` and `merchant_open`/`merchant_items` into
-        // `MerchantSlots::merchant`, both only by `ActionLoop::sync_messages`/`sync_merchant`,
-        // whose sole caller is `run_gameplay_phase`'s packet drain — NOT the zone-entry
-        // handshake's own drain. `gameplay::run_zone_entry_handshake` clears those two slots
-        // alongside this call; clearing only here leaves GET /v1/observe/dialogue and
-        // GET /v1/merchant/list serving the departed zone's answers for the whole zone load.
+        // `InteractSlots::dialogue`, `merchant_open`/`merchant_items` into
+        // `MerchantSlots::merchant`, and `task_offers` into `QuestSlots::task_offers_shared` —
+        // all three only by `ActionLoop::sync_messages`/`sync_merchant`/`sync_tasks`, whose sole
+        // caller is `run_gameplay_phase`'s packet drain — NOT the zone-entry handshake's own
+        // drain. `gameplay::run_zone_entry_handshake` clears those three slots alongside this
+        // call; clearing only here leaves GET /v1/observe/dialogue, GET /v1/merchant/list and
+        // GET /v1/quests/offers serving the departed zone's answers for the whole zone load.
 
         // The clickable saylink choices of the NPC we were talking to. Directly served by
         // GET /v1/observe/dialogue and directly ACTIONABLE via POST /v1/interact/dialogue, which
@@ -1668,6 +1669,16 @@ impl GameState {
         // writers are "a new NPC line carried saylinks" (`apply_*` in `packet_handler`) and the
         // hail clear (#274), so without this it survives until one of those happens to fire.
         self.dialogue_choices.clear();
+        // An open task-select window: each offer names the OFFERING NPC's spawn id (`npc_id`,
+        // "required by `OP_AcceptNewTask`'s `task_master_id` field" per `TaskOffer`'s own doc) —
+        // a per-zone namespace, exactly like `trainer_open`/`merchant_open` below. Directly served
+        // by GET /v1/quests/offers and directly ACTIONABLE via POST /v1/quests/accept, which
+        // resolves `task_master_id` from this list and sends OP_AcceptNewTask to it — the same
+        // read-then-act shape as `dialogue_choices` above. Its only other writer is
+        // `apply_task_select_window` replacing the list wholesale on a fresh OP_TaskSelectWindow
+        // from THIS zone's NPC, so without this clear a stale offer (and its stale `npc_id`)
+        // survives indefinitely, not just for the zone-in window.
+        self.task_offers.clear();
         // An open guildmaster-training window: the trainer's spawn id plus the caps IT offers.
         // Exposed as `player.trainer_open`/`player.trainer_skills` on /v1/observe/debug and read by
         // POST /v1/trainer/train, which addresses OP_GMTrainSkill to `trainer_open` — a stale id
@@ -2311,7 +2322,7 @@ mod pose_tests_643 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{CastState, ControllerHold, ControllerHoldReason, DialogueChoice, Door, GameState,
-                HeldMotion, LastConsider, MerchantItem, ZonePoint, make_entity};
+                HeldMotion, LastConsider, MerchantItem, TaskOffer, ZonePoint, make_entity};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
     /// including the FULL-SNAPSHOT (`resync_from_snapshot`) path that carries the real mid-zone
@@ -3473,6 +3484,10 @@ pub(crate) mod tests {
         gs.merchant_items.push(MerchantItem {
             merchant_slot: 1, item_id: 1, name: "Rusty Dagger".into(), icon: 0, price: 5, quantity: 1,
         });
+        gs.task_offers.push(TaskOffer {
+            task_id: 10, npc_id: 9001, title: "Offer One".into(),
+            description: "…".into(), has_rewards: true,
+        });
         gs.pet_id = Some(64);
         populate_loot_session(&mut gs);
         gs.combat_anims.insert(7, (5, std::time::Instant::now()));
@@ -3508,6 +3523,7 @@ pub(crate) mod tests {
         assert!(gs.trainer_skills.is_empty(), "trainer_skills");
         assert!(gs.merchant_open.is_none(), "merchant_open");
         assert!(gs.merchant_items.is_empty(), "merchant_items");
+        assert!(gs.task_offers.is_empty(), "task_offers");
         assert!(gs.pet_id.is_none(), "pet_id");
         assert!(gs.pending_loot.is_empty(), "pending_loot");
         assert!(!gs.loot_session_active, "loot_session_active");
@@ -3592,6 +3608,40 @@ pub(crate) mod tests {
              across a zone-in, GET /v1/observe/dialogue serves them as this zone's current choices \
              and POST /v1/interact/dialogue will send one — a confident falsehood the agent can \
              then act on, which is exactly the failure mode this client must never produce");
+    }
+
+    /// #1004 review — `task_offers` is the same shape as `dialogue_choices` above and belongs to
+    /// the same class: each offer names the OFFERING NPC's spawn id (`npc_id`, per `TaskOffer`'s
+    /// own doc — "required by `OP_AcceptNewTask`'s `task_master_id` field"), it is served verbatim
+    /// by GET /v1/quests/offers, and it is directly ACTIONABLE — POST /v1/quests/accept resolves
+    /// `task_master_id` from this list and sends OP_AcceptNewTask to it. A surviving offer after a
+    /// zone-in is therefore a well-formed, plausible, false answer the agent can act on, against an
+    /// NPC that is not in this zone — exactly `dialogue_choices`'s failure mode.
+    ///
+    /// Mutation check (both directions, verbatim output in the PR body): drop
+    /// `self.task_offers.clear();` → RED; and WRAP it as
+    /// `if std::hint::black_box(false) { self.task_offers.clear(); } else { self.task_offers.truncate(1); }`
+    /// (a plausible "trim it down" edit that leaves one stale offer in place) → also RED.
+    #[test]
+    fn begin_zone_in_clears_the_departed_zones_task_offers_941() {
+        let mut gs = GameState::new();
+        gs.task_offers.push(TaskOffer {
+            task_id: 10, npc_id: 9001, title: "Offer One".into(),
+            description: "Slay the rats".into(), has_rewards: true,
+        });
+        gs.task_offers.push(TaskOffer {
+            task_id: 11, npc_id: 9002, title: "Offer Two".into(),
+            description: "Fetch the ore".into(), has_rewards: false,
+        });
+
+        gs.begin_zone_in();
+
+        assert!(gs.task_offers.is_empty(),
+            "task_offers name the OFFERING NPC's spawn id (npc_id); carried across a zone-in, \
+             GET /v1/quests/offers serves them as this zone's current offers and POST \
+             /v1/quests/accept will address OP_AcceptNewTask to a departed zone's spawn id — the \
+             same confident-falsehood shape as dialogue_choices, and this client must never \
+             produce it");
     }
 
     /// #941 (2/6) — the departed zone's trainer window must NOT survive a zone-in.
@@ -3840,6 +3890,7 @@ pub(crate) mod tests {
             loot_last_activity: _, loot_end_requested_at: _, loot_queued_at: _,
             loot_defensive_close_at: _,
             combat_anims: _, recent_attackers: _,
+            task_offers: _,
 
             // ── NOT ZONE-SCOPED: survives a zone line by design. ──
             // Identity + character sheet: the same character, in a different zone.
@@ -3860,8 +3911,12 @@ pub(crate) mod tests {
             group_members: _, group_leader: _, pending_invite: _,
             guild_names: _, guild_members: _, pending_guild_invite: _, who_roster: _,
             // Inventory + quest log: character-scoped, server-replicated, not spawn-keyed.
+            // (`task_offers` is NOT here — see the ZONE-SCOPED group above: each offer names the
+            // offering NPC's spawn id, `npc_id`, per its own doc, so it is spawn-keyed the same way
+            // `dialogue_choices` is. `tasks`/`completed_task_history` are the accepted/finished
+            // task log — no NPC id, genuinely character-scoped.)
             inventory: _, inventory_received: _, trade_ack_ready: _,
-            tasks: _, task_offers: _, completed_task_history: _,
+            tasks: _, completed_task_history: _,
             // Logs, feeds and session plumbing.
             messages: _, chat_events: _, next_chat_id: _, last_book_text: _, ucs: _,
             strategy: _, server_corrections: _,

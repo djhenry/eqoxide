@@ -622,6 +622,7 @@ pub async fn run_gameplay_phase(
                     action_loop.doors_shared(),
                     action_loop.dialogue_shared(),
                     action_loop.merchant_shared(),
+                    action_loop.task_offers_shared(),
                     ZONE_ENTRY_HANDSHAKE_DEADLINE,
                 ).await;
                 if !zoned_in {
@@ -672,6 +673,7 @@ pub async fn run_gameplay_phase(
                         action_loop.doors_shared(),
                         action_loop.dialogue_shared(),
                         action_loop.merchant_shared(),
+                        action_loop.task_offers_shared(),
                         ZONE_ENTRY_HANDSHAKE_DEADLINE,
                     ).await;
                     if !zoned_in {
@@ -990,6 +992,7 @@ async fn run_zone_entry_handshake(
     doors:                &eqoxide_ipc::DoorsShared,
     dialogue:             &eqoxide_ipc::DialogueShared,
     merchant:             &eqoxide_ipc::MerchantShared,
+    task_offers:          &eqoxide_ipc::TaskOffersShared,
     deadline_dur:         Duration,
 ) -> bool {
     // Purge the previous zone's spawns/doors now, before OP_ReqClientSpawn asks for the new zone's
@@ -1018,29 +1021,35 @@ async fn run_zone_entry_handshake(
     // loop republishes on its first drained packet once this returns.
     doors.lock().unwrap().clear();
 
-    // ...and the PUBLISHED half of two more #941 clears, for exactly the reason above. Of the eight
-    // spawn/session-scoped fields #941 gave `GameState::begin_zone_in`, six are read by agents
-    // through `publish_snapshot` — which this handshake's own drain loop DOES call, every 10 ms —
-    // so the field clear is the whole fix for those. These two are not:
+    // ...and the PUBLISHED half of three more #941-class clears, for exactly the reason above. Of
+    // the nine spawn/session-scoped fields #941 and #1004's review gave `GameState::begin_zone_in`,
+    // six are read by agents through `publish_snapshot` — which this handshake's own drain loop
+    // DOES call, every 10 ms — so the field clear is the whole fix for those. These three are not:
     //
     //   * `dialogue_choices` → `InteractSlots::dialogue`, republished only by
     //     `ActionLoop::sync_messages`, and served by GET /v1/observe/dialogue *and acted on* by
     //     POST /v1/interact/dialogue, which sends an OP_ItemLinkClick for the chosen saylink.
     //   * `merchant_open`/`merchant_items` → `MerchantSlots::merchant`, republished only by
     //     `ActionLoop::sync_merchant`, and served by GET /v1/merchant/list.
+    //   * `task_offers` → `QuestSlots::task_offers_shared`, republished only by
+    //     `ActionLoop::sync_tasks`, and served by GET /v1/quests/offers *and acted on* by
+    //     POST /v1/quests/accept, which resolves `task_master_id` from this list and sends
+    //     OP_AcceptNewTask to it — the offering NPC's spawn id, per `TaskOffer::npc_id`'s own doc.
     //
-    // Both of those `sync_*` calls have exactly one caller — `run_gameplay_phase`'s packet drain —
-    // which this handshake does not reach. Without these two lines the departed NPC's dialogue
-    // choices and the departed merchant's open window + wares stay readable, and clickable, for the
-    // whole zone load (up to `ZONE_ENTRY_HANDSHAKE_DEADLINE`, 30s) while `publish_snapshot` keeps
-    // the HTTP session live and answering.
+    // All three of those `sync_*` calls have exactly one caller — `run_gameplay_phase`'s packet
+    // drain — which this handshake does not reach. Without these three lines the departed NPC's
+    // dialogue choices, the departed merchant's open window + wares, and the departed NPC's task
+    // offers stay readable, and clickable, for the whole zone load (up to
+    // `ZONE_ENTRY_HANDSHAKE_DEADLINE`, 30s) while `publish_snapshot` keeps the HTTP session live
+    // and answering.
     //
     // Clear, not republish, for the same reason as `doors` above: this handshake takes shared slots,
     // not the `ActionLoop`, and empty IS the honest reading mid-zone-in — no NPC here has offered us
-    // anything yet, and no merchant here is open. The gameplay loop republishes on its first drained
-    // packet once this returns.
+    // anything yet, no merchant here is open, and no task here has been offered. The gameplay loop
+    // republishes on its first drained packet once this returns.
     dialogue.lock().unwrap().clear();
     *merchant.lock().unwrap() = eqoxide_ipc::MerchantSnapshot::default();
+    task_offers.lock().unwrap().clear();
 
     // The one and ONLY OP_ZoneEntry for this session (see the fn doc — a second one self-kicks).
     // `poll_resend` retransmits this same datagram if it is lost in flight; nothing here ever issues a
@@ -1746,6 +1755,7 @@ mod zone_entry_handshake_publish_tests {
                 &eqoxide_ipc::DoorsShared::default(),
                 &eqoxide_ipc::DialogueShared::default(),
                 &eqoxide_ipc::MerchantShared::default(),
+                &eqoxide_ipc::TaskOffersShared::default(),
                 Duration::from_secs(30),
             ).await;
         });
@@ -1807,6 +1817,7 @@ mod zone_entry_handshake_publish_tests {
             &eqoxide_ipc::DoorsShared::default(),
             &eqoxide_ipc::DialogueShared::default(),
             &eqoxide_ipc::MerchantShared::default(),
+            &eqoxide_ipc::TaskOffersShared::default(),
             Duration::from_millis(3200), // > the 2.5s the KB warns a blind resend could fire at
         ).await;
 
@@ -1841,6 +1852,7 @@ mod zone_entry_handshake_publish_tests {
             &eqoxide_ipc::DoorsShared::default(),
             &eqoxide_ipc::DialogueShared::default(),
             &eqoxide_ipc::MerchantShared::default(),
+            &eqoxide_ipc::TaskOffersShared::default(),
             Duration::from_millis(200),  // deadline — never completes
         ).await;
 
@@ -1898,6 +1910,7 @@ mod zone_entry_handshake_publish_tests {
             &eqoxide_ipc::DoorsShared::default(),
             &eqoxide_ipc::DialogueShared::default(),
             &eqoxide_ipc::MerchantShared::default(),
+            &eqoxide_ipc::TaskOffersShared::default(),
             Duration::from_millis(50), // deadline — never completes; the clear is at the top
         ).await;
 
@@ -1948,6 +1961,7 @@ mod zone_entry_handshake_publish_tests {
             &doors,
             &eqoxide_ipc::DialogueShared::default(),
             &eqoxide_ipc::MerchantShared::default(),
+            &eqoxide_ipc::TaskOffersShared::default(),
             Duration::from_millis(50), // deadline — never completes; the clear is at the top
         ).await;
 
@@ -2021,6 +2035,7 @@ mod zone_entry_handshake_publish_tests {
             &eqoxide_ipc::DoorsShared::default(),
             &dialogue,
             &merchant,
+            &eqoxide_ipc::TaskOffersShared::default(),
             Duration::from_millis(50), // deadline — never completes; the clears are at the top
         ).await;
 
@@ -2037,6 +2052,67 @@ mod zone_entry_handshake_publish_tests {
         assert!(!m.open && m.merchant_id.is_none() && m.items.is_empty(),
             "and the PUBLISHED half — a departed merchant left in `MerchantSlots::merchant` is \
              served by GET /v1/merchant/list as an open shop in THIS zone, wares and all (#941)");
+    }
+
+    /// **#1004 review — the PUBLISHED half of the task-offer clear.**
+    ///
+    /// The ninth #941-class field, isolated exactly the way the merchant clear was isolated one
+    /// test up: `GameState::begin_zone_in` clears `gs.task_offers`, but what GET /v1/quests/offers
+    /// actually reads is `QuestSlots::task_offers_shared`, republished only by
+    /// `ActionLoop::sync_tasks` — whose sole caller is `run_gameplay_phase`'s packet drain, which
+    /// this handshake never reaches. Without the clear at the top of `run_zone_entry_handshake`,
+    /// the departed NPC's task offers — `npc_id` included — stay readable *and actionable*
+    /// (POST /v1/quests/accept resolves `task_master_id` from this list and sends
+    /// OP_AcceptNewTask to it) for the whole zone load, bounded by
+    /// `ZONE_ENTRY_HANDSHAKE_DEADLINE` (30 s), while `publish_snapshot` keeps the HTTP session
+    /// live and answering.
+    ///
+    /// Isolated in its own test (rather than folded into the dialogue/merchant test above) for the
+    /// same reason the merchant mutation was checked in isolation there: with all three assertions
+    /// in one test, an earlier assertion firing first can shadow this one and hide that it was
+    /// never independently covered.
+    ///
+    /// The seeded offer is the DEPARTED zone's; nothing here publishes a replacement, because the
+    /// claim is that it must be GONE, not swapped.
+    ///
+    /// MUTATION CHECK (both directions, verbatim output in the PR body): delete
+    /// `task_offers.lock().unwrap().clear();` from the top of `run_zone_entry_handshake` → RED
+    /// here. And WRAP it in a `black_box(false)` guard whose `else` arm does
+    /// `task_offers.lock().unwrap().truncate(1);` instead — the plausible "trim it down" edit —
+    /// → also RED, because this asserts the slot's CONTENTS after a real call, not the presence of
+    /// a line of source.
+    #[tokio::test]
+    async fn a_zone_entry_handshake_clears_the_departed_zones_published_task_offers_1004() {
+        let (mut stream, _unused_rx) = test_stream(0, 0).await;
+        let (_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
+        let (mut gs, snapshot, health) = fresh_gs_snapshot();
+
+        let task_offers: eqoxide_ipc::TaskOffersShared = Default::default();
+        task_offers.lock().unwrap().push(eqoxide_core::game_state::TaskOffer {
+            task_id: 10, npc_id: 9001, title: "Offer One".into(),
+            description: "Slay the rats".into(), has_rewards: true,
+        });
+        // Mirror the same state in `gs`, as production would: both copies exist simultaneously, and
+        // the point of this test is that clearing only the `gs` one is not enough.
+        gs.task_offers = task_offers.lock().unwrap().clone();
+
+        let _ = run_zone_entry_handshake(
+            &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
+            &eqoxide_ipc::ControllerSlots::default(),
+            &eqoxide_ipc::DoorsShared::default(),
+            &eqoxide_ipc::DialogueShared::default(),
+            &eqoxide_ipc::MerchantShared::default(),
+            &task_offers,
+            Duration::from_millis(50), // deadline — never completes; the clear is at the top
+        ).await;
+
+        assert!(gs.task_offers.is_empty(),
+            "the GameState half of the task-offer clear (`GameState::begin_zone_in`, #1004)");
+        assert!(task_offers.lock().unwrap().is_empty(),
+            "and the PUBLISHED half — a departed NPC's task offer left in \
+             `QuestSlots::task_offers_shared` is served by GET /v1/quests/offers as this zone's \
+             current offer, and POST /v1/quests/accept will address OP_AcceptNewTask to the \
+             departed NPC's spawn id (#1004)");
     }
 }
 
