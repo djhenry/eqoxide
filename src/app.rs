@@ -366,6 +366,16 @@ pub struct App {
     /// When `now >= active_until` and nothing is pending, the loop only wakes to poll the network
     /// channel — so a still scene costs ~no CPU. See `about_to_wait`.
     active_until:       std::time::Instant,
+    /// Consecutive `surface.get_current_texture()` failures — reset to 0 by a successful acquisition
+    /// and by `wake()` (any window event: input, resize, focus). Feeds `next_wake_interval`.
+    ///
+    /// Exists because "pending work keeps the loop awake" and "the surface never hands out a
+    /// texture" compose badly: the pending signal is never consumed, so the loop re-arms at
+    /// `FRAME_INTERVAL` and re-enters a `render_frame` that reconfigures the swapchain and returns,
+    /// indefinitely. That predates #895 (`frame_req` behaves the same way, and is why a
+    /// take-below-the-match fix does not create the class), but #895 adds `camera_cmd` to the set of
+    /// signals that can hold it, so this PR bounds the cost rather than leaving it unnamed.
+    surface_fail_streak: u32,
     /// Smoothed per-phase frame timings for the `--profile` HUD overlay (only written when enabled).
     frame_profile:      crate::profiling::FrameProfile,
     // Keyboard movement
@@ -624,6 +634,7 @@ impl App {
             fps_timer: std::time::Instant::now(),
             current_fps: 0.0,
             active_until: std::time::Instant::now(),
+            surface_fail_streak: 0,
             frame_profile: crate::profiling::FrameProfile::default(),
             keys_held: std::collections::HashSet::new(),
             controller: crate::movement::CharacterController::new([0.0, 0.0, 0.0]),
@@ -1277,11 +1288,56 @@ impl App {
     /// Idle wake cadence — just often enough to drain the network channel promptly without burning
     /// CPU. A still scene wakes ~20×/sec, does a `try_recv` on an empty channel, and sleeps again.
     const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    /// Consecutive failed surface acquisitions before the loop backs off to `SURFACE_RETRY_BACKOFF`.
+    /// Deliberately larger than a resize blip: at `FRAME_INTERVAL` this is ~128 ms of unchanged
+    /// full-rate retry, so the ordinary `Outdated`-during-resize path never reaches the backoff.
+    const SURFACE_FAIL_BACKOFF_AFTER: u32 = 8;
+    /// Retry cadence once acquisition has failed `SURFACE_FAIL_BACKOFF_AFTER` times in a row. Longer
+    /// than `IDLE_POLL` on purpose — see `next_wake_interval`.
+    const SURFACE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// Fold one acquisition outcome into the consecutive-failure streak. Pure so it can be tested —
+    /// the call site (inside `render_frame`) cannot be, since no test here reaches a GPU.
+    ///
+    /// `saturating_add` is not decoration: a wrapping counter would return to 0 and silently
+    /// un-arm the back-off after `u32::MAX` failures, i.e. turn a bound back into a spin.
+    fn surface_streak_after(prev: u32, acquired_ok: bool) -> u32 {
+        if acquired_ok { 0 } else { prev.saturating_add(1) }
+    }
+
+    /// How long to wait before the next loop iteration. Pure so it can be tested; `about_to_wait`
+    /// supplies the two inputs and does nothing else with them.
+    ///
+    /// The third arm is the one worth reading. A pending request that only a render can clear
+    /// (`frame_req`, and since #895 `camera_cmd`) makes `poll_external` return true forever while the
+    /// surface refuses to hand out a texture, because the thing that would clear it is exactly what
+    /// cannot run. Without a backoff that is a full `render_frame` plus a `surface.configure` every
+    /// `FRAME_INTERVAL`, unbounded. With it, a persistently failing surface costs one acquisition
+    /// attempt per `SURFACE_RETRY_BACKOFF` — which, being longer than `IDLE_POLL`, means a loop
+    /// pinned "active" by an unservable request wakes LESS often than an idle one, not more.
+    ///
+    /// What it does not do: it does not make the loop idle (`active_until` is still in the future),
+    /// and it does not bound how long the streak lasts. Recovery is event-driven — `wake()` zeroes
+    /// the streak, and it runs on every non-redraw window event, including the resize that un-
+    /// minimises the window — so the backoff costs nothing on a real recovery. Nothing bounds it if
+    /// the surface fails forever with no window events at all; that case now costs 2 Hz.
+    fn next_wake_interval(active: bool, surface_fail_streak: u32) -> std::time::Duration {
+        let base = if active { Self::FRAME_INTERVAL } else { Self::IDLE_POLL };
+        if surface_fail_streak >= Self::SURFACE_FAIL_BACKOFF_AFTER {
+            base.max(Self::SURFACE_RETRY_BACKOFF)
+        } else {
+            base
+        }
+    }
 
     /// Mark the app active (render at full rate for `ACTIVE_LINGER`) and request a redraw now. Called
     /// from input handlers and whenever `poll_external` finds pending work.
     fn wake(&mut self) {
         self.active_until = std::time::Instant::now() + Self::ACTIVE_LINGER;
+        // A window event is the signal that whatever was wrong with the surface may no longer be:
+        // un-minimising, un-occluding and resizing all arrive here. Clearing the streak restores
+        // full-rate retry immediately, so the backoff never adds latency to a real recovery.
+        self.surface_fail_streak = 0;
         if let Some(w) = &self.window { w.request_redraw(); }
     }
 
@@ -1981,7 +2037,12 @@ impl App {
         // borrow is live so Rust can verify field-level disjointness.
         let Some((surface, renderer)) = &mut self.gpu else { return };
 
-        let output = match surface.get_current_texture() {
+        // Every arm below updates `surface_fail_streak`, which is what stops a request only a render
+        // can service (`frame_req`, `camera_cmd`) from pinning the loop at `FRAME_INTERVAL` while
+        // acquisition keeps failing. See `next_wake_interval`.
+        let acquired = surface.get_current_texture();
+        self.surface_fail_streak = Self::surface_streak_after(self.surface_fail_streak, acquired.is_ok());
+        let output = match acquired {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 surface.configure(&renderer.device, &renderer.surface_config);
@@ -2000,21 +2061,35 @@ impl App {
         // redraws once `ACTIVE_LINGER` lapsed. A persistently `Outdated` surface (minimised or
         // occluded window) then meant nothing retried, and the Set was gone.
         //
+        // The converse cost of keeping the command queued is real and is bounded deliberately: an
+        // un-taken command keeps `poll_external` true, so under that same persistently-`Outdated`
+        // premise the loop cannot fall back to `IDLE_POLL`. It is not honest to assert persistence
+        // to justify the bug and then assume recovery to bound the fix, so `surface_fail_streak` /
+        // `next_wake_interval` cap the retry at `SURFACE_RETRY_BACKOFF`. `frame_req` already had
+        // this shape before #895; the cap covers it too.
+        //
         // Two types hold the ordering, so it survives a refactor that a source-text pin would not
         // see:
         //   * `TakenCameraCmd` re-queues the command on `Drop`, so any `return` between the take and
         //     the apply — including one added later, and including a panic — leaves it PENDING.
         //   * `apply_to` demands an `AcquiredFrame`, which can only be minted from the
         //     `wgpu::SurfaceTexture` above. Moving this take/apply back up the function does not
-        //     compile: there is nothing to pass.
+        //     compile IN A NON-TEST BUILD: there is nothing to pass. The qualifier is load-bearing
+        //     and was measured, not assumed — this crate's dev-dependency enables
+        //     `eqoxide-renderer/test-fixtures`, and cargo unifies features across the lib and its
+        //     test targets, so under `cargo test`/`cargo clippy --all-targets` the escape hatch
+        //     `AcquiredFrame::for_test()` IS visible to this production code and an above-the-match
+        //     apply compiles. `cargo build --release` (what CI ships, `test.yml`) rejects it, so the
+        //     bypass cannot reach a binary — but the mandated test gate is blind to it. This is a
+        //     property of every `test-fixtures` token in this repo, `DrawnFrame::for_test`
+        //     included; it is not specific to `AcquiredFrame`.
         // See `camera_state::TakenCameraCmd` for the invariant and for what it still does not cover.
         //
-        // One behaviour change worth naming rather than discovering later: `camera.tick(dt, ..)`
-        // no longer runs on a skipped tick, so the focus/azimuth easing does not advance for time
-        // that produced no frame. `dt` is measured from `last_frame_time`, which IS updated at the
-        // top of every call including skipped ones, so that slice of time is dropped rather than
-        // accumulated — during a stall the ease resumes from where it stopped instead of jumping.
-        // That is the correct behaviour for a smoothing term nobody saw, but it is a change.
+        // Not a behaviour change, recorded because it looks like one: `camera.tick(dt, ..)` no
+        // longer runs on a skipped tick. Its only `dt`-dependent term is the focus lerp, and
+        // `self.camera.focus = cpos` runs unconditionally above the match every tick, so at tick
+        // time `focus == player_pos` and the lerp is an identity for every `dt`. The azimuth term is
+        // a direct assignment, not an ease. Nothing accumulates and nothing jumps.
         let prof_cam = crate::profiling::Stopwatch::start();
         let taken   = crate::camera_state::TakenCameraCmd::take(&self.camera_cmd);
         let drawing = eqoxide_renderer::AcquiredFrame::from_surface_texture(&output);
@@ -2467,15 +2542,18 @@ impl ApplicationHandler for App {
             self.active_until = std::time::Instant::now() + Self::ACTIVE_LINGER;
         }
 
-        let now = std::time::Instant::now();
-        if now < self.active_until {
+        let now    = std::time::Instant::now();
+        let active = now < self.active_until;
+        if active {
             // Active: schedule another frame at ~60fps.
             if let Some(w) = &self.window { w.request_redraw(); }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Self::FRAME_INTERVAL));
-        } else {
-            // Idle: no render. Wake periodically only to poll the network channel; near-zero CPU.
-            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Self::IDLE_POLL));
         }
+        // Idle: no redraw requested. Wake periodically only to poll the network channel; near-zero
+        // CPU. Either way the interval is `next_wake_interval`'s call, which also throttles the
+        // active path when the surface has been refusing to hand out a texture (see its doc).
+        event_loop.set_control_flow(
+            ControlFlow::WaitUntil(now + Self::next_wake_interval(active, self.surface_fail_streak)),
+        );
     }
 
     fn window_event(
@@ -3886,5 +3964,104 @@ mod zone_load_wiring_803 {
              bug rather than a missing asset");
         assert!(col.zone_line_indices().is_err(),
             "and the exits question refuses rather than answering the empty list");
+    }
+}
+
+/// #895 (review B1) — the render loop's back-off arithmetic.
+///
+/// **Scope, stated up front.** These tests reach [`App::next_wake_interval`] and nothing else. They
+/// do NOT execute the render loop: no test in this repo can, because `App::render_frame` and
+/// `about_to_wait` need a GPU and a window. So what is pinned here is the *decision* — given "is the
+/// app active" and "how many acquisitions have failed in a row", what interval comes out. That the
+/// streak is actually incremented on each `SurfaceError` arm, zeroed on `Ok`, and zeroed by
+/// `wake()`, is enforced by reading and by the compiler, not by these assertions.
+#[cfg(test)]
+mod render_loop_backoff_tests_895 {
+    use super::App;
+    use std::time::Duration;
+
+    /// The relation the whole back-off argument rests on: a loop pinned "active" by a request only a
+    /// render can clear must, once the surface is persistently failing, wake **less** often than an
+    /// idle loop — otherwise "we bounded it" would be a re-labelling, not a bound.
+    #[test]
+    fn the_backoff_is_slower_than_idle_which_is_slower_than_a_frame_895() {
+        assert!(App::SURFACE_RETRY_BACKOFF > App::IDLE_POLL,
+            "a backed-off active loop must cost less than an idle one, else the cap bounds nothing");
+        assert!(App::IDLE_POLL > App::FRAME_INTERVAL,
+            "idle must be cheaper than active, or the whole schedule is upside down");
+        assert!(App::SURFACE_FAIL_BACKOFF_AFTER > 0,
+            "a threshold of 0 would back off on the first Outdated, i.e. on every ordinary resize");
+    }
+
+    /// Exhaustive over both activity states and every streak up to well past the threshold.
+    ///
+    /// Below the threshold the interval must be **exactly** what it was before #895 — that is the
+    /// no-regression half, and it is what keeps an ordinary `Outdated`-during-resize blip rendering
+    /// at full rate. At or above it, the interval must be at least `SURFACE_RETRY_BACKOFF`
+    /// regardless of activity — that is the bound. Monotonicity is asserted across the whole sweep
+    /// so no future arm can make more failures cost more frequent wakes.
+    #[test]
+    fn a_failing_surface_can_only_slow_the_loop_down_never_speed_it_up_895() {
+        let mut checked = 0_usize;
+        for active in [true, false] {
+            let mut prev = Duration::ZERO;
+            for streak in 0..=(App::SURFACE_FAIL_BACKOFF_AFTER + 8) {
+                let got = App::next_wake_interval(active, streak);
+
+                if streak < App::SURFACE_FAIL_BACKOFF_AFTER {
+                    let unchanged = if active { App::FRAME_INTERVAL } else { App::IDLE_POLL };
+                    assert_eq!(got, unchanged,
+                        "below the threshold the schedule must be untouched (active={active}, streak={streak})");
+                } else {
+                    assert!(got >= App::SURFACE_RETRY_BACKOFF,
+                        "at/above the threshold the loop must be capped (active={active}, streak={streak}): {got:?}");
+                    assert!(got >= App::IDLE_POLL,
+                        "a pinned-active loop under a dead surface must not outpace an idle one \
+                         (active={active}, streak={streak}): {got:?}");
+                }
+
+                assert!(got >= prev,
+                    "more consecutive failures must never mean a shorter wait \
+                     (active={active}, streak={streak}): {got:?} < {prev:?}");
+                prev = got;
+                checked += 1;
+            }
+        }
+        // Reach control: without it, a threshold edited to 0 (making the loop range empty) or an
+        // arm that became unreachable would report a green "nothing wrong" that is really
+        // "nothing looked at".
+        assert_eq!(checked, 2 * (App::SURFACE_FAIL_BACKOFF_AFTER as usize + 9),
+            "every (activity, streak) pair in the sweep must have been classified");
+    }
+
+    /// The streak arithmetic. A success must clear the streak outright — not decrement it — or a
+    /// surface that alternates fail/succeed would drift into a permanent back-off; and failures must
+    /// saturate rather than wrap, since a wrap to 0 would un-arm the bound.
+    #[test]
+    fn a_success_clears_the_streak_and_failures_saturate_895() {
+        for prev in [0, 1, App::SURFACE_FAIL_BACKOFF_AFTER, 9_999, u32::MAX] {
+            assert_eq!(App::surface_streak_after(prev, true), 0,
+                "one successful acquisition must clear the streak outright (prev={prev})");
+        }
+        assert_eq!(App::surface_streak_after(0, false), 1);
+        assert_eq!(App::surface_streak_after(App::SURFACE_FAIL_BACKOFF_AFTER, false),
+                   App::SURFACE_FAIL_BACKOFF_AFTER + 1);
+        assert_eq!(App::surface_streak_after(u32::MAX, false), u32::MAX,
+            "the counter must saturate: wrapping to 0 would silently un-arm the back-off");
+        assert!(App::next_wake_interval(true, App::surface_streak_after(u32::MAX, false))
+                    >= App::SURFACE_RETRY_BACKOFF,
+            "and the saturated value must still read as backed-off");
+    }
+
+    /// The threshold itself, pinned on both sides. `>=` vs `>` is a one-character edit that no
+    /// range-wide assertion above would notice on its own.
+    #[test]
+    fn the_backoff_starts_exactly_at_the_threshold_895() {
+        let below = App::next_wake_interval(true, App::SURFACE_FAIL_BACKOFF_AFTER - 1);
+        let at    = App::next_wake_interval(true, App::SURFACE_FAIL_BACKOFF_AFTER);
+        assert_eq!(below, App::FRAME_INTERVAL,
+            "one failure short of the threshold must still render at full rate");
+        assert_eq!(at, App::SURFACE_RETRY_BACKOFF,
+            "the threshold-th consecutive failure is what arms the back-off");
     }
 }

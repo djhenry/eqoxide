@@ -284,13 +284,28 @@ impl CameraState {
 /// - **Applying it requires an [`eqoxide_renderer::AcquiredFrame`]**, which can only be minted from
 ///   a `wgpu::SurfaceTexture`, which only exists on the `Ok` arm of `get_current_texture`. So a
 ///   caller that applies a command on a tick which has not yet got past the surface match does not
-///   compile. That is what pins the take-and-apply *below* the three `SurfaceError` arms that
-///   `return` without drawing, rather than above them where it used to sit.
+///   compile **in a non-test build**. That is what pins the take-and-apply *below* the three
+///   `SurfaceError` arms that `return` without drawing, rather than above them where it used to
+///   sit. The qualifier is not pedantry: cargo's feature unification makes
+///   `AcquiredFrame::for_test` (dev-only, `test-fixtures`) visible to `src/app.rs`'s production
+///   code inside any `cargo test` build of this crate, so an above-the-match apply compiles and
+///   passes the workspace gate there. `cargo build --release`, which is what CI ships, rejects it.
+///   This is a property of every `test-fixtures` token in the workspace, `DrawnFrame` included —
+///   written up on [`eqoxide_renderer::AcquiredFrame::for_test`].
 /// - **Dropping it puts the command back.** Every early `return` between the take and the apply —
 ///   including a panic unwinding through — runs [`Drop`], which restores the command to the slot it
 ///   came from. It is then pending again, `App::poll_external` sees it, and `about_to_wait` keeps
 ///   re-arming `active_until`, so the loop retries until a frame actually lands. Before this, the
 ///   take *was* the thing that cleared that retry signal.
+///
+///   **The cost of that, stated rather than assumed:** "until a frame lands" presumes one
+///   eventually does. If the surface fails forever — the same minimised/occluded premise #895 uses
+///   to argue the bug is severe — the command is never even taken, so `Drop` never runs, the slot
+///   stays occupied and `poll_external` stays true, and the loop cannot fall back to `IDLE_POLL`.
+///   `CameraCmd` carries no deadline to expire on. That is bounded in `App::next_wake_interval`
+///   rather than here: after `SURFACE_FAIL_BACKOFF_AFTER` consecutive failed acquisitions the loop
+///   waits `SURFACE_RETRY_BACKOFF` (longer than `IDLE_POLL`), so a loop pinned awake this way costs
+///   *less* than an idle one. `frame_req` had the same shape before #895 and gets the same bound.
 ///
 /// Together: applied ⇒ the surface was acquired; not applied ⇒ still queued. There is no third
 /// outcome to fall into.
