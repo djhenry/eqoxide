@@ -1337,10 +1337,14 @@ impl CharacterController {
     /// net") named that as the remedy, and the remedy is a TELEPORT: `is_embedded` tests the
     /// footprint ring at `Body::ring` = 3.0 with radius `PLAYER_RADIUS` = 1.0, so a body resting
     /// 0.75 u from any face at least `Body::ring` tall reads EMBEDDED and the net relocates it to a
-    /// ring candidate up to `PUSHOUT_RADII` away. MEASURED on a grounded walker driven at a 3.0-tall
-    /// barrier: the net fired on alternate frames and carried the body **+342.9 u laterally** along
-    /// a wall it was merely leaning on, in 15 s of simulated time, at unchanged z — every one of
-    /// those units reported to the driving agent as an ordinary position. The `lip >= 3.00`
+    /// ring candidate up to `PUSHOUT_RADII` away. On `ce1d89f` (pre-#870) that teleport fired on
+    /// alternate frames and dragged a grounded walker sideways along the wall it was merely leaning
+    /// on — bounded by the WALL'S LENGTH, not by how long it was driven: +99.7 u on a 100 u wall,
+    /// +342.9 u on a 2000 u one, in the same 15 s drive (independently re-derived in the #914
+    /// review). Both are historical; neither reproduces on this branch, because the bug they
+    /// measured is fixed. What IS pinned here, on THIS branch, at both wall lengths: **0.0000 u**
+    /// of drift, mutation-checked to go RED under exactly this defect
+    /// (`a_grounded_walk_never_drifts_on_a_short_or_a_2000u_wall`, #932). The `lip >= 3.00`
     /// threshold in #870 is exactly `Body::ring`; below it the ring never sees the barrier at all.
     ///
     /// So the look-ahead is DERIVED from the back-off rather than being a second hand-tuned number:
@@ -1523,9 +1527,12 @@ impl CharacterController {
     /// reach.** An earlier draft of this paragraph claimed the creep lands the body "at or behind
     /// where the penetrating version put it"; that is false and the measurement is the refutation.
     /// Fixture: a 2.0 riser at east 0 whose tread only BEGINS `g` east of the face — a slot the
-    /// centre probe lands in — driven at 20 u/s, 60 Hz, 600 frames, recording the first mounting
-    /// frame (so a depenetration teleport cannot be mistaken for a creep; `is_embedded` was false
-    /// on every frame before every mount, and lateral drift was 0.0000 throughout).
+    /// centre probe lands in — driven due east at 20 u/s, 60 Hz, 600 frames, recording the first
+    /// mounting frame (so a depenetration teleport cannot be mistaken for a creep; `is_embedded`
+    /// was false on every frame before every mount, and lateral drift was 0.0000 throughout). Wall
+    /// and floor use the file's own `wall`/`floor` helpers (north extent ±100, same as #938's
+    /// residual-clearance table above) — but unlike that table, the drive here is due EAST only, so
+    /// the body never approaches the north edge and the extent does not bound these numbers (#938).
     ///
     /// | tread gap `g` | 0.00 | 0.20 | 0.34 | 0.80 | 1.20 | 1.38 | 1.39 |
     /// |---|---|---|---|---|---|---|---|
@@ -1543,8 +1550,7 @@ impl CharacterController {
     /// **Open, and deliberately not asserted either way: whether the widening is DESIRED.**
     /// Stepping over a crack narrower than the body's own diameter is defensible, but it is a
     /// reachability change, it was not compared against the reference client, and no live client
-    /// was run. See #930, which also covers `try_step_up`'s own doc below still calling a gap an
-    /// unconditional `None`.
+    /// was run (#930).
     ///
     /// Two soundness gates, both load-bearing:
     ///   * the creep runs ONLY when the raised sweep made full progress. If the raised sweep was
@@ -1557,7 +1563,9 @@ impl CharacterController {
 
     /// Step-offset climb (design §3.2): raise the cylinder by `STEP_UP`, sweep again, and — only if
     /// a floor exists to stand on at the raised destination (the no-geometry-gap guard) — return the
-    /// stepped-up `[east, north, floor_z]`. `None` = no valid step (taller-than-2u wall or a gap).
+    /// stepped-up `[east, north, floor_z]`. `None` = a taller-than-2u wall, OR a tread gap wider than
+    /// `radius + SKIN` (#870's creep, doc'd above, extends the search that far past the raised lip —
+    /// see #930, which corrected this comment after review found it still calling any gap terminal).
     fn try_step_up(&self, wish: [f32; 3], max_step: f32, col: &Collision) -> Option<[f32; 3]> {
         let raised = [self.pos[0], self.pos[1], self.pos[2] + max_step];
         let (hi, _) = self.slide(raised, wish, col);
@@ -2612,8 +2620,14 @@ mod tests {
         let radius = crate::traversability::PLAYER_BODY.radius;
         let mut runs = 0_usize;
         let mut band_frames = 0_usize;
-        // ⚠️ **The lips start at 2.60, and the gap below it is a DIFFERENT, STILL-OPEN bug.**
-        // A lip in `(STEP_UP, STEP_UP + Body::foot)` = (2.00, 2.50) is passable, and #870's fix
+        // #933 — per-run reach control, not a global sum. MEASURED baseline (sha a17044b):
+        // every one of the 1134 runs settles for between 343 and 392 of its 400
+        // frames; `MIN_RUN_BAND_FRAMES` = 300 sits under the observed floor with headroom but
+        // rejects the failure mode `band_frames > runs` could not — one settled frame per run
+        // (an average of 1/400) passes the old control and fails this one on the FIRST run.
+        const MIN_RUN_BAND_FRAMES: usize = 300;
+        // ⚠️ **The lips start at 2.51, and the gap below it is a DIFFERENT, STILL-OPEN bug.**
+        // A lip in `(STEP_UP, STEP_UP + Body::foot]` = (2.00, 2.50] is passable, and #870's fix
         // does not touch it: `try_step_up` raises the body by `STEP_UP` and sweeps again, and that
         // raised sweep's own foot ray sits `Body::foot` = 0.5 ABOVE the raised feet, so a lip
         // topping out inside that half-unit is invisible to it — #854's blind band, one storey up.
@@ -2622,8 +2636,11 @@ mod tests {
         // byte-identical on unmodified `main` and on this branch, which is what makes it a
         // separate bug and not a regression. It is excluded here rather than fixed because the fix
         // is #854's (probe heights), not this one's (ray length), and asserting a barrier that low
-        // holds would be asserting something no code in this PR makes true.
-        for lip in [2.60_f32, 2.80, 2.95, 3.00, 3.05, 3.50, 4.00, 6.00, 12.00] {
+        // holds would be asserting something no code in this PR makes true. #931: 2.51 is the
+        // lowest lip that already blocks correctly (`the_blind_step_up_band_is_closed_at_its_upper_bound`
+        // below pins 2.5000 itself as still passable), so the grid starts exactly at the true
+        // boundary rather than leaving an unexplained margin above it.
+        for lip in [2.51_f32, 2.80, 2.95, 3.00, 3.05, 3.50, 4.00, 6.00, 12.00] {
             for far in [0.0_f32, -10.0] {
                 for speed in [20.0_f32, 35.0, 44.0] {
                     for dt in [1.0_f32 / 60.0, 1.0 / 30.0, 1.0 / 20.0] {
@@ -2636,6 +2653,7 @@ mod tests {
                             let mut ctrl = CharacterController::new([start, 0.0, 0.0]);
                             ctrl.on_ground = true;
                             runs += 1;
+                            let mut run_band_frames = 0_usize;
                             for f in 0..400 {
                                 assert!(!is_embedded(&c, ctrl.pos),
                                     "lip {lip} far {far} speed {speed} dt {dt} k {k} frame {f}: \
@@ -2653,17 +2671,58 @@ mod tests {
                                     "lip {lip} far {far} speed {speed} dt {dt} k {k} frame {f}: \
                                      north {} — the drive is due east, so this is displacement the \
                                      body never made (#870)", ctrl.pos[1]);
-                                if ctrl.pos[0] > -(radius + SKIN) - 1e-3 { band_frames += 1; }
+                                if ctrl.pos[0] > -(radius + SKIN) - 1e-3 { band_frames += 1; run_band_frames += 1; }
                             }
+                            // #933: classify THIS run, not just the corpus total — a run that
+                            // barely touches the band cannot hide behind others that settle solidly.
+                            assert!(run_band_frames >= MIN_RUN_BAND_FRAMES,
+                                "lip {lip} far {far} speed {speed} dt {dt} k {k}: only \
+                                 {run_band_frames}/400 settled frames (want >= {MIN_RUN_BAND_FRAMES}) \
+                                 — this run did not reach and rest against the barrier (#870/#933)");
                         }
                     }
                 }
             }
         }
-        // Reach control for the LOOP: a grid that silently visited nothing would also be green.
+        // Reach control for the LOOP itself (the corpus is an item too): a grid that silently
+        // visited nothing, or fewer combinations than intended, would also be green otherwise.
         assert_eq!(runs, 9 * 2 * 3 * 3 * 7, "the grid must actually run every combination");
         assert!(band_frames > runs, "every run must reach the barrier and rest against it; \
                                      only {band_frames} settled frames over {runs} runs");
+    }
+
+    /// #932 — the fixture for `slide()`'s doc-comment figure. `ce1d89f` (pre-#870) drove this exact
+    /// shape — a grounded walker into a 3.0-tall barrier, due east, 35 u/s, 900 frames (15 s) at
+    /// dt 1/60 — and measured lateral drift bounded by the WALL'S LENGTH, not by the 15 s: +99.7 u
+    /// on a 100 u wall, +342.9 u on a 2000 u one (both independently re-derived in the #914 review;
+    /// neither is reproducible here, because the bug they measured is gone). What IS reproducible on
+    /// THIS branch, pinned below at both lengths: zero drift, regardless of wall length — the
+    /// property `a_grounded_walk_at_a_barrier_never_enters_the_depenetration_net` already pins the
+    /// 100 u case; this extends the same drive to a 2000 u wall so the doc-comment has a real,
+    /// current-branch number for the long wall too, instead of restating `ce1d89f`'s.
+    #[test]
+    fn a_grounded_walk_never_drifts_on_a_short_or_a_2000u_wall() {
+        for half_extent in [100.0_f32, 1000.0] {
+            let c = col(vec![
+                floor_ext(0.0, -100.0, 0.0, half_extent),
+                wall_ext(0.0, 0.0, 3.0, half_extent),
+                floor_ext(0.0, 0.0, 100.0, half_extent),
+            ]);
+            let mut ctrl = CharacterController::new([-20.0, 0.0, 0.0]);
+            ctrl.on_ground = true;
+            let mut max_drift = 0.0_f32;
+            for f in 0..900 {
+                assert!(!is_embedded(&c, ctrl.pos),
+                    "half_extent {half_extent} frame {f}: a walker at a barrier was handed to the \
+                     depenetration net at {:?} (#870/#932)", ctrl.pos);
+                ctrl.step(walk(35.0, [1.0, 0.0]), 1.0 / 60.0, &c);
+                max_drift = max_drift.max(ctrl.pos[1].abs());
+            }
+            assert!(max_drift < 1e-3,
+                "half_extent {half_extent}: {max_drift:.4} u of north drift under a due-east drive \
+                 — ce1d89f measured +99.7 u (100 u wall) / +342.9 u (2000 u wall) here; #870 must \
+                 measure ~0 regardless of wall length (#932)");
+        }
     }
 
     /// #870's example, pinned: the drop shape it names (3.0 lip, floor beyond at -10). The walker
@@ -5975,6 +6034,93 @@ mod tests {
             a_swimmer_hauling_out_at_a_legitimate_bank_never_raises_the_afloat_stall,
             a_duck_across_a_divable_far_side_is_a_round_trip,
             the_step_landing_creep_reaches_one_back_off_past_the_riser_and_no_further,
+            // #932: cited by `slide()`'s doc comment (the new wall-length-independent zero-drift
+            // pin) and by the new test's own doc comment (which names the pre-existing 100 u pin).
+            a_grounded_walk_never_drifts_on_a_short_or_a_2000u_wall,
+            a_grounded_walk_at_a_barrier_never_enters_the_depenetration_net,
         ];
+    }
+
+    /// #931 — the passable band's upper boundary is CLOSED (`STEP_UP + Body::foot`, 2.50, is
+    /// still inside it), not open as the ⚠️ block above used to state. MEASURED, flat far floor,
+    /// straight-on drive at 20/35/44 u/s and dt in {1/60, 1/30, 1/20}, 600 frames: a lip of exactly
+    /// 2.5000 is fully passable (`is_embedded` fires while crossing and the body ends past the wall
+    /// on every speed/dt combination tried), while 2.5001 already rests correctly at
+    /// `-(radius + SKIN)` on all of them — a 1e-4 u swing across the boundary.
+    #[test]
+    fn the_blind_step_up_band_is_closed_at_its_upper_bound() {
+        let radius = crate::traversability::PLAYER_BODY.radius;
+        for &(lip, want_blocked) in &[(2.5000_f32, false), (2.5001_f32, true)] {
+            for &(speed, dt) in &[(20.0_f32, 1.0_f32 / 60.0), (35.0, 1.0 / 60.0),
+                                   (35.0, 1.0 / 30.0), (44.0, 1.0 / 20.0)] {
+                let c = col(vec![floor(0.0, -100.0, 0.0), wall(0.0, 0.0, lip), floor(0.0, 0.0, 100.0)]);
+                let mut ctrl = CharacterController::new([-20.0, 0.0, 0.0]);
+                ctrl.on_ground = true;
+                for _ in 0..600 { ctrl.step(walk(speed, [1.0, 0.0]), dt, &c); }
+                let blocked = (ctrl.pos[0] - -(radius + SKIN)).abs() < 1e-2;
+                assert_eq!(blocked, want_blocked,
+                    "lip {lip} speed {speed} dt {dt}: end east {} — blocked={blocked}, want {want_blocked}",
+                    ctrl.pos[0]);
+            }
+        }
+    }
+
+    /// Extent-parameterized wall/floor for #938 (the file's `wall`/`floor` hard-code a north
+    /// extent of 100, which is too short for the oblique columns below — see the doc above).
+    fn wall_ext(e: f32, h0: f32, h1: f32, half_extent: f32) -> MeshData {
+        mesh(vec![[-half_extent, h0, e], [half_extent, h0, e], [half_extent, h1, e], [-half_extent, h1, e]])
+    }
+    fn floor_ext(z: f32, e0: f32, e1: f32, half_extent: f32) -> MeshData {
+        mesh(vec![[-half_extent, z, e0], [half_extent, z, e0], [half_extent, z, e1], [-half_extent, z, e1]])
+    }
+
+    /// The residual-clearance table's own harness: drive a grounded body at a 6u wall at the
+    /// given `ndot` (cosine of approach vs. face normal), 40 sub-frame phases, 600 frames,
+    /// 35 u/s at 60 Hz, and return the closest perpendicular approach ever reached. `half_extent`
+    /// is the wall/floor's north half-extent — the parameter #938 found missing from the doc.
+    fn residual_clearance(ndot: f32, half_extent: f32) -> f32 {
+        let theta = ndot.acos();
+        let dir = [theta.cos(), theta.sin()];
+        let c = col(vec![
+            floor_ext(0.0, -100.0, 0.0, half_extent),
+            wall_ext(0.0, 0.0, 6.0, half_extent),
+            floor_ext(0.0, 0.0, 100.0, half_extent),
+        ]);
+        let mut worst = f32::MAX;
+        for k in 0..40 {
+            let phase = (k as f32) * (35.0 / 60.0) / 40.0;
+            let mut ctrl = CharacterController::new([-20.0 - phase, 0.0, 0.0]);
+            ctrl.on_ground = true;
+            for _ in 0..600 {
+                ctrl.step(walk(35.0, dir), 1.0 / 60.0, &c);
+                if ctrl.pos[0] < 0.0 { worst = worst.min(-ctrl.pos[0]); }
+            }
+        }
+        worst
+    }
+
+    /// #938 — the residual-clearance table above is reproducible ONLY past the wall's own lateral
+    /// extent. MEASURED (this fn): at `half_extent` = 500 (max north drift observed across all
+    /// eight columns: 399.8 u, so 500 clears it), every column matches the doc table within 0.01.
+    /// At the file's own `wall`/`floor` extent (100), the two columns the table's 6u/8-angle rows
+    /// name — `ndot` 0.866 and 0.707 — read 0.503 and 0.598: the body sliding around the end of a
+    /// too-short wall, not an oblique contact residual, matching #938's report almost exactly.
+    #[test]
+    fn the_residual_clearance_table_needs_the_walls_lateral_extent_stated() {
+        let cases = [
+            (1.000_f32, 1.0500_f32), (0.985, 1.0388), (0.866, 0.9203), (0.707, 0.7430),
+            (0.500, 0.7084), (0.342, 0.8005), (0.174, 0.8985), (0.087, 0.9493),
+        ];
+        for &(ndot, want) in &cases {
+            let got = residual_clearance(ndot, 500.0);
+            assert!((got - want).abs() < 0.01,
+                "ndot {ndot}: worst clearance {got:.4} at half_extent=500, want {want:.4}");
+        }
+        // The documented failure mode at the file's own (too-short) extent, so a future reader
+        // cannot mistake "the table is wrong" for "the extent was never the issue":
+        assert!((residual_clearance(0.866, 100.0) - 0.503).abs() < 0.01,
+            "half_extent=100 should reproduce #938's reported 0.503 edge artifact at ndot=0.866");
+        assert!((residual_clearance(0.707, 100.0) - 0.598).abs() < 0.01,
+            "half_extent=100 should reproduce #938's reported ~0.594 edge artifact at ndot=0.707");
     }
 }
