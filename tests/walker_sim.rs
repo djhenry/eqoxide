@@ -1196,9 +1196,17 @@ use eqoxide_ipc::MoveIntent;
         let poisoned = raw.replace(
             "[ABORTED while opening zone_c_never_terminates]",
             "[ABORTED while opening a_zone_this_fixture_never_opens]");
-        assert_ne!(poisoned, raw,
+        // NOT `assert_ne!`. Round-2 review measured that one reintroducing #897 inside the very
+        // test that exists to catch it: `assert_ne!` Debug-formats BOTH operands into its message,
+        // so when the fixture's tag moves this dumps the raw capture into the parent log TWICE —
+        // and twice is a MATCHED pair, so a header-vs-trailer balance check stays quiet while the
+        // numbers are wrong. Measured by renaming the tag to `[HALTED …]`: unanchored counts went
+        // 3/3 against true binary counts of 1/1 (anchored stayed 1/1 and saw nothing). Routing
+        // `raw` through the quoting instead restores 1/1 unanchored with both tests still RED.
+        assert!(poisoned != raw,
             "the fixture's report tag has moved, so this test can no longer force the failing \
-             branch it exists to observe");
+             branch it exists to observe.\n{}",
+            quote_child_output("captured stdout", &raw));
         let payload = std::panic::catch_unwind(|| assert_aborted_report_is_in(&poisoned))
             .expect_err("the first content check must FAIL once its tag is renamed — otherwise no \
                          failure message is produced and every count below is vacuously zero");
@@ -1219,9 +1227,19 @@ use eqoxide_ipc::MoveIntent;
             "a child result trailer still starts a line of this binary's output");
 
         // 3. …and it is redaction that produced those zeroes.
+        //
+        // `message` is interpolated here through the quoting too, as defence in depth. Round-2
+        // review could not reproduce a leak from this line and that is right: all four counts above
+        // must already read 0 to reach it, and `Anchor::Anywhere` counts every occurrence in the
+        // whole string, so a zero there means the phrase is absent outright. But that safety is a
+        // property of the ORDER these assertions sit in, and nothing enforces the order — move this
+        // line above the counts and the leak is back, silently. #897's whole lesson is that a red
+        // path should not depend on an invariant a future editor has to re-derive, so the invariant
+        // is made local instead of argued.
         assert!(message.contains(HEADER_REDACTION) && message.contains(TRAILER_REDACTION),
             "neither bookkeeping phrase was redacted, so the zeroes above say nothing about the \
-             quoting: {message}");
+             quoting.\n{}",
+            quote_child_output("the failure message under test", &message));
 
         // 4. …while the child's own evidence is still there to read.
         assert!(message.contains(CHILD_LINE_PREFIX), "the capture was not quoted at all");
