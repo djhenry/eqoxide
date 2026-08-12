@@ -55,6 +55,17 @@ jobs:
   # silently scanning nothing is exactly the state the script refuses (an empty corpus is an error
   # there, not a pass). `GH_TOKEN` gets the default read-only workflow token, which is enough for
   # every endpoint the script calls; a fork PR is fine because the script only reads.
+  #
+  # WHAT THIS JOB STRUCTURALLY CANNOT SCAN: a comment posted after the last push. The trigger is
+  # `pull_request`, so every run reads the text as it stood at a push, and the last green run keeps
+  # asserting a corpus that has since grown. This PR demonstrated it on itself — the only run at the
+  # time scanned 2 items, a comment was added 88 seconds later, and that run's `OK — all 2 items
+  # clean` still stood. Review comments on the final revision are always in this blind spot, since
+  # by definition nothing is pushed after them. Cover them by running the script by hand against the
+  # number. Adding an `issue_comment` trigger would close it and is deliberately NOT done here: this
+  # workflow's concurrency group is keyed on `github.ref`, which for an `issue_comment` event is the
+  # default branch rather than the PR head, so comment-triggered runs would cancel each other and
+  # cancel pushes. That is a workflow-structure change, not a one-line trigger addition.
   pr-text:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -66,11 +77,22 @@ jobs:
       - uses: actions/checkout@v4
       # `--self-test` first, same pattern as check-wrapped-literals above: a scanner that has
       # stopped discriminating must fail loudly rather than pass everything. It runs offline and
-      # drives the classifier through one deliberately-dirty item per pattern, three clean items,
-      # a reach control (empty the pattern list — nothing may flag, and every item must still be
-      # classified), the empty-pattern-list refusal, the empty-corpus case, and an assertion on how
-      # many checks ran, so a case that stops running fails the step instead of shrinking the
-      # output.
+      # drives the classifier through one deliberately-dirty item per pattern (the samples live
+      # beside the patterns, so adding a pattern without one is a length mismatch, not a silent
+      # gap), three clean items, a reach control (empty the pattern list — nothing may flag, and
+      # every item must still be classified), an unreadable item (must count toward the corpus and
+      # NOT toward `classified`, which is what makes the `classified N/N` line able to disagree),
+      # the empty-corpus case, and an assertion on how many checks ran, so a case that stops running
+      # fails the step instead of shrinking the output.
+      #
+      # It also EXECUTES both real scanners with `LOCAL_DETAIL_PATTERNS_FILE` pointing at an empty
+      # pattern list and requires each to refuse. That indirection exists for one reason: the first
+      # version of these two checks re-derived the refusal in an inline `bash -c` and never invoked
+      # either script, so deleting the only real reach guard in the repo left the self-test at full
+      # green. Verified both directions at this commit — replacing the guard in
+      # `check-no-local-detail.sh` with `if false; then` turns `--self-test` RED (`want '1', got
+      # '3'`), and neutering `require_patterns` in `check-pr-text.sh` turns it RED on two more
+      # checks; hand-editing each back restores 15/15.
       - name: check-pr-text self-test
         run: bash scripts/check-pr-text.sh --self-test
       - name: scan this PR's body and comments for local-system detail
@@ -147,15 +169,25 @@ jobs:
       # `main` green. The release build above would not have caught either half: it does not build
       # test targets at all.
       #
-      # MEASURED at `fddcb89` on cargo 1.97.1, one sitting, by appending an identical `const
-      # _PROBE_968: u32 = "not a u32";` (E0308) to ALL 23 integration targets under `tests/` — the
-      # same class of leaf unit as #896's `tests/entity_pose_643.rs` — then reverting it:
-      #   cargo test --workspace --locked                          -> exit 101, 1  of 23 units named
-      #   cargo build --workspace --all-targets --locked           -> exit 101, 2  of 23 units named
-      #   cargo build --workspace --all-targets --locked --keep-going -> exit 101, 23 of 23 named
-      # The first two both print `warning: build failed, waiting for other jobs to finish...`. Note
-      # the middle line: `--all-targets` alone is NOT what makes the report complete — the flag is.
-      # Unmutated, all three exit 0.
+      # MEASURED at `fddcb89` on cargo 1.97.1 by appending an identical `const _PROBE_968: u32 =
+      # "not a u32";` (E0308) to ALL 23 integration targets under `tests/` — the same class of leaf
+      # unit as #896's `tests/entity_pose_643.rs` — then reverting it:
+      #   cargo test --workspace --locked                             -> exit 101, 1-2 of 23 named
+      #   cargo build --workspace --all-targets --locked              -> exit 101, 1-2 of 23 named
+      #   cargo build --workspace --all-targets --locked --keep-going -> exit 101, 23  of 23 named
+      # The two fail-fast rows are written as a RANGE on purpose. Without the flag, how many units
+      # are named depends on how many compile jobs happened to be in flight when the first error
+      # landed, so it is scheduler noise, not a property of the command: one run each here gave 1
+      # and 2, and an independent reviewer's four runs each gave 2,2,2,2 and 1,2,2,2 — the two rows
+      # inverted on that reviewer's first run. Neither integer is reproducible and neither is the
+      # point. `23 of 23` IS exact and reproduced on every run by both of us. Note also that the
+      # middle row is a fail-fast row: `--all-targets` alone is NOT what makes the report complete
+      # — the flag is. Unmutated, all three exit 0.
+      #
+      # `warning: build failed, waiting for other jobs to finish...` is NOT the tell. All three runs
+      # above print it, including the `--keep-going` one that goes on to name all 23. It means "some
+      # unit failed and cargo is draining the jobs already started"; only the count of `could not
+      # compile` lines distinguishes a complete report from a truncated one.
       #
       # `cargo test` CANNOT take `--keep-going` — MEASURED on cargo 1.97.1 stable:
       # `cargo test --keep-going` exits 1 with `error: unexpected argument '--keep-going' found`
@@ -172,6 +204,15 @@ jobs:
       # on a warm target dir, not runner figures — the runner's cost depends on the rust-cache hit.
       #
       # WHAT IT DOES NOT COVER, so nobody reads it as more than it is:
+      #   - ANYTHING DOWNSTREAM OF A BROKEN UNIT — the largest limitation of the flag. `--keep-going`
+      #     fans out over units that are INDEPENDENT of the failing one; a unit that depends on it
+      #     cannot be compiled at all, so it is never reported. MEASURED here the same way, by
+      #     appending the same E0308 probe to `crates/eqoxide-core/src/game_state.rs` alone:
+      #     `cargo build --workspace --all-targets --locked --keep-going` -> exit 101, exactly 2
+      #     units named (`eqoxide-core` (lib) and `eqoxide-core` (lib test)), and `entity_pose_643`
+      #     appears 0 times — the identical zero-mentions symptom this step exists to fix. The
+      #     23-independent-leaf-targets mutation above is the flag's BEST case, not its typical one.
+      #     A break in a dependency root still reports one unit and hides the rest.
       #   - DOCTESTS. `--all-targets` does not include them (that is the same fact the test step
       #     below relies on), so a doctest that fails to COMPILE still surfaces only in `cargo
       #     test`, and still fails fast there.
@@ -182,8 +223,9 @@ jobs:
       #   - MERGING OVER A RED CHECK, which is the other half of #968 and cannot be fixed by any
       #     file in this repo. MEASURED 2026-08-12: `gh api repos/djhenry/eqoxide/branches/main/
       #     protection` returns 404 `Branch not protected`, and `gh api repos/djhenry/eqoxide/
-      #     rulesets` returns `[]` — so NO check is required on `main`, and #896 was merged 36
-      #     minutes after its only run went red with nothing to stop it. Making `test` a required
+      #     rulesets` returns `[]` — so NO check is required on `main`, and #896 was merged 33.5
+      #     minutes after its only run went red (run `31123248406` concluded 2026-08-06T17:31:43Z;
+      #     `merged_at` 18:05:13Z) with nothing to stop it. Making `test` a required
       #     status check is a repository-admin setting, not a workflow one; re-derive the current
       #     state with those two API calls rather than trusting this dated line.
       - name: cargo build --workspace --all-targets (compile every test target, keep going)

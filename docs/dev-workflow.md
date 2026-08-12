@@ -221,12 +221,24 @@ cannot drift:
 ```sh
 scripts/check-no-local-detail.sh              # tracked files — a preventer, runs before merge
 scripts/check-pr-text.sh <pr-or-issue-number> # PR/issue title, body, comments, review comments
-scripts/check-pr-text.sh --self-test          # offline; proves the scanner still discriminates
+scripts/check-pr-text.sh --self-test          # offline; runs both scanners through their guards
 ```
 
 `check-pr-text.sh` is a **detector, not a preventer**: GitHub has published the text before any
 check can read it, and keeps the edit history after it is scrubbed. Read a green run as "the
 current text is clean", never as "nothing was ever exposed".
+
+CI runs the scan from a `pull_request` trigger, so it only ever sees the text as it stood at the
+last **push**. A comment added afterwards — which is every review comment on the final revision — is
+never scanned automatically. Run `scripts/check-pr-text.sh <number>` by hand to cover those.
+
+`--self-test` checks a specific list, not a vague "still works": one deliberately-dirty item per
+pattern and three clean ones; a reach control that empties the pattern list and requires nothing to
+flag; an unreadable item that must count toward the corpus and not toward `classified`; the
+empty-corpus refusal; and — by *executing* `check-no-local-detail.sh` and `check-pr-text.sh` with
+`LOCAL_DETAIL_PATTERNS_FILE` pointed at an empty pattern list — each scanner's refusal to run with
+no patterns. That last part is deliberate: an earlier version asserted the refusal by re-deriving
+the condition inline, which stayed green when the real guard was deleted.
 
 Key test modules:
 - `src/assets.rs` — collision grid (floor_z, segment_blocked, path_clear)

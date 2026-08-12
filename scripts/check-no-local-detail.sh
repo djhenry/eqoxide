@@ -23,27 +23,35 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-# One regex per category, defined once and shared with scripts/check-pr-text.sh.
+# One regex per category, defined once and shared with scripts/check-pr-text.sh. The path is
+# overridable so `check-pr-text.sh --self-test` can point THIS script at an empty pattern list and
+# assert that it refuses — an assertion that runs the real guard instead of re-deriving it.
 # shellcheck source=scripts/local-detail-patterns.sh
-source "$(git rev-parse --show-toplevel)/scripts/local-detail-patterns.sh"
+patterns_file="${LOCAL_DETAIL_PATTERNS_FILE:-$(git rev-parse --show-toplevel)/scripts/local-detail-patterns.sh}"
+source "$patterns_file"
+# A pattern file that defines nothing at all must reach the refusal below, not crash on an unbound
+# variable with an exit code indistinguishable from a real finding.
+declare -p LOCAL_DETAIL_PATTERNS >/dev/null 2>&1 || LOCAL_DETAIL_PATTERNS=()
 patterns=("${LOCAL_DETAIL_PATTERNS[@]:-}")
 
 # Reach guard. This script reports only EXCEPTIONS, so with an empty pattern list it would print
 # OK having looked at nothing — indistinguishable from a clean tree. Refuse that state loudly.
 if [ "${#LOCAL_DETAIL_PATTERNS[@]}" -eq 0 ]; then
   echo "::error::check-no-local-detail: pattern list is EMPTY — the scan looked at nothing."
-  echo "This is a guard failure, not a clean tree. Check scripts/local-detail-patterns.sh."
+  echo "This is a guard failure, not a clean tree. Patterns were read from: ${patterns_file}"
   exit 1
 fi
 
-# Paths excluded from the scan:
-#   - this script itself, the shared pattern file, and the PR-text scanner (each necessarily
-#     contains the patterns it searches for)
+# Paths excluded from the scan. Every exclusion is a permanent blind spot in the one guard that is
+# a PREVENTER, so the list is kept as short as the patterns allow:
+#   - this script itself and the shared pattern file (each necessarily contains the patterns, and
+#     the pattern file also holds the dirty samples the guards are tested against)
 #   - the CI workflow (references the scripts)
+# `scripts/check-pr-text.sh` is deliberately NOT excluded: its dirty samples were moved into the
+# pattern file above precisely so the 300-line scanner stays inside this scan's reach.
 excludes=(
   ":(exclude)scripts/check-no-local-detail.sh"
   ":(exclude)scripts/local-detail-patterns.sh"
-  ":(exclude)scripts/check-pr-text.sh"
   ":(exclude).github/workflows/test.yml"
 )
 
