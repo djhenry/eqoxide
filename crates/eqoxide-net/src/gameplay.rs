@@ -2072,26 +2072,38 @@ mod zone_entry_handshake_publish_tests {
     /// in one test, an earlier assertion firing first can shadow this one and hide that it was
     /// never independently covered.
     ///
-    /// The seeded offer is the DEPARTED zone's; nothing here publishes a replacement, because the
-    /// claim is that it must be GONE, not swapped.
+    /// The seeded offers are the DEPARTED zone's; nothing here publishes a replacement, because the
+    /// claim is that they must be GONE, not swapped down to fewer.
     ///
-    /// MUTATION CHECK (both directions, verbatim output in the PR body): delete
-    /// `task_offers.lock().unwrap().clear();` from the top of `run_zone_entry_handshake` → RED
-    /// here. And WRAP it in a `black_box(false)` guard whose `else` arm does
+    /// MUTATION CHECK (both directions, self-measured survivor counts in the PR body, TWO offers
+    /// seeded on purpose — see the fixture comment below): delete
+    /// `task_offers.lock().unwrap().clear();` from the top of `run_zone_entry_handshake` → RED,
+    /// both offers survive. And WRAP it in a `black_box(false)` guard whose `else` arm does
     /// `task_offers.lock().unwrap().truncate(1);` instead — the plausible "trim it down" edit —
-    /// → also RED, because this asserts the slot's CONTENTS after a real call, not the presence of
-    /// a line of source.
+    /// → also RED, but with exactly one offer surviving, not two. A one-offer fixture would have
+    /// made `truncate(1)` a no-op indistinguishable from deletion (`Vec::truncate` is documented
+    /// as a no-op once the target length is at or above the current length) — the second offer is
+    /// what makes this genuinely two mutations, not one mutation counted twice.
     #[tokio::test]
     async fn a_zone_entry_handshake_clears_the_departed_zones_published_task_offers_1004() {
         let (mut stream, _unused_rx) = test_stream(0, 0).await;
         let (_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
         let (mut gs, snapshot, health) = fresh_gs_snapshot();
 
+        // TWO offers, not one (#1004 round-2 review): the wrap mutation's else-arm is
+        // `truncate(1)`, which is a documented no-op at length 1 — with a single-offer fixture
+        // that wrap and a straight deletion are the same mutation spelled two ways, and the
+        // "both directions" claim below would be one direction counted twice. At length 2,
+        // `truncate(1)` leaves exactly one survivor while a deleted clear leaves both — the two
+        // mutations are then genuinely distinguishable, matching the `GameState`-side test
+        // (`begin_zone_in_clears_the_departed_zones_task_offers_941`), which already seeds two.
         let task_offers: eqoxide_ipc::TaskOffersShared = Default::default();
-        task_offers.lock().unwrap().push(eqoxide_core::game_state::TaskOffer {
-            task_id: 10, npc_id: 9001, title: "Offer One".into(),
-            description: "Slay the rats".into(), has_rewards: true,
-        });
+        for (task_id, npc_id, title) in [(10, 9001, "Offer One"), (11, 9002, "Offer Two")] {
+            task_offers.lock().unwrap().push(eqoxide_core::game_state::TaskOffer {
+                task_id, npc_id, title: title.into(),
+                description: "Slay the rats".into(), has_rewards: true,
+            });
+        }
         // Mirror the same state in `gs`, as production would: both copies exist simultaneously, and
         // the point of this test is that clearing only the `gs` one is not enough.
         gs.task_offers = task_offers.lock().unwrap().clone();
