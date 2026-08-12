@@ -4999,8 +4999,9 @@ mod tests {
     ///  * everything at or below the file's first COLUMN-ZERO `#[cfg(test)]`. Tests call these
     ///    functions constantly and none of them is a consumer whose behaviour a new `NotUsable`
     ///    variant would change. The cost is that a PRODUCTION item placed BELOW the test module is
-    ///    invisible here — in `observe.rs` that cut-off is ~36% into the file. There are none today,
-    ///    which is why the census is exact, but this scan is not what would tell you one appeared.
+    ///    invisible here — in `observe.rs` that cut-off is ~36% into the file. There were none at
+    ///    `0c37ca0`, which is why the census is exact, but this scan is not what would tell you one
+    ///    appeared.
     ///  * the definitions themselves — they live in `zone_assets.rs`, which is not in the corpus.
     fn usability_consumers(text: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();

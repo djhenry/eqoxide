@@ -64,9 +64,10 @@ pub struct Hit {
 ///
 /// ## The `highpass` pair's two code states (#907)
 ///
-/// The mapped arm read **7,394** when #849 measured it and reads **7,393** today. #855 changed
-/// `nearest_floor`'s ray-hit acceptance window, which feeds this corpus's start/goal sampling, so
-/// both figures were right at the code state they were taken against. 7,393 is re-measured here
+/// The mapped arm read **7,394** when #849 measured it and **7,393** when #907 re-measured it on
+/// this branch. #855 changed `nearest_floor`'s ray-hit acceptance window, which feeds this
+/// corpus's start/goal sampling, so both figures were right at the code state they were taken
+/// against. 7,393 is re-measured here
 /// (`ZONES=highpass`, `worst_case_reachable_component`, reproduced twice, **`dev` profile: at
 /// `0c37ca0` the `--release` form of that command did not compile — #990, fix in flight as
 /// #994**); the mapless **7,229** is the original pre-#855 figure and was NOT re-run, because
@@ -10306,9 +10307,17 @@ mod clearance_probe_is_not_lossy_885 {
     /// `--lib` but a backtick), while the `--workspace --lib --no-fail-fast` line and this
     /// rustdoc's own `--lib <name>` sketch pass the split and are rejected by the first-character
     /// test. A prose line that put a lowercase word straight after ` --lib ` WOULD be a false
-    /// positive; none does today. Every recipe so classified must carry `-p eqoxide-nav`, and the
-    /// total is asserted, because a scan reporting only exceptions cannot tell "nothing wrong"
+    /// positive; none does at this head, and the count assertion below is what would surface one.
+    /// Every recipe so classified must carry `-p eqoxide-nav`, and the total is asserted, because a
+    /// scan reporting only exceptions cannot tell "nothing wrong"
     /// from "nothing looked at".
+    ///
+    /// **`-p` is the right remedy HERE because of what these recipes name, not in general.** All
+    /// nine resolve to `fn` definitions in this file — the `eqoxide-nav` LIB target — and this
+    /// crate has no `tests/` directory, so there is no integration target a recipe could have
+    /// meant. `-p` does NOT rescue an integration test: `-p <pkg> --lib <name>` against a test
+    /// living in `tests/*.rs` still selects the lib target, finds nothing, and exits 0. Such a
+    /// recipe needs `--test <file-stem>`, and this guard would wave it through.
     ///
     /// NOT matched, and none of these is claimed: a recipe wrapped across two lines; one written
     /// `--package` instead of `-p`; `--test`/`--bin`/`--bins` targets; and any file other than this
