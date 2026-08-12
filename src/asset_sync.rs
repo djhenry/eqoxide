@@ -850,8 +850,8 @@ mod sync_tests {
 
     #[test]
     fn old_format_synced_json_is_discarded_not_trusted_or_fatal() {
-        // Before #601, `synced.json` stored `{set: "digest-string"}` — every dev box and jimbo
-        // already have files in that shape on disk. The new format is `{set: {digest, files}}`.
+        // Before #601, `synced.json` stored `{set: "digest-string"}` — every existing install
+        // already has files in that shape on disk. The new format is `{set: {digest, files}}`.
         // A schema change to a persisted file must not paper over the mismatch: an old record must
         // not be silently (mis)trusted as valid new-format data, and reading it must not panic or
         // error out the client on first launch after upgrade. It must read as "never synced" and

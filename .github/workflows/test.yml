@@ -212,7 +212,8 @@ jobs:
       #     units named (`eqoxide-core` (lib) and `eqoxide-core` (lib test)), and `entity_pose_643`
       #     appears 0 times — the identical zero-mentions symptom this step exists to fix. The
       #     23-independent-leaf-targets mutation above is the flag's BEST case, not its typical one.
-      #     A break in a dependency root still reports one unit and hides the rest.
+      #     A break in a dependency root reports that ONE CRATE (both of its units) and hides every
+      #     crate downstream of it — 2 of 25+, not 23 of 23.
       #   - DOCTESTS. `--all-targets` does not include them (that is the same fact the test step
       #     below relies on), so a doctest that fails to COMPILE still surfaces only in `cargo
       #     test`, and still fails fast there.

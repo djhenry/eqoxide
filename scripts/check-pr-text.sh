@@ -38,6 +38,11 @@
 #   because a checker that prints only exceptions cannot tell "nothing wrong" from "nothing looked
 #   at". An empty corpus is an ERROR here, not a pass; so is an empty pattern list.
 #
+#   THE PATTERN SET IS AN ALLOWLIST. Even a fully-classified, fully-covered corpus is only checked
+#   against shapes someone already thought of, so a green run means "no KNOWN shape matched", never
+#   "no local detail is present". eqoxide#995 is the standing proof: a tracked comment naming
+#   deployment infrastructure sat green under the sibling scanner until the shape was added.
+#
 #   Which of those reach signals actually carry information, stated plainly so none of them is read
 #   as more than it is:
 #     - `flagged N` — the finding count. Load-bearing.
@@ -263,6 +268,8 @@ run_live() {
   echo "Not covered: edit history, commit messages, linked issues/PRs, releases, wiki, CI logs —"
   echo "and, when run from the pull_request workflow, any comment posted after the last push,"
   echo "which includes every review comment on the final revision."
+  echo "The pattern set is an ALLOWLIST of shapes someone already thought of, so this reads as"
+  echo "'no KNOWN shape matched', not 'no local detail is present' (eqoxide#995)."
   return 0
 }
 

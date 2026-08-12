@@ -16,8 +16,21 @@
 # the one guard that is a preventer, so the blind spot is kept to this one file instead of also
 # covering a 300-line script. Both scanners are scanned in full.
 #
-# Kept generic on purpose: every entry matches the *shape* of a leak, never a literal secret value,
-# so this file is safe to keep in a public repo.
+# Kept generic where a shape exists: most entries match the *shape* of a leak rather than a value.
+# NO CREDENTIAL OR SECRET IS EVER WRITTEN HERE. One class is an exception to the shape rule, and it
+# is worth being precise about rather than glossing: a deployment HOST NAME has no shape — any word
+# can be a host name — so covering that class means enumerating the names this project actually
+# uses. That is a literal in a public file, accepted for two reasons: the name is on a private
+# network with no external exposure, and the pre-scrub occurrence it was added for (#995) is already
+# permanent in this repo's history, which the standing decision is deliberately NOT to rewrite. So
+# the enumeration adds no exposure that does not already exist, and buys forward coverage.
+#
+# THE PATTERN SET IS AN ALLOWLIST OF LEAK SHAPES SOMEONE ALREADY THOUGHT OF. A green run from either
+# scanner means "no KNOWN shape matched", never "no local detail is present". #995 is the proof: a
+# tracked comment named deployment infrastructure and the guard exited 0 for months, because host
+# names were simply not in this list. When a new class is found, the fix is BOTH halves — scrub the
+# instance and add the pattern — in one change, or the class stays uncovered with nothing recording
+# that it ever was.
 #
 # Both scanners read this path from `${LOCAL_DETAIL_PATTERNS_FILE:-<repo>/scripts/local-detail-
 # patterns.sh}`. That override is not a convenience: it is how `check-pr-text.sh --self-test`
@@ -34,6 +47,7 @@ LOCAL_DETAIL_PATTERNS=(
   'eqgame\.exe'                 # the decompiled commercial client binary
   'decompiled/'                 # a path into decompiled output
   'FUN_[0-9a-fA-F]{6}'          # internal symbol name lifted from the binary
+  '\b[Jj]imbo\b'                # deployment host name (#995) -- see the allowlist note above
 )
 
 # One deliberately-dirty sample per pattern, in the SAME ORDER, invented here rather than quoted
@@ -50,4 +64,5 @@ LOCAL_DETAIL_DIRTY_SAMPLES=(
   'offsets read from eqgame.exe'
   'see decompiled/output.c'
   'the routine at FUN_004a1b2c'
+  'restarted the zone launcher on jimbo'
 )

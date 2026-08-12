@@ -4,12 +4,20 @@
 # content reappears in a TRACKED file. The repo is public; this guard is the durable defense
 # against re-introducing the categories that a one-time scrub removed.
 #
-# It flags (by PATTERN, so it never itself contains a real secret value):
+# It flags (never a credential or secret value; see the pattern file's note on the one class that
+# has no shape and must therefore be enumerated):
 #   - absolute home paths            (a local-system path leak)
 #   - the local container-name shape (deployment-specific infrastructure detail)
+#   - deployment host names          (#995 — the class this guard was green on for months)
 #   - an inline DB password flag     (the `-u<user> -p<pass>` credential antipattern)
 #   - references to a decompiled commercial client and RE tooling
 #     (ghidra / capstone / the client exe / a `decompiled/` path / lifted `FUN_xxxxxx` symbols)
+#
+# ITS PATTERN SET IS AN ALLOWLIST. A green run means "no KNOWN shape matched", NOT "no local detail
+# is present" — those differ by whatever nobody has thought of yet, which is not a hypothetical:
+# eqoxide#995 is a tracked comment naming deployment infrastructure that this script exited 0 on
+# until the shape was added. Finding a new class means scrubbing the instance AND adding the
+# pattern, in one change.
 #
 # Run locally with:  scripts/check-no-local-detail.sh
 # Exit 0 = clean, exit 1 = a forbidden pattern was found (prints file:line).
@@ -80,3 +88,5 @@ scanned=$(git grep --files-with-matches -I -E -e '' -- . "${excludes[@]}" 2>/dev
 echo "check-no-local-detail: OK — ${#patterns[@]} patterns x ${scanned} tracked text files, no matches."
 echo "check-no-local-detail: reach — tracked files only. PR/issue bodies and comments are NOT"
 echo "covered here; scripts/check-pr-text.sh is the scanner for that surface (eqoxide#980)."
+echo "check-no-local-detail: the pattern set is an ALLOWLIST of shapes someone already thought of,"
+echo "so OK means 'no KNOWN shape matched', not 'no local detail is present' (eqoxide#995)."
