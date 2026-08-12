@@ -67,11 +67,16 @@ pub struct Hit {
 /// The mapped arm read **7,394** when #849 measured it and reads **7,393** today. #855 changed
 /// `nearest_floor`'s ray-hit acceptance window, which feeds this corpus's start/goal sampling, so
 /// both figures were right at the code state they were taken against. 7,393 is re-measured here
-/// (`ZONES=highpass`, `worst_case_reachable_component`, reproduced twice); the mapless **7,229** is
+/// (`ZONES=highpass`, `worst_case_reachable_component`, reproduced twice, **`dev` profile — the
+/// `--release` form of that command does not build today, see #990**); the mapless **7,229** is
 /// the original pre-#855 figure and was NOT re-run — `open_corpus_zone` always attaches the region
 /// map, so the mapless arm cannot be reproduced without editing the corpus. Read the pair as
 /// "same zone, region map the only *intended* difference, arms taken either side of #855". The
 /// ratio survives that: 7393/7229 = +2.27%, which is what the +2.3% above rounds from.
+///
+/// `water_grid.rs` restates this pair for its own argument, and #907 found the two files
+/// disagreeing after only one was corrected. `both_files_state_the_same_re_measured_highpass_figure`
+/// now pins them to each other, so the next re-measurement cannot update one and miss the other.
 ///
 /// The old "~7× headroom" claim is retired **on measurement, not inference**: it was taken on a
 /// `Collision` with no region data attached, and `build_zone_collision` (`src/app.rs`) is the
@@ -8018,6 +8023,13 @@ mod tests {
     /// ```text
     /// cargo test --release --lib worst_case_reachable_component -- --ignored --nocapture
     /// ```
+    ///
+    /// **#990: that `--release` form does not build today.** `walker.rs`'s ungated `_cited` array
+    /// names a `#[cfg(debug_assertions)]` test, so the whole `eqoxide-nav` lib-test target fails to
+    /// compile under `--release` before any measurement runs. Drop `--release` until #990
+    /// lands — the #907 re-measurement above was taken on the `dev` profile for this reason, which
+    /// is why its wall times are what they are. (Not a claim about every row of the table: one
+    /// `butcher` run's profile was never captured, and that row says so.)
     #[test]
     #[ignore = "requires baked zone glbs; measurement for the #394 node cap"]
     fn worst_case_reachable_component() {
@@ -10152,6 +10164,65 @@ mod clearance_probe_is_not_lossy_885 {
         }
     }
 
+    /// **#907: the `highpass` pair is written in two files, so pin them to each other.**
+    ///
+    /// The measurement lives in `MAX_NODES`' rustdoc AND is restated in `water_grid.rs`'s
+    /// attachment-cost argument. Nothing tied them together, so #907's re-measurement corrected one
+    /// file and left the other asserting the superseded `7,394` — the tree then carried both numbers
+    /// for one measurement. A reader has no way to tell which file is stale.
+    ///
+    /// Every arrowed occurrence of the baseline must therefore name the SAME re-measured figure.
+    /// Both literals are spelled through `concat!` so this guard is not itself a corpus hit — its
+    /// corpus contains its own source, and a scanner that matches its own text can never report
+    /// clean (#973).
+    ///
+    /// **Reach, stated as a limit.** This keys on the arrow, so the bare mapless mention at
+    /// `MAX_NODES` is deliberately classified PROSE, not checked. Every site is classified and the
+    /// totals are asserted: a scan reporting only exceptions cannot distinguish "nothing wrong"
+    /// from "nothing looked at".
+    #[test]
+    fn both_files_state_the_same_re_measured_highpass_figure() {
+        let baseline = concat!("7,2", "29");
+        let re_measured = concat!("7,3", "93");
+        let corpus = [("collision.rs", include_str!("collision.rs")),
+                      ("water_grid.rs", include_str!("water_grid.rs"))];
+
+        let (mut paired, mut prose) = (Vec::new(), Vec::new());
+        for (name, src) in corpus {
+            // Line breaks fall between the baseline and its pair (rustdoc wraps), so normalise.
+            let flat: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+            for (i, _) in flat.match_indices(baseline) {
+                let after = &flat[i + baseline.len()..];
+                let window = &after[..after.len().min(24)];
+                match window.find("->").or_else(|| window.find('\u{2192}')) {
+                    None => prose.push(name),
+                    Some(at) => {
+                        let figure: String = after[at..]
+                            .chars()
+                            .skip_while(|c| !c.is_ascii_digit())
+                            .take_while(|c| c.is_ascii_digit() || *c == ',')
+                            .collect();
+                        paired.push((name, figure));
+                    }
+                }
+            }
+        }
+
+        for (name, figure) in &paired {
+            assert_eq!(figure, re_measured,
+                "{name} states the `highpass` pair as {baseline} -> {figure}, but #907 re-measured \
+                 the mapped arm at {re_measured}. Two tracked files disagreeing about one \
+                 measurement is the #907 defect itself — fix the file, do not relax this guard.");
+        }
+        assert_eq!(paired.len(), 3,
+            "expected 3 arrowed statements of the pair (2 in collision.rs, 1 in water_grid.rs), \
+             found {}: {paired:?}. If a site was added or deleted, weigh it — a scan that silently \
+             stopped reaching them would otherwise pass by finding nothing.", paired.len());
+        assert_eq!(prose.len(), 1,
+            "expected exactly 1 unarrowed mention (the mapless arm at `MAX_NODES`), found {}: \
+             {prose:?}", prose.len());
+    }
+
     // ── defect 1: a saturated spoke and a cap-distance hit ───────────────────────────────────────
 
     /// **The pair.** Open ground saturates; walls at exactly the cap are HITS at the cap. These two
@@ -10442,6 +10513,8 @@ mod clearance_probe_is_not_lossy_885 {
             evaluating_both_disjuncts_moves_the_published_facing_blind_counter,
             no_tracked_text_calls_the_facing_blind_counter_a_query_count,
             the_two_counter_accessors_do_not_describe_each_others_signal,
+            // cited by `MAX_NODES`' "two code states" section (#907 review round 1)
+            both_files_state_the_same_re_measured_highpass_figure,
         ];
     }
 

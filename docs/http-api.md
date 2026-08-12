@@ -1014,7 +1014,7 @@ which:
 
 The section above is `/goto`'s instance of a rule that now covers the whole API. Several routes
 accept **more than one way to name the same argument**, and each of them used to resolve the choice
-with a precedence chain that never looked at the losers. Most request structs carry
+with a precedence chain that never looked at the losers. Every request struct carries
 `serde(deny_unknown_fields)`, so a *misspelled* field is rejected. That is exactly what makes a
 *declared but unreached* field quiet: it is not unknown, so it parses, and the request is answered
 `200`. That is the failure this rule removes: the strongest signal the API can send ("your
@@ -1039,7 +1039,7 @@ instruction was understood") for an instruction that was thrown away.
 > empty exception set by `every_deserialize_request_struct_is_classified`, and the `35` on this page
 > against that module's constants by
 > `docs_http_api_md_may_not_disagree_with_this_modules_struct_counts`. That test also holds the `8`
-> and the `27` fixed relative to those two, but neither is derived from the code — re-derive them
+> and the `27` fixed relative to that figure, but neither is derived from the code — re-derive them
 > with the `grep` commands under "How far the guard actually reaches" below.
 
 **The rule.** Where two forms name *the same thing* in different notations (`{map_x,map_y}` and

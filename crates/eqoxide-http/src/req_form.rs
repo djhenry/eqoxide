@@ -477,8 +477,9 @@ mod tests {
     /// * `8` is not a constant of this module — it is the exhaustive-destructure figure re-derived
     ///   by the `grep -rnE` command in the module doc. It is written here so the pins can tie its
     ///   ARITHMETIC to the total: `27` is computed, never typed. The doc sentence promising which
-    ///   figures are asserted names only `2` and `35` for that reason; `8` and `27` are held fixed
-    ///   RELATIVE to them and nothing more.
+    ///   figures are asserted names only `35` for that reason; `8` and `27` are held fixed
+    ///   RELATIVE to it and nothing more. (It named `2` as well until #971 emptied
+    ///   `DENY_UNKNOWN_EXEMPT`; `2` is no longer a figure of this module.)
     /// * The corpus assertion bounds the text READ, and nothing about what the loop then does with
     ///   it. It compares a LENGTH, so a same-size substitution passes; and a skip added inside the
     ///   loop leaves every byte read and some of them never examined. Neither is caught here.
@@ -487,7 +488,7 @@ mod tests {
     /// `sha256sum`:
     /// * The review's own mutant — every `35` in `docs/http-api.md` rewritten to `36`, which left
     ///   the whole workspace gate green before this guard existed: **KILLED**, at the
-    ///   `doc:exempt-of-total` pin.
+    ///   `doc:protected-of-total` pin.
     /// * A NEW unpinned sentence quoting the count, inserted mid-page: **KILLED** by the sweep,
     ///   reported at the inserted line and nowhere else.
     /// * Reach control, WRAP: `if false { sites.clone() } else { sites[..4].to_vec() }`, i.e. the
@@ -534,7 +535,7 @@ mod tests {
     ///   comparison between the swept text and the variable it was sliced from still holds. Against
     ///   the size on disk it is **KILLED**.
     /// * All three second-pass mutants replayed on this tree: doc `35`→`36` **KILLED** at
-    ///   `doc:exempt-of-total`; the appended unpinned sentence **KILLED**, reported as `UNPINNED`
+    ///   `doc:protected-of-total`; the appended unpinned sentence **KILLED**, reported as `UNPINNED`
     ///   with its line number; the pins loop truncated to 4 of 9 sites **KILLED**, naming the five
     ///   missing labels. The classifier-forced mutant is **KILLED** as well.
     /// * INVALID control for this pass: a non-existent method in the corpus assertion's message →
