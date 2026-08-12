@@ -1646,6 +1646,93 @@ impl GameState {
         // eat the terminal of the first cast in the NEW zone. (eqoxide#348 review)
         self.reset_cast_tracking();
         self.casting = None;
+        // ── #941: the rest of the spawn/session-scoped state ──────────────────────────────────
+        // Every field below names either a spawn id in the zone we just left (a per-zone namespace,
+        // exactly like `target_id`/`last_consider` above) or an open NPC window that the departed
+        // NPC's disappearance has already closed. See `zone_scoped_state_941` on the class guard
+        // test for the question each was audited against.
+        //
+        // ⚠️ Three of these have a PUBLISHED copy this function cannot reach, the same way
+        // `world.doors` does (#891/#934 review B1): `dialogue_choices` is mirrored into
+        // `InteractSlots::dialogue`, `merchant_open`/`merchant_items` into
+        // `MerchantSlots::merchant`, and `task_offers` into `QuestSlots::task_offers_shared` —
+        // all three only by `ActionLoop::sync_messages`/`sync_merchant`/`sync_tasks`, whose sole
+        // caller is `run_gameplay_phase`'s packet drain — NOT the zone-entry handshake's own
+        // drain. `gameplay::run_zone_entry_handshake` clears those three slots alongside this
+        // call; clearing only here leaves GET /v1/observe/dialogue, GET /v1/merchant/list and
+        // GET /v1/quests/offers serving the departed zone's answers for the whole zone load.
+
+        // The clickable saylink choices of the NPC we were talking to. Directly served by
+        // GET /v1/observe/dialogue and directly ACTIONABLE via POST /v1/interact/dialogue, which
+        // sends an OP_ItemLinkClick — so a surviving list is a well-formed, plausible, false answer
+        // that an agent can then act on, against an NPC that is not in this zone. Its only other
+        // writers are "a new NPC line carried saylinks" (`apply_*` in `packet_handler`) and the
+        // hail clear (#274), so without this it survives until one of those happens to fire.
+        self.dialogue_choices.clear();
+        // An open task-select window: each offer names the OFFERING NPC's spawn id (`npc_id`,
+        // "required by `OP_AcceptNewTask`'s `task_master_id` field" per `TaskOffer`'s own doc) —
+        // a per-zone namespace, exactly like `trainer_open`/`merchant_open` below. Directly served
+        // by GET /v1/quests/offers and directly ACTIONABLE via POST /v1/quests/accept, which
+        // resolves `task_master_id` from this list and sends OP_AcceptNewTask to it — the same
+        // read-then-act shape as `dialogue_choices` above. Its only other writer is
+        // `apply_task_select_window` replacing the list wholesale on a fresh OP_TaskSelectWindow
+        // from THIS zone's NPC, so without this clear a stale offer (and its stale `npc_id`)
+        // survives indefinitely, not just for the zone-in window.
+        self.task_offers.clear();
+        // An open guildmaster-training window: the trainer's spawn id plus the caps IT offers.
+        // Exposed as `player.trainer_open`/`player.trainer_skills` on /v1/observe/debug and read by
+        // POST /v1/trainer/train, which addresses OP_GMTrainSkill to `trainer_open` — a stale id
+        // aims a training request at whatever the new zone assigned that spawn id.
+        self.trainer_open = None;
+        self.trainer_skills.clear();
+        // An open merchant window: the merchant's spawn id and its wares. Composes with — rather
+        // than fights — `begin_shop_open_for`'s no-flicker guard (#361 review FIX 2): that guard
+        // exists to stop a pre-buy/pre-sell OP_ShopRequest RESEND against the merchant that is
+        // already open from flickering the window closed for a round-trip. A zone-in is not a
+        // resend; the window is genuinely gone, and leaving it set is what would be the lie. After
+        // this clear the guard's next comparison is `None != Some(new_id)`, its clear-and-reopen
+        // path, which is exactly right for a first open in a new zone.
+        self.merchant_open = None;
+        self.merchant_items.clear();
+        // The player's pet's spawn id. The pet itself follows the player across a zone line in EQ,
+        // but the NEW zone assigns it a NEW spawn record, so this id is stale from the moment we
+        // zone. It is normally dropped by `remove_entity` when the pet despawns — which
+        // `begin_zone_in` cannot go through, because it empties `world.entities` wholesale. Until
+        // the new zone's pet spawn packet lands and rewrites it, a stale id sends /v1/pet/command's
+        // OP_PetCommands at a spawn that is not our pet.
+        self.pet_id = None;
+        // The whole auto-loot session and its queue. Every id in it is a CORPSE spawn id in the
+        // departed zone; an ungated `pending_loot` front would make the net thread's own drain send
+        // this zone's OP_LootRequest for a corpse id that named someone else's mob.
+        //
+        // ⚠️ #414's "deliberately left as-is" note on `loot_session_active`/`loot_current_corpse`
+        // (see `gameplay.rs`'s `LootTickAction::TimedOut` arm and `apply_loot_open_timeout`) does
+        // NOT govern here, and this clear is not an override of it. That note keeps the session
+        // pinned so a LATE `OP_MoneyOnCorpse`/`OP_LootComplete` — neither of which carries a corpse
+        // id — cannot be misattributed to the NEXT corpse's session. A zone change ends the zone
+        // server session that could still deliver such an ack (`run_gameplay_phase` drops the
+        // stream and `EqStream::connect`s a new one before the handshake that calls this), so there
+        // is no late ack left to quarantine AGAINST; keeping the quarantine armed would instead
+        // carry the departed zone's block into this one and withhold the new zone's first
+        // OP_LootRequest until it times out.
+        self.pending_loot.clear();
+        self.loot_session_active = false;
+        self.loot_confirmed = false;
+        self.loot_current_corpse = None;
+        self.loot_last_activity = None;
+        self.loot_end_requested_at = None;
+        self.loot_queued_at = None;
+        self.loot_defensive_close_at = None;
+        // Both are HashMaps keyed by spawn id. Neither is HTTP-exposed; both feed behaviour.
+        // `combat_anims` also keys the PLAYER's own id, which is the one id that does NOT change
+        // across a zone line — so an un-cleared entry replays the departed zone's swing on the
+        // first frames of the new one. `recent_attackers` feeds the auto-combat add-retarget; it is
+        // separately TTL-pruned (`ATTACKER_TTL`, 6s, in `action_loop`) and its consumer additionally
+        // requires the id to resolve to a live reachable NPC, so the surviving harm is narrow — an
+        // id the new zone reuses inside that window being treated as something that attacked us.
+        // Cleared anyway: "narrow" is a bound on a wrong answer, not an argument for keeping it.
+        self.combat_anims.clear();
+        self.recent_attackers.clear();
     }
 
     /// Drop all in-flight cast bookkeeping (but NOT `last_cast`, which is a true record of
@@ -2234,8 +2321,8 @@ mod pose_tests_643 {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{CastState, ControllerHold, ControllerHoldReason, Door, GameState, HeldMotion,
-                LastConsider, MerchantItem, ZonePoint, make_entity};
+    use super::{CastState, ControllerHold, ControllerHoldReason, DialogueChoice, Door, GameState,
+                HeldMotion, LastConsider, MerchantItem, TaskOffer, ZonePoint, make_entity};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
     /// including the FULL-SNAPSHOT (`resync_from_snapshot`) path that carries the real mid-zone
@@ -3321,12 +3408,15 @@ pub(crate) mod tests {
     /// one exercising all of them together from one populated state.
     ///
     /// It does NOT claim coverage of every spawn-scoped field in `GameState` — only the ones
-    /// `begin_zone_in` is documented (by the comments on each clear, above) to own. The #883 PR body
-    /// records a broader audit that found additional spawn-scoped fields (`merchant_open`,
-    /// `trainer_open`, `pet_id`, the loot-session fields, `dialogue_choices`, `combat_anims`,
-    /// `recent_attackers`) that `begin_zone_in` does NOT yet own; those are out of scope here and
-    /// tracked in a follow-up issue, so this test intentionally does not populate or assert them —
-    /// asserting them would be a false claim about what this function does today.
+    /// `begin_zone_in` is documented (by the comments on each clear, above) to own. Until #941 that
+    /// excluded `merchant_open`/`merchant_items`, `trainer_open`/`trainer_skills`, `pet_id`, the
+    /// loot-session fields, `dialogue_choices`, `combat_anims` and `recent_attackers` — the broader
+    /// audit the #883 PR body recorded. #941 gave `begin_zone_in` all of them, so they are populated
+    /// and asserted here too (below the `── #941 ──` markers), and the exclusion note that used to
+    /// stand here would now be a FALSE claim about what this function does. What is still not
+    /// claimed is that no OTHER `GameState` field is zone-scoped; the field that guards THAT is
+    /// `every_game_state_field_is_classified_against_begin_zone_in_941`, which is a compile-time
+    /// guard, not an assertion.
     #[test]
     fn begin_zone_in_clears_every_field_it_owns_at_once_883() {
         use crate::zone_cross::{CrossAttempts, ZoneCrossPlan, ZoneCrossResolution, MAX_CROSS_ATTEMPTS};
@@ -3385,6 +3475,23 @@ pub(crate) mod tests {
         gs.ended_cast_spell = Some((202, std::time::Instant::now()));
         gs.suppress_cast_end = true;
         gs.casting = Some(CastState { spell_id: 202, started: std::time::Instant::now(), cast_ms: 3000 });
+        // ── #941 ──
+        gs.dialogue_choices.push(saylink_choice("bind your soul"));
+        gs.trainer_open = Some(41);
+        gs.trainer_skills = vec![0; 78];
+        gs.trainer_skills[1] = 200;
+        gs.merchant_open = Some(111);
+        gs.merchant_items.push(MerchantItem {
+            merchant_slot: 1, item_id: 1, name: "Rusty Dagger".into(), icon: 0, price: 5, quantity: 1,
+        });
+        gs.task_offers.push(TaskOffer {
+            task_id: 10, npc_id: 9001, title: "Offer One".into(),
+            description: "…".into(), has_rewards: true,
+        });
+        gs.pet_id = Some(64);
+        populate_loot_session(&mut gs);
+        gs.combat_anims.insert(7, (5, std::time::Instant::now()));
+        gs.recent_attackers.insert(7, std::time::Instant::now());
 
         gs.begin_zone_in();
 
@@ -3410,6 +3517,410 @@ pub(crate) mod tests {
         assert!(gs.ended_cast_spell.is_none(), "ended_cast_spell");
         assert!(!gs.suppress_cast_end, "suppress_cast_end");
         assert!(gs.casting.is_none(), "casting");
+        // ── #941 ──
+        assert!(gs.dialogue_choices.is_empty(), "dialogue_choices");
+        assert!(gs.trainer_open.is_none(), "trainer_open");
+        assert!(gs.trainer_skills.is_empty(), "trainer_skills");
+        assert!(gs.merchant_open.is_none(), "merchant_open");
+        assert!(gs.merchant_items.is_empty(), "merchant_items");
+        assert!(gs.task_offers.is_empty(), "task_offers");
+        assert!(gs.pet_id.is_none(), "pet_id");
+        assert!(gs.pending_loot.is_empty(), "pending_loot");
+        assert!(!gs.loot_session_active, "loot_session_active");
+        assert!(!gs.loot_confirmed, "loot_confirmed");
+        assert!(gs.loot_current_corpse.is_none(), "loot_current_corpse");
+        assert!(gs.loot_last_activity.is_none(), "loot_last_activity");
+        assert!(gs.loot_end_requested_at.is_none(), "loot_end_requested_at");
+        assert!(gs.loot_queued_at.is_none(), "loot_queued_at");
+        assert!(gs.loot_defensive_close_at.is_none(), "loot_defensive_close_at");
+        assert!(gs.combat_anims.is_empty(), "combat_anims");
+        assert!(gs.recent_attackers.is_empty(), "recent_attackers");
+    }
+
+    /// A saylink choice shaped like the ones `parse_say_links` builds from a real NPC line — the
+    /// SAYLINK_ITEM_ID marker and a non-zero `augments[0]` sayid, which is what
+    /// `POST /v1/interact/dialogue` actually sends back to the server. Built as a fixture helper so
+    /// the #941 tests below (and the combined clear-list test above) all exercise a choice that
+    /// could really be clicked, not an empty struct that happens to clear.
+    fn saylink_choice(text: &str) -> DialogueChoice {
+        DialogueChoice {
+            text: text.to_string(),
+            // 0xF_FFFF is `SAYLINK_ITEM_ID` — the marker the server requires on a saylink click.
+            // Written as a literal because that const is private to `eq_net::packet_handler`,
+            // which sits ABOVE this crate and cannot be imported from here.
+            item_id: 0xF_FFFF,
+            augments: [5, 0, 0, 0, 0, 0],
+            link_hash: 0,
+            icon: 0,
+        }
+    }
+
+    /// Drive `gs` into a loot session that has actually REACHED the #414 defensive-close quarantine
+    /// — the state in which `loot_tick_action` withholds the next corpse's `OP_LootRequest` — with a
+    /// second corpse still queued behind it. A bare `Some(id)` would leave the assertions below
+    /// unfalsifiable about the thing that matters: it is the *quarantined, non-empty-queue* session
+    /// that a zone-in must not carry, because that is the one that both misdirects the drain (the
+    /// queued id) and blocks the new zone's first loot (the quarantine).
+    fn populate_loot_session(gs: &mut GameState) {
+        let now = std::time::Instant::now();
+        gs.pending_loot.push_back(31); // a second corpse, still queued, in the DEPARTED zone
+        gs.loot_session_active = true;
+        gs.loot_confirmed = true;
+        gs.loot_current_corpse = Some(30);
+        gs.loot_last_activity = Some(now);
+        gs.loot_end_requested_at = Some(now);
+        gs.loot_queued_at = Some(now);
+        gs.loot_defensive_close_at = Some(now);
+    }
+
+    /// #941 (1/6) — the departed NPC's dialogue choices must NOT survive a zone-in.
+    ///
+    /// The highest-exposure field in the #941 audit and the one that matches this project's
+    /// agent-honesty invariant most exactly: `GET /v1/observe/dialogue` serves these verbatim and
+    /// `POST /v1/interact/dialogue` ACTS on them (it sends an OP_ItemLinkClick carrying the saylink's
+    /// sayid). Carried across a zone line the endpoint answers with a well-formed, plausible, FALSE
+    /// list — choices offered by an NPC that is not in this zone — and the click endpoint will
+    /// happily fire one at the new zone's server.
+    ///
+    /// CODE-TRACED, not live-measured (the #941 issue asks for this to be said plainly): the field's
+    /// only other writers are `apply_channel_message`/`apply_special_mesg` in `packet_handler`
+    /// ("a new NPC line carried saylinks", overwrite-only, never clear) and `drain_chat`'s hail clear
+    /// (#274). Neither runs on a zone-in, so before this fix the list survived until the agent
+    /// happened to hail someone or another NPC happened to speak with links.
+    ///
+    /// Mutation check (both directions, verbatim output in the PR body): drop
+    /// `self.dialogue_choices.clear();` → RED; and WRAP it as
+    /// `if false { self.dialogue_choices.clear(); } else { self.dialogue_choices.truncate(1); }`
+    /// (a different, plausible-looking edit that leaves the one stale choice in place) → also RED.
+    #[test]
+    fn begin_zone_in_clears_the_departed_npcs_dialogue_choices_941() {
+        let mut gs = GameState::new();
+        gs.dialogue_choices.push(saylink_choice("bind your soul"));
+        gs.dialogue_choices.push(saylink_choice("train me"));
+        assert_eq!(gs.dialogue_choices[0].augments[0], 5,
+            "test setup: the fixture must be a CLICKABLE choice (a real sayid), or this test does \
+             not exercise the harm — an un-clickable choice would only be a bad read, not a bad act");
+
+        gs.begin_zone_in();
+
+        assert!(gs.dialogue_choices.is_empty(),
+            "dialogue_choices are the saylinks of ONE NPC's line in the zone we just left; carried \
+             across a zone-in, GET /v1/observe/dialogue serves them as this zone's current choices \
+             and POST /v1/interact/dialogue will send one — a confident falsehood the agent can \
+             then act on, which is exactly the failure mode this client must never produce");
+    }
+
+    /// #1004 review — `task_offers` is the same shape as `dialogue_choices` above and belongs to
+    /// the same class: each offer names the OFFERING NPC's spawn id (`npc_id`, per `TaskOffer`'s
+    /// own doc — "required by `OP_AcceptNewTask`'s `task_master_id` field"), it is served verbatim
+    /// by GET /v1/quests/offers, and it is directly ACTIONABLE — POST /v1/quests/accept resolves
+    /// `task_master_id` from this list and sends OP_AcceptNewTask to it. A surviving offer after a
+    /// zone-in is therefore a well-formed, plausible, false answer the agent can act on, against an
+    /// NPC that is not in this zone — exactly `dialogue_choices`'s failure mode.
+    ///
+    /// Mutation check (both directions, verbatim output in the PR body): drop
+    /// `self.task_offers.clear();` → RED; and WRAP it as
+    /// `if std::hint::black_box(false) { self.task_offers.clear(); } else { self.task_offers.truncate(1); }`
+    /// (a plausible "trim it down" edit that leaves one stale offer in place) → also RED.
+    #[test]
+    fn begin_zone_in_clears_the_departed_zones_task_offers_941() {
+        let mut gs = GameState::new();
+        gs.task_offers.push(TaskOffer {
+            task_id: 10, npc_id: 9001, title: "Offer One".into(),
+            description: "Slay the rats".into(), has_rewards: true,
+        });
+        gs.task_offers.push(TaskOffer {
+            task_id: 11, npc_id: 9002, title: "Offer Two".into(),
+            description: "Fetch the ore".into(), has_rewards: false,
+        });
+
+        gs.begin_zone_in();
+
+        assert!(gs.task_offers.is_empty(),
+            "task_offers name the OFFERING NPC's spawn id (npc_id); carried across a zone-in, \
+             GET /v1/quests/offers serves them as this zone's current offers and POST \
+             /v1/quests/accept will address OP_AcceptNewTask to a departed zone's spawn id — the \
+             same confident-falsehood shape as dialogue_choices, and this client must never \
+             produce it");
+    }
+
+    /// #941 (2/6) — the departed zone's trainer window must NOT survive a zone-in.
+    ///
+    /// `trainer_open` is a guildmaster's SPAWN id and `trainer_skills` are the caps THAT trainer
+    /// offers. Both are exposed on `GET /v1/observe/debug` (`player.trainer_open` as a bool,
+    /// `player.trainer_skills` as the cap list, `eqoxide-http/src/lib.rs`), and
+    /// `POST /v1/trainer/train` gates on the bool and then addresses OP_GMTrainSkill to the id
+    /// (`action_loop::drain_trainer`). A trainer window cannot survive a zone line — the NPC is not
+    /// here — so a surviving id aims a training request at whatever spawn the NEW zone assigned that
+    /// number, and a surviving cap list advertises skills this zone's trainer may not offer at all.
+    ///
+    /// CODE-TRACED: the only clear is the explicit `POST /v1/trainer/open {"trainer":0}` end-session
+    /// sentinel (`drain_trainer`), which a zone change obviously does not send.
+    ///
+    /// Mutation check (both directions): drop the two clears → RED; WRAP as
+    /// `if false { …clears… } else { self.trainer_skills.truncate(1); }` → also RED.
+    #[test]
+    fn begin_zone_in_clears_the_departed_zones_trainer_window_941() {
+        let mut gs = GameState::new();
+        gs.trainer_open = Some(41);
+        gs.trainer_skills = vec![0; 78];
+        gs.trainer_skills[1] = 200; // a cap this trainer offers — the shape /v1/train reads
+
+        gs.begin_zone_in();
+
+        assert!(gs.trainer_open.is_none(),
+            "the open trainer's spawn id belongs to the zone we left; left set, /observe/debug \
+             reports a training window as open here and POST /v1/trainer/train sends \
+             OP_GMTrainSkill at that id — a spawn the new zone assigned to something else");
+        assert!(gs.trainer_skills.is_empty(),
+            "…and its cap list must go with it: caps are what THAT trainer offered, and an agent \
+             reading them here would plan training this zone's trainer may not offer");
+    }
+
+    /// #941 (3/6) — the departed zone's merchant window must NOT survive a zone-in, AND the clear
+    /// must compose with the existing no-flicker invariant rather than fight it.
+    ///
+    /// The #941 issue flags this field specifically because `begin_shop_open_for` already carries a
+    /// deliberate, tested invariant (#361 review FIX 2): a pre-buy/pre-sell OP_ShopRequest RESEND
+    /// against the merchant that is ALREADY open must NOT flicker `merchant_open` to `None` for a
+    /// round-trip, because `sync_merchant` mirrors the field into `GET /v1/merchant/list` every tick
+    /// and the HUD gates its window on `is_some()`. The two are orthogonal, and this test measures
+    /// that rather than asserting it: after a zone-in it drives the full open → resend cycle and
+    /// checks the resend still does not flicker. (The invariant's own tests,
+    /// `shop_open_for_a_different_merchant_clears_the_previous_session_360` and
+    /// `shop_open_resend_for_the_same_merchant_does_not_flicker_361`, are untouched and still pass —
+    /// this clear does not go near `begin_shop_open_for`.)
+    ///
+    /// Mutation check (both directions): drop the two clears → RED at the first assertion; WRAP as
+    /// `if false { …clears… } else { self.merchant_items.clear(); }` — i.e. the plausible
+    /// half-fix that drops the wares but keeps the window "open" — → RED at the first assertion,
+    /// with the second and third still passing, which is why all three are here.
+    #[test]
+    fn begin_zone_in_clears_the_departed_zones_merchant_window_941() {
+        let mut gs = GameState::new();
+        gs.merchant_open = Some(111);
+        gs.merchant_items.push(MerchantItem {
+            merchant_slot: 1, item_id: 1, name: "Rusty Dagger".into(), icon: 0, price: 5, quantity: 1,
+        });
+
+        gs.begin_zone_in();
+
+        assert_eq!(gs.merchant_open, None,
+            "an open merchant window cannot survive a zone line — the NPC is not here; left set, \
+             GET /v1/merchant/list reports a shop open in this zone and a buy is addressed to a \
+             spawn id the new zone gave to something else");
+        assert!(gs.merchant_items.is_empty(),
+            "…and its wares list is the DEPARTED merchant's inventory, item ids, prices and slots");
+
+        // COMPOSITION with the #361 no-flicker guard: a first open in the new zone takes the guard's
+        // clear-and-reopen path (`None != Some(222)`), and the routine resend against that
+        // now-open merchant must still not flicker it closed.
+        gs.begin_shop_open_for(222);
+        gs.merchant_open = Some(222); // the server's OP_ShopRequest echo
+        gs.merchant_items.push(MerchantItem {
+            merchant_slot: 1, item_id: 2, name: "Cloth Cap".into(), icon: 0, price: 3, quantity: 1,
+        });
+        gs.begin_shop_open_for(222); // the pre-buy resend
+        assert_eq!(gs.merchant_open, Some(222),
+            "the zone-in clear must not disturb the #361 no-flicker invariant: a resend against the \
+             merchant already open in the NEW zone must still not blink the window closed");
+        assert!(!gs.merchant_items.is_empty(), "…nor drop its wares for a round-trip");
+    }
+
+    /// #941 (4/6) — the departed zone's `pet_id` must NOT survive a zone-in.
+    ///
+    /// A pet follows its owner across a zone line in EQ, but the NEW zone assigns it a NEW spawn
+    /// record, so the id held here is stale from the instant we zone. `action_loop::drain_pet` uses
+    /// it as the "do you have a pet" gate for `POST /v1/pet/command` and
+    /// `drive_auto_pet_combat` reads it every tick; until the new zone's pet spawn packet rewrites
+    /// it, an OP_PetCommands goes out addressed to a spawn that is not our pet.
+    ///
+    /// CODE-TRACED, and this one is a *structural* miss worth naming: `pet_id` IS cleared when the
+    /// pet leaves — but only via `remove_entity`, which is the one path `begin_zone_in` cannot go
+    /// through, because it empties `world.entities` wholesale rather than per-spawn. That is the
+    /// same shape as #883's `last_consider` (cleared by nothing `clear_target` calls).
+    ///
+    /// Mutation check (both directions): drop `self.pet_id = None;` → RED; WRAP as
+    /// `if false { self.pet_id = None; } else { self.world.entities.clear(); }` — the "surely the
+    /// entity purge covers it" assumption stated as code — → also RED, which is the point.
+    #[test]
+    fn begin_zone_in_clears_the_departed_zones_pet_id_941() {
+        let mut gs = GameState::new();
+        gs.pet_id = Some(64);
+        gs.world.entities.insert(64, make_entity(64, "Gynok`s pet", 0.0, 0.0, 0.0, true));
+
+        gs.begin_zone_in();
+
+        assert!(gs.pet_id.is_none(),
+            "a pet's spawn id is per-zone: the pet follows us but the new zone re-registers it under \
+             a new id, so this one now names whatever that zone assigned the number to. Note the \
+             entity purge above does NOT cover this — `remove_entity` is what normally clears \
+             `pet_id`, and `begin_zone_in` empties the map without going through it");
+    }
+
+    /// #941 (5/6) — the departed zone's loot session and queue must NOT survive a zone-in.
+    ///
+    /// Every id in `pending_loot` and in `loot_current_corpse` is a CORPSE spawn id in the zone we
+    /// left. This is not HTTP-exposed (there is no `/v1/loot/status`), so the harm is internal
+    /// rather than a direct API lie: the net thread's own auto-loot drain (`loot_tick_action` in
+    /// `gameplay.rs`) would send this zone's first `OP_LootRequest` for a departed zone's corpse id,
+    /// and a carried-over #414 defensive-close quarantine would instead WITHHOLD it until the
+    /// quarantine timed out.
+    ///
+    /// ## On #414's "deliberately left as-is"
+    /// `gameplay.rs`'s `LootTickAction::TimedOut` arm and `apply_loot_open_timeout` both deliberately
+    /// leave `loot_session_active`/`loot_current_corpse` set. That note was read before this clear
+    /// was written and it does NOT govern here: it keeps the session pinned so a LATE
+    /// `OP_MoneyOnCorpse`/`OP_LootComplete` — neither carries a corpse id — cannot be misattributed
+    /// to the next corpse's session. A zone change ends the zone-server session that could deliver
+    /// such an ack (`run_gameplay_phase` drops the stream and `EqStream::connect`s a new one before
+    /// the handshake that calls `begin_zone_in`), so there is nothing left to quarantine against.
+    /// That is a code trace of the reconnect path, not a live measurement, and it is stated as one.
+    /// This clear is scoped to `begin_zone_in`; the #414 arms themselves are untouched and their
+    /// tests (`loot_close_timeout_keeps_the_session_pinned_414` and siblings in `gameplay.rs`) still
+    /// pass.
+    ///
+    /// Mutation check (both directions): drop the eight clears → RED; WRAP them as
+    /// `if false { …clears… } else { self.pending_loot.clear(); }` — the half-fix that drops the
+    /// queue but leaves the quarantine armed — → also RED, at the `loot_session_active` assertion.
+    #[test]
+    fn begin_zone_in_clears_the_departed_zones_loot_session_941() {
+        let mut gs = GameState::new();
+        populate_loot_session(&mut gs);
+
+        gs.begin_zone_in();
+
+        assert!(gs.pending_loot.is_empty(),
+            "a queued corpse id names a corpse in the zone we left; the auto-loot drain would send \
+             this zone's OP_LootRequest for it, hitting whatever spawn holds that id here");
+        assert!(!gs.loot_session_active,
+            "no loot session can survive a zone line — and left true alongside the #414 \
+             defensive-close quarantine below, it also WITHHOLDS the new zone's first loot until \
+             that quarantine times out");
+        assert!(!gs.loot_confirmed, "loot_confirmed says the DEPARTED corpse actually opened");
+        assert_eq!(gs.loot_current_corpse, None,
+            "the open corpse's spawn id is what OP_EndLootRequest is addressed to");
+        assert!(gs.loot_last_activity.is_none(), "…and its inactivity clock");
+        assert!(gs.loot_end_requested_at.is_none(), "…and its close-ack deadline");
+        assert!(gs.loot_queued_at.is_none(), "…and the queue's open delay");
+        assert!(gs.loot_defensive_close_at.is_none(),
+            "…and the #414 quarantine itself: its whole premise is a late ack still arriving on \
+             THIS zone-server session, which the zone change has ended");
+    }
+
+    /// #941 (6/6) — the departed zone's spawn-id-keyed combat maps must NOT survive a zone-in.
+    ///
+    /// Both are keyed by spawn id and neither is HTTP-exposed, so this is the lowest-exposure item
+    /// in the #941 audit and is reported as such. It is still real:
+    ///
+    /// * `combat_anims` also keys the PLAYER's own id (`app.rs` reads `combat_anims[&player_id]`),
+    ///   and the player's id is the one id that does NOT change across a zone line — so a surviving
+    ///   entry replays the departed zone's swing on the first frames of the new zone with no packet
+    ///   behind it.
+    /// * `recent_attackers` feeds the auto-combat add-retarget. Its window is bounded (a 6s
+    ///   `ATTACKER_TTL` prune in `action_loop`) and its consumer additionally requires the id to
+    ///   resolve to a live, reachable NPC — so the surviving harm is narrow: an id the new zone
+    ///   reuses inside that window being treated as something that just attacked us. Narrow is a
+    ///   bound on a wrong answer, not a reason to keep it.
+    ///
+    /// Mutation check (both directions): drop the two clears → RED; WRAP as
+    /// `if false { …clears… } else { self.combat_anims.clear(); }` → RED at the
+    /// `recent_attackers` assertion.
+    #[test]
+    fn begin_zone_in_clears_the_departed_zones_spawn_keyed_combat_maps_941() {
+        let mut gs = GameState::new();
+        gs.player_id = 12;
+        gs.combat_anims.insert(12, (5, std::time::Instant::now())); // the PLAYER's own mid-swing
+        gs.combat_anims.insert(7, (5, std::time::Instant::now()));  // …and a mob's
+        gs.recent_attackers.insert(7, std::time::Instant::now());
+
+        gs.begin_zone_in();
+
+        assert!(gs.combat_anims.is_empty(),
+            "a swing is an event in the zone we left; the player's own id survives the zone line, \
+             so a surviving entry replays that swing in the new zone with no packet behind it");
+        assert!(gs.recent_attackers.is_empty(),
+            "an attacker id is a per-zone spawn id; inside the 6s TTL, an id the new zone reuses \
+             would be treated by the auto-combat retarget as something that just attacked us");
+    }
+
+    /// #941 — the CLASS guard. Not an assertion test: a COMPILE-TIME forcing function.
+    ///
+    /// #941's own framing is that "spawn-scoped" is a property no type enforces, so `begin_zone_in`
+    /// is a hand-maintained clear-list that has now been found incomplete three times (#757, #883,
+    /// and the eight fields #941 itself found). The strongest available fix — moving every
+    /// zone-scoped field behind one sub-struct that `begin_zone_in` resets wholesale, making
+    /// "forgotten" unrepresentable — is NOT what this test is, and the PR that added it says so:
+    /// those fields are read from ~180 call sites across eight crates (including `src/app.rs`'s
+    /// `combat_anims` read), which is a refactor with its own blast radius and its own review, and
+    /// doing it for only these eight would leave `begin_zone_in` owning BOTH a sub-struct and a hand
+    /// list — closing nothing.
+    ///
+    /// What this DOES close is the step before that one: a new `GameState` field can no longer be
+    /// added without someone deciding which group it belongs to. The destructure below is exhaustive
+    /// and deliberately has NO `..`, so adding a field to `GameState` makes this file FAIL TO
+    /// COMPILE until the field is listed under one of the two headings. It cannot check that the
+    /// classification is *correct* — only that it was made, deliberately, at the moment the field
+    /// was introduced, which is precisely the moment the three misses above were available to catch.
+    /// The correctness half stays with `begin_zone_in_clears_every_field_it_owns_at_once_883`, which
+    /// asserts that everything in the first group actually comes back cleared.
+    ///
+    /// Mutation check: add any field to `GameState` without touching this list → this file fails to
+    /// compile, naming the missing field. (Measured, both directions — see the PR body.)
+    #[test]
+    fn every_game_state_field_is_classified_against_begin_zone_in_941() {
+        let GameState {
+            // ── ZONE-SCOPED: cleared by `begin_zone_in`. Asserted by the combined test above. ──
+            // (`world` is listed here for its zone-scoped contents — entities, doors, zone_points,
+            // new_zone_applied, zone_in_failed. `world.zone_name` is deliberately NOT cleared; see
+            // `begin_zone_in`'s comment on `zone_in_failed`.)
+            world: _,
+            player_pos_known: _, position_provisional_since: _,
+            zone_cross_attempts: _, zone_cross_plan: _,
+            player_hold: _, player_afloat_stall: _,
+            target_id: _, target_name: _, target_hp_pct: _,
+            target_con: _, target_con_name: _, target_attitude: _,
+            last_consider: _,
+            casting: _, pending_cast_end: _, ended_cast_spell: _, suppress_cast_end: _,
+            dialogue_choices: _,
+            trainer_open: _, trainer_skills: _,
+            merchant_open: _, merchant_items: _,
+            pet_id: _,
+            pending_loot: _, loot_session_active: _, loot_confirmed: _, loot_current_corpse: _,
+            loot_last_activity: _, loot_end_requested_at: _, loot_queued_at: _,
+            loot_defensive_close_at: _,
+            combat_anims: _, recent_attackers: _,
+            task_offers: _,
+
+            // ── NOT ZONE-SCOPED: survives a zone line by design. ──
+            // Identity + character sheet: the same character, in a different zone.
+            player_id: _, player_name: _, player_level: _, player_race: _, player_class: _,
+            player_gender: _, player_face: _, player_hairstyle: _, player_haircolor: _,
+            player_guild_id: _, player_guild_rank: _, stats: _, player_skills: _,
+            player_equipment: _, player_equipment_tint: _, mem_spells: _,
+            // Position/posture: `player_x/y/z` deliberately keep the last-known numbers (there is
+            // nothing else to set them to) — `player_pos_known`, above, is what marks them untrusted.
+            player_x: _, player_y: _, player_z: _, player_heading: _, player_action: _,
+            sitting: _, run_mode: _, auto_attack: _, levitate: _,
+            // Vitals + wallet: server truth about the player, not about a spawn.
+            hp_pct: _, cur_hp: _, max_hp: _, mana_pct: _, cur_mana: _, max_mana: _, xp_pct: _,
+            coin: _, coin_confirmed: _, unverified_buys: _,
+            // Death record: `last_cast`-shaped — a true record of something that already happened.
+            player_dead: _, player_dead_since: _, killed_by: _, died_at: _, last_cast: _,
+            // Group/guild/social: keyed by NAME, and a group follows the player across a zone line.
+            group_members: _, group_leader: _, pending_invite: _,
+            guild_names: _, guild_members: _, pending_guild_invite: _, who_roster: _,
+            // Inventory + quest log: character-scoped, server-replicated, not spawn-keyed.
+            // (`task_offers` is NOT here — see the ZONE-SCOPED group above: each offer names the
+            // offering NPC's spawn id, `npc_id`, per its own doc, so it is spawn-keyed the same way
+            // `dialogue_choices` is. `tasks`/`completed_task_history` are the accepted/finished
+            // task log — no NPC id, genuinely character-scoped.)
+            inventory: _, inventory_received: _, trade_ack_ready: _,
+            tasks: _, completed_task_history: _,
+            // Logs, feeds and session plumbing.
+            messages: _, chat_events: _, next_chat_id: _, last_book_text: _, ucs: _,
+            strategy: _, server_corrections: _,
+        } = GameState::new();
     }
 
 }
