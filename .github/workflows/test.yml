@@ -103,10 +103,15 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    # Bound the job explicitly instead of relying on GitHub's 6-hour default. The full build+test
-    # suite runs in ~1.5 minutes on this runner; 20 minutes is generous headroom while still
-    # catching a wedged process (e.g. a reintroduced lock-order deadlock, #593) in minutes instead
-    # of silently burning most of a day and reporting nothing.
+    # Bound the job explicitly instead of relying on GitHub's 6-hour default. MEASURED across the
+    # 14 `test` job runs at and before run 31644425489 (`36ea882`/#993, 2026-08-12) — a fixed run-id
+    # window, not "the 14 most recent" (that phrase names a different set of runs every day) —
+    # (`gh api repos/djhenry/eqoxide/actions/runs/<id>/jobs`, `started_at`/`completed_at` deltas):
+    # 173s-220s wall (2m53s-3m40s). (An earlier version of this line said "~1.5 minutes", stale by
+    # roughly 2x; re-derive with the same API call, same run-id ceiling, if this has drifted
+    # again.) 20 minutes is still generous headroom
+    # while still catching a wedged process (e.g. a reintroduced lock-order deadlock, #593) in
+    # minutes instead of silently burning most of a day and reporting nothing.
     timeout-minutes: 20
     # The repo's tracked .cargo/config.toml sets `rustc-wrapper = "sccache"` and
     # `rustflags = ["-C", "link-arg=-fuse-ld=mold"]` — a local-dev speed-up for the shared dev
@@ -272,22 +277,87 @@ jobs:
       # The `tests/asset_sync_live.rs` integration test is the only one that wants the network,
       # and it is already `#[ignore]`d.
       #
-      # 29 tests are `#[ignore]`d, each for a stated environment reason, in three categories:
-      #   - baked asset fixtures — zone `.glb` + `.wtr` under `$ZONE_GLB`/`$ZONE_DIR`, bundled
-      #     model `.glb` under `assets/models/`; gitignored and absent on a fresh clone (27)
+      # 50 tests are `#[ignore]`d: 47 non-doctest plus 3 ignored doctests (part of the `Doc-tests`
+      # delta described above). MEASURED at `36ea882` with
+      # `cargo test --workspace --locked -- --ignored --list` (50 names, cross-checked against
+      # every `#[ignore]` in the tracked sources: 45 carry a reason string, 2 are bare —
+      # `zone_map.rs` and `asset_sync_live.rs`, whose reasons live in an adjacent doc comment
+      # instead), grouped by the *stated* environment reason each carries:
+      #   - baked zone assets (`.glb`/`.wtr`) from the LAN asset server (31). What GATES them splits
+      #     three ways — checked at each `env::var` call site AND by running one of each with all
+      #     five vars unset, because the call site's next line is usually a fallback:
+      #       - 8 REQUIRE a var and panic without it: `$ZONE_GLB` (2 in `eqoxide-assets/src/lib.rs`,
+      #         4 in `collision.rs`), `$DOORS_GLB` (1, `eqoxide-assets/src/lib.rs`),
+      #         `$EQOXIDE_ZONE_ASSETS` (1, `src/movement.rs`). MEASURED: unsetting `$ZONE_GLB` and
+      #         running `b2_glb_tests::from_glb_links_meshes_to_textures` panics — `NotPresent` —
+      #         in 0.00s.
+      #       - 22 treat it as an OPTIONAL OVERRIDE of a hardcoded fallback,
+      #         `~/.local/share/eqoxide/assets/models`: `$ZONE_DIR` (11 in `collision.rs`, 5 in
+      #         `walker_sim.rs`), `$EQZONES` (5 in `water_capability.rs` via its shared loader, 1 in
+      #         `src/movement.rs`). MEASURED at `36ea882` with all five vars unset:
+      #         `collision::tests::fix_700_coarse_agrees_with_fine_at_canal_lip` still runs — `ok.
+      #         1 passed`, tens of seconds of real work off that fallback path, not a 0.00s panic.
+      #         The var is not a gate for this group; a populated dev-machine cache is.
+      #       - 1, `worst_case_reachable_component`, hardcodes that same fallback path with NO
+      #         override at all (`$ZONES` there only picks which zone NAMES to scan).
+      #     So for 23 of the 31 (22 + the 1 hardcoded) what has to exist is a populated asset
+      #     directory — the `~/.local/share/eqoxide/assets/models` fallback by default, or wherever
+      #     the var points when one is set instead (MEASURED at `36ea882` with `env -u HOME
+      #     ZONE_DIR=<cache> cargo test -p eqoxide-nav --lib -- --ignored --exact
+      #     collision::tests::fix_700_coarse_agrees_with_fine_at_canal_lip`: passes with `HOME`
+      #     UNSET ENTIRELY, not just empty — the fallback's `unwrap_or_else` is lazy, so once
+      #     `$ZONE_DIR` is set that closure never runs and `HOME` is never consulted on this path at
+      #     all) — not the presence or absence of the variable itself. CI sets none of the five and
+      #     has no such directory, which is why all 31 still stay ignored here. On a fresh clone
+      #     none of the five is set: the 8 REQUIRED tests
+      #     fail at the variable itself, with no fallback and no path resolved; the other 23 resolve
+      #     to the default `~/.local/share` fallback, which is outside the repo — no `.gitignore`
+      #     rule is involved for that default path. That is a claim about the defaults nobody
+      #     overrides, not about every value a var could hold: a `$ZONE_DIR` pointed inside the repo
+      #     (e.g. `assets/zones/...`) would match the root-anchored `/assets` rule.
+      #     Breakdown: 3 in `eqoxide-assets/src/lib.rs`, 16 in
+      #     `crates/eqoxide-nav/src/collision.rs`, 2 in `src/movement.rs`, 5 in
+      #     `tests/water_capability.rs`, 5 in `tests/walker_sim.rs`
+      #   - bundled/cached model `.glb` (13): 11 read
+      #     `concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/...")` in
+      #     `crates/eqoxide-renderer/src/models.rs`, i.e. `crates/eqoxide-renderer/assets/models/`
+      #     — NOT the repo-root `assets/models/`, and NOT gitignored (`.gitignore`'s only rule is
+      #     the root-anchored `/assets`; `git check-ignore` on the renderer path exits 1). Nothing
+      #     in the repo populates that directory; it is simply absent, and a dev who creates it
+      #     sees it as untracked in `git status`. 2 more read the dev-machine model cache at
+      #     `~/.local/share/eqoxide/assets/models` (`anim.rs`'s test honors an `EQOXIDE_MODELS_DIR`
+      #     override; `skin_cap_selection.rs`'s does not)
       #   - extracted SOURCE assets — `tools`' `skinned_conversion_is_centered_grounded` needs
       #     `globalhum_chr.s3d` under `$EQ_ASSETS_DIR` (1)
+      #   - `zone_map::diagnostic_measure_contributing_zones_869` — CI has no client cache (1)
       #   - a running asset server at `$ASSET_URL` — `tests/asset_sync_live.rs` (1)
-      # They stay ignored here — see #357 for giving them their own optional/asset-backed job.
+      # They stay ignored here — see #357/#654 for giving them their own optional/asset-backed job.
+      #
+      # An earlier version of this comment said 29, in a 27+1+1 breakdown that could not even be
+      # reconciled with the true 47 non-doctest total (#993). Like the doctest counts above, this
+      # total and breakdown will drift again — they are pinned to a sha for that reason, not
+      # claimed current. Re-derive with the command above if you need today's numbers.
       #
       # BE PRECISE ABOUT WHAT THIS DOES *NOT* COVER — do not read "nav is now tested in CI" into
-      # the numbers above. Among those 29 ignored are the ENTIRE 12-test nav real-zone corpus in
-      # `crates/eqoxide-nav/src/collision.rs` and `walker_sim.rs`'s real-zone drift baseline
-      # (`faithful_walker_drift_corpus`). What runs here is the synthetic-geometry half: nav's 127
-      # unit tests and walker_sim's 4 hand-built-mesh cases (lintel, low wall, haul-out, swim
-      # depth). Nav's deepest verification — against real baked zones — still runs NOWHERE
-      # automatic (#357). Misreading a nav gate as broader than it is has already cost this
-      # project once: #411/D-2 passed nav QA and regressed live.
+      # the numbers above. MEASURED at `36ea882`: `cargo test -p eqoxide-nav --lib -- --ignored
+      # --list` names 16 ignored tests, all of them in `crates/eqoxide-nav/src/collision.rs` — that
+      # command lists the WHOLE crate's ignored set, which equals the collision.rs set only because
+      # no other file in `eqoxide-nav` has an `#[ignore]`d test today (checked: no other nav source
+      # file matched). Plus 5 more in `tests/walker_sim.rs` — the drift baseline
+      # `faithful_walker_drift_corpus` and four blast-radius corpora
+      # (`goal_append_blast_radius`,
+      # `corner_buffer_blast_radius`, `descent_guard_blast_radius`,
+      # `parallel_wall_clearance_blast_radius`), all gated on baked zone glbs at `$ZONE_DIR`. What
+      # runs here is the synthetic-geometry half: `eqoxide-nav`'s lib target passes 282 tests (16
+      # ignored) and `walker_sim.rs` passes 14 (5 ignored), including the hand-built lintel,
+      # low-wall, haul-out, and mid-water-depth fixtures. Nav's deepest verification — against real
+      # baked zones — still runs NOWHERE automatic (#357). Misreading a nav gate as broader than it
+      # is has already cost this project once: #411/D-2 passed nav QA and regressed live.
+      #
+      # An earlier version of this paragraph said "12-test" / "127 unit tests" / "4 hand-built-mesh
+      # cases"; none of the three survived re-derivation (#993). Re-derive with
+      # `cargo test -p eqoxide-nav --lib -- --ignored --list` and `cargo test --workspace --locked`
+      # if these have drifted again.
       #
       # THE ONE PLACE A FLAKE COULD COME FROM, so a future red run gets diagnosed instead of
       # papered over: `crates/eqoxide-nav/src/planner.rs` has two ABSOLUTE wall-clock assertions
