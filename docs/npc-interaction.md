@@ -40,7 +40,8 @@ hud.rs renders dialogue panel / tinted nameplate
 1. `Navigator::tick()` takes the name, builds `"Hail, Guard Phaeton"`
 2. Sends `OP_CHANNEL_MESSAGE` with `chan_num=8` (Say channel)
 3. EQEmu delivers the say to NPCs within 200 units; fires `EVENT_SAY`
-4. NPC replies with `OP_SPECIAL_MESG` (opcode `0x2372`)
+4. NPC replies with `OP_SPECIAL_MESG` — RoF2 `0x0083`, per the `OP_SPECIAL_MESG` constant in
+   `crates/eqoxide-protocol/src/protocol/mod.rs` (this line used to give Titanium's `0x2372`)
 5. `packet_handler.rs: handle_special_mesg()` adds it to `gs.messages` with `kind="npc"`
 6. `draw_quest_dialogue()` displays it in the NPC Dialogue panel
 
