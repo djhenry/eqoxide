@@ -15,6 +15,12 @@
 /// detail. See [`renderer::DrawnFrame`].
 pub use renderer::DrawnFrame;
 
+/// Proof-of-acquisition token (#895) — `DrawnFrame`'s pre-draw sibling, re-exported for the same
+/// reason: `eqoxide::camera_state::TakenCameraCmd::apply_to` requires one, so it is a cross-crate
+/// contract rather than a renderer internal. See [`renderer::AcquiredFrame`] for exactly what it
+/// does and does not prove.
+pub use renderer::AcquiredFrame;
+
 pub mod gpu;
 pub mod nav_overlay;
 pub mod pass;

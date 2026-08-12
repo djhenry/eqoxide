@@ -1961,24 +1961,10 @@ impl App {
             self.scene.player_heading = self.visual_heading;
         }
 
-        if let Ok(mut lock) = self.camera_cmd.lock() {
-            if let Some(cmd) = lock.take() { self.camera.apply_cmd(cmd); }
-        }
-        let (desired_eye, cam_target) = self.camera.tick(dt, self.scene.player_pos, self.scene.player_heading);
-        // Camera collision (#852): resolve the eye ONCE, here, and use that single value both
-        // for the render below and for the published snapshot. Before the #852 fix the pull-in
-        // mutated a local `cam_eye` for rendering only — `snapshot()` re-derived its own eye from
-        // `radius`/`focus`, which the pull-in never touched, so a pulled-in frame and the
-        // observable an agent reads disagreed 88% of the time a pull-in fired. See
-        // `camera_state::resolve_camera_eye`'s doc comment.
+        // The queued `/v1/camera` command is deliberately NOT taken here (#895) — the whole camera
+        // block now lives BELOW the `surface.get_current_texture()` match. See the take/apply site
+        // right after that match for why, and for the two types that keep it there.
         //
-        // The snapshot ITSELF is published later, not here — see the write site right after
-        // `renderer.render_frame(..)` below, and #867. Moving it back up here does not compile:
-        // `CameraState::snapshot` takes an `eqoxide_renderer::DrawnFrame`, and there is no way to
-        // produce one before the draw.
-        let resolved = crate::camera_state::resolve_camera_eye(self.collision.as_deref(), cam_target, desired_eye);
-        let cam_eye = resolved.eye;
-
         // Nav diagnostics overlay (#608): while toggled on (--nav-debug / F11), attach the
         // walker's PUBLISHED snapshot to the scene — a cheap Arc clone — and the renderer draws
         // it verbatim as a depth-tested pass. No nav state is derived here: this is wiring only.
@@ -2004,6 +1990,58 @@ impl App {
             Err(wgpu::SurfaceError::Timeout) => return, // compositor throttling; retry next frame
             Err(e) => { tracing::error!("surface error: {e}"); return; }
         };
+
+        // ── Camera: taken and applied only now that a surface texture is in hand (#895) ────────
+        //
+        // This block used to sit ABOVE the match — so a `/v1/camera` Set was taken off the queue and
+        // written into `self.camera`, and then one of the three arms above could `return` before
+        // anything was drawn from it. Worse than a one-tick delay: the take itself was the pending-
+        // command signal `poll_external` reports, so clearing it let `about_to_wait` stop asking for
+        // redraws once `ACTIVE_LINGER` lapsed. A persistently `Outdated` surface (minimised or
+        // occluded window) then meant nothing retried, and the Set was gone.
+        //
+        // Two types hold the ordering, so it survives a refactor that a source-text pin would not
+        // see:
+        //   * `TakenCameraCmd` re-queues the command on `Drop`, so any `return` between the take and
+        //     the apply — including one added later, and including a panic — leaves it PENDING.
+        //   * `apply_to` demands an `AcquiredFrame`, which can only be minted from the
+        //     `wgpu::SurfaceTexture` above. Moving this take/apply back up the function does not
+        //     compile: there is nothing to pass.
+        // See `camera_state::TakenCameraCmd` for the invariant and for what it still does not cover.
+        //
+        // One behaviour change worth naming rather than discovering later: `camera.tick(dt, ..)`
+        // no longer runs on a skipped tick, so the focus/azimuth easing does not advance for time
+        // that produced no frame. `dt` is measured from `last_frame_time`, which IS updated at the
+        // top of every call including skipped ones, so that slice of time is dropped rather than
+        // accumulated — during a stall the ease resumes from where it stopped instead of jumping.
+        // That is the correct behaviour for a smoothing term nobody saw, but it is a change.
+        let prof_cam = crate::profiling::Stopwatch::start();
+        let taken   = crate::camera_state::TakenCameraCmd::take(&self.camera_cmd);
+        let drawing = eqoxide_renderer::AcquiredFrame::from_surface_texture(&output);
+        if let Some(taken) = taken {
+            taken.apply_to(&mut self.camera, &drawing);
+        }
+        let (desired_eye, cam_target) = self.camera.tick(dt, self.scene.player_pos, self.scene.player_heading);
+        // Camera collision (#852): resolve the eye ONCE, here, and use that single value both
+        // for the render below and for the published snapshot. Before the #852 fix the pull-in
+        // mutated a local `cam_eye` for rendering only — `snapshot()` re-derived its own eye from
+        // `radius`/`focus`, which the pull-in never touched, so a pulled-in frame and the
+        // observable an agent reads disagreed 88% of the time a pull-in fired. See
+        // `camera_state::resolve_camera_eye`'s doc comment.
+        //
+        // The snapshot ITSELF is published later, not here — see the write site right after
+        // `renderer.render_frame(..)` below, and #867. Moving it back up here does not compile:
+        // `CameraState::snapshot` takes an `eqoxide_renderer::DrawnFrame`, and there is no way to
+        // produce one before the draw.
+        let resolved = crate::camera_state::resolve_camera_eye(self.collision.as_deref(), cam_target, desired_eye);
+        let cam_eye = resolved.eye;
+        // Fold this block's cost back into the `update` bucket. It used to be measured there; #895
+        // moved it below the acquisition, and the profile overlay's phases would otherwise quietly
+        // stop summing to `total`. It is NOT folded into `render`, and the `get_current_texture`
+        // wait above stays outside both — attributing a vsync block to "update" would be a far more
+        // misleading number than the sliver this preserves.
+        let dur_update = dur_update + prof_cam.elapsed();
+
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut enc = renderer.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("frame") },

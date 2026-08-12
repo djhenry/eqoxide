@@ -601,6 +601,68 @@ impl DrawnFrame {
     pub fn for_test(index: u64) -> Self { Self { index } }
 }
 
+/// Proof that this render tick **acquired a surface texture** — i.e. that it got past the
+/// `surface.get_current_texture()` match whose `Lost`/`Outdated`/`Timeout` arms `return` without
+/// drawing anything (#895).
+///
+/// [`DrawnFrame`] is the token for *"a frame was encoded"*, and it is minted **after**
+/// `render_frame` returns. That makes it useless for work which has to feed the frame being drawn:
+/// by the time you hold a `DrawnFrame` it is too late to change what was drawn. `AcquiredFrame` is
+/// its pre-draw sibling, for work that must be applied *to* the frame about to be drawn and must
+/// not happen at all on a tick that skips the draw — concretely, moving a queued `/v1/camera`
+/// command into `CameraState` (see `eqoxide::camera_state::TakenCameraCmd`, which requires one).
+///
+/// The guarantee is structural, and exactly this wide:
+///
+/// - The single field is private and the only public constructor is
+///   [`from_surface_texture`](Self::from_surface_texture), whose argument is a
+///   [`wgpu::SurfaceTexture`] — a value that exists **only** on the `Ok` arm of
+///   `Surface::get_current_texture`. So the evidence the token is minted from is itself unforgeable,
+///   and no caller in any crate can produce one on a tick that skipped the acquisition.
+///   (`test-fixtures` adds [`for_test`](Self::for_test); that feature is dev-only and off in a
+///   production build, the same convention [`DrawnFrame::for_test`] uses.)
+/// - It proves the surface texture was **acquired**. It does **not** prove `render_frame` was
+///   reached: nothing in the type system stops a caller `return`ing between the acquisition and the
+///   draw. In `app.rs` today that window holds a `create_view`, a `create_command_encoder` and the
+///   call itself — no `return`, no `?` — but that is a fact about the source, not about this type.
+///   Where *"the frame was encoded"* is the thing you need, take a [`DrawnFrame`] instead.
+/// - It carries no debt: dropping one is free and means nothing. It is a capability, not a receipt.
+/// - It is deliberately **not** `Copy`/`Clone`, so a consumer that takes it by value takes it once
+///   and cannot stash a spare for a later, draw-less tick.
+///
+/// ```
+/// // The type is public and nameable — the control for the `compile_fail` below, which would
+/// // otherwise pass on a typo in the path.
+/// fn _needs_proof(_a: eqoxide_renderer::AcquiredFrame) {}
+/// ```
+///
+/// ```compile_fail
+/// // …but it cannot be fabricated: the field is private and there is no public constructor that
+/// // does not demand a real `wgpu::SurfaceTexture`. This doctest going GREEN (i.e. the snippet
+/// // failing to compile) is the whole guarantee; making the field `pub`, or adding a
+/// // no-argument constructor, turns it RED.
+/// let _ = eqoxide_renderer::AcquiredFrame(());
+/// ```
+#[derive(Debug)]
+#[must_use = "an AcquiredFrame is the permission to feed the frame about to be drawn — pass it, or drop it deliberately"]
+pub struct AcquiredFrame(());
+
+impl AcquiredFrame {
+    /// Mint the token from the surface texture the acquisition returned.
+    ///
+    /// The texture is taken by reference and never read: it is here purely as **evidence**. A
+    /// [`wgpu::SurfaceTexture`] can only be obtained from a successful `get_current_texture`, so a
+    /// caller sitting above that call has no argument to pass and does not compile.
+    pub fn from_surface_texture(_acquired: &wgpu::SurfaceTexture) -> Self { Self(()) }
+
+    /// Fabricate a token in tests. Dev-only: gated behind `test-fixtures`, which downstream crates
+    /// enable as a **dev-dependency** feature so a production build cannot reach it. Without this,
+    /// no unit test outside this crate could exercise a path that takes an `AcquiredFrame`, since
+    /// the only production source of one is a real surface acquisition on a real GPU.
+    #[cfg(feature = "test-fixtures")]
+    pub fn for_test() -> Self { Self(()) }
+}
+
 /// All GPU resources for the currently-loaded zone: the wgpu device/queue/surface, uploaded zone +
 /// placed-object meshes, character models + textures, pipelines/layouts, and per-entity animation
 /// state. Rebuilt on each zone change; `pass.rs` reads it to issue the frame's draw calls.
