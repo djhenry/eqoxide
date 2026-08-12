@@ -10217,9 +10217,8 @@ mod clearance_probe_is_not_lossy_885 {
                         .chars().take(40).collect();
                     if let Some(a) = after.find("->").or_else(|| after.find('\u{2192}')) {
                         arrowed.push((site, digit_run(after[a..].chars())));
-                    } else if before.ends_with('/') {
-                        let behind: String = digit_run(before[..before.len() - 1].chars().rev())
-                            .chars().rev().collect();
+                    } else if let Some(head) = before.strip_suffix('/') {
+                        let behind: String = digit_run(head.chars().rev()).chars().rev().collect();
                         ratio.push((site, behind));
                     } else {
                         prose.push(site);
