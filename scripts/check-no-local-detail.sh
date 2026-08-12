@@ -8,16 +8,18 @@
 # has no shape and must therefore be enumerated):
 #   - absolute home paths            (a local-system path leak)
 #   - the local container-name shape (deployment-specific infrastructure detail)
-#   - deployment host names          (#995 — the class this guard was green on for months)
 #   - an inline DB password flag     (the `-u<user> -p<pass>` credential antipattern)
 #   - references to a decompiled commercial client and RE tooling
 #     (ghidra / capstone / the client exe / a `decompiled/` path / lifted `FUN_xxxxxx` symbols)
 #
 # ITS PATTERN SET IS AN ALLOWLIST. A green run means "no KNOWN shape matched", NOT "no local detail
 # is present" — those differ by whatever nobody has thought of yet, which is not a hypothetical:
-# eqoxide#995 is a tracked comment naming deployment infrastructure that this script exited 0 on
-# until the shape was added. Finding a new class means scrubbing the instance AND adding the
-# pattern, in one change.
+# eqoxide#995 was a tracked comment naming deployment infrastructure that this script exited 0 on
+# for months. The comment is scrubbed; the CLASS is still not covered here, deliberately, because a
+# host name has no shape and enumerating literal names would make this guard's own pattern file the
+# only tracked instance of the class. See the pattern file's header and #995 for the remaining
+# option. When a class IS coverable by shape, fix both halves at once — scrub the instance and add
+# the pattern.
 #
 # Run locally with:  scripts/check-no-local-detail.sh
 # Exit 0 = clean, exit 1 = a forbidden pattern was found (prints file:line).
