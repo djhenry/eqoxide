@@ -190,8 +190,12 @@ fn apply_animation(gs: &mut GameState, p: &[u8]) {
 //     (`zone/task_manager.cpp:972-1014`) delegating to `ActivityInformation::SerializeObjective`
 //     (`common/tasks.h:141-189`). See `parse_task_activity` below.
 //   * OP_CompletedTasks — re-derived from `zone/task_manager.cpp:946-966`.
-//   * OP_TaskDescription — NOT re-derived for RoF2. It has a RoF2 ENCODE, so the serialiser output
-//     is not the wire format; see `apply_task_description` and #949.
+//   * OP_TaskDescription — re-derived for RoF2 (#949/#955). It has a RoF2 ENCODE, so the `zone/`
+//     serialiser's output is NOT the wire format and the OP_TaskActivity method above does not
+//     transfer; it was derived against the live ENCODE instead. Field order and sizes match
+//     Titanium's; RoF2 changes only the CONTENT of two fields (Data1's third word is elapsed time,
+//     not an absolute start time; item_link is say-link-rewritten). The trailer is 5 bytes. See
+//     `parse_task_description` and `TASK_DESCRIPTION_TRAILER_LEN`.
 //
 // An earlier revision of this banner claimed the layouts here were "cross-checked against EQEmu
 // titanium.cpp ENCODE(OP_TaskDescription) + the TaskActivity_Struct in eq_packet_structs.h". Both
@@ -216,18 +220,88 @@ fn extract_saylink_text(s: &str) -> String {
     }
 }
 
-/// OP_TaskDescription — a task's header + title + reward. Upserts into gs.tasks (preserving any
-/// activities already received for it). Layout: Header{seq,task_id,open_window:u8,task_type,
-/// reward_type}(17) + title cstr + Data1{duration,dur_code,start_time}(12) + desc cstr +
-/// Data2{has_rewards:u8,coin,xp,faction}(13) + reward_text cstr + item_link cstr + a trailer this
-/// function does **not** read (it stops after `item_link`; nothing here needs `Points`). The
-/// trailer's size is disputed — 5 bytes in `common/eq_packet_structs.h:4702-4706`, 4 in
-/// `common/patches/rof2_structs.h:4249-4252` — and has not been derived for RoF2; see #955.
-/// This layout as a whole is **not** re-derived for RoF2 either (this opcode has a RoF2 ENCODE at
-/// `common/patches/rof2.cpp:3846`, so the serialiser output is not the wire format) — see #949.
-/// `sequence_number` (the header's SequenceNumber) is kept — OP_CancelTask addresses a task by it.
-/// `reward_item_text` is the item name extracted from item_link's EQ saylink markup.
-fn apply_task_description(gs: &mut GameState, p: &[u8]) {
+/// Byte length of the RoF2 `OP_TaskDescription` trailer that follows `item_link`: `u32 Points`
+/// then `u8 has_reward_selection` (#955).
+///
+/// **Five, not four.** Two `TaskDescriptionTrailer_Struct` definitions exist — a global 5-byte one
+/// (`common/eq_packet_structs.h:4702-4706`) and a 4-byte one in the RoF2 patch's own nested
+/// namespace (`common/patches/rof2_structs.h:4249-4252`). Both are live code (neither is inside an
+/// `#if 0`) and both are `#pragma pack(1)`. `ENCODE(OP_TaskDescription)` sizes and `memcpy`s the
+/// trailer with an **unqualified** `sizeof(TaskDescriptionTrailer_Struct)`, and its body is defined
+/// at the patch namespace's own scope rather than inside the nested struct namespace — so ordinary
+/// unqualified lookup does not descend into the nested namespace and the name binds to the
+/// **global, 5-byte** definition. That is not a reasoned claim: it was settled by compiling a probe
+/// reproducing the real namespace nesting (which printed 5 for the unqualified name, 5 for the
+/// global and 4 for the nested one), and independently corroborated by tracing the real client's
+/// own handler for this opcode, which reads a `u32` and then a `u8` immediately after `item_link`'s
+/// NUL. Two independent methods, same answer.
+///
+/// The doc's old `Trailer(5)` was therefore right and the code comment's `Trailer(4)` wrong —
+/// but neither had been derived, which is why #955 existed. Pinned by
+/// `task_description_trailer_is_five_bytes_not_four`.
+const TASK_DESCRIPTION_TRAILER_LEN: usize = 5;
+
+/// Everything [`parse_task_description`] recovers from an `OP_TaskDescription` payload.
+struct TaskDescriptionFields {
+    sequence_number: u32,
+    task_id: u32,
+    title: String,
+    description: String,
+    coin_reward: u32,
+    xp_reward: u32,
+    reward_item_text: String,
+    /// `(Points, has_reward_selection)` from the 5-byte trailer, read all-or-nothing.
+    ///
+    /// `None` means the payload ended before a whole trailer — recorded as an explicit "absent"
+    /// rather than defaulted to `(0, 0)`, because `Points` is a real DoN-crystal reward count and a
+    /// fabricated `0` there is indistinguishable from a genuine zero (agent-honesty).
+    trailer: Option<(u32, u8)>,
+    /// Bytes left after the trailer. `0` for every packet the current RoF2 `ENCODE` emits — it
+    /// computes the output size to end exactly at the trailer, and the trailer copy is the last
+    /// write. A nonzero value means the wire format has moved past what this parser models.
+    trailing_bytes: usize,
+}
+
+/// Parse an `OP_TaskDescription` payload. Split out of [`apply_task_description`] so the trailer
+/// length and the end-of-buffer position are observable to tests (#955) — the applier discards
+/// both.
+///
+/// **Body layout, re-derived for RoF2 (#949).** This opcode has a RoF2 `ENCODE`, so — unlike
+/// `OP_TaskActivity` — the `zone/` serialiser's output is *not* the wire format and #889's
+/// derivation method does not transfer; the `ENCODE` recomputes the size and reallocates the
+/// buffer before the packet goes out. Re-derived against that live `ENCODE` (taking care to stay
+/// out of the `#if 0 // original code` block inside the same function), the emitted layout is:
+///
+/// ```text
+/// Header{seq:u32, task_id:u32, open_window:u8, task_type:u32, reward_type:u32}   17
+/// title                                                                          cstr
+/// Data1{duration:u32, dur_code:u32, elapsed_time:u32}                            12
+/// description                                                                    cstr
+/// Data2{has_rewards:u8, coin:u32, xp:u32, faction:u32}                           13
+/// reward_text                                                                    cstr
+/// item_link                                                                      cstr
+/// Trailer{points:u32, has_reward_selection:u8}                                    5
+/// ```
+///
+/// The **field order and sizes are identical to Titanium's** — nothing is inserted, removed,
+/// resized or reordered. What RoF2 changes is *content*, at two fields, and both matter here:
+///
+/// * **`Data1`'s third word is elapsed time, not `start_time`.** The RoF2 `ENCODE` overwrites the
+///   sender's absolute start timestamp with `now - start_time` in place. This parser discards the
+///   field, so nothing is wrong today — but anything that starts reading it must not treat it as an
+///   absolute time. This doc previously called it `start_time`, inherited from Titanium.
+/// * **`item_link` is rewritten** by the RoF2 say-link converter, so its bytes and length differ
+///   from what the `zone/` sender wrote. `extract_saylink_text` parses the emitted form.
+///
+/// Two things are **NOT verified for RoF2** and must not be asserted from this comment: the exact
+/// internal byte encoding the RoF2 say-link converter produces (only that it is a
+/// content-and-length transform), and whether any sender path can set `has_rewards` to 0 — the one
+/// call site found hardcodes 1. `has_reward_selection` is likewise hardcoded to 0 on the live send
+/// path, so a nonzero value there is unmodeled rather than impossible.
+///
+/// Required reads **panic** on a short buffer (see `WireReader`): this is a fixed-layout,
+/// single-record opcode, so a truncated one is a bug to surface, not a shape to tolerate.
+fn parse_task_description(p: &[u8]) -> TaskDescriptionFields {
     let mut r = WireReader::new(p, "OP_TaskDescription");
     let sequence_number = r.u32();
     let task_id = r.u32();
@@ -237,7 +311,7 @@ fn apply_task_description(gs: &mut GameState, p: &[u8]) {
     let title = r.cstr();
     let _duration = r.u32();
     let _dur_code = r.u32();
-    let _start_time = r.u32();
+    let _elapsed_time = r.u32(); // RoF2 ENCODE rewrites the sender's start_time to `now - start`
     let description = r.cstr();
     r.skip(1); // has_rewards u8
     let coin_reward = r.u32();
@@ -246,6 +320,50 @@ fn apply_task_description(gs: &mut GameState, p: &[u8]) {
     let _reward_text = r.cstr();
     let item_link = r.cstr();
     let reward_item_text = extract_saylink_text(&item_link);
+    // All-or-nothing: a 4-byte remainder is NOT a Points-only trailer, it is a short packet.
+    let trailer = if r.has(TASK_DESCRIPTION_TRAILER_LEN) {
+        let points = r.u32();
+        let has_reward_selection = r.u8();
+        Some((points, has_reward_selection))
+    } else {
+        None
+    };
+    TaskDescriptionFields {
+        sequence_number, task_id, title, description, coin_reward, xp_reward, reward_item_text,
+        trailer, trailing_bytes: r.remaining(),
+    }
+}
+
+/// OP_TaskDescription — a task's header + title + reward. Upserts into gs.tasks (preserving any
+/// activities already received for it). See [`parse_task_description`] for the RoF2 wire layout.
+/// `sequence_number` (the header's SequenceNumber) is kept — OP_CancelTask addresses a task by it.
+/// `reward_item_text` is the item name extracted from item_link's EQ saylink markup.
+///
+/// The trailer is read but not stored: nothing downstream consumes `Points` yet. Both a missing
+/// trailer and bytes left over after it are logged rather than silently dropped — they are the two
+/// signals that the wire format has drifted from what this parser models.
+fn apply_task_description(gs: &mut GameState, p: &[u8]) {
+    let TaskDescriptionFields {
+        sequence_number, task_id, title, description, coin_reward, xp_reward, reward_item_text,
+        trailer, trailing_bytes,
+    } = parse_task_description(p);
+    match trailer {
+        Some((points, has_reward_selection)) => tracing::debug!(
+            "EQ: OP_TaskDescription task_id={task_id} trailer points={points} \
+             has_reward_selection={has_reward_selection}"
+        ),
+        None => tracing::warn!(
+            "EQ: OP_TaskDescription task_id={task_id}: payload ended before its {}-byte trailer \
+             ({} byte(s) left after item_link) — Points is UNKNOWN, not 0 (#955)",
+            TASK_DESCRIPTION_TRAILER_LEN, trailing_bytes
+        ),
+    }
+    if trailing_bytes != 0 && trailer.is_some() {
+        tracing::warn!(
+            "EQ: OP_TaskDescription task_id={task_id}: {trailing_bytes} unmodeled byte(s) after the \
+             trailer — the RoF2 wire layout has moved past what this parser reads (#949)"
+        );
+    }
     if task_id == 0 { return; }
     let title_for_log = title.clone();
     {
@@ -1031,10 +1149,21 @@ fn apply_completed_tasks(gs: &mut GameState, p: &[u8]) {
 /// nonzero count, its nested ActivityInformation::SerializeSelector payload is variable-length and
 /// not modeled here — stop parsing this packet (leaving gs.task_offers untouched) and log a warning
 /// rather than guess at the layout and desync/garble subsequent offers in the same packet.
+/// A **short read** on any per-entry field takes that same bail-out (#981): `gs.task_offers` is
+/// served verbatim by `GET /v1/quests/offers`, so filling a missing field with `0`/`""` would
+/// publish an offer the server never sent.
 fn apply_task_select_window(gs: &mut GameState, p: &[u8]) {
     // VARIABLE-LENGTH: `task_count` records, count clamped; a truncated/empty packet must degrade
     // gracefully (an empty payload legitimately clears the offers — see the navigation.rs mirror),
     // so this uses the non-panicking `try_*` path throughout.
+    //
+    // AGENT-HONESTY (#981): "gracefully" means *bail out*, never *substitute a default*. Every
+    // per-entry read below therefore bails on `None` instead of `.unwrap_or(0)` /
+    // `.unwrap_or_default()`. Those two combinators used to turn a short read into `task_id=0` or an
+    // empty title/description and then push the result — `gs.task_offers` is published verbatim on
+    // `GET /v1/quests/offers`, so a truncated packet minted a plausible-looking offer that never
+    // existed. That is a silent wrong answer to the driving agent, which has no other channel to the
+    // wire. A short read is now indistinguishable-from-nothing rather than indistinguishable-from-0.
     let mut r = WireReader::new(p, "OP_TaskSelectWindow");
     // Each entry is at least 23 bytes (task_id u32 + reward_multiplier f32 + duration u32 +
     // duration_code u32 + title cstr≥1 + desc cstr≥1 + has_rewards u8 + element_count u32).
@@ -1047,14 +1176,32 @@ fn apply_task_select_window(gs: &mut GameState, p: &[u8]) {
     let task_giver = r.try_u32().unwrap_or(0);
     let mut offers = Vec::with_capacity(task_count as usize);
     for _ in 0..task_count {
-        let task_id = r.try_u32().unwrap_or(0);
-        r.try_skip(4); // reward_multiplier f32 (unused)
-        let _duration = r.try_u32().unwrap_or(0);
-        let _duration_code = r.try_u32().unwrap_or(0);
-        let title = r.try_cstr().unwrap_or_default();
-        let description = r.try_cstr().unwrap_or_default();
-        let has_rewards = r.try_u8().unwrap_or(0) != 0;
-        let element_count = r.try_u32().unwrap_or(0);
+        // One `else` arm per field: a short read leaves `gs.task_offers` exactly as it was, the same
+        // bail-out this function already takes for an unmodeled `element_count` below.
+        macro_rules! or_bail {
+            ($opt:expr, $field:literal) => {
+                match $opt {
+                    Some(v) => v,
+                    None => {
+                        tracing::warn!(
+                            "EQ: OP_TaskSelectWindow: truncated at field `{}` ({} byte payload, \
+                             offset {}) — discarding this packet rather than publishing a partly \
+                             defaulted offer (agent-honesty #981)",
+                            $field, p.len(), r.pos()
+                        );
+                        return;
+                    }
+                }
+            };
+        }
+        let task_id = or_bail!(r.try_u32(), "task_id");
+        or_bail!(r.try_skip(4), "reward_multiplier"); // f32, unused
+        let _duration = or_bail!(r.try_u32(), "duration");
+        let _duration_code = or_bail!(r.try_u32(), "duration_code");
+        let title = or_bail!(r.try_cstr(), "title");
+        let description = or_bail!(r.try_cstr(), "description");
+        let has_rewards = or_bail!(r.try_u8(), "has_rewards") != 0;
+        let element_count = or_bail!(r.try_u32(), "element_count");
         if element_count != 0 {
             tracing::warn!(
                 "EQ: OP_TaskSelectWindow: task_id={task_id} has element_count={element_count} \
@@ -3253,7 +3400,7 @@ mod tests {
                 parse_begin_cast, apply_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_move_item, apply_spawn_appearance, apply_buff_with, apply_buff_create_with,
                 extract_saylink_text, apply_task_description, apply_task_activity, apply_completed_tasks,
-                parse_task_activity,
+                parse_task_activity, parse_task_description, TASK_DESCRIPTION_TRAILER_LEN,
                 apply_task_select_window, TASK_ACTIVITY_SHORT_LEN, TASK_ACTIVITY_LONG_MIN_LEN,
                 strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH, SIZE_NEW_ZONE,
                 apply_group_update_b, apply_group_join, apply_group_disband_you,
@@ -7170,7 +7317,7 @@ mod tests {
         p.extend_from_slice(title.as_bytes()); p.push(0);
         p.extend_from_slice(&0u32.to_le_bytes()); // duration
         p.extend_from_slice(&0u32.to_le_bytes()); // dur_code
-        p.extend_from_slice(&0u32.to_le_bytes()); // start_time
+        p.extend_from_slice(&0u32.to_le_bytes()); // elapsed_time (RoF2 rewrites start_time to this)
         p.extend_from_slice(desc.as_bytes()); p.push(0);
         p.push(1); // has_rewards
         p.extend_from_slice(&coin.to_le_bytes());
@@ -7178,7 +7325,54 @@ mod tests {
         p.extend_from_slice(&0u32.to_le_bytes()); // faction
         p.extend_from_slice(reward_text.as_bytes()); p.push(0);
         p.extend_from_slice(item_link.as_bytes()); p.push(0);
+        // Trailer (#955): u32 Points + u8 has_reward_selection = 5 bytes.
+        p.extend_from_slice(&TEST_TASK_POINTS.to_le_bytes());
+        p.push(0); // has_reward_selection — hardcoded 0 on the live RoF2 send path
         p
+    }
+
+    /// A deliberately nonzero `Points` so a parser that fabricated the trailer as zeroes could not
+    /// pass `task_description_trailer_is_five_bytes_not_four` by accident.
+    const TEST_TASK_POINTS: u32 = 0x0A0B_0C0D;
+
+    /// #955: the trailer after `item_link` is **5** bytes — a `u32` `Points` plus a `u8`
+    /// `has_reward_selection` — not the 4 of the trailer struct in the RoF2 patch's own nested
+    /// namespace. Three descriptions used to disagree — the doc said 5, a code comment said 4, the
+    /// parser read none — and none had been derived. See [`TASK_DESCRIPTION_TRAILER_LEN`] for the
+    /// derivation.
+    ///
+    /// This pins the size in **both** directions, which is what makes 5 falsifiable rather than
+    /// merely asserted:
+    /// * a 5-byte trailer parses whole and leaves the buffer exactly empty, and
+    /// * dropping ONE byte — i.e. the 4-byte `Points`-only shape — must NOT be accepted as a
+    ///   trailer. If it were, `Points` would be read from a packet that never carried a complete
+    ///   one.
+    #[test]
+    fn task_description_trailer_is_five_bytes_not_four() {
+        let full = build_task_description(3, 500, "Kill Rats", "Kill 5 rats", 10, 200, "reward!", "");
+
+        let f = parse_task_description(&full);
+        assert_eq!(f.trailer, Some((TEST_TASK_POINTS, 0)), "5-byte trailer must parse whole");
+        assert_eq!(f.trailing_bytes, 0, "nothing follows the trailer on the RoF2 wire");
+
+        // The 4-byte candidate: Points present, has_reward_selection absent.
+        let four = &full[..full.len() - 1];
+        let f4 = parse_task_description(four);
+        assert_eq!(f4.trailer, None, "a 4-byte remainder is a SHORT packet, not a Points-only trailer");
+        assert_eq!(f4.trailing_bytes, 4, "the 4 unread bytes must be reported, not silently consumed");
+    }
+
+    /// The body ends exactly `TASK_DESCRIPTION_TRAILER_LEN` bytes before the end of a well-formed
+    /// packet — stated as an independent arithmetic check on the whole layout, so a body-field size
+    /// error cannot be absorbed by the trailer read and vice versa.
+    #[test]
+    fn task_description_body_ends_five_bytes_before_end() {
+        let full = build_task_description(7, 501, "T", "D", 1, 2, "R", "");
+        let body_only = &full[..full.len() - TASK_DESCRIPTION_TRAILER_LEN];
+        let f = parse_task_description(body_only);
+        assert_eq!(f.task_id, 501, "the body alone must still decode");
+        assert_eq!(f.trailer, None);
+        assert_eq!(f.trailing_bytes, 0, "body consumes the payload exactly up to the trailer");
     }
 
     #[test]
@@ -7908,7 +8102,12 @@ mod tests {
     fn apply_completed_tasks_handles_truncated_packet_without_hanging() {
         let mut gs = GameState::new();
         // count says 5 entries but the buffer only has the count field — must not loop forever
-        // or panic; rd_u32/rd_cstr degrade to 0/empty on out-of-bounds reads.
+        // or panic. `apply_completed_tasks` reads with `WireReader::try_*`, which returns `None`
+        // (without advancing) rather than a value, and each read's `else` arm `break`s out of the
+        // record loop. No partial record is pushed. (#981: this comment used to claim
+        // `rd_u32`/`rd_cstr` "degrade to 0/empty" here — those macros live in `eqoxide-protocol`,
+        // are not called by this function, and describing them here invented a silent-degradation
+        // path the code does not have.)
         let p = 5u32.to_le_bytes().to_vec();
         apply_completed_tasks(&mut gs, &p);
         assert!(gs.completed_task_history.is_empty());
@@ -7962,10 +8161,47 @@ mod tests {
     fn apply_task_select_window_handles_truncated_packet_without_hanging() {
         let mut gs = GameState::new();
         // task_count says 100000 entries but the buffer only has the count field — must not hang
-        // or panic; rd_u32/rd_cstr degrade to 0/empty on out-of-bounds reads.
+        // or panic. The `(len - 12) / 23` clamp reduces the count to 0 here, so no entry is read at
+        // all. (#981: this comment used to claim `rd_u32`/`rd_cstr` "degrade to 0/empty" here —
+        // this function reads with `WireReader::try_*` and now bails out on `None`; see
+        // `apply_task_select_window_truncated_entry_publishes_no_offer`.)
         let p = 100000u32.to_le_bytes().to_vec();
         apply_task_select_window(&mut gs, &p);
         assert!(gs.task_offers.is_empty());
+    }
+
+    /// #981 (agent-honesty): a packet whose *last* entry is cut off mid-field must publish NO
+    /// offer, not an offer with the missing fields defaulted. `gs.task_offers` is served verbatim
+    /// on `GET /v1/quests/offers`, so a defaulted field is a fabricated fact reaching the agent.
+    ///
+    /// The payload below is two well-formed offers cut off immediately after the SECOND offer's
+    /// title terminator, so `description` / `has_rewards` / `element_count` all run off the end.
+    /// The truncation point matters: `try_cstr` does not advance on failure, so cutting *inside*
+    /// the description instead makes the following `try_u32` read description bytes as a nonzero
+    /// `element_count`, and the pre-existing "unmodeled nested elements" guard bails for an
+    /// unrelated reason — masking the defect. Cutting at the terminator makes every remaining read
+    /// return `None`, which is the case the old `.unwrap_or(0)`/`.unwrap_or_default()` idiom turned
+    /// into a fabricated offer.
+    ///
+    /// Two other things this test pins so it cannot pass vacuously: the `(len-12)/23` clamp still
+    /// admits 2 entries (so the clamp is not what rejects the packet), and the FIRST, entirely
+    /// well-formed offer is dropped too — a half-decoded packet is discarded whole.
+    #[test]
+    fn apply_task_select_window_truncated_entry_publishes_no_offer() {
+        let mut gs = GameState::new();
+        let full = build_task_select_window(9001, &[
+            (10, "Offer One", "Do a thing", true, 0),
+            (11, "Offer Two", "Do another thing", true, 0),
+        ]);
+        // Drop the trailing description+NUL, has_rewards u8 and element_count u32 of offer two.
+        let cut = &full[..full.len() - ("Do another thing".len() + 1 + 1 + 4)];
+        // The clamp is not what rejects this: it still permits >= 2 entries.
+        assert!((cut.len().saturating_sub(12)) / 23 >= 2, "clamp must not be the thing under test");
+        apply_task_select_window(&mut gs, cut);
+        assert!(
+            gs.task_offers.is_empty(),
+            "a truncated entry must yield no offers, got {:?}", gs.task_offers
+        );
     }
 
     // ── RoF2 Death_Struct byte-layout tests ─────────────────────────────────────────────────────
