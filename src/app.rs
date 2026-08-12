@@ -296,6 +296,93 @@ struct EntityMotion {
     floor_z:     f32,
 }
 
+/// The surface-retry back-off's **entire** state, and every transition on it (#895 review B1).
+///
+/// Exists because "pending work keeps the loop awake" and "the surface never hands out a texture"
+/// compose badly: the pending signal is never consumed, so the loop re-arms at `FRAME_INTERVAL` and
+/// re-enters a `render_frame` that reconfigures the swapchain and returns, indefinitely. That
+/// predates #895 (`frame_req` behaves the same way, and is why a take-below-the-match fix does not
+/// create the class), but #895 adds `camera_cmd` to the set of signals that can hold it, so this
+/// bounds the cost rather than leaving it unnamed.
+///
+/// **Why a struct and not a bare `u32` field on `App`.** `App` cannot be constructed in a unit test
+/// — it owns a window, a wgpu surface, a tokio handle and a dozen channels — so while the streak was
+/// an `App` field, *nothing that moved it was reachable from a test*. Round-2 review measured that:
+/// wrapping the increment in `if std::hint::black_box(false) { .. }` left the crate's lib tests at
+/// `249 passed; 0 failed` and left `cargo check` completely silent, and the same held for
+/// `wake()`'s clear. This type is constructible, so
+/// [`the_state_machine_backs_off_after_a_failure_run_and_recovers_895`] drives the real transitions
+/// on the real field and watches the interval change.
+///
+/// **What is pinned and what is still only read** — stated precisely, because the sentence this
+/// replaces claimed the compiler enforced things it does not:
+///
+/// | site | mutation | caught by |
+/// | --- | --- | --- |
+/// | the assignment inside [`fold`](Self::fold) | delete **or** wrap | the state-machine test |
+/// | the assignment inside [`note_window_event`](Self::note_window_event) | delete **or** wrap | the state-machine test |
+/// | the threshold arm reached via [`wake_interval`](Self::wake_interval) | delete **or** wrap | the sweep + state-machine tests |
+/// | `render_frame`'s call to `fold` | **wrap** in `if .. { }` | **the compiler** — `output` has no other source, so the wrap does not build |
+/// | `render_frame`'s call to `fold` | *unwrap* it — call `surface.get_current_texture()` straight | **nothing** — reading only |
+/// | `wake()`'s call to `note_window_event` | delete **or** wrap | **nothing** — reading only. Deleting it is silent under `cargo test` (the state-machine test is itself a caller, so no dead-code lint fires); only a non-test `cargo check` warns, and CI carries no `-D warnings` |
+/// | `about_to_wait`'s call to `wake_interval` | delete | the compiler (`now + ..` needs the value) |
+/// | `about_to_wait`'s call to `wake_interval` | *substitute* a constant | **nothing** — reading only |
+///
+/// The three "nothing" rows are the honest residue, and every row above was run in both directions
+/// and observed, not assumed. What they have in common is that they are call sites in functions no
+/// test in this repo can reach — `render_frame`, `wake` and `about_to_wait` need a GPU and a window.
+/// What changed this round is that the *state* they act on left `App`, so the transitions themselves
+/// are now driven by a test instead of read; the residue is three one-line call sites rather than
+/// the whole mechanism. It is not claimed to be guarded.
+#[derive(Default)]
+struct SurfaceRetry {
+    /// Consecutive `surface.get_current_texture()` failures — reset to 0 by a successful acquisition
+    /// and by `note_window_event` (any window event: input, resize, focus).
+    consecutive_failures: u32,
+}
+
+impl SurfaceRetry {
+    /// Fold one acquisition outcome into the streak and hand the outcome straight back.
+    ///
+    /// Taking the `Result` by value and returning it is the point, not a style choice: it makes the
+    /// fold **load-bearing** at the call site. `render_frame` has no other route from
+    /// `surface.get_current_texture()` to the `wgpu::SurfaceTexture` it needs, so the mutation that
+    /// defeated the previous shape — wrapping the update in `if std::hint::black_box(false) { .. }`,
+    /// which left the suite green and `cargo check` silent — no longer compiles here, and neither
+    /// does deleting the expression. Stated exactly, because the claim it replaces was overstated:
+    /// what this does **not** stop is a refactor that *unwraps* the call and matches on
+    /// `surface.get_current_texture()` directly. That compiles and stays green; it is guarded by
+    /// reading, like the other two call sites in the table above.
+    ///
+    /// The old shape was a bare `self.surface_fail_streak = ..` statement, whose deletion produced a
+    /// dead-code *warning* and nothing more — and that warning gated nothing: the workflow carries no
+    /// `-D warnings`, and one job sets `RUSTFLAGS: ""`.
+    ///
+    /// Generic in `T` so a test can drive it with `Result<(), _>`; the production instantiation is
+    /// `T = wgpu::SurfaceTexture`.
+    ///
+    /// `saturating_add` is not decoration: a wrapping counter would return to 0 and silently un-arm
+    /// the back-off after `u32::MAX` failures, i.e. turn a bound back into a spin.
+    fn fold<T>(
+        &mut self,
+        acquired: Result<T, wgpu::SurfaceError>,
+    ) -> Result<T, wgpu::SurfaceError> {
+        self.consecutive_failures = App::surface_streak_after(self.consecutive_failures, acquired.is_ok());
+        acquired
+    }
+
+    /// A window event arrived, so whatever was wrong with the surface may no longer be:
+    /// un-minimising, un-occluding and resizing all land here. Clearing the streak restores
+    /// full-rate retry immediately, so the back-off never adds latency to a real recovery.
+    fn note_window_event(&mut self) { self.consecutive_failures = 0; }
+
+    /// How long `about_to_wait` should sleep, given the streak this holds. See
+    /// [`App::next_wake_interval`] for the reasoning; this is the state-carrying wrapper.
+    fn wake_interval(&self, active: bool) -> std::time::Duration {
+        App::next_wake_interval(active, self.consecutive_failures)
+    }
+}
+
 /// `EqRenderer`, the per-frame `SceneState`, camera state, input state, and the shared request
 /// slots / packet receiver that connect it to the HTTP and EQ-network threads. Its event-loop
 /// callbacks (`resumed`, `window_event`, `about_to_wait`) drive zone loading, per-frame update from
@@ -366,6 +453,9 @@ pub struct App {
     /// When `now >= active_until` and nothing is pending, the loop only wakes to poll the network
     /// channel — so a still scene costs ~no CPU. See `about_to_wait`.
     active_until:       std::time::Instant,
+    /// The surface-retry back-off's state. See [`SurfaceRetry`] for the whole state machine and for
+    /// exactly how much of its wiring is pinned by a test and how much is not.
+    surface_retry:      SurfaceRetry,
     /// Smoothed per-phase frame timings for the `--profile` HUD overlay (only written when enabled).
     frame_profile:      crate::profiling::FrameProfile,
     // Keyboard movement
@@ -624,6 +714,7 @@ impl App {
             fps_timer: std::time::Instant::now(),
             current_fps: 0.0,
             active_until: std::time::Instant::now(),
+            surface_retry: SurfaceRetry::default(),
             frame_profile: crate::profiling::FrameProfile::default(),
             keys_held: std::collections::HashSet::new(),
             controller: crate::movement::CharacterController::new([0.0, 0.0, 0.0]),
@@ -1277,11 +1368,79 @@ impl App {
     /// Idle wake cadence — just often enough to drain the network channel promptly without burning
     /// CPU. A still scene wakes ~20×/sec, does a `try_recv` on an empty channel, and sleeps again.
     const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    /// Consecutive failed surface acquisitions before the loop backs off to `SURFACE_RETRY_BACKOFF`.
+    /// Deliberately larger than a resize blip: at `FRAME_INTERVAL` this is ~128 ms of unchanged
+    /// full-rate retry, so the ordinary `Outdated`-during-resize path never reaches the backoff.
+    const SURFACE_FAIL_BACKOFF_AFTER: u32 = 8;
+    /// Retry cadence once acquisition has failed `SURFACE_FAIL_BACKOFF_AFTER` times in a row. Longer
+    /// than `IDLE_POLL` on purpose — see `next_wake_interval`.
+    const SURFACE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// Fold one acquisition outcome into the consecutive-failure streak. Pure so it can be tested.
+    /// The only caller is [`SurfaceRetry::fold`], which is what owns the field and what a test
+    /// drives; `render_frame`'s call site cannot be reached by a test, since it needs a GPU.
+    ///
+    /// `saturating_add` is not decoration: a wrapping counter would return to 0 and silently
+    /// un-arm the back-off after `u32::MAX` failures, i.e. turn a bound back into a spin.
+    fn surface_streak_after(prev: u32, acquired_ok: bool) -> u32 {
+        if acquired_ok { 0 } else { prev.saturating_add(1) }
+    }
+
+    /// How long to wait before the next loop iteration. Pure so it can be tested; the state-carrying
+    /// caller is [`SurfaceRetry::wake_interval`], and `about_to_wait` does nothing else with it.
+    ///
+    /// The back-off arm is the one worth reading. A pending request that only a render can clear
+    /// (`frame_req`, and since #895 `camera_cmd`) makes `poll_external` return true forever while the
+    /// surface refuses to hand out a texture, because the thing that would clear it is exactly what
+    /// cannot run. Without a backoff that is a full `render_frame` plus a `surface.configure` every
+    /// `FRAME_INTERVAL`, unbounded. With it, a persistently failing surface costs one acquisition
+    /// attempt per `SURFACE_RETRY_BACKOFF` — which, being longer than `IDLE_POLL`, means a loop
+    /// pinned "active" by an unservable request wakes LESS often than an idle one, not more.
+    ///
+    /// **The back-off is scoped to the ACTIVE base, deliberately** (#895 review B2). The idle arm
+    /// issues **no surface acquisition to back off**: `about_to_wait` calls `request_redraw()` only
+    /// when `active`, `render_frame` runs only from the `RedrawRequested` arm of `window_event`, and
+    /// `render_frame` holds the render loop's only `surface.get_current_texture()` call
+    /// (`bin/render_model.rs` has its own, in a separate offscreen binary that never runs this loop).
+    /// So an idle wake performs a `try_recv` and nothing else, and stretching it to
+    /// `SURFACE_RETRY_BACKOFF` would buy no fewer acquisition attempts — it would only throttle the
+    /// network drain from 20 Hz to 2 Hz. That state is reachable and sticky: minimise the window
+    /// while anything is animating and ~18 failures accumulate inside `ACTIVE_LINGER`, then activity
+    /// lapses; idle requests no redraw, so no `Ok` can ever clear the streak, and `wake()` needs a
+    /// window event — absent in exactly the minimised case. An earlier revision capped the idle base
+    /// too and an incoming `/v1/camera` would then have waited up to 500 ms before the loop looked at
+    /// the slot at all, in the same scenario #895 is about.
+    ///
+    /// What it does not do: it does not make the loop idle (`active_until` is still in the future),
+    /// and it does not bound how long the streak lasts. Recovery is event-driven — `wake()` zeroes
+    /// the streak, and it runs on every non-redraw window event, including the resize that un-
+    /// minimises the window — so the backoff costs nothing on a real recovery. Nothing bounds it if
+    /// the surface fails forever with no window events at all; that case now costs 2 Hz.
+    ///
+    /// **A residue this does not fix, named rather than papered over.** While the loop is *active*
+    /// and backed off, the network drain is still throttled to 2 Hz, because the wake interval is the
+    /// only knob this function has and it governs the network poll and the surface retry together.
+    /// Decoupling them — keep waking at `FRAME_INTERVAL` for `poll_external`, but issue at most one
+    /// `request_redraw()` per `SURFACE_RETRY_BACKOFF` — needs a "last attempt" instant and a change
+    /// to `about_to_wait`'s redraw decision, which is a larger change than #895 should carry. What
+    /// bounds the damage today is that a real recovery is event-driven and clears the streak.
+    fn next_wake_interval(active: bool, surface_fail_streak: u32) -> std::time::Duration {
+        let base = if active { Self::FRAME_INTERVAL } else { Self::IDLE_POLL };
+        if active && surface_fail_streak >= Self::SURFACE_FAIL_BACKOFF_AFTER {
+            base.max(Self::SURFACE_RETRY_BACKOFF)
+        } else {
+            base
+        }
+    }
 
     /// Mark the app active (render at full rate for `ACTIVE_LINGER`) and request a redraw now. Called
     /// from input handlers and whenever `poll_external` finds pending work.
     fn wake(&mut self) {
         self.active_until = std::time::Instant::now() + Self::ACTIVE_LINGER;
+        // Clear the surface-retry streak: a window event means whatever was wrong with the surface
+        // may no longer be. That THIS line is present is the one transition nothing pins — wrapping
+        // it in `if std::hint::black_box(false)` leaves the suite green, measured. See `SurfaceRetry`.
+        self.surface_retry.note_window_event();
         if let Some(w) = &self.window { w.request_redraw(); }
     }
 
@@ -1961,24 +2120,10 @@ impl App {
             self.scene.player_heading = self.visual_heading;
         }
 
-        if let Ok(mut lock) = self.camera_cmd.lock() {
-            if let Some(cmd) = lock.take() { self.camera.apply_cmd(cmd); }
-        }
-        let (desired_eye, cam_target) = self.camera.tick(dt, self.scene.player_pos, self.scene.player_heading);
-        // Camera collision (#852): resolve the eye ONCE, here, and use that single value both
-        // for the render below and for the published snapshot. Before the #852 fix the pull-in
-        // mutated a local `cam_eye` for rendering only — `snapshot()` re-derived its own eye from
-        // `radius`/`focus`, which the pull-in never touched, so a pulled-in frame and the
-        // observable an agent reads disagreed 88% of the time a pull-in fired. See
-        // `camera_state::resolve_camera_eye`'s doc comment.
+        // The queued `/v1/camera` command is deliberately NOT taken here (#895) — the whole camera
+        // block now lives BELOW the `surface.get_current_texture()` match. See the take/apply site
+        // right after that match for why, and for the two types that keep it there.
         //
-        // The snapshot ITSELF is published later, not here — see the write site right after
-        // `renderer.render_frame(..)` below, and #867. Moving it back up here does not compile:
-        // `CameraState::snapshot` takes an `eqoxide_renderer::DrawnFrame`, and there is no way to
-        // produce one before the draw.
-        let resolved = crate::camera_state::resolve_camera_eye(self.collision.as_deref(), cam_target, desired_eye);
-        let cam_eye = resolved.eye;
-
         // Nav diagnostics overlay (#608): while toggled on (--nav-debug / F11), attach the
         // walker's PUBLISHED snapshot to the scene — a cheap Arc clone — and the renderer draws
         // it verbatim as a depth-tested pass. No nav state is derived here: this is wiring only.
@@ -1995,7 +2140,14 @@ impl App {
         // borrow is live so Rust can verify field-level disjointness.
         let Some((surface, renderer)) = &mut self.gpu else { return };
 
-        let output = match surface.get_current_texture() {
+        // The acquisition is routed THROUGH the retry state machine — `fold` takes the `Result` and
+        // returns it — so every arm below has updated the streak by construction, and short-circuiting
+        // that update (`if false { .. }`) is a compile error here rather than a silent no-op. What
+        // that does NOT stop is someone unwrapping this back to a bare `surface.get_current_texture()`;
+        // `SurfaceRetry`'s doc has the per-mutation table. The streak is what stops a request only a
+        // render can service (`frame_req`, `camera_cmd`) from pinning the loop at `FRAME_INTERVAL`
+        // while acquisition keeps failing.
+        let output = match self.surface_retry.fold(surface.get_current_texture()) {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 surface.configure(&renderer.device, &renderer.surface_config);
@@ -2004,6 +2156,76 @@ impl App {
             Err(wgpu::SurfaceError::Timeout) => return, // compositor throttling; retry next frame
             Err(e) => { tracing::error!("surface error: {e}"); return; }
         };
+
+        // ── Camera: taken and applied only now that a surface texture is in hand (#895) ────────
+        //
+        // This block used to sit ABOVE the match — so a `/v1/camera` Set was taken off the queue and
+        // written into `self.camera`, and then one of the three arms above could `return` before
+        // anything was drawn from it. Worse than a one-tick delay: the take itself was the pending-
+        // command signal `poll_external` reports, so clearing it let `about_to_wait` stop asking for
+        // redraws once `ACTIVE_LINGER` lapsed. A persistently `Outdated` surface (minimised or
+        // occluded window) then meant nothing retried, and the Set was gone.
+        //
+        // The converse cost of keeping the command queued is real and is bounded deliberately: an
+        // un-taken command keeps `poll_external` true, so under that same persistently-`Outdated`
+        // premise the loop cannot fall back to `IDLE_POLL`. It is not honest to assert persistence
+        // to justify the bug and then assume recovery to bound the fix, so `SurfaceRetry` caps the
+        // retry at `SURFACE_RETRY_BACKOFF`. `frame_req` already had this shape before #895; the cap
+        // covers it too.
+        //
+        // Two types hold the ordering, so it survives a refactor that a source-text pin would not
+        // see:
+        //   * `TakenCameraCmd` re-queues the command on `Drop`, so any `return` between the take and
+        //     the apply — including one added later, and including a panic — leaves it PENDING.
+        //   * `apply_to` demands an `AcquiredFrame`, which can only be minted from the
+        //     `wgpu::SurfaceTexture` above. Moving this take/apply back up the function does not
+        //     compile IN A NON-TEST BUILD: there is nothing to pass. The qualifier is load-bearing
+        //     and was measured, not assumed — this crate's dev-dependency enables
+        //     `eqoxide-renderer/test-fixtures`, and cargo unifies features across the lib and its
+        //     test targets, so under `cargo test`/`cargo clippy --all-targets` the escape hatch
+        //     `AcquiredFrame::for_test()` IS visible to this production code and an above-the-match
+        //     apply compiles. `cargo build --release` (what CI ships, `test.yml`) rejects it, so the
+        //     bypass cannot reach a binary — but the mandated test gate is blind to it. This is a
+        //     property of every `test-fixtures` token in this repo, `DrawnFrame::for_test`
+        //     included; it is not specific to `AcquiredFrame`.
+        // See `camera_state::TakenCameraCmd` for the invariant and for what it still does not cover.
+        //
+        // Not a behaviour change, recorded because it looks like one: `camera.tick(dt, ..)` no
+        // longer runs on a skipped tick. Its only `dt`-dependent term is the focus lerp, and
+        // `self.camera.focus = cpos` runs unconditionally above the match every tick, so at tick
+        // time `focus == player_pos` and the lerp is an identity for every `dt`. The azimuth term is
+        // a direct assignment, not an ease. Nothing accumulates and nothing jumps.
+        let prof_cam = crate::profiling::Stopwatch::start();
+        let taken   = crate::camera_state::TakenCameraCmd::take(&self.camera_cmd);
+        let drawing = eqoxide_renderer::AcquiredFrame::from_surface_texture(&output);
+        if let Some(taken) = taken {
+            taken.apply_to(&mut self.camera, &drawing);
+        }
+        let (desired_eye, cam_target) = self.camera.tick(dt, self.scene.player_pos, self.scene.player_heading);
+        // Camera collision (#852): resolve the eye ONCE, here, and use that single value both
+        // for the render below and for the published snapshot. Before the #852 fix the pull-in
+        // mutated a local `cam_eye` for rendering only — `snapshot()` re-derived its own eye from
+        // `radius`/`focus`, which the pull-in never touched, so a pulled-in frame and the
+        // observable an agent reads disagreed 88% of the time a pull-in fired. See
+        // `camera_state::resolve_camera_eye`'s doc comment.
+        //
+        // The snapshot ITSELF is published later, not here — see the write site right after
+        // `renderer.render_frame(..)` below, and #867. Moving it back up here does not compile IN A
+        // NON-TEST BUILD: `CameraState::snapshot` takes an `eqoxide_renderer::DrawnFrame`, and there
+        // is no way to produce one before the draw. Same qualifier, same reason, as the
+        // `AcquiredFrame` note 60 lines above — under `cargo test`/`cargo clippy --all-targets` this
+        // crate's dev-dependency on `eqoxide-renderer/test-fixtures` makes `DrawnFrame::for_test`
+        // visible to this production code, so the move compiles under the test gate and is rejected
+        // only by `cargo build --release`. See `eqoxide_renderer::AcquiredFrame::for_test`.
+        let resolved = crate::camera_state::resolve_camera_eye(self.collision.as_deref(), cam_target, desired_eye);
+        let cam_eye = resolved.eye;
+        // Fold this block's cost back into the `update` bucket. It used to be measured there; #895
+        // moved it below the acquisition, and the profile overlay's phases would otherwise quietly
+        // stop summing to `total`. It is NOT folded into `render`, and the `get_current_texture`
+        // wait above stays outside both — attributing a vsync block to "update" would be a far more
+        // misleading number than the sliver this preserves.
+        let dur_update = dur_update + prof_cam.elapsed();
+
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut enc = renderer.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("frame") },
@@ -2429,15 +2651,18 @@ impl ApplicationHandler for App {
             self.active_until = std::time::Instant::now() + Self::ACTIVE_LINGER;
         }
 
-        let now = std::time::Instant::now();
-        if now < self.active_until {
+        let now    = std::time::Instant::now();
+        let active = now < self.active_until;
+        if active {
             // Active: schedule another frame at ~60fps.
             if let Some(w) = &self.window { w.request_redraw(); }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Self::FRAME_INTERVAL));
-        } else {
-            // Idle: no render. Wake periodically only to poll the network channel; near-zero CPU.
-            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Self::IDLE_POLL));
         }
+        // Idle: no redraw requested. Wake periodically only to poll the network channel; near-zero
+        // CPU. Either way the interval is `SurfaceRetry::wake_interval`'s call, which also throttles
+        // the ACTIVE path when the surface has been refusing to hand out a texture (see its doc).
+        event_loop.set_control_flow(
+            ControlFlow::WaitUntil(now + self.surface_retry.wake_interval(active)),
+        );
     }
 
     fn window_event(
@@ -3848,5 +4073,200 @@ mod zone_load_wiring_803 {
              bug rather than a missing asset");
         assert!(col.zone_line_indices().is_err(),
             "and the exits question refuses rather than answering the empty list");
+    }
+}
+
+/// #895 (review B1) — the render loop's back-off: its arithmetic **and** its state machine.
+///
+/// **Scope, stated up front, and narrowed on purpose.** These tests reach [`App::next_wake_interval`],
+/// [`App::surface_streak_after`] and the whole of [`SurfaceRetry`]. They do NOT execute the render
+/// loop: no test in this repo can, because `App::render_frame` and `about_to_wait` need a GPU and a
+/// window, and `App` itself cannot be constructed here.
+///
+/// So there are two different things below, and they are pinned to two different strengths:
+///
+/// * The **decision** — given "is the app active" and "how many acquisitions have failed in a row",
+///   what interval comes out — is pinned exhaustively by the sweep.
+/// * The **state machine** — that a run of failed acquisitions actually moves the field, that the
+///   interval actually changes as a result, and that a success or a window event actually undoes it
+///   — is pinned by `the_state_machine_backs_off_after_a_failure_run_and_recovers_895`, which drives
+///   `SurfaceRetry`'s real transitions on its real field rather than calling the pure helpers.
+///
+/// What is **not** pinned, stated because a previous revision of this paragraph claimed otherwise
+/// ("enforced by reading and by the compiler") and that claim was false: that `wake()` calls
+/// `note_window_event`, and that `about_to_wait` passes `wake_interval`'s result rather than a
+/// constant. Those two call sites are guarded by reading only. `render_frame`'s call to
+/// [`SurfaceRetry::fold`] *is* compiler-enforced, because `fold` is the only route from the
+/// acquisition to the texture. The per-site table is in [`SurfaceRetry`]'s doc.
+#[cfg(test)]
+mod render_loop_backoff_tests_895 {
+    use super::{App, SurfaceRetry};
+    use std::time::Duration;
+
+    /// One failed acquisition, in the shape `SurfaceRetry::fold` actually consumes. `T = ()` because
+    /// a `wgpu::SurfaceTexture` cannot be built without a GPU — the fold only ever inspects
+    /// `is_ok()`, and its genericity exists precisely so this test can supply the outcome without
+    /// one.
+    fn failed() -> Result<(), wgpu::SurfaceError> { Err(wgpu::SurfaceError::Outdated) }
+
+    /// The relation the whole back-off argument rests on: a loop pinned "active" by a request only a
+    /// render can clear must, once the surface is persistently failing, wake **less** often than an
+    /// idle loop — otherwise "we bounded it" would be a re-labelling, not a bound.
+    #[test]
+    fn the_backoff_is_slower_than_idle_which_is_slower_than_a_frame_895() {
+        assert!(App::SURFACE_RETRY_BACKOFF > App::IDLE_POLL,
+            "a backed-off active loop must cost less than an idle one, else the cap bounds nothing");
+        assert!(App::IDLE_POLL > App::FRAME_INTERVAL,
+            "idle must be cheaper than active, or the whole schedule is upside down");
+        assert!(App::SURFACE_FAIL_BACKOFF_AFTER > 0,
+            "a threshold of 0 would back off on the first Outdated, i.e. on every ordinary resize");
+    }
+
+    /// Exhaustive over both activity states and every streak up to well past the threshold.
+    ///
+    /// Below the threshold the interval must be **exactly** what it was before #895 — that is the
+    /// no-regression half, and it is what keeps an ordinary `Outdated`-during-resize blip rendering
+    /// at full rate. At or above it, an **active** loop must be capped at `SURFACE_RETRY_BACKOFF` —
+    /// that is the bound. Monotonicity is asserted across the whole sweep so no future arm can make
+    /// more failures cost more frequent wakes.
+    ///
+    /// **The idle arm's pin changed in review round 3, and the old one was wrong** (#895 review B2).
+    /// It used to assert the cap applied "regardless of activity". That asserted the mechanism where
+    /// the mechanism has nothing to act on: the back-off's purpose is to bound *surface acquisition
+    /// attempts*, and the idle path issues none — `about_to_wait` calls `request_redraw()` only when
+    /// `active`, `render_frame` runs only from `RedrawRequested`, and `render_frame` holds the render
+    /// loop's only `surface.get_current_texture()`. So the old idle pin locked in a 10× throttle of
+    /// the *network drain* (`poll_external` runs at the wake cadence) that bought zero fewer
+    /// acquisition attempts, in a state that cannot self-clear. It is now pinned the other way: an
+    /// idle loop wakes at `IDLE_POLL` no matter how long the streak is. Deleting this arm's
+    /// `assert_eq!` is what a future "just cap everything" edit would have to do to go green.
+    #[test]
+    fn a_failing_surface_can_only_slow_the_loop_down_never_speed_it_up_895() {
+        let mut checked = 0_usize;
+        for active in [true, false] {
+            let mut prev = Duration::ZERO;
+            for streak in 0..=(App::SURFACE_FAIL_BACKOFF_AFTER + 8) {
+                let got = App::next_wake_interval(active, streak);
+
+                if !active {
+                    assert_eq!(got, App::IDLE_POLL,
+                        "the idle base must never be backed off: an idle wake acquires no surface, \
+                         so stretching it throttles only the network drain (streak={streak})");
+                } else if streak < App::SURFACE_FAIL_BACKOFF_AFTER {
+                    assert_eq!(got, App::FRAME_INTERVAL,
+                        "below the threshold the schedule must be untouched (streak={streak})");
+                } else {
+                    assert!(got >= App::SURFACE_RETRY_BACKOFF,
+                        "at/above the threshold an active loop must be capped (streak={streak}): {got:?}");
+                    assert!(got >= App::IDLE_POLL,
+                        "a pinned-active loop under a dead surface must not outpace an idle one \
+                         (streak={streak}): {got:?}");
+                }
+
+                assert!(got >= prev,
+                    "more consecutive failures must never mean a shorter wait \
+                     (active={active}, streak={streak}): {got:?} < {prev:?}");
+                prev = got;
+                checked += 1;
+            }
+        }
+        // Reach control: without it, a threshold edited to 0 (making the loop range empty) or an
+        // arm that became unreachable would report a green "nothing wrong" that is really
+        // "nothing looked at".
+        assert_eq!(checked, 2 * (App::SURFACE_FAIL_BACKOFF_AFTER as usize + 9),
+            "every (activity, streak) pair in the sweep must have been classified");
+    }
+
+    /// The streak arithmetic. A success must clear the streak outright — not decrement it — or a
+    /// surface that alternates fail/succeed would drift into a permanent back-off; and failures must
+    /// saturate rather than wrap, since a wrap to 0 would un-arm the bound.
+    #[test]
+    fn a_success_clears_the_streak_and_failures_saturate_895() {
+        for prev in [0, 1, App::SURFACE_FAIL_BACKOFF_AFTER, 9_999, u32::MAX] {
+            assert_eq!(App::surface_streak_after(prev, true), 0,
+                "one successful acquisition must clear the streak outright (prev={prev})");
+        }
+        assert_eq!(App::surface_streak_after(0, false), 1);
+        assert_eq!(App::surface_streak_after(App::SURFACE_FAIL_BACKOFF_AFTER, false),
+                   App::SURFACE_FAIL_BACKOFF_AFTER + 1);
+        assert_eq!(App::surface_streak_after(u32::MAX, false), u32::MAX,
+            "the counter must saturate: wrapping to 0 would silently un-arm the back-off");
+        assert!(App::next_wake_interval(true, App::surface_streak_after(u32::MAX, false))
+                    >= App::SURFACE_RETRY_BACKOFF,
+            "and the saturated value must still read as backed-off");
+    }
+
+    /// The threshold itself, pinned on both sides. `>=` vs `>` is a one-character edit that no
+    /// range-wide assertion above would notice on its own.
+    #[test]
+    fn the_backoff_starts_exactly_at_the_threshold_895() {
+        let below = App::next_wake_interval(true, App::SURFACE_FAIL_BACKOFF_AFTER - 1);
+        let at    = App::next_wake_interval(true, App::SURFACE_FAIL_BACKOFF_AFTER);
+        assert_eq!(below, App::FRAME_INTERVAL,
+            "one failure short of the threshold must still render at full rate");
+        assert_eq!(at, App::SURFACE_RETRY_BACKOFF,
+            "the threshold-th consecutive failure is what arms the back-off");
+    }
+
+    /// **The wiring, driven rather than read** (#895 review B1).
+    ///
+    /// Every test above calls a pure helper with a streak value handed to it. This one never names a
+    /// streak: it starts from a fresh [`SurfaceRetry`], pushes real acquisition outcomes through
+    /// [`SurfaceRetry::fold`] — the same method `render_frame` calls, on the same field — and asks
+    /// [`SurfaceRetry::wake_interval`] what the loop would do. So it fails if the increment, the
+    /// clear-on-success, the clear-on-window-event or the threshold comparison stops happening,
+    /// including when the offending statement is *wrapped* rather than deleted. That is the gap
+    /// round-2 review measured: with the streak as a bare `App` field, wrapping the increment in
+    /// `if std::hint::black_box(false)` left the suite fully green and `cargo check` silent.
+    ///
+    /// It does **not** pin that `render_frame`, `wake` and `about_to_wait` call these methods. One of
+    /// those three is compiler-enforced and two are not; the per-site table is on [`SurfaceRetry`].
+    #[test]
+    fn the_state_machine_backs_off_after_a_failure_run_and_recovers_895() {
+        let mut retry = SurfaceRetry::default();
+        assert_eq!(retry.wake_interval(true), App::FRAME_INTERVAL,
+            "a fresh loop renders at full rate");
+
+        // Below the threshold: the run is accumulating, and it must change nothing yet.
+        let mut folded = 0_usize;
+        for _ in 1..App::SURFACE_FAIL_BACKOFF_AFTER {
+            assert_eq!(retry.fold(failed()), Err(wgpu::SurfaceError::Outdated),
+                "fold must hand the acquisition straight back — that return value is the ONLY route \
+                 from `get_current_texture` to the texture in `render_frame`, and is what makes \
+                 dropping this call a compile error instead of a dead-code warning");
+            folded += 1;
+            assert_eq!(retry.wake_interval(true), App::FRAME_INTERVAL,
+                "a partial failure run must not slow the loop (after {folded} failures)");
+        }
+        assert_eq!(folded, App::SURFACE_FAIL_BACKOFF_AFTER as usize - 1,
+            "reach control: the sub-threshold run must have actually executed");
+
+        // The threshold-th failure is the one that arms it. This is the observation the whole
+        // finding was about: the interval CHANGES because failures were pushed through the field.
+        retry.fold(failed()).unwrap_err();
+        assert_eq!(retry.wake_interval(true), App::SURFACE_RETRY_BACKOFF,
+            "the {}th consecutive failure must back the active loop off",
+            App::SURFACE_FAIL_BACKOFF_AFTER);
+        assert_eq!(retry.wake_interval(false), App::IDLE_POLL,
+            "…and must leave the IDLE cadence alone: an idle wake acquires no surface, so backing \
+             it off would throttle only the network drain (#895 review B2)");
+
+        // Recovery path 1 — a window event (un-minimise, resize, focus, any input).
+        retry.note_window_event();
+        assert_eq!(retry.wake_interval(true), App::FRAME_INTERVAL,
+            "a window event must restore full-rate retry immediately, or the back-off adds latency \
+             to a real recovery");
+
+        // Recovery path 2 — a successful acquisition, from a saturated streak, so this also pins
+        // that success CLEARS rather than decrements.
+        for _ in 0..(App::SURFACE_FAIL_BACKOFF_AFTER + 5) { retry.fold(failed()).unwrap_err(); }
+        assert_eq!(retry.wake_interval(true), App::SURFACE_RETRY_BACKOFF,
+            "re-arm control: the second failure run must have armed it again, or the assertion \
+             below would pass on a machine that never backed off");
+        assert_eq!(retry.fold::<()>(Ok(())), Ok(()),
+            "fold must pass a successful acquisition through unchanged");
+        assert_eq!(retry.wake_interval(true), App::FRAME_INTERVAL,
+            "one success must clear the whole run outright — a decrement would leave a surface that \
+             alternates fail/succeed permanently backed off");
     }
 }

@@ -575,10 +575,13 @@ fn build_unit_cube(device: &wgpu::Device) -> GpuMesh {
 /// ```
 ///
 /// ```compile_fail
-/// // …but it cannot be fabricated. `index` is private and there is no constructor, so a
-/// // would-be pre-draw publisher has no way to produce the argument. This test going GREEN
-/// // (i.e. the snippet failing to compile) is the whole guarantee; if `index` were made `pub`,
-/// // or a public constructor added, this doctest fails.
+/// // …but the struct literal cannot be written from outside: `index` is private. Making `index`
+/// // `pub` turns this doctest RED — that, and only that, is what it pins.
+/// //
+/// // It does NOT pin "no public constructor exists" (this sentence used to claim it did, #895
+/// // review). A literal cannot see a constructor, so adding one leaves this GREEN; `for_test()`
+/// // is already exactly such a constructor and this doctest is green today. What keeps it honest
+/// // is the `test-fixtures` gate — whose limit is documented on [`DrawnFrame::for_test`].
 /// let _ = eqoxide_renderer::DrawnFrame { index: 7 };
 /// ```
 #[derive(Debug)]
@@ -597,8 +600,91 @@ impl DrawnFrame {
     /// enable as a **dev-dependency** feature so a production build cannot reach it. Without this,
     /// no unit test outside this crate could exercise a code path that takes a `DrawnFrame`, since
     /// `render_frame` needs a real GPU device.
+    ///
+    /// The gate is narrower than it looks — feature unification makes this visible to the
+    /// dev-dependent crate's *production* code under `cargo test`, so unconstructibility holds only
+    /// in a non-test build. Written up once, on [`AcquiredFrame::for_test`]; it is a property of the
+    /// convention, not of either token.
     #[cfg(feature = "test-fixtures")]
     pub fn for_test(index: u64) -> Self { Self { index } }
+}
+
+/// Proof that this render tick **acquired a surface texture** — i.e. that it got past the
+/// `surface.get_current_texture()` match whose `Lost`/`Outdated`/`Timeout` arms `return` without
+/// drawing anything (#895).
+///
+/// [`DrawnFrame`] is the token for *"a frame was encoded"*, and it is minted **after**
+/// `render_frame` returns. That makes it useless for work which has to feed the frame being drawn:
+/// by the time you hold a `DrawnFrame` it is too late to change what was drawn. `AcquiredFrame` is
+/// its pre-draw sibling, for work that must be applied *to* the frame about to be drawn and must
+/// not happen at all on a tick that skips the draw — concretely, moving a queued `/v1/camera`
+/// command into `CameraState` (see `eqoxide::camera_state::TakenCameraCmd`, which requires one).
+///
+/// The guarantee is structural, and exactly this wide:
+///
+/// - The single field is private and the only public constructor is
+///   [`from_surface_texture`](Self::from_surface_texture), whose argument is a
+///   [`wgpu::SurfaceTexture`] — a value that exists **only** on the `Ok` arm of
+///   `Surface::get_current_texture`. So the evidence the token is minted from is itself unforgeable,
+///   and no caller in any crate can produce one on a tick that skipped the acquisition.
+///   (`test-fixtures` adds [`for_test`](Self::for_test); that feature is dev-only and off in a
+///   production build, the same convention [`DrawnFrame::for_test`] uses.)
+/// - It proves the surface texture was **acquired**. It does **not** prove `render_frame` was
+///   reached: nothing in the type system stops a caller `return`ing between the acquisition and the
+///   draw. In `app.rs` today that window holds a `create_view`, a `create_command_encoder` and the
+///   call itself — no `return`, no `?` — but that is a fact about the source, not about this type.
+///   Where *"the frame was encoded"* is the thing you need, take a [`DrawnFrame`] instead.
+/// - It carries no debt: dropping one is free and means nothing. It is a capability, not a receipt.
+/// - It is deliberately **not** `Copy`/`Clone`, so a consumer that takes it by value takes it once
+///   and cannot stash a spare for a later, draw-less tick.
+///
+/// ```
+/// // The type is public and nameable — the control for the `compile_fail` below, which would
+/// // otherwise pass on a typo in the path.
+/// fn _needs_proof(_a: eqoxide_renderer::AcquiredFrame) {}
+/// ```
+///
+/// ```compile_fail
+/// // …but the tuple-struct literal cannot be written from outside: the field is private. Making
+/// // the field `pub` turns this doctest RED — that, and only that, is what it pins.
+/// //
+/// // It does NOT pin "no public constructor exists". A literal cannot see a constructor, so an
+/// // added `pub fn out_of_thin_air() -> Self` leaves this GREEN; measured, not assumed (an earlier
+/// // revision of this comment claimed otherwise and was wrong). The proof is already in the file:
+/// // `for_test()` IS a public no-argument constructor and this doctest is green today. What keeps
+/// // `for_test` honest is the `test-fixtures` gate, not this test — and see `from_surface_texture`
+/// // for the limit of that gate.
+/// let _ = eqoxide_renderer::AcquiredFrame(());
+/// ```
+#[derive(Debug)]
+#[must_use = "an AcquiredFrame is the permission to feed the frame about to be drawn — pass it, or drop it deliberately"]
+pub struct AcquiredFrame(());
+
+impl AcquiredFrame {
+    /// Mint the token from the surface texture the acquisition returned.
+    ///
+    /// The texture is taken by reference and never read: it is here purely as **evidence**. A
+    /// [`wgpu::SurfaceTexture`] can only be obtained from a successful `get_current_texture` — its
+    /// own fields are private in wgpu — so a caller sitting above that call has no argument to pass
+    /// and does not compile **in a non-test build**. See [`AcquiredFrame::for_test`] for why that
+    /// qualifier is needed.
+    pub fn from_surface_texture(_acquired: &wgpu::SurfaceTexture) -> Self { Self(()) }
+
+    /// Fabricate a token in tests. Dev-only: gated behind `test-fixtures`, which downstream crates
+    /// enable as a **dev-dependency** feature so a production build cannot reach it. Without this,
+    /// no unit test outside this crate could exercise a path that takes an `AcquiredFrame`, since
+    /// the only production source of one is a real surface acquisition on a real GPU.
+    ///
+    /// **The gate is narrower than it looks, and this applies to every `test-fixtures` token in the
+    /// workspace, [`DrawnFrame::for_test`] included.** Cargo unifies features across a crate's lib
+    /// and its test targets, so in any `cargo test` or `cargo clippy --all-targets` build of a crate
+    /// that dev-depends on `eqoxide-renderer/test-fixtures`, this function is visible to that
+    /// crate's **production** code, not merely to its tests. A forged token therefore compiles and
+    /// passes the workspace test gate. `cargo build --release` — what CI ships — has the feature off
+    /// and rejects it, so a forgery cannot reach a binary; but "does not compile" is a claim about
+    /// the release build only, and any test asserting unconstructibility must say so.
+    #[cfg(feature = "test-fixtures")]
+    pub fn for_test() -> Self { Self(()) }
 }
 
 /// All GPU resources for the currently-loaded zone: the wgpu device/queue/surface, uploaded zone +
