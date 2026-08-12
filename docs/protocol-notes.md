@@ -340,8 +340,8 @@ empty for broadcasts.
 ## Consider_Struct (OP_Consider)
 
 **Provenance: RoF2 (re-derived)** — request size from `SIZE_CONSIDER`
-(`crates/eqoxide-protocol/src/protocol/mod.rs:1110`); reply offsets from `apply_consider`
-(`crates/eqoxide-net/src/packet_handler.rs:2453-2457`) and pinned by
+(`crates/eqoxide-protocol/src/protocol/mod.rs:1110`); reply offsets from `apply_consider` in
+`crates/eqoxide-net/src/packet_handler.rs` and pinned by
 `apply_consider_parses_20byte_reply_and_logs_attitude`.
 
 The client sends a **32**-byte request (`playerid`@0, `targetid`@4, remainder zeroed). The server
@@ -391,8 +391,8 @@ player character like "Claude" doesn't get this). EQEmu sends loot-table debug a
 [Loot] AddLootDrop: item_id=1234 min/max=1/1
 ```
 
-These are filtered by `is_debug_spam()`
-(`crates/eqoxide-net/src/packet_handler.rs:2264`) before being added to the NPC Dialogue panel. If
+These are filtered by `is_debug_spam()` in
+`crates/eqoxide-net/src/packet_handler.rs` before being added to the NPC Dialogue panel. If
 the filter is too aggressive, adjust it there.
 
 ---
