@@ -234,8 +234,12 @@ impl CameraState {
     /// `wgpu::SurfaceError` arms, and a publish that only *textually* follows the render call is
     /// still reachable from before it after any ordinary refactor (extract-method, an `Arc::clone`
     /// alias). Taking an [`eqoxide_renderer::DrawnFrame`] by value instead means a pre-draw caller
-    /// has no argument to pass and does not compile. See that type's doc for the exact scope: it
-    /// proves a `render_frame` call returned, not that the frame was submitted or presented.
+    /// has no argument to pass and does not compile **in a non-test build** — under `cargo test` the
+    /// dev-dependency on `eqoxide-renderer/test-fixtures` makes `DrawnFrame::for_test` visible to
+    /// production code too, so only `cargo build --release` rejects it (written up once on
+    /// `eqoxide_renderer::AcquiredFrame::for_test`, for every `test-fixtures` token in the
+    /// workspace). See that type's doc for the other limit on scope: it proves a `render_frame` call
+    /// returned, not that the frame was submitted or presented.
     ///
     /// For the pre-first-frame seed, use [`CameraState::undrawn_snapshot`], which is honest about
     /// having no frame rather than borrowing one.
@@ -684,11 +688,17 @@ mod tests {
     /// both cases, and the nearby `snapshot_age_ms` on `/v1/observe/debug` is the NETWORK clock, so
     /// it reads fresh throughout a rendering stall.
     ///
-    /// The ordering half of #867 is not asserted here — it is enforced by the type system: the
-    /// `DrawnFrame` argument below can only be produced by `EqRenderer::render_frame` (its field is
-    /// private, its `for_test` constructor is dev-only), so a publisher sitting before the draw has
-    /// nothing to pass and fails to compile. See `eqoxide_renderer::DrawnFrame`'s `compile_fail`
-    /// doctest, which is the proof that it cannot be fabricated.
+    /// The ordering half of #867 is not asserted here — it is enforced by the type system **in a
+    /// non-test build**: the `DrawnFrame` argument below can only be produced by
+    /// `EqRenderer::render_frame` (its field is private, its `for_test` constructor is dev-only), so
+    /// a publisher sitting before the draw has nothing to pass and fails to compile. The qualifier
+    /// matters and is not a hedge: cargo unifies features across a crate's lib and its test targets,
+    /// so under `cargo test` this crate's dev-dependency turns `DrawnFrame::for_test` on for its own
+    /// *production* code too — the line right below this doc is that constructor in use. Only
+    /// `cargo build --release` (what CI ships) has it off. `DrawnFrame`'s `compile_fail` doctest pins
+    /// that the field stays private and *only* that; it does not pin "no public constructor exists",
+    /// since a struct literal cannot see one. See `eqoxide_renderer::AcquiredFrame::for_test`, where
+    /// this is written up once for every `test-fixtures` token in the workspace.
     #[test]
     fn a_snapshot_names_the_frame_it_describes_or_admits_there_was_none() {
         let cam = CameraState::new([1.0, 2.0, 3.0], 40.0);
@@ -751,9 +761,16 @@ mod tests {
     /// guard re-queues the command — which is ordinary data logic and is exactly what a mutation
     /// can break silently. The *other* half, that `render_frame` cannot apply a command before the
     /// surface texture is in hand, is not asserted here at all and is not assertable from a test:
-    /// it is a compile error, enforced by `apply_to` demanding an `eqoxide_renderer::AcquiredFrame`
-    /// that only a real acquisition can mint. `AcquiredFrame`'s `compile_fail` doctest is the proof
-    /// that the token cannot be fabricated; `cargo check` is the proof that `app.rs` obeys it.
+    /// it is a compile error **in a non-test build**, enforced by `apply_to` demanding an
+    /// `eqoxide_renderer::AcquiredFrame` that only a real acquisition can mint. The qualifier is
+    /// load-bearing: this crate dev-depends on `eqoxide-renderer/test-fixtures`, and cargo unifies
+    /// features across a crate's lib and its test targets, so in any test-profile build (plain
+    /// `cargo test`, or a clippy run that includes the test targets) the escape hatch
+    /// `AcquiredFrame::for_test()` is visible to `app.rs`'s production code and an above-the-match
+    /// apply compiles. `cargo build --release` (what CI ships) rejects it. `AcquiredFrame`'s `compile_fail` doctest pins that the tuple-struct field
+    /// stays private and *only* that — it does not pin that no constructor exists, and `for_test`
+    /// proves it cannot: see `eqoxide_renderer::AcquiredFrame::for_test`, which states this as a
+    /// property of every `test-fixtures` token in the workspace.
     #[test]
     fn a_taken_camera_cmd_reaches_the_camera_or_stays_queued_895() {
         use std::sync::{Arc, Mutex};
