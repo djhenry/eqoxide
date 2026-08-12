@@ -2749,7 +2749,7 @@ mod tests {
     /// sentence puts it in. An earlier draft of this paragraph did exactly that: renaming the test it
     /// named, with the prose left standing, made the scan report the loss AT THIS PARAGRAPH, while
     /// the same rename on a tree without the sentence was green. State the class here; keep the
-    /// instances in the `//` comments beside their entries, which the scan does not read. Any
+    /// instances in the `//` comments beside their entries, which the citation scan does not read. Any
     /// `#[cfg]` appearing on this statement should be read as removing the guard, not configuring
     /// it.
     #[test]
