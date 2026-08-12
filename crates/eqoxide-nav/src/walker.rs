@@ -2717,10 +2717,13 @@ mod tests {
     /// could not resolve the name and took the crate's WHOLE lib-test target down with it.
     ///
     /// **Why that hid.** Not because CI skips the release profile — it runs
-    /// `cargo build --release --workspace --locked`. It hid because `cargo build` never enables
-    /// `cfg(test)`: the gated test item was never compiled in that job at all. On the defective tree
-    /// a lib-only `cargo check --release -p eqoxide-nav` is green and only `--tests` is red, so the
-    /// break was reachable solely through a release-profile TEST build, which nothing in CI runs.
+    /// `cargo build --release --workspace --locked --keep-going`. It hid because `cargo build` never
+    /// enables `cfg(test)`: the gated test item was never compiled in that job at all. CI does also
+    /// compile every test target, via `cargo build --workspace --all-targets --locked --keep-going`,
+    /// but that step is the DEV profile, where `debug_assertions` is on and the gate is satisfied.
+    /// On the defective tree a lib-only `cargo check --release -p eqoxide-nav` is green and only
+    /// `--tests` is red, so the break was reachable solely through a release-profile TEST build,
+    /// which nothing in CI runs.
     ///
     /// The fix was to make the citee unconditional and gate only its `should_panic` expectation, via
     /// `#[cfg_attr(debug_assertions, should_panic(expected = "…"))]`. The test then exists in every
@@ -2737,10 +2740,18 @@ mod tests {
     /// which a cited test can be renamed with `cargo check` green. `steering`'s mechanical citation
     /// scan does not close that hole, because it matches the SOURCE TEXT of declarations beginning
     /// `let _cited` and so still sees the entries it can no longer enforce. Names cited only from a
-    /// tracked doc rather than a doc comment — `a_wedged_follow_chase_is_not_reported_as_stalled_at_all_851`,
-    /// cited by `docs/http-api.md` — are protected by compilation ALONE, and nothing else would
-    /// report their loss. Any `#[cfg]` appearing on this statement should be read as removing the
-    /// guard, not configuring it.
+    /// tracked doc rather than a doc comment are protected by compilation ALONE, and nothing else
+    /// would report their loss; this array's own `//` entry comments record which entries those are.
+    ///
+    /// **No instance of that class can be named here, and the attempt is what proves it.** This file
+    /// is in `citation_corpus()`, so writing such a name in backticks in a doc comment IS a
+    /// doc-comment citation — the act of citing it as an example moves it out of the class the
+    /// sentence puts it in. An earlier draft of this paragraph did exactly that: renaming the test it
+    /// named, with the prose left standing, made the scan report the loss AT THIS PARAGRAPH, while
+    /// the same rename on a tree without the sentence was green. State the class here; keep the
+    /// instances in the `//` comments beside their entries, which the scan does not read. Any
+    /// `#[cfg]` appearing on this statement should be read as removing the guard, not configuring
+    /// it.
     #[test]
     fn every_walker_test_name_cited_in_a_doc_comment_still_exists() {
         let _cited: &[fn()] = &[
@@ -4428,7 +4439,16 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// cross-zone branch, i.e. the `/v1/move/zone_cross` SUCCESS path) left the whole suite green,
     /// and the docs↔constants pin in `eqoxide-net` cannot see it either — a reasonless publish adds
     /// no constant to the list it compares. The `debug_assert!` in `set_nav_state_because` is what
-    /// closes that, so it needs its own test: without this, deleting the assert is silent.
+    /// closes that, so it needs its own test.
+    ///
+    /// **What this pins is the CLASS, not any single assert** (#994 review round 2, N5 — the earlier
+    /// wording here, "without this, deleting the assert is silent", was measurably backwards).
+    /// Two-direction mutation: neutering `set_nav_state_because`'s `debug_assert!` ALONE leaves this
+    /// test GREEN, because `NavStatus::retire_to_idle` carries an identical `#725 B1` assert that
+    /// fires instead; only neutering BOTH turns it RED (`test did not panic as expected`). So read a
+    /// failure here as "no writer refuses a reasonless `idle` any more", never as "this particular
+    /// assert is still present" — deleting one of the pair IS silent, and nothing here pins them
+    /// individually.
     ///
     /// Debug-only by construction — `debug_assert!` compiles out under `--release`, so the guard is
     /// a TEST-TIME instrument, not a runtime one. That is the honest scope of the claim: it fails
