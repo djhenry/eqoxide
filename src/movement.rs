@@ -1339,13 +1339,40 @@ impl CharacterController {
     /// 0.75 u from any face at least `Body::ring` tall reads EMBEDDED and the net relocates it to a
     /// ring candidate up to `PUSHOUT_RADII` away. On `ce1d89f` (pre-#870) that teleport fired on
     /// alternate frames and dragged a grounded walker sideways along the wall it was merely leaning
-    /// on — bounded by the WALL'S LENGTH, not by how long it was driven: +99.7 u on a 100 u wall,
-    /// +342.9 u on a 2000 u one, in the same 15 s drive (independently re-derived in the #914
-    /// review). Both are historical; neither reproduces on this branch, because the bug they
-    /// measured is fixed. What IS pinned here, on THIS branch, at both wall lengths: **0.0000 u**
-    /// of drift, mutation-checked to go RED under exactly this defect
-    /// (`a_grounded_walk_never_drifts_on_a_short_or_a_2000u_wall`, #932). The `lip >= 3.00`
-    /// threshold in #870 is exactly `Body::ring`; below it the ring never sees the barrier at all.
+    /// on: +99.7 u at a north half-extent of 100, +342.9 u at a half-extent of 1000, in the same
+    /// 15 s (900-frame, dt 1/60) drive.
+    ///
+    /// **The drag is bounded by whichever is SMALLER, the wall's north half-extent or the drive —
+    /// and only the +99.7 figure is extent-bounded.** RE-DERIVED here (#987 review round 2) by
+    /// wrapping this fn's own look-ahead back off (`ray_len = len + back_off * 0.0`), which
+    /// reproduces both historical figures at the precision they were recorded — 99.717377 against
+    /// the reported 99.7174, and 342.867859 against 342.8679 — and then varies each axis separately:
+    ///
+    /// | north half-extent | 900 frames (15 s) | 1800 frames | 3600 frames |
+    /// |---|---|---|---|
+    /// | 100 | 99.717377 | 99.717377 | — |
+    /// | 400 | — | 399.848816 | — |
+    /// | 1000 | 342.867859 | 698.348450 | 999.893250 |
+    /// | 2000 | 342.867859 | 698.348450 | — |
+    /// | 4000 | 342.867859 | 698.348450 | — |
+    ///
+    /// So **+342.9 u is DRIVE-bounded**: quadrupling the half-extent at a fixed 900-frame drive
+    /// leaves it bit-identical at 342.867859, while doubling the drive at half-extent 1000 moves it
+    /// to 698.348450. The extent binds only where it is the smaller of the two — half-extent 100
+    /// caps at 99.717377 no matter how long the drive runs, half-extent 400 at 399.848816, and
+    /// half-extent 1000 does become the binding constraint once the drive reaches 3600 frames
+    /// (999.893250). An earlier draft of this paragraph called BOTH figures wall-length-bounded;
+    /// that is false for +342.9, and the pre-#932 text — which attributed +342.9 to "15 s of
+    /// simulated time" — had this one right.
+    ///
+    /// Both figures are historical; neither reproduces on this branch, because the bug they
+    /// measured is fixed. What IS pinned here, on THIS branch, at both half-extents: **0.0000 u**
+    /// of drift (`a_grounded_walk_never_drifts_on_a_short_or_a_1000u_extent_wall`, #932). That
+    /// test does go RED under exactly the wrap above — but the pin that fires FIRST is its
+    /// per-frame `is_embedded` assert (measured: half-extent 100, frame 33), not its drift assert.
+    ///
+    /// The `lip >= 3.00` threshold in #870 is exactly `Body::ring`; below it the ring never sees
+    /// the barrier at all.
     ///
     /// So the look-ahead is DERIVED from the back-off rather than being a second hand-tuned number:
     /// `radius + SKIN` is the back-off at `ndot = 1`, the head-on case, and `contact` is now scaled
@@ -1358,15 +1385,26 @@ impl CharacterController {
     /// the head-on `radius + SKIN`, not by the oblique `radius/ndot + SKIN` (which reaches 20 u at
     /// the `ndot` floor and is not a sane ray length), so head-on is the only approach with a
     /// clean clearance. MEASURED, driving a grounded body at a 6 u wall at eight approach angles,
-    /// 40 phases each, 600 frames, 35 u/s at 60 Hz, recording the closest perpendicular approach
-    /// ever reached, where `ndot` is the cosine of the approach against the face normal:
+    /// 40 phases each, 600 frames, 35 u/s at 60 Hz, **on a wall and floor of north half-extent
+    /// 500** — the extent is part of the protocol, not a detail (#938; see below) — recording the
+    /// closest perpendicular approach ever reached, where `ndot` is the cosine of the approach
+    /// against the face normal:
     ///
     /// | `ndot` | 1.000 | 0.985 | 0.866 | 0.707 | 0.500 | 0.342 | 0.174 | 0.087 |
     /// |---|---|---|---|---|---|---|---|---|
-    /// | this branch | 1.050 | 1.037 | 0.920 | 0.743 | 0.708 | 0.801 | 0.899 | 0.949 |
+    /// | this branch | 1.050 | 1.039 | 0.920 | 0.743 | 0.708 | 0.801 | 0.899 | 0.949 |
     /// | pre-#870 `ce1d89f` | 0.417 | 0.426 | 0.495 | 0.588 | 0.708 | 0.801 | 0.899 | 0.949 |
     ///
     /// (`ce1d89f` is the pre-#870 baseline for both tables in this file.)
+    ///
+    /// **#938 — the half-extent 500 is load-bearing, and this file's own `wall`/`floor` helpers do
+    /// NOT produce this table.** They hard-code a north half-extent of 100, at which only FOUR of
+    /// the eight columns above reproduce within the 0.01 tolerance (`ndot` 1.000, 0.985, 0.500 and
+    /// 0.342). The other four read 0.5027, 0.5978, 2.2375 and 11.2202 at `ndot` 0.866, 0.707,
+    /// 0.174 and 0.087 — the body sliding around the END of a too-short wall, which is a different
+    /// phenomenon from an oblique contact residual, not a worse measurement of the same one. All
+    /// of these figures were re-derived in the #987 round-2 review and are pinned, both extents
+    /// and all eight columns, by `the_residual_clearance_table_needs_the_walls_lateral_extent_stated`.
     ///
     /// `is_embedded` still fires from `ndot` 0.866 down — those are the rows whose worst clearance
     /// is inside `PLAYER_RADIUS` = 1.0, and they are the rows with nonzero embedded frames on this
@@ -1530,9 +1568,12 @@ impl CharacterController {
     /// centre probe lands in — driven due east at 20 u/s, 60 Hz, 600 frames, recording the first
     /// mounting frame (so a depenetration teleport cannot be mistaken for a creep; `is_embedded`
     /// was false on every frame before every mount, and lateral drift was 0.0000 throughout). Wall
-    /// and floor use the file's own `wall`/`floor` helpers (north extent ±100, same as #938's
-    /// residual-clearance table above) — but unlike that table, the drive here is due EAST only, so
-    /// the body never approaches the north edge and the extent does not bound these numbers (#938).
+    /// and floor use the file's own `wall`/`floor` helpers, north half-extent 100 — which is NOT
+    /// the extent behind #938's residual-clearance table above; that table needs half-extent 500,
+    /// and at 100 only four of its eight columns reproduce. The difference does not matter here:
+    /// the drive is due EAST only, so the body never approaches the north edge and the extent does
+    /// not bound these numbers, whereas that table's oblique drives run the body into the wall's
+    /// end (#938).
     ///
     /// | tread gap `g` | 0.00 | 0.20 | 0.34 | 0.80 | 1.20 | 1.38 | 1.39 |
     /// |---|---|---|---|---|---|---|---|
@@ -1565,7 +1606,13 @@ impl CharacterController {
     /// a floor exists to stand on at the raised destination (the no-geometry-gap guard) — return the
     /// stepped-up `[east, north, floor_z]`. `None` = a taller-than-2u wall, OR a tread gap wider than
     /// `radius + SKIN` (#870's creep, doc'd above, extends the search that far past the raised lip —
-    /// see #930, which corrected this comment after review found it still calling any gap terminal).
+    /// see #930, which corrected this comment after review found it still calling any gap terminal),
+    /// OR a landing outside the step band — a DROP beyond the lip, with no gap in the floor at all.
+    /// That third cause is easy to miss because it is not a hole: MEASURED (#987 review round 2), a
+    /// 1.5 u riser with a CONTINUOUS far floor 10 u below returns `None` at `wish` 0.58 from east
+    /// −0.30 and from −0.10, while the identical fixture with the far floor at 0.0 returns `Some`.
+    /// `in_band` is the gate — a floor is only standable if it is within `GROUND_SNAP_TOL` below
+    /// the feet and no more than `max_step` above them.
     fn try_step_up(&self, wish: [f32; 3], max_step: f32, col: &Collision) -> Option<[f32; 3]> {
         let raised = [self.pos[0], self.pos[1], self.pos[2] + max_step];
         let (hi, _) = self.slide(raised, wish, col);
@@ -2565,7 +2612,10 @@ mod tests {
     // floors x 40 approach phases — produced the net's teleport every time and a far-side landing
     // NONE of the times; on a planar barrier every ring candidate east of the face is correctly
     // refused by `footprint_clear`, and the body is instead dragged sideways along the wall
-    // (measured: +99.7 u with a 100 u wall, +342.9 u with a 2000 u one, in 900 frames at dt 1/60).
+    // (measured: +99.7 u at a north half-extent of 100, +342.9 u at a half-extent of 1000, both in
+    // 900 frames at dt 1/60 — see `slide()`'s doc for which of those two is extent-bounded and
+    // which is drive-bounded; this line said "100 u wall" / "2000 u one" until #987 round 2, mixing
+    // half-extent and full-span naming in one sentence).
     // That lateral drag is the same falsehood as the crossing — a reported position the body never
     // walked to — and it is what these tests pin. See the PR body for the full disclosure.
 
@@ -2620,11 +2670,13 @@ mod tests {
         let radius = crate::traversability::PLAYER_BODY.radius;
         let mut runs = 0_usize;
         let mut band_frames = 0_usize;
-        // #933 — per-run reach control, not a global sum. MEASURED baseline (sha a17044b):
-        // every one of the 1134 runs settles for between 343 and 392 of its 400
-        // frames; `MIN_RUN_BAND_FRAMES` = 300 sits under the observed floor with headroom but
-        // rejects the failure mode `band_frames > runs` could not — one settled frame per run
-        // (an average of 1/400) passes the old control and fails this one on the FIRST run.
+        // #933 — per-run reach control, not a global sum. Re-measured on this branch in the #987
+        // round-2 review, on the 2.51-lip grid below: all 1134 runs settle for between 343 and 392
+        // of their 400 frames. `MIN_RUN_BAND_FRAMES` = 300 sits under that observed floor with
+        // headroom but rejects the failure mode `band_frames > runs` could not — TWO settled
+        // frames per run (an average of 2/400) passes the old control, 2268 > 1134, and fails this
+        // one on the FIRST run. It has to be two, not one: 1 × 1134 = 1134 and the old control is
+        // a STRICT `>`, so one frame per run already fails it.
         const MIN_RUN_BAND_FRAMES: usize = 300;
         // ⚠️ **The lips start at 2.51, and the gap below it is a DIFFERENT, STILL-OPEN bug.**
         // A lip in `(STEP_UP, STEP_UP + Body::foot]` = (2.00, 2.50] is passable, and #870's fix
@@ -2636,10 +2688,20 @@ mod tests {
         // byte-identical on unmodified `main` and on this branch, which is what makes it a
         // separate bug and not a regression. It is excluded here rather than fixed because the fix
         // is #854's (probe heights), not this one's (ray length), and asserting a barrier that low
-        // holds would be asserting something no code in this PR makes true. #931: 2.51 is the
-        // lowest lip that already blocks correctly (`the_blind_step_up_band_is_closed_at_its_upper_bound`
-        // below pins 2.5000 itself as still passable), so the grid starts exactly at the true
-        // boundary rather than leaving an unexplained margin above it.
+        // holds would be asserting something no code in this PR makes true. It is also a LATERAL
+        // teleport, not merely a pass-through: at lip 2.5000 under a due-EAST drive the body ends
+        // at north 99.72–99.95 across the four speed/dt pairs
+        // `the_blind_step_up_band_is_closed_at_its_upper_bound` uses — ~99.7 u of displacement the
+        // body never made, which is the same wrong-position class #870 is about, in the band this
+        // block hands off to #854.
+        //
+        // #931: the true boundary is 2.50 — `the_blind_step_up_band_is_closed_at_its_upper_bound`
+        // below pins 2.5000 as still passable and 2.5001 as already blocking. So 2.51 is NOT the
+        // lowest lip that blocks; it is the lowest TWO-DECIMAL lip above the boundary, and the
+        // grid still carries margin above the true edge — 0.01 u, down from the previous 0.10, not
+        // gone. MEASURED (#987 round 2, 600 frames, the same four speed/dt pairs): 2.5001, 2.51,
+        // 2.55, 2.59 and 2.60 all rest at east −1.0500 with `is_embedded` never firing, so every
+        // one of those would have served as the grid's first lip.
         for lip in [2.51_f32, 2.80, 2.95, 3.00, 3.05, 3.50, 4.00, 6.00, 12.00] {
             for far in [0.0_f32, -10.0] {
                 for speed in [20.0_f32, 35.0, 44.0] {
@@ -2691,17 +2753,29 @@ mod tests {
                                      only {band_frames} settled frames over {runs} runs");
     }
 
-    /// #932 — the fixture for `slide()`'s doc-comment figure. `ce1d89f` (pre-#870) drove this exact
+    /// #932 — the fixture for `slide()`'s doc-comment figures. `ce1d89f` (pre-#870) drove this exact
     /// shape — a grounded walker into a 3.0-tall barrier, due east, 35 u/s, 900 frames (15 s) at
-    /// dt 1/60 — and measured lateral drift bounded by the WALL'S LENGTH, not by the 15 s: +99.7 u
-    /// on a 100 u wall, +342.9 u on a 2000 u one (both independently re-derived in the #914 review;
-    /// neither is reproducible here, because the bug they measured is gone). What IS reproducible on
-    /// THIS branch, pinned below at both lengths: zero drift, regardless of wall length — the
+    /// dt 1/60 — and measured +99.7 u of lateral drift at a north half-extent of 100 and +342.9 u
+    /// at a half-extent of 1000.
+    ///
+    /// **Those two figures do not have the same bound, and `slide()`'s doc carries the full
+    /// derivation.** The drag is bounded by whichever is smaller, the half-extent or the drive:
+    /// +99.7 is extent-bounded (half-extent 100 caps at 99.717377 at 900 frames AND at 1800),
+    /// while +342.9 is DRIVE-bounded (342.867859 at 900 frames at half-extents 1000, 2000 and 4000
+    /// alike; 698.348450 when the drive doubles to 1800 frames). Re-derived in the #987 round-2
+    /// review by wrapping `slide()`'s look-ahead back off; neither figure is reproducible here,
+    /// because the bug they measured is gone.
+    ///
+    /// What IS reproducible on THIS branch, pinned below at both half-extents: zero drift. The
     /// property `a_grounded_walk_at_a_barrier_never_enters_the_depenetration_net` already pins the
-    /// 100 u case; this extends the same drive to a 2000 u wall so the doc-comment has a real,
-    /// current-branch number for the long wall too, instead of restating `ce1d89f`'s.
+    /// half-extent 100 case; this extends the same drive to half-extent 1000 so the doc comment has
+    /// a real, current-branch number for the long wall too, instead of restating `ce1d89f`'s.
+    ///
+    /// Both legs are named by their HALF-extent — the convention `wall()`, `wall_ext` and
+    /// `residual_clearance` use throughout this file. A reader who set `half_extent = 2000` would
+    /// be building a different fixture from the one that produced +342.9.
     #[test]
-    fn a_grounded_walk_never_drifts_on_a_short_or_a_2000u_wall() {
+    fn a_grounded_walk_never_drifts_on_a_short_or_a_1000u_extent_wall() {
         for half_extent in [100.0_f32, 1000.0] {
             let c = col(vec![
                 floor_ext(0.0, -100.0, 0.0, half_extent),
@@ -2720,8 +2794,8 @@ mod tests {
             }
             assert!(max_drift < 1e-3,
                 "half_extent {half_extent}: {max_drift:.4} u of north drift under a due-east drive \
-                 — ce1d89f measured +99.7 u (100 u wall) / +342.9 u (2000 u wall) here; #870 must \
-                 measure ~0 regardless of wall length (#932)");
+                 — ce1d89f measured +99.7 u at half-extent 100 (extent-bounded) / +342.9 u at \
+                 half-extent 1000 (drive-bounded) here; #870 must measure ~0 at either (#932)");
         }
     }
 
@@ -6036,8 +6110,11 @@ mod tests {
             the_step_landing_creep_reaches_one_back_off_past_the_riser_and_no_further,
             // #932: cited by `slide()`'s doc comment (the new wall-length-independent zero-drift
             // pin) and by the new test's own doc comment (which names the pre-existing 100 u pin).
-            a_grounded_walk_never_drifts_on_a_short_or_a_2000u_wall,
+            a_grounded_walk_never_drifts_on_a_short_or_a_1000u_extent_wall,
             a_grounded_walk_at_a_barrier_never_enters_the_depenetration_net,
+            // #938 (#987 round 2): cited by `slide()`'s residual-clearance table, which now states
+            // the half-extent its protocol needs and points here for the pinned proof.
+            the_residual_clearance_table_needs_the_walls_lateral_extent_stated,
         ];
     }
 
@@ -6047,6 +6124,14 @@ mod tests {
     /// 2.5000 is fully passable (`is_embedded` fires while crossing and the body ends past the wall
     /// on every speed/dt combination tried), while 2.5001 already rests correctly at
     /// `-(radius + SKIN)` on all of them — a 1e-4 u swing across the boundary.
+    ///
+    /// The passable leg asserts `east > 0` and not merely "not resting at `-(radius + SKIN)`":
+    /// #987 round 2 pointed out that the weaker predicate is satisfied by a body stuck ANYWHERE
+    /// else, which is not what "passable" means. Measured, the 2.5000 leg ends at east
+    /// 99.39–100.00 across the four pairs, so `east > 0` has ~99 u of headroom and is not a
+    /// tautology. This test deliberately does NOT pin the ~99.7 u of north drift that accompanies
+    /// the crossing — that figure is recorded in the ⚠️ block above, and it belongs to #854's
+    /// blind band, not to the boundary this test is about.
     #[test]
     fn the_blind_step_up_band_is_closed_at_its_upper_bound() {
         let radius = crate::traversability::PLAYER_BODY.radius;
@@ -6061,6 +6146,14 @@ mod tests {
                 assert_eq!(blocked, want_blocked,
                     "lip {lip} speed {speed} dt {dt}: end east {} — blocked={blocked}, want {want_blocked}",
                     ctrl.pos[0]);
+                if !want_blocked {
+                    // "Passable" means the body ENDED PAST THE WALL, not just "somewhere other
+                    // than the rest position" — a body wedged anywhere else passes that (#987 r2).
+                    assert!(ctrl.pos[0] > 0.0,
+                        "lip {lip} speed {speed} dt {dt}: end east {} — a passable lip must leave \
+                         the body past the barrier at east 0, not merely off the rest position",
+                        ctrl.pos[0]);
+                }
             }
         }
     }
@@ -6099,28 +6192,43 @@ mod tests {
         worst
     }
 
-    /// #938 — the residual-clearance table above is reproducible ONLY past the wall's own lateral
-    /// extent. MEASURED (this fn): at `half_extent` = 500 (max north drift observed across all
-    /// eight columns: 399.8 u, so 500 clears it), every column matches the doc table within 0.01.
-    /// At the file's own `wall`/`floor` extent (100), the two columns the table's 6u/8-angle rows
-    /// name — `ndot` 0.866 and 0.707 — read 0.503 and 0.598: the body sliding around the end of a
-    /// too-short wall, not an oblique contact residual, matching #938's report almost exactly.
+    /// #938 — the residual-clearance table in `slide()`'s doc is reproducible ONLY past the wall's
+    /// own lateral extent, so the extent is part of its protocol. MEASURED (this fn): at
+    /// `half_extent` = 500 (max north drift observed across all eight columns: 399.8 u, so 500
+    /// clears it), every column matches the doc table within 0.01.
+    ///
+    /// At the file's own `wall`/`floor` half-extent of 100, **four** of the eight columns still
+    /// reproduce and four do not — pinned below, all eight, so neither half of that claim rests on
+    /// prose. The four that diverge are `ndot` 0.866, 0.707, 0.174 and 0.087, reading 0.5027,
+    /// 0.5978, 2.2375 and 11.2202 against table cells of 0.920, 0.743, 0.899 and 0.949. #938 and
+    /// the first draft of this test named only the first two; the 0.174 and 0.087 columns are off
+    /// by 1.34 and 10.27 — over 100× this test's own tolerance — and are the reason the extent
+    /// belongs in the protocol line rather than in a footnote.
     #[test]
     fn the_residual_clearance_table_needs_the_walls_lateral_extent_stated() {
+        // (ndot, doc-table cell, value at the file's own half-extent of 100)
         let cases = [
-            (1.000_f32, 1.0500_f32), (0.985, 1.0388), (0.866, 0.9203), (0.707, 0.7430),
-            (0.500, 0.7084), (0.342, 0.8005), (0.174, 0.8985), (0.087, 0.9493),
+            (1.000_f32, 1.0500_f32, 1.0500_f32), (0.985, 1.0388, 1.0388),
+            (0.866, 0.9203, 0.5027), (0.707, 0.7430, 0.5978),
+            (0.500, 0.7084, 0.7086), (0.342, 0.8005, 0.8005),
+            (0.174, 0.8985, 2.2375), (0.087, 0.9493, 11.2202),
         ];
-        for &(ndot, want) in &cases {
+        let mut reproduce_at_100 = 0_usize;
+        for &(ndot, want, want_at_100) in &cases {
             let got = residual_clearance(ndot, 500.0);
             assert!((got - want).abs() < 0.01,
                 "ndot {ndot}: worst clearance {got:.4} at half_extent=500, want {want:.4}");
+            // The documented failure mode at the file's own (too-short) extent, so a future reader
+            // cannot mistake "the table is wrong" for "the extent was never the issue". Pinned for
+            // every column, not just the two #938 happened to name.
+            let got_100 = residual_clearance(ndot, 100.0);
+            assert!((got_100 - want_at_100).abs() < 0.01,
+                "ndot {ndot}: worst clearance {got_100:.4} at half_extent=100, want {want_at_100:.4}");
+            if (got_100 - want).abs() < 0.01 { reproduce_at_100 += 1; }
         }
-        // The documented failure mode at the file's own (too-short) extent, so a future reader
-        // cannot mistake "the table is wrong" for "the extent was never the issue":
-        assert!((residual_clearance(0.866, 100.0) - 0.503).abs() < 0.01,
-            "half_extent=100 should reproduce #938's reported 0.503 edge artifact at ndot=0.866");
-        assert!((residual_clearance(0.707, 100.0) - 0.598).abs() < 0.01,
-            "half_extent=100 should reproduce #938's reported ~0.594 edge artifact at ndot=0.707");
+        // The "four of eight" figure in this test's doc and in `slide()`'s, asserted rather than
+        // asserted-in-prose. A change that made the extent stop mattering would land here.
+        assert_eq!(reproduce_at_100, 4,
+            "exactly four of the eight doc-table columns must still reproduce at half_extent=100");
     }
 }
