@@ -509,6 +509,112 @@ mod tests {
         let _ = std::fs::remove_file(eqoxide_core::config::config_dir().join("ui_layout___uiprobe__.json"));
     }
 
+    /// #921: pin the PAINT ORDER, not just presence.
+    ///
+    /// `zone_map_error_reaches_the_frames_shape_list_873` above walks the untessellated shape list
+    /// looking for the reason STRING and therefore cannot see ordering — it stays green whether
+    /// #921 is fixed or not (the issue calls this out explicitly, and it was confirmed locally by
+    /// reverting the `windows/map.rs` fix and re-running that test: still green). egui paints
+    /// `FullOutput.shapes` in emission order, so what actually determines whether the minimap's
+    /// grid ticks occlude the "map data unavailable" text is each shape's INDEX in the flattened
+    /// paint list, not merely whether both shapes are present in it.
+    ///
+    /// This flattens the frame's shapes (recursing through `Shape::Vec`, same nesting
+    /// `rendered_text` above walks) into one ordered list, finds the index of the error-text
+    /// shape, and asserts every grid-tick `LineSegment` — identified by the exact stroke
+    /// `windows/map.rs` uses for ticks (width 0.5, `Color32::from_white_alpha(16)`) — comes
+    /// BEFORE it. A tick emitted after the text paints on top of it.
+    #[test]
+    fn zone_map_error_text_paints_after_the_grid_ticks_921() {
+        fn flatten<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        flatten(s, out);
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        fn is_grid_tick(shape: &egui::Shape) -> bool {
+            matches!(
+                shape,
+                egui::Shape::LineSegment { stroke, .. }
+                    if stroke.width == 0.5
+                        && stroke.color
+                            == egui::epaint::ColorMode::Solid(egui::Color32::from_white_alpha(16))
+            )
+        }
+
+        let mut ui = UiState::new("__uiprobe_921__", None);
+        let acts = actions();
+        let spells = eqoxide_core::spells::SpellDb::empty();
+        for def in REGISTRY {
+            if !def.transient {
+                ui.sys.layout.set_open(def.id, true);
+            }
+        }
+        let scene = SceneState::default();
+        const REASON: &str = "PROBE-REASON-921-paintorder";
+
+        let ctx = egui::Context::default();
+        // First frame has no meaningful window geometry yet (same reason the #873 test above
+        // reads its second frame); discard it and inspect the second.
+        let _ = ctx.run(Default::default(), |ctx| {
+            ui.draw_all(
+                ctx, [1280.0, 720.0], &scene, &spells, &acts, [0.0; 2], [100.0; 2],
+                None, Some(REASON), 60.0,
+            );
+        });
+        let out = ctx.run(Default::default(), |ctx| {
+            ui.draw_all(
+                ctx, [1280.0, 720.0], &scene, &spells, &acts, [0.0; 2], [100.0; 2],
+                None, Some(REASON), 60.0,
+            );
+        });
+
+        let mut ordered: Vec<&egui::Shape> = Vec::new();
+        for cs in &out.shapes {
+            flatten(&cs.shape, &mut ordered);
+        }
+
+        let text_idx = ordered
+            .iter()
+            .position(|s| matches!(s, egui::Shape::Text(ts) if ts.galley.text().contains(REASON)))
+            .expect(
+                "the #873 test above already pins that this text reaches the shape list at all",
+            );
+
+        let tick_idxs: Vec<usize> = ordered
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| is_grid_tick(s))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !tick_idxs.is_empty(),
+            "no grid-tick shapes found in the frame at all — the map window's background grid \
+             failed to draw, so this test cannot say anything about paint order without them"
+        );
+
+        let ticks_after_text: Vec<usize> =
+            tick_idxs.iter().copied().filter(|&i| i > text_idx).collect();
+        assert!(
+            ticks_after_text.is_empty(),
+            "{} grid-tick shape(s) painted AFTER the \"map data unavailable\" text (text at shape \
+             index {text_idx}, offending tick indices {ticks_after_text:?} of {tick_idxs:?} total) \
+             — egui paints in emission order, so a tick emitted after the text lands on top of it. \
+             The `else if let Some(err) = cx.zone_map_error` arm in windows/map.rs must flush the \
+             pending grid-tick `shapes` (`painter.extend(shapes.drain(..))`) BEFORE its \
+             `painter.text` call for the error line.",
+            ticks_after_text.len()
+        );
+
+        let _ = std::fs::remove_file(
+            eqoxide_core::config::config_dir().join("ui_layout___uiprobe_921__.json"),
+        );
+    }
+
     /// Regression: window sizes must STABILIZE across frames WITHIN ONE
     /// SESSION. A body that sizes its canvas from `available - <hardcoded
     /// footer>` and then draws a taller footer overflows its allotment; the

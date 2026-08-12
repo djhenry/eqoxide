@@ -198,6 +198,13 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         // least 27 of the shipped map pack's zones are in that ordinary state (exactly 27 of the
         // 497 that ship a `water/<zone>.wtr` have no base `<zone>.txt`; zones with neither were not
         // counted, so 27 is a floor — see `hud_zone_map_view` in the client's `app.rs`).
+        //
+        // #921: flush the pending grid ticks BEFORE painting the text. egui paints in emission
+        // order, so without this the ticks (pushed above, still sitting in `shapes` unflushed)
+        // would land in the paint list AFTER this text and draw over it. The `zm.lines` branch
+        // above already flushes `shapes` before its own `painter.text` calls for the same reason;
+        // this branch is the one #877 forgot to.
+        painter.extend(shapes.drain(..));
         painter.text(
             rect.min + Vec2::new(6.0, 6.0),
             egui::Align2::LEFT_TOP,
@@ -207,7 +214,9 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         );
     }
 
-    // No zone map: the grid ticks are still pending.
+    // No-op when either branch above already drained `shapes` (both do, as of #921). Only the
+    // "no `zone_map`, no `zone_map_error`" ordinary-blank-canvas case reaches this still holding
+    // the grid ticks.
     painter.extend(shapes);
 
     // ── Entity dots — billboard.pos = [east, north, up]. ────────────────────
