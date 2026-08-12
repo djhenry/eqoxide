@@ -1751,9 +1751,7 @@ mod cursor_resync_tests {
             every_test_citation_in_the_five_citation_files_resolves_and_is_listed_in_a_guard,
             unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace,
             the_doc_span_scan_reaches_all_five_citation_files_at_three_depths_each,
-            // #789/#874: the two new tests cited by name in
-            // `unbalanced_doc_spans_are_rejected_in_the_five_citation_files_only_not_the_workspace`'s
-            // own doc — caught by this file's own scan on the run that added the citations.
+            // #789/#874: two tests caught by this file's own scan on the run that added them.
             unbalanced_doc_code_spans_in_the_whole_workspace_are_a_named_shrinking_backlog,
             the_doc_span_scan_reaches_the_full_resolution_corpus_at_three_depths_each,
             // …and this one the scan caught on its first run, on a citation added in round 6
