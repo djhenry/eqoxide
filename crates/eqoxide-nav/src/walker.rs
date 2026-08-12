@@ -2706,6 +2706,52 @@ mod tests {
     /// Add a name here whenever a doc comment — in this module OR in another that cites `walker` by
     /// name, as `collision::ground_continuous` and `steering::resync_cursor` both do — starts
     /// citing a test that lives here.
+    ///
+    /// **Never name a `#[cfg]`-gated item from this array; gate the item's ATTRIBUTE instead (#990).**
+    /// An `fn()` reference resolves only where the citee is actually compiled, so naming a gated test
+    /// from this ungated array does not merely weaken the guard — it fails to compile wherever the
+    /// gate is off. This array named
+    /// `a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725` while that
+    /// test was `#[cfg(debug_assertions)]`, and the workspace root manifest sets no
+    /// `[profile.release] debug-assertions`, so `cargo check --release -p eqoxide-nav --lib --tests`
+    /// could not resolve the name and took the crate's WHOLE lib-test target down with it.
+    ///
+    /// **Why that hid.** Not because CI skips the release profile — it runs
+    /// `cargo build --release --workspace --locked --keep-going`. It hid because `cargo build` never
+    /// enables `cfg(test)`: the gated test item was never compiled in that job at all. CI does also
+    /// compile every test target, via `cargo build --workspace --all-targets --locked --keep-going`,
+    /// but that step is the DEV profile, where `debug_assertions` is on and the gate is satisfied.
+    /// On the defective tree a lib-only `cargo check --release -p eqoxide-nav` is green and only
+    /// `--tests` is red, so the break was reachable solely through a release-profile TEST build,
+    /// which nothing in CI runs.
+    ///
+    /// The fix was to make the citee unconditional and gate only its `should_panic` expectation, via
+    /// `#[cfg_attr(debug_assertions, should_panic(expected = "…"))]`. The test then exists in every
+    /// profile — so its name is pinned in every profile — and still asserts the panic wherever the
+    /// `debug_assert!` is live. The alternatives were measured and are worse: gating this whole `fn`
+    /// with `#[cfg(debug_assertions)]` compiles, but drops every OTHER name's protection under
+    /// `--release`; keeping the citee gated and splitting this array into a gated section also
+    /// compiles, but gives up the release-profile rename pin for anything in that section.
+    ///
+    /// **This guard is NOT immune to being disabled, and the `fn()` form is not self-protecting.**
+    /// A runtime wrap cannot evade it — name resolution happens at compile time, so
+    /// `if std::hint::black_box(false) { … }` around this array still makes a rename a compile error.
+    /// But a COMPILE-TIME wrap does: `#[cfg(any())]` on this `let` deletes the array outright, after
+    /// which a cited test can be renamed with `cargo check` green. `steering`'s mechanical citation
+    /// scan does not close that hole, because it matches the SOURCE TEXT of declarations beginning
+    /// `let _cited` and so still sees the entries it can no longer enforce. Names cited only from a
+    /// tracked doc rather than a doc comment are protected by compilation ALONE, and nothing else
+    /// would report their loss; this array's own `//` entry comments record which entries those are.
+    ///
+    /// **No instance of that class can be named here, and the attempt is what proves it.** This file
+    /// is in `citation_corpus()`, so writing such a name in backticks in a doc comment IS a
+    /// doc-comment citation — the act of citing it as an example moves it out of the class the
+    /// sentence puts it in. An earlier draft of this paragraph did exactly that: renaming the test it
+    /// named, with the prose left standing, made the scan report the loss AT THIS PARAGRAPH, while
+    /// the same rename on a tree without the sentence was green. State the class here; keep the
+    /// instances in the `//` comments beside their entries, which the citation scan does not read. Any
+    /// `#[cfg]` appearing on this statement should be read as removing the guard, not configuring
+    /// it.
     #[test]
     fn every_walker_test_name_cited_in_a_doc_comment_still_exists() {
         let _cited: &[fn()] = &[
@@ -2732,12 +2778,6 @@ mod tests {
             // including when the cited test is the guard. A rename is now a compile error, which is
             // the whole point: the instruction must not be able to point at a fn that moved.
             every_walker_test_name_cited_in_a_doc_comment_still_exists,
-            // #851 review round 1, N1: cited by
-            // `the_driving_nav_state_word_is_only_ever_written_through_the_verdict_851`'s rustdoc,
-            // which points at it as the prior reading that already recorded the same
-            // `debug_assert!`-is-test-time-only fact for the other assertions on this row. Caught by
-            // `steering`'s scan on the run that added the citation, not by me.
-            a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725,
             // #851 review round 2, B1: named by the production comment beside `drive_walk`'s
             // `debug_assert!`, which records that the assert's reach STOPS at the fixed-goal path
             // and points here for the chase side. That citation is in a `//` comment, which the
@@ -2753,6 +2793,12 @@ mod tests {
             // its `/follow` limitation paragraph. That citation is in a tracked doc, not a doc
             // comment, so no scan in this crate would catch a rename; this line does.
             a_wedged_follow_chase_is_not_reported_as_stalled_at_all_851,
+            // #851 review round 1, N1: cited by
+            // `the_driving_nav_state_word_is_only_ever_written_through_the_verdict_851`'s rustdoc,
+            // which points at it as the prior reading that already recorded the same
+            // `debug_assert!`-is-test-time-only fact for the other assertions on this row. Caught by
+            // `steering`'s scan on the run that added the citation, not by me.
+            a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725,
         ];
     }
 
@@ -4393,14 +4439,33 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
     /// cross-zone branch, i.e. the `/v1/move/zone_cross` SUCCESS path) left the whole suite green,
     /// and the docs↔constants pin in `eqoxide-net` cannot see it either — a reasonless publish adds
     /// no constant to the list it compares. The `debug_assert!` in `set_nav_state_because` is what
-    /// closes that, so it needs its own test: without this, deleting the assert is silent.
+    /// closes that, so it needs its own test.
+    ///
+    /// **What this pins is the CLASS, not any single assert** (#994 review round 2, N5 — the earlier
+    /// wording here, "without this, deleting the assert is silent", was measurably backwards).
+    /// Two-direction mutation: neutering `set_nav_state_because`'s `debug_assert!` ALONE leaves this
+    /// test GREEN, because `NavStatus::retire_to_idle` carries an identical `#725 B1` assert that
+    /// fires instead; only neutering BOTH turns it RED (`test did not panic as expected`). So read a
+    /// failure here as "no writer refuses a reasonless `idle` any more", never as "this particular
+    /// assert is still present" — deleting one of the pair IS silent, and nothing here pins them
+    /// individually.
     ///
     /// Debug-only by construction — `debug_assert!` compiles out under `--release`, so the guard is
     /// a TEST-TIME instrument, not a runtime one. That is the honest scope of the claim: it fails
     /// the suite for anyone who adds a reasonless `idle`; it does not police a shipped binary.
+    ///
+    /// **Its green under `--release` is NOT evidence (#990).** The expectation is gated, not the
+    /// test: `#[cfg_attr(debug_assertions, should_panic(…))]`. Where `debug_assertions` is on this
+    /// asserts the panic and is the real measurement; where it is off the `debug_assert!` is gone,
+    /// the body cannot fail, and the test passes VACUOUSLY. Read a release-profile pass as "this
+    /// instrument is not active here", never as "a reasonless `idle` was refused".
+    ///
+    /// It is written this way rather than `#[cfg(debug_assertions)]` on the whole test because the
+    /// citation guard names it as an `fn()` value: gating the item deleted it under `--release` and
+    /// broke that guard's build (#990). Keeping the ITEM unconditional keeps its name resolvable —
+    /// and therefore rename-pinned — in every profile, which is the protection #990 was about.
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "#725 B1")]
+    #[cfg_attr(debug_assertions, should_panic(expected = "#725 B1"))]
     fn a_reasonless_idle_is_refused_by_the_writer_not_just_by_a_per_call_site_test_725() {
         let (w, _nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
         w.set_nav_state("idle"); // the exact shape of B1's original defect, at the chokepoint
