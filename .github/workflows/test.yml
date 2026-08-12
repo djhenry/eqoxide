@@ -103,10 +103,13 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    # Bound the job explicitly instead of relying on GitHub's 6-hour default. The full build+test
-    # suite runs in ~1.5 minutes on this runner; 20 minutes is generous headroom while still
-    # catching a wedged process (e.g. a reintroduced lock-order deadlock, #593) in minutes instead
-    # of silently burning most of a day and reporting nothing.
+    # Bound the job explicitly instead of relying on GitHub's 6-hour default. MEASURED across the
+    # 14 most recent `test` job runs as of `36ea882`/#993 (`gh api repos/djhenry/eqoxide/actions/
+    # runs/<id>/jobs`, `started_at`/`completed_at` deltas): 173s-220s wall (2m53s-3m40s), avg
+    # ~3m20s. (An earlier version of this line said "~1.5 minutes", stale by roughly 2x; re-derive
+    # with the same API call if this has drifted again.) 20 minutes is still generous headroom
+    # while still catching a wedged process (e.g. a reintroduced lock-order deadlock, #593) in
+    # minutes instead of silently burning most of a day and reporting nothing.
     timeout-minutes: 20
     # The repo's tracked .cargo/config.toml sets `rustc-wrapper = "sccache"` and
     # `rustflags = ["-C", "link-arg=-fuse-ld=mold"]` — a local-dev speed-up for the shared dev
@@ -275,16 +278,27 @@ jobs:
       # 50 tests are `#[ignore]`d: 47 non-doctest plus 3 ignored doctests (part of the `Doc-tests`
       # delta described above). MEASURED at `36ea882` with
       # `cargo test --workspace --locked -- --ignored --list` (50 names, cross-checked against
-      # every `#[ignore = "..."]` in the tracked sources), grouped by the *stated* environment
-      # reason each carries:
-      #   - baked zone assets (`.glb`/`.wtr`) from the LAN asset server, under one of
-      #     `$ZONE_GLB`/`$ZONE_DIR`/`$EQZONES`/`$EQOXIDE_ZONE_ASSETS` — gitignored, absent on a
-      #     fresh clone (31): 3 in `eqoxide-assets/src/lib.rs`, 16 in
+      # every `#[ignore]` in the tracked sources: 45 carry a reason string, 2 are bare —
+      # `zone_map.rs` and `asset_sync_live.rs`, whose reasons live in an adjacent doc comment
+      # instead), grouped by the *stated* environment reason each carries:
+      #   - baked zone assets (`.glb`/`.wtr`) from the LAN asset server (31): 30 read one of
+      #     `$ZONE_GLB`/`$ZONE_DIR`/`$EQZONES`/`$EQOXIDE_ZONE_ASSETS`/`$DOORS_GLB` (checked at each
+      #     `env::var` call site, not just the `#[ignore]` string). The one exception,
+      #     `worst_case_reachable_component`, hardcodes `~/.local/share/eqoxide/assets/models` with
+      #     no directory override (`$ZONES` there only picks which zone NAMES to scan). All 31 are
+      #     gitignored/absent on a fresh clone regardless of which var or path gates them.
+      #     Breakdown: 3 in `eqoxide-assets/src/lib.rs`, 16 in
       #     `crates/eqoxide-nav/src/collision.rs`, 2 in `src/movement.rs`, 5 in
       #     `tests/water_capability.rs`, 5 in `tests/walker_sim.rs`
-      #   - bundled/cached model `.glb` (13): 11 under this repo's gitignored `assets/models/`
-      #     (`crates/eqoxide-renderer/src/models.rs`), 2 under the dev-machine model cache at
-      #     `~/.local/share/eqoxide/assets/models` (`anim.rs`, `skin_cap_selection.rs`)
+      #   - bundled/cached model `.glb` (13): 11 read
+      #     `concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/...")` in
+      #     `crates/eqoxide-renderer/src/models.rs`, i.e. `crates/eqoxide-renderer/assets/models/`
+      #     — NOT the repo-root `assets/models/`, and NOT gitignored (`.gitignore`'s only rule is
+      #     the root-anchored `/assets`; `git check-ignore` on the renderer path exits 1). Nothing
+      #     in the repo populates that directory; it is simply absent, and a dev who creates it
+      #     sees it as untracked in `git status`. 2 more read the dev-machine model cache at
+      #     `~/.local/share/eqoxide/assets/models` (`anim.rs`'s test honors an `EQOXIDE_MODELS_DIR`
+      #     override; `skin_cap_selection.rs`'s does not)
       #   - extracted SOURCE assets — `tools`' `skinned_conversion_is_centered_grounded` needs
       #     `globalhum_chr.s3d` under `$EQ_ASSETS_DIR` (1)
       #   - `zone_map::diagnostic_measure_contributing_zones_869` — CI has no client cache (1)
@@ -297,10 +311,12 @@ jobs:
       # claimed current. Re-derive with the command above if you need today's numbers.
       #
       # BE PRECISE ABOUT WHAT THIS DOES *NOT* COVER — do not read "nav is now tested in CI" into
-      # the numbers above. MEASURED at `36ea882`: the ignored set includes all 16 real-zone-gated
-      # tests in `crates/eqoxide-nav/src/collision.rs`
-      # (`cargo test -p eqoxide-nav --lib -- --ignored --list`) plus 5 in `tests/walker_sim.rs` —
-      # the drift baseline `faithful_walker_drift_corpus` and four blast-radius corpora
+      # the numbers above. MEASURED at `36ea882`: `cargo test -p eqoxide-nav --lib -- --ignored
+      # --list` names 16 ignored tests, all of them in `crates/eqoxide-nav/src/collision.rs` — that
+      # command lists the WHOLE crate's ignored set, which equals the collision.rs set only because
+      # no other file in `eqoxide-nav` has an `#[ignore]`d test today (checked: no other nav source
+      # file matched). Plus 5 more in `tests/walker_sim.rs` — the drift baseline
+      # `faithful_walker_drift_corpus` and four blast-radius corpora
       # (`goal_append_blast_radius`,
       # `corner_buffer_blast_radius`, `descent_guard_blast_radius`,
       # `parallel_wall_clearance_blast_radius`), all gated on baked zone glbs at `$ZONE_DIR`. What
