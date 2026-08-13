@@ -9,7 +9,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Duration, sleep};
 
 use crate::login::WorldCredentials;
-use crate::action_loop::{ActionLoop, ZoneChangeEcho};
+use crate::action_loop::{ActionLoop, ZoneChangeEcho, publish_doors};
 use crate::packet_handler::apply_packet;
 use crate::protocol::*;
 use crate::transport::{AppPacket, EqStream};
@@ -1006,19 +1006,21 @@ async fn run_zone_entry_handshake(
     controller.begin_zone_in(gs);
 
     // ...and the PUBLISHED half of the door purge (#934 review B1, #891). `begin_zone_in` empties
-    // `gs.world.doors`; the shared roster mirrored from it is republished only by
+    // `gs.world.doors`; the shared roster mirrored from it used to be republished only by
     // `ActionLoop::sync_doors`, whose sole caller is `run_gameplay_phase`'s packet drain — not the
-    // drain below. Without this line the roster keeps the DEPARTED zone's doors for this entire
-    // handshake (up to `ZONE_ENTRY_HANDSHAKE_DEADLINE`), while `publish_snapshot` runs every 10 ms
-    // and keeps the HTTP session live, so GET /v1/observe/doors serves the old zone's list as the
-    // current one and POST /v1/interact/click_door resolves a departed zone's id back to
-    // `200 clicking door N` — the exact #891 falsehood that endpoint was just fixed to stop telling.
+    // drain below. Without this clear the roster would keep the DEPARTED zone's doors for this
+    // entire handshake (up to `ZONE_ENTRY_HANDSHAKE_DEADLINE`), while `publish_snapshot` runs every
+    // 10 ms and keeps the HTTP session live, so GET /v1/observe/doors would serve the old zone's
+    // list as the current one and POST /v1/interact/click_door would resolve a departed zone's id
+    // back to `200 clicking door N` — the exact #891 falsehood that endpoint was just fixed to stop
+    // telling.
     //
-    // Clear, not republish: this handshake takes shared slots, not the `ActionLoop` (see
-    // `ActionLoop::controller_slots`), and empty is the honest reading mid-zone-in — the client has
-    // no way to know how much of the new zone's OP_SpawnDoor stream has landed, which is what
-    // `http::interact::door_lookup_miss`'s empty-roster body says in as many words. The gameplay
-    // loop republishes on its first drained packet once this returns.
+    // This handshake takes shared slots, not the `ActionLoop` (see `ActionLoop::controller_slots`),
+    // so it cannot call `sync_doors` itself. #937: it now republishes the NEW zone's doors as they
+    // arrive via `publish_doors` below (the same `GameState` → `DoorView` projection `sync_doors`
+    // uses) instead of leaving the roster empty for the whole handshake — see that call for the
+    // residual this closes (#939 case 2: records in hand but unpublished, read back as a confident
+    // `[]` rather than the departed zone's stale list).
     doors.lock().unwrap().clear();
 
     // ...and the PUBLISHED half of three more #941-class clears, for exactly the reason above. Of
@@ -1089,6 +1091,10 @@ async fn run_zone_entry_handshake(
             }
         }
 
+        // #937: republish the door roster every drain pass, same cadence as `publish_snapshot`
+        // below — an `OP_SpawnDoor` applied into `gs.world.doors` above must reach the shared slot
+        // this pass, not wait for `run_gameplay_phase`'s first post-handshake drain.
+        publish_doors(gs, doors);
         publish_snapshot(gs, game_state_snapshot, net_health);
         sleep(Duration::from_millis(10)).await;
     }
@@ -1971,6 +1977,101 @@ mod zone_entry_handshake_publish_tests {
             "and the PUBLISHED half — a departed zone's door left in `doors_shared` is served by \
              GET /v1/observe/doors as the current zone's, and resolves in POST \
              /v1/interact/click_door back to `200 clicking door N` (#891/#934 review B1)");
+    }
+
+    /// **#937 — the door roster REPUBLISHED as records arrive DURING the handshake, not only
+    /// cleared at the top of it.**
+    ///
+    /// #934 (#891, one test up) made the handshake CLEAR `doors_shared` at zone-in, which
+    /// correctly stops a departed zone's roster surviving into the new one. But that conversion
+    /// has a cost `run_zone_entry_handshake`'s doc calls out explicitly: it turns the whole
+    /// zone-in window from confidently-STALE to confidently-EMPTY. An `OP_SpawnDoor` this
+    /// handshake's own drain applies into `gs.world.doors` (`apply_packet` →
+    /// `apply_spawn_doors` → `GameState::upsert_door`) sat there unpublished — before this fix —
+    /// until `run_gameplay_phase`'s first POST-handshake drain, because `ActionLoop::sync_doors`,
+    /// the only prior publisher, is that drain's own call and this loop never reaches it. That is
+    /// #939's case 2: records in hand but unpublished, read back as a bare `[]` indistinguishable
+    /// from a genuinely doorless zone.
+    ///
+    /// This pins the shared slot's state WHILE the handshake is still running, not before it (an
+    /// empty `DoorsShared` proves nothing) and not after it returns (that could just as well be
+    /// `run_gameplay_phase` publishing post-handshake, which this test never runs). The deadline
+    /// is 30s and never reached — WEATHER/EXP_ZONE_IN are withheld on purpose, exactly like
+    /// `publishes_zone_name_as_op_new_zone_lands_not_only_at_handshake_end` above — so the ONLY
+    /// way `doors_shared` can become non-empty inside the 2s poll window below is a publish call
+    /// firing on a drain pass of the still-running handshake loop itself.
+    ///
+    /// The 100-byte record layout mirrors packet_handler.rs's `spawn_door_parses_one_record`
+    /// (name@0, door_id@60, opentype@61) — RoF2 sends 100-byte `Door_Struct` records; an 80-byte
+    /// stride (the server-internal struct size) would garble everything past record 1, though a
+    /// single record does not exercise that drift itself.
+    ///
+    /// MUTATION CHECK (both directions, verbatim `test result:` output in the PR body):
+    /// - DELETE `publish_doors(gs, doors);` from the drain loop → expect RED (times out, the
+    ///   slot never becomes non-empty).
+    /// - WRAP it as `if std::hint::black_box(false) { publish_doors(gs, doors); }` → expect ALSO
+    ///   RED, and by the SAME assertion (the poll timeout), not a vacuous pass — the wrap's
+    ///   else-arm here is "do nothing", which at this fixture's single-record size is a real
+    ///   behavioural difference from the fix (the slot stays empty), not a no-op restatement of
+    ///   it.
+    ///
+    /// `DoorsShared` (`Arc<Mutex<Vec<DoorView>>>`) has no compile-enforced single-publisher seal
+    /// the way the entity roster's `Roster<V>` does (#665/#652 — private fields + no `DerefMut`);
+    /// the invariant here is doc-only, which is exactly why `publish_doors` is factored out as the
+    /// ONE projection both call sites share rather than each hand-rolling their own `DoorView`
+    /// mapping — a second, slightly different mapping would be a silent second writer that this
+    /// test's assertion on the published field VALUES (not just non-emptiness) is positioned to
+    /// catch, but does not itself prove impossible.
+    #[tokio::test]
+    async fn zone_entry_handshake_republishes_doors_as_they_arrive_during_the_handshake_937() {
+        let (mut stream, _unused_rx) = test_stream(0, 0).await;
+        let (tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
+        let (mut gs, snapshot, health) = fresh_gs_snapshot();
+
+        let doors: eqoxide_ipc::DoorsShared = Default::default();
+        let doors_bg = doors.clone();
+
+        let handle = tokio::spawn(async move {
+            // Long deadline: this test is about the per-pass publish, not the timeout path, so the
+            // 30s deadline is never reached (WEATHER/EXP_ZONE_IN withheld) — same shape as
+            // `publishes_zone_name_as_op_new_zone_lands_not_only_at_handshake_end`.
+            run_zone_entry_handshake(
+                &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
+                &eqoxide_ipc::ControllerSlots::default(),
+                &doors_bg,
+                &eqoxide_ipc::DialogueShared::default(),
+                &eqoxide_ipc::MerchantShared::default(),
+                &eqoxide_ipc::TaskOffersShared::default(),
+                Duration::from_secs(30),
+            ).await;
+        });
+
+        // One 100-byte RoF2 OP_SpawnDoor record (see doc above for the field offsets).
+        let mut rec = [0u8; 100];
+        rec[..4].copy_from_slice(b"HHD1"); // name @0
+        rec[60] = 7;                        // door_id @60
+        rec[61] = 58;                       // opentype @61
+        tx.send(AppPacket { opcode: OP_SPAWN_DOOR, payload: rec.to_vec() }).unwrap();
+
+        // Give the 10ms-cadence drain loop a handful of ticks to pick up the packet and publish —
+        // well short of the 30s handshake deadline, which is never reached.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !doors.lock().unwrap().is_empty() { break; }
+            assert!(std::time::Instant::now() < deadline,
+                "doors_shared never became non-empty while the handshake was still running (30s \
+                 deadline, never reached) — the drain applied the OP_SpawnDoor into gs.world.doors \
+                 but nothing published it to the shared slot (#937/#939 case 2)");
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let published = doors.lock().unwrap().clone();
+        assert_eq!(published.len(), 1,
+            "exactly the one delivered door, no drift/dup from republishing on every drain pass");
+        assert_eq!(published[0].door_id, 7);
+        assert_eq!(published[0].name, "HHD1");
+
+        handle.abort();
     }
 
     /// **#941 — the PUBLISHED half of the dialogue-choice and merchant-window clears.**
