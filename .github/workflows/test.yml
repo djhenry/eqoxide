@@ -21,11 +21,18 @@ jobs:
   # Its reach is TRACKED FILES and nothing else — see the `pr-text` job below for the other public
   # surface (#980). Both jobs read one shared pattern list, `scripts/local-detail-patterns.sh`, so
   # the two scanners cannot drift apart.
+  #
+  # Its pattern set is also an ALLOWLIST OF SHAPES SOMEONE ALREADY THOUGHT OF, which is a different
+  # limit from the surface limit above and is what #995 was: a tracked comment naming deployment
+  # infrastructure that this job was green on for months. Deployment host names cannot be added to
+  # the pattern list — writing the names into a tracked public file moves the leak instead of
+  # closing it — so the class is covered by a separate WARNING step below.
   no-local-detail:
     runs-on: ubuntu-latest
-    # A ~5-second script — this is generous headroom for consistency with the `test` job below,
-    # not because this job has any known hang risk.
-    timeout-minutes: 5
+    # Seconds of scripts plus one small `apt-get install` for the dictionary the #995 heuristic
+    # refuses to run without. Generous headroom for consistency with the `test` job below, not
+    # because this job has any known hang risk.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: check for local-system detail / proprietary-derived content
@@ -39,6 +46,30 @@ jobs:
         run: |
           python3 scripts/check-wrapped-literals.py --self-test
           python3 scripts/check-wrapped-literals.py
+      # #995: the one leak class the regex scanner above structurally cannot express. A deployment
+      # host name has no shape, so a pattern for it would mean writing the literal names into
+      # scripts/local-detail-patterns.sh — tracked, public, and named after what it holds. This is
+      # the structural alternative: hostname-SHAPED bare tokens near infrastructure vocabulary,
+      # with an English dictionary as the vocabulary allowlist so there is no per-token suppression
+      # list in the repo to grow until the corpus goes quiet (#983's finding).
+      #
+      # IT IS A WARNING AND DELIBERATELY NOT A GATE, and `--strict` is deliberately not passed. On
+      # this repo's tracked corpus it flags 30 token occurrences of which NONE is a host name —
+      # measured precision 0 — because the class has 0 tracked occurrences since #989's scrub. Its
+      # value is recall, not precision: it goes RED on the exact pre-scrub text that the regex
+      # scanner exited 0 on for months. Blocking a merge on 30 known-innocent words would only buy
+      # a suppression list, and a suppression list grown until the corpus goes quiet is not a
+      # detector. If it ever flags something real, a human reads the list; CI does not decide.
+      #
+      # It DOES exit 1 for a guard failure — no dictionary, empty corpus, or a failed self-test —
+      # because a scan that cannot look is not a clean scan. That is why the dictionary is installed
+      # here rather than skipped when absent.
+      - name: install the English dictionary check-host-shape.py refuses to run without
+        run: sudo apt-get update && sudo apt-get install -y hunspell-en-us
+      - name: host-name shape heuristic (WARNING — findings are not fatal, see #995)
+        run: |
+          python3 scripts/check-host-shape.py --self-test
+          python3 scripts/check-host-shape.py
 
   # The other public surface (#980). `check-no-local-detail.sh` above scans TRACKED FILES ONLY, so
   # PR bodies, issue bodies and comments — every one of them public on this public repo — were

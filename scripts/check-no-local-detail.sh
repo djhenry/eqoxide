@@ -12,13 +12,26 @@
 #   - references to a decompiled commercial client and RE tooling
 #     (ghidra / capstone / the client exe / a `decompiled/` path / lifted `FUN_xxxxxx` symbols)
 #
-# ITS PATTERN SET IS AN ALLOWLIST. A green run means "no KNOWN shape matched", NOT "no local detail
-# is present" — those differ by whatever nobody has thought of yet, which is not a hypothetical:
-# eqoxide#995 was a tracked comment naming deployment infrastructure that this script exited 0 on
-# for months. The comment is scrubbed; the CLASS is still not covered here, deliberately, because a
-# host name has no shape and enumerating literal names would make this guard's own pattern file the
-# only tracked instance of the class. See the pattern file's header and #995 for the remaining
-# option. When a class IS coverable by shape, fix both halves at once — scrub the instance and add
+# ITS PATTERN SET IS AN ALLOWLIST OF KNOWN SHAPES. A green run means "no KNOWN shape matched", NOT
+# "no local detail is present" — those differ by whatever nobody has thought of yet, which is not a
+# hypothetical: eqoxide#995 was a tracked comment naming deployment infrastructure that this script
+# exited 0 on for months, because the pattern set is a list of leak shapes someone already wrote
+# down and a deployment HOST NAME is not one of them. It cannot become one: a host name has no
+# shape, any word can be one, so a regex covering that class means writing the literal names into
+# `scripts/local-detail-patterns.sh` — a tracked file in this public repo — and the leak would move
+# rather than close. That option was tried in PR #989 and refused.
+#
+# The class is covered instead by `scripts/check-host-shape.py`, a STRUCTURAL heuristic that names
+# nothing: it flags hostname-shaped bare tokens appearing near infrastructure vocabulary, with an
+# English dictionary as the vocabulary allowlist. It is a WARNING and not a gate, and that is a
+# measured decision rather than a cautious one — on this repo's tracked corpus it flags 30 token
+# occurrences and NONE of them is a host name, so its precision here is 0. Read its header before
+# quoting a run of it; a clean run there means "no hostname-SHAPED bare token survived five
+# filters", which is again narrower than "no host name is present".
+#
+# So the honest statement of what a green `no-local-detail` run means is: no known REGEX shape
+# matched, and separately, a warning-level heuristic with a stated and narrow reach found nothing it
+# can see. When a class IS coverable by shape, fix both halves at once — scrub the instance and add
 # the pattern.
 #
 # Run locally with:  scripts/check-no-local-detail.sh
@@ -92,3 +105,6 @@ echo "check-no-local-detail: reach — tracked files only. PR/issue bodies and c
 echo "covered here; scripts/check-pr-text.sh is the scanner for that surface (eqoxide#980)."
 echo "check-no-local-detail: the pattern set is an ALLOWLIST of shapes someone already thought of,"
 echo "so OK means 'no KNOWN shape matched', not 'no local detail is present' (eqoxide#995)."
+echo "check-no-local-detail: deployment HOST NAMES are structurally outside this pattern set — a"
+echo "host name has no shape. scripts/check-host-shape.py covers that class as a WARNING (measured"
+echo "precision on this corpus: 0 of 30 flags), and its reach is narrow. Neither run means clean."
