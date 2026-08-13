@@ -38,10 +38,11 @@ use crate::collision::Collision;
 pub type ZoneAssetStateShared = Arc<std::sync::Mutex<ZoneAssetState>>;
 
 /// Where this process is in loading the current zone's terrain + collision.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum ZoneAssetState {
     /// No zone has been loaded and none is loading — e.g. before the first zone-in. Distinct from
     /// `Pending`: nothing is on its way, so waiting for a `Ready` here would hang forever.
+    #[default]
     Idle,
     /// A load is in flight for `zone`. `status` is the loader's own live progress line
     /// ("Downloading zone 3/7 (12.4 MB)…", "Building collision grid…", …).
@@ -340,9 +341,9 @@ impl NotUsable {
 ///   * `ActionLoop::drain_zone_cross` (`crates/eqoxide-net/src/action_loop.rs`, #600 review round 2),
 ///     which resolves `/v1/move/zone_cross` off the grid and publishes `nav_state` — it answers the
 ///     honest transient `zone_loading` while not usable instead of a definitive `no_path`.
-/// A `None` here therefore guarantees, for ALL FOUR, that the collision grid they go on to read is
-/// the current zone's. What does NOT go through it, deliberately (each verified to make no
-/// route/geometry claim about the current zone):
+///     A `None` here therefore guarantees, for ALL FOUR, that the collision grid they go on to read is
+///     the current zone's. What does NOT go through it, deliberately (each verified to make no
+///     route/geometry claim about the current zone):
 ///   * the two per-zone DIAGNOSTIC COUNTERS `nav_support` and `nav_tight` read `shared_collision`
 ///     directly, but publish only cumulative metadata (facing-blind surfaces admitted /
 ///     minimum-clearance routes planned since zone load) and ride the SAME `/observe/debug` response
@@ -458,10 +459,6 @@ pub fn finish_zone_load(
     // readers to answer from — `Failed` and "here is your collision" cannot both be true.
     *collision_slot.write().unwrap() = verdict.collision().cloned();
     *lock_state(state) = verdict;
-}
-
-impl Default for ZoneAssetState {
-    fn default() -> Self { Self::Idle }
 }
 
 impl std::fmt::Debug for ZoneAssetState {

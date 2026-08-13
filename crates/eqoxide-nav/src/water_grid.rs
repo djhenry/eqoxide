@@ -1040,7 +1040,7 @@ mod tests {
         // `"INCOMPLETE".contains("COMPLETE")` is `true`, so a bare `.contains("COMPLETE")` would pass
         // on the dirty line above as well and prove nothing.
         assert!(clean.to_string().contains("— COMPLETE"),
-            "the complete form must mark itself COMPLETE, not just omit INCOMPLETE: {}", clean.to_string());
+            "the complete form must mark itself COMPLETE, not just omit INCOMPLETE: {}", clean);
         assert!(!line.contains("— COMPLETE"),
             "a rollup with a hole must never carry the COMPLETE marker: {line}");
     }

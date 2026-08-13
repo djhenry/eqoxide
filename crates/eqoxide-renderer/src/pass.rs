@@ -656,7 +656,7 @@ fn resolve_equip_tex<'a>(
     if let Some(es) = slot {
         let mat = equipment[es.slot];
         // equip_swap_key returns None for material 0 (naked → baked texture) / no prefix.
-        if let Some(key) = crate::models::equip_swap_key(prefix, es.clone(), mat) {
+        if let Some(key) = crate::models::equip_swap_key(prefix, es, mat) {
             if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) {
                 return bg;
             }
@@ -699,11 +699,11 @@ fn resolve_overlay_tex<'a>(
 ) -> Option<&'a wgpu::BindGroup> {
     let es = slot?;
     let mat = equipment[es.slot];
-    if let Some(key) = crate::models::equip_swap_key(prefix, es.clone(), mat) {
+    if let Some(key) = crate::models::equip_swap_key(prefix, es, mat) {
         if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) { return Some(bg); }
     }
     if let Some(rmat) = crate::models::velious_material_fallback(mat) {
-        if let Some(key) = crate::models::equip_swap_key(prefix, es.clone(), rmat) {
+        if let Some(key) = crate::models::equip_swap_key(prefix, es, rmat) {
             if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) { return Some(bg); }
         }
     }
@@ -1420,7 +1420,7 @@ pub fn encode_player_pass(
                         scene.player_face, scene.player_hairstyle,
                     ) { continue; }
                     let Some(overlay) = resolve_overlay_tex(r, &model.prefix,
-                        model.equip_slots[i].clone(), &scene.player_equipment) else { continue };
+                        model.equip_slots[i], &scene.player_equipment) else { continue };
                     pass.set_bind_group(2, &r.entity_uniform_pool[i].1, &[]);
                     pass.set_bind_group(1, overlay, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
@@ -1507,7 +1507,6 @@ pub fn encode_player_pass(
                         }
                     }
                 }
-                return;
             }
             Some(GpuModel::Static(model)) => {
                 // `floating: false` — the player's z is the CharacterController's FOOT datum, not
@@ -1558,13 +1557,12 @@ pub fn encode_player_pass(
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
                     pass.set_bind_group(2, &r.entity_uniform_pool[i].1, &[]);
                     let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
-                        &model.prefix, model.equip_slots[i].clone(), &scene.player_equipment);
+                        &model.prefix, model.equip_slots[i], &scene.player_equipment);
                     pass.set_bind_group(1, bg, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                 }
-                return;
             }
             None => {}
         }

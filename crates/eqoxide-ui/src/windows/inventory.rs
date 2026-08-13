@@ -154,7 +154,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     for parent in GENERAL_FIRST..=GENERAL_LAST {
         let mut contents: Vec<&InvItem> = inv
             .iter()
-            .filter(|i| eqoxide_core::game_state::bag_wire_parent(i.slot).map_or(false, |(p, _)| p == parent))
+            .filter(|i| eqoxide_core::game_state::bag_wire_parent(i.slot).is_some_and(|(p, _)| p == parent))
             .collect();
         if contents.is_empty() {
             continue;

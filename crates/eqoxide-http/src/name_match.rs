@@ -218,9 +218,10 @@ mod tests {
 
     /// Build the two lockstep tables (`ids` + `positions`) from `(key, id, pos)` triples, exactly as
     /// `sync_entities` does — same key in both maps.
+    type Tables = (HashMap<String, u32>, HashMap<String, (f32, f32, f32)>);
     fn tables(
         rows: &[(&str, u32, (f32, f32, f32))],
-    ) -> (HashMap<String, u32>, HashMap<String, (f32, f32, f32)>) {
+    ) -> Tables {
         let mut ids = HashMap::new();
         let mut pos = HashMap::new();
         for (k, id, p) in rows {

@@ -534,7 +534,7 @@ mod tests {
             let az = desired_azimuth(h);
             let back = heading_deg_from_azimuth(az);
             let diff = (back - h).rem_euclid(360.0);
-            assert!(diff < 1e-3 || diff > 360.0 - 1e-3, "h={h} -> {back}");
+            assert!(!(1e-3..=360.0 - 1e-3).contains(&diff), "h={h} -> {back}");
         }
     }
 

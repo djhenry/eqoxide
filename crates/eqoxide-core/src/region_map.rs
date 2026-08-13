@@ -697,9 +697,11 @@ impl RegionMap {
 mod tests {
     use super::*;
 
+    /// A `.wtr` v2 leaf record: (normal, split, special, left, right, zone_line_index).
+    type WtrV2Node = ([f32; 3], f32, i32, i32, i32, i32);
+
     /// Build a v2 `.wtr` byte blob for the given leaf records so the loader path is exercised.
-    /// Each `node` is (normal, split, special, left, right, zone_line_index).
-    fn wtr_v2(nodes: &[([f32; 3], f32, i32, i32, i32, i32)]) -> Vec<u8> {
+    fn wtr_v2(nodes: &[WtrV2Node]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"EQEMUWATER");
         out.extend_from_slice(&2u32.to_le_bytes());

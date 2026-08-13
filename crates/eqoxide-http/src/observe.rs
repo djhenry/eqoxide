@@ -1954,7 +1954,9 @@ fn dedup_entities(
     positions: &HashMap<String, (f32, f32, f32)>,
 ) -> (HashMap<String, [f32; 3]>, usize, Vec<DuplicateGroup>) {
     // key: (base name, position bit-pattern) → all full names placed there.
-    let mut groups: HashMap<(String, (u32, u32, u32)), Vec<String>> = HashMap::new();
+    type GroupKey = (String, (u32, u32, u32));
+    type Groups = HashMap<GroupKey, Vec<String>>;
+    let mut groups: Groups = HashMap::new();
     for (name, &(x, y, z)) in positions {
         let key = (base_name(name).to_string(), (x.to_bits(), y.to_bits(), z.to_bits()));
         groups.entry(key).or_default().push(name.clone());
@@ -2321,7 +2323,7 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Response {
             .map(|(_, p)| serde_json::json!([p[0], p[1], p[2]]));
         // An exit with a known destination is crossed by `perform_cross`, which never consults
         // the unresolved gate — so the gate can only ever close a `zone_id: null` exit.
-        let gated = dest_of.get(&index).is_none() && unresolved_gated;
+        let gated = !dest_of.contains_key(&index) && unresolved_gated;
         exits.push(serde_json::json!({
             "index": index,
             "zone_id": dest_of.get(&index),

@@ -19,7 +19,7 @@
 //! - `spells`      — `spells_us.txt` id→{name,icon} tables (#544 Step 2b)
 //! - `ucs`         — UCS (chat-server) connection-params POD (#544 Step 2b)
 //! - `zone_cross`  — zone-line crossing decisions shared by the net thread and the HTTP surface
-//!                   (the #679/#683 unresolved-cross gate, the #713 attempt bound + best-effort marker)
+//!   (the #679/#683 unresolved-cross gate, the #713 attempt bound + best-effort marker)
 //! - `zone_map`    — zone short-name / id maps
 
 pub mod afloat;

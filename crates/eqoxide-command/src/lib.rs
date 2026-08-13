@@ -60,21 +60,21 @@
 //!
 //! 1. NAMING. In `command_state/<d>.rs`, fill the `impl CommandState {}` shell with two kinds of
 //!    method, all reading `self.<d>.<slot>` (your bundle is already a field on this struct):
-//!      • `request_<verb>(args)`  — the write the VIEW makes (UI + HTTP). Sets `Some(..)` into the
-//!        slot. Name it after the domain verb; prefix with the domain where a bare verb could
-//!        collide with another domain's method (e.g. `request_group_invite`, not `request_invite`).
-//!      • `take_<thing>() -> Option<T>` — the drain the `ActionLoop` makes once per tick. Returns
-//!        `slot.lock().unwrap().take()`.
+//!    • `request_<verb>(args)`  — the write the VIEW makes (UI + HTTP). Sets `Some(..)` into the
+//!    slot. Name it after the domain verb; prefix with the domain where a bare verb could
+//!    collide with another domain's method (e.g. `request_group_invite`, not `request_invite`).
+//!    • `take_<thing>() -> Option<T>` — the drain the `ActionLoop` makes once per tick. Returns
+//!    `slot.lock().unwrap().take()`.
 //! 2. SLOT LOCATION. The slots already live in your `ipc::<D>Slots` bundle, held as the private
 //!    `<d>` field on `CommandState` (see the struct below). You do not add fields or touch this
 //!    file's struct — just read `self.<d>.<slot>` from your methods.
 //! 3. TWO CALL-SITE EDITS. Point both ends of each slot at the new methods:
-//!      • VIEW writes → method: `*s.<d>.<slot>.lock().unwrap() = Some(x)` becomes
-//!        `s.command.request_<verb>(x)` in `http/<d>.rs`, and `*cx.acts.<slot>.lock()… = Some(x)`
-//!        becomes `cx.acts.command.request_<verb>(x)` in `ui/windows/<d>.rs`.
-//!      • MODEL drain → `take_*`: in `action_loop.rs`, `self.<d>.<slot>.lock().unwrap().take()`
-//!        becomes `self.command.take_<thing>()` (each domain's drain lives in its own `drain_<d>`
-//!        method — non-adjacent, so parallel Wave-2 branches auto-merge here).
+//!    • VIEW writes → method: `*s.<d>.<slot>.lock().unwrap() = Some(x)` becomes
+//!    `s.command.request_<verb>(x)` in `http/<d>.rs`, and `*cx.acts.<slot>.lock()… = Some(x)`
+//!    becomes `cx.acts.command.request_<verb>(x)` in `ui/windows/<d>.rs`.
+//!    • MODEL drain → `take_*`: in `action_loop.rs`, `self.<d>.<slot>.lock().unwrap().take()`
+//!    becomes `self.command.take_<thing>()` (each domain's drain lives in its own `drain_<d>`
+//!    method — non-adjacent, so parallel Wave-2 branches auto-merge here).
 //! 4. DO NOT remove the `<d>` bundle field or touch any `fn` signature. Leaving the now-dead field
 //!    in place is DELIBERATE: it keeps every Wave-2 branch off the shared lines (`CommandState`'s
 //!    struct/`new()`, `main.rs`, `http/mod.rs`, `ui/mod.rs`, `ActionLoop::new`/`run_login_flow`/

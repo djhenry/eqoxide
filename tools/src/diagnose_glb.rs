@@ -103,9 +103,12 @@ fn main() {
             println!("    extent: {:.4} x {:.4} x {:.4}", px_ext, py_ext, pz_ext);
 
             // Update mesh bounds
-            if px0 < mx0 { mx0 = px0; } if px1 > mx1 { mx1 = px1; }
-            if py0 < my0 { my0 = py0; } if py1 > my1 { my1 = py1; }
-            if pz0 < mz0 { mz0 = pz0; } if pz1 > mz1 { mz1 = pz1; }
+            if px0 < mx0 { mx0 = px0; }
+            if px1 > mx1 { mx1 = px1; }
+            if py0 < my0 { my0 = py0; }
+            if py1 > my1 { my1 = py1; }
+            if pz0 < mz0 { mz0 = pz0; }
+            if pz1 > mz1 { mz1 = pz1; }
             mesh_verts += prim_vert_count;
             total_indices += indices.len();
             total_prims += 1;
@@ -136,9 +139,12 @@ fn main() {
         println!("  MESH EXTENT: {:.4} x {:.4} x {:.4}", mx_ext, my_ext, mz_ext);
 
         // Update global bounds
-        if mx0 < gx0 { gx0 = mx0; } if mx1 > gx1 { gx1 = mx1; }
-        if my0 < gy0 { gy0 = my0; } if my1 > gy1 { gy1 = my1; }
-        if mz0 < gz0 { gz0 = mz0; } if mz1 > gz1 { gz1 = mz1; }
+        if mx0 < gx0 { gx0 = mx0; }
+        if mx1 > gx1 { gx1 = mx1; }
+        if my0 < gy0 { gy0 = my0; }
+        if my1 > gy1 { gy1 = my1; }
+        if mz0 < gz0 { gz0 = mz0; }
+        if mz1 > gz1 { gz1 = mz1; }
 
         println!();
     }
