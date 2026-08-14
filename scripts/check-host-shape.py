@@ -27,9 +27,11 @@ short list of odd bare words near "server"/"box"/"deploy" is a cheap second pair
 failing on that many known-innocent words is not, and suppressing them with an allowlist until the
 corpus goes quiet would stop being a detector — which is exactly what #983 measured and refused.
 
-No count is written down in this header or in any other tracked file, deliberately: the corpus
+No flag count is written down in this header or in any other tracked file, deliberately: the corpus
 changes with every commit, so a pinned figure rots into a false claim. The live count, its
-denominator and every bucket are printed by the run itself.
+denominator and every bucket are printed by the run itself. The same rule cost this header two other
+numbers — see reach note 3 — on a second ground: a figure nobody else can re-derive from the words
+next to it is not evidence, whether or not it is stale.
 
 So: `--strict` exists and makes findings fatal, and CI deliberately does not use it.
 
@@ -53,12 +55,25 @@ silence the class while every check stayed green. Three things close that, and e
      sibling `.aff` — and refused if it is not, wherever it came from. A plain word list has neither.
   3. The self-test's dictionary control uses a fixture token that is a REAL but obscure English word
      (`aumbry`, an archaic word for a small cupboard, with nothing to do with this or any
-     deployment). It was drawn at random from the set of already-lowercase 4-8 letter words that are
-     present in the superset list and absent from `en_US.dic` — 117,159 of them on this machine.
-     A correct dictionary does not know the fixture, so the dirty fixture flags; a superset list
-     DOES know it, so the control goes RED. The previous fixture was an INVENTED word, absent from
-     every dictionary including the bad one, so that control could not fail: it passed against the
-     very list this header calls a trap, which is why review rejected it.
+     deployment). It was drawn at random from the lowercase 4-8 letter words present in the superset
+     list and absent from the resolved dictionary. NO SIZE IS GIVEN FOR THAT SET, deliberately: the
+     phrase does not determine one. Fold case or not, skip the count line or not, apply the stemmer
+     or not, and it moves by tens of thousands — review derived three different values from this
+     same sentence, all correct under their own reading. Any figure written here would be false
+     under the other readings.
+
+     The size is also not what the control rests on. What it rests on is checkable directly and in
+     one line: the fixture IS in the difference set, and `is_english(fixture, en_US)` is False. A
+     correct dictionary does not know it, so the dirty fixture flags; a superset list DOES know it,
+     so the control goes RED. The previous fixture was an INVENTED word, absent from every
+     dictionary including the bad one, so that control could not fail: it passed against the very
+     list this header calls a trap, which is why review rejected it.
+
+     What it does NOT cover, stated rather than controlled for: a dictionary crafted to hold exactly
+     this repo's leaked token and nothing else passes all three closures above. That is not a gap
+     worth a fourth control — building such a list means writing the token down, which republishes
+     the leak, and closure 1 refuses the override in CI regardless. A control against it would only
+     move the same question one level up.
 
 The dictionary is a hard dependency. If none is found, or the one found is not hunspell format, the
 script REFUSES (exit 1) rather than scanning with an empty or wrong allowlist and printing a green
@@ -86,7 +101,7 @@ Stated once, honestly, and not compensated for with further controls:
      count for a structural reason rather than a corpus one.
 
 A clean run means "no hostname-SHAPED bare token survived five filters", never "no host name is
-present". Those differ by all six items above.
+present". Those differ by all seven items above.
 
 CLASSIFICATION, NOT EXCEPTIONS (the #995 reach requirement)
 ------------------------------------------------------------
@@ -203,10 +218,16 @@ PREFIXES = ("un", "re", "non", "pre", "mis", "over", "under", "de", "dis", "in",
 # passed against every dictionary including the trap — 7/7 on the exact list this file documents as
 # unsafe. A control that cannot fail is the defect this whole PR is about.
 #
-# It has nothing to do with this or any deployment: it was drawn at random from the 119,882 lowercase
-# 4-8 letter words that are in the superset and not in `en_US.dic`. It is also the only reason this
-# file is excluded from its own scan (see `self_path()`), the same reason `check-no-local-detail.sh`
-# excludes itself and the pattern file.
+# It has nothing to do with this or any deployment: it was drawn at random from the lowercase 4-8
+# letter words that are in the superset and not in `en_US.dic`. That set's SIZE is deliberately not
+# written down here or in the header — see reach note 3: the description admits several readings and
+# each gives a different count, so any number would be false under the others. The property the
+# control needs is membership, not the count: `--self-test` asserts one half directly (the resolved
+# dictionary does NOT know this token), and pointing the script at a superset demonstrates the other
+# (that dictionary DOES know it, and the control turns red).
+#
+# This fixture is also the only reason this file is excluded from its own scan (see `self_path()`),
+# the same reason `check-no-local-detail.sh` excludes itself and the pattern file.
 DIRTY_TOKEN = "aumbry"
 
 
