@@ -264,12 +264,16 @@ contradicts, instead of queueing it and answering `200`. Nothing is queued and n
 closed set at any size: it grows as further door records arrive, and zoning empties it. So a
 populated roster establishes only that no door it holds *right now* matches — not that the door
 does not exist — and an empty roster does not even distinguish a zone with no doors from a zone
-whose door records have not arrived yet, since a zone-in that has not yet delivered its first door
-record looks exactly the same (records are now published as they arrive during the handshake, not
-only after it — #937 — so that ambiguous window no longer spans the whole zone-in, just the part
-before the first record). Read this `404` as *unknown* in both cases, never as *disproved*. (`503`
-would claim the session is not live and `409` would claim something is pending; neither is true, so
-the code stays `404` and the body carries the distinction.)
+whose door records have not arrived, *or have arrived and not yet been published*. Records are now
+published as they arrive during a **re-zone**'s handshake, not only after it (#937/#1016), so on that
+path the ambiguous window no longer spans the whole zone-in, just the part before the first record.
+That fix does not reach the very first zone-in of a session, which runs through a separate login
+state machine with no path to publish a door at all (#1016 review B5) — on that path the original
+#937 window still spans the whole handshake, however long it takes. Since this endpoint cannot tell
+which of the two zone-entry paths it is on, read this `404` as *unknown* in both cases, never as
+*disproved*, and never assume the narrower re-zone bound applies. (`503` would claim the session is
+not live and `409` would claim something is pending; neither is true, so the code stays `404` and the
+body carries the distinction.)
 
 **There is no observable that says the roster is complete**, so "re-check once the zone has
 finished loading" is advice this API cannot underwrite for doors specifically: `zone_assets.state`
@@ -792,22 +796,31 @@ an emptied roster is the same bytes as the true answer "this zone has no doors".
 `zone_exits`, there is no `ready` gate to wait on here, because doors are a server-pushed list, not
 a derivation from loaded geometry (see "Endpoints that are deliberately NOT gated" above).
 
-**One of the two things that used to produce that ambiguous `[]` is fixed.** During the zone-entry
-handshake, door records arrive and are parsed and applied to game state on their own drain loop,
-separate from the post-handshake gameplay drain that normally republishes them. Until #937 that
-separate drain never called the publish step at all, so a door applied mid-handshake stayed
-unpublished — readable nowhere — until the first drain pass *after* the handshake finished, no
-matter how early in the handshake it had actually arrived. `run_zone_entry_handshake`'s drain now
-calls the same publish step itself, on the same pass that applies a door record, so an
-arrived-and-applied door is a published one within the handshake, not only after it. Failing the
-handshake (timeout) clears the roster again rather than leaving a partial one behind next to
-`zone_in_failed: true` (#1016 review B4) — the same confident-falsehood shape #934 removed
-elsewhere.
+**One of the two things that used to produce that ambiguous `[]` is fixed, but only on a re-zone
+(#1016 review B5).** During a re-zone's zone-entry handshake, door records arrive and are parsed and
+applied to game state on their own drain loop, separate from the post-handshake gameplay drain that
+normally republishes them. Until #937 that separate drain never called the publish step at all, so a
+door applied mid-handshake stayed unpublished — readable nowhere — until the first drain pass *after*
+the handshake finished, no matter how early in the handshake it had actually arrived.
+`run_zone_entry_handshake`'s drain now calls the same publish step itself, on the same pass that
+applies a door record, so an arrived-and-applied door is a published one within the handshake, not
+only after it. Failing the handshake (timeout) clears the roster again rather than leaving a partial
+one behind next to `zone_in_failed: true` (#1016 review B4) — the same confident-falsehood shape #934
+removed elsewhere. **`run_zone_entry_handshake` is only reached on a re-zone** — both its production
+call sites fire after gameplay has already started, from inside the main gameplay loop. The very
+first zone-in of a session runs an entirely separate, earlier state machine (the login handshake) that
+applies `OP_SpawnDoor` to game state the same way but has no path to publish it at all, so on that
+path the original #937 shape — a door already arrived and applied, but unpublished — still stands for
+however long that handshake takes.
 
-**What remains is #939, and it is a narrower gap than before: records the server has not sent yet.**
-A zone-in that has not yet delivered its *first* door record still reads as an empty, doorless zone
-— that ambiguity has no packet to publish and nothing this client can do about it. Re-listing is the
-usual recourse; if you need to positively confirm a record has landed, packet capture
+**What remains is #939 on the re-zone path, and #937's original shape plus #939 on the first zone-in
+of a session — and this endpoint cannot tell you which path produced the `[]` you are looking at.** A
+zone-in that has not yet delivered its *first* door record reads as an empty, doorless zone on both
+paths (#939, unchanged) — that ambiguity has no packet to publish and nothing this client can do about
+it. On the first zone-in specifically, a `[]` can *also* mean a door record already landed and was
+applied to game state, but this client had no way to publish it (the re-zone-only fix above does not
+reach that path) — the same shape #937 was originally filed against. Re-listing is the usual recourse
+either way; if you need to positively confirm a record has landed, packet capture
 (`GET /v1/observe/packets`, opcode `0x7291`) records `OP_SpawnDoor` arrivals — but **capture is
 default-off and not retroactive**, so it must already have been enabled when the record landed.
 Enabling it *after* you see `[]` returns `count: 0` with `enabled: true`, which is the same

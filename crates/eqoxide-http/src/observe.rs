@@ -2165,8 +2165,9 @@ async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
 /// served here tells that case apart from a real, empty zone.
 ///
 /// **What #937 used to add on top of that — a record already applied to game state but not yet
-/// published — is fixed.** `sync_doors`/`publish_doors` (`eqoxide_net::action_loop`) used to have
-/// exactly one call site, the gameplay drain (`run_gameplay_phase`), which the zone-entry
+/// published — is fixed on the RE-ZONE path only (#1016 review B5); the first zone-in of a session
+/// still has the original #937 gap.** `sync_doors`/`publish_doors` (`eqoxide_net::action_loop`) used
+/// to have exactly one call site, the gameplay drain (`run_gameplay_phase`), which the zone-entry
 /// handshake's own drain never reached; a door parsed and applied during the handshake sat
 /// unpublished until the first post-handshake drain. `run_zone_entry_handshake`
 /// (`eqoxide_net::gameplay`) now calls `publish_doors` itself, on the same drain pass that applies
@@ -2174,6 +2175,17 @@ async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
 /// handshake, not only after it. It also clears the roster (not just leaves it) if the handshake
 /// times out having received a door but never finished — a partial roster for a zone the client was
 /// just told it failed to enter is not an honest `[]` either.
+///
+/// **But `run_zone_entry_handshake` is only reached on a re-zone** — both its production call sites
+/// (`eqoxide_net::gameplay::run_gameplay_phase`) fire after gameplay has already started. The very
+/// first zone-in of a session runs through `eqoxide_net::login`'s own, separate state machine
+/// (`run_login_phase`) instead: it applies `OP_SpawnDoor` through the same `apply_packet`, but that
+/// function has no `InteractSlots` handle in scope at all — not merely unused, absent from its own
+/// signature — so it cannot publish into this roster no matter how long the door has sat applied in
+/// game state. On that path #937's original shape is unchanged: `[]` here can mean a door record has
+/// already arrived and been applied, just not published, for as long as the login handshake takes.
+/// This endpoint cannot tell a caller which of the two zone-entry paths produced the `[]` it is
+/// looking at, so it does not claim the gap is closed — only that it is closed on one of the two.
 ///
 /// There is no completeness observable to wait on for the remaining #939 case: `zone_assets.state`
 /// reaching `"ready"` gates on terrain meshes and collision triangles, so it is about geometry, not
