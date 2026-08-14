@@ -2854,6 +2854,17 @@ mod cursor_resync_tests {
 
     /// Every identifier named inside a `let _cited: &[fn()] = &[ … ];` or `let _helpers … = ( … );`
     /// block in this source — i.e. the set a rename would break the build on.
+    ///
+    /// **A `//` comment tail does not count (#911).** Every line inside the block is stripped to
+    /// its code prefix before tokenising, so a commented-out entry — `// some_test_name,` — reads
+    /// as blank, not as a live guard. Without this, commenting out an array line while leaving the
+    /// same name quoted in the comment satisfied the guard exactly as well as a real entry: the
+    /// citation test stayed green while nothing in the file any longer forced a rename of that test
+    /// to be a compile error. A naive `line.split("//").next()` is exact here — unlike the
+    /// `strip_comments` in `zone_assets.rs` / `transport.rs`, which must additionally protect a
+    /// `//` living inside a string or char literal — because this block's content is restricted by
+    /// construction to bare identifiers, commas and whitespace; no citation guard entry is ever a
+    /// string or char literal, so there is nothing here for a naive split to cut through by mistake.
     fn guard_entries(src: &str) -> std::collections::HashSet<String> {
         let mut out = std::collections::HashSet::new();
         let mut depth: Option<&str> = None;
@@ -2865,8 +2876,9 @@ mod cursor_resync_tests {
                 else { continue; }
             }
             let end = depth.unwrap();
+            let code = line.split("//").next().unwrap_or(line);
             let mut cur = String::new();
-            for c in line.chars() {
+            for c in code.chars() {
                 if c.is_ascii_alphanumeric() || c == '_' { cur.push(c); }
                 else { if cur.len() > 2 { out.insert(std::mem::take(&mut cur)); } else { cur.clear(); } }
             }
