@@ -29,9 +29,10 @@ corpus goes quiet would stop being a detector — which is exactly what #983 mea
 
 No flag count is written down in this header or in any other tracked file, deliberately: the corpus
 changes with every commit, so a pinned figure rots into a false claim. The live count, its
-denominator and every bucket are printed by the run itself. The same rule cost this header two other
-numbers — see reach note 3 — on a second ground: a figure nobody else can re-derive from the words
-next to it is not evidence, whether or not it is stale.
+denominator and every bucket are printed by the run itself. The same rule cost this file its other
+magnitudes — see reach note 3 — on a second ground: a figure nobody else can re-derive from the
+words next to it is not evidence, whether or not it is stale. The one that survives names its
+artifact and its command in the same breath (`wc -l` on the superset list), which is the test.
 
 So: `--strict` exists and makes findings fatal, and CI deliberately does not use it.
 
@@ -45,8 +46,8 @@ here, deliberately: the flagged tokens are printed and left flagged.
 
 The contents being external is not by itself enough, and the first revision of this file claimed it
 was. Review found the hole: the dictionary's contents are external but its SELECTION was
-repo-controlled and unvalidated, so a PR could point `HOST_SHAPE_WORDLIST` at a 479k-entry
-names-and-inflections superset — which contains short given names, and therefore host names — and
+repo-controlled and unvalidated, so a PR could point `HOST_SHAPE_WORDLIST` at a
+names-and-inflections superset list — which contains short given names, and therefore host names — and
 silence the class while every check stayed green. Three things close that, and each is testable:
 
   1. `HOST_SHAPE_WORDLIST` is IGNORED when `CI` is set. In CI the dictionary is whatever the runner
@@ -176,7 +177,7 @@ POST_OK = set(" \t,.;:!?)—–\"'`*")
 
 # Hunspell/myspell dictionaries, in discovery order. A plain word list such as
 # `/usr/share/dict/words` is deliberately NOT here even though it is more widely installed: on this
-# dev box it is a 479,823-entry list that includes given names, and a dictionary large enough to
+# dev box it is a 479,823-line list that includes given names, and a dictionary large enough to
 # contain the very token this heuristic exists to catch would allowlist the leak silently — measured
 # by review, the leak drops out of the findings with the headline count unchanged.
 #
@@ -211,7 +212,7 @@ PREFIXES = ("un", "re", "non", "pre", "mis", "over", "under", "de", "dis", "in",
 
 # The one deliberately-dirty fixture. It is a REAL but obscure English word — an archaic term for a
 # small cupboard or recess — and that is the whole point: it is absent from `en_US.dic`, so a correct
-# dictionary leaves it flagged, and PRESENT in the 479k names-and-inflections superset, so pointing
+# dictionary leaves it flagged, and PRESENT in the names-and-inflections superset list, so pointing
 # this script at that superset makes the dictionary control FAIL instead of passing.
 #
 # The previous fixture was an invented string. Nothing knows an invented string, so the control
@@ -571,7 +572,7 @@ def self_test(words: set[str], wordlist_path: str) -> int:
     # DICTIONARY CONTROL — and this one now discriminates. The fixture is a real English word that
     # `en_US.dic` does not carry and a names-and-inflections superset does, so this check FAILS when
     # the resolved list is the trap. With an invented fixture it passed against every dictionary
-    # including the trap (measured by review: 7/7 on the 479k list), which made it no control at all.
+    # including the trap (measured by review: 7/7 on the superset list), which made it no control at all.
     checks.append(("dictionary does not know the fixture", not is_english(DIRTY_TOKEN, words)))
     checks.append(("dictionary knows ordinary English", is_english("machine", words)))
     checks.append(("stemmer resolves an inflection", is_english("disambiguates", words)))
