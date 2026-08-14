@@ -21,6 +21,16 @@ pub mod packet_telemetry;
 pub mod transport;
 pub mod ucs;
 
+// `wire` (the `WireReader` cursor) and `protocol` (every RoF2 packet decoder/struct/const) were
+// extracted into the `eqoxide-protocol` crate (#544 Step 2j) so `packet_telemetry` and
+// `http/observe` can reach the decoders without dragging in the whole app crate. Re-exported here
+// so every existing `crate::wire::…` / `crate::protocol::…` path keeps resolving
+// unchanged.
+pub use eqoxide_protocol::{protocol, wire};
+
+pub use login::run_login_flow;
+pub use transport::AppPacket;
+
 /// Test-only: mature a real [`eqoxide_core::afloat::AfloatStall`] from outside `eqoxide-core`.
 ///
 /// **Why this exists (#846 round-2 review F1).** The two #846 fixes each clear a PAIR — `player_hold`
@@ -56,13 +66,3 @@ pub(crate) mod test_afloat {
              None the fixtures below go blind on the afloat axis again, which is #846 review F1")
     }
 }
-
-// `wire` (the `WireReader` cursor) and `protocol` (every RoF2 packet decoder/struct/const) were
-// extracted into the `eqoxide-protocol` crate (#544 Step 2j) so `packet_telemetry` and
-// `http/observe` can reach the decoders without dragging in the whole app crate. Re-exported here
-// so every existing `crate::wire::…` / `crate::protocol::…` path keeps resolving
-// unchanged.
-pub use eqoxide_protocol::{protocol, wire};
-
-pub use login::run_login_flow;
-pub use transport::AppPacket;

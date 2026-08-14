@@ -1838,7 +1838,7 @@ pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
             // imprecision, not a lie. It affects exactly one spell id and only on a late packet.
             3 => {
                 let is_sentinel = spell_id == SPELLBAR_UNLOCK
-                    && gs.casting.as_ref().map_or(true, |c| c.spell_id != spell_id);
+                    && gs.casting.as_ref().is_none_or(|c| c.spell_id != spell_id);
                 if is_sentinel {
                     gs.casting = None;
                 } else {
@@ -2547,8 +2547,8 @@ pub fn attitude_name(faction: u32) -> &'static str {
 ///   level(u32)@12 (an EQEmu `ConsiderColor` enum value — Green=2, DarkBlue=4, Gray=6, White=10,
 ///   Red=13, Yellow=15, LightBlue=18, WhiteTitanium=20 — NOT the target's literal character level)
 ///   + pvpcon(u8)@16 (0 normal / 1 pvp-flagged / 4 raid target, unused here) + 3 unused bytes = 20.
-///   There is no HP data in this struct (an earlier revision of this comment guessed cur_hp/max_hp
-///   fields here; ground truth shows none exist).
+///     There is no HP data in this struct (an earlier revision of this comment guessed cur_hp/max_hp
+///     fields here; ground truth shows none exist).
 ///
 /// The native RoF2 client prints ONE line combining an attitude clause (from `faction`) and an
 /// idiomatic difficulty-assessment clause (from `level`'s bracket vs. the player's own level),
@@ -2922,7 +2922,7 @@ fn is_sentinel_zone_point(x: f32, y: f32, z: f32) -> bool {
 fn apply_zone_points(gs: &mut GameState, payload: &[u8]) {
     // Wire format: optional 4-byte header + N × ZonePointEntry_S (24 bytes each).
     // Detect header: if (len-4) % 24 == 0 and len >= 4, skip header.
-    let offset = if payload.len() >= 4 && (payload.len() - 4) % SIZE_ZONE_POINT_ENTRY == 0 {
+    let offset = if payload.len() >= 4 && (payload.len() - 4).is_multiple_of(SIZE_ZONE_POINT_ENTRY) {
         4
     } else {
         0
@@ -3422,7 +3422,7 @@ mod tests {
 
     /// Build a RoF2 saylink: 0x12 + 56-char body + display text + 0x12.
     fn saylink(body_seed: char, text: &str) -> String {
-        let body: String = std::iter::repeat(body_seed).take(SAY_LINK_BODY_SIZE).collect();
+        let body: String = std::iter::repeat_n(body_seed, SAY_LINK_BODY_SIZE).collect();
         format!("\u{12}{}{}\u{12}", body, text)
     }
 
@@ -5791,7 +5791,7 @@ mod tests {
         assert!((d.y - 80.0).abs() < 0.2);
         // 359° wraps to ~0 within wire quantization; accept either end of the circle.
         let dh = (d.heading - 359.0).rem_euclid(360.0);
-        assert!(dh < 1.0 || dh > 359.0, "heading={}", d.heading);
+        assert!(!(1.0..=359.0).contains(&dh), "heading={}", d.heading);
     }
 
     #[test]
@@ -5839,7 +5839,7 @@ mod tests {
         b[0..4].copy_from_slice(&200u32.to_le_bytes());               // spell_id
         b[4..6].copy_from_slice(&(gs.player_id as u16).to_le_bytes()); // caster = self
         b[6..10].copy_from_slice(&3000u32.to_le_bytes());            // cast_time ms
-        super::apply_begin_cast(&mut gs, &b.to_vec());
+        super::apply_begin_cast(&mut gs, b.as_ref());
         let c = gs.casting.as_ref().expect("casting set");
         assert_eq!(c.spell_id, 200);
         assert_eq!(c.cast_ms, 3000);
@@ -7513,7 +7513,7 @@ mod tests {
         let minimal = build_task_activity_long(1, 0, 0, false, "", "", 0, "", "", "", "", 0);
         assert_eq!(minimal.len(), TASK_ACTIVITY_LONG_MIN_LEN);
         assert_eq!(TASK_ACTIVITY_LONG_MIN_LEN, 58);
-        assert!(TASK_ACTIVITY_LONG_MIN_LEN > TASK_ACTIVITY_SHORT_LEN);
+        const { assert!(TASK_ACTIVITY_LONG_MIN_LEN > TASK_ACTIVITY_SHORT_LEN) };
         // …and it still decodes, so "minimum" is a real packet, not an impossible one.
         let mut gs = GameState::new();
         apply_task_activity(&mut gs, &minimal);
@@ -7590,7 +7590,7 @@ mod tests {
     ///     the string's NUL;
     ///   * the second `cstr` read the `LengthString` `item_list` (`00 00 00 00` when empty) as a
     ///     C string, consuming ONE byte instead of four — that alone is what shifted `goal_count`.
-    /// Fixing only the header would have left `goal_count` reading `0x05000000`.
+    ///     Fixing only the header would have left `goal_count` reading `0x05000000`.
     #[test]
     fn pre_fix_layout_reproduces_the_issue_889_values() {
         let p = build_task_activity_long(

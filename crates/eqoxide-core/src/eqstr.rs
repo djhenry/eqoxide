@@ -164,7 +164,7 @@ mod tests {
         let map = parse("EQST0002\n100 Your target is out of range, get closer!\n1 %1 %2 %3");
         assert_eq!(map.get(&100).map(String::as_str), Some("Your target is out of range, get closer!"));
         assert_eq!(map.get(&1).map(String::as_str), Some("%1 %2 %3"));
-        assert!(!map.contains_key(&0) || map.get(&0).is_some()); // header line skipped (no leading int+space match for EQST...)
+        assert!(!map.contains_key(&0) || map.contains_key(&0)); // header line skipped (no leading int+space match for EQST...)
     }
 
     #[test]

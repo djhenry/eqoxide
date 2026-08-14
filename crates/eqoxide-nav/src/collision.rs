@@ -1752,7 +1752,7 @@ impl Collision {
                     let inv = 1.0 / det;
                     let tvec = [from[0] - v0[0], from[1] - v0[1], from[2] - v0[2]];
                     let u = dot(tvec, p) * inv;
-                    if u < 0.0 || u > 1.0 { continue; }
+                    if !(0.0..=1.0).contains(&u) { continue; }
                     let q = cross(tvec, e1);
                     let v = dot(dir, q) * inv;
                     if v < 0.0 || u + v > 1.0 { continue; }
@@ -1874,13 +1874,13 @@ impl Collision {
                     let inv = 1.0 / det;
                     let tvec = [from[0] - v0[0], from[1] - v0[1], from[2] - v0[2]];
                     let u = dot(tvec, p) * inv;
-                    if u < 0.0 || u > 1.0 { continue; }
+                    if !(0.0..=1.0).contains(&u) { continue; }
                     let q = cross(tvec, e1);
                     let v = dot(dir, q) * inv;
                     if v < 0.0 || u + v > 1.0 { continue; }
                     let t = dot(e2, q) * inv;
                     let scale = ray_scale.max(axis_scale(v0)).max(axis_scale(v1)).max(axis_scale(v2));
-                    if hit_accepted(t, ray_len, scale) && best.map_or(true, |b| t < b) {
+                    if hit_accepted(t, ray_len, scale) && best.is_none_or(|b| t < b) {
                         best = Some(t);
                     }
                 }
@@ -1944,13 +1944,13 @@ impl Collision {
                     let inv = 1.0 / det;
                     let tvec = [from[0] - v0[0], from[1] - v0[1], from[2] - v0[2]];
                     let u = dot(tvec, p) * inv;
-                    if u < 0.0 || u > 1.0 { continue; }
+                    if !(0.0..=1.0).contains(&u) { continue; }
                     let q = cross(tvec, e1);
                     let v = dot(dir, q) * inv;
                     if v < 0.0 || u + v > 1.0 { continue; }
                     let t = dot(e2, q) * inv;
                     let scale = ray_scale.max(axis_scale(v0)).max(axis_scale(v1)).max(axis_scale(v2));
-                    if hit_accepted(t, ray_len, scale) && best.map_or(true, |(b, _)| t < b) {
+                    if hit_accepted(t, ray_len, scale) && best.is_none_or(|(b, _)| t < b) {
                         // Geometric normal e1×e2, normalised, flipped to face back toward `from`.
                         let mut n = cross(e1, e2);
                         let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
@@ -2067,7 +2067,7 @@ impl Collision {
     /// Is `from → to` blocked by geometry before ~92% of the way? Used for nameplate
     /// occlusion; the cutoff keeps the NPC's own feet/floor from counting as occluders.
     pub fn segment_blocked(&self, from: [f32; 3], to: [f32; 3]) -> bool {
-        self.nearest_hit_t(from, to).map_or(false, |t| t < 0.92)
+        self.nearest_hit_t(from, to).is_some_and(|t| t < 0.92)
     }
 
     /// Is the LINE `from → to` unobstructed? A single centre ray, extended past `to` by `radius`.
@@ -3531,7 +3531,7 @@ impl Collision {
                         if nc < 0 || nr < 0 || nc >= cols || nr >= rows { continue; }
                         if cell_has_start_floor(nc, nr) {
                             let d2 = dc * dc + dr * dr;
-                            if best.map_or(true, |(_, _, bd)| d2 < bd) { best = Some((nc, nr, d2)); }
+                            if best.is_none_or(|(_, _, bd)| d2 < bd) { best = Some((nc, nr, d2)); }
                         }
                     }
                 }
@@ -4486,7 +4486,7 @@ impl Collision {
         // Walkable a margin out = a floor exists within a tight vertical band of the waypoint (so a
         // wall lip above, a drop below, or water all read as "edge" and get avoided).
         let edge_ok = |x: f32, y: f32, z: f32| -> bool {
-            self.nearest_floor(x, y, z, 3.0, 8.0).map_or(false, |f| (f - z).abs() <= 8.0)
+            self.nearest_floor(x, y, z, 3.0, 8.0).is_some_and(|f| (f - z).abs() <= 8.0)
         };
         // WALL-AWARE half (#378 Phase 2 / the qcat L-corner). `edge_ok` sees only geometry that is
         // MISSING (drops, ledges, waterlines). A WALL standing on continuous floor is invisible to
@@ -4517,13 +4517,13 @@ impl Collision {
         // standing room". Margins are the search's concern; one here would refuse nudges the
         // search accepted.
         let inset_trav = crate::traversability::Traversability::new(self, radius, cell, 0.0, false);
-        for i in 0..path.len() {
-            let [x, y, z] = path[i];
+        for wp in path.iter_mut() {
+            let [x, y, z] = *wp;
             // A TELEPORT-PAD endpoint (#403 review D) must NOT be inset: near a footprint/ledge the
             // inset could nudge the SOURCE back OUT of the trigger volume (so the auto-cross never
             // fires) or move the DEST off its resolved arrival. These points were already validated
             // occupiable/standable by `resolve_teleport_pads`; leave them exactly where they are.
-            if ctx.teleport_pads.iter().any(|p| path[i] == p.source || path[i] == p.dest) { continue; }
+            if ctx.teleport_pads.iter().any(|p| *wp == p.source || *wp == p.dest) { continue; }
             let mut push = [0.0f32, 0.0f32];
             // A side is a hazard if the FLOOR runs out there (edge) OR a WALL stands there. Both
             // push away; opposing hazards (a corridor's two walls, a bridge's two rails) CANCEL, so
@@ -4540,7 +4540,7 @@ impl Collision {
                 // the mesh; the wall half stops it nudging straight INTO the far wall of a corridor
                 // narrower than 2·margin (where a one-sided push would otherwise cross the centre).
                 if inset_trav.can_occupy_fast(crate::traversability::Point::new([nx, ny], z)) {
-                    path[i] = [nx, ny, z];
+                    *wp = [nx, ny, z];
                 }
             }
         }
@@ -5032,7 +5032,7 @@ mod tests {
     /// * with NO pad edge → `Unreachable` (the two components are genuinely disconnected by terrain);
     /// * with the pad edge → a complete `Route` that TRAVERSES the pad (the destination point appears
     ///   in the path), proving A* routed THROUGH the discontinuous link rather than around it.
-    /// Revert the astar pad-edge emission and the with-pad case falls back to `Unreachable` → RED.
+    ///   Revert the astar pad-edge emission and the with-pad case falls back to `Unreachable` → RED.
     #[test]
     fn pad_two_components_route_only_through_the_pad() {
         let dest = [430.0, 40.0, 0.0]; // on slab B, distinct from the goal
@@ -7357,13 +7357,14 @@ mod tests {
     /// fall back to ray clearance and #358 would be un-fixed with every test still green.
     #[test]
     fn the_swept_edge_test_covers_the_tier_the_walker_actually_steers_along() {
-        assert!(crate::steering::LOCAL_CELL <= SWEPT_EDGE_MAX_CELL,
-            "the local tier ({}) is not covered by the swept edge test (<= {}) — the walker would \
-             be steered along ray-validated edges again (#358)",
-            crate::steering::LOCAL_CELL, SWEPT_EDGE_MAX_CELL);
+        const {
+            assert!(crate::steering::LOCAL_CELL <= SWEPT_EDGE_MAX_CELL,
+                "the local tier is not covered by the swept edge test (<=) — the walker would \
+                 be steered along ray-validated edges again (#358)");
+        }
         // ...and the coarse whole-zone grid (8u) must stay OUTSIDE it — sweeping an 8u lattice line
         // seals corridors (Ak'Anon: 90/120 routable pairs -> 55/120).
-        assert!(SWEPT_EDGE_MAX_CELL < 8.0, "the coarse tier must remain a ray-validated selector");
+        const { assert!(SWEPT_EDGE_MAX_CELL < 8.0, "the coarse tier must remain a ray-validated selector"); }
     }
 
     /// The coarse/fine asymmetry of `edge_clear` is a deliberate, MEASURED compromise, not an
@@ -7556,10 +7557,10 @@ mod tests {
     /// moves with are the same number, and the waypoint inset (#312) is never smaller than it.
     /// An inset below the collision radius puts the capsule's shoulder inside the wall by
     /// construction — which is what the old `.min(cell * 0.45)` clamp did on the fine 2u tier
-
+    ///
     /// The inset must deliver its margin from BOTH walls at an inside corner. A normalised diagonal
     /// push spends the margin on the diagonal and leaves only `margin / √2` per wall — under the
-
+    ///
     #[test]
     fn find_path_routes_around_a_partial_wall() {
         // 20x20 floor at z=0.
@@ -8818,7 +8819,7 @@ mod tests {
     /// `close_roof_ceiling_is_rejected_by_headroom` (a ceiling with a roof close above → low headroom)
     /// and `qcat_pocket_nearest_floor_is_never_the_ceiling` (a far roof, excluded by the `ref_z`
     /// window). See the design doc's "RETRACTED" note.
-
+    ///
     /// **THE #329 CLOSE-ROOF GATE (D-2, mutation-checked).** A realistic ceiling — a down-facing
     /// surface with a solid roof CLOSE above it — must be rejected by the headroom test
     /// (`headroom_to_next_solid_above < NAV_AGENT_HEIGHT`). This is a two-storey sandwich: room-A floor
@@ -9263,10 +9264,10 @@ mod tests {
     ///   * **far roof** — excluded by the caller's `ref_z ± window` (a character never queries at roof
     ///     height);
     ///   * **close roof** — a solid roof within `NAV_AGENT_HEIGHT` above → `headroom` rejects it.
-    /// Only the OPEN-TOPPED MID-HEIGHT band gets through, knowingly. If it ever bites a real zone, the
-    /// escalation is a connectivity/reachability mitigation (does a *route* lead the character onto it?
-    /// — a graph-level question), NOT a per-surface classifier rule, which the reviewer proved
-    /// impossible. Refs #375 / #329.
+    ///     Only the OPEN-TOPPED MID-HEIGHT band gets through, knowingly. If it ever bites a real zone, the
+    ///     escalation is a connectivity/reachability mitigation (does a *route* lead the character onto it?
+    ///     — a graph-level question), NOT a per-surface classifier rule, which the reviewer proved
+    ///     impossible. Refs #375 / #329.
     ///
     /// This test exists so the accepted state is explicit and greppable: ceiling-as-tier in THIS band
     /// is DELIBERATE, not a regression — do not "fix" it with a per-surface heuristic.
@@ -9919,7 +9920,7 @@ mod clearance_probe_is_not_lossy_885 {
     ///    `4 / cos θ ≥ 4.33 u`, past the cap. Under the old seed-at-the-cap encoding both kinds
     ///    wrote `4.0`, which is what made this fixture byte-identical to (1).
     ///    (An earlier draft of this comment, and of the PR body, said all sixteen were real hits.
-    ///     That was wrong — #885 review round 1, B3 — and re-measured here as 4 / 12.)
+    ///    That was wrong — #885 review round 1, B3 — and re-measured here as 4 / 12.)
     fn walls_exactly_at_cap() -> Collision {
         build(vec![floor(0.0, 100.0),
             wall_e(4.0, -100.0, 100.0, 0.0, 10.0), wall_e(-4.0, -100.0, 100.0, 0.0, 10.0),

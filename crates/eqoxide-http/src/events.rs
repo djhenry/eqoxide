@@ -74,7 +74,7 @@ async fn fetch(s: HttpState, q: EventsQuery, category: Option<String>) -> Json<s
             let evs: Vec<Event> = all.iter()
                 .filter(|e| e.id > since
                     && (!directed_only || e.directed)
-                    && category.as_deref().map_or(true, |c| e.category == c))
+                    && category.as_deref().is_none_or(|c| e.category == c))
                 .cloned().collect();
             (evs, last_id, first_id)
         };

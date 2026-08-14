@@ -454,6 +454,14 @@ pub const OP_CAMP: u16 = 0x28ec;         // RoF2: OP_Camp; client → zone, begi
 
 /// Read a packed struct from a byte slice. Pads with zeros if data is shorter
 /// than the struct size.
+///
+/// # Safety
+///
+/// `T` must be a type for which any bit pattern (including the all-zero padding used when
+/// `data` is short) is a valid value — i.e. a `#[repr(C)]` / packed POD struct of integers,
+/// floats, and arrays thereof. Reading an arbitrary/attacker-controlled `data` slice into a
+/// `T` with a smaller domain (an enum, `bool`, `NonZero*`, a type with a validity invariant)
+/// is undefined behaviour if the bytes don't happen to encode a valid value of `T`.
 pub unsafe fn safe_read<T: Copy>(data: &[u8]) -> T {
     let size = mem::size_of::<T>();
     let mut buf = vec![0u8; size];
@@ -866,7 +874,7 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
         () => {{ match r.try_cstr_ascii() { Some(v) => v, None => return None } }};
     }
     macro_rules! skip {
-        ($n:expr) => {{ if r.try_skip($n).is_none() { return None; } }};
+        ($n:expr) => {{ r.try_skip($n)?; }};
     }
 
     // 1. name (null-terminated)
@@ -1206,7 +1214,7 @@ mod tests {
     fn rof2_zone_entry_builder_writes_name_at_offset_4() {
         // Verify on_zone_connected layout: unknown00(u32) at [0..4], name at [4..68], zeros at [68..76].
         let char_name = "Mordeth";
-        let mut cze = vec![0u8; SIZE_CLIENT_ZONE_ENTRY];
+        let mut cze = [0u8; SIZE_CLIENT_ZONE_ENTRY];
         let nb = char_name.as_bytes();
         cze[4..4 + nb.len().min(64)].copy_from_slice(&nb[..nb.len().min(64)]);
         assert_eq!(cze.len(), 76);

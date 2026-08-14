@@ -76,12 +76,12 @@ impl SpellDb {
 
     /// A self-only spell (ST_SELF) always targets the caster, regardless of the current target.
     pub fn is_self_only(&self, id: u32) -> bool {
-        self.get(id).map_or(false, |s| s.target_type == ST_SELF)
+        self.get(id).is_some_and(|s| s.target_type == ST_SELF)
     }
 
     /// Beneficial spells (heals/buffs) should land on a friendly target (or self), never a mob.
     pub fn is_beneficial(&self, id: u32) -> bool {
-        self.get(id).map_or(false, |s| s.good_effect != 0)
+        self.get(id).is_some_and(|s| s.good_effect != 0)
     }
 
     /// Load from a `spells_us.txt` path. Missing/unreadable file → empty db (graceful).

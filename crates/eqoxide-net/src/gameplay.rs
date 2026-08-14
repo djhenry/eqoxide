@@ -87,7 +87,7 @@ fn reset_probe_clocks(net_health: &eqoxide_ipc::NetHealthShared) {
 /// single-snapshot test cannot see (see `wedge_timeline_tests` below, in this same module).
 fn should_send_probe(last_packet_ago: Duration, last_probe_sent_ago: Option<Duration>) -> bool {
     let app_silent = last_packet_ago >= PROBE_QUIET_THRESHOLD;
-    let probe_due  = last_probe_sent_ago.map_or(true, |a| a >= PROBE_INTERVAL);
+    let probe_due  = last_probe_sent_ago.is_none_or(|a| a >= PROBE_INTERVAL);
     app_silent && probe_due
 }
 
@@ -734,7 +734,7 @@ pub async fn run_gameplay_phase(
         if gs.player_dead_since.is_some() {
             let want_respawn = *respawn.lock().unwrap();
             if want_respawn
-                && last_respawn_retry.map_or(true, |t| t.elapsed() > RESPAWN_RETRY_INTERVAL)
+                && last_respawn_retry.is_none_or(|t| t.elapsed() > RESPAWN_RETRY_INTERVAL)
             {
                 let reply = pending_respawn.as_deref()
                     .and_then(respawn_window_reply)
@@ -2165,9 +2165,8 @@ mod liveness_probe_tests {
     /// while a sent probe is still awaiting its answer.
     #[test]
     fn probe_outstanding_reflects_the_send_reply_race() {
-        let mut h = NetHealth::default();
         // Never probed → nothing outstanding.
-        h.last_probe_sent = None; h.last_probe_reply = None;
+        let mut h = NetHealth { last_probe_sent: None, last_probe_reply: None, ..Default::default() };
         assert!(!probe_outstanding(&h), "no probe ever sent → nothing outstanding");
 
         // Sent, no reply yet → outstanding.

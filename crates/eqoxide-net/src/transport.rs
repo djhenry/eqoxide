@@ -124,7 +124,6 @@ const CRC32_TABLE: [u32; 256] = [
 
 /// EQ CRC32 keyed by session encode_key — matches EQ::Crc32(data, size, key).
 fn eq_crc32(data: &[u8], key: u32) -> u32 {
-    let key = key & 0xFFFFFFFF;
     let mut crc: u32 = 0xFFFFFFFF;
     for i in 0..4 {
         let b = ((key >> (i * 8)) & 0xFF) as u8;
@@ -133,7 +132,7 @@ fn eq_crc32(data: &[u8], key: u32) -> u32 {
     for b in data {
         crc = ((crc >> 8) & 0x00FFFFFF) ^ CRC32_TABLE[((crc ^ *b as u32) & 0xFF) as usize];
     }
-    (!crc) & 0xFFFFFFFF
+    !crc
 }
 
 /// XOR-encode/decode with 4-byte rolling key.
@@ -848,10 +847,10 @@ impl EqStream {
     ///     queue;
     ///   - the `OP_GMKick` path then parks in `loop { sleep }` forever — it never calls `poll_recv`
     ///     again and is never unwound, so `Drop` never runs either.
-    /// Deferring it there would have produced the exact failure this PR exists to prevent: a
-    /// datagram that is never sent AND never counted as lost, sitting in `send_deferred`, whose
-    /// documented meaning is "it went out, ~10ms late". Pre-#641 `main` counted it as a failure, so
-    /// that would have been an honesty REGRESSION.
+    ///     Deferring it there would have produced the exact failure this PR exists to prevent: a
+    ///     datagram that is never sent AND never counted as lost, sitting in `send_deferred`, whose
+    ///     documented meaning is "it went out, ~10ms late". Pre-#641 `main` counted it as a failure, so
+    ///     that would have been an honesty REGRESSION.
     ///
     /// `SendRetry::None` keeps the old accounting exactly: if it does not go out, it is counted as
     /// the loss it is. The queue is flushed first so anything already waiting still precedes it on
@@ -1142,7 +1141,7 @@ impl EqStream {
     /// an un-ACKed reliable is retransmitted by ITS resend window, which re-triggers this ACK.
     fn send_ack(&mut self, seq: u16) {
         let seq_bytes = seq.to_be_bytes();
-        if let Err(e) = self.send_raw(OP_ACK, &self.encode(&seq_bytes.to_vec())) {
+        if let Err(e) = self.send_raw(OP_ACK, &self.encode(seq_bytes.as_ref())) {
             tracing::debug!("NET: ACK for seq {} did not reach the wire ({:?}); the server will \
                              retransmit and we will re-ACK (#612)", seq, e.kind());
         }
@@ -1160,7 +1159,7 @@ impl EqStream {
         // DELIBERATE (#612): same as `send_ack` — counted, logged, not propagated. A lost
         // OutOfOrderAck only costs us the fast-retransmit hint; the server's timer-driven resend
         // still fills the gap.
-        if let Err(e) = self.send_raw(OP_OUT_OF_ORDER, &self.encode(&seq_bytes.to_vec())) {
+        if let Err(e) = self.send_raw(OP_OUT_OF_ORDER, &self.encode(seq_bytes.as_ref())) {
             tracing::debug!("NET: OutOfOrderAck for seq {} did not reach the wire ({:?}); the \
                              server's timer-driven resend still fills the gap (#612)", seq, e.kind());
         }
@@ -2170,17 +2169,12 @@ mod tests {
         let mut ooo_seq: Option<u16> = None;
         let mut ooo_body_raw: Option<Vec<u8>> = None;
         let mut buf = [0u8; 256];
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_millis(80), peer.recv_from(&mut buf)).await {
-                Ok(Ok((n, _))) => {
-                    let d = &buf[..n];
-                    if d.len() >= 2 && d[0] == 0x00 && d[1] == OP_OUT_OF_ORDER {
-                        ooo_body_raw = Some(d[2..].to_vec());
-                        let dec = decode_passes(&d[2..], ENCODE_XOR, ENCODE_NONE, key).unwrap();
-                        ooo_seq = Some(u16::from_be_bytes([dec[0], dec[1]]));
-                    }
-                }
-                _ => break, // timed out: no more datagrams
+        while let Ok(Ok((n, _))) = tokio::time::timeout(std::time::Duration::from_millis(80), peer.recv_from(&mut buf)).await {
+            let d = &buf[..n];
+            if d.len() >= 2 && d[0] == 0x00 && d[1] == OP_OUT_OF_ORDER {
+                ooo_body_raw = Some(d[2..].to_vec());
+                let dec = decode_passes(&d[2..], ENCODE_XOR, ENCODE_NONE, key).unwrap();
+                ooo_seq = Some(u16::from_be_bytes([dec[0], dec[1]]));
             }
         }
 
@@ -2961,7 +2955,7 @@ mod tests {
         let expect: Vec<Vec<u8>> = [0x0001u16, 0x0002, 0x0003].iter()
             .map(|seq| {
                 let mut raw = vec![0x00, OP_ACK];
-                raw.extend_from_slice(&stream.encode(&seq.to_be_bytes().to_vec()));
+                raw.extend_from_slice(&stream.encode(seq.to_be_bytes().as_ref()));
                 stream.append_crc(raw)
             })
             .collect();

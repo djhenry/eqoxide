@@ -9,6 +9,9 @@ use libeq_wld::parser::{
     Dag, DmSpriteDef2, HierarchicalSpriteDef, Track, TrackDef, WldDoc,
 };
 
+/// Per-vertex output of posing a skinned mesh into model space: (positions, normals, weighted flags).
+type PosedMeshData = (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<bool>);
+
 struct PrimitiveData {
     indices: Vec<u32>,
     material_idx: usize,
@@ -127,7 +130,7 @@ fn main() -> Result<()> {
         for entry in fs::read_dir(&input_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "s3d") {
+            if path.extension().is_some_and(|e| e == "s3d") {
                 let stem = path.file_stem().unwrap().to_string_lossy();
                 let out_path = output_dir.join(format!("{}.glb", stem));
                 eprintln!("Converting {} -> {}", path.display(), out_path.display());
@@ -206,7 +209,7 @@ fn convert_s3d_to_glb(input: &Path, output: &Path) -> Result<()> {
         // blob. Keyed by mesh name so the high-level loop below can pick up the
         // posed geometry. Zone/object meshes have no skin groups and fall back
         // to raw positions.
-        let posed: HashMap<String, (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<bool>)> =
+        let posed: HashMap<String, PosedMeshData> =
             match WldDoc::parse(&wld_bytes) {
                 Ok(doc) => match build_bind_pose(&doc) {
                     Some(bind) => {
@@ -598,7 +601,7 @@ fn detect_outliers(positions: &[[f32; 3]]) -> Vec<bool> {
 fn pose_skinned_mesh(
     frag: &DmSpriteDef2,
     bind: &BindPose,
-) -> Option<(Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<bool>)> {
+) -> Option<PosedMeshData> {
     if frag.skin_assignment_groups.is_empty() {
         return None;
     }
@@ -1070,7 +1073,7 @@ fn convert_s3d_to_glb_skinned(input: &Path, output: &Path, model_code: Option<&s
 // ── glTF buffer authoring helpers ────────────────────────────────────────────
 
 fn align4(buf: &mut Vec<u8>) {
-    while buf.len() % 4 != 0 {
+    while !buf.len().is_multiple_of(4) {
         buf.push(0);
     }
 }
@@ -1551,7 +1554,7 @@ fn write_glb(
         let view_idx = buffer_views.len();
         let byte_offset = buffer_data.len() as u32;
         buffer_data.extend_from_slice(&tex.png_bytes);
-        while buffer_data.len() % 4 != 0 {
+        while !buffer_data.len().is_multiple_of(4) {
             buffer_data.push(0);
         }
         buffer_views.push(serde_json::json!({
@@ -1678,7 +1681,7 @@ fn write_glb(
             for &i in &prim.indices {
                 buffer_data.extend_from_slice(&(i as u16).to_le_bytes());
             }
-            while buffer_data.len() % 4 != 0 {
+            while !buffer_data.len().is_multiple_of(4) {
                 buffer_data.push(0);
             }
             let idx_view_idx = buffer_views.len();
@@ -1723,7 +1726,7 @@ fn write_glb(
         for &i in collision_indices {
             buffer_data.extend_from_slice(&i.to_le_bytes());
         }
-        while buffer_data.len() % 4 != 0 {
+        while !buffer_data.len().is_multiple_of(4) {
             buffer_data.push(0);
         }
         let idx_view_idx = buffer_views.len();
@@ -1752,7 +1755,7 @@ fn write_glb(
     }
 
     // Pad buffer to 4 bytes
-    while buffer_data.len() % 4 != 0 {
+    while !buffer_data.len().is_multiple_of(4) {
         buffer_data.push(0);
     }
 

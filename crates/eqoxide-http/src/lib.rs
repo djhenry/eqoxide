@@ -293,7 +293,7 @@ impl PlayerState {
             zone_in_failed: gs.world.zone_in_failed,
             race:       gs.player_race.clone(),
             class:      gs.player_class.clone(),
-            level:      gs.player_level as u32,
+            level:      gs.player_level,
             pos_east:   gs.player_x,
             pos_north:  gs.player_y,
             position_provisional_since: gs.position_provisional_since,

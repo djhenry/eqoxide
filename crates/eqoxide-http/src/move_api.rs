@@ -263,11 +263,12 @@ enum ParsedTarget {
 
 /// Resolve the player's current target (the player's `target_id`) to its (key, position).
 /// Returns `Err((status, msg))` when there is no target, or the target isn't in the live tables.
+type MoveResult = Result<(String, (f32, f32, f32)), (StatusCode, String)>;
 fn resolve_current_target(
     target_id: Option<u32>,
     ids: &HashMap<String, u32>,
     positions: &HashMap<String, (f32, f32, f32)>,
-) -> Result<(String, (f32, f32, f32)), (StatusCode, String)> {
+) -> MoveResult {
     let target_id = target_id
         .ok_or((StatusCode::BAD_REQUEST, "no target; provide a name or coords".to_string()))?;
     let key = ids.iter()

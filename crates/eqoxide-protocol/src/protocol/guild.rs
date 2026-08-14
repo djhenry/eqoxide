@@ -8,9 +8,9 @@
 /// for a self-leave/remove it's ignored), u32 unknown136. A self-leave is othername == myname.
 pub fn build_guild_command(othername: &str, myname: &str, guild_id: u32, rank: u32) -> [u8; 140] {
     let mut buf = [0u8; 140];
-    let n = othername.as_bytes().len().min(63);
+    let n = othername.len().min(63);
     buf[0..n].copy_from_slice(&othername.as_bytes()[..n]);
-    let n2 = myname.as_bytes().len().min(63);
+    let n2 = myname.len().min(63);
     buf[64..64 + n2].copy_from_slice(&myname.as_bytes()[..n2]);
     buf[128..130].copy_from_slice(&(guild_id as u16).to_le_bytes());
     buf[132..136].copy_from_slice(&rank.to_le_bytes());
@@ -22,9 +22,9 @@ pub fn build_guild_command(othername: &str, myname: &str, guild_id: u32, rank: u
 /// u32 guildeqid@132 (the guild being joined).
 pub fn build_guild_invite_accept(inviter: &str, newmember: &str, response: u32, guild_id: u32) -> [u8; 136] {
     let mut buf = [0u8; 136];
-    let n = inviter.as_bytes().len().min(63);
+    let n = inviter.len().min(63);
     buf[0..n].copy_from_slice(&inviter.as_bytes()[..n]);
-    let n2 = newmember.as_bytes().len().min(63);
+    let n2 = newmember.len().min(63);
     buf[64..64 + n2].copy_from_slice(&newmember.as_bytes()[..n2]);
     buf[128..132].copy_from_slice(&response.to_le_bytes());
     buf[132..136].copy_from_slice(&guild_id.to_le_bytes());

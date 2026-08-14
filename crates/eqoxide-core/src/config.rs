@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 thread_local! {
     static LOAD_FALLBACK_DIR_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Directory where eqoxide stores its config and cached per-character login
