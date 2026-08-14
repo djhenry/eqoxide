@@ -24,8 +24,10 @@
 # The class is covered instead by `scripts/check-host-shape.py`, a STRUCTURAL heuristic that names
 # nothing: it flags hostname-shaped bare tokens appearing near infrastructure vocabulary, with an
 # English dictionary as the vocabulary allowlist. It is a WARNING and not a gate, and that is a
-# measured decision rather than a cautious one — on this repo's tracked corpus it flags 30 token
-# occurrences and NONE of them is a host name, so its precision here is 0. Read its header before
+# measured decision rather than a cautious one — on this repo's tracked corpus it flags a few dozen
+# token occurrences and NONE of them is a host name, so its precision here is 0. The live count is
+# deliberately not pinned in any tracked file (it moves with every commit); that tool prints its own
+# count, denominator and buckets on every run. Read its header before
 # quoting a run of it; a clean run there means "no hostname-SHAPED bare token survived five
 # filters", which is again narrower than "no host name is present".
 #
@@ -106,5 +108,6 @@ echo "covered here; scripts/check-pr-text.sh is the scanner for that surface (eq
 echo "check-no-local-detail: the pattern set is an ALLOWLIST of shapes someone already thought of,"
 echo "so OK means 'no KNOWN shape matched', not 'no local detail is present' (eqoxide#995)."
 echo "check-no-local-detail: deployment HOST NAMES are structurally outside this pattern set — a"
-echo "host name has no shape. scripts/check-host-shape.py covers that class as a WARNING (measured"
-echo "precision on this corpus: 0 of 30 flags), and its reach is narrow. Neither run means clean."
+echo "host name has no shape. scripts/check-host-shape.py covers that class as a WARNING whose"
+echo "measured precision on this corpus is 0 — run it for the live count — and its reach is narrow."
+echo "Neither run means clean."

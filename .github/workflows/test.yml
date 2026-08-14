@@ -54,12 +54,18 @@ jobs:
       # list in the repo to grow until the corpus goes quiet (#983's finding).
       #
       # IT IS A WARNING AND DELIBERATELY NOT A GATE, and `--strict` is deliberately not passed. On
-      # this repo's tracked corpus it flags 30 token occurrences of which NONE is a host name —
-      # measured precision 0 — because the class has 0 tracked occurrences since #989's scrub. Its
-      # value is recall, not precision: it goes RED on the exact pre-scrub text that the regex
-      # scanner exited 0 on for months. Blocking a merge on 30 known-innocent words would only buy
-      # a suppression list, and a suppression list grown until the corpus goes quiet is not a
-      # detector. If it ever flags something real, a human reads the list; CI does not decide.
+      # this repo's tracked corpus it flags a few dozen token occurrences of which NONE is a host
+      # name — measured precision 0 — because the class has 0 tracked occurrences since #989's
+      # scrub. No count is pinned here on purpose: the corpus moves with every commit, so a number
+      # written into this file rots into a false claim. The step prints the live count, its
+      # denominator and every bucket. Its value is recall, not precision: it goes RED on the exact
+      # pre-scrub text that the regex scanner exited 0 on for months. Blocking a merge on that many
+      # known-innocent words would only buy a suppression list, and a suppression list grown until
+      # the corpus goes quiet is not a detector. If it ever flags something real, a human reads the
+      # list; CI does not decide.
+      #
+      # The findings surface as `::warning file=,line=` annotations on the PR's Files-changed view
+      # and as a table on the run summary, not only as text inside a passing step's log.
       #
       # It DOES exit 1 for a guard failure — no dictionary, empty corpus, or a failed self-test —
       # because a scan that cannot look is not a clean scan. That is why the dictionary is installed

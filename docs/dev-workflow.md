@@ -242,11 +242,18 @@ appearing near infrastructure vocabulary, using an English dictionary as the voc
 there is no per-token suppression list in the repo that could be grown until the corpus goes quiet
 (#983 measured where that ends).
 
-**It is a warning, not a gate, and that is measured.** On this repo's tracked corpus it flags 30
-token occurrences across 24 distinct tokens, and **none of them is a host name** — the class has 0
-tracked occurrences since the #989 scrub, so its precision here is 0 and every flag is a false
-positive. What it has is recall: it goes RED on the exact pre-scrub text the regex scanner was
-green on. `--strict` makes findings fatal and CI deliberately does not pass it.
+**It is a warning, not a gate, and that is measured.** On this repo's tracked corpus it flags a few
+dozen token occurrences and **none of them is a host name** — the class has 0 tracked occurrences
+since the #989 scrub, so its precision here is 0 and every flag is a false positive. What it has is
+recall: it goes RED on the exact pre-scrub text the regex scanner was green on. `--strict` makes
+findings fatal and CI deliberately does not pass it.
+
+No flag count is written down here or in any other tracked file, deliberately: the corpus changes
+with every commit, so a pinned number rots into a false claim in a doc nobody re-measures. Run the
+script for the live figure — it prints the count, its denominator (every token the tokenizer
+produced) and all six buckets. In CI the findings also appear as annotations on the PR's
+Files-changed view and as a table on the run summary, so a warning is not something only a reader
+of a green step's log can see.
 
 Read its header before quoting a run. A clean run there means "no hostname-shaped bare token
 survived five filters" — a host name that is an English word, or carries a digit or a hyphen, or
