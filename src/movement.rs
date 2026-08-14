@@ -373,7 +373,15 @@ fn nearest_standing_place(col: &Collision, from: [f32; 3], underworld: f32) -> O
     // underworld (−∞) both values fall back to the plain symmetric band, so zones that declare no
     // underworld are unaffected.
     let ref_z = from[2].max(underworld);
-    let down = (ref_z - underworld).clamp(0.0, RESCUE_BAND);
+    // NaN handling is deliberate and is NOT a plain `clamp`. With the default underworld (−∞) — the
+    // common case, not an exotic one — a non-finite `from[2]` makes `ref_z` −∞ and this subtraction
+    // −∞ − (−∞) = NaN. `f32::clamp` propagates that NaN into the probe depth; the `.max(0.0).min(..)`
+    // this replaced returned 0.0, because `f32::max` returns the non-NaN operand. 0.0 is the right
+    // answer (probe nothing rather than probe a NaN depth), so the NaN branch is written out.
+    // Note the finite-underworld case is the SAFE one: `max` washes a NaN `from[2]` out to the
+    // finite bound, so it is the −∞ default that needs this, not a zone that declares an underworld.
+    let raw = ref_z - underworld;
+    let down = if raw.is_nan() { 0.0 } else { raw.clamp(0.0, RESCUE_BAND) };
     for &r in &RESCUE_RADII {
         let mut best: Option<([f32; 3], f32)> = None;
         for i in 0..RESCUE_DIRS {
@@ -4284,7 +4292,10 @@ mod tests {
         const STEP: f32 = 48.0;
         const REACH: f32 = 256.0;
         let ref_z = from[2].max(underworld);
-        let down = (ref_z - underworld).clamp(0.0, RESCUE_BAND);
+        // Mirrors `nearest_standing_place`'s NaN handling exactly — see the note there. The oracle
+        // has to agree with the search on probe depth or it stops being an oracle for it.
+        let raw = ref_z - underworld;
+        let down = if raw.is_nan() { 0.0 } else { raw.clamp(0.0, RESCUE_BAND) };
         let standable = |e: f32, n: f32| -> Option<f32> {
             let f = c.nearest_floor(e, n, ref_z, RESCUE_BAND, down)?;
             if f <= underworld { return None; }
