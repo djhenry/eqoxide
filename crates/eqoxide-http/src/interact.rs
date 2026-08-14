@@ -495,8 +495,13 @@ const DOOR_NO_ARGUMENT: &str = "provide {\"door_id\":N} or {\"name\":\"...\"}";
 /// the client cannot tell "this zone has no doors" from "this zone's doors have not landed yet".
 /// Zoning empties the roster — `GameState::begin_zone_in` for `gs.world.doors`, and the paired clear
 /// at the top of `gameplay::run_zone_entry_handshake` for this published copy (#934 review B1) — so
-/// a zone-in still in progress reads exactly like a doorless zone. It names both possibilities
-/// rather than picking one.
+/// a zone-in that has not yet delivered its first `OP_SpawnDoor` reads exactly like a doorless zone.
+/// That window used to span the WHOLE handshake, because nothing published a door the handshake had
+/// already applied to `gs.world.doors` — that was #937. `run_zone_entry_handshake`'s drain now calls
+/// `publish_doors` on the same pass that applies a door record (#1016 review B4), so the empty
+/// reading narrows to "before the first record has landed", not "for as long as the zone-in runs".
+/// It still names both possibilities rather than picking one — a genuinely doorless zone remains
+/// indistinguishable from that narrower pre-first-record window.
 ///
 /// Both bodies are pinned VERBATIM by `door_click_populated_miss_body_is_exactly_this` and
 /// `door_click_empty_roster_body_is_exactly_this`: the strings are what this endpoint delivers, so
@@ -507,11 +512,11 @@ fn door_lookup_miss(what: &str, known: usize) -> (StatusCode, String) {
         format!(
             "no door matching {what}: this client's door roster is EMPTY. That does NOT establish \
              that the door does not exist — an empty roster does not distinguish a genuinely \
-             doorless zone from one whose door records have not arrived or been published yet, and \
-             zoning empties the roster, so a zone-in still in progress reads exactly like this. \
-             This click was NOT sent and will not take effect. Re-list with GET /v1/observe/doors: \
-             if it is still empty once the zone has finished loading, there is no door here to \
-             click."
+             doorless zone from one whose door records have not arrived yet, and zoning empties the \
+             roster, so a zone-in that has not yet delivered its first door record reads exactly \
+             like this. This click was NOT sent and will not take effect. Re-list with \
+             GET /v1/observe/doors: if it is still empty once the zone has finished loading, there \
+             is no door here to click."
         )
     } else {
         let doors = if known == 1 { "door" } else { "doors" };
@@ -1264,19 +1269,25 @@ mod tests {
     ///     false (#934 review N1: `/observe/packets?op=` records `op_name`, and `/observe/debug`
     ///     carries `zone_assets.state` and `player.pos`) and self-undermining — it denied any other
     ///     observable and then told the caller to wait for a load state it would need one to see.
-    ///   * `zoning empties the roster, so a zone-in still in progress reads exactly like this` —
-    ///     names the case that made this branch reachable at all (#934 review B1).
+    ///   * `zoning empties the roster` — names the case that made this branch reachable at all
+    ///     (#934 review B1). The clause after it — "so a zone-in that has not yet delivered its
+    ///     first door record reads exactly like this" — originally covered the WHOLE handshake,
+    ///     because nothing published a door the handshake had already applied to `gs.world.doors`
+    ///     (#937). Fixed for #1016 review B2/B4: `run_zone_entry_handshake` now publishes on the
+    ///     same drain pass that applies a door record, so the empty reading only survives up to the
+    ///     first record, not for the handshake's full duration — the string was narrowed to match,
+    ///     not left overclaiming a window that no longer exists.
     #[tokio::test]
     async fn door_click_empty_roster_body_is_exactly_this() {
         let body = miss_body(&[], r#"{"name":"NO_SUCH_DOOR_XYZ"}"#).await;
         assert_eq!(body,
             "no door matching the name \"NO_SUCH_DOOR_XYZ\": this client's door roster is EMPTY. \
              That does NOT establish that the door does not exist — an empty roster does not \
-             distinguish a genuinely doorless zone from one whose door records have not arrived or \
-             been published yet, and zoning empties the roster, so a zone-in still in progress \
-             reads exactly like this. This click was NOT sent and will not take effect. Re-list \
-             with GET /v1/observe/doors: if it is still empty once the zone has finished loading, \
-             there is no door here to click.",
+             distinguish a genuinely doorless zone from one whose door records have not arrived \
+             yet, and zoning empties the roster, so a zone-in that has not yet delivered its first \
+             door record reads exactly like this. This click was NOT sent and will not take \
+             effect. Re-list with GET /v1/observe/doors: if it is still empty once the zone has \
+             finished loading, there is no door here to click.",
             "the empty-roster 404 body is the product of #891 and is pinned verbatim — if you are \
              changing it, change this string too and say in the commit which claim moved and what \
              measures it");

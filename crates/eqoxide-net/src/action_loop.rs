@@ -115,6 +115,13 @@ pub fn encode_client_position_update(
 /// [`ActionLoop::sync_doors`] uses from `run_gameplay_phase`'s drain, rather than the handshake
 /// growing a second, divergence-prone copy of the `GameState` door → `DoorView` mapping. One
 /// implementation, two call sites; `doors_shared`'s single-publisher doc comment names both of them.
+///
+/// `out.clear()` before `out.extend(...)` makes every call a full REPLACE from the CURRENT
+/// `gs.world.doors`, not an append onto whatever a previous call left behind — this is what
+/// makes it safe to call repeatedly (every drain pass that saw a packet) without accumulating
+/// duplicates or stale entries. Pinned by
+/// `gameplay::zone_entry_handshake_publish_tests::zone_entry_handshake_publish_doors_replaces_not_appends_across_two_drain_passes_1016`
+/// (#1016 review B3).
 pub(crate) fn publish_doors(gs: &GameState, doors: &eqoxide_ipc::DoorsShared) {
     let mut out = doors.lock().unwrap();
     out.clear();
