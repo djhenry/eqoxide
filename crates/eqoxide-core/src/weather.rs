@@ -126,7 +126,7 @@ pub fn particle_plan(w: &WeatherState) -> ParticlePlan {
     if !w.is_active() {
         return ParticlePlan { kind: WeatherKind::None, count: 0 };
     }
-    let i = w.intensity.min(FULL_DENSITY_INTENSITY).max(1) as u32;
+    let i = w.intensity.clamp(1, FULL_DENSITY_INTENSITY) as u32;
     let span = MAX_PARTICLES - MIN_ACTIVE_PARTICLES;
     // intensity 1 → MIN_ACTIVE_PARTICLES, intensity >= FULL_DENSITY_INTENSITY → MAX_PARTICLES,
     // linear between. Intensities above FULL_DENSITY_INTENSITY saturate (never exceed the cap).

@@ -373,7 +373,15 @@ fn nearest_standing_place(col: &Collision, from: [f32; 3], underworld: f32) -> O
     // underworld (−∞) both values fall back to the plain symmetric band, so zones that declare no
     // underworld are unaffected.
     let ref_z = from[2].max(underworld);
-    let down = (ref_z - underworld).max(0.0).min(RESCUE_BAND);
+    // NaN handling is deliberate and is NOT a plain `clamp`. With the default underworld (−∞) — the
+    // common case, not an exotic one — a non-finite `from[2]` makes `ref_z` −∞ and this subtraction
+    // −∞ − (−∞) = NaN. `f32::clamp` propagates that NaN into the probe depth; the `.max(0.0).min(..)`
+    // this replaced returned 0.0, because `f32::max` returns the non-NaN operand. 0.0 is the right
+    // answer (probe nothing rather than probe a NaN depth), so the NaN branch is written out.
+    // Note the finite-underworld case is the SAFE one: `max` washes a NaN `from[2]` out to the
+    // finite bound, so it is the −∞ default that needs this, not a zone that declares an underworld.
+    let raw = ref_z - underworld;
+    let down = if raw.is_nan() { 0.0 } else { raw.clamp(0.0, RESCUE_BAND) };
     for &r in &RESCUE_RADII {
         let mut best: Option<([f32; 3], f32)> = None;
         for i in 0..RESCUE_DIRS {
@@ -384,7 +392,7 @@ fn nearest_standing_place(col: &Collision, from: [f32; 3], underworld: f32) -> O
             let q = [e, n, f];
             if is_embedded(col, q) || body_in_water(col, q) { continue; }
             let dz = (f - from[2]).abs();
-            if best.map_or(true, |(_, b)| dz < b) { best = Some((q, dz)); }
+            if best.is_none_or(|(_, b)| dz < b) { best = Some((q, dz)); }
         }
         if let Some((q, _)) = best { return Some(q); }
     }
@@ -1447,7 +1455,7 @@ impl CharacterController {
                 let f = [pos[0], pos[1], pos[2] + hz];
                 let to = [f[0] + d_hat[0] * ray_len, f[1] + d_hat[1] * ray_len, f[2]];
                 if let Some((t, n)) = col.nearest_hit(f, to) {
-                    if best.map_or(true, |b| t < b.t) { best = Some(crate::nav::collision::Hit { t, normal: n }); }
+                    if best.is_none_or(|b| t < b.t) { best = Some(crate::nav::collision::Hit { t, normal: n }); }
                 }
             }
             match best {
@@ -2542,7 +2550,7 @@ mod tests {
     /// any slope whose per-frame descent was < 0.5u — i.e. essentially ALL walkable terrain at run
     /// speed — it snapped the feet to the floor every frame and the levitator followed the hill down,
     /// indistinguishable from walking (live-caught on a Qeynos-Hills ridge: z −1.9 → −7.5). Only a
-    /// >0.5u/frame cliff or a true no-floor gap ever held altitude — which is exactly why the earlier
+    /// \>0.5u/frame cliff or a true no-floor gap ever held altitude — which is exactly why the earlier
     /// flat-ground + single sharp-ledge tests passed while ordinary sloped terrain was broken.
     /// MUTATION-CHECK: restore `Some(f) if f >= foot - GROUND_SNAP_TOL` (the buggy down-snap) and this
     /// goes RED — the levitator's Z tracks the ramp down to ~−7.5 instead of holding ~−2.5.
@@ -3260,7 +3268,7 @@ mod tests {
     /// **THE #191 CONTROL: the duck must not override a genuine bank haul-out.**
     ///
     /// Same shape, but the face is SOLID to the pool floor — a real bank whose lip (surface
-    /// + 0.1) is inside the swimming step-up's 2.5 u reach. `try_duck_under` measures the water
+    /// \+ 0.1) is inside the swimming step-up's 2.5 u reach. `try_duck_under` measures the water
     /// route shut (diving gains no lateral progress against a face that runs to the bottom), so
     /// the haul-out keeps the right of way and the swimmer climbs out exactly as before #661.
     /// This is the asset-free companion to `walker_sim`'s
@@ -3335,7 +3343,7 @@ mod tests {
                 -40.0, 0.0);
             // Fixture: the far column must NOT be divable to the passage depth (−4.5) — either no
             // floor within the probe, or a floor above the ducked feet.
-            assert!(c.ground_below(8.0, 0.0, -4.5 + 1.0, 200.0).map_or(true, |f| f > -4.5),
+            assert!(c.ground_below(8.0, 0.0, -4.5 + 1.0, 200.0).is_none_or(|f| f > -4.5),
                 "fixture: the far shelf ({far_floor}) must be shallower than the duck depth, or \
                  this is the round-trip scene");
             let mut ctrl = CharacterController::new([-2.0, 0.0, -2.0]);
@@ -3668,7 +3676,8 @@ mod tests {
         // Each row is a state of `maps/water/<zone>.wtr` for a name the tree ALREADY says is a
         // zone (it has a map pack). Every row must stay in the population; what the water map
         // says is the LOADER's verdict to give, not a filter's.
-        let states: &[(&str, fn(&std::path::Path))] = &[
+        type WaterStateCase = (&'static str, fn(&std::path::Path));
+        let states: &[WaterStateCase] = &[
             ("a valid-looking .wtr", |p| std::fs::write(p, b"EQEMUWATER\x02\0\0\0\0\0\0\0").unwrap()),
             ("absent",               |_| ()),
             ("corrupt",              |p| std::fs::write(p, b"not region data at all").unwrap()),
@@ -3689,7 +3698,8 @@ mod tests {
         // ── each signal alone is enough ──────────────────────────────────────────────────────
         // A real zone that lost two of the three assets is still a zone, and still has to be
         // measured or named. Written as three separate names so one signal cannot cover another.
-        let alone: &[(&str, fn(&std::path::Path, &str))] = &[
+        type WaterAloneCase = (&'static str, fn(&std::path::Path, &str));
+        let alone: &[WaterAloneCase] = &[
             ("only the doors companion", |d, z| { std::fs::write(d.join(format!("{z}_doors.glb")), b"").unwrap(); }),
             ("only the map pack",        |d, z| { std::fs::write(d.join(format!("maps/{z}.txt")), b"").unwrap(); }),
             ("only a .wtr directory",    |d, z| { std::fs::create_dir(d.join(format!("maps/water/{z}.wtr"))).unwrap(); }),
@@ -4282,7 +4292,10 @@ mod tests {
         const STEP: f32 = 48.0;
         const REACH: f32 = 256.0;
         let ref_z = from[2].max(underworld);
-        let down = (ref_z - underworld).max(0.0).min(RESCUE_BAND);
+        // Mirrors `nearest_standing_place`'s NaN handling exactly — see the note there. The oracle
+        // has to agree with the search on probe depth or it stops being an oracle for it.
+        let raw = ref_z - underworld;
+        let down = if raw.is_nan() { 0.0 } else { raw.clamp(0.0, RESCUE_BAND) };
         let standable = |e: f32, n: f32| -> Option<f32> {
             let f = c.nearest_floor(e, n, ref_z, RESCUE_BAND, down)?;
             if f <= underworld { return None; }
@@ -5970,7 +5983,7 @@ mod tests {
         let mut rng = Lcg(0x776_0001);
         let mut clock = AfloatStallClock::default();
         for i in 0..500_000u32 {
-            let frame = if rng.next() % 2 == 0 { AfloatFrame::Resting } else { AfloatFrame::NotAfloat };
+            let frame = if rng.next().is_multiple_of(2) { AfloatFrame::Resting } else { AfloatFrame::NotAfloat };
             let pos = [rng.f32(-1000.0, 1000.0), rng.f32(-1000.0, 1000.0), rng.f32(-200.0, 200.0)];
             clock.observe(frame, pos, rng.f32(0.0, 0.5));
             assert!(clock.stall().is_none(),
@@ -5991,7 +6004,7 @@ mod tests {
             // Mature a stall in place.
             for _ in 0..200 { clock.observe(AfloatFrame::Wished, [0.0, 0.0, 0.0], 0.1); }
             assert!(clock.stall().is_some(), "fixture (iteration {i}): the window must be mature");
-            let frame = if rng.next() % 2 == 0 { AfloatFrame::Resting } else { AfloatFrame::NotAfloat };
+            let frame = if rng.next().is_multiple_of(2) { AfloatFrame::Resting } else { AfloatFrame::NotAfloat };
             clock.observe(frame, [rng.f32(-9.0, 9.0), rng.f32(-9.0, 9.0), rng.f32(-9.0, 9.0)],
                           rng.f32(0.0, 0.5));
             assert!(clock.stall().is_none(),
@@ -6022,7 +6035,7 @@ mod tests {
                 1 => AfloatFrame::NotAfloat,
                 _ => AfloatFrame::Wished,
             };
-            let step = if rng.next() % 8 == 0 { rng.f32(0.0, 1.2) } else { rng.f32(0.0, 0.45) };
+            let step = if rng.next().is_multiple_of(8) { rng.f32(0.0, 1.2) } else { rng.f32(0.0, 0.45) };
             let dt = rng.f32(0.05, 0.25);
             let prev = clock;
             let base = match shadow { Some((a, _)) => a, None => [0.0, 0.0, 0.0] };

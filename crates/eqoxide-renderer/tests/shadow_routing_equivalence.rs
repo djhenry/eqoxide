@@ -40,6 +40,10 @@ enum Cmd {
     Draw(usize),
 }
 
+/// `(mode, texture, animation)` triple describing one caster in the exhaustive small-scene alphabet
+/// below — factored out only to satisfy `clippy::type_complexity`, not a behaviour change.
+type CasterSpec = (RenderMode, Option<usize>, Option<(u32, Vec<usize>)>);
+
 struct Caster {
     mode: RenderMode,
     tex:  Option<usize>,
@@ -182,7 +186,7 @@ fn plan_reproduces_the_pre_721_command_sequence() {
 /// Exhaustive over every 3-caster scene built from a small alphabet, at several timestamps.
 #[test]
 fn plan_reproduces_the_pre_721_command_sequence_exhaustively_for_small_scenes() {
-    let alphabet: Vec<(RenderMode, Option<usize>, Option<(u32, Vec<usize>)>)> = vec![
+    let alphabet: Vec<CasterSpec> = vec![
         (RenderMode::Opaque, Some(1), None),
         (RenderMode::Opaque, None, Some((10, vec![4, 5]))),
         (RenderMode::Masked, Some(1), None),

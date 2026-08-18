@@ -630,7 +630,7 @@ impl ModelAsset {
         let clip_bounds: Vec<(f32, f32, f32)> = if let Some(sd) = skin_data.as_ref() {
             sd.clips.iter().enumerate().map(|(ci, clip)| {
                 let mats: Vec<glam::Mat4> = sd.evaluate(ci, 0.0).iter()
-                    .map(|m| glam::Mat4::from_cols_array_2d(m)).collect();
+                    .map(glam::Mat4::from_cols_array_2d).collect();
                 let (mut xmin, mut xmax, mut zmin, mut zmax) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
                 for (i, (mesh, sd_opt)) in meshes.iter().zip(skin_meshes.iter()).enumerate() {
                     if (skinned_mesh_scales[i] - skinned_node_scale).abs() >= skinned_node_scale * 0.5 { continue; }
@@ -671,7 +671,7 @@ impl ModelAsset {
                 let idle = sd.clip_for_action("idle")
                     .or_else(|| sd.clip_for_action("walking")).unwrap_or(0);
                 let mats: Vec<glam::Mat4> = sd.evaluate(idle, 0.0).iter()
-                    .map(|m| glam::Mat4::from_cols_array_2d(m)).collect();
+                    .map(glam::Mat4::from_cols_array_2d).collect();
                 let mut ys: Vec<f32> = Vec::new();
                 for (i, (mesh, sd_opt)) in meshes.iter().zip(skin_meshes.iter()).enumerate() {
                     if (skinned_mesh_scales[i] - skinned_node_scale).abs() >= skinned_node_scale * 0.5 { continue; }
@@ -1910,7 +1910,7 @@ mod tests {
         // Pose the model the way the live player renders it — the idle animation clip.
         let idle = sk.clip_for_action("idle").or_else(|| sk.clip_for_action("walking")).unwrap_or(0);
         let imats: Vec<glam::Mat4> = sk.evaluate(idle, 0.0).iter()
-            .map(|x| glam::Mat4::from_cols_array_2d(x)).collect();
+            .map(glam::Mat4::from_cols_array_2d).collect();
         let (mut mnx, mut mxx) = (f32::MAX, f32::MIN);
         let (mut mny, mut mxy) = (f32::MAX, f32::MIN);
         let (mut mnz, mut mxz) = (f32::MAX, f32::MIN);
@@ -1957,7 +1957,7 @@ mod tests {
         let mat = crate::camera::entity_model_matrix_heading(pos, 0.0, visual_scale, ms, [cx, cz], true, 0.0, glam::Mat4::IDENTITY);
         let m = glam::Mat4::from_cols_array_2d(&mat);
         let imats: Vec<glam::Mat4> = sk.evaluate(idle, 0.0).iter()
-            .map(|x| glam::Mat4::from_cols_array_2d(x)).collect();
+            .map(glam::Mat4::from_cols_array_2d).collect();
         let (mut mnx, mut mxx, mut mny, mut mxy, mut mnz, mut mxz) =
             (f32::MAX, f32::MIN, f32::MAX, f32::MIN, f32::MAX, f32::MIN);
         for (mesh, sdo) in a.meshes.iter().zip(a.skin_meshes.iter()) {
@@ -2007,7 +2007,7 @@ mod tests {
                 archetype_correction(archetype));
             let m = glam::Mat4::from_cols_array_2d(&mat);
             let imats: Vec<glam::Mat4> = sk.evaluate(idle, 0.0).iter()
-                .map(|x| glam::Mat4::from_cols_array_2d(x)).collect();
+                .map(glam::Mat4::from_cols_array_2d).collect();
             let (mut mnx, mut mxx, mut mny, mut mxy, mut mnz) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN, f32::MAX);
             for (mesh, sdo) in a.meshes.iter().zip(a.skin_meshes.iter()) {
                 if let Some(sd) = sdo {

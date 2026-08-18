@@ -640,9 +640,11 @@ mod tests {
                 ui.sys.layout.set_open(def.id, true);
             }
         }
-        let mut scene = SceneState::default();
-        scene.player_name = "Testy".into();
-        scene.merchant_open = Some(42); // exercise the merchant transient too
+        let mut scene = SceneState {
+            player_name: "Testy".into(),
+            merchant_open: Some(42), // exercise the merchant transient too
+            ..Default::default()
+        };
         for i in 0..80 {
             scene.messages.push(eqoxide_core::game_state::LogEntry {
                 kind: "chat".into(),
@@ -726,10 +728,12 @@ mod tests {
 
         let spells = eqoxide_core::spells::SpellDb::empty();
         let acts = actions();
-        let mut scene = SceneState::default();
-        scene.player_name = "Testy".into();
-        scene.zone = "qeytoqrg".into();
-        scene.player_pos = [100.0, 200.0, 0.0];
+        let scene = SceneState {
+            player_name: "Testy".into(),
+            zone: "qeytoqrg".into(),
+            player_pos: [100.0, 200.0, 0.0],
+            ..Default::default()
+        };
 
         // Seed a baseline "already used once" layout — a brand-new window
         // (no stored size at all) isn't where this bug lives; it only bites

@@ -5,9 +5,9 @@
 /// then 5 unknown/zero-filled u32s.
 pub fn build_group_invite(invitee_name: &str, inviter_name: &str) -> [u8; 148] {
     let mut buf = [0u8; 148];
-    let n = invitee_name.as_bytes().len().min(63);
+    let n = invitee_name.len().min(63);
     buf[0..n].copy_from_slice(&invitee_name.as_bytes()[..n]);
-    let n2 = inviter_name.as_bytes().len().min(63);
+    let n2 = inviter_name.len().min(63);
     buf[64..64 + n2].copy_from_slice(&inviter_name.as_bytes()[..n2]);
     buf
 }
@@ -16,9 +16,9 @@ pub fn build_group_invite(invitee_name: &str, inviter_name: &str) -> [u8; 148] {
 /// name2=invitee(us)[64], then 6 unknown/zero-filled u32s.
 pub fn build_group_follow(inviter_name: &str, invitee_name: &str) -> [u8; 152] {
     let mut buf = [0u8; 152];
-    let n = inviter_name.as_bytes().len().min(63);
+    let n = inviter_name.len().min(63);
     buf[0..n].copy_from_slice(&inviter_name.as_bytes()[..n]);
-    let n2 = invitee_name.as_bytes().len().min(63);
+    let n2 = invitee_name.len().min(63);
     buf[64..64 + n2].copy_from_slice(&invitee_name.as_bytes()[..n2]);
     buf
 }
@@ -34,9 +34,9 @@ pub fn build_group_follow(inviter_name: &str, invitee_name: &str) -> [u8; 152] {
 /// for a kick).
 pub fn build_group_disband(own_name: &str, target_name: &str) -> [u8; 148] {
     let mut buf = [0u8; 148];
-    let n = own_name.as_bytes().len().min(63);
+    let n = own_name.len().min(63);
     buf[0..n].copy_from_slice(&own_name.as_bytes()[..n]);
-    let n2 = target_name.as_bytes().len().min(63);
+    let n2 = target_name.len().min(63);
     buf[64..64 + n2].copy_from_slice(&target_name.as_bytes()[..n2]);
     buf
 }
@@ -45,9 +45,9 @@ pub fn build_group_disband(own_name: &str, target_name: &str) -> [u8; 148] {
 /// CurrentLeader[64], NewLeader[64], Unknown072[324]=0. Only NewLeader is read server-side.
 pub fn build_group_make_leader(current_leader: &str, new_leader: &str) -> [u8; 456] {
     let mut buf = [0u8; 456];
-    let n = current_leader.as_bytes().len().min(63);
+    let n = current_leader.len().min(63);
     buf[4..4 + n].copy_from_slice(&current_leader.as_bytes()[..n]);
-    let n2 = new_leader.as_bytes().len().min(63);
+    let n2 = new_leader.len().min(63);
     buf[68..68 + n2].copy_from_slice(&new_leader.as_bytes()[..n2]);
     buf
 }

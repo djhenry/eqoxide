@@ -31,9 +31,10 @@ pub struct ZonePoint {
 /// [`Pose::Unknown`] is deliberately explicit rather than being folded into `Standing`:
 /// an unrecognised wire value is a thing the client genuinely does not know, and the
 /// agent-honesty invariant says an observable "I don't know" beats a confident guess.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Pose {
     /// `Animation::Standing` (100) — the ordinary upright state.
+    #[default]
     Standing,
     /// `Animation::Freeze` (102) — held/frozen; renders as a still upright figure.
     Freeze,
@@ -93,9 +94,6 @@ impl Pose {
     }
 }
 
-impl Default for Pose {
-    fn default() -> Self { Pose::Standing }
-}
 
 /// An entity's **gait** — the 10-bit `animation` sub-field of `OP_ClientUpdate`, a
 /// speed-derived locomotion code (this client's own encoder is
@@ -2114,7 +2112,7 @@ impl GameState {
         // `entities` on every read, so it must be refreshed here whenever the update is for
         // whichever spawn is currently targeted (mob or self via F1). (eqoxide#9, task 6)
         if self.target_id == Some(spawn_id) {
-            self.target_hp_pct = Some(self.hp_pct).filter(|_| spawn_id == self.player_id)
+            self.target_hp_pct = (spawn_id == self.player_id).then_some(self.hp_pct)
                 .or_else(|| self.world.entities.get(&spawn_id).map(|e| e.hp_pct));
         }
     }
@@ -3077,7 +3075,7 @@ pub(crate) mod tests {
         assert!(!gs.world.doors.get(&3).unwrap().is_open);
         // Unknown door id is ignored, not a panic.
         gs.set_door_open(99, true);
-        assert!(gs.world.doors.get(&99).is_none());
+        assert!(!gs.world.doors.contains_key(&99));
     }
 
     // --- TaskStatus and quest structures ---

@@ -920,25 +920,20 @@ pub fn carrot_along_los(
     // MONOTONE: the clamp can only ever shorten the reach, never retreat behind where we already are.
     let mut best = cur;
     let (mut rem, mut i) = (reach, start_i);
-    loop {
-        match path.get(i + 1).copied() {
-            Some(bp) => {
-                let d = [bp[0] - cur[0], bp[1] - cur[1], bp[2] - cur[2]];
-                let dl = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                let last = dl >= rem || i + 2 >= path.len();
-                let cand = if last {
-                    if dl < 1e-6 { cur }
-                    else { let s = (rem / dl).min(1.0); [cur[0] + d[0] * s, cur[1] + d[1] * s, cur[2] + d[2] * s] }
-                } else { bp };
-                // Advance the accepted carrot only while the straight shot to it stays clear. The
-                // instant it would cross geometry (a corner), stop at the last clear point — the walker
-                // aims at the corner and rounds it. `best` may already be the LOS floor `cur`.
-                if los(from, cand) { best = cand; } else { break; }
-                if last { break; }
-                rem -= dl; cur = bp; i += 1;
-            }
-            None => break,
-        }
+    while let Some(bp) = path.get(i + 1).copied() {
+        let d = [bp[0] - cur[0], bp[1] - cur[1], bp[2] - cur[2]];
+        let dl = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let last = dl >= rem || i + 2 >= path.len();
+        let cand = if last {
+            if dl < 1e-6 { cur }
+            else { let s = (rem / dl).min(1.0); [cur[0] + d[0] * s, cur[1] + d[1] * s, cur[2] + d[2] * s] }
+        } else { bp };
+        // Advance the accepted carrot only while the straight shot to it stays clear. The
+        // instant it would cross geometry (a corner), stop at the last clear point — the walker
+        // aims at the corner and rounds it. `best` may already be the LOS floor `cur`.
+        if los(from, cand) { best = cand; } else { break; }
+        if last { break; }
+        rem -= dl; cur = bp; i += 1;
     }
     Some(best)
 }
@@ -1126,7 +1121,7 @@ mod cursor_resync_tests {
         [-526.718_75, 144.375, -4.161_232],
         [-534.718_75, 144.375, -6.095_749],
         [-542.718_75, 144.375, -8.030_266],
-        [-550.718_75, 144.375, -9.964_805_6],
+        [-550.718_75, 144.375, -9.964_806],
         [-558.718_75, 144.375, -11.899_315],
     ];
     /// Where the character physically ENDS UP, measured in the offline replay of that live route:
@@ -1270,10 +1265,10 @@ mod cursor_resync_tests {
     ///
     /// Structure mirrors `navigation.rs`'s two-rate loop: a 150 ms NAV TICK (cursor + `steer_target`
     /// + a fine-plan request) and 14 fast-steer frames at ~100 Hz in between, each calling the
-    /// production [`fast_steer_aim`] exactly as `Walker::apply_fast_steering` does. The steering
-    /// itself is **not mirrored** — it is the production functions, called with the production
-    /// arguments and the production `STEER_LOS_CLEARANCE`. The only copied numbers are the loop
-    /// rates, `LOOK_AHEAD` / `LOCAL_REACH` / `LOCAL_BOUND` and `RUN_SPEED`.
+    ///   production [`fast_steer_aim`] exactly as `Walker::apply_fast_steering` does. The steering
+    ///   itself is **not mirrored** — it is the production functions, called with the production
+    ///   arguments and the production `STEER_LOS_CLEARANCE`. The only copied numbers are the loop
+    ///   rates, `LOOK_AHEAD` / `LOCAL_REACH` / `LOCAL_BOUND` and `RUN_SPEED`.
     ///
     /// **`wish_dir` PERSISTS, which is the one thing a per-frame harness gets wrong by default.**
     /// `Walker::apply_fast_steering` runs only when `!self.local_path.is_empty()`, and all it does
@@ -1411,7 +1406,7 @@ mod cursor_resync_tests {
             // is what `drive_walk` turns into `MoveIntent.wish_dir` — and `wish_dir` then PERSISTS:
             // the controller keeps integrating that same vector every frame until something writes
             // a new one.
-            let aim = steer_target(&HAIRPIN, path_i, &local, &mut local_i, p, LOOK_AHEAD, coarse, &los);
+            let aim = steer_target(&HAIRPIN, path_i, &local, &mut local_i, p, LOOK_AHEAD, coarse, los);
             let (adx, ady) = (aim[0] - p[0], aim[1] - p[1]);
             let ad = (adx * adx + ady * ady).sqrt();
             // `drive_walk` publishes no intent for a degenerate aim; the previous tick's intent is
@@ -1478,7 +1473,7 @@ mod cursor_resync_tests {
         let los = |a: [f32; 3], b: [f32; 3]| col.carrot_los_clear(a, b, radius);
         let d = |q: [f32; 3]| (q[0] - LANDED[0]).hypot(q[1] - LANDED[1]);
 
-        let coarse = carrot_along_los(&HAIRPIN, STALE_I, LANDED, 5.0, &los).unwrap();
+        let coarse = carrot_along_los(&HAIRPIN, STALE_I, LANDED, 5.0, los).unwrap();
         assert!(d(coarse) > 10.0,
             "the COARSE carrot at LOOK_AHEAD is not the collapsed one — if this ever fails, the \
              round-3 account of #673 is wrong and the round-2 one may be right (was {:.2} u)", d(coarse));
@@ -1498,7 +1493,7 @@ mod cursor_resync_tests {
         assert_eq!(steer.len(), 2, "expected a degenerate fine plan, got {steer:?}");
 
         let mut local_i = 0usize;
-        let aim = steer_target(&HAIRPIN, STALE_I, &steer, &mut local_i, LANDED, 5.0, coarse, &los);
+        let aim = steer_target(&HAIRPIN, STALE_I, &steer, &mut local_i, LANDED, 5.0, coarse, los);
         assert!(d(aim) < 1.0,
             "the steering aim must be collapsed even though the coarse carrot is not (was {:.2} u)", d(aim));
         // One frame's travel is RUN_SPEED * 0.01 = 0.44 u, so an aim this near is overshot, not
@@ -1773,8 +1768,9 @@ mod cursor_resync_tests {
             carrot_leads_is_honest_at_the_route_end_and_where_it_can_measure_nothing,
         ];
         // Helpers cited by name in the same docs.
-        let _helpers: (fn(&crate::collision::Collision, usize, bool, bool) -> Run,
-                       fn(f32, [f32; 3], usize) -> HairpinRun) = (fixture_run, hairpin_carrot_stops_leading);
+        type FixtureRunFn = fn(&crate::collision::Collision, usize, bool, bool) -> Run;
+        type HairpinCarrotFn = fn(f32, [f32; 3], usize) -> HairpinRun;
+        let _helpers: (FixtureRunFn, HairpinCarrotFn) = (fixture_run, hairpin_carrot_stops_leading);
     }
 
     /// **The citation guard's ALPHABET is now mechanical, not remembered (#727 round 6 review,
@@ -1964,14 +1960,13 @@ mod cursor_resync_tests {
                              but no `_cited`/`_helpers` guard in this file names it — a rename would \
                              rot the citation silently. Add it to the guard array."));
                     }
-                } else if !all_fns.contains(&resolved) {
-                    if !NOT_A_FN.iter().any(|(n, _)| *n == resolved) {
+                } else if !all_fns.contains(&resolved)
+                    && !NOT_A_FN.iter().any(|(n, _)| *n == resolved) {
                         problems.push(format!(
                             "{where_}: `{name}` is cited in a doc comment and resolves to NO fn in \
                              the resolution corpus. Either the citation is stale, or it names \
                              something that is not a fn — in which case add it to NOT_A_FN with a \
                              reason."));
-                    }
                 }
             }
             // The structural check for a code span wrapped across two lines used to run here, over
@@ -4046,8 +4041,8 @@ mod tests {
     ///      not weaken it back. The body below records what this premise does NOT cover, measured
     ///      rather than assumed. (`Advancing` can never hold `quiet_ticks >= NAV_STUCK_TICKS` by
     ///      construction, so the cap is a no-op on that variant — asserted inside `cap` itself.)
-    /// So two states identified by the cap have identical futures and identical published words, and
-    /// covering the quotient covers the infinite original.
+    ///      So two states identified by the cap have identical futures and identical published words, and
+    ///      covering the quotient covers the infinite original.
     ///
     /// **What this test does and does not establish.** It establishes the invariant over the
     /// reachable product of the verdict machine and its oracle: no input sequence, of any length,

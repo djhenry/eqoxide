@@ -702,12 +702,12 @@ impl Rng {
 /// any kind on another scene. See that test's own doc comment for what it does and does not catch,
 /// including a round-2 fix for a truncation gap in the scan itself.
 fn build_scene(scene: usize) -> (Vec<Cand>, Option<Cand>, [f32; 3], [f32; 3]) {
-    let mut rng = Rng(splitmix64(0x5EED_740 ^ scene as u64));
+    let mut rng = Rng(splitmix64(0x05EE_D740 ^ scene as u64));
 
     // Every 5th scene is DENSE: a crowded zone where every candidate is comfortably inside the
     // cull, so the slot bound is actually reached. Left to chance, a uniformly-scattered corpus
     // hits the bound rarely, and the truncation path would go effectively unsampled.
-    let dense = scene % 5 == 0;
+    let dense = scene.is_multiple_of(5);
     let (half, player_half) = if dense { (280, 10) } else { (550, 80) };
     let n = if dense {
         (SHADOW_CASTER_SLOTS as u64 + 40 + rng.range(60)) as usize

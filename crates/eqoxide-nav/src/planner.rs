@@ -82,7 +82,7 @@ pub struct PlanReply {
     /// gets snapped to the column's floor, or it is SUBMERGED and the walker will arrive floating
     /// at the water surface instead (design §4d). The agent is told (`nav_reason: goal_z_snapped`
     /// + the message log) — an accommodation presented as compliance is a lie, and this one would
-    /// otherwise report `arrived` at a z nobody asked for / never reached (#377 review).
+    ///   otherwise report `arrived` at a z nobody asked for / never reached (#377 review).
     pub goal_snapped: Option<crate::collision::GoalSnap>,
     /// The per-route TIER (#378 Phase 2 / design §4c): `true` = this route only existed at the
     /// MINIMUM clearance (a tight door/bridge threaded with no margin — a riskier path). Published

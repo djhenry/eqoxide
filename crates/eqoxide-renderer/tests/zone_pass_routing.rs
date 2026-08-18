@@ -108,6 +108,10 @@ use eqoxide_renderer::pass::{
     ZoneDrawSink, ZoneMeshSource, ZoneTexBind, ZONE_SUBPASSES,
 };
 
+/// Signature shared by `old()`'s two verbatim-transcribed closures (`draw_static`/`draw_instanced`
+/// helpers below) — factored out only to satisfy `clippy::type_complexity`, not a behaviour change.
+type FrameTex<'a> = dyn Fn(Option<usize>, &Option<(u32, Vec<usize>)>) -> Option<usize> + 'a;
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum Cmd {
     SetPipeline(&'static str),
@@ -153,7 +157,7 @@ fn old(statics: &[Mesh], instanced: &[Mesh], now_ms: u64) -> Vec<Cmd> {
     };
     fn draw_static(
         out: &mut Vec<Cmd>, meshes: &[Mesh], pipeline: &'static str, modes: &[RenderMode],
-        frame_tex: &dyn Fn(Option<usize>, &Option<(u32, Vec<usize>)>) -> Option<usize>,
+        frame_tex: &FrameTex,
     ) {
         let mut bound = false;
         let mut current_tex: Option<usize> = None;
@@ -176,7 +180,7 @@ fn old(statics: &[Mesh], instanced: &[Mesh], now_ms: u64) -> Vec<Cmd> {
     }
     fn draw_instanced(
         out: &mut Vec<Cmd>, meshes: &[Mesh], pipeline: &'static str, modes: &[RenderMode],
-        frame_tex: &dyn Fn(Option<usize>, &Option<(u32, Vec<usize>)>) -> Option<usize>,
+        frame_tex: &FrameTex,
     ) {
         let mut bound = false;
         let mut current_tex: Option<usize> = None;

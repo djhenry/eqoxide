@@ -719,6 +719,7 @@ pub struct NetHealth {
     ///      issuing the syscall* (the bit is refilled only by its io driver); or
     ///   2. the bit is set, the syscall IS issued, and the kernel returns `EAGAIN`/`ENOBUFS` (which
     ///      also clears the bit).
+    ///
     /// A direct `send(2)` succeeding microseconds later fits (1) — but fits (2)-then-the-buffer-
     /// drained just as well, and a burst is exactly when the buffer is full and draining hard. So
     /// the error is systematic in one direction. A DOUBLE refusal (the direct `send(2)` fails too)

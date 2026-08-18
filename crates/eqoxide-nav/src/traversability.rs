@@ -707,7 +707,7 @@ mod tests {
         // (the over-rejection direction: a body too fat also lies).
         assert!(planner[0] > eqoxide_core::physics::STEP_UP,
             "the planner's low probe must clear the step-up band, or every stair reads as a wall");
-        assert!(PLAYER_BODY.radius >= eqoxide_core::physics::PLAYER_RADIUS);
+        const { assert!(PLAYER_BODY.radius >= eqoxide_core::physics::PLAYER_RADIUS); }
     }
 
 
@@ -812,7 +812,7 @@ mod tests {
     ///   * REFUSED at `Tier::Preferred` (margin 2.0 > its ~1.5 u of ground clearance), naming Floor;
     ///   * OCCUPIABLE at `Tier::Minimum` (no standing-room requirement — the tier's promise is only
     ///     "the character fits", which keeps narrow ledges routable, #310's mirror).
-    /// A mid-plateau point passes at both.
+    ///     A mid-plateau point passes at both.
     ///
     /// Mutation check (verified at authoring time): drop the `ground_clearance >= ledge_margin`
     /// clause from `occupy_margin_ok` and the near-edge Preferred case wrongly PASSES → red. (The
