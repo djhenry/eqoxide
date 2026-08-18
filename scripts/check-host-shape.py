@@ -404,9 +404,24 @@ def self_path(root: str) -> str:
 def count_tracked(root: str) -> int:
     """A SECOND, INDEPENDENT `git ls-files`, deliberately not the one `read_corpus` iterates.
 
-    The independence is the entire point. Tallying the four outcomes and comparing the sum to the
-    length of the list they were derived FROM compares a number to itself and cannot fail — the same
-    defect the round-1 bucket identity had, one level up. Re-asking git is what makes this a control.
+    WHAT THE SECOND CALL BUYS: coverage of a truncated SOURCE LIST. Re-counting `read_corpus`'s own
+    list would catch a file dropped INSIDE the loop — the counters are incremented in the loop, so
+    the sum falls below the length and the two sides do not move together. It would NOT catch the
+    list itself being narrowed on the way in: a pathspec on `read_corpus`'s `ls-files` shrinks the
+    denominator and the tally in lockstep, and the run goes green over a fraction of the tree.
+    Asking git a second time is the only way the denominator is not downstream of that truncation.
+
+    Measured both designs against both mutations rather than reasoning about it (round 7):
+
+        design                          in-loop drop      source list truncated
+        re-count read_corpus's list     exit 1            EXIT 0  <- the hole
+        second git ls-files (this)      exit 1            exit 1
+
+    An earlier revision of this docstring said the re-count design "compares a number to itself and
+    cannot fail" and called it the round-1 bucket-identity defect one level up. THAT WAS FALSE, and
+    review demonstrated it by building the design and running it. The control below is right; the
+    reason given for it was not, and a false reason would have taught the next reader to reject a
+    design that works.
     """
     out = subprocess.run(
         ["git", "-C", root, "ls-files", "-z"], capture_output=True, text=True, check=True
@@ -415,13 +430,23 @@ def count_tracked(root: str) -> int:
 
 
 def corpus_accounts_for(read: int, binary: int, unreadable: int, excluded: int, tracked: int) -> bool:
-    """Every tracked name must land in EXACTLY ONE of the four outcomes.
+    """Checks ONE THING: that the four outcome counts SUM to the number of tracked files.
 
-    `tracked` must come from `count_tracked`, not from the list `read_corpus` walked. A file that is
-    silently dropped on the way in is invisible to every downstream number: the bucket identity still
-    balances, the classification still reports `N/N`, and the run still exits 0 — it just looked at
-    less. That is this repo's canonical failure, a check that cannot tell "nothing wrong" from
-    "nothing looked at", and it is the failure this whole script exists to answer for one leak class.
+    Stated as a total rather than as a partition because a total is all this verifies. It detects a
+    file DROPPED on the way in — the sum falls short and the run refuses. It does NOT detect a file
+    MIS-CREDITED from one outcome to another, because the sum is unchanged by moving a unit between
+    its terms. Measured (round 7): booking dropped files as `skipped_binary` instead of reading them
+    passes at exit 0, over a corpus shrunk to a fraction of the tree, with findings missing.
+
+    Verifying a name-level PARTITION would not close that gap either, and it is worth writing down
+    so nobody spends the effort expecting it to: a mis-credited file is still accounted exactly once,
+    just under the wrong heading, so it satisfies the partition. Distinguishing the headings means
+    re-deciding "is this really binary?" — re-implementing the classification and trusting the copy.
+    The gap is therefore STATED here rather than closed, and it is narrower than the one this catches:
+    mis-crediting requires editing the outcome bookkeeping, not merely dropping a `continue` in.
+
+    `tracked` must come from `count_tracked`, not from the list `read_corpus` walked; see there for
+    which mutation that independence does and does not cover.
     """
     return read + binary + unreadable + excluded == tracked
 
