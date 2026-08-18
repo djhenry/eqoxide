@@ -3001,7 +3001,11 @@ impl ActionLoop {
                 let (dmg, _max) = fall_damage(height);
                 if dmg > 0 {
                     stream.send_app_packet(OP_ENV_DAMAGE, &build_env_damage_packet(gs.player_id, dmg, DMGTYPE_FALLING));
-                    gs.cur_hp = (gs.cur_hp - dmg as i32).max(0);
+                    // #1005: client-COMPUTED damage, applied before the server has answered the
+                    // OP_ENV_DAMAGE above — an estimate by construction. Routed through the shared
+                    // method so it is marked as one (and so `hp_pct`, which this site never used to
+                    // recompute at all, stops disagreeing with `hp`).
+                    gs.apply_local_hp_damage(dmg as i32);
                     gs.log_msg("combat", &format!("Fell {:.0}u — {} fall damage", height, dmg));
                     tracing::info!("EQ: fall damage {dmg} (fell {height:.0}u)");
                 }

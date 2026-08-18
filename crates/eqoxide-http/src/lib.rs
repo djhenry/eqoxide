@@ -176,6 +176,27 @@ pub struct PlayerState {
     pub hp_pct:        f32,
     pub cur_hp:        i32,
     pub max_hp:        i32,
+    /// #1005/agent-honesty: false when `hp_pct`/`cur_hp`/`max_hp` above are NOT what the server last
+    /// reported — the client has written them from its own arithmetic since the last authoritative
+    /// self `OP_HPUpdate`, and nothing else in this response would show it.
+    ///
+    /// This exists because the client publishes a per-hit HP estimate on purpose (eqoxide#55): a hit
+    /// is subtracted locally so the HUD/API react immediately instead of pinning at the last server
+    /// value. Measured live on `36ea882`: one `#damage` produced two damage lines, both were
+    /// subtracted, and `hp: 0` was published for a character the server held at 214/441 — for
+    /// 2.477 s, `dead: false` throughout, reproduced 2 of 2. A well-formed, plausible, false number
+    /// an agent would flee or fight on. The estimate is still published (it is useful, and #55 is a
+    /// deliberate feature); this flag is what stops it being indistinguishable from a confirmation.
+    ///
+    /// `true` ONLY immediately after a self `OP_HPUpdate` — the one server message carrying both
+    /// current and maximum HP. Every other writer leaves it false: local damage (#55), client-
+    /// computed fall damage (#442), the `OP_Death` zeroing, the bind-respawn full-HP assumption
+    /// (eqoxide#68), and the PlayerProfile seed (eqoxide#19), whose max is a guess.
+    ///
+    /// It covers `target_hp_pct` too while the player is self-targeted (F1), because that field then
+    /// resolves from the same `hp_pct`. Conservative by design: false under-claims, and the one
+    /// outcome #1005 rules out is a `200` carrying client arithmetic that reads as server truth.
+    pub hp_verified:   bool,
     /// Death state for headless agents (#284). `dead` = currently slain (held until POST
     /// /v1/lifecycle/respawn). `killed_by` + `died_ago_secs` also persist for a window AFTER a
     /// respawn, so an infrequently-polling agent can still tell it died and what killed it.
@@ -319,6 +340,10 @@ impl PlayerState {
             hp_pct:     gs.hp_pct,
             cur_hp:     gs.cur_hp,
             max_hp:     gs.max_hp,
+            // #1005: a COMPUTED read (`GameState::hp_verified`), never a stored flag — the same
+            // construction as `coin_verified` above, so no single estimate path can assert a trust
+            // the client has not verified against server truth.
+            hp_verified: gs.hp_verified(),
             // Death state (#284). `dead` is live (held slain until /lifecycle/respawn);
             // killed_by/died_ago_secs stay reported for DEATH_STICKY_SECS after death (through a
             // respawn too) so an infrequent poller still sees it. Both are time-derived — being

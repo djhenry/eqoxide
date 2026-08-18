@@ -1,0 +1,180 @@
+name = "issue 1005 — the client must never publish a self-HP value the server did not send without marking it"
+
+# Reproduce with:  scripts/mutate.py scripts/mutants/1005.toml
+#
+# Every mutant here is a WRAP, not a deletion (docs/mutation-testing.md): the original text stays in
+# the tree and still type-checks, so a verdict measures the BEHAVIOUR rather than the text. Several
+# of these wraps restore the pre-fix code verbatim in the `else` arm — i.e. they put the #1005 defect
+# back — which is the strongest available form: RED then means the suite catches the actual bug, not
+# merely a perturbation of it.
+#
+# The command is the default (`cargo test --workspace --locked`) — deliberately NOT --all-targets,
+# which silently drops the doctest targets.
+
+[[mutant]]
+id = "local-damage-not-marked"
+description = "WRAP the estimate mark inside GameState::apply_local_hp_damage — the arithmetic still runs, nothing records that it did"
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-core/src/game_state.rs"
+  anchor = '''
+        self.mark_hp_estimated();
+        if self.target_id == Some(self.player_id) {
+'''
+  replacement = '''
+        if false { self.mark_hp_estimated(); }
+        if self.target_id == Some(self.player_id) {
+'''
+
+[[mutant]]
+id = "combat-site-restores-the-1005-bug"
+description = "WRAP the shared-method call in apply_combat_damage and put the pre-fix raw subtraction back — the exact code that published hp: 0 while the server held 214/441"
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-net/src/packet_handler.rs"
+  anchor = '''
+        gs.apply_local_hp_damage(damage);
+'''
+  replacement = '''
+        if false { gs.apply_local_hp_damage(damage); } else {
+            gs.cur_hp = (gs.cur_hp - damage).max(0);
+            gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
+        }
+'''
+
+[[mutant]]
+id = "every-write-confirms"
+description = "WRAP the from_server branch in write_hp so a client-derived figure confirms the HP just like a server reading"
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-core/src/game_state.rs"
+  anchor = '''
+            if from_server {
+                self.hp_confirmed = true;
+                self.unverified_hp_writes = 0;
+            } else {
+                self.mark_hp_estimated();
+            }
+'''
+  replacement = '''
+            if false {
+                if from_server {
+                    self.hp_confirmed = true;
+                    self.unverified_hp_writes = 0;
+                } else {
+                    self.mark_hp_estimated();
+                }
+            } else {
+                self.hp_confirmed = true;
+                self.unverified_hp_writes = 0;
+            }
+'''
+
+[[mutant]]
+id = "verified-ignores-the-estimate-debt"
+description = "WRAP hp_verified so it reads hp_confirmed alone — a confirmation once earned is never spent by a local write"
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-core/src/game_state.rs"
+  anchor = '''
+        self.hp_confirmed && self.unverified_hp_writes == 0
+    }
+'''
+  replacement = '''
+        if false { self.hp_confirmed && self.unverified_hp_writes == 0 } else { self.hp_confirmed }
+    }
+'''
+
+[[mutant]]
+id = "verified-ignores-hp_confirmed"
+description = "WRAP hp_verified so it reads the counter alone — an untouched client publishes hp 0/0 as a confirmation"
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-core/src/game_state.rs"
+  anchor = '''
+        self.hp_confirmed && self.unverified_hp_writes == 0
+    }
+'''
+  replacement = '''
+        if false { self.hp_confirmed && self.unverified_hp_writes == 0 } else { self.unverified_hp_writes == 0 }
+    }
+'''
+
+[[mutant]]
+id = "key-never-reaches-the-body"
+description = "WRAP the get_debug insert — every other file on the path is still correct and the agent still never sees the flag (#409/#801/#817)"
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-http/src/observe.rs"
+  anchor = '''
+        player.insert("hp_verified".into(),            serde_json::json!(player_hp_verified));
+'''
+  replacement = '''
+        if false { player.insert("hp_verified".into(),            serde_json::json!(player_hp_verified)); }
+'''
+
+[[mutant]]
+id = "profile-seed-not-marked"
+description = "WRAP the estimate mark on the PlayerProfile HP seed, whose max is a guess and whose hp_pct is derived from it"
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-net/src/packet_handler.rs"
+  anchor = '''
+            gs.mark_hp_estimated();
+'''
+  replacement = '''
+            if false { gs.mark_hp_estimated(); }
+'''
+
+[[mutant]]
+id = "death-zero-not-marked"
+description = "WRAP the estimate mark on the OP_Death zeroing — the death is authoritative, the number is not"
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-net/src/packet_handler.rs"
+  anchor = '''
+        gs.mark_hp_estimated();
+        gs.strategy  = "Dead — POST /v1/lifecycle/respawn to revive".into();
+'''
+  replacement = '''
+        if false { gs.mark_hp_estimated(); }
+        gs.strategy  = "Dead — POST /v1/lifecycle/respawn to revive".into();
+'''
+
+[[mutant]]
+id = "respawn-assumption-confirms"
+description = "WRAP the respawn write so the client's full-HP assumption goes back through update_hp and confirms itself"
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-net/src/packet_handler.rs"
+  anchor = '''
+    gs.update_hp_estimated(gs.player_id, full, full); // cur=max → hp_pct=100, consistent with hp/hp_max
+'''
+  replacement = '''
+    if false { gs.update_hp_estimated(gs.player_id, full, full); } else { gs.update_hp(gs.player_id, full, full); }
+'''
+
+[[mutant]]
+id = "fall-damage-site-restores-the-raw-write"
+description = "WRAP the shared-method call at the client-computed fall-damage site and put the raw subtraction back. DECLARED GREEN: this call site is inside ActionLoop::stream_position, which needs a live CharacterController, and no test in the suite drives it. The row is here because leaving it out would let the PR imply a coverage it does not have."
+expect = "GREEN"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-net/src/action_loop.rs"
+  anchor = '''
+                    gs.apply_local_hp_damage(dmg as i32);
+'''
+  replacement = '''
+                    if false { gs.apply_local_hp_damage(dmg as i32); } else {
+                        gs.cur_hp = (gs.cur_hp - dmg as i32).max(0);
+                    }
+'''

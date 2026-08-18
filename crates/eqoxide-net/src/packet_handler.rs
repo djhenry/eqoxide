@@ -1690,6 +1690,15 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
             gs.cur_hp = p.cur_hp as i32;
             if gs.max_hp <= 0 { gs.max_hp = p.cur_hp as i32; }
             gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
+            // #1005: `p.cur_hp` IS server-sent, but the profile carries no max — so when max is
+            // unknown it is seeded = cur and the `hp_pct` two lines up reads 100 for a character
+            // that zoned in wounded. The published triple therefore contains a client-derived
+            // component until the first real OP_HPUpdate, and this counts as an estimate write. The
+            // rule is kept mechanical (this path NEVER confirms) rather than conditional on
+            // `max_hp` already being nonzero, because a max learned from an earlier profile seed is
+            // itself a guess, and tracking that provenance separately would be a second flag able
+            // to drift from this one.
+            gs.mark_hp_estimated();
             // A profile with HP means we're alive (respawn/zone-in) → clear death bookkeeping.
             gs.player_dead = false;         // nav walker / dead pose (eqoxide#61)
             gs.player_dead_since = None;    // respawn safety-net timer (eqoxide#50)
@@ -1931,6 +1940,10 @@ pub fn apply_death(gs: &mut GameState, payload: &[u8]) {
         // player's own model keeps standing. Respawn reseeds cur_hp from the fresh
         // PlayerProfile, so the avatar stands back up automatically. (eqoxide#44)
         gs.cur_hp    = 0;
+        // #1005: the DEATH is authoritative (`dead` is published from `player_dead`), but the
+        // NUMBER zero is the client's inference from it — no OP_HPUpdate said 0. Mark it, so an
+        // agent reading `hp` cannot mistake this inference for a server reading.
+        gs.mark_hp_estimated();
         gs.strategy  = "Dead — POST /v1/lifecycle/respawn to revive".into();
         let killer = gs.killed_by.clone();
         tracing::info!("EQ: combat: *** You have been slain by {killer}! ***");
@@ -2036,9 +2049,16 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     // the true post-heal HP.
     let beneficial_spell = spellid != 0 && spellid != SPELL_UNKNOWN
         && eqoxide_core::spells::global().is_some_and(|d| d.is_beneficial(spellid));
+    // #1005: the subtraction is kept — an agent still gets a per-hit reading — but it goes through
+    // `GameState::apply_local_hp_damage`, which marks the result an ESTIMATE. Before that, a
+    // `#damage` event whose two damage lines each landed here drove the client's own arithmetic to
+    // `hp: 0` while the server held 214/441, and `/v1/observe/debug` published that zero as
+    // indistinguishable from server truth for up to 2.477 s (reproduced 2 of 2). The double-apply
+    // itself is NOT suppressed here: whether the doubled line is a server-side artefact of the GM
+    // command or a genuine duplicate the client must tolerate is not established (#1005), and
+    // guessing would replace a marked estimate with an unmarked one.
     if target_id == gs.player_id && damage > 0 && gs.max_hp > 0 && !beneficial_spell {
-        gs.cur_hp = (gs.cur_hp - damage).max(0);
-        gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
+        gs.apply_local_hp_damage(damage);
     }
 
     // Remember who is swinging at us (hit OR miss) so auto-combat can engage an add that aggros
@@ -3021,7 +3041,9 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     // cur_hp/max_hp stale, so without this the HUD/API show a dead-but-full contradiction
     // (hp/hp_max full, hp_pct 0) until some later OP_HPUpdate happens to reconcile it (eqoxide#68).
     let full = gs.max_hp.max(1);
-    gs.update_hp(gs.player_id, full, full); // cur=max → hp_pct=100, consistent with hp/hp_max
+    // #1005: "real EQ revives at FULL HP" is the client's assumption about server behaviour, not a
+    // figure the server sent — `update_hp_estimated` writes it without marking it confirmed.
+    gs.update_hp_estimated(gs.player_id, full, full); // cur=max → hp_pct=100, consistent with hp/hp_max
     gs.strategy = "Respawning...".into();
     gs.log_msg("zone", "Respawning at bind point");
 }
@@ -4161,6 +4183,132 @@ mod tests {
         apply_combat_damage(&mut gs, &dmg(7, 99, 9999)); // lethal hit
         assert_eq!(gs.cur_hp, 0, "HP clamps at 0");
         assert!((gs.hp_pct - 0.0).abs() < 1e-4);
+    }
+
+    /// #1005 — THE MEASURED SCENARIO, driven over the real packet path.
+    ///
+    /// The server held the character at 214/441. One `#damage` command produced TWO
+    /// OP_Damage lines; `apply_combat_damage` subtracted each, so the client's own arithmetic
+    /// reached 0 and `/v1/observe/debug` published `hp: 0` — for up to 2.477 s, `dead: false`
+    /// across all 27,527 samples, no OP_Death packet, reproduced 2 of 2.
+    ///
+    /// A live run cannot discharge "the client never publishes a value the server did not send" —
+    /// it can only show the path CAN be right. This drives the update path instead, and asserts the
+    /// property the acceptance bar names: the value may still be an estimate, but it can never be
+    /// indistinguishable from a confirmation.
+    #[test]
+    fn one_damage_event_double_applied_never_publishes_a_fabricated_hp_as_verified_1005() {
+        use super::apply_combat_damage;
+        let dmg = |target: u16, source: u16, damage: i32| -> [u8; 13] {
+            let mut b = [0u8; 13];
+            b[0..2].copy_from_slice(&target.to_le_bytes());
+            b[2..4].copy_from_slice(&source.to_le_bytes());
+            b[9..13].copy_from_slice(&damage.to_le_bytes());
+            b
+        };
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.update_hp(7, 214, 441); // the server's last word, as measured
+        assert!(gs.hp_verified(), "precondition: the server's own figure reads verified");
+
+        // A miss, and a hit on somebody else, are the reach controls: neither is client arithmetic
+        // on OUR HP, so neither may spend the confirmation.
+        apply_combat_damage(&mut gs, &dmg(7, 99, 0));
+        assert!(gs.hp_verified(), "a miss writes no HP, so it must not mark ours an estimate");
+        apply_combat_damage(&mut gs, &dmg(99, 7, 50));
+        assert!(gs.hp_verified(), "damage to an NPC must not mark OUR HP an estimate");
+        assert_eq!(gs.cur_hp, 214, "control: neither line moved our HP");
+
+        // The one `#damage` event's two damage lines.
+        apply_combat_damage(&mut gs, &dmg(7, 99, 107));
+        apply_combat_damage(&mut gs, &dmg(7, 99, 107));
+        assert_eq!(gs.cur_hp, 0,
+            "control: the double-apply really does reach the fabricated zero on this path");
+        assert!(!gs.hp_verified(),
+            "hp: 0 for a character the server holds at 214/441 must never read as server truth");
+
+        // And the correction: the next OP_HPUpdate is the sole path back.
+        gs.update_hp(7, 214, 441);
+        assert!(gs.hp_verified());
+        assert_eq!(gs.cur_hp, 214);
+    }
+
+    /// #1005 — the OTHER three client-side writers of the published self-HP. Each publishes a
+    /// number no OP_HPUpdate carried, and each must therefore leave `hp_verified()` false.
+    #[test]
+    fn every_client_derived_self_hp_write_leaves_it_unverified_1005() {
+        use super::{apply_bind_respawn, apply_death, apply_player_profile};
+
+        // 1. The PlayerProfile seed (eqoxide#19). `cur_hp` IS server-sent, but the profile carries
+        //    no max — so max is seeded = cur and hp_pct reads 100 for a character that zoned in
+        //    wounded. The percent is a client-derived number even though the HP is not.
+        //
+        //    Both sub-cases below assert something the seed MOVED, not something that merely
+        //    happened to be false already: 1a counts the estimate write, and 1b starts from a
+        //    genuinely confirmed state. An earlier draft asserted only `!hp_verified()` on a fresh
+        //    `GameState`, where it is false before the call — the WRAP mutation over this seed's
+        //    `mark_hp_estimated()` stayed GREEN and exposed it (`profile-seed-not-marked`).
+        let profile = |cur_hp: u32| -> Vec<u8> {
+            let mut buf = vec![0u8; 1000];
+            buf[21] = 1; buf[22] = 10;
+            buf[948..952].copy_from_slice(&cur_hp.to_le_bytes()); // cur_hp, no max anywhere
+            buf
+        };
+
+        // 1a. First zone-in, no max ever learned: the max is a guess and the percent is derived
+        //     from the guess, so the seed owes an estimate write.
+        let mut gs = GameState::new();
+        gs.player_id = 0; // profile path writes the player branch
+        assert_eq!(gs.unverified_hp_writes, 0, "precondition: nothing owed yet");
+        apply_player_profile(&mut gs, &profile(214));
+        assert_eq!(gs.cur_hp, 214, "control: the seed really did run");
+        assert!((gs.hp_pct - 100.0).abs() < 1e-3,
+            "control: the seeded percent really is the 100 that the guessed max produces");
+        assert_eq!(gs.unverified_hp_writes, 1,
+            "the seed must RECORD its estimate, not merely inherit an unconfirmed state (#1005)");
+        assert!(!gs.hp_verified(),
+            "a percent derived from a guessed max is not a figure the server sent (#1005)");
+
+        // 1b. A later zone line, with a max already confirmed by an OP_HPUpdate in the last zone.
+        //     The seed still writes a percent the server never sent, so it must SPEND that
+        //     confirmation — this is the sub-case where `hp_verified()` has somewhere to fall from.
+        let mut gs = GameState::new();
+        gs.player_id = 0;
+        gs.update_hp(0, 441, 441);
+        assert!(gs.hp_verified(), "precondition: the previous zone's OP_HPUpdate was confirmed");
+        apply_player_profile(&mut gs, &profile(214));
+        assert_eq!((gs.cur_hp, gs.max_hp), (214, 441), "control: the seed ran and kept the real max");
+        assert!(!gs.hp_verified(),
+            "a zone-in seed is not an OP_HPUpdate; the prior confirmation does not carry (#1005)");
+
+        // 2. The OP_Death zeroing. The DEATH is authoritative; the number zero is an inference.
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.update_hp(7, 441, 441);
+        assert!(gs.hp_verified(), "precondition");
+        let mut pkt = [0u8; 32];
+        pkt[0..4].copy_from_slice(&7u32.to_le_bytes());
+        apply_death(&mut gs, &pkt);
+        assert_eq!(gs.cur_hp, 0, "control: the death path really did zero it");
+        assert!(gs.player_dead, "control: and `dead` — which IS authoritative — is set");
+        assert!(!gs.hp_verified(),
+            "no OP_HPUpdate said 0; `dead` is the confirmed channel, the number is not");
+
+        // 3. The bind-respawn "real EQ revives at FULL HP" assumption (eqoxide#68).
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.update_hp(7, 441, 441);
+        gs.hp_pct = 0.0; gs.cur_hp = 34; gs.max_hp = 34; // the post-death contradiction #68 fixes
+        gs.hp_confirmed = true; gs.unverified_hp_writes = 0; // and pretend it was all confirmed
+        let mut pkt = [0u8; 20];
+        pkt[4..8].copy_from_slice(&100.0f32.to_le_bytes());
+        pkt[8..12].copy_from_slice(&200.0f32.to_le_bytes());
+        pkt[12..16].copy_from_slice(&(-5.0f32).to_le_bytes());
+        apply_bind_respawn(&mut gs, &pkt);
+        assert!((gs.hp_pct - 100.0).abs() < 1e-4, "control: #68's full-HP revive still happens");
+        assert!(!gs.hp_verified(),
+            "\"real EQ revives at full HP\" is the client's assumption about the server, not a \
+             reading from it");
     }
 
     #[test]
