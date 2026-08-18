@@ -421,7 +421,9 @@ def count_tracked(root: str) -> int:
     cannot fail" and called it the round-1 bucket-identity defect one level up. THAT WAS FALSE, and
     review demonstrated it by building the design and running it. The control below is right; the
     reason given for it was not, and a false reason would have taught the next reader to reject a
-    design that works.
+    design that works. The commit that introduced this control, `23ddd63`, carries that same false
+    rationale in its message; commit messages are immutable, so it is corrected here and in the PR
+    record rather than rewritten there.
     """
     out = subprocess.run(
         ["git", "-C", root, "ls-files", "-z"], capture_output=True, text=True, check=True
@@ -438,12 +440,29 @@ def corpus_accounts_for(read: int, binary: int, unreadable: int, excluded: int, 
     its terms. Measured (round 7): booking dropped files as `skipped_binary` instead of reading them
     passes at exit 0, over a corpus shrunk to a fraction of the tree, with findings missing.
 
-    Verifying a name-level PARTITION would not close that gap either, and it is worth writing down
-    so nobody spends the effort expecting it to: a mis-credited file is still accounted exactly once,
-    just under the wrong heading, so it satisfies the partition. Distinguishing the headings means
-    re-deciding "is this really binary?" — re-implementing the classification and trusting the copy.
-    The gap is therefore STATED here rather than closed, and it is narrower than the one this catches:
-    mis-crediting requires editing the outcome bookkeeping, not merely dropping a `continue` in.
+    Verifying a name-level PARTITION would not close that gap: a mis-credited file is still accounted
+    exactly once, just under the wrong heading, so it SATISFIES the partition. That half stands.
+
+    An earlier revision of this docstring went on to say that distinguishing the headings therefore
+    "means re-deciding 'is this really binary?' — re-implementing the classification and trusting the
+    copy", prefaced by the claim that it was worth writing down so nobody spent the effort. THAT STEP
+    WAS FALSE, and round-8 review refuted it by construction rather than by argument: it built a
+    ~12-line check over `git ls-files --eol`, comparing the paths git marks `i/-text` against what
+    this function's caller books as binary. It opens no file and reads no byte. It does not
+    re-implement the NUL test — it asks a DIFFERENT AUTHORITY for that authority's verdict, the same
+    move `count_tracked` makes above by asking git again instead of re-counting. Measured: it refuses
+    the mis-credit attack (`38 booked binary that git calls TEXT`) and does not false-alarm on the
+    unmutated corpus.
+
+    So the mis-credit gap IS closable for the `binary` heading, and is tracked in #1026 — not landed
+    here, because the reviewer wrote that code and landing it in the PR it reviewed would end that
+    reviewer's independence on the hunk. The `unreadable` heading is a different matter and the original
+    argument holds there: any independent signal amounts to trying to open the file, which IS the
+    same test.
+
+    THE GAP IS THEREFORE REAL AND STILL OPEN IN THIS FILE, stated rather than closed. It is narrower
+    than the one this catches — mis-crediting requires editing the outcome bookkeeping, not merely
+    dropping a `continue` in.
 
     `tracked` must come from `count_tracked`, not from the list `read_corpus` walked; see there for
     which mutation that independence does and does not cover.
