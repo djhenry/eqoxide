@@ -502,12 +502,22 @@ Two consequences worth knowing:
   (This second case is a reading of the server source, not something observed.)
 
 **Fall damage in the combat log.** The `Fell Nu — reported N fall damage to the server` line reports
-what the client **asked for**, not what you took. The server may scale that number by resist and AA
-bonuses and a rule multiplier, or refuse it entirely (GM, invulnerable, invulnerable to
-environmental damage, the tutorial and load zones, or standing in liquid) and deduct 1 instead. The
-`hp` that follows the next `OP_HPUpdate` is the outcome; the log line is the request. Measured: the
-server answered `Your GM status protects you from 160 points of Falling (Type 252) damage` and
-applied **1**, while the old line announced `Fell 39u — 160 fall damage` (#1029).
+what the client **asked for**, not what you took. The server may scale that number by the
+environment-damage modifier, then by the spell/item/AA `ReduceFallDamage` bonuses, then by a rule
+multiplier, and apply the result — or refuse it. The refusals are not uniform, in either the amount
+or whether you hear about it:
+
+| server branch | HP change | update sent? |
+|---|---|---|
+| normal | scaled damage applied | yes, immediately |
+| GM, invulnerable, invulnerable to environmental damage, still loading | **−1** | no — only on the next 2 s poll, and only because that −1 passed the change gate |
+| standing in liquid, tutorial and load zones | **none** | **no — ever**, because no HP ever changed |
+
+So do not treat a fall as a promise that a fresh `hp` is about to arrive. The `hp` that follows the
+next `OP_HPUpdate` is the outcome; the log line is only the request. Measured: the server answered
+`Your GM status protects you from 160 points of Falling (Type 252) damage` and applied **1**, while
+the old line announced `Fell 39u — 160 fall damage` (#1029). That measured run exercised the GM
+branch; the invulnerability branches remain unexercised.
 
 ### `hold` — the character is physically stuck and the client cannot free it (#724)
 

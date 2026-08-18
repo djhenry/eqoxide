@@ -198,8 +198,17 @@ pub struct PlayerState {
     /// bind-respawn full-HP assumption (eqoxide#68), and the PlayerProfile seed (eqoxide#19), whose
     /// max is a guess.
     ///
-    /// It covers `target_hp_pct` too while the player is self-targeted (F1), because that field then
-    /// resolves from the same `hp_pct`. Conservative by design: false under-claims, and the one
+    /// While the player is self-targeted, `hp_verified` also reads false in every state where
+    /// `target_hp_pct` could be client-derived, so it covers that field too. The MECHANISM is not
+    /// "the field resolves from the same `hp_pct`" — an earlier version of this doc said that and
+    /// it is wrong. `target_hp_pct` is refreshed only by `set_target`, `clear_target`, `write_hp`
+    /// and `update_hp_pct`; the `OP_Death` zeroing and the PlayerProfile seed write `cur_hp` and
+    /// `hp_pct` RAW and leave `target_hp_pct` as a stale snapshot. A self-targeted character that
+    /// dies therefore publishes `hp: 0, dead: true` beside `target_hp_pct: 100` in one payload.
+    /// `hp_verified` is false there, so the coverage claim holds and nothing reads as server truth
+    /// — but the two numbers still disagree in the body, which is a pre-existing honesty defect on
+    /// the raw-write paths that this flag masks rather than fixes. Tracked as eqoxide#1033; not
+    /// fixed here. Conservative by design: false under-claims, and the one
     /// outcome #1005 rules out is a `200` carrying a client-derived figure that reads as server
     /// truth. It is NOT a freshness signal: self-HP is change-gated at the server (a measured
     /// 204.5 s idle window produced zero self updates), so `true` says the vitals match the last

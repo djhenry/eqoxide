@@ -243,7 +243,14 @@ unit tests, but NOT exhaustively live. Still to do:
 - Live-test an actual controlled-fall descent end-to-end with a character that can SURVIVE the drop
   (Keebler L1/20hp's guard correctly refuses the ~42u qcat drop, max ~364 dmg — need a mid-level
   char or a shorter drop). Confirm: server accepts the descending position updates (no rubber-band),
-  the bot lands in the qcat lower sewer, OP_EnvDamage is accepted and HP drops by the sent amount.
+  the bot lands in the qcat lower sewer, and OP_EnvDamage is accepted. Do NOT expect HP to drop by
+  the sent amount — #1005/#1029 established that it usually will not. The server scales the number
+  we send (environment-damage modifier, spell/item/AA `ReduceFallDamage`, rule multiplier), or
+  deducts 1 instead (GM, invulnerable, still loading), or ignores it entirely (in liquid, tutorial
+  and load zones) — and on every branch but the first it sends no HP update at that moment either.
+  A run written against "HP drops by the sent amount" will read a correct server as a failure. The
+  thing to confirm is that the packet is ACCEPTED (no DECODE_LENGTH_EXACT drop, cf. #195), and to
+  record what the server actually applied — never to assert our own figure back.
 - Validate the fall-damage curve vs the real client across drop heights (10/20/30/42/60u); tune
   GRAVITY/HZ in `fall_damage` if magnitudes diverge from native.
 - Check water/levitate negation: a fall ending in water (or with Levitate) should take 0 — confirm

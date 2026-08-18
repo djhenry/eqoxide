@@ -193,9 +193,16 @@ pub const OP_BUFF_CREATE: u16 = 0x3377;       // RoF2: OP_BuffCreate
 
 // Pet control: PetCommand_Struct { command:u32, target:u32 }. Command values from
 // EQEmu zone/common.h: PET_ATTACK=2, PET_GUARDHERE=5, PET_FOLLOWME=4(GetOwner), PET_BACKOFF=28.
-// Environmental (fall/lava/drown) damage — CLIENT-COMPUTED in native EQ; the server only validates
-// and applies it. EnvDamage2_Struct (31b): id@0, damage(u32)@6, dmgtype(u8)@22 (0xFC=falling),
-// constant(u16)@27=0xFFFF. See ~/git/eq_kb/falling-physics.md.
+// Environmental (fall/lava/drown) damage — the MAGNITUDE is CLIENT-COMPUTED in native EQ, because
+// the server has no fall detection and reads the number straight out of the `damage` field below.
+// It does NOT merely validate that report: `Client::Handle_OP_EnvDamage` (zone/client_packet.cpp)
+// may scale it, apply it, refuse it outright, or ignore it entirely depending on the branch taken —
+// see `fall_damage` in eqoxide-core/src/physics.rs for the full enumeration. An earlier version of
+// this comment said "the server only validates and applies it"; that was wrong, and #1005 retracts
+// it in physics.rs as plausibly why a local HP subtraction once looked necessary beside the send.
+// The value we send is what we ASK FOR, never what the player took, and must not be subtracted from
+// any published HP. EnvDamage2_Struct (31b): id@0, damage(u32)@6, dmgtype(u8)@22 (0xFC=falling),
+// constant(u16)@27=0xFFFF. Derivation: `falling-physics.md` in the private EQ knowledge-base tree.
 pub const OP_ENV_DAMAGE: u16 = 0x51fd;        // RoF2: OP_EnvDamage
 pub const DMGTYPE_FALLING: u8 = 0xFC;
 

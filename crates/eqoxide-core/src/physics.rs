@@ -472,9 +472,17 @@ pub fn running_jump_reach(run_speed: f32) -> f32 {
 /// possibly scaled it by the environment-damage modifier and the spell/item/AA `ReduceFallDamage`
 /// bonuses — or refused it entirely, deducting exactly 1 instead, for a GM, `GetInvul()`,
 /// `GetInvulnerableEnvironmentDamage()`, or (with no HP change at all) in liquid on a zone with a
-/// water map and in the tutorial/load zones. It then calls `SendHPUpdate()`. So the value this
-/// function returns is what we ASK FOR, never what the player took, and it must not be subtracted
-/// from any published HP.
+/// water map and in the tutorial/load zones.
+///
+/// Whether anything is sent BACK also differs by branch, and the two must not be collapsed: only
+/// the branch that actually applies the damage falls through to `SendHPUpdate()`. Every refusal
+/// returns before it, and `Mob::SetHP` sends nothing on its own. So on the GM / invulnerable
+/// branches the correction reaches the client only when the 2 s `hpupdate_timer` poll next runs,
+/// and only because that `-1` moved `current_hp` past `SendHPUpdate`'s change gate; on the liquid
+/// and tutorial/load branches NO update is ever sent, because no HP ever changed. There is no
+/// branch on which an authoritative number can be assumed to be coming promptly. Either way, the
+/// value this function returns is what we ASK FOR, never what the player took, and it must not be
+/// subtracted from any published HP.
 ///
 /// Model: impact velocity = min(terminal, sqrt(2·g·h)) converted to the client's internal
 /// per-update z-velocity units (~5-13); then `fall_score = |z_vel| − 4` (char_counter≈0, no

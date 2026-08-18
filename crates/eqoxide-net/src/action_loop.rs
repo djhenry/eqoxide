@@ -3016,16 +3016,32 @@ impl ActionLoop {
                     // of them with `hp_pct` left un-recomputed beside the moved `cur_hp`. One event
                     // published `cur_hp = 0` with `dead: false` while the server held 440/441: the
                     // `.max(0)` clamp is what turned an already-wrong number into the specific
-                    // false answer "you are dead" rather than something visibly nonsensical. The same handler may
-                    // refuse it outright (GM, `GetInvul()`, `GetInvulnerableEnvironmentDamage()`,
-                    // the tutorial/load zones, or standing in liquid on a zone with a water map) or
-                    // scale it by the environment-damage modifier, the spell/item/AA
-                    // `ReduceFallDamage` bonuses and that rule multiplier — and on the refusal
-                    // branches it deducts exactly 1 instead. It then calls `SendHPUpdate()`, so the
-                    // authoritative number arrives on its own. Computing damage is required here
-                    // ONLY because the protocol makes us report it; applying our own figure to
-                    // published state is what made `/v1/observe/debug` publish an HP the server
-                    // never sent.
+                    // false answer "you are dead" rather than something visibly nonsensical.
+                    //
+                    // What the handler actually does with our number, branch by branch
+                    // (`Client::Handle_OP_EnvDamage`, zone/client_packet.cpp) — the amounts differ
+                    // AND so does whether anything is sent back, so the two must not be collapsed:
+                    //   * not finished loading → `SetHP(GetHP() - 1)`, return
+                    //   * in liquid on a water-mapped zone → return, HP UNCHANGED
+                    //   * GM / `GetInvul()` / `GetInvulnerableEnvironmentDamage()`
+                    //                        → `SetHP(GetHP() - 1)`, return
+                    //   * tutorial/load zones → return, HP UNCHANGED
+                    //   * otherwise → scale by the environment-damage modifier, then by the
+                    //     spell/item/AA `ReduceFallDamage` bonuses, then by
+                    //     `RuleR(Character, EnvironmentDamageMulipliter)`, apply, fall through.
+                    // So a refusal deducts 1 on some branches and NOTHING at all on liquid and
+                    // tutorial/load. The trailing `SendHPUpdate()` is reached ONLY on that last
+                    // branch: every refusal returns before it and `Mob::SetHP` sends nothing
+                    // itself. On GM — the branch this PR actually measured live — the handler
+                    // therefore sends nothing, and the correction reaches us only when the 2 s
+                    // `hpupdate_timer` poll next runs, and only because that `-1` moved
+                    // `current_hp` past `SendHPUpdate`'s change gate. On liquid and tutorial/load
+                    // NO update is ever sent, because no HP ever changed. There is no branch on
+                    // which we may assume an authoritative number is coming promptly, which is
+                    // exactly why the client must publish what the server said and nothing else.
+                    // Computing damage is required here ONLY because the protocol makes us report
+                    // it; applying our own figure to published state is what made
+                    // `/v1/observe/debug` publish an HP the server never sent.
                     //
                     // The log line therefore reports the REQUEST, in those words. Driving it from
                     // the resulting server HP update instead was considered and rejected: on the

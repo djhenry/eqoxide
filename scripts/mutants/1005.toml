@@ -185,7 +185,7 @@ expect = "GREEN"
 
 [[mutant]]
 id = "env-damage-report-never-sent"
-description = "WRAP the OP_ENV_DAMAGE send. This is the row that matters most for the deletion being SAFE: the server has no fall detection and reads the magnitude out of EnvDamage2_Struct.damage, so without this packet the player silently never takes fall damage — a worse lie than the one being fixed. DECLARED GREEN, same reason as the row above: nothing in the suite drives ActionLoop::stream_position, so deleting the fall report is currently unguarded. Disclosed, not papered over."
+description = "WRAP the OP_ENV_DAMAGE send. This is the row that matters most for the deletion being SAFE: the server has no fall detection and reads the magnitude out of EnvDamage2_Struct.damage, so without this packet the player silently never takes fall damage — a worse lie than the one being fixed. DECLARED GREEN, same reason as the row above: nothing in the suite drives ActionLoop::stream_position, so deleting the fall report is currently unguarded. Disclosed, not papered over — and filed as eqoxide#1032, whose acceptance test is flipping this row from a declared GREEN to a measured RED."
 expect = "GREEN"
 
   [[mutant.edit]]
