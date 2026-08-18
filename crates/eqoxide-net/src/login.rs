@@ -15,7 +15,7 @@ use des::Des;
 
 use eqoxide_core::config::{CharacterCreate, LoginConfig};
 use crate::gameplay::{record_app_packet, run_gameplay_phase};
-use crate::action_loop::ActionLoop;
+use crate::action_loop::{ActionLoop, publish_doors};
 use crate::packet_handler::apply_packet;
 use crate::protocol::*;
 use crate::transport::{AppPacket, EqStream};
@@ -100,7 +100,7 @@ pub async fn run_login_flow(
             tracing::warn!("EQ: retry {}/{}", attempt, max_retries);
             sleep(Duration::from_secs(3)).await;
         }
-        match run_login_phase(&config, &net_health, &controller).await {
+        match run_login_phase(&config, &net_health, &controller, &interact.doors_shared).await {
             // A server-rejected create can't succeed on retry — surface it and stop now so the
             // user sees the real reason instead of an endless "Login timed out" loop. (#6)
             Err(LoginError::Fatal(e)) => return Err(e),
@@ -158,10 +158,48 @@ fn record_login_liveness(net_health: &eqoxide_ipc::NetHealthShared, now: std::ti
 /// (multiple server hops + a fresh char list), and without this the connection-health check
 /// (`connected` in `/v1/observe/debug`) would falsely go stale/disconnected while login is healthy
 /// and simply still in progress.
+///
+/// `doors` is the published `GET /v1/observe/doors` roster (#1022). It is a bare
+/// [`eqoxide_ipc::DoorsShared`] rather than the whole `InteractSlots`, and NOT an `ActionLoop` —
+/// the loop does not exist yet at this point in `run_login_flow`, which is precisely why this path
+/// had no door publisher before. Same slot, same projection (`action_loop::publish_doors`) and same
+/// per-drain-pass gate `run_zone_entry_handshake` uses on the re-zone path; see the call site in
+/// [`run_login_handshake`]'s drain.
+///
+/// This wrapper owns ONE thing beyond that state machine: a login attempt that FAILS must not
+/// leave the door roster it published standing. That is the shape #1016 review B4 found on the
+/// re-zone path, arriving on this one the moment #1022 gave it a publisher — a timeout, a rejected
+/// credential or a dropped world/zone reconnect after even one `OP_SpawnDoor` had landed would
+/// otherwise leave a partial, well-formed, readable roster of a zone the client never entered,
+/// served by GET /v1/observe/doors and clickable through POST /v1/interact/click_door, for the
+/// whole 3s backoff AND the entire next attempt (which starts from a fresh `GameState`, so nothing
+/// republishes over the stale rows until that attempt drains its own first packet). Empty is the
+/// honest reading of a failed login: no zone was entered, so no zone's doors are ours to report.
+///
+/// It is a wrapper rather than a `clear()` at each error exit because [`run_login_handshake`] has
+/// six of them today — three explicit `return Err`s (`PhaseResult::Error`, `PhaseResult::Fatal`,
+/// the `is_timed_out` arm) and three `?`s on `EqStream::connect` (login, world reconnect, zone
+/// reconnect) — and a seventh added later must not be able to skip it. Pinned by
+/// `run_login_phase_clears_the_roster_it_published_when_the_attempt_fails_1022`.
 async fn run_login_phase(
     config: &LoginConfig,
     net_health: &eqoxide_ipc::NetHealthShared,
     controller: &eqoxide_ipc::ControllerSlots,
+    doors: &eqoxide_ipc::DoorsShared,
+) -> Result<(EqStream, UnboundedReceiver<AppPacket>, GameState, WorldCredentials), LoginError> {
+    let outcome = run_login_handshake(config, net_health, controller, doors).await;
+    if outcome.is_err() {
+        doors.lock().unwrap().clear();
+    }
+    outcome
+}
+
+/// The login state machine itself — see [`run_login_phase`], the only caller, for what wraps it.
+async fn run_login_handshake(
+    config: &LoginConfig,
+    net_health: &eqoxide_ipc::NetHealthShared,
+    controller: &eqoxide_ipc::ControllerSlots,
+    doors: &eqoxide_ipc::DoorsShared,
 ) -> Result<(EqStream, UnboundedReceiver<AppPacket>, GameState, WorldCredentials), LoginError> {
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<AppPacket>();
 
@@ -181,7 +219,9 @@ async fn run_login_phase(
         stream.poll_recv();
         stream.poll_resend(); // retransmit un-ACKed login reliables (#254)
 
+        let mut drained_a_packet = false;
         while let Ok(packet) = net_rx.try_recv() {
+            drained_a_packet = true;
             // Apply gameplay side effects.
             apply_packet(&mut gs, &packet);
             record_login_liveness(net_health, std::time::Instant::now());
@@ -226,12 +266,45 @@ async fn run_login_phase(
             }
         }
 
+        // #1022: publish the door roster from THIS drain too, on the same
+        // `drained_a_packet` gate `run_zone_entry_handshake` uses for its own copy of this call
+        // (#937/#1016 review B1) — `gs.world.doors` cannot have changed on a pass that applied
+        // nothing, so an ungated call would be pure lock/clone churn on every 10ms tick of a
+        // handshake that can run for a minute.
+        //
+        // Before this line the FIRST zone-in of a session had no door publisher at all. #937/#1016
+        // gave `run_zone_entry_handshake` one, but that function is only reachable from
+        // `run_gameplay_phase` — i.e. only on a RE-zone. The first zone-in runs this state machine
+        // instead, and `apply_packet` above routes `OP_SPAWN_DOOR` into `gs.world.doors` exactly as
+        // it does there, so the records were held, applied, and never published: GET
+        // /v1/observe/doors served a fresh, well-formed, confident `[]` for a zone whose doors the
+        // client had already parsed, and POST /v1/interact/click_door answered the empty-roster 404
+        // for a door it knew about. That window ran from session start until `run_gameplay_phase`
+        // drained its first packet, because `ActionLoop::sync_doors`' one call site is that drain
+        // and it is unconditional per drained packet — so it was NOT bounded by door arrival, it
+        // spanned the whole login handshake (connect, auth, char select, world reconnect, zone
+        // connect, zone load).
+        if drained_a_packet {
+            publish_doors(&gs, doors);
+        }
+
         sleep(Duration::from_millis(10)).await;
 
         if proto.is_timed_out() {
             return Err(LoginError::Retryable("Login timed out".to_string()));
         }
     }
+
+    // #1022: `PhaseResult::Done` breaks 'login from INSIDE the inner drain, so the gated publish
+    // above never runs for the pass that ended the handshake. Without this line every door record
+    // applied on that final pass — which on a fast server is where the whole burst lands, since
+    // EQEmu queues OP_SpawnDoor and the OP_SendExpZonein this state machine completes on from the
+    // SAME connect-phase handler, doors first (EQEmu `zone/client_packet.cpp`,
+    // `Handle_Connect_OP_ReqClientSpawn`) — would stay unpublished until `run_gameplay_phase`
+    // drained its first packet. Unconditional rather than gated: this runs exactly once per
+    // successful login, so there is no churn to gate away, and gating it on a flag scoped to the
+    // last loop iteration would be a second, subtler way to miss the same pass.
+    publish_doors(&gs, doors);
 
     let world_creds = WorldCredentials {
         lsid:       proto.lsid,
@@ -983,5 +1056,222 @@ mod sod_login_tests {
         let (id, host, _name) = parse_server_list_payload(&p, "myfallback");
         assert_eq!(id, 9);
         assert_eq!(host, "myfallback");
+    }
+}
+
+// ── #1022: the login path's door publisher ────────────────────────────────────
+#[cfg(test)]
+mod login_door_publish_tests {
+    use super::*;
+
+    /// One RoF2 `OP_SpawnDoor` wire record. 100 bytes, NOT the 80-byte server struct — EQEmu's
+    /// RoF2 patch re-serialises 1:1 into 100-byte records, and `apply_spawn_doors` strides by 100.
+    /// Only the fields this test reads back are set; the rest stay zero.
+    fn door_record(door_id: u8, name: &str) -> Vec<u8> {
+        let mut r = vec![0u8; 100];
+        r[..name.len()].copy_from_slice(name.as_bytes()); // name[32], NUL-padded
+        r[60] = door_id;
+        r[61] = 58; // opentype
+        r
+    }
+
+    /// A datagram carrying one reliable application packet, framed exactly as the server frames it
+    /// for a session that negotiated `crc_bytes = 0` and no encode passes (which is what the
+    /// all-zero `OP_SessionResponse` body below negotiates):
+    /// `[0x00, OP_PACKET, seq(BE u16), opcode(LE u16), payload…]`.
+    fn reliable(seq: u16, opcode: u16, payload: &[u8]) -> Vec<u8> {
+        let mut d = vec![0x00u8, OP_PACKET];
+        d.extend_from_slice(&seq.to_be_bytes());
+        d.extend_from_slice(&opcode.to_le_bytes());
+        d.extend_from_slice(payload);
+        d
+    }
+
+    /// #1022 — the door roster must be published from `run_login_phase`'s OWN drain, not only from
+    /// `run_gameplay_phase`'s.
+    ///
+    /// # Why this test drives the real function over a real socket
+    ///
+    /// The defect is a REACH defect: the projection (`action_loop::publish_doors`) was already
+    /// correct and already tested; what was missing was any call to it on the login path. A unit
+    /// test of a helper would pin that the publish is *written*, which is exactly the kind of
+    /// evidence #799 records eight measured evasions of. So this runs the production
+    /// `run_login_phase` against a fake login server on loopback and observes `doors_shared` from
+    /// outside it, while it is still running.
+    ///
+    /// The fake server needs to be almost nothing, because an all-zero `OP_SessionResponse` body
+    /// negotiates `crc_bytes = 0`, `encode_pass1 = encode_pass2 = ENCODE_NONE` and
+    /// `encode_key = 0` (`EqStream::handle_session_response`), so the door datagram is plaintext
+    /// and unchecksummed. `OP_SPAWN_DOOR` (0x7291) is far outside the login opcode space
+    /// (0x0001..0x0031), so `LoginProtocol::handle` takes its default arm and returns `Continue` —
+    /// the login state machine keeps waiting for `OP_ChatMessage` and never completes, which is
+    /// what lets this observe the MID-handshake window the defect lives in rather than the state
+    /// after it.
+    ///
+    /// # MUTATION CHECK
+    ///
+    /// - DELETE `publish_doors(&gs, doors);` from the gated call in the drain loop → RED (the poll
+    ///   below runs out its budget; nothing else on this path ever writes `doors_shared`).
+    /// - WRAP it as `if std::hint::black_box(false) { publish_doors(&gs, doors); }` → also RED, by
+    ///   the same timeout. Per #1016 review B3's retraction this is NOT independent evidence of the
+    ///   DELETE result on a line that is already inside an `if` — `black_box(false)` simply never
+    ///   takes the branch — but it is run and recorded because the WRAP is the mutation that
+    ///   catches an inert fix, and "present but unreachable" is the failure mode this whole test
+    ///   exists to exclude.
+    ///
+    /// The post-loop unconditional `publish_doors(&gs, doors);` (the `PhaseResult::Done` escape) is
+    /// NOT covered here — reaching it requires driving the full login → world → zone handshake to
+    /// completion, which needs a fake world server and a fake zone server, not just a fake login
+    /// listener. That gap is stated in the PR rather than papered over.
+    #[tokio::test]
+    async fn run_login_phase_publishes_doors_applied_during_the_login_handshake_1022() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+
+        let doors: eqoxide_ipc::DoorsShared = Default::default();
+        let doors_bg = doors.clone();
+
+        let config = LoginConfig {
+            login_host:     "127.0.0.1".to_string(),
+            login_port:     port,
+            world_port:     port,
+            username:       "tester".to_string(),
+            password:       "secret".to_string(),
+            character_name: "Tester".to_string(),
+            create:         None,
+        };
+
+        let handle = tokio::spawn(async move {
+            let _ = run_login_phase(
+                &config,
+                &eqoxide_ipc::NetHealthShared::default(),
+                &eqoxide_ipc::ControllerSlots::default(),
+                &doors_bg,
+            ).await;
+        });
+
+        // 1. Answer the session handshake. `connect` re-sends OP_SessionRequest on its own retry
+        //    cadence, so the first datagram to arrive is one of those; any of them will do.
+        let mut buf = [0u8; 4096];
+        let (_n, client_addr) = tokio::time::timeout(
+            Duration::from_secs(10), server.recv_from(&mut buf),
+        ).await.expect("no OP_SessionRequest from run_login_phase within 10s").unwrap();
+
+        let mut session_response = vec![0x00u8, OP_SESSION_RESPONSE];
+        session_response.extend_from_slice(&[0u8; 15]); // crc_bytes = 0, both encode passes NONE
+        server.send_to(&session_response, client_addr).await.unwrap();
+
+        // 2. Deliver one door record on the very first reliable sequence, exactly as EQEmu does
+        //    during the connect phase, and let the drain apply it.
+        server.send_to(&reliable(0, OP_SPAWN_DOOR, &door_record(66, "CRATEB")), client_addr)
+              .await.unwrap();
+
+        // 3. Observe the PUBLISHED roster from outside, while `run_login_phase` is still running.
+        //    `LoginProtocol` times out at 120s and this test never lets it get near that; the
+        //    budget below is what fails, promptly, if nothing publishes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let published = doors.lock().unwrap();
+                if let Some(d) = published.first() {
+                    assert_eq!(d.door_id, 66);
+                    assert_eq!(d.name, "CRATEB");
+                    assert_eq!(published.len(), 1);
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline,
+                "an OP_SpawnDoor applied during the LOGIN handshake was never published to \
+                 `doors_shared` — GET /v1/observe/doors serves that slot verbatim, so it answers a \
+                 fresh, well-formed, confident `[]` for a zone whose doors this client has already \
+                 parsed into `gs.world.doors`, indistinguishable from a genuinely doorless zone, \
+                 and POST /v1/interact/click_door answers the empty-roster 404 for a door it knows \
+                 about (#1022)");
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        handle.abort();
+    }
+
+    /// #1022, the #1016-review-B4 shape arriving on this path with the publisher: a login attempt
+    /// that PUBLISHED a door roster and then FAILED must not leave that roster standing.
+    ///
+    /// Failure is driven the fastest honest way this state machine offers — an `OP_LoginAccepted`
+    /// whose decrypted `success` byte is 0, which `parse_login_accepted_payload` reads as an
+    /// explicit credential rejection (never as an OK — see
+    /// `login_accepted_rejects_on_success_zero`), giving `PhaseResult::Error` and a `return Err`
+    /// out of `run_login_handshake`. That is one of the six error exits the wrapper funnels.
+    ///
+    /// The premise is OBSERVED, not assumed: the roster is polled to NON-EMPTY before the rejection
+    /// is sent. Without that step this test would pass identically if the door had never been
+    /// published at all, which is the exact non-vacuity defect #1016's round-2 reviewer found in
+    /// `zone_entry_handshake_clears_published_doors_on_timeout_after_one_arrived_1016`.
+    ///
+    /// MUTATION CHECK: DELETE `doors.lock().unwrap().clear();` from `run_login_phase`'s wrapper →
+    /// RED (the roster still holds door 66 after the attempt returned Err). WRAP it as
+    /// `if std::hint::black_box(false) { doors.lock().unwrap().clear(); }` → also RED.
+    #[tokio::test]
+    async fn run_login_phase_clears_the_roster_it_published_when_the_attempt_fails_1022() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+
+        let doors: eqoxide_ipc::DoorsShared = Default::default();
+        let doors_bg = doors.clone();
+
+        let config = LoginConfig {
+            login_host:     "127.0.0.1".to_string(),
+            login_port:     port,
+            world_port:     port,
+            username:       "tester".to_string(),
+            password:       "secret".to_string(),
+            character_name: "Tester".to_string(),
+            create:         None,
+        };
+
+        let handle = tokio::spawn(async move {
+            run_login_phase(
+                &config,
+                &eqoxide_ipc::NetHealthShared::default(),
+                &eqoxide_ipc::ControllerSlots::default(),
+                &doors_bg,
+            ).await.err().map(|e| e.to_string())
+        });
+
+        let mut buf = [0u8; 4096];
+        let (_n, client_addr) = tokio::time::timeout(
+            Duration::from_secs(10), server.recv_from(&mut buf),
+        ).await.expect("no OP_SessionRequest from run_login_phase within 10s").unwrap();
+
+        let mut session_response = vec![0x00u8, OP_SESSION_RESPONSE];
+        session_response.extend_from_slice(&[0u8; 15]);
+        server.send_to(&session_response, client_addr).await.unwrap();
+        server.send_to(&reliable(0, OP_SPAWN_DOOR, &door_record(66, "CRATEB")), client_addr)
+              .await.unwrap();
+
+        // PREMISE, observed: the roster really did get published before the failure.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while doors.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline,
+                "the door never reached `doors_shared`, so this test's premise — that a FAILING \
+                 attempt had something published to leave behind — was never established (#1022)");
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        // Now reject the credentials: 10-byte LoginBaseMessage + DES(plain) with plain[0] == 0.
+        let mut rejected = vec![0u8; 10];
+        rejected.extend_from_slice(&des_encrypt(&[0u8; 32]));
+        server.send_to(&reliable(1, OP_LOGIN_ACCEPTED, &rejected), client_addr).await.unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await.expect("run_login_phase did not return within 10s of the credential rejection")
+            .unwrap();
+        assert_eq!(err.as_deref(), Some("Login credentials rejected"),
+            "the attempt must fail for the reason this test drives, not some other one");
+
+        assert!(doors.lock().unwrap().is_empty(),
+            "a FAILED login attempt left the door roster it had published standing — GET \
+             /v1/observe/doors then serves a partial, well-formed roster of a zone this client \
+             never entered, and POST /v1/interact/click_door resolves its ids, for the whole \
+             backoff and the entire next attempt (#1022; the #1016 review B4 shape on this path)");
     }
 }

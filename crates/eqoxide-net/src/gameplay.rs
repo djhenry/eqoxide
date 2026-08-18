@@ -2102,7 +2102,8 @@ mod zone_entry_handshake_publish_tests {
     /// `DoorsShared` (`Arc<Mutex<Vec<DoorView>>>`) has no compile-enforced single-publisher seal
     /// the way the entity roster's `Roster<V>` does (#665/#652 — private fields + no `DerefMut`);
     /// the invariant here is doc-only, which is exactly why `publish_doors` is factored out as the
-    /// ONE projection both call sites share rather than each hand-rolling their own `DoorView`
+    /// ONE projection ALL of its call sites share (`ActionLoop::sync_doors`, this handshake, and
+    /// since #1022 `login::run_login_handshake`) rather than each hand-rolling their own `DoorView`
     /// mapping — a second, slightly different mapping would be a silent second writer that this
     /// test's assertion on the published field VALUES (not just non-emptiness) is positioned to
     /// catch, but does not itself prove impossible.

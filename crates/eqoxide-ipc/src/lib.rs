@@ -2246,7 +2246,13 @@ pub struct DoorView {
     pub opentype: u8,
     pub is_open:  bool,
 }
-/// Snapshot of the current zone's doors, published each nav tick for GET /v1/observe/doors.
+/// Snapshot of the current zone's doors, served by GET /v1/observe/doors.
+///
+/// Published from three places, all through the single `eqoxide_net::action_loop::publish_doors`
+/// projection (see its doc for the inventory): the nav tick's `ActionLoop::sync_doors` during
+/// gameplay, `gameplay::run_zone_entry_handshake`'s own drain on a re-zone (#937/#1016), and
+/// `login::run_login_handshake`'s own drain on a session's first zone-in (#1022). "Each nav tick"
+/// alone was true only of the first of those, and only after a zone-in had already finished.
 pub type DoorsShared = Arc<Mutex<Vec<DoorView>>>;
 
 /// Current zone name and id, updated on every OP_NEW_ZONE.
