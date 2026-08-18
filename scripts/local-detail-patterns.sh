@@ -25,25 +25,32 @@
 # account, a machine-specific path, or a secret. Anyone can write down all eight from public sources
 # without knowing anything about this deployment.
 #
-# A CLASS THAT IS DELIBERATELY NOT COVERED: deployment HOST NAMES (#995). A host name has no shape —
-# any word can be one — so covering the class by pattern means enumerating the literal names in use.
-# That was tried in this PR and REFUSED, for a reason worth keeping written down: after the one
-# tracked occurrence is scrubbed, a literal here would be the ONLY occurrence of the class in the
-# tree, in a file whose name announces exactly what it is, at HEAD, indexed by code search. The
+# A CLASS THAT IS DELIBERATELY NOT COVERED *HERE*: deployment HOST NAMES (#995). A host name has no
+# shape — any word can be one — so covering the class by pattern means enumerating the literal names
+# in use. That was tried in PR #989 and REFUSED, for a reason worth keeping written down: after the
+# one tracked occurrence is scrubbed, a literal here would be the ONLY occurrence of the class in
+# the tree, in a file whose name announces exactly what it is, at HEAD, indexed by code search. The
 # leak-detection guard would become the only tracked leak. Neither of the two arguments for it
 # reaches far enough: private-network reachability is a property of the network and can change with
 # nobody editing this file, and "already in the history" was a decision about the COST of rewriting,
-# not a finding that the value is fine to publish. A hash-based matcher (tokenize, sha256, compare
-# against tracked digests) is the option that avoids the literal; it is not built here, and it is
-# not free — see #995.
+# not a finding that the value is fine to publish.
+#
+# The owner's decision on #995 was to cover the class with a STRUCTURAL heuristic that names
+# nothing, and it lives in `scripts/check-host-shape.py` rather than in this array — it cannot be
+# expressed as a regex, because the discriminator is not the token, it is the token's shape, its
+# proximity to infrastructure vocabulary, and its absence from an English dictionary. Nothing was
+# added to this file for #995 and nothing should be: the moment a name is written here, the leak has
+# moved instead of closing. That script is a WARNING, not a gate, on measured grounds — see its
+# header and #995.
 #
 # THE PATTERN SET IS AN ALLOWLIST OF LEAK SHAPES SOMEONE ALREADY THOUGHT OF. A green run from either
 # scanner means "no KNOWN shape matched", never "no local detail is present". #995 is the standing
-# proof, and it is now a LIVE gap rather than a closed one: a tracked comment named deployment
-# infrastructure, the guard exited 0 on it for months, the comment is scrubbed — and the class is
-# still undetectable, by choice. When a new class IS coverable by shape, the fix is both halves at
-# once — scrub the instance and add the pattern — or it stays uncovered with nothing recording that
-# it ever was.
+# proof: a tracked comment named deployment infrastructure, the guard exited 0 on it for months, and
+# the comment was scrubbed by #989. The class now has a detector — `scripts/check-host-shape.py` —
+# but that does not upgrade this sentence, because that detector is a warning with a narrow, stated
+# reach and no literal here matches a host name. When a new class IS coverable by shape, the fix is
+# both halves at once — scrub the instance and add the pattern — or it stays uncovered with nothing
+# recording that it ever was.
 #
 # Both scanners read this path from `${LOCAL_DETAIL_PATTERNS_FILE:-<repo>/scripts/local-detail-
 # patterns.sh}`. That override is not a convenience: it is how `check-pr-text.sh --self-test`

@@ -216,13 +216,49 @@ is the entire leak. The same holds for host names, container names, and any `-u<
 form. Pasted `ps` output and build-host detail are out for the same reason.
 
 Two scanners enforce this, sharing one pattern list (`scripts/local-detail-patterns.sh`) so they
-cannot drift:
+cannot drift, plus a third tool for the one class a regex cannot express:
 
 ```sh
 scripts/check-no-local-detail.sh              # tracked files — a preventer, runs before merge
 scripts/check-pr-text.sh <pr-or-issue-number> # PR/issue title, body, comments, review comments
 scripts/check-pr-text.sh --self-test          # offline; runs both scanners through their guards
+scripts/check-host-shape.py                   # tracked files — host-name heuristic, WARNING only
+scripts/check-host-shape.py --self-test       # offline fixtures, both directions
 ```
+
+### The pattern set is an allowlist of shapes, and host names have no shape (#995)
+
+The surface limit above is not the only limit. Both scanners match a fixed list of **leak shapes
+someone already wrote down**, so a green run means "no *known* shape matched", never "no local
+detail is present". #995 is the standing proof: a doc comment in `src/asset_sync.rs` named a piece
+of deployment infrastructure and `check-no-local-detail.sh` exited 0 on it for months. It was found
+by a reviewer, not by the guard whose job it was.
+
+That class cannot join the pattern list. A host name has no shape — any word can be one — so a
+regex for it means writing the names in use into `scripts/local-detail-patterns.sh`, a tracked file
+in this public repo, which moves the leak instead of closing it. `scripts/check-host-shape.py` is
+the structural alternative and it **names nothing**: it flags hostname-*shaped* bare tokens
+appearing near infrastructure vocabulary, using an English dictionary as the vocabulary allowlist so
+there is no per-token suppression list in the repo that could be grown until the corpus goes quiet
+(#983 measured where that ends).
+
+**It is a warning, not a gate, and that is measured.** On this repo's tracked corpus it flags a few
+dozen token occurrences and **none of them is a host name** — the class has 0 tracked occurrences
+since the #989 scrub, so its precision here is 0 and every flag is a false positive. What it has is
+recall: it goes RED on the exact pre-scrub text the regex scanner was green on. `--strict` makes
+findings fatal and CI deliberately does not pass it.
+
+No flag count is written down here or in any other tracked file, deliberately: the corpus changes
+with every commit, so a pinned number rots into a false claim in a doc nobody re-measures. Run the
+script for the live figure — it prints the count, its denominator (every token the tokenizer
+produced) and all six buckets. In CI the findings also appear as annotations on the PR's
+Files-changed view and as a table on the run summary, so a warning is not something only a reader
+of a green step's log can see.
+
+Read its header before quoting a run. A clean run there means "no hostname-shaped bare token
+survived five filters" — a host name that is an English word, or carries a digit or a hyphen, or
+sits in code rather than prose, or recurs across files, or is not on a line with infrastructure
+vocabulary, is invisible to it.
 
 `check-pr-text.sh` is a **detector, not a preventer**: GitHub has published the text before any
 check can read it, and keeps the edit history after it is scrubbed. Read a green run as "the
