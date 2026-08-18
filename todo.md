@@ -257,7 +257,9 @@ unit tests, but NOT exhaustively live. Still to do:
   we don't send OP_EnvDamage in those cases (currently we always send on a dry controlled-fall).
 - Decide whether WASD (human) ledge-falls should also send OP_EnvDamage (currently only the nav
   controlled-fall path does).
-See ~/git/eq_kb/falling-physics.md.
+See `swimming-and-fall-damage.md` in the private EQ knowledge-base tree for the wire and
+behaviour half. It has NO damage-curve content, so the curve bullet above is uncited and the
+measurement is the point. (The `falling-physics.md` this line used to cite never existed.)
 
 ## COMPLETE: Clickable & animated doors + agent API (branch worktree-zone-portal-objects)
 

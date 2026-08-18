@@ -22,7 +22,8 @@ pub const PLAYER_RADIUS: f32 = 1.0;
 /// 20u ridges/invisible walls and stranded it on the high side of boundaries.)
 pub const STEP_UP: f32 = 2.0;
 
-/// Gravity / terminal fall (matches the renderer's prior physics + falling-physics.md).
+/// Gravity / terminal fall (matches the renderer's prior physics; the `falling-physics.md`
+/// this used to credit has never existed — see the UNCITED note on `fall_damage`).
 pub const GRAVITY: f32 = 120.0;
 
 /// Jump impulse for the free-WASD Space jump. Peak height = v²/(2·GRAVITY); at 31 that's ~4.0u —
@@ -482,13 +483,19 @@ pub fn running_jump_reach(run_speed: f32) -> f32 {
 /// and tutorial/load branches NO update is ever sent, because no HP ever changed. There is no
 /// branch on which an authoritative number can be assumed to be coming promptly. Either way, the
 /// value this function returns is what we ASK FOR, never what the player took, and it must not be
-/// subtracted from any published HP.
+/// subtracted from any published HP. The wire and behaviour half of this is derived in
+/// `swimming-and-fall-damage.md` in the private EQ knowledge-base tree (§3 "fall damage is
+/// CLIENT-COMPUTED and entering water is NOT a fall", §4 gap analysis against this source tree).
 ///
 /// Model: impact velocity = min(terminal, sqrt(2·g·h)) converted to the client's internal
 /// per-update z-velocity units (~5-13); then `fall_score = |z_vel| − 4` (char_counter≈0, no
 /// safe-fall skill): ≤0 → no damage, ≥9 → lethal (20000), else a roll in `[0, score²·10]`.
-/// Returns (rolled_damage, max_damage). Derivation: `falling-physics.md` in the private EQ
-/// knowledge-base tree.
+/// Returns (rolled_damage, max_damage). NOTE: this curve is UNCITED. It previously credited a
+/// `falling-physics.md`, which has never existed in the knowledge-base tree (no commit ever added
+/// one). `swimming-and-fall-damage.md` is the real document for the wire and behaviour half above,
+/// but it carries NO damage-curve content — no formula, no roll model — so it must NOT be read as
+/// supporting the constants here. Treat the numbers as unverified against a source until someone
+/// re-derives them; #1005's todo.md entry has the measurement plan.
 pub fn fall_damage(height: f32) -> (u32, u32) {
     const GRAVITY: f32 = 120.0;   // matches the renderer's fall physics
     const TERMINAL: f32 = 128.0;  // native internal z-velocity clamp
