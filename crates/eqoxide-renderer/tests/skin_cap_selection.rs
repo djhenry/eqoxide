@@ -533,10 +533,9 @@ fn joint_cap_clears_the_widest_shipped_rig() {
         MEASURED_SHIPPED_RIG_JOINTS.iter().copied().max(), Some(MAX_MEASURED_CHARACTER_RIG_JOINTS),
         "the constant must be the maximum of the measured corpus, not an unrelated number"
     );
-    assert!(JOINT_CAP >= MAX_MEASURED_CHARACTER_RIG_JOINTS,
-        "JOINT_CAP is {JOINT_CAP}, below the widest shipped rig ({MAX_MEASURED_CHARACTER_RIG_JOINTS} \
-         joints, race_pcfroglok.glb). A cap this small does not error — it silently renders real \
-         rigs unskinned.");
+    const { assert!(JOINT_CAP >= MAX_MEASURED_CHARACTER_RIG_JOINTS,
+        "JOINT_CAP is below the widest shipped rig (race_pcfroglok.glb). A cap this small does not \
+         error — it silently renders real rigs unskinned."); }
     for &n in MEASURED_SHIPPED_RIG_JOINTS {
         assert!(SkinFit::classify(Some(n)).is_skinned(),
             "a shipped rig with {n} joints is classified {:?} — it would render unskinned",

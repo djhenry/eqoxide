@@ -176,10 +176,8 @@ fn prune_max_age() -> std::time::Duration {
 fn pid_from_crash_filename(name: &str) -> Option<u32> {
     let digits = if let Some(rest) = name.strip_prefix("crash-") {
         rest.strip_suffix(".log")?
-    } else if let Some(rest) = name.strip_prefix("heartbeat-") {
-        rest
     } else {
-        return None;
+        name.strip_prefix("heartbeat-")?
     };
     digits.parse::<u32>().ok()
 }

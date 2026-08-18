@@ -1333,7 +1333,7 @@ impl App {
                 // exist, proceed; otherwise surface the error.
                 let satisfied = cache.models_dir().exists()
                     && std::fs::read_dir(cache.models_dir())
-                        .map(|mut d| d.any(|e| e.map(|e| e.path().extension().map_or(false, |x| x == "glb")).unwrap_or(false)))
+                        .map(|mut d| d.any(|e| e.map(|e| e.path().extension().is_some_and(|x| x == "glb")).unwrap_or(false)))
                         .unwrap_or(false);
                 let final_result = match result {
                     Ok(()) => Ok(()),
@@ -1665,7 +1665,7 @@ impl App {
             let pid = self.game_state_view.player_id;
             let player_dead = self.game_state_view.cur_hp <= 0 && self.game_state_view.max_hp > 0;
             let swinging = self.game_state_view.combat_anims.get(&pid)
-                .map_or(false, |(_, t)| t.elapsed() < crate::scene::COMBAT_SWING_WINDOW);
+                .is_some_and(|(_, t)| t.elapsed() < crate::scene::COMBAT_SWING_WINDOW);
             let combat_code = self.game_state_view.combat_anims.get(&pid)
                 .filter(|_| swinging).map(|(code, _)| *code);
             let moving = self.last_moved_at.elapsed().as_millis() < 250;
@@ -3085,7 +3085,7 @@ fn smooth_entity_motion(
             if d > 1e-4 {
                 let move_d = (m.speed * dt).min(d);
                 let f = move_d / d;
-                for i in 0..3 { m.display[i] += to[i] * f; }
+                for (d, t) in m.display.iter_mut().zip(to.iter()) { *d += t * f; }
             }
             b.pos = m.display;
 
@@ -3351,8 +3351,8 @@ mod tests {
     /// the ANIM_ADVANCE_DIST invariant from PR #161.
     #[test]
     fn motion_gate_covers_draw_distance() {
-        assert!(MOTION_SMOOTH_DIST >= crate::pass::ENTITY_DRAW_DIST,
-            "motion gate {MOTION_SMOOTH_DIST} must be >= draw cull {}", crate::pass::ENTITY_DRAW_DIST);
+        const { assert!(MOTION_SMOOTH_DIST >= crate::pass::ENTITY_DRAW_DIST,
+            "motion gate must be >= draw cull"); }
     }
 
     #[test]
@@ -3629,7 +3629,7 @@ mod tests {
         let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
         let now = std::time::Instant::now();
         let player = [1000.0, 0.0, 0.0]; // entity is ~990u away — well past MOTION_SMOOTH_DIST
-        assert!(1000.0 - 10.0 > MOTION_SMOOTH_DIST, "precondition: entity is out of range");
+        const { assert!(1000.0 - 10.0 > MOTION_SMOOTH_DIST, "precondition: entity is out of range"); }
         for _ in 0..2 {
             let mut bbs = vec![bb(8, [10.0, 0.0, 5.0])];
             smooth_entity_motion(&mut motion, &mut bbs, player, Some(&col), now, 1.0 / 60.0);
@@ -4021,7 +4021,9 @@ mod zone_load_wiring_803 {
         // (normal, split, special, left, right, zone_line_index). `leaf_at` walks LEFT when
         // `dot(normal, p) + split > 0`, so z > 0 lands on the dry leaf and z < 0 on the zone line.
         // `special == 3` is `REGION_ZONE_LINE` (private to region_map, hence the literal).
-        let nodes: &[([f32; 3], f32, i32, i32, i32, i32)] = &[
+        // `(normal, split, special, left, right, zone_line_index)` per BSP node.
+        type WtrNode = ([f32; 3], f32, i32, i32, i32, i32);
+        let nodes: &[WtrNode] = &[
             ([0.0, 0.0, 1.0], 0.0, 0, 2, 3, 0), // split at z == 0
             ([0.0; 3], 0.0, 0, 0, 0, 0),        // 2: dry leaf (above)
             ([0.0; 3], 0.0, 3, 0, 0, index),    // 3: ZONE LINE leaf (below)
@@ -4118,8 +4120,8 @@ mod render_loop_backoff_tests_895 {
             "a backed-off active loop must cost less than an idle one, else the cap bounds nothing");
         assert!(App::IDLE_POLL > App::FRAME_INTERVAL,
             "idle must be cheaper than active, or the whole schedule is upside down");
-        assert!(App::SURFACE_FAIL_BACKOFF_AFTER > 0,
-            "a threshold of 0 would back off on the first Outdated, i.e. on every ordinary resize");
+        const { assert!(App::SURFACE_FAIL_BACKOFF_AFTER > 0,
+            "a threshold of 0 would back off on the first Outdated, i.e. on every ordinary resize"); }
     }
 
     /// Exhaustive over both activity states and every streak up to well past the threshold.

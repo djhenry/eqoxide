@@ -106,7 +106,7 @@ const BOAT_Y_MIN: f32 = -3.982317;
 const BOAT_Y_MAX: f32 = 5.962854;
 const BOAT_X_MIN: f32 = -14.881587;
 const BOAT_X_MAX: f32 = 22.851353;
-const BOAT_Z_MIN: f32 = -8.304960;
+const BOAT_Z_MIN: f32 = -8.304_96;
 const BOAT_Z_MAX: f32 = 8.413661;
 
 fn boat_y_extent() -> f32 { BOAT_Y_MAX - BOAT_Y_MIN }

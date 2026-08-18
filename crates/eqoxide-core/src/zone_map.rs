@@ -214,9 +214,9 @@ impl ZoneMap {
     fn parse_into(text: &str, lines: &mut Vec<ZoneMapLine>, labels: &mut Vec<ZoneMapLabel>) {
         for line in text.lines() {
             let line = line.trim();
-            if line.starts_with('L') {
+            if let Some(stripped) = line.strip_prefix('L') {
                 // L x1, y1, z1, x2, y2, z2, r, g, b — file (x, y) = (−server_x, −server_y); negate.
-                let nums: Vec<f32> = line[1..].split(',')
+                let nums: Vec<f32> = stripped.split(',')
                     .filter_map(|s| s.trim().parse().ok())
                     .collect();
                 if nums.len() >= 9 {
@@ -226,9 +226,8 @@ impl ZoneMap {
                         r: nums[6] as u8, g: nums[7] as u8, b: nums[8] as u8,
                     });
                 }
-            } else if line.starts_with('P') {
+            } else if let Some(rest) = line.strip_prefix('P') {
                 // P x, y, z, r, g, b, size, label — file (x, y) = (−server_x, −server_y); negate.
-                let rest = &line[1..];
                 if let Some(label_start) = rest.rfind(',') {
                     let text = rest[label_start + 1..].trim().replace('_', " ").to_string();
                     let nums: Vec<f32> = rest[..label_start].split(',')

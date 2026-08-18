@@ -70,13 +70,15 @@ mod walk_speed_tests {
         // The locomotion-clip threshold (#623) must classify a WALK_SPEED move as walking, or the
         // two constants have drifted apart and #625's toggle would send OP_SetRunMode(false) while
         // still rendering (and reporting) the run clip.
-        assert!(WALK_SPEED < WALK_RUN_THRESHOLD,
-            "WALK_SPEED {WALK_SPEED} must clear the run clip threshold {WALK_RUN_THRESHOLD}");
+        const {
+            assert!(WALK_SPEED < WALK_RUN_THRESHOLD,
+                "WALK_SPEED must clear the run clip threshold");
+        }
     }
 
     #[test]
     fn walk_speed_is_strictly_slower_than_run_speed() {
-        assert!(WALK_SPEED < RUN_SPEED, "a walk toggle that isn't slower than running is a no-op");
+        const { assert!(WALK_SPEED < RUN_SPEED, "a walk toggle that isn't slower than running is a no-op"); }
         // Sanity-check the derivation itself: 0.3/0.7 of RUN_SPEED, matching the #623 comment's
         // ~18.857 u/s figure.
         assert!((WALK_SPEED - 18.857).abs() < 0.01, "got {WALK_SPEED}");
@@ -441,8 +443,10 @@ mod walk_or_run_tests {
         let native_walk_speed = RUN_SPEED * (0.3 / 0.7);
         assert!(WALK_RUN_THRESHOLD > native_walk_speed,
             "threshold {WALK_RUN_THRESHOLD} must clear the native walk speed {native_walk_speed}");
-        assert!(WALK_RUN_THRESHOLD < RUN_SPEED,
-            "threshold {WALK_RUN_THRESHOLD} must stay below RUN_SPEED {RUN_SPEED}");
+        const {
+            assert!(WALK_RUN_THRESHOLD < RUN_SPEED,
+                "threshold must stay below RUN_SPEED");
+        }
     }
 }
 

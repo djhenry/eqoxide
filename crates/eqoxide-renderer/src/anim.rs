@@ -479,7 +479,9 @@ mod tests {
         ]
     }
 
-    fn default_rest(n: usize) -> (Vec<[f32;3]>, Vec<[f32;4]>, Vec<[f32;3]>) {
+    type RestPose = (Vec<[f32;3]>, Vec<[f32;4]>, Vec<[f32;3]>);
+
+    fn default_rest(n: usize) -> RestPose {
         (vec![[0.0;3]; n], vec![[0.0,0.0,0.0,1.0]; n], vec![[1.0;3]; n])
     }
 

@@ -779,7 +779,7 @@ impl Walker {
     /// are** (#615 review F1: a fresh login published a confident `[0,0,0]`, 985 units from the
     /// character; "unknown" must be representable, never a fabricated origin).
     fn known_pos(gs: &GameState) -> Option<[f32; 3]> {
-        gs.player_pos_known.then(|| [gs.player_x, gs.player_y, gs.player_z])
+        gs.player_pos_known.then_some([gs.player_x, gs.player_y, gs.player_z])
     }
 
     /// Publish the nav diagnostics snapshot (#608). **This is the one place the snapshot is
@@ -968,7 +968,7 @@ impl Walker {
         let resynced = {
             let coll = self.collision.read().unwrap();
             let reachable = |a: [f32; 3], b: [f32; 3]| coll.as_ref()
-                .map_or(true, |c| crate::steering::resync_reachable(c, a, b));
+                .is_none_or(|c| crate::steering::resync_reachable(c, a, b));
             crate::steering::resync_cursor(&self.path, walked_to, p, reachable)
         };
         self.path_i = resynced;
@@ -1730,7 +1730,7 @@ impl Walker {
             // when no grid is loaded. Held for the single synchronous `steer_target` call only.
             let coll = self.collision.read().unwrap();
             let los = |a: [f32; 3], b: [f32; 3]|
-                coll.as_ref().map_or(true, |c| c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE));
+                coll.as_ref().is_none_or(|c| c.carrot_los_clear(a, b, STEER_LOS_CLEARANCE));
             let aim = steer_target(&self.path, self.path_i, &self.local_path, &mut self.local_i,
                 [px, py, pz], LOOK_AHEAD, coarse, los);
             drop(coll);
@@ -2287,7 +2287,7 @@ mod tests {
             [-526.718_75, 144.375, -4.161_232],
             [-534.718_75, 144.375, -6.095_749],
             [-542.718_75, 144.375, -8.030_266],
-            [-550.718_75, 144.375, -9.964_805_6],
+            [-550.718_75, 144.375, -9.964_806],
             [-558.718_75, 144.375, -11.899_315],
         ];
         w.path_i = 2;

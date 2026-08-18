@@ -507,7 +507,7 @@ fn resolve_anim(anim: &Option<(u32, Vec<String>)>, texture_names: &[String]) -> 
     let idxs: Vec<usize> = names.iter()
         .filter_map(|n| texture_names.iter().position(|t| t == n))
         .collect();
-    (idxs.len() >= 2).then(|| (*ms, idxs))
+    (idxs.len() >= 2).then_some((*ms, idxs))
 }
 
 fn build_unit_cube(device: &wgpu::Device) -> GpuMesh {
@@ -1077,9 +1077,12 @@ impl EqRenderer {
             // (texture_idx, render_mode) → (accumulated vertices, accumulated indices).
             // render_mode is part of the key so each draw call has a single blend mode
             // (opaque/masked/blend/additive) and routes to the matching pipeline.
-            let mut groups: HashMap<(Option<usize>, eqoxide_assets::RenderMode), (Vec<Vertex>, Vec<u32>)> = HashMap::new();
+            type GroupKey = (Option<usize>, eqoxide_assets::RenderMode);
+            type GroupVal = (Vec<Vertex>, Vec<u32>);
+            type AnimVal = Option<(u32, Vec<usize>)>;
+            let mut groups: HashMap<GroupKey, GroupVal> = HashMap::new();
             // Resolved animated-texture frames per group (same texture ⇒ same anim).
-            let mut anim_by_group: HashMap<(Option<usize>, eqoxide_assets::RenderMode), Option<(u32, Vec<usize>)>> = HashMap::new();
+            let mut anim_by_group: HashMap<GroupKey, AnimVal> = HashMap::new();
 
             // Terrain only — placed objects now go to the GPU-instanced path below
             // (collision still uses terrain + expand_objects, unchanged).
@@ -1094,7 +1097,7 @@ impl EqRenderer {
                     .and_then(|n| self.texture_names.iter().position(|t| t == n));
 
                 let gkey = (texture_idx, mesh.render_mode);
-                anim_by_group.entry(gkey.clone())
+                anim_by_group.entry(gkey)
                     .or_insert_with(|| resolve_anim(&mesh.anim, &self.texture_names));
 
                 let [cx, cy, cz] = mesh.center;
@@ -1997,8 +2000,10 @@ mod tests {
         // Invariant (#152): every entity the skinned pass DRAWS must also have its animation clock
         // advanced, or it would render frozen. The anim gate must therefore reach at least as far as
         // the draw-distance cull. (The margin keeps a ring beyond the draw distance warm.)
-        assert!(ANIM_ADVANCE_DIST >= crate::pass::ENTITY_DRAW_DIST,
-            "anim gate {ANIM_ADVANCE_DIST} must be >= draw cull {}", crate::pass::ENTITY_DRAW_DIST);
+        const {
+            assert!(ANIM_ADVANCE_DIST >= crate::pass::ENTITY_DRAW_DIST,
+                "the anim-advance gate must not be tighter than the entity draw-cull distance");
+        }
     }
 
     #[test]

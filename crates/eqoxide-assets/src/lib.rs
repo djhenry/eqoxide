@@ -16,6 +16,9 @@
 
 use anyhow::Context;
 
+/// Compacted per-vertex mesh data: (positions, normals, uvs, indices).
+type CompactedMesh = (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<u32>);
+
 /// Parse a glTF material's `extras` JSON (the asset server's `eqAdditive` / `eqAnim`).
 fn material_extras(material: &gltf::Material) -> Option<serde_json::Value> {
     material
@@ -165,6 +168,9 @@ pub struct TextureData {
     pub rgba: Vec<u8>,
 }
 
+/// Object-model meshes keyed by UPPERCASE glTF mesh name, plus the GLB's decoded textures.
+pub type ObjectModelsByName = (std::collections::HashMap<String, Vec<MeshData>>, Vec<TextureData>);
+
 /// A reusable object model plus its per-placement instance transforms.
 ///
 /// `meshes` are in model-local space (one entry per glTF primitive); each matrix in
@@ -238,7 +244,7 @@ fn compact_primitive(
     normals:   Vec<[f32; 3]>,
     uvs:       Vec<[f32; 2]>,
     indices:   Vec<u32>,
-) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<u32>) {
+) -> CompactedMesh {
     let mut remap = vec![u32::MAX; positions.len()];
     let mut np = Vec::new();
     let mut nn = Vec::new();
@@ -484,7 +490,7 @@ impl ZoneAssets {
     /// plus decoded textures. Placement is applied by the caller from live door state.
     pub fn object_models_from_glb(
         path: &std::path::Path,
-    ) -> anyhow::Result<(std::collections::HashMap<String, Vec<MeshData>>, Vec<TextureData>)> {
+    ) -> anyhow::Result<ObjectModelsByName> {
         let g = gltf::Gltf::open(path)
             .with_context(|| format!("open door glb: {}", path.display()))?;
         let base = path.parent().unwrap_or_else(|| std::path::Path::new("./"));
@@ -578,7 +584,7 @@ mod b2_glb_tests {
         let all: Vec<MeshData> = za.terrain.iter().cloned().chain(expand_objects(&za.objects)).collect();
         assert!(!all.is_empty());
         let tex_names: std::collections::HashSet<_> = za.textures.iter().map(|t| t.name.clone()).collect();
-        let linked = all.iter().filter(|m| m.texture_name.as_ref().map_or(false, |n| tex_names.contains(n))).count();
+        let linked = all.iter().filter(|m| m.texture_name.as_ref().is_some_and(|n| tex_names.contains(n))).count();
         assert!(linked > 0, "at least some meshes must resolve their texture by name");
     }
 }
@@ -595,7 +601,7 @@ mod door_glb_tests {
         assert!(models.keys().all(|k| k == &k.to_uppercase()), "keys are uppercase base names");
         let tex: std::collections::HashSet<_> = textures.iter().map(|t| t.name.clone()).collect();
         let linked = models.values().flatten()
-            .filter(|m| m.texture_name.as_ref().map_or(false, |n| tex.contains(&n.to_lowercase()))).count();
+            .filter(|m| m.texture_name.as_ref().is_some_and(|n| tex.contains(&n.to_lowercase()))).count();
         assert!(linked > 0, "some door meshes resolve textures by name");
     }
 }

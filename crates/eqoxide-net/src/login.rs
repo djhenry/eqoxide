@@ -184,7 +184,7 @@ async fn run_login_phase(
         while let Ok(packet) = net_rx.try_recv() {
             // Apply gameplay side effects.
             apply_packet(&mut gs, &packet);
-            record_login_liveness(&net_health, std::time::Instant::now());
+            record_login_liveness(net_health, std::time::Instant::now());
 
             // Handle login-protocol state transitions.
             match proto.handle(&packet, &mut stream, &gs) {

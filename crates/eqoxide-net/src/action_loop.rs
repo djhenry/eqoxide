@@ -367,7 +367,7 @@ fn send_cast(stream: &mut EqStream, gs: &mut GameState, req: eqoxide_ipc::CastRe
             // Keep an explicitly-chosen friendly (PC) target for group heals; otherwise (no target,
             // cleared, or a hostile NPC) land the buff/heal on ourselves.
             let friendly = target == gs.player_id
-                || gs.world.entities.get(&target).map_or(false, |e| !e.is_npc);
+                || gs.world.entities.get(&target).is_some_and(|e| !e.is_npc);
             if !friendly { target = gs.player_id; }
         }
     }
@@ -1296,12 +1296,12 @@ impl ActionLoop {
         }
     }
 
-    /// Publish the current `/move/goto` navigation state for GET /v1/observe/debug (#166, #337).
-    /// The value set is an AGENT-FACING CONTRACT — every value is documented in `docs/http-api.md`:
-    ///
-    ///   pending | idle | planning | navigating | navigating_partial | navigating_stalled
-    ///   | following | arrived | no_path | search_exhausted | blocked | zone_loading
-    ///
+    // Publish the current `/move/goto` navigation state for GET /v1/observe/debug (#166, #337).
+    // The value set is an AGENT-FACING CONTRACT — every value is documented in `docs/http-api.md`:
+    //
+    //   pending | idle | planning | navigating | navigating_partial | navigating_stalled
+    //   | following | arrived | no_path | search_exhausted | blocked | zone_loading
+    //
     // `set_nav_state`/`stop_nav`/`apply_plan`/`apply_local_plan`/`is_player_dead`/`nav_halt_if_dead`/
     // `find_in_zone_portal`/`aggro_avoid` moved to `eqoxide_nav::walker::Walker` (M1 extraction).
     // `is_player_dead` itself moved further, to `GameState::is_player_dead` — both `Walker` and
@@ -2572,7 +2572,7 @@ impl ActionLoop {
             // `path_clear` now sweeps the player's whole collision volume (#358), which would also
             // reject a perfectly attackable NPC standing in a doorway.
             let clear_to = |e: &eqoxide_core::game_state::Entity| -> bool {
-                col.as_ref().map_or(true, |c| {
+                col.as_ref().is_none_or(|c| {
                     c.line_clear([gs.player_x, gs.player_y, e.z + 3.0], [e.x, e.y, e.z + 3.0], 2.0)
                 })
             };
@@ -2583,7 +2583,7 @@ impl ActionLoop {
             let current = gs.target_id;
             // The current target is valid only if alive AND still reachable in a straight line —
             // otherwise drop it so we retarget or roam (don't get stuck swinging "too far").
-            let current_valid = current.map(|id| alive_reachable(id)).unwrap_or(false);
+            let current_valid = current.map(&alive_reachable).unwrap_or(false);
             let current_is_attacker = current.map(|id| gs.recent_attackers.contains_key(&id)).unwrap_or(false);
 
             // The add to engage: the most-recent attacker that is alive + reachable and isn't already
@@ -2728,8 +2728,8 @@ impl ActionLoop {
     ///      cursor item into the NPC trade slot — the server rejects cursor→trade moves before the
     ///      trade session exists.
     ///   3. Ack seen: OP_MoveItem cursor(30)→trade slot(3000), then OP_TradeAcceptClick.
-    /// The server then sends OP_FinishTrade (handled in packet_handler). If no ack arrives within
-    /// ~3s we abort and reset. Called every tick (not gated by the 150ms walk throttle).
+    ///      The server then sends OP_FinishTrade (handled in packet_handler). If no ack arrives within
+    ///      ~3s we abort and reset. Called every tick (not gated by the 150ms walk throttle).
     ///
     /// A3 Migration 2 (#448), SERIALIZED (#475 review): NEITHER path clears at step 3. Both hold
     /// `give_state` through a phase-2 wait for OP_FinishTrade, so at most one trade is ever in flight
@@ -3363,17 +3363,17 @@ impl ActionLoop {
     /// Send OP_ZONE_CHANGE to request crossing a zone line to `target_zone_id`.
     /// ZoneChange_Struct (88 bytes): char_name[64] + zoneID(u16) + instance_id(u16)
     ///   + y(f32) + x(f32) + z(f32) + zone_reason(u32) + success(i32=0)
-    /// NOTE: zoneID is sent as **0** (the "resolve from my position" sentinel), NOT the resolved
-    /// destination. On zoneID==0 the server (`Handle_OP_ZoneChange`, `zone/zoning.cpp:49`) routes to
-    /// `GetClosestZonePointWithoutZone` (`zone.cpp:2093`) — an XY-only, z-agnostic match with no
-    /// water-map/OBB check — and derives the real destination from the matched zone point. Sending a
-    /// nonzero destination instead routes to `GetClosestZonePoint`, whose water-map `InZoneLine` OBB
-    /// test (z-bounded) rejects a valid walk-in with a stale tracked z and logs
-    /// `MQZone … with Unknown Destination` (a false positive that could flag/kick on a strict server),
-    /// and also hard-cancels if the matched point's target != the named zone. zoneID=0 avoids both.
-    /// (`target_zone_id` is kept for logging/clarity; the server resolves the true target itself.)
-    /// This is NOT the same as the old bug of sending our *current* zone (target==current → cancel):
-    /// 0 is the documented resolve-from-position sentinel, not a zone id. (eqoxide#199)
+    ///     NOTE: zoneID is sent as **0** (the "resolve from my position" sentinel), NOT the resolved
+    ///     destination. On zoneID==0 the server (`Handle_OP_ZoneChange`, `zone/zoning.cpp:49`) routes to
+    ///     `GetClosestZonePointWithoutZone` (`zone.cpp:2093`) — an XY-only, z-agnostic match with no
+    ///     water-map/OBB check — and derives the real destination from the matched zone point. Sending a
+    ///     nonzero destination instead routes to `GetClosestZonePoint`, whose water-map `InZoneLine` OBB
+    ///     test (z-bounded) rejects a valid walk-in with a stale tracked z and logs
+    ///     `MQZone … with Unknown Destination` (a false positive that could flag/kick on a strict server),
+    ///     and also hard-cancels if the matched point's target != the named zone. zoneID=0 avoids both.
+    ///     (`target_zone_id` is kept for logging/clarity; the server resolves the true target itself.)
+    ///     This is NOT the same as the old bug of sending our *current* zone (target==current → cancel):
+    ///     0 is the documented resolve-from-position sentinel, not a zone id. (eqoxide#199)
     fn send_zone_change_packet(&self, stream: &mut EqStream, gs: &GameState, target_zone_id: u16) {
         // RoF2 ZoneChange_Struct is 100 bytes (rof2_structs.h): char_name[64], zoneID@64,
         // instanceID@66, Unknown068@68, Unknown072@72, y@76, x@80, z@84, zone_reason@88,
@@ -4429,7 +4429,7 @@ mod tests {
             // keep draining until the position update itself shows up or the timeout above fires.
         };
 
-        assert!(anim >= 20 && anim <= 32,
+        assert!((20..=32).contains(&anim),
             "running at RUN_SPEED (44 u/s) for a full ~280ms throttle window must report an \
              animation near 28 (running), not the ~1 a per-tick-sliver window (or the old hardcoded \
              boolean) would produce — got {anim}");
@@ -5980,12 +5980,12 @@ mod tests {
     ///   1. the echoed zone_id (1) != current (2) → CrossZoneReconnect even though the client's
     ///      local guess (and the pending flag) said same-zone;
     ///   2. the flag is peeked, not consumed, so the duplicate echo classifies IDENTICALLY.
-    /// So BOTH echoes → CrossZoneReconnect, and `world_reconnect_needed` (a set-once bool on the
-    /// receive side) reconnects exactly once. Mutation checks: (a) drop the `echo == current` guard
-    /// (classify same-zone purely on the pending flag) → the first assertion goes RED (it would
-    /// SameZoneReposition and never zone to South Qeynos); (b) revert `same_zone_reposition_pending`
-    /// to a consuming `take` → the duplicate assertion goes RED (duplicate would SameZoneReposition,
-    /// the exact old split-interpretation bounce).
+    ///      So BOTH echoes → CrossZoneReconnect, and `world_reconnect_needed` (a set-once bool on the
+    ///      receive side) reconnects exactly once. Mutation checks: (a) drop the `echo == current` guard
+    ///      (classify same-zone purely on the pending flag) → the first assertion goes RED (it would
+    ///      SameZoneReposition and never zone to South Qeynos); (b) revert `same_zone_reposition_pending`
+    ///      to a consuming `take` → the duplicate assertion goes RED (duplicate would SameZoneReposition,
+    ///      the exact old split-interpretation bounce).
     #[test]
     fn vault_translocator_server_resolves_cross_zone_no_double_cross() {
         const CURRENT: u16 = 2; // qeynos2 (North Qeynos), where we stand
@@ -7818,7 +7818,7 @@ mod tests {
         assert_eq!(nav.walker.proactive_replans, 1, "a threaded fine plan must not forgive the oscillation budget");
 
         // The cap is a real, small bound — the guard is not a no-op.
-        assert!(PROACTIVE_REPLAN_CAP > 0 && PROACTIVE_REPLAN_CAP <= 16);
+        const { assert!(PROACTIVE_REPLAN_CAP > 0 && PROACTIVE_REPLAN_CAP <= 16) };
     }
 
     #[test]
