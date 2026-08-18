@@ -1865,9 +1865,34 @@ mod tests {
     #[test]
     #[ignore = "requires extracted assets (set EQ_ASSETS_DIR): globalhum_chr.s3d"]
     fn skinned_conversion_is_centered_grounded() {
-        let Some(dir) = std::env::var_os("EQ_ASSETS_DIR") else { return; };
+        // eqoxide#1009: this MUST panic, not `return`, when the precondition is absent.
+        // A `let ... else { return; }` here made the test both #[ignore]d AND silently
+        // vacuous: on the one run where someone deliberately opts in
+        // (`cargo test -p s3d_to_gltf -- --ignored`), a machine without EQ_ASSETS_DIR got
+        // `test result: ok. 1 passed` in 0.00s having executed none of the assertions
+        // below. Nothing in that output distinguishes "the converter is covered" from
+        // "the converter was never invoked", and the #[ignore] reason string above makes
+        // the vacuous pass read as compliance. Because the test is already #[ignore]d,
+        // running it at all is a deliberate act, so a caller who asked for it and got a
+        // green no-op is precisely the lie. Failing loudly and naming the missing
+        // variable is the honest shape, and it matches
+        // eqoxide-assets::from_glb_links_meshes_to_textures, which panics with
+        // `set ZONE_GLB` rather than passing when its own variable is unset.
+        let dir = std::env::var_os("EQ_ASSETS_DIR")
+            .expect("EQ_ASSETS_DIR must point at extracted assets containing globalhum_chr.s3d");
         let inp = std::path::PathBuf::from(dir).join("globalhum_chr.s3d");
-        let out = std::path::PathBuf::from("/tmp/test_hum_norm.glb");
+        // Per-process output path under the platform temp dir: the previous hardcoded
+        // /tmp/test_hum_norm.glb collided between concurrent runs and was never removed.
+        // The guard deletes it on assertion failure and panic too, not just on success.
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let out = std::env::temp_dir()
+            .join(format!("eqoxide_test_hum_norm_{}.glb", std::process::id()));
+        let _cleanup = RemoveOnDrop(out.clone());
         convert_s3d_to_glb_skinned(&inp, &out, None).unwrap();
 
         // Re-parse with the gltf crate and confirm the root node carries a positive
