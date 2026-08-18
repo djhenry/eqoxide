@@ -401,11 +401,38 @@ def self_path(root: str) -> str:
     return os.path.relpath(os.path.abspath(__file__), root)
 
 
+def count_tracked(root: str) -> int:
+    """A SECOND, INDEPENDENT `git ls-files`, deliberately not the one `read_corpus` iterates.
+
+    The independence is the entire point. Tallying the four outcomes and comparing the sum to the
+    length of the list they were derived FROM compares a number to itself and cannot fail — the same
+    defect the round-1 bucket identity had, one level up. Re-asking git is what makes this a control.
+    """
+    out = subprocess.run(
+        ["git", "-C", root, "ls-files", "-z"], capture_output=True, text=True, check=True
+    ).stdout
+    return sum(1 for n in out.split("\0") if n)
+
+
+def corpus_accounts_for(read: int, binary: int, unreadable: int, excluded: int, tracked: int) -> bool:
+    """Every tracked name must land in EXACTLY ONE of the four outcomes.
+
+    `tracked` must come from `count_tracked`, not from the list `read_corpus` walked. A file that is
+    silently dropped on the way in is invisible to every downstream number: the bucket identity still
+    balances, the classification still reports `N/N`, and the run still exits 0 — it just looked at
+    less. That is this repo's canonical failure, a check that cannot tell "nothing wrong" from
+    "nothing looked at", and it is the failure this whole script exists to answer for one leak class.
+    """
+    return read + binary + unreadable + excluded == tracked
+
+
 def read_corpus(root: str) -> tuple[dict[str, str], int, int, int]:
     """Returns (texts, binary-skipped, unreadable-skipped, excluded).
 
     Binary and unreadable are counted apart: skipping a PNG is expected and skipping a tracked file
     that is missing from the working tree is a reach gap, and one number cannot say which happened.
+
+    REFUSES if the four outcomes do not account for every tracked file. See `corpus_accounts_for`.
     """
     out = subprocess.run(
         ["git", "-C", root, "ls-files", "-z"], capture_output=True, text=True, check=True
@@ -429,6 +456,18 @@ def read_corpus(root: str) -> tuple[dict[str, str], int, int, int]:
             skipped_binary += 1
             continue
         texts[name] = raw.decode("utf-8", errors="replace")
+    tracked = count_tracked(root)
+    if not corpus_accounts_for(len(texts), skipped_binary, skipped_unreadable, excluded, tracked):
+        sys.stderr.write(
+            "::error::check-host-shape: CORPUS INCOMPLETE — the files read, skipped and excluded do\n"
+            f"not account for every tracked file ({len(texts)} read + {skipped_binary} binary + "
+            f"{skipped_unreadable} unreadable + {excluded} excluded != {tracked} tracked).\n"
+            "Some tracked file was dropped on the way in. Every downstream number would still look\n"
+            "healthy — the buckets would balance and the run would exit 0 — over a corpus smaller\n"
+            "than the one this scan claims to cover. Refusing, rather than reporting a clean scan of\n"
+            "an unknown fraction of the tree.\n"
+        )
+        raise SystemExit(1)
     return texts, skipped_binary, skipped_unreadable, excluded
 
 
@@ -599,6 +638,16 @@ def self_test(words: set[str], wordlist_path: str) -> int:
     here = sum(len(TOKEN_RE.findall(ln)) for ln in dirty["fixture.md"].splitlines())
     checks.append(("buckets == tokens produced", bucket_total == produced))
     checks.append(("tokens produced == an independent count of the fixture", produced == here == 9))
+
+    # CORPUS-REACH CONTROL, in both directions. The accounting above proves every token that was
+    # READ got classified; it says nothing about whether every tracked file was read. Review
+    # demonstrated the gap by patching `read_corpus` to drop one file extension: the run stayed
+    # green, the identity still balanced, and findings simply vanished. Direction 2 is the half that
+    # matters — a control nobody has watched go red is not a control.
+    checks.append(("corpus accounting holds when every tracked file is accounted for",
+                   corpus_accounts_for(3, 1, 1, 1, 6)))
+    checks.append(("corpus accounting goes RED when a tracked file is silently dropped",
+                   not corpus_accounts_for(2, 1, 1, 1, 6)))
 
     failed = 0
     for label, ok in checks:
