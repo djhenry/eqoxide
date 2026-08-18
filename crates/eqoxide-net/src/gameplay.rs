@@ -1029,9 +1029,13 @@ async fn run_zone_entry_handshake(
     // redundant for that case. It is NOT redundant for the (common, and the one this test below
     // pins) case of a handshake that never drains a single packet before timing out: the drain loop
     // below only calls `publish_doors` on a pass that drained something (see that call's doc), so a
-    // silent zone with no `OP_SpawnDoor` at all would otherwise leave the departed roster untouched
-    // — published, well-formed, and wrong — for the whole `ZONE_ENTRY_HANDSHAKE_DEADLINE`. This line
-    // is what makes that case honest.
+    // handshake that drains NOTHING AT ALL — not one packet of any opcode — would otherwise leave the
+    // departed roster untouched, published, well-formed, and wrong, for the whole
+    // `ZONE_ENTRY_HANDSHAKE_DEADLINE`. This line is what makes that case honest. Note the condition is
+    // "drained no packet", NOT "received no `OP_SpawnDoor`" (#1016 review N1): a handshake that drains
+    // an `OP_NEW_ZONE` but no door record DOES reach the gated `publish_doors`, which full-replaces
+    // from the already-emptied `gs.world.doors` and so clears the departed roster with or without this
+    // line. Only the drained-nothing case is load-bearing for it.
     doors.lock().unwrap().clear();
 
     // ...and the PUBLISHED half of three more #941-class clears, for exactly the reason above. Of
@@ -2147,7 +2151,8 @@ mod zone_entry_handshake_publish_tests {
 
         let published = doors.lock().unwrap().clone();
         assert_eq!(published.len(), 1,
-            "exactly the one delivered door, no drift/dup from republishing on every drain pass");
+            "exactly the one delivered door, no drift/dup from republishing across successive \
+             gated drain passes");
         assert_eq!(published[0].door_id, 7);
         assert_eq!(published[0].name, "HHD1");
 

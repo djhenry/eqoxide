@@ -1144,7 +1144,8 @@ impl ActionLoop {
     pub fn controller_slots(&self) -> &eqoxide_ipc::ControllerSlots { &self.controller }
 
     /// The published door roster, for the zone-entry handshake to CLEAR at zone-in and REPUBLISH on
-    /// every drain pass thereafter (#934 review B1, #891; republish added by #937).
+    /// each drain pass that actually drained a packet — NOT on every pass (#934 review B1, #891;
+    /// republish added by #937, gated by #1016 review B1).
     ///
     /// `GameState::begin_zone_in` empties `gs.world.doors`, but the shared roster mirrored from it
     /// used to be republished only by [`Self::sync_doors`], whose sole caller was `run_gameplay_phase`'s
