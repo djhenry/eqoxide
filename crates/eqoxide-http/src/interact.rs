@@ -501,7 +501,7 @@ const DOOR_NO_ARGUMENT: &str = "provide {\"door_id\":N} or {\"name\":\"...\"}";
 /// **This is narrower on one path than the other, and the body does not claim to know which path it
 /// is on (#1016 review B5).** `run_zone_entry_handshake` — used only for re-zones, both its
 /// production call sites are inside `run_gameplay_phase` in `gameplay.rs` — republishes on the same
-/// drain pass that applies a door record (#1016 review B4), so on THAT path the empty reading narrows
+/// drain pass that applies a door record (#1016 review B1), so on THAT path the empty reading narrows
 /// to "before the first record has landed". The very first zone-in of a session goes through
 /// `login.rs`'s own separate state machine instead (`run_login_phase`), which applies `OP_SpawnDoor`
 /// via the same `apply_packet` but has no access to `InteractSlots` at all (not in its function
@@ -1290,7 +1290,7 @@ mod tests {
     ///     yet been published into this roster" — #1016 review B5's correction. A previous revision
     ///     narrowed this to "a zone-in that has not yet delivered its first door record" on the
     ///     strength of `run_zone_entry_handshake` now publishing on the same drain pass that applies
-    ///     a door record (#1016 review B2/B4). That fix is real, but `run_zone_entry_handshake` is
+    ///     a door record (#1016 review B2/B1). That fix is real, but `run_zone_entry_handshake` is
     ///     only reached on a RE-ZONE (its two production call sites are both inside
     ///     `run_gameplay_phase`) — the first zone-in of a session goes through `login.rs`'s own
     ///     separate state machine, which applies `OP_SpawnDoor` via `apply_packet` but has no
