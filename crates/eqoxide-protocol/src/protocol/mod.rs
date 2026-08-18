@@ -194,15 +194,27 @@ pub const OP_BUFF_CREATE: u16 = 0x3377;       // RoF2: OP_BuffCreate
 // Pet control: PetCommand_Struct { command:u32, target:u32 }. Command values from
 // EQEmu zone/common.h: PET_ATTACK=2, PET_GUARDHERE=5, PET_FOLLOWME=4(GetOwner), PET_BACKOFF=28.
 // Environmental (fall/lava/drown) damage — the MAGNITUDE is CLIENT-COMPUTED in native EQ, because
-// the server has no fall detection and reads the number straight out of the `damage` field below.
+// the server has no fall detection and reads the number out of the packet's `damage` field.
 // It does NOT merely validate that report: `Client::Handle_OP_EnvDamage` (zone/client_packet.cpp)
 // may scale it, apply it, refuse it outright, or ignore it entirely depending on the branch taken —
 // see `fall_damage` in eqoxide-core/src/physics.rs for the full enumeration. An earlier version of
 // this comment said "the server only validates and applies it"; that was wrong, and #1005 retracts
 // it in physics.rs as plausibly why a local HP subtraction once looked necessary beside the send.
 // The value we send is what we ASK FOR, never what the player took, and must not be subtracted from
-// any published HP. EnvDamage2_Struct (31b): id@0, damage(u32)@6, dmgtype(u8)@22 (0xFC=falling),
-// constant(u16)@27=0xFFFF. Derivation: `falling-physics.md` in the private EQ knowledge-base tree.
+// any published HP.
+//
+// LAYOUT — there are TWO different `EnvDamage2_Struct`s in EQEmu and we must emit the WIRE one:
+//   * WIRE (what we send), RoF2 `common/patches/rof2_structs.h`: 39 bytes, id@0, damage(u32)@6,
+//     dmgtype(u8)@26 (0xFC=falling), constant(u16)@33. Built and pinned by
+//     `build_env_damage_packet` in world.rs — that builder, not this comment, is the authority.
+//   * GENERIC/internal, `common/eq_packet_structs.h`: 31 bytes, dmgtype@22, constant@27. This is
+//     the POST-DECODE form `Handle_OP_EnvDamage` casts to; it is byte-identical to Titanium's wire
+//     struct, which is why it is easy to reach for by mistake.
+// `common/patches/rof2.cpp` DECODE(OP_EnvDamage) converts wire -> generic: `DECODE_LENGTH_EXACT`
+// drops anything that is not exactly 39 bytes BEFORE the handler runs, then it copies id/damage/
+// dmgtype across and sets `constant = 0xFFFF` itself — the server never reads our `constant`.
+// Sending the 31-byte layout is therefore silent: the packet is dropped, no fall damage is ever
+// applied, and HP desyncs with no error anywhere on the client (#195).
 pub const OP_ENV_DAMAGE: u16 = 0x51fd;        // RoF2: OP_EnvDamage
 pub const DMGTYPE_FALLING: u8 = 0xFC;
 
