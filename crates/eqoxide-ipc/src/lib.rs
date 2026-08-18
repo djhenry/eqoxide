@@ -2248,7 +2248,8 @@ pub struct DoorView {
 }
 /// Snapshot of the current zone's doors, served by GET /v1/observe/doors.
 ///
-/// Published from three places, all through the single `eqoxide_net::action_loop::publish_doors`
+/// Published from three paths — four call expressions, the login path publishing both inside its
+/// drain and once after it — all through the single `eqoxide_net::action_loop::publish_doors`
 /// projection (see its doc for the inventory): the nav tick's `ActionLoop::sync_doors` during
 /// gameplay, `gameplay::run_zone_entry_handshake`'s own drain on a re-zone (#937/#1016), and
 /// `login::run_login_handshake`'s own drain on a session's first zone-in (#1022). "Each nav tick"

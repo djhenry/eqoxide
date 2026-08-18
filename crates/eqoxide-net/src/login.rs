@@ -163,8 +163,11 @@ fn record_login_liveness(net_health: &eqoxide_ipc::NetHealthShared, now: std::ti
 /// [`eqoxide_ipc::DoorsShared`] rather than the whole `InteractSlots`, and NOT an `ActionLoop` —
 /// the loop does not exist yet at this point in `run_login_flow`, which is precisely why this path
 /// had no door publisher before. Same slot, same projection (`action_loop::publish_doors`) and same
-/// per-drain-pass gate `run_zone_entry_handshake` uses on the re-zone path; see the call site in
-/// [`run_login_handshake`]'s drain.
+/// per-drain-pass gate `run_zone_entry_handshake` uses on the re-zone path. [`run_login_handshake`]
+/// publishes from TWO call expressions, not one: that gated call inside the drain, and an
+/// unconditional one after the loop — `PhaseResult::Done` breaks out from INSIDE the inner drain,
+/// so the gated call never runs for the pass that ends the handshake, and on a fast server that is
+/// the pass the whole door burst lands on. Both are documented at their own sites.
 ///
 /// This wrapper owns ONE thing beyond that state machine: a login attempt that FAILS must not
 /// leave the door roster it published standing. That is the shape #1016 review B4 found on the

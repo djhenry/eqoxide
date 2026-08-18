@@ -120,8 +120,15 @@ pub fn encode_client_position_update(
 ///     straight off `InteractSlots`, because no `ActionLoop` exists yet that early in
 ///     `run_login_flow` — which is exactly why that path had no door publisher at all before #1022.
 ///
-/// One implementation, three call sites; `doors_shared`'s doc comment covers the two on the
-/// re-zone/gameplay side, and `login::run_login_phase`'s doc covers the third.
+/// One implementation, three publishing paths, FOUR call expressions: `sync_doors` and
+/// `run_zone_entry_handshake` call it once each — `doors_shared`'s doc comment covers those two —
+/// and the login path calls it TWICE, the per-pass gated call inside the drain plus an
+/// unconditional one after the loop, which is the only one that can catch the pass a
+/// `PhaseResult::Done` breaks out of. `login::run_login_phase`'s doc covers both of those.
+///
+/// The production call expressions are exactly those four; a bare grep for the call also hits this
+/// definition and the mutation recipes in the tests' doc comments, so count paths and expressions
+/// separately — they differ here.
 ///
 /// `out.clear()` before `out.extend(...)` makes every call a full REPLACE from the CURRENT
 /// `gs.world.doors`, not an append onto whatever a previous call left behind — this is what
