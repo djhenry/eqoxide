@@ -150,10 +150,20 @@ pub struct Hit {
 ///
 /// * **`max_nodes_headroom_claim_stays_true`** — fast, every `cargo test`, no assets. It checks
 ///   `MEASURED_WORST_BUTCHER_PRODUCTION` against this constant using two-decimal figures
-///   hand-transcribed into its own body, not the prose above: editing `57.3%`/`1.75×` here without
-///   editing those literals leaves it green. It guarantees **nothing** about whether the measured
+///   hand-transcribed into its own body. It guarantees **nothing** about whether the measured
 ///   figure still describes the client — change what `astar` admits, rebake butcher, or edit the
 ///   corpus and it stays green while the figures above go false.
+/// * **`the_headroom_claim_window_is_closed_at_both_ends`** — fast. Pins the four boundary points
+///   of the window those two tolerances jointly admit, and which bound owns each end, so the
+///   interval `butcher_headroom_claim_check`'s rustdoc states is held by execution rather than by
+///   prose (#909 — it was stated open at the low end and is closed there).
+/// * **`the_max_nodes_prose_figures_are_anchored_to_the_arithmetic_they_restate`** — fast, in
+///   `steering.rs`'s #882 citation-guard corpus. This is what holds the `57.3%`/`1.75×` **prose
+///   above**. Until #910 nothing did: #880's review mutated only this doc comment (57.3% → 60.0%,
+///   1.75× → 2.10×), touched no code literal, and got a green run on a real rebuild. The guard
+///   derives both figures from this constant and the pinned measurement and then requires the
+///   derived text verbatim, so editing the prose here without the literals is now RED — and so is
+///   editing the literals without the prose.
 /// * **`worst_case_reachable_component`** — the `#[ignore]`d ~10 h corpus run, the only thing that
 ///   can re-derive the number. It asserts `worst < MAX_NODES` and, since #880, its freshly measured
 ///   `butcher` close against `MEASURED_WORST_BUTCHER_PRODUCTION`. **That is the only comparison
@@ -2144,6 +2154,17 @@ impl Collision {
     /// character's WIDTH (that is [`Self::path_clear`]'s question). Callers must bound the hop: at
     /// ~2 u spacing the cost is one column probe per 2 u of run.
     ///
+    /// **#905 — the WIDTH half of that sentence has already been litigated; do not re-derive it.**
+    /// Centre-only sampling was filed as a defect (#734 gap 2), and the fix — three parallel probes
+    /// offset across the direction of travel — was built, measured and **WITHDRAWN**: the
+    /// controller's own floor clamp is a single centre column too, so the sweep refused hops whose
+    /// floor the controller stands on at every sample, which is a FALSE REFUSAL. Width-blindness
+    /// here is *agreement* with the consumer, not a gap against it. The retraction, its measurement
+    /// table and the regression guard that keeps the sweep out are on
+    /// `crate::steering::resync_reachable`'s rustdoc — read that before treating the width sentence
+    /// above as an open defect. The LINE-SAMPLING half (#734 gap 1) is a different matter and IS
+    /// still live; `PROBE_SPACING`'s own comment in the body below says what holds it.
+    ///
     /// **And the envelope is PER PROBE, not over the hop.** `prev_z` chains, so each probe is judged
     /// against the last floor found rather than against the hop's own start and end. A descent that
     /// takes the full allowance at every probe therefore compounds, and the aggregate it compounds to
@@ -2181,6 +2202,24 @@ impl Collision {
     pub fn ground_continuous(&self, from: [f32; 3], to: [f32; 3]) -> bool {
         /// The fine local tier's cell (`steering::LOCAL_CELL`): the finest scale the walker's own
         /// planner resolves, so a gap missed here is one the fine planner could not express either.
+        ///
+        /// **#903 — this value is pinned from OFF-FILE, and shrinking it reds `main` with no git
+        /// conflict.** Two tests hold it, and only one of them lives in this file:
+        ///
+        /// * `ground_continuous_probe_spacing_catches_every_hole_wider_than_the_spacing` (below in
+        ///   this file) — the ordinary direction: a hole WIDER than the spacing must be caught.
+        /// * `a_narrow_hole_between_probes_still_crosses_the_resync_undetected`, in
+        ///   `crate::walker`'s test module — a bug-CHARACTERISATION test for #734 gap 1. It
+        ///   hard-codes its own local copy of this constant and asserts that a 1.5 u hole, narrower
+        ///   than it, is still stepped over undetected. **Narrowing this constant turns that test
+        ///   RED**, and because the two files never touch, nothing in the diff surfaces the
+        ///   coupling. That red is not a regression — it means #734 gap 1 has been FIXED — and its
+        ///   failure message is the delete-me instruction (the test, its entry in
+        ///   `every_walker_test_name_cited_in_a_doc_comment_still_exists`, and the gap-1 bullets in
+        ///   `steering::resync_cursor`'s and `Walker::advance_cursor`'s rustdocs).
+        ///
+        /// That delete-me path is measured, not argued: #887 round 2 set this constant to 1.0 and
+        /// re-ran the walker tests — that one test alone went red, 43 passed / 1 failed of 44.
         const PROBE_SPACING: f32 = 2.0;
         if !self.has_geometry() { return true; }
         let step_up = crate::traversability::PLAYER_BODY.step_up;
@@ -6005,6 +6044,8 @@ mod tests {
             // #856: the fast headroom-claim drift pin, cited by both `MAX_NODES`' doc comment and
             // `MEASURED_WORST_BUTCHER_PRODUCTION`'s.
             max_nodes_headroom_claim_stays_true,
+            // #909: the boundary pin, cited by `butcher_headroom_claim_check`'s own rustdoc.
+            the_headroom_claim_window_is_closed_at_both_ends,
         ];
     }
 
@@ -8269,11 +8310,34 @@ mod tests {
                 }
             }
             None => {
+                // #908: this assert's message used to say that a run which silently SKIPS `butcher`
+                // "did not run" the cross-check and must not pass. It cannot catch that state, and
+                // the reason is assertion ORDER in this same fn — traced, not argued:
+                //
+                //   * `butcher` drops (no glb / no grid) => `open_corpus_zone` records
+                //     `cover.skip(zone, ..)` and returns `Err`, so `cover.add` never runs =>
+                //     `cover.is_complete()` is false => the `#839` assert ABOVE fires first and
+                //     execution never reaches this `match` at all. Reproduced in #880's round-2
+                //     review with a `ZONES=` corpus of one nonexistent zone: the `#839` assert is
+                //     the killer and this one is never evaluated.
+                //   * `butcher` succeeds => `butcher_closed` is `Some`, so this arm is not taken.
+                //   * a `ZONES=`-overridden run without `butcher` => `override_zones.is_some()` is
+                //     trivially true, so the assert passes and proves nothing.
+                //
+                // The ONE state that reaches this line with `override_zones` unset is `DEFAULT_ZONES`
+                // above edited to drop `butcher` — the corpus narrowed at SOURCE rather than a zone
+                // dropped at RUNTIME. That is what the message now names. The assert is kept rather
+                // than deleted (#880's "dead code presented as coverage" treatment) because that
+                // state is genuinely reachable and worth a loud failure; what was dead was the
+                // description, not the check.
                 assert!(override_zones.is_some(),
-                    "#880: `butcher` is in the default corpus but produced no figure, so the \
-                     cross-check against MEASURED_WORST_BUTCHER_PRODUCTION did not run. A run that \
-                     silently skips the zone that sets this corpus's number is not a measurement of \
-                     it. (zones asked for: {zones:?})");
+                    "#908: this run produced no `butcher` figure and no ZONES override was set, so \
+                     the cross-check against MEASURED_WORST_BUTCHER_PRODUCTION did not run. A \
+                     RUNTIME drop of `butcher` cannot reach this line — the `#839` completeness \
+                     assert above fires first — so what this reports is that DEFAULT_ZONES has been \
+                     edited to no longer contain `butcher`. `butcher` is the zone that sets this \
+                     corpus's number and pins MEASURED_WORST_BUTCHER_PRODUCTION; a default corpus \
+                     without it is not a measurement of this constant. (zones asked for: {zones:?})");
                 println!("butcher cross-check: SKIPPED — `butcher` is not in this ZONES-overridden \
                           run ({zones:?}), so MEASURED_WORST_BUTCHER_PRODUCTION was NOT verified \
                           against the world by this run.");
@@ -8318,12 +8382,20 @@ mod tests {
     /// the two prose figures the input fails and what it recomputed instead.
     ///
     /// **The window this admits is narrow and OFF-CENTRE**, which is a property of two-decimal
-    /// rounding checks and is stated rather than discovered: jointly the two bounds accept only
-    /// `n ∈ (4,580,000, 4,584,527]`, i.e. **+742 / −3,785** around the pinned 4,583,785. The
-    /// headroom bound is the tight side and sits at 94.3% of its own tolerance. That is deliberate —
-    /// the check exists to say "the two-decimal prose above is still true", not "the number is
-    /// roughly right" — but anyone re-measuring should expect a real move to land RED and should fix
-    /// the constant and the prose, not the tolerance.
+    /// rounding checks and is stated rather than discovered: jointly the two bounds accept exactly
+    /// `n ∈ [4,580,000, 4,584,527]` — **closed at BOTH ends** — i.e. **+742 / −3,785** around the
+    /// pinned 4,583,785. The headroom bound is the tight side and sits at 94.3% of its own
+    /// tolerance. That is deliberate — the check exists to say "the two-decimal prose above is still
+    /// true", not "the number is roughly right" — but anyone re-measuring should expect a real move
+    /// to land RED and should fix the constant and the prose, not the tolerance.
+    ///
+    /// **#909 — the low end is CLOSED, and this doc used to say it was open.** Both bounds are `>=`
+    /// comparisons, so an input is accepted when its deviation is strictly BELOW the tolerance; at
+    /// `n = 4,580,000` the percentage deviation is not the `0.05` it is algebraically, it is the f64
+    /// value of `57.25 - 57.3`, `0.049999999999997158`, which is strictly below `0.05`. That
+    /// endpoint is therefore ACCEPTED. Which end of a rounding window is open is exactly the kind of
+    /// figure this file states in prose and nothing checks, so all four boundary points are now
+    /// pinned by execution in `the_headroom_claim_window_is_closed_at_both_ends`.
     fn butcher_headroom_claim_check(measured: usize) -> Result<(f64, f64), String> {
         let pct = measured as f64 * 100.0 / MAX_NODES as f64;
         let headroom = MAX_NODES as f64 / measured.max(1) as f64;
@@ -8400,6 +8472,74 @@ mod tests {
                     MEASURED_WORST_BUTCHER_PRODUCTION={}; this test does NOT re-measure it — only \
                     `worst_case_reachable_component` can.)", MEASURED_WORST_BUTCHER_PRODUCTION);
         }
+    }
+
+    /// **#909 — the ONE pin on WHICH END of `butcher_headroom_claim_check`'s window is open.**
+    ///
+    /// That fn's rustdoc states the accepted interval in prose. Before this test the prose said
+    /// `(4,580,000, 4,584,527]`, open at the low end, and the low end is **closed**: both bounds are
+    /// `>=` comparisons, so acceptance is "deviation strictly below tolerance", and at
+    /// `n = 4,580,000` the percentage deviation is the f64 value of `57.25 - 57.3`,
+    /// `0.049999999999997158`, strictly below `0.05`. A one-character prose slip about an interval's
+    /// openness was invisible to every other test in this file, because nothing else ever feeds the
+    /// predicate anything but the pinned constant.
+    ///
+    /// So the window is pinned by EXECUTION at all four boundary points — the last accepted and the
+    /// first rejected value on each side — rather than restated. WHICH bound rejects each outer
+    /// point is asserted too, so a change that moves the responsibility from one bound to the other
+    /// cannot pass by coincidence, and the rustdoc's "the headroom bound is the tight side" is
+    /// held with it.
+    ///
+    /// **What this does NOT do.** Like `max_nodes_headroom_claim_stays_true`, it constrains only the
+    /// predicate's arithmetic against `MAX_NODES`; it says nothing about whether the pinned
+    /// measurement still describes the client. And it is deliberately NOT a restatement of the
+    /// prose: if the tolerances are legitimately retaken, this test is what goes red first, and the
+    /// prose is then re-derived from it — not the other way round.
+    #[test]
+    fn the_headroom_claim_window_is_closed_at_both_ends() {
+        const LAST_REJECTED_BELOW:  usize = 4_579_999;
+        const FIRST_ACCEPTED:       usize = 4_580_000;
+        const LAST_ACCEPTED:        usize = 4_584_527;
+        const FIRST_REJECTED_ABOVE: usize = 4_584_528;
+
+        for (n, which) in [(FIRST_ACCEPTED, "LOW"), (LAST_ACCEPTED, "HIGH")] {
+            let verdict = butcher_headroom_claim_check(n);
+            assert!(verdict.is_ok(),
+                "#909: {n} is the {which} end of `butcher_headroom_claim_check`'s accepted window \
+                 and that end is CLOSED, but it was REJECTED. The window has moved: re-derive the \
+                 interval in that fn's rustdoc from the two tolerances, correct it there, and \
+                 update this test — do NOT widen a tolerance to make this pass. (verdict: \
+                 {verdict:?})");
+        }
+
+        // The outer points, each named with the bound that must be the one to reject it. A window
+        // that accepted these would make the rustdoc's "+742 / −3,785" figure false.
+        let below = butcher_headroom_claim_check(LAST_REJECTED_BELOW).expect_err(
+            "#909: one below the window's closed low end must be REJECTED; accepting it makes the \
+             −3,785 figure in `butcher_headroom_claim_check`'s rustdoc false");
+        assert!(below.contains("57.3% of the cap"),
+            "#909: the value one below the window must be refused by the PERCENTAGE bound — the low \
+             end is that bound's side. It was refused by something else, so the two bounds have \
+             swapped sides and the rustdoc's \"the headroom bound is the tight side\" is now false: \
+             {below}");
+
+        let above = butcher_headroom_claim_check(FIRST_REJECTED_ABOVE).expect_err(
+            "#909: one above the window's closed high end must be REJECTED; accepting it makes the \
+             +742 figure in `butcher_headroom_claim_check`'s rustdoc false");
+        assert!(above.contains("1.75x headroom"),
+            "#909: the value one above the window must be refused by the HEADROOM bound — that is \
+             what makes it \"the tight side\" in the rustdoc. It was refused by something else: \
+             {above}");
+
+        // REACH CONTROL. The four points above are only meaningful if the pinned constant actually
+        // sits INSIDE the window they bound. A window that had drifted wholesale would still pass
+        // every assert above while describing an interval bracketing no real measurement.
+        assert!(MEASURED_WORST_BUTCHER_PRODUCTION > FIRST_ACCEPTED
+                && MEASURED_WORST_BUTCHER_PRODUCTION < LAST_ACCEPTED,
+            "#909: the pinned MEASURED_WORST_BUTCHER_PRODUCTION \
+             ({MEASURED_WORST_BUTCHER_PRODUCTION}) is not strictly inside the window this test pins \
+             ([{FIRST_ACCEPTED}, {LAST_ACCEPTED}]), so the four boundary asserts above are about an \
+             interval that no longer brackets the measurement they exist to bracket");
     }
 
     /// **THE #382 CORPUS MEASUREMENT.** Fine-tier route success and cost, OLD (inline, net-thread) vs

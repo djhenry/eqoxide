@@ -639,10 +639,15 @@ pub fn carrot_leads(path: &[[f32; 3]], start_i: usize, from: [f32; 3], reach: f3
 /// `tests/walker_sim.rs` — and #887's round-1 review measured what that costs: changing the
 /// walker's copy left the other two modelling a predicate production no longer ran, while both of
 /// their doc comments went on saying they ran "the walker's own predicate". `pub`, not
-/// `pub(crate)`, specifically so the integration harness can call it: `tests/walker_sim.rs` also
-/// hand-copies the clearance today (its own ⚠️ Correction discloses that the copy agrees with
-/// `STEER_LOS_CLEARANCE` by coincidence rather than by construction), and this function closes both
-/// holes for whoever edits that file next.
+/// `pub(crate)`, so the integration harness can call it.
+///
+/// **#904 — that `pub` now has its out-of-crate caller, and the third copy is gone.** It was
+/// filed as a speculative justification: `tests/walker_sim.rs` was still hand-copying the
+/// conjunction inside `faithful_walker_drift_corpus`, so nothing outside this crate called this
+/// function and the exact drift the extraction exists to prevent was still live in that file. It
+/// now calls this function, which also retires the clearance copy that file used to disclose as
+/// agreeing with `STEER_LOS_CLEARANCE` only by coincidence. All three call sites are this one
+/// definition.
 ///
 /// ## Why BOTH halves are centre-line — and why the floor half must not be widened to the body
 ///
@@ -655,9 +660,18 @@ pub fn carrot_leads(path: &[[f32; 3]], start_i: usize, from: [f32; 3], reach: f3
 /// the body's CENTRE — in `src/movement.rs` it is
 /// `ground_below(self.pos[0], self.pos[1], foot + GROUND_ORIGIN, GROUND_DEPTH)`, with no
 /// `±radius` term in either the grounded or the levitating arm. A body whose shoulder overhangs a
-/// ledge lip is supported and walks normally. A floor test at `±PLAYER_RADIUS` therefore models a
-/// body production does not have, and every hop it newly refuses is one the controller would in
-/// fact have walked.
+/// ledge lip is supported and walks normally. A floor test at `±STEER_LOS_CLEARANCE` therefore
+/// models a body production does not have, and every hop it newly refuses is one the controller
+/// would in fact have walked.
+///
+/// **#906 — the constant named there is `STEER_LOS_CLEARANCE`, not `PLAYER_RADIUS`.** This
+/// paragraph and the gap-2 bullet on [`resync_cursor`] both used to say `±PLAYER_RADIUS`; the
+/// withdrawn round-1 code passed `STEER_LOS_CLEARANCE` (verified against that commit, `b9be51e`,
+/// which reads `ground_continuous_swept(c, a, b, STEER_LOS_CLEARANCE)`). The two are equal in
+/// value today only because `STEER_LOS_CLEARANCE` is *defined as* `PLAYER_RADIUS` — a coincidence,
+/// not a construction, and the walker's own clearance is the one this predicate uses. Re-point
+/// that definition and the sentence above stays true while `±PLAYER_RADIUS` would silently stop
+/// describing anything this crate does.
 ///
 /// Measured — the real `Walker::advance_cursor` on the `CHASM_ROUTE`/`CHASM_BODY` fixture, cursor
 /// starting at 2, alongside the controller's own `ground_below` sampled every 0.5 u along the same
@@ -779,7 +793,8 @@ pub fn resync_reachable(col: &crate::collision::Collision, from: [f32; 3], to: [
 /// * **Width-blind (#734 gap 2) — WITHDRAWN as a defect, on measurement (#887).** The floor probe
 ///   samples the centre only and so cannot tell a body-width crossing from a knife-edge ridge. That
 ///   is not a gap between this predicate and production, it is *agreement* with it: the controller's
-///   floor clamp is also a single centre column. A three-line `±PLAYER_RADIUS` sweep was built and
+///   floor clamp is also a single centre column. A three-line `±STEER_LOS_CLEARANCE` sweep (#906 —
+///   the withdrawn code passed the walker's clearance, not `PLAYER_RADIUS`) was built and
 ///   measured to refuse hops whose floor the controller stands on at every sample — a false refusal,
 ///   which under the agent-honesty invariant is as wrong as a false acceptance. The numbers, the
 ///   `edge_clear` precedent (876 → 813 routable pairs), and the regression guard that keeps the
@@ -2652,6 +2667,215 @@ mod cursor_resync_tests {
     #[test]
     fn the_doc_span_scan_reaches_all_five_citation_files_at_three_depths_each() {
         assert_doc_span_scan_reaches_corpus(&citation_corpus(), "citation");
+    }
+
+    /// **#910 — the fast guard on the `MAX_NODES` PROSE figures, in the #882 citation corpus rather
+    /// than as a one-off parser in `collision.rs`.**
+    ///
+    /// `collision.rs` states two DERIVED figures about `butcher` in prose — "57.3% of this cap" and
+    /// "1.75× headroom" — and pins them with `butcher_headroom_claim_check`, whose two tolerances
+    /// are hand-transcribed literals in its own body. Nothing read the prose. #880's round-2 review
+    /// demonstrated the gap by execution: mutating ONLY the doc comment (57.3% → 60.0%, 1.75× →
+    /// 2.10×), with no code literal touched, left `max_nodes_headroom_claim_stays_true` green on a
+    /// real rebuild. A figure stated in a tracked file with nothing able to contradict it is this
+    /// repo's recurring defect, and #910 filed it with an explicit constraint on the fix: route it
+    /// through the doc-span / citation guard corpus this module already maintains, not through a
+    /// bespoke prose parser next to the constant.
+    ///
+    /// **There is no parser here.** Nothing reads a number out of prose. The guard goes the other
+    /// way: it CONSTRUCTS the exact text each figure must be written as, from the arithmetic, and
+    /// then requires that text to occur. That is the source-text-anchor mechanism #919 already uses
+    /// on `walker.rs`, pointed at figures instead of at identifiers.
+    ///
+    /// **Where each input comes from, because a guard that copies both sides proves nothing.**
+    ///
+    /// * `MAX_NODES` is READ, not copied — `crate::collision::MAX_NODES`, the live constant.
+    /// * The measured `butcher` close is the one literal typed here, and it is not free-floating:
+    ///   entry 2 anchors it to `MEASURED_WORST_BUTCHER_PRODUCTION`'s definition line in
+    ///   `collision.rs`, so a change to that constant fails this test rather than being silently
+    ///   tracked.
+    /// * Both prose figures are then DERIVED from those two, formatted at the precision the prose
+    ///   uses, and required verbatim. Neither `57.3` nor `1.75` is typed anywhere in this file.
+    /// * The two tolerance lines inside `butcher_headroom_claim_check` are anchored against the
+    ///   same derived figures, so the doc prose and the code literals are held to each other
+    ///   through a common source rather than to a third copy.
+    ///
+    /// So: edit the prose alone and entries 5–7 stop resolving. Edit a code literal alone and
+    /// entries 3–4 stop resolving. Move `MEASURED_WORST_BUTCHER_PRODUCTION` and entry 2 goes with
+    /// it — and every derived figure moves at once, so the prose entries go red in the same run
+    /// rather than one at a time.
+    ///
+    /// **What it does NOT do**, stated because the sibling guards in this module have each had to
+    /// learn it:
+    ///
+    /// * it says nothing about whether the measurement still describes the CLIENT. Only
+    ///   `worst_case_reachable_component` compares it to the world, and only when someone pays the
+    ///   ~10 h. This closes the "prose drifted from the literals" hole and no other;
+    /// * a coordinated edit of the prose, the literals AND the typed node count here is green — as
+    ///   it should be, since all three then agree — but that makes this file a THIRD site to keep
+    ///   current, and that cost is the price of the guard, not an oversight;
+    /// * it is a substring match, not a claim that the surrounding sentence is apt.
+    ///
+    /// **Reach control.** Every entry is CLASSIFIED (0 hits / 1 hit / n hits), never only reported
+    /// on exception, and the corpus is an item in its own right: the scan's only product is one
+    /// `Verdict` per (line, needle) pair, obtainable only by performing that comparison, and a
+    /// second traversal sharing nothing but `digest` reconstructs the pairs the scan must have been
+    /// handed. A scan that stops part-way, or that compares substituted text, fails before any
+    /// figure verdict is read — the #778/#919 shape, where a truncated scanner's positive verdicts
+    /// were all inside the window it could still see.
+    #[test]
+    fn the_max_nodes_prose_figures_are_anchored_to_the_arithmetic_they_restate() {
+        use std::path::PathBuf;
+
+        // ── the inputs ──
+        //
+        // READ from the live constant. If #856's decision is ever retaken, every derived string
+        // below moves with it and this test reds on the prose that did not.
+        let cap = crate::collision::MAX_NODES;
+        // The one typed figure: #859's measured production-config `butcher` whole-zone close.
+        // Anchored to its definition line by entry 2 below, so it cannot quietly stop agreeing
+        // with the constant it restates.
+        const MEASURED_BUTCHER: usize = 4_583_785;
+
+        // Digit grouping, both spellings the tree uses: `4,583,785` in prose, `4_583_785` in code.
+        let group = |n: usize, sep: char| {
+            let d = n.to_string();
+            let mut out = String::new();
+            for (i, c) in d.chars().enumerate() {
+                if i > 0 && (d.len() - i) % 3 == 0 { out.push(sep); }
+                out.push(c);
+            }
+            out
+        };
+
+        // The two DERIVED figures, at the precision the prose writes them in. Nothing is typed.
+        let pct = format!("{:.1}", MEASURED_BUTCHER as f64 * 100.0 / cap as f64);
+        let head = format!("{:.2}", cap as f64 / MEASURED_BUTCHER as f64);
+
+        // ── the anchors ──
+        //
+        // Each is (constructed text, what it claims). Exactly one occurrence across the whole
+        // citation corpus is required: zero means the figure was edited away from its arithmetic,
+        // and more than one means the text is not the single site the claim names.
+        let anchors: Vec<(String, String)> = vec![
+            (format!("pub const MAX_NODES: usize = {};", group(cap, '_')),
+             "the node cap itself, read live above — if this line does not resolve, the constant \
+              this whole guard derives from is not where it thinks it is".to_string()),
+            (format!("const MEASURED_WORST_BUTCHER_PRODUCTION: usize = {};",
+                     group(MEASURED_BUTCHER, '_')),
+             "the pinned #859 measurement, which is the one figure this test types by hand; this \
+              entry is what stops that copy from drifting".to_string()),
+            (format!("if (pct - {pct}).abs() >= 0.05 {{"),
+             "`butcher_headroom_claim_check`'s PERCENTAGE tolerance, whose literal must be the \
+              percentage the prose states".to_string()),
+            (format!("if (headroom - {head}).abs() >= 0.005 {{"),
+             "`butcher_headroom_claim_check`'s HEADROOM tolerance, whose literal must be the \
+              headroom the prose states".to_string()),
+            (format!("{} — {pct}% of this cap, {head}× headroom.", group(MEASURED_BUTCHER, ',')),
+             "`MAX_NODES`' own doc comment, the headline statement of the production-config figure \
+              — the exact sentence #880's review mutated to 60.0%/2.10× and got a green run"
+                 .to_string()),
+            (format!("**{pct}% of `MAX_NODES`, {head}× headroom**"),
+             "`MEASURED_WORST_BUTCHER_PRODUCTION`'s doc comment, which restates the same pair"
+                 .to_string()),
+            (format!("{pct}% of `MAX_NODES`, {head}x headroom"),
+             "`worst_case_reachable_component`'s own MAGNITUDE comment, the third restatement \
+              (ASCII `x`, unlike the two above)".to_string()),
+            (format!("states butcher consumes {pct}% of the cap"),
+             "the percentage bound's FAILURE message, which tells the next author what prose to \
+              go and correct".to_string()),
+            (format!("states {head}x headroom over butcher"),
+             "the headroom bound's failure message, same reason".to_string()),
+        ];
+        assert!(!anchors.is_empty(), "the anchor list is empty; this test would pass on anything");
+
+        // ── the instrument (the #919 shape) ──
+        //
+        // A `Verdict` cannot be fabricated: its fields are private and its only constructor runs
+        // the comparison and records a digest of the two strings it was handed. A comparison the
+        // scan skips leaves NO verdict; one fed substituted input leaves a verdict whose digests
+        // disagree with the control's. Neither traversal normalises, so they share nothing but
+        // `digest` — two traversals cannot cross-check each other through a component they share.
+        mod probe {
+            pub struct Verdict { hit: bool, hay: u64, needle: u64 }
+            impl Verdict {
+                pub fn test(line: &str, needle: &str) -> Verdict {
+                    Verdict { hit: line.contains(needle), hay: digest(line), needle: digest(needle) }
+                }
+                pub fn hit(&self) -> bool { self.hit }
+                pub fn inputs(&self) -> (u64, u64) { (self.hay, self.needle) }
+            }
+            /// FNV-1a, so a verdict can name its own two inputs in 16 bytes.
+            pub fn digest(s: &str) -> u64 {
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                for b in s.as_bytes() { h ^= u64::from(*b); h = h.wrapping_mul(0x0000_0100_0000_01b3); }
+                h
+            }
+        }
+
+        // The corpus is an ITEM, not a backdrop: read it, prove it is the tree this test thinks it
+        // is, and let a short read fail loudly rather than quietly classify every anchor as absent.
+        let files: Vec<PathBuf> = citation_corpus().to_vec();
+        for p in &files {
+            assert!(p.is_file(), "citation corpus file is missing: {}", p.display());
+        }
+        let corpus = read_corpus(&files);
+        let total_lines: usize = corpus.iter().map(|(_, s)| s.lines().count()).sum();
+        assert!(total_lines >= 10_000,
+            "the citation corpus read as only {total_lines} lines across {} files; the source tree \
+             is not where this test thinks it is, and every anchor would fail for the wrong reason",
+            corpus.len());
+
+        let mut verdicts: Vec<probe::Verdict> = Vec::new();
+        for (_, src) in &corpus {
+            for line in src.lines() {
+                for (needle, _) in &anchors { verdicts.push(probe::Verdict::test(line, needle)); }
+            }
+        }
+
+        // ── reach control, read BEFORE any figure verdict ──
+        let mut expected: Vec<(u64, u64)> = Vec::new();
+        for (_, src) in &corpus {
+            for line in src.lines() {
+                let hay = probe::digest(line);
+                for (needle, _) in &anchors { expected.push((hay, probe::digest(needle))); }
+            }
+        }
+        assert_eq!(expected.len(), total_lines * anchors.len(),
+            "the reach control's own expectation is malformed: {} pairs for {total_lines} lines × \
+             {} anchors", expected.len(), anchors.len());
+        let performed: Vec<(u64, u64)> = verdicts.iter().map(probe::Verdict::inputs).collect();
+        assert_eq!(performed.len(), expected.len(),
+            "the figure-anchor scan did not cover the citation corpus: {} of {} (line, anchor) \
+             comparisons were performed across {total_lines} lines. Every verdict below is unsound.",
+            performed.len(), expected.len());
+        if let Some(k) = performed.iter().zip(&expected).position(|(a, b)| a != b) {
+            panic!("the figure-anchor scan ran on substituted input: comparison {k} — corpus line \
+                    {}, anchor #{} — was not performed on that line's text against that anchor. \
+                    Every verdict below is unsound.", k / anchors.len() + 1, k % anchors.len());
+        }
+
+        // Anchor `i`'s verdicts are every `i`-th one, by the construction asserted above. EVERY
+        // anchor is classified; nothing is reported by exception only.
+        let mut problems: Vec<String> = Vec::new();
+        for (i, (needle, claim)) in anchors.iter().enumerate() {
+            let hits = verdicts.iter().skip(i).step_by(anchors.len()).filter(|v| v.hit()).count();
+            match hits {
+                1 => {}
+                0 => problems.push(format!(
+                    "MISSING: the citation corpus contains no line with `{needle}`, which this \
+                     guard derived from MAX_NODES={cap} and the pinned butcher close \
+                     {MEASURED_BUTCHER}, and which is cited as {claim}. Either a figure was edited \
+                     away from the arithmetic it restates, or the arithmetic moved and this text \
+                     did not follow it. Re-derive it — do NOT retype this guard to match the prose.")),
+                n => problems.push(format!(
+                    "AMBIGUOUS: `{needle}` occurs on {n} lines of the citation corpus and is cited \
+                     as {claim}, which reads as one site. Anchor a longer, unique phrase.")),
+            }
+        }
+        assert!(problems.is_empty(),
+            "#910: {} of {} MAX_NODES figure anchor(s) no longer resolve:\n  {}",
+            problems.len(), anchors.len(), problems.join("\n  "));
     }
 
     /// **#789's own reach control: the same proof, over `workspace_rs_files()` instead of the five

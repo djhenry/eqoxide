@@ -2431,9 +2431,11 @@ mod tests {
 
     /// A single flat slab whose NORTH edge sits `margin` from the hop line (n = 0) the resync
     /// tests: east ∈ [-60, 60], north ∈ [-100, `margin`], all at h = 0. The body's centre column is
-    /// over floor the whole way; a probe offset `+PLAYER_RADIUS` north is over void whenever
-    /// `margin < 1.0`. This is the ordinary "route runs along a ledge lip" shape, and the
-    /// controller walks it — its floor clamp only ever asks about the centre.
+    /// over floor the whole way; a probe offset `+STEER_LOS_CLEARANCE` north is over void whenever
+    /// `margin < 1.0` (#906: the withdrawn sweep passed that constant, not `PLAYER_RADIUS`; they
+    /// are equal today only because the former is defined as the latter). This is the ordinary
+    /// "route runs along a ledge lip" shape, and the controller walks it — its floor clamp only
+    /// ever asks about the centre.
     fn lip_zone(margin: f32) -> crate::collision::SharedCollision {
         let slab = |e0: f32, e1: f32, n0: f32, n1: f32, h: f32| {
             quad(vec![[n0, h, e0], [n1, h, e0], [n1, h, e1], [n0, h, e1]])
