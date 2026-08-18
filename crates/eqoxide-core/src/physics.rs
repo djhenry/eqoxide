@@ -461,12 +461,26 @@ pub fn running_jump_reach(run_speed: f32) -> f32 {
     air_time * run_speed
 }
 
-/// Native Titanium fall damage for a fall of `height` EQ units. Fall damage is CLIENT-computed in
-/// EQ (the server only validates OP_EnvDamage). Model: impact velocity = min(terminal,
-/// sqrt(2·g·h)) converted to the client's internal per-update z-velocity units (~5-13); then
-/// `fall_score = |z_vel| − 4` (char_counter≈0, no safe-fall skill): ≤0 → no damage, ≥9 → lethal
-/// (20000), else a roll in `[0, score²·10]`. Returns (rolled_damage, max_damage). See
-/// ~/git/eq_kb/falling-physics.md.
+/// Native Titanium fall damage for a fall of `height` EQ units. The MAGNITUDE is client-computed
+/// because the protocol gives the server no way to derive it: the server has no fall detection and
+/// reads the number straight out of the `EnvDamage2_Struct.damage` field we report (see
+/// `Client::Handle_OP_EnvDamage`, zone/client_packet.cpp). What it does NOT do is merely validate
+/// that report — an earlier version of this comment said "the server only validates OP_EnvDamage",
+/// which was wrong, and that misreading is plausibly why a local subtraction looked necessary
+/// alongside the send (#1005). The handler APPLIES the damage
+/// (`SetHP(GetHP() - damage * RuleR(Character, EnvironmentDamageMulipliter))`), having first
+/// possibly scaled it by the environment-damage modifier and the spell/item/AA `ReduceFallDamage`
+/// bonuses — or refused it entirely, deducting exactly 1 instead, for a GM, `GetInvul()`,
+/// `GetInvulnerableEnvironmentDamage()`, or (with no HP change at all) in liquid on a zone with a
+/// water map and in the tutorial/load zones. It then calls `SendHPUpdate()`. So the value this
+/// function returns is what we ASK FOR, never what the player took, and it must not be subtracted
+/// from any published HP.
+///
+/// Model: impact velocity = min(terminal, sqrt(2·g·h)) converted to the client's internal
+/// per-update z-velocity units (~5-13); then `fall_score = |z_vel| − 4` (char_counter≈0, no
+/// safe-fall skill): ≤0 → no damage, ≥9 → lethal (20000), else a roll in `[0, score²·10]`.
+/// Returns (rolled_damage, max_damage). Derivation: `falling-physics.md` in the private EQ
+/// knowledge-base tree.
 pub fn fall_damage(height: f32) -> (u32, u32) {
     const GRAVITY: f32 = 120.0;   // matches the renderer's fall physics
     const TERMINAL: f32 = 128.0;  // native internal z-velocity clamp

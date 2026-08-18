@@ -1415,19 +1415,20 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // `false`). Attached here, not in the literal above, which is at the json! recursion limit.
         player.insert("levitating".into(),             serde_json::json!(player_levitating));
         // #1005/agent-honesty — IS THE HP ABOVE THE SERVER'S? false = `hp`/`hp_max`/`hp_pct` in this
-        // payload are the CLIENT's own arithmetic, not a figure the server sent. The client applies
-        // each hit locally on purpose so the reading moves per-hit instead of pinning at the last
-        // server value (eqoxide#55). Measured live on `36ea882`: one `#damage` produced two damage
-        // lines, both were subtracted, and this payload carried `hp: 0` for a character the server
-        // held at 214/441 — for 2.477 s, `dead: false` throughout, no OP_Death, reproduced 2 of 2.
+        // payload are a number the CLIENT inferred, not a figure the server sent. The client used to
+        // apply each hit locally so the reading moved per-hit instead of pinning at the last server
+        // value (eqoxide#55). Measured live on `36ea882`: one `#damage` produced two damage lines,
+        // both were subtracted, and this payload carried `hp: 0` for a character the server held at
+        // 214/441 — for 2.477 s, `dead: false` throughout, no OP_Death, reproduced 2 of 2.
         // Well-formed, plausible, false, and nothing else in the response distinguished it from
-        // server truth; an agent deciding whether to flee had no channel that could tell.
+        // server truth; an agent deciding whether to flee had no channel that could tell. That
+        // subtraction is now deleted outright; this flag covers the residue that cannot be.
         //
         // `true` ONLY straight after a self OP_HPUpdate — the only server message carrying both
-        // current and maximum HP. Local damage, client-computed fall damage, the OP_Death zeroing,
-        // the bind-respawn full-HP assumption and the PlayerProfile seed all leave it false; see
-        // `PlayerState::hp_verified` for why each one counts. It governs `target_hp_pct` too while
-        // the player is self-targeted, since that field then resolves from the same `hp_pct`.
+        // current and maximum HP. The OP_Death zeroing, the bind-respawn full-HP assumption and the
+        // PlayerProfile seed all leave it false; see `PlayerState::hp_verified` for why each one
+        // counts. It governs `target_hp_pct` too while the player is self-targeted, since that field
+        // then resolves from the same `hp_pct`.
         //
         // ALWAYS PRESENT, never omitted — an absent key cannot be told from "this client is too old
         // to know", which is the same contract as `levitating` above and `afloat_stall` below. This
@@ -4656,18 +4657,22 @@ mod tests {
         assert_eq!(v["player"]["hp_verified"], serde_json::json!(true),
             "a self OP_HPUpdate is what the flag is for; if it never reads true the flag is inert");
 
-        // ── The measured #1005 window: one `#damage` event, two damage lines, both subtracted. ──
-        set_gs(&state, |gs| { gs.apply_local_hp_damage(107); gs.apply_local_hp_damage(107); });
+        // ── A client-derived write of the same fields. The measured #1005 zero came from a damage
+        //    subtraction, and that arithmetic is deleted (see `a_damage_packet_never_moves_the_
+        //    published_self_hp_1005`), so no OP_Damage can produce this state any more. The residue
+        //    can: `update_hp_estimated` is the bind-respawn path, and the death path writes a zero
+        //    the same way. The published body must mark it either way. ────────────────────────────
+        set_gs(&state, |gs| gs.update_hp_estimated(7, 0, 441));
         let v = debug_json(state.clone()).await;
         let p = &v["player"];
         assert_eq!(p["hp"], serde_json::json!(0),
-            "control: the payload really does carry the fabricated zero — without this the \
+            "control: the payload really does carry a zero nobody sent — without this the \
              assertion below could pass on a body that never entered the window");
         assert_eq!(p["dead"], serde_json::json!(false),
-            "control: and `dead` is false throughout, exactly as measured across 27,527 samples — \
+            "control: and `dead` is false beside it, exactly as measured across 27,527 samples — \
              so `dead` was never the field that could have warned the agent");
         assert_eq!(p["hp_verified"], serde_json::json!(false),
-            "THE #1005 BAR: a 200 carrying client-side arithmetic must not be indistinguishable \
+            "THE #1005 BAR: a 200 carrying a client-derived number must not be indistinguishable \
              from server truth. `hp: 0` for a character the server holds at 214/441 has to be \
              marked, in this body, or an agent flees or fights on a number nobody sent");
 

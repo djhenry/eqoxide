@@ -1274,8 +1274,8 @@ pub struct GameState {
     /// Player's absolute current/max HP (from OP_HP_UPDATE), used for the lethal-fall guard.
     ///
     /// NOT necessarily a figure the server sent — read [`hp_verified`](Self::hp_verified) beside it
-    /// (#1005). Several paths write these fields from the client's own arithmetic; see
-    /// [`apply_local_hp_damage`](Self::apply_local_hp_damage) and `unverified_hp_writes`.
+    /// (#1005). No path computes DAMAGE into these fields any more, but a few still write them from
+    /// the client's own inference; `unverified_hp_writes` below lists every one.
     pub cur_hp: i32,
     pub max_hp: i32,
     /// True once at least one authoritative self `OP_HPUpdate` has landed (#1005). It is the only
@@ -1287,12 +1287,8 @@ pub struct GameState {
     pub hp_confirmed: bool,
     /// Count of writes to the player's `cur_hp`/`hp_pct` made by the CLIENT rather than read from a
     /// self `OP_HPUpdate`, since the last such update (#1005). Nonzero means the published HP is at
-    /// least partly the client's own arithmetic. The writers that increment it, all of them:
+    /// least partly the client's own inference. The writers that increment it, all of them:
     ///
-    /// * the per-hit optimistic damage subtraction (eqoxide#55) — the measured #1005 trigger, where
-    ///   one `#damage` produced two damage lines, each subtracted, and the client's own arithmetic
-    ///   reached `hp: 0` while the server held 214/441 for up to 2.477 s;
-    /// * client-computed fall damage (#442), which subtracts before OP_ENV_DAMAGE is answered;
     /// * the `OP_Death` zeroing of `cur_hp`/`hp_pct` — the death itself is authoritative, the
     ///   *number* zero is the client's inference from it;
     /// * the bind-respawn "real EQ revives at full HP" assumption (eqoxide#68);
@@ -2020,35 +2016,6 @@ impl GameState {
         self.unverified_hp_writes = self.unverified_hp_writes.saturating_add(1);
     }
 
-    /// The ONE place client-side self-HP arithmetic is allowed to live (#1005). Subtracts `damage`
-    /// from the player's own HP, clamped at 0, recomputes `hp_pct`, and marks the result an
-    /// ESTIMATE so the published value can never be mistaken for a figure the server sent.
-    ///
-    /// Callers: the per-hit optimistic subtraction in `apply_combat_damage` (eqoxide#55) and
-    /// client-computed fall damage in `ActionLoop::stream_position` (#442). Both used to write
-    /// `gs.cur_hp` directly, and the measured #1005 divergence — `hp: 0` published while the server
-    /// held 214/441, for 2.477 s, reproduced 2 of 2 — came from the first of them double-applying
-    /// one `#damage` event's two damage lines.
-    ///
-    /// Also refreshes `target_hp_pct` when the player is self-targeted, for the same reason
-    /// `update_hp` does: a stale self target readout beside a moved `hp_pct` is two different
-    /// answers to "how much health do I have" in one payload. Fall damage previously moved `cur_hp`
-    /// without touching `hp_pct` at all; routing it here fixes that inconsistency too.
-    ///
-    /// `max_hp <= 0` (no known max) leaves `hp_pct` alone rather than dividing by a fabricated 1 —
-    /// but still counts the write, because `cur_hp` moved.
-    pub fn apply_local_hp_damage(&mut self, damage: i32) {
-        if damage <= 0 { return; }
-        self.cur_hp = (self.cur_hp - damage).max(0);
-        if self.max_hp > 0 {
-            self.hp_pct = (self.cur_hp as f32 / self.max_hp as f32) * 100.0;
-        }
-        self.mark_hp_estimated();
-        if self.target_id == Some(self.player_id) {
-            self.target_hp_pct = Some(self.hp_pct);
-        }
-    }
-
     /// Is the self-player levitating (gravity off)? The CONTROLLER read path (bool: hover or fall).
     /// The single read path for [`LevitateState`]. Agent-facing observables must instead use
     /// [`player_levitating_state`](Self::player_levitating_state), which distinguishes `Unknown`.
@@ -2752,12 +2719,14 @@ pub(crate) mod tests {
     /// marking it. This drives the update path directly rather than a live run: a live run showing
     /// correct HP proves the path CAN be right and cannot discharge a "never" claim.
     ///
-    /// The scenario is the measured one. The server held the character at 214/441; one `#damage`
-    /// command produced TWO damage lines and the client subtracted both, so its own arithmetic
-    /// reached 0 — published as `hp: 0` for up to 2.477 s with `dead: false` throughout and no
-    /// OP_Death packet, reproduced 2 of 2.
+    /// The measured defect was a client-side DAMAGE subtraction, and that arithmetic is now gone
+    /// outright — `apply_combat_damage` no longer touches `cur_hp`, and the assertion that it
+    /// cannot lives beside it in `eqoxide-net`. What remains here is the residue: paths that still
+    /// write the player's own HP from a client INFERENCE (a death's zero, a respawn's assumed full
+    /// bar, a zone-in seed with no max). Those cannot be deleted — the fields have to hold
+    /// something — so they must be distinguishable instead, which is what this covers.
     #[test]
-    fn a_double_applied_local_hit_reaches_zero_but_never_reads_verified_1005() {
+    fn a_client_derived_self_hp_write_can_never_read_verified_1005() {
         let mut gs = GameState::new();
         gs.player_id = 7;
 
@@ -2769,19 +2738,16 @@ pub(crate) mod tests {
         gs.update_hp(7, 214, 441);
         assert!(gs.hp_verified(), "a self OP_HPUpdate is the one reading that confirms the triple");
 
-        // Damage line 1 of the single `#damage` event.
-        gs.apply_local_hp_damage(107);
-        assert_eq!(gs.cur_hp, 107, "the per-hit estimate still moves — eqoxide#55 is preserved");
-        assert!(!gs.hp_verified(), "one local subtraction is already client arithmetic");
+        // A client-derived write of the same fields — e.g. the bind-respawn full-HP assumption.
+        gs.update_hp_estimated(7, 441, 441);
+        assert_eq!(gs.cur_hp, 441, "control: the estimate path really does write the fields");
+        assert!(!gs.hp_verified(), "one client-derived write is enough to spend the confirmation");
 
-        // Damage line 2 — the double-apply. This is where the fabricated zero came from.
-        gs.apply_local_hp_damage(107);
-        assert_eq!(gs.cur_hp, 0, "control: the double-apply really does reach zero, as measured");
-        assert!((gs.hp_pct - 0.0).abs() < 1e-4, "hp_pct is derived from the same arithmetic: {}", gs.hp_pct);
-        assert!(!gs.hp_verified(),
-            "a zero the server never sent must not be published as a confirmation (#1005)");
-        assert_eq!(gs.unverified_hp_writes, 2,
-            "each client write is counted; a counter (not a bool) is why nothing can assert trust              back after only one of them is accounted for");
+        // A second one. The counter is why nothing can hand trust back after accounting for only
+        // one of several outstanding writes.
+        gs.mark_hp_estimated();
+        assert_eq!(gs.unverified_hp_writes, 2, "each client write is counted");
+        assert!(!gs.hp_verified());
 
         // Only a real server reading restores trust — and it restores the value too.
         gs.update_hp(7, 214, 441);
@@ -2791,13 +2757,13 @@ pub(crate) mod tests {
 
     /// #1005 — reach control for the player branch: an HP update for SOMETHING ELSE must not
     /// confirm the player's own HP. Without this, any mob's OP_HPUpdate during a fight would clear
-    /// the estimate debt and re-publish the client's arithmetic as server truth.
+    /// the estimate debt and re-publish the client's inference as server truth.
     #[test]
     fn another_spawns_hp_update_does_not_confirm_the_players_own_hp_1005() {
         let mut gs = GameState::new();
         gs.player_id = 7;
         gs.update_hp(7, 214, 441);
-        gs.apply_local_hp_damage(107);
+        gs.update_hp_estimated(7, 107, 441);
         assert!(!gs.hp_verified(), "precondition: the player's HP is an estimate");
 
         gs.world.entities.insert(99, make_entity(99, "a rat", 0.0, 0.0, 0.0, true));
@@ -2820,7 +2786,7 @@ pub(crate) mod tests {
         assert_eq!(gs.target_hp_pct, Some(100.0));
         assert!(gs.hp_verified());
 
-        gs.apply_local_hp_damage(441);
+        gs.update_hp_estimated(7, 0, 441);
         assert_eq!(gs.cur_hp, 0);
         assert_eq!(gs.target_hp_pct, Some(0.0),
             "the self-target readout must not stay at 100 while hp_pct reads 0");
@@ -2828,20 +2794,18 @@ pub(crate) mod tests {
             "target_hp_pct is self-HP while self-targeted, so the same flag has to cover it");
     }
 
-    /// #1005 — `apply_local_hp_damage` with no known max must still count the write. `cur_hp` moved,
-    /// so the published `hp` is client arithmetic whether or not a percent could be recomputed; and
-    /// it must not divide by the fabricated 1 that the `max(1)` idiom elsewhere uses.
+    /// #1005 — the counter saturates rather than wrapping. A `u32` that wrapped to 0 would hand an
+    /// unearned `hp_verified() == true` back to an agent after enough client-derived writes, which
+    /// is the exact failure the flag exists to prevent. Cheap to assert, impossible to notice live.
     #[test]
-    fn a_local_hit_with_no_known_max_still_counts_as_an_estimate_1005() {
+    fn the_estimate_counter_saturates_and_never_wraps_back_to_verified_1005() {
         let mut gs = GameState::new();
         gs.player_id = 7;
-        gs.cur_hp = 50; gs.max_hp = 0; gs.hp_pct = 77.0;
-        gs.apply_local_hp_damage(10);
-        assert_eq!(gs.cur_hp, 40);
-        assert!((gs.hp_pct - 77.0).abs() < 1e-4,
-            "with no known max, hp_pct must be left alone rather than computed against a made-up \
-             denominator, got {}", gs.hp_pct);
-        assert!(!gs.hp_verified(), "cur_hp still moved by client arithmetic");
+        gs.update_hp(7, 441, 441);
+        gs.unverified_hp_writes = u32::MAX;
+        gs.mark_hp_estimated();
+        assert_eq!(gs.unverified_hp_writes, u32::MAX, "saturating, not wrapping");
+        assert!(!gs.hp_verified(), "a wrap here would publish client arithmetic as server truth");
     }
 
     #[test]

@@ -2990,7 +2990,9 @@ impl ActionLoop {
         // clear that one-shot exactly once here and, if the fall was past the safe height, apply the
         // native (client-computed) fall damage + OP_ENV_DAMAGE — the same formula/threshold the old
         // `drive_controlled_fall` used. Any fall past the safe height damages, so WASD off a ledge
-        // now damages too, matching the native RoF2 client. A teleport / server correction clears the
+        // now damages too, matching the native RoF2 client. (#1030 is open against that last claim:
+        // a measured run had walk-off falls firing 0/3 where jump-off fired 6/6. Not touched here.)
+        // A teleport / server correction clears the
         // signal at the controller (see `CharacterController::teleport`), so a correction is never
         // misread as a fall (hazard 2b); a mid-fall depenetration/ground-snap recovery latches nothing
         // (hazard 2a). `SAFE_FALL_HEIGHT` is named so the threshold is easy to tune/revert.
@@ -3000,14 +3002,42 @@ impl ActionLoop {
             if height > SAFE_FALL_HEIGHT {
                 let (dmg, _max) = fall_damage(height);
                 if dmg > 0 {
+                    // The OP_ENV_DAMAGE report is MANDATORY and stays. The server has no fall
+                    // detection of its own: `Client::Handle_OP_EnvDamage` takes the magnitude
+                    // straight out of `EnvDamage2_Struct.damage` (this packet) and applies it with
+                    // `SetHP(GetHP() - damage * RuleR(Character, EnvironmentDamageMulipliter))`.
+                    // Stop sending and the player silently never takes fall damage at all.
                     stream.send_app_packet(OP_ENV_DAMAGE, &build_env_damage_packet(gs.player_id, dmg, DMGTYPE_FALLING));
-                    // #1005: client-COMPUTED damage, applied before the server has answered the
-                    // OP_ENV_DAMAGE above — an estimate by construction. Routed through the shared
-                    // method so it is marked as one (and so `hp_pct`, which this site never used to
-                    // recompute at all, stops disagreeing with `hp`).
-                    gs.apply_local_hp_damage(dmg as i32);
-                    gs.log_msg("combat", &format!("Fell {:.0}u — {} fall damage", height, dmg));
-                    tracing::info!("EQ: fall damage {dmg} (fell {height:.0}u)");
+                    // #1005/#1029: the local subtraction that used to sit here is GONE. `dmg` is
+                    // the magnitude we REQUESTED, not the one the player took. Measured over six
+                    // falls: the server answered `Your GM status protects you from 160 points of
+                    // Falling (Type 252) damage`, applied 1, and the client had already subtracted
+                    // the full 160 — divergences of 1 to 440 HP lasting 67 ms to 11.3 s, every one
+                    // of them with `hp_pct` left un-recomputed beside the moved `cur_hp`. One event
+                    // published `cur_hp = 0` with `dead: false` while the server held 440/441: the
+                    // `.max(0)` clamp is what turned an already-wrong number into the specific
+                    // false answer "you are dead" rather than something visibly nonsensical. The same handler may
+                    // refuse it outright (GM, `GetInvul()`, `GetInvulnerableEnvironmentDamage()`,
+                    // the tutorial/load zones, or standing in liquid on a zone with a water map) or
+                    // scale it by the environment-damage modifier, the spell/item/AA
+                    // `ReduceFallDamage` bonuses and that rule multiplier — and on the refusal
+                    // branches it deducts exactly 1 instead. It then calls `SendHPUpdate()`, so the
+                    // authoritative number arrives on its own. Computing damage is required here
+                    // ONLY because the protocol makes us report it; applying our own figure to
+                    // published state is what made `/v1/observe/debug` publish an HP the server
+                    // never sent.
+                    //
+                    // The log line therefore reports the REQUEST, in those words. Driving it from
+                    // the resulting server HP update instead was considered and rejected: on the
+                    // liquid and tutorial/load branches the handler returns before changing HP at
+                    // all, so there is no update to key off and a fall that really happened would
+                    // log nothing — and any later OP_HPUpdate we did pick up could just as easily
+                    // be a mob hit landing in the same window, which would attribute someone
+                    // else's damage to the fall. Under-claiming beats mis-attributing.
+                    gs.log_msg("combat",
+                        &format!("Fell {height:.0}u — reported {dmg} fall damage to the server \
+                                  (the server decides the amount actually taken)"));
+                    tracing::info!("EQ: fall damage REPORTED {dmg} (fell {height:.0}u) — server decides the actual amount");
                 }
             }
         }

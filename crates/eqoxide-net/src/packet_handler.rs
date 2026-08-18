@@ -2040,26 +2040,33 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     tracing::info!("EQ: combat: {msg}");
     gs.log_msg("combat", &msg);
 
-    // Optimistic local HP (eqoxide#55): apply damage the player TOOK immediately so the HUD/API
-    // react per-hit instead of pinning at the last server value until the next OP_HPUpdate (which
-    // then reconciles the authoritative HP). `damage`@9 is the same reliable field shown above; only
-    // real hits (>0) reduce HP, clamped at 0. Guarded on a known max so the percent stays sane.
-    // A BENEFICIAL spell (heal/buff) whose `damage` field carries the heal amount must NOT be
-    // subtracted from HP — that would drain the player on every heal (#272); the OP_HPUpdate carries
-    // the true post-heal HP.
-    let beneficial_spell = spellid != 0 && spellid != SPELL_UNKNOWN
-        && eqoxide_core::spells::global().is_some_and(|d| d.is_beneficial(spellid));
-    // #1005: the subtraction is kept — an agent still gets a per-hit reading — but it goes through
-    // `GameState::apply_local_hp_damage`, which marks the result an ESTIMATE. Before that, a
-    // `#damage` event whose two damage lines each landed here drove the client's own arithmetic to
-    // `hp: 0` while the server held 214/441, and `/v1/observe/debug` published that zero as
-    // indistinguishable from server truth for up to 2.477 s (reproduced 2 of 2). The double-apply
-    // itself is NOT suppressed here: whether the doubled line is a server-side artefact of the GM
-    // command or a genuine duplicate the client must tolerate is not established (#1005), and
-    // guessing would replace a marked estimate with an unmarked one.
-    if target_id == gs.player_id && damage > 0 && gs.max_hp > 0 && !beneficial_spell {
-        gs.apply_local_hp_damage(damage);
-    }
+    // #1005: NO local HP arithmetic here. The "optimistic local HP" block that used to sit at this
+    // point (eqoxide#55) subtracted `damage`@9 from `gs.cur_hp` and recomputed `hp_pct` from it, to
+    // make the HUD/API react per-hit rather than pin at the last server value. It was deleted, not
+    // merely marked, because the value it published was not just unconfirmed — it was WRONG, and
+    // structurally so:
+    //
+    //   * The authoritative number has ALREADY ARRIVED by the time this runs. `Mob::CommonDamage`
+    //     (zone/attack.cpp) queues `SendHPUpdate(true)` for a client BEFORE it builds the OP_Damage
+    //     packet this function decodes, on the same reliable stream — so the subtraction re-applied
+    //     a hit the server had already accounted for. Measured on real NPC melee, pairing each hit
+    //     to the update whose SERVER-side delta matched it (so the pairing cannot be biased by the
+    //     subtraction under test): the update arrived FIRST in 29 of 30 cases, median offset
+    //     −0.2 ms. Removing the subtraction costs ~0 ms on a damage event.
+    //   * And the estimate was not merely unconfirmed, it was usually WRONG: over 38 real melee
+    //     hits it matched the server exactly 2 times (5.3%) and erred in BOTH directions — 25 low,
+    //     11 high, range −19..+16. Not a conservative bound; noise under a confident label.
+    //   * Measured consequence: one `#damage` command produced two OP_Damage lines (source ==
+    //     target puts the caster on both notify lists, so `#damage` delivers twice; real NPC melee
+    //     delivered exactly once, 30/30), each was subtracted, and the client's own arithmetic
+    //     reached `hp: 0` while the server held 214/441. `/v1/observe/debug` published that
+    //     fabricated zero as indistinguishable from server truth for up to 2.477 s, reproduced
+    //     2 of 2, with `dead: false` throughout and no OP_Death — so nothing else in the payload
+    //     could have warned a caller.
+    //
+    // The governing rule this file now follows: COMPUTE damage only where the protocol REQUIRES us
+    // to report it (see the OP_ENV_DAMAGE fall report in `action_loop.rs`, which the server has no
+    // way to derive on its own), and NEVER apply our own damage number to published state.
 
     // Remember who is swinging at us (hit OR miss) so auto-combat can engage an add that aggros
     // mid-fight instead of tanking it unanswered. Only NPC attackers on the player count.
@@ -4155,50 +4162,26 @@ mod tests {
         assert!(gs.inventory.iter().any(|i| i.slot == 5), "non-possessions delete ignored");
     }
 
-    #[test]
-    fn combat_damage_to_player_decrements_local_hp() {
-        // eqoxide#55: a hit on the player should optimistically reduce local HP between OP_HPUpdates.
-        use super::apply_combat_damage;
-        // CombatDamage_Struct: target@0(u16) source@2(u16) type@4(u8) spellid@5(u32) damage@9(i32).
-        let dmg = |target: u16, source: u16, damage: i32| -> [u8; 13] {
-            let mut b = [0u8; 13];
-            b[0..2].copy_from_slice(&target.to_le_bytes());
-            b[2..4].copy_from_slice(&source.to_le_bytes());
-            b[9..13].copy_from_slice(&damage.to_le_bytes());
-            b
-        };
-        let mut gs = GameState::new();
-        gs.player_id = 7; gs.cur_hp = 100; gs.max_hp = 100; gs.hp_pct = 100.0;
-
-        apply_combat_damage(&mut gs, &dmg(7, 99, 14)); // mob hits player for 14
-        assert_eq!(gs.cur_hp, 86, "player HP should drop by the hit");
-        assert!((gs.hp_pct - 86.0).abs() < 1e-4, "hp_pct recomputed: {}", gs.hp_pct);
-
-        apply_combat_damage(&mut gs, &dmg(7, 99, 0)); // a miss
-        assert_eq!(gs.cur_hp, 86, "a miss must not change HP");
-
-        apply_combat_damage(&mut gs, &dmg(99, 7, 50)); // player hits an NPC
-        assert_eq!(gs.cur_hp, 86, "damage to an NPC must not change the player's HP");
-
-        apply_combat_damage(&mut gs, &dmg(7, 99, 9999)); // lethal hit
-        assert_eq!(gs.cur_hp, 0, "HP clamps at 0");
-        assert!((gs.hp_pct - 0.0).abs() < 1e-4);
-    }
-
-    /// #1005 — THE MEASURED SCENARIO, driven over the real packet path.
+    /// #1005 — THE MEASURED SCENARIO, driven over the real packet path, asserting the invariant
+    /// that replaced eqoxide#55's optimistic subtraction: **OP_Damage must not move the player's
+    /// published HP at all.**
     ///
-    /// The server held the character at 214/441. One `#damage` command produced TWO
-    /// OP_Damage lines; `apply_combat_damage` subtracted each, so the client's own arithmetic
-    /// reached 0 and `/v1/observe/debug` published `hp: 0` — for up to 2.477 s, `dead: false`
-    /// across all 27,527 samples, no OP_Death packet, reproduced 2 of 2.
+    /// The server held the character at 214/441. One `#damage` command produced TWO OP_Damage
+    /// lines; the old `apply_combat_damage` subtracted each, so the client's own arithmetic reached
+    /// 0 and `/v1/observe/debug` published `hp: 0` — for up to 2.477 s, `dead: false` across all
+    /// 27,527 samples, no OP_Death packet, reproduced 2 of 2.
+    ///
+    /// The subtraction was never needed: `Mob::CommonDamage` (zone/attack.cpp) queues
+    /// `SendHPUpdate(true)` for a client BEFORE it builds the OP_Damage packet this function
+    /// decodes, on the same reliable stream — so the authoritative figure has already arrived and
+    /// the local subtraction re-applied a hit that was already accounted for.
     ///
     /// A live run cannot discharge "the client never publishes a value the server did not send" —
-    /// it can only show the path CAN be right. This drives the update path instead, and asserts the
-    /// property the acceptance bar names: the value may still be an estimate, but it can never be
-    /// indistinguishable from a confirmation.
+    /// it can only show the path CAN be right. This drives the update path instead.
     #[test]
-    fn one_damage_event_double_applied_never_publishes_a_fabricated_hp_as_verified_1005() {
+    fn a_damage_packet_never_moves_the_published_self_hp_1005() {
         use super::apply_combat_damage;
+        // CombatDamage_Struct: target@0(u16) source@2(u16) type@4(u8) spellid@5(u32) damage@9(i32).
         let dmg = |target: u16, source: u16, damage: i32| -> [u8; 13] {
             let mut b = [0u8; 13];
             b[0..2].copy_from_slice(&target.to_le_bytes());
@@ -4211,26 +4194,38 @@ mod tests {
         gs.update_hp(7, 214, 441); // the server's last word, as measured
         assert!(gs.hp_verified(), "precondition: the server's own figure reads verified");
 
-        // A miss, and a hit on somebody else, are the reach controls: neither is client arithmetic
-        // on OUR HP, so neither may spend the confirmation.
+        // The one `#damage` event's two damage lines — the exact input that fabricated the zero.
+        apply_combat_damage(&mut gs, &dmg(7, 99, 107));
+        assert_eq!(gs.messages.len(), 1, "control: the packet really was processed, not ignored");
+        apply_combat_damage(&mut gs, &dmg(7, 99, 107));
+
+        assert_eq!((gs.cur_hp, gs.max_hp), (214, 441),
+            "OP_Damage must not move the published HP — the server's SendHPUpdate(true) for this \
+             same hit is already queued ahead of it");
+        assert!((gs.hp_pct - (214.0 / 441.0) * 100.0).abs() < 1e-3,
+            "nor the percent derived from it: {}", gs.hp_pct);
+        assert!(gs.hp_verified(),
+            "and with no client arithmetic there is nothing to mark: the triple is still the \
+             server's own, so it must not be devalued to an estimate either");
+        assert_eq!(gs.unverified_hp_writes, 0, "no client-derived write happened");
+
+        // A lethal-looking line is the case that mattered most: it is what drove `hp` to 0 while
+        // `dead` stayed false and no OP_Death ever arrived.
+        apply_combat_damage(&mut gs, &dmg(7, 99, 9999));
+        assert_eq!(gs.cur_hp, 214, "a 9999 damage line is a report, not an authority on our HP");
+        assert!(!gs.player_dead, "control: nothing here claims death either way");
+
+        // Reach controls: a miss, and a hit on somebody else, must also leave the triple alone —
+        // so a GREEN on the assertions above cannot come from the function doing nothing at all.
         apply_combat_damage(&mut gs, &dmg(7, 99, 0));
-        assert!(gs.hp_verified(), "a miss writes no HP, so it must not mark ours an estimate");
         apply_combat_damage(&mut gs, &dmg(99, 7, 50));
-        assert!(gs.hp_verified(), "damage to an NPC must not mark OUR HP an estimate");
-        assert_eq!(gs.cur_hp, 214, "control: neither line moved our HP");
-
-        // The one `#damage` event's two damage lines.
-        apply_combat_damage(&mut gs, &dmg(7, 99, 107));
-        apply_combat_damage(&mut gs, &dmg(7, 99, 107));
-        assert_eq!(gs.cur_hp, 0,
-            "control: the double-apply really does reach the fabricated zero on this path");
-        assert!(!gs.hp_verified(),
-            "hp: 0 for a character the server holds at 214/441 must never read as server truth");
-
-        // And the correction: the next OP_HPUpdate is the sole path back.
-        gs.update_hp(7, 214, 441);
-        assert!(gs.hp_verified());
         assert_eq!(gs.cur_hp, 214);
+        assert_eq!(gs.messages.len(), 5, "control: all five lines reached the combat log");
+
+        // The server's own reading is still the only thing that moves it.
+        gs.update_hp(7, 107, 441);
+        assert_eq!(gs.cur_hp, 107, "an OP_HPUpdate is what changes the published HP");
+        assert!(gs.hp_verified());
     }
 
     /// #1005 — the OTHER three client-side writers of the published self-HP. Each publishes a
