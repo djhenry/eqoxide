@@ -106,6 +106,32 @@ pub fn encode_client_position_update(
     // delta_heading at [42..46] = 0 (already zeroed)
     buf
 }
+
+/// Map `gs.world.doors` into the shared `GET /v1/observe/doors` roster (#937).
+///
+/// A free function, not a method, so `gameplay::run_zone_entry_handshake` — which has the bare
+/// [`eqoxide_ipc::DoorsShared`] slot handed to it via `ActionLoop::doors_shared`, not an `ActionLoop`
+/// itself (see that accessor's doc for why) — can publish through the exact same projection
+/// [`ActionLoop::sync_doors`] uses from `run_gameplay_phase`'s drain, rather than the handshake
+/// growing a second, divergence-prone copy of the `GameState` door → `DoorView` mapping. One
+/// implementation, two call sites; `doors_shared`'s single-publisher doc comment names both of them.
+///
+/// `out.clear()` before `out.extend(...)` makes every call a full REPLACE from the CURRENT
+/// `gs.world.doors`, not an append onto whatever a previous call left behind — this is what
+/// makes it safe to call repeatedly (every drain pass that saw a packet) without accumulating
+/// duplicates or stale entries. Pinned by
+/// `gameplay::zone_entry_handshake_publish_tests::zone_entry_handshake_publish_doors_replaces_not_appends_across_two_drain_passes_1016`
+/// (#1016 review B3).
+pub(crate) fn publish_doors(gs: &GameState, doors: &eqoxide_ipc::DoorsShared) {
+    let mut out = doors.lock().unwrap();
+    out.clear();
+    out.extend(gs.world.doors.values().map(|d| eqoxide_ipc::DoorView {
+        door_id: d.door_id, name: d.name.clone(),
+        x: d.x, y: d.y, z: d.z, heading: d.heading,
+        opentype: d.opentype, is_open: d.is_open,
+    }));
+}
+
 /// A >12u jump in the network gs player position between ticks that we did NOT stream is a genuine
 /// server correction (anti-cheat snap / teleport), handed to the render controller to apply.
 const CORRECTION_SQ: f32 = 144.0;
@@ -1100,18 +1126,12 @@ impl ActionLoop {
 
     /// Publish the current zone's doors from `gs` into the shared slot (GET /doors).
     ///
-    /// The ONLY writer of `interact.doors_shared` other than the zone-in clear that
-    /// [`Self::doors_shared`] hands to `gameplay::run_zone_entry_handshake`. This one is called only
-    /// from `run_gameplay_phase`'s packet drain, which does not run during a zone-entry handshake —
-    /// see that accessor's doc for why the handshake has to do the clear itself.
+    /// Thin wrapper over [`publish_doors`] (#937) — kept as a method because `run_gameplay_phase`'s
+    /// packet drain only has `&ActionLoop` in scope, not the bare `DoorsShared` handle. See that
+    /// function's doc for why `run_zone_entry_handshake` needs its own call site into the SAME
+    /// projection rather than a second implementation of it.
     pub fn sync_doors(&self, gs: &GameState) {
-        let mut out = self.interact.doors_shared.lock().unwrap();
-        out.clear();
-        out.extend(gs.world.doors.values().map(|d| eqoxide_ipc::DoorView {
-            door_id: d.door_id, name: d.name.clone(),
-            x: d.x, y: d.y, z: d.z, heading: d.heading,
-            opentype: d.opentype, is_open: d.is_open,
-        }));
+        publish_doors(gs, &self.interact.doors_shared);
     }
 
     /// The controller slots this loop streams from, for the zone-entry handshake (#846 review B1).
@@ -1123,21 +1143,31 @@ impl ActionLoop {
     /// has no business driving the loop, it just needs the shared slots.
     pub fn controller_slots(&self) -> &eqoxide_ipc::ControllerSlots { &self.controller }
 
-    /// The published door roster, for the zone-entry handshake to CLEAR (#934 review B1, #891).
+    /// The published door roster, for the zone-entry handshake to CLEAR at zone-in and REPUBLISH on
+    /// each drain pass that actually drained a packet — NOT on every pass (#934 review B1, #891;
+    /// republish added by #937, gated by #1016 review B1).
     ///
-    /// `GameState::begin_zone_in` empties `gs.world.doors`, but the shared roster published FROM it
-    /// is republished only by [`Self::sync_doors`], whose sole caller is `run_gameplay_phase`'s
-    /// packet drain. `run_zone_entry_handshake` runs its own drain and never reaches that one, so
-    /// without an explicit clear the roster keeps the DEPARTED zone's doors for the whole handshake
-    /// (bounded by `ZONE_ENTRY_HANDSHAKE_DEADLINE`), while `publish_snapshot` keeps the HTTP session
-    /// live and answering. GET /v1/observe/doors then serves the old zone's list as the current
-    /// one, and POST /v1/interact/click_door resolves a departed zone's id straight back to
-    /// `200 clicking door N` — #891's own failure mode, with a lookup behind it.
+    /// `GameState::begin_zone_in` empties `gs.world.doors`, but the shared roster mirrored from it
+    /// used to be republished only by [`Self::sync_doors`], whose sole caller was `run_gameplay_phase`'s
+    /// packet drain — `run_zone_entry_handshake` runs its own drain and never reached that one. Before
+    /// #937 that meant the roster held the DEPARTED zone's doors for the whole handshake (bounded by
+    /// `ZONE_ENTRY_HANDSHAKE_DEADLINE`) — GET /v1/observe/doors served the old zone's list as the
+    /// current one, and POST /v1/interact/click_door resolved a departed zone's id straight back to
+    /// `200 clicking door N` (#891's own failure mode) — and after #934's zone-in clear, held a
+    /// confident `[]` instead for doors that HAD arrived and been applied to `gs.world.doors` but
+    /// never published (#937/#939 case 2).
     ///
-    /// The handshake clears rather than republishes: it has no `ActionLoop` to publish through (see
-    /// [`Self::controller_slots`]), and an empty roster is the honest reading during a zone-in
-    /// anyway — the client cannot yet tell how much of the new zone's door stream has landed, which
-    /// is exactly what `http::interact::door_lookup_miss`'s empty-roster body says.
+    /// The handshake now clears here at zone-in (still correct — a departed zone's roster is worse
+    /// than an empty one) and calls [`publish_doors`] itself on every drain pass that actually drained
+    /// a packet (#1016 review B1) — NOT the same cadence as `publish_snapshot`, which this handshake
+    /// still calls unconditionally on every 10 ms pass regardless of whether anything was drained.
+    /// `publish_doors` is gated because `gs.world.doors` cannot change on a pass with nothing to
+    /// apply, so republishing on every tick bought nothing; see the drain loop's own comment on that
+    /// gate for the full reasoning. Both calls go through the identical `GameState` → `DoorView`
+    /// projection `sync_doors` uses — see that free function's doc for why it is one shared
+    /// implementation rather than a second, divergence-prone copy. It has no `ActionLoop` to call
+    /// [`Self::sync_doors`] through (see [`Self::controller_slots`]), which is why this accessor
+    /// hands out the bare slot instead.
     pub fn doors_shared(&self) -> &eqoxide_ipc::DoorsShared { &self.interact.doors_shared }
 
     /// The published NPC-dialogue choices, for the zone-entry handshake to CLEAR (#941).
