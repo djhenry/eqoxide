@@ -985,10 +985,10 @@ than deriving anything itself:
 | `zone_entrances` | `GET /v1/observe/zone_entrances` (alias `/zone_points`) | `OP_SendZonepoints` |
 
 For all three, an empty body has two readings — *this zone has none* and *the records have not
-arrived yet* — and nothing published told them apart. Every zone-entry path clears all three (doors
-#891; the entity roster and `zone_points` #1010/#1063), which is the right call — serving the zone
-you just left is the worse lie — but it makes the ambiguous empty the NORMAL reading for the length
-of a zone-in rather than a rare one.
+arrived yet* — and nothing published told them apart. The zone-entry handshake clears all three
+before it asks for the new zone's records (doors #891/#934; the entity roster and `zone_points`
+#1010/#1063), which is the right call — serving the zone you just left is the worse lie — but it
+makes the ambiguous empty the NORMAL reading for the length of a zone-in rather than a rare one.
 
 ```jsonc
 "server_pushed_rosters": {

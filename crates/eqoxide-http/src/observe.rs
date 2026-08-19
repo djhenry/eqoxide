@@ -738,10 +738,11 @@ const NO_COMPLETENESS_SIGNAL: &str =
 ///
 /// **What this is.** `/v1/observe/doors`, `/v1/observe/entities` and
 /// `/v1/observe/zone_entrances` all answer an empty body in two situations an agent must tell apart:
-/// this zone genuinely has none, and the records have not arrived yet. Every zone-entry path clears
-/// all three (doors #891, the entity roster and `zone_points` #1010/#1063), which is right — a
-/// roster left over from the zone you left is the worse lie — but it makes the ambiguous empty the
-/// NORMAL reading for the length of a zone-in rather than a rare one.
+/// this zone genuinely has none, and the records have not arrived yet. The zone-entry handshake
+/// clears all three before it asks for the new zone's records (doors #891/#934, the entity roster
+/// and `zone_points` #1010/#1063), which is right — a roster left over from the zone you left is the
+/// worse lie — but it makes the ambiguous empty the NORMAL reading for the length of a zone-in
+/// rather than a rare one.
 ///
 /// **Which of #939's three options this is, and why the other two are not available.** #939 asked
 /// for one of: (1) a nullable reason naming *why* the roster is empty, mirroring #816's
@@ -2129,7 +2130,7 @@ struct EntitiesQuery {
 /// stays targetable by its full (suffixed) name.
 ///
 /// **An empty body during a zone-in means "not published yet", not "this zone is empty" (#1073).**
-/// Every zone-entry path clears the published roster triple (#1010/#1063) — correct, because the
+/// The zone-entry handshake clears the published roster triple (#1010/#1063) — correct, because the
 /// alternative is serving the DEPARTED zone's entities for the length of the handshake — and it
 /// refills from spawn packets as they arrive. So for that window `{}` (or `{"count": 0, …}` on the
 /// labeled shape) is the same bytes as the true answer "there is nobody here", and this endpoint is
