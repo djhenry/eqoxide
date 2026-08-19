@@ -2211,12 +2211,23 @@ impl GameState {
         }
     }
 
-    /// Apply a percent-only HP update (OP_MobHealth / `SpawnHPUpdate_Struct2`). A mob
-    /// you are fighting but not grouped with only sends its HP as a 0-100 percentage,
-    /// so there is no absolute cur/max to record — just its `hp_pct`. The target HUD
-    /// readout (`target_hp_pct`) follows `entities[id].hp_pct`, so this is what makes a
-    /// fought mob's health bar move. Don't touch the player's own bar here: the player
-    /// gets a full OP_HPUpdate with real cur/max, which is strictly better. (eqoxide#51)
+    /// Apply a percent-only HP update (OP_MobHealth / `SpawnHPUpdate_Struct2`). Every entity that
+    /// is NOT you reports its HP only as a 0-100 percentage, so there is no absolute cur/max to
+    /// record — just its `hp_pct`. The target HUD readout (`target_hp_pct`) follows
+    /// `entities[id].hp_pct`, so this is what makes a fought mob's health bar move. Don't touch the
+    /// player's own bar here: the player gets a full OP_HPUpdate with real cur/max, which is
+    /// strictly better. (eqoxide#51)
+    ///
+    /// **#1028 — grouping has nothing to do with the precision.** This doc used to read *"A mob you
+    /// are fighting but not grouped with only sends its HP as a 0-100 percentage"*, which tells the
+    /// next reader that a mob you ARE grouped with sends something better. It does not. Read off the
+    /// EQEmu tree at `f9129e5e`: `Mob::SendHPUpdate` (`zone/mob.cpp`) holds the zone server's only
+    /// `OP_HPUpdate` emit, it is inside `if (IsClient())`, and it is delivered by
+    /// `CastToClient()->QueuePacket(&p)` to that one client. Every fan-out below it — targeters,
+    /// x-targeters, the group, the raid, a pet's owner — carries a DIFFERENT packet built by
+    /// `Mob::CreateHPPacket`, which sets `OP_MobHealth` and writes `ds->hp = (int)GetHPRatio()`.
+    /// Self vs not-self is what decides the precision; group membership does not. The full fan-out
+    /// is read out at `apply_mob_health` in `eqoxide-net`.
     pub fn update_hp_pct(&mut self, spawn_id: u32, hp_pct: f32) {
         if spawn_id != self.player_id {
             if let Some(e) = self.world.entities.get_mut(&spawn_id) {

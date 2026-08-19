@@ -72,7 +72,7 @@ async fn post_manual(
 ) -> Response {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     // #644: a corpse cannot be driven manually
-    if let Err((code, msg)) = require_alive(&s) { return text(code, msg); }
+    if let Err((code, _tok, msg)) = require_alive(&s) { return text(code, msg); }
     // #884: refuse while the controller is frozen, BEFORE the manual-move slot is written — an
     // accepted `ManualMove` the controller will never read is a queued action with no outcome.
     if let Some(r) = crate::MoveGate::read(&s).refusal() { return r; }
@@ -96,7 +96,7 @@ async fn post_manual(
 /// upward toward the surface (#207), e.g. to lift off a pool floor.
 async fn post_jump(State(s): State<HttpState>) -> Response {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
-    if let Err((code, msg)) = require_alive(&s) { return text(code, msg); } // #644: a corpse cannot jump
+    if let Err((code, _tok, msg)) = require_alive(&s) { return text(code, msg); } // #644: a corpse cannot jump
     if let Some(r) = crate::MoveGate::read(&s).refusal() { return r; } // #884
     s.camera.request_manual_move(ManualMove {
         dir: [0.0, 0.0], up: 0.0, jump: true,
@@ -334,8 +334,10 @@ async fn post_goto(
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     // #644: a dead character cannot move — reject with an explicit `dead` token BEFORE stamping a
     // goal, so an agent never reads `200 … navigating` for a goal a corpse can never reach.
-    if let Err((code, msg)) = require_alive(&s) {
-        return json(code, serde_json::json!({ "status": "dead", "message": msg }));
+    // #1000: `status` is the branchable token and it must not outrank the prose — `require_alive`
+    // hands back `dead` or `halted_hp_zero`, the same two words `nav_state` publishes.
+    if let Err((code, tok, msg)) = require_alive(&s) {
+        return json(code, serde_json::json!({ "status": tok, "message": msg }));
     }
     // #884 (agent-honesty): a frozen controller cannot walk anywhere, so refuse BEFORE a goal id is
     // stamped — the same position in the handler, and for the same reason, as #644's `dead` gate
@@ -446,8 +448,10 @@ async fn post_follow(
 ) -> Response {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     // #644: a corpse cannot follow — same explicit `dead` rejection as /goto.
-    if let Err((code, msg)) = require_alive(&s) {
-        return json(code, serde_json::json!({ "status": "dead", "message": msg }));
+    // #1000: `status` is the branchable token and it must not outrank the prose — `require_alive`
+    // hands back `dead` or `halted_hp_zero`, the same two words `nav_state` publishes.
+    if let Err((code, tok, msg)) = require_alive(&s) {
+        return json(code, serde_json::json!({ "status": tok, "message": msg }));
     }
     let gate = crate::MoveGate::read(&s); // #884 — see /goto
     if let Some(r) = gate.refusal() { return r; }
@@ -578,7 +582,7 @@ async fn post_zone_cross(
 ) -> Response {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     // #644: a corpse cannot cross a zone line
-    if let Err((code, msg)) = require_alive(&s) { return text(code, msg); }
+    if let Err((code, _tok, msg)) = require_alive(&s) { return text(code, msg); }
     // #884: THE issue's headline case. This endpoint's 200 asserts an activity — "walking to the
     // zone line" — and a frozen controller is not walking anywhere. Refuse before `request_zone_cross`
     // so nothing is queued and no goal_id is stamped.
@@ -1422,6 +1426,73 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         assert!(goto_target.lock().unwrap().is_none());
+    }
+
+    /// #1000: the HP-only refusal must not claim a death. `require_alive` fires on
+    /// `is_player_dead()` = `player_dead || (cur_hp <= 0 && max_hp > 0)`, and the second disjunct is
+    /// reachable with `player.dead` reading `false` — measured live at 230/230 and 1,889/1,889
+    /// `409`s co-occurring with `dead: false`, in runs where the character was alive and healthy
+    /// throughout and the `hp: 0` was a value the client had computed itself (#1005). The old body
+    /// said "the character is dead", pointed the agent at `dead` (which contradicted it), and
+    /// prescribed a respawn for a character that had not died.
+    ///
+    /// **The refusal itself is unchanged and that is asserted first** — a `200` here would be a
+    /// worse lie, since the walker halts on the same predicate and the movement would not happen.
+    ///
+    /// MUTATION CHECK: collapse `require_alive`'s two message arms back to the single `dead` text
+    /// (return the confirmed-death branch unconditionally) → RED on the token and on every prose
+    /// assert below. WRAP the condition as `if gs.player_dead || true` → RED identically without
+    /// deleting a line. Restore the hardcoded `"status": "dead"` in `post_goto` → RED on the token
+    /// assert alone, which is the one an agent branches on.
+    #[tokio::test]
+    async fn the_hp_only_refusal_does_not_claim_a_death_1000() {
+        let state = empty_state();
+        set_gs(&state, |gs| { gs.player_dead = false; gs.cur_hp = 0; gs.max_hp = 441; });
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "the refusal itself must not change");
+        let j = body_json(resp).await;
+        assert_eq!(j["status"], "halted_hp_zero",
+            "the branchable token must name the condition that actually holds, not `dead`: {j}");
+        let m = j["message"].as_str().unwrap();
+        assert!(!m.contains("the character is dead"),
+            "no OP_Death has arrived — the client must not assert a death it cannot know: {m}");
+        // It must not PRESCRIBE a respawn. It may — and does — mention the route in order to rule it
+        // out, which is strictly better than silence: an agent that has learned "movement 409 →
+        // respawn" from the other branch needs to be told this branch is not that. The first draft
+        // of this assert banned the substring outright and went RED on the client's own disclaimer,
+        // which is the distinction being pinned here, so it is pinned as two asserts, not one.
+        assert!(!m.contains("Respawn first"),
+            "respawn addresses nothing when nothing died; prescribing it sends the agent after a \
+             fiction: {m}");
+        assert!(m.contains("NOT the remedy"),
+            "and it must say so out loud, or an agent carrying the other branch's habit will \
+             respawn anyway: {m}");
+        assert!(m.contains("0/441"),
+            "the refusal must quote the reading it rests on so the agent can check it: {m}");
+    }
+
+    /// The control for the test above, in both directions: a CONFIRMED death still refuses under the
+    /// `dead` token, still says so, and still prescribes the remedy that exists. Without this the
+    /// split could be satisfied by never saying `dead` at all.
+    #[tokio::test]
+    async fn a_confirmed_death_still_refuses_under_the_dead_token_1000() {
+        let state = empty_state();
+        set_gs(&state, |gs| { gs.player_dead = true; gs.cur_hp = 0; gs.max_hp = 441; });
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let j = body_json(resp).await;
+        assert_eq!(j["status"], "dead", "a real death must still carry the `dead` token: {j}");
+        let m = j["message"].as_str().unwrap();
+        assert!(m.contains("the character is dead"), "{m}");
+        assert!(m.contains("/v1/lifecycle/respawn"), "respawn IS the remedy here: {m}");
     }
 
     /// A LIVE character's /goto is unaffected (the guard must not over-fire): cur_hp<=0 with

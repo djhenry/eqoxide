@@ -1265,17 +1265,78 @@ pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::Sta
 /// fires in the HP-to-0-before-OP_Death window (`cur_hp <= 0` with a known `max_hp`), not just on the
 /// `player_dead` flag. Only movement WRITEs that would report progress are gated by callers; `/stop`
 /// is a cancel (idempotent and honest even on a corpse) and is deliberately NOT gated.
-pub(crate) fn require_alive(s: &HttpState) -> Result<(), (axum::http::StatusCode, String)> {
-    if s.game_state.load().is_player_dead() {
-        return Err((
-            axum::http::StatusCode::CONFLICT,
-            "the character is dead — this movement command was NOT accepted and will not take \
-             effect (a corpse cannot move). Respawn first (POST /v1/lifecycle/respawn), then \
-             reissue. See GET /v1/observe/debug (`dead`)."
-                .to_string(),
-        ));
+///
+/// # The refusal must not point at a field that contradicts it (#1000)
+///
+/// The message used to end *"See GET /v1/observe/debug (`dead`)."* in both cases. `dead` is
+/// `GameState::player_dead` alone, so in the HP-only window it reads `false` — the refusal pointed
+/// the agent at the one field in the payload that said the refusal was wrong. Measured live: 230 of
+/// 230 and 1,889 of 1,889 of these `409`s co-occurred with `dead: false`, and in those runs the
+/// agent would have been RIGHT to disbelieve the refusal, because the character was alive and
+/// healthy throughout and the `hp: 0` behind it was a figure the client had computed itself (#1005).
+///
+/// The remedy was wrong too, and worse than the pointer. `POST /v1/lifecycle/respawn` addresses
+/// nothing when nothing died; an agent that follows it is acting on a fiction.
+///
+/// So the two disjuncts now answer differently. **Neither changes WHETHER the command is refused** —
+/// that is the same predicate as before, and the walker halts on it either way, so a `200` here
+/// would be its own lie. What changes is that each refusal names its own basis, points at a field
+/// that agrees with it, and prescribes a remedy that exists. The machine-readable half of the
+/// distinction is `nav_state`: `dead` for the first, `halted_hp_zero` for the second.
+///
+/// # The machine token has to move with the prose (#1000)
+///
+/// `/goto` and `/follow` serialise this refusal as `{"status": "...", "message": "..."}`, and
+/// `status` is what an agent is told to branch on. Leaving it at a hardcoded `"dead"` would have
+/// left the lie fully intact in the only field a program reads — the prose would say "not confirmed
+/// dead" under a token that says `dead`. So the token is returned from here, next to the message it
+/// belongs to, and it is drawn from the SAME two words `nav_state` publishes
+/// ([`eqoxide_ipc::NAV_STATE_DEAD`] / [`eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO`]) rather than a
+/// third private vocabulary. A caller that matched `status == "dead"` and now sees
+/// `halted_hp_zero` falls through to its unknown-refusal branch, which is the correct outcome: the
+/// condition genuinely is not the one it was matching. Both are still `409` and the refusal set is
+/// unchanged, so nothing that checked the status CODE is affected. Match
+/// [`eqoxide_ipc::nav_state_is_life_halt`]'s two words to catch both.
+///
+/// Returned as `(code, token, message)`: deriving both the token and the message from ONE
+/// `game_state.load()` is deliberate — a second load could observe a different snapshot and pair a
+/// token with a message derived from the other disjunct.
+pub(crate) fn require_alive(
+    s: &HttpState,
+) -> Result<(), (axum::http::StatusCode, &'static str, String)> {
+    let gs = s.game_state.load();
+    if !gs.is_player_dead() {
+        return Ok(());
     }
-    Ok(())
+    let token = if gs.player_dead {
+        eqoxide_ipc::NAV_STATE_DEAD
+    } else {
+        eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO
+    };
+    let msg = if gs.player_dead {
+        // The server sent OP_Death. `dead` on /v1/observe/debug reads `true`, so pointing there is
+        // pointing at agreement, and respawning is the actual remedy.
+        "the character is dead — this movement command was NOT accepted and will not take \
+         effect (a corpse cannot move). Respawn first (POST /v1/lifecycle/respawn), then \
+         reissue. See GET /v1/observe/debug (`dead`: true, `nav_state`: \"dead\")."
+            .to_string()
+    } else {
+        // HP-only: no OP_Death has arrived. Say that, do not claim a death, and do not prescribe a
+        // respawn for a character that may well be alive.
+        format!(
+            "movement is halted because this client's published HP is {cur}/{max} — at or below 0 \
+             with a known maximum. This command was NOT accepted and will not take effect. NO \
+             OP_Death has arrived, so the character is NOT confirmed dead: `dead` on GET \
+             /v1/observe/debug reads false and that is not a contradiction of this refusal. \
+             /v1/lifecycle/respawn is NOT the remedy here — nothing has died. The halt clears by \
+             itself as soon as an authoritative HP update puts `hp` back above 0; if it does not, \
+             the reading is stale or client-derived rather than the server's. See GET \
+             /v1/observe/debug (`hp`, `hp_max`, `nav_state`: \"halted_hp_zero\").",
+            cur = gs.cur_hp,
+            max = gs.max_hp,
+        )
+    };
+    Err((axum::http::StatusCode::CONFLICT, token, msg))
 }
 
 /// #884 (agent-honesty): **what a `/v1/move/*` request may honestly claim, given the controller

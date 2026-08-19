@@ -1335,6 +1335,18 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
+/// OP_HPUpdate: the EXACT current/max HP of one spawn. The server sends it to the owning client
+/// only (see `apply_mob_health` below for the full argument), so in practice the only one this
+/// client receives carries its own `spawn_id` — and `GameState::update_hp`'s
+/// `spawn_id == player_id` test is what recognises it.
+///
+/// **#1006 — `spawn_id` must be widened from an UNSIGNED field.** `HPUpdate_S::spawn_id` is `u16`,
+/// so `as u32` here is value-preserving. It was `i16` (EQEmu's spelling of the same slot), and from
+/// a signed field this same `as u32` sign-extends: any id above 32767 would arrive as `0xFFFF_xxxx`,
+/// the self-match would never fire for the life of that spawn, and self HP would pin at its last
+/// value with no error and nothing to distinguish it from "the server sent nothing". See
+/// `HPUpdate_S`'s doc for why the field is unsigned on the wire despite the server header, and for
+/// why this is latent rather than live today.
 fn apply_hp_update(gs: &mut GameState, payload: &[u8]) {
     if payload.len() >= SIZE_HP_UPDATE {
         let hp = unsafe { safe_read::<HPUpdate_S>(payload) };
@@ -1342,13 +1354,40 @@ fn apply_hp_update(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
-/// OP_MobHealth: percent-only HP for a mob you have targeted/x-targeted but aren't
-/// grouped with (the server only sends the full OP_HPUpdate to self/group/pet).
-/// Without this, a fought mob's `hp_pct` — and thus `target_hp_pct` — stays frozen
-/// at its seeded value the whole fight. (eqoxide#51)
+/// OP_MobHealth: the PERCENT-only HP update, and the ONLY way any entity's HP other than your own
+/// reaches this client. The exact-HP `OP_HPUpdate` goes to the owning client and to nobody else.
+///
+/// **#1028 — the parenthetical this replaces was false in both halves.** It read *"the server only
+/// sends the full OP_HPUpdate to self/group/pet"*, which told the next reader that a group member's
+/// exact HP arrives over `OP_HPUpdate` (it never does — a group-HP feature would look like a decode
+/// bug rather than the missing feature it is), and it misstated why this handler exists: it is
+/// needed for EVERY other entity, not merely for mobs you are not grouped with.
+///
+/// What the server actually does, read from the EQEmu tree at `f9129e5e`:
+///
+/// * `Mob::SendHPUpdate` (`zone/mob.cpp`) has exactly ONE `OP_HPUpdate` emit. It is inside
+///   `if (IsClient())` and delivers via `CastToClient()->QueuePacket(&p)` — that one client.
+///   `OP_HPUpdate` appears nowhere else in `zone/` (the only other hits are the opcode tables and a
+///   Lua binding), so there is no second exact-HP path to be grouped or petted into.
+/// * Everything after that branch builds the PERCENT packet — `Mob::CreateHPPacket` sets opcode
+///   `OP_MobHealth` and writes `GetHPRatio()` — and fans *that* out: to clients targeting or
+///   x-targeting the mob (`QueueClientsByTarget`/`QueueClientsByXTarget`, both called with
+///   `iSendToSender = false`, and `EntityList::QueueClientsByTarget` in `zone/entity.cpp`
+///   additionally skips the sender with its own `c != sender` guard), to the mob's group
+///   (`Group::SendHPPacketsFrom` in `zone/groups.cpp`, which calls the same `CreateHPPacket`), to
+///   its raid, and to a pet's owner (`GetOwner()->CastToClient()->QueuePacket(&hp_packet, ...)`).
+///
+/// So group members and a pet's owner DO get a fan-out — of this percent packet. Exact HP for
+/// anyone but yourself is not on the wire at all.
+///
+/// Without this handler, a fought mob's `hp_pct` — and thus `target_hp_pct` — stays frozen at its
+/// seeded value for the whole fight (eqoxide#51).
 fn apply_mob_health(gs: &mut GameState, payload: &[u8]) {
     if payload.len() >= SIZE_MOB_HEALTH {
         let mh = unsafe { safe_read::<MobHealth_S>(payload) };
+        // #1006: `MobHealth_S::spawn_id` is `u16`, so this widening is value-preserving. From the
+        // `i16` it used to be, an id above 32767 sign-extends and this percent lands on no entity
+        // at all — a mob's `hp_pct` silently frozen. Same trap as `apply_hp_update` above.
         gs.update_hp_pct(mh.spawn_id as u32, mh.hp as f32);
     }
 }
@@ -8642,5 +8681,106 @@ mod tests {
         });
         apply_task_select_window(&mut gs, &[]);
         assert!(gs.task_offers.is_empty());
+    }
+
+    // ─────────────────── #1006: the self-HP match must not depend on spawn_id < 32768 ───────────────────
+
+    /// A 10-byte RoF2 `SpawnHPUpdate_Struct` on the wire: `spawn_id` u16 LE, `cur_hp` u32 LE,
+    /// `max_hp` i32 LE. Written from the WIRE's point of view (raw bytes), not from the Rust
+    /// struct, so the test cannot be satisfied by a struct whose field types drifted.
+    fn hp_update_wire(spawn_id: u16, cur_hp: u32, max_hp: i32) -> Vec<u8> {
+        let mut b = Vec::with_capacity(10);
+        b.extend_from_slice(&spawn_id.to_le_bytes());
+        b.extend_from_slice(&cur_hp.to_le_bytes());
+        b.extend_from_slice(&max_hp.to_le_bytes());
+        assert_eq!(b.len(), 10, "SIZE_HP_UPDATE");
+        b
+    }
+
+    /// #1006 (agent-honesty). `HPUpdate_S::spawn_id` was `i16` — EQEmu's spelling of the slot — and
+    /// the decode widens it with `as u32` for `GameState::update_hp`'s `spawn_id == player_id`
+    /// self-match. From a SIGNED field that widening sign-extends, so an id above 32767 arrives as
+    /// `0xFFFF_xxxx`, the self-match never fires, and self HP silently pins at its last value with
+    /// no error and nothing distinguishing it from "the server sent nothing" — the whole life of
+    /// that spawn.
+    ///
+    /// This is a decode test on purpose. **A live run cannot discharge it**: a character whose
+    /// spawn_id happens to be small (every one on today's server — `EntityList::GetFreeID` hands
+    /// out 1..=1500 first) passes every time.
+    ///
+    /// MUTATION CHECK: change `HPUpdate_S::spawn_id` back to `i16` → the 40000 arm goes RED
+    /// (`cur_hp` stays at the seeded 441 because `update_hp` matched nothing).
+    #[test]
+    fn self_hp_update_matches_a_spawn_id_above_32767_1006() {
+        // Every id here is checked the same way, so the assertion cannot be satisfied by one arm.
+        // 1500 is the top of EQEmu's pre-seeded pool (the reachable-today control: it must pass
+        // both before and after the fix, which is what proves the harness is not simply broken).
+        // 32767/32768 straddle the sign boundary; 40000 and 65535 are past it.
+        for &sid in &[1u16, 1500, 32767, 32768, 40000, 65535] {
+            let mut gs = GameState::new();
+            gs.player_id = sid as u32;
+            gs.cur_hp = 441; gs.max_hp = 441; gs.hp_pct = 100.0;
+
+            super::apply_packet(&mut gs, &crate::transport::AppPacket {
+                opcode: crate::protocol::OP_HP_UPDATE, payload: hp_update_wire(sid, 214, 441),
+            });
+
+            assert_eq!(gs.cur_hp, 214,
+                "spawn_id {sid}: the server's own HP update must reach the player's cur_hp");
+            assert_eq!(gs.max_hp, 441, "spawn_id {sid}: max_hp");
+            assert!((gs.hp_pct - (214.0 / 441.0 * 100.0)).abs() < 1e-3,
+                "spawn_id {sid}: hp_pct recomputed from the update, got {}", gs.hp_pct);
+        }
+    }
+
+    /// The other half of the same property, and what stops the test above from passing for the
+    /// wrong reason: an update for a DIFFERENT spawn must not be mistaken for the player's, at any
+    /// id. If the widening were replaced by something that collapses ids (e.g. a truncation), the
+    /// arm above could go green while this one goes red.
+    #[test]
+    fn an_hp_update_for_another_spawn_never_moves_self_hp_1006() {
+        for &(player, other) in &[(1u16, 2u16), (40000, 40001), (32768, 32767), (65535, 1)] {
+            let mut gs = GameState::new();
+            gs.player_id = player as u32;
+            gs.cur_hp = 441; gs.max_hp = 441; gs.hp_pct = 100.0;
+
+            super::apply_packet(&mut gs, &crate::transport::AppPacket {
+                opcode: crate::protocol::OP_HP_UPDATE, payload: hp_update_wire(other, 1, 441),
+            });
+
+            assert_eq!(gs.cur_hp, 441,
+                "player {player}: an update for spawn {other} must not touch self HP");
+            assert!((gs.hp_pct - 100.0).abs() < 1e-4, "player {player}: hp_pct untouched");
+        }
+    }
+
+    /// #1006, the percent path. `MobHealth_S::spawn_id` carries the same slot and had the same
+    /// `i16`; from it, `mh.spawn_id as u32` sign-extends and the percent lands on no entity at all,
+    /// leaving that mob's `hp_pct` (and `target_hp_pct` when it is your target) frozen at its
+    /// seeded value for the whole fight — the eqoxide#51 defect, back again above 32767.
+    ///
+    /// MUTATION CHECK: change `MobHealth_S::spawn_id` back to `i16` → the 40000/65535 arms go RED.
+    #[test]
+    fn mob_health_percent_reaches_a_spawn_id_above_32767_1006() {
+        for &sid in &[1u32, 1500, 32767, 32768, 40000, 65535] {
+            let mut gs = GameState::new();
+            gs.player_id = 7;
+            gs.world.entities.insert(sid, test_entity(sid, "a bat", 100.0));
+            gs.target_id = Some(sid);
+            gs.target_hp_pct = Some(100.0);
+
+            let mut payload = Vec::with_capacity(3);
+            payload.extend_from_slice(&(sid as u16).to_le_bytes());
+            payload.push(37u8);
+            super::apply_packet(&mut gs, &crate::transport::AppPacket {
+                opcode: crate::protocol::OP_MOB_HEALTH, payload,
+            });
+
+            assert!((gs.world.entities[&sid].hp_pct - 37.0).abs() < 1e-4,
+                "spawn_id {sid}: the percent update must reach that entity, got {}",
+                gs.world.entities[&sid].hp_pct);
+            assert_eq!(gs.target_hp_pct, Some(37.0),
+                "spawn_id {sid}: and the targeted mob's published hp_pct with it");
+        }
     }
 }

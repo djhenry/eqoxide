@@ -167,8 +167,11 @@ pub const OP_WEAR_CHANGE: u16 = 0x7994; // RoF2: OP_WearChange
 
 // ── Gameplay: combat ──────────────────────────────────────────────────────
 
-pub const OP_HP_UPDATE: u16 = 0x2828;         // RoF2: OP_HPUpdate (full cur/max, self+group only)
-pub const OP_MOB_HEALTH: u16 = 0x37b1;        // RoF2: OP_MobHealth (percent-only, to everyone targeting the mob)
+// #1028: the exact-HP OP_HPUpdate is sent to the owning client and to NOBODY else — not group,
+// not a pet's owner. Everyone else's HP arrives only as the OP_MobHealth percent, which IS fanned
+// out to targeters/x-targeters, group, raid and a pet's owner. See `HPUpdate_S`/`MobHealth_S`.
+pub const OP_HP_UPDATE: u16 = 0x2828;         // RoF2: OP_HPUpdate (exact cur/max, SELF only)
+pub const OP_MOB_HEALTH: u16 = 0x37b1;        // RoF2: OP_MobHealth (percent-only, every other entity)
 pub const OP_DEATH: u16 = 0x6517;             // RoF2: OP_Death
 pub const OP_DAMAGE: u16 = 0x6f15;            // RoF2: OP_Damage
 pub const OP_AUTO_ATTACK: u16 = 0x109d;       // RoF2: OP_AutoAttack
@@ -1720,24 +1723,68 @@ pub fn encode_position_update(spawn_id: u16, x: f32, y: f32, z: f32, heading: f3
 /// fields total 10 bytes either way, so a byte-length check never caught the
 /// earlier mis-ordering; getting the order right is what makes `spawn_id` parse
 /// from the correct offset.
+///
+/// # `spawn_id` is `u16`, and EQEmu spells the same slot `int16` (#1006)
+///
+/// **This is a deliberate, load-bearing deviation from the server header, not a transcription
+/// slip — do not "correct" it back.** RoF2's `SpawnHPUpdate_Struct` in `common/patches/rof2_structs.h`
+/// declares `int16 spawn_id`, and this struct used to copy that spelling. The VALUE in that slot is
+/// unsigned: the only producer is `Mob::SendHPUpdate` (`zone/mob.cpp`), which assigns
+/// `b->spawn_id = GetID()`, and `Entity::GetID()` returns `uint16`. Every id EQEmu can hand out
+/// comes from `EntityList::GetFreeID()` (`zone/entity.cpp`), which draws from a `std::queue<uint16>`
+/// seeded `1..=1500` and, if that is ever exhausted, scans upward from 1501 — an unsigned counter
+/// throughout. Nothing anywhere writes a negative id into it. (Read at EQEmu `f9129e5e`.)
+///
+/// Why the spelling mattered: the decode widens this field to `u32` for
+/// `GameState::update_hp`'s `spawn_id == player_id` self-match. A `as u32` from `i16`
+/// SIGN-EXTENDS, so an id above 32767 would arrive as `0xFFFF_xxxx` instead of its true value and
+/// the self-match would never fire — for the whole life of that spawn, with no error, no log line
+/// and no observable difference from "the server sent nothing".
+///
+/// **The consequence is the VALUE, not merely a confirmation flag, and it is worth being precise
+/// about because the weaker reading is the tempting one.** `GameState::update_hp` is
+/// `if spawn_id == player_id { … } else if let Some(e) = world.entities.get_mut(&spawn_id) { … }`.
+/// A sign-extended id fails the first arm AND cannot be found by the second — `world.entities` is
+/// keyed by true ids, and no `0xFFFF_xxxx` key exists — so the packet writes **nothing at all**.
+/// Self `cur_hp`/`max_hp`/`hp_pct` would then never be corrected by the one authoritative source
+/// for them, and would hold whatever some other path last wrote (the `OP_PlayerProfile` zone-in
+/// seed, or any local estimate) for as long as the character kept that spawn id — silently pinned,
+/// and still published with full confidence. The `cur_hp > 0` branch inside that same arm, which
+/// clears `player_dead`/`player_dead_since`, would not fire either. From `u16` the widening is
+/// value-preserving by construction and the failure cannot be written.
+///
+/// **How reachable is it?** Not, on today's server. Exhausting the 1500-id pool takes 1500 live
+/// entities in one zone, and `GetFreeID`'s own comments there read "The client has a hard cap on
+/// entity count some where" and "Neither the client or server performs well with a lot entities
+/// either"; reaching 32768 takes more than twenty times that many. So this is LATENT, and the fix
+/// is a no-op on every id the server can currently allocate — `x as u32` is bit-identical for `i16`
+/// and `u16` over `0..=32767`. It is fixed anyway because the failure mode is the
+/// silent-wrong-answer class: the client would keep answering, confidently, with a stale number.
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct HPUpdate_S {
-    pub spawn_id: i16,
+    pub spawn_id: u16,
     pub cur_hp: u32,
     pub max_hp: i32,
 }
 
 /// Percent-only HP update (3 bytes), RoF2 `SpawnHPUpdate_Struct2`
-/// (`common/patches/rof2_structs.h`). Sent via OP_MobHealth to every client that
-/// has the mob targeted (or on their x-target) — the compact update a client gets
-/// for a mob it is merely fighting but not grouped with. `hp` is a 0-100 HP
-/// percentage (`Mob::CreateHPPacket` writes `GetHPRatio()`), not an absolute value.
-/// See eqoxide#51.
+/// (`common/patches/rof2_structs.h`). `hp` is a 0-100 HP percentage
+/// (`Mob::CreateHPPacket` writes `GetHPRatio()`), not an absolute value. See eqoxide#51.
+///
+/// Sent to clients targeting or x-targeting the mob, AND to the mob's group, raid and a pet's
+/// owner — see the `apply_mob_health` handler in `eqoxide-net` for the full fan-out read off
+/// `Mob::SendHPUpdate`. It is not "the update for a mob you are not grouped with" (#1028): it is
+/// the update for every entity that is not you, because the exact-HP `OP_HPUpdate` is sent to the
+/// owning client alone.
+///
+/// `spawn_id` is `u16` for the same reason as [`HPUpdate_S`]'s — same slot, same unsigned
+/// `Entity::GetID()` value, same sign-extension trap on the `as u32` widening (#1006). EQEmu spells
+/// it `int16`; see that struct's doc for the argument.
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct MobHealth_S {
-    pub spawn_id: i16,
+    pub spawn_id: u16,
     pub hp: u8,
 }
 
