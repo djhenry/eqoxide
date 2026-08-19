@@ -759,8 +759,11 @@ fn parse_server_list_payload(payload: &[u8], fallback_host: &str) -> (u32, Strin
 
 // ── Character-creation helpers ─────────────────────────────────────────────────
 
-/// Normalize a character name to Titanium's convention: first letter uppercase,
-/// the rest lowercase (the native client enforces this on the create screen).
+/// Normalize a character name for OP_ApproveName: first character uppercase, the rest
+/// lowercase. Required, not cosmetic — EQEmu's `Client::HandleNameApprovalPacket`
+/// (`world/client.cpp`) rejects a lower-case first character, or any upper-case character
+/// after it. Casing only: length, spaces, `name_filter` and uniqueness are separate server
+/// checks (docs/specs/2026-06-26-pregame-screens-design.md, "Name rules").
 fn normalize_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for (i, c) in name.chars().enumerate() {
