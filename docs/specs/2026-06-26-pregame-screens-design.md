@@ -80,12 +80,18 @@ stays the single source of truth; egui screens are thin views over shared slots.
 
 ## Section 3 — Native rules data (ground truth from eq-client-expert, cited)
 
-Full detail + citations in `~/git/eq_kb/character-creation.md`. Summary tables:
+Summary tables below; each cites its own EQEmu source directly. (This section originally pointed
+here at a private working note, `~/git/eq_kb/character-creation.md`, as the consolidated citation
+for the whole section. That note has no history in the private knowledge-base repo at all — checked
+via `git rev-list --objects --all` there, zero blobs of that name — so it dangled from the day the
+KB migrated. It is not restored; every table below already names its own EQEmu source inline, so
+nothing here actually depended on it except the one item flagged UNCITED below.)
 
-### Race IDs
+### Race IDs (`common/races.h`)
 Human=1, Barbarian=2, Erudite=3, Wood Elf=4, High Elf=5, Dark Elf=6, Half Elf=7, Dwarf=8, Troll=9,
 Ogre=10, Halfling=11, Gnome=12, Iksar=128, Vah Shir=130. (Froglok=330/Drakkin=522 exist in tables but
-are not Titanium-creatable — hide.)
+are not Titanium-creatable — hide.) Verified against `common/races.h`'s `Race` namespace constants:
+every value above matches exactly.
 
 ### Race/class validity matrix (`ClassRaceLookupTable`, EQEmu `world/client.cpp:2053`)
 ```
@@ -145,8 +151,16 @@ still constrain them to native choices.
 ### Deity IDs (`deity.h`)
 Agnostic=396, Bertoxxulous=201, BrellSerilis=202, Cazic-Thule=203, ErollisiMarr=204, Bristlebane=205,
 Innoruuk=206, Karana=207, MithanielMarr=208, Prexus=209, Quellious=210, RallosZek=211, RodcetNife=212,
-SolusekRo=213, TheTribunal=214, Tunare=215, Veeshan=216. (Per-class deity lists in the knowledgebase
-doc; deity not enforced server-side, so the per-class list is a UI nicety.)
+SolusekRo=213, TheTribunal=214, Tunare=215, Veeshan=216. (Per-class deity restrictions are UNCITED
+here. They are runtime data: `world/client.cpp` validates a create against a `char_create_combinations`
+DB table, loaded (`world/worlddb.cpp`, `LoadCharacterCreateCombos`, `SELECT * FROM
+char_create_combinations`) into the `character_create_race_class_combos` vector it checks against —
+not a table in the EQEmu source tree, so there is no public file this repo could cite for the
+per-class breakdown. A private working note once listed one; it has no history in the private
+knowledge-base repo — see the Section 3 note above — so it cannot be repointed either. To discharge
+this: read the per-combo rows from a running EQEmu server's `char_create_combinations` table, or drop
+per-class deity filtering from the UI entirely. Deity is not server-validated on Titanium, so
+shipping without it is not a correctness gap — only a lost affordance.)
 
 ### Start city → `start_zone` wire value (a ZONE_ID under RoF2) and per-race start cities
 > ⚠ **The `start_zone` wire value is a ZONE_ID, not the Titanium StartZoneIndex 0–13.** RoF2's

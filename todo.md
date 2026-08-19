@@ -291,7 +291,17 @@ Parse OP_SpawnDoor on zone-in; render with real models (from `_obj.s3d`) + fallb
 Animate open/close via OP_MoveDoor (server-authoritative, no client-side toggle). Portal doors
 (opentype 57/58) zone the player on open. Click via 3D picker or HTTP API (`GET /v1/observe/doors`,
 `POST /v1/interact/click_door {door_id:N}` or `{name:"DOOR1"}`). Verified live: doors render (untextured),
-click opens (server replies), portal doors trigger zoning. Notes: `docs/http-api.md`, `~/git/eq_kb/doors.md`.
+click opens (server replies), portal doors trigger zoning. Notes: `docs/http-api.md`.
+(This used to cite `~/git/eq_kb/doors.md`. That file has no history in the private knowledge-base
+repo at all — no add, no delete, `git rev-list --objects --all` there finds zero blobs of that name
+— so the citation dangled from the day the KB migrated, independent of whichever earlier eqoxide-repo
+note it was meant to carry forward. Repointed to the two private-tree notes that actually cover this
+claim, verified by reading them: `~/git/eq_kb/kelethin-lift-and-doors.md` documents the
+`OP_SpawnDoor`/`OP_ClickDoor`/`OP_MoveDoor` wire structs and the opentype-57/58 teleport-door
+semantics this paragraph describes; `~/git/eq_kb/rof2-door-spawn-delivery.md` documents the zone-in
+`OP_SpawnDoor` delivery mechanics ("Parse OP_SpawnDoor on zone-in" above). Neither is a
+merely-similar substitute — both were read and both name the exact mechanisms this paragraph
+claims.)
 
 **Follow-ups (not blocking):**
 - Door textures (models currently untextured; geometry/placement correct)
