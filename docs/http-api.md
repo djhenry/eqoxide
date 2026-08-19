@@ -1022,11 +1022,15 @@ nullable reason naming *why* the roster is empty, mirroring
 server-advertised total to compare holdings against; or, failing both, (3) an explicit "no
 completeness signal exists" field, so the endpoint discloses its own limit in band rather than only
 in prose. **This is (3).** (1) is not built here because this client never reads the packet that
-would separate "not sent yet" from "none exist", so it has no reason to name. (2) cannot be
-built because no message in this protocol carries a door, spawn or zone-point total. `zone_map_load`
-stays what it is: a terminal fact about one *additive* contributor to `zone_entrances` (#816), not a
-completeness verdict on any roster: it reports the outcome of that `.txt` load and nothing else, so
-it says nothing about whether the server-advertised entries have arrived.
+would separate "not sent yet" from "none exist", so it has no reason to name. (2) is not built
+here: this client compares its holdings against no total. For `zone_entrances` the server does
+advertise one — EQEmu's `Client::SendZonePoints()` writes `zp->count` (`zone/client.cpp:6959`) and
+the RoF2 patch copies it onto the wire (`common/patches/rof2.cpp:3632`) — but `apply_zone_points`
+discards it, and reading it into an observable is #939's scope, not this disclosure's.
+`zone_map_load` stays what it is: a terminal fact about one *additive* contributor to
+`zone_entrances` (#816), not a completeness verdict on any roster: it reports the outcome of that
+`.txt` load and nothing else, so it says nothing about whether the server-advertised entries have
+arrived.
 
 **`zone_assets.state` is not this signal.** It gates loaded terrain and collision — geometry — not
 which packets have arrived. That is why none of these three endpoints is gated on it (see

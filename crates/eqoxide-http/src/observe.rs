@@ -727,11 +727,11 @@ const NO_COMPLETENESS_SIGNAL: &str =
     "`complete` is null for every roster listed here and no code path in this client can set it to \
      true or false. These three rosters are filled from records the SERVER pushes — OP_SpawnDoor for \
      doors, spawn packets for entities, OP_SendZonepoints for zone_entrances — which arrive on no \
-     schedule this client controls, and the server advertises no total for any of them. So neither \
-     an empty roster nor a populated one is known to be complete, at any size. `zone_assets.state` \
-     is NOT this signal: it gates loaded terrain and collision, i.e. geometry, not which packets \
-     have arrived. Read an empty body from any of these three endpoints as `no record held`, never \
-     as `none exist`.";
+     schedule this client controls, and this client compares its holdings against no total. So \
+     neither an empty roster nor a populated one is known to be complete, at any size. \
+     `zone_assets.state` is NOT this signal: it gates loaded terrain and collision, i.e. geometry, \
+     not which packets have arrived. Read an empty body from any of these three endpoints as `no \
+     record held`, never as `none exist`.";
 
 /// The #939/#1073 completeness disclosure for the three SERVER-PUSHED rosters, served top-level on
 /// `GET /v1/observe/debug`.
@@ -750,9 +750,13 @@ const NO_COMPLETENESS_SIGNAL: &str =
 /// failing both, (3) an explicit "no completeness signal exists" field, so the endpoint discloses
 /// its own limit in band rather than only in prose. This is **(3)**. (1) is not built here because
 /// this client never reads the packet that would separate "not sent yet" from "none exist", so it
-/// has no reason to name. (2) cannot be built because no message in this protocol carries a door,
-/// spawn or zone-point total. `zone_map_load` stays what it is: a real terminal fact about ONE
-/// additive contributor to `zone_entrances` (#816), not a completeness verdict on the roster.
+/// has no reason to name. (2) is not built here: this client compares its holdings against no
+/// total. For `zone_entrances` the server does advertise one — EQEmu's `Client::SendZonePoints()`
+/// writes `zp->count` (`zone/client.cpp:6959`) and the RoF2 patch copies it onto the wire
+/// (`common/patches/rof2.cpp:3632`) — but `apply_zone_points` discards it, and reading it into an
+/// observable is #939's scope, not this disclosure's. `zone_map_load` stays what it is: a real
+/// terminal fact about ONE additive contributor to `zone_entrances` (#816), not a completeness
+/// verdict on the roster.
 ///
 /// **`complete` is therefore `null` on every entry, always, and that is not a placeholder for a
 /// value some other code path supplies.** Nothing in this client writes `true` or `false` there —
@@ -6672,11 +6676,11 @@ mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
 /// **What these three tests are for, and what they cannot do.** The defect is not that any of the
 /// three endpoints computes the wrong array — each one faithfully serves the roster it holds. It is
 /// that the roster is filled by records the SERVER pushes, so an empty one has two readings and
-/// nothing published told them apart. No test here can produce the missing signal, because it does
-/// not exist (see [`NO_COMPLETENESS_SIGNAL`]); what they hold is that the DISCLOSURE is published,
-/// that it enumerates all three endpoints rather than crowning one, that it never hardens into a
-/// completeness claim, and that its `held` counts are read off the same rosters the endpoints serve
-/// rather than typed into a list that can drift.
+/// nothing published told them apart. No test here can produce the missing signal, because this
+/// client holds none (see [`NO_COMPLETENESS_SIGNAL`]); what they hold is that the DISCLOSURE is
+/// published, that it enumerates all three endpoints rather than crowning one, that it never
+/// hardens into a completeness claim, and that its `held` counts are read off the same rosters the
+/// endpoints serve rather than typed into a list that can drift.
 #[cfg(test)]
 mod server_pushed_roster_completeness_939_1073 {
     use super::*;
