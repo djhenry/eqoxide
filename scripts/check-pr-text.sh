@@ -289,8 +289,27 @@ NEGCLOSE_NEGATIONS=(
 # en_US.UTF-8, checked, so the multi-byte character inside a negated bracket expression is not a
 # locale hazard here in the way it would be for a positive match.
 #
-# All of these exclusions trade recall for precision and all are exercised by --self-test in both
-# directions.
+# COVERAGE OF THESE TWO CONSTANTS, stated narrowly and measured, because an overstated coverage
+# claim is the exact defect this script exists to catch. An earlier revision of this comment said
+# "all of these exclusions ... are exercised by --self-test in both directions". That was FALSE:
+# when it was written only `.` and `—` were pinned, and dropping any of `#`, `;`, `!` or `?` left
+# --self-test at a full-green 67. Re-measured against THIS revision, one character at a time:
+#
+#   stop set   dropping any ONE of `#` `.` `;` `!` `?` `—` turns --self-test RED (1 check each);
+#              emptying the set entirely turns 19 red. Each is now held by a named green fixture,
+#              `#` included — it is the one with its own written rationale above, and it was the
+#              least guarded of the six.
+#   NEGCLOSE_GAP  pinned on the RECALL side only. The widest real instance in NC_RED_FIXTURES needs
+#              16 characters, so 15 and below turn --self-test RED and 16 turns it green.
+#
+# WHAT IS STILL NOT PINNED, said plainly rather than left inside a broad claim: nothing requires the
+# window to STOP at 40. 41, 100 and 400 are all full green, so a widened window is invisible to this
+# suite. Pinning that side needs a green fixture asserting that a negation ~41 characters ahead of a
+# close is unrelated, and this repository has no measured text supporting that boundary — inventing
+# one would encode 40 as correct on no evidence, which is the same failure in the other direction.
+# It is recorded as a known gap instead. Narrowing the window is NOT invisible and never was
+# harmless: at NEGCLOSE_GAP=3 the real bodies of pull requests 835 and 66 flip from flagged to
+# clean and the exit code from 1 to 0 — measured, which is why the recall side is pinned first.
 NEGCLOSE_GAP=40
 NEGCLOSE_GAP_STOPS='#.;!?—'
 
@@ -1028,6 +1047,15 @@ run_self_test() {
     'PR752 body line 145 (issue 194, the one a HUMAN caught — in 1h 40m — and the one two
      successive counts then dropped for exactly that reason)|194|**Deliberately does not close #194.** Two gaps stay open, and the full re-verification of all three'
     'PR653 body (issue 302 — see the NEGATIVE note below)|302|- This does not close #302 or #254. It removes one documented contributor.'
+    # THE WIDEST GAP IN THE SET, and the only fixture that exercises NEGCLOSE_GAP above 3.
+    # Measured instance, quoted verbatim from comment 4849028657 on 49: the negation `n't` sits
+    # 16 characters in front of `close #41` (' claim to fully '). Before this row the suite pinned
+    # only `gap >= 3`, so the 40 that eqoxide#1041 specified could be narrowed to 3 — or widened to
+    # 400 — with --self-test still fully green, while narrowing MEASURABLY disarmed the gating
+    # surface on real repository text. This is a genuine disclaimer on a warn-only surface: it did
+    # NOT cause a false close (issue 41 was closed by PR 49's BODY, which is a separate row above),
+    # and it is here for its SHAPE, which is the wording the 40-character window was sized for.
+    'comment 4849028657 on 49 (issue 41, gap 16 — WIDEST in the set; pins NEGCLOSE_GAP)|41|The PR is honest about its scope (doesn'"'"'t claim to fully close #41'
   )
   local n_red=0
   for row in "${NC_RED_FIXTURES[@]}"; do
@@ -1060,6 +1088,15 @@ run_self_test() {
     'fix(inventory): auto-loot into a free slot + stack, never overwrite occupied slots — Fixes #56'
     'fix(convert): W=0 quaternion frames are a 180° rotation, not identity (wolf rear inverted) — Fixes #40'
     'fix(render): hold sit/kneel poses instead of looping the transition — Fixes #83'
+    # ONE PER REMAINING GAP STOP, so that every character in NEGCLOSE_GAP_STOPS is pinned by a
+    # fixture rather than by its rationale alone. Each goes RED if that one character is dropped
+    # from the set. `#` is the one the comment above singles out with its own reasoning — the
+    # window must not leap over an intervening issue reference and attribute a disclaimer about
+    # one number to the next number in the sentence — and it was the least guarded of the six.
+    'does not affect #12 and closes #34'
+    'This is not in scope; Closes #77'
+    'Not this one! Closes #88'
+    'Why not this one? Closes #99'
   )
   local n_green=0
   for text in "${NC_GREEN_FIXTURES[@]}"; do
