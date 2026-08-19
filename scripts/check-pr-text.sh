@@ -585,12 +585,26 @@ negclose_attribution() {
 # recent commit messages on `origin/main` plus the body and full comment corpus of the 12 most
 # recently merged pull requests (12 bodies + 38 comments) = 200 items, 1336511 bytes.
 #
-#   as proposed in eqoxide#1051 (`the (previous|earlier|preceding|last) commit`, `this branch's`,
-#   `(on|in|from) (the same|this) branch`, `commit <n>`)   50 flagged lines, 6 true, 44 FALSE (88%)
+#   eqoxide#1051's two TEXT cues verbatim — `the (previous|earlier|preceding|last)
+#   commit`, `this branch's ... commit`                       6 flagged lines, 4 true,  2 false (33%)
+#   those two widened to a BARE `this branch's`, plus
+#   `(on|in|from) (the same|this) branch` and `commit <n>`   45 flagged lines, 4 true, 41 FALSE (91%)
+#   eqoxide#1051's THIRD cue on its own — a `[0-9a-f]{7,40}` sha that is not an ancestor of
+#   `origin/main`, counted over sha-SHAPED tokens only      171 flagged lines in 61 of the 200 items
+#   (as literally written that pattern also matches any 7-or-more-digit figure: 408 flagged lines)
 #   the set below, without the code-span strip                8 flagged lines, 6 true,  2 false (25%)
 #   the set below, as shipped                                 7 flagged lines, 6 true,  1 false (14%)
 #
-# The 44 dropped false positives are one class and it is this project's own provenance idiom:
+# The two TEXT cues as eqoxide#1051 words them are already low-noise; what makes the proposal
+# unshippable is its THIRD cue. That one flags 76 distinct tokens across 171 lines, and exactly 3
+# of the 76 are the references eqoxide#1051's own table names — all 3 of which resolve, per the
+# measurement above. Widening the text cues is the other trap: adding a bare `this branch's` and
+# `on this branch` takes 6 flagged lines to 45 without adding a single true positive, worse than
+# the 62.7% that closed eqoxide#983 as not viable. The shipped set moves the other way — it flags
+# 7 and finds 6, because `the (second|third|...) commit` catches two instances eqoxide#1051's
+# `(previous|earlier|preceding|last)` list misses (`96f0baf` and PR 1090's body).
+#
+# The 41 dropped false positives are one class and it is this project's own provenance idiom:
 # "Verified by the orchestrator on this branch MERGED WITH current `main`", "this branch's own
 # added tests and nothing else", "re-derived the 343-392 per-run band floor on this branch". Every
 # one of those stays TRUE after a squash, because the squash commit IS this branch — so the bare

@@ -213,11 +213,18 @@ jobs:
   # ITS FALSE-POSITIVE RATE IS MEASURED, not assumed, because the near-identical guard proposed in
   # #983 was abandoned at 62.7%. Corpus: 200 items / 1,336,511 bytes — the 150 most recent commit
   # messages on `main` plus the body and full comment corpus of the 12 most recently merged pull
-  # requests (12 bodies + 38 comments), swept 2026-08-19. The cue set as #1051 proposed it flags 50
-  # lines, 6 true and 44 false: 88% FP, all 44 of one shape — this project's provenance idiom
-  # ("verified on this branch merged with current `main`", "this branch's own added tests"), every
-  # one of which stays TRUE after a squash because the squash commit IS that branch. The three cues
-  # that ship flag 8 (25% FP); adding the code-span and fenced-block strip takes it to 7 flagged, 6
+  # requests (12 bodies + 38 comments), swept 2026-08-19. #1051's two TEXT cues, worded exactly as
+  # it words them, flag 6 lines: 4 true, 2 false (33% FP). Its THIRD cue is what makes the proposal
+  # unshippable — a `[0-9a-f]{7,40}` sha that is not an ancestor of `origin/main` flags 76 distinct
+  # tokens across 171 lines in 61 of the 200 items, and exactly 3 of those 76 are the references
+  # #1051's own table names, all 3 of which still resolve (see the sha note in the script). Widening
+  # the text cues instead is the other trap: a bare `this branch's` plus `(on|in|from) (the same|
+  # this) branch` and `commit <n>` takes 6 flagged lines to 45 while still finding only 4 — 91% FP,
+  # worse than the 62.7% that closed #983 — and all 41 are one shape, this project's provenance
+  # idiom ("verified on this branch merged with current `main`", "this branch's own added tests"),
+  # every one of which stays TRUE after a squash because the squash commit IS that branch. The
+  # three cues that ship flag 8 (25% FP) and find 6, two more true instances than #1051's own
+  # wording reaches; adding the code-span and fenced-block strip takes it to 7 flagged, 6
   # true, 1 false — 14% FP over 200 items, and the one line the strip removes across the whole
   # corpus is exactly the self-reference case (a review comment quoting the phrase in backticks
   # while discussing it). The residual false positive is quoted verbatim in the script so it is not
