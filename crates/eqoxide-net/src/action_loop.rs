@@ -1261,21 +1261,21 @@ impl ActionLoop {
     ///
     /// Same shape as [`Self::doors_shared`] above, one step more dangerous: this slot is not only
     /// READ by an agent (GET /v1/observe/dialogue) but ACTED on (POST /v1/interact/dialogue sends an
-    /// OP_ItemLinkClick for the chosen saylink). Its only publisher is [`Self::sync_messages`],
+    /// OP_ItemLinkClick for the chosen saylink). It is republished only by [`Self::sync_messages`],
     /// whose sole caller is `run_gameplay_phase`'s packet drain — not the handshake's own drain — so
     /// `GameState::begin_zone_in` clearing `gs.dialogue_choices` does not reach it, and the departed
     /// NPC's choices stay readable and clickable for the whole zone load without this.
     pub fn dialogue_shared(&self) -> &eqoxide_ipc::DialogueShared { &self.interact.dialogue }
 
     /// The published merchant session, for the zone-entry handshake to CLEAR (#941). Same shape and
-    /// same reason as [`Self::dialogue_shared`]: published only by [`Self::sync_merchant`] from
+    /// same reason as [`Self::dialogue_shared`]: republished only by [`Self::sync_merchant`] from
     /// `run_gameplay_phase`'s drain, and served by GET /v1/merchant/list.
     pub fn merchant_shared(&self) -> &eqoxide_ipc::MerchantShared { &self.merchant_slots.merchant }
 
     /// The published task-offer list, for the zone-entry handshake to CLEAR (#1004 review — the
     /// ninth #941 field, misclassified NOT ZONE-SCOPED in the original PR). Same shape and same
     /// reason as [`Self::dialogue_shared`]: each offer names the OFFERING NPC's spawn id (`npc_id`,
-    /// per `TaskOffer`'s own doc), it is published only by [`Self::sync_tasks`] from
+    /// per `TaskOffer`'s own doc), it is republished only by [`Self::sync_tasks`] from
     /// `run_gameplay_phase`'s drain — not the handshake's own drain — and it is served by
     /// GET /v1/quests/offers *and acted on* by POST /v1/quests/accept, which resolves
     /// `task_master_id` from this list and sends OP_AcceptNewTask to it.
