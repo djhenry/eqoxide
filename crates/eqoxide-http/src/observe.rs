@@ -719,6 +719,84 @@ fn parse_packets_query(raw: &str) -> Result<PacketsQuery, (&'static str, String)
         .map_err(|e| ("invalid_query_param", format!("could not parse query string: {e}")))
 }
 
+/// The sentence every `complete` in [`server_pushed_rosters`] is `null` for (#939, #1073).
+///
+/// Published verbatim so an agent reads the limit off the same payload it reads the rosters from,
+/// rather than only out of `docs/http-api.md`, which it never sees.
+const NO_COMPLETENESS_SIGNAL: &str =
+    "`complete` is null for every roster listed here and no code path in this client can set it to \
+     true or false. These three rosters are filled from records the SERVER pushes — OP_SpawnDoor for \
+     doors, spawn packets for entities, OP_SendZonepoints for zone_entrances — which arrive on no \
+     schedule this client controls, and this client compares its holdings against no total. So \
+     neither an empty roster nor a populated one is known to be complete, at any size. \
+     `zone_assets.state` is NOT this signal: it gates loaded terrain and collision, i.e. geometry, \
+     not which packets have arrived. Read an empty body from any of these three endpoints as `no \
+     record held`, never as `none exist`.";
+
+/// The #939/#1073 completeness disclosure for the three SERVER-PUSHED rosters, served top-level on
+/// `GET /v1/observe/debug`.
+///
+/// **What this is.** `/v1/observe/doors`, `/v1/observe/entities` and
+/// `/v1/observe/zone_entrances` all answer an empty body in two situations an agent must tell apart:
+/// this zone genuinely has none, and the records have not arrived yet. The zone-entry handshake
+/// clears all three before it asks for the new zone's records (doors #891/#934, the entity roster
+/// and `zone_points` #1010/#1063), which is right — a roster left over from the zone you left is the
+/// worse lie — but it makes the ambiguous empty the NORMAL reading for the length of a zone-in
+/// rather than a rare one.
+///
+/// **Which of #939's three options this is, and why the other two are not built here.** #939 asked
+/// for one of: (1) a nullable reason naming *why* the roster is empty, mirroring #816's
+/// `zone_map_load`; (2) a server-advertised total the client could compare its holdings against; or,
+/// failing both, (3) an explicit "no completeness signal exists" field, so the endpoint discloses
+/// its own limit in band rather than only in prose. This is **(3)**. (1) is not built here because
+/// this client never reads the packet that would separate "not sent yet" from "none exist", so it
+/// has no reason to name. (2) is not built here: this client compares its holdings against no
+/// total. For `zone_entrances` the server does advertise one — EQEmu's `Client::SendZonePoints()`
+/// writes `zp->count` (`zone/client.cpp:6959`) and the RoF2 patch copies it onto the wire
+/// (`common/patches/rof2.cpp:3632`) — but `apply_zone_points` discards it, and reading it into an
+/// observable is #939's scope, not this disclosure's. `zone_map_load` stays what it is: a real
+/// terminal fact about ONE additive contributor to `zone_entrances` (#816), not a completeness
+/// verdict on the roster.
+///
+/// **`complete` is therefore `null` on every entry, always, and that is not a placeholder for a
+/// value some other code path supplies.** Nothing in this client writes `true` or `false` there —
+/// see [`NO_COMPLETENESS_SIGNAL`], which is published alongside it and says so to the agent in the
+/// same words. It is spelled as a three-valued field rather than dropped so that a roster which one
+/// day DOES acquire a signal has a place to put it without a shape change, and so that "unknown" is
+/// something an agent reads rather than something it has to infer from an absence.
+///
+/// **`held` is a reading, not a promise.** It counts the entries in the same shared slot the named
+/// endpoint serves, at the moment this payload was built — for `entities` that is the deduped
+/// projection (#471), the same one the endpoint returns, not the raw table. Two separate HTTP
+/// requests can still straddle a publish, so `held` is not a prediction of what a subsequent GET
+/// will return; it is what this roster held when `/debug` read it.
+///
+/// **The three keys are an enumeration, deliberately** (#1073: "it has to be an enumeration someone
+/// can check, not an adjective"). `debug_roster_disclosure_held_counts_match_the_endpoints_939`
+/// drives each named endpoint and compares, so the list cannot quietly drift from what the routes
+/// actually serve.
+fn server_pushed_rosters(s: &HttpState) -> serde_json::Value {
+    // Each lock is taken and released within its own statement — no two are ever held at once, so
+    // this adds no edge to the `entity_positions` → `entity_ids` → `entity_poses` order that
+    // `WorldSlots::publish_entities` and `name_match::resolve_in_world` share.
+    let doors = s.interact.doors_shared.lock().unwrap().len();
+    let zone_entrances = s.world.zone_points.lock().unwrap().len();
+    // The DEDUPED count, so this agrees with what `GET /v1/observe/entities` returns rather than
+    // with the raw table behind it (#471 collapses same-name + byte-identical-position duplicates).
+    let entities = {
+        let positions = s.world.entity_positions();
+        dedup_entities(&positions).0.len()
+    };
+    serde_json::json!({
+        "rosters": {
+            "doors":          { "endpoint": "/v1/observe/doors",          "held": doors,          "complete": null },
+            "entities":       { "endpoint": "/v1/observe/entities",       "held": entities,       "complete": null },
+            "zone_entrances": { "endpoint": "/v1/observe/zone_entrances", "held": zone_entrances, "complete": null },
+        },
+        "no_completeness_signal": NO_COMPLETENESS_SIGNAL,
+    })
+}
+
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let cam   = s.camera.snapshot.lock().unwrap().clone();
     // Projected from the network thread's GameState, and freshness measured RIGHT NOW — not read
@@ -1223,6 +1301,13 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // #816 — see where it is built, above. `null` while this zone's map-label fallback exits
         // (a purely-additive contribution to `zone_points`/`zone_entrances`) loaded fine.
         "zone_map_load": zone_map_load,
+        // #939/#1073 — the completeness disclosure for the three SERVER-PUSHED rosters
+        // (`doors`, `entities`, `zone_entrances`). ALWAYS PRESENT, in every state, unlike the
+        // `null`-when-healthy fields around it: this is not a fault report that appears when
+        // something breaks, it is a standing statement of a limit that never goes away, and an
+        // absent key is indistinguishable from an older client that never had it. See
+        // `server_pushed_rosters` for what each field means and for why `complete` is `null`.
+        "server_pushed_rosters": server_pushed_rosters(&s),
         // The FINE 2u STEERING tier (#382). `null` while it is healthy (a complete fine route to its
         // carrot) or has not yet answered. Non-null when the tier that is actually steering the
         // character cannot see a way through the next 40u — and it says WHICH kind of cannot:
@@ -2046,6 +2131,17 @@ struct EntitiesQuery {
 ///
 /// The underlying `gs.world.entities`/`entity_ids` model is untouched in either case, so every instance
 /// stays targetable by its full (suffixed) name.
+///
+/// **An empty body during a zone-in means "not published yet", not "this zone is empty" (#1073).**
+/// The zone-entry handshake clears the published roster triple (#1010/#1063) — correct, because the
+/// alternative is serving the DEPARTED zone's entities for the length of the handshake — and it
+/// refills from spawn packets as they arrive. So for that window `{}` (or `{"count": 0, …}` on the
+/// labeled shape) is the same bytes as the true answer "there is nobody here", and this endpoint is
+/// NOT gated on `zone_assets.state`: the roster is a server-pushed list, not a derivation from
+/// loaded geometry, so `ready` would be the wrong thing to wait for even if it were consulted.
+/// The limit is disclosed in band on `GET /v1/observe/debug`'s `server_pushed_rosters`, which lists
+/// this endpoint alongside `/v1/observe/doors` and `/v1/observe/zone_entrances`; see
+/// [`server_pushed_rosters`].
 async fn get_entities(State(s): State<HttpState>, Query(q): Query<EntitiesQuery>) -> Response {
     let labeled = q.labeled.as_deref()
         .is_some_and(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true"));
@@ -2226,7 +2322,11 @@ async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
 ///
 /// There is no completeness observable to wait on for the remaining #939 case: `zone_assets.state`
 /// reaching `"ready"` gates on terrain meshes and collision triangles, so it is about geometry, not
-/// about which door packets the server has sent.
+/// about which door packets the server has sent. **That limit is now disclosed IN BAND** rather than
+/// only here and in `docs/http-api.md`: `GET /v1/observe/debug`'s `server_pushed_rosters` lists this
+/// endpoint alongside `/v1/observe/entities` and `/v1/observe/zone_entrances` — the other two
+/// rosters filled from server-pushed records — with the count held and `complete: null`. See
+/// [`server_pushed_rosters`] for why `null` is the only value that field ever takes.
 ///
 /// The same limit binds the other direction, and this is the reason `/v1/interact/click_door`
 /// answers a miss with `404` *unknown* rather than *disproved*: a **populated** roster is not a
@@ -2254,6 +2354,19 @@ async fn get_doors(State(s): State<HttpState>) -> Response {
 /// or hasn't been needed yet; non-null names why it didn't, so an empty/short list here can be told
 /// apart from "this zone's map genuinely has no fallback labels"). The SERVER-advertised entries in
 /// this list are never affected — this only ever narrows the additive fallback.
+///
+/// **`[]` here carries the same ambiguity `/v1/observe/doors` does, and for the same reason
+/// (#1073).** The zone-entry handshake clears `zone_points` (#1010/#1063) so that this list stops
+/// describing the zone the character just LEFT. A session's FIRST zone-in reaches the same empty by
+/// a different route: the roster starts empty, so there is nothing to clear and the same ambiguity
+/// holds without any clear having run. Either way the records refill from `OP_SendZonepoints` on no
+/// schedule this client controls. During that window an `[]` is the same bytes as the true answer
+/// "this zone has no entrances". `zone_map_load` does not cover this — it reports the outcome of the
+/// additive map-label `.txt` load and nothing else, so it says nothing at all about whether the
+/// SERVER-advertised entries have arrived. The limit is disclosed in band on
+/// `GET /v1/observe/debug`'s `server_pushed_rosters`,
+/// which lists this endpoint with the other two rosters that share the shape; see
+/// [`server_pushed_rosters`].
 async fn get_zone_entrances(State(s): State<HttpState>) -> Response {
     // #646: bare array body (backward-compatible shape, also served under the deprecated
     // `/zone_points` alias) — freshness rides `SNAPSHOT_AGE_HEADER` instead of a JSON key.
@@ -6553,6 +6666,184 @@ mod zone_exits_never_publishes_a_failed_read_as_empty_803 {
             "region data is a separate readiness question from the zone's terrain assets, and the \
              refusal has to SAY so — an array body would make a bare `assert_ne!` pass: {j}");
         assert_ne!(j["error"], "zone_assets_not_ready", "body: {j}");
+    }
+}
+
+/// #939 / #1073 — `GET /v1/observe/debug`'s `server_pushed_rosters`, the in-band disclosure that an
+/// empty body from `/v1/observe/doors`, `/v1/observe/entities` or `/v1/observe/zone_entrances` means
+/// "no record held", not "none exist".
+///
+/// **What these three tests are for, and what they cannot do.** The defect is not that any of the
+/// three endpoints computes the wrong array — each one faithfully serves the roster it holds. It is
+/// that the roster is filled by records the SERVER pushes, so an empty one has two readings and
+/// nothing published told them apart. No test here can produce the missing signal, because this
+/// client holds none (see [`NO_COMPLETENESS_SIGNAL`]); what they hold is that the DISCLOSURE is
+/// published, that it enumerates all three endpoints rather than crowning one, that it never
+/// hardens into a completeness claim, and that its `held` counts are read off the same rosters the
+/// endpoints serve rather than typed into a list that can drift.
+#[cfg(test)]
+mod server_pushed_roster_completeness_939_1073 {
+    use super::*;
+    use crate::testkit::empty_state;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// The router these tests drive is the `observe` sub-router; production mounts it under
+    /// `/v1/observe`, which is the prefix the disclosure's `endpoint` values are written in.
+    const MOUNT: &str = "/v1/observe";
+
+    /// The three rosters the disclosure is about, and the route each is served on — declared here
+    /// INDEPENDENTLY of the payload, so `the_disclosure_enumerates_exactly_the_three_endpoints`
+    /// compares two separately-written lists rather than the payload against itself. A roster
+    /// dropped from the payload and a roster added to it are both red, which is the "classify every
+    /// item" discipline: a check that only reports exceptions cannot tell "nothing wrong" from
+    /// "nothing looked at".
+    const ROSTERS: &[(&str, &str)] = &[
+        ("doors",          "/v1/observe/doors"),
+        ("entities",       "/v1/observe/entities"),
+        ("zone_entrances", "/v1/observe/zone_entrances"),
+    ];
+
+    async fn body_json(state: &HttpState, uri: &str) -> serde_json::Value {
+        let app = router().with_state(state.clone());
+        let resp = app.oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri} must answer 200 for this fixture");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn door(door_id: u8, name: &str) -> eqoxide_ipc::DoorView {
+        eqoxide_ipc::DoorView {
+            door_id, name: name.to_string(),
+            x: 1.0, y: 2.0, z: 3.0, heading: 0.0, opentype: 58, is_open: false,
+        }
+    }
+
+    fn zone_point(iterator: u32, zone_id: u16) -> eqoxide_core::game_state::ZonePoint {
+        eqoxide_core::game_state::ZonePoint {
+            iterator, server_x: 1.0, server_y: 2.0, server_z: 3.0, heading: 0.0, zone_id,
+        }
+    }
+
+    /// All three rosters non-empty and at three DISTINCT sizes (4 doors / 2 entities / 3 zone
+    /// points), so a payload that wired every entry to one roster could not pass. The entity roster
+    /// deliberately carries a #471 positional duplicate: its `held` must agree with what the
+    /// ENDPOINT returns (2, deduped), not with the raw table behind it (3).
+    fn populated_state() -> HttpState {
+        let s = empty_state();
+        *s.interact.doors_shared.lock().unwrap() =
+            vec![door(7, "QEYNOS_GATE"), door(9, "HHCELL"), door(11, "DOOR11"), door(12, "DOOR12")];
+        *s.world.zone_points.lock().unwrap() =
+            vec![zone_point(1, 2), zone_point(2, 3), zone_point(3, 4)];
+        {
+            let mut pos = s.world.entity_positions_mut();
+            pos.insert_for_test("Geeda".to_string(),        (100.0, 200.0, 5.0));
+            pos.insert_for_test("Geeda00".to_string(),      (100.0, 200.0, 5.0)); // the duplicate
+            pos.insert_for_test("Bidl_Frugrin".to_string(), (10.0,  20.0,  3.0));
+        }
+        s
+    }
+
+    /// The number of entries `uri`'s body reports: an array's length for the two bare-array
+    /// endpoints, the key count for `entities`' bare `{name: [x,y,z]}` map.
+    fn entry_count(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Array(a)  => a.len(),
+            serde_json::Value::Object(o) => o.len(),
+            other => panic!("not a roster body: {other}"),
+        }
+    }
+
+    /// **#939, the heart of it.** With every roster empty — the state a zone-in produces, since the
+    /// zone-entry handshake clears all three (#891 for doors, #1010/#1063 for the entity roster and
+    /// `zone_points`), and a session's FIRST zone-in reaches the same empty by a different route:
+    /// those rosters start empty, so there is nothing to clear and the same ambiguity holds without
+    /// any clear having run — the disclosure must still be published, and it must say UNKNOWN
+    /// rather than hardening into a verdict. `complete: null` PRESENT is the whole point: a missing
+    /// key and an explicit null both read as `Value::Null` through a bare `assert_eq!`, so presence
+    /// is asserted separately (same discipline as `zone_map_load`, #647 review F3).
+    #[tokio::test]
+    async fn an_empty_roster_is_disclosed_as_unknown_never_as_complete_939() {
+        let s = empty_state();
+        let j = body_json(&s, "/debug").await;
+        let d = j.get("server_pushed_rosters")
+            .expect("the disclosure must be present on /debug, not omitted");
+        assert!(d.get("no_completeness_signal").and_then(|v| v.as_str()).is_some_and(|t| !t.is_empty()),
+            "the disclosure must say IN BAND why every `complete` is null: {d}");
+        for (key, endpoint) in ROSTERS {
+            let e = d["rosters"].get(key)
+                .unwrap_or_else(|| panic!("roster `{key}` missing from the disclosure: {d}"));
+            assert_eq!(e["endpoint"], serde_json::json!(endpoint),
+                "roster `{key}` must name the route it is about");
+            assert_eq!(e["held"], serde_json::json!(0), "roster `{key}` is empty in this fixture");
+            assert!(e.get("complete").is_some(),
+                "roster `{key}` must carry `complete` EXPLICITLY — an absent key is \
+                 indistinguishable from an older client that never had it");
+            assert_eq!(e["complete"], serde_json::Value::Null,
+                "an empty roster is UNKNOWN, never a settled answer: {e}");
+            assert_ne!(e["complete"], serde_json::json!(true),
+                "nothing this client can observe entitles it to call a roster complete");
+        }
+    }
+
+    /// **#1073.** The disclosure has to be an ENUMERATION someone can check, not an adjective and
+    /// not a superlative over one favoured member — that is the defect the issue filed against the
+    /// old "`/v1/observe/doors` is the case that matters" line. Both directions are asserted: a
+    /// roster missing from the payload is red, and a roster present in the payload but not in
+    /// [`ROSTERS`] is red too.
+    #[tokio::test]
+    async fn the_disclosure_enumerates_exactly_the_three_endpoints_1073() {
+        let j = body_json(&empty_state(), "/debug").await;
+        let mut published: Vec<String> = j["server_pushed_rosters"]["rosters"]
+            .as_object().expect("`rosters` must be an object keyed by roster name")
+            .keys().cloned().collect();
+        published.sort();
+        let mut expected: Vec<String> = ROSTERS.iter().map(|(k, _)| k.to_string()).collect();
+        expected.sort();
+        assert_eq!(published, expected,
+            "the enumerated set must be exactly doors + entities + zone_entrances — no member \
+             crowned, none dropped");
+    }
+
+    /// **The enumeration is checked against the ROUTES, not against itself.** Every `endpoint` the
+    /// disclosure names is fetched, and its entry count must equal the `held` the same payload
+    /// published. This is what stops the list from being three strings someone typed once: rename a
+    /// route, point an entry at the wrong roster, or count the raw entity table instead of the
+    /// deduped projection the endpoint serves, and this goes red.
+    ///
+    /// The fixture is populated (4 doors / 3 zone points / 3 raw entities collapsing to 2) so the
+    /// three counts are DISTINCT — with everything empty, `0 == 0` would pass for a payload that had
+    /// every entry wired to the same roster.
+    #[tokio::test]
+    async fn debug_roster_disclosure_held_counts_match_the_endpoints_939() {
+        let s = populated_state();
+        let j = body_json(&s, "/debug").await;
+        let rosters = j["server_pushed_rosters"]["rosters"].as_object().unwrap().clone();
+        assert!(!rosters.is_empty(), "an empty enumeration would pass this loop vacuously");
+        for (key, entry) in rosters {
+            let endpoint = entry["endpoint"].as_str()
+                .unwrap_or_else(|| panic!("roster `{key}` has no `endpoint` string: {entry}"));
+            let route = endpoint.strip_prefix(MOUNT)
+                .unwrap_or_else(|| panic!("`{endpoint}` is not under {MOUNT}"));
+            let served = entry_count(&body_json(&s, route).await);
+            assert_eq!(entry["held"], serde_json::json!(served),
+                "roster `{key}`: /debug says {} held, {endpoint} serves {served}",
+                entry["held"]);
+        }
+        // The three counts really are distinct in this fixture, so the loop above could not have
+        // passed by comparing three copies of one number.
+        assert_eq!(rosters_held(&j, "doors"),          4);
+        assert_eq!(rosters_held(&j, "entities"),       2);
+        assert_eq!(rosters_held(&j, "zone_entrances"), 3);
+        // …and `entities` is the DEDUPED projection: the raw table holds three.
+        assert_eq!(s.world.entity_positions().len(), 3,
+            "the fixture's raw table must hold the duplicate this endpoint collapses");
+    }
+
+    fn rosters_held(j: &serde_json::Value, key: &str) -> u64 {
+        j["server_pushed_rosters"]["rosters"][key]["held"].as_u64()
+            .unwrap_or_else(|| panic!("roster `{key}` has no numeric `held`"))
     }
 }
 
