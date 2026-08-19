@@ -1341,7 +1341,7 @@ pub type EntityPoses = Arc<Mutex<Roster<EntityPoseView>>>;
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /v1/observe/zone_points.
 ///
 /// Published by `ActionLoop::sync_zone_points` (server adverts + the client-synthesized `"to "`
-/// label entries), and EMPTIED by `gameplay::run_zone_entry_handshake` at the top of every zone-in
+/// label entries), and EMPTIED by `gameplay::run_zone_entry_handshake` on a re-zone
 /// (#1010) — without the clear this list describes the DEPARTED zone for the whole
 /// handshake. The handshake's clear is why the post-handshake resync must go through
 /// `ActionLoop::sync_zone_points_after_zone_in` rather than `sync_zone_points` directly.
@@ -2560,7 +2560,7 @@ impl WorldSlots {
     /// and `sync_entities` full-replaces from authoritative state on the next tick regardless.
     ///
     /// The third caller (#1010) is `gameplay::run_zone_entry_handshake`, which uses exactly this
-    /// full-replace property to EMPTY the roster at the top of a zone-in: `begin_zone_in` has just
+    /// full-replace property to EMPTY the roster on a re-zone: `begin_zone_in` has just
     /// cleared `gs.world.entities`, and publishing that empty map through here is the only way to
     /// clear the roster without becoming a second writer of the sealed maps. Until then the
     /// departed zone's roster stayed published for the whole handshake, because `sync_entities`'

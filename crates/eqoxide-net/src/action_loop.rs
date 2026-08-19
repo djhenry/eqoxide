@@ -1174,8 +1174,8 @@ impl ActionLoop {
 
     /// Republish `zone_points` after a zone-entry handshake, rebuilding from scratch (#1010).
     ///
-    /// `gameplay::run_zone_entry_handshake` empties the published `WorldSlots::zone_points` at the
-    /// top of every zone-in (see its comment for why). That leaves [`Self::sync_zone_points`]'s
+    /// `gameplay::run_zone_entry_handshake` empties the published `WorldSlots::zone_points` on a
+    /// re-zone (see its comment for why). That leaves [`Self::sync_zone_points`]'s
     /// zone-change latch — `self.current_zone`, the zone name the published list was last rebuilt
     /// for (#816) — asserting something no longer true: the list it names is gone. Re-arming the
     /// latch here makes the next sync take the REBUILD branch instead of the same-zone one.
@@ -1284,12 +1284,12 @@ impl ActionLoop {
     /// Sync zone exit points from `gs` into the shared zone_points map.
     /// On zone change, also loads map-label exits from disk as fallback zone points.
     ///
-    /// ⚠️ The zone-change test below is a LATCH on `self.current_zone` (#816), and it is only true
-    /// while this loop is the only thing that writes the published list. `run_zone_entry_handshake`
-    /// empties that list at every zone-in (#1010), so the post-handshake resync must go through
-    /// [`Self::sync_zone_points_after_zone_in`], which re-arms the latch first. The difference is
-    /// observable on EVERY re-entry whose zone NAME is unchanged — a same-zone death/bind respawn is
-    /// the most common of those, not the only one; see that method's doc for the full rule.
+    /// ⚠️ The zone-change test below is a LATCH on `self.current_zone` (#816).
+    /// `run_zone_entry_handshake` empties that list on a re-zone (#1010), so the post-handshake
+    /// resync must go through [`Self::sync_zone_points_after_zone_in`], which re-arms the latch
+    /// first. The difference is observable on EVERY re-entry whose zone NAME is unchanged — a
+    /// same-zone death/bind respawn is the most common of those, not the only one; see that
+    /// method's doc for the full rule.
     pub fn sync_zone_points(&mut self, gs: &GameState) {
         // On zone change, load map labels from disk as fallback zone points.
         if gs.world.zone_name != self.current_zone {
@@ -4917,11 +4917,10 @@ mod tests {
     /// `sync_zone_points` decides between "rebuild from disk" and "same zone: keep the map labels
     /// already published" purely by comparing `gs.world.zone_name` against `self.current_zone`. The
     /// same-zone arm is a PRESERVE arm: it `drain(..)`s the published list and puts the
-    /// `iterator == u32::MAX` map-label entries back. That arm is only correct while this loop is
-    /// the sole writer of the list — and as of #1010 `run_zone_entry_handshake` empties it at every
-    /// zone-in, so on any zone-in that does NOT change the zone name the preserve arm would drain an
-    /// already-empty list and put nothing back, permanently dropping this zone's `"to "`-label
-    /// fallback exits until some LATER crossing happened to re-arm the latch.
+    /// `iterator == u32::MAX` map-label entries back. As of #1010 `run_zone_entry_handshake`
+    /// empties it on a re-zone, so on any re-zone that does NOT change the zone name the preserve
+    /// arm would drain an already-empty list and put nothing back, permanently dropping this
+    /// zone's `"to "`-label fallback exits until some LATER crossing happened to re-arm the latch.
     ///
     /// That is not a hypothetical branch, and it is not a single one either. `classify_zone_change_echo`
     /// returns `CrossZoneReconnect` for ANY `success == 1` echo that is not (echo zone id == current

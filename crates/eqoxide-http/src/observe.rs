@@ -1953,8 +1953,8 @@ struct EntitiesView {
     note: Option<String>,
     /// #643 — name → server-published `{pose, gait}`. Its key set is **exactly** `entities`'s:
     /// both are projected inside one critical section over the shared world tables, and every
-    /// publisher of `entity_positions` (`ActionLoop::sync_entities` and `login.rs`'s zone-in seed)
-    /// writes both maps together, so `body["poses"][name]` is safe for any `name` in `entities`.
+    /// publisher of `entity_positions` writes both maps together, so `body["poses"][name]` is safe
+    /// for any `name` in `entities`.
     ///
     /// `pose` is the discrete body state (`standing`/`sitting`/`crouching`/`lying`/`looting`/
     /// `freeze`) and `gait` is the locomotion speed code from the last position update (`null`
@@ -2029,9 +2029,9 @@ struct EntitiesQuery {
 /// name+position with consecutive server spawn_ids (e.g. 526/527), including unique named NPCs that
 /// exist once per server, which also leaked into chat as doubled zone-in greetings. The client
 /// cannot manufacture a second spawn_id (`register_spawn` upserts `gs.world.entities` by the verbatim
-/// server id, `packet_handler.rs`), it clears the roster on every zone-in (`apply_new_zone`), and
-/// both name→pos publishers full-replace their maps (`action_loop::sync_entities`, `login.rs`) — so
-/// two distinct ids at one position can only be two genuine server `Mob`s (duplicated `spawn2`
+/// server id, `packet_handler.rs`), it clears the roster on every zone-in, and
+/// the name→pos publishers full-replace their maps — so two distinct ids at one position can only
+/// be two genuine server `Mob`s (duplicated `spawn2`
 /// content, whose names the wire disambiguates with a numeric suffix). A packet capture is still
 /// needed to confirm two distinct spawn_ids on the wire vs. a client artifact.
 ///

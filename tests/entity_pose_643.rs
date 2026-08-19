@@ -288,7 +288,7 @@ async fn entities_labeled_body_reports_pose_and_gait_separately_643() {
 
     let state = empty_state();
     // Publish through the REAL production roster publisher (`WorldSlots::publish_entities`, the
-    // single writer both the nav tick and the login seed go through) rather than hand-seeding the
+    // single writer) rather than hand-seeding the
     // maps — so this test exercises the same projection the live client does.
     world_slots(&state).publish_entities(&gs.world.entities);
 
@@ -325,8 +325,8 @@ async fn entities_labeled_body_reports_pose_and_gait_separately_643() {
 /// What this test can and cannot show: it pins that the projection does not drop keys for the
 /// entities it is given (including through the #471 dedup, which is where a mismatch would be
 /// easiest to introduce). The RACE itself is excluded structurally, not by this test — both maps
-/// are now read under one critical section, and both publishers (`sync_entities` and `login.rs`'s
-/// zone-in seed) write positions and poses together. Per the verification hierarchy, a passing
+/// are now read under one critical section, and the publishers write positions and poses
+/// together. Per the verification hierarchy, a passing
 /// example test does not discharge a "cannot" claim; the single lock scope is what does.
 #[tokio::test]
 async fn entities_and_poses_have_identical_key_sets_643() {
