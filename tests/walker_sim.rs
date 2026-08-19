@@ -1399,10 +1399,13 @@ use eqoxide_ipc::MoveIntent;
     /// printing `— COMPLETE` anywhere would satisfy the rest while telling the reader less.
     ///
     /// **MUTATION CHECKS (each independently turns this RED) — see the PR body for transcripts:**
-    /// 1. Put the two rollups back on one line in `open_zone_checked` → property 2 fails on the
-    ///    `[ABORTED …]` line.
+    /// 1. Render both rollups on ONE line (drop the per-rollup `writeln!` from `RollupReport`'s
+    ///    `Display`) → property 2 fails on the `[ABORTED …]` line. **This is the mutant that ran
+    ///    GREEN against the first version of property 2 — see the ⚠️ note inside it.**
     /// 2. Delete the verdict line from `RollupReport`'s `Display` → property 3 fails.
-    /// 3. Close `#423` in the fixture → property 1's `[ABORTED …]` control fails (no abort at all).
+    /// 3. Close `#423` in the fixture as well, so nothing aborts → the fixture no longer satisfies
+    ///    its own `#[should_panic]`, and the subprocess-status assertion at the top of this test
+    ///    fires before the reach control does.
     #[test]
     fn a_diverged_abort_report_is_not_greppable_as_clean_898() {
         let out = run_fixture_capturing_output("a_diverged_abort_prints_one_clean_rollup_and_one_hole_898");
@@ -1427,12 +1430,27 @@ use eqoxide_ipc::MoveIntent;
                 quote_child_output("captured stdout", &stdout));
         }
 
-        // 2. THE FIX. No line of the report carries a per-rollup clean marker together with either
-        //    the abort tag or the report's own verdict — and in particular the `[ABORTED …]` line
-        //    itself no longer contains `— COMPLETE`.
+        // 2. THE FIX. No line of the report carries a per-rollup clean marker together with the
+        //    abort tag, the report's own verdict, or the OTHER per-rollup marker — and in
+        //    particular the `[ABORTED …]` line itself no longer contains `— COMPLETE`.
+        //
+        //    `— COMPLETE` identifies that marker on its own: `"— INCOMPLETE"`, `"— ALL-COMPLETE"`
+        //    and `"— NOT-ALL-COMPLETE"` all fail to contain it, because the em-dash-and-space is
+        //    the disambiguator. `composite_markers_are_line_safe_against_every_other_898` in
+        //    `water_grid.rs` asserts that for all twelve ordered pairs, so it is pinned, not assumed.
+        //
+        //    ⚠️ MEASURED — this loop USED to open with
+        //    `let per_clean = line.contains("— COMPLETE") && !line.contains("— INCOMPLETE");
+        //     if !per_clean { continue }`
+        //    and mutation 1 below ran GREEN against it. The mutant renders both rollups on ONE
+        //    line, so that line carries BOTH per-rollup markers, `per_clean` was FALSE, the line
+        //    was skipped, and every assertion in this loop was vacuous — including the one that
+        //    says a line must not carry both. The exempting term is gone. A predicate that
+        //    excludes the very state its assertions are about is #927's shape inside #898's test.
+        let mut clean_lines = 0usize;
         for line in stdout.lines() {
-            let per_clean = line.contains("— COMPLETE") && !line.contains("— INCOMPLETE");
-            if !per_clean { continue }
+            if !line.contains("— COMPLETE") { continue }
+            clean_lines += 1;
             assert!(!line.contains("[ABORTED while opening"),
                 "the ABORTED tag shares a line with a per-rollup `— COMPLETE`: a line-level grep \
                  for the clean marker lands on the very line that says the run died. Line: \
@@ -1446,6 +1464,16 @@ use eqoxide_ipc::MoveIntent;
                 "one line carries both per-rollup markers. Line: {line:?}\n{}",
                 quote_child_output("captured stdout", &stdout));
         }
+        // …and the loop above really examined a line. An exceptions-only scan cannot tell "nothing
+        // wrong" from "nothing looked at" (#927), and that is not hypothetical here: the skipped-line
+        // form of this loop above is exactly how it went green on a real mutant. Exactly one line, so
+        // this is also the audit a reader would run — a grep for the clean marker lands only on the
+        // rollup that really is clean.
+        assert_eq!(clean_lines, 1,
+            "reach control: the per-rollup `— COMPLETE` must appear on exactly one line of the \
+             captured stdout — the clean rollup's — and the loop above must have examined it; \
+             found {clean_lines}\n{}",
+            quote_child_output("captured stdout", &stdout));
 
         // 3. …and the report DOES state a verdict of its own, exactly once, and it is not clean.
         let verdicts: Vec<&str> = stdout.lines()

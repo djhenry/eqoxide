@@ -1386,8 +1386,8 @@ mod tests {
     /// measuring nothing.
     ///
     /// MUTATION CHECKS (each independently turns this RED):
-    /// 1. Render the rollups on ONE line (`write!(f, "{label}: {roll} ")` with no `writeln!`) →
-    ///    property 2 fails: a line carries both markers.
+    /// 1. Render the rollups on ONE line (drop the per-rollup `writeln!` from `Display`) →
+    ///    property 2 fails: one line carries both per-rollup markers.
     /// 2. Delete the verdict line from `Display` → property 3 fails.
     /// 3. Drop the `!self.rolls.is_empty()` term from `all_complete` → the empty case below flips.
     #[test]
@@ -1407,14 +1407,32 @@ mod tests {
             "reach control: #898's exhibit is `— COMPLETE` printed beside `0 (over 1/1 zones)`, and \
              this fixture no longer produces that string.\n{text}");
 
-        // 2. THE FIX. No line carries a clean marker and a dirty one, and no line carries a
-        //    per-rollup marker together with the report's own verdict.
-        for line in &lines {
-            let per_clean = line.contains("— COMPLETE") && !line.contains("— INCOMPLETE");
-            assert!(!(line.contains("— COMPLETE") && line.contains("— INCOMPLETE")),
+        // 2. THE FIX, stated as the audit a reader would actually run: a naive line-level grep for
+        //    the clean marker lands on exactly ONE line, and that line carries nothing else that a
+        //    grep could confuse it with.
+        //
+        //    `— COMPLETE` identifies the per-rollup clean marker ON ITS OWN — `"— INCOMPLETE"`,
+        //    `"— ALL-COMPLETE"` and `"— NOT-ALL-COMPLETE"` all fail to contain it, because the
+        //    em-dash-and-space is the disambiguator. That is not assumed here: it is the whole
+        //    subject of `composite_markers_are_line_safe_against_every_other_898` above, which
+        //    asserts all twelve ordered pairs.
+        //
+        //    ⚠️ MEASURED, and the reason this reads the way it does: this loop was first written as
+        //    `let per_clean = line.contains("— COMPLETE") && !line.contains("— INCOMPLETE")` with
+        //    the composite check gated on `per_clean`. The one-line-rendering mutant listed above
+        //    puts BOTH per-rollup markers on one line — which makes `per_clean` FALSE, so the gated
+        //    assertion was skipped on precisely the state it exists for. The sibling of this test in
+        //    `walker_sim.rs` gated its WHOLE loop that way and ran GREEN on that mutant. A predicate
+        //    that excludes the state its assertions are about is #927's shape inside #898's test.
+        let clean_lines: Vec<&&str> = lines.iter().filter(|l| l.contains("— COMPLETE")).collect();
+        assert_eq!(clean_lines.len(), 1,
+            "a line-level grep for the clean marker must land on exactly one line — the rollup that \
+             really is clean. Got {clean_lines:?}\n{text}");
+        for line in &clean_lines {
+            assert!(!line.contains("— INCOMPLETE"),
                 "one line carries BOTH per-rollup markers — a line-level grep for either is a \
                  coin flip: {line:?}\n{text}");
-            assert!(!(per_clean && (line.contains(COMPOSITE_CLEAN) || line.contains(COMPOSITE_DIRTY))),
+            assert!(!line.contains(COMPOSITE_CLEAN) && !line.contains(COMPOSITE_DIRTY),
                 "a per-rollup `— COMPLETE` shares a line with the report's own verdict, so the two \
                  claims are indistinguishable by line: {line:?}\n{text}");
         }
@@ -1431,12 +1449,7 @@ mod tests {
             "the verdict must NAME which half is dirty, not merely say one is");
         assert!(verdicts[0].contains("#423"), "…and print it: {:?}", verdicts[0]);
 
-        // 4. …and a naive line-level grep for the clean marker now lands ONLY on the line of the
-        //    rollup that really is clean. That is the property #898 asks for, stated as the audit
-        //    a reader would actually run.
-        let clean_lines: Vec<&&str> = lines.iter().filter(|l| l.contains("— COMPLETE")
-            && !l.contains("— INCOMPLETE")).collect();
-        assert_eq!(clean_lines.len(), 1, "{clean_lines:?}\n{text}");
+        // 4. …and the one line that grep lands on is the CLEAN rollup's, not the other one's.
         assert!(clean_lines[0].contains("wat-route"),
             "the only `— COMPLETE` line must be the clean rollup's own: {:?}", clean_lines[0]);
     }
