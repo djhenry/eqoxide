@@ -574,8 +574,9 @@ negclose_attribution() {
 # GitHub: it survives deletion of the head branch, and a default clone's refspec never fetches it,
 # so `git merge-base --is-ancestor` and `git for-each-ref refs/remotes/origin/*` both answer a
 # DIFFERENT question ("is it here?") from the one that decides whether a citation resolves ("does
-# the forge still serve it?"). Checked on 2026-08-19 against the three non-ancestor shas named in
-# eqoxide#1051's own table — `b585625`, `23ddd63` and `42048cf`: every one is `not-ancestor`
+# the forge still serve it?"). Checked on 2026-08-19 against the three non-ancestor shas that
+# eqoxide#1051's own table points at — `b585625`, which it quotes, plus `23ddd63` and `42048cf`,
+# the two carried by `def3249`, the row it files as "same class": every one is `not-ancestor`
 # locally and every one returns 200 from `gh api repos/djhenry/eqoxide/commits/<sha>`. So the
 # ancestry rule would have flagged 3 for 3 references that resolve fine, which is the shape #983
 # was closed not-viable on. It is also why this pass needs NO GIT HISTORY AT ALL and behaves
@@ -597,7 +598,7 @@ negclose_attribution() {
 #
 # The two TEXT cues as eqoxide#1051 words them are already low-noise; what makes the proposal
 # unshippable is its THIRD cue. That one flags 76 distinct tokens across 171 lines, and exactly 3
-# of the 76 are the references eqoxide#1051's own table names — all 3 of which resolve, per the
+# of the 76 are the references eqoxide#1051's own table points at — all 3 of which resolve, per the
 # measurement above. Widening the text cues is the other trap: adding a bare `this branch's` and
 # `on this branch` takes 6 flagged lines to 45 without adding a single true positive, worse than
 # the 62.7% that closed eqoxide#983 as not viable. The shipped set moves the other way — it flags
