@@ -351,7 +351,7 @@ pub const OP_LEVEL_UPDATE: u16 = 0x1eec;  // RoF2: OP_LevelUpdate
 
 pub const OP_CHANNEL_MESSAGE: u16 = 0x2b2d;   // RoF2: OP_ChannelMessage
 /// Sent by the zone at zone-in with the UCS (chat server) address + mail key the client uses to
-/// connect to the Universal Chat Service for cross-zone tells/OOC. Payload is a comma string:
+/// connect to the Universal Chat Service. Payload is a comma string:
 /// `"<host>,<port>,<shortname>.<charname>,<connTypeChar><8charKey>"`. (EQEmu zone/client.cpp.)
 pub const OP_SET_CHAT_SERVER: u16 = 0x1bc5;    // RoF2: OP_SetChatServer
 /// NPC dialogue / emotes (quest text arrives here). SpecialMesg_Struct:

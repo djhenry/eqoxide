@@ -271,7 +271,7 @@ fn main() {
     };
     // #643: built via `Default` rather than field-by-field, because `Roster` has no public
     // constructor — only `eqoxide-ipc` can produce the empty roster maps, which is what makes
-    // `WorldSlots::publish_entities` the sole writer. All four fields are empty here either way.
+    // `WorldSlots::publish_entities` the sole writer. All fields are empty here either way.
     let world = ipc::WorldSlots::default();
     let quest = ipc::QuestSlots {
         task_log:               Arc::new(Mutex::new(Vec::new())),
