@@ -23,7 +23,7 @@
 //! the controller — it writes only the per-frame `nav_intent`.
 
 use eqoxide_core::coord::eq_heading;
-use eqoxide_core::physics::fall_damage;
+use eqoxide_core::physics::{fall_damage, fall_damage_ceiling};
 use eqoxide_core::game_state::GameState;
 use eqoxide_ipc::MoveIntent;
 use crate::steering::*;
@@ -190,6 +190,62 @@ fn nav_speed(gs: &GameState) -> f32 {
     if gs.run_mode { RUN_SPEED } else { WALK_SPEED }
 }
 
+/// What the pre-emptive lethal-fall guard is entitled to say about a drop of `drop_u` EQ units at
+/// `cur_hp` current HP. See [`classify_ledge_fall`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgeFallVerdict {
+    /// The worst case this client would REPORT for the drop reaches current HP. Stop at the ledge
+    /// and publish `blocked` / `fall_would_be_lethal`.
+    Stop { max_dmg: u32 },
+    /// The drop is survivable at an HP where the guard could still have fired for a bigger drop.
+    /// This is the arm on which "the walker descended" really does mean "the guard checked".
+    Survivable { max_dmg: u32 },
+    /// **The guard cannot fire at this HP at all** — `cur_hp` is above
+    /// [`fall_damage_ceiling`](eqoxide_core::physics::fall_damage_ceiling), so `max_dmg >= cur_hp`
+    /// is unconditionally false for EVERY drop, however large. Distinguished from `Survivable`
+    /// because the two are different facts wearing the same behaviour, and collapsing them is what
+    /// #1058 is about.
+    Inert { max_dmg: u32, ceiling: u32 },
+    /// No usable HP reading to compare against (`cur_hp <= 0`), so the guard is not applicable.
+    /// Checked FIRST and deliberately: `cur_hp as u32` would make `0` compare as "any damage kills
+    /// me" and block every ledge for a character the caller has already halted on other grounds.
+    NoHpReading,
+}
+
+/// The pre-emptive lethal-fall guard's decision, as a pure function of the drop and current HP.
+///
+/// Split out of the walker tick so the guard's REACH is checkable without a live session, because
+/// the reach is the defect (#1058). [`fall_damage`]'s `max_damage` is bounded — see
+/// [`fall_damage_ceiling`](eqoxide_core::physics::fall_damage_ceiling), 774 at the constants in the
+/// tree today — so the comparison this guard makes is unconditionally false above that HP and the
+/// walker descends every ledge it is asked to. Nothing at the call site said so, and nothing on the
+/// wire did either: the walker simply did not publish `blocked`, which is byte-identical to having
+/// weighed the fall and found it survivable. `Inert` exists to keep those two apart.
+///
+/// **This function does not change WHEN the guard fires**, and must not: `Stop` is exactly the old
+/// `gs.cur_hp > 0 && max_dmg >= gs.cur_hp as u32`. Whether the ceiling is a real property of falls
+/// or an artefact of an unre-derived constant is unresolved (see [`fall_damage`]'s doc and
+/// `todo.md`'s "exhaustive fall-damage testing (controlled-fall nav)" section); until that
+/// measurement is run, tightening the guard would be inventing a threat, and staying silent about
+/// its reach is asserting a protection. Reporting is the only honest option left.
+pub fn classify_ledge_fall(drop_u: f32, cur_hp: i32) -> LedgeFallVerdict {
+    let (_, max_dmg) = fall_damage(drop_u);
+    if cur_hp <= 0 {
+        return LedgeFallVerdict::NoHpReading;
+    }
+    if max_dmg >= cur_hp as u32 {
+        return LedgeFallVerdict::Stop { max_dmg };
+    }
+    // Strict `>`: at cur_hp EXACTLY equal to the ceiling the guard can still fire (a big enough
+    // drop reports the ceiling, and `>=` holds), so that HP is inside the guard's reach, not
+    // outside it. Calling it inert would be a fresh false claim in the other direction.
+    let ceiling = fall_damage_ceiling();
+    if cur_hp as u32 > ceiling {
+        return LedgeFallVerdict::Inert { max_dmg, ceiling };
+    }
+    LedgeFallVerdict::Survivable { max_dmg }
+}
+
 /// **The #543 honesty gate.** Whether nav TRUSTS an advertised same-zone crossing enough to
 /// AUTO-ROUTE the walker onto it — as a #403 teleport-pad planner edge, or as a #266 sealed-area
 /// escape. It is `false`, and for a client that only has the wire to go on it must stay `false`.
@@ -293,6 +349,12 @@ pub struct Walker {
     /// Throttled live clearance sample near the player (see `CLEARANCE_REFRESH_TICKS`).
     last_clearance: Option<crate::diagnostics::ClearanceProbe>,
     clearance_countdown: u32,
+    /// #1058: has this journey already disclosed that the lethal-fall guard cannot fire at the
+    /// walker's HP? The disclosure is once per journey — reset in [`Walker::reset_drive_state`]
+    /// alongside the rest of the per-journey state — because it is a fact about the character, not
+    /// about this tick, and repeating it every tick of a long descent would bury the log it is
+    /// meant to inform.
+    inert_fall_disclosed: bool,
 
     /// Cached A* waypoints for the current goto goal (routes around walls). `path_i` is the
     /// current waypoint; `path_goal` is the goal these waypoints were computed for (recompute
@@ -442,6 +504,7 @@ impl Walker {
             last_pads: Vec::new(),
             last_clearance: None,
             clearance_countdown: 0,
+            inert_fall_disclosed: false,
             path: Vec::new(),
             path_i: 0,
             path_goal: None,
@@ -664,6 +727,10 @@ impl Walker {
         // — the worst-wedged one — which is the understatement B2c is about, re-introduced.)
         self.last_progress_at = Some(std::time::Instant::now());
         self.committed = None;
+        // #1058: a new journey gets the disclosure again. HP changes between journeys, so a walker
+        // that was above the guard's reach on the last goto may be inside it now (or the reverse),
+        // and a stale `true` would silently suppress a true statement about the new one.
+        self.inert_fall_disclosed = false;
     }
 
     /// Advance the execution verdict by one nav tick (#851) and return it.
@@ -1894,19 +1961,42 @@ impl Walker {
         let water_landing = self.collision.read().unwrap().as_ref()
             .is_some_and(|c| c.in_water([target.0, target.1, target.2 + 3.0]));
         if drop_to_target > FALL_TRIGGER && dist <= STOP_DIST + 8.0 && !water_landing {
-            let (_, max_dmg) = fall_damage(drop_to_target);
-            if gs.cur_hp > 0 && max_dmg >= gs.cur_hp as u32 {
-                tracing::info!("NAV: fall of {:.0}u (up to {} dmg) would exceed {} hp — stopping at ledge",
-                    drop_to_target, max_dmg, gs.cur_hp);
-                gs.log_msg("zone", "Fall too dangerous (HP too low) — stopped at the ledge");
-                self.set_nav_state_because("blocked", Some("fall_would_be_lethal"));
-                *self.nav.goto_target.lock().unwrap() = None;
-                *self.nav_intent.lock().unwrap() = None; // else the controller keeps walking the last
-                // wish_dir forever — drifting 1000s of units with no nav activity (eqoxide#71).
-                self.publish_debug(Self::known_pos(gs), None);
-                return;
+            match classify_ledge_fall(drop_to_target, gs.cur_hp) {
+                LedgeFallVerdict::Stop { max_dmg } => {
+                    tracing::info!("NAV: fall of {:.0}u (up to {} dmg) would exceed {} hp — stopping at ledge",
+                        drop_to_target, max_dmg, gs.cur_hp);
+                    gs.log_msg("zone", "Fall too dangerous (HP too low) — stopped at the ledge");
+                    self.set_nav_state_because("blocked", Some("fall_would_be_lethal"));
+                    *self.nav.goto_target.lock().unwrap() = None;
+                    *self.nav_intent.lock().unwrap() = None; // else the controller keeps walking the last
+                    // wish_dir forever — drifting 1000s of units with no nav activity (eqoxide#71).
+                    self.publish_debug(Self::known_pos(gs), None);
+                    return;
+                }
+                // #1058: the guard is structurally unable to fire at this HP. Say so ONCE per ledge
+                // approach instead of letting a descent-with-no-`blocked` read as "the guard looked
+                // at this and judged it safe" — the two are not the same fact and the difference is
+                // the whole defect.
+                LedgeFallVerdict::Inert { max_dmg, ceiling } => {
+                    tracing::info!("NAV: fall of {:.0}u — the lethal-fall guard CANNOT fire at {} hp: \
+                        reported fall damage is capped at {} (this fall reports up to {}), so no drop \
+                        of any size trips it (#1058). Descending.",
+                        drop_to_target, gs.cur_hp, ceiling, max_dmg);
+                    // The log line above goes to the process log; an AGENT reads the zone log. Put it
+                    // where the reader is, once per journey (see `inert_fall_disclosed`).
+                    if !self.inert_fall_disclosed {
+                        self.inert_fall_disclosed = true;
+                        gs.log_msg("zone", &format!(
+                            "Lethal-fall guard cannot fire at {} hp: reported fall damage is capped \
+                             at {}, so no drop trips it. Descending unchecked. (eqoxide#1058)",
+                            gs.cur_hp, ceiling));
+                    }
+                }
+                // Survivable at an HP the guard could still have protected, or no usable HP reading
+                // to compare against: fall through to normal walking — the controller descends off
+                // the edge.
+                LedgeFallVerdict::Survivable { .. } | LedgeFallVerdict::NoHpReading => {}
             }
-            // Non-lethal: fall through to normal walking — the controller descends off the edge.
         }
 
         // Arrival: measure distance to the FINAL goal, not the look-ahead carrot.
@@ -5469,5 +5559,256 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
         assert!(w.committed.is_some(),
             "reach control: a route must stay committed — `publish_drive_state` returns early \
              without one and every tick above would be vacuous");
+    }
+
+    /// The pre-emptive lethal-fall guard's REACH, which is what #1058 is actually about.
+    ///
+    /// These drive [`classify_ledge_fall`] rather than a walker tick, deliberately: the tick needs a
+    /// live `GameState`, a collision grid and a planner, and the property under test is a pure
+    /// relationship between a drop, current HP, and the bound `fall_damage` reports under. Two things
+    /// are pinned here — that the guard's FIRING condition is byte-for-byte what it always was, and
+    /// that the HP range in which it cannot fire is reported instead of passing as a survivable fall.
+    mod ledge_fall_guard_tests {
+        use super::*;
+        use crate::walker::{classify_ledge_fall, LedgeFallVerdict};
+        use eqoxide_core::physics::{fall_damage, fall_damage_ceiling};
+
+        /// A drop far past the height at which `fall_damage` saturates, so `max_dmg` is the ceiling.
+        const SATURATING_DROP: f32 = 500.0;
+
+        fn ceiling() -> u32 { fall_damage_ceiling() }
+
+        /// The behaviour that must NOT change: at or below the ceiling the guard still fires on exactly
+        /// the old condition, `max_dmg >= cur_hp`.
+        #[test]
+        fn still_stops_when_the_reported_damage_reaches_current_hp() {
+            let c = ceiling();
+            assert!(c > 1, "the ceiling must be a usable HP range for the rest of this test");
+            assert_eq!(classify_ledge_fall(SATURATING_DROP, 1), LedgeFallVerdict::Stop { max_dmg: c });
+            assert_eq!(classify_ledge_fall(SATURATING_DROP, c as i32),
+                LedgeFallVerdict::Stop { max_dmg: c },
+                "at exactly the ceiling the worst case still reaches HP, so the guard fires");
+            // And a real mid-size drop against a matching HP, so this is not only exercising the clamp.
+            let (_, mid) = fall_damage(42.0);
+            assert!(mid > 0 && mid < c, "42u must report a mid-curve, non-saturated figure; got {mid}");
+            assert_eq!(classify_ledge_fall(42.0, mid as i32), LedgeFallVerdict::Stop { max_dmg: mid });
+        }
+
+        /// The defect: above the ceiling NO drop can trip the guard, and that must be reported as its
+        /// own verdict rather than as a survivable fall.
+        #[test]
+        fn above_the_ceiling_the_guard_is_reported_inert_not_survivable() {
+            let c = ceiling();
+            let v = classify_ledge_fall(SATURATING_DROP, c as i32 + 1);
+            assert_eq!(v, LedgeFallVerdict::Inert { max_dmg: c, ceiling: c },
+                "one HP above the ceiling the guard is already unable to fire");
+            // The characters this project actually targets. A level-65 character has thousands of HP.
+            for hp in [1_000, 5_000, 12_000, i32::MAX] {
+                assert!(matches!(classify_ledge_fall(SATURATING_DROP, hp), LedgeFallVerdict::Inert { .. }),
+                    "the guard must report itself inert at {hp} hp");
+            }
+            // ...and it is inert for EVERY drop at that HP, not just an enormous one. This is the
+            // sentence `Inert` exists to make true.
+            for drop_u in [19.0_f32, 30.0, 68.3, 500.0, 1.0e9, f32::INFINITY] {
+                assert!(matches!(classify_ledge_fall(drop_u, 5_000), LedgeFallVerdict::Inert { .. }),
+                    "a {drop_u}u drop at 5000 hp must still be reported inert");
+            }
+        }
+
+        /// The boundary is exactly the ceiling, and it is a boundary in both directions — the reach
+        /// control for the test above, which would otherwise pass on a classifier that called
+        /// EVERYTHING inert.
+        #[test]
+        fn the_inert_boundary_sits_exactly_at_the_ceiling() {
+            let c = ceiling() as i32;
+            assert!(matches!(classify_ledge_fall(SATURATING_DROP, c), LedgeFallVerdict::Stop { .. }),
+                "at the ceiling the guard is still in reach");
+            assert!(matches!(classify_ledge_fall(SATURATING_DROP, c + 1), LedgeFallVerdict::Inert { .. }),
+                "one above the ceiling it is not");
+        }
+
+        /// A survivable fall below the ceiling is NOT inert: at that HP the guard would have fired for
+        /// a bigger drop, so "the walker descended" really does mean "the guard checked".
+        #[test]
+        fn a_survivable_drop_below_the_ceiling_is_not_inert() {
+            let c = ceiling();
+            let (_, small) = fall_damage(20.0);
+            assert!(small > 0 && small < c, "20u must report a small non-zero figure; got {small}");
+            let hp = (small + 1) as i32;
+            assert!(hp <= c as i32, "the HP under test must sit inside the guard's reach");
+            assert_eq!(classify_ledge_fall(20.0, hp), LedgeFallVerdict::Survivable { max_dmg: small });
+            // The boundary from the other side, and the only case that can tell `>` from `>=`: AT
+            // the ceiling, with a drop small enough that the `Stop` arm does not shadow the
+            // comparison. `>=` here would call an HP the guard can still protect "inert" — the same
+            // class of false claim as #1058, pointed the other way.
+            assert_eq!(classify_ledge_fall(20.0, c as i32), LedgeFallVerdict::Survivable { max_dmg: small },
+                "at exactly the ceiling the guard is in reach, so a small drop is survivable, not inert");
+        }
+
+        /// Ordering, not presence: the `cur_hp <= 0` gate must be evaluated BEFORE the damage
+        /// comparison. `0i32 as u32` is `0`, and `max_dmg >= 0` is true of every drop, so a classifier
+        /// that checked HP second would block every ledge at 0 HP under `fall_would_be_lethal` — a
+        /// state the old code never published. Negative HP casts to a huge `u32` and would silently
+        /// fall through to `Inert` instead.
+        #[test]
+        fn no_hp_reading_is_decided_before_the_damage_comparison() {
+            assert_eq!(classify_ledge_fall(SATURATING_DROP, 0), LedgeFallVerdict::NoHpReading);
+            assert_eq!(classify_ledge_fall(SATURATING_DROP, -5), LedgeFallVerdict::NoHpReading);
+            assert_eq!(classify_ledge_fall(SATURATING_DROP, i32::MIN), LedgeFallVerdict::NoHpReading);
+            // Positive control: 1 HP is a reading, and it must NOT take this arm.
+            assert!(matches!(classify_ledge_fall(SATURATING_DROP, 1), LedgeFallVerdict::Stop { .. }));
+        }
+
+        /// A drop the curve reports nothing for is survivable, never inert, at an in-reach HP — the
+        /// verdict must follow the comparison, not the drop's size. (`FALL_TRIGGER` keeps the walker
+        /// from ever asking about a drop this short; the classifier is still defined on it, and a
+        /// classifier that returned `Stop` for a 0-damage fall would block every step.)
+        #[test]
+        fn a_harmless_drop_is_survivable_at_low_hp() {
+            assert_eq!(fall_damage(6.0).1, 0, "a 6u drop must report no damage at these constants");
+            assert_eq!(classify_ledge_fall(6.0, 20), LedgeFallVerdict::Survivable { max_dmg: 0 });
+        }
+
+        /// A walker standing on a ledge `drop_u` above its committed route, one tick from the edge.
+        /// The route waypoints sit on the lower floor and the body is above them, which is the
+        /// production geometry the guard exists for.
+        fn walker_on_a_ledge(drop_u: f32, cur_hp: i32)
+            -> (Walker, eqoxide_ipc::NavSlots, eqoxide_core::game_state::GameState, (f32, f32, f32))
+        {
+            let (mut w, nav, _intent, _view) = walker_with(open_plane(2000.0));
+            let mut gs = eqoxide_core::game_state::GameState::new();
+            gs.world.zone_name = TEST_ZONE.into(); // #600: loaded-zone match
+            gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = drop_u; gs.player_pos_known = true;
+            gs.max_hp = 20_000; gs.cur_hp = cur_hp;
+            let goal = (100.0, 0.0, 0.0);
+            *nav.goto_target.lock().unwrap() = Some(goal);
+            nav.nav_state.lock().unwrap().goal_id = 1;
+            w.reset_drive_state();
+            w.committed = Some(committed_complete());
+            w.publish_drive_state();
+            w.path = vec![[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]];
+            w.path_i = 0;
+            w.stuck_i = 0;
+            w.path_goal = Some(goal);
+            (w, nav, gs, goal)
+        }
+
+        /// **The reach boundary, driven through the REAL `drive_walk` tick and read off the row an
+        /// agent reads.** One HP apart: at the ceiling the walker stops at the ledge and publishes
+        /// `blocked`/`fall_would_be_lethal`; one HP above it the same ledge, the same drop and the
+        /// same tick produce no block at all, because the guard cannot fire.
+        ///
+        /// The HP values are DERIVED from `fall_damage_ceiling()`, never written out, so this test
+        /// tracks the curve instead of pinning today's number twice.
+        #[test]
+        fn drive_walk_stops_at_the_ledge_up_to_the_ceiling_and_cannot_above_it() {
+            let ceiling = fall_damage_ceiling();
+            // A drop past saturation, so the reported figure IS the ceiling.
+            let drop_u = 100.0_f32;
+            assert_eq!(fall_damage(drop_u).1, ceiling,
+                "the fixture's drop must saturate the curve, or the boundary below is not the reach \
+                 boundary");
+
+            // AT the ceiling: unchanged behaviour — the guard fires.
+            let (mut w, nav, mut gs, goal) = walker_on_a_ledge(drop_u, ceiling as i32);
+            w.drive_walk(&mut gs, goal);
+            let s = nav.nav_state.lock().unwrap().clone();
+            assert_eq!((s.state.as_str(), s.reason.as_deref()), ("blocked", Some("fall_would_be_lethal")),
+                "at {ceiling} hp a {drop_u}u drop must still stop the walker at the ledge");
+            assert!(nav.goto_target.lock().unwrap().is_none(),
+                "the guard that fired must also have dropped the goal (eqoxide#71)");
+
+            // ONE HP ABOVE it: the same ledge, and the guard is structurally unable to fire. This is
+            // #1058 — the walker descends, and the ABSENCE of `blocked` here does not mean the fall
+            // was judged survivable.
+            let (mut w2, nav2, mut gs2, goal2) = walker_on_a_ledge(drop_u, ceiling as i32 + 1);
+            w2.drive_walk(&mut gs2, goal2);
+            let s2 = nav2.nav_state.lock().unwrap().clone();
+            assert_ne!(s2.reason.as_deref(), Some("fall_would_be_lethal"),
+                "one hp above the ceiling the guard cannot fire, so it must not be publishing that it did");
+            // The POSITIVE form as well: the tick must end on the ordinary walking row. Asserted
+            // because a `blocked` publication that a later line in the same tick overwrites is
+            // invisible to the negative assertion above — measured, not assumed (see the
+            // `inert-arm-also-blocks` row of scripts/mutants/1058.toml).
+            assert_eq!((s2.state.as_str(), s2.reason.as_deref()), ("navigating", None),
+                "an inert guard must leave the walker navigating, with no reason of any kind");
+            assert!(nav2.goto_target.lock().unwrap().is_some(),
+                "a guard that cannot fire must not be dropping the goal either");
+
+            // ...and it SAYS so, on the surface an agent reads. Silence here is the #1058 defect:
+            // a descent with no `blocked` row and no message is indistinguishable from a fall that
+            // was weighed and found survivable.
+            assert_eq!(inert_notices(&gs2), 1,
+                "the inert guard must disclose itself in the zone log exactly once");
+            assert_eq!(inert_notices(&gs), 0,
+                "...and must NOT be claiming inertness on the run where the guard actually fired");
+        }
+
+        /// The other half of the citation pin in `eqoxide-core`'s `fall_damage` doc: that comment
+        /// tells readers the bound is not confined to physics and sends them HERE by name, and
+        /// `docs/http-api.md`'s `fall_would_be_lethal` row states the reach in terms of the helper.
+        /// Neither citation can fail loudly on its own — a renamed function leaves the prose intact
+        /// and still authoritative-looking. `eqoxide-nav` depends on `eqoxide-core`, so this is the
+        /// direction the pin can run.
+        #[test]
+        fn the_citations_that_point_at_this_guard_still_resolve() {
+            const PHYSICS: &str = include_str!("../../eqoxide-core/src/physics.rs");
+            const NAV: &str = include_str!("walker.rs");
+            const API: &str = include_str!("../../../docs/http-api.md");
+            assert!(PHYSICS.len() > 10_000 && NAV.len() > 10_000 && API.len() > 10_000,
+                "a truncated corpus would pass every line below without looking at anything");
+            // Assembled, not written out: a literal control string would plant the very name it
+            // claims is absent into `NAV`, which is one of the corpora searched below.
+            let absent = format!("classify_ledge_{}", "drop");
+            assert!(!PHYSICS.contains(&absent) && !NAV.contains(&absent),
+                "control: a name that is in neither file must not be found");
+
+            const NAME: &str = "classify_ledge_fall";
+            assert!(NAV.contains(&format!("pub fn {NAME}(")),
+                "the function both citations name must exist and be public");
+            assert!(PHYSICS.contains(&format!("walker::{NAME}")),
+                "physics.rs's fall_damage doc no longer sends readers to `walker::{NAME}`");
+
+            const HELPER: &str = "fall_damage_ceiling";
+            assert!(PHYSICS.contains(&format!("pub fn {HELPER}(")), "the helper must exist");
+            // The DEFINING row, not the first line that happens to mention the word — the state
+            // table upstream lists the reason too, and pinning that one would prove nothing.
+            let row = API.lines().find(|l| l.trim_start().starts_with("| `fall_would_be_lethal` |"))
+                .expect("docs/http-api.md must still carry the `fall_would_be_lethal` reason row");
+            assert!(row.contains(HELPER),
+                "the published contract for `fall_would_be_lethal` must state its bound in terms \
+                 of `{HELPER}()`, so the doc moves when the curve does; row was: {row}");
+            // The two figures the row states in prose, checked against the running curve. Prose
+            // numbers are the ones that rot silently.
+            let c = fall_damage_ceiling();
+            assert!(row.contains(&format!("**{c}**")),
+                "the row states a ceiling that is no longer the one this build computes ({c})");
+            assert!(row.contains(&format!("**{} HP or more", c + 1)),
+                "the row states an inert threshold that is not one above the ceiling ({})", c + 1);
+        }
+
+        /// How many #1058 disclosures are sitting in the zone log.
+        fn inert_notices(gs: &eqoxide_core::game_state::GameState) -> usize {
+            gs.messages.iter().filter(|m| m.kind == "zone" && m.text.contains("eqoxide#1058")).count()
+        }
+
+        /// The disclosure is once per JOURNEY, not once per tick — and a new journey gets it again.
+        /// Both halves are load-bearing: a per-tick line buries the log of a long descent, and a
+        /// latch that survived `reset_drive_state` would silently withhold a true statement about a
+        /// journey begun at a different HP.
+        #[test]
+        fn the_inert_disclosure_is_once_per_journey_and_returns_on_the_next_one() {
+            let hp = fall_damage_ceiling() as i32 + 1;
+            let (mut w, _nav, mut gs, goal) = walker_on_a_ledge(100.0, hp);
+            w.drive_walk(&mut gs, goal);
+            assert_eq!(inert_notices(&gs), 1, "first tick at the ledge must disclose");
+            w.drive_walk(&mut gs, goal);
+            w.drive_walk(&mut gs, goal);
+            assert_eq!(inert_notices(&gs), 1, "later ticks of the SAME journey must not repeat it");
+
+            w.reset_drive_state();
+            w.drive_walk(&mut gs, goal);
+            assert_eq!(inert_notices(&gs), 2, "a new journey must disclose again");
+        }
     }
 }

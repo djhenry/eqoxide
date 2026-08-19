@@ -257,6 +257,17 @@ unit tests, but NOT exhaustively live. Still to do:
   record what the server actually applied — never to assert our own figure back.
 - Validate the fall-damage curve vs the real client across drop heights (10/20/30/42/60u); tune
   GRAVITY/HZ in `fall_damage` if magnitudes diverge from native.
+- Settle `fall_damage`'s `score >= 9 -> lethal (20000)` branch, which the constants in the body make
+  UNREACHABLE: the velocity clamp caps `score` below 9, so the largest figure the function can
+  report is 774 (#1058). That bound is now pinned by `fall_damage_ceiling_tests` in
+  `crates/eqoxide-core/src/physics.rs` and re-derived by `fall_damage_ceiling()`, so it cannot rot
+  silently — but pinning it is not settling it. The measurement above is what decides between the
+  two readings (the branch is vestigial / a constant is miscalibrated and the branch is the evidence
+  for it), and until it runs the branch stays, because deleting it destroys the only surviving
+  evidence for the second. The consequence to check live: `eqoxide-nav`'s pre-emptive lethal-fall
+  guard compares that bounded figure against current HP, so it CANNOT fire above 774 HP — a
+  level-65 character is outside its reach entirely. `walker::classify_ledge_fall` now reports that
+  case (`Inert`) rather than letting it pass as a survivable fall.
 - Check water/levitate negation: a fall ending in water (or with Levitate) should take 0 — confirm
   we don't send OP_EnvDamage in those cases (currently we always send on a dry controlled-fall).
 - Decide whether WASD (human) ledge-falls should also send OP_EnvDamage (currently only the nav
