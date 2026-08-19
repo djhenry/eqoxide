@@ -1977,7 +1977,9 @@ mod cursor_resync_tests {
                         problems.push(format!(
                             "{where_}: `{name}` is a #[test] in this file cited in a doc comment, \
                              but no `_cited`/`_helpers` guard in this file names it — a rename would \
-                             rot the citation silently. Add it to the guard array."));
+                             rot the citation silently. Add a `_cited`/`_helpers` array in the SAME \
+                             module as the citation (this scan reads the whole file, so that is \
+                             enough)."));
                     }
                 } else if !all_fns.contains(&resolved)
                     && !NOT_A_FN.iter().any(|(n, _)| *n == resolved) {
