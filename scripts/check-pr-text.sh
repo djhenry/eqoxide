@@ -81,8 +81,17 @@
 #     - `classified N/N` — load-bearing only because CORPUS_TOTAL is read from the manifest while
 #       CORPUS_CLASSIFIED is incremented per item actually read. An earlier version incremented both
 #       in the same iteration, which made this line true by construction and its check unfailable.
-#     - `negclose corpus = N items; classified N/N; flagged N` — the same three signals for the
-#       second pass, with the same construction and the same empty-list refusal. Load-bearing.
+#     - `negclose corpus = N items; classified N/N; flagged N (M on a surface that can actually
+#       close)` — the same three signals for the second pass, with the same construction and the
+#       same empty-list refusal. Load-bearing. The two numbers differ on purpose: N is every
+#       finding, M is the subset on a surface GitHub links from, and only M decides the exit code.
+#     - `[negclose-warn]` — a finding on a surface MEASURED not to link (a title, a comment, an
+#       issue body). It is a real finding and the rewrite is the same; it does not gate because it
+#       cannot close anything. Read it as "fix this before it gets pasted into a body", never as
+#       noise. A run whose only findings are warnings exits 0 and says so in the summary line —
+#       that is a deliberate policy, recorded with its measurements at negclose_surface_gates, not
+#       an accident of the exit code. In `--commits` mode every item is a commit message, so
+#       flagged and gating must be EQUAL there; the script errors out if they are not.
 #     - `closingIssuesReferences` — printed verbatim on any negclose finding for a PR. This is the
 #       only observable that reports what GitHub actually PARSED; what a body appears to say is not
 #       evidence of what was linked. Load-bearing, and it is the check to run before every merge.
@@ -338,7 +347,9 @@ EOF
 }
 
 # Walk the same corpus manifest and classify EVERY line for a negated closing keyword.
-# Sets globals: NEGCLOSE_TOTAL, NEGCLOSE_CLASSIFIED, NEGCLOSE_FLAGGED, NEGCLOSE_NUMBERS.
+# Sets globals: NEGCLOSE_TOTAL, NEGCLOSE_CLASSIFIED, NEGCLOSE_FLAGGED, NEGCLOSE_GATING,
+# NEGCLOSE_NUMBERS. FLAGGED counts every item with a hit; GATING counts only the subset on a
+# surface GitHub actually links from, which is the number that decides the exit code.
 # NEGCLOSE_TOTAL is read from the manifest and NOT incremented alongside NEGCLOSE_CLASSIFIED, for
 # the same reason classify_corpus does it that way: counting both in one loop iteration makes
 # `classified N/N` an identity that can never disagree.
@@ -350,11 +361,34 @@ EOF
 #   PR title               -> does NOT link. 5/5 measured: PRs 236, 437, 461, 465 and 466 each
 #                             carry a closing keyword in the title for an issue the body never
 #                             names, and every one reports `closingIssuesReferences: []`.
-#   issue body/title, comments -> nothing to link FROM; no close event in this repo's timelines
-#                             is attributable to one.
-# The lint still flags all of them, because the text is copied from one surface to another and the
-# rewrite is the same. But the per-item line must not tell an operator their comment is about to
-# close an issue, so it says what that surface actually does.
+#   comments               -> do NOT link. 33/33 measured across 23 pull requests: every case
+#                             where a comment names a closing target its body never names, the
+#                             number is absent from that PR's `closingIssuesReferences`. The
+#                             sharpest instance is this script's own review thread on PR 1048,
+#                             which quotes eleven such pairs and linked exactly none of them.
+#   issue body/title       -> nothing to link FROM; an issue is not a pull request.
+#
+# THE GRAMMAR BETWEEN THE KEYWORD AND THE NUMBER was measured too, because this repository's own
+# commit-subject convention sits right on it. `fix(<NUM>)` — the conventional-commit scope form used
+# by nearly every commit here — does NOT link: 2/2 clean cases in the last 40 merged pull requests
+# (PR 1019's body carries that form for issue 1015 and linked only 995; PR 947 carries it for issue
+# 884 and linked only 901), with a third case confounded because the same number was also named
+# plainly elsewhere in the body.
+# A parenthesis is therefore not a link, which is why the gap this scanner allows between the
+# keyword and the `#` is whitespace and a colon and nothing else. Two consequences worth stating:
+# a `fix(<NUM>)` subject line does not close that issue, so a commit that MEANS to close must say so
+# in the plain form; and the scanner allows a zero-width gap, which is marginally wider than the
+# measured grammar — it can only cost a false positive, never a miss.
+#
+# THIS IS WHY ONLY TWO SURFACES GATE. Every item is still scanned, still classified, still printed
+# — the text is copied from one surface into another and the rewrite is identical — but only a
+# finding that can ACTUALLY cause a false close returns non-zero: a pull request's BODY, or a
+# COMMIT MESSAGE. A finding on a title, a comment or an issue body is reported as a WARNING.
+#
+# The alternative was measured and rejected on this very pull request. Gating on all surfaces made
+# the review comment that QUOTES the defect fail the check, which would block every PR whose review
+# discusses this class — the shape that gets a guard switched off. And it would have been a false
+# statement as well as an obstruction: the same comment linked nothing at all.
 negclose_surface_note() {
   local kind="$1" num="$2"
   case "$kind" in
@@ -371,14 +405,25 @@ negclose_surface_note() {
       echo "                A title does not link (measured 5/5 here), so issue ${num} does not"
       echo "                close from here — rewrite it anyway; titles get copied into bodies." ;;
     *)
-      echo "                A comment does not link, so issue ${num} does not close from here"
-      echo "                — rewrite it anyway; comment text gets pasted into bodies." ;;
+      echo "                A comment does not link (measured 33/33 here), so issue ${num} does"
+      echo "                not close from here — rewrite it anyway; comments get pasted into bodies." ;;
+  esac
+}
+
+# Does a finding on this surface gate the run, or only warn? Exactly the surfaces measured above to
+# create a real link: a PULL REQUEST's body, and any commit message. Kept as its own function so
+# --self-test can assert the policy directly rather than inferring it from an exit code.
+negclose_surface_gates() {
+  case "$1" in
+    commit) return 0 ;;
+    body)   [ "${CORPUS_IS_PR:-no}" = "yes" ] && return 0 || return 1 ;;
+    *)      return 1 ;;
   esac
 }
 
 classify_negclose() {
   local manifest="$1" kind id path hits hit ln txt num
-  NEGCLOSE_CLASSIFIED=0; NEGCLOSE_FLAGGED=0; NEGCLOSE_NUMBERS=""
+  NEGCLOSE_CLASSIFIED=0; NEGCLOSE_FLAGGED=0; NEGCLOSE_GATING=0; NEGCLOSE_NUMBERS=""
   NEGCLOSE_TOTAL=$(grep -c '[^[:space:]]' "$manifest" || true)
   while IFS=$'\t' read -r kind id path; do
     [ -n "${kind:-}" ] || continue
@@ -389,7 +434,12 @@ classify_negclose() {
     hits="$(scan_negated_close "$path")"
     if [ -n "$hits" ]; then
       NEGCLOSE_FLAGGED=$((NEGCLOSE_FLAGGED + 1))
-      echo "  [NEGCLOSE]    ${kind}#${id}"
+      if negclose_surface_gates "$kind"; then
+        NEGCLOSE_GATING=$((NEGCLOSE_GATING + 1))
+        echo "  [NEGCLOSE]    ${kind}#${id}"
+      else
+        echo "  [negclose-warn] ${kind}#${id} — this surface does not link, so it does not gate"
+      fi
       while IFS= read -r hit; do
         [ -n "$hit" ] || continue
         ln="${hit%%:*}"; txt="${hit#*:}"
@@ -664,14 +714,18 @@ run_live() {
   echo "check-pr-text: negated-closing-keyword pass (eqoxide#1041) over the same ${CORPUS_TOTAL} items,"
   echo "               ${#NEGCLOSE_NEGATIONS[@]} negation cues against GitHub's closing-keyword set."
   classify_negclose "$manifest"
-  echo "check-pr-text: negclose corpus = ${NEGCLOSE_TOTAL} items; classified ${NEGCLOSE_CLASSIFIED}/${NEGCLOSE_TOTAL}; flagged ${NEGCLOSE_FLAGGED}."
+  echo "check-pr-text: negclose corpus = ${NEGCLOSE_TOTAL} items; classified ${NEGCLOSE_CLASSIFIED}/${NEGCLOSE_TOTAL}; flagged ${NEGCLOSE_FLAGGED} (${NEGCLOSE_GATING} on a surface that can actually close)."
   if [ "$NEGCLOSE_CLASSIFIED" -ne "$NEGCLOSE_TOTAL" ]; then
     echo "::error::check-pr-text: negclose pass classified ${NEGCLOSE_CLASSIFIED} of ${NEGCLOSE_TOTAL} items — the rest were skipped."
     rc=1
   fi
 
   if [ "$NEGCLOSE_FLAGGED" -gt 0 ]; then
-    echo "::error::check-pr-text: ${NEGCLOSE_FLAGGED} of ${NEGCLOSE_TOTAL} items put a closing keyword next to an issue number they appear to disclaim."
+    if [ "$NEGCLOSE_GATING" -gt 0 ]; then
+      echo "::error::check-pr-text: ${NEGCLOSE_GATING} of ${NEGCLOSE_TOTAL} items put a closing keyword next to an issue number they appear to disclaim, on a surface GitHub links from."
+    else
+      echo "::warning::check-pr-text: ${NEGCLOSE_FLAGGED} of ${NEGCLOSE_TOTAL} items put a closing keyword next to an issue number they appear to disclaim — all of them on a surface GitHub does NOT link from (title/comment/issue body), so this WARNS and does not gate. Rewrite them anyway: that text gets pasted into a body."
+    fi
     local nums num
     nums="$(printf '%s' "$NEGCLOSE_NUMBERS" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')"
     echo "  numbers at risk: ${nums}"
@@ -690,7 +744,11 @@ run_live() {
     fi
     echo
     print_negclose_convention
-    rc=1
+    # Only a finding on a surface GitHub actually links from can cause the defect, so only that
+    # gates. See negclose_surface_gates: measured, not a preference.
+    if [ "$NEGCLOSE_GATING" -gt 0 ]; then
+      rc=1
+    fi
   fi
 
   if [ "$rc" -ne 0 ]; then
@@ -764,6 +822,13 @@ run_commits() {
   echo "check-pr-text: negclose corpus = ${NEGCLOSE_TOTAL} commits; classified ${NEGCLOSE_CLASSIFIED}/${NEGCLOSE_TOTAL}; flagged ${NEGCLOSE_FLAGGED}."
   if [ "$NEGCLOSE_CLASSIFIED" -ne "$NEGCLOSE_TOTAL" ]; then
     echo "::error::check-pr-text: classified ${NEGCLOSE_CLASSIFIED} of ${NEGCLOSE_TOTAL} commits — the rest were skipped."
+    return 1
+  fi
+  # Every item in this mode is a commit message, which is a surface GitHub links from, so nothing
+  # here can land in the warn-only bucket. Asserted rather than assumed: if these ever disagree the
+  # gating policy has drifted and a real finding would be downgraded to a warning in silence.
+  if [ "$NEGCLOSE_FLAGGED" -ne "$NEGCLOSE_GATING" ]; then
+    echo "::error::check-pr-text: ${NEGCLOSE_FLAGGED} flagged but only ${NEGCLOSE_GATING} gating in --commits mode, where every item is a commit message. That is a guard bug, not a result."
     return 1
   fi
   if [ "$NEGCLOSE_FLAGGED" -gt 0 ]; then
@@ -966,6 +1031,20 @@ run_self_test() {
     "$(printf '%s' "$NEGCLOSE_NUMBERS" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')" \
     "35 41 302 314 378 854 871 939 982 1010 "
 
+  # The gating policy as a unit, independent of any corpus: measured behaviour is that only a pull
+  # request's body and a commit message create a link, so only those may decide an exit code.
+  CORPUS_IS_PR=yes
+  negclose_surface_gates commit  && want "policy: a commit message gates"            "yes" "yes" \
+                                 || want "policy: a commit message gates"            "no"  "yes"
+  negclose_surface_gates body    && want "policy: a PULL REQUEST body gates"         "yes" "yes" \
+                                 || want "policy: a PULL REQUEST body gates"         "no"  "yes"
+  negclose_surface_gates comment && want "policy: a comment does NOT gate"           "yes" "no"  \
+                                 || want "policy: a comment does NOT gate"           "no"  "no"
+  CORPUS_IS_PR=no
+  negclose_surface_gates body    && want "policy: an ISSUE body does NOT gate"       "yes" "no"  \
+                                 || want "policy: an ISSUE body does NOT gate"       "no"  "no"
+  CORPUS_IS_PR=no
+
   classify_negclose "$nc_green" > "${nc_dir}/green-verdicts.txt"
   want "no must-stay-green item flagged"        "$NEGCLOSE_FLAGGED"    "0"
   want "every must-stay-green item classified"  "$NEGCLOSE_CLASSIFIED" "$n_green"
@@ -1099,7 +1178,15 @@ GHSTUB
          bash "${REPO_ROOT}/scripts/check-pr-text.sh" 1037 --repo owner/name 2>&1)" || rc=$?
   want "run_live exits 1 on a negated closing keyword" "$rc" "1"
   want "run_live flags it on ALL THREE surfaces (body, comment, commit message)" \
-       "$(printf '%s' "$out" | grep -c '^  \[NEGCLOSE\]' || true)" "3"
+       "$(printf '%s' "$out" | grep -cE '^  \[(NEGCLOSE\]|negclose-warn\])' || true)" "3"
+  # The gating policy, asserted on a real run rather than inferred from the exit code: the two
+  # surfaces GitHub links from gate, the one it does not link from warns. Getting this backwards
+  # would either block every review thread that discusses this defect class or let a real false
+  # close through as a warning.
+  want "only the two LINKING surfaces gate" \
+       "$(printf '%s' "$out" | grep -c '^  \[NEGCLOSE\]' || true)" "2"
+  want "the non-linking surface warns instead of gating" \
+       "$(printf '%s' "$out" | grep -c '^  \[negclose-warn\]' || true)" "1"
   # Three assertions, not one, because the per-item verdict has to be TRUE per surface and not just
   # loud. GitHub links from a pull request's body and from commit messages; it does not link from a
   # comment. A guard that told an operator their comment was about to close an issue would be making
@@ -1107,7 +1194,7 @@ GHSTUB
   want "run_live says a PR BODY will close it, twice" \
        "$(printf '%s' "$out" | grep -cE 'will CLOSE issue (939|1010) on merge' || true)" "2"
   want "run_live does NOT claim a COMMENT closes anything" \
-       "$(printf '%s' "$out" | grep -c 'A comment does not link, so issue 939 does not close from here' || true)" "1"
+       "$(printf '%s' "$out" | grep -c 'A comment does not link (measured 33/33 here), so issue 939 does' || true)" "1"
   want "run_live says a COMMIT closes on reaching the default branch" \
        "$(printf '%s' "$out" | grep -c 'GitHub closes issue 1010 when this commit reaches the default branch' || true)" "1"
   want "run_live prints what GitHub actually parsed" \
@@ -1173,7 +1260,7 @@ GHSTUB
 
   # Assert how many checks ran. A case that silently stops running must fail this step rather than
   # shrink the output. `checks + 1` counts this assertion itself, which has not been tallied yet.
-  want "self-test ran every check (incl. this one)" "$((checks + 1))" "54"
+  want "self-test ran every check (incl. this one)" "$((checks + 1))" "60"
 
   if [ "$fails" -ne 0 ]; then
     echo "check-pr-text --self-test: FAILED ${fails} of ${checks} checks."

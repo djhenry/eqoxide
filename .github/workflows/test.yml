@@ -128,6 +128,20 @@ jobs:
   # default branch rather than the PR head, so comment-triggered runs would cancel each other and
   # cancel pushes. That is a workflow-structure change, not a one-line trigger addition.
   #
+  # ONLY TWO SURFACES CAN FAIL THIS JOB, and the reason is measured rather than chosen. GitHub
+  # links from a PULL REQUEST's body and from a commit message; it does not link from a title (5/5
+  # measured here: PRs 236, 437, 461, 465 and 466 each name a closing target in the title that the
+  # body never names, and all five report `closingIssuesReferences: []`) and it does not link from
+  # a comment (33/33 measured across 23 pull requests). So a finding on a body or a commit message
+  # is an `::error::` and fails the step, while a finding on a title, a comment or an issue body is
+  # an `::warning::` that does not. Everything is still scanned, classified and printed, and the
+  # rewrite is identical on every surface — the summary line reports both numbers, `flagged N (M on
+  # a surface that can actually close)`. The all-surfaces alternative was tried first and rejected
+  # on evidence: it turned this very PR red because the REVIEW COMMENT quoting the defect matched,
+  # which would make every PR whose review discusses this class unmergeable — and the failure would
+  # have been a false statement too, since that comment linked nothing. A guard that fails on
+  # discussion of the bug is a guard that gets switched off.
+  #
   # THAT BLIND SPOT BITES #1041 HARDER THAN IT BIT #980, and this job must not be read as sealing
   # the surface. A scope note — "this PR deliberately does not close X" — is most often ADDED TO THE
   # BODY DURING REVIEW, after the final push, which is exactly the edit no run here will ever see.
@@ -179,9 +193,12 @@ jobs:
       # new pass from run_live was MEASURED to leave the self-test at full green without it — and a
       # `--commits` pass over a throwaway repository. Verified red in both directions at this
       # commit: neutering the scanner, dropping the `\b` from the `not` cue, widening the match
-      # window past a sentence boundary, breaking the attribution comparison, deleting the pass from
-      # run_live, and deleting the commit fetch from the corpus each turn `--self-test` RED; hand-
-      # reverting each restores a full-green run. The em dash is in the gap stop set on measured
+      # window past a sentence boundary, removing the em dash from the gap stop set, breaking the
+      # attribution comparison, deleting the pass from run_live, deleting the commit fetch from the
+      # corpus, and BOTH directions of the gating policy — making every surface gate (the rejected
+      # design; 4 checks red) and making no surface gate (6 red) — each turn `--self-test` RED, nine
+      # mutations for nine reds; hand-reverting each restores a full-green run, verified by
+      # sha256 against a pristine copy rather than by `git restore`. The em dash is in the gap stop set on measured
       # evidence too: over the full published history (4598 items, swept 2026-08-19) it takes the
       # flag count 49 -> 41, all 8 dropped items are false positives of the shape `<clause with a
       # negation> — Fixes #N`, and zero measured true instances are lost. Three of those exact
