@@ -236,21 +236,54 @@ files — could be removed from config/App::new in a cleanup). Loose ends:
 
 ## TODO: exhaustive fall-damage testing (controlled-fall nav)
 
-Controlled-fall navigation + native fall rate (app.rs gravity/terminal 120/128) + client-side fall
-damage (OP_EnvDamage 0x31b3, `fall_damage(height)` in navigation.rs) + a lethal-fall guard landed
+Controlled-fall navigation + fall rate (acceleration `GRAVITY` 120 in
+`crates/eqoxide-core/src/physics.rs`; terminal `MAX_FALL` 128, module-private in `src/movement.rs`,
+which is what `CharacterController::step` clamps to — NOT the identically-named, identically-valued
+`TERMINAL` inside `fall_damage`, which is a damage-curve constant and a different quantity, #1045)
++ client-side fall damage (OP_EnvDamage, RoF2 `0x51fd`, via
+`fall_damage(height)` in `crates/eqoxide-core/src/physics.rs`) + a lethal-fall guard landed
 on `main` (was branch worktree-necro-combat). Verified offline (qcat dry sewer routes 56–88 wp) +
 unit tests, but NOT exhaustively live. Still to do:
 - Live-test an actual controlled-fall descent end-to-end with a character that can SURVIVE the drop
   (Keebler L1/20hp's guard correctly refuses the ~42u qcat drop, max ~364 dmg — need a mid-level
   char or a shorter drop). Confirm: server accepts the descending position updates (no rubber-band),
-  the bot lands in the qcat lower sewer, OP_EnvDamage is accepted and HP drops by the sent amount.
+  the bot lands in the qcat lower sewer, and OP_EnvDamage is accepted. Do NOT expect HP to drop by
+  the sent amount — #1005/#1029 established that it usually will not. The server scales the number
+  we send (environment-damage modifier, spell/item/AA `ReduceFallDamage`, rule multiplier), or
+  deducts 1 instead (GM, invulnerable, still loading), or ignores it entirely (in liquid, tutorial
+  and load zones) — and on every branch but the first it sends no HP update at that moment either.
+  A run written against "HP drops by the sent amount" will read a correct server as a failure. The
+  thing to confirm is that the packet is ACCEPTED (no DECODE_LENGTH_EXACT drop, cf. #195), and to
+  record what the server actually applied — never to assert our own figure back.
 - Validate the fall-damage curve vs the real client across drop heights (10/20/30/42/60u); tune
   GRAVITY/HZ in `fall_damage` if magnitudes diverge from native.
 - Check water/levitate negation: a fall ending in water (or with Levitate) should take 0 — confirm
   we don't send OP_EnvDamage in those cases (currently we always send on a dry controlled-fall).
 - Decide whether WASD (human) ledge-falls should also send OP_EnvDamage (currently only the nav
   controlled-fall path does).
-See ~/git/eq_kb/falling-physics.md.
+See `swimming-and-fall-damage.md` in the private EQ knowledge-base tree for the wire and
+behaviour half. It has NO damage-curve content, so the curve is uncited and the measurement is the
+point. (This line used to cite a second, curve-specific reverse-engineering note that the repo
+carried and then removed during the RoF2 retarget. It was not carried into the knowledge-base tree,
+so there is nothing to repoint the citation at and it has deliberately not been repointed.)
+
+SCOPE OF THAT CITATION: it covers the wire/behaviour claims ONLY. Naming the curve as the uncited
+item previously implied the rest of this block was checked; it was not. Everything here about
+magnitudes, tuning constants and expected damage is unsourced until the measurement above is run.
+
+The three referents in the opening paragraph were CORRECT the day this block was written and rotted
+afterwards — they are referent ROT, not authorial error, and the difference is load-bearing. Each
+named a real thing that later moved: the opcode was this client's until the application opcode table
+was switched to RoF2; `fall_damage` really did live in `navigation.rs` until that file was renamed
+to `action_loop.rs`; and `app.rs` really did hold both fall constants until the CharacterController
+extraction moved them, after which `GRAVITY` moved again into `eqoxide-core`. They were repointed in
+#1005 round 5, and round 6 fixed the terminal, which round 5 had repointed to a same-named,
+same-valued constant that is a different quantity (#1045). Reading rot as authorial error is what
+made deleting this block's original — and at the time genuinely sourced — attribution look like
+removing a mistake rather than dropping the last pointer to a source that had been purged. Re-check
+a referent here before citing it, prefer naming the symbol over the file it currently sits in, and
+before concluding that something a referent names never existed, check whether the corpus you
+searched is younger than the claim: a tree created after a deletion cannot witness what was deleted.
 
 ## COMPLETE: Clickable & animated doors + agent API (branch worktree-zone-portal-objects)
 
@@ -534,8 +567,9 @@ on any mob (mobs hit HER fine). EQEmu gates the player swing (zone/client_proces
 on: may_use_attacks (OK — has target, not dead/casting/stunned) && attack_timer && CombatRange &&
 los_status (CheckLosFN) && los_status_facing (IsFacingMob). So the blocker is CombatRange, LOS, or
 FACING. IsFacingMob (zone/mob.cpp) needs |HeadingAngleToMob - GetHeading()| <= 80 EQ-units (~56°).
-Suspect: the heading the client sends (eq_heading->ccw_to_cw->12bit in navigation.rs
-send_position_update) may not match EQEmu's HeadingAngleToMob convention, so server-side she isn't
+Suspect: the heading the client sends (eq_heading->ccw_to_cw->12bit in `action_loop.rs`
+`send_position_update`, which calls `ccw_to_cw` from the protocol crate) may not match EQEmu's
+HeadingAngleToMob convention, so server-side she isn't
 "facing" the mob. NEXT STEPS (next iter):
  1. /v1/observe/frame during auto-engage to see if Claude VISUALLY faces the mob + whether the mob's HP bar
     drops (need a mob within the 60u engage range — qeynos rodents are sparse/far + guards kill
@@ -632,10 +666,19 @@ position + a very generous zone-point range). VERIFIED live: qcat<->qeynos both 
 (OP_ZONE_CHANGE success=1, "transition complete"). /v1/navigate/zone_cross {"zone_id":N} now travels to zone N
 for any zone reachable from the current one (qeynos reaches zone_ids 2,45).
 So the 4 play goals: win ✅, level ✅ (hands-free), travel ✅. Remaining: BUY (merchant endpoint).
-NOTE: the auto-walk-into-a-zone-line detection (proximity in navigation.rs) still uses the client's
-zone_points which are ARRIVAL coords, not trigger coords, so it rarely fires; API /v1/navigate/zone_cross is the
-working travel path. Proper walk-in detection would need trigger coords (not sent by the server;
+NOTE (written 2026-06-20 — SUPERSEDED, see the UPDATE below; do not read it as current behaviour):
+the auto-walk-into-a-zone-line detection then keyed off the client's zone_points, which are ARRIVAL
+coords rather than trigger coords, so it rarely fired; API /v1/navigate/zone_cross was the working
+travel path. Proper walk-in detection would need trigger coords (not sent by the server;
 OP_SendZonepoints carries arrival coords) or zone-line geometry parsing.
+
+UPDATE: the geometry route is the one that landed, so the caveat above no longer describes the code
+and the word "proximity" in it points at nothing. `ActionLoop::tick` auto-crosses off the zone's
+baked WLD zone-line regions (#174), probed capsule-span rather than feet-only (#266); the probe is
+`zone_line_at_standing` — "is the character standing inside a zone-line region", not "is the
+character within N units of a zone_point". The last distance threshold left anywhere on this path
+(the 15u one in the /v1/navigate/zone_cross request arm, which chose between "already on the line"
+and "walk to it") was deleted by #725. There is no proximity band in `action_loop.rs` for this now.
 
 ## ✅ ALL 4 PLAY GOALS ACHIEVED (2026-06-20)
 1. CREATE ✅ non-GM Female Wood Elf Ranger "Claude" (account claude/REDACTED), model verified.

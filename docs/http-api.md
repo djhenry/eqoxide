@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_stall`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + **camera state** (`camera`, describing the last frame ACTUALLY DRAWN, not the current tick — read `drawn_frame`/`drawn_age_ms` first, and note that the `snapshot_age_ms` in the same payload is the network clock and does not age it; see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867)). |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct` plus [`hp_verified`](#hp_verified--is-the-hp-in-this-payload-the-servers-1005) — **read it before acting on `hp`**: `false` means at least one of those three vitals is a number the client inferred, not a figure the server sent, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_stall`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + **camera state** (`camera`, describing the last frame ACTUALLY DRAWN, not the current tick — read `drawn_frame`/`drawn_age_ms` first, and note that the `snapshot_age_ms` in the same payload is the network clock and does not age it; see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867)). |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. Optional `preset`/`pitch`/`yaw`/`distance` params request a one-off diagnostic camera angle for just this capture — see [Camera override for `/frame`](#camera-override-for-observeframe-422). |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses, snapshot_age_ms}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. The default bare-map shape carries the same freshness value in the `X-Snapshot-Age-Ms` header instead — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646). |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -446,6 +446,120 @@ cross-referenced to SPA 57. GM `#flymode 1` (Flying) genuinely turns gravity off
 `false`, because #529 deliberately scoped this field to the levitate buff, not to every gravity-off
 mode. An agent reasoning specifically about the levitate *buff* can trust it; an agent that wants a
 general gravity answer must not read this field as one.
+
+### `hp_verified` — is the `hp` in this payload the server's? (#1005)
+
+`player.hp_verified` says whether `hp`, `hp_max` and `hp_pct` in the **same payload** are what the
+server last reported, or a number the client worked out for itself.
+
+| Value | Meaning |
+|-------|---------|
+| `true`  | The three vitals are exactly the figures carried by the most recent self `OP_HPUpdate` — the only server message that carries both current and maximum HP — and nothing has written them since. |
+| `false` | At least one of them is **client-side arithmetic**. It is usually close, it is *not* a reading, and it can be wildly wrong. |
+
+The key is **always present**, never omitted, so an absent key can never be mistaken for "verified".
+
+**Why this field exists.** The client used to apply each hit to your HP locally, on purpose
+(eqoxide#55), so the reading moved per-hit instead of pinning at the last server value. Measured
+live: one `#damage` command produced **two** damage lines, the client subtracted both, and this
+endpoint published `hp: 0` for a character the server was holding at **214/441** — for up to
+**2.477 s**, with `dead: false` in all 27,527 samples and no `OP_Death` packet, reproduced 2 of 2.
+Every field in that response was well-formed and plausible, and nothing in it distinguished the
+fabricated zero from server truth. An agent deciding whether to flee, heal or engage had no channel
+that could tell.
+
+**That arithmetic is gone.** `OP_Damage` no longer moves your published HP at all, and neither does
+client-computed fall damage. The subtraction was never buying accuracy it could keep: EQEmu queues
+the authoritative `SendHPUpdate(true)` for a client *before* it builds the `OP_Damage` packet for
+the same hit, on the same reliable stream, so the real figure has already arrived by the time the
+client could estimate one. The rule the client now follows is: compute damage only where the
+protocol *requires* it to be reported (the `OP_ENV_DAMAGE` fall report, which the server has no way
+to derive on its own), and never apply that number to published state.
+
+So `hp` is the server's figure in the ordinary case. This flag covers the **residue** — the handful
+of paths that still have to write your HP from an inference, because the fields must hold
+something.
+
+**Every writer that leaves it `false`:**
+
+* the `OP_Death` zeroing of `hp` — the *death* is authoritative and `dead` reports it, but the
+  *number* zero is the client's inference, not a reading;
+* the bind-respawn "real EQ revives at full HP" assumption (eqoxide#68);
+* the `OP_PlayerProfile` HP seed (eqoxide#19). Its `hp` **is** server-sent, but the profile carries
+  no maximum at all, so `hp_max` is seeded equal to it and `hp_pct` then reads `100` for a character
+  that zoned in wounded. Expect `hp_verified: false` from zone-in until the first `OP_HPUpdate`.
+
+It governs **`target_hp_pct`** as well whenever you are self-targeted (F1) — but not for the reason
+this page used to give. `target_hp_pct` does **not** resolve from `hp_pct` on read. For an ordinary
+mob target the published figure follows that entity's own health. For the F1 self-target there is no
+entity to follow — your own character is not in the entity list — so what you get is a stored
+snapshot the client re-seeds at a few specific moments: when you select a target, when you clear it,
+and on each HP write for whichever spawn you currently have targeted. The estimate reaches it
+because the estimate path is one of those moments.
+
+**Known gap — eqoxide#1033 (open).** The two writers that set your own HP *raw* rather than through
+that path — the `OP_Death` zeroing and the `OP_PlayerProfile` seed — do not re-seed the snapshot. So
+a self-targeted character that dies can publish `hp: 0`, `hp_pct: 0`, `dead: true` beside a stale
+`target_hp_pct: 100` in one payload. `hp_verified` reads `false` in both of those states, so nothing
+here is server truth being faked — but the two figures do contradict each other inside a single
+response. Until #1033 is fixed: for **your own** health read `hp` / `hp_pct`, not `target_hp_pct`,
+even when self-targeted.
+
+The flag is deliberately **conservative**: it under-claims rather than over-claims. `false` does not
+mean the number is wrong, only that the client cannot vouch for it. The outcome #1005 rules out is
+the other direction — a `200` carrying a client-derived figure that reads as server truth.
+
+**How to use it.** If a decision turns on an exact HP figure and `hp_verified` is `false`, wait for
+the next `OP_HPUpdate` to reconcile — the flag flips to `true` the moment one lands *and is
+recognised as yours*.
+
+That qualifier is not pedantry, and the wait is **not bounded**. Recognising an update as yours is a
+comparison against your own spawn id, and eqoxide#1006 — open, and explicitly an unverified reading
+of the source rather than a measurement — records a way that comparison could silently never match.
+If it turns out to be real for your character, no amount of waiting flips the flag: the client would
+go on publishing its last known figure with `hp_verified: false` for the life of that spawn, with no
+error and no log line to distinguish it from "your HP simply has not changed". So treat "the next
+update flips it" as the expected case, not a guarantee. If your HP has demonstrably moved and the
+flag has not flipped, stop waiting: treat the figure as unverifiable rather than blocking on it.
+
+**What `true` does and does not promise.** It means the vitals match the last self `OP_HPUpdate` —
+not that one arrived recently. Self-HP is **change-gated** at the server: it queues an update only
+when your current HP actually moves, and the 2 s `hpupdate_timer` re-checks that same gate rather
+than acting as a heartbeat. Measured: an idle window of **204.5 s at full HP produced zero self HP
+updates**, and when HP was moving the observed cadence was the **~6 s regen tic**, not 2 s. So there
+is no 2 s bound on anything here; the interval between updates is however long it takes your HP to
+change next.
+
+Two consequences worth knowing:
+
+* If the client's number is ever wrong, the correction is not on a timer — it waits for the server's
+  HP to move. A measured fall-damage divergence persisted **11.3 s** for exactly this reason: the
+  server had already sent its one update, so from its point of view nothing had changed.
+* The wire values are `current_hp - itembonuses.HP` and `max_hp - itembonuses.HP`, and the gate
+  tests `current_hp`. So equipping or removing an item carrying `+HP` shifts both published numbers
+  while `current_hp` itself does not change, and no update is sent until your HP next moves.
+  `hp_verified` still reads `true` there, correctly: the client received those figures from the
+  server and nothing local has touched them. That is a freshness gap, not an honesty gap — and one
+  a local estimate could not have closed either, since the client does not know the item bonus.
+  (This second case is a reading of the server source, not something observed.)
+
+**Fall damage in the combat log.** The `Fell Nu — reported N fall damage to the server` line reports
+what the client **asked for**, not what you took. The server may scale that number by the
+environment-damage modifier, then by the spell/item/AA `ReduceFallDamage` bonuses, then by a rule
+multiplier, and apply the result — or refuse it. The refusals are not uniform, in either the amount
+or whether you hear about it:
+
+| server branch | HP change | update sent? |
+|---|---|---|
+| normal | scaled damage applied | yes, immediately |
+| GM, invulnerable, invulnerable to environmental damage, still loading | **−1** | no — only on the next 2 s poll, and only because that −1 passed the change gate |
+| standing in liquid, tutorial and load zones | **none** | **no — ever**, because no HP ever changed |
+
+So do not treat a fall as a promise that a fresh `hp` is about to arrive. The `hp` that follows the
+next `OP_HPUpdate` is the outcome; the log line is only the request. Measured: the server answered
+`Your GM status protects you from 160 points of Falling (Type 252) damage` and applied **1**, while
+the old line announced `Fell 39u — 160 fall damage` (#1029). That measured run exercised the GM
+branch; the invulnerability branches remain unexercised.
 
 ### `hold` — the character is physically stuck and the client cannot free it (#724)
 

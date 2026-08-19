@@ -176,6 +176,44 @@ pub struct PlayerState {
     pub hp_pct:        f32,
     pub cur_hp:        i32,
     pub max_hp:        i32,
+    /// #1005/agent-honesty: false when `hp_pct`/`cur_hp`/`max_hp` above are NOT what the server last
+    /// reported — the client has written at least one of them from its own inference since the last
+    /// authoritative self `OP_HPUpdate`, and nothing else in this response would show it.
+    ///
+    /// It exists because the client used to publish a per-hit HP estimate on purpose (eqoxide#55):
+    /// a hit was subtracted locally so the HUD/API reacted immediately instead of pinning at the
+    /// last server value. Measured live on `36ea882`: one `#damage` produced two damage lines, both
+    /// were subtracted, and `hp: 0` was published for a character the server held at 214/441 — for
+    /// 2.477 s, `dead: false` throughout, reproduced 2 of 2. A well-formed, plausible, false number
+    /// an agent would flee or fight on.
+    ///
+    /// That subtraction is DELETED, not merely marked: EQEmu queues `SendHPUpdate(true)` for a
+    /// client before it builds the `OP_Damage` packet for the same hit, so the estimate was
+    /// re-applying a hit already accounted for. What remains is the residue — paths that must write
+    /// the player's HP from an inference because the fields have to hold something — and this flag
+    /// is what keeps that residue distinguishable from a reading.
+    ///
+    /// `true` ONLY immediately after a self `OP_HPUpdate` — the one server message carrying both
+    /// current and maximum HP. The writers that leave it false: the `OP_Death` zeroing, the
+    /// bind-respawn full-HP assumption (eqoxide#68), and the PlayerProfile seed (eqoxide#19), whose
+    /// max is a guess.
+    ///
+    /// While the player is self-targeted, `hp_verified` also reads false in every state where
+    /// `target_hp_pct` could be client-derived, so it covers that field too. The MECHANISM is not
+    /// "the field resolves from the same `hp_pct`" — an earlier version of this doc said that and
+    /// it is wrong. `target_hp_pct` is refreshed only by `set_target`, `clear_target`, `write_hp`
+    /// and `update_hp_pct`; the `OP_Death` zeroing and the PlayerProfile seed write `cur_hp` and
+    /// `hp_pct` RAW and leave `target_hp_pct` as a stale snapshot. A self-targeted character that
+    /// dies therefore publishes `hp: 0, dead: true` beside `target_hp_pct: 100` in one payload.
+    /// `hp_verified` is false there, so the coverage claim holds and nothing reads as server truth
+    /// — but the two numbers still disagree in the body, which is a pre-existing honesty defect on
+    /// the raw-write paths that this flag masks rather than fixes. Tracked as eqoxide#1033; not
+    /// fixed here. Conservative by design: false under-claims, and the one
+    /// outcome #1005 rules out is a `200` carrying a client-derived figure that reads as server
+    /// truth. It is NOT a freshness signal: self-HP is change-gated at the server (a measured
+    /// 204.5 s idle window produced zero self updates), so `true` says the vitals match the last
+    /// `OP_HPUpdate`, never that one arrived recently. See `docs/http-api.md`.
+    pub hp_verified:   bool,
     /// Death state for headless agents (#284). `dead` = currently slain (held until POST
     /// /v1/lifecycle/respawn). `killed_by` + `died_ago_secs` also persist for a window AFTER a
     /// respawn, so an infrequently-polling agent can still tell it died and what killed it.
@@ -319,6 +357,10 @@ impl PlayerState {
             hp_pct:     gs.hp_pct,
             cur_hp:     gs.cur_hp,
             max_hp:     gs.max_hp,
+            // #1005: a COMPUTED read (`GameState::hp_verified`), never a stored flag — the same
+            // construction as `coin_verified` above, so no single estimate path can assert a trust
+            // the client has not verified against server truth.
+            hp_verified: gs.hp_verified(),
             // Death state (#284). `dead` is live (held slain until /lifecycle/respawn);
             // killed_by/died_ago_secs stay reported for DEATH_STICKY_SECS after death (through a
             // respawn too) so an infrequent poller still sees it. Both are time-derived — being

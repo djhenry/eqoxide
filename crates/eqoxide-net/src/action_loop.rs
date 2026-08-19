@@ -3042,7 +3042,9 @@ impl ActionLoop {
         // clear that one-shot exactly once here and, if the fall was past the safe height, apply the
         // native (client-computed) fall damage + OP_ENV_DAMAGE — the same formula/threshold the old
         // `drive_controlled_fall` used. Any fall past the safe height damages, so WASD off a ledge
-        // now damages too, matching the native RoF2 client. A teleport / server correction clears the
+        // now damages too, matching the native RoF2 client. (#1030 is open against that last claim:
+        // a measured run had walk-off falls firing 0/3 where jump-off fired 6/6. Not touched here.)
+        // A teleport / server correction clears the
         // signal at the controller (see `CharacterController::teleport`), so a correction is never
         // misread as a fall (hazard 2b); a mid-fall depenetration/ground-snap recovery latches nothing
         // (hazard 2a). `SAFE_FALL_HEIGHT` is named so the threshold is easy to tune/revert.
@@ -3052,10 +3054,58 @@ impl ActionLoop {
             if height > SAFE_FALL_HEIGHT {
                 let (dmg, _max) = fall_damage(height);
                 if dmg > 0 {
+                    // The OP_ENV_DAMAGE report is MANDATORY and stays. The server has no fall
+                    // detection of its own: `Client::Handle_OP_EnvDamage` takes the magnitude
+                    // straight out of `EnvDamage2_Struct.damage` (this packet) and applies it with
+                    // `SetHP(GetHP() - damage * RuleR(Character, EnvironmentDamageMulipliter))`.
+                    // Stop sending and the player silently never takes fall damage at all.
                     stream.send_app_packet(OP_ENV_DAMAGE, &build_env_damage_packet(gs.player_id, dmg, DMGTYPE_FALLING));
-                    gs.cur_hp = (gs.cur_hp - dmg as i32).max(0);
-                    gs.log_msg("combat", &format!("Fell {:.0}u — {} fall damage", height, dmg));
-                    tracing::info!("EQ: fall damage {dmg} (fell {height:.0}u)");
+                    // #1005/#1029: the local subtraction that used to sit here is GONE. `dmg` is
+                    // the magnitude we REQUESTED, not the one the player took. Measured over six
+                    // falls: the server answered `Your GM status protects you from 160 points of
+                    // Falling (Type 252) damage`, applied 1, and the client had already subtracted
+                    // the full 160 — divergences of 1 to 440 HP lasting 67 ms to 11.3 s, every one
+                    // of them with `hp_pct` left un-recomputed beside the moved `cur_hp`. One event
+                    // published `cur_hp = 0` with `dead: false` while the server held 440/441: the
+                    // `.max(0)` clamp is what turned an already-wrong number into the specific
+                    // false answer "you are dead" rather than something visibly nonsensical.
+                    //
+                    // What the handler actually does with our number, branch by branch
+                    // (`Client::Handle_OP_EnvDamage`, zone/client_packet.cpp) — the amounts differ
+                    // AND so does whether anything is sent back, so the two must not be collapsed:
+                    //   * not finished loading → `SetHP(GetHP() - 1)`, return
+                    //   * in liquid on a water-mapped zone → return, HP UNCHANGED
+                    //   * GM / `GetInvul()` / `GetInvulnerableEnvironmentDamage()`
+                    //                        → `SetHP(GetHP() - 1)`, return
+                    //   * tutorial/load zones → return, HP UNCHANGED
+                    //   * otherwise → scale by the environment-damage modifier, then by the
+                    //     spell/item/AA `ReduceFallDamage` bonuses, then by
+                    //     `RuleR(Character, EnvironmentDamageMulipliter)`, apply, fall through.
+                    // So a refusal deducts 1 on some branches and NOTHING at all on liquid and
+                    // tutorial/load. The trailing `SendHPUpdate()` is reached ONLY on that last
+                    // branch: every refusal returns before it and `Mob::SetHP` sends nothing
+                    // itself. On GM — the branch this PR actually measured live — the handler
+                    // therefore sends nothing, and the correction reaches us only when the 2 s
+                    // `hpupdate_timer` poll next runs, and only because that `-1` moved
+                    // `current_hp` past `SendHPUpdate`'s change gate. On liquid and tutorial/load
+                    // NO update is ever sent, because no HP ever changed. There is no branch on
+                    // which we may assume an authoritative number is coming promptly, which is
+                    // exactly why the client must publish what the server said and nothing else.
+                    // Computing damage is required here ONLY because the protocol makes us report
+                    // it; applying our own figure to published state is what made
+                    // `/v1/observe/debug` publish an HP the server never sent.
+                    //
+                    // The log line therefore reports the REQUEST, in those words. Driving it from
+                    // the resulting server HP update instead was considered and rejected: on the
+                    // liquid and tutorial/load branches the handler returns before changing HP at
+                    // all, so there is no update to key off and a fall that really happened would
+                    // log nothing — and any later OP_HPUpdate we did pick up could just as easily
+                    // be a mob hit landing in the same window, which would attribute someone
+                    // else's damage to the fall. Under-claiming beats mis-attributing.
+                    gs.log_msg("combat",
+                        &format!("Fell {height:.0}u — reported {dmg} fall damage to the server \
+                                  (the server decides the amount actually taken)"));
+                    tracing::info!("EQ: fall damage REPORTED {dmg} (fell {height:.0}u) — server decides the actual amount");
                 }
             }
         }

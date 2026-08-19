@@ -1272,8 +1272,37 @@ pub struct GameState {
     pub pending_guild_invite: Option<(String, u32, u32)>,
     pub hp_pct: f32,
     /// Player's absolute current/max HP (from OP_HP_UPDATE), used for the lethal-fall guard.
+    ///
+    /// NOT necessarily a figure the server sent — read [`hp_verified`](Self::hp_verified) beside it
+    /// (#1005). No path computes DAMAGE into these fields any more, but a few still write them from
+    /// the client's own inference; `unverified_hp_writes` below lists every one.
     pub cur_hp: i32,
     pub max_hp: i32,
+    /// True once at least one authoritative self `OP_HPUpdate` has landed (#1005). It is the only
+    /// server message carrying BOTH the player's current and maximum HP, so it is the only reading
+    /// that can establish the whole published `hp`/`hp_max`/`hp_pct` triple. Before the first one,
+    /// `cur_hp`/`max_hp` are the all-zero startup default or a PlayerProfile seed whose max is a
+    /// guess — neither is server truth, and publishing either as confirmed is the #1005 defect.
+    /// Set ONLY by [`update_hp`](Self::update_hp) for `player_id`; never by an estimate path.
+    pub hp_confirmed: bool,
+    /// Count of writes to the player's `cur_hp`/`hp_pct` made by the CLIENT rather than read from a
+    /// self `OP_HPUpdate`, since the last such update (#1005). Nonzero means the published HP is at
+    /// least partly the client's own inference. The writers that increment it, all of them:
+    ///
+    /// * the `OP_Death` zeroing of `cur_hp`/`hp_pct` — the death itself is authoritative, the
+    ///   *number* zero is the client's inference from it;
+    /// * the bind-respawn "real EQ revives at full HP" assumption (eqoxide#68);
+    /// * the PlayerProfile HP seed (eqoxide#19), whose `cur_hp` IS server-sent but which carries no
+    ///   max at all — so `max_hp` is seeded = `cur_hp` and the published `hp_pct` is then 100 for a
+    ///   character that zoned in wounded. That is a second unmarked estimate derived from `cur_hp`,
+    ///   so the seed counts here too.
+    ///
+    /// Deliberately a counter, not a bool, and [`hp_verified`](Self::hp_verified) is a COMPUTED read
+    /// of it — never an independently-settable field — for the same reason `coin_verified` is
+    /// (#361): a single call site must not be able to assert a trust the client has not actually
+    /// verified against server truth. Reset to zero ONLY by [`update_hp`](Self::update_hp) for
+    /// `player_id`. Saturating, so a long fight can never wrap it back to "verified".
+    pub unverified_hp_writes: u32,
     pub mana_pct: f32,
     /// Player's absolute current/max mana. Seeded from the PlayerProfile (no max in the profile, so
     /// max is seeded = cur at zone-in) and updated from OP_ManaChange, which carries only the new
@@ -1960,6 +1989,45 @@ impl GameState {
         self.coin_confirmed && self.unverified_buys == 0
     }
 
+    /// True only when the published self-HP triple (`hp`/`hp_max`/`hp_pct`) is exactly what the
+    /// server last reported: an authoritative self `OP_HPUpdate` has landed (`hp_confirmed`) AND no
+    /// client-side write has touched it since (`unverified_hp_writes == 0`). #1005, agent-honesty.
+    ///
+    /// Computed — never an independently-settable field — so no single estimate path can assert a
+    /// trust the client has not verified against server truth. Same construction as
+    /// [`coin_verified`](Self::coin_verified) (#361).
+    ///
+    /// It governs `target_hp_pct` too whenever the player is self-targeted (F1) — but NOT because
+    /// "that field resolves from `self.hp_pct`". An earlier version of this doc said exactly that and
+    /// it is wrong. `target_hp_pct` is a STORED snapshot, never derived on read: it is refreshed by
+    /// four functions in this file and nothing else — `set_target`, `clear_target`, the tail of
+    /// `write_hp`, and `update_hp_pct`. The estimate reaches it because `update_hp_estimated` routes
+    /// through `write_hp`, whose tail re-seeds the snapshot while the updated spawn is the current
+    /// target. Writers that assign `cur_hp`/`hp_pct` RAW instead of calling `write_hp` — the
+    /// `OP_Death` zeroing and the PlayerProfile seed — bypass all four and leave it stale (#1033).
+    ///
+    /// (The HTTP layer publishes a field of the same name that is NOT this one: it prefers the live
+    /// `world.entities` entry for the targeted id and falls back to this snapshot. For the F1
+    /// self-target the two coincide, because the player's own spawn is kept out of `world.entities`
+    /// — the spawn handler returns before inserting once it recognises the self-spawn — so the
+    /// fallback is what is published.)
+    ///
+    /// Deliberately CONSERVATIVE in the safe direction: it reads false during the window between a
+    /// PlayerProfile seed and the first `OP_HPUpdate`, because the profile carries no max and the
+    /// seeded `hp_pct` is therefore derived from a guess. Under-claiming is survivable; the
+    /// forbidden direction is publishing client arithmetic as a confirmation.
+    pub fn hp_verified(&self) -> bool {
+        self.hp_confirmed && self.unverified_hp_writes == 0
+    }
+
+    /// Record that the published self-HP has just been written by the CLIENT rather than read from
+    /// a self `OP_HPUpdate` (#1005), so [`hp_verified`](Self::hp_verified) reads false until the
+    /// next authoritative update reconciles it. Saturating: a marathon fight cannot wrap the
+    /// counter back to "verified".
+    pub fn mark_hp_estimated(&mut self) {
+        self.unverified_hp_writes = self.unverified_hp_writes.saturating_add(1);
+    }
+
     /// Is the self-player levitating (gravity off)? The CONTROLLER read path (bool: hover or fall).
     /// The single read path for [`LevitateState`]. Agent-facing observables must instead use
     /// [`player_levitating_state`](Self::player_levitating_state), which distinguishes `Unknown`.
@@ -2092,11 +2160,37 @@ impl GameState {
         }
     }
 
+    /// Apply an AUTHORITATIVE self `OP_HPUpdate` (or an entity's HP update). For `player_id` this
+    /// is the one and only path that marks the published HP server-verified — it resets
+    /// `unverified_hp_writes` to zero and sets `hp_confirmed` (#1005).
+    ///
+    /// **Never call this with a client-derived figure.** Doing so publishes the client's own
+    /// arithmetic as server truth, which is exactly the #1005 defect; use
+    /// [`update_hp_estimated`](Self::update_hp_estimated) instead.
     pub fn update_hp(&mut self, spawn_id: u32, cur_hp: i32, max_hp: i32) {
+        self.write_hp(spawn_id, cur_hp, max_hp, true);
+    }
+
+    /// Same write as [`update_hp`], for a figure the CLIENT derived rather than read off the wire
+    /// (#1005) — today, the bind-respawn "real EQ revives at full HP" assumption. Leaves the HP
+    /// unverified, so `hp_verified()` keeps reading false until a real `OP_HPUpdate` reconciles it.
+    pub fn update_hp_estimated(&mut self, spawn_id: u32, cur_hp: i32, max_hp: i32) {
+        self.write_hp(spawn_id, cur_hp, max_hp, false);
+    }
+
+    fn write_hp(&mut self, spawn_id: u32, cur_hp: i32, max_hp: i32, from_server: bool) {
         if spawn_id == self.player_id {
             self.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
             self.cur_hp = cur_hp;
             self.max_hp = max_hp;
+            // #1005: a server OP_HPUpdate is the ONLY thing that can clear the estimate debt — it
+            // is the only message carrying both cur and max. A client-derived figure adds to it.
+            if from_server {
+                self.hp_confirmed = true;
+                self.unverified_hp_writes = 0;
+            } else {
+                self.mark_hp_estimated();
+            }
             // Alive again → clear the death/respawn bookkeeping. (eqoxide#61, #50)
             if cur_hp > 0 {
                 self.player_dead = false;       // revived / healed above 0
@@ -2642,6 +2736,117 @@ pub(crate) mod tests {
         assert_eq!(gs.coin, [9, 5, 0, 0], "coin must be corrected to the server's authoritative figure");
         assert!(gs.coin_verified(), "the figure is now fresh from the source of truth");
         assert!(gs.coin_confirmed);
+    }
+
+    /// #1005 — the client must never publish a self-HP figure the server did not send WITHOUT
+    /// marking it. This drives the update path directly rather than a live run: a live run showing
+    /// correct HP proves the path CAN be right and cannot discharge a "never" claim.
+    ///
+    /// The measured defect was a client-side DAMAGE subtraction, and that arithmetic is now gone
+    /// outright — `apply_combat_damage` no longer touches `cur_hp`, and the assertion that it
+    /// cannot lives beside it in `eqoxide-net`. What remains here is the residue: paths that still
+    /// write the player's own HP from a client INFERENCE (a death's zero, a respawn's assumed full
+    /// bar, a zone-in seed with no max). Those cannot be deleted — the fields have to hold
+    /// something — so they must be distinguishable instead, which is what this covers.
+    #[test]
+    fn a_client_derived_self_hp_write_can_never_read_verified_1005() {
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+
+        // The all-zero startup default is not a server reading either. `hp_confirmed` is what stops
+        // an untouched GameState publishing 0/0 as confirmed — the counter alone would say verified.
+        assert!(!gs.hp_verified(),
+            "an untouched GameState has heard nothing from the server; 0/0 is not a confirmation");
+
+        gs.update_hp(7, 214, 441);
+        assert!(gs.hp_verified(), "a self OP_HPUpdate is the one reading that confirms the triple");
+
+        // A client-derived write of the same fields — e.g. the bind-respawn full-HP assumption.
+        gs.update_hp_estimated(7, 441, 441);
+        assert_eq!(gs.cur_hp, 441, "control: the estimate path really does write the fields");
+        assert!(!gs.hp_verified(), "one client-derived write is enough to spend the confirmation");
+
+        // A second one. The counter is why nothing can hand trust back after accounting for only
+        // one of several outstanding writes.
+        gs.mark_hp_estimated();
+        assert_eq!(gs.unverified_hp_writes, 2, "each client write is counted");
+        assert!(!gs.hp_verified());
+
+        // Only a real server reading restores trust — and it restores the value too.
+        gs.update_hp(7, 214, 441);
+        assert!(gs.hp_verified(), "the reconciling OP_HPUpdate is the sole path back to verified");
+        assert_eq!(gs.cur_hp, 214, "and the server's figure replaces the estimate");
+    }
+
+    /// #1005 — reach control for the player branch: an HP update carrying a spawn id that is NOT
+    /// the player's must not confirm the player's own HP. The discrimination lives in `write_hp`
+    /// (`spawn_id == self.player_id`) and nowhere upstream of it — the `OP_HPUpdate` handler passes
+    /// on whatever id the payload carries without filtering — so without that test the first
+    /// non-self `update_hp` the client processed would clear the estimate debt and re-publish the
+    /// client's inference as server truth.
+    ///
+    /// Deliberately stated as an ENTITY RELATIONSHIP — an update about a spawn that is not us — and
+    /// NOT as a claim about which spawns the server will send this client a full `OP_HPUpdate` for.
+    /// That wire question is open and is being settled elsewhere (#1050); this control holds either
+    /// way, because it turns only on the id not being ours. The fixture below uses a non-player id
+    /// for that reason and for no other.
+    #[test]
+    fn another_spawns_hp_update_does_not_confirm_the_players_own_hp_1005() {
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.update_hp(7, 214, 441);
+        gs.update_hp_estimated(7, 107, 441);
+        assert!(!gs.hp_verified(), "precondition: the player's HP is an estimate");
+
+        gs.world.entities.insert(99, make_entity(99, "a rat", 0.0, 0.0, 0.0, true));
+        gs.update_hp(99, 50, 100); // some spawn that is not us
+        assert!(!gs.hp_verified(),
+            "an HP update about another spawn says nothing about OUR HP — it must not clear the \
+             estimate debt");
+        assert_eq!(gs.cur_hp, 107, "and it must not touch our HP either (control)");
+    }
+
+    /// #1005 — every observable derived from `cur_hp` must be covered, not just `hp` itself. With
+    /// the player self-targeted (F1), `target_hp_pct` carries the same estimate — not because it
+    /// resolves from `self.hp_pct` on read (it does not; it is a stored snapshot) but because
+    /// `update_hp_estimated` routes through `write_hp`, whose tail re-seeds that snapshot for
+    /// whichever spawn is currently targeted. It must track the estimate rather than sit stale
+    /// beside a moved `hp_pct` (two different answers to "how much health do I have" in one
+    /// payload), and `hp_verified` must govern it.
+    ///
+    /// REACH LIMIT, stated so a pass here is not read as broader than it is: this drives the SETTER
+    /// path only. The two raw self-HP writers — the `OP_Death` zeroing and the PlayerProfile seed —
+    /// never call `write_hp`, so they lie outside this test and can still leave the snapshot stale.
+    /// That gap is #1033: filed, deliberately not fixed here.
+    #[test]
+    fn self_target_hp_pct_follows_the_estimate_and_is_governed_by_hp_verified_1005() {
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.update_hp(7, 441, 441);
+        gs.set_target(7); // F1
+        assert_eq!(gs.target_hp_pct, Some(100.0));
+        assert!(gs.hp_verified());
+
+        gs.update_hp_estimated(7, 0, 441);
+        assert_eq!(gs.cur_hp, 0);
+        assert_eq!(gs.target_hp_pct, Some(0.0),
+            "the self-target readout must not stay at 100 while hp_pct reads 0");
+        assert!(!gs.hp_verified(),
+            "target_hp_pct is self-HP while self-targeted, so the same flag has to cover it");
+    }
+
+    /// #1005 — the counter saturates rather than wrapping. A `u32` that wrapped to 0 would hand an
+    /// unearned `hp_verified() == true` back to an agent after enough client-derived writes, which
+    /// is the exact failure the flag exists to prevent. Cheap to assert, impossible to notice live.
+    #[test]
+    fn the_estimate_counter_saturates_and_never_wraps_back_to_verified_1005() {
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.update_hp(7, 441, 441);
+        gs.unverified_hp_writes = u32::MAX;
+        gs.mark_hp_estimated();
+        assert_eq!(gs.unverified_hp_writes, u32::MAX, "saturating, not wrapping");
+        assert!(!gs.hp_verified(), "a wrap here would publish client arithmetic as server truth");
     }
 
     #[test]
@@ -3912,7 +4117,14 @@ pub(crate) mod tests {
             player_x: _, player_y: _, player_z: _, player_heading: _, player_action: _,
             sitting: _, run_mode: _, auto_attack: _, levitate: _,
             // Vitals + wallet: server truth about the player, not about a spawn.
-            hp_pct: _, cur_hp: _, max_hp: _, mana_pct: _, cur_mana: _, max_mana: _, xp_pct: _,
+            // (#1005: `hp_confirmed`/`unverified_hp_writes` are the HP counterparts of
+            // `coin_confirmed`/`unverified_buys` on the next line, and are classified the same way.
+            // They survive a zone line because `cur_hp`/`max_hp` do — clearing the debt while
+            // keeping the numbers it describes would republish the same values as confirmed. The
+            // fresh PlayerProfile every zone-in delivers re-marks them as an estimate regardless,
+            // since the profile carries no max.)
+            hp_pct: _, cur_hp: _, max_hp: _, hp_confirmed: _, unverified_hp_writes: _,
+            mana_pct: _, cur_mana: _, max_mana: _, xp_pct: _,
             coin: _, coin_confirmed: _, unverified_buys: _,
             // Death record: `last_cast`-shaped — a true record of something that already happened.
             player_dead: _, player_dead_since: _, killed_by: _, died_at: _, last_cast: _,
