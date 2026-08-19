@@ -4162,8 +4162,15 @@ mod tests {
     /// default `$EQZONES` is `CacheDirs::resolve().models_dir()` (`<cache root>/models`) and
     /// `CacheDirs` writes its per-set record to `<cache root>/synced.json`, so the record path is
     /// `$EQZONES/..`. This test drives `record_path` through a REAL `CacheDirs::models_dir()` — the
-    /// only reference to that function in this file — so moving the models directory DEEPER under
-    /// the cache root reaches this assertion.
+    /// same function the corpus below derives its default from, so the two move together — and so
+    /// moving the models directory DEEPER under the cache root reaches this assertion.
+    ///
+    /// This clause used to read "the only reference to that function in this file". That was false
+    /// and is retracted here rather than quietly dropped: `models_dir()` is called from TWO lines of
+    /// code in this file — the one in this test and the corpus default below — and `record_path`
+    /// appears on four (its definition, one call in `read`, two in this test). The second
+    /// `models_dir()` call site is the very fix the next paragraph describes, so the sentence
+    /// contradicted its own neighbours. (PR #1052 review round 2, REFUTED 2.)
     ///
     /// **What it does not catch, stated rather than implied.** Renaming `models_dir` at the same
     /// depth (`<root>/models` → `<root>/glbs`) leaves `record_path` correct and this test green.
