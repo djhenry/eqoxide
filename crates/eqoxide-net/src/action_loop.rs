@@ -1189,13 +1189,23 @@ impl ActionLoop {
     /// which by design sends no OP_ZoneChange at all. So every SERVER-originated `success = 1` echo
     /// carrying the CURRENT zone id classifies `CrossZoneReconnect` and runs a full re-entry with
     /// `gs.world.zone_name` UNCHANGED. The most common such path is a **death/bind respawn inside
-    /// the same zone**; it is not the only one. Others of the same shape: a GM `#zone <this zone>`
-    /// (which `ZoneChangeEcho::CrossZoneReconnect`'s own doc already lists), a `/gate` bound inside
-    /// this zone, a server-resolved cross (`zoneID = 0`) that the server resolves back to the zone
-    /// we are standing in, and a client-fired same-zone translocator whose echo lands after
-    /// `same_zone_reposition_pending`'s 1500 ms window has aged out (the flag is never consumed,
-    /// only aged). **That is why the re-arm is UNCONDITIONAL — do not narrow it to the respawn
-    /// case.**
+    /// the same zone**; it is not the only one. Four more of the same shape, each derivable from
+    /// this tree rather than assumed:
+    ///
+    /// - Any OTHER server-initiated bind relocation. `gameplay.rs`'s `OP_ZONE_PLAYER_TO_BIND` arm
+    ///   is not death-specific — it answers whatever made the server send it, and it replies with
+    ///   `gs.world.zone_id` whenever `bind_zone_id == 0` (the server's "same zone" marker). A bind
+    ///   point inside the zone we are standing in is exactly this shape.
+    /// - A GM `#zone` naming the zone we are already in — `ZoneChangeEcho::CrossZoneReconnect`'s
+    ///   own doc already lists a GM `#zone` among what it covers.
+    /// - A crossing the SERVER resolves back to this zone. `Self::send_zone_change_packet` writes
+    ///   `zoneID = 0` on EVERY outgoing request (#199), so the client never names the destination;
+    ///   the server picks it from our position, and it may pick the zone we are standing in.
+    /// - A client-fired same-zone translocator whose echo lands after
+    ///   `Self::same_zone_reposition_pending`'s 1500 ms window has aged out — that flag is never
+    ///   consumed, only aged, so a late echo classifies as a cross.
+    ///
+    /// **That is why the re-arm is UNCONDITIONAL — do not narrow it to the respawn case.**
     ///
     /// Without the re-arm, any of those would leave the following sync on the same-zone branch:
     /// `drain(..)` an already-empty list and re-extend it from the server adverts alone —
@@ -4920,9 +4930,12 @@ mod tests {
     /// zone id AND a same-zone translocator pending), and that pending flag has exactly one writer —
     /// `perform_cross`'s same-zone branch, which sends no OP_ZoneChange at all. So every
     /// server-originated echo carrying the CURRENT zone id runs a full re-entry with an UNCHANGED
-    /// zone name: a death/bind respawn (the most common), a GM `#zone <this zone>`, a `/gate` bound
-    /// here, a server-resolved `zoneID = 0` cross that resolves back here, and a same-zone
-    /// translocator echo that lands after the 1500 ms pending window aged out. The consequence is
+    /// zone name: a death/bind respawn (the most common), any other server-initiated bind
+    /// relocation landing in this zone, a GM `#zone` naming the zone we are already in, a crossing
+    /// the server resolves back here (every outgoing request carries `zoneID = 0`, #199, so the
+    /// server picks the destination), and a same-zone translocator echo that lands after the
+    /// 1500 ms pending window aged out. See `sync_zone_points_after_zone_in`'s doc for the
+    /// derivation of each. The consequence is
     /// agent-visible and silent: `GET /v1/observe/zone_entrances` answers SHORT (it lists only the
     /// server's OP_SendZonepoints adverts, and the map-label exits are exactly the ones the server
     /// does not advertise) and `POST /v1/move/zone_cross` REJECTS a `zone_id` that is genuinely
@@ -4937,8 +4950,24 @@ mod tests {
     /// plain `nav.sync_zone_points(&gs)` and this goes RED with zero exits restored — that mutant IS
     /// the pre-fix behaviour, so this test is what makes the new method load-bearing rather than a
     /// wrapper. Deleting `self.current_zone.clear();` from `sync_zone_points_after_zone_in` is the
-    /// same mutation one level down, and is likewise RED, as is wrapping it
-    /// `if std::hint::black_box(false) { … }`.
+    /// same mutation one level down, and is likewise RED. Wrapping that same statement
+    /// `if std::hint::black_box(false) { … }` is RED too, but it is NOT independent evidence: for a
+    /// bare statement the never-taken wrap is behaviourally identical to the delete, so it falsifies
+    /// the same property (presence). The independent mutation on a bare statement is a MOVE, and the
+    /// one that matters here is at the call sites, pinned separately by
+    /// `the_two_production_zone_entry_handshake_call_sites_stay_wired_to_the_1010_slots`.
+    ///
+    /// **The `zone_map_load` assertion at the end is now DISCRIMINATING, and that was measured**
+    /// (#1063 review round 1, finding 2). In its round-1 form it asserted `None` on a slot that was
+    /// `None` before the resync and `None` after it whichever arm ran, so it could not fail for the
+    /// reason its message gave. Three runs of this test with the label-count assertion above it
+    /// removed, so the `zone_map_load` one is reached: (a) unmutated → PASS, so removing the label
+    /// assertion is not itself what changes the outcome; (b) with `self.current_zone.clear();`
+    /// deleted → FAIL, on the `zone_map_load` assertion; (c) the same mutant but with the
+    /// `Some(Missing)` poison seed removed, i.e. the round-1 form → PASS, reproducing the defect.
+    /// With both assertions present the label-count one still fires first, which is correct — it is
+    /// the one that names the agent-visible consequence; the `zone_map_load` assertion is now an
+    /// honest second observation rather than a restatement of an initial value.
     ///
     /// One mutant SURVIVES and is worth naming rather than leaving for a reviewer to rediscover:
     /// replacing that `clear()` with `self.current_zone.truncate(1)` keeps this test GREEN. It is an
