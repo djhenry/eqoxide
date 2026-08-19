@@ -418,6 +418,3 @@ To schedule recurring autonomous development runs:
 /schedule list   # find the cron id
 /schedule delete <id>
 ```
-
-The `autonomous-run-credit-guard.md` memory file documents the credit threshold
-at which autonomous runs should stop (currently ~5%).

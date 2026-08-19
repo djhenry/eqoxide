@@ -349,11 +349,10 @@ pub struct Walker {
     /// Throttled live clearance sample near the player (see `CLEARANCE_REFRESH_TICKS`).
     last_clearance: Option<crate::diagnostics::ClearanceProbe>,
     clearance_countdown: u32,
-    /// #1058: has this journey already disclosed that the lethal-fall guard cannot fire at the
-    /// walker's HP? The disclosure is once per journey — reset in [`Walker::reset_drive_state`]
-    /// alongside the rest of the per-journey state — because it is a fact about the character, not
-    /// about this tick, and repeating it every tick of a long descent would bury the log it is
-    /// meant to inform.
+    /// #1058: has the lethal-fall guard's inertness at the walker's HP already been disclosed since
+    /// the last [`Walker::reset_drive_state`]? Cleared there alongside the rest of the drive state,
+    /// because it is a fact about the character, not about this tick, and repeating it every tick of
+    /// a long descent would bury the log it is meant to inform.
     inert_fall_disclosed: bool,
 
     /// Cached A* waypoints for the current goto goal (routes around walls). `path_i` is the
@@ -1973,17 +1972,16 @@ impl Walker {
                     self.publish_debug(Self::known_pos(gs), None);
                     return;
                 }
-                // #1058: the guard is structurally unable to fire at this HP. Say so ONCE per ledge
-                // approach instead of letting a descent-with-no-`blocked` read as "the guard looked
-                // at this and judged it safe" — the two are not the same fact and the difference is
-                // the whole defect.
+                // #1058: the guard is structurally unable to fire at this HP. Say so instead of
+                // letting a descent-with-no-`blocked` read as "the guard looked at this and judged
+                // it safe" — the two are not the same fact and the difference is the whole defect.
                 LedgeFallVerdict::Inert { max_dmg, ceiling } => {
                     tracing::info!("NAV: fall of {:.0}u — the lethal-fall guard CANNOT fire at {} hp: \
                         reported fall damage is capped at {} (this fall reports up to {}), so no drop \
                         of any size trips it (#1058). Descending.",
                         drop_to_target, gs.cur_hp, ceiling, max_dmg);
                     // The log line above goes to the process log; an AGENT reads the zone log. Put it
-                    // where the reader is, once per journey (see `inert_fall_disclosed`).
+                    // where the reader is (see `inert_fall_disclosed`).
                     if !self.inert_fall_disclosed {
                         self.inert_fall_disclosed = true;
                         gs.log_msg("zone", &format!(
@@ -5817,23 +5815,23 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
             gs.messages.iter().filter(|m| m.kind == "zone" && m.text.contains("eqoxide#1058")).count()
         }
 
-        /// The disclosure is once per JOURNEY, not once per tick — and a new journey gets it again.
-        /// Both halves are load-bearing: a per-tick line buries the log of a long descent, and a
-        /// latch that survived `reset_drive_state` would silently withhold a true statement about a
-        /// journey begun at a different HP.
+        /// #1058's latch, both directions: the gate suppresses a repeat on a later tick of the same
+        /// route, and `reset_drive_state` clears it so a later disclosure can fire. Both are driven
+        /// through `drive_walk`; the clear is called directly rather than by beginning a new journey,
+        /// so what is pinned here is the mechanism and no frequency bound (#1080).
         #[test]
-        fn the_inert_disclosure_is_once_per_journey_and_returns_on_the_next_one() {
+        fn the_inert_disclosure_is_latched_and_reset_drive_state_rearms_it() {
             let hp = fall_damage_ceiling() as i32 + 1;
             let (mut w, _nav, mut gs, goal) = walker_on_a_ledge(100.0, hp);
             w.drive_walk(&mut gs, goal);
             assert_eq!(inert_notices(&gs), 1, "first tick at the ledge must disclose");
             w.drive_walk(&mut gs, goal);
             w.drive_walk(&mut gs, goal);
-            assert_eq!(inert_notices(&gs), 1, "later ticks of the SAME journey must not repeat it");
+            assert_eq!(inert_notices(&gs), 1, "later ticks of the same route must not repeat it");
 
             w.reset_drive_state();
             w.drive_walk(&mut gs, goal);
-            assert_eq!(inert_notices(&gs), 2, "a new journey must disclose again");
+            assert_eq!(inert_notices(&gs), 2, "clearing the drive state must re-arm the disclosure");
         }
     }
 }

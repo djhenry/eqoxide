@@ -891,7 +891,6 @@ GOAL: weapons render in hand + combat swing animations. Driven by a cron loop wh
 ### Loop control
 - Each fire: make concrete progress, build+test, commit. Verify with /v1/observe/frame + /tmp/eqoxide.log.
 - When BOTH phases verified done: CronList -> CronDelete this job -> post final summary -> stop.
-- Stop + CronDelete if credits < ~5% (autonomous-run-credit-guard).
 
 ### Loop progress (fire 1, 2026-06-22)
 - Phase 1 VERIFIED-WIRED: EQEmu DoAnim QueueCloseClients(ignore_sender=false) => player receives her
