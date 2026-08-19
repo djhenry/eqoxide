@@ -1443,6 +1443,11 @@ pub struct EntityPoseView {
 pub type EntityPoses = Arc<Mutex<Roster<EntityPoseView>>>;
 
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /v1/observe/zone_points.
+///
+/// EMPTIED by `gameplay::run_zone_entry_handshake` on a re-zone (#1010) — without the clear this
+/// list describes the DEPARTED zone for the whole handshake. The handshake's clear is why the
+/// post-handshake resync must go through `ActionLoop::sync_zone_points_after_zone_in` rather than
+/// `sync_zone_points` directly.
 pub type ZonePoints = Arc<Mutex<Vec<eqoxide_core::game_state::ZonePoint>>>;
 /// Outcome of the most recent attempt to load the current zone's map `.txt` pack for the
 /// client-synthesized `"to "`-label fallback entries `ActionLoop::sync_zone_points` merges into
@@ -2700,8 +2705,8 @@ pub struct WorldSlots {
     // this seals the CONTAINER.
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
-    /// name → pose/gait (#643). Same keys as `entity_positions`; published by the same
-    /// `sync_entities` full-replace so it can never go stale independently of the roster.
+    /// name → pose/gait (#643). Same keys as `entity_positions`; published in the same
+    /// full-replace so it can never go stale independently of the roster.
     entity_poses:     EntityPoses,
     pub zone_points:      ZonePoints,
     /// #816 — see [`ZoneMapLoadShared`].
@@ -2743,7 +2748,7 @@ impl WorldSlots {
     ///
     /// # Full replace, deliberately
     ///
-    /// Both callers want current-zone truth, so stale entries from a previous zone are cleared
+    /// Every caller wants current-zone truth, so stale entries from a previous zone are cleared
     /// rather than merged. `sync_entities` already did this; the login seed did not, and inherits
     /// the stricter behaviour here.
     ///
@@ -2753,6 +2758,13 @@ impl WorldSlots {
     /// and `sync_entities` full-replaces from authoritative state on the next DRAINED PACKET
     /// regardless — not on the next tick: that publish is traffic-driven, not clock-driven (#1044,
     /// see [`EntityPoses`]).
+    ///
+    /// The third caller (#1010) is `gameplay::run_zone_entry_handshake`, which uses exactly this
+    /// full-replace property to EMPTY the roster on a re-zone: `begin_zone_in` has just
+    /// cleared `gs.world.entities`, and publishing that empty map through here is the only way to
+    /// clear the roster without becoming a second writer of the sealed maps. Until then the
+    /// departed zone's roster stayed published for the whole handshake, because `sync_entities`'
+    /// sole caller is `run_gameplay_phase`'s drain, which a zone-in has not reached yet.
     pub fn publish_entities<'a, I>(&self, entities: I) -> usize
     where
         I: IntoIterator<Item = (&'a u32, &'a eqoxide_core::game_state::Entity)>,
