@@ -506,8 +506,30 @@ pub fn running_jump_reach(run_speed: f32) -> f32 {
 ///
 /// Model, stated purely in terms of this function's own inputs/outputs and the constants defined
 /// in its body below: `v = min(terminal, sqrt(2·gravity·max(height, 0)))`, then `score = v/hz − 4`.
-/// `score` ≤ 0 → no damage; `score` ≥ 9 → lethal (20000); otherwise a roll in `[0, score²·10]`.
-/// Returns (rolled_damage, max_damage).
+/// `score` ≤ 0 → no damage; a `score` ≥ 9 branch returns a lethal (20000) pair; otherwise a roll in
+/// `[0, score²·10]`. Returns (rolled_damage, max_damage).
+///
+/// **THAT LETHAL BRANCH IS UNREACHABLE AT THE CONSTANTS IN THE TREE TODAY, and this comment does
+/// not ask you to take that on trust or re-derive it by hand** (#1058). `fall_damage_ceiling_tests`
+/// below drives THIS function and pins the outcome: the lethal pair is never returned, and no input
+/// — a swept range of heights, plus `f32::INFINITY`, `f32::MAX`, `f32::NAN`, negatives and `0.0` —
+/// takes the returned pair above `(774, 774)`. A written-out derivation here would rot silently the
+/// first time a constant moved; the test cannot, because it re-measures on every run. Read the test
+/// for the bound, not this paragraph, and use [`fall_damage_ceiling`] in code rather than the
+/// literal — it re-derives the number from this function instead of repeating it.
+///
+/// **WHICH READING OF THAT DISCREPANCY IS TRUE IS UNRESOLVED, so do not delete the branch to tidy
+/// it away.** Either the curve never had a lethal case at these constants and the branch is
+/// vestigial, or one of the three constants is miscalibrated — in which case the unreachable branch
+/// is the surviving EVIDENCE of that and deleting it destroys the evidence. Nothing in this tree
+/// can tell the two apart, and changing a constant to force one reading is a decision nobody has
+/// taken. `todo.md`'s "exhaustive fall-damage testing (controlled-fall nav)" section settles it by
+/// measurement — specifically its "Validate the fall-damage curve vs the real client across drop
+/// heights" item. Until that runs, treat the ceiling as a property of THIS code, not of a fall.
+///
+/// The bound is not confined to this function: `eqoxide-nav`'s pre-emptive lethal-fall guard
+/// compares `max_damage` against current HP, so it cannot fire at all above the ceiling. See
+/// `walker::classify_ledge_fall`, which reports that case rather than passing it off as safe.
 ///
 /// UNCITED, as a statement about the tree as it stands: no document in this repository, and none in
 /// the private EQ knowledge-base tree, derives this curve or its constants. That is the operative
@@ -544,4 +566,216 @@ pub fn fall_damage(height: f32) -> (u32, u32) {
     let roll = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos()).unwrap_or(0);
     (if max == 0 { 0 } else { roll % (max + 1) }, max)
+}
+
+/// The largest `max_damage` [`fall_damage`] can ever report, for ANY input — MEASURED off that
+/// function, never a written-down copy of it.
+///
+/// Why infinity is the right probe, rather than a lucky guess: `fall_damage` clamps its derived
+/// impact velocity to a terminal, and every step after that (`score`, then `score²·10`) is
+/// non-decreasing in velocity, so `max_damage` is non-decreasing in `height` and SATURATES at the
+/// clamp. `f32::INFINITY` therefore lands on exactly the same clamped velocity as every height at
+/// or above the saturation point and reads the supremum off the live code path. That monotonicity
+/// is not asserted here on the strength of this paragraph — `fall_damage_ceiling_tests` checks it
+/// across the sweep, so if a future edit made the curve non-monotone this helper's justification
+/// fails loudly instead of quietly returning a non-maximum.
+///
+/// The point of the indirection is that this cannot go stale. At the constants in the tree today
+/// the value is 774, and no line of code here says 774 — re-derive `GRAVITY`, `TERMINAL` or `HZ`
+/// (#1005, #1045) and every caller moves with them. Compare a damage threshold against this rather
+/// than against a literal, and read [`fall_damage`]'s doc for why the number is a property of this
+/// code and not yet a property of a real fall.
+///
+/// ```
+/// use eqoxide_core::physics::{fall_damage, fall_damage_ceiling};
+/// // No height, however absurd, is reported above the ceiling...
+/// assert_eq!(fall_damage(f32::MAX).1, fall_damage_ceiling());
+/// assert!(fall_damage(1e9).1 <= fall_damage_ceiling());
+/// // ...and the documented lethal pair is never one of the outcomes (#1058).
+/// assert_ne!(fall_damage(f32::INFINITY), (20_000, 20_000));
+/// ```
+pub fn fall_damage_ceiling() -> u32 {
+    fall_damage(f32::INFINITY).1
+}
+
+/// The executable half of [`fall_damage`]'s doc comment (#1058).
+///
+/// The claim under test is that the function's documented `score >= 9 -> lethal (20000)` outcome
+/// cannot occur at the constants the body defines, and that the real ceiling on the returned pair
+/// is `(774, 774)`. It is a TEST rather than a sentence in the comment because a sentence stating
+/// a derived bound is exactly the kind of claim that rots the first time somebody re-derives a
+/// constant, with nothing to notice — and the whole reason #1058 is an honesty defect rather than
+/// a tidiness one is that a stale statement about fall damage is a statement an agent plans on.
+///
+/// THE SWEEP'S OWN CONTROLS, because a check that only reports exceptions cannot tell "nothing
+/// exceeded the bound" from "nothing was looked at": every assertion over the sweep is paired with
+/// a positive one. The sample count is pinned, so an emptied corpus fails; the ceiling is asserted
+/// ATTAINED, so a corpus that never reaches the velocity clamp fails; and the zero-damage,
+/// saturation and monotonicity properties each name a height that must exhibit them.
+#[cfg(test)]
+mod fall_damage_ceiling_tests {
+    use super::*;
+
+    /// The bound the current constants produce. Written out ONCE, here, as the thing under test —
+    /// production code reads [`fall_damage_ceiling`] instead, which derives it.
+    const OBSERVED_CEILING: u32 = 774;
+
+    /// Sweep resolution and extent. The extent deliberately runs far past the height at which the
+    /// curve saturates, so the swept corpus contains the clamped region rather than approaching it.
+    const SWEEP_STEP: f32 = 0.05;
+    const SWEEP_MAX_U: f32 = 200.0;
+    const SWEEP_SAMPLES: usize = 4001; // 0.0 ..= 200.0 inclusive, at 0.05u
+
+    fn swept_heights() -> Vec<f32> {
+        (0..SWEEP_SAMPLES).map(|i| i as f32 * SWEEP_STEP).collect()
+    }
+
+    /// Every pathological `f32` a caller can hand this function. `drop_to_target` in the nav walker
+    /// is a subtraction of two published floats, so a NaN or an infinity is a real reachable input,
+    /// not a theoretical one.
+    fn pathological_heights() -> Vec<f32> {
+        vec![
+            0.0, -0.0, -1.0, -1e9, f32::MIN, f32::NEG_INFINITY,
+            f32::MAX, f32::INFINITY, f32::NAN,
+            f32::MIN_POSITIVE, f32::EPSILON,
+        ]
+    }
+
+    /// The headline claim: across the whole corpus the lethal pair never appears and the returned
+    /// pair never exceeds `(774, 774)`.
+    ///
+    /// Note the two assertions are NOT independent — the lethal pair is itself above the ceiling,
+    /// so anything that produces it also breaks the bound. The lethal one is kept because it names
+    /// the claim in #1058 directly, and so a failure says which sentence in the doc comment is now
+    /// false rather than only that a number moved.
+    #[test]
+    fn no_input_reaches_the_lethal_branch_or_exceeds_the_ceiling() {
+        let mut checked = 0usize;
+        let mut attained = false;
+        for h in swept_heights().into_iter().chain(pathological_heights()) {
+            let (roll, max) = fall_damage(h);
+            assert_ne!((roll, max), (20_000, 20_000),
+                "fall_damage({h}) returned the documented lethal pair, which #1058 says the \
+                 constants make unreachable — the doc comment and the constants now disagree");
+            assert!(max <= OBSERVED_CEILING,
+                "fall_damage({h}) reported max {max}, above the pinned ceiling {OBSERVED_CEILING}");
+            assert!(roll <= max, "fall_damage({h}) rolled {roll} above its own max {max}");
+            if max == OBSERVED_CEILING { attained = true; }
+            checked += 1;
+        }
+        // The controls. Without these an empty or truncated corpus passes every line above.
+        assert_eq!(checked, SWEEP_SAMPLES + pathological_heights().len(),
+            "the corpus was not the one this test claims to have swept");
+        assert!(attained,
+            "the sweep never reached {OBSERVED_CEILING}, so 'nothing exceeded it' is vacuous — \
+             the corpus does not contain the saturated region it claims to bound");
+    }
+
+    /// [`fall_damage_ceiling`] must equal the largest value actually observed over the corpus, not
+    /// a number that happens to be written near it.
+    #[test]
+    fn ceiling_helper_equals_the_measured_maximum() {
+        let observed = swept_heights().into_iter().chain(pathological_heights())
+            .map(|h| fall_damage(h).1).max().expect("corpus must not be empty");
+        assert_eq!(observed, OBSERVED_CEILING, "the swept corpus's maximum moved");
+        assert_eq!(fall_damage_ceiling(), observed,
+            "fall_damage_ceiling() must be derived from fall_damage, not a stale literal");
+    }
+
+    /// The property [`fall_damage_ceiling`]'s infinity probe rests on: `max_damage` is
+    /// non-decreasing in height. If a future edit broke this, probing at infinity would silently
+    /// stop returning the supremum.
+    #[test]
+    fn max_damage_is_monotone_non_decreasing_in_height() {
+        let hs = swept_heights();
+        assert!(hs.len() >= 2, "monotonicity needs at least one pair");
+        let mut pairs = 0usize;
+        let mut prev = fall_damage(hs[0]).1;
+        for h in &hs[1..] {
+            let cur = fall_damage(*h).1;
+            assert!(cur >= prev, "max_damage fell from {prev} to {cur} at height {h}");
+            prev = cur;
+            pairs += 1;
+        }
+        assert_eq!(pairs, SWEEP_SAMPLES - 1, "monotonicity was not checked over the whole sweep");
+        assert_eq!(prev, fall_damage_ceiling(),
+            "the top of the sweep must already sit on the clamp the infinity probe reads");
+    }
+
+    /// The saturation point is inside the sweep and the curve is flat above it — the positive form
+    /// of the bound, so this file cannot pass by never generating a large fall.
+    #[test]
+    fn the_curve_saturates_inside_the_swept_range() {
+        // Below saturation the curve must still be climbing, or "flat above" would be trivially
+        // true of a curve that is flat everywhere.
+        assert!(fall_damage(30.0).1 < fall_damage(60.0).1,
+            "the curve must still be rising below saturation");
+        assert!(fall_damage(60.0).1 < OBSERVED_CEILING,
+            "60u must sit below the ceiling, or the saturation point is not where this test thinks");
+        for h in [69.0_f32, 100.0, 150.0, SWEEP_MAX_U, 1.0e9] {
+            assert_eq!(fall_damage(h).1, OBSERVED_CEILING,
+                "the curve must be flat at the ceiling above saturation, and is not at {h}");
+        }
+    }
+
+    /// The doc comment above sends readers to three named referents. **A citation that no longer
+    /// resolves does not fail loudly — it keeps reading as evidence**, which is the same class of
+    /// defect #1058 itself is. These are the two this crate can reach; the third (`eqoxide-nav`'s
+    /// `classify_ledge_fall`) is pinned from the nav side, which is the direction the dependency
+    /// runs.
+    #[test]
+    fn the_doc_comments_citations_still_resolve() {
+        const SRC: &str = include_str!("physics.rs");
+        const TODO: &str = include_str!("../../../todo.md");
+        // Non-degeneracy. Without these an empty or truncated corpus, or a `contains` that matched
+        // anything, would pass every assertion below without looking at a thing.
+        assert!(SRC.len() > 10_000, "physics.rs corpus looks truncated ({} bytes)", SRC.len());
+        assert!(TODO.len() > 10_000, "todo.md corpus looks truncated ({} bytes)", TODO.len());
+        // The control strings are ASSEMBLED, not written out: a literal absent-name control is a
+        // contradiction in a test that searches its own file — the literal puts the name there.
+        let absent_mod = format!("fall_damage_{}_tests", "basement");
+        let absent_heading = format!("exhaustive fall-damage testing ({} free-fall)", "uncontrolled");
+        assert!(!SRC.contains(&absent_mod),
+            "control: a name that is NOT in physics.rs must not be found, or these searches prove nothing");
+        assert!(!TODO.contains(&absent_heading),
+            "control: a heading that is NOT in todo.md must not be found");
+
+        // 1. The test module the doc tells readers to read for the bound.
+        const TEST_MOD: &str = "fall_damage_ceiling_tests";
+        assert!(SRC.contains(&format!("mod {TEST_MOD}")),
+            "the doc cites `{TEST_MOD}`, and no module by that name exists in this file");
+        assert!(SRC.contains(&format!("`{TEST_MOD}`")),
+            "this module was renamed without updating the doc comment that sends readers to it");
+
+        // 2. The todo.md section that settles the two readings, and the item inside it that does.
+        const SECTION: &str = "## TODO: exhaustive fall-damage testing (controlled-fall nav)";
+        const ITEM: &str = "Validate the fall-damage curve vs the real client across drop";
+        assert!(SRC.contains("exhaustive fall-damage testing (controlled-fall nav)")
+            && SRC.contains(ITEM), "the doc no longer names the todo.md section and item it cites");
+        let sec = TODO.find(SECTION).unwrap_or_else(|| panic!("todo.md no longer has the section \
+            the doc comment cites, verbatim: {SECTION:?}"));
+        let item = TODO.find(ITEM).unwrap_or_else(|| panic!("todo.md no longer has the measurement \
+            item the doc comment cites: {ITEM:?}"));
+        // POSITION, not just presence: the item must live under that heading. A citation that
+        // resolves to the right words under the wrong heading is the silent failure this guards.
+        assert!(item > sec, "the cited item is above the section it is cited as belonging to");
+        assert!(!TODO[sec + SECTION.len()..item].contains("\n## "),
+            "another `## ` heading now sits between the cited section and the cited item, so the \
+             item is no longer in that section");
+    }
+
+    /// The bottom of the curve, asserted positively as well as negatively: a short fall reports
+    /// nothing, and the first height that reports anything is inside the swept range.
+    #[test]
+    fn short_and_invalid_falls_report_nothing() {
+        for h in [0.0_f32, -0.0, 1.0, 6.0, -1.0, -1e9, f32::NEG_INFINITY, f32::MIN, f32::NAN] {
+            assert_eq!(fall_damage(h), (0, 0), "fall_damage({h}) must report no damage");
+        }
+        // Positive control: damage does start somewhere inside the sweep, so the assertions above
+        // are not passing because the function returns (0, 0) for everything.
+        let first_damaging = swept_heights().into_iter().find(|h| fall_damage(*h).1 > 0)
+            .expect("some swept height must report damage");
+        assert!(first_damaging > 6.0 && first_damaging < 12.0,
+            "the zero-damage cutoff moved: first damaging swept height was {first_damaging}");
+    }
 }
