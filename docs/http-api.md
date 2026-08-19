@@ -918,10 +918,13 @@ server-pushed lists, not derived from the collision grid), and `/v1/move/manual`
 character is moving through a world the client has not built, so prefer waiting for `ready`).
 
 **Ungated is not the same as honest during a load, and it applies to each of those three observe
-endpoints.** Zoning empties all three server-pushed rosters — the door roster (#891), and the entity
-roster and `zone_points` (#1010/#1063) — and, like `zone_exits` before #803, an empty body from an
-emptied roster is the same bytes as the true answer "this zone has none of these". Unlike
-`zone_exits`, there is no `ready` gate to wait on for any of them, because they are server-pushed
+endpoints.** The zone-entry handshake empties all three server-pushed rosters — the door roster
+(#891/#934), and the entity roster and `zone_points` (#1010/#1063) — before it asks for the new
+zone's records, and, like `zone_exits` before #803, an empty body from an emptied roster is the same
+bytes as the true answer "this zone has none of these". A session's FIRST zone-in reaches the same
+empty by a different route: those rosters start empty, so there is nothing to clear and the same
+ambiguity holds without any clear having run. Unlike `zone_exits`, there is no `ready` gate to wait
+on for any of them, because they are server-pushed
 lists, not derivations from loaded geometry (see "Endpoints that are deliberately NOT gated" above).
 The three are enumerated in band, with the client's own limit stated alongside them, on
 `GET /v1/observe/debug` — see
