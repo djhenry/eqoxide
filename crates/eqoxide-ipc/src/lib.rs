@@ -1667,8 +1667,9 @@ pub type CampUntil = Arc<Mutex<Option<std::time::Instant>>>;
 /// inbound drain has drained AND applied via `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`)
 /// — a cadence driven by server traffic, not the 150 ms nav clock; the interval is unbounded in a
 /// silent zone (#1023). `run_zone_entry_handshake` also writes this slot: once, unconditionally,
-/// resetting it to `MerchantSnapshot::default()` at the start of every zone-in, before the new
-/// zone's own traffic can repopulate it. `open` mirrors `GameState::merchant_open`.
+/// resetting it to `MerchantSnapshot::default()` on a re-zone, before the new zone's own traffic
+/// can repopulate it — a session's first zone-in goes through `run_login_handshake` instead, which
+/// takes no merchant slot. `open` mirrors `GameState::merchant_open`.
 #[derive(Default, Clone, serde::Serialize)]
 pub struct MerchantSnapshot {
     pub open: bool,
