@@ -3159,6 +3159,35 @@ mod cursor_resync_tests {
     /// `//` living inside a string or char literal — because this block's content is restricted by
     /// construction to bare identifiers, commas and whitespace; no citation guard entry is ever a
     /// string or char literal, so there is nothing here for a naive split to cut through by mistake.
+    ///
+    /// **THE TWO ARMS ARE ASYMMETRIC ON PURPOSE, and this paragraph is the decision #1017 asked
+    /// for** ("decide and document which behaviour is intended rather than preserving the asymmetry
+    /// by accident"). The `_cited` arm `continue`s past its opening line; the `_helpers` arm does
+    /// not. Keeping that is not tidiness deferred — it is load-bearing. The `_helpers` guard in
+    /// this file is written as ONE line that opens and closes at once, so its entries live on the
+    /// opening line; a `continue` there would drop every one of them and silently empty that half
+    /// of the guard, which is the exact failure direction #911 and #1017 are both about. The
+    /// `_cited` guard's opening line carries only the binding and its type, so skipping it costs
+    /// nothing.
+    ///
+    /// The two prices of keeping it, measured over this file rather than reasoned about:
+    ///
+    /// * Because the `_helpers` opening line is tokenised like any other, the binding's own words
+    ///   and the two type names in its annotation land in the set beside the real entries — today
+    ///   `let`, `_helpers`, and the two `Fn` aliases. Harmless — but not because the file names
+    ///   nothing like them, which an earlier revision of this paragraph claimed and which
+    ///   `type FixtureRunFn` and `type HairpinCarrotFn`, declared on the two lines just above the
+    ///   binding by the very annotation that puts them in the set, refute (#1042 review B4).
+    ///   Harmless upstream of the set instead: `doc_citations` emits a chunk only if it starts
+    ///   ASCII-lowercase and holds at least three underscores, so none of the four can ever be a
+    ///   cited name at all; and the one branch that reads this set is gated on the name already
+    ///   being a `#[test]` in this file, which a type alias is not. Still, anyone reading the set
+    ///   as a list of pinned names is reading four entries the guard never meant to hold, and a
+    ///   count of it is four too high.
+    /// * An entry written ON the `_cited` opening line would be silently dropped. Nothing does
+    ///   that today and nothing stops a later edit from doing it, so: keep `_cited` entries on
+    ///   their own lines. That direction is the lying one, which is why it is called out here
+    ///   rather than left to be rediscovered.
     fn guard_entries(src: &str) -> std::collections::HashSet<String> {
         let mut out = std::collections::HashSet::new();
         let mut depth: Option<&str> = None;
@@ -3177,9 +3206,58 @@ mod cursor_resync_tests {
                 else { if cur.len() > 2 { out.insert(std::mem::take(&mut cur)); } else { cur.clear(); } }
             }
             if cur.len() > 2 { out.insert(cur); }
-            if t.ends_with(end) { depth = None; }
+            // The terminator must be tested against the SAME comment-stripped text `code` was
+            // tokenised from, not the raw trimmed line `t` (#1017). Before this fix the block's
+            // closing line — `];  // done` — has `t` ending in `done`, not `end`, so `depth` never
+            // clears and every later line in the file keeps being folded into this guard's set: a
+            // silent over-broadening, the same direction of lie as #911 (a name reads as "pinned"
+            // when nothing in the file actually cites it). `code.trim()` is deliberate, not just
+            // `code`: `code` still carries the line's original leading whitespace, which `ends_with`
+            // would see and reject even on an honest, comment-free closing line.
+            if code.trim().ends_with(end) { depth = None; }
         }
         out
+    }
+
+    /// #1017: a trailing `//` comment on the block's *closing* line must not stop the terminator
+    /// from matching — the guard's `];`/`);` detection has to run on the same comment-stripped text
+    /// `guard_entries` tokenises from, or the block never closes and silently absorbs every
+    /// identifier for the rest of the file (see `guard_entries`'s doc for the full mechanism).
+    #[test]
+    fn guard_entries_terminator_matches_through_a_trailing_comment() {
+        let src = "        let _cited: &[fn()] = &[\n            alpha,\n        ];  // done\n        \
+                    stray_identifier_after_the_block,\n";
+        let got = guard_entries(src);
+        let mut expected = std::collections::HashSet::new();
+        expected.insert("alpha".to_string());
+        assert_eq!(got, expected,
+            "a comment tail on the closing `];` must not stop the terminator matching — the block \
+             should close after `alpha,` and `stray_identifier_after_the_block` (outside the block \
+             entirely) must not be swept into the guard set. Got {got:?}.");
+    }
+
+    /// The mirror direction of #1017. Before this fix, the terminator check ran on raw `t`, so a
+    /// content line whose trailing *comment* happens to contain the terminator text — the source
+    /// fixture below has `alpha,` followed by a comment holding a bracket-semicolon pair — matched
+    /// on the comment and closed the block early, dropping every entry after it (here, `beta`) from
+    /// the guard set. The issue calls this half "honest by luck": it fails
+    /// loudly (an assertion mismatch) rather than lying, so it was lower priority than the
+    /// closing-line case — but it is the SAME root cause (the terminator check reading comment
+    /// text), and #1017's acceptance bar calls for pinning it too, so a future edit cannot silently
+    /// fix one direction and reopen the other. Testing `code.trim()` against `end` fixes both at
+    /// once: comment text no longer participates in matching the terminator either.
+    #[test]
+    fn guard_entries_terminator_ignores_a_bracket_that_only_appears_in_a_comment() {
+        let src = "        let _cited: &[fn()] = &[\n            alpha, // ];\n            beta,\n        \
+                    ];\n";
+        let got = guard_entries(src);
+        let mut expected = std::collections::HashSet::new();
+        expected.insert("alpha".to_string());
+        expected.insert("beta".to_string());
+        assert_eq!(got, expected,
+            "a `];` that only appears inside a `//` comment on a content line must NOT end the \
+             block early — `beta`, the entry after that comment, belongs in the guard set exactly \
+             as much as `alpha` does. Got {got:?}.");
     }
 
     /// **A distance TIE resolves to the EARLIER segment, and that is the conservative half of the

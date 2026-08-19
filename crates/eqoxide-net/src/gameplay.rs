@@ -2160,6 +2160,99 @@ mod zone_entry_handshake_publish_tests {
         handle.abort();
     }
 
+    /// **#1025 — the `drained_a_packet` GATE on the republish above, not just that the publish
+    /// happens at all.**
+    ///
+    /// Every other door-publish test in this module drives a pass that DOES drain a packet, so
+    /// none of them can tell a gated publish from an ungated one — `publish_doors` fires on that
+    /// pass either way. Measured directly: forcing the gate to
+    /// `if drained_a_packet || std::hint::black_box(true)` left every pre-existing lib test in this
+    /// crate green (see the issue for the logged run). No absolute test count is quoted here, on
+    /// purpose: the first revision of this doc named one, and it was already wrong on the day it
+    /// landed, because every test added to this crate moves it. This is the missing negative case:
+    /// a handshake that drains NOTHING AT ALL must never call `publish_doors`.
+    ///
+    /// The top-of-function `doors.lock().unwrap().clear();` (#891/#934) runs unconditionally, so a
+    /// sentinel seeded BEFORE the handshake starts is wiped by that clear regardless of the gate
+    /// under test and would make this vacuous (issue's own warning). This test instead lets the
+    /// handshake run for a window comfortably longer than that synchronous startup section (which
+    /// does no network I/O beyond a single non-blocking UDP send) and only THEN writes the
+    /// sentinel directly into `doors_shared` from the test — i.e. strictly after the clear — before
+    /// observing whether it survives several 10ms drain-loop ticks with an empty `net_rx`
+    /// (`_tx` is bound but never sent on, exactly like `never_sends_a_second_zone_entry_on_a_single_session`
+    /// above, so `drained_a_packet` is false on every single pass for the rest of this test).
+    ///
+    /// **THE TWO SLEEPS ARE THIS TEST'S ONLY LOAD-BEARING TIMING ASSUMPTION, and they fail SAFE
+    /// (#1042 review N4).** The first must outlast the handshake's synchronous startup section, so
+    /// the sentinel write lands strictly after the unconditional clear; the second must span
+    /// several of the drain loop's 10ms ticks. Both directions of error are the harmless one. If a
+    /// contended box has not finished startup inside the first window, the clear lands after the
+    /// sentinel write, the sentinel is gone, and this test goes RED — a spurious failure, never a
+    /// false green. And lengthening either sleep can only make the test STRICTER, since every
+    /// extra millisecond is one more no-drain pass an ungated publish would have to survive
+    /// without wiping the sentinel. So if this ever flakes, raise the first constant; do not
+    /// shorten it and do not weaken the assertion.
+    ///
+    /// MUTATION CHECK (#1025, run and log-verified before this test was added): gate forced to
+    /// `drained_a_packet || std::hint::black_box(true)` → RED — the sentinel is gone within the
+    /// first 10ms tick after being written (`publish_doors` full-replaces from the already-emptied
+    /// `gs.world.doors`, i.e. with nothing). Un-mutated code → GREEN, sentinel intact for the whole
+    /// observation window. The three pre-existing publish tests above all stay GREEN under the same
+    /// mutant, which is exactly the gap this test exists to close.
+    #[tokio::test]
+    async fn zone_entry_handshake_does_not_republish_doors_on_a_pass_that_drains_nothing_1025() {
+        let (mut stream, _unused_rx) = test_stream(0, 0).await;
+        // Bound but never sent on — models a handshake that never drains a single packet, the same
+        // shape `never_sends_a_second_zone_entry_on_a_single_session` uses.
+        let (_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
+        let (mut gs, snapshot, health) = fresh_gs_snapshot();
+
+        let doors: eqoxide_ipc::DoorsShared = Default::default();
+        let doors_bg = doors.clone();
+
+        let handle = tokio::spawn(async move {
+            run_zone_entry_handshake(
+                &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
+                &eqoxide_ipc::ControllerSlots::default(),
+                &doors_bg,
+                &eqoxide_ipc::DialogueShared::default(),
+                &eqoxide_ipc::MerchantShared::default(),
+                &eqoxide_ipc::TaskOffersShared::default(),
+                Duration::from_secs(30), // never reached — no packets are ever sent
+            ).await;
+        });
+
+        // Let the handshake clear its way through the synchronous startup section (begin_zone_in,
+        // the doors/dialogue/merchant/task_offers clears, and the one send_zone_entry) and reach
+        // its 10ms-cadence drain loop, so the write below lands strictly AFTER the top-of-function
+        // `doors.lock().unwrap().clear();` rather than racing it.
+        sleep(Duration::from_millis(100)).await;
+
+        const SENTINEL_ID: u8 = 253;
+        doors.lock().unwrap().push(eqoxide_ipc::DoorView {
+            door_id: SENTINEL_ID, name: "SENTINEL".into(),
+            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, opentype: 58, is_open: false,
+        });
+
+        // Several drain-loop ticks (10ms cadence) with `net_rx` empty the whole time — every pass
+        // in this window has `drained_a_packet == false`.
+        sleep(Duration::from_millis(300)).await;
+
+        let published = doors.lock().unwrap().clone();
+        let ids: Vec<u8> = published.iter().map(|d| d.door_id).collect();
+        assert_eq!(published.len(), 1,
+            "a handshake pass that drains no packet must not call publish_doors at all — the \
+             sentinel should be the ONLY entry in doors_shared, but got {} entries with ids {ids:?} \
+             (#1025 — the gate is unpinned; publish_doors full-replaces from the already-emptied \
+             gs.world.doors, so any ungated/mis-gated call wipes the sentinel to nothing, not to a \
+             different non-sentinel value)",
+            published.len());
+        assert_eq!(published[0].door_id, SENTINEL_ID,
+            "the surviving entry must be the sentinel itself, not some other publish's output");
+
+        handle.abort();
+    }
+
     /// **#1016 review B3 — pin full REPLACE, not append.**
     ///
     /// `publish_doors` (crates/eqoxide-net/src/action_loop.rs) is `out.clear(); out.extend(...)`
