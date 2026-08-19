@@ -1182,18 +1182,31 @@ impl ActionLoop {
     /// for (#816) — asserting something no longer true: the list it names is gone. Re-arming the
     /// latch here makes the next sync take the REBUILD branch instead of the same-zone one.
     ///
-    /// It is load-bearing on exactly one reachable path, and that path is real: a **death/bind
-    /// respawn inside the same zone**. [`classify_zone_change_echo`]'s own doc names it — such an
-    /// echo carries the CURRENT zone id and sets no same-zone-translocator pending flag, so it
-    /// classifies as `CrossZoneReconnect` and runs a full re-entry with `gs.world.zone_name`
-    /// UNCHANGED. Without this re-arm the following sync would take the same-zone branch, `drain(..)`
-    /// an already-empty list and re-extend it from the server adverts alone — permanently dropping
-    /// this zone's client-synthesized `"to "`-label fallback exits (`iterator == u32::MAX`) until
-    /// the next differently-named zone change, so GET /v1/observe/zone_entrances would answer short
-    /// and POST /v1/move/zone_cross would reject a zone_id only those entries make reachable. Every
-    /// other path into the handshake changes the zone name, where the latch re-arms itself.
+    /// **The rule: it is load-bearing on EVERY re-entry whose zone NAME is unchanged, and there is
+    /// more than one such path.** [`classify_zone_change_echo`] returns `CrossZoneReconnect` for any
+    /// `success == 1` echo that is not (echo zone id == current zone id AND a same-zone translocator
+    /// pending), and that pending flag has exactly one writer — `perform_cross`'s same-zone branch,
+    /// which by design sends no OP_ZoneChange at all. So every SERVER-originated `success = 1` echo
+    /// carrying the CURRENT zone id classifies `CrossZoneReconnect` and runs a full re-entry with
+    /// `gs.world.zone_name` UNCHANGED. The most common such path is a **death/bind respawn inside
+    /// the same zone**; it is not the only one. Others of the same shape: a GM `#zone <this zone>`
+    /// (which `ZoneChangeEcho::CrossZoneReconnect`'s own doc already lists), a `/gate` bound inside
+    /// this zone, a server-resolved cross (`zoneID = 0`) that the server resolves back to the zone
+    /// we are standing in, and a client-fired same-zone translocator whose echo lands after
+    /// `same_zone_reposition_pending`'s 1500 ms window has aged out (the flag is never consumed,
+    /// only aged). **That is why the re-arm is UNCONDITIONAL — do not narrow it to the respawn
+    /// case.**
     ///
-    /// Taking the rebuild branch on that path also runs what a completed re-entry warrants and the
+    /// Without the re-arm, any of those would leave the following sync on the same-zone branch:
+    /// `drain(..)` an already-empty list and re-extend it from the server adverts alone —
+    /// permanently dropping this zone's client-synthesized `"to "`-label fallback exits
+    /// (`iterator == u32::MAX`) until the next differently-named zone change, so
+    /// GET /v1/observe/zone_entrances would answer short and POST /v1/move/zone_cross would reject a
+    /// zone_id only those entries make reachable. A re-entry that DOES change the zone name re-arms
+    /// the latch by itself and this method costs it nothing, which is why it is safe to route every
+    /// call site through here.
+    ///
+    /// Taking the rebuild branch on those paths also runs what a completed re-entry warrants and the
     /// same-zone branch skips: the walker reset (#248), the gated-refusal re-arm (#683) and the
     /// parked-command reaps (#448/#479). All four were already correct for a full zone-in; only the
     /// name comparison was hiding them.
@@ -1266,8 +1279,9 @@ impl ActionLoop {
     /// ⚠️ The zone-change test below is a LATCH on `self.current_zone` (#816), and it is only true
     /// while this loop is the only thing that writes the published list. `run_zone_entry_handshake`
     /// empties that list at every zone-in (#1010), so the post-handshake resync must go through
-    /// [`Self::sync_zone_points_after_zone_in`], which re-arms the latch first — see its doc for the
-    /// one path (a same-zone death/bind respawn) where the difference is observable.
+    /// [`Self::sync_zone_points_after_zone_in`], which re-arms the latch first. The difference is
+    /// observable on EVERY re-entry whose zone NAME is unchanged — a same-zone death/bind respawn is
+    /// the most common of those, not the only one; see that method's doc for the full rule.
     pub fn sync_zone_points(&mut self, gs: &GameState) {
         // On zone change, load map labels from disk as fallback zone points.
         if gs.world.zone_name != self.current_zone {
@@ -4901,16 +4915,23 @@ mod tests {
     /// already-empty list and put nothing back, permanently dropping this zone's `"to "`-label
     /// fallback exits until some LATER crossing happened to re-arm the latch.
     ///
-    /// That is not a hypothetical branch. `classify_zone_change_echo`'s own doc records the path: a
-    /// death/bind respawn echoes the CURRENT zone id with no same-zone-pending flag, is classified
-    /// `CrossZoneReconnect`, and runs a full re-entry handshake with an UNCHANGED zone name. The
-    /// consequence is agent-visible and silent: `GET /v1/observe/zone_entrances` answers SHORT (it
-    /// lists only the server's OP_SendZonepoints adverts, and the map-label exits are exactly the
-    /// ones the server does not advertise) and `POST /v1/move/zone_cross` REJECTS a `zone_id` that
-    /// is genuinely reachable, because reachability is judged against that same list.
+    /// That is not a hypothetical branch, and it is not a single one either. `classify_zone_change_echo`
+    /// returns `CrossZoneReconnect` for ANY `success == 1` echo that is not (echo zone id == current
+    /// zone id AND a same-zone translocator pending), and that pending flag has exactly one writer —
+    /// `perform_cross`'s same-zone branch, which sends no OP_ZoneChange at all. So every
+    /// server-originated echo carrying the CURRENT zone id runs a full re-entry with an UNCHANGED
+    /// zone name: a death/bind respawn (the most common), a GM `#zone <this zone>`, a `/gate` bound
+    /// here, a server-resolved `zoneID = 0` cross that resolves back here, and a same-zone
+    /// translocator echo that lands after the 1500 ms pending window aged out. The consequence is
+    /// agent-visible and silent: `GET /v1/observe/zone_entrances` answers SHORT (it lists only the
+    /// server's OP_SendZonepoints adverts, and the map-label exits are exactly the ones the server
+    /// does not advertise) and `POST /v1/move/zone_cross` REJECTS a `zone_id` that is genuinely
+    /// reachable, because reachability is judged against that same list.
     ///
     /// So this test drives the real sequence: publish the labels through the real production hook,
-    /// apply the handshake's clear verbatim, then resync with the zone name UNCHANGED.
+    /// apply the handshake's clear verbatim, then resync with the zone name UNCHANGED. It fixes the
+    /// respawn as its concrete instance; the rule it pins is the name-unchanged one, which every
+    /// path above shares.
     ///
     /// **Mutation check:** change the `nav.sync_zone_points_after_zone_in(&gs)` call below back to a
     /// plain `nav.sync_zone_points(&gs)` and this goes RED with zero exits restored — that mutant IS
@@ -4921,11 +4942,19 @@ mod tests {
     ///
     /// One mutant SURVIVES and is worth naming rather than leaving for a reviewer to rediscover:
     /// replacing that `clear()` with `self.current_zone.truncate(1)` keeps this test GREEN. It is an
-    /// equivalent mutant, not a hole — the latch is a string EQUALITY test, so any value that is not
-    /// the current zone name falsifies it just as well as the empty string, and `"q" != "qeytoqrg"`.
-    /// `clear()` is the right spelling because it is the only one that is correct for EVERY zone
-    /// name (a one-char truncation of a one-char zone name would not falsify anything), but this
-    /// test cannot distinguish the two on this fixture and does not claim to.
+    /// equivalent mutant on every reachable input, not a hole — the latch is a string EQUALITY test,
+    /// so any value that is not the current zone name falsifies it just as well as the empty string,
+    /// and `"q" != "qeytoqrg"`. **Neither spelling is universally correct, and this doc does not
+    /// claim otherwise** (#1063 review round 1, finding 3): `truncate(1)` fails on a one-character
+    /// zone name, and `clear()` fails on the symmetric case — with `gs.world.zone_name == ""` and a
+    /// non-empty `current_zone`, `clear()` yields `"" == ""` and so takes the PRESERVE arm, i.e.
+    /// exactly the bug. `clear()` is using `""` as an "impossible zone name" sentinel, and `""` is
+    /// in fact the initial value and the post-failure value of `gs.world.zone_name`. That input does
+    /// not reach this line today — the only `zone_name.clear()` is the handshake's failure path,
+    /// which returns `false` before `run_gameplay_phase` gets to the resync — so this is a latent
+    /// robustness note, not a live bug. Making the claim true rather than trimmed would mean an
+    /// `Option<String>` latch, which removes the sentinel collision; that is a follow-up, not this
+    /// change. This fixture cannot distinguish the two spellings and does not try.
     #[test]
     fn a_same_zone_re_entry_restores_the_map_label_exits_the_handshake_cleared_1010() {
         let dir = tempfile::tempdir().unwrap();
@@ -4951,6 +4980,15 @@ mod tests {
         gs.world.zone_points.clear();
         nav.world.zone_points.lock().unwrap().clear();
 
+        // Poison `zone_map_load` so the assertion below can actually DISCRIMINATE (#1063 review
+        // round 1, finding 2). It is `None` both before and after a successful load, so asserting
+        // `None` on an untouched slot cannot fail for the reason a message about it would give.
+        // Only the REBUILD arm writes this slot (its `Ok` branch sets `None`, its `Err` branch sets
+        // `Some`); the preserve arm never touches it — so from a poisoned `Some` a `None` afterwards
+        // is a positive observation that the rebuild arm ran, not a restatement of the initial value.
+        *nav.world.zone_map_load.lock().unwrap() =
+            Some(eqoxide_core::zone_map::ZoneMapLoadError::Missing);
+
         // The zone name is UNCHANGED, so a plain `sync_zone_points` would take the preserve arm and
         // preserve nothing. The post-handshake resync must re-arm the latch first.
         nav.sync_zone_points_after_zone_in(&gs);
@@ -4961,8 +4999,9 @@ mod tests {
              POST /v1/move/zone_cross rejects a zone_id that is genuinely reachable — a confident \
              wrong answer, not a visible failure (#1010, #816 latch)");
         assert_eq!(*nav.world.zone_map_load.lock().unwrap(), None,
-            "and the rebuild arm really ran — a preserve-arm no-op would never have touched \
-             zone_map_load at all");
+            "and the REBUILD arm really ran: zone_map_load was poisoned to Some(Missing) just above, \
+             and only the rebuild arm writes this slot — the preserve arm never touches it — so a \
+             None here is the rebuild arm's successful load clearing the poison (#816, #1010)");
     }
 
     /// **#600 (review round 2): `drain_zone_cross` is the THIRD world-answering consumer, and it must

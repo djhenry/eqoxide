@@ -1089,7 +1089,14 @@ async fn run_zone_entry_handshake(
     //     addresses a spawn id that means something else here, or nothing.
     //   * `zone_points` is served by GET /v1/observe/zone_entrances (and its `/zone_points` alias)
     //     and is what POST /v1/move/zone_cross validates a requested `zone_id` against, so during
-    //     the window the exits answered are the departed zone's.
+    //     the window the exits answered are the departed zone's. GET /v1/observe/zone_exits reads
+    //     the same list too (#1063 review round 1, finding 5 — it was missing from this list): for
+    //     `dest_of` and to feed `classify_unresolved_cross`. On the cleared list it reports every
+    //     exit as `"zone_id": null` (documented as honestly UNKNOWN, #683) with `gated: true`,
+    //     which is what the net thread independently concludes from the same empty list — so that
+    //     endpoint degrades consistently and honestly, and needed no change here. (Separately and
+    //     PRE-EXISTING, not touched by #1010: its 503 asset gate keys on `s.player().zone`, which
+    //     during a handshake is still the DEPARTED zone's name.)
     //
     // The roster is cleared by PUBLISHING the just-emptied `gs.world.entities` through the sole
     // publisher rather than by touching the three maps: they are private behind the
@@ -1106,8 +1113,11 @@ async fn run_zone_entry_handshake(
     // here.
     //
     // The `zone_points` clear invalidates the zone-change latch `ActionLoop::sync_zone_points` keys
-    // on (#816), so both call sites resync through `ActionLoop::sync_zone_points_after_zone_in` —
-    // see that method for the one path (a same-zone death/bind respawn) where it is observable.
+    // on (#816), so both call sites resync through `ActionLoop::sync_zone_points_after_zone_in`,
+    // which re-arms it. That re-arm is load-bearing on EVERY re-entry whose zone NAME is unchanged —
+    // i.e. any server-originated `success = 1` OP_ZoneChange echo carrying the CURRENT zone id with
+    // no same-zone reposition pending. A same-zone death/bind respawn is the most common of those,
+    // NOT the only one, so the re-arm is unconditional; see that method's doc for the full rule.
     world.publish_entities(&gs.world.entities);
     world.zone_points.lock().unwrap().clear();
 
@@ -2811,6 +2821,85 @@ mod zone_entry_handshake_publish_tests {
         }
 
         handle.abort();
+    }
+
+    /// **#1010 (review round 1, finding 4): a SOURCE-TEXT PIN on the two PRODUCTION call sites.**
+    ///
+    /// The two tests above pin what `run_zone_entry_handshake` does with the slots it is HANDED.
+    /// Nothing pinned that `run_gameplay_phase` hands it the real ones. The round-1 reviewer
+    /// measured that hole with two mutants, both of which left the whole 430-test crate GREEN:
+    /// pointing both call sites at a throwaway `&eqoxide_ipc::WorldSlots::default()` (so the entire
+    /// fix writes into a discarded bundle), and reverting both post-handshake resyncs to a plain
+    /// `sync_zone_points` (which IS the pre-fix behaviour, i.e. the #816 latch defect this PR's
+    /// design check 3 exists to prevent). Both call sites need a real `EqStream::connect`, so a
+    /// behavioural test would need a live server.
+    ///
+    /// This is the idiom `eqoxide-net` already uses where the property is "the call site must be
+    /// written this way" and a behavioural test cannot reach it —
+    /// `the_only_raw_fd_socket_in_the_crate_is_the_manually_dropped_send_rescue` and
+    /// `there_is_exactly_one_socket_send_call_in_the_crate_and_it_records_failures` in
+    /// `transport.rs`.
+    ///
+    /// **Be exact about what this proves: WRITTEN, not REACHED.** It cannot show either call site
+    /// executes; it matches characters. That is precisely the property that is unpinned here, and a
+    /// pin on it is strictly better than nothing — but it must not be read as coverage of the
+    /// production paths.
+    ///
+    /// It anchors on `ActionLoop::controller_slots()`, which occurs at exactly the two production
+    /// call sites (every test in this module passes `&eqoxide_ipc::ControllerSlots::default()`
+    /// instead), and for each one checks two things:
+    ///
+    /// 1. **wiring** — the same argument list also passes `ActionLoop::world_slots()`, so the fix
+    ///    cannot be aimed at a throwaway bundle;
+    /// 2. **spelling AND position** — between that call's `.await;` and the NEXT production call
+    ///    site (or end of file), the first `ActionLoop::sync_zone_points…` that appears is the
+    ///    `_after_zone_in` one. That catches the plain-`sync_zone_points` revert, a single-site
+    ///    revert, and the resync being hoisted ABOVE its handshake (which would leave this call
+    ///    site's window with no resync in it at all).
+    ///
+    /// Needles are split with `concat!` so this test's own source text cannot satisfy them.
+    #[test]
+    fn the_two_production_zone_entry_handshake_call_sites_stay_wired_to_the_1010_slots() {
+        let src = include_str!("gameplay.rs");
+        let ctrl_arg = concat!("action_loop.", "controller_slots()");
+        let slots_arg = concat!("action_loop.", "world_slots()");
+        let any_resync = concat!("action_loop.", "sync_zone_points");
+        let good_resync = concat!("action_loop.", "sync_zone_points_after_zone_in(&gs);");
+
+        let sites: Vec<usize> = src.match_indices(ctrl_arg).map(|(i, _)| i).collect();
+        assert_eq!(sites.len(), 2,
+            "expected exactly the two production `run_zone_entry_handshake` call sites in \
+             `run_gameplay_phase` (the world-reconnect one and the zone-transition one); found {}. \
+             If a third real call site was added it needs the same #1010 wiring — add it here \
+             rather than relaxing this count.", sites.len());
+
+        for (n, &at) in sites.iter().enumerate() {
+            let window_end = sites.get(n + 1).copied().unwrap_or(src.len());
+            let rel_await = src[at..window_end].find(").await;").unwrap_or_else(|| panic!(
+                "production call site {n} does not close with `).await;` before the next one — this \
+                 pin's anchoring assumption no longer holds; re-derive it rather than deleting it"));
+            let arglist = &src[at..at + rel_await];
+            assert!(arglist.contains(slots_arg),
+                "production `run_zone_entry_handshake` call site {n} must pass \
+                 `ActionLoop::world_slots()` — without it the #1010 clears write into a bundle no \
+                 agent ever reads, and every test in this module still passes because they hand the \
+                 function its slots directly");
+
+            let tail = &src[at + rel_await..window_end];
+            let rel_sync = tail.find(any_resync).unwrap_or_else(|| panic!(
+                "production call site {n} has no `ActionLoop::sync_zone_points…` after its \
+                 `.await;` — the post-handshake resync is what re-arms the #816 zone-change latch \
+                 the handshake's `zone_points` clear invalidates, and hoisting it above the \
+                 handshake would leave the latch asserting a list that is about to be emptied"));
+            assert!(tail[rel_sync..].starts_with(good_resync),
+                "production call site {n} must resync through \
+                 `sync_zone_points_after_zone_in`, not plain `sync_zone_points`: the plain call IS \
+                 the pre-fix behaviour, and on every re-entry whose zone NAME is unchanged it takes \
+                 the preserve arm, drains the already-emptied published list and puts nothing back \
+                 — permanently dropping this zone's map-label fallback exits (#1010 design check 3, \
+                 #816). Found instead: {:?}",
+                tail[rel_sync..].chars().take(60).collect::<String>());
+        }
     }
 }
 
