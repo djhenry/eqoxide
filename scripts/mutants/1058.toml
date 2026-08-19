@@ -246,7 +246,7 @@ expect = "RED"
 
 [[mutant]]
 id = "disclosure-latch-never-set"
-description = "PROPERTY: the GATE closes — the disclosure is once per journey, not once per tick. Without the latch every tick of a long descent repeats the line and buries the log it exists to inform."
+description = "PROPERTY: the GATE closes — a disclosure is not repeated on the ticks that follow it. Without the latch every tick of a long descent repeats the line and buries the log it exists to inform."
 expect = "RED"
 
   [[mutant.edit]]
@@ -260,7 +260,7 @@ expect = "RED"
 
 [[mutant]]
 id = "disclosure-latch-never-reset"
-description = "PROPERTY: the gate REOPENS — the latch is per-journey, not per-process. The opposite direction from the row above and a different failure: HP changes between journeys, so a walker inside the guard's reach on one goto may be outside it on the next, and a stuck latch silently withholds a true statement about that one."
+description = "PROPERTY: the gate REOPENS — `reset_drive_state` clears the latch, so it is not per-process. The opposite direction from the row above and a different failure: HP changes between journeys, so a walker inside the guard's reach on one goto may be outside it on the next, and a stuck latch silently withholds a true statement about that one."
 expect = "RED"
 
   [[mutant.edit]]
