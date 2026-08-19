@@ -5787,6 +5787,31 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
                 "the row states an inert threshold that is not one above the ceiling ({})", c + 1);
         }
 
+        /// #1070: the same row promises a disclosure at the ledge, so it must say where that line
+        /// can be read. The surface is named in prose and nowhere else — a renamed route leaves the
+        /// sentence intact and still authoritative-looking — so pin the route and the `kind` an
+        /// agent has to filter on, and check the route the row cites is still documented.
+        #[test]
+        fn the_row_says_where_the_inert_disclosure_can_be_read() {
+            const API: &str = include_str!("../../../docs/http-api.md");
+            assert!(API.len() > 10_000,
+                "a truncated corpus would pass every line below without looking at anything");
+            const ROUTE: &str = "/v1/observe/messages";
+            assert!(!API.contains(&format!("{ROUTE}_log")),
+                "control: a route nothing serves must not be found by these searches");
+
+            let row = API.lines().find(|l| l.trim_start().starts_with("| `fall_would_be_lethal` |"))
+                .expect("docs/http-api.md must still carry the `fall_would_be_lethal` reason row");
+            assert!(row.contains(&format!("{ROUTE}?kind=zone")),
+                "the row must name the surface its disclosure lands on; row was: {row}");
+
+            let ep = API.lines().find(|l| l.trim_start().starts_with(&format!("| `GET {ROUTE}")))
+                .expect("the endpoint that row cites must still be documented");
+            assert!(ep.contains("zone"),
+                "the messages endpoint no longer advertises the `zone` kind the row sends readers \
+                 to; endpoint row was: {ep}");
+        }
+
         /// How many #1058 disclosures are sitting in the zone log.
         fn inert_notices(gs: &eqoxide_core::game_state::GameState) -> usize {
             gs.messages.iter().filter(|m| m.kind == "zone" && m.text.contains("eqoxide#1058")).count()
