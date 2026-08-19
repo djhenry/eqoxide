@@ -6,7 +6,6 @@
 > hand slot mapping wrong and proposes selecting one primitive per slot (primitives are
 > disjoint regions and must all be drawn). Use instead:
 > - Verified facts: `docs/equipment-textures-findings.md`
-> - Corrected design: `docs/superpowers/specs/2026-06-19-equipment-textures-design.md`
 
 ## Problem
 
