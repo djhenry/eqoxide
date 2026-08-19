@@ -1722,6 +1722,72 @@ pub type MessagesShared = Arc<Mutex<Vec<MessageEntry>>>;
 /// message), published each tick by the nav thread and read by GET /v1/observe/dialogue. (#120)
 pub type DialogueShared = Arc<Mutex<Vec<eqoxide_core::game_state::DialogueChoice>>>;
 
+/// ── The LIFE-HALT `nav_state` vocabulary (#1000/#1007, agent-honesty) ───────────────────────────
+///
+/// The two words the walker publishes when navigation is halted because the character is not in a
+/// state to walk. They live HERE, beside [`NavStatus`], rather than in `eqoxide-nav` where the rest
+/// of the vocabulary lives, because two crates that cannot see each other both need them:
+/// `eqoxide-nav`'s `Walker` WRITES them, and `eqoxide-command`'s `CommandState` must be able to
+/// RECOGNISE them so a goal-level event does not relabel one (see [`nav_state_is_life_halt`]).
+/// `eqoxide-nav` re-exports both under their historical names, so `walker::NAV_STATE_DEAD` still
+/// resolves.
+///
+/// **Why there are two words and not one.** The walker halts on
+/// `GameState::is_player_dead()` = `player_dead || (cur_hp <= 0 && max_hp > 0)`. Those two
+/// disjuncts do not carry the same authority. `player_dead` is the server's `OP_Death` and nothing
+/// else; the `cur_hp` disjunct fires on a published NUMBER, which is a weaker claim in both
+/// directions — it can be true before an `OP_Death` that is genuinely in flight, and it can be true
+/// when no death is coming at all. Publishing the single word `dead` for both put a life claim into
+/// the payload that the `player.dead` field — which is `player_dead` alone — contradicted in the
+/// SAME response (#1000; reproduced 2 of 2 live, in windows of 0.386 s and 2.477 s — the
+/// orchestrator's figures, reported under #1007's "Relationship to #1000" section, cited here and
+/// NOT re-derived in this change). One word per disjunct makes that contradiction unrepresentable:
+/// `dead` now implies `player.dead: true`, and the HP-only case says so in its own name.
+///
+/// Both are IN-PROGRESS words, deliberately absent from `eqoxide_nav::walker::TERMINAL_NAV_STATES`
+/// — see the trap documented on that array before adding either.
+///
+/// The server-confirmed halt: `OP_Death` has arrived and `GameState::player_dead` is set (#644).
+/// While this is published, the `dead` field on GET /v1/observe/debug reads `true` — the two agree
+/// by construction, which is the whole point of splitting the word.
+pub const NAV_STATE_DEAD: &str = "dead";
+
+/// The UNCONFIRMED halt: navigation is stopped because the client's published `hp` is at or below
+/// zero with a known `hp_max`, and **no `OP_Death` has arrived** (#1000/#1007). It is a statement
+/// about the HP reading, not about the character's life — say only what is known.
+///
+/// **This branch is not a corner case, and its reachability does not depend on any one way of
+/// getting to zero.** It fires on the published value, whatever produced it: an authoritative
+/// HP-to-0 that arrives before an `OP_Death` still in flight (the original justification for the
+/// disjunct, #238), a server value at or below 0 that is not a death at all, or — historically — a
+/// purely client-side artifact. The live reproduction behind #1000/#1007 was of the last kind (see
+/// #1005, addressed separately), so treat it as evidence that the branch is REACHED, not as a
+/// description of the only mechanism that reaches it. What this word fixes is orthogonal to all of
+/// them: whichever way `hp` got to zero, the client must not report a death it cannot evidence.
+/// In that reproduction `dead` was `false` in all 27,527 samples across both reproducing runs and
+/// no `OP_Death` packet existed, while the old single `dead` word claimed one anyway, beside a
+/// `player.dead: false` in the same payload. (Figures from #1007 §1, measured by the orchestrator
+/// on `36ea882`; not re-derived here.)
+pub const NAV_STATE_HALTED_HP_ZERO: &str = "halted_hp_zero";
+
+/// Is `state` one of the two LIFE-HALT words above — i.e. a claim about the character's condition
+/// that the walker owns, rather than an outcome of a navigation GOAL?
+///
+/// **The distinction is authority, not wording.** Only the walker evaluates
+/// `GameState::is_player_dead()`, so only the walker may retire a life-halt. Every other writer of
+/// `state` is reacting to a goal-level event — a `/stop`, a supersede, a zone change — none of
+/// which is evidence about whether the character can walk. Before this existed, the render thread's
+/// per-frame `request_cancel_goto` (WASD / `/v1/move/manual`) and the net thread's per-tick
+/// `nav_halt_if_dead` wrote the same field with no ordering between them, and the published word
+/// alternated between `idle` and `dead` with nothing underneath it changing — measured at 46
+/// alternations inside 0.386 s while `hp` held 0 and `dead` held `false` across all 230 samples
+/// (#1007 §1; that figure is the orchestrator's live measurement, not re-derived here). An agent
+/// polling once got either answer essentially at random; an agent polling twice saw a recovery that
+/// never happened.
+pub fn nav_state_is_life_halt(state: &str) -> bool {
+    state == NAV_STATE_DEAD || state == NAV_STATE_HALTED_HP_ZERO
+}
+
 /// Live navigation state for the active `/move/goto`, set by the nav thread and read by
 /// GET /v1/observe/debug. `state` is the agent-facing contract documented in `docs/http-api.md`:
 ///
