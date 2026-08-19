@@ -5726,6 +5726,12 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
             let s2 = nav2.nav_state.lock().unwrap().clone();
             assert_ne!(s2.reason.as_deref(), Some("fall_would_be_lethal"),
                 "one hp above the ceiling the guard cannot fire, so it must not be publishing that it did");
+            // The POSITIVE form as well: the tick must end on the ordinary walking row. Asserted
+            // because a `blocked` publication that a later line in the same tick overwrites is
+            // invisible to the negative assertion above — measured, not assumed (see the
+            // `inert-arm-also-blocks` row of scripts/mutants/1058.toml).
+            assert_eq!((s2.state.as_str(), s2.reason.as_deref()), ("navigating", None),
+                "an inert guard must leave the walker navigating, with no reason of any kind");
             assert!(nav2.goto_target.lock().unwrap().is_some(),
                 "a guard that cannot fire must not be dropping the goal either");
 

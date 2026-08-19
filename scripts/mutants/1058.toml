@@ -274,17 +274,24 @@ expect = "RED"
 
 [[mutant]]
 id = "inert-arm-also-blocks"
-description = "PROPERTY: the fix does not INVENT a stop where the old code descended. Make the `Inert` arm publish `blocked`/`fall_would_be_lethal` as well. That would be a lie in the cautious direction — the guard did not fire, it cannot fire — and it would change behaviour #1058 does not authorise changing."
+description = "PROPERTY: the fix does not INVENT a stop where the old code descended. Give the `Inert` arm the `Stop` arm's whole body — publish `blocked`/`fall_would_be_lethal`, drop the goal, return — which is a lie in the cautious direction (the guard did not fire; it CANNOT fire) and a behaviour change #1058 does not authorise. FIRST ATTEMPT AT THIS ROW WAS A MEASURED GREEN, and the reason is worth recording: it inserted only the `set_nav_state_because` call, which a later line in the SAME tick overwrites with the ordinary `navigating` row — an equivalent mutant, not an uncovered behaviour. That measurement is why the call-site test now also asserts the tick's published row POSITIVELY."
 expect = "RED"
 
   [[mutant.edit]]
   file = "crates/eqoxide-nav/src/walker.rs"
   anchor = '''
-                LedgeFallVerdict::Inert { max_dmg, ceiling } => {
+                            gs.cur_hp, ceiling));
+                    }
+                }
 '''
   replacement = '''
-                LedgeFallVerdict::Inert { max_dmg, ceiling } => {
+                            gs.cur_hp, ceiling));
+                    }
                     self.set_nav_state_because("blocked", Some("fall_would_be_lethal"));
+                    *self.nav.goto_target.lock().unwrap() = None;
+                    self.publish_debug(Self::known_pos(gs), None);
+                    return;
+                }
 '''
 
 [[mutant]]
