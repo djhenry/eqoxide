@@ -31,7 +31,7 @@ test-fixtures = []
 # absent from the lib target's NON-TEST build, not from the lib target. (#1042 review B3: an earlier
 # revision of this sentence dropped that qualifier and said flatly that cargo does not make
 # `serde_json` available to the lib target — which this crate's own src/ is the counterexample to,
-# and which contradicted src/zone_in.rs on the same branch.)
+# and which contradicted the qualifier src/zone_in.rs documents for `test-fixtures`.)
 # The pathfinding math is all plain `[f32; 3]` arrays, so it needs no glam; gltf comes
 # in transitively via eqoxide-assets' `ZoneAssets::from_glb`. (#1035: an earlier revision of this
 # comment said "ONLY those three internal crates plus tracing", which the `serde` entry in this same
