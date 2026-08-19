@@ -19,8 +19,20 @@ test-fixtures = []
 # deps are ONLY those three crates — never wgpu/winit/egui/tokio/axum/eq_net/renderer/app/movement/
 # http/ui/model. `tracing` and `serde` (for the diagnostics snapshot types, #608, below) are the only
 # external deps IN THIS BLOCK; the scope is the point, because [dev-dependencies] at the bottom of
-# this file adds `serde_json`, which is external too and which cargo does not make available to the
-# lib target. The pathfinding math is all plain `[f32; 3]` arrays, so it needs no glam; gltf comes
+# this file adds `serde_json`, which is external too. Cargo DOES link that into this crate's lib
+# target — but only when the lib is rebuilt with `--cfg test`, and as the tree stands that build is
+# its only consumer: there is no tests/, benches/ or examples/ dir, so the lib is this crate's only
+# target, and every `serde_json` call sits inside a `#[cfg(test)] mod` under src/. Measured both
+# directions rather than reasoned about: a non-test reference to `serde_json` added to src/lib.rs
+# fails the plain lib build with E0433 while the identical line compiles for the lib test target,
+# and commenting the dev-dep out leaves `cargo check -p eqoxide-nav` green but breaks
+# `eqoxide-nav (lib test)` at 15 sites, 11 in collision.rs and 4 in diagnostics.rs. The qualifier
+# doing the work is the same one src/zone_in.rs spells out for `test-fixtures`: a dev-dependency is
+# absent from the lib target's NON-TEST build, not from the lib target. (#1042 review B3: an earlier
+# revision of this sentence dropped that qualifier and said flatly that cargo does not make
+# `serde_json` available to the lib target — which this crate's own src/ is the counterexample to,
+# and which contradicted src/zone_in.rs on the same branch.)
+# The pathfinding math is all plain `[f32; 3]` arrays, so it needs no glam; gltf comes
 # in transitively via eqoxide-assets' `ZoneAssets::from_glb`. (#1035: an earlier revision of this
 # comment said "ONLY those three internal crates plus tracing", which the `serde` entry in this same
 # block already contradicted. The block scoping is #1042 review N3: an unqualified "the only external

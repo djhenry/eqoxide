@@ -2875,10 +2875,16 @@ mod cursor_resync_tests {
     ///
     /// * Because the `_helpers` opening line is tokenised like any other, the binding's own words
     ///   and the two type names in its annotation land in the set beside the real entries — today
-    ///   `let`, `_helpers`, and the two `Fn` aliases. Harmless: the set is only ever queried for
-    ///   membership by a cited name, and nothing in the file is named any of those. But anyone
-    ///   reading the set as a list of pinned names is reading four entries the guard never meant
-    ///   to hold, and a count of it is four too high.
+    ///   `let`, `_helpers`, and the two `Fn` aliases. Harmless — but not because the file names
+    ///   nothing like them, which an earlier revision of this paragraph claimed and which
+    ///   `type FixtureRunFn` and `type HairpinCarrotFn`, declared on the two lines just above the
+    ///   binding by the very annotation that puts them in the set, refute (#1042 review B4).
+    ///   Harmless upstream of the set instead: `doc_citations` emits a chunk only if it starts
+    ///   ASCII-lowercase and holds at least three underscores, so none of the four can ever be a
+    ///   cited name at all; and the one branch that reads this set is gated on the name already
+    ///   being a `#[test]` in this file, which a type alias is not. Still, anyone reading the set
+    ///   as a list of pinned names is reading four entries the guard never meant to hold, and a
+    ///   count of it is four too high.
     /// * An entry written ON the `_cited` opening line would be silently dropped. Nothing does
     ///   that today and nothing stops a later edit from doing it, so: keep `_cited` entries on
     ///   their own lines. That direction is the lying one, which is why it is called out here
