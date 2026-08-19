@@ -2716,19 +2716,36 @@ mod cursor_resync_tests {
     ///
     /// **The entries PARTITION by what they hold** — which is the accurate form of a sentence
     /// that used to state a consequence instead, and stated it as three-at-a-time. 1–2 are the two
-    /// constants the arithmetic is derived FROM; 3–4 are the two code literals in
+    /// CONSTANT-DEFINITION lines, and they hold their constants differently: entry 1 pins the line
+    /// defining the constant this test READS LIVE, while entry 2 pins `collision.rs`' copy of the
+    /// figure this test TYPES BY HAND. That difference is not cosmetic — it is why the two do not
+    /// red together, which the paragraph after next measures. 3–4 are the two code literals in
     /// `butcher_headroom_claim_check`; 5–6 are the two live restatements inside `MAX_NODES`' own
     /// doc comment; 7–8 are the restatements in `MEASURED_WORST_BUTCHER_PRODUCTION`'s doc comment
     /// and in `worst_case_reachable_component`'s MAGNITUDE comment; 9–10 are the two bound failure
-    /// messages. Editing any ONE site reds exactly that entry, and the failure message says so —
-    /// `1 of 10`, which is what #1038's round-2 review measured on two independent single-site
-    /// mutations, not the group the old sentence implied.
+    /// messages. Editing any ONE of the RESTATEMENT sites reds exactly that entry, and the
+    /// failure message says so — `1 of 10`, which is what #1038's round-2 review measured on two
+    /// independent single-site mutations, not the group the old sentence implied. The two CONSTANT
+    /// sites behave differently, because the arithmetic is derived from them; the next paragraph
+    /// measures how.
     ///
-    /// By construction, though — `pct` and `head` below are computed from `MAX_NODES` and the copy
-    /// of the measured close typed here — changing either of THOSE moves every derived string at
-    /// once, so entries 3–10 red together. Changing `MEASURED_WORST_BUTCHER_PRODUCTION` in
-    /// `collision.rs` alone reds entry 2 and nothing else, which is entry 2's whole job: it is the
-    /// one thing holding the typed copy to the constant it restates.
+    /// By construction `pct` and `head` below are computed from `MAX_NODES` and the copy of the
+    /// measured close typed here, so moving either of THOSE moves the eight strings derived from
+    /// them at once. But the two are NOT interchangeable, and an earlier revision of this
+    /// paragraph gave one range for both — #1038's round-3 review caught it. Measured, each
+    /// mutation run on a pristine tree and hand-reverted:
+    ///
+    /// | mutate | anchors that red | why |
+    /// |---|---|---|
+    /// | the copy typed below | entries 2–10, `9 of 10` | entry 2's needle is built from that copy as well |
+    /// | `MAX_NODES`' VALUE in `collision.rs` | entries 3–10, `8 of 10` | entry 1 reads that constant LIVE, so its needle self-updates with the edit |
+    /// | `MEASURED_WORST_BUTCHER_PRODUCTION` alone | entry 2, `1 of 10` | nothing else derives from the `collision.rs` copy |
+    ///
+    /// The middle row is the one to remember: entry 1 is NOT a value pin and cannot red on a
+    /// change to that constant's value. What it holds is the line's SHAPE — writing the same
+    /// number without its digit separators reds entry 1 and nothing else (`1 of 10`, measured).
+    /// Entry 2 is the mirror, and that is its whole job: it reds exactly when the two copies of
+    /// the measured close drift apart, in whichever direction they drift.
     ///
     /// **What it does NOT do**, stated because the sibling guards in this module have each had to
     /// learn it:
