@@ -1342,8 +1342,7 @@ pub type EntityPoses = Arc<Mutex<Roster<EntityPoseView>>>;
 ///
 /// Published by `ActionLoop::sync_zone_points` (server adverts + the client-synthesized `"to "`
 /// label entries), and EMPTIED by `gameplay::run_zone_entry_handshake` at the top of every zone-in
-/// (#1010) — that publisher's only caller is `run_gameplay_phase`'s packet drain, which a zone-in
-/// has not reached, so without the clear this list describes the DEPARTED zone for the whole
+/// (#1010) — without the clear this list describes the DEPARTED zone for the whole
 /// handshake. The handshake's clear is why the post-handshake resync must go through
 /// `ActionLoop::sync_zone_points_after_zone_in` rather than `sync_zone_points` directly.
 pub type ZonePoints = Arc<Mutex<Vec<eqoxide_core::game_state::ZonePoint>>>;

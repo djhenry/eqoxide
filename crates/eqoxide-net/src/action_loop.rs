@@ -1162,12 +1162,10 @@ impl ActionLoop {
     /// [`Self::controller_slots`] — a read-only borrow of the slots, not the loop.
     ///
     /// Two of its groups describe the zone we are LEAVING and have no publisher the handshake can
-    /// otherwise reach: the entity roster triple (`entity_positions`/`entity_ids`/`entity_poses`,
-    /// published only by [`Self::sync_entities`]) and `zone_points` (published only by
-    /// [`Self::sync_zone_points`]). Both of those `sync_*` calls have exactly one caller —
-    /// `run_gameplay_phase`'s packet drain — which the handshake never reaches, so
-    /// `GameState::begin_zone_in` emptying `gs.world.entities` / `gs.world.zone_points` does not
-    /// reach the copies an agent reads. See `gameplay::run_zone_entry_handshake`'s own comment.
+    /// otherwise reach: the entity roster triple (`entity_positions`/`entity_ids`/`entity_poses`)
+    /// and `zone_points`. `GameState::begin_zone_in` emptying `gs.world.entities` /
+    /// `gs.world.zone_points` does not reach the copies an agent reads. See
+    /// `gameplay::run_zone_entry_handshake`'s own comment.
     ///
     /// The roster half is why this hands out the whole bundle rather than the three maps: they are
     /// private behind the single-publisher seal (#665/#652) and can only be written through
@@ -1199,8 +1197,8 @@ impl ActionLoop {
     /// - A GM `#zone` naming the zone we are already in — `ZoneChangeEcho::CrossZoneReconnect`'s
     ///   own doc already lists a GM `#zone` among what it covers.
     /// - A crossing the SERVER resolves back to this zone. `Self::send_zone_change_packet` writes
-    ///   `zoneID = 0` on EVERY outgoing request (#199), so the client never names the destination;
-    ///   the server picks it from our position, and it may pick the zone we are standing in.
+    ///   `zoneID = 0` on EVERY outgoing request (#199); the server picks the destination from our
+    ///   position, and it may pick the zone we are standing in.
     /// - A client-fired same-zone translocator whose echo lands after
     ///   `Self::same_zone_reposition_pending`'s 1500 ms window has aged out — that flag is never
     ///   consumed, only aged, so a late echo classifies as a cross.
@@ -4932,8 +4930,7 @@ mod tests {
     /// server-originated echo carrying the CURRENT zone id runs a full re-entry with an UNCHANGED
     /// zone name: a death/bind respawn (the most common), any other server-initiated bind
     /// relocation landing in this zone, a GM `#zone` naming the zone we are already in, a crossing
-    /// the server resolves back here (every outgoing request carries `zoneID = 0`, #199, so the
-    /// server picks the destination), and a same-zone translocator echo that lands after the
+    /// the server resolves back here, and a same-zone translocator echo that lands after the
     /// 1500 ms pending window aged out. See `sync_zone_points_after_zone_in`'s doc for the
     /// derivation of each. The consequence is
     /// agent-visible and silent: `GET /v1/observe/zone_entrances` answers SHORT (it lists only the

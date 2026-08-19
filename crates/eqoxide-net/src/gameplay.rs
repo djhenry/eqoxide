@@ -1074,13 +1074,10 @@ async fn run_zone_entry_handshake(
     // ...and the PUBLISHED half of the entity roster and of this zone's exit points (#1010), for
     // exactly the reason the four clears above exist. `controller.begin_zone_in(gs)` has just
     // emptied `gs.world.entities` and `gs.world.zone_points`, but what an agent reads are the
-    // SHARED copies in `WorldSlots`, and each has exactly one publisher —
-    // `ActionLoop::sync_entities` (→ `WorldSlots::publish_entities`) and
-    // `ActionLoop::sync_zone_points` — whose sole caller is `run_gameplay_phase`'s packet drain,
-    // NOT the drain below. Without these two lines the DEPARTED zone's roster and exit points stay
-    // published, complete and well-formed, with no marker distinguishing them from a fresh publish,
-    // for the whole zone load (up to `ZONE_ENTRY_HANDSHAKE_DEADLINE`, 30 s) while `publish_snapshot`
-    // runs every 10 ms and keeps the HTTP session live and answering:
+    // SHARED copies in `WorldSlots`. Without these two lines the DEPARTED zone's roster and exit
+    // points stay published, complete and well-formed, with no marker distinguishing them from a
+    // fresh publish, for the whole zone load (up to `ZONE_ENTRY_HANDSHAKE_DEADLINE`, 30 s) while
+    // `publish_snapshot` runs every 10 ms and keeps the HTTP session live and answering:
     //
     //   * the roster triple backs NAME → SPAWN-ID resolution — GET /v1/observe/entities,
     //     POST /v1/interact/hail, /v1/merchant/open|buy|sell, /v1/trainer/open, /v1/move/goto by
@@ -2647,11 +2644,9 @@ mod zone_entry_handshake_publish_tests {
     /// **#1010 — the PUBLISHED half of the ENTITY ROSTER purge, pinned DURING the handshake window.**
     ///
     /// `GameState::begin_zone_in` empties `gs.world.entities`, but what an agent reads is the
-    /// roster triple in `WorldSlots` (`entity_positions`/`entity_ids`/`entity_poses`), whose only
-    /// publisher is `ActionLoop::sync_entities` → `WorldSlots::publish_entities`, and whose only
-    /// caller is `run_gameplay_phase`'s packet drain. This handshake runs its OWN drain and never
-    /// reaches that one, so before this fix the roster held the DEPARTED zone's entities for the
-    /// whole handshake — up to `ZONE_ENTRY_HANDSHAKE_DEADLINE` (30 s) — while `publish_snapshot`
+    /// roster triple in `WorldSlots` (`entity_positions`/`entity_ids`/`entity_poses`). Before this
+    /// fix the roster held the DEPARTED zone's entities for the whole handshake — up to
+    /// `ZONE_ENTRY_HANDSHAKE_DEADLINE` (30 s) — while `publish_snapshot`
     /// ran every 10 ms and kept the HTTP session live. That roster is what name → spawn-id
     /// resolution reads, so `POST /v1/interact/hail {"name":"…"}`, `/v1/merchant/open`,
     /// `/v1/trainer/open`, `/v1/move/goto` by name and the "is this spawn known?" gate on
@@ -2742,10 +2737,9 @@ mod zone_entry_handshake_publish_tests {
 
     /// **#1010 — the PUBLISHED half of the ZONE_POINTS purge, pinned DURING the handshake window.**
     ///
-    /// Same shape and same reason as the roster test above, for the other `WorldSlots` group whose
-    /// sole publisher (`ActionLoop::sync_zone_points`) is only ever called from
-    /// `run_gameplay_phase`'s drain. `GameState::begin_zone_in` clears `gs.world.zone_points`
-    /// (#683 review F2); the published list it is mirrored into is what
+    /// Same shape and same reason as the roster test above, for the other `WorldSlots` group.
+    /// `GameState::begin_zone_in` clears `gs.world.zone_points` (#683 review F2); the published
+    /// list it is mirrored into is what
     /// `GET /v1/observe/zone_entrances` (and its `/zone_points` alias) serves and what
     /// `POST /v1/move/zone_cross` validates a requested `zone_id` against — so for the whole
     /// zone-in window the exits an agent reads, and the reachability its crossing request is judged
