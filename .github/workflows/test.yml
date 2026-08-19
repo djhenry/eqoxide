@@ -231,7 +231,9 @@ jobs:
   # phrase in backticks while discussing it). The residual false positive is quoted verbatim in the
   # script so it is not met as a surprise. A fourth proposed cue, `commit <n>`, was DROPPED on the
   # same measurement: its only corpus occurrence is "(body 15, commit 14, reviewer 22)", three
-  # figures rather than an ordinal.
+  # figures rather than an ordinal. Every line a TEXT cue flagged was read and classified; the 171
+  # the sha rule flags were COUNTED, NOT CLASSIFIED, and the figure is stated that way on purpose —
+  # classifying them means adjudicating each citation against the premise this measurement disproves.
   #
   # SECOND PASS, SAME JOB (#1041): a NEGATED CLOSING KEYWORD. GitHub links
   # `close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved` to the `#<n>` after it and does

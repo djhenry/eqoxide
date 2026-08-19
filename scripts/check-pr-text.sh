@@ -596,6 +596,12 @@ negclose_attribution() {
 #   the set below, without the code-span strip                8 flagged lines, 6 true,  2 false (25%)
 #   the set below, as shipped                                 7 flagged lines, 6 true,  1 false (14%)
 #
+# EVERY LINE A TEXT CUE FLAGGED WAS READ AND CLASSIFIED — all 6, all 45, all 8, all 7. The sha row
+# is the one exception and it carries no true/false split because it has not earned one: those 171
+# lines are COUNTED, NOT CLASSIFIED. Classifying them would mean adjudicating each citation against
+# a premise this same measurement disproves, namely that a non-ancestor sha stops resolving. The
+# row still decides the question it is here for: 76 tokens flagged, at most 3 of them the class.
+#
 # The two TEXT cues as eqoxide#1051 words them are already low-noise; what makes the proposal
 # unshippable is its THIRD cue. That one flags 76 distinct tokens across 171 lines, and exactly 3
 # of the 76 are the references eqoxide#1051's own table points at — all 3 of which resolve, per the
