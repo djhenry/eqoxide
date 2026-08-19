@@ -2166,9 +2166,11 @@ mod zone_entry_handshake_publish_tests {
     /// Every other door-publish test in this module drives a pass that DOES drain a packet, so
     /// none of them can tell a gated publish from an ungated one — `publish_doors` fires on that
     /// pass either way. Measured directly: forcing the gate to
-    /// `if drained_a_packet || std::hint::black_box(true)` left all 416 of this crate's lib tests
-    /// green (see the issue). This is the missing negative case: a handshake that drains NOTHING
-    /// AT ALL must never call `publish_doors`.
+    /// `if drained_a_packet || std::hint::black_box(true)` left every pre-existing lib test in this
+    /// crate green (see the issue for the logged run). No absolute test count is quoted here, on
+    /// purpose: the first revision of this doc named one, and it was already wrong on the day it
+    /// landed, because every test added to this crate moves it. This is the missing negative case:
+    /// a handshake that drains NOTHING AT ALL must never call `publish_doors`.
     ///
     /// The top-of-function `doors.lock().unwrap().clear();` (#891/#934) runs unconditionally, so a
     /// sentinel seeded BEFORE the handshake starts is wiped by that clear regardless of the gate
@@ -2179,6 +2181,17 @@ mod zone_entry_handshake_publish_tests {
     /// observing whether it survives several 10ms drain-loop ticks with an empty `net_rx`
     /// (`_tx` is bound but never sent on, exactly like `never_sends_a_second_zone_entry_on_a_single_session`
     /// above, so `drained_a_packet` is false on every single pass for the rest of this test).
+    ///
+    /// **THE TWO SLEEPS ARE THIS TEST'S ONLY LOAD-BEARING TIMING ASSUMPTION, and they fail SAFE
+    /// (#1042 review N4).** The first must outlast the handshake's synchronous startup section, so
+    /// the sentinel write lands strictly after the unconditional clear; the second must span
+    /// several of the drain loop's 10ms ticks. Both directions of error are the harmless one. If a
+    /// contended box has not finished startup inside the first window, the clear lands after the
+    /// sentinel write, the sentinel is gone, and this test goes RED — a spurious failure, never a
+    /// false green. And lengthening either sleep can only make the test STRICTER, since every
+    /// extra millisecond is one more no-drain pass an ungated publish would have to survive
+    /// without wiping the sentinel. So if this ever flakes, raise the first constant; do not
+    /// shorten it and do not weaken the assertion.
     ///
     /// MUTATION CHECK (#1025, run and log-verified before this test was added): gate forced to
     /// `drained_a_packet || std::hint::black_box(true)` → RED — the sentinel is gone within the

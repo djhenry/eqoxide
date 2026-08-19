@@ -2860,6 +2860,29 @@ mod cursor_resync_tests {
     /// `//` living inside a string or char literal — because this block's content is restricted by
     /// construction to bare identifiers, commas and whitespace; no citation guard entry is ever a
     /// string or char literal, so there is nothing here for a naive split to cut through by mistake.
+    ///
+    /// **THE TWO ARMS ARE ASYMMETRIC ON PURPOSE, and this paragraph is the decision #1017 asked
+    /// for** ("decide and document which behaviour is intended rather than preserving the asymmetry
+    /// by accident"). The `_cited` arm `continue`s past its opening line; the `_helpers` arm does
+    /// not. Keeping that is not tidiness deferred — it is load-bearing. The `_helpers` guard in
+    /// this file is written as ONE line that opens and closes at once, so its entries live on the
+    /// opening line; a `continue` there would drop every one of them and silently empty that half
+    /// of the guard, which is the exact failure direction #911 and #1017 are both about. The
+    /// `_cited` guard's opening line carries only the binding and its type, so skipping it costs
+    /// nothing.
+    ///
+    /// The two prices of keeping it, measured over this file rather than reasoned about:
+    ///
+    /// * Because the `_helpers` opening line is tokenised like any other, the binding's own words
+    ///   and the two type names in its annotation land in the set beside the real entries — today
+    ///   `let`, `_helpers`, and the two `Fn` aliases. Harmless: the set is only ever queried for
+    ///   membership by a cited name, and nothing in the file is named any of those. But anyone
+    ///   reading the set as a list of pinned names is reading four entries the guard never meant
+    ///   to hold, and a count of it is four too high.
+    /// * An entry written ON the `_cited` opening line would be silently dropped. Nothing does
+    ///   that today and nothing stops a later edit from doing it, so: keep `_cited` entries on
+    ///   their own lines. That direction is the lying one, which is why it is called out here
+    ///   rather than left to be rediscovered.
     fn guard_entries(src: &str) -> std::collections::HashSet<String> {
         let mut out = std::collections::HashSet::new();
         let mut depth: Option<&str> = None;
