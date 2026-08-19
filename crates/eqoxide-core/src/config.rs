@@ -498,10 +498,9 @@ pub struct LoginConfig {
     pub create:         Option<CharacterCreate>,
 }
 
-/// Appearance + stat allocation for creating a new character. Mirrors the
-/// fields the native Titanium character-creation screen sends in
-/// CharCreate_Struct. Stats must satisfy the server's per-class/race floors
-/// and total; cosmetic fields default to 0.
+/// Appearance + stat allocation for creating a new character. Stats must
+/// satisfy the server's per-class/race floors and total; cosmetic fields
+/// default to 0.
 #[derive(Clone, Debug)]
 pub struct CharacterCreate {
     pub race:       u32,

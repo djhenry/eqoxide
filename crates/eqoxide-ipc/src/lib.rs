@@ -485,8 +485,7 @@ pub type NavIntent = Arc<Mutex<Option<MoveIntent>>>;
 /// (teleport). Small deltas are ignored — the controller is authoritative (design §3.4).
 pub type PosCorrection = Arc<Mutex<Option<[f32; 3]>>>;
 
-/// Single-owner GameState publication (see
-/// docs/superpowers/plans/2026-07-12-gamestate-single-owner-snapshot.md). The network thread is
+/// Single-owner GameState publication. The network thread is
 /// the sole writer of `GameState`; it publishes an immutable clone here after every gameplay tick
 /// via `eq_net::gameplay::publish_snapshot`. Render/HTTP consumers read it lock-free via `.load()`
 /// (borrowed) or `.load_full()` (owned `Arc<GameState>`).

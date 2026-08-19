@@ -4,7 +4,7 @@
 //! exchanges `OP_ChannelMessage`s. This module starts with parsing that bootstrap packet; the
 //! connection + login + message routing build on top.
 //!
-//! See bugs/cross-zone-chat-needs-ucs.md and EQEmu ucs/clientlist.cpp for the server side.
+//! See EQEmu ucs/clientlist.cpp for the server side.
 
 // The `UcsInfo` POD moved DOWN into `eqoxide-core` (#544 Step 2b) so `game_state` (now also in
 // core) no longer up-references this `eq_net` layer. Re-export it here so every existing

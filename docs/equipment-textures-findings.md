@@ -123,5 +123,4 @@ plan's `0x6427` is unverified.
 
 ## Related
 
-- Design/plan: `docs/superpowers/specs/2026-06-19-equipment-textures-design.md`.
 - Superseded (incorrect) plan: `docs/equipment_texture_plan.md`.
