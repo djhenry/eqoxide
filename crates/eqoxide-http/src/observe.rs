@@ -744,14 +744,13 @@ const NO_COMPLETENESS_SIGNAL: &str =
 /// worse lie — but it makes the ambiguous empty the NORMAL reading for the length of a zone-in
 /// rather than a rare one.
 ///
-/// **Which of #939's three options this is, and why the other two are not available.** #939 asked
+/// **Which of #939's three options this is, and why the other two are not built here.** #939 asked
 /// for one of: (1) a nullable reason naming *why* the roster is empty, mirroring #816's
 /// `zone_map_load`; (2) a server-advertised total the client could compare its holdings against; or,
 /// failing both, (3) an explicit "no completeness signal exists" field, so the endpoint discloses
-/// its own limit in band rather than only in prose. This is **(3)**. (1) cannot be built for the
-/// residual case because naming the reason *is* the thing the client cannot do — "not sent yet" and
-/// "none exist" are the two readings, and no observation here separates them; that is the whole
-/// content of the residual. (2) cannot be built because no message in this protocol carries a door,
+/// its own limit in band rather than only in prose. This is **(3)**. (1) is not built here because
+/// this client never reads the packet that would separate "not sent yet" from "none exist", so it
+/// has no reason to name. (2) cannot be built because no message in this protocol carries a door,
 /// spawn or zone-point total. `zone_map_load` stays what it is: a real terminal fact about ONE
 /// additive contributor to `zone_entrances` (#816), not a completeness verdict on the roster.
 ///

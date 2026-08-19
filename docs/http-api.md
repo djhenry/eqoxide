@@ -1016,14 +1016,13 @@ makes the ambiguous empty the NORMAL reading for the length of a zone-in rather 
 - **`no_completeness_signal`** — the same statement in words, published in band so an agent gets it
   off the payload it is already reading rather than out of this file, which it never sees.
 
-**Why `complete` cannot be anything else.** #939 asked for one of three things, in cost order: (1) a
+**Why `complete` is `null` today.** #939 asked for one of three things, in cost order: (1) a
 nullable reason naming *why* the roster is empty, mirroring
 [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816); (2) a
 server-advertised total to compare holdings against; or, failing both, (3) an explicit "no
 completeness signal exists" field, so the endpoint discloses its own limit in band rather than only
-in prose. **This is (3).** (1) cannot be built for this case, because naming the reason *is* the
-thing the client cannot do — "not sent yet" and "none exist" are the two readings, and no
-observation here separates them; that is the whole content of the residual #939 case. (2) cannot be
+in prose. **This is (3).** (1) is not built here because this client never reads the packet that
+would separate "not sent yet" from "none exist", so it has no reason to name. (2) cannot be
 built because no message in this protocol carries a door, spawn or zone-point total. `zone_map_load`
 stays what it is: a terminal fact about one *additive* contributor to `zone_entrances` (#816), not a
 completeness verdict on any roster: it reports the outcome of that `.txt` load and nothing else, so
