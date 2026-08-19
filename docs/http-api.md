@@ -33,16 +33,16 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct` plus [`hp_verified`](#hp_verified--is-the-hp-in-this-payload-the-servers-1005) — **read it before acting on `hp`**: `false` means at least one of those three vitals is a number the client inferred, not a figure the server sent, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_stall`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + **camera state** (`camera`, describing the last frame ACTUALLY DRAWN, not the current tick — read `drawn_frame`/`drawn_age_ms` first, and note that the `snapshot_age_ms` in the same payload is the network clock and does not age it; see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867)). |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct` plus [`hp_verified`](#hp_verified--is-the-hp-in-this-payload-the-servers-1005) — **read it before acting on `hp`**: `false` means at least one of those three vitals is a number the client inferred, not a figure the server sent, `levitating` (three-valued `true`/`false`/`null` — see [`levitating`](#levitating--three-valued-levitate-buff-state-not-a-gravity-reading-598)), target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation — SPLIT ACROSS TWO NESTING LEVELS; this grouping is by topic, not by where the field lives** (under `player`: `nav_state`, `nav_reason`, `position_provisional`, `crossing_pending_ms`. Top-level, siblings of `player`, NOT under it — same convention as `last_consider`: `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `nav_local`, `nav_local_planner_dead`, `nav_stall`, `nav_support`, `nav_tight`; they sit outside `player` because that object is already at serde_json's macro recursion limit — see [Navigation state](#navigation-state), [The fine steering tier](#the-fine-steering-tier-nav_local--382) for `nav_local` and [`nav_local_planner_dead`](#nav_local_planner_dead--fine-planner-liveness-session-scoped) — the **session-scoped** fine-planner liveness flag, the one nav field that is always present rather than `null` when healthy, and the one to poll for a dead fine planner because `nav_local` retires with the goal — and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_starved`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`zone_map_load`** (`null` while this zone's map-labeled fallback entries in `zone_entrances` loaded fine (or none were needed yet); `{reason, detail}` once that `.txt` read failed — see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816)) + **`server_pushed_rosters`** (top-level, ALWAYS present: the `doors`/`entities`/`zone_entrances` rosters with the count `held` and `complete: null`, plus the `no_completeness_signal` sentence saying why `complete` is never anything else — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073)) + **`zone_cross_best_effort`** and **`zone_cross_stopped`** (top-level, `null` while there is nothing to disclose — see [Zone-cross degradations you can detect](#zone-cross-degradations-you-can-detect-713)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + **camera state** (`camera`, describing the last frame ACTUALLY DRAWN, not the current tick — read `drawn_frame`/`drawn_age_ms` first, and note that the `snapshot_age_ms` in the same payload is the network clock and does not age it; see [Camera freshness](#camera-freshness-drawn_frame--drawn_age_ms-867)). |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. Optional `preset`/`pitch`/`yaw`/`distance` params request a one-off diagnostic camera angle for just this capture — see [Camera override for `/frame`](#camera-override-for-observeframe-422). |
-| `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses, snapshot_age_ms}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. The default bare-map shape carries the same freshness value in the `X-Snapshot-Age-Ms` header instead — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646). |
+| `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses, snapshot_age_ms}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. The default bare-map shape carries the same freshness value in the `X-Snapshot-Age-Ms` header instead — see [Per-endpoint freshness](#per-endpoint-freshness--snapshot_age_ms-646). **An empty body does not mean "this zone is empty"**: zone-in clears the published roster (#1010/#1063) and it refills from spawn packets, so during that window `{}` is "not published yet" — and there is no `ready` gate to wait for, because this endpoint is not derived from loaded geometry. See [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency, coin_verified, snapshot_age_ms}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
 | `GET /v1/observe/messages[?kind=npc]` | Machine-readable message log (oldest→newest). `{count, messages, snapshot_age_ms}`; each line `{kind, text, keywords}`; `kind` ∈ npc/chat/combat/system/exp/loot/trade/zone. This is how you read NPC dialogue. |
 | `GET /v1/observe/dialogue` | Pending NPC dialogue/quest choices `{count, choices:[{index, text}], snapshot_age_ms}`. |
 | `GET /v1/observe/spells` | The 9 memorized gems `{gems:[{gem, spell_id, name}], snapshot_age_ms}` (empty = null). |
 | `GET /v1/observe/skills` | All skills with current trained value `{skills:[{id, name, value}], snapshot_age_ms}`; `value == 0` means untrained. |
-| `GET /v1/observe/doors` | Current zone's doors — a bare array `[{door_id,name,x,y,z,heading,opentype,is_open}]`; freshness rides the `X-Snapshot-Age-Ms` header (no room for a JSON key on a bare array). |
-| `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side — see [Navigation state](#navigation-state) for the distinction from `zone_exits`), plus a handful of client-synthesized entries read from the CURRENT zone's own map (the heuristic only ever recognizes a label naming North/South Qeynos or Qeynos2, but — measured — five zones' shipped map packs actually carry such a label: see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) for the list and method). Also served at the deprecated alias `GET /v1/observe/zone_points`. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. **If those synthesized entries failed to load, this list is silently short** — check [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) on `/v1/observe/debug`. This same list also backs `POST /v1/move/zone_cross`'s reachable-`zone_id` check and the walker's `no_zone_line_to_zone` result — a load gap here is not only a reporting gap, it can change what a crossing request does. |
+| `GET /v1/observe/doors` | Current zone's doors — a bare array `[{door_id,name,x,y,z,heading,opentype,is_open}]`; freshness rides the `X-Snapshot-Age-Ms` header (no room for a JSON key on a bare array). **`[]` does not mean "this zone has no doors"** — the roster is server-pushed and zone-in empties it, so an empty body is "no record held", not "none exist"; see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
+| `GET /v1/observe/zone_entrances` | Zone entrance points received from the server (arrival side — see [Navigation state](#navigation-state) for the distinction from `zone_exits`), plus a handful of client-synthesized entries read from the CURRENT zone's own map (the heuristic only ever recognizes a label naming North/South Qeynos or Qeynos2, but — measured — five zones' shipped map packs actually carry such a label: see [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) for the list and method). Also served at the deprecated alias `GET /v1/observe/zone_points`. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. **If those synthesized entries failed to load, this list is silently short** — check [`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816) on `/v1/observe/debug`. This same list also backs `POST /v1/move/zone_cross`'s reachable-`zone_id` check and the walker's `no_zone_line_to_zone` result — a load gap here is not only a reporting gap, it can change what a crossing request does. Separately from that load gap, **`[]` does not mean "this zone has no entrances"**: zone-in empties this list too (#1010/#1063) and the server-advertised entries refill on no schedule the client controls — see [`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073). |
 | `GET /v1/observe/zone_exits` | Current zone's exits (the WLD zone-line regions you navigate toward — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579) for its 503 gating). An entry with `"zone_id": null` is a REAL exit region whose baked index matches no advertised zone point (#683) — its destination is honestly unknown until the server resolves a crossing there. Crossing it works **only if this zone advertises no same-zone teleport point and server zone points are available** (received and not all filtered client-side) — the same #679 gate that keeps the client from firing a blind crossing off an intra-zone pad. In a gated zone (e.g. one with teleport pads), standing on a `zone_id: null` exit does NOT cross. **Each entry carries `"gated": true|false` (#713)** — it reports the **#679/#683 zone-level** unresolved-cross gate and nothing else, so you can see that refusal **before** walking there instead of reading about it in the message log after. **`gated` is a property of the zone and the entry, not of you**: your position is not an input to it. `gated` is only ever `true` for `zone_id: null` entries (an advertised destination is crossed directly and is never subject to the #679 gate); it **reports** the gate verdict and does not change it. **`gated: false` is not a promise the auto-cross will fire.** It says only that this gate is open — the stand-scoped [#713 attempt bound](#zone-cross-degradations-you-can-detect-713) can independently have stopped auto-crossing, and `zone_exits` never consults it, so cross-check `zone_cross_stopped` on `/v1/observe/debug` before concluding an exit is broken. The message-log line ("auto-cross is disabled here", once per stand) is still emitted for callers that watch events. A bare array; freshness rides the `X-Snapshot-Age-Ms` header. |
 | `GET /v1/observe/item_text` | Text of the most recently read book/note `{text, snapshot_age_ms}` (`text: null` if none read this session). |
 | `GET /v1/observe/packets[?summary=1]` | Packet-telemetry ring dump (#525), default-off capture. `{enabled, count, packets, snapshot_age_ms}`, or with `?summary=1`, `{enabled, summary, snapshot_age_ms}` (opcode histogram + reliable-sequence-gap analysis). |
@@ -912,19 +912,26 @@ a PNG body has no room for an in-band field, so the same freshness clock every o
 carries rides this header instead.
 
 **Endpoints that are deliberately NOT gated**, because they do not read zone geometry or collision:
-`/v1/observe/doors` and `/v1/observe/zone_entrances` (both are server-pushed lists, not derived from
-the collision grid), and `/v1/move/manual` and `/v1/move/jump`
+`/v1/observe/doors`, `/v1/observe/entities` and `/v1/observe/zone_entrances` (all three are
+server-pushed lists, not derived from the collision grid), and `/v1/move/manual` and `/v1/move/jump`
 (they drive the controller directly and make no routing claim — though with no collision loaded the
 character is moving through a world the client has not built, so prefer waiting for `ready`).
 
-**Ungated is not the same as honest during a load, and `/v1/observe/doors` is the case that
-matters.** Zoning empties the door roster (#891), and — like `zone_exits` before #803 — a `[]` from
-an emptied roster is the same bytes as the true answer "this zone has no doors". Unlike
-`zone_exits`, there is no `ready` gate to wait on here, because doors are a server-pushed list, not
-a derivation from loaded geometry (see "Endpoints that are deliberately NOT gated" above).
+**Ungated is not the same as honest during a load, and it applies to each of those three observe
+endpoints.** Zoning empties all three server-pushed rosters — the door roster (#891), and the entity
+roster and `zone_points` (#1010/#1063) — and, like `zone_exits` before #803, an empty body from an
+emptied roster is the same bytes as the true answer "this zone has none of these". Unlike
+`zone_exits`, there is no `ready` gate to wait on for any of them, because they are server-pushed
+lists, not derivations from loaded geometry (see "Endpoints that are deliberately NOT gated" above).
+The three are enumerated in band, with the client's own limit stated alongside them, on
+`GET /v1/observe/debug` — see
+[`server_pushed_rosters`](#server_pushed_rosters--what-an-empty-roster-means-939-1073).
 
-**One of the two things that used to produce that ambiguous `[]` is now addressed on both zone-entry
-paths (#937/#1016, then #1022).** Each zone-entry path parses and applies door records on its OWN
+The rest of this subsection is about **doors specifically**, whose publishing side has its own
+history; `entities` and `zone_entrances` are covered in the linked section above.
+
+**For doors, one of the two things that used to produce that ambiguous `[]` is now addressed on both
+zone-entry paths (#937/#1016, then #1022).** Each zone-entry path parses and applies door records on its OWN
 drain loop, separate from the post-handshake gameplay drain that normally republishes them. Until
 #937 neither of those drains called the publish step at all, so a door applied mid-zone-in stayed
 unpublished — readable nowhere — until the first drain pass *after* the zone-in finished, no matter
@@ -941,9 +948,9 @@ how early it had actually arrived.
   identical per-pass gate, and any failed login attempt clears the roster it published rather than
   leaving a partial one readable across the retry backoff and the next attempt.
 
-**What remains is #939 on both paths, plus a one-drain-pass residue of #937's shape on both.** A
-zone-in that has not yet delivered its *first* door record reads as an empty, doorless zone (#939,
-unchanged) — that ambiguity has no packet to publish and nothing this client can do about it. And
+**What remains for doors is #939 on both paths, plus a one-drain-pass residue of #937's shape on
+both.** A zone-in that has not yet delivered its *first* door record reads as an empty, doorless
+zone (#939, unchanged) — that ambiguity has no packet to publish and nothing this client can do about it. And
 because each zone-entry drain applies every packet of a pass and publishes once at the end of it, a
 record applied earlier in the same pass is still unpublished for the remainder of that pass. That
 residue is bounded by one drain iteration rather than by a whole zone-in, but it is not zero, and
@@ -960,6 +967,86 @@ not as *this zone has no doors*, until the zone-in has otherwise finished.
 `POST /v1/move/goto` still accepts the goal, but its response carries a non-null
 **`zone_assets_pending`** note while the assets are missing, and `nav_state` reads `zone_loading`
 until they land.
+
+### `server_pushed_rosters` — what an empty roster means (#939, #1073)
+
+Top-level on `GET /v1/observe/debug`, **always present** — in every state, unlike the
+`null`-when-healthy fields around it. It is not a fault report that appears when something breaks;
+it is a standing statement of a limit that never goes away, and an absent key would be
+indistinguishable from an older client that never had it.
+
+Three `observe` endpoints serve a roster the client fills from records the *server* pushes, rather
+than deriving anything itself:
+
+| Roster key | Endpoint | Filled from |
+|---|---|---|
+| `doors` | `GET /v1/observe/doors` | `OP_SpawnDoor` records |
+| `entities` | `GET /v1/observe/entities` | spawn packets |
+| `zone_entrances` | `GET /v1/observe/zone_entrances` (alias `/zone_points`) | `OP_SendZonepoints` |
+
+For all three, an empty body has two readings — *this zone has none* and *the records have not
+arrived yet* — and nothing published told them apart. Every zone-entry path clears all three (doors
+#891; the entity roster and `zone_points` #1010/#1063), which is the right call — serving the zone
+you just left is the worse lie — but it makes the ambiguous empty the NORMAL reading for the length
+of a zone-in rather than a rare one.
+
+```jsonc
+"server_pushed_rosters": {
+  "rosters": {
+    "doors":          { "endpoint": "/v1/observe/doors",          "held": 0, "complete": null },
+    "entities":       { "endpoint": "/v1/observe/entities",       "held": 0, "complete": null },
+    "zone_entrances": { "endpoint": "/v1/observe/zone_entrances", "held": 0, "complete": null }
+  },
+  "no_completeness_signal": "…the sentence every `complete` above is null for…"
+}
+```
+
+- **`held`** — how many entries that roster held when this payload was built, counted off the same
+  shared slot the endpoint serves. For `entities` it is the **deduped** count (#471) — the same
+  projection the endpoint returns, not the raw table behind it. It is a reading, not a prediction:
+  two separate HTTP requests can straddle a publish, so `held` does not promise what a later `GET`
+  on that endpoint will return.
+- **`complete`** — **`null` on every roster, always.** No code path in this client sets it to `true`
+  or `false`, and this document is not promising one will. It is spelled as a three-valued field so
+  that "unknown" is something you *read* rather than infer from an absent key, and so that a roster
+  which one day acquires a real signal has somewhere to put it without a shape change.
+- **`no_completeness_signal`** — the same statement in words, published in band so an agent gets it
+  off the payload it is already reading rather than out of this file, which it never sees.
+
+**Why `complete` cannot be anything else.** #939 asked for one of three things, in cost order: (1) a
+nullable reason naming *why* the roster is empty, mirroring
+[`zone_map_load`](#zone_map_load--the-map-labeled-fallbacks-load-outcome-816); (2) a
+server-advertised total to compare holdings against; or, failing both, (3) an explicit "no
+completeness signal exists" field, so the endpoint discloses its own limit in band rather than only
+in prose. **This is (3).** (1) cannot be built for this case, because naming the reason *is* the
+thing the client cannot do — "not sent yet" and "none exist" are the two readings, and no
+observation here separates them; that is the whole content of the residual #939 case. (2) cannot be
+built because no message in this protocol carries a door, spawn or zone-point total. `zone_map_load`
+stays what it is: a terminal fact about one *additive* contributor to `zone_entrances` (#816), not a
+completeness verdict on any roster: it reports the outcome of that `.txt` load and nothing else, so
+it says nothing about whether the server-advertised entries have arrived.
+
+**`zone_assets.state` is not this signal.** It gates loaded terrain and collision — geometry — not
+which packets have arrived. That is why none of these three endpoints is gated on it (see
+"Endpoints that are deliberately NOT gated" above), and why `ready` is not something to wait for
+before believing a roster.
+
+**The limit binds the populated case too.** A non-empty roster is not a closed set either: it grows
+as further records arrive. "Not among the entries held right now" is the strongest claim available
+at any size, which is why `POST /v1/interact/click_door` answers a lookup miss with `404` *unknown*
+rather than *disproved*. Do not read a populated list as a complete one.
+
+**What this does not do.** It publishes no new fact about the world — it publishes the client's own
+limit, so an agent can stop mistaking an empty roster for a reading of an empty zone. If you need to
+positively confirm a record landed rather than infer it, the recourse is unchanged: re-list, or
+packet capture, with the retroactivity caveat spelled out for doors under
+[`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579) above.
+
+**The enumeration is checked against the routes, not asserted.** `observe.rs`'s
+`server_pushed_roster_completeness_939_1073` tests drive every endpoint the payload names and
+compare its entry count against the `held` the same payload published, and assert the key set is
+exactly these three — so the list cannot drift from what the router serves, and no member can be
+dropped or crowned.
 
 ### Zone exits: `[]` means exactly one thing (#803)
 
