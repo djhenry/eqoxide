@@ -84,14 +84,25 @@ Summary tables below; each cites its own EQEmu source directly. (This section or
 here at a private working note, `~/git/eq_kb/character-creation.md`, as the consolidated citation
 for the whole section. That note has no history in the private knowledge-base repo at all — checked
 via `git rev-list --objects --all` there, zero blobs of that name — so it dangled from the day the
-KB migrated. It is not restored; every table below already names its own EQEmu source inline, so
-nothing here actually depended on it except the one item flagged UNCITED below.)
+KB migrated. It is not restored, and it is not repointed at a lookalike: every table below names
+its own EQEmu source inline instead — including the per-class deity restrictions, which are sourced
+below to EQEmu's own seed rows for `char_create_combinations`. Nothing in this section is left
+UNCITED.)
 
 ### Race IDs (`common/races.h`)
 Human=1, Barbarian=2, Erudite=3, Wood Elf=4, High Elf=5, Dark Elf=6, Half Elf=7, Dwarf=8, Troll=9,
 Ogre=10, Halfling=11, Gnome=12, Iksar=128, Vah Shir=130. (Froglok=330/Drakkin=522 exist in tables but
-are not Titanium-creatable — hide.) Verified against `common/races.h`'s `Race` namespace constants:
-every value above matches exactly.
+are not Titanium-creatable — hide.) The **fourteen creatable** values above match the `Race`
+namespace constants in `common/races.h` one-for-one: `races.h:45–56` for Human…Gnome, `:172` Iksar,
+`:174` VahShir.
+
+> ⚠ The two hidden ids do **not** both match by name. Drakkin=522 is `Race::Drakkin`
+> (`races.h:566`), but 330 is `Race::Froglok2` (`races.h:374`) — `Race::Froglok` is **26**
+> (`races.h:70`), a different, non-creatable race. 330 is nonetheless the correct id for the
+> creatable froglok: it is the only froglok race id appearing in `char_create_combinations` (26
+> appears in no row of the seed — see the deity section below for that file). So the number is
+> right and the *name* is the trap. Same name-collision shape as `Agnostic1`/`Agnostic2` below;
+> code that resolves either of these by constant name will pick the wrong one.
 
 ### Race/class validity matrix (`ClassRaceLookupTable`, EQEmu `world/client.cpp:2053`)
 ```
@@ -146,21 +157,60 @@ sent[s] <= base[s] + pool               (per stat)
 sum(sent) == sum(base) + pool           (EXACT — Create disabled while points remain)
 ```
 Deity and appearance are **not** server-validated on Titanium (`client.cpp:2159`) but the UI should
-still constrain them to native choices.
+still constrain them to native choices. **This is a Titanium-only statement.** This repo targets
+RoF2, where deity *is* validated and a mismatch aborts the create — see the deity section below.
 
 ### Deity IDs (`deity.h`)
 Agnostic=396, Bertoxxulous=201, BrellSerilis=202, Cazic-Thule=203, ErollisiMarr=204, Bristlebane=205,
 Innoruuk=206, Karana=207, MithanielMarr=208, Prexus=209, Quellious=210, RallosZek=211, RodcetNife=212,
-SolusekRo=213, TheTribunal=214, Tunare=215, Veeshan=216. (Per-class deity restrictions are UNCITED
-here. They are runtime data: `world/client.cpp` validates a create against a `char_create_combinations`
-DB table, loaded (`world/worlddb.cpp`, `LoadCharacterCreateCombos`, `SELECT * FROM
-char_create_combinations`) into the `character_create_race_class_combos` vector it checks against —
-not a table in the EQEmu source tree, so there is no public file this repo could cite for the
-per-class breakdown. A private working note once listed one; it has no history in the private
-knowledge-base repo — see the Section 3 note above — so it cannot be repointed either. To discharge
-this: read the per-combo rows from a running EQEmu server's `char_create_combinations` table, or drop
-per-class deity filtering from the UI entirely. Deity is not server-validated on Titanium, so
-shipping without it is not a correctness gap — only a lost affordance.)
+SolusekRo=213, TheTribunal=214, Tunare=215, Veeshan=216.
+
+> ⚠ `deity.h` defines **two** Agnostic constants and this list carries only one.
+> `Deity::Agnostic1 = 140` (`common/deity.h:28`) and `Deity::Agnostic2 = 396` (`common/deity.h:45`)
+> map to the *same* display string `"Agnostic"` (`deity.h:74–75`) and the *same*
+> `Deity::Bitmask::Agnostic = 1` (`deity.h:95–96`). 396 is the char-create-reachable one: 140
+> appears in **0** of the 641 seeded `char_create_combinations` rows (below), so a create can never
+> carry it. It is still reachable on the **read** path — a `deity` field read back off a
+> `PlayerProfile` can be 140, and an id→name map built only from the list above will fail to name it.
+
+**Per-class/per-race deity restrictions — sourced to EQEmu.** EQEmu ships the seed data for
+`char_create_combinations` in a tracked file: `utils/sql/svn/2024_required_update.sql`, whose
+`CREATE TABLE char_create_combinations` is line 1 and which carries **641** contiguous
+`INSERT INTO char_create_combinations` rows at lines 11–651, every one with the same column list
+`(expansions_req, race, class, deity, allocation_id, start_zone)`. The per-class deity list is just a
+projection of the `deity` column of those rows — e.g. class 1 (Warrior) →
+`{201,202,203,204,206,207,208,209,211,212,214,215,216,396}`, class 2 (Cleric) →
+`{201,202,203,204,205,206,207,208,209,210,212,215,216}`. Across all 641 rows the `deity` column takes
+only the values `201`–`216` and `396`.
+
+> ⚠ **Caveat on that citation, which does not discharge it but does bound it:** that file is a
+> one-shot svn-era migration script — a *seed* snapshot, not the live table. A long-lived PEQ
+> database may have drifted from it, and the server validates against the live rows. Two ways to get
+> the live values, in preference order:
+>
+> 1. **Read them off the wire.** On SoF-and-later the world server answers
+>    `OP_CharacterCreateRequest` by serialising the whole live combo vector to the client:
+>    `Client::HandleCharacterCreateRequestPacket` (`world/client.cpp:699–744`) writes an allocation
+>    count + `RaceClassAllocation` array, then a combo count + one `RaceClassCombos` per row
+>    (`world/sof_char_create_data.h:29–36`: `ExpansionRequired, Race, Class, Deity, AllocationIndex,
+>    Zone`). That is authoritative for the server actually connected to, and it is what the
+>    char-create UI should drive off — including the start-zone resolution noted below.
+> 2. Read `SELECT * FROM char_create_combinations` on the target server
+>    (`WorldDatabase::LoadCharacterCreateCombos`, `world/worlddb.cpp:811–833`, is the exact query the
+>    server runs into `character_create_race_class_combos`).
+
+**Do not ship char-create without deity filtering — under RoF2 it is a correctness gap, not a
+nicety.** `Client::OPCharCreate` (`world/client.cpp:1677`) branches on client version at
+`world/client.cpp:1734–1738`: `m_ClientVersionBit & EQ::versions::maskSoFAndLater` →
+`CheckCharCreateInfoSoF(cc)`, and a `false` return aborts the create. `CheckCharCreateInfoSoF`
+(`world/client.cpp:1901`) scans `character_create_race_class_combos` for a row matching `Class`,
+`Race`, **`Deity`** and `Zone` (`world/client.cpp:1912–1915`); on no match it logs
+`"Could not find class/race/deity/start_zone combination"` and returns `false`
+(`world/client.cpp:1922–1924`). Same function and same match expression as the start-zone warning
+below — `deity` is one field over from `start_zone`, and a wrong deity fails exactly the way a raw
+0–13 StartZoneIndex does. Titanium is the exception, not the rule: `CheckCharCreateInfoTitanium`
+carries an explicit `/*TODO: Check for deity/class/race..*/` at `world/client.cpp:2159` and performs
+no such check.
 
 ### Start city → `start_zone` wire value (a ZONE_ID under RoF2) and per-race start cities
 > ⚠ **The `start_zone` wire value is a ZONE_ID, not the Titanium StartZoneIndex 0–13.** RoF2's

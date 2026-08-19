@@ -300,8 +300,14 @@ claim, verified by reading them: `~/git/eq_kb/kelethin-lift-and-doors.md` docume
 `OP_SpawnDoor`/`OP_ClickDoor`/`OP_MoveDoor` wire structs and the opentype-57/58 teleport-door
 semantics this paragraph describes; `~/git/eq_kb/rof2-door-spawn-delivery.md` documents the zone-in
 `OP_SpawnDoor` delivery mechanics ("Parse OP_SpawnDoor on zone-in" above). Neither is a
-merely-similar substitute — both were read and both name the exact mechanisms this paragraph
-claims.)
+merely-similar substitute — both were read end to end, and between them they name the exact
+mechanism behind every **wire** claim in this paragraph: the zone-in spawn burst, the
+server-authoritative open/close, and opentype-57/58 zoning. The **render** half — "real models (from
+`_obj.s3d`) + fallback box" — is an eqoxide implementation statement rather than a wire claim, and
+is deliberately NOT cited to either note: `kelethin-lift-and-doors.md` mentions `_obj.s3d` door
+actordefs and the `<zone>_doors.glb` asset in passing during a lift-animation investigation, but
+neither note derives eqoxide's model-load-or-fallback behaviour, so stretching them to cover it
+would be exactly the silent repoint this change is avoiding.)
 
 **Follow-ups (not blocking):**
 - Door textures (models currently untextured; geometry/placement correct)
