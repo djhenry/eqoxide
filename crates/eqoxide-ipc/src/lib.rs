@@ -1495,7 +1495,10 @@ pub struct GroupMemberView {
     pub hp_pct:   f32,
 }
 
-/// Published each nav tick from GameState.group_members/group_leader/pending_invite (GET
+/// Published by `ActionLoop::sync_group`, called once per packet `run_gameplay_phase`'s inbound
+/// drain has drained AND applied via `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — a
+/// cadence driven by server traffic, not the 150 ms nav clock; the interval is unbounded in a
+/// silent zone (#1023). Sourced from GameState.group_members/group_leader/pending_invite (GET
 /// /v1/group/roster, and the UI roster panel). `you_are_leader` is precomputed at publish time
 /// (gs.player_name == gs.group_leader) so handlers don't need the player's own name separately.
 #[derive(Clone, Default)]
@@ -1507,7 +1510,10 @@ pub struct GroupSnapshot {
 }
 pub type GroupShared = Arc<Mutex<GroupSnapshot>>;
 
-/// Published each nav tick from the player's guild identity + roster: the guild fields of
+/// Published by `ActionLoop::sync_guild`, called once per packet `run_gameplay_phase`'s inbound
+/// drain has drained AND applied via `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — a
+/// cadence driven by server traffic, not the 150 ms nav clock; the interval is unbounded in a
+/// silent zone (#1023). Sourced from the player's guild identity + roster: the guild fields of
 /// /v1/observe/debug and GET /v1/guild/roster. `guild_id == 0` / empty `guild_name` = not in a
 /// guild. Mirrors GroupSnapshot. (#295)
 #[derive(Clone, Default)]
@@ -1656,8 +1662,14 @@ pub type RespawnReq = Arc<Mutex<bool>>;
 /// by handlers to know whether a camp is already running.
 pub type CampUntil = Arc<Mutex<Option<std::time::Instant>>>;
 
-/// Live merchant-session snapshot published each nav tick, read by GET /v1/merchant/list and used
-/// for the HUD merchant window. `open` mirrors `GameState::merchant_open`.
+/// Live merchant-session snapshot, read by GET /v1/merchant/list and used for the HUD merchant
+/// window. Published by `ActionLoop::sync_merchant`, called once per packet `run_gameplay_phase`'s
+/// inbound drain has drained AND applied via `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`)
+/// — a cadence driven by server traffic, not the 150 ms nav clock; the interval is unbounded in a
+/// silent zone (#1023). `run_zone_entry_handshake` also writes this slot: once, unconditionally,
+/// resetting it to `MerchantSnapshot::default()` on a re-zone, before the new zone's own traffic
+/// can repopulate it — a session's first zone-in goes through `run_login_handshake` instead, which
+/// takes no merchant slot. `open` mirrors `GameState::merchant_open`.
 #[derive(Default, Clone, serde::Serialize)]
 pub struct MerchantSnapshot {
     pub open: bool,
@@ -2250,10 +2262,16 @@ pub struct DoorView {
 ///
 /// Published from three paths — four call expressions, the login path publishing both inside its
 /// drain and once after it — all through the single `eqoxide_net::action_loop::publish_doors`
-/// projection (see its doc for the inventory): the nav tick's `ActionLoop::sync_doors` during
-/// gameplay, `gameplay::run_zone_entry_handshake`'s own drain on a re-zone (#937/#1016), and
-/// `login::run_login_handshake`'s own drain on a session's first zone-in (#1022). "Each nav tick"
-/// alone was true only of the first of those, and only after a zone-in had already finished.
+/// projection (see its doc for the inventory), all packet-drain driven rather than the 150 ms nav
+/// clock — the interval is server-traffic-driven and unbounded in a silent zone (#1023):
+///
+/// 1. `ActionLoop::sync_doors`, called once per packet `run_gameplay_phase`'s inbound drain has
+///    drained AND applied via `apply_packet`, during ongoing gameplay.
+/// 2. `gameplay::run_zone_entry_handshake`'s own drain, gated once per pass that drained at least
+///    one packet, on a re-zone (#937/#1016).
+/// 3. `login::run_login_handshake`'s own drain on a session's first zone-in (#1022) — the same gate
+///    as (2), plus one unconditional call after its loop, needed because `PhaseResult::Done` can
+///    break out from inside the inner drain before that pass's gated call runs.
 pub type DoorsShared = Arc<Mutex<Vec<DoorView>>>;
 
 /// Current zone name and id, updated on every OP_NEW_ZONE.
