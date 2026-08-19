@@ -504,9 +504,9 @@ pub fn running_jump_reach(run_speed: f32) -> f32 {
 /// `swimming-and-fall-damage.md` in the private EQ knowledge-base tree (§3 "fall damage is
 /// CLIENT-COMPUTED and entering water is NOT a fall", §4 gap analysis against this source tree).
 ///
-/// Model: impact velocity = min(terminal, sqrt(2·g·h)) converted to the client's internal
-/// per-update z-velocity units (~5-13); then `fall_score = |z_vel| − 4` (char_counter≈0, no
-/// safe-fall skill): ≤0 → no damage, ≥9 → lethal (20000), else a roll in `[0, score²·10]`.
+/// Model, stated purely in terms of this function's own inputs/outputs and the constants defined
+/// in its body below: `v = min(terminal, sqrt(2·gravity·max(height, 0)))`, then `score = v/hz − 4`.
+/// `score` ≤ 0 → no damage; `score` ≥ 9 → lethal (20000); otherwise a roll in `[0, score²·10]`.
 /// Returns (rolled_damage, max_damage).
 ///
 /// UNCITED, as a statement about the tree as it stands: no document in this repository, and none in
