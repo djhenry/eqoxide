@@ -2189,21 +2189,40 @@ async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
 
 /// GET /v1/observe/doors — list the current zone's doors (id, name, position, opentype, open state).
 ///
-/// **`[]` does NOT mean "this zone has no doors" (#939).** The roster is emptied on zone entry
-/// (#891) and refills from `OP_SpawnDoor` records once they have both **arrived and been
-/// published** — so during a zone-in this endpoint returns a confident empty list for a zone that
-/// does have doors, and nothing served here tells the two apart.
+/// **`[]` does NOT mean "this zone has no doors" (#939, residual case).** The roster starts empty
+/// on either zone-entry path and refills from `OP_SpawnDoor` records as they arrive — but a record
+/// the server genuinely has not sent yet arrives on no schedule this client controls, and nothing
+/// served here tells that case apart from a real, empty zone. (#891 clears it at the top of the
+/// re-zone handshake; on a session's FIRST zone-in it starts empty because the process just
+/// started, and #1022's failure clear keeps it empty across `run_login_flow`'s retries.)
 ///
-/// Those are two different failures and only one of them is about the network. During the zone-entry
-/// handshake the records are applied to game state but **not published**: `sync_doors` has exactly
-/// one call site, in the gameplay drain (`eqoxide_net::gameplay`, `run_gameplay_phase`), which the
-/// handshake loop is not. So a record can be in hand and still absent here — that is #937, and it is
-/// a missing publication, not a missing packet. Separately, records genuinely not yet sent arrive on
-/// no schedule this client publishes.
+/// **What #937 used to add on top of that — a record already applied to game state but not yet
+/// published — is now addressed on BOTH zone-entry paths (#1016, then #1022).**
+/// `sync_doors`/`publish_doors` (`eqoxide_net::action_loop`) used to have exactly one call site, the
+/// gameplay drain (`run_gameplay_phase`), which NEITHER zone-entry path's own drain ever reached; a
+/// door parsed and applied during a zone-in sat unpublished until the first post-handshake drain.
+/// `run_zone_entry_handshake` (`eqoxide_net::gameplay`, the re-zone path, #1016) and
+/// `run_login_handshake` (`eqoxide_net::login`, the first zone-in of a session, #1022) now each call
+/// `publish_doors` from their OWN drain, on the same pass that applies an `OP_SpawnDoor` record — so
+/// an arrived-and-applied door is also a published one within the zone-in, not only after it. Both
+/// also CLEAR the roster rather than leave a partial one standing when the attempt fails (#1016
+/// review B4 for the re-zone handshake's timeout; #1022's `run_login_phase` wrapper for every login
+/// error exit) — a partial roster for a zone the client was just told it failed to enter is not an
+/// honest `[]` either.
 ///
-/// There is no completeness observable to wait on for either: `zone_assets.state` reaching
-/// `"ready"` gates on terrain meshes and collision triangles, so it is about geometry, not about
-/// which door packets have landed.
+/// **The residual publish window is one drain PASS, not one zone-in, and it is the same on both
+/// zone-entry paths.** Each ZONE-ENTRY drain applies every packet it drained and then publishes
+/// once, at the end of the pass — so a record applied earlier in the same pass is readable here only
+/// after that pass's publish. (The gameplay drain does not share this: `sync_doors` runs after EVERY
+/// applied packet there, not once per pass.) That is bounded by a single drain iteration instead of
+/// by however long a zone-in takes, but it is not zero, which is why POST /v1/interact/click_door's
+/// empty-roster `404` body still names "arrived but not yet published" as a live cause. This
+/// endpoint states the window in drain passes rather than milliseconds because it has no
+/// measurement of a pass's wall-clock duration.
+///
+/// There is no completeness observable to wait on for the remaining #939 case: `zone_assets.state`
+/// reaching `"ready"` gates on terrain meshes and collision triangles, so it is about geometry, not
+/// about which door packets the server has sent.
 ///
 /// The same limit binds the other direction, and this is the reason `/v1/interact/click_door`
 /// answers a miss with `404` *unknown* rather than *disproved*: a **populated** roster is not a

@@ -264,10 +264,17 @@ contradicts, instead of queueing it and answering `200`. Nothing is queued and n
 closed set at any size: it grows as further door records arrive, and zoning empties it. So a
 populated roster establishes only that no door it holds *right now* matches — not that the door
 does not exist — and an empty roster does not even distinguish a zone with no doors from a zone
-whose door records have not arrived yet, since a zone-in in progress looks exactly the same. Read
-this `404` as *unknown* in both cases, never as *disproved*. (`503` would claim the session is not
-live and `409` would claim something is pending; neither is true, so the code stays `404` and the
-body carries the distinction.)
+whose door records have not arrived, *or have arrived and not yet been published*. Records are now
+published as they arrive during **both** zone-entry paths' own handshake drains, not only after them
+— the re-zone handshake since #937/#1016, and a session's very first zone-in (which runs through a
+separate login state machine) since #1022. On both paths the "arrived but unpublished" window is now
+bounded by one drain **pass**, not by the length of the zone-in: each zone-entry drain applies every
+packet it drained and then publishes once, at the end of the pass (the gameplay drain republishes
+after every applied packet instead). That is smaller, not zero, and this document does not convert
+it to milliseconds because nothing here measures a pass's duration. Read this `404` as *unknown*,
+never as *disproved*. (`503` would claim the session is not live and `409`
+would claim something is pending; neither is true, so the code stays `404` and the body carries the
+distinction.)
 
 **There is no observable that says the roster is complete**, so "re-check once the zone has
 finished loading" is advice this API cannot underwrite for doors specifically: `zone_assets.state`
@@ -876,29 +883,44 @@ the collision grid), and `/v1/move/manual` and `/v1/move/jump`
 character is moving through a world the client has not built, so prefer waiting for `ready`).
 
 **Ungated is not the same as honest during a load, and `/v1/observe/doors` is the case that
-matters.** Zoning empties the door roster (#891), and it refills only once records have both
-arrived **and been published** — so during a zone-in the endpoint returns a confident `[]` for a
-zone that does have doors, the same bytes as the true answer "this zone has no doors". That is the
-shape #803 removed from [`zone_exits`](#zone-exits--means-exactly-one-thing-803): an empty list
-serving as both a reading of the world and a non-answer.
+matters.** Zoning empties the door roster (#891), and — like `zone_exits` before #803 — a `[]` from
+an emptied roster is the same bytes as the true answer "this zone has no doors". Unlike
+`zone_exits`, there is no `ready` gate to wait on here, because doors are a server-pushed list, not
+a derivation from loaded geometry (see "Endpoints that are deliberately NOT gated" above).
 
-Two distinct things produce that `[]`, and conflating them understates how cheaply one of them
-could be fixed. **During the zone-entry handshake the records have already arrived** — they are
-parsed and applied to game state — but the publish step that would surface them here runs only in
-the gameplay drain, so they sit in hand and unpublished. That is **#937**, a missing publication
-rather than a missing packet. Separately, records the server has not sent yet arrive on no schedule
-this client publishes, which is **#939**.
+**One of the two things that used to produce that ambiguous `[]` is now addressed on both zone-entry
+paths (#937/#1016, then #1022).** Each zone-entry path parses and applies door records on its OWN
+drain loop, separate from the post-handshake gameplay drain that normally republishes them. Until
+#937 neither of those drains called the publish step at all, so a door applied mid-zone-in stayed
+unpublished — readable nowhere — until the first drain pass *after* the zone-in finished, no matter
+how early it had actually arrived.
 
-The *cause* is also where doors differ from `zone_exits`: there a file read had failed, which is a
-terminal fact the client can name in a `503`. "Not published yet" and "not sent yet" have no
-terminal moment to report, and unlike the geometry gate there is no `ready` to wait for. Treat `[]`
-from this endpoint as *not yet known*. Re-listing is the usual recourse; if you need to tell the
-two apart, packet capture (`GET /v1/observe/packets`, opcode `0x7291`) records `OP_SpawnDoor`
-arrivals independently of whether this endpoint has published them — but **capture is default-off
-and not retroactive**, so it must already have been enabled when the records landed. Enabling it
-*after* you see `[]` returns `count: 0` with `enabled: true`, which is the same false-negative this
-paragraph is warning you about, wearing a different hat. Check the `enabled` field before reading
-any conclusion into a zero count.
+* **Re-zone** (`run_zone_entry_handshake`, reached only from inside the main gameplay loop): its
+  drain calls the publish step itself since #937/#1016, on the same pass that applies a door record.
+  Failing the handshake (timeout) clears the roster rather than leaving a partial one behind next to
+  `zone_in_failed: true` (#1016 review B4) — the same confident-falsehood shape #934 removed
+  elsewhere.
+* **A session's first zone-in** (the earlier, separate login handshake): it applied `OP_SpawnDoor` to
+  game state the same way but had no path to publish it at all, so the original #937 shape stood for
+  however long that handshake took. Since #1022 it publishes through the identical projection on the
+  identical per-pass gate, and any failed login attempt clears the roster it published rather than
+  leaving a partial one readable across the retry backoff and the next attempt.
+
+**What remains is #939 on both paths, plus a one-drain-pass residue of #937's shape on both.** A
+zone-in that has not yet delivered its *first* door record reads as an empty, doorless zone (#939,
+unchanged) — that ambiguity has no packet to publish and nothing this client can do about it. And
+because each zone-entry drain applies every packet of a pass and publishes once at the end of it, a
+record applied earlier in the same pass is still unpublished for the remainder of that pass. That
+residue is bounded by one drain iteration rather than by a whole zone-in, but it is not zero, and
+this document states it in drain passes rather than milliseconds because nothing here measures a
+pass's duration. Re-listing is the usual recourse; if you need to positively confirm a record has
+landed, packet capture (`GET /v1/observe/packets`, opcode `0x7291`) records `OP_SpawnDoor`
+arrivals — but **capture is
+default-off and not retroactive**, so it must already have been enabled when the record landed.
+Enabling it *after* you see `[]` returns `count: 0` with `enabled: true`, which is the same
+false-negative this paragraph is warning you about, wearing a different hat. Check the `enabled`
+field before reading any conclusion into a zero count. Treat a persistent `[]` as *not yet known*,
+not as *this zone has no doors*, until the zone-in has otherwise finished.
 
 `POST /v1/move/goto` still accepts the goal, but its response carries a non-null
 **`zone_assets_pending`** note while the assets are missing, and `nav_state` reads `zone_loading`

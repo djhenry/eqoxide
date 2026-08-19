@@ -40,11 +40,14 @@
 #
 #   THE PATTERN SET IS AN ALLOWLIST. Even a fully-classified, fully-covered corpus is only checked
 #   against shapes someone already thought of, so a green run means "no KNOWN shape matched", never
-#   "no local detail is present". eqoxide#995 is the standing proof, and it is an OPEN gap rather
-#   than a closed one: a tracked comment naming deployment infrastructure sat green under the
-#   sibling scanner for months. That comment is scrubbed; the class itself is still not covered by
-#   either scanner, because a host name has no shape and enumerating literals would put the value
-#   in a tracked file. See #995.
+#   "no local detail is present". eqoxide#995 is the standing proof: a tracked comment naming
+#   deployment infrastructure sat green under the sibling scanner for months. That comment is
+#   scrubbed, and the class is now covered by a THIRD tool — `scripts/check-host-shape.py`, a
+#   structural heuristic that flags hostname-shaped bare tokens near infrastructure vocabulary
+#   without naming anything. It does NOT run on this surface: it needs a whole tracked corpus to
+#   compute its cross-file frequency filter, and a PR body is a handful of paragraphs. So for PR
+#   and issue text the host-name class remains uncovered, and this scanner's green run still means
+#   only "no KNOWN shape matched". See #995.
 #
 #   Which of those reach signals actually carry information, stated plainly so none of them is read
 #   as more than it is:
