@@ -498,20 +498,23 @@ const DOOR_NO_ARGUMENT: &str = "provide {\"door_id\":N} or {\"name\":\"...\"}";
 /// this published copy (#934 review B1) — so a zone-in in progress can read exactly like a doorless
 /// zone.
 ///
-/// **This is narrower on one path than the other, and the body does not claim to know which path it
-/// is on (#1016 review B5).** `run_zone_entry_handshake` — used only for re-zones, both its
-/// production call sites are inside `run_gameplay_phase` in `gameplay.rs` — republishes on the same
-/// drain pass that applies a door record (#1016 review B1), so on THAT path the empty reading narrows
-/// to "before the first record has landed". The very first zone-in of a session goes through
-/// `login.rs`'s own separate state machine instead (`run_login_phase`), which applies `OP_SpawnDoor`
-/// via the same `apply_packet` but has no access to `InteractSlots` at all (not in its function
-/// signature) and so cannot publish into this roster — on THAT path the empty reading can span the
-/// whole login handshake, however long that takes, even after door records have already landed in
-/// `gs.world.doors`. This endpoint has no way to tell which of the two zone-entry paths produced the
-/// empty roster it is looking at, so the body below does not name a bound on the window — narrowing
-/// it to the re-zone path's tighter bound would be confidently wrong on the other path (the #937
-/// shape survives there verbatim). See `docs/http-api.md` and `observe.rs`'s `get_doors` doc for the
-/// same distinction; this is the one HTTP-visible location it also has to hold in.
+/// **Both zone-entry paths now republish from their own drain, and the body still does not name a
+/// bound on the window (#1022, superseding #1016 review B5).** `run_zone_entry_handshake` — used
+/// only for re-zones, both its production call sites are inside `run_gameplay_phase` in
+/// `gameplay.rs` — republishes on the same drain pass that applies a door record (#1016 review B1).
+/// The very first zone-in of a session goes through `login.rs`'s own separate state machine
+/// instead (`run_login_phase`), which applied `OP_SpawnDoor` via the same `apply_packet` but had no
+/// access to `InteractSlots` at all and so could not publish into this roster; on THAT path the
+/// empty reading could span the whole login handshake, however long that took. #1022 hands that
+/// state machine the bare `DoorsShared` slot and the same per-pass publish, so it no longer can.
+/// What survives on both ZONE-ENTRY paths is one drain PASS: each applies every packet it drained
+/// and then publishes once at the end, so a record applied earlier in a pass is unreadable here
+/// until that pass's publish. (The gameplay drain publishes after every applied packet instead, so
+/// it does not carry this window — only the two zone-entry drains do.) The empty reading therefore narrows on both paths but does not close, and the
+/// body below still names both causes without asserting a bound — a wall-clock bound would be a
+/// figure neither this endpoint nor the publisher measures. See `docs/http-api.md` and
+/// `observe.rs`'s `get_doors` doc for the same distinction; this is the one HTTP-visible location
+/// it also has to hold in.
 ///
 /// Both bodies are pinned VERBATIM by `door_click_populated_miss_body_is_exactly_this` and
 /// `door_click_empty_roster_body_is_exactly_this`: the strings are what this endpoint delivers, so
@@ -1124,9 +1127,10 @@ mod tests {
     /// The same id form against an EMPTY roster. Still a 404 and still unqueued — but the body must
     /// NOT assert the door does not exist, because with no separate "doors have arrived" observable
     /// the client cannot tell a doorless zone from one whose door records have not landed yet, OR
-    /// (#1016 review B5) from one whose door records landed and were applied to game state but never
-    /// published into this roster — still possible on the very first zone-in of a session, which runs
-    /// through a separate login state machine with no path to publish a door at all.
+    /// from one whose door records landed and were applied to game state but are not yet published
+    /// into this roster — still possible within any single drain pass on EITHER zone-entry path
+    /// (#1022), because each applies every packet it drained before publishing once at the end of
+    /// the pass. It is no longer possible for a whole login handshake (the #1016 review B5 case).
     #[tokio::test]
     async fn door_click_unknown_id_with_an_empty_roster_says_the_roster_is_empty() {
         let state = empty_state();
@@ -1146,8 +1150,8 @@ mod tests {
              doors: {body:?}");
         assert!(body.contains("not yet been published"),
             "the empty-roster body must ALSO disclose that a door already arrived but not yet \
-             published looks identical to no doors — the #937 shape that still applies on the \
-             first zone-in of a session (#1016 review B5): {body:?}");
+             published looks identical to no doors — the #937 shape, bounded since #1022 to a \
+             single drain pass on both zone-entry paths but not eliminated: {body:?}");
         assert!(body.contains("NOT sent"), "{body:?}");
     }
 
@@ -1293,12 +1297,21 @@ mod tests {
     ///     a door record (#1016 review B2/B1). That fix is real, but `run_zone_entry_handshake` is
     ///     only reached on a RE-ZONE (its two production call sites are both inside
     ///     `run_gameplay_phase`) — the first zone-in of a session goes through `login.rs`'s own
-    ///     separate state machine, which applies `OP_SpawnDoor` via `apply_packet` but has no
-    ///     `InteractSlots` in scope and so cannot publish into this roster at all. The narrowed
-    ///     string was therefore MORE confident than the code earns on that path: the "arrived but
-    ///     unpublished" cause it had dropped is exactly #937's original shape, still live on every
+    ///     separate state machine, which applied `OP_SpawnDoor` via `apply_packet` but had no
+    ///     `InteractSlots` in scope and so could not publish into this roster at all. The narrowed
+    ///     string was therefore MORE confident than the code earned on that path: the "arrived but
+    ///     unpublished" cause it had dropped was exactly #937's original shape, live on every
     ///     session's first zone. This body restores both causes and says outright that the client
     ///     cannot tell them apart, rather than picking a bound that is only true on one path.
+    ///
+    ///     #1022 gave the login state machine that publisher, so the login-handshake-long version of
+    ///     the "arrived but unpublished" cause is gone — but the clause STAYS, because the cause is
+    ///     not. Both drains apply every packet of a pass and publish once at the end of it, so a
+    ///     record applied earlier in the same pass is unpublished for the rest of that pass on
+    ///     either path. Dropping the clause now would re-assert the same over-confidence the
+    ///     previous revision was corrected for, one order of magnitude smaller; the honest edit was
+    ///     to the surrounding prose that blamed it on the login path having no publisher, not to
+    ///     this string.
     #[tokio::test]
     async fn door_click_empty_roster_body_is_exactly_this() {
         let body = miss_body(&[], r#"{"name":"NO_SUCH_DOOR_XYZ"}"#).await;
