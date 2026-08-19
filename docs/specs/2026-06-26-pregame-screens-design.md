@@ -155,7 +155,7 @@ Berserker(16)   -   Y   -   -   -   -   -   Y   Y   Y   -   -   -   Y   -   -
 > Ranger, Druid, Bard, Rogue), and **zero** with class 2. So a half-elf cleric is admitted by the
 > Titanium validator and rejected by RoF2's. Build the UI's validity predicate from the combo rows.
 
-### Race base stats — Titanium validator array `BaseRace` (`world/client.cpp:2013`), order STR/STA/AGI/DEX/WIS/INT/CHA
+### Race base stats — Titanium validator array `BaseRace` (`world/client.cpp:2013`), order STR/STA/AGI/DEX/WIS/INT/CHR
 All 16 rows of the array are rendered (`_TABLE_RACES` is 16, `world/client.cpp:2011`).
 ```
 Human      75 75 75 75 75 75 75      Dwarf     90 90 70 90 83 60 45
@@ -173,7 +173,7 @@ Froglok    70 80 100 100 75 75 50    Drakkin   70 80 85 75 80 85 75
 > — STR, DEX, AGI, STA, INT, WIS, CHA (`world/client.cpp:1951–1984`). Reading those values with this
 > table's column order swaps STA with DEX and WIS with INT.
 
-### Class stat bonuses + bonus-point pool — Titanium validator array `BaseClass` (`world/client.cpp:2033`), order STR/STA/AGI/DEX/WIS/INT/CHA/ADD
+### Class stat bonuses + bonus-point pool — Titanium validator array `BaseClass` (`world/client.cpp:2033`), order STR/STA/AGI/DEX/WIS/INT/CHR/ADD
 All 16 rows are rendered. RoF2 does not use this array either — see the base-stats note above.
 ```
 Warrior      10 10  5  0  0  0  0  25      Rogue       0  0 10 10  0  0  0  30
