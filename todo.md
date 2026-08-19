@@ -302,9 +302,6 @@ click opens (server replies), portal doors trigger zoning. Notes: `docs/http-api
 
 ## COMPLETE: Player action grid + spell casting + APIs (branch worktree-action-grid-spellcasting)
 
-Spec: `docs/superpowers/specs/2026-06-23-action-grid-spellcasting-design.md`
-Plan: `docs/superpowers/plans/2026-06-23-action-grid-spellcasting.md`
-
 HUD action grid (bottom-center): auto-attack TOGGLE, sit/stand toggle, target/consider, and
 the 9 memorized spell gems with real TGA icons + a cast bar. Real spell casting over the wire
 (`OP_CastSpell`) with `OP_BeginCast`/`OP_ManaChange`/`OP_MemorizeSpell`/`OP_InterruptCast`
@@ -326,8 +323,6 @@ Follow-ups (not blocking):
 
 ## Current feature: Gender character models + conversion normalization
 
-Plan (full detail, exact code/commands): `docs/superpowers/plans/2026-06-19-gender-models-and-normalization.md`
-Spec: `docs/superpowers/specs/2026-06-19-gender-models-and-normalization-design.md`
 Branch: `feat/equipment-textures`
 
 Goal: render correct race + gender models (human/wood-elf/dwarf, male/female) at the right
@@ -365,7 +360,6 @@ Player position offset FIXED: per-clip posed bounds (center+feet) drive recenter
 from the current animation clip (bind pose differed from the live idle pose). Verified via
 test `humanoid_idle_pose_grounds_and_centers` + /v1/observe/frame (player now in the doorway).
 Loop continues to verify NPCs/walking/female-elf-dwarf placement + tune monster heights.
-Notes: `.superpowers/sdd/overnight-notes.md`.
 
 UPDATE: positioning fix verified to GENERALIZE to all 6 gendered models (humanoid/elf/dwarf
 M+F) via `gendered_models_idle_ground_and_center` (all ground+center, correct prefixes).
@@ -388,9 +382,9 @@ ZONE BUG SOLVED (57a5274 + docs): objects placed via ActorInstance placements (q
 qeynos2 478/481); buildings render, NPCs among them (numeric: city NPCs at correct coords z~3.8,
 only aquatic creatures underwater). All 3 symptoms (0,0,0 pile / NPCs in water / qeynos2 offset)
 resolved + verified via /v1/observe/frame + /v1/observe/entities. Docs: docs/zone-rendering.md. Minor follow-ups:
-few unmatched placements; eyeball object rotation. Notes: `.superpowers/sdd/zone-coords-notes.md`.
+few unmatched placements; eyeball object rotation.
 buildings appear + NPCs among them. NEXT: confirm NPCs-in-water resolved vs maps; fix qeynos2
-(North) terrain offset (lands outside playable area). Plan/findings: `.superpowers/sdd/zone-coords-notes.md`.
+(North) terrain offset (lands outside playable area).
 
 ## NEEDS USER VISUAL CONFIRMATION (when back)
 - Player + NPCs: correct race (human, not halfling), gender, size, grounded, centered, no walk bob.

@@ -413,8 +413,7 @@ fn main() {
     // process is a frozen snapshot. See `eqoxide::model::run_net_thread`.
     let net_thread_dead: eqoxide::model::NetThreadDeadShared = Arc::new(Mutex::new(None));
     // (#715's `asset_sync_activity` is constructed much earlier — see the comment there for why.)
-    // Single-owner GameState snapshot (see
-    // docs/superpowers/plans/2026-07-12-gamestate-single-owner-snapshot.md). The network thread is
+    // Single-owner GameState snapshot. The network thread is
     // the sole writer of GameState; it publishes here every tick. `last_inbound` is a separate,
     // smaller signal: the wall-clock time of the last REAL inbound packet, used for connection
     // health (a hung network thread stops updating it even though nothing else changes).
