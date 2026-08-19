@@ -3640,16 +3640,226 @@ mod tests {
     /// of them leaves the population.
     ///
     /// **The residual, stated rather than hidden.** A `<name>.glb` with none of the three is
-    /// indistinguishable from a creature model by anything on disk, and is excluded — printed by
-    /// name on the discovery line. That is the boundary of what this can know, not an oversight.
-    /// Widening it needs a source of truth outside the asset directory: a baked-zone manifest, so
-    /// the corpus can ASSERT its population rather than infer it. Filed as #928 with the exact
-    /// corpus and both outputs; not closable by a change to this predicate.
+    /// indistinguishable from a creature model **by anything in this directory**, and this
+    /// predicate excludes it. That is the boundary of what a filesystem predicate can know, and it
+    /// is not widened here: #928 is answered BESIDE this function, by [`ZoneManifest`], which reads
+    /// the asset cache's own sync record — a statement made by the asset SERVER, outside
+    /// `$EQZONES`. The discovery loop admits a name that either this predicate or that record calls
+    /// a zone, and PRINTS which of the two admitted it. Where there is no readable record the
+    /// population is still an inference, and the run now says so on its own line
+    /// ([`POPULATION_INFERRED`]) instead of printing a verdict that reads as though it had been
+    /// asserted.
     fn zone_evidence(dir: &std::path::Path, name: &str) -> bool {
         let entry_at = |p: std::path::PathBuf| p.symlink_metadata().is_ok();
         entry_at(dir.join(format!("{name}_doors.glb")))
             || entry_at(dir.join("maps").join(format!("{name}.txt")))
             || entry_at(dir.join("maps/water").join(format!("{name}.wtr")))
+    }
+
+    // ───────── #928: a source of truth for the corpus POPULATION, outside `$EQZONES` ─────────
+
+    /// What the asset cache's own sync record says about which names are ZONES.
+    ///
+    /// **Why a second source at all (#928).** [`zone_evidence`] infers the population from files
+    /// sitting beside `<name>.glb`. That inference has a boundary it cannot cross: a `<name>.glb`
+    /// with no doors companion, no map pack and no `.wtr` entry is byte-for-byte the situation of
+    /// `bat.glb`, so a real zone whose three companion assets were all lost is excluded as "not a
+    /// zone" and only NAMED on the discovery line — while the run's verdict still reads
+    /// `— COMPLETE` over the corpus that shrank underneath it. Admitting such a name unconditionally
+    /// is not an option either: [`zone_evidence`]'s own doc records the measurement, on the default
+    /// `$EQZONES` at the time that doc was written — 52 of the 94 non-furniture `.glb` names have
+    /// none of the three signals, and those 52 are the character/creature/prop models. That figure
+    /// is QUOTED from that doc, not re-derived here. This corpus WAS run for this change over a
+    /// baked `$EQZONES` — but a different, smaller tree: 43 entries, 42 zone `.glb`, no doors/obj
+    /// companions at all, no `.glb` with neither signal, and no sync record, so it reported
+    /// `— POPULATION-INFERRED`, admitted nothing by the record, and exercised no `Present` branch.
+    /// It says nothing about the 52-of-94 figure in either direction.
+    ///
+    /// **The source used.** `synced.json` in the asset cache root — the file
+    /// `asset_sync::CacheDirs` writes after every successful set sync, one entry per SET NAME. The
+    /// client asks the asset server for `zone/<name>` and `zonedoors/<name>` sets (`app.rs`), and a
+    /// record is only written after the server actually served that set. So a key `zone/blackburrow`
+    /// in that file is the ASSET SERVER's own statement that `blackburrow` is a zone — derived from
+    /// outside `$EQZONES`, which is exactly what #928 asks for. The corpus's default `$EQZONES` is
+    /// `CacheDirs::models_dir()`, i.e. `<cache root>/models`, so the record sits at
+    /// `$EQZONES/../synced.json`. `$EQZONES_MANIFEST` overrides the path.
+    ///
+    /// **What this still does NOT close, stated rather than hidden.** The record lists the sets THIS
+    /// cache has synced, not every zone the server can bake. A `<name>.glb` that arrived in the
+    /// models directory by some route other than `asset_sync` — a hand-assembled scratch corpus like
+    /// the one in #928's reproduction, an rsync, a build artifact — has no record, and for such a
+    /// name the population is still an inference from companion files. That is why the three states
+    /// below are distinct and why the corpus PRINTS which one it is in rather than letting a green
+    /// run imply its population was asserted.
+    enum ZoneManifest {
+        /// No record at the path looked at. The population is INFERRED, and the run says so.
+        Absent { looked_at: std::path::PathBuf },
+        /// A record exists and could not be read or parsed. **Not** folded into `Absent`: "we asked
+        /// and it was not there" and "we asked and could not read the answer" are different claims,
+        /// the same distinction `RegionLoadError` keeps for water maps (#762).
+        Unreadable { looked_at: std::path::PathBuf, why: String },
+        /// Zone names the record names, from `zone/<name>` and `zonedoors/<name>` set keys.
+        Present { looked_at: std::path::PathBuf, zones: std::collections::BTreeSet<String> },
+    }
+
+    impl ZoneManifest {
+        /// Where the record for a corpus rooted at `dir` (`$EQZONES`) lives: `$EQZONES_MANIFEST`
+        /// if set, else `<dir>/../synced.json` — the asset cache root, since the corpus's default
+        /// `$EQZONES` is `CacheDirs::models_dir()` = `<cache root>/models`.
+        ///
+        /// Split from [`Self::read_at`] so the reader can be driven from a test with an explicit
+        /// path instead of by mutating the process environment, which is shared by every test in
+        /// the binary and racy under the default threaded runner.
+        fn record_path(dir: &std::path::Path) -> std::path::PathBuf {
+            if let Some(p) = std::env::var_os("EQZONES_MANIFEST") {
+                return std::path::PathBuf::from(p);
+            }
+            // `$EQZONES` with no parent is a filesystem root: there is nowhere else to look, and
+            // `<root>/synced.json` is the honest thing to name as "looked at and not there".
+            dir.parent().unwrap_or(dir).join("synced.json")
+        }
+
+        /// Read the record for a corpus rooted at `dir` (`$EQZONES`).
+        fn read(dir: &std::path::Path) -> Self { Self::read_at(Self::record_path(dir)) }
+
+        /// Read a record from an explicit path.
+        fn read_at(looked_at: std::path::PathBuf) -> Self {
+            let bytes = match std::fs::read(&looked_at) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+                    return ZoneManifest::Absent { looked_at },
+                Err(e) => return ZoneManifest::Unreadable { looked_at, why: e.to_string() },
+            };
+            // Only the KEYS are read. Deserialising the recorded `files` lists would couple this to
+            // `SyncedSet`'s schema — which has already changed once (#601 D-4) and is deliberately
+            // strict, so an older record is a hard parse error there. A key is a set name and that
+            // is the whole claim being consumed.
+            let map: std::collections::BTreeMap<String, serde_json::Value> =
+                match serde_json::from_slice(&bytes) {
+                    Ok(m) => m,
+                    Err(e) => return ZoneManifest::Unreadable { looked_at, why: e.to_string() },
+                };
+            let zones = map.keys()
+                .filter_map(|k| k.strip_prefix("zone/").or_else(|| k.strip_prefix("zonedoors/")))
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect();
+            ZoneManifest::Present { looked_at, zones }
+        }
+
+        /// Does the record name `name` as a zone? Always false when there is no readable record —
+        /// an absent record must never be able to make a name LOOK like a zone.
+        fn names_zone(&self, name: &str) -> bool {
+            matches!(self, ZoneManifest::Present { zones, .. } if zones.contains(name))
+        }
+
+        fn zone_names(&self) -> Vec<&str> {
+            match self {
+                ZoneManifest::Present { zones, .. } => zones.iter().map(String::as_str).collect(),
+                _ => Vec::new(),
+            }
+        }
+
+        /// The line-level marker for the corpus's population provenance. See
+        /// [`POPULATION_ASSERTED`]/[`POPULATION_INFERRED`].
+        fn marker(&self) -> &'static str {
+            match self {
+                ZoneManifest::Present { .. } => POPULATION_ASSERTED,
+                _ => POPULATION_INFERRED,
+            }
+        }
+    }
+
+    impl std::fmt::Display for ZoneManifest {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                ZoneManifest::Present { looked_at, zones } => write!(f,
+                    "{} zone name(s) from {} {POPULATION_ASSERTED} (a `zone/<name>` set key is the \
+                     asset server's own statement that <name> is a zone)",
+                    zones.len(), looked_at.display()),
+                ZoneManifest::Absent { looked_at } => write!(f,
+                    "no sync record at {} {POPULATION_INFERRED} — the population below is inferred \
+                     from companion files only, so a `<name>.glb` that lost its doors companion, \
+                     its map pack AND its .wtr entry is excluded and cannot be told from a \
+                     creature model (#928)", looked_at.display()),
+                ZoneManifest::Unreadable { looked_at, why } => write!(f,
+                    "the sync record at {} could not be read ({why}) {POPULATION_INFERRED} — \
+                     unreadable is NOT the same claim as absent, and neither asserts a population",
+                    looked_at.display()),
+            }
+        }
+    }
+
+    /// The corpus's population was checked against a source of truth outside `$EQZONES` (#928).
+    const POPULATION_ASSERTED: &str = "— POPULATION-ASSERTED";
+    /// …and it was not: the population is an inference from companion files. Printed for BOTH
+    /// non-`Present` states, because neither of them asserts anything.
+    const POPULATION_INFERRED: &str = "— POPULATION-INFERRED";
+
+    // ───────── #927: per-zone embedded-probe coverage, not one corpus total ─────────
+
+    /// Every measured zone contributed at least one embedded probe.
+    const PROBES_EVERY_ZONE: &str = "— EVERY-ZONE-PROBED";
+    /// …or it did not, and the zones that contributed nothing are named.
+    const PROBES_HOLE: &str = "— ZONES-WITH-NO-PROBE";
+
+    /// How many embedded probes each measured zone actually contributed (#927).
+    ///
+    /// **The defect this replaces.** The corpus bumped one counter, `t_emb`, across every zone and
+    /// asserted `t_emb > 0` once, after the loop. Both payload assertions below it —
+    /// `drifters.is_empty()` and `ch_dry == 0` — are vacuously true for a zone that contributed no
+    /// embedded sample, so 41 of 42 zones probing NOTHING left the run green, with one zone's worth
+    /// of evidence under a headline reading `discovered=42 covered=42`. A total is not evidence
+    /// about its terms — the same shape as #778, where a scanner silently covered an eighth of its
+    /// corpus and passed.
+    ///
+    /// So the coverage is per zone, every measured zone is classified, and a zone that probed
+    /// nothing is NAMED rather than absorbed into a sum. `is_complete_over` additionally requires
+    /// that the number of zones recorded here equals the number the rollup counts as measured — a
+    /// zone that reaches `cover.add` without ever reaching `record` is a hole in THIS accounting
+    /// even if its probes were nonzero, which is the "future `continue`" shape `WaterRollup`'s
+    /// `unaccounted` bucket catches one level up.
+    #[derive(Default)]
+    struct ProbeCoverage {
+        per_zone: Vec<(String, u64)>,
+    }
+
+    impl ProbeCoverage {
+        fn new() -> Self { Self::default() }
+        /// Record what one zone contributed. Call once per zone that reaches the bottom of the
+        /// corpus loop body, beside the `cover.add` that closes it.
+        fn record(&mut self, zone: &str, probes: u64) {
+            self.per_zone.push((zone.to_string(), probes));
+        }
+        fn zones(&self) -> usize { self.per_zone.len() }
+        fn total(&self) -> u64 { self.per_zone.iter().map(|(_, n)| n).sum() }
+        /// The measured zones that contributed no embedded probe at all, in loop order.
+        fn barren(&self) -> Vec<&str> {
+            self.per_zone.iter().filter(|(_, n)| *n == 0).map(|(z, _)| z.as_str()).collect()
+        }
+        /// At least one zone recorded, none of them barren, and one record per measured zone.
+        fn is_complete_over(&self, measured_zones: usize) -> bool {
+            !self.per_zone.is_empty()
+                && self.per_zone.len() == measured_zones
+                && self.barren().is_empty()
+        }
+    }
+
+    impl std::fmt::Display for ProbeCoverage {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if self.per_zone.is_empty() {
+                return write!(f, "0 embedded probes over 0/0 zones {PROBES_HOLE} — no zone ever \
+                                  reached this coverage");
+            }
+            let barren = self.barren();
+            if barren.is_empty() {
+                return write!(f, "{} embedded probes over {}/{} zones {PROBES_EVERY_ZONE}",
+                    self.total(), self.zones(), self.zones());
+            }
+            write!(f, "{} embedded probes over {}/{} zones {PROBES_HOLE}, {} zone(s) contributed \
+                       none: {barren:?}",
+                self.total(), self.zones() - barren.len(), self.zones(), barren.len())
+        }
     }
 
     /// **The corpus population may never shrink because a water map got WORSE (#850, #879 round-2
@@ -3723,13 +3933,292 @@ mod tests {
              the real corpus on all 52 character/creature/prop models");
     }
 
+    /// **#927 — the exhibit, measured: the guard that stood here passes on the corpus that broke.**
+    ///
+    /// The old control was `assert!(t_emb > 0)` over a corpus total. This test builds the exact
+    /// corpus the issue names — 42 zones, ONE of them contributing every probe — and asserts both
+    /// directions on it: the old total-based control is satisfied (`total() > 0`), and the per-zone
+    /// one is not. Without the first half this would be a test of a stricter guard rather than
+    /// evidence that the guard it replaces was blind to this input.
+    ///
+    /// MUTATION CHECKS (each independently turns this RED):
+    /// 1. Make `barren()` return `Vec::new()` unconditionally → `is_complete_over` goes true on
+    ///    the 41-barren corpus.
+    /// 2. Drop the `self.per_zone.len() == measured_zones` term from `is_complete_over` → the
+    ///    "measured but never recorded" case at the bottom goes green.
+    /// 3. Drop the `!self.per_zone.is_empty()` term → the empty case goes green.
+    #[test]
+    fn a_corpus_where_41_of_42_zones_probe_nothing_is_not_complete_927() {
+        let mut probes = ProbeCoverage::new();
+        probes.record("qeynos2", 59);
+        for i in 0..41 { probes.record(&format!("zone{i}"), 0); }
+
+        // The control this replaces, on the very corpus it cannot see. Not a rhetorical point: it
+        // is the only thing that makes the assertion below evidence rather than a stricter rule.
+        assert!(probes.total() > 0,
+            "reach control: `t_emb > 0` — the corpus-level guard this replaces — must be SATISFIED \
+             here, or this corpus is not the one #927 is about");
+        assert_eq!(probes.zones(), 42);
+
+        assert!(!probes.is_complete_over(42),
+            "41 of 42 zones contributed no embedded probe, so `drifters.is_empty()` and \
+             `ch_dry == 0` are vacuous for 41/42 of the corpus: {probes}");
+        assert_eq!(probes.barren().len(), 41, "every barren zone is named, not summed: {probes}");
+        assert!(probes.barren().contains(&"zone0") && !probes.barren().contains(&"qeynos2"));
+
+        let line = probes.to_string();
+        assert!(line.contains(PROBES_HOLE) && !line.contains(PROBES_EVERY_ZONE),
+            "the coverage line must state its own hole and must not carry the clean marker: {line}");
+        assert!(line.contains("zone0"), "…and NAME the zones that probed nothing: {line}");
+
+        // A zone the rollup counted as measured but that never reached `record` is a hole here too,
+        // even with every recorded zone probing.
+        let mut short = ProbeCoverage::new();
+        short.record("qeynos2", 59);
+        assert!(short.is_complete_over(1), "one measured zone, one record, one probe: {short}");
+        assert!(!short.is_complete_over(2),
+            "a zone the rollup measured but that never reached `record` must make this incomplete: \
+             {short}");
+
+        // …and a coverage that was never told about any zone is not a clean result, for the same
+        // reason `WaterRollup::is_complete` carries `attempted_zones() > 0`.
+        let empty = ProbeCoverage::new();
+        assert!(!empty.is_complete_over(0), "zero zones is not probe coverage");
+        assert!(empty.to_string().contains(PROBES_HOLE)
+                && !empty.to_string().contains(PROBES_EVERY_ZONE), "{empty}");
+
+        // The GREEN direction, so the guard is not simply always-red.
+        let mut clean = ProbeCoverage::new();
+        clean.record("qeynos2", 59); clean.record("gfaydark", 1);
+        assert!(clean.is_complete_over(2), "{clean}");
+        assert_eq!(clean.total(), 60);
+        let cline = clean.to_string();
+        assert!(cline.contains(PROBES_EVERY_ZONE) && !cline.contains(PROBES_HOLE), "{cline}");
+    }
+
+    /// **#927/#928/#898 — the three markers this corpus prints must be line-safe against each
+    /// other.** `"— ZONES-WITH-NO-PROBE"` and `"— POPULATION-INFERRED"` exist so that "did every
+    /// zone probe?" and "was the population asserted?" are separate line-level greps from the water
+    /// accounting's `"— COMPLETE"`. The trap is #831's: `"INCOMPLETE".contains("COMPLETE")`, so a
+    /// marker that is a substring of another silently answers the wrong question.
+    ///
+    /// REACH CONTROL, two halves. A cross-product over strings nothing emits is the very failure
+    /// this batch is about, so the FOUR markers this file OWNS are asserted here against real
+    /// values' rendering before the table runs; and the table's own corpus is an item, so the
+    /// number of ordered pairs actually compared is asserted after it. The other four are pinned to
+    /// real emitters elsewhere and not restated: `— COMPLETE`/`— INCOMPLETE` and the two
+    /// `COMPOSITE_*` by `composite_markers_are_line_safe_against_every_other_898` in
+    /// `water_grid.rs`, whose reach control builds a real clean rollup, a real dirty rollup, and a
+    /// `RollupReport` over each.
+    ///
+    /// That citation was FALSE as FIRST WRITTEN in this PR. It claimed the cited test built a
+    /// report; the cited test built no `RollupReport` at all, so nothing anywhere pinned the two
+    /// `COMPOSITE_*` strings to a real rendering and this table was, for those two entries, exactly
+    /// the cross-product-over-nothing it warns about. Proved by execution rather than by reading:
+    /// with `RollupReport`'s `Display` stopped from emitting `COMPOSITE_CLEAN`, the cited test
+    /// stayed GREEN — of the four `_898` tests in that file, only
+    /// `a_clean_composite_report_states_it_898` reddened (3 passed, 1 failed). The cited test now
+    /// renders both reports, so the sentence above is true and that mutant reddens it.
+    /// (PR #1052 review round 1, R1.)
+    ///
+    /// MUTATION CHECK: shorten `POPULATION_ASSERTED` to `"— POPULATION"` — the plausible
+    /// "simplify the marker" edit — → RED here: *marker `— POPULATION-INFERRED` contains
+    /// `— POPULATION`, so a line-level grep for `— POPULATION` matches a line that only carries
+    /// `— POPULATION-INFERRED`*. Measured. The reach control above PASSES under that mutant (the
+    /// `Present` render still contains the shortened constant), so the table is what catches it,
+    /// which is the point of having both halves.
+    ///
+    /// MUTATION CHECK 2: shrink `markers` to a single element — the plausible "trim the table"
+    /// edit, and the one the reviewer of this PR used — → RED on the pair-count control:
+    /// *the table must compare every ordered pair of all eight markers this corpus prints,
+    /// left: `(1, 0)`, right: `(8, 56)`*. Measured. Without that control the shrunken table passed:
+    /// zero pairs compared reports "no collisions" in exactly the words a real clean scan uses,
+    /// which is #927's complaint surviving inside #927's own fix. (PR #1052 review round 1, R3.)
+    #[test]
+    fn every_corpus_marker_is_line_safe_against_every_other_927_928() {
+        // The four this file owns are strings real values REALLY print.
+        let mut probed = ProbeCoverage::new();
+        probed.record("qeynos2", 1);
+        assert!(probed.to_string().contains(PROBES_EVERY_ZONE), "{probed}");
+        assert!(ProbeCoverage::new().to_string().contains(PROBES_HOLE), "an empty coverage");
+        // Driven through `read_at`, not `read`: `$EQZONES_MANIFEST` is process-wide and the
+        // default runner is threaded, so the env is not a safe input to a test.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rec = tmp.path().join("synced.json");
+        assert!(ZoneManifest::read_at(rec.clone()).to_string().contains(POPULATION_INFERRED),
+            "no record on disk must render the INFERRED marker");
+        std::fs::write(&rec, br#"{"zone/blackburrow": {}}"#).unwrap();
+        assert!(ZoneManifest::read_at(rec).to_string().contains(POPULATION_ASSERTED),
+            "a readable record must render the ASSERTED marker");
+
+        let markers = ["— COMPLETE", "— INCOMPLETE",
+                       crate::nav::water_grid::COMPOSITE_CLEAN,
+                       crate::nav::water_grid::COMPOSITE_DIRTY,
+                       PROBES_EVERY_ZONE, PROBES_HOLE,
+                       POPULATION_ASSERTED, POPULATION_INFERRED];
+        let mut pairs = 0usize;
+        for (i, a) in markers.iter().enumerate() {
+            for (j, b) in markers.iter().enumerate() {
+                if i == j { continue }
+                pairs += 1;
+                assert!(!a.contains(b),
+                    "marker {a:?} contains {b:?}, so a line-level grep for {b:?} matches a line \
+                     that only carries {a:?} — #831's trap, one corpus later");
+            }
+        }
+        // The CORPUS is an item. Without this the array could be shrunk to one marker and the scan
+        // would still report no collisions — a guard green because it looked at nothing, which is
+        // the whole complaint in #927 and has no business surviving inside #927's own fix.
+        assert_eq!((markers.len(), pairs), (8, 56),
+            "the table must compare every ordered pair of all eight markers this corpus prints");
+    }
+
+    /// **#928 — a `.glb` with all three companion assets gone is admitted when the sync record
+    /// names it, and still excluded when nothing does.**
+    ///
+    /// The record is the asset cache's `synced.json`: the client asks the asset server for
+    /// `zone/<name>` and `zonedoors/<name>` sets and the entry is written only after the server
+    /// served one, so a `zone/<name>` key is the SERVER's statement that `<name>` is a zone. This
+    /// test writes that file by hand — no asset server, no baked GLB — and drives the three states
+    /// `ZoneManifest` distinguishes.
+    ///
+    /// MUTATION CHECKS (each independently turns this RED). Measured, and stated as the assertion
+    /// that actually fires — a mutation check that names the wrong mechanism is still a claim about
+    /// execution that nothing ran:
+    /// 1. Make `names_zone` return `true` for the `Absent`/`Unreadable` states → *"an ABSENT record
+    ///    must never make a name look like a zone"*. That is the mutant that would admit all 52
+    ///    character/creature/prop models as zones.
+    /// 2. Fold `Unreadable` into `Absent` → the `matches!(bad, ZoneManifest::Unreadable { .. })`
+    ///    discriminant assertion fires FIRST, before the provenance strings are compared; what the
+    ///    mutant destroys is the "could not be read" line, but that is not where it is caught.
+    /// 3. Drop the `zonedoors/` prefix from `read` → the doors-only record stops naming its zone.
+    #[test]
+    fn a_zone_named_only_by_the_sync_record_is_still_a_zone_928() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        // The #928 corpus: a bare `<name>.glb` with no doors companion, no map pack, no `.wtr`.
+        std::fs::write(models.join("blackburrow.glb"), b"").unwrap();
+        std::fs::write(models.join("bat.glb"), b"").unwrap();
+        assert!(!zone_evidence(&models, "blackburrow"),
+            "fixture precondition: nothing on disk distinguishes this zone from a creature model");
+
+        // ── state 1: no record at all. The population is inferred, and says so. ────────────────
+        let absent = ZoneManifest::read(&models);
+        assert!(matches!(absent, ZoneManifest::Absent { .. }), "{absent}");
+        assert!(!absent.names_zone("blackburrow"),
+            "an ABSENT record must never make a name look like a zone — that would admit all 52 \
+             character/creature/prop models");
+        assert!(absent.to_string().contains(POPULATION_INFERRED)
+                && !absent.to_string().contains(POPULATION_ASSERTED), "{absent}");
+        assert_eq!(absent.marker(), POPULATION_INFERRED);
+
+        // ── state 2: an unreadable record is NOT an absent one. ────────────────────────────────
+        std::fs::write(root.join("synced.json"), b"{ this is not json").unwrap();
+        let bad = ZoneManifest::read(&models);
+        assert!(matches!(bad, ZoneManifest::Unreadable { .. }), "{bad}");
+        assert!(!bad.names_zone("blackburrow"));
+        assert!(bad.to_string().contains(POPULATION_INFERRED), "{bad}");
+        assert!(bad.to_string().contains("could not be read"),
+            "an unreadable record must say so, not report itself as absent: {bad}");
+
+        // ── state 3: the record names the zone. ────────────────────────────────────────────────
+        std::fs::write(root.join("synced.json"), br#"{
+            "common": {"digest": "d", "files": []},
+            "zone/blackburrow": {"digest": "d", "files": []},
+            "zonedoors/gfaydark": {"digest": "d", "files": []},
+            "charmodel/race_1": {"digest": "d", "files": []}
+        }"#).unwrap();
+        let present = ZoneManifest::read(&models);
+        assert!(matches!(present, ZoneManifest::Present { .. }), "{present}");
+        assert!(present.names_zone("blackburrow"),
+            "#928: a `zone/<name>` key is the asset server's own statement that <name> is a zone");
+        assert!(present.names_zone("gfaydark"),
+            "a `zonedoors/<name>` key names a zone too — it is a per-zone set");
+        assert!(!present.names_zone("bat"),
+            "…and a name the record does NOT carry is still excluded: admitting it would red the \
+             real corpus on every character/creature/prop model");
+        assert!(!present.names_zone("common") && !present.names_zone("race_1"),
+            "only the two zone-scoped prefixes name zones");
+        assert_eq!(present.zone_names(), vec!["blackburrow", "gfaydark"]);
+        assert_eq!(present.marker(), POPULATION_ASSERTED);
+        assert!(present.to_string().contains(POPULATION_ASSERTED)
+                && !present.to_string().contains(POPULATION_INFERRED), "{present}");
+
+        // ── an explicit path is honoured, so a corpus rooted anywhere can be pointed at a record.
+        //    Driven through `read_at` rather than by setting `$EQZONES_MANIFEST`: the environment
+        //    is shared by every test in this binary and the default runner is threaded, so a test
+        //    that mutates it would be measuring a race, not a reader.
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let explicit = elsewhere.path().join("m.json");
+        std::fs::write(&explicit, br#"{"zone/qeynos2": {"digest": "d", "files": []}}"#).unwrap();
+        let m = ZoneManifest::read_at(explicit);
+        assert!(m.names_zone("qeynos2") && !m.names_zone("blackburrow"),
+            "an explicitly-named record must be the one read: {m}");
+    }
+
+    /// **#928 — the record is looked for beside `$EQZONES`, at the asset cache root.** The corpus's
+    /// default `$EQZONES` is `CacheDirs::resolve().models_dir()` (`<cache root>/models`) and
+    /// `CacheDirs` writes its per-set record to `<cache root>/synced.json`, so the record path is
+    /// `$EQZONES/..`. This test drives `record_path` through a REAL `CacheDirs::models_dir()` — the
+    /// same function the corpus below derives its default from, so the two move together — and so
+    /// moving the models directory DEEPER under the cache root reaches this assertion.
+    ///
+    /// This clause used to read "the only reference to that function in this file". That was false
+    /// and is retracted here rather than quietly dropped: `models_dir()` is called from TWO lines of
+    /// code in this file — the one in this test and the corpus default below — and `record_path`
+    /// appears on four (its definition, one call in `read`, two in this test). The second
+    /// `models_dir()` call site is the very fix the next paragraph describes, so the sentence
+    /// contradicted its own neighbours. (PR #1052 review round 2, REFUTED 2.)
+    ///
+    /// **What it does not catch, stated rather than implied.** Renaming `models_dir` at the same
+    /// depth (`<root>/models` → `<root>/glbs`) leaves `record_path` correct and this test green.
+    /// Nothing here guards that name, and nothing needs to: the corpus below now DERIVES its
+    /// default from the same function instead of restating the path, so a rename moves both
+    /// together. The `<root>/synced.json` half is restated here rather than called, because
+    /// `CacheDirs::synced_path` is private; it is guarded by the `asset_sync` tests, which redden
+    /// if it moves.
+    ///
+    /// As FIRST WRITTEN in this PR the coupling above was prose and nothing else. The corpus
+    /// HARDCODED the literal `$HOME/.local/share/eqoxide/assets/models` and this file referenced
+    /// `CacheDirs` from no line of code, so moving `models_dir()` left the whole lib suite green
+    /// (254 passed, 0 failed) while this doc claimed the move would be caught here. The two also
+    /// disagreed in general — `CacheDirs::resolve()` honours `$XDG_DATA_HOME` and the literal did
+    /// not — so under a redirected data dir the corpus read a different tree than the one whose
+    /// record it named. Both halves are fixed here rather than the claim being softened.
+    /// (PR #1052 review round 1, R2.)
+    ///
+    /// Skipped, not silently passed, when `$EQZONES_MANIFEST` is set — an override is a legitimate
+    /// state and a test that read it as a pass would be reporting the wrong thing.
+    #[test]
+    fn the_sync_record_is_looked_for_at_the_asset_cache_root_928() {
+        if std::env::var_os("EQZONES_MANIFEST").is_some() {
+            println!("$EQZONES_MANIFEST is set, so the default path is deliberately not in use — \
+                      this test asserts nothing about the override");
+            return;
+        }
+        let root = std::path::Path::new("/tmp/eqoxide-corpus-root");
+        let models = crate::asset_sync::CacheDirs::with_root(root).models_dir();
+        assert_eq!(models.parent(), Some(root),
+            "the corpus default `$EQZONES` sits ONE level under the cache root; if `models_dir` \
+             moved deeper, `$EQZONES/..` would name a directory inside the models tree and the \
+             record would be looked for somewhere `CacheDirs` never writes one");
+        assert_eq!(ZoneManifest::record_path(&models), root.join("synced.json"),
+                   "the record lives beside the models directory, at the asset cache root");
+        // A `$EQZONES` with no parent must still name a path rather than panic.
+        assert_eq!(ZoneManifest::record_path(std::path::Path::new("/")),
+                   std::path::Path::new("/synced.json"));
+    }
+
     /// **THE DEPENETRATION CORPUS — the blast-radius harness, committed so its numbers are
     /// reproducible (#649 review, finding 6).**
     ///
     /// Two things at once, over every baked zone found at `$EQZONES` — where **a zone is a
-    /// `<name>.glb` the asset tree carries zone evidence for** (see `zone_evidence` and the
-    /// discovery block below), not any `.glb` that is not furniture: that older predicate admitted
-    /// 52 character/creature/prop models as "zones". Discovery and the per-zone accounting are both
+    /// `<name>.glb` that either the asset tree carries zone evidence for (see `zone_evidence`) or
+    /// the asset cache's own sync record names (see `ZoneManifest`, #928)**, not any `.glb` that is
+    /// not furniture: that older predicate admitted 52 character/creature/prop models as "zones".
+    /// Discovery, the per-zone water accounting and the per-zone PROBE coverage (#927) are all
     /// asserted, so the counts this prints are the corpus, not the survivors:
     ///
     /// 1. **An ITERATION invariant, driven through the real controller.** The first cut of the #649
@@ -3751,9 +4240,14 @@ mod tests {
     #[test]
     #[ignore = "asset-gated: needs baked zone glbs + maps/water at $EQZONES (#357)"]
     fn depenetration_corpus_over_baked_zones() {
-        let dir = std::path::PathBuf::from(std::env::var("EQZONES").unwrap_or_else(|_| {
-            format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap())
-        }));
+        // DERIVED from `CacheDirs`, not restated as a literal: `ZoneManifest` looks for the sync
+        // record at `$EQZONES/../synced.json`, and that is only the right place because this IS
+        // the asset cache's models directory (#928). A hardcoded twin of that path silently stops
+        // being the cache when `models_dir` moves or `$XDG_DATA_HOME` is set.
+        let dir = match std::env::var_os("EQZONES") {
+            Some(p) => std::path::PathBuf::from(p),
+            None => crate::asset_sync::CacheDirs::resolve().models_dir(),
+        };
         /// The pre-#649 rule, verbatim: nearest floor in EITHER direction, always grounded.
         fn legacy_recovery(col: &Collision, p: [f32; 3]) -> Option<([f32; 3], bool)> {
             for &r in &PUSHOUT_RADII {
@@ -3815,6 +4309,12 @@ mod tests {
         let mut furniture: Vec<String> = Vec::new();
         let mut not_a_zone: Vec<String> = Vec::new();
         let mut zones: Vec<String> = Vec::new();
+        // #928: names admitted by the sync record ALONE — a `<name>.glb` whose doors companion, map
+        // pack and `.wtr` entry are all gone, which `zone_evidence` cannot tell from a creature
+        // model. These go INTO the corpus, where `open_corpus_zone` classifies them and a real zone
+        // with lost assets goes RED with a named reason instead of vanishing as "not a zone".
+        let manifest = ZoneManifest::read(&dir);
+        let mut manifest_only: Vec<String> = Vec::new();
         for ent in std::fs::read_dir(&dir).expect("$EQZONES") {
             entries += 1;
             let path = match ent {
@@ -3832,15 +4332,19 @@ mod tests {
             let Some(name) = file.strip_suffix(".glb") else { non_glb += 1; continue };
             if name.ends_with("_doors") || name.ends_with("_obj") {
                 furniture.push(name.to_string());
-            } else if !zone_evidence(&dir, name) {
-                not_a_zone.push(name.to_string());
-            } else {
+            } else if zone_evidence(&dir, name) {
                 zones.push(name.to_string());
+            } else if manifest.names_zone(name) {
+                manifest_only.push(name.to_string());
+                zones.push(name.to_string());
+            } else {
+                not_a_zone.push(name.to_string());
             }
         }
         zones.sort();
         furniture.sort();
         not_a_zone.sort();
+        manifest_only.sort();
         unreadable.sort();
         // A FUTURE-EDIT guard, not a check on the filesystem (#879 review N4). As the loop above is
         // written every path increments `entries` and lands in exactly one bucket, so this cannot
@@ -3854,9 +4358,11 @@ mod tests {
              glb + {} zone glb", unreadable.len(), furniture.len(), not_a_zone.len(), zones.len());
         assert!(!zones.is_empty(),
             "no baked zones at {dir:?} — a zone here is a `<name>.glb` the tree carries zone \
-             evidence for: a `<name>_doors.glb`, a `maps/<name>.txt`, or any entry at \
-             `maps/water/<name>.wtr` ({entries} entries scanned, {non_glb} non-glb, {} doors/obj, \
-             {} glb with no zone evidence)", furniture.len(), not_a_zone.len());
+             evidence for (a `<name>_doors.glb`, a `maps/<name>.txt`, or any entry at \
+             `maps/water/<name>.wtr`) OR that the asset cache's sync record names (#928): \
+             {entries} entries scanned, {non_glb} non-glb, {} doors/obj, {} glb with neither. \
+             Population provenance: {manifest}",
+            furniture.len(), not_a_zone.len());
         let discovered = zones.len();
 
         // ── #850 / #879 review B1: the ACCOUNTING, owned by a type instead of by call sites ─────
@@ -3884,6 +4390,10 @@ mod tests {
         // `covered + dropped == discovered` and passed green having measured zero zones, with
         // `drifters.is_empty()` and `ch_dry == 0` both vacuously true.
         let mut cover = crate::nav::water_grid::WaterRollup::new();
+        // #927: per-zone, beside the corpus total. `t_emb` stays as the printed headline number and
+        // is reconciled against this type's per-zone terms below — a total may not disagree with
+        // the terms it is a total of.
+        let mut probes = ProbeCoverage::new();
         let mut t_emb = 0u64;
         let (mut ch_dry, mut ch_chest, mut ch_wet) = (0u64, 0u64, 0u64);
         let (mut same_dry, mut same_chest, mut same_wet) = (0u64, 0u64, 0u64);
@@ -3957,6 +4467,10 @@ mod tests {
             println!("{name:>12}: embedded={zone_emb}");
             // The ONLY way to close the zone `open_corpus_zone` opened. Reached only by an
             // iteration that ran to the bottom; anything else leaves the zone `unaccounted`.
+            // #927: the zone's own probe count is recorded on the same path, so a zone that is
+            // counted as MEASURED and a zone that is counted as PROBED are the same set by
+            // construction — `is_complete_over` below re-checks that rather than assuming it.
+            probes.record(name, u64::from(zone_emb));
             cover.add(name, &zw.tally());
         }
         // `accounting:` is ZONE accounting only. The rollup's own water total is structurally 0
@@ -3964,12 +4478,32 @@ mod tests {
         // below — the `changed:`/`unchanged:` buckets — and folds a zero-valued tally per zone. The
         // "0" on that line is not a measurement of anything; the "over N/M zones" and the
         // COMPLETE/INCOMPLETE verdict are.
+        // Names the sync record calls zones that this `$EQZONES` has no `.glb` for. PRINTED, not
+        // asserted: the record accumulates every set this cache ever synced, across servers and
+        // across evictions, so its names are a superset of what is on disk now and a missing `.glb`
+        // here is not by itself evidence of anything. Hoisted out of the `println!` because the
+        // borrow of `manifest.zone_names()`'s temporary would not outlive the format arguments.
+        let zone_set: std::collections::BTreeSet<&str> = zones.iter().map(String::as_str).collect();
+        let recorded = manifest.zone_names();
+        let recorded_no_glb: Vec<&str> =
+            recorded.iter().copied().filter(|n| !zone_set.contains(n)).collect();
+        // Every marker on this report is on a LINE OF ITS OWN (#898): `— COMPLETE` is a claim
+        // about the zone accounting, `— EVERY-ZONE-PROBED` about probe coverage and
+        // `— POPULATION-ASSERTED`/`— POPULATION-INFERRED` about where the population came from.
+        // Three different questions; a line-level grep for one must not land on another's answer.
         println!("\nzones: discovered={discovered} covered={} embedded={t_emb}\n  \
                   accounting (zones only; the leading 0 is not a water measurement): {cover}\n  \
-                  discovery: {entries} $EQZONES entries = {discovered} zone glb (with zone \
-                  evidence) + {} doors/obj glb + {} glb with no zone evidence (NOT sampled) + \
+                  probe coverage (#927, per zone — a corpus total cannot see 41 of 42 zones \
+                  probing nothing): {probes}\n  \
+                  population provenance (#928): {manifest}\n  \
+                  discovery: {entries} $EQZONES entries = {discovered} zone glb + {} doors/obj glb \
+                  + {} glb with neither zone evidence nor a sync record (NOT sampled) + \
                   {non_glb} non-glb + {} unreadable\n  \
-                  no zone evidence, excluded: {not_a_zone:?}\n  \
+                  admitted by the sync record alone (no doors companion, no map pack, no .wtr \
+                  entry — #928): {manifest_only:?}\n  \
+                  neither zone evidence nor a sync record, excluded: {not_a_zone:?}\n  \
+                  named by the sync record with no glb here (printed, NOT asserted — the record \
+                  outlives any one asset sync): {recorded_no_glb:?}\n  \
                   unreadable: {unreadable:?}\n  \
                   no floor: {no_floor} of {t_cols} sampled columns\n  \
                   changed: dry-body={ch_dry} wet-chest-dry-feet={ch_chest} \
@@ -3993,15 +4527,30 @@ mod tests {
             "#850: the rollup saw {} zones but discovery found {discovered} — a zone was never even \
              opened, so the corpus is smaller than its own rollup line says",
             cover.attempted_zones());
-        // CORPUS-level clean-over-nothing, and only that (#879 review N5): `t_emb` is the total
-        // across every zone, so this catches a corpus that probed nothing at all and NOT a corpus
-        // where all but one zone contributed zero probes. It exists because `drifters.is_empty()`
-        // and `ch_dry == 0` below are both vacuously true on an empty sample. A per-zone version
-        // would be the stronger claim and is not what this is.
-        assert!(t_emb > 0,
-            "#850: {discovered} zone(s) measured but ZERO embedded samples were found across the \
-             WHOLE corpus — `drifters.is_empty()` and `ch_dry == 0` below are vacuous at this \
-             coverage ({no_floor} of {t_cols} sampled columns found no floor)");
+        // #927: PER-ZONE clean-over-nothing. What stood here was `assert!(t_emb > 0)` — a corpus
+        // total, so it caught a corpus that probed nothing at all and could not catch a corpus
+        // where 41 of 42 zones contributed zero probes. Both payload assertions below
+        // (`drifters.is_empty()`, `ch_dry == 0`) are vacuously true for a zone that contributed no
+        // embedded sample, so that corpus passed green with one zone's worth of evidence under a
+        // headline reading `discovered=42 covered=42`.
+        //
+        // Now every zone the rollup counts as MEASURED must also be recorded here with at least one
+        // embedded probe, or be NAMED as one that was not. The count check is the other half: a
+        // zone that reaches `cover.add` without reaching `probes.record` would otherwise be
+        // measured-but-unprobed and invisible, which is the future-`continue` shape one level down
+        // from `WaterRollup`'s `unaccounted` bucket.
+        assert!(probes.is_complete_over(cover.measured_zones()),
+            "#927: probe coverage is not per-zone complete over the {} zone(s) the rollup measured \
+             — {probes}. `drifters.is_empty()` and `ch_dry == 0` below are VACUOUS for any zone \
+             named there, so this run's payload assertions do not cover the corpus its headline \
+             claims ({no_floor} of {t_cols} sampled columns found no floor)",
+            cover.measured_zones());
+        // …and the printed headline `embedded={t_emb}` must equal the per-zone terms it is a total
+        // of. A total that can drift from its terms is how a corpus-level number came to stand for
+        // per-zone evidence in the first place.
+        assert_eq!(probes.total(), t_emb,
+            "#927: the printed corpus total embedded={t_emb} disagrees with the per-zone terms \
+             ({}) — {probes}", probes.total());
         assert!(drifters.is_empty(),
             "a recovery must never itself be embedded — {} sample(s) were STILL MOVING and STILL \
              EMBEDDED after two input-free seconds (the review's finding-1 drift signature): {:?}",

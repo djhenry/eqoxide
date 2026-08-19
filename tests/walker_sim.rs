@@ -26,7 +26,8 @@ use eqoxide::assets::{MeshData, RenderMode, ZoneAssets};
 use eqoxide::region_map::RegionMap;
 // #762: water/region data is carried as a MEASURED-or-UNMEASURED value, never as an `Option` a
 // corpus can silently read as "this zone has no water".
-use eqoxide::nav::water_grid::{open_corpus_zone, WaterRollup, ZoneWater, UNMEASURED};
+use eqoxide::nav::water_grid::{open_corpus_zone, RollupReport, WaterRollup, ZoneWater,
+                               COMPOSITE_CLEAN, COMPOSITE_DIRTY, UNMEASURED};
 use eqoxide_core::physics::{PLAYER_RADIUS, RUN_SPEED};
 use eqoxide_ipc::MoveIntent;
 
@@ -806,10 +807,12 @@ use eqoxide_ipc::MoveIntent;
             roll_423.add(zone, &zw.measure(|_| n_423));
         }
         let rate = if tot_walked > 0 { 100.0 * tot_wedged as f32 / tot_walked as f32 } else { 0.0 };
+        // #898: the two rollups are rendered by `RollupReport`, one per line plus the report's own
+        // verdict, instead of being concatenated into this headline — see that type's doc.
         println!("\n=== FAITHFUL WALKER DRIFT [{}]: {tot_walked} full journeys walked, {tot_wedged} terminal wedges \
-            ({rate:.2}%) — height #386: {tot_height}, overlap #381: {tot_overlap}, other: {tot_other}, \
-            wat-route: {roll_wr}, #423: {roll_423} ===",
-            if include_water { "WATER-INCLUSIVE" } else { "DRY" });
+            ({rate:.2}%) — height #386: {tot_height}, overlap #381: {tot_overlap}, other: {tot_other} ==={}",
+            if include_water { "WATER-INCLUSIVE" } else { "DRY" },
+            RollupReport::new([("wat-route", &roll_wr), ("#423", &roll_423)]));
         if include_water {
             println!("(wat-route = wedge whose COMMITTED coarse route carried water waypoints near the wedge = a \
                       planner/ROUTING failure, OURS to fix in later water-nav increments. #423 = route dry near the \
@@ -844,10 +847,12 @@ use eqoxide_ipc::MoveIntent;
              unaccounted (left the loop without reaching add or skip — a corpus wiring bug, not an \
              asset problem): {:?}\n  \
              #423     — unmeasured: {:?}; skipped: {:?}; unaccounted: {:?}\n  \
-             Bake or fetch the missing region files / zone glbs and re-run. \
-             (wat-route {roll_wr}; #423 {roll_423})",
+             Bake or fetch the missing region files / zone glbs and re-run.{}",
             roll_wr.unmeasured_zones(), roll_wr.skipped_zones(), roll_wr.unaccounted_zones(),
-            roll_423.unmeasured_zones(), roll_423.skipped_zones(), roll_423.unaccounted_zones());
+            roll_423.unmeasured_zones(), roll_423.skipped_zones(), roll_423.unaccounted_zones(),
+            // #898: not `(wat-route {roll_wr}; #423 {roll_423})` — that put both rollups' markers
+            // on one line of a FAILURE message, where a reader is least able to afford it.
+            RollupReport::new([("wat-route", &roll_wr), ("#423", &roll_423)]));
     }
 
 // ── #805: the corpus's zone accounting, enforced per zone instead of only at the end ──
@@ -937,9 +942,10 @@ use eqoxide_ipc::MoveIntent;
     ///   the corpus calls it. That was measured (by running the deletion and comparing figures), not
     ///   assumed, and it is not fixed here — whether `#[ignore]`d tests should run in CI is
     ///   #777/#654/#659, an owner decision.
-    /// * The corpus's total line (`wat-route: {roll_wr}`) sits after the same loop, so an
-    ///   unterminated run prints no water total — a claim about statement order in THIS file,
-    ///   checked by reading it, not an observation of a hung run. No blackburrow run was executed.
+    /// * The corpus's total line (the `RollupReport` in the `FAITHFUL WALKER DRIFT [{}]` println)
+    ///   sits after the same loop, so an unterminated run prints no water total — a claim about
+    ///   statement order in THIS file, checked by reading it, not an observation of a hung run. No
+    ///   blackburrow run was executed.
     fn open_zone_checked(wr: &mut WaterRollup, r423: &mut WaterRollup, zone: &str) {
         for (label, roll) in [("wat-route", &*wr), ("#423", &*r423)] {
             let orphans = roll.unaccounted_zones();
@@ -948,9 +954,13 @@ use eqoxide_ipc::MoveIntent;
             // N4: the corpus's own total line runs after the loop and this panic is inside it, so
             // print what the run DID establish before dying. PARTIAL by construction — the zones
             // after this one are never opened.
+            // #898: the two rollups go through `RollupReport`, which puts each on its OWN line and
+            // gives the report a verdict marker of its own. Printed side by side on this line they
+            // produced exactly the composite #898 is about — a `— COMPLETE` from whichever rollup
+            // happened to be clean, sitting on the line of a report that is aborted and partial.
             println!("\n=== FAITHFUL WALKER DRIFT [ABORTED while opening {zone}] — PARTIAL rollups; \
-                      the zones after {zone} were never opened, so this is not a corpus score: \
-                      wat-route: {}, #423: {} ===", &*wr, &*r423);
+                      the zones after {zone} were never opened, so this is not a corpus score ==={}",
+                     RollupReport::new([("wat-route", &*wr), ("#423", &*r423)]));
             panic!("#805/#762: opening zone {zone:?}, but the {label} rollup already holds a hole \
                     that the terminal assert would only have reported at the END of a run that may \
                     never get there (#763). unaccounted (left the loop body without reaching add or \
@@ -1083,9 +1093,15 @@ use eqoxide_ipc::MoveIntent;
     /// Shared by the #831 pin below and by the #897 regression test, so the regression measures the
     /// same genuine libtest output the pin would have leaked.
     fn run_inner_fixture_capturing_output() -> std::process::Output {
+        run_fixture_capturing_output("zone_accounting_fires_before_the_corpus_loop_ends")
+    }
+
+    /// The same subprocess re-run, for any fixture in this binary by name (#898 needed a second
+    /// one — a DIVERGED abort, which the #805 fixture does not produce).
+    fn run_fixture_capturing_output(test_name: &str) -> std::process::Output {
         let exe = std::env::current_exe().expect("test binary path (for the subprocess re-run)");
         std::process::Command::new(&exe)
-            .arg("zone_accounting_fires_before_the_corpus_loop_ends")
+            .arg(test_name)
             .arg("--exact")
             .arg("--nocapture")
             .output()
@@ -1341,6 +1357,137 @@ use eqoxide_ipc::MoveIntent;
         open_zone_checked(&mut wr, &mut r423, "zone_b");
         panic!("UNREACHED: zone_b opened with `#423` still holding an abandoned zone_a — the gate \
                 only consults the wat-route rollup");
+    }
+
+    // ───────── #898: the DIVERGED abort — one rollup clean, the other holding the hole ─────────
+
+    /// **#898 fixture — the state the composite marker exists for.** `wat-route` closes `zone_a`
+    /// with a real MEASUREMENT (so its own `Display` is honestly `— COMPLETE`, and prints the
+    /// historical defect string `(over 1/1 zones)` while it is at it) and `#423` is left open.
+    /// Opening `zone_b` then trips `open_zone_checked` on its SECOND arm, and the `[ABORTED …]`
+    /// report it prints carries one clean rollup and one hole.
+    ///
+    /// `zone_accounting_covers_the_423_rollup_not_just_wat_route` above drives the same divergence
+    /// but closes `wat-route` with `skip`, which makes it incomplete too — so it never produced a
+    /// `— COMPLETE` inside an aborted report and cannot serve as this test's fixture.
+    #[test]
+    #[should_panic(expected = "the #423 rollup already holds a hole")]
+    fn a_diverged_abort_prints_one_clean_rollup_and_one_hole_898() {
+        let mut wr = WaterRollup::new();
+        let mut r423 = WaterRollup::new();
+        let measured = ZoneWater::from_map(RegionMap::water_slab(-44.0, -4.0));
+        open_zone_checked(&mut wr, &mut r423, "zone_a");
+        // wat-route: measured and CLOSED — genuinely complete. `#423`: opened, never closed.
+        wr.add("zone_a", &measured.measure(|_| 0usize));
+        open_zone_checked(&mut wr, &mut r423, "zone_b");
+        panic!("UNREACHED: zone_b opened with `#423` still holding an abandoned zone_a — the gate \
+                only consults the wat-route rollup");
+    }
+
+    /// **#898 — the `[ABORTED …]` report cannot be read as clean by a line-level grep.**
+    ///
+    /// Before this change `open_zone_checked` printed both rollups on ONE line, so an aborted,
+    /// partial report contained the literal substring `— COMPLETE` on the same line as the tag
+    /// saying the run had died. `— COMPLETE` is a marker designed to be grep-able so a reader or a
+    /// script does not have to parse a rollup; two markers of different kinds on one line is
+    /// exactly the composite a naive audit is trying to catch.
+    ///
+    /// Measured by EXECUTION, not source text (#799): the fixture above runs as a subprocess and
+    /// this test scans the bytes it really wrote.
+    ///
+    /// Four properties, the first a REACH CONTROL — without it, a report that simply stopped
+    /// printing `— COMPLETE` anywhere would satisfy the rest while telling the reader less.
+    ///
+    /// **MUTATION CHECKS (each independently turns this RED) — see the PR body for transcripts:**
+    /// 1. Render both rollups on ONE line (drop the per-rollup `writeln!` from `RollupReport`'s
+    ///    `Display`) → property 2 fails on the `[ABORTED …]` line. **This is the mutant that ran
+    ///    GREEN against the first version of property 2 — see the ⚠️ note inside it.**
+    /// 2. Delete the verdict line from `RollupReport`'s `Display` → property 3 fails.
+    /// 3. Close `#423` in the fixture as well, so nothing aborts → the fixture no longer satisfies
+    ///    its own `#[should_panic]`, and the subprocess-status assertion at the top of this test
+    ///    fires before the reach control does.
+    #[test]
+    fn a_diverged_abort_report_is_not_greppable_as_clean_898() {
+        let out = run_fixture_capturing_output("a_diverged_abort_prints_one_clean_rollup_and_one_hole_898");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(),
+            "fixture broke: a_diverged_abort_prints_one_clean_rollup_and_one_hole_898 did not pass \
+             as a subprocess (status {:?}).\n{}{}",
+            out.status, quote_child_output("captured stdout", &stdout),
+            quote_child_output("captured stderr", &String::from_utf8_lossy(&out.stderr)));
+
+        // 1. REACH CONTROL. The abort really happened, and the divergence really produced a clean
+        //    rollup marker beside the historical defect string. Without all three, everything
+        //    below is vacuous.
+        for (what, needle) in [
+            ("the abort itself", "[ABORTED while opening zone_b]"),
+            ("a genuinely clean rollup's own marker", "— COMPLETE"),
+            ("#898's exhibit, the clean rollup's `(over 1/1 zones)`", "(over 1/1 zones)"),
+        ] {
+            assert!(stdout.contains(needle),
+                "reach control: {what} ({needle:?}) is missing from the captured stdout, so the \
+                 properties below measure nothing.\n{}",
+                quote_child_output("captured stdout", &stdout));
+        }
+
+        // 2. THE FIX. No line of the report carries a per-rollup clean marker together with the
+        //    abort tag, the report's own verdict, or the OTHER per-rollup marker — and in
+        //    particular the `[ABORTED …]` line itself no longer contains `— COMPLETE`.
+        //
+        //    `— COMPLETE` identifies that marker on its own: `"— INCOMPLETE"`, `"— ALL-COMPLETE"`
+        //    and `"— NOT-ALL-COMPLETE"` all fail to contain it, because the em-dash-and-space is
+        //    the disambiguator. `composite_markers_are_line_safe_against_every_other_898` in
+        //    `water_grid.rs` asserts that for all twelve ordered pairs, so it is pinned, not assumed.
+        //
+        //    ⚠️ MEASURED — this loop USED to open with
+        //    `let per_clean = line.contains("— COMPLETE") && !line.contains("— INCOMPLETE");
+        //     if !per_clean { continue }`
+        //    and mutation 1 below ran GREEN against it. The mutant renders both rollups on ONE
+        //    line, so that line carries BOTH per-rollup markers, `per_clean` was FALSE, the line
+        //    was skipped, and every assertion in this loop was vacuous — including the one that
+        //    says a line must not carry both. The exempting term is gone. A predicate that
+        //    excludes the very state its assertions are about is #927's shape inside #898's test.
+        let mut clean_lines = 0usize;
+        for line in stdout.lines() {
+            if !line.contains("— COMPLETE") { continue }
+            clean_lines += 1;
+            assert!(!line.contains("[ABORTED while opening"),
+                "the ABORTED tag shares a line with a per-rollup `— COMPLETE`: a line-level grep \
+                 for the clean marker lands on the very line that says the run died. Line: \
+                 {line:?}\n{}",
+                quote_child_output("captured stdout", &stdout));
+            assert!(!line.contains(COMPOSITE_CLEAN) && !line.contains(COMPOSITE_DIRTY),
+                "a per-rollup `— COMPLETE` shares a line with the report's own verdict, so the two \
+                 claims cannot be told apart by line. Line: {line:?}\n{}",
+                quote_child_output("captured stdout", &stdout));
+            assert!(!line.contains("— INCOMPLETE"),
+                "one line carries both per-rollup markers. Line: {line:?}\n{}",
+                quote_child_output("captured stdout", &stdout));
+        }
+        // …and the loop above really examined a line. An exceptions-only scan cannot tell "nothing
+        // wrong" from "nothing looked at" (#927), and that is not hypothetical here: the skipped-line
+        // form of this loop above is exactly how it went green on a real mutant. Exactly one line, so
+        // this is also the audit a reader would run — a grep for the clean marker lands only on the
+        // rollup that really is clean.
+        assert_eq!(clean_lines, 1,
+            "reach control: the per-rollup `— COMPLETE` must appear on exactly one line of the \
+             captured stdout — the clean rollup's — and the loop above must have examined it; \
+             found {clean_lines}\n{}",
+            quote_child_output("captured stdout", &stdout));
+
+        // 3. …and the report DOES state a verdict of its own, exactly once, and it is not clean.
+        let verdicts: Vec<&str> = stdout.lines()
+            .filter(|l| l.contains(COMPOSITE_CLEAN) || l.contains(COMPOSITE_DIRTY)).collect();
+        assert_eq!(verdicts.len(), 1,
+            "the aborted report must carry exactly one composite verdict line, got {verdicts:?}\n{}",
+            quote_child_output("captured stdout", &stdout));
+        assert!(verdicts[0].contains(COMPOSITE_DIRTY) && !verdicts[0].contains(COMPOSITE_CLEAN),
+            "a report holding an abandoned zone must not print the clean composite marker: {:?}",
+            verdicts[0]);
+
+        // 4. …and it names WHICH half is dirty, so the reader is not left to diff two rollups.
+        assert!(verdicts[0].contains("#423"),
+            "the composite verdict must name the incomplete rollup: {:?}", verdicts[0]);
     }
 
     /// **#805 — `unmeasured` is refused per zone too (round-2 B1/B3).** Round 1 checked only
@@ -1664,6 +1811,12 @@ use eqoxide_ipc::MoveIntent;
             // #919: named by plain `//` comments elsewhere in this file, which the nav crate's scan
             // cannot see (it reads `///` and `//!` only), so it is pinned by hand here.
             walker_source_anchors_cited_in_this_file_still_resolve,
+            // cited by `a_diverged_abort_prints_one_clean_rollup_and_one_hole_898`'s rustdoc
+            // (#898), which names it to say why it cannot serve as that fixture: it closes
+            // `wat-route` with `skip`, so both rollups are incomplete and no `— COMPLETE` ever
+            // reaches an aborted report. Added after the workspace suite failed on the citation,
+            // exactly as the two entries above were — the scan is the measurement, not this note.
+            zone_accounting_covers_the_423_rollup_not_just_wat_route,
         ];
     }
 
