@@ -1,7 +1,6 @@
 //! Universal Chat Service (UCS) link. The zone sends `OP_SetChatServer` at zone-in with the UCS
-//! address + mail key; the client opens a second EQStream to it, logs in with `OP_MailLogin`, then
-//! exchanges `OP_ChannelMessage`s. This module starts with parsing that bootstrap packet; the
-//! connection + login + message routing build on top.
+//! address + mail key; the client opens a second EQStream to it and logs in with `OP_MailLogin`.
+//! This module starts with parsing that bootstrap packet; the connection + login build on top.
 //!
 //! See EQEmu ucs/clientlist.cpp for the server side.
 
