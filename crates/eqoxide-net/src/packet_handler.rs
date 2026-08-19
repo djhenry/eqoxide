@@ -2129,7 +2129,7 @@ fn apply_level_update(gs: &mut GameState, payload: &[u8]) {
 }
 
 /// OP_SetChatServer — the UCS (chat server) address + mail key, sent at zone-in. Capture it so the
-/// UCS link can connect for cross-zone tells/OOC. (Connection/login is built on top of this.)
+/// UCS link can connect. (Connection/login is built on top of this.)
 fn apply_set_chat_server(gs: &mut GameState, payload: &[u8]) {
     match crate::ucs::parse_set_chat_server(payload) {
         Some(info) => {

@@ -623,6 +623,7 @@ pub async fn run_gameplay_phase(
                     action_loop.dialogue_shared(),
                     action_loop.merchant_shared(),
                     action_loop.task_offers_shared(),
+                    action_loop.world_slots(),
                     ZONE_ENTRY_HANDSHAKE_DEADLINE,
                 ).await;
                 if !zoned_in {
@@ -632,7 +633,7 @@ pub async fn run_gameplay_phase(
                     tracing::warn!("EQ: zone-in never completed after world reconnect — exiting gameplay");
                     return;
                 }
-                action_loop.sync_zone_points(&gs);
+                action_loop.sync_zone_points_after_zone_in(&gs);
                 last_keepalive = std::time::Instant::now();
                 reset_probe_clocks(&net_health);
             } else {
@@ -674,6 +675,7 @@ pub async fn run_gameplay_phase(
                         action_loop.dialogue_shared(),
                         action_loop.merchant_shared(),
                         action_loop.task_offers_shared(),
+                        action_loop.world_slots(),
                         ZONE_ENTRY_HANDSHAKE_DEADLINE,
                     ).await;
                     if !zoned_in {
@@ -682,7 +684,7 @@ pub async fn run_gameplay_phase(
                         tracing::warn!("EQ: zone transition never completed — exiting gameplay");
                         return;
                     }
-                    action_loop.sync_zone_points(&gs);
+                    action_loop.sync_zone_points_after_zone_in(&gs);
                     last_keepalive = std::time::Instant::now();
                     reset_probe_clocks(&net_health);
                 }
@@ -993,6 +995,7 @@ async fn run_zone_entry_handshake(
     dialogue:             &eqoxide_ipc::DialogueShared,
     merchant:             &eqoxide_ipc::MerchantShared,
     task_offers:          &eqoxide_ipc::TaskOffersShared,
+    world:                &eqoxide_ipc::WorldSlots,
     deadline_dur:         Duration,
 ) -> bool {
     // Purge the previous zone's spawns/doors now, before OP_ReqClientSpawn asks for the new zone's
@@ -1067,6 +1070,53 @@ async fn run_zone_entry_handshake(
     dialogue.lock().unwrap().clear();
     *merchant.lock().unwrap() = eqoxide_ipc::MerchantSnapshot::default();
     task_offers.lock().unwrap().clear();
+
+    // ...and the PUBLISHED half of the entity roster and of this zone's exit points (#1010), for
+    // exactly the reason the four clears above exist. `controller.begin_zone_in(gs)` has just
+    // emptied `gs.world.entities` and `gs.world.zone_points`, but what an agent reads are the
+    // SHARED copies in `WorldSlots`. Without these two lines the DEPARTED zone's roster and exit
+    // points stay published, complete and well-formed, with no marker distinguishing them from a
+    // fresh publish, for the whole zone load (up to `ZONE_ENTRY_HANDSHAKE_DEADLINE`, 30 s) while
+    // `publish_snapshot` runs every 10 ms and keeps the HTTP session live and answering:
+    //
+    //   * the roster triple backs NAME → SPAWN-ID resolution — GET /v1/observe/entities,
+    //     POST /v1/interact/hail, /v1/merchant/open|buy|sell, /v1/trainer/open, /v1/move/goto by
+    //     name, and the "is this spawn known?" gate on /v1/combat/target and /v1/combat/consider —
+    //     so a call issued during the window resolves a name against the zone we just left and
+    //     addresses a spawn id that means something else here, or nothing.
+    //   * `zone_points` is served by GET /v1/observe/zone_entrances (and its `/zone_points` alias)
+    //     and is what POST /v1/move/zone_cross validates a requested `zone_id` against, so during
+    //     the window the exits answered are the departed zone's. GET /v1/observe/zone_exits reads
+    //     the same list too (#1063 review round 1, finding 5 — it was missing from this list): for
+    //     `dest_of` and to feed `classify_unresolved_cross`. On the cleared list it reports every
+    //     exit as `"zone_id": null` (documented as honestly UNKNOWN, #683) with `gated: true`,
+    //     which is what the net thread independently concludes from the same empty list — so that
+    //     endpoint degrades consistently and honestly, and needed no change here. (Separately and
+    //     PRE-EXISTING, not touched by #1010: its 503 asset gate keys on `s.player().zone`, which
+    //     during a handshake is still the DEPARTED zone's name.)
+    //
+    // The roster is cleared by PUBLISHING the just-emptied `gs.world.entities` through the sole
+    // publisher rather than by touching the three maps: they are private behind the
+    // single-publisher seal (#665/#652), and a second writer here is precisely what that seal
+    // exists to make impossible — this is the same call `ActionLoop::sync_entities` makes.
+    // ⚠️ ORDER: it reads `gs.world.entities`, so it must stay BELOW `controller.begin_zone_in(gs)`.
+    // Moved above it, this line would republish the departed zone's roster verbatim — present,
+    // reached, and inert. The #1010 test moves it to prove that, not only deletes it.
+    //
+    // Clear, not republish-as-they-arrive, for the same reason as `doors` above — and note what
+    // that leaves: records this drain applies into `gs` during the window stay unpublished until
+    // `run_gameplay_phase` drains its first packet. That is the publishing-gap shape #937 named for
+    // doors (a conservative empty, not a falsehood); it is a separate class and is not addressed
+    // here.
+    //
+    // The `zone_points` clear invalidates the zone-change latch `ActionLoop::sync_zone_points` keys
+    // on (#816), so both call sites resync through `ActionLoop::sync_zone_points_after_zone_in`,
+    // which re-arms it. That re-arm is load-bearing on EVERY re-entry whose zone NAME is unchanged —
+    // i.e. any server-originated `success = 1` OP_ZoneChange echo carrying the CURRENT zone id with
+    // no same-zone reposition pending. A same-zone death/bind respawn is the most common of those,
+    // NOT the only one, so the re-arm is unconditional; see that method's doc for the full rule.
+    world.publish_entities(&gs.world.entities);
+    world.zone_points.lock().unwrap().clear();
 
     // The one and ONLY OP_ZoneEntry for this session (see the fn doc — a second one self-kicks).
     // `poll_resend` retransmits this same datagram if it is lost in flight; nothing here ever issues a
@@ -1795,6 +1845,7 @@ mod zone_entry_handshake_publish_tests {
                 &eqoxide_ipc::DialogueShared::default(),
                 &eqoxide_ipc::MerchantShared::default(),
                 &eqoxide_ipc::TaskOffersShared::default(),
+                &eqoxide_ipc::WorldSlots::default(),
                 Duration::from_secs(30),
             ).await;
         });
@@ -1857,6 +1908,7 @@ mod zone_entry_handshake_publish_tests {
             &eqoxide_ipc::DialogueShared::default(),
             &eqoxide_ipc::MerchantShared::default(),
             &eqoxide_ipc::TaskOffersShared::default(),
+            &eqoxide_ipc::WorldSlots::default(),
             Duration::from_millis(3200), // > the 2.5s the KB warns a blind resend could fire at
         ).await;
 
@@ -1892,6 +1944,7 @@ mod zone_entry_handshake_publish_tests {
             &eqoxide_ipc::DialogueShared::default(),
             &eqoxide_ipc::MerchantShared::default(),
             &eqoxide_ipc::TaskOffersShared::default(),
+            &eqoxide_ipc::WorldSlots::default(),
             Duration::from_millis(200),  // deadline — never completes
         ).await;
 
@@ -1950,6 +2003,7 @@ mod zone_entry_handshake_publish_tests {
             &eqoxide_ipc::DialogueShared::default(),
             &eqoxide_ipc::MerchantShared::default(),
             &eqoxide_ipc::TaskOffersShared::default(),
+            &eqoxide_ipc::WorldSlots::default(),
             Duration::from_millis(50), // deadline — never completes; the clear is at the top
         ).await;
 
@@ -2042,6 +2096,7 @@ mod zone_entry_handshake_publish_tests {
                 &eqoxide_ipc::DialogueShared::default(),
                 &eqoxide_ipc::MerchantShared::default(),
                 &eqoxide_ipc::TaskOffersShared::default(),
+                &eqoxide_ipc::WorldSlots::default(),
                 Duration::from_secs(30),
             ).await;
         });
@@ -2127,6 +2182,7 @@ mod zone_entry_handshake_publish_tests {
                 &eqoxide_ipc::DialogueShared::default(),
                 &eqoxide_ipc::MerchantShared::default(),
                 &eqoxide_ipc::TaskOffersShared::default(),
+                &eqoxide_ipc::WorldSlots::default(),
                 Duration::from_secs(30),
             ).await;
         });
@@ -2218,6 +2274,7 @@ mod zone_entry_handshake_publish_tests {
                 &eqoxide_ipc::DialogueShared::default(),
                 &eqoxide_ipc::MerchantShared::default(),
                 &eqoxide_ipc::TaskOffersShared::default(),
+                &eqoxide_ipc::WorldSlots::default(),
                 Duration::from_secs(30), // never reached — no packets are ever sent
             ).await;
         });
@@ -2293,6 +2350,7 @@ mod zone_entry_handshake_publish_tests {
                 &eqoxide_ipc::DialogueShared::default(),
                 &eqoxide_ipc::MerchantShared::default(),
                 &eqoxide_ipc::TaskOffersShared::default(),
+                &eqoxide_ipc::WorldSlots::default(),
                 Duration::from_secs(30),
             ).await;
         });
@@ -2389,6 +2447,7 @@ mod zone_entry_handshake_publish_tests {
                 &eqoxide_ipc::DialogueShared::default(),
                 &eqoxide_ipc::MerchantShared::default(),
                 &eqoxide_ipc::TaskOffersShared::default(),
+                &eqoxide_ipc::WorldSlots::default(),
                 Duration::from_millis(300),
             ).await;
             // `gs` is moved into this task, so read the #335 fields the caller also checks BEFORE
@@ -2489,6 +2548,7 @@ mod zone_entry_handshake_publish_tests {
             &dialogue,
             &merchant,
             &eqoxide_ipc::TaskOffersShared::default(),
+            &eqoxide_ipc::WorldSlots::default(),
             Duration::from_millis(50), // deadline — never completes; the clears are at the top
         ).await;
 
@@ -2568,6 +2628,7 @@ mod zone_entry_handshake_publish_tests {
             &eqoxide_ipc::DialogueShared::default(),
             &eqoxide_ipc::MerchantShared::default(),
             &task_offers,
+            &eqoxide_ipc::WorldSlots::default(),
             Duration::from_millis(50), // deadline — never completes; the clear is at the top
         ).await;
 
@@ -2578,6 +2639,261 @@ mod zone_entry_handshake_publish_tests {
              `QuestSlots::task_offers_shared` is served by GET /v1/quests/offers as this zone's \
              current offer, and POST /v1/quests/accept will address OP_AcceptNewTask to the \
              departed NPC's spawn id (#1004)");
+    }
+
+    /// **#1010 — the PUBLISHED half of the ENTITY ROSTER purge, pinned DURING the handshake window.**
+    ///
+    /// `GameState::begin_zone_in` empties `gs.world.entities`, but what an agent reads is the
+    /// roster triple in `WorldSlots` (`entity_positions`/`entity_ids`/`entity_poses`). Before this
+    /// fix the roster held the DEPARTED zone's entities for the whole handshake — up to
+    /// `ZONE_ENTRY_HANDSHAKE_DEADLINE` (30 s) — while `publish_snapshot`
+    /// ran every 10 ms and kept the HTTP session live. That roster is what name → spawn-id
+    /// resolution reads, so `POST /v1/interact/hail {"name":"…"}`, `/v1/merchant/open`,
+    /// `/v1/trainer/open`, `/v1/move/goto` by name and the "is this spawn known?" gate on
+    /// `/v1/combat/target` all resolved a name against the zone we had just left and addressed a
+    /// spawn id that means something else here, or nothing.
+    ///
+    /// **Shape: this pins the state DURING the window, not after it** — the whole defect lives in
+    /// the interval where the drain has not started, so a test that only checks the settled state
+    /// proves nothing (that is #1016 review B1's finding on the doors test, applied here from the
+    /// start). The handshake runs in the BACKGROUND with a 30 s deadline that is never reached
+    /// (`_tx` is bound but never `.send()`s, so the inner `try_recv` never once succeeds), and the
+    /// roster is polled with a 1 s budget — three orders of magnitude short of the deadline. Unlike
+    /// the doors case there is no failure-path clear for the roster to mask a late result either:
+    /// with the fix removed, NOTHING in this function ever touches the three maps.
+    ///
+    /// The seeded entities are the departed zone's, in BOTH copies, as production would have them:
+    /// published (via the real single publisher, not a hand-rolled write — the maps are private,
+    /// #665) and in `gs.world.entities`. Nothing here publishes replacements; the claim is that
+    /// they must be GONE, not swapped.
+    ///
+    /// MUTATION CHECK — three, and the third is the one that is not a restatement:
+    /// - DELETE `world.publish_entities(&gs.world.entities);` from the top of
+    ///   `run_zone_entry_handshake` → RED (the poll budget expires; nothing else ever writes the
+    ///   maps).
+    /// - WRAP it as `if std::hint::black_box(false) { world.publish_entities(&gs.world.entities); }`
+    ///   → also RED, by the same timeout. Stated plainly, per the correction #1016 already recorded
+    ///   on the doors test: `black_box(false)` never takes the branch, so for a bare-statement fix
+    ///   this wrap is behaviourally IDENTICAL to the delete — the same finding shown twice, not
+    ///   independent evidence.
+    /// - MOVE it ABOVE `controller.begin_zone_in(gs);` (line present, reached, and executed —
+    ///   inert only in effect) → also RED, and this one IS independent: `gs.world.entities` is
+    ///   still full there, so the call republishes the departed roster verbatim and the poll sees
+    ///   two live entries rather than none. That is the ordering hazard of sourcing the clear from
+    ///   `gs`, and it is why this test seeds `gs.world.entities` as well as the published copy.
+    #[tokio::test]
+    async fn a_zone_entry_handshake_clears_the_departed_zones_published_entity_roster_1010() {
+        let (mut stream, _unused_rx) = test_stream(0, 0).await;
+        let (_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
+        let (mut gs, snapshot, health) = fresh_gs_snapshot();
+
+        // The departed zone's entities, in both copies. TWO of them so a mutation that trims the
+        // roster rather than clearing it leaves a survivor count distinguishable from "did nothing".
+        for (id, name) in [(4001u32, "a_departed_rat"), (4002, "Guard Departed")] {
+            gs.world.entities.insert(
+                id,
+                eqoxide_core::game_state::make_entity(id, name, 10.0, 20.0, 30.0, true),
+            );
+        }
+        let world = eqoxide_ipc::WorldSlots::default();
+        // Publish them the way production does — through the ONE publisher (#665/#652: the three
+        // maps are private and this is the only writer), so the fixture is a real prior publish.
+        assert_eq!(world.publish_entities(&gs.world.entities), 2,
+            "fixture premise: the departed zone's roster really is published before the zone-in");
+        let world_bg = world.clone();
+
+        let handle = tokio::spawn(async move {
+            run_zone_entry_handshake(
+                &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
+                &eqoxide_ipc::ControllerSlots::default(),
+                &eqoxide_ipc::DoorsShared::default(),
+                &eqoxide_ipc::DialogueShared::default(),
+                &eqoxide_ipc::MerchantShared::default(),
+                &eqoxide_ipc::TaskOffersShared::default(),
+                &world_bg,
+                Duration::from_secs(30), // never reached — no packet is ever sent
+            ).await;
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let (p, i, o) = (
+                world.entity_positions().len(),
+                world.entity_ids().len(),
+                world.entity_poses().len(),
+            );
+            if (p, i, o) == (0, 0, 0) { break; }
+            assert!(std::time::Instant::now() < deadline,
+                "the published entity roster still held the departed zone's entities 1s into a \
+                 handshake whose deadline is 30s (positions={p} ids={i} poses={o}) — an agent \
+                 polling GET /v1/observe/entities reads a complete, well-formed roster of a zone it \
+                 is no longer in, and every name → spawn-id resolution built on it (hail, merchant, \
+                 trainer, goto-by-name, combat target) addresses a departed spawn id (#1010)");
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        handle.abort();
+    }
+
+    /// **#1010 — the PUBLISHED half of the ZONE_POINTS purge, pinned DURING the handshake window.**
+    ///
+    /// Same shape and same reason as the roster test above, for the other `WorldSlots` group.
+    /// `GameState::begin_zone_in` clears `gs.world.zone_points` (#683 review F2); the published
+    /// list it is mirrored into is what
+    /// `GET /v1/observe/zone_entrances` (and its `/zone_points` alias) serves and what
+    /// `POST /v1/move/zone_cross` validates a requested `zone_id` against — so for the whole
+    /// zone-in window the exits an agent reads, and the reachability its crossing request is judged
+    /// by, are the DEPARTED zone's.
+    ///
+    /// Isolated in its own test rather than folded into the roster one, for the reason #1004's
+    /// review gave for the merchant/task-offer split: with both groups asserted in one test an
+    /// earlier assertion firing first can shadow the other and hide that it was never independently
+    /// covered.
+    ///
+    /// Both seeded points are the departed zone's, and one of them is a client-synthesized
+    /// map-label entry (`iterator == u32::MAX`, the kind `sync_zone_points` merges in from the
+    /// zone's `.txt`) — the two kinds are cleared together, and the map-label kind is exactly what
+    /// `ActionLoop::sync_zone_points_after_zone_in` exists to put back for the new zone.
+    ///
+    /// MUTATION CHECK (both directions):
+    /// - DELETE `world.zone_points.lock().unwrap().clear();` → RED (the poll budget expires).
+    /// - WRAP it, taken arm `if std::hint::black_box(false) { …the clear… }` with the untaken arm
+    ///   spelled `else { world.zone_points.lock().unwrap().truncate(1); }` → also RED, and the
+    ///   else-arm is what makes it a genuinely DIFFERENT mutation, not a restatement: with two
+    ///   seeded points `truncate(1)` leaves exactly one survivor where the delete leaves two, so
+    ///   the assertion is failing on a different state (the `Vec::truncate` no-op-at-length-1 trap
+    ///   #1004's round-2 review found is why this fixture seeds two, not one).
+    #[tokio::test]
+    async fn a_zone_entry_handshake_clears_the_departed_zones_published_zone_points_1010() {
+        let (mut stream, _unused_rx) = test_stream(0, 0).await;
+        let (_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
+        let (mut gs, snapshot, health) = fresh_gs_snapshot();
+
+        let departed = vec![
+            // A server advert from OP_SendZonepoints…
+            eqoxide_core::game_state::ZonePoint {
+                iterator: 7, server_x: 100.0, server_y: 200.0, server_z: 0.0,
+                heading: 0.0, zone_id: 38,
+            },
+            // …and a client-synthesized map-label fallback exit (#816), which is the kind that
+            // does NOT come back from the wire and has to be reloaded from disk.
+            eqoxide_core::game_state::ZonePoint {
+                iterator: u32::MAX, server_x: -100.0, server_y: -200.0, server_z: 0.0,
+                heading: 0.0, zone_id: 2,
+            },
+        ];
+        let world = eqoxide_ipc::WorldSlots::default();
+        *world.zone_points.lock().unwrap() = departed.clone();
+        // Mirror the server adverts in `gs`, as production would: both copies exist simultaneously,
+        // and the point of this test is that clearing only the `gs` one is not enough.
+        gs.world.zone_points = departed;
+        let world_bg = world.clone();
+
+        let handle = tokio::spawn(async move {
+            run_zone_entry_handshake(
+                &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
+                &eqoxide_ipc::ControllerSlots::default(),
+                &eqoxide_ipc::DoorsShared::default(),
+                &eqoxide_ipc::DialogueShared::default(),
+                &eqoxide_ipc::MerchantShared::default(),
+                &eqoxide_ipc::TaskOffersShared::default(),
+                &world_bg,
+                Duration::from_secs(30), // never reached — no packet is ever sent
+            ).await;
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let left = world.zone_points.lock().unwrap().len();
+            if left == 0 { break; }
+            assert!(std::time::Instant::now() < deadline,
+                "the published zone_points list still held {left} of the departed zone's exit \
+                 points 1s into a handshake whose deadline is 30s — GET /v1/observe/zone_entrances \
+                 serves them as this zone's exits and POST /v1/move/zone_cross judges a requested \
+                 zone_id reachable against them (#1010)");
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        handle.abort();
+    }
+
+    /// **#1010 (review round 1, finding 4): a SOURCE-TEXT PIN on the two PRODUCTION call sites.**
+    ///
+    /// The two tests above pin what `run_zone_entry_handshake` does with the slots it is HANDED.
+    /// Nothing pinned that `run_gameplay_phase` hands it the real ones. The round-1 reviewer
+    /// measured that hole with two mutants, both of which left the whole 430-test crate GREEN:
+    /// pointing both call sites at a throwaway `&eqoxide_ipc::WorldSlots::default()` (so the entire
+    /// fix writes into a discarded bundle), and reverting both post-handshake resyncs to a plain
+    /// `sync_zone_points` (which IS the pre-fix behaviour, i.e. the #816 latch defect this PR's
+    /// design check 3 exists to prevent). Both call sites need a real `EqStream::connect`, so a
+    /// behavioural test would need a live server.
+    ///
+    /// This is the idiom `eqoxide-net` already uses where the property is "the call site must be
+    /// written this way" and a behavioural test cannot reach it —
+    /// `the_only_raw_fd_socket_in_the_crate_is_the_manually_dropped_send_rescue` and
+    /// `there_is_exactly_one_socket_send_call_in_the_crate_and_it_records_failures` in
+    /// `transport.rs`.
+    ///
+    /// **Be exact about what this proves: WRITTEN, not REACHED.** It cannot show either call site
+    /// executes; it matches characters. That is precisely the property that is unpinned here, and a
+    /// pin on it is strictly better than nothing — but it must not be read as coverage of the
+    /// production paths.
+    ///
+    /// It anchors on `ActionLoop::controller_slots()`, which occurs at exactly the two production
+    /// call sites (every test in this module passes `&eqoxide_ipc::ControllerSlots::default()`
+    /// instead), and for each one checks two things:
+    ///
+    /// 1. **wiring** — the same argument list also passes `ActionLoop::world_slots()`, so the fix
+    ///    cannot be aimed at a throwaway bundle;
+    /// 2. **spelling AND position** — between that call's `.await;` and the NEXT production call
+    ///    site (or end of file), the first `ActionLoop::sync_zone_points…` that appears is the
+    ///    `_after_zone_in` one. That catches the plain-`sync_zone_points` revert, a single-site
+    ///    revert, and the resync being hoisted ABOVE its handshake (which would leave this call
+    ///    site's window with no resync in it at all).
+    ///
+    /// Needles are split with `concat!` so this test's own source text cannot satisfy them.
+    #[test]
+    fn the_two_production_zone_entry_handshake_call_sites_stay_wired_to_the_1010_slots() {
+        let src = include_str!("gameplay.rs");
+        let ctrl_arg = concat!("action_loop.", "controller_slots()");
+        let slots_arg = concat!("action_loop.", "world_slots()");
+        let any_resync = concat!("action_loop.", "sync_zone_points");
+        let good_resync = concat!("action_loop.", "sync_zone_points_after_zone_in(&gs);");
+
+        let sites: Vec<usize> = src.match_indices(ctrl_arg).map(|(i, _)| i).collect();
+        assert_eq!(sites.len(), 2,
+            "expected exactly the two production `run_zone_entry_handshake` call sites in \
+             `run_gameplay_phase` (the world-reconnect one and the zone-transition one); found {}. \
+             If a third real call site was added it needs the same #1010 wiring — add it here \
+             rather than relaxing this count.", sites.len());
+
+        for (n, &at) in sites.iter().enumerate() {
+            let window_end = sites.get(n + 1).copied().unwrap_or(src.len());
+            let rel_await = src[at..window_end].find(").await;").unwrap_or_else(|| panic!(
+                "production call site {n} does not close with `).await;` before the next one — this \
+                 pin's anchoring assumption no longer holds; re-derive it rather than deleting it"));
+            let arglist = &src[at..at + rel_await];
+            assert!(arglist.contains(slots_arg),
+                "production `run_zone_entry_handshake` call site {n} must pass \
+                 `ActionLoop::world_slots()` — without it the #1010 clears write into a bundle no \
+                 agent ever reads, and every test in this module still passes because they hand the \
+                 function its slots directly");
+
+            let tail = &src[at + rel_await..window_end];
+            let rel_sync = tail.find(any_resync).unwrap_or_else(|| panic!(
+                "production call site {n} has no `ActionLoop::sync_zone_points…` after its \
+                 `.await;` — the post-handshake resync is what re-arms the #816 zone-change latch \
+                 the handshake's `zone_points` clear invalidates, and hoisting it above the \
+                 handshake would leave the latch asserting a list that is about to be emptied"));
+            assert!(tail[rel_sync..].starts_with(good_resync),
+                "production call site {n} must resync through \
+                 `sync_zone_points_after_zone_in`, not plain `sync_zone_points`: the plain call IS \
+                 the pre-fix behaviour, and on every re-entry whose zone NAME is unchanged it takes \
+                 the preserve arm, drains the already-emptied published list and puts nothing back \
+                 — permanently dropping this zone's map-label fallback exits (#1010 design check 3, \
+                 #816). Found instead: {:?}",
+                tail[rel_sync..].chars().take(60).collect::<String>());
+        }
     }
 }
 
