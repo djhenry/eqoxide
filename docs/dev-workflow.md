@@ -215,12 +215,17 @@ The proof value is in the command and its result. The absolute path adds nothing
 is the entire leak. The same holds for host names, container names, and any `-u<user> -p<pass>`
 form. Pasted `ps` output and build-host detail are out for the same reason.
 
-Two scanners enforce this, sharing one pattern list (`scripts/local-detail-patterns.sh`) so they
-cannot drift, plus a third tool for the one class a regex cannot express:
+Two scanners enforce the local-detail class, sharing one pattern list
+(`scripts/local-detail-patterns.sh`) so they cannot drift, plus a third tool for the one class a
+regex cannot express. `check-pr-text.sh` carries two further passes over the same corpus, for two
+defects that have nothing to do with local detail — they are described under
+[What `check-pr-text.sh` scans](#what-check-pr-textsh-scans) below:
 
 ```sh
 scripts/check-no-local-detail.sh              # tracked files — a preventer, runs before merge
-scripts/check-pr-text.sh <pr-or-issue-number> # PR/issue title, body, comments, review comments
+scripts/check-pr-text.sh <pr-or-issue-number> # PR/issue title, body, comments, review comments,
+                                              #   and (for a PR) its commit messages
+scripts/check-pr-text.sh --commits <range>    # local git commit messages, before the PR exists
 scripts/check-pr-text.sh --self-test          # offline; runs both scanners through their guards
 scripts/check-host-shape.py                   # tracked files — host-name heuristic, WARNING only
 scripts/check-host-shape.py --self-test       # offline fixtures, both directions
@@ -260,6 +265,37 @@ survived five filters" — a host name that is an English word, or carries a dig
 sits in code rather than prose, or recurs across files, or is not on a line with infrastructure
 vocabulary, is invisible to it.
 
+### What `check-pr-text.sh` scans
+
+Three independent passes over one corpus. All three run on every invocation and all three classify
+every item; the summary prints a line per pass.
+
+1. **Local-system detail** (#980) — the shared pattern list above, on the surface
+   `check-no-local-detail.sh` structurally cannot see. Gates on any finding.
+2. **A negated closing keyword** (#1041) — "does not close #N" and its variants. GitHub links the
+   keyword to the number and does not read the negation in front of it, so the sentence written to
+   record that an issue is OUT of scope is the sentence that closes it. At least ten issues here
+   were closed exactly that way.
+3. **A squash-relative reference** (#1051) — "the previous commit", "this branch's earlier commit
+   message". This repository squashes with `squash_merge_commit_message=COMMIT_MESSAGES`, so every
+   branch commit message is concatenated into `main`'s permanent history at merge, and force-push is
+   blocked. A phrase that resolves only while the branch exists as a distinct object becomes false
+   the moment the squash collapses it: "the previous commit" silently starts naming whatever sits
+   behind the squash commit on `main`. Four instances are already permanent in this repo's history.
+
+Passes 2 and 3 gate only on a pull request's **body** and on a **commit message** — the surfaces
+where each defect can actually happen. Both fail the CI step. On a title, a comment or an issue body
+either one is printed as a warning and does not change the exit code, because a comment links
+nothing and is not squashed into anything. **Read the summary lines, not just the exit code**: a
+warn-only run says `NOT CLEAN, but not gating`, and the text still wants rewriting before anyone
+pastes it into a body or a commit message.
+
+`--commits <range>` runs passes 2 and 3 over local git commit messages before a pull request exists.
+It is the mode that matters most for pass 3, since a commit message is the surface the squash
+publishes verbatim. It is deliberately not wired into CI: every `actions/checkout` in
+`.github/workflows/test.yml` runs at the default fetch-depth of 1, so a runner has no branch history
+to walk, and the live mode already reads a PR's commits through the API.
+
 `check-pr-text.sh` is a **detector, not a preventer**: GitHub has published the text before any
 check can read it, and keeps the edit history after it is scrubbed. Read a green run as "the
 current text is clean", never as "nothing was ever exposed".
@@ -268,13 +304,23 @@ CI runs the scan from a `pull_request` trigger, so it only ever sees the text as
 last **push**. A comment added afterwards — which is every review comment on the final revision — is
 never scanned automatically. Run `scripts/check-pr-text.sh <number>` by hand to cover those.
 
-`--self-test` checks a specific list, not a vague "still works": one deliberately-dirty item per
-pattern and three clean ones; a reach control that empties the pattern list and requires nothing to
-flag; an unreadable item that must count toward the corpus and not toward `classified`; the
-empty-corpus refusal; and — by *executing* `check-no-local-detail.sh` and `check-pr-text.sh` with
-`LOCAL_DETAIL_PATTERNS_FILE` pointed at an empty pattern list — each scanner's refusal to run with
-no patterns. That last part is deliberate: an earlier version asserted the refusal by re-deriving
-the condition inline, which stayed green when the real guard was deleted.
+`--self-test` checks a specific list, not a vague "still works", and it covers all three passes.
+For each: one deliberately-dirty item per pattern, and clean items that must NOT flag; a reach
+control that empties that pass's pattern list and requires nothing to flag while every item stays
+classified; a mixed manifest with one readable item and one unreadable one, which must come back
+`classified 1/2` so the `classified N/N` line is something that can disagree rather than an
+identity; and the empty-corpus refusal. Passes 2 and 3 additionally pin every positive fixture to a
+**measured instance quoted verbatim** from this repo's own history, run end-to-end against a stub
+`gh` serving recorded payloads, and assert the gating policy in both directions. Pass 3's
+must-stay-green fixtures include the **sanctioned** form — an absolute sha that is already on `main`
+— by name, because flagging that would push authors back to the relative phrasing that caused the
+defect.
+
+Each pass's pattern list is overridable by an environment variable
+(`LOCAL_DETAIL_PATTERNS_FILE`, `NEGCLOSE_PATTERNS_FILE`, `SQUASHREL_PATTERNS_FILE`) for one reason:
+so `--self-test` can point the REAL script at an empty list and require it to refuse. That
+indirection is deliberate — an earlier version asserted the refusal by re-deriving the condition
+inline, which stayed green when the real guard was deleted.
 
 Key test modules:
 - `src/assets.rs` — collision grid (floor_z, segment_blocked, path_clear)
