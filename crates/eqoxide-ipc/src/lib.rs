@@ -1334,8 +1334,21 @@ pub struct EntityPoseView {
     pub gait: Option<i32>,
 }
 
-/// Live entity name → pose/gait map (same keys as `EntityPositions`), published each tick by the
-/// net thread and read by `GET /v1/observe/entities?labeled=1` (#643).
+/// Live entity name → pose/gait map (same keys as `EntityPositions`), read by
+/// `GET /v1/observe/entities?labeled=1` (#643). NOT on a clock (#1044, same class as #1023):
+/// published from two call sites, both through the single `WorldSlots::publish_entities`
+/// projection —
+///
+/// 1. `ActionLoop::sync_entities`, called once per packet `run_gameplay_phase`'s inbound drain
+///    has drained AND applied via `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — a
+///    cadence driven by server traffic, not the 150 ms nav clock; the interval is unbounded in a
+///    silent zone.
+/// 2. `login::run_login_flow`'s own one-time seed, republishing everything discovered during
+///    login once, before the gameplay loop's own drain takes over.
+///
+/// `run_zone_entry_handshake`'s own drain during a re-zone does not touch this slot (it takes no
+/// `WorldSlots` parameter) — the roster keeps the departed zone's poses until the gameplay loop's
+/// drain resumes after the handshake returns.
 pub type EntityPoses = Arc<Mutex<Roster<EntityPoseView>>>;
 
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /v1/observe/zone_points.
@@ -1459,12 +1472,27 @@ impl NetThreadDeath {
 /// reads `None` forever.
 pub type NetThreadDeadShared = Arc<Mutex<Option<NetThreadDeath>>>;
 
-/// Native Task-system quest log, published from GameState.tasks each tick (GET /v1/observe/quests/log).
+/// Native Task-system quest log, sourced from GameState.tasks (GET /v1/observe/quests/log).
+/// NOT on a clock (#1044, same class as #1023): published by `ActionLoop::sync_tasks`, called
+/// once per packet `run_gameplay_phase`'s inbound drain has drained AND applied via
+/// `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — a cadence driven by server traffic,
+/// not the 150 ms nav clock; the interval is unbounded in a silent zone. Quest progress is not
+/// zone-scoped, so unlike [`TaskOffersShared`] this slot is NOT cleared by
+/// `run_zone_entry_handshake` on a re-zone — it keeps its value across a zone line, which is the
+/// honest answer for a character-wide log.
 pub type TaskLog = Arc<Mutex<Vec<eqoxide_core::game_state::ActiveTask>>>;
 
-/// Pending offers from an open task-selector window, published each tick (GET /v1/quests/offers).
+/// Pending offers from an open task-selector window (GET /v1/quests/offers). Published by
+/// `ActionLoop::sync_tasks` alongside [`TaskLog`] and [`CompletedTasksShared`] — same cadence and
+/// gate, see that type's doc (#1044, same class as #1023). Unlike the other two, this one IS
+/// zone-scoped (an offer names the offering NPC in the zone we are leaving):
+/// `run_zone_entry_handshake` clears it directly on a re-zone, before the gameplay drain resumes
+/// (`crates/eqoxide-net/src/gameplay.rs`, `task_offers.lock().unwrap().clear();`).
 pub type TaskOffersShared = Arc<Mutex<Vec<eqoxide_core::game_state::TaskOffer>>>;
-/// Completed-task history with titles, published each tick (GET /v1/quests/completed).
+/// Completed-task history with titles (GET /v1/quests/completed). Published by
+/// `ActionLoop::sync_tasks` alongside [`TaskLog`] and [`TaskOffersShared`] — same cadence, gate,
+/// and not-zone-scoped behaviour as [`TaskLog`]; see that type's doc (#1044, same class as
+/// #1023).
 pub type CompletedTasksShared = Arc<Mutex<Vec<eqoxide_core::game_state::CompletedTaskEntry>>>;
 /// Accept/decline a pending task offer, set by POST /v1/quests/accept ({"task_id":N}) or
 /// POST /v1/quests/decline (task_id=0). The nav thread reads it once and sends
@@ -1701,10 +1729,25 @@ pub type GiveReq = Arc<Mutex<Option<(u32, u32)>>>;
 pub type GiveAwaitReq = Arc<Mutex<Option<(u32, u32,
     oneshot::Sender<CommandResult<GiveOk>>)>>>;
 
-/// Live snapshot of the player's inventory + equipment, published each tick by the nav thread
-/// and read by GET /v1/observe/inventory. Slots are Titanium **wire** ids (the same numbers /give
-/// and /inventory/move take — note these are one less than the EQEmu DB `inventory.slot_id` for
-/// general slots: DB 23-30 → wire 22-29).
+/// Live snapshot of the player's inventory + equipment, read by GET /v1/observe/inventory. Slots
+/// are Titanium **wire** ids (the same numbers /give and /inventory/move take — note these are one
+/// less than the EQEmu DB `inventory.slot_id` for general slots: DB 23-30 → wire 22-29).
+///
+/// NOT on a clock (#1044, same class as #1023): published by `ActionLoop::sync_inventory` from
+/// two drivers —
+///
+/// 1. Once per packet `run_gameplay_phase`'s inbound drain has drained AND applied via
+///    `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — mirrors what the SERVER just told
+///    us.
+/// 2. Immediately, within the same tick, whenever a locally-applied inventory-mutating command
+///    (move/scribe/unmem/trade-stage/etc.) is drained — via `ActionLoop::mirror_move_item` /
+///    `mirror_remove_item`, called from `drain_move_item`/`drain_mem_spell`/etc. inside
+///    `ActionLoop::tick` (`crates/eqoxide-net/src/action_loop.rs`), which runs every ~10 ms
+///    outer-loop pass and is NOT gated by the 150 ms nav-planner clock — mirrors what WE just
+///    told the server, since EQEmu sends no echo for a self-initiated move.
+///
+/// Both drivers are event-driven; a pass with no drained packet and no pending local command
+/// publishes nothing.
 pub type InventoryShared = Arc<Mutex<Vec<eqoxide_core::game_state::InvItem>>>;
 
 /// Loot request — a corpse spawn id, set by POST /v1/interact/loot. The nav thread reads it once and
@@ -1726,12 +1769,24 @@ pub struct MessageEntry {
     pub item_links:  Vec<eqoxide_core::game_state::ItemLink>,
 }
 
-/// Live snapshot of the in-game message log, published each tick by the nav thread and read by
-/// GET /v1/observe/messages. Exposes NPC dialogue (kind "npc") as machine-readable text + keywords.
+/// Live snapshot of the in-game message log, read by GET /v1/observe/messages. Exposes NPC
+/// dialogue (kind "npc") as machine-readable text + keywords.
+///
+/// NOT on a clock (#1044, same class as #1023): published by `ActionLoop::sync_messages`, called
+/// once per packet `run_gameplay_phase`'s inbound drain has drained AND applied via
+/// `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — a cadence driven by server traffic,
+/// not the 150 ms nav clock; the interval is unbounded in a silent zone. `sync_messages` is also
+/// the sole publisher of [`DialogueShared`] and [`ChatEventsShared`] — same call, same gate.
 pub type MessagesShared = Arc<Mutex<Vec<MessageEntry>>>;
 
 /// Live snapshot of the current clickable NPC-dialogue choices (saylinks from the most recent NPC
-/// message), published each tick by the nav thread and read by GET /v1/observe/dialogue. (#120)
+/// message), read by GET /v1/observe/dialogue. (#120)
+///
+/// Published by `ActionLoop::sync_messages` alongside [`MessagesShared`] and [`ChatEventsShared`]
+/// — same cadence and gate, see that type's doc (#1044, same class as #1023). Unlike the other
+/// two, this one IS zone-scoped (a choice names the NPC in the zone we are leaving):
+/// `run_zone_entry_handshake` clears it directly on a re-zone, before the gameplay drain resumes
+/// (`crates/eqoxide-net/src/gameplay.rs`, `dialogue.lock().unwrap().clear();`).
 pub type DialogueShared = Arc<Mutex<Vec<eqoxide_core::game_state::DialogueChoice>>>;
 
 /// ── The LIFE-HALT `nav_state` vocabulary (#1000/#1007, agent-honesty) ───────────────────────────
@@ -2248,8 +2303,22 @@ pub struct Event {
     pub text:     String,
 }
 
-/// Live snapshot of async events, published each tick by the nav thread, read by the
-/// `GET /v1/events/*` endpoints. Ordered by ascending `id`.
+/// Live snapshot of async events, read by the `GET /v1/events/*` endpoints. Ordered by ascending
+/// `id`.
+///
+/// NOT on a clock (#1044, same class as #1023): published by `ActionLoop::sync_messages`
+/// alongside [`MessagesShared`] and [`DialogueShared`] — same cadence and gate, see that type's
+/// doc. Sourced from `GameState::push_event`'s own 200-entry ring
+/// (`crates/eqoxide-core/src/game_state.rs`), which many packet handlers and a couple of
+/// `gameplay.rs` timeout paths append to directly — `sync_messages` republishes that ring
+/// wholesale (clear + extend) into this slot, so it is the only writer of the PUBLISHED copy even
+/// though `push_event` itself has many callers upstream of it.
+///
+/// Checked for a second writer in `eqoxide-http` (flagged as a possibility in #1044): none found
+/// in production code. `eqoxide-http/src/events.rs` only ever READS this slot (`fetch`'s
+/// `s.chat.chat_events.lock().unwrap()`); the direct `.push()`s onto it in that file live in its
+/// own `#[cfg(test)]` module, seeding fixtures for the endpoint's own tests, and do not run in the
+/// shipped binary.
 pub type ChatEventsShared = Arc<Mutex<Vec<Event>>>;
 
 /// One queued outgoing chat message, set by POST /v1/chat/{tell,ooc,shout,group} and drained by the
