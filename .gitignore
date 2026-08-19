@@ -17,8 +17,12 @@ config-*.yaml
 Zone_*.jpg
 Zone_*.png
 
-# Claude Code workspace (agents, skills, settings, local state) — not published
+# Agent-harness workspaces (agents, skills, settings, local state) — not published.
+# .claude/ is Claude Code's; .agents/ and .codex/ are the same content mirrored for
+# other harnesses. Any future harness workspace belongs under this same rule.
 .claude/
+.agents/
+.codex/
 
 # Superpowers plans/specs — developer-local, not published
 docs/superpowers/
