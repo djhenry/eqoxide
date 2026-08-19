@@ -591,7 +591,7 @@ negclose_attribution() {
 #   those two widened to a BARE `this branch's`, plus
 #   `(on|in|from) (the same|this) branch` and `commit <n>`   45 flagged lines, 4 true, 41 FALSE (91%)
 #   eqoxide#1051's THIRD cue on its own — a `[0-9a-f]{7,40}` sha that is not an ancestor of
-#   `origin/main`, counted over sha-SHAPED tokens only      171 flagged lines in 61 of the 200 items
+#   `origin/main`, counted over sha-SHAPED tokens only      171 flagged lines in 59 of the 200 items
 #   (as literally written that pattern also matches any 7-or-more-digit figure: 408 flagged lines)
 #   the set below, without the code-span strip                8 flagged lines, 6 true,  2 false (25%)
 #   the set below, as shipped                                 7 flagged lines, 6 true,  1 false (14%)

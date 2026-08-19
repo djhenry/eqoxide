@@ -216,7 +216,7 @@ jobs:
   # requests (12 bodies + 38 comments), swept 2026-08-19. #1051's two TEXT cues, worded exactly as it
   # words them, flag 6 lines: 4 true, 2 false (33% FP). Its THIRD cue is what makes the proposal
   # unshippable — a `[0-9a-f]{7,40}` sha that is not an ancestor of `origin/main` flags 76 distinct
-  # tokens across 171 lines in 61 of the 200 items, and exactly 3 of those 76 are the references
+  # tokens across 171 lines in 59 of the 200 items, and exactly 3 of those 76 are the references
   # #1051's own table points at, all 3 of which still resolve (see the sha note in the script; only
   # `b585625` is quoted there, the other two are carried by the `def3249` row it files as "same
   # class"). Widening the text cues instead is the other trap: a bare `this branch's` plus
@@ -393,7 +393,8 @@ jobs:
       # against the fixtures as they stand at this commit; a fixture edit is not local, so the WHOLE
       # set is re-run whenever any fixture changes. Two earlier revisions are the reason that rule is
       # written down: one quoted 4 for the every-surface mutation, true against a 60-check suite and
-      # false at 67, and the 19 quoted for the emptied stop set was true at 67 and is 27 here. That OK-line mutation is why the warn-only stub mode exists: neither of the other
+      # false at 67, and the 19 quoted for the emptied stop set was true at 67 and is 27 here. That
+      # OK-line mutation is why the warn-only stub mode exists: neither of the other
       # two modes reaches the final summary line with a flagged item in hand, so every one of the 60
       # checks the suite then contained passed over a line stating the opposite of what had just
       # happened. The em dash is in the gap stop set on measured evidence too: over the full published
