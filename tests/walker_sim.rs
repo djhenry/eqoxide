@@ -13,6 +13,9 @@
 use eqoxide::movement::CharacterController;
 use eqoxide::nav::collision::{Collision, LocalOutcome, PlanCtx, PlanOutcome};
 use eqoxide::nav::steering::{carrot_along, carrot_along_los, fast_steer_aim, swim_vspeed};
+// #904: the ONE cursor-resync reachability conjunction. This file used to hand-copy it — see the
+// resync block in `faithful_walker_drift_corpus` for what that copy cost and why it is gone.
+use eqoxide::nav::steering::resync_reachable;
 // Production tuning constants, IMPORTED rather than copied. Every name here was a private
 // `const … = <literal>;` inside a test fn until #733's review found `LOCAL_REACH` still copied three
 // lines under a comment promising the opposite; the rest came out of the same grep. Values were
@@ -402,22 +405,30 @@ use eqoxide_ipc::MoveIntent;
                 // The predicate is the walker's own conjunction, and both halves are the SAME public
                 // `Collision` methods `Walker::advance_cursor` calls.
                 //
-                // ⚠️ Correction (#727 round 4). The clearance IS a divergence, and this comment used
-                // to deny it: it said the `PLAYER_RADIUS` below is "the same" value as walker.rs's
-                // `STEER_LOS_CLEARANCE` and therefore "nothing here is a copy, so nothing can drift".
-                // `STEER_LOS_CLEARANCE` is *defined as* `PLAYER_RADIUS` today, so the two agree by
-                // coincidence, not by construction — change that definition and this scanner silently
-                // stops modelling the walker. This is an integration test, so it cannot name the
-                // `pub(crate)` constant; the in-crate sim in `steering.rs` references it directly and
-                // does not have this gap. Until this file can too, the coincidence is disclosed here
-                // rather than asserted away. #919: that definition is quoted verbatim as an anchor in
-                // `walker_source_anchors_cited_in_this_file_still_resolve`, so changing it turns this
-                // paragraph RED instead of quietly false.
+                // ⚠️ Correction (#727 round 4), and its RESOLUTION (#904). Round 4's correction said
+                // the clearance IS a divergence: this loop passed `PLAYER_RADIUS` where the walker
+                // passes `STEER_LOS_CLEARANCE`, and since the latter is *defined as* the former the
+                // two agreed by coincidence, not by construction — re-point that definition and this
+                // scanner silently stops modelling the walker. It also said this file "cannot name
+                // the `pub(crate)` constant", so the coincidence was disclosed rather than removed.
+                //
+                // Both halves are now moot, and the reason is that the conjunction itself moved.
+                // #734/#887 extracted `steering::resync_reachable` — one definition of
+                // `carrot_los_clear` ∧ `ground_continuous`, marked `pub` explicitly so an integration
+                // test could call it. This file was the THIRD hand-copy and did not call it, which is
+                // what #904 filed: the extraction existed to stop exactly the drift this line was
+                // still carrying. Calling it takes the clearance with it — the constant is chosen
+                // INSIDE that function now, so there is nothing here to agree by coincidence.
+                //
+                // #919 still quotes `STEER_LOS_CLEARANCE`'s definition as a source-text anchor in
+                // `walker_source_anchors_cited_in_this_file_still_resolve`; its claim is now that the
+                // definition is the one this paragraph's retraction is ABOUT, not one this loop
+                // depends on.
                 {
                     let walked_to = path_i;
                     path_i = eqoxide::nav::steering::resync_cursor(
                         &coarse, path_i, [px, py, pz],
-                        |a, b| col.carrot_los_clear(a, b, PLAYER_RADIUS) && col.ground_continuous(a, b));
+                        |a, b| resync_reachable(col, a, b));
                     // A resync is NOT progress: raise the stall detector's high-water mark with it,
                     // exactly as the walker does, so a jump can never reset `stuck_ticks`.
                     if path_i > walked_to { stuck_i = stuck_i.max(path_i); }
@@ -1662,8 +1673,11 @@ use eqoxide_ipc::MoveIntent;
             // The three the first revision's regex could not see: review found the first two
             // (#919 review, non-blocking 6), the third turned up on a re-read afterwards.
             ("pub(crate) const STEER_LOS_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS;",
-             "the clearance this file's resync comment discloses as equal to PLAYER_RADIUS only by \
-              coincidence — the whole disclosure is void if this definition changes"),
+             "the definition this file's resync-block retraction is about (#904): while this loop \
+              hand-copied the conjunction, the copy agreed with the walker's clearance only by \
+              this coincidence. The loop now calls `steering::resync_reachable`, which picks the \
+              clearance itself, so the retraction is history — and it is history that stops being \
+              readable if this definition is re-pointed without rewriting it"),
             ("const CORNER_BUFFER: f32 = 2.0;",
              "the corner buffer this file's inflation fixture restates by value"),
             ("(design §8.2)",
