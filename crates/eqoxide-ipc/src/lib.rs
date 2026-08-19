@@ -78,10 +78,17 @@ pub struct MoveIntent {
     pub hop:         bool,
 }
 
-/// A snapshot of the controller the render thread republishes each frame for the nav thread to
-/// stream to the server (design §2 "Threading"). `heading` is EQ-CCW degrees.
+/// A snapshot of the controller the render thread republishes for the nav thread to stream to the
+/// server (design §2 "Threading"). `heading` is EQ-CCW degrees.
 ///
-/// "Each frame" describes how the render thread refreshes `pos`/`heading`/`initialized`, which it
+/// NOT "each frame", and [`ControllerShared`] states the terms this doc has to agree with (#1044
+/// review round 3, N1 — the two blocks disagreed): the republish runs on every RENDERED frame, and
+/// only once the camera has initialised. `about_to_wait`'s idle branch requests no redraw, so a
+/// still scene renders nothing at all; and `src/app.rs` gates the whole publish on
+/// `camera_initialized`, which is set once at camera init and never cleared, so nothing is
+/// published here before then.
+///
+/// That cadence describes how the render thread refreshes `pos`/`heading`/`initialized`, which it
 /// alone writes. It does NOT mean the render thread is the only writer of the published copy: two
 /// net-thread writers also mutate it, off the frame cadence entirely. Both are named on
 /// [`ControllerShared`] — read that before treating a value read from this struct as render-thread
@@ -469,14 +476,55 @@ pub type FriendsListShared = Arc<Mutex<Vec<String>>>;
 /// the server sends back) — mirrors [`WhoReq`]. (#301)
 pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_state::WhoEntry>>>>>;
 
-/// Target position for the navigation system. Set by /goto, cleared on arrival.
+/// Target position for the navigation system: the coordinate the nav walker is steering to, `None`
+/// when it has no goal. It is not written only by `/goto` — see [`GotoEntity`] for the FOLLOW case,
+/// where `NavWalker::drive_chase` republishes this slot from the chased entity's current position,
+/// and where the clearing rules that used to be stated here are set out against the code.
 pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
 
-/// When /goto targets a named ENTITY, this holds its `entity_positions` key so the nav walker can
-/// re-resolve the entity's CURRENT position each tick and CHASE it — roaming mobs move (and their
+/// When the nav walker is FOLLOWing a named ENTITY, this holds its `entity_positions` key so the
+/// walker can re-resolve the entity's CURRENT position and CHASE it — roaming mobs move (and their
 /// client position is stale until they come within the server's update range), so pathing to a
-/// one-time snapshot lands nowhere near them (eqoxide#88). `None` for coordinate gotos. Cleared
-/// on arrival/stop alongside `goto_target`.
+/// one-time snapshot lands nowhere near them (eqoxide#88). `None` for coordinate gotos.
+///
+/// Written by ONE production site and cleared by six. Those two counts are the compiler's, not a
+/// grep's: every access to this field in the workspace was enumerated by marking the field and
+/// reading back the use sites the build reports, and the test-only ones were separated out by
+/// comparing `cargo check --workspace` against `cargo check --workspace --all-targets`.
+///
+/// * SET only by `NavCommands::request_follow` (`crates/eqoxide-command/src/nav.rs`), whose only
+///   production caller is POST /v1/move/follow. `/goto` does NOT set it — `request_goto` CLEARS
+///   it, so a coordinate goto cancels an in-flight chase.
+/// * CLEARED by `request_goto`, `request_stop`, `NavWalker::reset_for_zone_change`,
+///   `NavWalker::nav_halt_if_dead`, and `NavWalker::drive_chase`'s own two clears (the goal was
+///   cancelled elsewhere; the entity despawned or left view).
+///
+/// Two things this slot does NOT do, both of which earlier revisions of this doc asserted (#1044
+/// review round 3, BLOCKING 1):
+///
+/// * **Re-resolution is not guaranteed once per nav tick.** The re-resolve lives in `drive_chase`,
+///   whose only production call site is in `ActionLoop::tick`
+///   (`crates/eqoxide-net/src/action_loop.rs`) below the 150 ms nav gate — but also below
+///   `if self.drive_auto_engage_melee(stream, gs) { return; }`. Auto-melee returns `true`,
+///   skipping the remainder of that tick and `drive_chase` with it, whenever it runs with
+///   auto-attack on, `target_id` set, that target present in the entity roster, and that target
+///   within 200 units. While melee is engaging, the chase is not re-resolved at all.
+/// * **It is not cleared on arrival** — a chase has no arrival. While following,
+///   `steering::arrival_action` (`crates/eqoxide-nav/src/steering.rs`) returns `FollowHold` inside
+///   the follow distance and `Drive` outside it, never `Arrived`.
+///
+/// The first of those is agent-visible, because that same auto-melee branch also calls
+/// `NavCommands::request_cancel_goto`, which clears [`GotoTarget`] and deliberately LEAVES this
+/// slot set (pinned by `request_cancel_goto_clears_only_target`). The melee path does not put the
+/// goal back. So the next `drive_chase` to run reads `goto_target` and finds it `None` — unless a
+/// fresh `/goto`, `/follow` or zone-cross resolution has issued a new goal meanwhile, each of
+/// which writes THIS slot itself — takes its "cancelled elsewhere" branch, and clears this slot as
+/// well: the follow is ABANDONED, not suspended and resumed. The cancel is at least announced
+/// (`request_cancel_goto` stamps a fresh idle goal with reason `goto_superseded`), but nothing
+/// restarts the chase, so an agent that wants to keep following through a melee engagement has to
+/// re-POST /v1/move/follow. Auto-melee is not the only route in: the render thread calls
+/// `request_cancel_goto` too, on the frame WASD or `/v1/move/manual` takes steering over, and a
+/// chase dies the same way there.
 pub type GotoEntity = Arc<Mutex<Option<String>>>;
 
 /// Authoritative controller snapshot: once the camera has initialised, the render thread
@@ -486,10 +534,11 @@ pub type GotoEntity = Arc<Mutex<Option<String>>>;
 /// republish: `landed_fall_height` is a one-shot latch the render thread writes only into an
 /// already-empty slot, so an unconsumed fall is never clobbered (second bullet below).
 ///
-/// The render thread is NOT this slot's only writer, and "each frame" is not its only cadence
-/// (#1044 review round 1, finding D — same undercount shape as #1022/#1037, found while checking
-/// whether this claim could be left alone). Two NET-thread writers also mutate the published view
-/// in production, both deliberately and both outside the frame cadence:
+/// The render thread is NOT this slot's only writer, and the rendered-frame republish above is not
+/// this slot's only cadence (#1044 review round 1, finding D — same undercount shape as
+/// #1022/#1037, found while checking whether this claim could be left alone). Two NET-thread
+/// writers also mutate the published view in production, both deliberately and both outside the
+/// frame cadence:
 ///
 /// * `ControllerSlots::begin_zone_in` calls `ControllerView::invalidate_disclosures()` on it.
 ///   TWO production callers reach it, not one. `run_zone_entry_handshake`
@@ -504,12 +553,17 @@ pub type GotoEntity = Arc<Mutex<Option<String>>>;
 ///   line before then — consuming the render thread's one-shot fall signal so it can fire exactly
 ///   once.
 ///
-/// So a consumer must not read "published by the render thread each frame" as a guarantee that
-/// every field it sees was authored by the render thread on the last frame.
+/// So a consumer must not read "published by the render thread on every rendered frame" as a
+/// guarantee that every field it sees was authored by the render thread on the last frame.
 pub type ControllerShared = Arc<Mutex<ControllerView>>;
 
-/// The `/goto` planner's per-frame movement intent. The nav planner writes `Some` while walking a
-/// path and `None` when idle/arrived; the render controller consumes it when no WASD key is held.
+/// Movement intent for the render controller, which consumes it when no WASD key is held. The nav
+/// planner writes `Some` while walking a path and `None` when idle/arrived — but it is neither the
+/// only writer nor a per-FRAME one. Those writes are the NAV thread's, on its own cadence, and
+/// `ActionLoop::drive_auto_engage_melee` drives this slot from that thread too, while closing on a
+/// melee target (see [`GotoEntity`]). The render thread does write it — but only ever to clear it
+/// to `None`, on the frame WASD or `/v1/move/manual` takes steering over: the same two sites that
+/// call `request_cancel_goto`.
 pub type NavIntent = Arc<Mutex<Option<MoveIntent>>>;
 
 /// A large (>12u) server position correction the nav thread hands to the render controller to apply
@@ -1791,12 +1845,13 @@ pub type GiveAwaitReq = Arc<Mutex<Option<(u32, u32,
 ///   counts its ack/finish timeouts in nav ticks, so it must be paced by them. `begin_give`'s
 ///   slot→cursor mirror (its only caller is `tick_give`) therefore lands up to one ~150 ms nav
 ///   tick after POST /v1/interact/give is queued — and only for a give from a real slot: it sits
-///   inside `if from_slot != SLOT_CURSOR`, so a give of an item ALREADY on the cursor publishes
-///   nothing here at all. `tick_give`'s own cursor→trade-slot mirror
-///   lands later still: it is additionally guarded by `gs.trade_ack_ready`, i.e. by the server's
-///   OP_TradeRequestAck, so its bound is a SERVER ROUND-TRIP plus a nav tick — not a tick at all.
-///   An agent that POSTs a give and immediately polls this slot must not read an unchanged
-///   inventory as "the give did not happen".
+///   inside `if from_slot != SLOT_CURSOR`, so a give of an item ALREADY on the cursor skips THAT
+///   mirror. Only that one (#1044 review round 3, N3): such a give still publishes here at the
+///   OTHER mirror, `tick_give`'s own cursor→trade-slot move, which is guarded by
+///   `gs.trade_ack_ready` and not by `from_slot`. That mirror lands later still —
+///   `gs.trade_ack_ready` is the server's OP_TradeRequestAck, so its bound is a SERVER ROUND-TRIP
+///   plus a nav tick, not a tick at all. An agent that POSTs a give and immediately polls this
+///   slot must not read an unchanged inventory as "the give did not happen".
 ///
 /// Nothing republishes this slot on its own — every publish is CAUSED by an event: a drained
 /// packet (driver 1) or a local command (driver 2). Do NOT invert that into "this pass drained no
@@ -2378,9 +2433,16 @@ pub struct Event {
 ///
 /// Checked for a second writer in `eqoxide-http` (flagged as a possibility in #1044): none found
 /// in production code. `eqoxide-http/src/events.rs` only ever READS this slot (`fetch`'s
-/// `s.chat.chat_events.lock().unwrap()`); the direct `.push()`s onto it in that file live in its
-/// own `#[cfg(test)]` module, seeding fixtures for the endpoint's own tests, and do not run in the
-/// shipped binary.
+/// `s.chat.chat_events.lock().unwrap()`); the direct `.push()`s onto it in that file seed fixtures
+/// for the endpoint's own tests and are not compiled into the non-test configuration at all.
+///
+/// That last clause is the COMPILER's answer, not a brace-counting scan of the source (#1044
+/// review round 3, BLOCKING 3; the scan method is measured-defeated in this repo by #825 — a `}`
+/// inside a comment or string literal silently truncates the region it thinks it is reading). To
+/// re-run it: bind a marker at each candidate site and compare `cargo check --workspace` against
+/// `cargo check --workspace --all-targets`. A site the first configuration never reaches is
+/// test-only. Include at least one site you already know is production, or an all-negative result
+/// cannot be told apart from an instrument that never fired.
 pub type ChatEventsShared = Arc<Mutex<Vec<Event>>>;
 
 /// One queued outgoing chat message, set by POST /v1/chat/{tell,ooc,shout,group} and drained by the
