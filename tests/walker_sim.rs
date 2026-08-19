@@ -1475,11 +1475,21 @@ use eqoxide_ipc::MoveIntent;
     ///   from their spacing, and the spacing it asserted was not the spacing they have. Their
     ///   positions are a property of today's `walker.rs` and rot exactly like the line numbers this
     ///   test exists to replace, so no argument is built on them — but they are why the GREEN
-    ///   escapes above stay green: the LAST of the eight resolves at line 2049 (both the anchor
-    ///   set and that line derived by execution in one pass at #975, sha `cd94a85`), so an
-    ///   instrument blinded past line 2100 still finds every one and the eight positive verdicts
-    ///   say nothing. No file TOTAL is quoted on purpose: it is the term that moves under every
-    ///   future edit, and the argument needs only "the last anchor sits above the blind line".
+    ///   escapes above stay green. Such an escape needs a blind line that blanks a large tail of
+    ///   the file while still leaving every anchor visible, and one exists whenever the LAST anchor
+    ///   sits above the blind line. That is a RELATION between the anchor set and the file, not a
+    ///   line number: it holds for as long as `walker.rs` continues below its last anchor, and an
+    ///   edit made ABOVE the anchors cannot falsify it — which is the kind of edit that moved them
+    ///   here. No line number is quoted for the last anchor and no file TOTAL is quoted, on
+    ///   purpose: both are terms that move under every future edit, and the relation is not.
+    ///   (An earlier revision did quote them — "the LAST of the eight resolves at line 2049 … an
+    ///   instrument blinded past line 2100 still finds every one" — and #1000's life-halt split
+    ///   falsified that sentence SILENTLY. It inserted lines above all but the first two anchors,
+    ///   which carried three of the eight past 2100; nothing in this test went red, because
+    ///   nothing here pins a line number, and the only reason it was caught is that a reviewer on
+    ///   another PR measured it. The new positions are deliberately not written down: recording
+    ///   them would rebuild the same trap. The claim was rewritten rather than renumbered. The
+    ///   anchor SET is still the one derived by execution in one pass at #975, sha `cd94a85`.)
     ///   That is the standing reason the reach control exists and cannot be replaced by the
     ///   verdicts it guards.
     #[test]

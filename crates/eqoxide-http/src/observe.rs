@@ -1066,6 +1066,9 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         "ago_secs": c.at.elapsed().as_secs(),
     }));
     let player_levitating = player.levitating;
+    // #1005: read off the projection HERE, because the `player` binding is shadowed by the
+    // served JSON object at the insert site below.
+    let player_hp_verified = player.hp_verified;
     let player_run_mode = player.run_mode;
     // #724/#817 — the stuck-and-cannot-free disclosure. `PlayerHoldView` is not `Copy` (it carries
     // a `&'static str` reason plus a `f32`/`&'static str` detail, both trivially `Clone`), so this
@@ -1104,6 +1107,9 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "hp_pct":      player.hp_pct,
             "hp":          player.cur_hp,
             "hp_max":      player.max_hp,
+            // `hp_verified` belongs beside these three and is inserted BELOW rather than here: this
+            // literal is already at the json! recursion limit (measured — adding the key here fails
+            // the build with "recursion limit reached while expanding `$crate::json_internal!`").
             "mana_pct":    player.mana_pct,
             "mana":        player.cur_mana,
             "mana_max":    player.max_mana,
@@ -1408,6 +1414,32 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // NOTE: this is the levitate *buff* state, NOT a general gravity flag (GM `#flymode 1` reads
         // `false`). Attached here, not in the literal above, which is at the json! recursion limit.
         player.insert("levitating".into(),             serde_json::json!(player_levitating));
+        // #1005/agent-honesty — IS THE HP ABOVE THE SERVER'S? false = `hp`/`hp_max`/`hp_pct` in this
+        // payload are a number the CLIENT inferred, not a figure the server sent. The client used to
+        // apply each hit locally so the reading moved per-hit instead of pinning at the last server
+        // value (eqoxide#55). Measured live on `36ea882`: one `#damage` produced two damage lines,
+        // both were subtracted, and this payload carried `hp: 0` for a character the server held at
+        // 214/441 — for 2.477 s, `dead: false` throughout, no OP_Death, reproduced 2 of 2.
+        // Well-formed, plausible, false, and nothing else in the response distinguished it from
+        // server truth; an agent deciding whether to flee had no channel that could tell. That
+        // subtraction is now deleted outright; this flag covers the residue that cannot be.
+        //
+        // `true` ONLY straight after a self OP_HPUpdate — the only server message carrying both
+        // current and maximum HP. The OP_Death zeroing, the bind-respawn full-HP assumption and the
+        // PlayerProfile seed all leave it false; see `PlayerState::hp_verified` for why each one
+        // counts. It governs `target_hp_pct` too while the player is self-targeted — though not by
+        // "resolving from the same `hp_pct`", which is what this comment used to claim and is wrong.
+        // `target_hp_pct` is a stored snapshot with four refreshers in `GameState` (`set_target`,
+        // `clear_target`, the tail of `write_hp`, `update_hp_pct`); the estimate reaches it through
+        // `write_hp`, and the raw self-HP writers bypass all four and leave it stale. See
+        // `GameState::hp_verified` for the mechanism and #1033 for the gap that remains.
+        //
+        // ALWAYS PRESENT, never omitted — an absent key cannot be told from "this client is too old
+        // to know", which is the same contract as `levitating` above and `afloat_stall` below. This
+        // insert is the LAST file on the path and the one that actually reaches an agent:
+        // `PlayerState` is an internal projection no handler serialises whole (#409/#801/#817), so a
+        // test that serialises it directly would pass with this key reaching no response body.
+        player.insert("hp_verified".into(),            serde_json::json!(player_hp_verified));
         // #625 — our own last-SENT run/walk toggle intent (`true` = run, `false` = walk).
         // `OP_SetRunMode` has no server ack, so this is NOT a confirmation of what the server
         // granted — exactly the same epistemic level as `sitting`/`auto_attack` elsewhere in this
@@ -4619,6 +4651,59 @@ mod tests {
             "the probe reply must NOT reset last_packet_age_ms — its 'world quiet' meaning is preserved");
         assert!(p["last_world_response_ms"].as_u64().unwrap() < 3_000,
             "proof-of-life is fresh (probe answered 2s ago), even though spontaneous traffic is 45s stale");
+    }
+
+    /// #1005 — `hp_verified` must reach the SERVED BODY, and must read false in the exact window
+    /// the issue measured.
+    ///
+    /// This goes through the real router rather than serialising `PlayerState`, because
+    /// `PlayerState` is an internal projection no handler serialises whole (#409/#801/#817): a test
+    /// that serialised it directly would pass while the key reached no response body at all.
+    #[tokio::test]
+    async fn hp_verified_reaches_the_debug_json_1005() {
+        // ── Always present, and false before the server has said anything. ──────────────────────
+        let v = debug_json(empty_state()).await;
+        let player = v["player"].as_object().expect("player object");
+        assert!(player.contains_key("hp_verified"),
+            "the hp_verified key must be PRESENT in the served body — an agent that greps for it \
+             and finds nothing cannot tell \"this is server truth\" from \"this client cannot say\". \
+             Keys served: {:?}", player.keys().collect::<Vec<_>>());
+        assert_eq!(player["hp_verified"], serde_json::json!(false),
+            "an untouched client has heard no OP_HPUpdate; hp 0/0 is not a confirmation");
+
+        // ── A real server reading confirms it. ─────────────────────────────────────────────────
+        let state = empty_state();
+        set_gs(&state, |gs| { gs.player_id = 7; gs.update_hp(7, 214, 441); });
+        let v = debug_json(state.clone()).await;
+        assert_eq!(v["player"]["hp"],          serde_json::json!(214));
+        assert_eq!(v["player"]["hp_max"],      serde_json::json!(441));
+        assert_eq!(v["player"]["hp_verified"], serde_json::json!(true),
+            "a self OP_HPUpdate is what the flag is for; if it never reads true the flag is inert");
+
+        // ── A client-derived write of the same fields. The measured #1005 zero came from a damage
+        //    subtraction, and that arithmetic is deleted (see `a_damage_packet_never_moves_the_
+        //    published_self_hp_1005`), so no OP_Damage can produce this state any more. The residue
+        //    can: `update_hp_estimated` is the bind-respawn path, and the death path writes a zero
+        //    the same way. The published body must mark it either way. ────────────────────────────
+        set_gs(&state, |gs| gs.update_hp_estimated(7, 0, 441));
+        let v = debug_json(state.clone()).await;
+        let p = &v["player"];
+        assert_eq!(p["hp"], serde_json::json!(0),
+            "control: the payload really does carry a zero nobody sent — without this the \
+             assertion below could pass on a body that never entered the window");
+        assert_eq!(p["dead"], serde_json::json!(false),
+            "control: and `dead` is false beside it, exactly as measured across 27,527 samples — \
+             so `dead` was never the field that could have warned the agent");
+        assert_eq!(p["hp_verified"], serde_json::json!(false),
+            "THE #1005 BAR: a 200 carrying a client-derived number must not be indistinguishable \
+             from server truth. `hp: 0` for a character the server holds at 214/441 has to be \
+             marked, in this body, or an agent flees or fights on a number nobody sent");
+
+        // ── And the reconciliation clears it, so the flag is not simply stuck off. ─────────────
+        set_gs(&state, |gs| gs.update_hp(7, 214, 441));
+        let v = debug_json(state).await;
+        assert_eq!(v["player"]["hp"],          serde_json::json!(214));
+        assert_eq!(v["player"]["hp_verified"], serde_json::json!(true));
     }
 
     /// Before any probe has fired, `world_responsive` defers to the passive signals rather than

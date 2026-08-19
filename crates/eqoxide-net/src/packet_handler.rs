@@ -1335,6 +1335,18 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
+/// OP_HPUpdate: the EXACT current/max HP of one spawn. The server sends it to the owning client
+/// only (see `apply_mob_health` below for the full argument), so in practice the only one this
+/// client receives carries its own `spawn_id` — and `GameState::update_hp`'s
+/// `spawn_id == player_id` test is what recognises it.
+///
+/// **#1006 — `spawn_id` must be widened from an UNSIGNED field.** `HPUpdate_S::spawn_id` is `u16`,
+/// so `as u32` here is value-preserving. It was `i16` (EQEmu's spelling of the same slot), and from
+/// a signed field this same `as u32` sign-extends: any id above 32767 would arrive as `0xFFFF_xxxx`,
+/// the self-match would never fire for the life of that spawn, and self HP would pin at its last
+/// value with no error and nothing to distinguish it from "the server sent nothing". See
+/// `HPUpdate_S`'s doc for why the field is unsigned on the wire despite the server header, and for
+/// why this is latent rather than live today.
 fn apply_hp_update(gs: &mut GameState, payload: &[u8]) {
     if payload.len() >= SIZE_HP_UPDATE {
         let hp = unsafe { safe_read::<HPUpdate_S>(payload) };
@@ -1342,13 +1354,40 @@ fn apply_hp_update(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
-/// OP_MobHealth: percent-only HP for a mob you have targeted/x-targeted but aren't
-/// grouped with (the server only sends the full OP_HPUpdate to self/group/pet).
-/// Without this, a fought mob's `hp_pct` — and thus `target_hp_pct` — stays frozen
-/// at its seeded value the whole fight. (eqoxide#51)
+/// OP_MobHealth: the PERCENT-only HP update, and the ONLY way any entity's HP other than your own
+/// reaches this client. The exact-HP `OP_HPUpdate` goes to the owning client and to nobody else.
+///
+/// **#1028 — the parenthetical this replaces was false in both halves.** It read *"the server only
+/// sends the full OP_HPUpdate to self/group/pet"*, which told the next reader that a group member's
+/// exact HP arrives over `OP_HPUpdate` (it never does — a group-HP feature would look like a decode
+/// bug rather than the missing feature it is), and it misstated why this handler exists: it is
+/// needed for EVERY other entity, not merely for mobs you are not grouped with.
+///
+/// What the server actually does, read from the EQEmu tree at `f9129e5e`:
+///
+/// * `Mob::SendHPUpdate` (`zone/mob.cpp`) has exactly ONE `OP_HPUpdate` emit. It is inside
+///   `if (IsClient())` and delivers via `CastToClient()->QueuePacket(&p)` — that one client.
+///   `OP_HPUpdate` appears nowhere else in `zone/` (the only other hits are the opcode tables and a
+///   Lua binding), so there is no second exact-HP path to be grouped or petted into.
+/// * Everything after that branch builds the PERCENT packet — `Mob::CreateHPPacket` sets opcode
+///   `OP_MobHealth` and writes `GetHPRatio()` — and fans *that* out: to clients targeting or
+///   x-targeting the mob (`QueueClientsByTarget`/`QueueClientsByXTarget`, both called with
+///   `iSendToSender = false`, and `EntityList::QueueClientsByTarget` in `zone/entity.cpp`
+///   additionally skips the sender with its own `c != sender` guard), to the mob's group
+///   (`Group::SendHPPacketsFrom` in `zone/groups.cpp`, which calls the same `CreateHPPacket`), to
+///   its raid, and to a pet's owner (`GetOwner()->CastToClient()->QueuePacket(&hp_packet, ...)`).
+///
+/// So group members and a pet's owner DO get a fan-out — of this percent packet. Exact HP for
+/// anyone but yourself is not on the wire at all.
+///
+/// Without this handler, a fought mob's `hp_pct` — and thus `target_hp_pct` — stays frozen at its
+/// seeded value for the whole fight (eqoxide#51).
 fn apply_mob_health(gs: &mut GameState, payload: &[u8]) {
     if payload.len() >= SIZE_MOB_HEALTH {
         let mh = unsafe { safe_read::<MobHealth_S>(payload) };
+        // #1006: `MobHealth_S::spawn_id` is `u16`, so this widening is value-preserving. From the
+        // `i16` it used to be, an id above 32767 sign-extends and this percent lands on no entity
+        // at all — a mob's `hp_pct` silently frozen. Same trap as `apply_hp_update` above.
         gs.update_hp_pct(mh.spawn_id as u32, mh.hp as f32);
     }
 }
@@ -1690,6 +1729,15 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
             gs.cur_hp = p.cur_hp as i32;
             if gs.max_hp <= 0 { gs.max_hp = p.cur_hp as i32; }
             gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
+            // #1005: `p.cur_hp` IS server-sent, but the profile carries no max — so when max is
+            // unknown it is seeded = cur and the `hp_pct` two lines up reads 100 for a character
+            // that zoned in wounded. The published triple therefore contains a client-derived
+            // component until the first real OP_HPUpdate, and this counts as an estimate write. The
+            // rule is kept mechanical (this path NEVER confirms) rather than conditional on
+            // `max_hp` already being nonzero, because a max learned from an earlier profile seed is
+            // itself a guess, and tracking that provenance separately would be a second flag able
+            // to drift from this one.
+            gs.mark_hp_estimated();
             // A profile with HP means we're alive (respawn/zone-in) → clear death bookkeeping.
             gs.player_dead = false;         // nav walker / dead pose (eqoxide#61)
             gs.player_dead_since = None;    // respawn safety-net timer (eqoxide#50)
@@ -1931,6 +1979,10 @@ pub fn apply_death(gs: &mut GameState, payload: &[u8]) {
         // player's own model keeps standing. Respawn reseeds cur_hp from the fresh
         // PlayerProfile, so the avatar stands back up automatically. (eqoxide#44)
         gs.cur_hp    = 0;
+        // #1005: the DEATH is authoritative (`dead` is published from `player_dead`), but the
+        // NUMBER zero is the client's inference from it — no OP_HPUpdate said 0. Mark it, so an
+        // agent reading `hp` cannot mistake this inference for a server reading.
+        gs.mark_hp_estimated();
         gs.strategy  = "Dead — POST /v1/lifecycle/respawn to revive".into();
         let killer = gs.killed_by.clone();
         tracing::info!("EQ: combat: *** You have been slain by {killer}! ***");
@@ -2027,19 +2079,33 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     tracing::info!("EQ: combat: {msg}");
     gs.log_msg("combat", &msg);
 
-    // Optimistic local HP (eqoxide#55): apply damage the player TOOK immediately so the HUD/API
-    // react per-hit instead of pinning at the last server value until the next OP_HPUpdate (which
-    // then reconciles the authoritative HP). `damage`@9 is the same reliable field shown above; only
-    // real hits (>0) reduce HP, clamped at 0. Guarded on a known max so the percent stays sane.
-    // A BENEFICIAL spell (heal/buff) whose `damage` field carries the heal amount must NOT be
-    // subtracted from HP — that would drain the player on every heal (#272); the OP_HPUpdate carries
-    // the true post-heal HP.
-    let beneficial_spell = spellid != 0 && spellid != SPELL_UNKNOWN
-        && eqoxide_core::spells::global().is_some_and(|d| d.is_beneficial(spellid));
-    if target_id == gs.player_id && damage > 0 && gs.max_hp > 0 && !beneficial_spell {
-        gs.cur_hp = (gs.cur_hp - damage).max(0);
-        gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
-    }
+    // #1005: NO local HP arithmetic here. The "optimistic local HP" block that used to sit at this
+    // point (eqoxide#55) subtracted `damage`@9 from `gs.cur_hp` and recomputed `hp_pct` from it, to
+    // make the HUD/API react per-hit rather than pin at the last server value. It was deleted, not
+    // merely marked, because the value it published was not just unconfirmed — it was WRONG, and
+    // structurally so:
+    //
+    //   * The authoritative number has ALREADY ARRIVED by the time this runs. `Mob::CommonDamage`
+    //     (zone/attack.cpp) queues `SendHPUpdate(true)` for a client BEFORE it builds the OP_Damage
+    //     packet this function decodes, on the same reliable stream — so the subtraction re-applied
+    //     a hit the server had already accounted for. Measured on real NPC melee, pairing each hit
+    //     to the update whose SERVER-side delta matched it (so the pairing cannot be biased by the
+    //     subtraction under test): the update arrived FIRST in 29 of 30 cases, median offset
+    //     −0.2 ms. Removing the subtraction costs ~0 ms on a damage event.
+    //   * And the estimate was not merely unconfirmed, it was usually WRONG: over 38 real melee
+    //     hits it matched the server exactly 2 times (5.3%) and erred in BOTH directions — 25 low,
+    //     11 high, range −19..+16. Not a conservative bound; noise under a confident label.
+    //   * Measured consequence: one `#damage` command produced two OP_Damage lines (source ==
+    //     target puts the caster on both notify lists, so `#damage` delivers twice; real NPC melee
+    //     delivered exactly once, 30/30), each was subtracted, and the client's own arithmetic
+    //     reached `hp: 0` while the server held 214/441. `/v1/observe/debug` published that
+    //     fabricated zero as indistinguishable from server truth for up to 2.477 s, reproduced
+    //     2 of 2, with `dead: false` throughout and no OP_Death — so nothing else in the payload
+    //     could have warned a caller.
+    //
+    // The governing rule this file now follows: COMPUTE damage only where the protocol REQUIRES us
+    // to report it (see the OP_ENV_DAMAGE fall report in `action_loop.rs`, which the server has no
+    // way to derive on its own), and NEVER apply our own damage number to published state.
 
     // Remember who is swinging at us (hit OR miss) so auto-combat can engage an add that aggros
     // mid-fight instead of tanking it unanswered. Only NPC attackers on the player count.
@@ -3021,7 +3087,9 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     // cur_hp/max_hp stale, so without this the HUD/API show a dead-but-full contradiction
     // (hp/hp_max full, hp_pct 0) until some later OP_HPUpdate happens to reconcile it (eqoxide#68).
     let full = gs.max_hp.max(1);
-    gs.update_hp(gs.player_id, full, full); // cur=max → hp_pct=100, consistent with hp/hp_max
+    // #1005: "real EQ revives at FULL HP" is the client's assumption about server behaviour, not a
+    // figure the server sent — `update_hp_estimated` writes it without marking it confirmed.
+    gs.update_hp_estimated(gs.player_id, full, full); // cur=max → hp_pct=100, consistent with hp/hp_max
     gs.strategy = "Respawning...".into();
     gs.log_msg("zone", "Respawning at bind point");
 }
@@ -4133,9 +4201,24 @@ mod tests {
         assert!(gs.inventory.iter().any(|i| i.slot == 5), "non-possessions delete ignored");
     }
 
+    /// #1005 — THE MEASURED SCENARIO, driven over the real packet path, asserting the invariant
+    /// that replaced eqoxide#55's optimistic subtraction: **OP_Damage must not move the player's
+    /// published HP at all.**
+    ///
+    /// The server held the character at 214/441. One `#damage` command produced TWO OP_Damage
+    /// lines; the old `apply_combat_damage` subtracted each, so the client's own arithmetic reached
+    /// 0 and `/v1/observe/debug` published `hp: 0` — for up to 2.477 s, `dead: false` across all
+    /// 27,527 samples, no OP_Death packet, reproduced 2 of 2.
+    ///
+    /// The subtraction was never needed: `Mob::CommonDamage` (zone/attack.cpp) queues
+    /// `SendHPUpdate(true)` for a client BEFORE it builds the OP_Damage packet this function
+    /// decodes, on the same reliable stream — so the authoritative figure has already arrived and
+    /// the local subtraction re-applied a hit that was already accounted for.
+    ///
+    /// A live run cannot discharge "the client never publishes a value the server did not send" —
+    /// it can only show the path CAN be right. This drives the update path instead.
     #[test]
-    fn combat_damage_to_player_decrements_local_hp() {
-        // eqoxide#55: a hit on the player should optimistically reduce local HP between OP_HPUpdates.
+    fn a_damage_packet_never_moves_the_published_self_hp_1005() {
         use super::apply_combat_damage;
         // CombatDamage_Struct: target@0(u16) source@2(u16) type@4(u8) spellid@5(u32) damage@9(i32).
         let dmg = |target: u16, source: u16, damage: i32| -> [u8; 13] {
@@ -4146,21 +4229,120 @@ mod tests {
             b
         };
         let mut gs = GameState::new();
-        gs.player_id = 7; gs.cur_hp = 100; gs.max_hp = 100; gs.hp_pct = 100.0;
+        gs.player_id = 7;
+        gs.update_hp(7, 214, 441); // the server's last word, as measured
+        assert!(gs.hp_verified(), "precondition: the server's own figure reads verified");
 
-        apply_combat_damage(&mut gs, &dmg(7, 99, 14)); // mob hits player for 14
-        assert_eq!(gs.cur_hp, 86, "player HP should drop by the hit");
-        assert!((gs.hp_pct - 86.0).abs() < 1e-4, "hp_pct recomputed: {}", gs.hp_pct);
+        // The one `#damage` event's two damage lines — the exact input that fabricated the zero.
+        apply_combat_damage(&mut gs, &dmg(7, 99, 107));
+        assert_eq!(gs.messages.len(), 1, "control: the packet really was processed, not ignored");
+        apply_combat_damage(&mut gs, &dmg(7, 99, 107));
 
-        apply_combat_damage(&mut gs, &dmg(7, 99, 0)); // a miss
-        assert_eq!(gs.cur_hp, 86, "a miss must not change HP");
+        assert_eq!((gs.cur_hp, gs.max_hp), (214, 441),
+            "OP_Damage must not move the published HP — the server's SendHPUpdate(true) for this \
+             same hit is already queued ahead of it");
+        assert!((gs.hp_pct - (214.0 / 441.0) * 100.0).abs() < 1e-3,
+            "nor the percent derived from it: {}", gs.hp_pct);
+        assert!(gs.hp_verified(),
+            "and with no client arithmetic there is nothing to mark: the triple is still the \
+             server's own, so it must not be devalued to an estimate either");
+        assert_eq!(gs.unverified_hp_writes, 0, "no client-derived write happened");
 
-        apply_combat_damage(&mut gs, &dmg(99, 7, 50)); // player hits an NPC
-        assert_eq!(gs.cur_hp, 86, "damage to an NPC must not change the player's HP");
+        // A lethal-looking line is the case that mattered most: it is what drove `hp` to 0 while
+        // `dead` stayed false and no OP_Death ever arrived.
+        apply_combat_damage(&mut gs, &dmg(7, 99, 9999));
+        assert_eq!(gs.cur_hp, 214, "a 9999 damage line is a report, not an authority on our HP");
+        assert!(!gs.player_dead, "control: nothing here claims death either way");
 
-        apply_combat_damage(&mut gs, &dmg(7, 99, 9999)); // lethal hit
-        assert_eq!(gs.cur_hp, 0, "HP clamps at 0");
-        assert!((gs.hp_pct - 0.0).abs() < 1e-4);
+        // Reach controls: a miss, and a hit on somebody else, must also leave the triple alone —
+        // so a GREEN on the assertions above cannot come from the function doing nothing at all.
+        apply_combat_damage(&mut gs, &dmg(7, 99, 0));
+        apply_combat_damage(&mut gs, &dmg(99, 7, 50));
+        assert_eq!(gs.cur_hp, 214);
+        assert_eq!(gs.messages.len(), 5, "control: all five lines reached the combat log");
+
+        // The server's own reading is still the only thing that moves it.
+        gs.update_hp(7, 107, 441);
+        assert_eq!(gs.cur_hp, 107, "an OP_HPUpdate is what changes the published HP");
+        assert!(gs.hp_verified());
+    }
+
+    /// #1005 — the OTHER three client-side writers of the published self-HP. Each publishes a
+    /// number no OP_HPUpdate carried, and each must therefore leave `hp_verified()` false.
+    #[test]
+    fn every_client_derived_self_hp_write_leaves_it_unverified_1005() {
+        use super::{apply_bind_respawn, apply_death, apply_player_profile};
+
+        // 1. The PlayerProfile seed (eqoxide#19). `cur_hp` IS server-sent, but the profile carries
+        //    no max — so max is seeded = cur and hp_pct reads 100 for a character that zoned in
+        //    wounded. The percent is a client-derived number even though the HP is not.
+        //
+        //    Both sub-cases below assert something the seed MOVED, not something that merely
+        //    happened to be false already: 1a counts the estimate write, and 1b starts from a
+        //    genuinely confirmed state. An earlier draft asserted only `!hp_verified()` on a fresh
+        //    `GameState`, where it is false before the call — the WRAP mutation over this seed's
+        //    `mark_hp_estimated()` stayed GREEN and exposed it (`profile-seed-not-marked`).
+        let profile = |cur_hp: u32| -> Vec<u8> {
+            let mut buf = vec![0u8; 1000];
+            buf[21] = 1; buf[22] = 10;
+            buf[948..952].copy_from_slice(&cur_hp.to_le_bytes()); // cur_hp, no max anywhere
+            buf
+        };
+
+        // 1a. First zone-in, no max ever learned: the max is a guess and the percent is derived
+        //     from the guess, so the seed owes an estimate write.
+        let mut gs = GameState::new();
+        gs.player_id = 0; // profile path writes the player branch
+        assert_eq!(gs.unverified_hp_writes, 0, "precondition: nothing owed yet");
+        apply_player_profile(&mut gs, &profile(214));
+        assert_eq!(gs.cur_hp, 214, "control: the seed really did run");
+        assert!((gs.hp_pct - 100.0).abs() < 1e-3,
+            "control: the seeded percent really is the 100 that the guessed max produces");
+        assert_eq!(gs.unverified_hp_writes, 1,
+            "the seed must RECORD its estimate, not merely inherit an unconfirmed state (#1005)");
+        assert!(!gs.hp_verified(),
+            "a percent derived from a guessed max is not a figure the server sent (#1005)");
+
+        // 1b. A later zone line, with a max already confirmed by an OP_HPUpdate in the last zone.
+        //     The seed still writes a percent the server never sent, so it must SPEND that
+        //     confirmation — this is the sub-case where `hp_verified()` has somewhere to fall from.
+        let mut gs = GameState::new();
+        gs.player_id = 0;
+        gs.update_hp(0, 441, 441);
+        assert!(gs.hp_verified(), "precondition: the previous zone's OP_HPUpdate was confirmed");
+        apply_player_profile(&mut gs, &profile(214));
+        assert_eq!((gs.cur_hp, gs.max_hp), (214, 441), "control: the seed ran and kept the real max");
+        assert!(!gs.hp_verified(),
+            "a zone-in seed is not an OP_HPUpdate; the prior confirmation does not carry (#1005)");
+
+        // 2. The OP_Death zeroing. The DEATH is authoritative; the number zero is an inference.
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.update_hp(7, 441, 441);
+        assert!(gs.hp_verified(), "precondition");
+        let mut pkt = [0u8; 32];
+        pkt[0..4].copy_from_slice(&7u32.to_le_bytes());
+        apply_death(&mut gs, &pkt);
+        assert_eq!(gs.cur_hp, 0, "control: the death path really did zero it");
+        assert!(gs.player_dead, "control: and `dead` — which IS authoritative — is set");
+        assert!(!gs.hp_verified(),
+            "no OP_HPUpdate said 0; `dead` is the confirmed channel, the number is not");
+
+        // 3. The bind-respawn "real EQ revives at FULL HP" assumption (eqoxide#68).
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.update_hp(7, 441, 441);
+        gs.hp_pct = 0.0; gs.cur_hp = 34; gs.max_hp = 34; // the post-death contradiction #68 fixes
+        gs.hp_confirmed = true; gs.unverified_hp_writes = 0; // and pretend it was all confirmed
+        let mut pkt = [0u8; 20];
+        pkt[4..8].copy_from_slice(&100.0f32.to_le_bytes());
+        pkt[8..12].copy_from_slice(&200.0f32.to_le_bytes());
+        pkt[12..16].copy_from_slice(&(-5.0f32).to_le_bytes());
+        apply_bind_respawn(&mut gs, &pkt);
+        assert!((gs.hp_pct - 100.0).abs() < 1e-4, "control: #68's full-HP revive still happens");
+        assert!(!gs.hp_verified(),
+            "\"real EQ revives at full HP\" is the client's assumption about the server, not a \
+             reading from it");
     }
 
     #[test]
@@ -8499,5 +8681,106 @@ mod tests {
         });
         apply_task_select_window(&mut gs, &[]);
         assert!(gs.task_offers.is_empty());
+    }
+
+    // ─────────────────── #1006: the self-HP match must not depend on spawn_id < 32768 ───────────────────
+
+    /// A 10-byte RoF2 `SpawnHPUpdate_Struct` on the wire: `spawn_id` u16 LE, `cur_hp` u32 LE,
+    /// `max_hp` i32 LE. Written from the WIRE's point of view (raw bytes), not from the Rust
+    /// struct, so the test cannot be satisfied by a struct whose field types drifted.
+    fn hp_update_wire(spawn_id: u16, cur_hp: u32, max_hp: i32) -> Vec<u8> {
+        let mut b = Vec::with_capacity(10);
+        b.extend_from_slice(&spawn_id.to_le_bytes());
+        b.extend_from_slice(&cur_hp.to_le_bytes());
+        b.extend_from_slice(&max_hp.to_le_bytes());
+        assert_eq!(b.len(), 10, "SIZE_HP_UPDATE");
+        b
+    }
+
+    /// #1006 (agent-honesty). `HPUpdate_S::spawn_id` was `i16` — EQEmu's spelling of the slot — and
+    /// the decode widens it with `as u32` for `GameState::update_hp`'s `spawn_id == player_id`
+    /// self-match. From a SIGNED field that widening sign-extends, so an id above 32767 arrives as
+    /// `0xFFFF_xxxx`, the self-match never fires, and self HP silently pins at its last value with
+    /// no error and nothing distinguishing it from "the server sent nothing" — the whole life of
+    /// that spawn.
+    ///
+    /// This is a decode test on purpose. **A live run cannot discharge it**: a character whose
+    /// spawn_id happens to be small (every one on today's server — `EntityList::GetFreeID` hands
+    /// out 1..=1500 first) passes every time.
+    ///
+    /// MUTATION CHECK: change `HPUpdate_S::spawn_id` back to `i16` → the 40000 arm goes RED
+    /// (`cur_hp` stays at the seeded 441 because `update_hp` matched nothing).
+    #[test]
+    fn self_hp_update_matches_a_spawn_id_above_32767_1006() {
+        // Every id here is checked the same way, so the assertion cannot be satisfied by one arm.
+        // 1500 is the top of EQEmu's pre-seeded pool (the reachable-today control: it must pass
+        // both before and after the fix, which is what proves the harness is not simply broken).
+        // 32767/32768 straddle the sign boundary; 40000 and 65535 are past it.
+        for &sid in &[1u16, 1500, 32767, 32768, 40000, 65535] {
+            let mut gs = GameState::new();
+            gs.player_id = sid as u32;
+            gs.cur_hp = 441; gs.max_hp = 441; gs.hp_pct = 100.0;
+
+            super::apply_packet(&mut gs, &crate::transport::AppPacket {
+                opcode: crate::protocol::OP_HP_UPDATE, payload: hp_update_wire(sid, 214, 441),
+            });
+
+            assert_eq!(gs.cur_hp, 214,
+                "spawn_id {sid}: the server's own HP update must reach the player's cur_hp");
+            assert_eq!(gs.max_hp, 441, "spawn_id {sid}: max_hp");
+            assert!((gs.hp_pct - (214.0 / 441.0 * 100.0)).abs() < 1e-3,
+                "spawn_id {sid}: hp_pct recomputed from the update, got {}", gs.hp_pct);
+        }
+    }
+
+    /// The other half of the same property, and what stops the test above from passing for the
+    /// wrong reason: an update for a DIFFERENT spawn must not be mistaken for the player's, at any
+    /// id. If the widening were replaced by something that collapses ids (e.g. a truncation), the
+    /// arm above could go green while this one goes red.
+    #[test]
+    fn an_hp_update_for_another_spawn_never_moves_self_hp_1006() {
+        for &(player, other) in &[(1u16, 2u16), (40000, 40001), (32768, 32767), (65535, 1)] {
+            let mut gs = GameState::new();
+            gs.player_id = player as u32;
+            gs.cur_hp = 441; gs.max_hp = 441; gs.hp_pct = 100.0;
+
+            super::apply_packet(&mut gs, &crate::transport::AppPacket {
+                opcode: crate::protocol::OP_HP_UPDATE, payload: hp_update_wire(other, 1, 441),
+            });
+
+            assert_eq!(gs.cur_hp, 441,
+                "player {player}: an update for spawn {other} must not touch self HP");
+            assert!((gs.hp_pct - 100.0).abs() < 1e-4, "player {player}: hp_pct untouched");
+        }
+    }
+
+    /// #1006, the percent path. `MobHealth_S::spawn_id` carries the same slot and had the same
+    /// `i16`; from it, `mh.spawn_id as u32` sign-extends and the percent lands on no entity at all,
+    /// leaving that mob's `hp_pct` (and `target_hp_pct` when it is your target) frozen at its
+    /// seeded value for the whole fight — the eqoxide#51 defect, back again above 32767.
+    ///
+    /// MUTATION CHECK: change `MobHealth_S::spawn_id` back to `i16` → the 40000/65535 arms go RED.
+    #[test]
+    fn mob_health_percent_reaches_a_spawn_id_above_32767_1006() {
+        for &sid in &[1u32, 1500, 32767, 32768, 40000, 65535] {
+            let mut gs = GameState::new();
+            gs.player_id = 7;
+            gs.world.entities.insert(sid, test_entity(sid, "a bat", 100.0));
+            gs.target_id = Some(sid);
+            gs.target_hp_pct = Some(100.0);
+
+            let mut payload = Vec::with_capacity(3);
+            payload.extend_from_slice(&(sid as u16).to_le_bytes());
+            payload.push(37u8);
+            super::apply_packet(&mut gs, &crate::transport::AppPacket {
+                opcode: crate::protocol::OP_MOB_HEALTH, payload,
+            });
+
+            assert!((gs.world.entities[&sid].hp_pct - 37.0).abs() < 1e-4,
+                "spawn_id {sid}: the percent update must reach that entity, got {}",
+                gs.world.entities[&sid].hp_pct);
+            assert_eq!(gs.target_hp_pct, Some(37.0),
+                "spawn_id {sid}: and the targeted mob's published hp_pct with it");
+        }
     }
 }

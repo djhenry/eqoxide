@@ -3042,7 +3042,9 @@ impl ActionLoop {
         // clear that one-shot exactly once here and, if the fall was past the safe height, apply the
         // native (client-computed) fall damage + OP_ENV_DAMAGE — the same formula/threshold the old
         // `drive_controlled_fall` used. Any fall past the safe height damages, so WASD off a ledge
-        // now damages too, matching the native RoF2 client. A teleport / server correction clears the
+        // now damages too, matching the native RoF2 client. (#1030 is open against that last claim:
+        // a measured run had walk-off falls firing 0/3 where jump-off fired 6/6. Not touched here.)
+        // A teleport / server correction clears the
         // signal at the controller (see `CharacterController::teleport`), so a correction is never
         // misread as a fall (hazard 2b); a mid-fall depenetration/ground-snap recovery latches nothing
         // (hazard 2a). `SAFE_FALL_HEIGHT` is named so the threshold is easy to tune/revert.
@@ -3052,10 +3054,58 @@ impl ActionLoop {
             if height > SAFE_FALL_HEIGHT {
                 let (dmg, _max) = fall_damage(height);
                 if dmg > 0 {
+                    // The OP_ENV_DAMAGE report is MANDATORY and stays. The server has no fall
+                    // detection of its own: `Client::Handle_OP_EnvDamage` takes the magnitude
+                    // straight out of `EnvDamage2_Struct.damage` (this packet) and applies it with
+                    // `SetHP(GetHP() - damage * RuleR(Character, EnvironmentDamageMulipliter))`.
+                    // Stop sending and the player silently never takes fall damage at all.
                     stream.send_app_packet(OP_ENV_DAMAGE, &build_env_damage_packet(gs.player_id, dmg, DMGTYPE_FALLING));
-                    gs.cur_hp = (gs.cur_hp - dmg as i32).max(0);
-                    gs.log_msg("combat", &format!("Fell {:.0}u — {} fall damage", height, dmg));
-                    tracing::info!("EQ: fall damage {dmg} (fell {height:.0}u)");
+                    // #1005/#1029: the local subtraction that used to sit here is GONE. `dmg` is
+                    // the magnitude we REQUESTED, not the one the player took. Measured over six
+                    // falls: the server answered `Your GM status protects you from 160 points of
+                    // Falling (Type 252) damage`, applied 1, and the client had already subtracted
+                    // the full 160 — divergences of 1 to 440 HP lasting 67 ms to 11.3 s, every one
+                    // of them with `hp_pct` left un-recomputed beside the moved `cur_hp`. One event
+                    // published `cur_hp = 0` with `dead: false` while the server held 440/441: the
+                    // `.max(0)` clamp is what turned an already-wrong number into the specific
+                    // false answer "you are dead" rather than something visibly nonsensical.
+                    //
+                    // What the handler actually does with our number, branch by branch
+                    // (`Client::Handle_OP_EnvDamage`, zone/client_packet.cpp) — the amounts differ
+                    // AND so does whether anything is sent back, so the two must not be collapsed:
+                    //   * not finished loading → `SetHP(GetHP() - 1)`, return
+                    //   * in liquid on a water-mapped zone → return, HP UNCHANGED
+                    //   * GM / `GetInvul()` / `GetInvulnerableEnvironmentDamage()`
+                    //                        → `SetHP(GetHP() - 1)`, return
+                    //   * tutorial/load zones → return, HP UNCHANGED
+                    //   * otherwise → scale by the environment-damage modifier, then by the
+                    //     spell/item/AA `ReduceFallDamage` bonuses, then by
+                    //     `RuleR(Character, EnvironmentDamageMulipliter)`, apply, fall through.
+                    // So a refusal deducts 1 on some branches and NOTHING at all on liquid and
+                    // tutorial/load. The trailing `SendHPUpdate()` is reached ONLY on that last
+                    // branch: every refusal returns before it and `Mob::SetHP` sends nothing
+                    // itself. On GM — the branch this PR actually measured live — the handler
+                    // therefore sends nothing, and the correction reaches us only when the 2 s
+                    // `hpupdate_timer` poll next runs, and only because that `-1` moved
+                    // `current_hp` past `SendHPUpdate`'s change gate. On liquid and tutorial/load
+                    // NO update is ever sent, because no HP ever changed. There is no branch on
+                    // which we may assume an authoritative number is coming promptly, which is
+                    // exactly why the client must publish what the server said and nothing else.
+                    // Computing damage is required here ONLY because the protocol makes us report
+                    // it; applying our own figure to published state is what made
+                    // `/v1/observe/debug` publish an HP the server never sent.
+                    //
+                    // The log line therefore reports the REQUEST, in those words. Driving it from
+                    // the resulting server HP update instead was considered and rejected: on the
+                    // liquid and tutorial/load branches the handler returns before changing HP at
+                    // all, so there is no update to key off and a fall that really happened would
+                    // log nothing — and any later OP_HPUpdate we did pick up could just as easily
+                    // be a mob hit landing in the same window, which would attribute someone
+                    // else's damage to the fall. Under-claiming beats mis-attributing.
+                    gs.log_msg("combat",
+                        &format!("Fell {height:.0}u — reported {dmg} fall damage to the server \
+                                  (the server decides the amount actually taken)"));
+                    tracing::info!("EQ: fall damage REPORTED {dmg} (fell {height:.0}u) — server decides the actual amount");
                 }
             }
         }
@@ -5681,9 +5731,19 @@ mod tests {
     /// built by `NavStatus::default()`, which routes through neither writer.
     ///
     /// It lives in `eqoxide-net` because that is the crate that can see both halves — `zoned`,
-    /// `goal_dropped` and `respawned` are the walker's, `stopped`, `goto_superseded` and
-    /// `zone_cross_dropped_unhandled` are `CommandState`'s. Splitting the assertion by crate would
-    /// let a reason exist in one half and be missing from the docs, which is the bug.
+    /// `goal_dropped`, `respawned` and `hp_restored` are the walker's, `stopped`, `goto_superseded`
+    /// and `zone_cross_dropped_unhandled` are `CommandState`'s. Splitting the assertion by crate
+    /// would let a reason exist in one half and be missing from the docs, which is the bug.
+    ///
+    /// **`hp_restored` was added by #1000 and this test is how that was caught.** The life-halt
+    /// retirement publishes `idle` under two different reasons — [`NAV_REASON_RESPAWNED`] when a
+    /// real death ended, [`NAV_REASON_HP_RESTORED`] when an HP-only halt cleared with nothing
+    /// having died — and the docs half of the change landed a run before the constants half. That
+    /// is direction 2 doing exactly the job it was written for: the `idle` row promised an agent a
+    /// reason string that no code path could produce.
+    ///
+    /// [`NAV_REASON_RESPAWNED`]: eqoxide_nav::walker::NAV_REASON_RESPAWNED
+    /// [`NAV_REASON_HP_RESTORED`]: eqoxide_nav::walker::NAV_REASON_HP_RESTORED
     #[test]
     fn the_documented_idle_reasons_are_exactly_the_ones_the_code_can_publish_725() {
         const DOC: &str = include_str!("../../../docs/http-api.md");
@@ -5692,6 +5752,7 @@ mod tests {
             eqoxide_nav::walker::NAV_REASON_ZONED,
             eqoxide_nav::walker::NAV_REASON_GOAL_DROPPED,
             eqoxide_nav::walker::NAV_REASON_RESPAWNED,
+            eqoxide_nav::walker::NAV_REASON_HP_RESTORED,
             eqoxide_command::NAV_REASON_STOPPED,
             eqoxide_command::NAV_REASON_GOTO_CANCELLED,
             eqoxide_command::NAV_REASON_ZONE_CROSS_UNHANDLED,
@@ -7682,7 +7743,12 @@ mod tests {
             *nav.nav.nav_state.lock().unwrap() =
                 eqoxide_ipc::NavStatus { state: "navigating".to_string(), ..Default::default() };
         };
-        let assert_halted = |nav: &ActionLoop| {
+        // #1000: the halt publishes ONE OF TWO words, one per disjunct of `is_player_dead()`, so the
+        // expected pair is a parameter now rather than a constant. The single word `dead` used to be
+        // published for both, which put `nav_state: "dead"` beside `player.dead: false` in one
+        // payload (measured live at 230/230 and 1,889/1,889 refusals) with nothing in the response
+        // saying which predicate was meant.
+        let assert_halted = |nav: &ActionLoop, want_state: &str, want_reason: &str| {
             assert!(nav.nav.goto_target.lock().unwrap().is_none(), "goto_target must clear on death");
             assert!(nav.nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on death");
             assert!(nav.controller.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
@@ -7697,12 +7763,13 @@ mod tests {
             // left over a cleared/rebuilt local_path aims the walker at the wrong segment.
             assert_eq!(nav.walker.local_i, 0, "local_i must reset with local_path on death");
             assert_eq!(nav.walker.path_goal, None);
-            // #644: the halted state must be the HONEST TERMINAL `dead`, NOT the ambiguous `idle`
-            // (which also means "ready for work"). An agent that issued a goto and then polled must
-            // be able to tell "you died and went nowhere" from "arrived / ready".
+            // #644: the halted state must be an HONEST HALT WORD, NOT the ambiguous `idle` (which
+            // also means "ready for work"). An agent that issued a goto and then polled must be able
+            // to tell "you went nowhere and here is why" from "arrived / ready".
             let ns = nav.nav.nav_state.lock().unwrap();
-            assert_eq!(ns.state, "dead", "a slain character's nav_state must be the honest `dead`, not `idle`");
-            assert_eq!(ns.reason.as_deref(), Some("player_dead"));
+            assert_eq!(ns.state, want_state,
+                "a halted character's nav_state must be the honest halt word, not `idle`");
+            assert_eq!(ns.reason.as_deref(), Some(want_reason));
         };
         let new_nav = || {
             let g: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
@@ -7718,7 +7785,9 @@ mod tests {
         gs.cur_hp = 0;
         gs.max_hp = 1284;
         assert!(nav.walker.nav_halt_if_dead(&gs), "cur_hp<=0 (pre-OP_Death) must halt navigation");
-        assert_halted(&nav);
+        // #1000: NOT `dead`. No OP_Death has arrived, so `player.dead` in the same payload reads
+        // `false`; publishing `dead` here is the contradiction the split removes.
+        assert_halted(&nav, "halted_hp_zero", "hp_zero_unconfirmed");
 
         // (b) The OP_Death flag path (player_dead set, cur_hp already zeroed by apply_death).
         let mut nav = new_nav();
@@ -7728,7 +7797,7 @@ mod tests {
         gs.cur_hp = 0;
         gs.max_hp = 1284;
         assert!(nav.walker.nav_halt_if_dead(&gs));
-        assert_halted(&nav);
+        assert_halted(&nav, "dead", "player_dead");
 
         // (c) A LIVE player must NOT be halted (and cur_hp<=0 with max_hp==0 = "unknown", not dead —
         //     e.g. a fresh spawn before the first HP update — must not spuriously stop nav).
@@ -7744,6 +7813,196 @@ mod tests {
         gs.max_hp = 0; // unknown HP, not a death
         assert!(!nav.walker.nav_halt_if_dead(&gs), "cur_hp<=0 with max_hp==0 is unknown HP, not death");
         assert!(nav.nav.goto_target.lock().unwrap().is_some());
+    }
+
+    /// #1000: **the payload must never contain two contradictory answers to "am I alive".** The
+    /// halt word and `player.dead` are computed from different predicates — `is_player_dead()` is
+    /// `player_dead || (cur_hp <= 0 && max_hp > 0)`, `player.dead` is `player_dead` alone — and the
+    /// old code published the single word `dead` for both, so on the HP disjunct the payload
+    /// carried `nav_state: "dead"` beside `dead: false`, with nothing saying which was meant.
+    ///
+    /// This asserts the implication directly over the matrix, in the direction that can lie:
+    /// **`nav_state == "dead"` ⇒ `player_dead`**. It is deliberately not `assert_eq!` against a
+    /// hardcoded word per row — the property is the cross-field agreement, not the spelling, so a
+    /// future rename cannot satisfy it by moving both sides together.
+    ///
+    /// MUTATION CHECK (both directions, and a WRAP not just a deletion):
+    /// * collapse the two arms of the `(state, why)` choice in `nav_halt_if_dead` back to one word
+    ///   (`(NAV_STATE_DEAD, NAV_REASON_PLAYER_DEAD)` unconditionally) → RED on the HP-only rows;
+    /// * WRAP the choice as `if gs.player_dead || true { … }` (the same collapse without deleting a
+    ///   line, so a source-text pin would not notice) → RED on the same rows;
+    /// * invert it (`if !gs.player_dead`) → RED on the confirmed-death rows via the second assert.
+    #[test]
+    fn a_halt_word_never_contradicts_player_dead_1000() {
+        let g = || -> eqoxide_ipc::GroupShared {
+            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()))
+        };
+        // (player_dead, cur_hp, max_hp, must_halt)
+        let matrix = [
+            (false, 0i32,   441i32, true),  // HP disjunct with no death behind it (#1000's shape)
+            (false, -100,   441,    true),  // negative cur_hp: reachable, see `apply_hp_update`
+            (true,  0,      441,    true),  // OP_Death arrived
+            (true,  214,    441,    true),  // flag set, HP not yet zeroed — still a death
+            (false, 214,    441,    false), // healthy
+            (false, 0,      0,      false), // unknown HP (fresh spawn), not a death
+        ];
+        for (player_dead, cur_hp, max_hp, must_halt) in matrix {
+            let mut nav = test_action_loop(g());
+            let mut gs = GameState::new();
+            gs.player_dead = player_dead;
+            gs.cur_hp = cur_hp;
+            gs.max_hp = max_hp;
+            let halted = nav.walker.nav_halt_if_dead(&gs);
+            assert_eq!(halted, must_halt, "halt decision changed for {player_dead}/{cur_hp}/{max_hp}");
+            let ns = nav.nav.nav_state.lock().unwrap().clone();
+            // THE INVARIANT: the word `dead` may only be published when the field an agent is told
+            // to read (`player.dead`, i.e. `gs.player_dead`) says the same thing.
+            if ns.state == eqoxide_ipc::NAV_STATE_DEAD {
+                assert!(gs.player_dead,
+                    "nav_state `dead` published while player.dead reads false \
+                     ({player_dead}/{cur_hp}/{max_hp}) — the #1000 contradiction");
+            }
+            // And the converse, so the split cannot be satisfied by never saying `dead` at all:
+            // a confirmed death must still be reported as a death and not hidden behind the HP word.
+            if halted && gs.player_dead {
+                assert_eq!(ns.state, eqoxide_ipc::NAV_STATE_DEAD,
+                    "a confirmed death must publish `dead` ({player_dead}/{cur_hp}/{max_hp})");
+            }
+            if halted && !gs.player_dead {
+                assert_eq!(ns.state, eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO,
+                    "an HP-only halt must publish `halted_hp_zero` ({player_dead}/{cur_hp}/{max_hp})");
+            }
+            assert!(eqoxide_ipc::nav_state_is_life_halt(&ns.state) == halted,
+                "a life halt must be recognisable as one, and only when it happened");
+        }
+    }
+
+    /// #1000/#1007: a standing halt word **clears by itself** when its own predicate stops holding,
+    /// and it clears under a reason that does not invent an event. `respawned` for a real death;
+    /// `hp_restored` for the HP-only halt, because nothing died and nothing respawned.
+    ///
+    /// MUTATION CHECK: delete the `retire_life_halt()` call from `nav_halt_if_dead`'s not-dead
+    /// branch → RED (the halt word stands forever). WRAP the retirement in `if false { … }` → RED
+    /// the same way without removing the line.
+    #[test]
+    fn a_life_halt_clears_itself_under_an_honest_reason_1000() {
+        let g = || -> eqoxide_ipc::GroupShared {
+            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()))
+        };
+        for (player_dead, want_state, want_reason) in [
+            (true,  eqoxide_ipc::NAV_STATE_DEAD,            "respawned"),
+            (false, eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO,  "hp_restored"),
+        ] {
+            let mut nav = test_action_loop(g());
+            let mut gs = GameState::new();
+            gs.player_dead = player_dead;
+            gs.cur_hp = 0;
+            gs.max_hp = 441;
+            assert!(nav.walker.nav_halt_if_dead(&gs));
+            assert_eq!(nav.nav.nav_state.lock().unwrap().state, want_state);
+
+            // The predicate stops holding — a respawn for (a), an authoritative OP_HPUpdate for (b).
+            gs.player_dead = false;
+            gs.cur_hp = 214;
+            assert!(!nav.walker.nav_halt_if_dead(&gs));
+            let ns = nav.nav.nav_state.lock().unwrap().clone();
+            assert_eq!(ns.state, "idle", "the halt must retire once its predicate stops holding");
+            assert_eq!(ns.reason.as_deref(), Some(want_reason),
+                "the retirement must not claim an event that did not happen");
+        }
+    }
+
+    /// #1000: `retire_life_halt` must only ever touch the two words it owns. A goal state standing
+    /// when the character is alive is somebody else's to retire, and stamping `idle` over it here
+    /// would replace a true outcome with a false one — #725's defect class running backwards.
+    ///
+    /// MUTATION CHECK: drop the `else { return; }` arm in `retire_life_halt` (retire anything
+    /// non-terminal) → RED on the `navigating`/`planning` rows.
+    #[test]
+    fn the_life_halt_retirement_leaves_every_other_word_alone_1000() {
+        let g = || -> eqoxide_ipc::GroupShared {
+            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()))
+        };
+        for word in ["navigating", "planning", "pending", "following", "arrived", "blocked", "no_path"] {
+            let mut nav = test_action_loop(g());
+            *nav.nav.nav_state.lock().unwrap() = eqoxide_ipc::NavStatus {
+                state: word.to_string(), reason: Some("seeded".into()), ..Default::default()
+            };
+            let mut gs = GameState::new();
+            gs.player_dead = false;
+            gs.cur_hp = 400;
+            gs.max_hp = 441;
+            assert!(!nav.walker.nav_halt_if_dead(&gs));
+            let ns = nav.nav.nav_state.lock().unwrap().clone();
+            assert_eq!(ns.state, word, "`{word}` is not a life halt and must not be retired here");
+            assert_eq!(ns.reason.as_deref(), Some("seeded"));
+        }
+    }
+
+    /// #1007 §2: the halt's ONLY retirement used to sit in `Walker::resolve_goal`, which the tick
+    /// reaches **below** `if self.drive_auto_engage_melee(stream, gs) { return; }`. A character that
+    /// halted and then recovered while auto-attacking could therefore never reach the code that
+    /// clears the word — the candidate mechanism for the original "every sample of the run" sighting
+    /// (unverified at filing; this test settles the code half of it). The retirement now runs inside
+    /// `nav_halt_if_dead`, which the tick calls **unconditionally, above every early return** — this
+    /// drives the real `tick` with the melee early return LIVE and asserts the word still clears.
+    ///
+    /// The reach control is the third assert: `drive_auto_engage_melee` is called directly and must
+    /// return `true`, so the tick provably takes the early return and the retirement provably did
+    /// NOT come from `resolve_goal`. Without it this test could pass on a tick that simply fell
+    /// through to the bottom, and would then prove nothing about the ordering it is named for.
+    ///
+    /// MUTATION CHECK: move the `retire_life_halt()` call out of `nav_halt_if_dead` and into
+    /// `resolve_goal`'s no-goal branch (i.e. restore the pre-fix arrangement) → RED here while
+    /// `a_life_halt_clears_itself_under_an_honest_reason_1000` above stays GREEN, which is exactly
+    /// the pair of verdicts that distinguishes "the retirement exists" from "the retirement is
+    /// reachable".
+    #[tokio::test]
+    async fn a_life_halt_retires_above_the_auto_engage_early_return_1007() {
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let group: eqoxide_ipc::GroupShared =
+            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
+        let mut nav = test_action_loop(group);
+
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        // A live auto-attack on a target 10u away: `drive_auto_engage_melee` returns true (< 200u).
+        gs.upsert_entity(eqoxide_core::game_state::Entity {
+            spawn_id: 42, name: "a bat".into(), level: 3, is_npc: true,
+            x: 10.0, y: 0.0, z: 0.0, hp_pct: 100.0, cur_hp: 30, max_hp: 30, race: "BAT".into(),
+            heading: 0.0, dead: false, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
+            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0,
+            pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false,
+            flymode: 0, npc_tint_index: 0,
+        });
+        gs.target_id = Some(42);
+        nav.auto_attack = true;
+
+        // (1) HP hits 0 with a known max and no OP_Death — the tick halts on the HP disjunct.
+        gs.player_dead = false;
+        gs.cur_hp = 0;
+        gs.max_hp = 441;
+        nav.last_tick = Instant::now() - Duration::from_millis(NAV_TICK_MS as u64 * 4);
+        nav.tick(&mut stream, &mut gs);
+        assert_eq!(nav.nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO,
+            "the tick must publish the HP-only halt word");
+
+        // (2) An authoritative OP_HPUpdate restores HP. The melee driver still owns this tick.
+        gs.cur_hp = 214;
+        nav.last_tick = Instant::now() - Duration::from_millis(NAV_TICK_MS as u64 * 4);
+        nav.tick(&mut stream, &mut gs);
+        let ns = nav.nav.nav_state.lock().unwrap().clone();
+        assert_eq!(ns.state, "idle",
+            "the halt must clear even though the melee early return owns the rest of the tick");
+        assert_eq!(ns.reason.as_deref(), Some("hp_restored"));
+
+        // (3) REACH CONTROL — the early return really is taken, so (2) cannot have been retired by
+        // `resolve_goal` further down. If this ever goes false the test above is vacuous.
+        assert!(nav.drive_auto_engage_melee(&mut stream, &mut gs),
+            "the melee override must be active, or this test proves nothing about tick ordering");
     }
 
     #[test]

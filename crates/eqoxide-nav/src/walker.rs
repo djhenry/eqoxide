@@ -57,12 +57,23 @@ const CORNER_BUFFER: f32 = 2.0;
 /// Read `zone_assets` on GET /v1/observe/debug to tell *pending* from *failed*.
 pub const NAV_STATE_ZONE_LOADING: &str = "zone_loading";
 
-/// Terminal `nav_state` published when navigation is halted because the player is DEAD (#644). A
-/// slain character abandons its route (#238); before, that was reported as the ambiguous `idle`
-/// (which also means "ready for work"), so an agent that issued a goto and then polled saw `idle`
-/// and could not tell "arrived / ready" from "you died and went nowhere". `dead` names the
-/// condition honestly and clears back to `idle` on respawn (see `Walker::resolve_goal`).
-pub const NAV_STATE_DEAD: &str = "dead";
+/// The two LIFE-HALT `nav_state` words, re-exported from `eqoxide-ipc` where they are defined
+/// (#1000/#1007). They are declared there, not here, because `eqoxide-command` needs to recognise
+/// them and cannot see this crate; the full argument for the split and for their placement is on
+/// [`eqoxide_ipc::nav_state_is_life_halt`]. These names are unchanged, so existing
+/// `walker::NAV_STATE_DEAD` paths keep resolving.
+///
+/// [`NAV_STATE_DEAD`] is published when navigation is halted because `OP_Death` has arrived (#644).
+/// A slain character abandons its route (#238); before #644 that was reported as the ambiguous
+/// `idle` (which also means "ready for work"), so an agent that issued a goto and then polled saw
+/// `idle` and could not tell "arrived / ready" from "you died and went nowhere".
+///
+/// [`NAV_STATE_HALTED_HP_ZERO`] is published when the halt fired on the OTHER disjunct of
+/// `GameState::is_player_dead()` — `cur_hp <= 0` with a known `max_hp`, no `OP_Death` — which is a
+/// fact about the published HP reading and NOT a death (#1000).
+///
+/// Both retire in [`Walker::nav_halt_if_dead`] the first tick the halt condition is false.
+pub use eqoxide_ipc::{NAV_STATE_DEAD, NAV_STATE_HALTED_HP_ZERO, nav_state_is_life_halt};
 
 /// The CLOSED set of `nav_state` words that are a finished OUTCOME — an answer an agent may read
 /// after the goal that produced it is gone (#725).
@@ -72,9 +83,19 @@ pub const NAV_STATE_DEAD: &str = "dead";
 /// state NOT listed here the moment there is no goto goal and no queued zone-cross left to justify
 /// it — see the argument there for why the rule is stated this way round.
 ///
-/// `dead` is deliberately ABSENT: it is terminal *for the goal*, but it must clear on respawn
-/// (#644), which is exactly a retirement. `zone_loading` is absent for the same reason — it is a
-/// promise that a route is still coming.
+/// **`dead` and `halted_hp_zero` are deliberately ABSENT, and the prose in this file will tempt you
+/// to "fix" that — do not (#1007).** Both are terminal *for the goal*, and `resolve_goal` below
+/// calls `dead` terminal in so many words: it retires "the terminal `dead`". Adding either to this
+/// array is a REGRESSION, not a tidy-up: the retirements that clear them are both guarded by
+/// `!nav_state_is_terminal(&current)` (see `Walker::retire_life_halt` and `Walker::resolve_goal`),
+/// so listing them makes the retirement dead code and the halt PERMANENT — a bounded lie converted
+/// into a never-clearing one.
+/// The omission is load-bearing in the opposite direction from what the surrounding prose implies.
+/// `zone_loading` is absent for the related reason — it is a promise that a route is still coming.
+///
+/// Read the rule below precisely: it says a genuinely terminal word must be listed. These are
+/// terminal about the *goal* and live about the *character*, and it is the second half that decides
+/// membership here, because membership is what gates retirement.
 pub const TERMINAL_NAV_STATES: [&str; 5] = ["idle", "arrived", "no_path", "search_exhausted", "blocked"];
 
 /// Is `state` a finished outcome (see [`TERMINAL_NAV_STATES`]) rather than a claim that work is
@@ -100,6 +121,28 @@ pub const NAV_REASON_GOAL_DROPPED: &str = "goal_dropped";
 /// `nav_reason` on the `idle` that [`NAV_STATE_DEAD`] retires to once the character is alive again
 /// (#644) — "idle because you respawned", not "idle, nothing happened".
 pub const NAV_REASON_RESPAWNED: &str = "respawned";
+
+/// `nav_reason` accompanying [`NAV_STATE_DEAD`]: the halt is the server's `OP_Death`, i.e.
+/// `GameState::player_dead`. **Published only when `player.dead` on GET /v1/observe/debug also
+/// reads `true`** — that agreement is the point of the #1000 split, so this reason can never again
+/// appear beside a `dead: false` the way the old single-word form did (measured at 100%
+/// co-occurrence over 230/230 and 1,889/1,889 refusals in the two reproducing runs).
+pub const NAV_REASON_PLAYER_DEAD: &str = "player_dead";
+
+/// `nav_reason` accompanying [`NAV_STATE_HALTED_HP_ZERO`]: the halt fired on the HP disjunct alone
+/// — the client's published `hp` is at or below 0 with a known `hp_max`, and no `OP_Death` has
+/// arrived. It says what is known and no more: navigation is stopped because of an HP reading, and
+/// the character is **not** confirmed dead. The test is on the client's PUBLISHED number, which
+/// carries no death claim of its own; historically it could even be a value the server never sent
+/// (#1005, addressed separately). A respawn is therefore not the remedy here, and none is
+/// prescribed.
+pub const NAV_REASON_HP_ZERO_UNCONFIRMED: &str = "hp_zero_unconfirmed";
+
+/// `nav_reason` on the `idle` that [`NAV_STATE_HALTED_HP_ZERO`] retires to when `hp` comes back
+/// above 0 (#1000) — "idle because the HP reading recovered". Deliberately NOT
+/// [`NAV_REASON_RESPAWNED`]: nothing died and nothing respawned, and saying so would re-tell the
+/// story the halt word was split apart to stop telling.
+pub const NAV_REASON_HP_RESTORED: &str = "hp_restored";
 
 /// `nav_reason` on the `idle` that [`Walker::reset_for_zone_change`] publishes when the character
 /// changes zone — **including the SUCCESS path of `/v1/move/zone_cross`** (#725 review, B1).
@@ -1209,8 +1252,41 @@ impl Walker {
     /// Stop all navigation the instant the player is slain (#238): abandon the destination + route +
     /// controller intent so a corpse doesn't keep walking toward the goal, and clear the overlay
     /// line. Returns true when the player is dead (the caller returns early from the tick).
+    ///
+    /// # This is also the RETIREMENT site for the life-halt word (#1007)
+    ///
+    /// The not-dead branch below is not a bare `return false` any more: it retires a standing
+    /// [`NAV_STATE_DEAD`]/[`NAV_STATE_HALTED_HP_ZERO`] before returning.
+    ///
+    /// It has to be ABOVE every early return in the tick, and it is — it is NOT the first thing the
+    /// tick does (the pending-reaper, the `drain_*` calls and `stream_position` all run first), but
+    /// none of those returns, so this call is still the first `return` the tick can take. See the
+    /// "FIRST early return" paragraph below, which is the property the argument actually rests on.
+    /// `resolve_goal` used to hold the one retirement, and in `ActionLoop::tick` it sits
+    /// BELOW `if self.drive_auto_engage_melee(stream, gs) { return; }` — so while auto-engage keeps
+    /// returning `true`, the retirement is never reached and the word never clears. The same is
+    /// true of `drive_walk`'s four writers (`planning`, `blocked`, `following`, `arrived`), which
+    /// means a sustained melee run does not merely fail to retire the halt: **no walker writer
+    /// downstream of that early return runs at all, and `nav_state` freezes at whatever word was
+    /// last published.**
+    /// Chained with the HP disjunct — which latches the halt on any published `hp` of 0 with a known
+    /// max, with or without a death behind it — the reachable shape is `nav_state` reporting a halt
+    /// for the whole of a combat run, beside `player.dead: false` in the same payload. That is
+    /// #1000's observable with no death anywhere in the causal chain and no bound on its duration.
+    /// (The route that produced the zero in #1000's own reproduction is #1005's, addressed
+    /// separately; the freeze above does not depend on it.)
+    ///
+    /// `nav_halt_if_dead` is the FIRST early return in the tick, above every other one, and it is
+    /// called unconditionally on every tick rather than behind the 150 ms planner gate. A retirement
+    /// placed here therefore cannot be skipped by any later `return`. `resolve_goal` keeps its own
+    /// retirement as a backstop for direct callers, but on the production path this one always runs
+    /// first, so that branch no longer fires there.
+    ///
+    /// This retires a published WORD. It touches no slot, no path, no plan and no intent, and it
+    /// does not change when navigation halts or resumes — `is_player_dead()` is untouched.
     pub fn nav_halt_if_dead(&mut self, gs: &GameState) -> bool {
         if !gs.is_player_dead() {
+            self.retire_life_halt();
             return false;
         }
         if self.nav.goto_target.lock().unwrap().take().is_some() {
@@ -1227,13 +1303,63 @@ impl Walker {
         // A corpse must not act on a plan that lands after it died (#238 + #340).
         self.planner.cancel();
         self.awaiting_first_plan = false;
-        // #644: publish an HONEST TERMINAL state, not the ambiguous `idle`. `idle` also means "ready
-        // for work", so an agent that issued a goto (accepted while alive) and then polled after the
+        // #644: publish an honest halt word, not the ambiguous `idle`. `idle` also means "ready for
+        // work", so an agent that issued a goto (accepted while alive) and then polled after the
         // character died mid-route saw `idle` and could not distinguish "arrived / ready" from "you
-        // died". `dead` names the condition; it clears back to `idle` on respawn (see `resolve_goal`).
-        self.set_nav_state_because(NAV_STATE_DEAD, Some("player_dead"));
+        // died".
+        //
+        // #1000: WHICH word depends on which disjunct of `is_player_dead()` fired, and that is the
+        // fix for a contradiction an agent could not adjudicate. `player_dead` is the server's
+        // `OP_Death`; `cur_hp <= 0 && max_hp > 0` is a test on the client's published number, which
+        // carries no death claim of its own — it can precede an `OP_Death` genuinely in flight, and
+        // it can hold with no death coming at all. Publishing the single word `dead` for both put a
+        // life claim in the payload that `player.dead` — which is `player_dead` alone —
+        // contradicted in the SAME response. Reproduced 2 of 2 live: `nav_state: "dead"` beside
+        // `dead: false`, for 0.386 s and 2.477 s, on a character that never died and for which no
+        // `OP_Death` ever existed. Those windows are the orchestrator's live figures, reported
+        // under #1007's "Relationship to #1000" section; they are cited here, NOT re-derived in
+        // this change.
+        //
+        // Splitting the word makes that unrepresentable rather than unlikely: `dead` is now
+        // published only under the `player_dead` flag, so it agrees with `player.dead` by
+        // construction, and the HP-only case names its own basis instead of borrowing the word for
+        // a death. Both halt navigation identically — this decides what is SAID, not what is done.
+        let (state, why) = if gs.player_dead {
+            (NAV_STATE_DEAD, NAV_REASON_PLAYER_DEAD)
+        } else {
+            (NAV_STATE_HALTED_HP_ZERO, NAV_REASON_HP_ZERO_UNCONFIRMED)
+        };
+        self.set_nav_state_because(state, Some(why));
         self.publish_debug(Self::known_pos(gs), None);
         true
+    }
+
+    /// Clear a standing life-halt word the moment its condition is false — the retirement half of
+    /// [`Walker::nav_halt_if_dead`], split out so the two halves read as one decision. Does nothing
+    /// unless the currently published state IS one of the halt words, so it cannot overwrite a
+    /// goal's outcome or an in-progress state.
+    ///
+    /// The retirement SAYS WHY, and says two different things, because the two halts ended for two
+    /// different reasons: [`NAV_REASON_RESPAWNED`] after a real death, and [`NAV_REASON_HP_RESTORED`]
+    /// when an HP reading recovered on a character that never died. Reusing `respawned` for the
+    /// second would re-tell exactly the story #1000 split the words apart to stop telling.
+    fn retire_life_halt(&mut self) {
+        let current = self.nav.nav_state.lock().unwrap().state.clone();
+        // Guarded on membership of `TERMINAL_NAV_STATES` for the same reason `resolve_goal` is: if
+        // a future edit adds a halt word to that array, this becomes dead code and the halt becomes
+        // permanent. The guard is here so that failure is at least consistent with the array's own
+        // documented contract rather than silently diverging from it. See the trap note there.
+        if nav_state_is_terminal(&current) {
+            return;
+        }
+        let why = if current == NAV_STATE_DEAD {
+            NAV_REASON_RESPAWNED
+        } else if current == NAV_STATE_HALTED_HP_ZERO {
+            NAV_REASON_HP_RESTORED
+        } else {
+            return;
+        };
+        self.set_nav_state_because("idle", Some(why));
     }
 
     /// Live NPC-camp positions to route AROUND (aggro-avoidance, #67), excluding NPCs near the
@@ -1361,7 +1487,19 @@ impl Walker {
                     // `resolve_goal`), retire the terminal `dead` back to `idle` so the honest death
                     // state doesn't linger as a new never-clearing observable — and SAY WHY, so
                     // "idle because you came back" is distinguishable from "idle, ready for work".
-                    let why = if current == NAV_STATE_DEAD { NAV_REASON_RESPAWNED } else { NAV_REASON_GOAL_DROPPED };
+                    // #1000: `halted_hp_zero` is the second life-halt word and retires the same way
+                    // — see `Walker::retire_life_halt`, which is the retirement that actually runs
+                    // on the production path (it is above every early return in `ActionLoop::tick`,
+                    // and this one is below several). Both arms are kept here so a direct caller of
+                    // `resolve_goal` still gets an honest retirement, and so this ternary cannot go
+                    // stale against the halt vocabulary.
+                    let why = if current == NAV_STATE_DEAD {
+                        NAV_REASON_RESPAWNED
+                    } else if current == NAV_STATE_HALTED_HP_ZERO {
+                        NAV_REASON_HP_RESTORED
+                    } else {
+                        NAV_REASON_GOAL_DROPPED
+                    };
                     self.set_nav_state_because("idle", Some(why));
                     // #725 review N3's KNOWN GAP is CLOSED here (#732). It read: "`set_nav_state_
                     // because` never clears `s.goal`, so this retirement can leave the abandoned

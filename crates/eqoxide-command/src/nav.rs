@@ -174,7 +174,38 @@ impl CommandState {
         // `idle` side — the explicit `s.local = None;` that used to sit here because
         // `retire_to_idle` kept `local`.)
         if new_state == "idle" {
+            // #1007/#1000 — A LIFE-HALT WORD IS NOT A GOAL OUTCOME, so a goal-level event must not
+            // relabel it. `idle` means "nothing to do, ready for work"; while the walker is halted
+            // on `GameState::is_player_dead()` that is false, and only the walker can know it is
+            // false — this crate cannot see `GameState` and none of the events that reach here
+            // (`/move/stop`, a supersede by manual movement or the melee-engage override, a zone
+            // change) is evidence about whether the character can walk.
+            //
+            // Without this guard the field has two unordered writers on two threads: the net
+            // thread's `nav_halt_if_dead` republishes the halt every tick, and the render thread's
+            // per-frame `request_cancel_goto` (WASD, and the non-draining `/v1/move/manual` slot,
+            // which re-stamps on EVERY frame until its deadline) writes `idle`/`goto_superseded`.
+            // Measured live: the published word alternated 46 times inside 0.386 s while `hp` held
+            // 0 and `dead` held `false` across all 230 samples (#1007 §1 — the orchestrator's
+            // figure, not re-derived in this change). Two polls a few ms apart legitimately
+            // disagreed, so an agent could not tell "the state changed" from "I sampled a different
+            // phase of a flap", and an agent polling twice saw a recovery that never happened.
+            //
+            // What is preserved is exactly the two published WORDS. Everything else the retirement
+            // decides still happens: `goal_id` was already bumped above, and `retire_to_idle` still
+            // clears `goal`, `blocked_*`, `tier`, `local` and `stall` — because the goal really is
+            // over, which is the true half of what the caller is reporting. The caller's own
+            // channel for "your request landed" is the fresh `goal_id` it returns, which is
+            // untouched. `retire_to_idle` stays the single exhaustive (E0027-netted) writer; this
+            // restores two fields after it, and deliberately not by destructuring, so a field added
+            // to `NavStatus` tomorrow is still force-decided there and cannot leak through here.
+            let halted = eqoxide_ipc::nav_state_is_life_halt(&s.state)
+                .then(|| (s.state.clone(), s.reason.clone()));
             s.retire_to_idle(reason);
+            if let Some((halt_state, halt_reason)) = halted {
+                s.state  = halt_state;
+                s.reason = halt_reason;
+            }
             return s.goal_id;
         }
         s.stamp_fresh_goal(new_state, reason, goal.map(|(x, y, z)| [x, y, z]));
@@ -837,6 +868,92 @@ mod tests {
                 "{label}: and the per-route tier goes with it — same lifetime, same argument. This \
                  half already passed before the fix, which is what showed the two fields had drifted \
                  apart in a list nothing checked for exhaustiveness.");
+        }
+    }
+
+    /// #1007/#1000: **a goal-level retirement must not relabel a standing life halt.** The halt word
+    /// is published by the net thread's `nav_halt_if_dead`; every route below is written by the
+    /// render thread or by an HTTP handler, and none of them has any evidence about whether the
+    /// character can walk. Before this guard the two writers raced and the published word flapped
+    /// (measured live at 46 alternations inside 0.386 s while `dead` held `false` across all 230
+    /// samples — the orchestrator's figure from #1007 §1, not re-derived here).
+    ///
+    /// The goal side of the retirement must still happen — the goal really is over — so this also
+    /// asserts the fresh `goal_id` and the cleared per-goal payload. That is the caller's "your
+    /// request landed" channel, and it is why preserving the word costs the caller nothing.
+    ///
+    /// MUTATION CHECK: delete the `if let Some((halt_state, halt_reason)) = halted` restore in
+    /// `stamp_new_goal` → RED on the state/reason asserts. WRAP the capture as
+    /// `nav_state_is_life_halt(&s.state) && false` (no line removed, so a source-text pin would not
+    /// see it) → RED the same way. Delete the `s.retire_to_idle(reason)` call → RED on the
+    /// goal-cleared asserts, so the guard cannot be satisfied by skipping the retirement.
+    #[test]
+    fn a_goal_retirement_cannot_relabel_a_standing_life_halt_1007() {
+        for halt in [eqoxide_ipc::NAV_STATE_DEAD, eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO] {
+            let halt_reason = if halt == eqoxide_ipc::NAV_STATE_DEAD {
+                "player_dead"
+            } else {
+                "hp_zero_unconfirmed"
+            };
+            for (label, act) in [
+                ("stop",          Box::new(|cs: &CommandState| { cs.request_stop(); })
+                                      as Box<dyn Fn(&CommandState)>),
+                ("cancel_goto",   Box::new(|cs: &CommandState| { cs.request_cancel_goto(); })
+                                      as Box<dyn Fn(&CommandState)>),
+            ] {
+                let cs = CommandState::default();
+                // A goal in flight, carrying per-goal payload, then the walker halts on top of it.
+                cs.request_goto((2216.0, 579.0, -113.0));
+                {
+                    let mut s = cs.nav.nav_state.lock().unwrap();
+                    s.state  = halt.to_string();
+                    s.reason = Some(halt_reason.into());
+                    s.tier   = Some("preferred");
+                }
+                let halted_id = cs.nav.nav_state.lock().unwrap().goal_id;
+                assert_eq!(cs.nav.nav_state.lock().unwrap().state, halt,
+                    "{halt}/{label}: PREMISE — the halt really is published");
+
+                act(&cs);
+
+                let s = cs.nav.nav_state.lock().unwrap();
+                assert_eq!(s.state, halt,
+                    "{halt}/{label}: a goal-level event says nothing about whether the character \
+                     can walk; relabelling the halt `idle` tells the reader it cleared");
+                assert_eq!(s.reason.as_deref(), Some(halt_reason),
+                    "{halt}/{label}: the halt's reason belongs to the halt, not to this event");
+                // …and the goal side still retired, which is the true half of what the caller reported.
+                assert!(s.goal_id > halted_id, "{halt}/{label}: the request must still stamp identity");
+                assert_eq!(s.goal, None, "{halt}/{label}: the goal really is over");
+                assert_eq!(s.tier, None, "{halt}/{label}: per-goal payload retires with the goal");
+            }
+        }
+    }
+
+    /// The control for the test above: with a NON-halt word standing, the same routes must retire to
+    /// `idle` exactly as they always did. Without this, the guard could be satisfied by preserving
+    /// every word — which would resurrect #725's defect (a state that outlives its goal).
+    #[test]
+    fn a_goal_retirement_still_reaches_idle_when_nothing_is_halted_1007() {
+        for (label, act, want_reason) in [
+            ("stop",        Box::new(|cs: &CommandState| { cs.request_stop(); })
+                                as Box<dyn Fn(&CommandState)>, NAV_REASON_STOPPED),
+            ("cancel_goto", Box::new(|cs: &CommandState| { cs.request_cancel_goto(); })
+                                as Box<dyn Fn(&CommandState)>, NAV_REASON_GOTO_CANCELLED),
+        ] {
+            let cs = CommandState::default();
+            cs.request_goto((2216.0, 579.0, -113.0));
+            {
+                let mut s = cs.nav.nav_state.lock().unwrap();
+                s.state = "navigating".into();
+                s.tier  = Some("preferred");
+            }
+            act(&cs);
+            let s = cs.nav.nav_state.lock().unwrap();
+            assert_eq!(s.state, "idle", "{label}: an unhalted goal must still retire to idle (#725)");
+            assert_eq!(s.reason.as_deref(), Some(want_reason));
+            assert_eq!(s.goal, None);
+            assert_eq!(s.tier, None);
         }
     }
 }
