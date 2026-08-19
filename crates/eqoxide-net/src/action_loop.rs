@@ -1161,7 +1161,7 @@ impl ActionLoop {
     /// The shared world index, for the zone-entry handshake to CLEAR (#1010). Same shape as
     /// [`Self::controller_slots`] — a read-only borrow of the slots, not the loop.
     ///
-    /// Two of its groups describe the zone we are LEAVING and have no publisher the handshake can
+    /// Some of its groups describe the zone we are LEAVING and have no publisher the handshake can
     /// otherwise reach: the entity roster triple (`entity_positions`/`entity_ids`/`entity_poses`)
     /// and `zone_points`. `GameState::begin_zone_in` emptying `gs.world.entities` /
     /// `gs.world.zone_points` does not reach the copies an agent reads. See
@@ -1216,7 +1216,7 @@ impl ActionLoop {
     ///
     /// Taking the rebuild branch on those paths also runs what a completed re-entry warrants and the
     /// same-zone branch skips: the walker reset (#248), the gated-refusal re-arm (#683) and the
-    /// parked-command reaps (#448/#479). All four were already correct for a full zone-in; only the
+    /// parked-command reaps (#448/#479). These were already correct for a full zone-in; only the
     /// name comparison was hiding them.
     pub fn sync_zone_points_after_zone_in(&mut self, gs: &GameState) {
         self.current_zone.clear();
