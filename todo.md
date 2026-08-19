@@ -302,7 +302,32 @@ Parse OP_SpawnDoor on zone-in; render with real models (from `_obj.s3d`) + fallb
 Animate open/close via OP_MoveDoor (server-authoritative, no client-side toggle). Portal doors
 (opentype 57/58) zone the player on open. Click via 3D picker or HTTP API (`GET /v1/observe/doors`,
 `POST /v1/interact/click_door {door_id:N}` or `{name:"DOOR1"}`). Verified live: doors render (untextured),
-click opens (server replies), portal doors trigger zoning. Notes: `docs/http-api.md`, `~/git/eq_kb/doors.md`.
+click opens (server replies), portal doors trigger zoning. Notes: `docs/http-api.md`.
+(This used to cite `~/git/eq_kb/doors.md`. That file has no history in the private knowledge-base
+repo at all — no add, no delete, `git rev-list --objects --all` there finds zero blobs of that name
+— so the citation dangled from the day the KB migrated, independent of whichever earlier eqoxide-repo
+note it was meant to carry forward. Repointed to the two private-tree notes that actually cover this
+claim: `~/git/eq_kb/kelethin-lift-and-doors.md` documents the
+`OP_SpawnDoor`/`OP_ClickDoor`/`OP_MoveDoor` wire structs and the opentype-57/58 teleport-door
+semantics this paragraph describes; `~/git/eq_kb/rof2-door-spawn-delivery.md` documents the zone-in
+`OP_SpawnDoor` delivery mechanics ("Parse OP_SpawnDoor on zone-in" above). Both were read end to end
+before being cited, and both were then put through the same test that condemns `doors.md`, because
+reading a file on disk is a weaker check than the one this note applies to the citation it removed:
+each is **tracked** in that repo — one blob apiece under `git rev-list --objects --all`, and
+`git ls-files --error-unmatch` succeeds for both. `rof2-door-spawn-delivery.md` was an uncommitted
+working-tree file when it was first cited here and has since been committed there; a citation that
+resolves on one machine only is the same defect as one that resolves nowhere, just quieter.
+**What that check does not buy:** the knowledge-base repo has no configured remote, so "tracked"
+makes these two citations reproducible for a holder of that repository, not for a reader of this one.
+Whether this repo should cite a non-public tree at all is a separate open question and is not settled
+here. Between them the two notes name the exact mechanism behind every **wire** claim in this
+paragraph: the zone-in spawn burst, the server-authoritative open/close, and opentype-57/58 zoning.
+The **render** half — "real models (from `_obj.s3d`) + fallback box" — is an eqoxide implementation
+statement rather than a wire claim, and is deliberately NOT cited to either note:
+`kelethin-lift-and-doors.md` mentions `_obj.s3d` door actordefs and the `<zone>_doors.glb` asset in
+passing during a lift-animation investigation, but neither note derives eqoxide's
+model-load-or-fallback behaviour, so stretching them to cover it would be exactly the silent repoint
+this change is avoiding.)
 
 **Follow-ups (not blocking):**
 - Door textures (models currently untextured; geometry/placement correct)
