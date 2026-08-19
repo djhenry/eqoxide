@@ -9,9 +9,10 @@ character-creation handshake (commit `8a03a15`) that this UI builds on.
 ## Goal
 
 When the client is launched **without `--config`**, present interactive **Login → Character-Select
-→ Character-Create** screens that follow the same rules the native Titanium client enforces, instead
-of auto-logging-in from a config file. With `--config <name>` the current non-interactive behavior is
-unchanged.
+→ Character-Create** screens that follow the same rules the server enforces for **RoF2**, the client
+this repo targets. (Some tables in Section 3 are EQEmu's *Titanium*-path validator arrays; each is
+labelled with the client it applies to, and the RoF2 rule is given alongside where the two differ.)
+With `--config <name>` the current non-interactive behavior is unchanged.
 
 ## Decisions (from brainstorming)
 
@@ -73,12 +74,13 @@ stays the single source of truth; egui screens are thin views over shared slots.
 4. **Char-list parsing**: parse the 1704-byte `CharacterSelect_Struct` into `Vec<CharSummary>`
    (replaces today's substring scan in `login.rs`).
 5. **Interactive `LoginProtocol`** + the command-slot channel (Section 1).
-6. **`OP_DeleteCharacter`** (`0x26c9`).
+6. **`OP_DeleteCharacter`** (RoF2 `0x1808`, `utils/patches/patch_RoF2.conf:37`; `0x26c9` is the
+   Titanium value).
 7. **Live 3D preview** (`src/pregame/preview.rs`): render the selected race/gender/face/hair model to
    an offscreen texture exposed to egui. Reuse `render_model` / renderer model-loading. Re-render
    only on input change. **Highest-risk integration — stage last.**
 
-## Section 3 — Native rules data (ground truth from eq-client-expert, cited)
+## Section 3 — Native rules data (cited to EQEmu source)
 
 Summary tables below; each cites its own EQEmu source directly. (This section originally pointed
 here at a private working note, `~/git/eq_kb/character-creation.md`, as the consolidated citation
@@ -91,41 +93,70 @@ UNCITED.)
 
 ### Race IDs (`common/races.h`)
 Human=1, Barbarian=2, Erudite=3, Wood Elf=4, High Elf=5, Dark Elf=6, Half Elf=7, Dwarf=8, Troll=9,
-Ogre=10, Halfling=11, Gnome=12, Iksar=128, Vah Shir=130. (Froglok=330/Drakkin=522 exist in tables but
-are not Titanium-creatable — hide.) The **fourteen creatable** values above match the `Race`
-namespace constants in `common/races.h` one-for-one: `races.h:45–56` for Human…Gnome, `:172` Iksar,
-`:174` VahShir.
+Ogre=10, Halfling=11, Gnome=12, Iksar=128, Vah Shir=130, Froglok=330, Drakkin=522. All **sixteen**
+match `Race` namespace constants in `common/races.h` one-for-one: `races.h:45–56` for Human…Gnome,
+`:172` Iksar, `:174` VahShir, `:374` Froglok2 (=330), `:566` Drakkin.
 
-> ⚠ The two hidden ids do **not** both match by name. Drakkin=522 is `Race::Drakkin`
-> (`races.h:566`), but 330 is `Race::Froglok2` (`races.h:374`) — `Race::Froglok` is **26**
-> (`races.h:70`), a different, non-creatable race. 330 is nonetheless the correct id for the
-> creatable froglok: it is the only froglok race id appearing in `char_create_combinations` (26
-> appears in no row of the seed — see the deity section below for that file). So the number is
-> right and the *name* is the trap. Same name-collision shape as `Agnostic1`/`Agnostic2` below;
-> code that resolves either of these by constant name will pick the wrong one.
+**All sixteen are creatable under RoF2 — do not hide froglok or drakkin.** The creatable set is
+exactly the distinct `race` values in `char_create_combinations`, the table `CheckCharCreateInfoSoF`
+validates against (the deity section below names the file and the row count): its 641 seed rows carry
+**16** distinct race ids, the sixteen above, with 330 in **18** rows and 522 in **13**.
+`CheckCharCreateInfoSoF` matches only `Class`/`Race`/`Deity`/`Zone` (`world/client.cpp:1912–1915`)
+and never gates on `ExpansionRequired`, which occurs in `world/` only where it is read off the row
+(`worlddb.cpp:827`, `sof_char_create_data.h:30`) and echoed back to the client (`client.cpp:732`).
+Drive the race list off the combo rows rather than a hardcoded list.
 
-### Race/class validity matrix (`ClassRaceLookupTable`, EQEmu `world/client.cpp:2053`)
+> ⚠ **This corrects an earlier revision of this section, which said froglok and drakkin "exist in
+> tables but are not Titanium-creatable — hide".** The directive is removed rather than hedged,
+> because it was wrong under both clients. Under RoF2 the combo rows above refute it. It is also
+> wrong about EQEmu's **Titanium** validator, which admits both: `ClassRaceLookupTable` is
+> dimensioned `[…][_TABLE_RACES]` with `_TABLE_RACES 16` (`world/client.cpp:2011`), its column header
+> names Froglok and Drakkin as columns 15–16 (`:2054`), the Warrior row is `true` in both (`:2055`),
+> and `CheckCharCreateInfoTitanium` maps them in explicitly — `Race::Froglok2` to index 14 (`:2081`)
+> and `Race::Drakkin` to index 15 (`:2084`). What a retail Titanium client offered in its own UI is a
+> client-side question this document does not source; it is also moot, because this repo targets
+> RoF2.
+
+> ⚠ **Name collision — the two high ids do not both match by name.** Drakkin=522 is `Race::Drakkin`
+> (`races.h:566`), but 330 is `Race::Froglok2` (`races.h:374`); `Race::Froglok` is **26**
+> (`races.h:70`), a different race that appears in **no** row of the seed and is not creatable. 330
+> is the right id for the creatable froglok — it is the only froglok id present in
+> `char_create_combinations`. So the number is right and the *name* is the trap. Same shape as
+> `Agnostic1`/`Agnostic2` below; code that resolves either of these by constant name will pick the
+> wrong one.
+
+### Race/class validity matrix — Titanium validator table (`ClassRaceLookupTable`, `world/client.cpp:2053`)
+All 16 classes × all 16 races are rendered; the column header naming Froglok and Drakkin as columns
+15–16 is `world/client.cpp:2054`.
 ```
-              Hum Bar Eru  WE  HE  DE HlfE Dwr Trl Ogr Hlf Gno Iks VaS
-Warrior  (1)   Y   Y   -   Y   -   Y   Y   Y   Y   Y   Y   Y   Y   Y
-Cleric   (2)   Y   -   Y   -   Y   Y   Y   Y   -   -   Y   Y   -   -
-Paladin  (3)   Y   -   Y   -   Y   -   Y   Y   -   -   Y   Y   -   -
-Ranger   (4)   Y   -   -   Y   -   -   Y   -   -   -   Y   -   -   -
-SK       (5)   Y   -   Y   -   -   Y   -   -   Y   Y   -   Y   Y   -
-Druid    (6)   Y   -   -   Y   -   -   Y   -   -   -   Y   -   -   -
-Monk     (7)   Y   -   -   -   -   -   -   -   -   -   -   -   Y   -
-Bard     (8)   Y   -   -   Y   -   -   Y   -   -   -   -   -   -   Y
-Rogue    (9)   Y   Y   -   Y   -   Y   Y   Y   -   -   Y   Y   -   Y
-Shaman  (10)   -   Y   -   -   -   -   -   -   Y   Y   -   -   Y   Y
-Necro   (11)   Y   -   Y   -   -   Y   -   -   -   -   -   Y   Y   -
-Wizard  (12)   Y   -   Y   -   Y   Y   -   -   -   -   -   Y   -   -
-Mage    (13)   Y   -   Y   -   Y   Y   -   -   -   -   -   Y   -   -
-Enchant (14)   Y   -   Y   -   Y   Y   -   -   -   -   -   Y   -   -
-Beastlord(15)  -   Y   -   -   -   -   -   -   Y   Y   -   -   Y   Y
-Berserker(16)  -   Y   -   -   -   -   -   Y   Y   Y   -   -   -   Y
+              Hum Bar Eru  WE  HE  DE HlfE Dwr Trl Ogr Hlf Gno Iks VaS Frg Drk
+Warrior  (1)    Y   Y   -   Y   -   Y   Y   Y   Y   Y   Y   Y   Y   Y   Y   Y
+Cleric   (2)    Y   -   Y   -   Y   Y   Y   Y   -   -   Y   Y   -   -   Y   Y
+Paladin  (3)    Y   -   Y   -   Y   -   Y   Y   -   -   Y   Y   -   -   Y   Y
+Ranger   (4)    Y   -   -   Y   -   -   Y   -   -   -   Y   -   -   -   -   Y
+SK       (5)    Y   -   Y   -   -   Y   -   -   Y   Y   -   Y   Y   -   Y   Y
+Druid    (6)    Y   -   -   Y   -   -   Y   -   -   -   Y   -   -   -   -   Y
+Monk     (7)    Y   -   -   -   -   -   -   -   -   -   -   -   Y   -   -   Y
+Bard     (8)    Y   -   -   Y   -   -   Y   -   -   -   -   -   -   Y   -   Y
+Rogue    (9)    Y   Y   -   Y   -   Y   Y   Y   -   -   Y   Y   -   Y   Y   Y
+Shaman  (10)    -   Y   -   -   -   -   -   -   Y   Y   -   -   Y   Y   Y   -
+Necro   (11)    Y   -   Y   -   -   Y   -   -   -   -   -   Y   Y   -   Y   Y
+Wizard  (12)    Y   -   Y   -   Y   Y   -   -   -   -   -   Y   -   -   Y   Y
+Mage    (13)    Y   -   Y   -   Y   Y   -   -   -   -   -   Y   -   -   -   Y
+Enchant (14)    Y   -   Y   -   Y   Y   -   -   -   -   -   Y   -   -   -   Y
+Beastlord(15)   -   Y   -   -   -   -   -   -   Y   Y   -   -   Y   Y   -   -
+Berserker(16)   -   Y   -   -   -   -   -   Y   Y   Y   -   -   -   Y   -   -
 ```
+> ⚠ **This is the Titanium path's table; it is not what RoF2 validates against.** RoF2 creates go
+> through `CheckCharCreateInfoSoF`, which matches `char_create_combinations` rows (see the deity
+> section below), not this array. The two nearly agree: all **112** distinct race/class pairs in the
+> 641 seed rows are `true` here, and this table carries exactly **one** pair the seed does not —
+> **Half Elf Cleric**. Race 7 has 116 seed rows, across classes 1/3/4/6/8/9 (Warrior, Paladin,
+> Ranger, Druid, Bard, Rogue), and **zero** with class 2. So a half-elf cleric is admitted by the
+> Titanium validator and rejected by RoF2's. Build the UI's validity predicate from the combo rows.
 
-### Race base stats — order STR/STA/AGI/DEX/WIS/INT/CHA (`world/client.cpp:2013`)
+### Race base stats — Titanium validator array `BaseRace` (`world/client.cpp:2013`), order STR/STA/AGI/DEX/WIS/INT/CHA
+All 16 rows of the array are rendered (`_TABLE_RACES` is 16, `world/client.cpp:2011`).
 ```
 Human      75 75 75 75 75 75 75      Dwarf     90 90 70 90 83 60 45
 Barbarian 103 95 82 70 70 60 55      Troll    108 109 83 75 60 52 40
@@ -134,9 +165,16 @@ Wood Elf   65 65 95 80 80 75 75      Halfling  70 75 95 90 80 67 50
 High Elf   55 65 85 70 95 92 80      Gnome     60 70 85 85 67 98 60
 Dark Elf   60 65 90 75 83 99 60      Iksar     70 70 90 85 80 75 55
 Half Elf   70 70 90 85 60 75 75      Vah Shir  90 75 90 70 70 65 65
+Froglok    70 80 100 100 75 75 50    Drakkin   70 80 85 75 80 85 75
 ```
+> ⚠ **RoF2 does not use this array.** `CheckCharCreateInfoSoF` range-checks the submitted stats
+> against the `char_create_point_allocations` row named by the matched combo's `AllocationIndex`
+> (`world/client.cpp:1927–1941`), and that struct's `BaseStats[7]` is indexed in a **different order**
+> — STR, DEX, AGI, STA, INT, WIS, CHA (`world/client.cpp:1951–1984`). Reading those values with this
+> table's column order swaps STA with DEX and WIS with INT.
 
-### Class stat bonuses + bonus-point pool — STR/STA/AGI/DEX/WIS/INT/CHA/POINTS (`world/client.cpp:2033`)
+### Class stat bonuses + bonus-point pool — Titanium validator array `BaseClass` (`world/client.cpp:2033`), order STR/STA/AGI/DEX/WIS/INT/CHA/ADD
+All 16 rows are rendered. RoF2 does not use this array either — see the base-stats note above.
 ```
 Warrior      10 10  5  0  0  0  0  25      Rogue       0  0 10 10  0  0  0  30
 Cleric        5  5  0  0 10  0  0  30      Shaman      0  5  0  0 10  0  5  30
@@ -150,15 +188,18 @@ Bard          5  0  0 10  0  0 10  25      Berserker  10  5  0 10  0  0  0  25
 
 ### Stat validation (`world/client.cpp:2104`, Titanium) — must hold EXACTLY
 ```
-base[s] = RaceBase[race][s] + ClassBonus[class][s]
-pool    = ClassBonus[class].POINTS
+base[s] = BaseRace[race][s] + BaseClass[class][s]   (the two arrays named above)
+pool    = BaseClass[class][7]                       (the "ADD" column, `world/client.cpp:2034`)
 sent[s] >= base[s]                      (per stat)
 sent[s] <= base[s] + pool               (per stat)
 sum(sent) == sum(base) + pool           (EXACT — Create disabled while points remain)
 ```
 Deity and appearance are **not** server-validated on Titanium (`client.cpp:2159`) but the UI should
-still constrain them to native choices. **This is a Titanium-only statement.** This repo targets
-RoF2, where deity *is* validated and a mismatch aborts the create — see the deity section below.
+still constrain them to native choices. **The block above is a Titanium-only statement.** This repo
+targets RoF2, where both halves differ: deity *is* validated and a mismatch aborts the create (see
+the deity section below), and the stat rule is a **`<=`, not an `==`** — `CheckCharCreateInfoSoF`
+rejects only when `current_stats > max_stats` (`world/client.cpp:1994`), so under RoF2 a create with
+points left unspent is accepted. Do not port the exact-sum rule to RoF2.
 
 ### Deity IDs (`deity.h`)
 Agnostic=396, Bertoxxulous=201, BrellSerilis=202, Cazic-Thule=203, ErollisiMarr=204, Bristlebane=205,
@@ -190,8 +231,10 @@ only the values `201`–`216` and `396`.
 >
 > 1. **Read them off the wire.** On SoF-and-later the world server answers
 >    `OP_CharacterCreateRequest` by serialising the whole live combo vector to the client:
->    `Client::HandleCharacterCreateRequestPacket` (`world/client.cpp:699–744`) writes an allocation
->    count + `RaceClassAllocation` array, then a combo count + one `RaceClassCombos` per row
+>    `Client::HandleCharacterCreateRequestPacket` (`world/client.cpp:699–744`) writes a leading
+>    `uint8` (always 0 — `client.cpp:711–712`, and counted in the length at `:705–707`), then a
+>    `uint32` allocation count + `RaceClassAllocation` array, then a `uint32` combo count + one
+>    `RaceClassCombos` per row
 >    (`world/sof_char_create_data.h:29–36`: `ExpansionRequired, Race, Class, Deity, AllocationIndex,
 >    Zone`). That is authoritative for the server actually connected to, and it is what the
 >    char-create UI should drive off — including the start-zone resolution noted below.
@@ -229,6 +272,10 @@ no such check.
 5 Neriak(neriaka)                       12 Cabilis(cabwest)| Dark Elf 5       Iksar    12
 6 Grobb                                 13 Shar Vahl      | Half Elf 1,4,9    Vah Shir 13
 ```
+> ⚠ **The index table above covers fourteen races only** — Froglok and Drakkin have
+> no row in it. In the seed rows, race 330 carries `start_zone` 50 or 394 and race 522 carries 394
+> only. Resolve those the same way as every other race: from `char_create_combinations`, not from
+> this table.
 
 ### Appearance ranges (`races.cpp`; not server-validated, UI guidance)
 - **Face:** 0–7 (all races).
@@ -241,10 +288,19 @@ no such check.
   0–1; all others 0.
 - **Beard color:** same race set as hair color where beards exist, else 0.
 
+> ⚠ **This list covers fourteen races; Froglok and Drakkin are not in it**, and this document does
+> not source their ranges. Appearance is not server-validated — `CheckCharCreateInfoSoF` matches only
+> `Class`/`Race`/`Deity`/`Zone` (`world/client.cpp:1912–1915`) — so a wrong range is a cosmetic bug
+> rather than a create failure, but do not read the list as complete. Drakkin additionally carries
+> `drakkin_heritage`/`tattoo`/`details` in the RoF2 create struct (Section 4).
+
 ### Name rules (server-enforced at `OP_ApproveName`)
 4–15 chars, alphabetic only, first char uppercase / rest lowercase, no spaces, no 3 identical
 consecutive chars, server `name_filter` substring check, uniqueness via `ReserveName`. Reply is the
-same opcode `0x3ea6` with a 1-byte body (`0x01`=ok, `0x00`=reject).
+same opcode with a 1-byte body (`0x01`=ok, `0x00`=reject). ⚠ **The opcode value is per-client:** RoF2
+is `0x56a2` (`utils/patches/patch_RoF2.conf:39`), which is what eqoxide sends
+(`crates/eqoxide-protocol/src/protocol/mod.rs:104`); `0x3ea6` is the **Titanium** value
+(`utils/patches/patch_Titanium.conf:27`).
 
 ### Default stat pre-spend (UI seed; player may redistribute) — `char_create_point_allocations`
 Warrior→STA, Cleric→WIS(+STR), Paladin→STA, Ranger→DEX, SK→STA, Druid→WIS(+STA), Monk→AGI, Bard→CHA,
@@ -253,24 +309,30 @@ Beastlord→WIS, Berserker→STA. Appearance defaults all 0, gender male.
 
 ## Section 4 — Wire formats
 
-- **`OP_ApproveName` (0x3ea6), 72B, C→S.** ⚠ Layout discrepancy to resolve at implementation: the
+⚠ **Opcode values below are RoF2**, from `utils/patches/patch_RoF2.conf` — `OP_SendCharInfo` `:20`,
+`OP_CharacterCreate` `:36`, `OP_DeleteCharacter` `:37`, `OP_ApproveName` `:39` — and they match what
+eqoxide actually sends (`crates/eqoxide-protocol/src/protocol/mod.rs:103–105`). Earlier revisions of
+this section gave the **Titanium** values for all four (`0x4513`/`0x10b2`/`0x26c9`/`0x3ea6`,
+`patch_Titanium.conf:22`/`:24`/`:21`/`:27`) in a document that targets RoF2; every opcode literal in
+this spec now says which client it belongs to.
+- **`OP_ApproveName` (RoF2 `0x56a2`), 72B, C→S.** ⚠ Layout discrepancy to resolve at implementation: the
   knowledgebase/expert describes `race_id u32, gender u32, name[64]`, but the **live-verified Mordeth
   code** (`build_approve_name` in `login.rs`) uses `name[64] @0, race u32 @64, class u32 @68` and the
   server accepted it (created "Mordeth" with the correct name). **Trust the working layout** (name at
   offset 0); only the name + race materially matter to the server. Re-verify if changing.
-- **`OP_CharacterCreate` (0x10b2), RoF2 96B (24 LE u32), C→S.** ⚠ The 80B/20-u32 Titanium layout
+- **`OP_CharacterCreate` (RoF2 `0x6bbf`), 96B (24 LE u32), C→S.** ⚠ The 80B/20-u32 Titanium layout
   below is NOT what we send — the live `build_char_create` (`login.rs`) emits the RoF2 96-byte
   struct in order: gender, race, class, deity, **start_zone (zone_id)**, haircolor, beard,
   beardcolor, hairstyle, face, eyecolor1, eyecolor2, drakkin_heritage/tattoo/details, STR, STA,
   AGI, DEX, WIS, INT, CHA, tutorial, unknown0092. (Titanium order was: class, haircolor, beardcolor,
   beard, gender, race, start_zone, hairstyle, deity, STR..CHA, face, eyecolor1/2, tutorial.) Success
   = server resends `OP_SendCharInfo`; failure = `OP_ApproveName{0}`.
-- **`OP_SendCharInfo` (0x4513), 1704B fixed, S→C.** 10 fixed slots (Titanium hard-caps at 8 but emits
+- **`OP_SendCharInfo` (RoF2 `0x00d2`), 1704B fixed, S→C.** 10 fixed slots (Titanium hard-caps at 8 but emits
   10); empty slot `Name == "<none>"`. Struct-of-arrays layout (offsets in the knowledgebase doc): per
   slot Race, Class, Level, Zone, Gender, Face, HairStyle/HairColor/Beard/BeardColor, EyeColor1/2,
   Deity, the 9-slot Equip material array + 9-slot color array, Primary/SecondaryIDFile, Name[64].
   Parse all 10, skip `<none>`. Equip/colors feed the char-select 3D model (if added there later).
-- **`OP_DeleteCharacter` (0x26c9), C→S.** Body = null-terminated character name only (no struct).
+- **`OP_DeleteCharacter` (RoF2 `0x1808`), C→S.** Body = null-terminated character name only (no struct).
   Server verifies ownership, deletes, and replies with a fresh `OP_SendCharInfo` (no separate ack) —
   client re-parses that to refresh the list.
 
