@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::charname::{check_name, NameRuleViolation};
+
 // Test-only override for the directory [`AppConfig::load`]'s `./config.yaml`
 // fallback searches (see [`AppConfig::load_fallback_dir`]). `thread_local`, not a
 // process-global: each test thread gets its own cell, so a test can drive the
@@ -501,7 +503,7 @@ pub struct LoginConfig {
 /// Appearance + stat allocation for creating a new character. Stats must
 /// satisfy the server's per-class/race floors and total; cosmetic fields
 /// default to 0.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CharacterCreate {
     pub race:       u32,
     pub class:      u32,
@@ -602,6 +604,26 @@ impl LoginConfig {
                 .unwrap_or("Aiquestbot").to_string(),
             create: CharacterCreate::from_yaml(&cfg),
         }
+    }
+
+    /// Check `character_name` against the locally-decidable subset of the server's name rules,
+    /// so a name that provably cannot be approved is caught at config load rather than after a
+    /// full login handshake (#1092).
+    ///
+    /// **Gated on `create`.** OP_ApproveName is only ever sent when a `character_create` block is
+    /// present; without one the name is never submitted for approval, it is only matched against
+    /// the account's char-select list. Checking it there would reject a working config for a
+    /// character that already exists — the server applies these rules at creation time only, and
+    /// a character created out of band (a GM command, a direct DB insert) can legitimately carry
+    /// a name that would not pass them today.
+    ///
+    /// `Ok(())` is not an approval: see [`crate::charname`] — `name_filter` and uniqueness stay
+    /// server-side, so a name that passes here can still be rejected.
+    pub fn check_character_name(&self) -> Result<(), NameRuleViolation> {
+        if self.create.is_none() {
+            return Ok(());
+        }
+        check_name(&self.character_name)
     }
 }
 
@@ -981,5 +1003,47 @@ http_port: 8795
         let lines = with_env(&[("EQ_UI_DIR", None), ("EQ_SPELL_ICONS_DIR", None)],
             || bare.disclose_lines());
         assert!(lines[4].contains("<unset>") && lines[4].contains("default atlas dir"), "{}", lines[4]);
+    }
+}
+
+/// #1092: `character_name` is checked against the locally-decidable name rules at config load,
+/// but only when a `character_create` block makes it a name the client will actually submit.
+#[cfg(test)]
+mod name_precheck_tests_1092 {
+    use super::*;
+
+    fn cfg(name: &str, create: Option<CharacterCreate>) -> LoginConfig {
+        LoginConfig {
+            login_host:     "127.0.0.1".into(),
+            login_port:     5999,
+            world_port:     9000,
+            username:       "u".into(),
+            password:       "p".into(),
+            character_name: name.into(),
+            create,
+        }
+    }
+
+    #[test]
+    fn a_creatable_name_passes() {
+        assert!(cfg("mordeth", Some(CharacterCreate::default())).check_character_name().is_ok());
+    }
+
+    #[test]
+    fn an_uncreatable_name_fails_and_names_its_rule() {
+        let e = cfg("Al", Some(CharacterCreate::default())).check_character_name().unwrap_err();
+        assert_eq!(e.rule, crate::charname::NameRule::Length(2));
+
+        let e = cfg("Bo bby", Some(CharacterCreate::default())).check_character_name().unwrap_err();
+        assert_eq!(e.rule, crate::charname::NameRule::Space);
+    }
+
+    /// Without a `character_create` block the client never sends OP_ApproveName, so the same name
+    /// must NOT be rejected: the character may already exist under a name created out of band,
+    /// and refusing to start would break a config that logs in fine today.
+    #[test]
+    fn without_a_create_block_the_name_is_not_judged() {
+        assert!(cfg("Al", None).check_character_name().is_ok());
+        assert!(cfg("Bo bby", None).check_character_name().is_ok());
     }
 }

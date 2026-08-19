@@ -157,6 +157,22 @@ fn main() {
     tracing::info!("renderer: loading login config from {}", login_cfg_path.display());
 
     let login_cfg = config::LoginConfig::load(&login_cfg_path);
+    // #1092: a character name the server provably cannot approve fails HERE, at config load,
+    // naming the rule — not after a full login handshake as an unexplained 1-byte rejection.
+    // Only fires when the config carries a `character_create` block, because that is the only
+    // case in which the client submits the name for approval at all
+    // (`LoginConfig::check_character_name`). `--testzone` never logs in, so it is exempt.
+    //
+    // This is NOT a complete check and the message says so: the server's `name_filter` table and
+    // the uniqueness test stay server-side, so a name that passes here can still be rejected.
+    if !testzone_mode {
+        if let Err(v) = login_cfg.check_character_name() {
+            let msg = eqoxide::charname::describe_violation(&login_cfg.character_name, &v);
+            tracing::error!("{msg}");
+            eprintln!("error: {msg}");
+            eqoxide::crash::exit("bad-config", 2);
+        }
+    }
     // Renderer/HTTP settings honor --config too (#597): the per-character file is merged OVER the
     // global ~/.config/eqoxide/config.yaml key by key, so `renderer: { asset_server_url: ... }` in a
     // per-character config actually takes effect instead of being silently discarded. `disclose()`
