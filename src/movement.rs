@@ -3669,7 +3669,11 @@ mod tests {
     /// is not an option either: [`zone_evidence`]'s own doc records the measurement, on the default
     /// `$EQZONES` at the time that doc was written — 52 of the 94 non-furniture `.glb` names have
     /// none of the three signals, and those 52 are the character/creature/prop models. That figure
-    /// is quoted from the tree, not re-derived here; no `$EQZONES` was measured for this change.
+    /// is QUOTED from that doc, not re-derived here. This corpus WAS run for this change over a
+    /// baked `$EQZONES` — but a different, smaller tree: 43 entries, 42 zone `.glb`, no doors/obj
+    /// companions at all, no `.glb` with neither signal, and no sync record, so it reported
+    /// `— POPULATION-INFERRED`, admitted nothing by the record, and exercised no `Present` branch.
+    /// It says nothing about the 52-of-94 figure in either direction.
     ///
     /// **The source used.** `synced.json` in the asset cache root — the file
     /// `asset_sync::CacheDirs` writes after every successful set sync, one entry per SET NAME. The
@@ -3997,8 +4001,37 @@ mod tests {
     /// zone probe?" and "was the population asserted?" are separate line-level greps from the water
     /// accounting's `"— COMPLETE"`. The trap is #831's: `"INCOMPLETE".contains("COMPLETE")`, so a
     /// marker that is a substring of another silently answers the wrong question.
+    ///
+    /// REACH CONTROL. A cross-product over strings nothing emits is the very failure this batch is
+    /// about, so the FOUR markers this file OWNS are asserted here against real values' rendering
+    /// before the table runs. The other four are pinned to real emitters elsewhere and not restated:
+    /// `— COMPLETE`/`— INCOMPLETE` and the two `COMPOSITE_*` by
+    /// `composite_markers_are_line_safe_against_every_other_898` in `water_grid.rs`, which builds a
+    /// real clean and a real dirty rollup and a report over them.
+    ///
+    /// MUTATION CHECK: shorten `POPULATION_ASSERTED` to `"— POPULATION"` — the plausible
+    /// "simplify the marker" edit — → RED here: *marker `— POPULATION-INFERRED` contains
+    /// `— POPULATION`, so a line-level grep for `— POPULATION` matches a line that only carries
+    /// `— POPULATION-INFERRED`*. Measured. The reach control above PASSES under that mutant (the
+    /// `Present` render still contains the shortened constant), so the table is what catches it,
+    /// which is the point of having both halves.
     #[test]
     fn every_corpus_marker_is_line_safe_against_every_other_927_928() {
+        // The four this file owns are strings real values REALLY print.
+        let mut probed = ProbeCoverage::new();
+        probed.record("qeynos2", 1);
+        assert!(probed.to_string().contains(PROBES_EVERY_ZONE), "{probed}");
+        assert!(ProbeCoverage::new().to_string().contains(PROBES_HOLE), "an empty coverage");
+        // Driven through `read_at`, not `read`: `$EQZONES_MANIFEST` is process-wide and the
+        // default runner is threaded, so the env is not a safe input to a test.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rec = tmp.path().join("synced.json");
+        assert!(ZoneManifest::read_at(rec.clone()).to_string().contains(POPULATION_INFERRED),
+            "no record on disk must render the INFERRED marker");
+        std::fs::write(&rec, br#"{"zone/blackburrow": {}}"#).unwrap();
+        assert!(ZoneManifest::read_at(rec).to_string().contains(POPULATION_ASSERTED),
+            "a readable record must render the ASSERTED marker");
+
         let markers = ["— COMPLETE", "— INCOMPLETE",
                        crate::nav::water_grid::COMPOSITE_CLEAN,
                        crate::nav::water_grid::COMPOSITE_DIRTY,
@@ -4023,10 +4056,15 @@ mod tests {
     /// test writes that file by hand — no asset server, no baked GLB — and drives the three states
     /// `ZoneManifest` distinguishes.
     ///
-    /// MUTATION CHECKS (each independently turns this RED):
-    /// 1. Make `names_zone` return `true` for the `Absent`/`Unreadable` states → the "no record"
-    ///    half goes green while a creature model is admitted as a zone.
-    /// 2. Fold `Unreadable` into `Absent` → the two provenance strings stop differing.
+    /// MUTATION CHECKS (each independently turns this RED). Measured, and stated as the assertion
+    /// that actually fires — a mutation check that names the wrong mechanism is still a claim about
+    /// execution that nothing ran:
+    /// 1. Make `names_zone` return `true` for the `Absent`/`Unreadable` states → *"an ABSENT record
+    ///    must never make a name look like a zone"*. That is the mutant that would admit all 52
+    ///    character/creature/prop models as zones.
+    /// 2. Fold `Unreadable` into `Absent` → the `matches!(bad, ZoneManifest::Unreadable { .. })`
+    ///    discriminant assertion fires FIRST, before the provenance strings are compared; what the
+    ///    mutant destroys is the "could not be read" line, but that is not where it is caught.
     /// 3. Drop the `zonedoors/` prefix from `read` → the doors-only record stops naming its zone.
     #[test]
     fn a_zone_named_only_by_the_sync_record_is_still_a_zone_928() {

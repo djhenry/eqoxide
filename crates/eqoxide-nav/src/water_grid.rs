@@ -1389,7 +1389,11 @@ mod tests {
     /// 1. Render the rollups on ONE line (drop the per-rollup `writeln!` from `Display`) →
     ///    property 2 fails: one line carries both per-rollup markers.
     /// 2. Delete the verdict line from `Display` → property 3 fails.
-    /// 3. Drop the `!self.rolls.is_empty()` term from `all_complete` → the empty case below flips.
+    ///
+    /// A third mutation — drop the `!self.rolls.is_empty()` term from `all_complete` — was listed
+    /// here as turning this test RED. Measured: it does NOT. This test's report holds two rollups,
+    /// so the non-empty term never decides anything here; the mutant is caught by
+    /// `an_empty_composite_report_is_not_clean_898` below, which is where the claim now lives.
     #[test]
     fn a_composite_report_keeps_every_marker_line_true_898() {
         let (wr, r423) = diverged_pair_898();
@@ -1457,6 +1461,11 @@ mod tests {
     /// **#898 — a report over zero rollups is not a clean report.** Same refusal as
     /// `an_empty_rollup_is_not_a_complete_result_762`, one level up: a composite that has been told
     /// about nothing has looked at nothing, and must not print the marker a reader greps for.
+    ///
+    /// MUTATION CHECK: drop the `!self.rolls.is_empty()` term from `RollupReport::all_complete`
+    /// → this test goes RED on its first assertion (`zero rollups is not a clean report`). Measured
+    /// over the four `_898` tests in this file, it is the only one that reddens: the other three
+    /// build reports that HOLD rollups, so the non-empty term never decides anything for them.
     #[test]
     fn an_empty_composite_report_is_not_clean_898() {
         let nothing: [(&str, &WaterRollup); 0] = [];
