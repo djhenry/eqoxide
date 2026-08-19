@@ -7,8 +7,16 @@
 //! the pure kinematics moved down. Each original site re-exports the symbol it used to define, so
 //! `crate::movement::{PLAYER_RADIUS,STEP_UP,JUMP_VELOCITY,running_jump_reach}`,
 //! `crate::eq_net::action_loop::RUN_SPEED`, and `crate::eq_net::protocol::fall_damage` all keep
-//! resolving unchanged. Keeping a single source of truth here also prevents the two sides of a shared
-//! physics number from silently drifting apart.
+//! resolving unchanged.
+//!
+//! This is a single source of truth for the symbols above and NOT for every physics number in the
+//! workspace — do not read co-location here as identity. Two values are still defined more than
+//! once, so editing the copy here moves only the sites that read the copy here. [`GRAVITY`] is
+//! shadowed by a function-local `GRAVITY` inside [`fall_damage`]. The 128.0 fall terminal is
+//! defined twice in two crates: as `MAX_FALL`, module-private in the app crate's `movement` module,
+//! which is what the controller actually clamps to, and as a function-local `TERMINAL` inside
+//! [`fall_damage`], which is a damage-curve clamp on a derived impact velocity — a DIFFERENT
+//! quantity that happens to share both the name-shape and the value. Tracked as #1045.
 
 /// Wall-collision sphere radius, matched to the reference RoF2 client.
 pub const PLAYER_RADIUS: f32 = 1.0;
@@ -22,8 +30,15 @@ pub const PLAYER_RADIUS: f32 = 1.0;
 /// 20u ridges/invisible walls and stranded it on the high side of boundaries.)
 pub const STEP_UP: f32 = 2.0;
 
-/// Gravity / terminal fall (matches the renderer's prior physics; the `falling-physics.md`
-/// this used to credit has never existed — see the UNCITED note on `fall_damage`).
+/// Downward acceleration for the fall integration, in EQ units/s². This is the ACCELERATION only —
+/// the terminal it is clamped against is `MAX_FALL`, module-private in the app crate's `movement`
+/// module, which is the sole out-of-crate consumer of this constant (`CharacterController::step`).
+/// `running_jump_reach` below reads it too.
+///
+/// UNCITED: nothing in this tree, or in the private EQ knowledge-base tree, derives this number.
+/// See the note on [`fall_damage`] for the lineage — it is the same one, and it is no longer
+/// available to cite. The function-local `GRAVITY` inside [`fall_damage`] repeats this value but is
+/// a second unlinked copy (#1045), so it corroborates nothing.
 pub const GRAVITY: f32 = 120.0;
 
 /// Jump impulse for the free-WASD Space jump. Peak height = v²/(2·GRAVITY); at 31 that's ~4.0u —
@@ -492,19 +507,35 @@ pub fn running_jump_reach(run_speed: f32) -> f32 {
 /// Model: impact velocity = min(terminal, sqrt(2·g·h)) converted to the client's internal
 /// per-update z-velocity units (~5-13); then `fall_score = |z_vel| − 4` (char_counter≈0, no
 /// safe-fall skill): ≤0 → no damage, ≥9 → lethal (20000), else a roll in `[0, score²·10]`.
-/// Returns (rolled_damage, max_damage). NOTE: this curve is UNCITED. It previously credited a
-/// `falling-physics.md`, which has never existed in the knowledge-base tree (no commit ever added
-/// one). `swimming-and-fall-damage.md` is the real document for the wire and behaviour half above,
-/// but it carries NO damage-curve content — no formula, no roll model — so it must NOT be read as
-/// supporting the constants here. Treat the numbers as unverified against a source until someone
-/// re-derives them; #1005's todo.md entry has the measurement plan. The LINEAGE is unestablished
-/// too: this doc used to call the model "Native Titanium", but nothing here sources it to any
-/// particular client, and the opcode and struct we actually send are RoF2's. Do not restore a
-/// client attribution without a citation — naming a different client would be just as unsourced.
+/// Returns (rolled_damage, max_damage).
+///
+/// UNCITED, as a statement about the tree as it stands: no document in this repository, and none in
+/// the private EQ knowledge-base tree, derives this curve or its constants. That is the operative
+/// fact — treat every number here as unverified until someone re-derives it. #1005's `todo.md`
+/// entry has the measurement plan.
+///
+/// The lineage, because it explains the gap rather than filling it: the curve and its constants
+/// came from a reverse-engineering note that this repository once carried and deliberately removed
+/// during the RoF2 retarget. The note was not carried into the knowledge-base tree either, so there
+/// is nothing left to cite and the citation has NOT been repointed — a citation that resolves to a
+/// merely-adjacent document would fail silently, which is worse than none. Knowing where the
+/// numbers came from does not verify them, because the source is gone.
+///
+/// Two corollaries, so nobody re-litigates this:
+/// - `swimming-and-fall-damage.md` is the real document for the wire and behaviour half above, but
+///   it carries NO damage-curve content — no formula, no roll model, no constants — so it must not
+///   be stretched to cover this curve.
+/// - Do not attribute the curve to a named client to close the gap. The removed note was the only
+///   thing that sourced the attribution this comment used to carry, and naming any client now would
+///   be a fresh unsourced claim. Independently of where the curve came from, the opcode and struct
+///   we actually send are RoF2's.
 pub fn fall_damage(height: f32) -> (u32, u32) {
-    const GRAVITY: f32 = 120.0;   // matches the renderer's fall physics
-    const TERMINAL: f32 = 128.0;  // z-velocity clamp; UNCITED (see the doc note above)
-    const HZ: f32 = 10.0;         // update rate the curve is calibrated to; UNCITED (see above)
+    // All three are UNCITED (see the doc note above). GRAVITY and TERMINAL repeat values that exist
+    // elsewhere in the workspace; neither is linked to its twin, and TERMINAL is not the same
+    // quantity as the controller's identically-valued `movement::MAX_FALL` (#1045).
+    const GRAVITY: f32 = 120.0;   // private copy of the module GRAVITY, not a reference to it
+    const TERMINAL: f32 = 128.0;  // damage-curve clamp on the derived impact velocity
+    const HZ: f32 = 10.0;         // update rate the curve is calibrated to
     let v = (2.0 * GRAVITY * height.max(0.0)).sqrt().min(TERMINAL);
     let score = v / HZ - 4.0;
     if score <= 0.0 { return (0, 0); }
