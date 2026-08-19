@@ -95,9 +95,15 @@ jobs:
   #
   # SECOND PASS, SAME JOB (#1041): a NEGATED CLOSING KEYWORD. GitHub links
   # `close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved` to the `#<n>` after it and does
-  # not read the negation in front of it, so "does not close" plus a number CLOSES that number. Six
-  # issues in this repo were false-closed exactly that way, one of them for 48 days, and the sentence
-  # that did it is the sentence written specifically to record that the issue was OUT of scope. The
+  # not read the negation in front of it — with or without a colon after the keyword — so "does not
+  # close" plus a number CLOSES that number. AT LEAST NINE issues in this repo were false-closed
+  # exactly that way (as of 2026-08-19; all nine now reopened and listed in #1041), the longest
+  # standing 49 days, and the sentence that did it is the sentence written specifically to record
+  # that the issue was OUT of scope. NINE IS A FLOOR, NOT A COUNT: three of the nine were invisible
+  # to the sweep that first reported "six", any sweep reads bodies as they stand TODAY so a
+  # disclaimer later edited out leaves no trace, and it can only match the phrasings on the script's
+  # cue list — which issue 871 already proved incomplete once. Treat any number this workflow or the
+  # script prints as "at least N, by these cues", never as exhaustive. The
   # script now runs that pass over the same corpus and, for a pull request, prints GitHub's own
   # `closingIssuesReferences` beside the findings — the only observable that reports what was
   # actually parsed, as opposed to what the body appears to say.
@@ -125,8 +131,9 @@ jobs:
   # THAT BLIND SPOT BITES #1041 HARDER THAN IT BIT #980, and this job must not be read as sealing
   # the surface. A scope note — "this PR deliberately does not close X" — is most often ADDED TO THE
   # BODY DURING REVIEW, after the final push, which is exactly the edit no run here will ever see.
-  # Two of the six measured false closes were disclaimed in a body, one in a comment, and one in a
-  # commit message alone. Nothing automated covers a body edited after the last push, and nothing
+  # Eight of the nine confirmed false closes were disclaimed in a PULL-REQUEST BODY — the surface
+  # this blind spot covers — and the ninth (issue 314) in a commit message alone; a body edit after
+  # the last push is therefore the single likeliest way the next one gets through. Nothing
   # automated anywhere covers the squash-merge message typed into GitHub's merge dialog, which does
   # not exist until the merge button is pressed. Before merging, run the script by hand against the
   # number and check `gh pr view <n> --json closingIssuesReferences` against what the PR intends to
@@ -165,14 +172,21 @@ jobs:
       # checks; hand-editing each back restores 15/15.
       #
       # The #1041 half adds to that: every positive fixture is a MEASURED instance quoted verbatim
-      # (the six real false closes, plus the one text match whose close was legitimate), a run_live
+      # (twelve items covering nine confirmed false closes across both surfaces — including the
+      # colon variant `## Filed, not fixed: #871` and the two the first sweep's cues missed — plus
+      # the one text match whose close was legitimate), a run_live
       # end-to-end pass against a stub `gh` serving recorded payloads — added because deleting the
       # new pass from run_live was MEASURED to leave the self-test at full green without it — and a
       # `--commits` pass over a throwaway repository. Verified red in both directions at this
       # commit: neutering the scanner, dropping the `\b` from the `not` cue, widening the match
       # window past a sentence boundary, breaking the attribution comparison, deleting the pass from
       # run_live, and deleting the commit fetch from the corpus each turn `--self-test` RED; hand-
-      # reverting each restores 52/52.
+      # reverting each restores a full-green run. The em dash is in the gap stop set on measured
+      # evidence too: over the full published history (4598 items, swept 2026-08-19) it takes the
+      # flag count 49 -> 41, all 8 dropped items are false positives of the shape `<clause with a
+      # negation> — Fixes #N`, and zero measured true instances are lost. Three of those exact
+      # subject lines are must-stay-green fixtures, so removing `—` from the stop set turns
+      # `--self-test` RED rather than silently costing precision.
       - name: check-pr-text self-test
         run: bash scripts/check-pr-text.sh --self-test
       - name: scan this PR's text for local-system detail and negated closing keywords

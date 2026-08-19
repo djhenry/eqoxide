@@ -141,11 +141,25 @@ EOF
 # ---------------------------------------------------------------------------------------------
 # eqoxide#1041 — NEGATED CLOSING KEYWORD.
 #
-# GitHub links `close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved` to the `#<n>` that
-# immediately follows it and does NOT read a negation in front of it. "Does not close" + a number
-# closes that issue. Six issues in this repo were false-closed exactly that way, one of them for 48
-# days, across two surfaces and five separate work threads — the sentence written specifically to
-# record that an issue is OUT of scope is the sentence that marks it resolved.
+# GitHub links `close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved` — optionally with a
+# colon after it — to the `#<n>` that follows and does NOT read a negation in front of it. "Does
+# not close" + a number closes that issue. The sentence written specifically to record that an
+# issue is OUT of scope is the sentence that marks it resolved.
+#
+# HOW MANY TIMES THIS HAS HAPPENED HERE IS A LOWER BOUND, NOT A COUNT. As of 2026-08-19: AT LEAST
+# NINE confirmed false closes, across two surfaces and seven work threads, the longest standing 49
+# days; all nine are now reopened and enumerated in eqoxide#1041. Three of them (issues 41, 378 and
+# 871) were invisible to the sweep that first reported "six", and 871 exposed the colon variant of
+# the defect. The floor moves for two reasons that no sweep can remove:
+#
+#   - it reads each body as it stands TODAY, so a disclaimer later edited out leaves no trace; and
+#   - it can only match the phrasings on the cue list below, which issue 871 already proved
+#     incomplete once.
+#
+# So the only honest form of the claim is "at least N, found by THESE cues". The cue list is
+# NEGCLOSE_NEGATIONS below; every run of this script prints its size next to the corpus size, so
+# the cues are named at the point the number is used. Never quote a bare count from this file as
+# if the set were closed. It is not closed, and it was wrong the first time.
 #
 # TWO THINGS ARE CHECKED HERE AND THEY ARE DELIBERATELY NOT THE SAME CHECK:
 #
@@ -158,8 +172,9 @@ EOF
 #      issue's close?" A different question with a different answer, and issue 302 is the standing
 #      proof that it has to be asked separately: PR #653's body disclaims 302, GitHub linked 302 to
 #      that PR anyway (it is in its `closingIssuesReferences` to this day) — and 302's close was
-#      still legitimate, because the close event fired 2026-07-11, eleven days BEFORE PR #653 was
-#      opened. PR #306 closed it. Matching the text pattern is not a false close.
+#      still legitimate. That close fired at 2026-07-11T20:18:54Z, ONE SECOND after PR #306 merged
+#      (20:18:53Z); PR #653 was not opened until 2026-07-22T14:35:40Z, 10d 18h 16m LATER. PR #306
+#      closed it. Matching the text pattern is not a false close.
 #
 #   So: the text lint flags PR #653's sentence — correctly, because it created a real link and the
 #   remedy is the same rewrite — while the attribution classifier returns NOT-ATTRIBUTED for 302. A
@@ -177,14 +192,28 @@ EOF
 #            pre-merge check; text edited after the last push (see the `pull_request` note above —
 #            a scope note added to a body during review is exactly the edit this misses);
 #            `GH-123` and full-URL issue references, which GitHub also links but this regex does
-#            not read; and a negation separated from the keyword by `.`, `;`, `!` or `?`, which the
-#            window deliberately will not cross (see NEGCLOSE_GAP).
-#   BACKTICKS ARE NOT A DISCRIMINATOR, in either direction. This lint does not exempt a keyword
-#            inside backticks, and it must not: PR #1037 wrote its real target inside backticks and
-#            GitHub did NOT link it, while linking the two issues that same body disclaimed. Since
-#            backticks change what GitHub links unpredictably, neither reading them nor ignoring
-#            them is safe — so the rule is simply "do not write the keyword next to a number you
-#            are not closing", and the lint enforces exactly that.
+#            not read; a negation separated from the keyword by `.`, `;`, `!`, `?` or an em dash,
+#            which the window deliberately will not cross (see NEGCLOSE_GAP); a disclaimer SPLIT
+#            ACROSS TWO LINES, with the negation ending one line and the keyword opening the next,
+#            because the scan is line-oriented `grep` — plausible in wrapped Markdown, and swept
+#            for across this repo's full published history on 2026-08-19 with zero instances
+#            found, so it is a real hole with no known occupant; and, in live mode, a pull request
+#            with more than 250 commits, which is where `/pulls/<n>/commits` stops paginating
+#            (measured maximum in this repo: 14, so it cannot bite today).
+#   BACKTICKS ARE REAL SUPPRESSION AND YOU STILL MUST NOT USE THEM AS SUCH. Measured 4/4 in this
+#            repo (PRs #670, #841, #996, #1037; zero counterexamples): a closing keyword inside a
+#            code span is NOT parsed and creates NO link. Every control that DID link — #791,
+#            #821, #824, #835, #840 — carries a second, un-backticked copy of the keyword.
+#            This lint flags backticked occurrences anyway, on purpose, because the exemption is
+#            not a mechanism to rely on: bodies get edited, backticks come off, and the exemption
+#            is undocumented behaviour observed in one repo rather than a promise.
+#            THE OTHER HALF MATTERS MORE AND IS EASY TO MISS: do not put your REAL `Closes #N`
+#            inside backticks either, or it will silently not close. That is not hypothetical —
+#            PR #1037 wrote its real target as `Closes #1022` in backticks, so its
+#            `closingIssuesReferences` came back as exactly [939, 1010], the two issues it
+#            DISCLAIMED and not the one it fixed. Issue 1022 was closed only because that PR's
+#            squash commit `895d36c` happened to carry a plain `Closes #1022` on line 38 of its
+#            MESSAGE — the other surface, by luck. One PR, both failure modes, one body.
 #   CONSEQUENCE, stated so nobody is surprised: a PR whose body QUOTES this pattern — including the
 #            PR that added this check — is flagged, and that is correct behaviour, not a false
 #            positive. Quoting it in a body is not safe; GitHub links quoted text too.
@@ -217,9 +246,23 @@ NEGCLOSE_NEGATIONS=(
 # How far the negation may sit in front of the keyword. eqoxide#1041 specified ~40 characters. The
 # gap class excludes `#` so the window cannot leap over an intervening issue reference, and excludes
 # `.;!?` so a negation in the PREVIOUS sentence cannot trip the next sentence's legitimate close
-# ("This does not touch the renderer. Fixes #500." must stay green). Both exclusions trade recall
-# for precision and both are exercised by --self-test in both directions.
+# ("This does not touch the renderer. Fixes #500." must stay green).
+#
+# The em dash is in the stop set for the same reason, and it was added on measured evidence rather
+# than taste: this repo's conventional subject line is `<what changed, often with a negation> —
+# Fixes #N`, e.g. "auto-loot into a free slot + stack, never overwrite occupied slots — Fixes #56".
+# Swept over the full published history on 2026-08-19 (4598 items: every PR title and body, every
+# issue title and body, every issue/PR comment, every commit message on main), adding `—` takes the
+# flag count 49 -> 41. All 8 dropped items are false positives — three PR titles, their three
+# commit-message twins, and two comments — and ZERO measured true instances are lost: every fixture
+# in NC_RED_FIXTURES still fires. The set is also byte-identical under LC_ALL=C and LC_ALL=
+# en_US.UTF-8, checked, so the multi-byte character inside a negated bracket expression is not a
+# locale hazard here in the way it would be for a positive match.
+#
+# All of these exclusions trade recall for precision and all are exercised by --self-test in both
+# directions.
 NEGCLOSE_GAP=40
+NEGCLOSE_GAP_STOPS='#.;!?—'
 
 # Same override mechanism as LOCAL_DETAIL_PATTERNS_FILE, and for the same reason: it is how the
 # self-test points the REAL script at an empty list and asserts that it refuses to run, instead of
@@ -255,7 +298,7 @@ negclose_regex() {
     joined="${joined:+${joined}|}${n}"
   done
   [ -n "$joined" ] || return 1
-  printf '%s' "(${joined})[^#.;!?]{0,${NEGCLOSE_GAP}}\\b(${NEGCLOSE_KEYWORDS})[[:space:]:]*#[0-9]+"
+  printf '%s' "(${joined})[^${NEGCLOSE_GAP_STOPS}]{0,${NEGCLOSE_GAP}}\\b(${NEGCLOSE_KEYWORDS})[[:space:]:]*#[0-9]+"
 }
 
 # Classify one text file for negated closing keywords. Prints `LINE:matched text`, one per hit;
@@ -271,12 +314,23 @@ scan_negated_close() {
 # the sentence" — the scope note is worth keeping, it just must not use a linking keyword.
 print_negclose_convention() {
   cat <<'EOF'
-A closing keyword immediately before an issue number LINKS that issue, and GitHub does not read the
-negation in front of it. The sentence you wrote to keep the issue OUT of scope is the sentence that
-closes it. Backticks do not protect it. Rewrite, keeping the scope note:
+A closing keyword immediately before an issue number LINKS that issue — with or without a colon
+after the keyword — and GitHub does not read the negation in front of it. The sentence you wrote to
+keep the issue OUT of scope is the sentence that closes it. Rewrite, keeping the scope note:
   instead of:  does not close <NUM>            write:  Refs <NUM> — not addressed here
   instead of:  deliberately NOT Closes <NUM>   write:  <NUM> stays open — narrowed, not closed
   instead of:  it does NOT fix <NUM>           write:  does not address <NUM>
+  instead of:  ## Filed, not fixed: <NUM>      write:  ## Filed, not addressed: <NUM>
+
+ABOUT BACKTICKS — this is flagged even inside a code span, and the reason is not that backticks
+fail to suppress the link. They DO suppress it: measured 4/4 in this repo (PRs 670, 841, 996, 1037,
+no counterexamples), a closing keyword inside a code span creates no link at all. It is flagged
+anyway because that exemption is undocumented behaviour to lean a guard on, and one edit that drops
+the backticks turns the sentence live again with nothing to notice it.
+The consequence you are far more likely to be bitten by runs the OTHER way: do not put your REAL
+`Closes <NUM>` inside backticks either, or it will silently never close. PR 1037 did exactly that
+and GitHub reported its links as the two issues it DISCLAIMED and not the one it fixed.
+
 Then, before merging, check `gh pr view <n> --json closingIssuesReferences` against what this pull
 request actually intends to close. That command reports what GitHub PARSED; what you meant to write
 is not observable from the body. See eqoxide#1041.
@@ -288,6 +342,40 @@ EOF
 # NEGCLOSE_TOTAL is read from the manifest and NOT incremented alongside NEGCLOSE_CLASSIFIED, for
 # the same reason classify_corpus does it that way: counting both in one loop iteration makes
 # `classified N/N` an identity that can never disagree.
+
+# Which surfaces GitHub actually LINKS from. Measured in this repo, not assumed:
+#   body of a PULL REQUEST -> links (eight of the nine confirmed false closes of eqoxide#1041);
+#   commit message         -> links once the commit reaches the default branch (issue 314, and
+#                             issue 1022 via the squash commit 895d36c);
+#   PR title               -> does NOT link. 5/5 measured: PRs 236, 437, 461, 465 and 466 each
+#                             carry a closing keyword in the title for an issue the body never
+#                             names, and every one reports `closingIssuesReferences: []`.
+#   issue body/title, comments -> nothing to link FROM; no close event in this repo's timelines
+#                             is attributable to one.
+# The lint still flags all of them, because the text is copied from one surface to another and the
+# rewrite is the same. But the per-item line must not tell an operator their comment is about to
+# close an issue, so it says what that surface actually does.
+negclose_surface_note() {
+  local kind="$1" num="$2"
+  case "$kind" in
+    commit)
+      echo "                GitHub closes issue ${num} when this commit reaches the default branch." ;;
+    body)
+      if [ "${CORPUS_IS_PR:-no}" = "yes" ]; then
+        echo "                GitHub reads that as a link and will CLOSE issue ${num} on merge."
+      else
+        echo "                An issue body does not link, so issue ${num} does not close from here"
+        echo "                — but this sentence closes it the moment it is pasted into a PR body."
+      fi ;;
+    title)
+      echo "                A title does not link (measured 5/5 here), so issue ${num} does not"
+      echo "                close from here — rewrite it anyway; titles get copied into bodies." ;;
+    *)
+      echo "                A comment does not link, so issue ${num} does not close from here"
+      echo "                — rewrite it anyway; comment text gets pasted into bodies." ;;
+  esac
+}
+
 classify_negclose() {
   local manifest="$1" kind id path hits hit ln txt num
   NEGCLOSE_CLASSIFIED=0; NEGCLOSE_FLAGGED=0; NEGCLOSE_NUMBERS=""
@@ -307,7 +395,7 @@ classify_negclose() {
         ln="${hit%%:*}"; txt="${hit#*:}"
         num="$(printf '%s' "$txt" | sed -E 's/.*#([0-9]+).*/\1/')"
         echo "                line ${ln}: \"${txt}\""
-        echo "                GitHub reads that as a link and will CLOSE issue ${num}."
+        negclose_surface_note "$kind" "$num"
         NEGCLOSE_NUMBERS="${NEGCLOSE_NUMBERS} ${num}"
       done <<< "$hits"
     else
@@ -321,7 +409,7 @@ classify_negclose() {
 # ATTRIBUTION — a different question from the text lint. Given an issue's close event and the pull
 # request or commit range under examination, did THIS change cause that close?
 #
-# The rules are derived from the seven measured close events of eqoxide#1041, not invented:
+# The rules are derived from measured close events of eqoxide#1041, not invented:
 #   - a linked-issue close carries `commit_id: null` and fires 1-2 seconds after the PR's merge, so
 #     a close that PRE-DATES the merge cannot have come from it (this is the whole of issue 302);
 #   - a commit-message close carries the closing commit's sha, so membership in the range is the
@@ -795,11 +883,19 @@ run_self_test() {
   # -------------------------------------------------------------------------------------------
   # eqoxide#1041 — NEGATED CLOSING KEYWORD.
   #
-  # EVERY POSITIVE FIXTURE BELOW IS A MEASURED INSTANCE, QUOTED VERBATIM, not invented. An invented
-  # fixture for this class would be written by the same hand that missed it six times in a row. Each
-  # RED line is the exact text from the pull-request body or commit message that actually closed the
-  # issue named beside it; each was verified to go red on this regex and green on the pre-#1041
-  # script, which had no such regex at all.
+  # EVERY POSITIVE FIXTURE BELOW IS A MEASURED INSTANCE, QUOTED VERBATIM, not invented — with the
+  # single, labelled exception noted on the last row. An invented fixture for this class would be
+  # written by the same hand that failed to find three of these on the first sweep. Each RED line is
+  # the exact text from the pull-request body or commit message that actually closed the issue named
+  # beside it; each was verified to go red on this regex and green on the pre-#1041 script, which
+  # had no such regex at all.
+  #
+  # Three of these are here BECAUSE the first sweep missed them, which is the point:
+  #   - PR49 / issue 41 and PR421 / issue 378 were worded outside the negation cues that sweep used;
+  #   - PR868 / issue 871 is the COLON VARIANT — `## Filed, not fixed: #871` — proof that the
+  #     keyword may be followed by `:` and still link, and that "filed, not fixed" is exactly how an
+  #     agent writes a negative scope decision.
+  # They are the standing evidence that the cue list is a floor and not a closed set.
   # -------------------------------------------------------------------------------------------
   local nc_dir="${dir}/negclose"; mkdir -p "$nc_dir"
   local nc_red="${nc_dir}/red.tsv"; : > "$nc_red"
@@ -808,7 +904,11 @@ run_self_test() {
 
   # label | issue the sentence disclaims and GitHub closed anyway | the text
   local NC_RED_FIXTURES=(
+    'PR49 body (issue 41, closed 49 days — MISSED by the first sweep)|41|## Caveat — why this doesn'"'"'t close #41'
     'PR54 body (issue 35, closed 48 days)|35|Refs #35, #2, #49 — partial (routing half of the multi-tier fix); does not close #35.'
+    'PR421 body (issue 378, closed 34 days — MISSED by the first sweep)|378|This is **Phase 1** (partial — does **not** close #378). It collapses the height-axis half of the four mutually-blind nav predicates into one `Traversability` authority.'
+    'PR868 body heading (issue 871, closed 12 days — COLON VARIANT, MISSED by the first sweep)|871|## Filed, not fixed: #871'
+    'the same colon variant as running prose, the form the heading is short for|871|Filed, not fixed: #871 — the zone-in ordering bug is real but out of scope here.'
     'PR864 body (issue 854)|854|    capability drops 2.5 → 2.0; a 2.40 curb becomes impassable — and it still does not close #854,'
     'PR994 body (issue 982)|982|Does not close #982 (the `_cited` list is still a compile-only existence check with no reverse'
     'PR1037 body, quoted note (issue 939)|939|> **#939** ... "Landing this issue does not close #939; it narrows the window #939 has to'
@@ -827,7 +927,11 @@ run_self_test() {
 
   # MUST NOT FLAG. Four are real text from the same pull requests — including PR1037's real target,
   # which it wrote inside backticks and GitHub did NOT link, and PR653's and PR994's legitimate
-  # closes. The rest are the boundary cases the regex has to survive: `Notes:`, `Another` and
+  # closes. The last three are this repo's conventional subject line, verbatim from PRs 62, 86 and
+  # 89: a clause containing a negation, an em dash, then a perfectly legitimate `Fixes #N`. They are
+  # measured false positives of the pre-em-dash gap class and they are the assertion that keeps `—`
+  # in NEGCLOSE_GAP_STOPS — delete it from the stop set and these three go red.
+  # The rest are the boundary cases the regex has to survive: `Notes:`, `Another` and
   # `annotation` all contain the letters "not", `unfixed` contains "fix", and a negation in the
   # PREVIOUS sentence must not poison the next sentence's legitimate close.
   local NC_GREEN_FIXTURES=(
@@ -841,6 +945,9 @@ run_self_test() {
     'This PR does not touch the renderer. Fixes #500.'
     'annotation cleanup, fixes #9'
     'The prefix handling is unfixed; resolves #12'
+    'fix(inventory): auto-loot into a free slot + stack, never overwrite occupied slots — Fixes #56'
+    'fix(convert): W=0 quaternion frames are a 180° rotation, not identity (wolf rear inverted) — Fixes #40'
+    'fix(render): hold sit/kneel poses instead of looping the transition — Fixes #83'
   )
   local n_green=0
   for text in "${NC_GREEN_FIXTURES[@]}"; do
@@ -857,7 +964,7 @@ run_self_test() {
   # reported the wrong issue would still pass a count-only assertion.
   want "the disclaimed numbers are extracted" \
     "$(printf '%s' "$NEGCLOSE_NUMBERS" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')" \
-    "35 302 314 854 939 982 1010 "
+    "35 41 302 314 378 854 871 939 982 1010 "
 
   classify_negclose "$nc_green" > "${nc_dir}/green-verdicts.txt"
   want "no must-stay-green item flagged"        "$NEGCLOSE_FLAGGED"    "0"
@@ -898,8 +1005,9 @@ run_self_test() {
   #
   # Every row is measured: the close-event timestamps and commit ids come from each issue's
   # timeline and each pull request's `merged_at`, read from the API during the eqoxide#1041 sweep.
-  # The six false closes land 1-2 seconds after their PR merged. Issue 302's close landed
-  # 2026-07-11, ELEVEN DAYS BEFORE PR #653 was opened — PR #306 closed it, legitimately — so the
+  # Every confirmed false close lands 1-2 seconds after its PR merged. Issue 302's close landed at
+  # 2026-07-11T20:18:54Z, ONE SECOND after PR #306 merged and 10d 18h 16m BEFORE PR #653 was even
+  # opened (2026-07-22T14:35:40Z) — PR #306 closed it, legitimately — so the
   # classifier must return NOT-ATTRIBUTED there even though PR #653's text matched the lint above
   # and even though GitHub does list 302 in that PR's closingIssuesReferences. That is the whole
   # point of keeping the two checks apart: matching the pattern is not a false close.
@@ -937,6 +1045,13 @@ run_self_test() {
   # because `gh` applies `--jq` itself. STUB_MODE=clean serves the corrected text through the same
   # code path, so the run can be shown to go GREEN as well as RED — a check that only ever goes one
   # way is not evidence.
+  #
+  # One caveat about reading these checks, so nobody leans on the wrong one. Under the mutation
+  # above, `run_live exits 1 on a negated closing keyword` still passes — but for the wrong reason:
+  # with classify_negclose gone, the child dies on an unbound NEGCLOSE_TOTAL under `set -u`, and a
+  # dead process also exits non-zero. It is the PAIRED clean-corpus check below it — `run_live exits
+  # 0 once the same text is rewritten` — that actually catches the deletion, because a crash cannot
+  # produce exit 0. An exit-code assertion is only evidence when the same corpus is run BOTH ways.
   # -------------------------------------------------------------------------------------------
   local stubdir="${nc_dir}/stub"; mkdir -p "$stubdir"
   cat > "${stubdir}/gh" <<'GHSTUB'
@@ -985,8 +1100,16 @@ GHSTUB
   want "run_live exits 1 on a negated closing keyword" "$rc" "1"
   want "run_live flags it on ALL THREE surfaces (body, comment, commit message)" \
        "$(printf '%s' "$out" | grep -c '^  \[NEGCLOSE\]' || true)" "3"
-  want "run_live names both disclaimed issues" \
-       "$(printf '%s' "$out" | grep -c 'will CLOSE issue 939\|will CLOSE issue 1010' || true)" "4"
+  # Three assertions, not one, because the per-item verdict has to be TRUE per surface and not just
+  # loud. GitHub links from a pull request's body and from commit messages; it does not link from a
+  # comment. A guard that told an operator their comment was about to close an issue would be making
+  # the same class of false statement this whole check exists to catch.
+  want "run_live says a PR BODY will close it, twice" \
+       "$(printf '%s' "$out" | grep -cE 'will CLOSE issue (939|1010) on merge' || true)" "2"
+  want "run_live does NOT claim a COMMENT closes anything" \
+       "$(printf '%s' "$out" | grep -c 'A comment does not link, so issue 939 does not close from here' || true)" "1"
+  want "run_live says a COMMIT closes on reaching the default branch" \
+       "$(printf '%s' "$out" | grep -c 'GitHub closes issue 1010 when this commit reaches the default branch' || true)" "1"
   want "run_live prints what GitHub actually parsed" \
        "$(printf '%s' "$out" | grep -c 'closingIssuesReferences for this pull request: 939 1010' || true)" "1"
   want "run_live reports the close attribution" \
@@ -1028,7 +1151,7 @@ GHSTUB
   out="$(cd "$trepo" && LOCAL_DETAIL_PATTERNS_FILE="$PATTERNS_FILE" \
          bash "${REPO_ROOT}/scripts/check-pr-text.sh" --commits HEAD~2..HEAD~1 2>&1)" || rc=$?
   want "--commits flags the measured commit-message instance" \
-       "$(printf '%s' "$out" | grep -c 'will CLOSE issue 314' || true)" "1"
+       "$(printf '%s' "$out" | grep -c 'GitHub closes issue 314 when this commit reaches the default branch' || true)" "1"
   want "--commits exits 1 on a finding" "$rc" "1"
 
   rc=0
@@ -1050,7 +1173,7 @@ GHSTUB
 
   # Assert how many checks ran. A case that silently stops running must fail this step rather than
   # shrink the output. `checks + 1` counts this assertion itself, which has not been tallied yet.
-  want "self-test ran every check (incl. this one)" "$((checks + 1))" "52"
+  want "self-test ran every check (incl. this one)" "$((checks + 1))" "54"
 
   if [ "$fails" -ne 0 ]; then
     echo "check-pr-text --self-test: FAILED ${fails} of ${checks} checks."
