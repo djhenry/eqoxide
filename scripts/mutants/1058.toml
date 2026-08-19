@@ -1,0 +1,311 @@
+name = "issue 1058 — fall_damage documents a lethal outcome its own constants make unreachable, and the walker guard that reads it is silently inert above the real ceiling"
+
+# Reproduce with:  scripts/mutate.py scripts/mutants/1058.toml
+#
+# WRAPs rather than deletions (docs/mutation-testing.md) wherever the property under test is a
+# BEHAVIOUR: the original text stays in the tree, still type-checks and still moves the same values,
+# so the verdict measures the outcome rather than the text.
+#
+# FOUR ROWS ARE DELIBERATE TEXT EDITS, and are not the false-RED the WRAP rule warns about. The
+# `citation` rows below perturb prose in `physics.rs`, `todo.md` and `docs/http-api.md`, and the
+# property they measure IS textual: "the name this comment sends a reader to still resolves, and
+# still resolves to the right place". A wrap has no meaning in a Markdown heading. Read those four
+# as absent-referent probes, not as behaviour coverage.
+#
+# The command is the default (`cargo test --workspace --locked`) — deliberately NOT --all-targets,
+# which silently drops the doctest targets, and `fall_damage_ceiling` carries a doctest.
+
+# ---------------------------------------------------------------------------------------------
+# A. The curve itself: does the new pin MEASURE the ceiling, or merely sit next to it?
+# ---------------------------------------------------------------------------------------------
+
+[[mutant]]
+id = "lethal-branch-becomes-reachable"
+description = "PROPERTY: the lethal (20000, 20000) pair is never returned. Move the score offset 4.0 -> 3.5, which lifts the supremum of `score` from 8.8 to 9.3 and makes the `score >= 9.0` branch fire at any height past saturation. This is the row that matters most: it is the doc comment's original claim actually coming true, and it must not pass unnoticed. NOTE this perturbs a derived offset, NOT one of the three named constants — #1058 rules changing those out of scope for the FIX; a mutant is applied and reverted by this harness and never lands in the tree."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-core/src/physics.rs"
+  anchor = '''
+    let score = v / HZ - 4.0;
+'''
+  replacement = '''
+    let score = if false { v / HZ - 4.0 } else { v / HZ - 3.5 };
+'''
+
+[[mutant]]
+id = "ceiling-drifts-by-one"
+description = "PROPERTY: the bound is pinned EXACTLY, not as a loose inequality. Add 1 to the rolled maximum so the ceiling becomes 775. A test that only asserted `max <= 774` with a slack bound, or that re-derived the ceiling on both sides of its own comparison, would not notice."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-core/src/physics.rs"
+  anchor = '''
+    let max = (score * score * 10.0) as u32;
+'''
+  replacement = '''
+    let max = if false { (score * score * 10.0) as u32 } else { (score * score * 10.0) as u32 + 1 };
+'''
+
+[[mutant]]
+id = "ceiling-helper-returns-a-literal"
+description = "PROPERTY: `fall_damage_ceiling()` is DERIVED from `fall_damage` rather than repeating a number. DECLARED GREEN, and the row exists to say so out loud: while the curve is unchanged the literal and the derivation agree on every input, so NO behavioural test can separate them. The property is covered only JOINTLY — `lethal-branch-becomes-reachable` and `ceiling-drifts-by-one` both move the curve, and under either of those a hard-coded 774 makes `ceiling_helper_equals_the_measured_maximum` fail. Reported rather than papered over."
+expect = "GREEN"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-core/src/physics.rs"
+  anchor = '''
+    fall_damage(f32::INFINITY).1
+'''
+  replacement = '''
+    if false { fall_damage(f32::INFINITY).1 } else { 774 }
+'''
+
+# ---------------------------------------------------------------------------------------------
+# B. The corpus controls. A guard that reports only its exceptions cannot tell "nothing wrong"
+#    from "nothing looked at" — these two rows separate the two failure modes.
+# ---------------------------------------------------------------------------------------------
+
+[[mutant]]
+id = "swept-corpus-emptied"
+description = "PROPERTY: NOTHING LOOKED AT is red. Empty the swept corpus. Every `assert!(max <= CEILING)` inside the loop then passes vacuously, because the loop body never runs."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-core/src/physics.rs"
+  anchor = '''
+        (0..SWEEP_SAMPLES).map(|i| i as f32 * SWEEP_STEP).collect()
+'''
+  replacement = '''
+        if false { (0..SWEEP_SAMPLES).map(|i| i as f32 * SWEEP_STEP).collect() } else { Vec::new() }
+'''
+
+[[mutant]]
+id = "swept-corpus-never-reaches-saturation"
+description = "PROPERTY: the corpus REACHES the region it claims to bound — distinct from the row above, and the sharper of the two. The sample COUNT is left correct (4001 heights are still generated and still checked, so the count control passes) but the range is scaled to 0..0.2u, far below the ~68.3u saturation point. 'No input exceeded the ceiling' is then true and worthless. The `attained` control is what must catch this."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-core/src/physics.rs"
+  anchor = '''
+        (0..SWEEP_SAMPLES).map(|i| i as f32 * SWEEP_STEP).collect()
+'''
+  replacement = '''
+        if false { (0..SWEEP_SAMPLES).map(|i| i as f32 * SWEEP_STEP).collect() }
+        else { (0..SWEEP_SAMPLES).map(|i| i as f32 * SWEEP_STEP * 0.001).collect() }
+'''
+
+# ---------------------------------------------------------------------------------------------
+# C. The citations. #1058 is a defect of a comment asserting something untrue; a comment that
+#    points at a referent which has moved is the same defect one step removed, and it fails
+#    SILENTLY — the prose keeps reading as evidence.
+# ---------------------------------------------------------------------------------------------
+
+[[mutant]]
+id = "citation-test-module-renamed"
+description = "PROPERTY: the test module `fall_damage`'s doc comment sends readers to still exists under that name. Rename the module and leave the prose. Nothing in the crate refers to it by path, so this compiles and every other test passes."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-core/src/physics.rs"
+  anchor = '''
+mod fall_damage_ceiling_tests {
+'''
+  replacement = '''
+mod fall_damage_bound_tests {
+'''
+
+[[mutant]]
+id = "citation-todo-section-renamed"
+description = "PROPERTY: the `todo.md` section the doc cites as the thing that settles the vestigial-vs-miscalibrated question exists, verbatim. Rename the heading."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "todo.md"
+  anchor = '''
+## TODO: exhaustive fall-damage testing (controlled-fall nav)
+'''
+  replacement = '''
+## TODO: exhaustive fall-damage testing (controlled falls)
+'''
+
+[[mutant]]
+id = "citation-todo-item-leaves-its-section"
+description = "PROPERTY: POSITION, not presence. The cited measurement item must live UNDER the cited heading. Wedge an unrelated `## ` heading between them: both strings are still present in the file, and a presence-only check would stay green while the citation now resolves to the wrong section. This is the mutant that a `contains`-only pin cannot kill."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "todo.md"
+  anchor = '''- Validate the fall-damage curve vs the real client across drop heights'''
+  replacement = '''## TODO: an unrelated section wedged in
+
+- Validate the fall-damage curve vs the real client across drop heights'''
+
+[[mutant]]
+id = "citation-api-row-states-a-stale-ceiling"
+description = "PROPERTY: the published contract's PROSE number tracks the running curve. `docs/http-api.md`'s `fall_would_be_lethal` row states the ceiling as a literal for a reader who will never run the code; a stale number there is a lie on the surface an agent reads. Change 774 to 750."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "docs/http-api.md"
+  anchor = '''**774**'''
+  replacement = '''**750**'''
+
+# ---------------------------------------------------------------------------------------------
+# D. The walker consequence — the part that actually bites.
+# ---------------------------------------------------------------------------------------------
+
+[[mutant]]
+id = "inert-case-collapses-back-into-survivable"
+description = "PROPERTY: the guard's structural inertness above the ceiling is DETECTED at all. Make the ceiling test never fire, which restores the pre-fix behaviour exactly: a character above the ceiling descends every ledge and nothing anywhere says the guard could not have fired. This is #1058 itself, put back."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-nav/src/walker.rs"
+  anchor = '''
+    if cur_hp as u32 > ceiling {
+'''
+  replacement = '''
+    if std::hint::black_box(false) && cur_hp as u32 > ceiling {
+'''
+
+[[mutant]]
+id = "inert-boundary-becomes-inclusive"
+description = "PROPERTY: the boundary sits EXACTLY at the ceiling. `>` becomes `>=`, so an HP the guard can still protect (a big enough drop reports the ceiling, and `max_dmg >= cur_hp` holds) is reported inert — a fresh false claim in the opposite direction. Only a SMALL drop at exactly the ceiling can see this, because at a saturating drop the `Stop` arm returns first and shadows the comparison."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-nav/src/walker.rs"
+  anchor = '''
+    if cur_hp as u32 > ceiling {
+'''
+  replacement = '''
+    if cur_hp as u32 >= ceiling {
+'''
+
+[[mutant]]
+id = "nohp-gate-made-vacuous"
+description = "PROPERTY: PRESENCE — the `cur_hp <= 0` gate has any effect at all. `0i32 as u32` is 0 and `max_dmg >= 0` holds for every drop, so without the gate a character with no usable HP reading blocks at every ledge under `fall_would_be_lethal`, a row the pre-fix code never published."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-nav/src/walker.rs"
+  anchor = '''
+    if cur_hp <= 0 {
+'''
+  replacement = '''
+    if std::hint::black_box(false) && cur_hp <= 0 {
+'''
+
+[[mutant]]
+id = "nohp-gate-moved-after-the-damage-check"
+description = "PROPERTY: ORDERING, and INDEPENDENT of the row above. Every line is still present, still reached and still executed — at the wrong point. The two blocks are swapped, so the damage comparison decides first and 0 HP takes the `Stop` arm. A presence-only mutant cannot falsify this and a position-only test cannot falsify the presence one."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-nav/src/walker.rs"
+  anchor = '''
+    if cur_hp <= 0 {
+        return LedgeFallVerdict::NoHpReading;
+    }
+    if max_dmg >= cur_hp as u32 {
+        return LedgeFallVerdict::Stop { max_dmg };
+    }
+'''
+  replacement = '''
+    if max_dmg >= cur_hp as u32 {
+        return LedgeFallVerdict::Stop { max_dmg };
+    }
+    if cur_hp <= 0 {
+        return LedgeFallVerdict::NoHpReading;
+    }
+'''
+
+[[mutant]]
+id = "disclosure-never-reaches-the-zone-log"
+description = "PROPERTY: the disclosure lands on the surface an AGENT reads. The `tracing::info!` beside it goes to the process log, which no agent consults; wrapping the `log_msg` leaves the fix looking complete in the source and invisible in play."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-nav/src/walker.rs"
+  anchor = '''
+                        gs.log_msg("zone", &format!(
+'''
+  replacement = '''
+                        if false { gs.log_msg("zone", &format!(
+'''
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-nav/src/walker.rs"
+  anchor = '''
+                            gs.cur_hp, ceiling));
+'''
+  replacement = '''
+                            gs.cur_hp, ceiling)); }
+'''
+
+[[mutant]]
+id = "disclosure-latch-never-set"
+description = "PROPERTY: the GATE closes — the disclosure is once per journey, not once per tick. Without the latch every tick of a long descent repeats the line and buries the log it exists to inform."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-nav/src/walker.rs"
+  anchor = '''
+                        self.inert_fall_disclosed = true;
+'''
+  replacement = '''
+                        if false { self.inert_fall_disclosed = true; }
+'''
+
+[[mutant]]
+id = "disclosure-latch-never-reset"
+description = "PROPERTY: the gate REOPENS — the latch is per-journey, not per-process. The opposite direction from the row above and a different failure: HP changes between journeys, so a walker inside the guard's reach on one goto may be outside it on the next, and a stuck latch silently withholds a true statement about that one."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-nav/src/walker.rs"
+  anchor = '''
+        self.inert_fall_disclosed = false;
+'''
+  replacement = '''
+        if false { self.inert_fall_disclosed = false; }
+'''
+
+[[mutant]]
+id = "inert-arm-also-blocks"
+description = "PROPERTY: the fix does not INVENT a stop where the old code descended. Give the `Inert` arm the `Stop` arm's whole body — publish `blocked`/`fall_would_be_lethal`, drop the goal, return — which is a lie in the cautious direction (the guard did not fire; it CANNOT fire) and a behaviour change #1058 does not authorise. FIRST ATTEMPT AT THIS ROW WAS A MEASURED GREEN, and the reason is worth recording: it inserted only the `set_nav_state_because` call, which a later line in the SAME tick overwrites with the ordinary `navigating` row — an equivalent mutant, not an uncovered behaviour. That measurement is why the call-site test now also asserts the tick's published row POSITIVELY."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-nav/src/walker.rs"
+  anchor = '''
+                            gs.cur_hp, ceiling));
+                    }
+                }
+'''
+  replacement = '''
+                            gs.cur_hp, ceiling));
+                    }
+                    self.set_nav_state_because("blocked", Some("fall_would_be_lethal"));
+                    *self.nav.goto_target.lock().unwrap() = None;
+                    self.publish_debug(Self::known_pos(gs), None);
+                    return;
+                }
+'''
+
+[[mutant]]
+id = "firing-guard-stops-clearing-the-goal"
+description = "PROPERTY: the REFACTOR preserved the firing guard byte-for-byte. `classify_ledge_fall` moved the comparison out of the call site; the `Stop` arm must still drop the goal, or the controller keeps walking the last wish_dir off the ledge forever (eqoxide#71) — the bug the guard exists to prevent, re-introduced by the fix for a different one."
+expect = "RED"
+
+  [[mutant.edit]]
+  file = "crates/eqoxide-nav/src/walker.rs"
+  anchor = '''
+                    self.set_nav_state_because("blocked", Some("fall_would_be_lethal"));
+                    *self.nav.goto_target.lock().unwrap() = None;
+'''
+  replacement = '''
+                    self.set_nav_state_because("blocked", Some("fall_would_be_lethal"));
+                    if false { *self.nav.goto_target.lock().unwrap() = None; }
+'''

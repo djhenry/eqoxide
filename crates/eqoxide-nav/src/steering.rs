@@ -1899,6 +1899,10 @@ mod cursor_resync_tests {
              "a `nav_reason` string (`NotUsable::StaleForPreviousZone::as_str`), not a fn."),
             ("local_no_way_through",
              "a `stop_nav` reason string, not a fn."),
+            ("fall_would_be_lethal",
+             "a published `nav_reason` string (`docs/http-api.md`), not a fn. Cited by name in \
+              `walker::classify_ledge_fall` and its tests because #1058 is about what that string \
+              does and does not promise a reader."),
             ("arrived_at_goal_tier",
              "a local binding in the walker sim's arrival check, not a fn."),
             ("route_goal_offset_reports_vertical_shortfall_only",
