@@ -4002,12 +4002,24 @@ mod tests {
     /// accounting's `"— COMPLETE"`. The trap is #831's: `"INCOMPLETE".contains("COMPLETE")`, so a
     /// marker that is a substring of another silently answers the wrong question.
     ///
-    /// REACH CONTROL. A cross-product over strings nothing emits is the very failure this batch is
-    /// about, so the FOUR markers this file OWNS are asserted here against real values' rendering
-    /// before the table runs. The other four are pinned to real emitters elsewhere and not restated:
-    /// `— COMPLETE`/`— INCOMPLETE` and the two `COMPOSITE_*` by
-    /// `composite_markers_are_line_safe_against_every_other_898` in `water_grid.rs`, which builds a
-    /// real clean and a real dirty rollup and a report over them.
+    /// REACH CONTROL, two halves. A cross-product over strings nothing emits is the very failure
+    /// this batch is about, so the FOUR markers this file OWNS are asserted here against real
+    /// values' rendering before the table runs; and the table's own corpus is an item, so the
+    /// number of ordered pairs actually compared is asserted after it. The other four are pinned to
+    /// real emitters elsewhere and not restated: `— COMPLETE`/`— INCOMPLETE` and the two
+    /// `COMPOSITE_*` by `composite_markers_are_line_safe_against_every_other_898` in
+    /// `water_grid.rs`, whose reach control builds a real clean rollup, a real dirty rollup, and a
+    /// `RollupReport` over each.
+    ///
+    /// That citation was FALSE as FIRST WRITTEN in this PR. It claimed the cited test built a
+    /// report; the cited test built no `RollupReport` at all, so nothing anywhere pinned the two
+    /// `COMPOSITE_*` strings to a real rendering and this table was, for those two entries, exactly
+    /// the cross-product-over-nothing it warns about. Proved by execution rather than by reading:
+    /// with `RollupReport`'s `Display` stopped from emitting `COMPOSITE_CLEAN`, the cited test
+    /// stayed GREEN — of the four `_898` tests in that file, only
+    /// `a_clean_composite_report_states_it_898` reddened (3 passed, 1 failed). The cited test now
+    /// renders both reports, so the sentence above is true and that mutant reddens it.
+    /// (PR #1052 review round 1, R1.)
     ///
     /// MUTATION CHECK: shorten `POPULATION_ASSERTED` to `"— POPULATION"` — the plausible
     /// "simplify the marker" edit — → RED here: *marker `— POPULATION-INFERRED` contains
@@ -4015,6 +4027,13 @@ mod tests {
     /// `— POPULATION-INFERRED`*. Measured. The reach control above PASSES under that mutant (the
     /// `Present` render still contains the shortened constant), so the table is what catches it,
     /// which is the point of having both halves.
+    ///
+    /// MUTATION CHECK 2: shrink `markers` to a single element — the plausible "trim the table"
+    /// edit, and the one the reviewer of this PR used — → RED on the pair-count control:
+    /// *the table must compare every ordered pair of all eight markers this corpus prints,
+    /// left: `(1, 0)`, right: `(8, 56)`*. Measured. Without that control the shrunken table passed:
+    /// zero pairs compared reports "no collisions" in exactly the words a real clean scan uses,
+    /// which is #927's complaint surviving inside #927's own fix. (PR #1052 review round 1, R3.)
     #[test]
     fn every_corpus_marker_is_line_safe_against_every_other_927_928() {
         // The four this file owns are strings real values REALLY print.
@@ -4037,14 +4056,21 @@ mod tests {
                        crate::nav::water_grid::COMPOSITE_DIRTY,
                        PROBES_EVERY_ZONE, PROBES_HOLE,
                        POPULATION_ASSERTED, POPULATION_INFERRED];
+        let mut pairs = 0usize;
         for (i, a) in markers.iter().enumerate() {
             for (j, b) in markers.iter().enumerate() {
                 if i == j { continue }
+                pairs += 1;
                 assert!(!a.contains(b),
                     "marker {a:?} contains {b:?}, so a line-level grep for {b:?} matches a line \
                      that only carries {a:?} — #831's trap, one corpus later");
             }
         }
+        // The CORPUS is an item. Without this the array could be shrunk to one marker and the scan
+        // would still report no collisions — a guard green because it looked at nothing, which is
+        // the whole complaint in #927 and has no business surviving inside #927's own fix.
+        assert_eq!((markers.len(), pairs), (8, 56),
+            "the table must compare every ordered pair of all eight markers this corpus prints");
     }
 
     /// **#928 — a `.glb` with all three companion assets gone is admitted when the sync record
@@ -4133,10 +4159,28 @@ mod tests {
     }
 
     /// **#928 — the record is looked for beside `$EQZONES`, at the asset cache root.** The corpus's
-    /// default `$EQZONES` is `CacheDirs::models_dir()` (`<cache root>/models`) and `CacheDirs`
-    /// writes its per-set record to `<cache root>/synced.json`, so the path is `$EQZONES/..`. Named
-    /// here because that relationship is the whole reason the default resolves to anything at all,
-    /// and nothing else in this file would notice if `models_dir` moved.
+    /// default `$EQZONES` is `CacheDirs::resolve().models_dir()` (`<cache root>/models`) and
+    /// `CacheDirs` writes its per-set record to `<cache root>/synced.json`, so the record path is
+    /// `$EQZONES/..`. This test drives `record_path` through a REAL `CacheDirs::models_dir()` — the
+    /// only reference to that function in this file — so moving the models directory DEEPER under
+    /// the cache root reaches this assertion.
+    ///
+    /// **What it does not catch, stated rather than implied.** Renaming `models_dir` at the same
+    /// depth (`<root>/models` → `<root>/glbs`) leaves `record_path` correct and this test green.
+    /// Nothing here guards that name, and nothing needs to: the corpus below now DERIVES its
+    /// default from the same function instead of restating the path, so a rename moves both
+    /// together. The `<root>/synced.json` half is restated here rather than called, because
+    /// `CacheDirs::synced_path` is private; it is guarded by the `asset_sync` tests, which redden
+    /// if it moves.
+    ///
+    /// As FIRST WRITTEN in this PR the coupling above was prose and nothing else. The corpus
+    /// HARDCODED the literal `$HOME/.local/share/eqoxide/assets/models` and this file referenced
+    /// `CacheDirs` from no line of code, so moving `models_dir()` left the whole lib suite green
+    /// (254 passed, 0 failed) while this doc claimed the move would be caught here. The two also
+    /// disagreed in general — `CacheDirs::resolve()` honours `$XDG_DATA_HOME` and the literal did
+    /// not — so under a redirected data dir the corpus read a different tree than the one whose
+    /// record it named. Both halves are fixed here rather than the claim being softened.
+    /// (PR #1052 review round 1, R2.)
     ///
     /// Skipped, not silently passed, when `$EQZONES_MANIFEST` is set — an override is a legitimate
     /// state and a test that read it as a pass would be reporting the wrong thing.
@@ -4147,9 +4191,13 @@ mod tests {
                       this test asserts nothing about the override");
             return;
         }
-        let models = std::path::Path::new("/tmp/eqoxide-corpus-root/models");
-        assert_eq!(ZoneManifest::record_path(models),
-                   std::path::Path::new("/tmp/eqoxide-corpus-root/synced.json"),
+        let root = std::path::Path::new("/tmp/eqoxide-corpus-root");
+        let models = crate::asset_sync::CacheDirs::with_root(root).models_dir();
+        assert_eq!(models.parent(), Some(root),
+            "the corpus default `$EQZONES` sits ONE level under the cache root; if `models_dir` \
+             moved deeper, `$EQZONES/..` would name a directory inside the models tree and the \
+             record would be looked for somewhere `CacheDirs` never writes one");
+        assert_eq!(ZoneManifest::record_path(&models), root.join("synced.json"),
                    "the record lives beside the models directory, at the asset cache root");
         // A `$EQZONES` with no parent must still name a path rather than panic.
         assert_eq!(ZoneManifest::record_path(std::path::Path::new("/")),
@@ -4185,9 +4233,14 @@ mod tests {
     #[test]
     #[ignore = "asset-gated: needs baked zone glbs + maps/water at $EQZONES (#357)"]
     fn depenetration_corpus_over_baked_zones() {
-        let dir = std::path::PathBuf::from(std::env::var("EQZONES").unwrap_or_else(|_| {
-            format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap())
-        }));
+        // DERIVED from `CacheDirs`, not restated as a literal: `ZoneManifest` looks for the sync
+        // record at `$EQZONES/../synced.json`, and that is only the right place because this IS
+        // the asset cache's models directory (#928). A hardcoded twin of that path silently stops
+        // being the cache when `models_dir` moves or `$XDG_DATA_HOME` is set.
+        let dir = match std::env::var_os("EQZONES") {
+            Some(p) => std::path::PathBuf::from(p),
+            None => crate::asset_sync::CacheDirs::resolve().models_dir(),
+        };
         /// The pre-#649 rule, verbatim: nearest floor in EITHER direction, always grounded.
         fn legacy_recovery(col: &Collision, p: [f32; 3]) -> Option<([f32; 3], bool)> {
             for &r in &PUSHOUT_RADII {

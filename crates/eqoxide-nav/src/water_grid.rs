@@ -1351,29 +1351,51 @@ mod tests {
     /// MUTATION CHECKS (each independently turns this RED):
     /// 1. Drop the `— ` from `COMPOSITE_CLEAN` → `COMPOSITE_DIRTY` now contains it.
     /// 2. Spell `COMPOSITE_CLEAN` as `"— COMPLETE"` → it collides with the per-rollup marker.
+    /// 3. Shrink `markers` to a single element → the pair-count control fires: a table that
+    ///    compares nothing reports "no collisions" exactly as a clean one does.
+    /// 4. Stop [`RollupReport`]'s `Display` emitting [`COMPOSITE_CLEAN`] → the reach control fires.
+    ///
+    /// Mutant 4 did NOT redden this test as FIRST WRITTEN in this PR, and that was the defect: the
+    /// reach control then covered only the two per-rollup markers, so the two `COMPOSITE_*` strings
+    /// were table entries with no emitter behind them, and `every_corpus_marker_is_line_safe_…` in
+    /// `src/movement.rs` cited this test for a pinning it did not perform. Proved by execution —
+    /// under that mutant this test stayed green and only `a_clean_composite_report_states_it_898`
+    /// reddened. The reach control below now renders a real report over each rollup, so the
+    /// citation is true. (PR #1052 review round 1, R1.)
     #[test]
     fn composite_markers_are_line_safe_against_every_other_898() {
         const ROLLUP_CLEAN: &str = "— COMPLETE";
         const ROLLUP_DIRTY: &str = "— INCOMPLETE";
-        // The two per-rollup markers really are what `WaterRollup` prints — otherwise this table
-        // is about strings nothing emits (the reach control for this test).
+        // REACH CONTROL, half one: all FOUR markers in the table below are strings real values
+        // REALLY print — otherwise this table is a cross-product over strings nothing emits.
         let mut clean = WaterRollup::new();
         clean.begin_zone("z"); clean.add("z", &dry_but_loaded().measure(|_| 1usize));
         let mut dirty = WaterRollup::new();
         dirty.begin_zone("z"); // abandoned
         assert!(clean.to_string().contains(ROLLUP_CLEAN), "{clean}");
         assert!(dirty.to_string().contains(ROLLUP_DIRTY), "{dirty}");
+        let clean_report = RollupReport::new([("wat-route", &clean)]).to_string();
+        let dirty_report = RollupReport::new([("wat-route", &dirty)]).to_string();
+        assert!(clean_report.contains(COMPOSITE_CLEAN), "{clean_report}");
+        assert!(dirty_report.contains(COMPOSITE_DIRTY), "{dirty_report}");
 
         let markers = [ROLLUP_CLEAN, ROLLUP_DIRTY, COMPOSITE_CLEAN, COMPOSITE_DIRTY];
+        let mut pairs = 0usize;
         for (i, a) in markers.iter().enumerate() {
             for (j, b) in markers.iter().enumerate() {
                 if i == j { continue }
+                pairs += 1;
                 assert!(!a.contains(b),
                     "marker {a:?} contains marker {b:?} as a substring, so a grep for {b:?} matches \
                      a line that only carries {a:?} — that is #831's `INCOMPLETE`/`COMPLETE` trap, \
                      and the whole point of the leading em-dash");
             }
         }
+        // REACH CONTROL, half two: the CORPUS is an item. An exceptions-only scan cannot tell
+        // "no collisions" from "nothing compared", which is #927's complaint one file over.
+        assert_eq!((markers.len(), pairs), (4, 12),
+            "the table must compare every ordered pair of all four markers this module prints; \
+             a shrunken array reports a clean scan over a corpus it never looked at");
     }
 
     /// **#898 — a two-rollup report cannot put a per-rollup `— COMPLETE` on a line that is not
