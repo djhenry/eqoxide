@@ -158,12 +158,24 @@ pub struct Hit {
 ///   interval `butcher_headroom_claim_check`'s rustdoc states is held by execution rather than by
 ///   prose (#909 — it was stated open at the low end and is closed there).
 /// * **`the_max_nodes_prose_figures_are_anchored_to_the_arithmetic_they_restate`** — fast, in
-///   `steering.rs`'s #882 citation-guard corpus. This is what holds the `57.3%`/`1.75×` **prose
-///   above**. Until #910 nothing did: #880's review mutated only this doc comment (57.3% → 60.0%,
-///   1.75× → 2.10×), touched no code literal, and got a green run on a real rebuild. The guard
-///   derives both figures from this constant and the pinned measurement and then requires the
-///   derived text verbatim, so editing the prose here without the literals is now RED — and so is
-///   editing the literals without the prose.
+///   `steering.rs`'s #882 citation-guard corpus. Until #910 nothing read the prose at all: #880's
+///   review mutated both figures in this doc comment (to 60.0% and 2.10×), touched no code
+///   literal, and got a green run on a real rebuild. The guard derives both figures from this
+///   constant and the pinned measurement, then requires the derived text verbatim at each site it
+///   NAMES — so editing an anchored sentence without the literals is RED, and editing a literal
+///   without the prose is RED.
+///
+///   **It holds a NAMED LIST of sentences, not a region.** Inside this doc comment it holds
+///   exactly two: the production-config headline above, and item 3 of THE DECISION. #1038's
+///   round-2 review measured the previous revision of this bullet FALSE — it claimed prose-only
+///   edits here were RED, and a mutation of item 3 alone, with no code literal touched, ran
+///   GREEN, because item 3 was not an anchor. It is one now. Restatements of the same pair
+///   elsewhere in the tree — in `worst_case_reachable_component`, in the rustdocs of
+///   `MEASURED_WORST_BUTCHER_PRODUCTION`, `butcher_headroom_claim_check` and the two fast
+///   checkers above, and in `water_grid.rs`, which the citation corpus does not contain — are
+///   enumerated as measured-and-unheld in the guard's own rustdoc. This bullet does not cover
+///   them. The `60.0%`/`2.10×` above is a record of what #880's review typed, not a restatement
+///   of the arithmetic, and is deliberately left unanchored so that it stays true as history.
 /// * **`worst_case_reachable_component`** — the `#[ignore]`d ~10 h corpus run, the only thing that
 ///   can re-derive the number. It asserts `worst < MAX_NODES` and, since #880, its freshly measured
 ///   `butcher` close against `MEASURED_WORST_BUTCHER_PRODUCTION`. **That is the only comparison
@@ -2209,17 +2221,29 @@ impl Collision {
         /// * `ground_continuous_probe_spacing_catches_every_hole_wider_than_the_spacing` (below in
         ///   this file) — the ordinary direction: a hole WIDER than the spacing must be caught.
         /// * `a_narrow_hole_between_probes_still_crosses_the_resync_undetected`, in
-        ///   `crate::walker`'s test module — a bug-CHARACTERISATION test for #734 gap 1. It
-        ///   hard-codes its own local copy of this constant and asserts that a 1.5 u hole, narrower
-        ///   than it, is still stepped over undetected. **Narrowing this constant turns that test
-        ///   RED**, and because the two files never touch, nothing in the diff surfaces the
-        ///   coupling. That red is not a regression — it means #734 gap 1 has been FIXED — and its
-        ///   failure message is the delete-me instruction (the test, its entry in
-        ///   `every_walker_test_name_cited_in_a_doc_comment_still_exists`, and the gap-1 bullets in
-        ///   `steering::resync_cursor`'s and `Walker::advance_cursor`'s rustdocs).
+        ///   `crate::walker`'s test module — a bug-CHARACTERISATION test for #734 gap 1. It builds
+        ///   a 1.5 u hole and asserts that the resync predicate still steps over it undetected.
+        ///   **That 1.5 is a HOLE WIDTH, not a second copy of this constant.** The test names
+        ///   `PROBE_SPACING` only in prose, and the line below is its only definition in the whole
+        ///   tree, so the coupling is not copy-against-copy — which a grep would find — but a
+        ///   fixture width chosen to sit under a constant the fixture cannot see. **Narrowing this
+        ///   constant turns that test RED**, and because the two files never touch, nothing in the
+        ///   diff surfaces the coupling. That red is not a regression — it means #734 gap 1 has
+        ///   been FIXED — and its failure message is the delete-me instruction (the test, its
+        ///   entry in `every_walker_test_name_cited_in_a_doc_comment_still_exists`, and the gap-1
+        ///   bullets in `steering::resync_cursor`'s and `Walker::advance_cursor`'s rustdocs).
         ///
-        /// That delete-me path is measured, not argued: #887 round 2 set this constant to 1.0 and
-        /// re-ran the walker tests — that one test alone went red, 43 passed / 1 failed of 44.
+        ///   #903's body describes that test as hard-coding "its own local
+        ///   `PROBE_SPACING: f32 = 2.0`", and #1038 round 1 carried that description into this
+        ///   comment. #1038's round-2 review refuted it by measurement. The issue's ASK — a
+        ///   reverse pointer at the constant — is what this comment is; only the mechanism it
+        ///   described was wrong, and the true mechanism is the stronger warning, because a second
+        ///   copy would at least be greppable and a fixture width is not.
+        ///
+        /// That delete-me path is measured, not argued: at #887 round 2, when `walker.rs` held 44
+        /// tests, this constant was set to 1.0 and the walker tests re-run — that one test alone
+        /// went red, 43 passed / 1 failed of 44. That denominator is a record of THAT run;
+        /// `walker.rs` has grown since and it no longer describes the file.
         const PROBE_SPACING: f32 = 2.0;
         if !self.has_geometry() { return true; }
         let step_up = crate::traversability::PLAYER_BODY.step_up;

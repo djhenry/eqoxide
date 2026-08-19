@@ -2577,8 +2577,10 @@ mod tests {
     ///
     /// **The delete-me path is measured, not asserted (#887 round 2).** `PROBE_SPACING` was
     /// temporarily set to 1.0 in `collision.rs` and the walker tests re-run: this test alone went
-    /// RED (`43 passed; 1 failed` of the 44 walker tests) with the instruction above, and the
-    /// mutation was hand-restored. So a future `collision.rs` change that shrinks the spacing turns
+    /// RED (`43 passed; 1 failed` of the 44 walker tests this file held at that round — it holds
+    /// more now, so read the denominator as a record of the run, not a description of the file)
+    /// with the instruction above, and the mutation was hand-restored. So a future `collision.rs`
+    /// change that shrinks the spacing turns
     /// `main` RED here, with **no git conflict** to warn anyone first — that is the whole reason
     /// the instruction is in the assertion message and not only in this doc.
     ///
