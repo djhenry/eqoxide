@@ -78,8 +78,14 @@ pub struct MoveIntent {
     pub hop:         bool,
 }
 
-/// A read-only snapshot of the controller the render thread publishes each frame for the nav
-/// thread to stream to the server (design §2 "Threading"). `heading` is EQ-CCW degrees.
+/// A snapshot of the controller the render thread republishes each frame for the nav thread to
+/// stream to the server (design §2 "Threading"). `heading` is EQ-CCW degrees.
+///
+/// "Each frame" describes how the render thread refreshes `pos`/`heading`/`initialized`, which it
+/// alone writes. It does NOT mean the render thread is the only writer of the published copy: two
+/// net-thread writers also mutate it, off the frame cadence entirely. Both are named on
+/// [`ControllerShared`] — read that before treating a value read from this struct as render-thread
+/// output (#1044 review round 1, finding D).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ControllerView {
     pub pos:     [f32; 3],
@@ -473,8 +479,25 @@ pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
 /// on arrival/stop alongside `goto_target`.
 pub type GotoEntity = Arc<Mutex<Option<String>>>;
 
-/// Authoritative controller snapshot published by the render thread each frame and read by the nav
-/// thread to stream OP_ClientUpdate (design §2). Single source of position truth.
+/// Authoritative controller snapshot: the render thread republishes the whole [`ControllerView`]
+/// each frame and the nav thread reads it to stream OP_ClientUpdate (design §2). Single source of
+/// position truth — `pos`/`heading`/`initialized` are the render thread's alone.
+///
+/// The render thread is NOT this slot's only writer, and "each frame" is not its only cadence
+/// (#1044 review round 1, finding D — same undercount shape as #1022/#1037, found while checking
+/// whether this claim could be left alone). Two NET-thread writers also mutate the published view
+/// in production, both deliberately and both outside the frame cadence:
+///
+/// * `ControllerSlots::begin_zone_in` calls `ControllerView::invalidate_disclosures()` on it,
+///   reached from `run_zone_entry_handshake` (`crates/eqoxide-net/src/gameplay.rs`) — precisely
+///   the window in which the render loop may publish nothing at all, which is why the clear has
+///   to reach the view and not only the `GameState` fields mirrored from it (#846 review B1).
+/// * `ActionLoop::stream_position` take-and-clears `landed_fall_height` (a write, not a read) on
+///   every ~10 ms outer-loop pass, consuming the render thread's one-shot fall signal so it can
+///   fire exactly once.
+///
+/// So a consumer must not read "published by the render thread each frame" as a guarantee that
+/// every field it sees was authored by the render thread on the last frame.
 pub type ControllerShared = Arc<Mutex<ControllerView>>;
 
 /// The `/goto` planner's per-frame movement intent. The nav planner writes `Some` while walking a
@@ -1739,12 +1762,30 @@ pub type GiveAwaitReq = Arc<Mutex<Option<(u32, u32,
 /// 1. Once per packet `run_gameplay_phase`'s inbound drain has drained AND applied via
 ///    `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — mirrors what the SERVER just told
 ///    us.
-/// 2. Immediately, within the same tick, whenever a locally-applied inventory-mutating command
-///    (move/scribe/unmem/trade-stage/etc.) is drained — via `ActionLoop::mirror_move_item` /
-///    `mirror_remove_item`, called from `drain_move_item`/`drain_mem_spell`/etc. inside
-///    `ActionLoop::tick` (`crates/eqoxide-net/src/action_loop.rs`), which runs every ~10 ms
-///    outer-loop pass and is NOT gated by the 150 ms nav-planner clock — mirrors what WE just
-///    told the server, since EQEmu sends no echo for a self-initiated move.
+/// 2. Whenever a locally-applied inventory-mutating command is drained inside `ActionLoop::tick`
+///    (`crates/eqoxide-net/src/action_loop.rs`) — via `ActionLoop::mirror_move_item` /
+///    `mirror_remove_item` — mirroring what WE just told the server, since EQEmu sends no echo
+///    for a self-initiated move.
+///
+/// Driver 2 does NOT have a single cadence, and the difference is agent-visible. Its five
+/// production call sites SPLIT across the 150 ms nav-planner gate inside `tick`
+/// (`if self.last_tick.elapsed().as_millis() < NAV_TICK_MS { return; }`), so WHICH command was
+/// drained decides how soon GET /v1/observe/inventory reflects it (#1044 review round 1, finding
+/// A — the first rewrite of this doc claimed the fast half for all five):
+///
+/// * **Ahead of the gate — republished on the same ~10 ms outer-loop pass that drained the
+///   command.** `drain_move_item` (POST /v1/inventory/move) and `drain_mem_spell`'s scribe path
+///   (the scroll's slot→cursor move, plus the mirror of the cursor deletion the server performs
+///   without telling us).
+/// * **BEHIND the gate — both give/turn-in mirrors.** They run from `ActionLoop::tick_give`,
+///   whose only call site sits *below* that early return, deliberately: the give state machine
+///   counts its ack/finish timeouts in nav ticks, so it must be paced by them. `begin_give`'s
+///   slot→cursor mirror (its only caller is `tick_give`) therefore lands up to one ~150 ms nav
+///   tick after POST /v1/interact/give is queued. `tick_give`'s own cursor→trade-slot mirror
+///   lands later still: it is additionally guarded by `gs.trade_ack_ready`, i.e. by the server's
+///   OP_TradeRequestAck, so its bound is a SERVER ROUND-TRIP plus a nav tick — not a tick at all.
+///   An agent that POSTs a give and immediately polls this slot must not read an unchanged
+///   inventory as "the give did not happen".
 ///
 /// Both drivers are event-driven; a pass with no drained packet and no pending local command
 /// publishes nothing.
@@ -1775,8 +1816,12 @@ pub struct MessageEntry {
 /// NOT on a clock (#1044, same class as #1023): published by `ActionLoop::sync_messages`, called
 /// once per packet `run_gameplay_phase`'s inbound drain has drained AND applied via
 /// `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — a cadence driven by server traffic,
-/// not the 150 ms nav clock; the interval is unbounded in a silent zone. `sync_messages` is also
-/// the sole publisher of [`DialogueShared`] and [`ChatEventsShared`] — same call, same gate.
+/// not the 150 ms nav clock; the interval is unbounded in a silent zone. `sync_messages` also
+/// publishes [`DialogueShared`] and [`ChatEventsShared`] in the SAME call, on this same cadence.
+/// It is the sole production writer of [`ChatEventsShared`] and of this slot — but NOT of
+/// [`DialogueShared`], which `run_zone_entry_handshake` clears directly on a re-zone. See that
+/// type's own doc, which names the second writer (#1044 review round 1, finding B: the earlier
+/// wording said "sole publisher" of all three and contradicted the doc nine lines below it).
 pub type MessagesShared = Arc<Mutex<Vec<MessageEntry>>>;
 
 /// Live snapshot of the current clickable NPC-dialogue choices (saylinks from the most recent NPC
