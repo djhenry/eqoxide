@@ -102,7 +102,7 @@ pub const OP_LOG_SERVER: u16 = 0x7ceb;        // RoF2: OP_LogServer
 pub const OP_MOTD: u16 = 0x0c22;              // RoF2: OP_MOTD
 pub const OP_SEND_CHAR_INFO: u16 = 0x00d2;    // RoF2: OP_SendCharInfo
 pub const OP_APPROVE_NAME: u16 = 0x56a2;      // RoF2: OP_ApproveName; C->S NameApproval_Struct (72B); S->C 1 byte (1=ok,0=reject)
-pub const OP_CHARACTER_CREATE: u16 = 0x6bbf;  // RoF2: OP_CharacterCreate; C->S CharCreate_Struct (wire = 80B)
+pub const OP_CHARACTER_CREATE: u16 = 0x6bbf;  // RoF2: OP_CharacterCreate; C->S CharCreate_Struct (wire = 96B, 24 x u32 — see build_char_create in eqoxide-net/src/login.rs; 80B is the Titanium layout, which RoF2 rejects on size)
 pub const OP_ENTER_WORLD: u16 = 0x578f;       // RoF2: OP_EnterWorld
 pub const OP_POST_ENTER_WORLD: u16 = 0x6259;  // RoF2: OP_PostEnterWorld
 pub const OP_ZONE_SERVER_INFO: u16 = 0x4c44;  // RoF2: OP_ZoneServerInfo

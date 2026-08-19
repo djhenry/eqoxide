@@ -310,9 +310,12 @@ Beastlord→WIS, Berserker→STA. Appearance defaults all 0, gender male.
 ## Section 4 — Wire formats
 
 ⚠ **Opcode values below are RoF2**, from `utils/patches/patch_RoF2.conf` — `OP_SendCharInfo` `:20`,
-`OP_CharacterCreate` `:36`, `OP_DeleteCharacter` `:37`, `OP_ApproveName` `:39` — and they match what
-eqoxide actually sends (`crates/eqoxide-protocol/src/protocol/mod.rs:103–105`). Earlier revisions of
-this section gave the **Titanium** values for all four (`0x4513`/`0x10b2`/`0x26c9`/`0x3ea6`,
+`OP_CharacterCreate` `:36`, `OP_DeleteCharacter` `:37`, `OP_ApproveName` `:39`. Three of the four
+match a constant eqoxide already defines: `OP_SEND_CHAR_INFO`, `OP_APPROVE_NAME` and
+`OP_CHARACTER_CREATE` at `crates/eqoxide-protocol/src/protocol/mod.rs:103–105`. **`OP_DeleteCharacter`
+has no constant in the Rust sources at all** — it is unimplemented work (Section 2, item 6), so its
+value here is cited to the patch file only and has never been exercised against a server. Earlier
+revisions of this section gave the **Titanium** values for all four (`0x4513`/`0x10b2`/`0x26c9`/`0x3ea6`,
 `patch_Titanium.conf:22`/`:24`/`:21`/`:27`) in a document that targets RoF2; every opcode literal in
 this spec now says which client it belongs to.
 - **`OP_ApproveName` (RoF2 `0x56a2`), 72B, C→S.** ⚠ Layout discrepancy to resolve at implementation: the
