@@ -533,9 +533,9 @@ pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
 /// reaches `request_cancel_goto` from FOUR sites, and a chase dies the same way at every one of
 /// them — the per-frame WASD branch, the per-frame `/v1/move/manual` branch, the key-DOWN handler
 /// for W/A/S/D/Q/E, and the key-DOWN handler for R/F9. That last one is the surprising member: it
-/// is the CAMERA reset-to-follow and moves the character nowhere, so recentring the camera ends a
-/// live follow. All four are named rather than summarised as the movement paths, because that
-/// summary is the same undercount shape [`ControllerShared`] records below.
+/// is the CAMERA reset-to-follow and moves the character nowhere. All four are named rather than
+/// summarised as the movement paths, because that summary is the same undercount shape
+/// [`ControllerShared`] records below.
 pub type GotoEntity = Arc<Mutex<Option<String>>>;
 
 /// Authoritative controller snapshot: once the camera has initialised, the render thread
