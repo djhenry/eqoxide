@@ -8,7 +8,12 @@
 #   2. a NEGATED CLOSING KEYWORD — "does not close" and friends immediately before an issue number,
 #      which GitHub links and closes anyway because it does not read the negation (eqoxide#1041).
 #
-# Both passes always run and both classify every item; the exit code is the union.
+# Both passes always run and both classify every item. The exit code is NOT their plain union: the
+# local-detail pass gates on any finding, while the negated-close pass gates only on the surfaces
+# GitHub actually links from (a pull request's body, a commit message). A finding on a title, a
+# comment or an issue body is reported, counted and printed as a WARNING and does not change the
+# exit code, because it cannot close anything from where it sits. See negclose_surface_gates, where
+# the policy and the measurements behind it live.
 #
 # WHY THIS EXISTS (eqoxide#980). `check-no-local-detail.sh` scans TRACKED FILES ONLY. PR bodies,
 # issue bodies and comments are public artifacts of this public repo that it structurally cannot
@@ -27,8 +32,14 @@
 #           scripts/check-pr-text.sh --commits <rev-range>
 #           scripts/check-pr-text.sh --self-test
 #
-#   exit 0 = every item in the corpus was classified and none matched
-#   exit 1 = a pattern matched, or the corpus could not be established (see REACH below)
+#   exit 0 = every item in the corpus was classified, and nothing matched that this run GATES on:
+#            no local-detail pattern anywhere, and no negated closing keyword on a surface GitHub
+#            links from. It does NOT mean nothing matched — a negated closing keyword on a title, a
+#            comment or an issue body warns and still exits 0. READ THE SUMMARY LINE, not the exit
+#            code: it prints `flagged N (M on a surface that can actually close)`, and the final
+#            line says CLEAN or NOT CLEAN accordingly.
+#   exit 1 = a local-detail pattern matched, or a negated closing keyword matched on a linking
+#            surface, or the corpus could not be established (see REACH below)
 #
 # REACH — what this run did and did not look at. Read this before quoting a green result.
 #   COVERED: the CURRENT text of, for one number: the title, the body, every issue-style comment,
@@ -156,10 +167,20 @@ EOF
 # issue is OUT of scope is the sentence that marks it resolved.
 #
 # HOW MANY TIMES THIS HAS HAPPENED HERE IS A LOWER BOUND, NOT A COUNT. As of 2026-08-19: AT LEAST
-# NINE confirmed false closes, across two surfaces and seven work threads, the longest standing 49
-# days; all nine are now reopened and enumerated in eqoxide#1041. Three of them (issues 41, 378 and
-# 871) were invisible to the sweep that first reported "six", and 871 exposed the colon variant of
-# the defect. The floor moves for two reasons that no sweep can remove:
+# TEN confirmed false closes, across two surfaces and eight work threads, the longest standing 49
+# days (issue 41); all ten are open again and enumerated in eqoxide#1041. Three of them (issues 41,
+# 378 and 871) were invisible to the sweep that first reported "six", and 871 exposed the colon
+# variant of the defect.
+#
+# ONE OF THE TEN WAS CAUGHT BY A HUMAN, IN 1h 40m, and it is worth more than the other nine put
+# together. Issue 194 was false-closed by PR 752's body and someone noticed the same evening. It was
+# then left out of two successive counts as "the one that got noticed" — which is not an instance
+# criterion, and on a check whose whole thesis is that these go unnoticed it inverts the meaning of
+# the number. Detection latency does not decide membership. If a sentence closed an issue it did not
+# mean to close, it is an instance, and the fast catch is evidence the class is real rather than
+# evidence that one did not count.
+#
+# The floor moves for two reasons that no sweep can remove:
 #
 #   - it reads each body as it stands TODAY, so a disclaimer later edited out leaves no trace; and
 #   - it can only match the phrasings on the cue list below, which issue 871 already proved
@@ -355,17 +376,30 @@ EOF
 # `classified N/N` an identity that can never disagree.
 
 # Which surfaces GitHub actually LINKS from. Measured in this repo, not assumed:
-#   body of a PULL REQUEST -> links (eight of the nine confirmed false closes of eqoxide#1041);
+#   body of a PULL REQUEST -> links (nine of the ten confirmed false closes of eqoxide#1041);
 #   commit message         -> links once the commit reaches the default branch (issue 314, and
 #                             issue 1022 via the squash commit 895d36c);
 #   PR title               -> does NOT link. 5/5 measured: PRs 236, 437, 461, 465 and 466 each
-#                             carry a closing keyword in the title for an issue the body never
-#                             names, and every one reports `closingIssuesReferences: []`.
-#   comments               -> do NOT link. 33/33 measured across 23 pull requests: every case
-#                             where a comment names a closing target its body never names, the
-#                             number is absent from that PR's `closingIssuesReferences`. The
-#                             sharpest instance is this script's own review thread on PR 1048,
-#                             which quotes eleven such pairs and linked exactly none of them.
+#                             carry a closing keyword in the title for a number the body never
+#                             names WITH A CLOSING KEYWORD, and every one reports
+#                             `closingIssuesReferences: []`. Note the qualifier: three of the five
+#                             (236, 465, 466) DO name the number in prose. Bare mentions are not
+#                             the control — a keyword-free mention cannot link either — so the
+#                             control is "no keyword in the body", which holds 5/5.
+#   comments               -> do NOT link, and the measurement is built to be falsifiable: a
+#                             comment can only be shown not to link where the BODY does not
+#                             already explain the link. Swept 2026-08-19 over 500 pull requests
+#                             and all 833 issue-style comments on them: 134 comment-borne
+#                             keyword+number pairs across 61 pull requests, 80 distinct
+#                             (pull request, number) references. 41 of those numbers ARE in the
+#                             parent's `closingIssuesReferences` and every one of the 41 is
+#                             explained by a closing keyword in the pull request's own BODY; the
+#                             other 39, across 26 pull requests, are not linked at all. Links
+#                             attributable to a comment: ZERO out of 80.
+#                             (An earlier revision of this file said "33/33 ... a closing target
+#                             its body never names". That sentence had the same defect as the
+#                             title one above — "names" where it meant "names with a closing
+#                             keyword" — so it was replaced rather than restated.)
 #   issue body/title       -> nothing to link FROM; an issue is not a pull request.
 #
 # THE GRAMMAR BETWEEN THE KEYWORD AND THE NUMBER was measured too, because this repository's own
@@ -405,7 +439,7 @@ negclose_surface_note() {
       echo "                A title does not link (measured 5/5 here), so issue ${num} does not"
       echo "                close from here — rewrite it anyway; titles get copied into bodies." ;;
     *)
-      echo "                A comment does not link (measured 33/33 here), so issue ${num} does"
+      echo "                A comment does not link (0 of 80 measured here), so issue ${num} does"
       echo "                not close from here — rewrite it anyway; comments get pasted into bodies." ;;
   esac
 }
@@ -755,7 +789,18 @@ run_live() {
     return "$rc"
   fi
 
-  echo "check-pr-text: OK — all ${CORPUS_TOTAL} items clean AS CURRENTLY WRITTEN, on both passes."
+  # A warn-only negclose finding does not gate, so this line is reachable with NEGCLOSE_FLAGGED > 0.
+  # It said "all N items clean ... on both passes" over a flagged item, on the honesty surface, in
+  # the one check whose entire subject is a sentence that states the opposite of what happened.
+  # Whatever it says now has to be true of BOTH passes, so it is derived from the counts.
+  if [ "${NEGCLOSE_FLAGGED:-0}" -gt 0 ]; then
+    echo "check-pr-text: NOT CLEAN, but not gating — ${CORPUS_TOTAL} items, ${NEGCLOSE_FLAGGED} with"
+    echo "a negated closing keyword, ${NEGCLOSE_GATING} of them on a surface that can actually close."
+    echo "Exit 0 here means NOT GATING, it does not mean clean. Rewrite the flagged text anyway: it"
+    echo "closes the issue the moment anyone pastes it into a pull request body."
+  else
+    echo "check-pr-text: OK — all ${CORPUS_TOTAL} items clean AS CURRENTLY WRITTEN, on both passes."
+  fi
   echo "check-pr-text: this is a DETECTOR, not a preventer. It reads the CURRENT text only, so a"
   echo "green run means 'nothing is exposed now', NOT 'nothing was ever exposed' — an earlier"
   echo "revision of any of these items may have carried detail that is still in the edit history."
@@ -980,6 +1025,8 @@ run_self_test() {
     'PR1037 body, scope line (issue 939)|939|- **deliberately NOT Closes #939** — narrowed, not closed. Both zone-entry paths now publish, so'
     'PR1037 body, scope line (issue 1010)|1010|- **deliberately NOT Closes #1010** — untouched. Separate PR.'
     'commit 10619d99 message (issue 314, closed 37 days, COMMIT surface)|314|Scope note: this is the edge-SLIP class. It does NOT fix #314 (the North Qeynos'
+    'PR752 body line 145 (issue 194, the one a HUMAN caught — in 1h 40m — and the one two
+     successive counts then dropped for exactly that reason)|194|**Deliberately does not close #194.** Two gaps stay open, and the full re-verification of all three'
     'PR653 body (issue 302 — see the NEGATIVE note below)|302|- This does not close #302 or #254. It removes one documented contributor.'
   )
   local n_red=0
@@ -1029,7 +1076,7 @@ run_self_test() {
   # reported the wrong issue would still pass a count-only assertion.
   want "the disclaimed numbers are extracted" \
     "$(printf '%s' "$NEGCLOSE_NUMBERS" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')" \
-    "35 41 302 314 378 854 871 939 982 1010 "
+    "35 41 194 302 314 378 854 871 939 982 1010 "
 
   # The gating policy as a unit, independent of any corpus: measured behaviour is that only a pull
   # request's body and a commit message create a link, so only those may decide an exit code.
@@ -1138,7 +1185,17 @@ run_self_test() {
 # Offline stand-in for `gh api`, driven by check-pr-text.sh --self-test. Recorded from
 # djhenry/eqoxide#1037. Not a general gh: it answers exactly the calls run_live makes.
 set -euo pipefail
-if [ "${STUB_MODE:-dirty}" = "clean" ]; then
+if [ "${STUB_MODE:-dirty}" = "warnonly" ]; then
+  # The case B2 was hiding in: the ONLY finding is on a surface GitHub does not link from, so the
+  # run does not gate and reaches the final summary line with a flagged item in hand.
+  BODY='- Closes #1022
+- #939 stays open — narrowed, not closed. Both zone-entry paths now publish.
+- #1010 is untouched. Separate PR.'
+  COMMENT='Landing this issue does not close #939; it narrows the window #939 has to fire.'
+  CMSG='fix(#1022): publish the door roster from the LOGIN handshake own drain too
+
+Scope: #939 stays open (narrowed, not closed) and #1010 is untouched.'
+elif [ "${STUB_MODE:-dirty}" = "clean" ]; then
   BODY='- Closes #1022
 - #939 stays open — narrowed, not closed. Both zone-entry paths now publish.
 - #1010 is untouched. Separate PR.'
@@ -1194,7 +1251,7 @@ GHSTUB
   want "run_live says a PR BODY will close it, twice" \
        "$(printf '%s' "$out" | grep -cE 'will CLOSE issue (939|1010) on merge' || true)" "2"
   want "run_live does NOT claim a COMMENT closes anything" \
-       "$(printf '%s' "$out" | grep -c 'A comment does not link (measured 33/33 here), so issue 939 does' || true)" "1"
+       "$(printf '%s' "$out" | grep -c 'A comment does not link (0 of 80 measured here), so issue 939 does' || true)" "1"
   want "run_live says a COMMIT closes on reaching the default branch" \
        "$(printf '%s' "$out" | grep -c 'GitHub closes issue 1010 when this commit reaches the default branch' || true)" "1"
   want "run_live prints what GitHub actually parsed" \
@@ -1216,6 +1273,28 @@ GHSTUB
        "$(printf '%s' "$out" | grep -c 'clean AS CURRENTLY WRITTEN, on both passes' || true)" "1"
   want "the rewritten text really went through the negclose pass" \
        "$(printf '%s' "$out" | grep -c 'negclose corpus = 4 items; classified 4/4; flagged 0' || true)" "1"
+
+  # -------------------------------------------------------------------------------------------
+  # The WARN-ONLY run: a finding on a surface GitHub does not link from. It does not gate, so the
+  # run exits 0 and reaches the final summary — which is exactly where this script spent a revision
+  # printing "OK — all N items clean ... on both passes" over a flagged item. Nothing in the other
+  # 60 checks could see that, because both other modes either gate or have nothing to report. The
+  # summary text is asserted directly here for that reason: the exit code was never the bug.
+  # -------------------------------------------------------------------------------------------
+  rc=0
+  out="$(PATH="${stubdir}:${PATH}" STUB_MODE=warnonly \
+         bash "${REPO_ROOT}/scripts/check-pr-text.sh" 1037 --repo owner/name 2>&1)" || rc=$?
+  want "a warn-only finding does not gate" "$rc" "0"
+  want "warn-only run flags exactly one item, on the non-linking surface" \
+       "$(printf '%s' "$out" | grep -c '^  \[negclose-warn\]' || true)" "1"
+  want "warn-only run gates on nothing" \
+       "$(printf '%s' "$out" | grep -c '^  \[NEGCLOSE\]' || true)" "0"
+  want "warn-only run counts it as flagged-but-not-gating" \
+       "$(printf '%s' "$out" | grep -c 'flagged 1 (0 on a surface that can actually close)' || true)" "1"
+  want "warn-only run does NOT call the corpus clean" \
+       "$(printf '%s' "$out" | grep -c 'clean AS CURRENTLY WRITTEN, on both passes' || true)" "0"
+  want "warn-only run says what actually happened" \
+       "$(printf '%s' "$out" | grep -c 'NOT CLEAN, but not gating' || true)" "1"
 
   # -------------------------------------------------------------------------------------------
   # --commits mode, end to end, on a throwaway repository built here. This is the surface issue 314
@@ -1260,7 +1339,7 @@ GHSTUB
 
   # Assert how many checks ran. A case that silently stops running must fail this step rather than
   # shrink the output. `checks + 1` counts this assertion itself, which has not been tallied yet.
-  want "self-test ran every check (incl. this one)" "$((checks + 1))" "60"
+  want "self-test ran every check (incl. this one)" "$((checks + 1))" "66"
 
   if [ "$fails" -ne 0 ]; then
     echo "check-pr-text --self-test: FAILED ${fails} of ${checks} checks."

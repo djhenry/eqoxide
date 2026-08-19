@@ -96,10 +96,14 @@ jobs:
   # SECOND PASS, SAME JOB (#1041): a NEGATED CLOSING KEYWORD. GitHub links
   # `close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved` to the `#<n>` after it and does
   # not read the negation in front of it — with or without a colon after the keyword — so "does not
-  # close" plus a number CLOSES that number. AT LEAST NINE issues in this repo were false-closed
-  # exactly that way (as of 2026-08-19; all nine now reopened and listed in #1041), the longest
-  # standing 49 days, and the sentence that did it is the sentence written specifically to record
-  # that the issue was OUT of scope. NINE IS A FLOOR, NOT A COUNT: three of the nine were invisible
+  # close" plus a number CLOSES that number. AT LEAST TEN issues in this repo were false-closed
+  # exactly that way (as of 2026-08-19; all ten are open again and listed in #1041), the longest
+  # standing 49 days (issue 41), and the sentence that did it is the sentence written specifically
+  # to record that the issue was OUT of scope. Exactly one of the ten (issue 194) was caught by a
+  # human, in 1h 40m — and it was then left out of two successive counts for that reason, which is
+  # not an instance criterion: detection latency does not decide membership, and on a check whose
+  # thesis is that these go unnoticed, dropping the noticed one inverts the number's meaning.
+  # TEN IS A FLOOR, NOT A COUNT: three of the ten were invisible
   # to the sweep that first reported "six", any sweep reads bodies as they stand TODAY so a
   # disclaimer later edited out leaves no trace, and it can only match the phrasings on the script's
   # cue list — which issue 871 already proved incomplete once. Treat any number this workflow or the
@@ -131,8 +135,13 @@ jobs:
   # ONLY TWO SURFACES CAN FAIL THIS JOB, and the reason is measured rather than chosen. GitHub
   # links from a PULL REQUEST's body and from a commit message; it does not link from a title (5/5
   # measured here: PRs 236, 437, 461, 465 and 466 each name a closing target in the title that the
-  # body never names, and all five report `closingIssuesReferences: []`) and it does not link from
-  # a comment (33/33 measured across 23 pull requests). So a finding on a body or a commit message
+  # body never names WITH A CLOSING KEYWORD — three of the five do name the number in prose, which
+  # is why the keyword is the load-bearing half of the control — and all five report
+  # `closingIssuesReferences: []`) and it does not link from
+  # a comment (swept over 500 PRs and all 833 issue-style comments on them: 80 distinct
+  # comment-borne references, 41 of them linked and all 41 explained by a closing keyword in the
+  # PR's own body, 39 not linked at all — zero links attributable to a comment). So a finding on a
+  # body or a commit message
   # is an `::error::` and fails the step, while a finding on a title, a comment or an issue body is
   # an `::warning::` that does not. Everything is still scanned, classified and printed, and the
   # rewrite is identical on every surface — the summary line reports both numbers, `flagged N (M on
@@ -145,8 +154,8 @@ jobs:
   # THAT BLIND SPOT BITES #1041 HARDER THAN IT BIT #980, and this job must not be read as sealing
   # the surface. A scope note — "this PR deliberately does not close X" — is most often ADDED TO THE
   # BODY DURING REVIEW, after the final push, which is exactly the edit no run here will ever see.
-  # Eight of the nine confirmed false closes were disclaimed in a PULL-REQUEST BODY — the surface
-  # this blind spot covers — and the ninth (issue 314) in a commit message alone; a body edit after
+  # Nine of the ten confirmed false closes were disclaimed in a PULL-REQUEST BODY — the surface
+  # this blind spot covers — and the tenth (issue 314) in a commit message alone; a body edit after
   # the last push is therefore the single likeliest way the next one gets through. Nothing
   # automated anywhere covers the squash-merge message typed into GitHub's merge dialog, which does
   # not exist until the merge button is pressed. Before merging, run the script by hand against the
@@ -186,9 +195,10 @@ jobs:
       # checks; hand-editing each back restores 15/15.
       #
       # The #1041 half adds to that: every positive fixture is a MEASURED instance quoted verbatim
-      # (twelve items covering nine confirmed false closes across both surfaces — including the
-      # colon variant `## Filed, not fixed: #871` and the two the first sweep's cues missed — plus
-      # the one text match whose close was legitimate), a run_live
+      # (thirteen items covering ten confirmed false closes across both surfaces — including the
+      # colon variant `## Filed, not fixed: #871`, the two the first sweep's cues missed, and the
+      # one instance a human caught inside 1h 40m and two counts then dropped for that reason —
+      # plus the one text match whose close was legitimate), a run_live
       # end-to-end pass against a stub `gh` serving recorded payloads — added because deleting the
       # new pass from run_live was MEASURED to leave the self-test at full green without it — and a
       # `--commits` pass over a throwaway repository. Verified red in both directions at this
@@ -196,9 +206,13 @@ jobs:
       # window past a sentence boundary, removing the em dash from the gap stop set, breaking the
       # attribution comparison, deleting the pass from run_live, deleting the commit fetch from the
       # corpus, and BOTH directions of the gating policy — making every surface gate (the rejected
-      # design; 4 checks red) and making no surface gate (6 red) — each turn `--self-test` RED, nine
-      # mutations for nine reds; hand-reverting each restores a full-green run, verified by
-      # sha256 against a pristine copy rather than by `git restore`. The em dash is in the gap stop set on measured
+      # design; 4 checks red), making no surface gate (6 red), and restoring the unconditional
+      # "OK — all N items clean" final line that the narrowing made false on a warn-only run (2 red)
+      # — each turn `--self-test` RED, ten mutations for ten reds; hand-reverting each restores a
+      # full-green run, verified by sha256 against a pristine copy rather than by `git restore`.
+      # That last one is why the warn-only stub mode exists: neither of the other two modes reaches
+      # the final summary line with a flagged item in hand, so 60 checks passed over a line stating
+      # the opposite of what had just happened. The em dash is in the gap stop set on measured
       # evidence too: over the full published history (4598 items, swept 2026-08-19) it takes the
       # flag count 49 -> 41, all 8 dropped items are false positives of the shape `<clause with a
       # negation> — Fixes #N`, and zero measured true instances are lost. Three of those exact
