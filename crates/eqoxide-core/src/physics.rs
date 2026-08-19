@@ -462,9 +462,11 @@ pub fn running_jump_reach(run_speed: f32) -> f32 {
     air_time * run_speed
 }
 
-/// Native Titanium fall damage for a fall of `height` EQ units. The MAGNITUDE is client-computed
-/// because the protocol gives the server no way to derive it: the server has no fall detection and
-/// reads the number straight out of the `EnvDamage2_Struct.damage` field we report (see
+/// Fall-damage magnitude to REPORT for a fall of `height` EQ units — curve UNCITED, see below.
+///
+/// The MAGNITUDE is client-computed because the protocol gives the server no way to derive it:
+/// the server has no fall detection and reads the number straight out of the
+/// `EnvDamage2_Struct.damage` field we report (see
 /// `Client::Handle_OP_EnvDamage`, zone/client_packet.cpp). What it does NOT do is merely validate
 /// that report — an earlier version of this comment said "the server only validates OP_EnvDamage",
 /// which was wrong, and that misreading is plausibly why a local subtraction looked necessary
@@ -495,11 +497,14 @@ pub fn running_jump_reach(run_speed: f32) -> f32 {
 /// one). `swimming-and-fall-damage.md` is the real document for the wire and behaviour half above,
 /// but it carries NO damage-curve content — no formula, no roll model — so it must NOT be read as
 /// supporting the constants here. Treat the numbers as unverified against a source until someone
-/// re-derives them; #1005's todo.md entry has the measurement plan.
+/// re-derives them; #1005's todo.md entry has the measurement plan. The LINEAGE is unestablished
+/// too: this doc used to call the model "Native Titanium", but nothing here sources it to any
+/// particular client, and the opcode and struct we actually send are RoF2's. Do not restore a
+/// client attribution without a citation — naming a different client would be just as unsourced.
 pub fn fall_damage(height: f32) -> (u32, u32) {
     const GRAVITY: f32 = 120.0;   // matches the renderer's fall physics
-    const TERMINAL: f32 = 128.0;  // native internal z-velocity clamp
-    const HZ: f32 = 10.0;         // native position-update rate the formula is calibrated to
+    const TERMINAL: f32 = 128.0;  // z-velocity clamp; UNCITED (see the doc note above)
+    const HZ: f32 = 10.0;         // update rate the curve is calibrated to; UNCITED (see above)
     let v = (2.0 * GRAVITY * height.max(0.0)).sqrt().min(TERMINAL);
     let score = v / HZ - 4.0;
     if score <= 0.0 { return (0, 0); }

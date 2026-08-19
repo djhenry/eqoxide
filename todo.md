@@ -236,8 +236,9 @@ files — could be removed from config/App::new in a cleanup). Loose ends:
 
 ## TODO: exhaustive fall-damage testing (controlled-fall nav)
 
-Controlled-fall navigation + native fall rate (app.rs gravity/terminal 120/128) + client-side fall
-damage (OP_EnvDamage 0x31b3, `fall_damage(height)` in navigation.rs) + a lethal-fall guard landed
+Controlled-fall navigation + fall rate (`GRAVITY`/`TERMINAL` 120/128, both in
+`crates/eqoxide-core/src/physics.rs`) + client-side fall damage (OP_EnvDamage, RoF2 `0x51fd`, via
+`fall_damage(height)` in `crates/eqoxide-core/src/physics.rs`) + a lethal-fall guard landed
 on `main` (was branch worktree-necro-combat). Verified offline (qcat dry sewer routes 56–88 wp) +
 unit tests, but NOT exhaustively live. Still to do:
 - Live-test an actual controlled-fall descent end-to-end with a character that can SURVIVE the drop
@@ -258,8 +259,15 @@ unit tests, but NOT exhaustively live. Still to do:
 - Decide whether WASD (human) ledge-falls should also send OP_EnvDamage (currently only the nav
   controlled-fall path does).
 See `swimming-and-fall-damage.md` in the private EQ knowledge-base tree for the wire and
-behaviour half. It has NO damage-curve content, so the curve bullet above is uncited and the
-measurement is the point. (The `falling-physics.md` this line used to cite never existed.)
+behaviour half. It has NO damage-curve content, so the curve is uncited and the measurement is the
+point. (The `falling-physics.md` this line used to cite never existed.)
+
+SCOPE OF THAT CITATION: it covers the wire/behaviour claims ONLY. Naming the curve as the uncited
+item previously implied the rest of this block was checked; it was not. Everything here about
+magnitudes, tuning constants and expected damage is unsourced until the measurement above is run,
+and the three referents in the opening paragraph were themselves wrong until #1005 round 5 (they
+named the Titanium opcode `0x31b3` rather than RoF2's `0x51fd`, a `navigation.rs` that does not
+exist, and constants in `app.rs` that are not there). Re-check a referent here before citing it.
 
 ## COMPLETE: Clickable & animated doors + agent API (branch worktree-zone-portal-objects)
 
