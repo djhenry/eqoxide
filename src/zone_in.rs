@@ -2243,6 +2243,10 @@ mod tests {
     // tidy-up. What a byte-offset scan measures is where characters sit, not when a write executes.
     // The ordering is now a type fact instead — `CameraState::snapshot` takes the
     // `eqoxide_renderer::DrawnFrame` that only `render_frame` returns, so a pre-draw publisher has
-    // no argument to pass and does not compile. See #799 for the pattern, and `DrawnFrame`'s own
-    // `compile_fail` doctest for the proof that it cannot be fabricated.
+    // no argument to pass and does not compile in a non-test build — cargo unifies features across
+    // a crate's lib and test targets, so `cargo test` also turns on the dev-only `for_test`
+    // constructor (documented on `eqoxide_renderer::AcquiredFrame::for_test`). See #799 for the
+    // pattern. `DrawnFrame`'s `compile_fail` doctest pins only that its field stays private, not
+    // that no public constructor can exist — a struct literal cannot see a constructor, so adding
+    // one leaves the doctest green (#895 review, measured; see #1008).
 }
