@@ -477,15 +477,38 @@ something.
   no maximum at all, so `hp_max` is seeded equal to it and `hp_pct` then reads `100` for a character
   that zoned in wounded. Expect `hp_verified: false` from zone-in until the first `OP_HPUpdate`.
 
-It governs **`target_hp_pct`** as well whenever you are self-targeted (F1), because that field then
-resolves from the same `hp_pct`.
+It governs **`target_hp_pct`** as well whenever you are self-targeted (F1) — but not for the reason
+this page used to give. `target_hp_pct` does **not** resolve from `hp_pct` on read. For an ordinary
+mob target the published figure follows that entity's own health. For the F1 self-target there is no
+entity to follow — your own character is not in the entity list — so what you get is a stored
+snapshot the client re-seeds at a few specific moments: when you select a target, when you clear it,
+and on each HP write for whichever spawn you currently have targeted. The estimate reaches it
+because the estimate path is one of those moments.
+
+**Known gap — eqoxide#1033 (open).** The two writers that set your own HP *raw* rather than through
+that path — the `OP_Death` zeroing and the `OP_PlayerProfile` seed — do not re-seed the snapshot. So
+a self-targeted character that dies can publish `hp: 0`, `hp_pct: 0`, `dead: true` beside a stale
+`target_hp_pct: 100` in one payload. `hp_verified` reads `false` in both of those states, so nothing
+here is server truth being faked — but the two figures do contradict each other inside a single
+response. Until #1033 is fixed: for **your own** health read `hp` / `hp_pct`, not `target_hp_pct`,
+even when self-targeted.
 
 The flag is deliberately **conservative**: it under-claims rather than over-claims. `false` does not
 mean the number is wrong, only that the client cannot vouch for it. The outcome #1005 rules out is
 the other direction — a `200` carrying a client-derived figure that reads as server truth.
 
 **How to use it.** If a decision turns on an exact HP figure and `hp_verified` is `false`, wait for
-the next `OP_HPUpdate` to reconcile — the flag flips to `true` the moment one lands.
+the next `OP_HPUpdate` to reconcile — the flag flips to `true` the moment one lands *and is
+recognised as yours*.
+
+That qualifier is not pedantry, and the wait is **not bounded**. Recognising an update as yours is a
+comparison against your own spawn id, and eqoxide#1006 — open, and explicitly an unverified reading
+of the source rather than a measurement — records a way that comparison could silently never match.
+If it turns out to be real for your character, no amount of waiting flips the flag: the client would
+go on publishing its last known figure with `hp_verified: false` for the life of that spawn, with no
+error and no log line to distinguish it from "your HP simply has not changed". So treat "the next
+update flips it" as the expected case, not a guarantee. If your HP has demonstrably moved and the
+flag has not flipped, stop waiting: treat the figure as unverifiable rather than blocking on it.
 
 **What `true` does and does not promise.** It means the vitals match the last self `OP_HPUpdate` —
 not that one arrived recently. Self-HP is **change-gated** at the server: it queues an update only

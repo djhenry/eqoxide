@@ -666,10 +666,19 @@ position + a very generous zone-point range). VERIFIED live: qcat<->qeynos both 
 (OP_ZONE_CHANGE success=1, "transition complete"). /v1/navigate/zone_cross {"zone_id":N} now travels to zone N
 for any zone reachable from the current one (qeynos reaches zone_ids 2,45).
 So the 4 play goals: win ✅, level ✅ (hands-free), travel ✅. Remaining: BUY (merchant endpoint).
-NOTE: the auto-walk-into-a-zone-line detection (proximity in `action_loop.rs`) still uses the client's
-zone_points which are ARRIVAL coords, not trigger coords, so it rarely fires; API /v1/navigate/zone_cross is the
-working travel path. Proper walk-in detection would need trigger coords (not sent by the server;
+NOTE (written 2026-06-20 — SUPERSEDED, see the UPDATE below; do not read it as current behaviour):
+the auto-walk-into-a-zone-line detection then keyed off the client's zone_points, which are ARRIVAL
+coords rather than trigger coords, so it rarely fired; API /v1/navigate/zone_cross was the working
+travel path. Proper walk-in detection would need trigger coords (not sent by the server;
 OP_SendZonepoints carries arrival coords) or zone-line geometry parsing.
+
+UPDATE: the geometry route is the one that landed, so the caveat above no longer describes the code
+and the word "proximity" in it points at nothing. `ActionLoop::tick` auto-crosses off the zone's
+baked WLD zone-line regions (#174), probed capsule-span rather than feet-only (#266); the probe is
+`zone_line_at_standing` — "is the character standing inside a zone-line region", not "is the
+character within N units of a zone_point". The last distance threshold left anywhere on this path
+(the 15u one in the /v1/navigate/zone_cross request arm, which chose between "already on the line"
+and "walk to it") was deleted by #725. There is no proximity band in `action_loop.rs` for this now.
 
 ## ✅ ALL 4 PLAY GOALS ACHIEVED (2026-06-20)
 1. CREATE ✅ non-GM Female Wood Elf Ranger "Claude" (account claude/REDACTED), model verified.

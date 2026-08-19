@@ -1997,8 +1997,20 @@ impl GameState {
     /// trust the client has not verified against server truth. Same construction as
     /// [`coin_verified`](Self::coin_verified) (#361).
     ///
-    /// It governs `target_hp_pct` too whenever the player is self-targeted (F1): that field then
-    /// resolves from `self.hp_pct`, so it carries the same estimate.
+    /// It governs `target_hp_pct` too whenever the player is self-targeted (F1) — but NOT because
+    /// "that field resolves from `self.hp_pct`". An earlier version of this doc said exactly that and
+    /// it is wrong. `target_hp_pct` is a STORED snapshot, never derived on read: it is refreshed by
+    /// four functions in this file and nothing else — `set_target`, `clear_target`, the tail of
+    /// `write_hp`, and `update_hp_pct`. The estimate reaches it because `update_hp_estimated` routes
+    /// through `write_hp`, whose tail re-seeds the snapshot while the updated spawn is the current
+    /// target. Writers that assign `cur_hp`/`hp_pct` RAW instead of calling `write_hp` — the
+    /// `OP_Death` zeroing and the PlayerProfile seed — bypass all four and leave it stale (#1033).
+    ///
+    /// (The HTTP layer publishes a field of the same name that is NOT this one: it prefers the live
+    /// `world.entities` entry for the targeted id and falls back to this snapshot. For the F1
+    /// self-target the two coincide, because the player's own spawn is kept out of `world.entities`
+    /// — the spawn handler returns before inserting once it recognises the self-spawn — so the
+    /// fallback is what is published.)
     ///
     /// Deliberately CONSERVATIVE in the safe direction: it reads false during the window between a
     /// PlayerProfile seed and the first `OP_HPUpdate`, because the profile carries no max and the
@@ -2755,9 +2767,18 @@ pub(crate) mod tests {
         assert_eq!(gs.cur_hp, 214, "and the server's figure replaces the estimate");
     }
 
-    /// #1005 — reach control for the player branch: an HP update for SOMETHING ELSE must not
-    /// confirm the player's own HP. Without this, any mob's OP_HPUpdate during a fight would clear
-    /// the estimate debt and re-publish the client's inference as server truth.
+    /// #1005 — reach control for the player branch: an HP update carrying a spawn id that is NOT
+    /// the player's must not confirm the player's own HP. The discrimination lives in `write_hp`
+    /// (`spawn_id == self.player_id`) and nowhere upstream of it — the `OP_HPUpdate` handler passes
+    /// on whatever id the payload carries without filtering — so without that test the first
+    /// non-self `update_hp` the client processed would clear the estimate debt and re-publish the
+    /// client's inference as server truth.
+    ///
+    /// Deliberately stated as an ENTITY RELATIONSHIP — an update about a spawn that is not us — and
+    /// NOT as a claim about which spawns the server will send this client a full `OP_HPUpdate` for.
+    /// That wire question is open and is being settled elsewhere (#1050); this control holds either
+    /// way, because it turns only on the id not being ours. The fixture below uses a non-player id
+    /// for that reason and for no other.
     #[test]
     fn another_spawns_hp_update_does_not_confirm_the_players_own_hp_1005() {
         let mut gs = GameState::new();
@@ -2767,16 +2788,25 @@ pub(crate) mod tests {
         assert!(!gs.hp_verified(), "precondition: the player's HP is an estimate");
 
         gs.world.entities.insert(99, make_entity(99, "a rat", 0.0, 0.0, 0.0, true));
-        gs.update_hp(99, 50, 100); // a mob we are fighting
+        gs.update_hp(99, 50, 100); // some spawn that is not us
         assert!(!gs.hp_verified(),
-            "a mob's HP update says nothing about OUR HP — it must not clear the estimate debt");
+            "an HP update about another spawn says nothing about OUR HP — it must not clear the \
+             estimate debt");
         assert_eq!(gs.cur_hp, 107, "and it must not touch our HP either (control)");
     }
 
     /// #1005 — every observable derived from `cur_hp` must be covered, not just `hp` itself. With
-    /// the player self-targeted (F1) `target_hp_pct` resolves from `self.hp_pct`, so it carries the
-    /// same estimate; it must track it rather than sit stale beside a moved `hp_pct` (two different
-    /// answers to "how much health do I have" in one payload), and `hp_verified` must govern it.
+    /// the player self-targeted (F1), `target_hp_pct` carries the same estimate — not because it
+    /// resolves from `self.hp_pct` on read (it does not; it is a stored snapshot) but because
+    /// `update_hp_estimated` routes through `write_hp`, whose tail re-seeds that snapshot for
+    /// whichever spawn is currently targeted. It must track the estimate rather than sit stale
+    /// beside a moved `hp_pct` (two different answers to "how much health do I have" in one
+    /// payload), and `hp_verified` must govern it.
+    ///
+    /// REACH LIMIT, stated so a pass here is not read as broader than it is: this drives the SETTER
+    /// path only. The two raw self-HP writers — the `OP_Death` zeroing and the PlayerProfile seed —
+    /// never call `write_hp`, so they lie outside this test and can still leave the snapshot stale.
+    /// That gap is #1033: filed, deliberately not fixed here.
     #[test]
     fn self_target_hp_pct_follows_the_estimate_and_is_governed_by_hp_verified_1005() {
         let mut gs = GameState::new();

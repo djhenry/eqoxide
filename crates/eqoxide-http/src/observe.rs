@@ -1427,8 +1427,12 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // `true` ONLY straight after a self OP_HPUpdate — the only server message carrying both
         // current and maximum HP. The OP_Death zeroing, the bind-respawn full-HP assumption and the
         // PlayerProfile seed all leave it false; see `PlayerState::hp_verified` for why each one
-        // counts. It governs `target_hp_pct` too while the player is self-targeted, since that field
-        // then resolves from the same `hp_pct`.
+        // counts. It governs `target_hp_pct` too while the player is self-targeted — though not by
+        // "resolving from the same `hp_pct`", which is what this comment used to claim and is wrong.
+        // `target_hp_pct` is a stored snapshot with four refreshers in `GameState` (`set_target`,
+        // `clear_target`, the tail of `write_hp`, `update_hp_pct`); the estimate reaches it through
+        // `write_hp`, and the raw self-HP writers bypass all four and leave it stale. See
+        // `GameState::hp_verified` for the mechanism and #1033 for the gap that remains.
         //
         // ALWAYS PRESENT, never omitted — an absent key cannot be told from "this client is too old
         // to know", which is the same contract as `levitating` above and `afloat_stall` below. This
