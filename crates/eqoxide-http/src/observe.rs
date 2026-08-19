@@ -2028,12 +2028,12 @@ struct EntitiesQuery {
 /// #471 (agent-honesty): live play saw the roster report ~2× duplicate spawns — byte-identical
 /// name+position with consecutive server spawn_ids (e.g. 526/527), including unique named NPCs that
 /// exist once per server, which also leaked into chat as doubled zone-in greetings. The client
-/// cannot manufacture a second spawn_id (`register_spawn` upserts `gs.world.entities` by the verbatim
-/// server id, `packet_handler.rs`), it clears the roster on every zone-in, and
-/// the name→pos publishers full-replace their maps — so two distinct ids at one position can only
-/// be two genuine server `Mob`s (duplicated `spawn2`
-/// content, whose names the wire disambiguates with a numeric suffix). A packet capture is still
-/// needed to confirm two distinct spawn_ids on the wire vs. a client artifact.
+/// cannot manufacture a second spawn_id (`register_spawn` upserts `gs.world.entities` by the
+/// verbatim server id, `packet_handler.rs`), it clears the roster on every zone-in, and the
+/// name→pos publishers full-replace their maps — so two distinct ids at one position can only be
+/// two genuine server `Mob`s (duplicated `spawn2` content, whose names the wire disambiguates with
+/// a numeric suffix). A packet capture is still needed to confirm two distinct spawn_ids on the
+/// wire vs. a client artifact.
 ///
 /// Two response shapes, so the dedup fixes the doubling for EVERY existing consumer with ZERO shape
 /// change:

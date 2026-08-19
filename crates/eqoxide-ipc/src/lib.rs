@@ -1340,11 +1340,10 @@ pub type EntityPoses = Arc<Mutex<Roster<EntityPoseView>>>;
 
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /v1/observe/zone_points.
 ///
-/// Published by `ActionLoop::sync_zone_points` (server adverts + the client-synthesized `"to "`
-/// label entries), and EMPTIED by `gameplay::run_zone_entry_handshake` on a re-zone
-/// (#1010) — without the clear this list describes the DEPARTED zone for the whole
-/// handshake. The handshake's clear is why the post-handshake resync must go through
-/// `ActionLoop::sync_zone_points_after_zone_in` rather than `sync_zone_points` directly.
+/// EMPTIED by `gameplay::run_zone_entry_handshake` on a re-zone (#1010) — without the clear this
+/// list describes the DEPARTED zone for the whole handshake. The handshake's clear is why the
+/// post-handshake resync must go through `ActionLoop::sync_zone_points_after_zone_in` rather than
+/// `sync_zone_points` directly.
 pub type ZonePoints = Arc<Mutex<Vec<eqoxide_core::game_state::ZonePoint>>>;
 /// Outcome of the most recent attempt to load the current zone's map `.txt` pack for the
 /// client-synthesized `"to "`-label fallback entries `ActionLoop::sync_zone_points` merges into
@@ -2507,8 +2506,8 @@ pub struct WorldSlots {
     // this seals the CONTAINER.
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
-    /// name → pose/gait (#643). Same keys as `entity_positions`; published by the same
-    /// `sync_entities` full-replace so it can never go stale independently of the roster.
+    /// name → pose/gait (#643). Same keys as `entity_positions`; published in the same
+    /// full-replace so it can never go stale independently of the roster.
     entity_poses:     EntityPoses,
     pub zone_points:      ZonePoints,
     /// #816 — see [`ZoneMapLoadShared`].

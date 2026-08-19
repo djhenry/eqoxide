@@ -4722,10 +4722,8 @@ mod tests {
 
     /// Build a minimal ActionLoop for unit tests that only exercise a single `sync_*`/tick method —
     /// every other shared slot gets an empty/default placeholder.
-    /// #643: `sync_entities` is the ONLY publisher of the agent-facing world tables, so if it does
-    /// not carry pose/gait, `/v1/observe/entities?labeled=1` can only ever report nothing. This
-    /// pins the publisher half of the net→HTTP path (the HTTP half is pinned by the app crate's
-    /// `tests/entity_pose_643.rs`). It also pins the SIGN of the gait field: `animation` is
+    /// #643: This pins the publisher half of the net→HTTP path (the HTTP half is pinned by the app
+    /// crate's `tests/entity_pose_643.rs`). It also pins the SIGN of the gait field: `animation` is
     /// `signed animation:10` on the wire, so a mob backing up carries a negative gait — reporting
     /// the raw unsigned bits would turn -12 into a confident, wrong 1012.
     #[test]

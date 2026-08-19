@@ -288,8 +288,8 @@ async fn entities_labeled_body_reports_pose_and_gait_separately_643() {
 
     let state = empty_state();
     // Publish through the REAL production roster publisher (`WorldSlots::publish_entities`, the
-    // single writer) rather than hand-seeding the
-    // maps — so this test exercises the same projection the live client does.
+    // single writer) rather than hand-seeding the maps — so this test exercises the same
+    // projection the live client does.
     world_slots(&state).publish_entities(&gs.world.entities);
 
     let body = observe_json(state, "/entities?labeled=1").await;
