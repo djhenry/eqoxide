@@ -2353,8 +2353,10 @@ async fn get_doors(State(s): State<HttpState>) -> Response {
 /// this list are never affected — this only ever narrows the additive fallback.
 ///
 /// **`[]` here carries the same ambiguity `/v1/observe/doors` does, and for the same reason
-/// (#1073).** Both zone-entry paths clear `zone_points` (#1010/#1063) so that this list stops
-/// describing the zone the character just LEFT; the records refill from `OP_SendZonepoints` on no
+/// (#1073).** The zone-entry handshake clears `zone_points` (#1010/#1063) so that this list stops
+/// describing the zone the character just LEFT. A session's FIRST zone-in reaches the same empty by
+/// a different route: the roster starts empty, so there is nothing to clear and the same ambiguity
+/// holds without any clear having run. Either way the records refill from `OP_SendZonepoints` on no
 /// schedule this client controls. During that window an `[]` is the same bytes as the true answer
 /// "this zone has no entrances". `zone_map_load` does not cover this — it reports the outcome of the
 /// additive map-label `.txt` load and nothing else, so it says nothing at all about whether the
@@ -6750,12 +6752,14 @@ mod server_pushed_roster_completeness_939_1073 {
         }
     }
 
-    /// **#939, the heart of it.** With every roster empty — the state a zone-in produces, since both
-    /// zone-entry paths clear all three (#891 for doors, #1010/#1063 for the entity roster and
-    /// `zone_points`) — the disclosure must still be published, and it must say UNKNOWN rather than
-    /// hardening into a verdict. `complete: null` PRESENT is the whole point: a missing key and an
-    /// explicit null both read as `Value::Null` through a bare `assert_eq!`, so presence is asserted
-    /// separately (same discipline as `zone_map_load`, #647 review F3).
+    /// **#939, the heart of it.** With every roster empty — the state a zone-in produces, since the
+    /// zone-entry handshake clears all three (#891 for doors, #1010/#1063 for the entity roster and
+    /// `zone_points`), and a session's FIRST zone-in reaches the same empty by a different route:
+    /// those rosters start empty, so there is nothing to clear and the same ambiguity holds without
+    /// any clear having run — the disclosure must still be published, and it must say UNKNOWN
+    /// rather than hardening into a verdict. `complete: null` PRESENT is the whole point: a missing
+    /// key and an explicit null both read as `Value::Null` through a bare `assert_eq!`, so presence
+    /// is asserted separately (same discipline as `zone_map_load`, #647 review F3).
     #[tokio::test]
     async fn an_empty_roster_is_disclosed_as_unknown_never_as_complete_939() {
         let s = empty_state();
