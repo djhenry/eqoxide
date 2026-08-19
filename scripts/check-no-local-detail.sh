@@ -31,10 +31,11 @@
 # quoting a run of it; a clean run there means "no hostname-SHAPED bare token survived five
 # filters", which is again narrower than "no host name is present".
 #
-# So the honest statement of what a green `no-local-detail` run means is: no known REGEX shape
-# matched, and separately, a warning-level heuristic with a stated and narrow reach found nothing it
-# can see. When a class IS coverable by shape, fix both halves at once — scrub the instance and add
-# the pattern.
+# So the honest statement of what a green `no-local-detail` run means is narrower than it looks: no
+# known REGEX shape matched. It says NOTHING about the heuristic, which since #1056 runs in its own
+# CI job (`host-shape`) rather than as two more steps of this one — read that job, and the tool's
+# own header, for what it saw and what it structurally cannot see. When a class IS coverable by
+# shape, fix both halves at once — scrub the instance and add the pattern.
 #
 # Run locally with:  scripts/check-no-local-detail.sh
 # Exit 0 = clean, exit 1 = a forbidden pattern was found (prints file:line).
