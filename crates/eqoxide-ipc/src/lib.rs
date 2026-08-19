@@ -78,8 +78,21 @@ pub struct MoveIntent {
     pub hop:         bool,
 }
 
-/// A read-only snapshot of the controller the render thread publishes each frame for the nav
-/// thread to stream to the server (design §2 "Threading"). `heading` is EQ-CCW degrees.
+/// A snapshot of the controller the render thread republishes for the nav thread to stream to the
+/// server (design §2 "Threading"). `heading` is EQ-CCW degrees.
+///
+/// NOT "each frame", and [`ControllerShared`] states the terms this doc has to agree with (#1044
+/// review round 3, N1 — the two blocks disagreed): the republish runs on every RENDERED frame, and
+/// only once the camera has initialised. `about_to_wait`'s idle branch requests no redraw, so a
+/// still scene renders nothing at all; and `src/app.rs` gates the whole publish on
+/// `camera_initialized`, which is set once at camera init and never cleared, so nothing is
+/// published here before then.
+///
+/// That cadence describes how the render thread refreshes `pos`/`heading`/`initialized`, which it
+/// alone writes. It does NOT mean the render thread is the only writer of the published copy: two
+/// net-thread writers also mutate it, off the frame cadence entirely. Both are named on
+/// [`ControllerShared`] — read that before treating a value read from this struct as render-thread
+/// output (#1044 review round 1, finding D).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ControllerView {
     pub pos:     [f32; 3],
@@ -463,22 +476,105 @@ pub type FriendsListShared = Arc<Mutex<Vec<String>>>;
 /// the server sends back) — mirrors [`WhoReq`]. (#301)
 pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_state::WhoEntry>>>>>;
 
-/// Target position for the navigation system. Set by /goto, cleared on arrival.
+/// Target position for the navigation system: the coordinate the nav walker is steering to, `None`
+/// when it has no goal. `/goto` sets it — `CommandState::request_goto`
+/// (`crates/eqoxide-command/src/nav.rs`) — and the walker clears it on ARRIVAL: the
+/// `ArrivalAction::Arrived` arm of `Walker::drive_walk` (`crates/eqoxide-nav/src/walker.rs`) clears
+/// this slot as it publishes the `arrived` nav state. That arm is reachable only for a COORDINATE
+/// goal: `arrival_action` (`crates/eqoxide-nav/src/steering.rs`) returns `Arrived` from its
+/// non-`following` branch alone, and `drive_walk` passes it `following = goto_entity.is_some()`.
+///
+/// Those two are not the whole writer set — see [`GotoEntity`] for the FOLLOW case, where
+/// `Walker::drive_chase` republishes this slot from the chased entity's current position, and where
+/// `CommandState::request_cancel_goto` clears THIS slot while deliberately leaving that one set.
 pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
 
-/// When /goto targets a named ENTITY, this holds its `entity_positions` key so the nav walker can
-/// re-resolve the entity's CURRENT position each tick and CHASE it — roaming mobs move (and their
+/// When the nav walker is FOLLOWing a named ENTITY, this holds its `entity_positions` key so the
+/// walker can re-resolve the entity's CURRENT position and CHASE it — roaming mobs move (and their
 /// client position is stale until they come within the server's update range), so pathing to a
-/// one-time snapshot lands nowhere near them (eqoxide#88). `None` for coordinate gotos. Cleared
-/// on arrival/stop alongside `goto_target`.
+/// one-time snapshot lands nowhere near them (eqoxide#88). `None` for coordinate gotos.
+///
+/// Written by ONE production site and cleared by six. Those two counts are the compiler's, not a
+/// grep's: every access to this field in the workspace was enumerated by marking the field and
+/// reading back the use sites the build reports, and the test-only ones were separated out by
+/// comparing `cargo check --workspace` against `cargo check --workspace --all-targets`.
+///
+/// * SET only by `CommandState::request_follow` (`crates/eqoxide-command/src/nav.rs`), whose only
+///   production caller is POST /v1/move/follow. `/goto` does NOT set it — `request_goto` CLEARS
+///   it, so a coordinate goto cancels an in-flight chase.
+/// * CLEARED by `request_goto`, `request_stop`, `Walker::reset_for_zone_change`,
+///   `Walker::nav_halt_if_dead`, and `Walker::drive_chase`'s own two clears (the goal was
+///   cancelled elsewhere; the entity despawned or left view).
+///
+/// Two things this slot does NOT do, both of which earlier revisions of this doc asserted (#1044
+/// review round 3, BLOCKING 1):
+///
+/// * **Re-resolution is not guaranteed once per nav tick.** The re-resolve lives in `drive_chase`,
+///   whose only production call site is in `ActionLoop::tick`
+///   (`crates/eqoxide-net/src/action_loop.rs`) below the 150 ms nav gate — but also below
+///   `if self.drive_auto_engage_melee(stream, gs) { return; }`. Auto-melee returns `true`,
+///   skipping the remainder of that tick and `drive_chase` with it, whenever it runs with
+///   auto-attack on, `target_id` set, that target present in the entity roster, and that target
+///   within 200 units. While melee is engaging, the chase is not re-resolved at all.
+/// * **It is not cleared on arrival** — a chase has no arrival. While following,
+///   `steering::arrival_action` (`crates/eqoxide-nav/src/steering.rs`) returns `FollowHold` inside
+///   the follow distance and `Drive` outside it, never `Arrived`.
+///
+/// The first of those is agent-visible, because that same auto-melee branch also calls
+/// `CommandState::request_cancel_goto`, which clears [`GotoTarget`] and deliberately LEAVES this
+/// slot set (pinned by `request_cancel_goto_clears_only_target`). The melee path does not put the
+/// goal back. So the next `drive_chase` to run reads `goto_target` and finds it `None` — unless a
+/// fresh `/goto`, `/follow` or zone-cross resolution has issued a new goal meanwhile, each of
+/// which writes THIS slot itself — takes its "cancelled elsewhere" branch, and clears this slot as
+/// well: the follow is ABANDONED, not suspended and resumed. The cancel is at least announced
+/// (`request_cancel_goto` stamps a fresh idle goal with reason `goto_superseded`), but nothing
+/// restarts the chase, so an agent that wants to keep following through a melee engagement has to
+/// re-POST /v1/move/follow. Auto-melee is not the only route in: the render thread (`src/app.rs`)
+/// reaches `request_cancel_goto` from FOUR sites, and a chase dies the same way at every one of
+/// them — the per-frame WASD branch, the per-frame `/v1/move/manual` branch, the key-DOWN handler
+/// for W/A/S/D/Q/E, and the key-DOWN handler for R/F9. That last one is the surprising member: it
+/// is the CAMERA reset-to-follow and moves the character nowhere. All four are named rather than
+/// summarised as the movement paths, because that summary is the same undercount shape
+/// [`ControllerShared`] records below.
 pub type GotoEntity = Arc<Mutex<Option<String>>>;
 
-/// Authoritative controller snapshot published by the render thread each frame and read by the nav
-/// thread to stream OP_ClientUpdate (design §2). Single source of position truth.
+/// Authoritative controller snapshot: once the camera has initialised, the render thread
+/// republishes `pos`, `heading`, `initialized` and both [`ControllerView`] disclosures on every
+/// RENDERED frame, and the nav thread reads it to stream OP_ClientUpdate (design §2). Single source of position truth —
+/// `pos`/`heading`/`initialized` are the render thread's alone. It is NOT a whole-struct
+/// republish: `landed_fall_height` is a one-shot latch the render thread writes only into an
+/// already-empty slot, so an unconsumed fall is never clobbered (second bullet below).
+///
+/// The render thread is NOT this slot's only writer, and the rendered-frame republish above is not
+/// this slot's only cadence (#1044 review round 1, finding D — same undercount shape as
+/// #1022/#1037, found while checking whether this claim could be left alone). Two NET-thread
+/// writers also mutate the published view in production, both deliberately and both outside the
+/// frame cadence:
+///
+/// * `ControllerSlots::begin_zone_in` calls `ControllerView::invalidate_disclosures()` on it.
+///   TWO production callers reach it, not one. `run_zone_entry_handshake`
+///   (`crates/eqoxide-net/src/gameplay.rs`) on a re-zone — precisely the window in which the
+///   render loop may publish nothing at all, which is why the clear has to reach the view and not
+///   only the `GameState` fields mirrored from it (#846 review B1). And `run_login_handshake`
+///   (`crates/eqoxide-net/src/login.rs`) on a session's FIRST zone-in, where its own comment
+///   records that nothing has published into the view yet on that path, so the call is a no-op
+///   today and is written anyway to keep the two zone-in sites symmetric.
+/// * `ActionLoop::stream_position` take-and-clears `landed_fall_height` (a write, not a read) on
+///   every ~10 ms outer-loop pass once the view reads `initialized` — it returns early above that
+///   line before then — consuming the render thread's one-shot fall signal so it can fire exactly
+///   once.
+///
+/// So a consumer must not read "published by the render thread on every rendered frame" as a
+/// guarantee that every field it sees was authored by the render thread on the last frame.
 pub type ControllerShared = Arc<Mutex<ControllerView>>;
 
-/// The `/goto` planner's per-frame movement intent. The nav planner writes `Some` while walking a
-/// path and `None` when idle/arrived; the render controller consumes it when no WASD key is held.
+/// Movement intent for the render controller, which consumes it when no WASD key is held. The nav
+/// planner writes `Some` while walking a path and `None` when idle/arrived — but it is neither the
+/// only writer nor a per-FRAME one. Those writes are the NAV thread's, on its own cadence, and
+/// `ActionLoop::drive_auto_engage_melee` drives this slot from that thread too, while closing on a
+/// melee target (see [`GotoEntity`]). The render thread does write it — but only ever to clear it
+/// to `None`, on the frame WASD or `/v1/move/manual` takes steering over — both of which also
+/// call `request_cancel_goto`, which has further call sites of its own.
 pub type NavIntent = Arc<Mutex<Option<MoveIntent>>>;
 
 /// A large (>12u) server position correction the nav thread hands to the render controller to apply
@@ -1333,8 +1429,17 @@ pub struct EntityPoseView {
     pub gait: Option<i32>,
 }
 
-/// Live entity name → pose/gait map (same keys as `EntityPositions`), published each tick by the
-/// net thread and read by `GET /v1/observe/entities?labeled=1` (#643).
+/// Live entity name → pose/gait map (same keys as `EntityPositions`), read by
+/// `GET /v1/observe/entities?labeled=1` (#643). NOT on a clock (#1044, same class as #1023). Every
+/// write goes through the single `WorldSlots::publish_entities` projection, which is where its
+/// callers are documented. Among them, with the cadence each publishes on:
+///
+/// 1. `ActionLoop::sync_entities`, called once per packet `run_gameplay_phase`'s inbound drain
+///    has drained AND applied via `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — a
+///    cadence driven by server traffic, not the 150 ms nav clock; the interval is unbounded in a
+///    silent zone.
+/// 2. `login::run_login_flow`'s own one-time seed, republishing everything discovered during
+///    login once, before the gameplay loop's own drain takes over.
 pub type EntityPoses = Arc<Mutex<Roster<EntityPoseView>>>;
 
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /v1/observe/zone_points.
@@ -1463,12 +1568,26 @@ impl NetThreadDeath {
 /// reads `None` forever.
 pub type NetThreadDeadShared = Arc<Mutex<Option<NetThreadDeath>>>;
 
-/// Native Task-system quest log, published from GameState.tasks each tick (GET /v1/observe/quests/log).
+/// Native Task-system quest log, sourced from GameState.tasks (GET /v1/observe/quests/log).
+/// NOT on a clock (#1044, same class as #1023): published by `ActionLoop::sync_tasks`, called
+/// once per packet `run_gameplay_phase`'s inbound drain has drained AND applied via
+/// `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — a cadence driven by server traffic,
+/// not the 150 ms nav clock; the interval is unbounded in a silent zone. Quest progress is not
+/// zone-scoped, so unlike [`TaskOffersShared`] this slot is NOT cleared by
+/// `run_zone_entry_handshake` on a re-zone — it keeps its value across a zone line, which is the
+/// honest answer for a character-wide log.
 pub type TaskLog = Arc<Mutex<Vec<eqoxide_core::game_state::ActiveTask>>>;
 
-/// Pending offers from an open task-selector window, published each tick (GET /v1/quests/offers).
+/// Pending offers from an open task-selector window (GET /v1/quests/offers). Published by
+/// `ActionLoop::sync_tasks` alongside [`TaskLog`] and [`CompletedTasksShared`] — same cadence,
+/// see [`TaskLog`]'s doc (#1044, same class as #1023). Unlike the other two, this one IS
+/// zone-scoped (an offer names the offering NPC in the zone we are leaving):
+/// `run_zone_entry_handshake` clears it directly on a re-zone, before the gameplay drain resumes
+/// (`crates/eqoxide-net/src/gameplay.rs`, `task_offers.lock().unwrap().clear();`).
 pub type TaskOffersShared = Arc<Mutex<Vec<eqoxide_core::game_state::TaskOffer>>>;
-/// Completed-task history with titles, published each tick (GET /v1/quests/completed).
+/// Completed-task history with titles (GET /v1/quests/completed). Published by
+/// `ActionLoop::sync_tasks` alongside [`TaskLog`] and [`TaskOffersShared`] — same cadence and
+/// not-zone-scoped behaviour as [`TaskLog`]; see its doc (#1044, same class as #1023).
 pub type CompletedTasksShared = Arc<Mutex<Vec<eqoxide_core::game_state::CompletedTaskEntry>>>;
 /// Accept/decline a pending task offer, set by POST /v1/quests/accept ({"task_id":N}) or
 /// POST /v1/quests/decline (task_id=0). The nav thread reads it once and sends
@@ -1705,10 +1824,53 @@ pub type GiveReq = Arc<Mutex<Option<(u32, u32)>>>;
 pub type GiveAwaitReq = Arc<Mutex<Option<(u32, u32,
     oneshot::Sender<CommandResult<GiveOk>>)>>>;
 
-/// Live snapshot of the player's inventory + equipment, published each tick by the nav thread
-/// and read by GET /v1/observe/inventory. Slots are Titanium **wire** ids (the same numbers /give
-/// and /inventory/move take — note these are one less than the EQEmu DB `inventory.slot_id` for
-/// general slots: DB 23-30 → wire 22-29).
+/// Live snapshot of the player's inventory + equipment, read by GET /v1/observe/inventory. Slots
+/// are Titanium **wire** ids (the same numbers /give and /inventory/move take — note these are one
+/// less than the EQEmu DB `inventory.slot_id` for general slots: DB 23-30 → wire 22-29).
+///
+/// NOT on a clock (#1044, same class as #1023): published by `ActionLoop::sync_inventory` from
+/// two drivers —
+///
+/// 1. Once per packet `run_gameplay_phase`'s inbound drain has drained AND applied via
+///    `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — mirrors what the SERVER just told
+///    us.
+/// 2. Whenever a locally-applied inventory-mutating command is SERVICED inside `ActionLoop::tick`
+///    (`crates/eqoxide-net/src/action_loop.rs`) — via `ActionLoop::mirror_move_item` /
+///    `mirror_remove_item` — reflecting what WE just told the server (or, for the scribe path,
+///    what the server does in response without telling us), since EQEmu sends no echo for a
+///    self-initiated move. "Serviced", not "drained": the give state machine spans several
+///    passes, so its mirrors do not all land on the pass that drained the command (see below).
+///
+/// Driver 2 does NOT have a single cadence, and the difference is agent-visible. Its five
+/// production call sites SPLIT across the 150 ms nav-planner gate inside `tick`
+/// (`if self.last_tick.elapsed().as_millis() < NAV_TICK_MS { return; }`), so WHICH command was
+/// drained decides how soon GET /v1/observe/inventory reflects it (#1044 review round 1, finding
+/// A — the first rewrite of this doc claimed the fast half for all five):
+///
+/// * **Ahead of the gate — republished on the same ~10 ms outer-loop pass that drained the
+///   command.** `drain_move_item` (POST /v1/inventory/move) and `drain_mem_spell`'s scribe path
+///   (the scroll's slot→cursor move, plus the mirror of the cursor deletion the server performs
+///   without telling us).
+/// * **BEHIND the gate — both give/turn-in mirrors.** They run from `ActionLoop::tick_give`,
+///   whose only call site sits *below* that early return, deliberately: the give state machine
+///   counts its ack/finish timeouts in nav ticks, so it must be paced by them. `begin_give`'s
+///   slot→cursor mirror (its only caller is `tick_give`) therefore lands up to one ~150 ms nav
+///   tick after POST /v1/interact/give is queued — and only for a give from a real slot: it sits
+///   inside `if from_slot != SLOT_CURSOR`, so a give of an item ALREADY on the cursor skips THAT
+///   mirror. Only that one (#1044 review round 3, N3): such a give still publishes here at the
+///   OTHER mirror, `tick_give`'s own cursor→trade-slot move, which is guarded by
+///   `gs.trade_ack_ready` and not by `from_slot`. That mirror lands later still —
+///   `gs.trade_ack_ready` is the server's OP_TradeRequestAck, so its bound is a SERVER ROUND-TRIP
+///   plus a nav tick, not a tick at all. An agent that POSTs a give and immediately polls this
+///   slot must not read an unchanged inventory as "the give did not happen".
+///
+/// Nothing republishes this slot on its own — every publish is CAUSED by an event: a drained
+/// packet (driver 1) or a local command (driver 2). Do NOT invert that into "this pass drained no
+/// packet and held no command, so nothing published". An in-flight give DECOUPLES the two:
+/// `tick_give` consumes the command and `begin_give` mirrors on one pass, the server's
+/// OP_TradeRequestAck is drained on another, and the trade-stage mirror then fires on the next
+/// gate-open `tick_give` pass — which typically carries neither, because the outer loop sleeps
+/// ~10 ms per pass while the gate opens only every ~150 ms.
 pub type InventoryShared = Arc<Mutex<Vec<eqoxide_core::game_state::InvItem>>>;
 
 /// Loot request — a corpse spawn id, set by POST /v1/interact/loot. The nav thread reads it once and
@@ -1730,12 +1892,29 @@ pub struct MessageEntry {
     pub item_links:  Vec<eqoxide_core::game_state::ItemLink>,
 }
 
-/// Live snapshot of the in-game message log, published each tick by the nav thread and read by
-/// GET /v1/observe/messages. Exposes NPC dialogue (kind "npc") as machine-readable text + keywords.
+/// Live snapshot of the in-game message log, read by GET /v1/observe/messages. Exposes NPC
+/// dialogue (kind "npc") as machine-readable text + keywords.
+///
+/// NOT on a clock (#1044, same class as #1023): published by `ActionLoop::sync_messages`, called
+/// once per packet `run_gameplay_phase`'s inbound drain has drained AND applied via
+/// `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — a cadence driven by server traffic,
+/// not the 150 ms nav clock; the interval is unbounded in a silent zone. `sync_messages` also
+/// publishes [`DialogueShared`] and [`ChatEventsShared`] in the SAME call, on this same cadence.
+/// It is the sole production writer of [`ChatEventsShared`] and of this slot — but NOT of
+/// [`DialogueShared`], which `run_zone_entry_handshake` clears directly on a re-zone. See that
+/// type's own doc, which names the second writer (#1044 review round 1, finding B: the earlier
+/// wording said "sole publisher" of all three and contradicted [`DialogueShared`]'s own doc just
+/// below it).
 pub type MessagesShared = Arc<Mutex<Vec<MessageEntry>>>;
 
 /// Live snapshot of the current clickable NPC-dialogue choices (saylinks from the most recent NPC
-/// message), published each tick by the nav thread and read by GET /v1/observe/dialogue. (#120)
+/// message), read by GET /v1/observe/dialogue. (#120)
+///
+/// Published by `ActionLoop::sync_messages` alongside [`MessagesShared`] and [`ChatEventsShared`]
+/// — same cadence, see [`MessagesShared`]'s doc (#1044, same class as #1023). Unlike the other
+/// two, this one IS zone-scoped (a choice names the NPC in the zone we are leaving):
+/// `run_zone_entry_handshake` clears it directly on a re-zone, before the gameplay drain resumes
+/// (`crates/eqoxide-net/src/gameplay.rs`, `dialogue.lock().unwrap().clear();`).
 pub type DialogueShared = Arc<Mutex<Vec<eqoxide_core::game_state::DialogueChoice>>>;
 
 /// ── The LIFE-HALT `nav_state` vocabulary (#1000/#1007, agent-honesty) ───────────────────────────
@@ -2252,8 +2431,29 @@ pub struct Event {
     pub text:     String,
 }
 
-/// Live snapshot of async events, published each tick by the nav thread, read by the
-/// `GET /v1/events/*` endpoints. Ordered by ascending `id`.
+/// Live snapshot of async events, read by the `GET /v1/events/*` endpoints. Ordered by ascending
+/// `id`.
+///
+/// NOT on a clock (#1044, same class as #1023): published by `ActionLoop::sync_messages`
+/// alongside [`MessagesShared`] and [`DialogueShared`] — same cadence, see [`MessagesShared`]'s
+/// doc. Sourced from `GameState::push_event`'s own 200-entry ring
+/// (`crates/eqoxide-core/src/game_state.rs`), which many packet handlers and a couple of
+/// `gameplay.rs` timeout paths append to directly — `sync_messages` republishes that ring
+/// wholesale (clear + extend) into this slot, so it is the only writer of the PUBLISHED copy even
+/// though `push_event` itself has many callers upstream of it.
+///
+/// Checked for a second writer in `eqoxide-http` (flagged as a possibility in #1044): none found
+/// in production code. `eqoxide-http/src/events.rs` only ever READS this slot (`fetch`'s
+/// `s.chat.chat_events.lock().unwrap()`); the direct `.push()`s onto it in that file seed fixtures
+/// for the endpoint's own tests and are not compiled into the non-test configuration at all.
+///
+/// That last clause is the COMPILER's answer, not a brace-counting scan of the source (#1044
+/// review round 3, BLOCKING 3; the scan method is measured-defeated in this repo by #825 — a `}`
+/// inside a comment or string literal silently truncates the region it thinks it is reading). To
+/// re-run it: bind a marker at each candidate site and compare `cargo check --workspace` against
+/// `cargo check --workspace --all-targets`. A site the first configuration never reaches is
+/// test-only. Include at least one site you already know is production, or an all-negative result
+/// cannot be told apart from an instrument that never fired.
 pub type ChatEventsShared = Arc<Mutex<Vec<Event>>>;
 
 /// One queued outgoing chat message, set by POST /v1/chat/{tell,ooc,shout,group} and drained by the
@@ -2555,7 +2755,9 @@ impl WorldSlots {
     /// For the login seed this is **latent hardening, not a bug that was reachable**: on current
     /// control flow the seed runs exactly once against still-empty maps (it sits in the `Ok(..)`
     /// arm, so a failed attempt never seeds and a successful one never returns to the retry loop),
-    /// and `sync_entities` full-replaces from authoritative state on the next tick regardless.
+    /// and `sync_entities` full-replaces from authoritative state on the next DRAINED PACKET
+    /// regardless — not on the next tick: that publish is traffic-driven, not clock-driven (#1044,
+    /// see [`EntityPoses`]).
     ///
     /// The third caller (#1010) is `gameplay::run_zone_entry_handshake`, which uses exactly this
     /// full-replace property to EMPTY the roster on a re-zone: `begin_zone_in` has just
