@@ -19,7 +19,7 @@ const FIXED_KEYS: [(&str, &str); 8] = [
 const CHAT_CMDS: [(&str, &str); 7] = [
     ("/say <msg>", "Say to those nearby"),
     ("/tell <name> <msg>", "Private message a player"),
-    ("/ooc <msg>", "Out-of-character (zone-wide)"),
+    ("/ooc <msg>", "Out-of-character"),
     ("/shout <msg>", "Shout (zone-wide)"),
     ("/g <msg>", "Group chat"),
     ("/r <msg>", "Reply to the last tell"),
