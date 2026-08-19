@@ -208,11 +208,10 @@ sent[s] <= base[s] + pool                            (per stat, same lines)
 sum(sent - base) <= pool                             (INEQUALITY, `client.cpp:1986–1997`)
 ```
 
-So under RoF2 **a create with points left unspent is accepted** — there is no exact-sum test — and
-the per-stat floor/ceiling are the only hard bounds. Deity *is* validated on this path and a
-mismatch aborts the create (see the deity section below). `pool` is the same seed data the pre-spend
-section below is derived from, so the two must be read together: the pre-spend is a *point in* the
-allowed region, not the region.
+So under RoF2 **a create with points left unspent is accepted** — there is no exact-sum test. Deity
+*is* validated on this path and a mismatch aborts the create (see the deity section below). `pool`
+is the same seed data the pre-spend section below is derived from, so the two must be read
+together: the pre-spend is a *point in* the allowed region, not the region.
 
 **Titanium (`CheckCharCreateInfoTitanium`, `world/client.cpp:2002`) — must hold EXACTLY. Not this
 client.**
@@ -238,12 +237,8 @@ Bertoxxulous=201, BrellSirilis=202, CazicThule=203, ErollisiMarr=204, Bristleban
 Karana=207, MithanielMarr=208, Prexus=209, Quellious=210, RallosZek=211, RodcetNife=212,
 SolusekRo=213, TheTribunal=214, Tunare=215, Veeshan=216.
 
-> ⚠ **Do not use the constant names as UI strings — for two of them they differ.** The player-facing
-> strings live in a separate map, `deity_names` (`common/deity.h:73–92`), and it renders 202 as
-> `"Brell Serilis"` (`:77`, an *e*, against the constant's `BrellSirilis`) and 203 as `"Cazic-Thule"`
-> (`:79`, hyphenated, against the constant's `CazicThule`). An earlier revision of this list mixed
-> the two conventions — it wrote `BrellSerilis` (which is neither) and `Cazic-Thule` (the display
-> string) while spelling every other entry as a constant. Take ids from the constants and labels from
+> ⚠ **Do not use the constant names as UI strings.** The player-facing strings live in a separate
+> map, `deity_names` (`common/deity.h:73–92`). Take ids from the constants and labels from
 > `deity_names`.
 
 > ⚠ `common/deity.h` defines **two** Agnostic constants and this list carries only one.
@@ -379,7 +374,7 @@ both are load-bearing:
 All **sixteen** creatable races are covered, per gender wherever the source distinguishes them, and
 every one of the ten `IsValid*` functions is accounted for below. A `—` means the validator names no
 value at all for that race/gender. "The fourteen" below always means the sixteen creatable races
-minus Froglok and Drakkin, which is the split EQEmu's own switches use.
+minus Froglok and Drakkin.
 
 - **Face** — `IsValidFace` (`:1721–1780`): Drakkin **0–6** (`:1728–1730`); the fourteen **0–7**
   (`:1735–1763`); Froglok **0–9** (`:1768–1770`).
@@ -482,7 +477,7 @@ this spec now says which client it belongs to.
   knowledgebase/expert describes `race_id u32, gender u32, name[64]`, but the **live-verified Mordeth
   code** (`build_approve_name` in `login.rs`) uses `name[64] @0, race u32 @64, class u32 @68` and the
   server accepted it (created "Mordeth" with the correct name). **Trust the working layout** (name at
-  offset 0); only the name + race materially matter to the server. Re-verify if changing.
+  offset 0). Re-verify if changing.
 - **`OP_CharacterCreate` (RoF2 `0x6bbf`), 96B (24 LE u32), C→S.** ⚠ The 80B/20-u32 Titanium layout
   below is NOT what we send — the live `build_char_create` (`login.rs`) emits the RoF2 96-byte
   struct in order: gender, race, class, deity, **start_zone (zone_id)**, haircolor, beard,
