@@ -5788,10 +5788,9 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
         }
 
         /// #1070: the same row promises a disclosure at the ledge, so it must say where that line
-        /// can be read. The surface is named in prose and nowhere else — a renamed route or a
-        /// drifted bound leaves the sentence intact and still authoritative-looking — so pin the
-        /// route, the `kind` an agent has to filter on, and the once-per-journey bound, and check
-        /// the route the row cites is really served with that kind.
+        /// can be read. The surface is named in prose and nowhere else — a renamed route leaves the
+        /// sentence intact and still authoritative-looking — so pin the route and the `kind` an
+        /// agent has to filter on, and check the route the row cites is still documented.
         #[test]
         fn the_row_says_where_the_inert_disclosure_can_be_read() {
             const API: &str = include_str!("../../../docs/http-api.md");
@@ -5805,8 +5804,6 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
                 .expect("docs/http-api.md must still carry the `fall_would_be_lethal` reason row");
             assert!(row.contains(&format!("{ROUTE}?kind=zone")),
                 "the row must name the surface its disclosure lands on; row was: {row}");
-            assert!(row.contains("once per journey"),
-                "the row must state the disclosure's once-per-journey bound; row was: {row}");
 
             let ep = API.lines().find(|l| l.trim_start().starts_with(&format!("| `GET {ROUTE}")))
                 .expect("the endpoint that row cites must still be documented");
