@@ -193,6 +193,48 @@ jobs:
   # there, not a pass). `GH_TOKEN` gets the default read-only workflow token, which is enough for
   # every endpoint the script calls; a fork PR is fine because the script only reads.
   #
+  # THIRD PASS, SAME JOB (#1051): a SQUASH-RELATIVE REFERENCE — "the previous commit", "this
+  # branch's earlier commit message", "on the same branch". This repository sets
+  # `squash_merge_commit_message=COMMIT_MESSAGES` (read from the API on 2026-08-19), so pressing
+  # the squash button concatenates EVERY commit message on the branch into `main`'s permanent
+  # history and then deletes the branch; force-push is blocked, so nothing published that way can
+  # be corrected in place. A phrase that resolves only while the branch exists as a distinct object
+  # is true when written and false immediately after the merge: "the previous commit" starts naming
+  # whatever happens to sit behind the squash commit on `main`. FOUR instances are already
+  # permanent here and are listed in #1051; the worst, `00f33bd`'s "Two defects in the previous
+  # commit's replacement text", now sits behind an unrelated request-form-validation PR and reads as
+  # an accusation against it. THE CHECK CATCHES TWO OF THOSE FOUR by the exact sentence #1051
+  # quotes, a THIRD by a different sentence in the same commit message, and MISSES THE FOURTH
+  # (`def3249`) entirely, because that one references bare shas and nothing else — see the cue-list
+  # rationale in the script for why no sha rule ships. NO GIT HISTORY IS REQUIRED for this pass: it
+  # reads the same corpus the other two read, so the fetch-depth-1 constraint below does not apply
+  # to it, and it behaves identically in number mode and in `--commits` mode.
+  #
+  # ITS FALSE-POSITIVE RATE IS MEASURED, not assumed, because the near-identical guard proposed in
+  # #983 was abandoned at 62.7%. Corpus: 200 items / 1,336,511 bytes — the 150 most recent commit
+  # messages on `main` plus the body and full comment corpus of the 12 most recently merged pull
+  # requests (12 bodies + 38 comments), swept 2026-08-19. #1051's two TEXT cues, worded exactly as it
+  # words them, flag 6 lines: 4 true, 2 false (33% FP). Its THIRD cue is what makes the proposal
+  # unshippable — a `[0-9a-f]{7,40}` sha that is not an ancestor of `origin/main` flags 76 distinct
+  # tokens across 171 lines in 59 of the 200 items, and exactly 3 of those 76 are the references
+  # #1051's own table points at, all 3 of which still resolve (see the sha note in the script; only
+  # `b585625` is quoted there, the other two are carried by the `def3249` row it files as "same
+  # class"). Widening the text cues instead is the other trap: a bare `this branch's` plus
+  # `(on|in|from) (the same|this) branch` and `commit <n>` takes 6 flagged lines to 45 while still
+  # finding only 4 — 91% FP, worse than the 62.7% that closed #983 — and all 41 of those false
+  # positives are one shape, this project's provenance idiom ("verified on this branch merged with
+  # current `main`", "this branch's own added tests"), every one of which stays TRUE after a squash
+  # because the squash commit IS that branch. The three cues that ship flag 8 (25% FP) and find 6,
+  # two more true instances than #1051's own wording reaches; adding the code-span and fenced-block
+  # strip takes it to 7 flagged, 6 true, 1 false — 14% FP over 200 items, and the one line the strip
+  # removes across the whole corpus is exactly the self-reference case (a review comment quoting the
+  # phrase in backticks while discussing it). The residual false positive is quoted verbatim in the
+  # script so it is not met as a surprise. A fourth proposed cue, `commit <n>`, was DROPPED on the
+  # same measurement: its only corpus occurrence is "(body 15, commit 14, reviewer 22)", three
+  # figures rather than an ordinal. Every line a TEXT cue flagged was read and classified; the 171
+  # the sha rule flags were COUNTED, NOT CLASSIFIED, and the figure is stated that way on purpose —
+  # classifying them means adjudicating each citation against the premise this measurement disproves.
+  #
   # SECOND PASS, SAME JOB (#1041): a NEGATED CLOSING KEYWORD. GitHub links
   # `close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved` to the `#<n>` after it and does
   # not read the negation in front of it — with or without a colon after the keyword — so "does not
@@ -232,7 +274,15 @@ jobs:
   # default branch rather than the PR head, so comment-triggered runs would cancel each other and
   # cancel pushes. That is a workflow-structure change, not a one-line trigger addition.
   #
-  # ONLY TWO SURFACES CAN FAIL THIS JOB, and the reason is measured rather than chosen. GitHub
+  # ONLY TWO SURFACES CAN FAIL THIS JOB — a pull request's BODY and a COMMIT MESSAGE — and both
+  # of the warn-capable passes land on that same pair for different measured reasons. For #1051 the
+  # question is not what GitHub links but what OUTLIVES THE BRANCH: a commit message is republished
+  # into `main` verbatim by the squash, and a PR's body is the change's own permanent description
+  # (#1051 asks for it by name, and PR 1090's body carries a live instance, which is the measured
+  # refutation of that issue's own note that bodies are "largely clean by construction"). A TITLE
+  # warns rather than gates even though `squash_merge_commit_title=COMMIT_OR_PR_TITLE`, because the
+  # merge dialog overrides it and does: PR 1090, nine commits, merged under a subject that is not
+  # its title. For #1041 the reason is link behaviour, measured as follows. GitHub
   # links from a PULL REQUEST's body and from a commit message; it does not link from a title (5/5
   # measured here: PRs 236, 437, 461, 465 and 466 each name a closing target in the title that the
   # body never names WITH A CLOSING KEYWORD — three of the five do name the number in prose, which
@@ -244,8 +294,10 @@ jobs:
   # body or a commit message
   # is an `::error::` and fails the step, while a finding on a title, a comment or an issue body is
   # an `::warning::` that does not. Everything is still scanned, classified and printed, and the
-  # rewrite is identical on every surface — the summary line reports both numbers, `flagged N (M on
-  # a surface that can actually close)`. The all-surfaces alternative was tried first and rejected
+  # rewrite is identical on every surface — each pass prints its own summary line reporting both
+  # numbers, `flagged N (M on a surface that can actually close)` for #1041 and `flagged N (M on a
+  # surface that outlives the branch)` for #1051, and the final line says CLEAN or NOT CLEAN over
+  # all three. The all-surfaces alternative was tried first and rejected
   # on evidence: it turned this very PR red because the REVIEW COMMENT quoting the defect matched,
   # which would make every PR whose review discusses this class unmergeable — and the failure would
   # have been a false statement too, since that comment linked nothing. A guard that fails on
@@ -279,20 +331,27 @@ jobs:
       # stopped discriminating must fail loudly rather than pass everything. It runs offline and
       # drives the classifier through one deliberately-dirty item per pattern (the samples live
       # beside the patterns, so adding a pattern without one is a length mismatch, not a silent
-      # gap), three clean items, a reach control (empty the pattern list — nothing may flag, and
-      # every item must still be classified), an unreadable item (must count toward the corpus and
-      # NOT toward `classified`, which is what makes the `classified N/N` line able to disagree),
-      # the empty-corpus case, and an assertion on how many checks ran, so a case that stops running
-      # fails the step instead of shrinking the output.
+      # gap), three clean items, a reach control per pass (empty that pass's pattern list — nothing
+      # may flag, and every item must still be classified), a MIXED manifest of one readable and one
+      # unreadable item (the ghost must count toward the corpus and NOT toward `classified`, which
+      # is what makes the `classified N/N` line able to disagree), the empty-corpus case, and an
+      # assertion on how many checks ran, so a case that stops running fails the step instead of
+      # shrinking the output. The manifest is mixed rather than ghost-only on measured evidence:
+      # with only the ghost in it, the assertion also passes for a classifier that assigns
+      # CLASSIFIED=TOTAL outright, because that assignment sits after the unreadable branch's
+      # `continue` and never runs. That mutant SURVIVED the ghost-only form on all three passes
+      # (measured 2026-08-19, #1051) and dies on the mixed one.
       #
       # It also EXECUTES both real scanners with `LOCAL_DETAIL_PATTERNS_FILE` pointing at an empty
       # pattern list and requires each to refuse. That indirection exists for one reason: the first
       # version of these two checks re-derived the refusal in an inline `bash -c` and never invoked
       # either script, so deleting the only real reach guard in the repo left the self-test at full
-      # green. Verified both directions at this commit — replacing the guard in
-      # `check-no-local-detail.sh` with `if false; then` turns `--self-test` RED (`want '1', got
-      # '3'`), and neutering `require_patterns` in `check-pr-text.sh` turns it RED on two more
-      # checks; hand-editing each back restores 15/15.
+      # green. Re-derived at this commit against the 102-check suite — replacing the guard in
+      # `check-no-local-detail.sh` with `if false; then` turns `--self-test` RED on 1 check
+      # (`check-no-local-detail refuses an empty pattern list`, `want '1', got '5'`), neutering
+      # `require_patterns` in `check-pr-text.sh` turns it RED on 2, and emptying the #1051 cue list
+      # through `SQUASHREL_PATTERNS_FILE` makes the real script exit 1 with its refusal instead of
+      # reporting no findings; hand-reverting each restores a full-green 102.
       #
       # The #1041 half adds to that: every positive fixture is a MEASURED instance quoted verbatim
       # (fourteen items covering ten confirmed false closes across both surfaces — including the colon
@@ -302,26 +361,40 @@ jobs:
       # history, 16 characters between the negation and the keyword), a run_live end-to-end pass
       # against a stub `gh` serving recorded payloads — added because deleting the new pass from
       # run_live was MEASURED to leave the self-test at full green without it — and a `--commits` pass
-      # over a throwaway repository. Verified red in both directions at this commit: neutering the
-      # scanner, dropping the `\b` from the `not` cue, dropping any ONE of the six characters in the
-      # gap stop set (`#`, `.`, `;`, `!`, `?` and the em dash) — six separate mutations, each turning
-      # exactly one check red, because each stop now has a fixture that depends on it; emptying the
-      # set outright turns 19 red — narrowing the SEPARATE match-window length `NEGCLOSE_GAP` from 40
-      # to 15 (a distinct knob from the stop set: the stops decide where the window ends early, the
-      # length decides how far it may run at most), inverting the attribution timestamp comparison,
-      # dropping the space padding from the attribution range test, deleting the pass from run_live,
-      # deleting the commit fetch from the corpus, and BOTH directions of the gating policy — making
-      # every surface gate (the rejected design; 9 checks red), making no surface gate (6 red), and
-      # restoring the unconditional "OK — all N items clean" final line that the narrowing made false
-      # on a warn-only run (2 red) — each turn `--self-test` RED, sixteen mutations for sixteen reds;
-      # hand-reverting each restores a full-green run, verified by sha256 against a pristine copy, not
-      # `git restore`. `NEGCLOSE_GAP` is pinned on the RECALL side only: 15 and below turn a check
-      # red, and 16, 17, 20, 40, 100 and 400 are all full green. Nothing in the suite requires the
-      # window to stop at 40, and no fixture is invented to make it look otherwise — an invented one
-      # would encode 40 as correct on no evidence. Every count here is re-derived against THIS
-      # revision's 67-check suite; an earlier revision quoted 4 for the every-surface mutation, which
-      # was its true value against the 60-check suite of a previous revision and became false when the
-      # suite grew. That OK-line mutation is why the warn-only stub mode exists: neither of the other
+      # over a throwaway repository. The #1051 half is built the same way and is described above.
+      #
+      # THE MUTANT SET, RE-DERIVED IN FULL against THIS revision's 102-check suite (2026-08-19).
+      # Thirty-six mutations, thirty-six reds, no survivors; hand-reverting each restores a full-green
+      # run, verified by sha256 against a pristine copy, not `git restore`. Twenty-one on the two
+      # older passes: neutering the negclose scanner (18 red), dropping the `\b` from the `not` cue
+      # (1), dropping any ONE of the six characters in the gap stop set — `#`, `.`, `;`, `!`, `?` and
+      # the em dash — six separate mutations at 1 red each, because each stop now has a fixture that
+      # depends on it; emptying the set outright (27); narrowing the SEPARATE match-window length
+      # `NEGCLOSE_GAP` from 40 to 15 (1) — a distinct knob from the stop set: the stops decide where
+      # the window ends early, the length decides how far it may run at most; inverting the
+      # attribution timestamp comparison (7); dropping the space padding from the attribution range
+      # test (1); deleting the negclose pass from run_live (23); deleting the commit fetch from the
+      # corpus (13); BOTH directions of the negclose gating policy — every surface gates, the
+      # rejected design (9), no surface gates (6); restoring the unconditional "OK — all N items
+      # clean" final line that the narrowing made false on a warn-only run (2); neutering either
+      # empty-pattern-list guard (2 and 1); and forging `CLASSIFIED = TOTAL` on the local-detail and
+      # negclose passes (1 each) — the last two are new checks added by #1051, because both of those
+      # mutants SURVIVED before it. Fifteen on the #1051 pass: dropping either half of the
+      # code-span/fenced-block strip (1, 2), dropping its line-preserving `print ""` (2), widening
+      # either narrowed cue back toward the provenance idiom (1, 1), adding back the rejected
+      # `commit <n>` cue (2), all three gating directions (6, 6, 1), deleting the pass from run_live
+      # (10) or from run_commits (4), forging its `CLASSIFIED = TOTAL` (1), neutering its scanner
+      # (12), and dropping `-i` or `-n` from its grep (1, 1).
+      #
+      # `NEGCLOSE_GAP` is pinned on the RECALL side only: 3, 10 and 15 turn a check red, and 16, 17,
+      # 20, 40, 100 and 400 are all full green. Nothing in the suite requires the window to stop at
+      # 40, and no fixture is invented to make it look otherwise — an invented one would encode 40 as
+      # correct on no evidence. Every count above is re-derived against the 102-check suite and
+      # against the fixtures as they stand at this commit; a fixture edit is not local, so the WHOLE
+      # set is re-run whenever any fixture changes. Two earlier revisions are the reason that rule is
+      # written down: one quoted 4 for the every-surface mutation, true against a 60-check suite and
+      # false at 67, and the 19 quoted for the emptied stop set was true at 67 and is 27 here. That
+      # OK-line mutation is why the warn-only stub mode exists: neither of the other
       # two modes reaches the final summary line with a flagged item in hand, so every one of the 60
       # checks the suite then contained passed over a line stating the opposite of what had just
       # happened. The em dash is in the gap stop set on measured evidence too: over the full published
@@ -331,7 +404,7 @@ jobs:
       # removing `—` from the stop set turns `--self-test` RED rather than silently costing precision.
       - name: check-pr-text self-test
         run: bash scripts/check-pr-text.sh --self-test
-      - name: scan this PR's text for local-system detail and negated closing keywords
+      - name: scan this PR's text for local-system detail, negated closes and squash-relative refs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
