@@ -727,8 +727,10 @@ const NO_COMPLETENESS_SIGNAL: &str =
     "`complete` is null for every roster listed here and no code path in this client can set it to \
      true or false. These three rosters are filled from records the SERVER pushes — OP_SpawnDoor for \
      doors, spawn packets for entities, OP_SendZonepoints for zone_entrances — which arrive on no \
-     schedule this client controls, and this client compares its holdings against no total. So \
-     neither an empty roster nor a populated one is known to be complete, at any size. \
+     schedule this client controls, and this client compares its holdings against no total: it \
+     reads the zone-point count only to bound its parse of that packet, never to judge the roster \
+     complete. So neither an empty roster nor a populated one is known to be complete, at any \
+     size. \
      `zone_assets.state` is NOT this signal: it gates loaded terrain and collision, i.e. geometry, \
      not which packets have arrived. Read an empty body from any of these three endpoints as `no \
      record held`, never as `none exist`.";
@@ -749,14 +751,17 @@ const NO_COMPLETENESS_SIGNAL: &str =
 /// `zone_map_load`; (2) a server-advertised total the client could compare its holdings against; or,
 /// failing both, (3) an explicit "no completeness signal exists" field, so the endpoint discloses
 /// its own limit in band rather than only in prose. This is **(3)**. (1) is not built here because
-/// this client never reads the packet that would separate "not sent yet" from "none exist", so it
-/// has no reason to name. (2) is not built here: this client compares its holdings against no
-/// total. For `zone_entrances` the server does advertise one — EQEmu's `Client::SendZonePoints()`
-/// writes `zp->count` (`zone/client.cpp:6959`) and the RoF2 patch copies it onto the wire
-/// (`common/patches/rof2.cpp:3632`) — but `apply_zone_points` discards it, and reading it into an
-/// observable is #939's scope, not this disclosure's. `zone_map_load` stays what it is: a real
-/// terminal fact about ONE additive contributor to `zone_entrances` (#816), not a completeness
-/// verdict on the roster.
+/// this client retains no record of whether the packet that would separate "not sent yet" from
+/// "none exist" has arrived, so it has no reason to name. (2) is not built here: this client
+/// compares its holdings against no total. For `zone_entrances` the server does advertise one —
+/// EQEmu's `Client::SendZonePoints()` writes `zp->count` (`zone/client.cpp:6959`) and the RoF2
+/// patch copies it onto the wire (`common/patches/rof2.cpp:3632`) — and since #1094
+/// `apply_zone_points` does read it, but **only to bound its parse**, never to judge the roster.
+/// It could not be compared naively even if something wanted to: the #136 sentinel filter drops
+/// entries from inside the counted range, so `held` and the count legitimately differ. Turning it
+/// into a completeness observable is #939's scope, not this disclosure's. `zone_map_load` stays
+/// what it is: a real terminal fact about ONE additive contributor to `zone_entrances` (#816), not
+/// a completeness verdict on the roster.
 ///
 /// **`complete` is therefore `null` on every entry, always, and that is not a placeholder for a
 /// value some other code path supplies.** Nothing in this client writes `true` or `false` there —

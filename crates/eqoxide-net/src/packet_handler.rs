@@ -2985,17 +2985,68 @@ fn is_sentinel_zone_point(x: f32, y: f32, z: f32) -> bool {
     x.abs() >= SENTINEL || y.abs() >= SENTINEL || z.abs() >= SENTINEL
 }
 
+/// `OP_SendZonepoints` — `uint32 count`, then **`count + 1`** × `ZonePointEntry_S`
+/// (`SIZE_ZONE_POINT_ENTRY` = 32 octets for RoF2).
+///
+/// **The trailing entry is a terminator, not a zone point (#1094).** EQEmu sizes the packet for
+/// `count + 1` entries and fills only `count`: `zone/client.cpp:6956` allocates
+/// `(count + 1) * sizeof(ZonePoint_Entry)` and `:6959` writes `zp->count = count`, and the RoF2
+/// ENCODE does the same — `common/patches/rof2.cpp:3630` allocates `(emu->count + 1)`, `:3632`
+/// copies the count onto the wire, `:3633` loops `i < emu->count`. The struct comment says it
+/// outright: "Always add one extra to the end after all zonepoints"
+/// (`common/eq_packet_structs.h:2460`). `ALLOC_VAR_ENCODE` memsets its fresh buffer
+/// (`common/patches/ss_define.h:57`), so the extra entry arrives as deterministic **zeros**, not as
+/// garbage. Bounding the loop by `payload.len()` therefore parsed it as a record and published a
+/// phantom entrance at the origin with `zone_id = 0` in every zone. **The loop is bounded by
+/// `count`.**
+///
+/// **The terminator is identified by its INDEX, never by its value.** Filtering `(0,0,0)` would be
+/// wrong: #150 recorded a live Nektulos zone-point list carrying four legitimate all-zero rows from
+/// the server's own table (`number` 1, 2, 3 and 77). A coordinate filter would silently drop real
+/// zone points, and its effects would be indistinguishable from the bug it was meant to fix.
+///
+/// **The published length is NOT `count`.** The `999999` sentinel drop (#136) is a separate filter
+/// that runs *inside* the counted range, so `zone_points.len()` can be strictly less than `count`.
+/// Nothing may assert equality between them.
+///
+/// **The header is detected, not assumed.** The two candidate shapes are distinguishable exactly:
+/// a headed payload is `4 + 32 * M` so `(len - 4) % 32 == 0`, while a bare array is `32 * N` so
+/// `(len - 4) % 32 == 28` for every `N >= 1`. When the header is absent **there is no count to
+/// bound by**, and this falls back to the pre-#1094 behaviour — parse to the end of the payload,
+/// which cannot recognise a terminator. That path is reachable only for a shape RoF2 does not send.
+/// A `count` larger than the entries actually present is clamped to what is there, so neither path
+/// can panic or read past the payload.
 fn apply_zone_points(gs: &mut GameState, payload: &[u8]) {
-    // Wire format: optional 4-byte header + N × ZonePointEntry_S (24 bytes each).
-    // Detect header: if (len-4) % 24 == 0 and len >= 4, skip header.
-    let offset = if payload.len() >= 4 && (payload.len() - 4).is_multiple_of(SIZE_ZONE_POINT_ENTRY) {
-        4
+    let has_header =
+        payload.len() >= 4 && (payload.len() - 4).is_multiple_of(SIZE_ZONE_POINT_ENTRY);
+    let offset = if has_header { 4 } else { 0 };
+    // How many whole entries the payload can actually supply after the header.
+    let available = (payload.len() - offset) / SIZE_ZONE_POINT_ENTRY;
+    // Bound by the count when we have one. Clamped to `available` so a malformed or truncated
+    // packet cannot drive the loop past the buffer; without a header there is no count, so the
+    // payload length is the only bound left.
+    let to_read = if has_header {
+        let advertised =
+            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+        if advertised > available {
+            tracing::warn!(
+                "EQ: OP_SendZonepoints advertises {} zone points but only {} entries are present \
+                 ({} payload octets); reading {}",
+                advertised, available, payload.len(), available
+            );
+        }
+        advertised.min(available)
     } else {
-        0
+        tracing::debug!(
+            "EQ: OP_SendZonepoints has no count header ({} octets); parsing to end of payload, so \
+             a trailing terminator entry cannot be recognised",
+            payload.len()
+        );
+        available
     };
     gs.world.zone_points.clear();
     let mut i = offset;
-    while i + SIZE_ZONE_POINT_ENTRY <= payload.len() {
+    for _ in 0..to_read {
         let e = unsafe { safe_read::<ZonePointEntry_S>(&payload[i..]) };
         i += SIZE_ZONE_POINT_ENTRY;
         // Copy out of the packed struct before use (unaligned field refs are UB).
@@ -6464,6 +6515,9 @@ mod tests {
         assert_eq!(super::parse_mana_change(&120u32.to_le_bytes()), Some((120, None, None)));
     }
 
+    /// The #136 sentinel drop, on a payload with **no count header** (three bare entries, 96
+    /// octets). That is deliberate and still the headerless path after #1094: with no count, every
+    /// whole entry is read and the sentinel filter is the only thing removing any of them.
     #[test]
     fn zone_points_drop_sentinel_entries() {
         use super::apply_zone_points;
@@ -6491,6 +6545,157 @@ mod tests {
         assert!(gs.world.zone_points.iter().all(|zp| zp.server_x.abs() < 900_000.0),
             "no sentinel coordinate survives");
         assert!(gs.world.zone_points.iter().any(|zp| (zp.server_x - 100.0).abs() < 0.5), "kept the real lines");
+    }
+
+    /// One 32-octet RoF2 `ZonePoint_Entry`, laid out from `common/patches/rof2_structs.h`:
+    /// iterator@0, y@4, x@8, z@12, heading@16, zoneid(u16)@20, zoneinstance(u16)@22, then two
+    /// trailing u32s. Zero-filled elsewhere.
+    fn zp_entry(iter: u32, y: f32, x: f32, z: f32, zoneid: u16) -> Vec<u8> {
+        use crate::protocol::SIZE_ZONE_POINT_ENTRY;
+        let mut b = vec![0u8; SIZE_ZONE_POINT_ENTRY];
+        b[0..4].copy_from_slice(&iter.to_le_bytes());
+        b[4..8].copy_from_slice(&y.to_le_bytes());
+        b[8..12].copy_from_slice(&x.to_le_bytes());
+        b[12..16].copy_from_slice(&z.to_le_bytes());
+        b[16..20].copy_from_slice(&0f32.to_le_bytes());
+        b[20..22].copy_from_slice(&zoneid.to_le_bytes());
+        b
+    }
+
+    /// The `OP_SendZonepoints` envelope: `uint32 count` then the entries as given.
+    ///
+    /// `count` is passed SEPARATELY from the entry list on purpose — that disagreement is the whole
+    /// defect. EQEmu sizes the packet for `count + 1` entries and fills `count`
+    /// (`zone/client.cpp:6956`/`:6959`; RoF2 `common/patches/rof2.cpp:3630`/`:3632`/`:3633`), so the
+    /// honest fixture is one where the list is longer than the count.
+    fn zp_packet(count: u32, entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut p = count.to_le_bytes().to_vec();
+        for e in entries { p.extend_from_slice(e); }
+        p
+    }
+
+    /// An all-zero terminator entry — what `ALLOC_VAR_ENCODE`'s memset
+    /// (`common/patches/ss_define.h:57`) leaves in the `count + 1`-th slot.
+    fn zp_terminator() -> Vec<u8> {
+        vec![0u8; crate::protocol::SIZE_ZONE_POINT_ENTRY]
+    }
+
+    /// **#1094.** The loop must stop at the advertised `count`, not at the end of the payload, so
+    /// EQEmu's deliberate trailing entry is never published as a zone entrance.
+    ///
+    /// This payload is constructed from the EQEmu struct definitions, not captured from a server:
+    /// it proves what this parser does with that shape, not that the server emits it.
+    #[test]
+    fn zone_points_stop_at_the_advertised_count_so_the_terminator_is_not_published_1094() {
+        use super::apply_zone_points;
+        use crate::protocol::SIZE_ZONE_POINT_ENTRY;
+        let payload = zp_packet(2, &[
+            zp_entry(0, 200.0, 100.0, -7.0, 2),
+            zp_entry(1, 1395.0, 734.5, 4.0, 2),
+            zp_terminator(),
+        ]);
+        assert_eq!(payload.len(), 4 + 3 * SIZE_ZONE_POINT_ENTRY,
+            "the wire shape is 4 + 32 * (count + 1)");
+        let mut gs = GameState::new();
+        apply_zone_points(&mut gs, &payload);
+        assert_eq!(gs.world.zone_points.len(), 2,
+            "the loop is bounded by `count`, not by the payload length: {:?}", gs.world.zone_points);
+        assert!(!gs.world.zone_points.iter().any(|zp| zp.zone_id == 0),
+            "the all-zero terminator must never be published as an entrance into zone 0");
+        assert!(!gs.world.zone_points.iter()
+            .any(|zp| zp.server_x == 0.0 && zp.server_y == 0.0 && zp.server_z == 0.0),
+            "and no phantom entrance sits at the map origin");
+    }
+
+    /// **#1094, the sharpest case.** A zone with no zone lines at all: `count = 0`, one terminator
+    /// on the wire. The roster must be EMPTY. Before the count bound this published exactly one
+    /// phantom entrance at `[0,0,0]` into zone 0.
+    #[test]
+    fn a_zone_with_zero_zone_points_publishes_an_empty_roster_1094() {
+        use super::apply_zone_points;
+        use crate::protocol::SIZE_ZONE_POINT_ENTRY;
+        let payload = zp_packet(0, &[zp_terminator()]);
+        assert_eq!(payload.len(), 4 + SIZE_ZONE_POINT_ENTRY, "count=0 still ships one entry");
+        let mut gs = GameState::new();
+        apply_zone_points(&mut gs, &payload);
+        assert!(gs.world.zone_points.is_empty(),
+            "count=0 means no zone points, not one at the origin: {:?}", gs.world.zone_points);
+    }
+
+    /// **The two filters are separate and they compose.** `count` bounds WHICH entries are read;
+    /// the `999999` sentinel (#136) then drops one of the entries that were read. So the published
+    /// length here is `count - 1`, which is why nothing in this tree may assert
+    /// `zone_points.len() == count`.
+    #[test]
+    fn the_136_sentinel_still_drops_inside_the_counted_range_so_len_is_below_count_1094() {
+        use super::apply_zone_points;
+        let payload = zp_packet(3, &[
+            zp_entry(0, 200.0, 100.0, -7.0, 2),
+            zp_entry(1, -350.0, 999_999.0, 0.0, 2), // sentinel, INSIDE the counted range
+            zp_entry(2, 1395.0, 734.5, 4.0, 2),
+            zp_terminator(),
+        ]);
+        let mut gs = GameState::new();
+        apply_zone_points(&mut gs, &payload);
+        assert_eq!(gs.world.zone_points.len(), 2,
+            "3 counted minus 1 sentinel = 2 — the published length is NOT `count`");
+        assert!(gs.world.zone_points.iter().all(|zp| zp.server_x.abs() < 900_000.0),
+            "the #136 sentinel filter is untouched");
+        assert!(!gs.world.zone_points.iter().any(|zp| zp.zone_id == 0),
+            "and the terminator is still excluded by the count bound");
+    }
+
+    /// **A legitimate all-zero row survives.** #150 recorded a live Nektulos list carrying real
+    /// all-zero rows from the server's own table, so the terminator must be excluded by its INDEX
+    /// and never by its value. Here an all-zero entry sits INSIDE the counted range and must be
+    /// published; only the one past `count` is dropped. A `(0,0,0)` coordinate filter fails this.
+    #[test]
+    fn an_all_zero_entry_inside_the_count_is_kept_the_terminator_is_index_not_value_1094() {
+        use super::apply_zone_points;
+        let payload = zp_packet(2, &[
+            zp_entry(0, 0.0, 0.0, 0.0, 0),          // a REAL all-zero row (#150)
+            zp_entry(1, 1395.0, 734.5, 4.0, 2),
+            zp_terminator(),
+        ]);
+        let mut gs = GameState::new();
+        apply_zone_points(&mut gs, &payload);
+        assert_eq!(gs.world.zone_points.len(), 2,
+            "the counted all-zero row is real data and must survive: {:?}", gs.world.zone_points);
+        assert!(gs.world.zone_points.iter()
+            .any(|zp| zp.server_x == 0.0 && zp.server_y == 0.0 && zp.server_z == 0.0),
+            "a coordinate filter would have dropped this legitimate row (#150)");
+    }
+
+    /// **Header absent — the documented fallback.** A bare array carries no count, so every whole
+    /// entry is read and a terminator cannot be recognised. The two shapes never collide:
+    /// `32 * N` is never `4 + 32 * M`.
+    #[test]
+    fn a_headerless_payload_falls_back_to_length_bounded_parsing_1094() {
+        use super::apply_zone_points;
+        use crate::protocol::SIZE_ZONE_POINT_ENTRY;
+        let payload: Vec<u8> = [
+            zp_entry(0, 200.0, 100.0, -7.0, 2),
+            zp_entry(1, 1395.0, 734.5, 4.0, 2),
+        ].concat();
+        assert!(payload.len().is_multiple_of(SIZE_ZONE_POINT_ENTRY));
+        assert!(!(payload.len() - 4).is_multiple_of(SIZE_ZONE_POINT_ENTRY),
+            "a bare array must never be mistaken for a headed payload");
+        let mut gs = GameState::new();
+        apply_zone_points(&mut gs, &payload);
+        assert_eq!(gs.world.zone_points.len(), 2,
+            "with no count there is nothing to stop earlier than the payload end");
+    }
+
+    /// **A count larger than the payload is clamped, not trusted.** A truncated or malformed packet
+    /// must not drive the loop past the buffer.
+    #[test]
+    fn an_over_advertised_count_is_clamped_to_the_entries_present_1094() {
+        use super::apply_zone_points;
+        let payload = zp_packet(99, &[zp_entry(0, 200.0, 100.0, -7.0, 2)]);
+        let mut gs = GameState::new();
+        apply_zone_points(&mut gs, &payload);
+        assert_eq!(gs.world.zone_points.len(), 1,
+            "read what is actually there — and do not panic doing it");
     }
 
     #[test]
