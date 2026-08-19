@@ -2161,33 +2161,36 @@ async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
 
 /// GET /v1/observe/doors — list the current zone's doors (id, name, position, opentype, open state).
 ///
-/// **`[]` does NOT mean "this zone has no doors" (#939, residual case).** The roster is emptied on
-/// zone entry (#891) and refills from `OP_SpawnDoor` records as they arrive — but a record the
-/// server genuinely has not sent yet arrives on no schedule this client controls, and nothing
-/// served here tells that case apart from a real, empty zone.
+/// **`[]` does NOT mean "this zone has no doors" (#939, residual case).** The roster starts empty
+/// on either zone-entry path and refills from `OP_SpawnDoor` records as they arrive — but a record
+/// the server genuinely has not sent yet arrives on no schedule this client controls, and nothing
+/// served here tells that case apart from a real, empty zone. (#891 clears it at the top of the
+/// re-zone handshake; on a session's FIRST zone-in it starts empty because the process just
+/// started, and #1022's failure clear keeps it empty across `run_login_flow`'s retries.)
 ///
 /// **What #937 used to add on top of that — a record already applied to game state but not yet
-/// published — is fixed on the RE-ZONE path only (#1016 review B5); the first zone-in of a session
-/// still has the original #937 gap.** `sync_doors`/`publish_doors` (`eqoxide_net::action_loop`) used
-/// to have exactly one call site, the gameplay drain (`run_gameplay_phase`), which the zone-entry
-/// handshake's own drain never reached; a door parsed and applied during the handshake sat
-/// unpublished until the first post-handshake drain. `run_zone_entry_handshake`
-/// (`eqoxide_net::gameplay`) now calls `publish_doors` itself, on the same drain pass that applies
-/// an `OP_SpawnDoor` record — so an arrived-and-applied door is also a published one, within the
-/// handshake, not only after it. It also clears the roster (not just leaves it) if the handshake
-/// times out having received a door but never finished — a partial roster for a zone the client was
-/// just told it failed to enter is not an honest `[]` either.
+/// published — is now addressed on BOTH zone-entry paths (#1016, then #1022).**
+/// `sync_doors`/`publish_doors` (`eqoxide_net::action_loop`) used to have exactly one call site, the
+/// gameplay drain (`run_gameplay_phase`), which NEITHER zone-entry path's own drain ever reached; a
+/// door parsed and applied during a zone-in sat unpublished until the first post-handshake drain.
+/// `run_zone_entry_handshake` (`eqoxide_net::gameplay`, the re-zone path, #1016) and
+/// `run_login_handshake` (`eqoxide_net::login`, the first zone-in of a session, #1022) now each call
+/// `publish_doors` from their OWN drain, on the same pass that applies an `OP_SpawnDoor` record — so
+/// an arrived-and-applied door is also a published one within the zone-in, not only after it. Both
+/// also CLEAR the roster rather than leave a partial one standing when the attempt fails (#1016
+/// review B4 for the re-zone handshake's timeout; #1022's `run_login_phase` wrapper for every login
+/// error exit) — a partial roster for a zone the client was just told it failed to enter is not an
+/// honest `[]` either.
 ///
-/// **But `run_zone_entry_handshake` is only reached on a re-zone** — both its production call sites
-/// (`eqoxide_net::gameplay::run_gameplay_phase`) fire after gameplay has already started. The very
-/// first zone-in of a session runs through `eqoxide_net::login`'s own, separate state machine
-/// (`run_login_phase`) instead: it applies `OP_SpawnDoor` through the same `apply_packet`, but that
-/// function has no `InteractSlots` handle in scope at all — not merely unused, absent from its own
-/// signature — so it cannot publish into this roster no matter how long the door has sat applied in
-/// game state. On that path #937's original shape is unchanged: `[]` here can mean a door record has
-/// already arrived and been applied, just not published, for as long as the login handshake takes.
-/// This endpoint cannot tell a caller which of the two zone-entry paths produced the `[]` it is
-/// looking at, so it does not claim the gap is closed — only that it is closed on one of the two.
+/// **The residual publish window is one drain PASS, not one zone-in, and it is the same on both
+/// zone-entry paths.** Each ZONE-ENTRY drain applies every packet it drained and then publishes
+/// once, at the end of the pass — so a record applied earlier in the same pass is readable here only
+/// after that pass's publish. (The gameplay drain does not share this: `sync_doors` runs after EVERY
+/// applied packet there, not once per pass.) That is bounded by a single drain iteration instead of
+/// by however long a zone-in takes, but it is not zero, which is why POST /v1/interact/click_door's
+/// empty-roster `404` body still names "arrived but not yet published" as a live cause. This
+/// endpoint states the window in drain passes rather than milliseconds because it has no
+/// measurement of a pass's wall-clock duration.
 ///
 /// There is no completeness observable to wait on for the remaining #939 case: `zone_assets.state`
 /// reaching `"ready"` gates on terrain meshes and collision triangles, so it is about geometry, not

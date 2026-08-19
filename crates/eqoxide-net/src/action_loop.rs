@@ -109,12 +109,26 @@ pub fn encode_client_position_update(
 
 /// Map `gs.world.doors` into the shared `GET /v1/observe/doors` roster (#937).
 ///
-/// A free function, not a method, so `gameplay::run_zone_entry_handshake` — which has the bare
-/// [`eqoxide_ipc::DoorsShared`] slot handed to it via `ActionLoop::doors_shared`, not an `ActionLoop`
-/// itself (see that accessor's doc for why) — can publish through the exact same projection
-/// [`ActionLoop::sync_doors`] uses from `run_gameplay_phase`'s drain, rather than the handshake
-/// growing a second, divergence-prone copy of the `GameState` door → `DoorView` mapping. One
-/// implementation, two call sites; `doors_shared`'s single-publisher doc comment names both of them.
+/// A free function, not a method, so the two zone-entry drains that hold the bare
+/// [`eqoxide_ipc::DoorsShared`] slot rather than an `ActionLoop` can publish through the exact same
+/// projection [`ActionLoop::sync_doors`] uses from `run_gameplay_phase`'s drain, rather than each
+/// growing its own divergence-prone copy of the `GameState` door → `DoorView` mapping:
+///
+///   * `gameplay::run_zone_entry_handshake` (re-zone, #1016) gets the slot via
+///     [`ActionLoop::doors_shared`] — see that accessor's doc for why it is the bare slot;
+///   * `login::run_login_handshake` (a session's FIRST zone-in, #1022) gets it as a parameter
+///     straight off `InteractSlots`, because no `ActionLoop` exists yet that early in
+///     `run_login_flow` — which is exactly why that path had no door publisher at all before #1022.
+///
+/// One implementation, three publishing paths, FOUR call expressions: `sync_doors` and
+/// `run_zone_entry_handshake` call it once each — `doors_shared`'s doc comment covers those two —
+/// and the login path calls it TWICE, the per-pass gated call inside the drain plus an
+/// unconditional one after the loop, which is the only one that can catch the pass a
+/// `PhaseResult::Done` breaks out of. `login::run_login_phase`'s doc covers both of those.
+///
+/// The production call expressions are exactly those four; a bare grep for the call also hits this
+/// definition and the mutation recipes in the tests' doc comments, so count paths and expressions
+/// separately — they differ here.
 ///
 /// `out.clear()` before `out.extend(...)` makes every call a full REPLACE from the CURRENT
 /// `gs.world.doors`, not an append onto whatever a previous call left behind — this is what
@@ -1128,8 +1142,9 @@ impl ActionLoop {
     ///
     /// Thin wrapper over [`publish_doors`] (#937) — kept as a method because `run_gameplay_phase`'s
     /// packet drain only has `&ActionLoop` in scope, not the bare `DoorsShared` handle. See that
-    /// function's doc for why `run_zone_entry_handshake` needs its own call site into the SAME
-    /// projection rather than a second implementation of it.
+    /// function's doc for why the two zone-entry drains (`run_zone_entry_handshake`, #1016;
+    /// `login::run_login_handshake`, #1022) each need their own call site into the SAME projection
+    /// rather than a second implementation of it.
     pub fn sync_doors(&self, gs: &GameState) {
         publish_doors(gs, &self.interact.doors_shared);
     }
@@ -1168,6 +1183,13 @@ impl ActionLoop {
     /// implementation rather than a second, divergence-prone copy. It has no `ActionLoop` to call
     /// [`Self::sync_doors`] through (see [`Self::controller_slots`]), which is why this accessor
     /// hands out the bare slot instead.
+    ///
+    /// This accessor is NOT the only way the slot leaves `InteractSlots`. `login::run_login_phase`
+    /// takes `&interact.doors_shared` as a parameter directly (#1022): a session's FIRST zone-in
+    /// runs before this `ActionLoop` is constructed at all, so there is no `&self` to reach through
+    /// — which is precisely why that path had no door publisher until #1022 added one. Read
+    /// [`publish_doors`]'s doc for the full call-site inventory; this doc covers only the two
+    /// (`sync_doors` from `run_gameplay_phase`, and `run_zone_entry_handshake`) that go through here.
     pub fn doors_shared(&self) -> &eqoxide_ipc::DoorsShared { &self.interact.doors_shared }
 
     /// The published NPC-dialogue choices, for the zone-entry handshake to CLEAR (#941).
