@@ -246,7 +246,7 @@ expect = "RED"
 
 [[mutant]]
 id = "disclosure-latch-never-set"
-description = "PROPERTY: the GATE closes — a disclosure is not repeated on the ticks that follow it. Without the latch every tick of a long descent repeats the line and buries the log it exists to inform."
+description = "PROPERTY: the GATE closes — the latch, once set, suppresses a repeat until `reset_drive_state` clears it (`disclosure-latch-never-reset`). Without the latch every tick of a long descent repeats the line and buries the log it exists to inform."
 expect = "RED"
 
   [[mutant.edit]]
