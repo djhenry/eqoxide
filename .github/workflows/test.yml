@@ -26,12 +26,25 @@ jobs:
   # limit from the surface limit above and is what #995 was: a tracked comment naming deployment
   # infrastructure that this job was green on for months. Deployment host names cannot be added to
   # the pattern list — writing the names into a tracked public file moves the leak instead of
-  # closing it — so the class is covered by a separate WARNING step below.
+  # closing it — so the class is covered by the separate WARNING job `host-shape` below. It used to
+  # be two more steps in THIS job; #1056 moved it out, and the reason is in that job's header.
   no-local-detail:
     runs-on: ubuntu-latest
-    # Seconds of scripts plus one small `apt-get install` for the dictionary the #995 heuristic
-    # refuses to run without. Generous headroom for consistency with the `test` job below, not
-    # because this job has any known hang risk.
+    # Two scripts and nothing else. MEASURED per-step on job 96002688332 (the 25s success in #1056's
+    # table): checkout 2s, `check-no-local-detail.sh` and `check-wrapped-literals.py` under a second
+    # between them (both stamped 08:15:13 -> 08:15:13).
+    #
+    # THE PREVIOUS VERSION OF THIS COMMENT SAID "not because this job has any known hang risk" AND
+    # THAT WAS FALSE (#1056). This job had a measured, reproducing hang: `sudo apt-get update` for
+    # the #995 dictionary, four job timeouts across two commits in ~45 minutes on 2026-08-19, every
+    # one of them AFTER both fatal-by-design steps had already passed. A timed-out job reports
+    # `cancelled` rather than `failure`, and `cancelled` is not `success`, so each one left a
+    # blameless PR sitting OPEN BLOCKED on a required check with nothing wrong with it.
+    #
+    # The apt step is gone from here — it lives in `host-shape` below, which is not a required
+    # status check. What remains in this required job that can still stall is `actions/checkout`,
+    # which every job in this file runs; that is a real residual risk and not a claim of zero. The
+    # budget stays at 10 minutes for consistency with the `test` job below.
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -46,32 +59,93 @@ jobs:
         run: |
           python3 scripts/check-wrapped-literals.py --self-test
           python3 scripts/check-wrapped-literals.py
-      # #995: the one leak class the regex scanner above structurally cannot express. A deployment
-      # host name has no shape, so a pattern for it would mean writing the literal names into
-      # scripts/local-detail-patterns.sh — tracked, public, and named after what it holds. This is
-      # the structural alternative: hostname-SHAPED bare tokens near infrastructure vocabulary,
-      # with an English dictionary as the vocabulary allowlist so there is no per-token suppression
-      # list in the repo to grow until the corpus goes quiet (#983's finding).
+  # #995: the one leak class the regex scanner in `no-local-detail` structurally cannot express. A
+  # deployment host name has no shape, so a pattern for it would mean writing the literal names into
+  # scripts/local-detail-patterns.sh — tracked, public, and named after what it holds. This is
+  # the structural alternative: hostname-SHAPED bare tokens near infrastructure vocabulary,
+  # with an English dictionary as the vocabulary allowlist so there is no per-token suppression
+  # list in the repo to grow until the corpus goes quiet (#983's finding).
+  #
+  # WHY THIS IS ITS OWN JOB (#1056). It used to be two steps inside `no-local-detail`, and the
+  # sentence that framed them there — "IT IS A WARNING AND DELIBERATELY NOT A GATE" — was true of
+  # its FINDINGS and false of the STEPS. `--strict` genuinely is not passed, so a flagged token fails nothing; but the steps
+  # ran in a REQUIRED status check with the default `continue-on-error: false`, so their setup gated
+  # every merge in the repo through a channel the comment was not talking about. On 2026-08-19 that
+  # channel fired: `sudo apt-get update` stalled on the package mirror and took `no-local-detail`
+  # to its job timeout four times across two commits, each time long after both fatal-by-design
+  # steps had passed. A timed-out job reports `cancelled`, which is not `success`, so the PRs sat
+  # OPEN BLOCKED with nothing wrong with them.
+  #
+  # Moving it here decouples the two. As of 2026-08-19 the required contexts on `main` are exactly
+  # `test`, `pr-text` and `no-local-detail` (read from the branch-protection API; this file cannot
+  # see that setting and did not change it), so `host-shape` going red is informative and not
+  # merge-blocking. THAT PROPERTY LIVES IN BRANCH PROTECTION, NOT HERE: adding this job's name to
+  # the required list would re-arm exactly the coupling #1056 removed, silently, with no diff in
+  # this file. `continue-on-error: true` on the steps was the other candidate and was rejected — it
+  # would also swallow the deliberate exit 1 below, which is the thing that must stay loud.
+  #
+  # WHAT IS AND IS NOT FATAL HERE, now true of the steps as well as the findings:
+  #   * a FINDING is not fatal to anything. `--strict` is not passed, the step exits 0, and the
+  #     tokens are printed and left flagged.
+  #   * a GUARD FAILURE — no usable dictionary, an empty corpus, a failed self-test, or a
+  #     classification that does not add up — IS fatal to the step and turns this job red, because a
+  #     scan that cannot look is not a clean scan. It does not block a merge, and it is not supposed
+  #     to be quiet either.
+  #
+  # On this repo's tracked corpus it flags a few dozen token occurrences of which NONE is a host
+  # name — measured precision 0 — because the class has 0 tracked occurrences since #989's
+  # scrub. No count is pinned here on purpose: the corpus moves with every commit, so a number
+  # written into this file rots into a false claim. The step prints the live count, its
+  # denominator and every bucket. Its value is recall, not precision: it goes RED on the exact
+  # pre-scrub text that the regex scanner exited 0 on for months. Blocking a merge on that many
+  # known-innocent words would only buy a suppression list, and a suppression list grown until
+  # the corpus goes quiet is not a detector. If it ever flags something real, a human reads the
+  # list; CI does not decide.
+  #
+  # The findings surface as `::warning file=,line=` annotations on the PR's Files-changed view
+  # and as a table on the run summary, not only as text inside a passing step's log. Neither
+  # surface depends on the job being required: `check-host-shape.py` emits them from `GITHUB_ACTIONS`
+  # and `$GITHUB_STEP_SUMMARY`, which every job gets, and GitHub aggregates annotations per run
+  # rather than per required check.
+  host-shape:
+    runs-on: ubuntu-latest
+    # Seconds of Python on the hot path. The budget is generous for the cold path below, where a
+    # runner image without the dictionary means an actual package-mirror round trip — which is now
+    # allowed to be slow, because a slow run here is a slow warning and not a blocked merge.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # #1056 option 3: stop depending on a package mirror. The old step ran
+      # `apt-get update && apt-get install -y hunspell-en-us` unconditionally, and MEASURED over
+      # every run sampled — job 95833972234 (2026-08-18, the first run the step ever had),
+      # 96002688332, 96076699113, 96103284902 and 96123028684 — apt reported
+      # `hunspell-en-us is already the newest version (1:2020.12.07-2)` and
+      # `0 newly installed` in 5 of 5. `ubuntu-latest` ships the dictionary. Every one of those
+      # runs fetched ~11 MB of package index in order to install nothing, and one of those fetches
+      # is what hung the required job four times.
       #
-      # IT IS A WARNING AND DELIBERATELY NOT A GATE, and `--strict` is deliberately not passed. On
-      # this repo's tracked corpus it flags a few dozen token occurrences of which NONE is a host
-      # name — measured precision 0 — because the class has 0 tracked occurrences since #989's
-      # scrub. No count is pinned here on purpose: the corpus moves with every commit, so a number
-      # written into this file rots into a false claim. The step prints the live count, its
-      # denominator and every bucket. Its value is recall, not precision: it goes RED on the exact
-      # pre-scrub text that the regex scanner exited 0 on for months. Blocking a merge on that many
-      # known-innocent words would only buy a suppression list, and a suppression list grown until
-      # the corpus goes quiet is not a detector. If it ever flags something real, a human reads the
-      # list; CI does not decide.
+      # So look before reaching for the network. The mirror is retained as a COLD PATH only, for
+      # the day the runner image drops the package; it is bounded with `timeout` so that case
+      # reports a `failure` naming the mirror rather than a `cancelled` naming nothing.
       #
-      # The findings surface as `::warning file=,line=` annotations on the PR's Files-changed view
-      # and as a table on the run summary, not only as text inside a passing step's log.
-      #
-      # It DOES exit 1 for a guard failure — no dictionary, empty corpus, or a failed self-test —
-      # because a scan that cannot look is not a clean scan. That is why the dictionary is installed
-      # here rather than skipped when absent.
-      - name: install the English dictionary check-host-shape.py refuses to run without
-        run: sudo apt-get update && sudo apt-get install -y hunspell-en-us
+      # This presence test is NOT the reach control and must not be mistaken for one. It proves
+      # only that two files exist. `check-host-shape.py` still resolves the path itself, still
+      # validates it as hunspell `.dic` format (bare count line plus a sibling `.aff`), still
+      # enforces its entry ceiling, still refuses a `HOST_SHAPE_WORDLIST` override while `CI` is
+      # set, and still exits 1 if none of that yields a usable dictionary.
+      - name: ensure the English dictionary check-host-shape.py refuses to run without
+        run: |
+          set -euo pipefail
+          if [ -r /usr/share/hunspell/en_US.dic ] && [ -r /usr/share/hunspell/en_US.aff ]; then
+            echo "hunspell en_US is already on the runner image; not contacting the package mirror."
+            ls -l /usr/share/hunspell/en_US.dic /usr/share/hunspell/en_US.aff
+            exit 0
+          fi
+          echo "::warning::no hunspell en_US on the runner image, falling back to the package mirror (eqoxide#1056)"
+          if ! sudo timeout 240 apt-get update || ! sudo timeout 240 apt-get install -y hunspell-en-us; then
+            echo "::error::the package mirror did not answer within 4 minutes. This job is not a required status check, so this is a red job and not a blocked merge (eqoxide#1056)."
+            exit 1
+          fi
       - name: host-name shape heuristic (WARNING — findings are not fatal, see #995)
         run: |
           python3 scripts/check-host-shape.py --self-test
