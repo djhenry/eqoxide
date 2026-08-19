@@ -86,10 +86,19 @@ Summary tables below; each cites its own EQEmu source directly. (This section or
 here at a private working note, `~/git/eq_kb/character-creation.md`, as the consolidated citation
 for the whole section. That note has no history in the private knowledge-base repo at all — checked
 via `git rev-list --objects --all` there, zero blobs of that name — so it dangled from the day the
-KB migrated. It is not restored, and it is not repointed at a lookalike: every table below names
-its own EQEmu source inline instead — including the per-class deity restrictions, which are sourced
-below to EQEmu's own seed rows for `char_create_combinations`. Nothing in this section is left
-UNCITED.)
+KB migrated. It is not restored, and it is not repointed at a lookalike: each heading below names
+its own EQEmu source inline instead — including the per-class deity restrictions and the default
+stat pre-spend, both sourced below to EQEmu's own seed rows.)
+
+**The scope of that claim, so it can be checked instead of trusted.** It ranges over the **ten**
+headings below and was discharged by classifying all ten, not by spot-checking, and it covers the
+**server rules** they state. It does *not* cover the one thing in this section that is a UI choice
+rather than a server rule — the create screen's own initial appearance values and gender, under
+*Default stat pre-spend* — which is labelled in place as this document's default, not EQEmu's.
+`UNCITED` is a marker with a fixed meaning in this repo (`crates/eqoxide-core/src/physics.rs:38`,
+`:512`): *no source for this exists in this tree or the private one*. No rule in this section is in
+that state; where an earlier revision left one that way, it is now either sourced or deleted, and
+the deletion is recorded where the text stood.
 
 ### Race IDs (`common/races.h`)
 Human=1, Barbarian=2, Erudite=3, Wood Elf=4, High Elf=5, Dark Elf=6, Half Elf=7, Dwarf=8, Troll=9,
@@ -186,30 +195,62 @@ Monk          5  5 10 10  0  0  0  20      Beastlord   0 10  5  0 10  0  5  20
 Bard          5  0  0 10  0  0 10  25      Berserker  10  5  0 10  0  0  0  25
 ```
 
-### Stat validation (`world/client.cpp:2104`, Titanium) — must hold EXACTLY
-```
-base[s] = BaseRace[race][s] + BaseClass[class][s]   (the two arrays named above)
-pool    = BaseClass[class][7]                       (the "ADD" column, `world/client.cpp:2034`)
-sent[s] >= base[s]                      (per stat)
-sent[s] <= base[s] + pool               (per stat)
-sum(sent) == sum(base) + pool           (EXACT — Create disabled while points remain)
-```
-Deity and appearance are **not** server-validated on Titanium (`client.cpp:2159`) but the UI should
-still constrain them to native choices. **The block above is a Titanium-only statement.** This repo
-targets RoF2, where both halves differ: deity *is* validated and a mismatch aborts the create (see
-the deity section below), and the stat rule is a **`<=`, not an `==`** — `CheckCharCreateInfoSoF`
-rejects only when `current_stats > max_stats` (`world/client.cpp:1994`), so under RoF2 a create with
-points left unspent is accepted. Do not port the exact-sum rule to RoF2.
+### Stat validation — RoF2 (`CheckCharCreateInfoSoF`, `world/client.cpp:1901`) vs Titanium (`CheckCharCreateInfoTitanium`, `:2002`)
+**RoF2 (`CheckCharCreateInfoSoF`, `world/client.cpp:1901`) — an inequality, and the numbers come
+from the database, not from a table in the source.** The matched combo's `AllocationIndex` selects a
+`char_create_point_allocations` row (`world/client.cpp:1927–1941`); that row supplies both halves:
 
-### Deity IDs (`deity.h`)
-Agnostic=396, Bertoxxulous=201, BrellSerilis=202, Cazic-Thule=203, ErollisiMarr=204, Bristlebane=205,
-Innoruuk=206, Karana=207, MithanielMarr=208, Prexus=209, Quellious=210, RallosZek=211, RodcetNife=212,
+```
+base[s] = allocation.BaseStats[s]                    (the row's base_* columns)
+pool    = sum(allocation.DefaultPointAllocation[])   (the row's alloc_* columns, `client.cpp:1943–1949`)
+sent[s] >= base[s]                                   (per stat, `client.cpp:1951–1984`)
+sent[s] <= base[s] + pool                            (per stat, same lines)
+sum(sent - base) <= pool                             (INEQUALITY, `client.cpp:1986–1997`)
+```
+
+So under RoF2 **a create with points left unspent is accepted** — there is no exact-sum test — and
+the per-stat floor/ceiling are the only hard bounds. Deity *is* validated on this path and a
+mismatch aborts the create (see the deity section below). `pool` is the same seed data the pre-spend
+section below is derived from, so the two must be read together: the pre-spend is a *point in* the
+allowed region, not the region.
+
+**Titanium (`CheckCharCreateInfoTitanium`, `world/client.cpp:2002`) — must hold EXACTLY. Not this
+client.**
+
+```
+base[s] = BaseRace[race][s] + BaseClass[class][s]   (`client.cpp:2013` / `:2033`, summed `:2107–2113`)
+pool    = BaseClass[class][7]                       (the "ADD" column, `world/client.cpp:2034`)
+sum(sent) == sum(base) + pool                       (EXACT, `client.cpp:2115–2116` and `:2125`)
+sent[s] >= base[s]                                  (per stat, `client.cpp:2130–2157`)
+sent[s] <= base[s] + pool                           (per stat, same lines)
+```
+
+Three differences that matter, none of them cosmetic: Titanium's numbers are **hard-coded arrays in
+`world/client.cpp`**, not database rows; its sum test is an **equality**, so Create must be disabled
+while points remain; and it does **not** validate deity or appearance at all — the function carries
+an explicit `/*TODO: Check for deity/class/race..*/` where that check would be
+(`world/client.cpp:2159`) and then returns purely on the counted stat errors (`:2164`). Do not port
+the exact-sum rule, the hard-coded tables, or the missing deity check to RoF2.
+
+### Deity IDs (`namespace Deity`, `common/deity.h:26`)
+Constant names exactly as EQEmu spells them (`common/deity.h:28–45`): Agnostic2=396,
+Bertoxxulous=201, BrellSirilis=202, CazicThule=203, ErollisiMarr=204, Bristlebane=205, Innoruuk=206,
+Karana=207, MithanielMarr=208, Prexus=209, Quellious=210, RallosZek=211, RodcetNife=212,
 SolusekRo=213, TheTribunal=214, Tunare=215, Veeshan=216.
 
-> ⚠ `deity.h` defines **two** Agnostic constants and this list carries only one.
+> ⚠ **Do not use the constant names as UI strings — for two of them they differ.** The player-facing
+> strings live in a separate map, `deity_names` (`common/deity.h:73–92`), and it renders 202 as
+> `"Brell Serilis"` (`:77`, an *e*, against the constant's `BrellSirilis`) and 203 as `"Cazic-Thule"`
+> (`:79`, hyphenated, against the constant's `CazicThule`). An earlier revision of this list mixed
+> the two conventions — it wrote `BrellSerilis` (which is neither) and `Cazic-Thule` (the display
+> string) while spelling every other entry as a constant. Take ids from the constants and labels from
+> `deity_names`.
+
+> ⚠ `common/deity.h` defines **two** Agnostic constants and this list carries only one.
 > `Deity::Agnostic1 = 140` (`common/deity.h:28`) and `Deity::Agnostic2 = 396` (`common/deity.h:45`)
-> map to the *same* display string `"Agnostic"` (`deity.h:74–75`) and the *same*
-> `Deity::Bitmask::Agnostic = 1` (`deity.h:95–96`). 396 is the char-create-reachable one: 140
+> map to the *same* display string `"Agnostic"` (`common/deity.h:74–75`) and the *same*
+> `Deity::Bitmask::Agnostic = 1` (`common/deity.h:48`, joined by `deity_bitmasks` at
+> `common/deity.h:95–96`). 396 is the char-create-reachable one: 140
 > appears in **0** of the 641 seeded `char_create_combinations` rows (below), so a create can never
 > carry it. It is still reachable on the **read** path — a `deity` field read back off a
 > `PlayerProfile` can be 140, and an id→name map built only from the list above will fail to name it.
@@ -250,62 +291,181 @@ nicety.** `Client::OPCharCreate` (`world/client.cpp:1677`) branches on client ve
 `Race`, **`Deity`** and `Zone` (`world/client.cpp:1912–1915`); on no match it logs
 `"Could not find class/race/deity/start_zone combination"` and returns `false`
 (`world/client.cpp:1922–1924`). Same function and same match expression as the start-zone warning
-below — `deity` is one field over from `start_zone`, and a wrong deity fails exactly the way a raw
-0–13 StartZoneIndex does. Titanium is the exception, not the rule: `CheckCharCreateInfoTitanium`
+below — `deity` is one field over from `start_zone`, and a wrong deity fails exactly the way a
+`start_zone` that is not a valid zone_id for the combo does. Titanium is the exception, not the rule: `CheckCharCreateInfoTitanium`
 carries an explicit `/*TODO: Check for deity/class/race..*/` at `world/client.cpp:2159` and performs
 no such check.
 
-### Start city → `start_zone` wire value (a ZONE_ID under RoF2) and per-race start cities
-> ⚠ **The `start_zone` wire value is a ZONE_ID, not the Titanium StartZoneIndex 0–13.** RoF2's
+### Start city → `start_zone` wire value: a ZONE_ID under RoF2 (`WorldDatabase::GetStartZone`, `world/worlddb.cpp:500`)
+> ⚠ **The `start_zone` wire value is a ZONE_ID, not the Titanium StartZoneIndex.** RoF2's
 > `CheckCharCreateInfoSoF` matches `cc->start_zone` against `char_create_combinations.start_zone`
 > (zone_ids), so the UI must resolve the chosen start city to a **zoneidnumber valid for that
 > race/class/deity** (e.g. Dark Elf Necromancer → 42 `neriakc` or 394 `crescent`). Sending the raw
-> 0–13 index makes the server reject every create (eqoxide#5). The map index→zone_id is per-combo
-> (the same index can resolve to different neriak sub-zones), so resolve it from
-> `char_create_combinations`, not a fixed table. The index table below is for the city picker only.
+> index makes the server reject every create (eqoxide#5). One named city can also resolve to
+> different zone_ids per combo — Neriak has two, 41 and 42 — so resolve it from
+> `char_create_combinations`, not from a fixed city→id table.
+
+EQEmu splits the two lineages at one call site, and that split is why this heading carries no index
+table. `WorldDatabase::GetStartZone` (`world/worlddb.cpp:500`) takes an `is_titanium` flag, passed as
+`m_ClientVersionBit & EQ::versions::maskTitaniumAndEarlier` (`world/client.cpp:1816`). Its own comment
+is explicit: *"SoF doesn't send the player_choice field in character creation, it now sends the real
+zoneID instead"* (`world/worlddb.cpp:506`). Titanium-and-earlier looks the row up by
+`start_zones.player_choice` (`:531–542`); everything later, **RoF2 included**, looks it up by
+`start_zones.zone_id` (`:544–555`). On no matching row the same ternary picks the matching defaulter
+(`:564–566`); the RoF2 one is `WorldDatabase::SetSoFDefaultStartZone` (`:616–632`), whose last resort
+is Crescent Reach (`:630`). So the picker's rows under RoF2 are the distinct `start_zone` values of
+the combos matching the chosen race/class/deity — read off the wire or the table, per the deity
+section above.
+
+For orientation only, here is what the seed contains today, **all sixteen races enumerated** rather
+than sampled (zone names from the `Zones` namespace in `common/eq_constants.h`, line cited per id).
+This is a snapshot of one seed file, not a rule to hardcode — the caveat on the deity section's
+citation applies here identically:
+
 ```
-0 Odus(erudnext; paineel if deity=203)  7 Oggok          | Human    1,4      Dwarf    8
-1 Qeynos(qeynos2)                        8 Kaladim        | Barb     2        Troll    6
-2 Halas                                  9 GreaterFaydark | Erudite  0        Ogre     7
-3 Rivervale                             10 Felwithe       | Wood Elf 9        Halfling 3
-4 Freeport(freportw)                    11 Akanon         | High Elf 10       Gnome    11
-5 Neriak(neriaka)                       12 Cabilis(cabwest)| Dark Elf 5       Iksar    12
-6 Grobb                                 13 Shar Vahl      | Half Elf 1,4,9    Vah Shir 13
+Human      1,2,3,9,10,45,394          Troll      52,394
+Barbarian  29,394                     Ogre       49,394
+Erudite    23,24,75,394               Halfling   19,394
+Wood Elf   54,394                     Gnome      55,394
+High Elf   61,62,394                  Iksar      82,106,394
+Dark Elf   41,42,394                  Vah Shir   155,394
+Half Elf   1,2,3,9,10,45,54,61,394    Froglok    50,394
+Dwarf      60,67,394                  Drakkin    394
 ```
-> ⚠ **The index table above covers fourteen races only** — Froglok and Drakkin have
-> no row in it. In the seed rows, race 330 carries `start_zone` 50 or 394 and race 522 carries 394
-> only. Resolve those the same way as every other race: from `char_create_combinations`, not from
-> this table.
 
-### Appearance ranges (`races.cpp`; not server-validated, UI guidance)
-- **Face:** 0–7 (all races).
-- **Eye color 1/2:** 0–9 (Troll 0–10).
-- **Hairstyle:** 0–3 most races; Erudite M 0–5, Erudite F 0–8; Troll/Ogre males, Iksar, Vah Shir = no
-  hair (send 0).
-- **Hair color:** 0–19 (Human/Barb/WoodElf/HalfElf/Dwarf/Halfling); High Elf 0–14; Dark Elf 13–18;
-  Gnome 0–24; Troll/Ogre F 0–23; Troll/Ogre M, Iksar, Vah Shir = 0.
-- **Beard:** Human/Barb/Erudite/Dwarf/Halfling/Gnome M 0–5; HighElf/DarkElf/HalfElf M 0–3; Dwarf F
-  0–1; all others 0.
-- **Beard color:** same race set as hair color where beards exist, else 0.
+1 QEYNOS (`:201`), 2 QEYNOS2 (`:202`), 3 QRG (`:203`), 9 FREPORTW (`:208`), 10 FREPORTE (`:209`),
+19 RIVERVALE (`:218`), 23 ERUDNINT (`:222`), 24 ERUDNEXT (`:223`), 29 HALAS (`:228`),
+41 NERIAKB (`:240`), 42 NERIAKC (`:241`), 45 QCAT (`:244`), 49 OGGOK (`:248`), 50 RATHEMTN (`:249`),
+52 GROBB (`:251`), 54 GFAYDARK (`:253`), 55 AKANON (`:254`), 60 KALADIMA (`:259`),
+61 FELWITHEA (`:260`), 62 FELWITHEB (`:261`), 67 KALADIMB (`:266`), 75 PAINEEL (`:274`),
+82 CABWEST (`:281`), 106 CABEAST (`:304`), 155 SHARVAHL (`:333`), 394 CRESCENT (`:546`) — 26 distinct
+ids across the 641 rows, and **394 Crescent Reach is the one value every one of the sixteen races
+carries**, which is why it is also the SoF defaulter's last resort (`world/worlddb.cpp:630`).
+Drakkin carries *only* 394. The narrowing is per class and deity as well as per race — Dark Elf
+Necromancer, for instance, is `{42, 394}`, not the full Dark Elf set `{41, 42, 394}` — so query the
+combos with all three fields, never race alone.
 
-> ⚠ **This list covers fourteen races; Froglok and Drakkin are not in it**, and this document does
-> not source their ranges. Appearance is not server-validated — `CheckCharCreateInfoSoF` matches only
-> `Class`/`Race`/`Deity`/`Zone` (`world/client.cpp:1912–1915`) — so a wrong range is a cosmetic bug
-> rather than a create failure, but do not read the list as complete. Drakkin additionally carries
-> `drakkin_heritage`/`tattoo`/`details` in the RoF2 create struct (Section 4).
+> ⚠ **This deletes a table an earlier revision of this section carried:** a start-city index table
+> numbered 0–13 (`0 Odus(erudnext; paineel if deity=203)` … `13 Shar Vahl`) beside a per-race index
+> column (`Human 1,4` … `Vah Shir 13`). Deleted rather than relabelled, on three counts. **(1)** Its
+> left half is Titanium's `enum StartZoneIndex` (`common/eq_constants.h:974–990`), whose only
+> consumer is `WorldDatabase::SetTitaniumDefaultStartZone` (`world/worlddb.cpp:634`, the Odus
+> deity-203 branch at `:643–655`) — reached only on the `is_titanium` side of the split above, so it
+> never governed this client. **(2)** It was short by one anyway: that enum runs 0–**14**, ending
+> `RatheMtn = 14` (`common/eq_constants.h:989`), handled at `world/worlddb.cpp:735`. **(3)** Its right
+> half, the per-race index assignments, had **no EQEmu source at all** — UNCITED in this repo's sense,
+> without saying so. Attributing this client's start-city behaviour to a Titanium enum is the defect
+> class this whole change exists to remove, so the table goes rather than gaining a label.
 
-### Name rules (server-enforced at `OP_ApproveName`)
-4–15 chars, alphabetic only, first char uppercase / rest lowercase, no spaces, no 3 identical
-consecutive chars, server `name_filter` substring check, uniqueness via `ReserveName`. Reply is the
-same opcode with a 1-byte body (`0x01`=ok, `0x00`=reject). ⚠ **The opcode value is per-client:** RoF2
-is `0x56a2` (`utils/patches/patch_RoF2.conf:39`), which is what eqoxide sends
-(`crates/eqoxide-protocol/src/protocol/mod.rs:104`); `0x3ea6` is the **Titanium** value
-(`utils/patches/patch_Titanium.conf:27`).
+### Appearance ranges (`common/races.cpp`; not server-validated, UI guidance)
+The ranges are the `RaceAppearance::IsValid*` functions in `common/races.cpp`, EQEmu's own tabulation
+of what each race **and gender** accepts. Two properties of that file bound how far these go, and
+both are load-bearing:
 
-### Default stat pre-spend (UI seed; player may redistribute) — `char_create_point_allocations`
-Warrior→STA, Cleric→WIS(+STR), Paladin→STA, Ranger→DEX, SK→STA, Druid→WIS(+STA), Monk→AGI, Bard→CHA,
-Rogue→STR(+DEX), Shaman→WIS(+STA), Necro→INT(+STA), Wizard→INT(+STA), Mage→INT(+STA), Enchanter→INT(+CHA),
-Beastlord→WIS, Berserker→STA. Appearance defaults all 0, gender male.
+- **It is not on the character-creation path.** Its only callers in the tree are the bot appearance
+  commands (`zone/bot_commands/bot_appearance.cpp:68`–`:539`). `CheckCharCreateInfoSoF` matches only
+  `Class`/`Race`/`Deity`/`Zone` (`world/client.cpp:1912–1915`), so a wrong value here is a cosmetic
+  bug, not a create failure. Use the ranges to constrain the UI, not to predict a reject.
+- **Every one of these ten functions returns `true` for an "unset" sentinel before its switch, and
+  `false` for any race/gender it does not name.** The sentinel is `std::numeric_limits<T>::max()` of
+  the *value parameter's own type*, so it is **`0xFF` for the seven `uint8` attributes** (beard,
+  beard colour, eye colour, face, hair, hair colour, woad) and **`0xFFFFFFFF` for the three `uint32`
+  ones** (detail, heritage, tattoo) — do not use one sentinel for all ten. So "no valid value" below
+  means exactly that: the validator accepts nothing but the sentinel — **not** that 0 is accepted.
+- **The Luclin branch is the reachable one.** Each function's `use_luclin` parameter defaults to
+  `true` (`common/races.h:822–831`) and every caller in the tree takes the default, so where a
+  function branches on it the ranges below are read off the Luclin side.
+
+All **sixteen** creatable races are covered, per gender wherever the source distinguishes them, and
+every one of the ten `IsValid*` functions is accounted for below. A `—` means the validator names no
+value at all for that race/gender. "The fourteen" below always means the sixteen creatable races
+minus Froglok and Drakkin, which is the split EQEmu's own switches use.
+
+- **Face** — `IsValidFace` (`:1721–1780`): Drakkin **0–6** (`:1728–1730`); the fourteen **0–7**
+  (`:1735–1763`); Froglok **0–9** (`:1768–1770`).
+- **Eye color 1 and 2** — one function, `IsValidEyeColor` (`:1660–1719`), governs both fields:
+  **0–9** for thirteen of the fourteen (`:1667–1693`); Troll **0–10** (`:1698–1700`); Froglok and
+  Drakkin **0–11** (`:1705–1709`).
+- **Hairstyle** — `IsValidHair` (`:1782–1859`; Luclin branch `:1788–1838`): **0–3** for
+  Human, Barbarian, Wood Elf, High Elf, Dark Elf, Half Elf, Dwarf, Halfling and Gnome (both genders)
+  plus Troll F and Ogre F (`:1790–1810`); Erudite M **0–5** (`:1815–1816`); Drakkin F **0–7**
+  (`:1821–1822`); Erudite F and Drakkin M **0–8** (`:1827–1829`); **—** for Troll M, Ogre M, Iksar,
+  Vah Shir and **Froglok**.
+- **Hair color** — `IsValidHairColor` (`:1861–1927`): Gnome **0–24** (`:1868–1870`); Troll F and Ogre F **0–23**
+  (`:1875–1877`); Human, Barbarian, Wood Elf, Half Elf, Dwarf, Halfling **0–19** (`:1882–1894`);
+  Dark Elf **13–18** (`:1899–1901`); High Elf **0–14** (`:1906–1908`); Froglok and Drakkin **0–3**
+  (`:1913–1917`); **—** for **Erudite** (both genders), Troll M, Ogre M, Iksar and Vah Shir.
+- **Beard** — `IsValidBeard` (`:1519–1584`; Luclin branch `:1525–1563`): Dwarf F **0–1** (`:1527–1528`); High Elf M,
+  Dark Elf M, Half Elf M and Drakkin F **0–3** (`:1533–1537`); Human M, Barbarian M, Erudite M,
+  Dwarf M, Halfling M, Gnome M **0–5** (`:1542–1548`); Drakkin M **0–11** (`:1553–1554`); **—** for
+  every other race/gender.
+- **Beard color** — `IsValidBeardColor` (`:1586–1637`): Gnome M **0–24** (`:1593–1594`); Human M, Barbarian M, Erudite M,
+  Half Elf M, Dwarf M, **Dwarf F** and Halfling M **0–19** (`:1599–1606`); Dark Elf M **13–18**
+  (`:1611–1612`); High Elf M **0–14** (`:1617–1618`); Froglok and Drakkin, both genders, **0–3**
+  (`:1623–1627`); **—** for every other race/gender.
+- **Drakkin only** — the three extra fields in the RoF2 create struct (Section 4): heritage **0–7**
+  (`IsValidHeritage`, `:1929–1948`), tattoo **0–7** (`IsValidTattoo`, `:1950–1969`), details **0–7**
+  (`IsValidDetail`, `:1639–1658`). No other race has a valid value for any of them. These are the
+  three `uint32` ones, so their sentinel is `0xFFFFFFFF`.
+- **Barbarian only** — woad **0–8**, `IsValidWoad`, Luclin branch only (`:1971–1992`). Not a field in
+  the create struct; listed so the absence is deliberate rather than an omission.
+
+> ⚠ **Do not infer one attribute's race set from another's — two pairs cross.** Erudite has **no**
+> valid hair colour yet Erudite M has beard colour 0–19, so "beard colour follows the hair-colour
+> race set" is false. Froglok has **no** hairstyle yet has beard colour 0–3. Earlier revisions of
+> this section stated the first of those as a rule and gave face as "0–7 (all races)", which stopped
+> being true the moment this document corrected the creatable set from fourteen races to sixteen.
+
+### Name rules (`Client::HandleNameApprovalPacket`, `world/client.cpp:567`)
+Checked in order, first failure wins: length 4–15 (`:601`), first character not lower-case (`:603`),
+no space anywhere (`:605`), then `Database::CheckNameFilter` (`:607`), then no upper-case character
+after the first (`:611`), then uniqueness via `ReserveName` (`:619`). `CheckNameFilter`
+(`common/database.cpp:830`) is where the rest live: alphabetic-only (`:843`), no **3** identical
+consecutive characters (`:858`, the test is `num_c > 2`), and a case-insensitive substring match
+against every row of the `name_filter` table (`:870`). Reply is the same opcode with a 1-byte body,
+`0x01`=ok / `0x00`=reject (`:622–624`).
+
+`HandleNameApprovalPacket` contains **no client-version branch** — unlike the stat and combo checks
+above, these rules are the same for Titanium and for RoF2. Only the opcode number differs:
+
+> ⚠ **The opcode value is per-client.** RoF2 is `0x56a2` (`utils/patches/patch_RoF2.conf:39`), which
+> is what eqoxide sends (`crates/eqoxide-protocol/src/protocol/mod.rs:104`); `0x3ea6` is the
+> **Titanium** value (`utils/patches/patch_Titanium.conf:27`).
+
+### Default stat pre-spend — RoF2/SoF path only, UI seed (`char_create_point_allocations`, `utils/sql/svn/2024_required_update.sql:655`)
+**This is per combo, not per class.** The pre-spend is the `alloc_str`…`alloc_cha` columns of the
+`char_create_point_allocations` row named by the matched combo's `allocation_id`, which the server
+looks up by `AllocationIndex` (`world/client.cpp:1927–1941`). EQEmu's tracked seed carries the table
+definition at `utils/sql/svn/2024_required_update.sql:655` and **109** rows, ids 0–108, at
+`:674–782` — the same file the deity section above cites for `char_create_combinations`.
+
+Projecting the seed's 641 combo rows onto the allocation row each names gives, per class:
+
+```
+Warrior     STA+25  or  STR+7/STA+18      Rogue        STR+25/DEX+5
+Cleric      WIS+25/STA+5                  Shaman       WIS+25/STA+5
+Paladin     STA+20                        Necromancer  INT+25/STA+5
+Ranger      DEX+20                        Wizard       INT+25/STA+5
+ShadowKnight STA+20                       Magician     INT+25/STA+5
+Druid       WIS+25/STA+5                  Enchanter    CHA+25/INT+5
+Monk        AGI+20                        Beastlord    STA+5/AGI+5/DEX+5/WIS+5
+Bard        CHA+25                        Berserker    STR+25  or  STR+10/STA+15
+```
+
+Warrior and Berserker are the only two classes whose combos span more than one allocation vector, so
+they are the only two for which a single per-class default is not well defined; drive the UI off
+`allocation_id` and the per-class column above is only a sanity check.
+
+> ⚠ **This corrects an earlier revision of this section**, which gave `Cleric→WIS(+STR)` (the second
+> stat is STA, not STR), `Enchanter→INT(+CHA)` (reversed — it is CHA+25 with INT+5),
+> `Beastlord→WIS` (it is an even +5 across STA, AGI, DEX and WIS) and `Berserker→STA` (it is STR+25,
+> or STR+10/STA+15). Those four were unsourced and wrong; the values above are derived from the seed
+> rows cited here.
+
+**A UI choice, not a server rule:** this document's create screen starts with gender male and every
+appearance field at 0. EQEmu neither requires nor supplies that — it is the only thing under this
+heading that is not read off an EQEmu source, and 0 is not necessarily a value the appearance
+validator accepts (see *Appearance ranges* above).
 
 ## Section 4 — Wire formats
 
