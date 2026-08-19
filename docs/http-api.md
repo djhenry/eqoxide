@@ -176,7 +176,7 @@ shape.
 | Route | Body | Description |
 |-------|------|-------------|
 | `POST /v1/chat/tell` | `{"to":"Name","text":"..."}` | Directed whisper (chan 7). The recipient sees a `directed` chat event. |
-| `POST /v1/chat/ooc` | `{"text":"..."}` | Zone-wide OOC broadcast (chan 5). |
+| `POST /v1/chat/ooc` | `{"text":"..."}` | OOC broadcast (chan 5). |
 | `POST /v1/chat/shout` | `{"text":"..."}` | Zone-wide shout (chan 3). |
 | `POST /v1/chat/group` | `{"text":"..."}` | Group-channel message (chan 2). |
 

@@ -32,7 +32,7 @@ async fn post_tell(State(s): State<HttpState>, Json(b): Json<TellBody>) -> (Stat
 #[serde(deny_unknown_fields)]
 struct TextBody { text: String }
 
-/// POST /v1/chat/ooc {"text"} — zone-wide out-of-character broadcast (chan 5).
+/// POST /v1/chat/ooc {"text"} — out-of-character broadcast (chan 5).
 async fn post_ooc(State(s): State<HttpState>, Json(b): Json<TextBody>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
     if b.text.trim().is_empty() { return (StatusCode::BAD_REQUEST, "ooc requires 'text'".into()); }
