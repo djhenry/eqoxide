@@ -203,16 +203,21 @@ jobs:
       # new pass from run_live was MEASURED to leave the self-test at full green without it — and a
       # `--commits` pass over a throwaway repository. Verified red in both directions at this
       # commit: neutering the scanner, dropping the `\b` from the `not` cue, widening the match
-      # window past a sentence boundary, removing the em dash from the gap stop set, breaking the
-      # attribution comparison, deleting the pass from run_live, deleting the commit fetch from the
-      # corpus, and BOTH directions of the gating policy — making every surface gate (the rejected
-      # design; 4 checks red), making no surface gate (6 red), and restoring the unconditional
+      # window past a sentence boundary, removing the em dash from the gap stop set, inverting the
+      # attribution timestamp comparison, dropping the space padding from the attribution range
+      # test, deleting the pass from run_live, deleting the commit fetch from the corpus, and BOTH
+      # directions of the gating policy — making every surface gate (the rejected
+      # design; 9 checks red), making no surface gate (6 red), and restoring the unconditional
       # "OK — all N items clean" final line that the narrowing made false on a warn-only run (2 red)
-      # — each turn `--self-test` RED, ten mutations for ten reds; hand-reverting each restores a
-      # full-green run, verified by sha256 against a pristine copy rather than by `git restore`.
+      # — each turn `--self-test` RED, eleven mutations for eleven reds; hand-reverting each
+      # restores a full-green run, verified by sha256 against a pristine copy, not `git restore`.
+      # Every count here is re-derived against THIS revision's 67-check suite; an earlier revision
+      # quoted 4 for the every-surface mutation, which was its true value against the 60-check
+      # suite of a previous revision and became false when the suite grew.
       # That last one is why the warn-only stub mode exists: neither of the other two modes reaches
-      # the final summary line with a flagged item in hand, so 60 checks passed over a line stating
-      # the opposite of what had just happened. The em dash is in the gap stop set on measured
+      # the final summary line with a flagged item in hand, so every one of the 60 checks the suite
+      # then contained passed over a line stating the opposite of what had just happened.
+      # The em dash is in the gap stop set on measured
       # evidence too: over the full published history (4598 items, swept 2026-08-19) it takes the
       # flag count 49 -> 41, all 8 dropped items are false positives of the shape `<clause with a
       # negation> — Fixes #N`, and zero measured true instances are lost. Three of those exact

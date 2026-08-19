@@ -1147,6 +1147,16 @@ run_self_test() {
     'issue 1010 <- PR 1037|2026-08-18T23:36:59Z|null|2026-08-18T23:36:57Z||ATTRIBUTED-LINK'
     'issue 314 <- its closing commit|2026-07-12T18:18:53Z|10619d99dab87aa6fe57503fcec17d5c416254a8||10619d99dab87aa6fe57503fcec17d5c416254a8|ATTRIBUTED-COMMIT'
     'issue 314 vs a range without that commit|2026-07-12T18:18:53Z|10619d99dab87aa6fe57503fcec17d5c416254a8||bb15748000000000000000000000000000000000|NOT-ATTRIBUTED'
+    # The range test is EXACT-TOKEN membership, and the space padding around both sides of the
+    # `case` glob is what makes it exact. Without this row the padding is unpinned: dropping it
+    # (`*" ${close_commit} "*` -> `*"${close_commit}"*`) was MEASURED to leave --self-test at full
+    # green, because every other row here compares a full 40-char sha against a range of full
+    # 40-char shas, where substring and exact membership cannot disagree. An ABBREVIATED sha is
+    # where they disagree, so that is what this row feeds. NOT-ATTRIBUTED is the correct verdict
+    # and the safe direction: both real inputs are full shas (the API's `commit_id`, and
+    # `git log --format=%H`), so an abbreviated one is out-of-contract input that must fail to
+    # match rather than silently match a commit it merely prefixes.
+    'an ABBREVIATED sha must not match a range by substring (pins the space padding)|2026-07-12T18:18:53Z|10619d99||10619d99dab87aa6fe57503fcec17d5c416254a8|NOT-ATTRIBUTED'
     'issue 302 <- PR 653 (NEGATIVE FIXTURE)|2026-07-11T20:18:54Z|null|2026-07-22T22:31:39Z||NOT-ATTRIBUTED'
     'a disclaimed issue that is still open|||2026-07-22T22:31:39Z||STILL-OPEN'
     'a disclaimed issue closed while the PR is unmerged|2026-08-01T00:00:00Z|null|||NOT-ATTRIBUTED'
@@ -1277,8 +1287,9 @@ GHSTUB
   # -------------------------------------------------------------------------------------------
   # The WARN-ONLY run: a finding on a surface GitHub does not link from. It does not gate, so the
   # run exits 0 and reaches the final summary — which is exactly where this script spent a revision
-  # printing "OK — all N items clean ... on both passes" over a flagged item. Nothing in the other
-  # 60 checks could see that, because both other modes either gate or have nothing to report. The
+  # printing "OK — all N items clean ... on both passes" over a flagged item. Nothing in the 60
+  # checks the suite THEN CONTAINED could see that (the number is that revision's, not this one's),
+  # because both other modes either gate or have nothing to report. The
   # summary text is asserted directly here for that reason: the exit code was never the bug.
   # -------------------------------------------------------------------------------------------
   rc=0
@@ -1339,7 +1350,7 @@ GHSTUB
 
   # Assert how many checks ran. A case that silently stops running must fail this step rather than
   # shrink the output. `checks + 1` counts this assertion itself, which has not been tallied yet.
-  want "self-test ran every check (incl. this one)" "$((checks + 1))" "66"
+  want "self-test ran every check (incl. this one)" "$((checks + 1))" "67"
 
   if [ "$fails" -ne 0 ]; then
     echo "check-pr-text --self-test: FAILED ${fails} of ${checks} checks."
