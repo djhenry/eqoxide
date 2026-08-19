@@ -84,12 +84,12 @@ pub use eqoxide_ipc::{NAV_STATE_DEAD, NAV_STATE_HALTED_HP_ZERO, nav_state_is_lif
 /// it — see the argument there for why the rule is stated this way round.
 ///
 /// **`dead` and `halted_hp_zero` are deliberately ABSENT, and the prose in this file will tempt you
-/// to "fix" that — do not (#1007).** Both are terminal *for the goal*, and two comments below call
-/// `dead` terminal in so many words (`nav_halt_if_dead` publishes "an HONEST TERMINAL state";
-/// `resolve_goal` retires "the terminal `dead`"). Adding either to this array is a REGRESSION, not
-/// a tidy-up: the retirements that clear them are both guarded by `!nav_state_is_terminal(&current)`
-/// (see `Walker::retire_life_halt` and `Walker::resolve_goal`), so listing them makes the
-/// retirement dead code and the halt PERMANENT — a bounded lie converted into a never-clearing one.
+/// to "fix" that — do not (#1007).** Both are terminal *for the goal*, and `resolve_goal` below
+/// calls `dead` terminal in so many words: it retires "the terminal `dead`". Adding either to this
+/// array is a REGRESSION, not a tidy-up: the retirements that clear them are both guarded by
+/// `!nav_state_is_terminal(&current)` (see `Walker::retire_life_halt` and `Walker::resolve_goal`),
+/// so listing them makes the retirement dead code and the halt PERMANENT — a bounded lie converted
+/// into a never-clearing one.
 /// The omission is load-bearing in the opposite direction from what the surrounding prose implies.
 /// `zone_loading` is absent for the related reason — it is a promise that a route is still coming.
 ///
@@ -1258,8 +1258,11 @@ impl Walker {
     /// The not-dead branch below is not a bare `return false` any more: it retires a standing
     /// [`NAV_STATE_DEAD`]/[`NAV_STATE_HALTED_HP_ZERO`] before returning.
     ///
-    /// It has to be ABOVE every early return in the tick, and this function is the first thing the
-    /// tick does. `resolve_goal` used to hold the one retirement, and in `ActionLoop::tick` it sits
+    /// It has to be ABOVE every early return in the tick, and it is — it is NOT the first thing the
+    /// tick does (the pending-reaper, the `drain_*` calls and `stream_position` all run first), but
+    /// none of those returns, so this call is still the first `return` the tick can take. See the
+    /// "FIRST early return" paragraph below, which is the property the argument actually rests on.
+    /// `resolve_goal` used to hold the one retirement, and in `ActionLoop::tick` it sits
     /// BELOW `if self.drive_auto_engage_melee(stream, gs) { return; }` — so while auto-engage keeps
     /// returning `true`, the retirement is never reached and the word never clears. The same is
     /// true of `drive_walk`'s four writers (`planning`, `blocked`, `following`, `arrived`), which
