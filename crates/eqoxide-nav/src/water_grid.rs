@@ -697,12 +697,17 @@ impl WaterRollup {
 impl std::fmt::Display for WaterRollup {
     /// **#831 (item 2).** The dirty branch below marks itself with `— INCOMPLETE`; this branch used
     /// to print nothing at all to say the opposite, so a caller printing two rollups side by side
-    /// (the corpus prints `wat-route` and `#423` on the same line) relied on the READER already
+    /// (`tests/walker_sim.rs` tracks a `wat-route` and a `#423` rollup) relied on the READER already
     /// knowing that an absence of `INCOMPLETE` means complete, rather than the line saying so itself.
     /// `— COMPLETE` closes that gap: every rollup line now states its own completeness. **Note for
     /// anyone grepping either marker: `"INCOMPLETE".contains("COMPLETE")` is `true` — a naive
     /// `line.contains("COMPLETE")` check matches BOTH branches. Match the em-dash too
     /// (`"— COMPLETE"`), which the dirty branch's `"— INCOMPLETE"` never contains as a substring.**
+    ///
+    /// **#898.** This marker is true of THIS rollup and says nothing about any other rollup printed
+    /// near it. A caller with more than one rollup must render them through [`RollupReport`], which
+    /// puts each on its own line and adds a verdict for the report as a whole — see that type's doc
+    /// for the composite line the two `walker_sim` rollups used to produce.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let zones = self.attempted_zones();
         if self.is_complete() {
@@ -728,6 +733,120 @@ impl std::fmt::Display for WaterRollup {
         }
         write!(f, "{} over {}/{} zones — INCOMPLETE, {}",
             self.total, self.measured_zones, zones, parts.join("; "))
+    }
+}
+
+// ───────── #898: a report that prints MORE THAN ONE rollup is its own honesty surface ─────────
+
+/// The marker a [`RollupReport`] prints when EVERY rollup on it is complete.
+///
+/// Deliberately not a superstring or substring of any other marker in this module — see
+/// [`RollupReport`] for the table and `composite_markers_are_line_safe_against_every_other_898`
+/// for the pin.
+pub const COMPOSITE_CLEAN: &str = "— ALL-COMPLETE";
+/// The marker a [`RollupReport`] prints when ANY rollup on it is incomplete — **and when it holds
+/// no rollups at all**, which is the same clean-over-nothing refusal [`WaterRollup::is_complete`]
+/// makes with its `attempted_zones() > 0` term.
+pub const COMPOSITE_DIRTY: &str = "— NOT-ALL-COMPLETE";
+
+/// Several labelled [`WaterRollup`]s rendered as ONE report, with a verdict of its own.
+///
+/// ## The defect this exists for (#898, a #831 follow-up)
+///
+/// [`WaterRollup`]'s `Display` marks itself `— COMPLETE` or `— INCOMPLETE`, and that marker is
+/// true *of that rollup*. `tests/walker_sim.rs` tracks TWO rollups side by side (`wat-route` and
+/// `#423`) and printed both **on one line**:
+///
+/// ```text
+/// === FAITHFUL WALKER DRIFT [ABORTED while opening blackburrow] — PARTIAL rollups; … wat-route: 0 (over 1/1 zones) — COMPLETE, #423: 0 over 1/2 zones — INCOMPLETE, 1 unaccounted [q] ===
+/// ```
+///
+/// Every substring of that line is true. The LINE is not: it carries `— COMPLETE` while the report
+/// it belongs to is an aborted, partial one whose other rollup holds the hole. `— COMPLETE` was
+/// designed to be grep-able precisely so a reader or a script would not have to parse a rollup, and
+/// a line-level grep for it lands on that line and reads it as "clean". That is the shape a naive
+/// audit is trying to CATCH, produced by the marker meant to prevent it.
+///
+/// ## What this type changes
+///
+/// 1. **One rollup per line.** Each rollup's own `— COMPLETE`/`— INCOMPLETE` is line-safe again,
+///    because the only thing on its line is the rollup the marker describes.
+/// 2. **The report gets its own line-level verdict**, [`COMPOSITE_CLEAN`] / [`COMPOSITE_DIRTY`],
+///    on a line of its own. So "is this whole report clean?" is a line-level grep too, and it is a
+///    DIFFERENT string from the per-rollup markers — a grep for one can never match the other.
+/// 3. **Empty is not clean.** `RollupReport::new([])` answers `false` from
+///    [`all_complete`](Self::all_complete) and prints [`COMPOSITE_DIRTY`], for the same reason
+///    [`WaterRollup::is_complete`] carries `attempted_zones() > 0`: a type whose job is refusing to
+///    look clean must not have a value that looks clean over nothing.
+///
+/// ## The marker table, and why these four strings
+///
+/// | marker | printed by | contains `— COMPLETE`? | contains `— ALL-COMPLETE`? |
+/// |---|---|---|---|
+/// | `— COMPLETE` | one clean [`WaterRollup`] | yes (itself) | no |
+/// | `— INCOMPLETE` | one dirty [`WaterRollup`] | no | no |
+/// | [`COMPOSITE_CLEAN`] | a clean report | no | yes (itself) |
+/// | [`COMPOSITE_DIRTY`] | a dirty or EMPTY report | no | no |
+///
+/// The em-dash is load-bearing in every row, exactly as it is for `— INCOMPLETE` vs `COMPLETE`:
+/// `"NOT-ALL-COMPLETE"` contains `"ALL-COMPLETE"`, and only the leading `— ` separates them.
+/// `composite_markers_are_line_safe_against_every_other_898` asserts the whole table rather than
+/// leaving it as prose.
+///
+/// ## What this does NOT claim
+///
+/// * It does not stop a caller writing its own `format!("{a}, {b}")` over two rollups. Nothing in
+///   Rust can. What it does is give every such call site in this workspace one thing to use
+///   instead, and pin the property so a reviewer has a name for what a hand-rolled line loses.
+/// * It says nothing about a reader who greps a whole multi-line BLOCK rather than a line. A
+///   clean rollup inside an aborted report is still printed, and printing it is the point — the
+///   report says which rollup is clean and states, on its own line, that the report is not.
+pub struct RollupReport<'a> {
+    rolls: Vec<(&'a str, &'a WaterRollup)>,
+}
+
+impl<'a> RollupReport<'a> {
+    pub fn new(rolls: impl IntoIterator<Item = (&'a str, &'a WaterRollup)>) -> Self {
+        Self { rolls: rolls.into_iter().collect() }
+    }
+
+    /// Every rollup on the report is complete, **and there is at least one**. See the type doc's
+    /// point 3 for why the second term is not decoration.
+    pub fn all_complete(&self) -> bool {
+        !self.rolls.is_empty() && self.rolls.iter().all(|(_, r)| r.is_complete())
+    }
+
+    /// The labels of the rollups that are NOT complete, in report order.
+    pub fn incomplete_labels(&self) -> Vec<&'a str> {
+        self.rolls.iter().filter(|(_, r)| !r.is_complete()).map(|(l, _)| *l).collect()
+    }
+
+    /// The report's own line-level marker: [`COMPOSITE_CLEAN`] or [`COMPOSITE_DIRTY`].
+    pub fn marker(&self) -> &'static str {
+        if self.all_complete() { COMPOSITE_CLEAN } else { COMPOSITE_DIRTY }
+    }
+}
+
+impl std::fmt::Display for RollupReport<'_> {
+    /// Renders as a leading newline, then one `  <label>: <rollup>` line per rollup, then the
+    /// report's own verdict line. Every line carries at most one marker, and the verdict is the
+    /// only line that can be read as a claim about the report as a whole.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (label, roll) in &self.rolls {
+            writeln!(f)?;
+            write!(f, "  {label}: {roll}")?;
+        }
+        writeln!(f)?;
+        let n = self.rolls.len();
+        if self.rolls.is_empty() {
+            return write!(f, "  0 rollups on this report {COMPOSITE_DIRTY} — no rollup ever \
+                              reached this report, which is not a clean result");
+        }
+        if self.all_complete() {
+            return write!(f, "  {n} rollup(s) on this report {COMPOSITE_CLEAN}");
+        }
+        write!(f, "  {n} rollup(s) on this report {COMPOSITE_DIRTY}, incomplete: {:?}",
+            self.incomplete_labels())
     }
 }
 
@@ -1207,6 +1326,153 @@ mod tests {
         assert!(line.contains("INCOMPLETE"), "an empty rollup must not print a clean total: {line}");
         assert!(!line.contains("(over 0/0 zones)"),
             "the round-2 clean-looking empty string must not be producible: {line}");
+    }
+
+    // ───────── #898: the COMPOSITE report's own honesty, pinned without any baked asset ─────────
+
+    /// The exact divergence #898 is about, built by hand: `wat-route` closes clean while `#423`
+    /// holds an unaccounted hole for the SAME zone. This is the state
+    /// `zone_accounting_covers_the_423_rollup_not_just_wat_route` drives in `tests/walker_sim.rs`,
+    /// reproduced here so the rendering property can be measured without that file's subprocess.
+    fn diverged_pair_898() -> (WaterRollup, WaterRollup) {
+        let (mut wr, mut r423) = (WaterRollup::new(), WaterRollup::new());
+        wr.begin_zone("zone_a");
+        wr.add("zone_a", &dry_but_loaded().measure(|_| 0usize)); // clean, and its total is 0
+        r423.begin_zone("zone_a"); // opened and abandoned — the hole
+        (wr, r423)
+    }
+
+    /// **#898 — the marker table, asserted rather than described.** Every honesty marker in this
+    /// module has to survive a naive `line.contains(..)` against every OTHER marker, in both
+    /// directions. `"INCOMPLETE".contains("COMPLETE")` is the original trap (#831) and
+    /// `"NOT-ALL-COMPLETE".contains("ALL-COMPLETE")` is the same trap one level up, which is why
+    /// the em-dash is part of all four strings and not decoration.
+    ///
+    /// MUTATION CHECKS (each independently turns this RED):
+    /// 1. Drop the `— ` from `COMPOSITE_CLEAN` → `COMPOSITE_DIRTY` now contains it.
+    /// 2. Spell `COMPOSITE_CLEAN` as `"— COMPLETE"` → it collides with the per-rollup marker.
+    #[test]
+    fn composite_markers_are_line_safe_against_every_other_898() {
+        const ROLLUP_CLEAN: &str = "— COMPLETE";
+        const ROLLUP_DIRTY: &str = "— INCOMPLETE";
+        // The two per-rollup markers really are what `WaterRollup` prints — otherwise this table
+        // is about strings nothing emits (the reach control for this test).
+        let mut clean = WaterRollup::new();
+        clean.begin_zone("z"); clean.add("z", &dry_but_loaded().measure(|_| 1usize));
+        let mut dirty = WaterRollup::new();
+        dirty.begin_zone("z"); // abandoned
+        assert!(clean.to_string().contains(ROLLUP_CLEAN), "{clean}");
+        assert!(dirty.to_string().contains(ROLLUP_DIRTY), "{dirty}");
+
+        let markers = [ROLLUP_CLEAN, ROLLUP_DIRTY, COMPOSITE_CLEAN, COMPOSITE_DIRTY];
+        for (i, a) in markers.iter().enumerate() {
+            for (j, b) in markers.iter().enumerate() {
+                if i == j { continue }
+                assert!(!a.contains(b),
+                    "marker {a:?} contains marker {b:?} as a substring, so a grep for {b:?} matches \
+                     a line that only carries {a:?} — that is #831's `INCOMPLETE`/`COMPLETE` trap, \
+                     and the whole point of the leading em-dash");
+            }
+        }
+    }
+
+    /// **#898 — a two-rollup report cannot put a per-rollup `— COMPLETE` on a line that is not
+    /// itself clean.** The report under test is the diverged one: one rollup genuinely complete
+    /// (and printing the historical defect string `(over 1/1 zones)` while it is at it), the other
+    /// holding the hole.
+    ///
+    /// Four properties, and the first is a REACH CONTROL: if the clean rollup stopped printing
+    /// `— COMPLETE` at all the remaining three would pass vacuously, and this test would be
+    /// measuring nothing.
+    ///
+    /// MUTATION CHECKS (each independently turns this RED):
+    /// 1. Render the rollups on ONE line (`write!(f, "{label}: {roll} ")` with no `writeln!`) →
+    ///    property 2 fails: a line carries both markers.
+    /// 2. Delete the verdict line from `Display` → property 3 fails.
+    /// 3. Drop the `!self.rolls.is_empty()` term from `all_complete` → the empty case below flips.
+    #[test]
+    fn a_composite_report_keeps_every_marker_line_true_898() {
+        let (wr, r423) = diverged_pair_898();
+        let report = RollupReport::new([("wat-route", &wr), ("#423", &r423)]);
+        let text = report.to_string();
+        let lines: Vec<&str> = text.lines().collect();
+
+        // 1. REACH CONTROL. The clean rollup's own marker — and the historical defect string it
+        //    prints beside it — must really be in this text, or nothing below is measuring the
+        //    rendering.
+        assert!(text.contains("— COMPLETE"),
+            "reach control: the clean rollup's own marker is absent, so the properties below are \
+             vacuous.\n{text}");
+        assert!(text.contains("(over 1/1 zones)"),
+            "reach control: #898's exhibit is `— COMPLETE` printed beside `0 (over 1/1 zones)`, and \
+             this fixture no longer produces that string.\n{text}");
+
+        // 2. THE FIX. No line carries a clean marker and a dirty one, and no line carries a
+        //    per-rollup marker together with the report's own verdict.
+        for line in &lines {
+            let per_clean = line.contains("— COMPLETE") && !line.contains("— INCOMPLETE");
+            assert!(!(line.contains("— COMPLETE") && line.contains("— INCOMPLETE")),
+                "one line carries BOTH per-rollup markers — a line-level grep for either is a \
+                 coin flip: {line:?}\n{text}");
+            assert!(!(per_clean && (line.contains(COMPOSITE_CLEAN) || line.contains(COMPOSITE_DIRTY))),
+                "a per-rollup `— COMPLETE` shares a line with the report's own verdict, so the two \
+                 claims are indistinguishable by line: {line:?}\n{text}");
+        }
+
+        // 3. The report states its own verdict, on exactly one line, and that verdict is DIRTY.
+        let verdicts: Vec<&&str> = lines.iter()
+            .filter(|l| l.contains(COMPOSITE_CLEAN) || l.contains(COMPOSITE_DIRTY)).collect();
+        assert_eq!(verdicts.len(), 1, "exactly one verdict line, got {verdicts:?}\n{text}");
+        assert!(verdicts[0].contains(COMPOSITE_DIRTY) && !verdicts[0].contains(COMPOSITE_CLEAN),
+            "the report holds an incomplete rollup, so its verdict must be {COMPOSITE_DIRTY}: \
+             {:?}", verdicts[0]);
+        assert!(!report.all_complete() && report.marker() == COMPOSITE_DIRTY);
+        assert_eq!(report.incomplete_labels(), vec!["#423"],
+            "the verdict must NAME which half is dirty, not merely say one is");
+        assert!(verdicts[0].contains("#423"), "…and print it: {:?}", verdicts[0]);
+
+        // 4. …and a naive line-level grep for the clean marker now lands ONLY on the line of the
+        //    rollup that really is clean. That is the property #898 asks for, stated as the audit
+        //    a reader would actually run.
+        let clean_lines: Vec<&&str> = lines.iter().filter(|l| l.contains("— COMPLETE")
+            && !l.contains("— INCOMPLETE")).collect();
+        assert_eq!(clean_lines.len(), 1, "{clean_lines:?}\n{text}");
+        assert!(clean_lines[0].contains("wat-route"),
+            "the only `— COMPLETE` line must be the clean rollup's own: {:?}", clean_lines[0]);
+    }
+
+    /// **#898 — a report over zero rollups is not a clean report.** Same refusal as
+    /// `an_empty_rollup_is_not_a_complete_result_762`, one level up: a composite that has been told
+    /// about nothing has looked at nothing, and must not print the marker a reader greps for.
+    #[test]
+    fn an_empty_composite_report_is_not_clean_898() {
+        let nothing: [(&str, &WaterRollup); 0] = [];
+        let report = RollupReport::new(nothing);
+        assert!(!report.all_complete(), "zero rollups is not a clean report");
+        assert_eq!(report.marker(), COMPOSITE_DIRTY);
+        let text = report.to_string();
+        assert!(!text.contains(COMPOSITE_CLEAN),
+            "an empty report must not print the clean marker: {text}");
+        assert!(text.contains(COMPOSITE_DIRTY) && text.contains("no rollup ever reached"), "{text}");
+    }
+
+    /// **#898 — and a report whose rollups are ALL complete says so, on its own line.** Without
+    /// this the type could satisfy every assertion above by never printing [`COMPOSITE_CLEAN`] at
+    /// all, which would make the marker useless rather than safe.
+    #[test]
+    fn a_clean_composite_report_states_it_898() {
+        let (mut a, mut b) = (WaterRollup::new(), WaterRollup::new());
+        a.begin_zone("z"); a.add("z", &dry_but_loaded().measure(|_| 3usize));
+        b.begin_zone("z"); b.add("z", &dry_but_loaded().measure(|_| 0usize));
+        let report = RollupReport::new([("wat-route", &a), ("#423", &b)]);
+        assert!(report.all_complete() && report.marker() == COMPOSITE_CLEAN);
+        assert!(report.incomplete_labels().is_empty());
+        let text = report.to_string();
+        let verdicts: Vec<&str> = text.lines()
+            .filter(|l| l.contains(COMPOSITE_CLEAN) || l.contains(COMPOSITE_DIRTY)).collect();
+        assert_eq!(verdicts.len(), 1, "{text}");
+        assert!(verdicts[0].contains(COMPOSITE_CLEAN) && !verdicts[0].contains(COMPOSITE_DIRTY),
+            "{:?}", verdicts[0]);
     }
 
     /// Installing an unmeasured zone onto a collision grid is an error the caller must handle: a
