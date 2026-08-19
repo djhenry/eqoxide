@@ -36,15 +36,28 @@ jobs:
     #
     # THE PREVIOUS VERSION OF THIS COMMENT SAID "not because this job has any known hang risk" AND
     # THAT WAS FALSE (#1056). This job had a measured, reproducing hang: `sudo apt-get update` for
-    # the #995 dictionary, four job timeouts across two commits in ~45 minutes on 2026-08-19, every
-    # one of them AFTER both fatal-by-design steps had already passed. A timed-out job reports
-    # `cancelled` rather than `failure`, and `cancelled` is not `success`, so each one left a
-    # blameless PR sitting OPEN BLOCKED on a required check with nothing wrong with it.
+    # the #995 dictionary repeatedly ran the job out of its 10-minute budget on 2026-08-19, every
+    # time AFTER both fatal-by-design steps had already passed. A timed-out job reports `cancelled`
+    # rather than `failure`, and `cancelled` is not `success`, so each one left a blameless PR
+    # sitting OPEN BLOCKED on a required check with nothing wrong with it.
+    #
+    # NO TALLY IS PINNED HERE, for the same reason the `host-shape` header below pins no corpus
+    # count: it moves whenever an attempt is re-run, so a figure written into this file rots into a
+    # false claim. The first version of this comment pinned one anyway — a figure that was accurate
+    # at the instant #1056 was filed and stale by the time it was committed hours later. Re-derive
+    # it from the API instead, and sweep EVERY ATTEMPT of every run: `runs/<id>/jobs` returns only
+    # the latest attempt and undercounts.
+    #
+    #   gh api "repos/djhenry/eqoxide/actions/runs/<run-id>/attempts/<n>/jobs?per_page=100" \
+    #     --jq '.jobs[] | select(.name == "no-local-detail")'
+    #
+    # An occurrence is `conclusion: cancelled` with a wall time at the budget, the apt step
+    # `cancelled` and the heuristic step after it `skipped`. #1056 carries the enumerated runs.
     #
     # The apt step is gone from here — it lives in `host-shape` below, which is not a required
     # status check. What remains in this required job that can still stall is `actions/checkout`,
     # which every job in this file runs; that is a real residual risk and not a claim of zero. The
-    # budget stays at 10 minutes for consistency with the `test` job below.
+    # budget stays at 10 minutes.
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -68,21 +81,28 @@ jobs:
   #
   # WHY THIS IS ITS OWN JOB (#1056). It used to be two steps inside `no-local-detail`, and the
   # sentence that framed them there — "IT IS A WARNING AND DELIBERATELY NOT A GATE" — was true of
-  # its FINDINGS and false of the STEPS. `--strict` genuinely is not passed, so a flagged token fails nothing; but the steps
-  # ran in a REQUIRED status check with the default `continue-on-error: false`, so their setup gated
-  # every merge in the repo through a channel the comment was not talking about. On 2026-08-19 that
-  # channel fired: `sudo apt-get update` stalled on the package mirror and took `no-local-detail`
-  # to its job timeout four times across two commits, each time long after both fatal-by-design
-  # steps had passed. A timed-out job reports `cancelled`, which is not `success`, so the PRs sat
-  # OPEN BLOCKED with nothing wrong with them.
+  # its FINDINGS and false of the STEPS. `--strict` genuinely is not passed, so a flagged token
+  # fails nothing; but the steps ran in a REQUIRED status check with the default
+  # `continue-on-error: false`, so their setup gated every merge in the repo through a channel the
+  # comment was not talking about. On 2026-08-19 that channel fired: `sudo apt-get update` stalled
+  # on the package mirror and took `no-local-detail` to its job timeout, repeatedly, each time long
+  # after both fatal-by-design steps had passed. A timed-out job reports `cancelled`, which is not
+  # `success`, so the PRs sat OPEN BLOCKED with nothing wrong with them. The `no-local-detail`
+  # header above says how to re-derive that from the API, and why no tally is pinned in this file.
   #
   # Moving it here decouples the two. As of 2026-08-19 the required contexts on `main` are exactly
   # `test`, `pr-text` and `no-local-detail` (read from the branch-protection API; this file cannot
   # see that setting and did not change it), so `host-shape` going red is informative and not
   # merge-blocking. THAT PROPERTY LIVES IN BRANCH PROTECTION, NOT HERE: adding this job's name to
   # the required list would re-arm exactly the coupling #1056 removed, silently, with no diff in
-  # this file. `continue-on-error: true` on the steps was the other candidate and was rejected — it
-  # would also swallow the deliberate exit 1 below, which is the thing that must stay loud.
+  # this file. `continue-on-error: true` on the steps was the other candidate. IT WAS REJECTED
+  # BECAUSE IT COULD NOT HAVE FIXED #1056 AT ALL, not because it was merely expensive: what wedged
+  # the merges was the JOB's `timeout-minutes` elapsing, and a step-level key does not stop the
+  # job's clock. The apt step would have hung exactly as before, the job would still have been
+  # cancelled at its budget, and the check would still have reported `cancelled` — which is still
+  # not `success`. So do not read this as a trade and move these steps back into `no-local-detail`
+  # under `continue-on-error: true`: that re-arms the wedge #1056 removed and buys nothing. It
+  # would separately swallow the deliberate exit 1 below, which is the thing that must stay loud.
   #
   # WHAT IS AND IS NOT FATAL HERE, now true of the steps as well as the findings:
   #   * a FINDING is not fatal to anything. `--strict` is not passed, the step exits 0, and the
@@ -121,12 +141,17 @@ jobs:
       # 96002688332, 96076699113, 96103284902 and 96123028684 — apt reported
       # `hunspell-en-us is already the newest version (1:2020.12.07-2)` and
       # `0 newly installed` in 5 of 5. `ubuntu-latest` ships the dictionary. Every one of those
-      # runs fetched ~11 MB of package index in order to install nothing, and one of those fetches
-      # is what hung the required job four times.
+      # runs fetched ~11 MB of package index in order to install nothing. All five of those jobs
+      # themselves finished `success` in under a minute — it is a fetch of this same kind, on other
+      # runs, that hung the required job (#1056).
       #
       # So look before reaching for the network. The mirror is retained as a COLD PATH only, for
-      # the day the runner image drops the package; it is bounded with `timeout` so that case
-      # reports a `failure` naming the mirror rather than a `cancelled` naming nothing.
+      # the day the runner image drops the package; it is bounded with `timeout -k` so that case
+      # reports a `failure` naming the mirror rather than a `cancelled` naming nothing. The `-k 30`
+      # is the fallback for an apt that ignores the SIGTERM: without it `timeout` sends TERM and
+      # then waits forever, which would put the cold path straight back into the shape this job
+      # exists to avoid. `-k` cannot save a process wedged uninterruptibly in the kernel; nothing
+      # in userspace can, and on this job the consequence of that is a red warning, not a wedge.
       #
       # This presence test is NOT the reach control and must not be mistaken for one. It proves
       # only that two files exist. `check-host-shape.py` still resolves the path itself, still
@@ -142,7 +167,8 @@ jobs:
             exit 0
           fi
           echo "::warning::no hunspell en_US on the runner image, falling back to the package mirror (eqoxide#1056)"
-          if ! sudo timeout 240 apt-get update || ! sudo timeout 240 apt-get install -y hunspell-en-us; then
+          if ! sudo timeout -k 30 240 apt-get update \
+             || ! sudo timeout -k 30 240 apt-get install -y hunspell-en-us; then
             echo "::error::the package mirror did not answer within 4 minutes. This job is not a required status check, so this is a red job and not a blocked merge (eqoxide#1056)."
             exit 1
           fi
