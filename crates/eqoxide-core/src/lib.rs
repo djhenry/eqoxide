@@ -7,6 +7,8 @@
 //! re-exports each module (`pub use eqoxide_core::…`) so existing `crate::<mod>` paths across the
 //! tree keep resolving.
 //!
+//! - `charname`    — character-name normalization + the locally-decidable subset of the server's
+//!   OP_ApproveName name rules (#1092)
 //! - `config`      — client config (YAML) loading
 //! - `coord`       — EQ coordinate-space math (deliberately dependency-free)
 //! - `eqstr`       — EQ string-table (`eqstr_us.txt`) lookups
@@ -23,6 +25,7 @@
 //! - `zone_map`    — zone short-name / id maps
 
 pub mod afloat;
+pub mod charname;
 pub mod config;
 pub mod coord;
 pub mod eqstr;

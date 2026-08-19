@@ -420,6 +420,19 @@ consecutive characters (`:858`, the test is `num_c > 2`), and a case-insensitive
 against every row of the `name_filter` table (`:870`). Reply is the same opcode with a 1-byte body,
 `0x01`=ok / `0x00`=reject (`:622–624`).
 
+**Client-side pre-check (#1092).** `crates/eqoxide-core/src/charname.rs` models the subset of the
+list above that is decidable without the server — length, the two case rules, the space rule, and
+`CheckNameFilter`'s alphabetic-only and three-identical-consecutive clauses — in the server's own
+order, so the rule it names is the rule that would have fired first. It runs on the **normalized**
+bytes (the ones `build_approve_name` puts on the wire), not on the raw config value, and fires at
+config load when a `character_create` block is present, plus again at the send site. This list stays
+the single source for the rules; `charname.rs` cites it rather than restating it.
+
+> ⚠ **The pre-check is partial and must never be described as an approval.** The `name_filter`
+> substring match (`:870`) and uniqueness (`:619`) have no client-side equivalent — the client has
+> no copy of the table and no view of the name space. A name that passes the local check can still
+> come back rejected, and the client's rejection message says exactly that.
+
 `HandleNameApprovalPacket` contains **no client-version branch** — unlike the stat and combo checks
 above, these rules are the same for Titanium and for RoF2. Only the opcode number differs:
 

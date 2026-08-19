@@ -13,6 +13,7 @@ use cbc::{Decryptor, Encryptor};
 use des::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::NoPadding};
 use des::Des;
 
+use eqoxide_core::charname::{check_name, describe_violation, normalize_name};
 use eqoxide_core::config::{CharacterCreate, LoginConfig};
 use crate::gameplay::{record_app_packet, run_gameplay_phase};
 use crate::action_loop::{ActionLoop, publish_doors};
@@ -477,6 +478,14 @@ impl<'a> LoginProtocol<'a> {
                              (valid race/class/deity combo, stats total, and start_zone = a zone_id).",
                             name));
                     }
+                    // #1092: never put a name on the wire that we can already prove the server
+                    // will reject. Config load checks this too, but the guard lives here as well
+                    // because THIS is the send site — every path that reaches OP_ApproveName goes
+                    // through it, whatever built the LoginConfig. It also underwrites the
+                    // rejection message below: reaching that arm now implies these rules held.
+                    if let Err(v) = check_name(name) {
+                        return PhaseResult::Fatal(describe_violation(name, &v));
+                    }
                     self.create_attempted = true;
                     self.awaiting_name_approval = true;
                     let pkt = build_approve_name(name, cc.race, cc.class);
@@ -493,8 +502,15 @@ impl<'a> LoginProtocol<'a> {
                 self.awaiting_name_approval = false;
                 let approved = packet.payload.first().copied().unwrap_or(0) == 1;
                 if !approved {
+                    // #1092: the locally-decidable rules were proven to hold on the exact bytes
+                    // sent (the guard above), so the reason is necessarily one of the two the
+                    // client cannot evaluate. The reply is still a bare 1-byte 0x00 with no
+                    // reason field — we are narrowing the possibilities, not reading one off.
                     return PhaseResult::Error(format!(
-                        "server rejected character name '{}'", self.config.character_name));
+                        "server rejected character name '{}'. The rules this client can check \
+                         locally all held, so the reason is server-side only: the name matches \
+                         the name_filter table, or it is already taken.",
+                        self.config.character_name));
                 }
                 let cc = self.config.create.as_ref().expect("create set while awaiting approval");
                 let pkt = build_char_create(cc);
@@ -758,20 +774,6 @@ fn parse_server_list_payload(payload: &[u8], fallback_host: &str) -> (u32, Strin
 }
 
 // ── Character-creation helpers ─────────────────────────────────────────────────
-
-/// Normalize a character name for OP_ApproveName: first character uppercase, the rest
-/// lowercase. Required, not cosmetic — EQEmu's `Client::HandleNameApprovalPacket`
-/// (`world/client.cpp`) rejects a lower-case first character, or any upper-case character
-/// after it. Casing only: length, spaces, `name_filter` and uniqueness are separate server
-/// checks (docs/specs/2026-06-26-pregame-screens-design.md, "Name rules").
-fn normalize_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for (i, c) in name.chars().enumerate() {
-        if i == 0 { out.extend(c.to_uppercase()); }
-        else      { out.extend(c.to_lowercase()); }
-    }
-    out
-}
 
 /// True if `name` appears as a null-terminated entry in an OP_SendCharInfo
 /// payload (CharacterSelect_Struct holds up to 10 fixed-width name buffers).
