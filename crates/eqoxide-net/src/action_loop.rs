@@ -1158,6 +1158,50 @@ impl ActionLoop {
     /// has no business driving the loop, it just needs the shared slots.
     pub fn controller_slots(&self) -> &eqoxide_ipc::ControllerSlots { &self.controller }
 
+    /// The shared world index, for the zone-entry handshake to CLEAR (#1010). Same shape as
+    /// [`Self::controller_slots`] — a read-only borrow of the slots, not the loop.
+    ///
+    /// Two of its groups describe the zone we are LEAVING and have no publisher the handshake can
+    /// otherwise reach: the entity roster triple (`entity_positions`/`entity_ids`/`entity_poses`,
+    /// published only by [`Self::sync_entities`]) and `zone_points` (published only by
+    /// [`Self::sync_zone_points`]). Both of those `sync_*` calls have exactly one caller —
+    /// `run_gameplay_phase`'s packet drain — which the handshake never reaches, so
+    /// `GameState::begin_zone_in` emptying `gs.world.entities` / `gs.world.zone_points` does not
+    /// reach the copies an agent reads. See `gameplay::run_zone_entry_handshake`'s own comment.
+    ///
+    /// The roster half is why this hands out the whole bundle rather than the three maps: they are
+    /// private behind the single-publisher seal (#665/#652) and can only be written through
+    /// `WorldSlots::publish_entities`, which needs the bundle.
+    pub fn world_slots(&self) -> &eqoxide_ipc::WorldSlots { &self.world }
+
+    /// Republish `zone_points` after a zone-entry handshake, rebuilding from scratch (#1010).
+    ///
+    /// `gameplay::run_zone_entry_handshake` empties the published `WorldSlots::zone_points` at the
+    /// top of every zone-in (see its comment for why). That leaves [`Self::sync_zone_points`]'s
+    /// zone-change latch — `self.current_zone`, the zone name the published list was last rebuilt
+    /// for (#816) — asserting something no longer true: the list it names is gone. Re-arming the
+    /// latch here makes the next sync take the REBUILD branch instead of the same-zone one.
+    ///
+    /// It is load-bearing on exactly one reachable path, and that path is real: a **death/bind
+    /// respawn inside the same zone**. [`classify_zone_change_echo`]'s own doc names it — such an
+    /// echo carries the CURRENT zone id and sets no same-zone-translocator pending flag, so it
+    /// classifies as `CrossZoneReconnect` and runs a full re-entry with `gs.world.zone_name`
+    /// UNCHANGED. Without this re-arm the following sync would take the same-zone branch, `drain(..)`
+    /// an already-empty list and re-extend it from the server adverts alone — permanently dropping
+    /// this zone's client-synthesized `"to "`-label fallback exits (`iterator == u32::MAX`) until
+    /// the next differently-named zone change, so GET /v1/observe/zone_entrances would answer short
+    /// and POST /v1/move/zone_cross would reject a zone_id only those entries make reachable. Every
+    /// other path into the handshake changes the zone name, where the latch re-arms itself.
+    ///
+    /// Taking the rebuild branch on that path also runs what a completed re-entry warrants and the
+    /// same-zone branch skips: the walker reset (#248), the gated-refusal re-arm (#683) and the
+    /// parked-command reaps (#448/#479). All four were already correct for a full zone-in; only the
+    /// name comparison was hiding them.
+    pub fn sync_zone_points_after_zone_in(&mut self, gs: &GameState) {
+        self.current_zone.clear();
+        self.sync_zone_points(gs);
+    }
+
     /// The published door roster, for the zone-entry handshake to CLEAR at zone-in and REPUBLISH on
     /// each drain pass that actually drained a packet — NOT on every pass (#934 review B1, #891;
     /// republish added by #937, gated by #1016 review B1).
@@ -1218,6 +1262,12 @@ impl ActionLoop {
 
     /// Sync zone exit points from `gs` into the shared zone_points map.
     /// On zone change, also loads map-label exits from disk as fallback zone points.
+    ///
+    /// ⚠️ The zone-change test below is a LATCH on `self.current_zone` (#816), and it is only true
+    /// while this loop is the only thing that writes the published list. `run_zone_entry_handshake`
+    /// empties that list at every zone-in (#1010), so the post-handshake resync must go through
+    /// [`Self::sync_zone_points_after_zone_in`], which re-arms the latch first — see its doc for the
+    /// one path (a same-zone death/bind respawn) where the difference is observable.
     pub fn sync_zone_points(&mut self, gs: &GameState) {
         // On zone change, load map labels from disk as fallback zone points.
         if gs.world.zone_name != self.current_zone {
@@ -4837,6 +4887,82 @@ mod tests {
                  confident-but-wrong reading #816 exists to prevent, reproduced one level down."
             ),
         }
+    }
+
+    /// **#1010 (design check 3): the handshake's `zone_points` clear falsifies the #816 zone-change
+    /// LATCH, and `sync_zone_points_after_zone_in` is what keeps the two compatible.**
+    ///
+    /// `sync_zone_points` decides between "rebuild from disk" and "same zone: keep the map labels
+    /// already published" purely by comparing `gs.world.zone_name` against `self.current_zone`. The
+    /// same-zone arm is a PRESERVE arm: it `drain(..)`s the published list and puts the
+    /// `iterator == u32::MAX` map-label entries back. That arm is only correct while this loop is
+    /// the sole writer of the list — and as of #1010 `run_zone_entry_handshake` empties it at every
+    /// zone-in, so on any zone-in that does NOT change the zone name the preserve arm would drain an
+    /// already-empty list and put nothing back, permanently dropping this zone's `"to "`-label
+    /// fallback exits until some LATER crossing happened to re-arm the latch.
+    ///
+    /// That is not a hypothetical branch. `classify_zone_change_echo`'s own doc records the path: a
+    /// death/bind respawn echoes the CURRENT zone id with no same-zone-pending flag, is classified
+    /// `CrossZoneReconnect`, and runs a full re-entry handshake with an UNCHANGED zone name. The
+    /// consequence is agent-visible and silent: `GET /v1/observe/zone_entrances` answers SHORT (it
+    /// lists only the server's OP_SendZonepoints adverts, and the map-label exits are exactly the
+    /// ones the server does not advertise) and `POST /v1/move/zone_cross` REJECTS a `zone_id` that
+    /// is genuinely reachable, because reachability is judged against that same list.
+    ///
+    /// So this test drives the real sequence: publish the labels through the real production hook,
+    /// apply the handshake's clear verbatim, then resync with the zone name UNCHANGED.
+    ///
+    /// **Mutation check:** change the `nav.sync_zone_points_after_zone_in(&gs)` call below back to a
+    /// plain `nav.sync_zone_points(&gs)` and this goes RED with zero exits restored — that mutant IS
+    /// the pre-fix behaviour, so this test is what makes the new method load-bearing rather than a
+    /// wrapper. Deleting `self.current_zone.clear();` from `sync_zone_points_after_zone_in` is the
+    /// same mutation one level down, and is likewise RED, as is wrapping it
+    /// `if std::hint::black_box(false) { … }`.
+    ///
+    /// One mutant SURVIVES and is worth naming rather than leaving for a reviewer to rediscover:
+    /// replacing that `clear()` with `self.current_zone.truncate(1)` keeps this test GREEN. It is an
+    /// equivalent mutant, not a hole — the latch is a string EQUALITY test, so any value that is not
+    /// the current zone name falsifies it just as well as the empty string, and `"q" != "qeytoqrg"`.
+    /// `clear()` is the right spelling because it is the only one that is correct for EVERY zone
+    /// name (a one-char truncation of a one-char zone name would not falsify anything), but this
+    /// test cannot distinguish the two on this fixture and does not claim to.
+    #[test]
+    fn a_same_zone_re_entry_restores_the_map_label_exits_the_handshake_cleared_1010() {
+        let dir = tempfile::tempdir().unwrap();
+        // One qualifying `"to "` label — the kind `sync_zone_points` turns into an `iterator ==
+        // u32::MAX` fallback exit, and the kind that does NOT come back from the wire.
+        std::fs::write(dir.path().join("qeytoqrg.txt"),
+            "P 100.0, 200.0, 0, 0, 0, 0, 3, to_North_Qeynos").unwrap();
+
+        let g: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
+        let mut nav = test_action_loop_with_maps_dir(g, dir.path().to_path_buf());
+        let mut gs = GameState::new();
+        gs.world.zone_name = "qeytoqrg".into();
+
+        // Arriving in the zone the ordinary way arms the latch and publishes the label exit.
+        nav.sync_zone_points(&gs);
+        let labels_first = |nav: &ActionLoop| nav.world.zone_points.lock().unwrap()
+            .iter().filter(|zp| zp.iterator == u32::MAX).count();
+        assert_eq!(labels_first(&nav), 1,
+            "fixture premise: the zone's map label really did become a published fallback exit");
+
+        // Now a same-zone re-entry (death/bind respawn → CrossZoneReconnect). `begin_zone_in` empties
+        // `gs.world.zone_points`, and #1010's handshake empties the PUBLISHED list — verbatim.
+        gs.world.zone_points.clear();
+        nav.world.zone_points.lock().unwrap().clear();
+
+        // The zone name is UNCHANGED, so a plain `sync_zone_points` would take the preserve arm and
+        // preserve nothing. The post-handshake resync must re-arm the latch first.
+        nav.sync_zone_points_after_zone_in(&gs);
+
+        assert_eq!(labels_first(&nav), 1,
+            "after a same-zone re-entry the map-label fallback exits must be back: with them missing \
+             GET /v1/observe/zone_entrances answers SHORT (the server never advertises these) and \
+             POST /v1/move/zone_cross rejects a zone_id that is genuinely reachable — a confident \
+             wrong answer, not a visible failure (#1010, #816 latch)");
+        assert_eq!(*nav.world.zone_map_load.lock().unwrap(), None,
+            "and the rebuild arm really ran — a preserve-arm no-op would never have touched \
+             zone_map_load at all");
     }
 
     /// **#600 (review round 2): `drain_zone_cross` is the THIRD world-answering consumer, and it must
