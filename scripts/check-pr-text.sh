@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 #
-# check-pr-text.sh — scan the text a PR or issue publishes (title, body, and every comment) for the
-# same local-system / proprietary-derived patterns that `check-no-local-detail.sh` keeps out of
-# tracked files.
+# check-pr-text.sh — scan the text a PR or issue publishes (title, body, every comment, and a pull
+# request's commit messages) on TWO independent passes:
+#
+#   1. the local-system / proprietary-derived patterns that `check-no-local-detail.sh` keeps out of
+#      tracked files but structurally cannot see on this surface (eqoxide#980);
+#   2. a NEGATED CLOSING KEYWORD — "does not close" and friends immediately before an issue number,
+#      which GitHub links and closes anyway because it does not read the negation (eqoxide#1041).
+#
+# Both passes always run and both classify every item; the exit code is the union.
 #
 # WHY THIS EXISTS (eqoxide#980). `check-no-local-detail.sh` scans TRACKED FILES ONLY. PR bodies,
 # issue bodies and comments are public artifacts of this public repo that it structurally cannot
@@ -18,6 +24,7 @@
 # clean", never "nothing was ever exposed".
 #
 #   usage:  scripts/check-pr-text.sh <pr-or-issue-number> [--repo <owner>/<name>]
+#           scripts/check-pr-text.sh --commits <rev-range>
 #           scripts/check-pr-text.sh --self-test
 #
 #   exit 0 = every item in the corpus was classified and none matched
@@ -25,15 +32,31 @@
 #
 # REACH — what this run did and did not look at. Read this before quoting a green result.
 #   COVERED: the CURRENT text of, for one number: the title, the body, every issue-style comment,
-#            and (for a PR) every review body and every inline review comment.
+#            and (for a PR) every review body, every inline review comment, and the message of
+#            every commit in the pull request. The commit surface was added for eqoxide#1041: issue
+#            314 was false-closed by a commit message and by nothing else, so a check that read only
+#            bodies and comments watched that one go past. It comes from the API, not from git,
+#            because every `actions/checkout` in this repo's workflow runs at the default
+#            fetch-depth of 1 — the runner does not have the branch history, and a git-based scan
+#            there would read one merge commit and report a clean corpus.
 #   NOT COVERED: the edit history of any of those (the first version is the one that leaked);
-#            commit messages and branch names; the bodies of OTHER issues/PRs this one links to;
-#            releases, wiki, gists, and the Actions logs; and anything published after this run.
+#            branch names; the bodies of OTHER issues/PRs this one links to; releases, wiki, gists,
+#            and the Actions logs; and anything published after this run. Commit messages are
+#            covered for a PULL REQUEST number only — an issue number has no commits, and a push
+#            straight to main never reaches this script at all (use `--commits <rev-range>`).
+#   NOT COVERED BY ANYTHING, and worth saying out loud: the squash-merge commit message GitHub
+#            composes in the merge dialog. It does not exist until the merge button is pressed, so
+#            no pre-merge check of any kind can read it. Whatever is typed there is published
+#            unscanned, and a closing keyword typed there closes just as hard.
 #   NOT COVERED BY CI, specifically: the workflow that calls this script is triggered by
 #            `pull_request`, so in CI it only ever reads the text as it stood at the last PUSH.
 #            A comment posted after the final push — including a review comment, and including the
-#            comment that reports this scan — is never scanned by any automated run. Run this
-#            script by hand against the number to cover them.
+#            comment that reports this scan — is never scanned by any automated run. The same limit
+#            hits eqoxide#1041 harder than eqoxide#980 did: a scope note ("this PR deliberately
+#            does not close X") is most often ADDED TO THE BODY DURING REVIEW, after the last push,
+#            which is precisely the edit no automated run here will ever see. This job is therefore
+#            NOT a seal on that surface. Run this script by hand against the number before merging,
+#            and check `gh pr view <n> --json closingIssuesReferences` against what you intend.
 #   The script prints its corpus size and classifies EVERY item, printing one verdict line each,
 #   because a checker that prints only exceptions cannot tell "nothing wrong" from "nothing looked
 #   at". An empty corpus is an ERROR here, not a pass; so is an empty pattern list.
@@ -58,6 +81,11 @@
 #     - `classified N/N` — load-bearing only because CORPUS_TOTAL is read from the manifest while
 #       CORPUS_CLASSIFIED is incremented per item actually read. An earlier version incremented both
 #       in the same iteration, which made this line true by construction and its check unfailable.
+#     - `negclose corpus = N items; classified N/N; flagged N` — the same three signals for the
+#       second pass, with the same construction and the same empty-list refusal. Load-bearing.
+#     - `closingIssuesReferences` — printed verbatim on any negclose finding for a PR. This is the
+#       only observable that reports what GitHub actually PARSED; what a body appears to say is not
+#       evidence of what was linked. Load-bearing, and it is the check to run before every merge.
 
 set -euo pipefail
 
@@ -108,6 +136,219 @@ How to keep the proof and drop the leak — name the tree, do not paste its path
 The proof value is in the command and its result. The absolute path adds nothing to the claim and
 is the entire leak. Same for host names, container names, and inline credentials.
 EOF
+}
+
+# ---------------------------------------------------------------------------------------------
+# eqoxide#1041 — NEGATED CLOSING KEYWORD.
+#
+# GitHub links `close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved` to the `#<n>` that
+# immediately follows it and does NOT read a negation in front of it. "Does not close" + a number
+# closes that issue. Six issues in this repo were false-closed exactly that way, one of them for 48
+# days, across two surfaces and five separate work threads — the sentence written specifically to
+# record that an issue is OUT of scope is the sentence that marks it resolved.
+#
+# TWO THINGS ARE CHECKED HERE AND THEY ARE DELIBERATELY NOT THE SAME CHECK:
+#
+#   1. NEGCLOSE (a text lint, offline, gates). "A closing keyword sits next to a number you appear
+#      to be disclaiming." No attempt is made to infer intent from wider context, because the
+#      remedy is the same rewrite either way: `Refs <NUM>` / `does not address <NUM>` / `<NUM>
+#      stays open`. This fires on the TEXT and says nothing about whether anything was closed.
+#
+#   2. ATTRIBUTION (an audit verdict). "Did THIS pull request or commit range actually cause that
+#      issue's close?" A different question with a different answer, and issue 302 is the standing
+#      proof that it has to be asked separately: PR #653's body disclaims 302, GitHub linked 302 to
+#      that PR anyway (it is in its `closingIssuesReferences` to this day) — and 302's close was
+#      still legitimate, because the close event fired 2026-07-11, eleven days BEFORE PR #653 was
+#      opened. PR #306 closed it. Matching the text pattern is not a false close.
+#
+#   So: the text lint flags PR #653's sentence — correctly, because it created a real link and the
+#   remedy is the same rewrite — while the attribution classifier returns NOT-ATTRIBUTED for 302. A
+#   guard that collapsed the two into one would have to choose between missing 982 and libelling
+#   PR #653.
+#
+# REACH OF THE NEGCLOSE LINT — stated because a scanner that reports only exceptions cannot tell
+# "nothing wrong" from "nothing looked at":
+#   COVERED: every item in the corpus this script assembles, which in live mode now INCLUDES the
+#            commit messages of the pull request's own commits — surface 2 of the defect, where
+#            issue 314 died and nowhere else. `--commits <range>` scans local git commit messages
+#            instead, for use before a PR exists.
+#   NOT COVERED: the squash-merge message typed into GitHub's merge dialog, which does not exist
+#            anywhere until the merge button is pressed and is therefore unreachable by ANY
+#            pre-merge check; text edited after the last push (see the `pull_request` note above —
+#            a scope note added to a body during review is exactly the edit this misses);
+#            `GH-123` and full-URL issue references, which GitHub also links but this regex does
+#            not read; and a negation separated from the keyword by `.`, `;`, `!` or `?`, which the
+#            window deliberately will not cross (see NEGCLOSE_GAP).
+#   BACKTICKS ARE NOT A DISCRIMINATOR, in either direction. This lint does not exempt a keyword
+#            inside backticks, and it must not: PR #1037 wrote its real target inside backticks and
+#            GitHub did NOT link it, while linking the two issues that same body disclaimed. Since
+#            backticks change what GitHub links unpredictably, neither reading them nor ignoring
+#            them is safe — so the rule is simply "do not write the keyword next to a number you
+#            are not closing", and the lint enforces exactly that.
+#   CONSEQUENCE, stated so nobody is surprised: a PR whose body QUOTES this pattern — including the
+#            PR that added this check — is flagged, and that is correct behaviour, not a false
+#            positive. Quoting it in a body is not safe; GitHub links quoted text too.
+#
+# `\b` is a GNU grep extension. Both CI (ubuntu-latest) and the dev boxes run GNU grep; --self-test
+# exercises every boundary case, so a grep without `\b` fails the self-test loudly rather than
+# silently matching "Notes:" and "another".
+
+# The keyword half is GitHub's documented set, verbatim, as an ERE alternation. Kept as a plain
+# string (not an array) so that emptying it via NEGCLOSE_PATTERNS_FILE is a one-line mutation.
+NEGCLOSE_KEYWORDS='close[sd]?|fix(es|ed)?|resolve[sd]?'
+
+# The negation half. Each entry carries its own word-boundary anchoring because they do not all
+# anchor the same way: `not` MUST be a whole word or `Notes:`, `another` and `annotation` all match
+# it, while `n't` is a suffix with no left boundary at all inside `doesn't`. The typographic
+# apostrophe is a separate entry rather than a bracket expression, because a multi-byte character
+# inside `[...]` is not portable across grep locales while an alternation is.
+NEGCLOSE_NEGATIONS=(
+  '\bnot\b'
+  '\bcannot\b'
+  "n't\\b"
+  'n’t\b'
+  '\bnever\b'
+  '\bno longer\b'
+  '\bwithout\b'
+  '\brather than\b'
+  '\binstead of\b'
+)
+
+# How far the negation may sit in front of the keyword. eqoxide#1041 specified ~40 characters. The
+# gap class excludes `#` so the window cannot leap over an intervening issue reference, and excludes
+# `.;!?` so a negation in the PREVIOUS sentence cannot trip the next sentence's legitimate close
+# ("This does not touch the renderer. Fixes #500." must stay green). Both exclusions trade recall
+# for precision and both are exercised by --self-test in both directions.
+NEGCLOSE_GAP=40
+
+# Same override mechanism as LOCAL_DETAIL_PATTERNS_FILE, and for the same reason: it is how the
+# self-test points the REAL script at an empty list and asserts that it refuses to run, instead of
+# re-deriving the refusal inline where the assertion could not fail.
+if [ -n "${NEGCLOSE_PATTERNS_FILE:-}" ]; then
+  # shellcheck disable=SC1090
+  source "$NEGCLOSE_PATTERNS_FILE"
+fi
+declare -p NEGCLOSE_NEGATIONS >/dev/null 2>&1 || NEGCLOSE_NEGATIONS=()
+
+# Refuse to run rather than report a clean corpus, for the same reason require_patterns does: with
+# no negations (or no keywords) every item is compared against nothing and prints "no findings",
+# which is the same word an actually-clean corpus prints.
+require_negclose_patterns() {
+  local ctx="$1"
+  if [ "${#NEGCLOSE_NEGATIONS[@]}" -eq 0 ] || [ -z "${NEGCLOSE_KEYWORDS:-}" ]; then
+    echo "::error::check-pr-text: the negated-close negation or keyword list is EMPTY — ${ctx}"
+    echo "would compare every item against nothing and report no findings. That is a guard failure,"
+    echo "not a clean result. See eqoxide#1041."
+    return 1
+  fi
+  return 0
+}
+
+# Build the ERE. Returns 1 (printing nothing) when either half is empty, so the reach control in
+# --self-test can empty a list and observe that NOTHING flags.
+negclose_regex() {
+  [ "${#NEGCLOSE_NEGATIONS[@]}" -gt 0 ] || return 1
+  [ -n "${NEGCLOSE_KEYWORDS:-}" ] || return 1
+  local joined="" n
+  for n in "${NEGCLOSE_NEGATIONS[@]}"; do
+    [ -n "$n" ] || continue
+    joined="${joined:+${joined}|}${n}"
+  done
+  [ -n "$joined" ] || return 1
+  printf '%s' "(${joined})[^#.;!?]{0,${NEGCLOSE_GAP}}\\b(${NEGCLOSE_KEYWORDS})[[:space:]:]*#[0-9]+"
+}
+
+# Classify one text file for negated closing keywords. Prints `LINE:matched text`, one per hit;
+# prints nothing when clean. Never exits non-zero on "no match" — the caller decides what a match
+# means, same contract as scan_text_file above.
+scan_negated_close() {
+  local f="$1" re
+  re="$(negclose_regex)" || return 0
+  grep -noEi -e "$re" -- "$f" 2>/dev/null || true
+}
+
+# The convention half of eqoxide#1041, printed on every finding because the fix is never "delete
+# the sentence" — the scope note is worth keeping, it just must not use a linking keyword.
+print_negclose_convention() {
+  cat <<'EOF'
+A closing keyword immediately before an issue number LINKS that issue, and GitHub does not read the
+negation in front of it. The sentence you wrote to keep the issue OUT of scope is the sentence that
+closes it. Backticks do not protect it. Rewrite, keeping the scope note:
+  instead of:  does not close <NUM>            write:  Refs <NUM> — not addressed here
+  instead of:  deliberately NOT Closes <NUM>   write:  <NUM> stays open — narrowed, not closed
+  instead of:  it does NOT fix <NUM>           write:  does not address <NUM>
+Then, before merging, check `gh pr view <n> --json closingIssuesReferences` against what this pull
+request actually intends to close. That command reports what GitHub PARSED; what you meant to write
+is not observable from the body. See eqoxide#1041.
+EOF
+}
+
+# Walk the same corpus manifest and classify EVERY line for a negated closing keyword.
+# Sets globals: NEGCLOSE_TOTAL, NEGCLOSE_CLASSIFIED, NEGCLOSE_FLAGGED, NEGCLOSE_NUMBERS.
+# NEGCLOSE_TOTAL is read from the manifest and NOT incremented alongside NEGCLOSE_CLASSIFIED, for
+# the same reason classify_corpus does it that way: counting both in one loop iteration makes
+# `classified N/N` an identity that can never disagree.
+classify_negclose() {
+  local manifest="$1" kind id path hits hit ln txt num
+  NEGCLOSE_CLASSIFIED=0; NEGCLOSE_FLAGGED=0; NEGCLOSE_NUMBERS=""
+  NEGCLOSE_TOTAL=$(grep -c '[^[:space:]]' "$manifest" || true)
+  while IFS=$'\t' read -r kind id path; do
+    [ -n "${kind:-}" ] || continue
+    if [ ! -r "${path:-/nonexistent}" ]; then
+      echo "  [UNREAD]      ${kind}#${id} — ${path:-<no path>} unreadable; NOT classified"
+      continue
+    fi
+    hits="$(scan_negated_close "$path")"
+    if [ -n "$hits" ]; then
+      NEGCLOSE_FLAGGED=$((NEGCLOSE_FLAGGED + 1))
+      echo "  [NEGCLOSE]    ${kind}#${id}"
+      while IFS= read -r hit; do
+        [ -n "$hit" ] || continue
+        ln="${hit%%:*}"; txt="${hit#*:}"
+        num="$(printf '%s' "$txt" | sed -E 's/.*#([0-9]+).*/\1/')"
+        echo "                line ${ln}: \"${txt}\""
+        echo "                GitHub reads that as a link and will CLOSE issue ${num}."
+        NEGCLOSE_NUMBERS="${NEGCLOSE_NUMBERS} ${num}"
+      done <<< "$hits"
+    else
+      echo "  [no-negclose] ${kind}#${id}"
+    fi
+    NEGCLOSE_CLASSIFIED=$((NEGCLOSE_CLASSIFIED + 1))
+  done < "$manifest"
+}
+
+# ---------------------------------------------------------------------------------------------
+# ATTRIBUTION — a different question from the text lint. Given an issue's close event and the pull
+# request or commit range under examination, did THIS change cause that close?
+#
+# The rules are derived from the seven measured close events of eqoxide#1041, not invented:
+#   - a linked-issue close carries `commit_id: null` and fires 1-2 seconds after the PR's merge, so
+#     a close that PRE-DATES the merge cannot have come from it (this is the whole of issue 302);
+#   - a commit-message close carries the closing commit's sha, so membership in the range is the
+#     test (this is issue 314, closed by 10619d99 with no PR link at all).
+# Prints exactly one of: ATTRIBUTED-LINK, ATTRIBUTED-COMMIT, NOT-ATTRIBUTED, STILL-OPEN.
+# ISO-8601 UTC timestamps compare correctly as strings; every value here arrives from the API in
+# that form, so no date parsing is involved and there is nothing for a locale to break.
+negclose_attribution() {
+  local close_at="$1" close_commit="$2" pr_merged_at="$3" range_commits="$4"
+  if [ -z "$close_at" ] || [ "$close_at" = "null" ]; then
+    echo "STILL-OPEN"; return 0
+  fi
+  if [ -n "$close_commit" ] && [ "$close_commit" != "null" ]; then
+    case " ${range_commits} " in
+      *" ${close_commit} "*) echo "ATTRIBUTED-COMMIT" ;;
+      *)                     echo "NOT-ATTRIBUTED" ;;
+    esac
+    return 0
+  fi
+  if [ -z "$pr_merged_at" ] || [ "$pr_merged_at" = "null" ]; then
+    echo "NOT-ATTRIBUTED"; return 0
+  fi
+  if [[ "$close_at" < "$pr_merged_at" ]]; then
+    echo "NOT-ATTRIBUTED"
+  else
+    echo "ATTRIBUTED-LINK"
+  fi
 }
 
 # Classify one text file. Prints one line per matching pattern; prints nothing when clean.
@@ -189,6 +430,7 @@ fetch_or_die() {
 fetch_corpus() {
   local number="$1" repo="$2" dir="$3" manifest="$4"
   : > "$manifest"
+  CORPUS_IS_PR="no"; CORPUS_PR_COMMITS=""
 
   # /issues/<n> serves both issues and PRs, so title/body/comments work for either — and the SAME
   # payload carries `.pull_request` when the number is a PR. Probing /pulls/<n> separately used to
@@ -207,8 +449,8 @@ fetch_corpus() {
     --jq '.[] | "comment\t\(.id)\t\(.body // "" | @base64)"' || return 1
   emit_items "$dir" "$manifest" < "$comments"
 
-  local is_pr
-  is_pr="$(jq -r 'if .pull_request then "yes" else "no" end' < "$issue_json")"
+  CORPUS_IS_PR="$(jq -r 'if .pull_request then "yes" else "no" end' < "$issue_json")"
+  local is_pr="$CORPUS_IS_PR"
   if [ "$is_pr" = "yes" ]; then
     local reviews="${dir}/reviews.tsv" rcomments="${dir}/review-comments.tsv"
     fetch_or_die "$reviews" "repos/${repo}/pulls/${number}/reviews" \
@@ -221,17 +463,74 @@ fetch_corpus() {
       --jq '.[] | "review-comment\t\(.id)\t\(.body // "" | @base64)"' || return 1
     emit_items "$dir" "$manifest" < "$rcomments"
 
+    # COMMIT MESSAGES (eqoxide#1041, surface 2). Issue 314 was false-closed by a commit message and
+    # by nothing else — no PR body anywhere carried the text — so a check that reads only bodies and
+    # comments would have watched that one go past. These come from the API rather than from git on
+    # purpose: every `actions/checkout` in this repo's workflow runs at the default fetch-depth of
+    # 1, so the runner does NOT have the branch history, and a git-based scan there would silently
+    # examine one merge commit and report a clean corpus. Use `--commits <range>` for the git-based
+    # scan on a machine that actually has the commits.
+    local prcommits="${dir}/pr-commits.tsv"
+    fetch_or_die "$prcommits" "repos/${repo}/pulls/${number}/commits" \
+      "repos/${repo}/pulls/${number}/commits" --paginate \
+      --jq '.[] | "commit\t\(.sha)\t\(.commit.message // "" | @base64)"' || return 1
+    emit_items "$dir" "$manifest" < "$prcommits"
+    CORPUS_PR_COMMITS="$(cut -f2 "$prcommits" | tr '\n' ' ')"
+
     echo "check-pr-text: number ${number} is a PULL REQUEST (issues/${number} carries .pull_request)"
-    echo "               — review bodies and inline review comments included."
+    echo "               — review bodies, inline review comments and commit messages included."
   else
     echo "check-pr-text: number ${number} is an ISSUE (issues/${number} has no .pull_request);"
     echo "               there are no pull-request surfaces to fetch."
   fi
 }
 
+# The pre-merge control eqoxide#1041 asks for by name: ask GITHUB what it parsed, rather than
+# trusting what the body appears to say. `closingIssuesReferences` is the only observable that
+# reports the actual links; it is what proves PR #1037 linked the two issues it disclaimed and did
+# NOT link the one it meant to close.
+# Sets NEGCLOSE_LINKED (space-padded list of linked issue numbers). Returns 1 on fetch failure.
+negclose_fetch_links() {
+  local number="$1" repo="$2" dir="$3"
+  local owner="${repo%%/*}" name="${repo##*/}" out="${dir}/closing-refs.json"
+  fetch_or_die "$out" "closingIssuesReferences for ${repo}#${number}" graphql \
+    -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){merged mergedAt closingIssuesReferences(first:100){nodes{number state}}}}}' \
+    -F owner="$owner" -F name="$name" -F number="$number" || return 1
+  NEGCLOSE_LINKED=" $(jq -r '.data.repository.pullRequest.closingIssuesReferences.nodes[].number' < "$out" | tr '\n' ' ')"
+  NEGCLOSE_PR_MERGED_AT="$(jq -r '.data.repository.pullRequest.mergedAt // ""' < "$out")"
+  return 0
+}
+
+# For one disclaimed issue number, say whether GitHub currently links it to this PR and — when the
+# PR is already merged — whether that issue's close is actually attributable to it.
+negclose_report_number() {
+  local num="$1" repo="$2" dir="$3"
+  case "$NEGCLOSE_LINKED" in
+    *" ${num} "*)
+      echo "    issue ${num}: LINKED by GitHub to this pull request — it WILL close on merge." ;;
+    *)
+      echo "    issue ${num}: not currently in this pull request's closingIssuesReferences."
+      echo "                  Still rewrite the sentence: the link set is recomputed from the body"
+      echo "                  on every edit, so 'not linked right now' is not a durable property."
+      return 0 ;;
+  esac
+  [ -n "${NEGCLOSE_PR_MERGED_AT:-}" ] || return 0
+  local tl="${dir}/timeline-${num}.json" close_at close_commit verdict
+  fetch_or_die "$tl" "close events for ${repo}#${num}" \
+    "repos/${repo}/issues/${num}/timeline?per_page=100" --paginate \
+    --jq '[.[] | select(.event=="closed")] | last | "\(.created_at // "")\t\(.commit_id // "null")"' || return 1
+  close_at="$(cut -f1 < "$tl")"; close_commit="$(cut -f2 < "$tl")"
+  verdict="$(negclose_attribution "$close_at" "$close_commit" "$NEGCLOSE_PR_MERGED_AT" "${CORPUS_PR_COMMITS:-}")"
+  echo "                  close attribution: ${verdict} (close_at=${close_at:-none} commit_id=${close_commit:-null}"
+  echo "                  merged_at=${NEGCLOSE_PR_MERGED_AT}). NOT-ATTRIBUTED means something else"
+  echo "                  closed it first, as with issue 302 — the text is still wrong, the close is not."
+  return 0
+}
+
 run_live() {
   local number="$1" repo="$2"
   require_patterns "a live scan of ${repo}#${number}" || return 1
+  require_negclose_patterns "a live scan of ${repo}#${number}" || return 1
 
   local dir manifest
   dir="$(mktemp -d)"; SCRATCH_DIRS+=("$dir")
@@ -252,9 +551,14 @@ run_live() {
   classify_corpus "$manifest"
 
   echo "check-pr-text: corpus = ${CORPUS_TOTAL} items; classified ${CORPUS_CLASSIFIED}/${CORPUS_TOTAL}; flagged ${CORPUS_FLAGGED}."
+  # Both passes always RUN. An early `return 1` from the local-detail half used to be the only exit
+  # here; leaving it that way would mean a body with a home path in it never got scanned for a
+  # negated closing keyword at all, and the run would report one finding while silently declining to
+  # look for the other. Accumulate instead, and report every pass.
+  local rc=0
   if [ "$CORPUS_CLASSIFIED" -ne "$CORPUS_TOTAL" ]; then
     echo "::error::check-pr-text: ${CORPUS_CLASSIFIED} of ${CORPUS_TOTAL} items were classified — the rest were skipped."
-    return 1
+    rc=1
   fi
 
   if [ "$CORPUS_FLAGGED" -gt 0 ]; then
@@ -264,18 +568,126 @@ run_live() {
     echo
     echo "DETECTOR, NOT PREVENTER: this text is already published and GitHub keeps the edit"
     echo "history. Editing it now limits further exposure; it does not un-publish it."
-    return 1
+    rc=1
   fi
 
-  echo "check-pr-text: OK — all ${CORPUS_TOTAL} items clean AS CURRENTLY WRITTEN."
+  # ---- eqoxide#1041: the negated-closing-keyword pass, over the SAME corpus. ----
+  echo
+  echo "check-pr-text: negated-closing-keyword pass (eqoxide#1041) over the same ${CORPUS_TOTAL} items,"
+  echo "               ${#NEGCLOSE_NEGATIONS[@]} negation cues against GitHub's closing-keyword set."
+  classify_negclose "$manifest"
+  echo "check-pr-text: negclose corpus = ${NEGCLOSE_TOTAL} items; classified ${NEGCLOSE_CLASSIFIED}/${NEGCLOSE_TOTAL}; flagged ${NEGCLOSE_FLAGGED}."
+  if [ "$NEGCLOSE_CLASSIFIED" -ne "$NEGCLOSE_TOTAL" ]; then
+    echo "::error::check-pr-text: negclose pass classified ${NEGCLOSE_CLASSIFIED} of ${NEGCLOSE_TOTAL} items — the rest were skipped."
+    rc=1
+  fi
+
+  if [ "$NEGCLOSE_FLAGGED" -gt 0 ]; then
+    echo "::error::check-pr-text: ${NEGCLOSE_FLAGGED} of ${NEGCLOSE_TOTAL} items put a closing keyword next to an issue number they appear to disclaim."
+    local nums num
+    nums="$(printf '%s' "$NEGCLOSE_NUMBERS" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')"
+    echo "  numbers at risk: ${nums}"
+    if [ "${CORPUS_IS_PR:-no}" = "yes" ]; then
+      if negclose_fetch_links "$number" "$repo" "$dir"; then
+        echo "  GitHub's own answer — closingIssuesReferences for this pull request:${NEGCLOSE_LINKED:- <none>}"
+        for num in $nums; do
+          negclose_report_number "$num" "$repo" "$dir" || rc=1
+        done
+      else
+        rc=1
+      fi
+    else
+      echo "  (This number is an ISSUE, not a pull request: closingIssuesReferences does not apply,"
+      echo "   so only the text is checked here. The same sentence in a PR body WOULD link.)"
+    fi
+    echo
+    print_negclose_convention
+    rc=1
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    return "$rc"
+  fi
+
+  echo "check-pr-text: OK — all ${CORPUS_TOTAL} items clean AS CURRENTLY WRITTEN, on both passes."
   echo "check-pr-text: this is a DETECTOR, not a preventer. It reads the CURRENT text only, so a"
   echo "green run means 'nothing is exposed now', NOT 'nothing was ever exposed' — an earlier"
   echo "revision of any of these items may have carried detail that is still in the edit history."
-  echo "Not covered: edit history, commit messages, linked issues/PRs, releases, wiki, CI logs —"
+  echo "Not covered: edit history, linked issues/PRs, releases, wiki, CI logs —"
   echo "and, when run from the pull_request workflow, any comment posted after the last push,"
   echo "which includes every review comment on the final revision."
+  echo "Commit messages ARE covered for a pull request (the PR's own commits, via the API), and are"
+  echo "NOT covered for an issue number or for a push straight to main. The squash-merge message"
+  echo "typed into GitHub's merge dialog is covered by nothing: it does not exist until merge."
   echo "The pattern set is an ALLOWLIST of shapes someone already thought of, so this reads as"
   echo "'no KNOWN shape matched', not 'no local detail is present' (eqoxide#995)."
+  return 0
+}
+
+# ---------------------------------------------------------------------------------------------
+# Commit mode: scan LOCAL git commit messages in a revision range for a negated closing keyword.
+#
+# This is the pre-push half of eqoxide#1041's surface 2. Live mode covers a pull request's commits
+# from the API; this covers them before the pull request exists, and covers a range that is going
+# straight to main (which no `pull_request`-triggered job ever sees). It scans ONLY for the negated
+# closing keyword — the local-detail patterns are the tracked-file scanner's job on this surface.
+#
+# Deliberately NOT wired into the `test` CI job: every `actions/checkout` in this repo's workflow
+# runs at the default fetch-depth of 1, so the runner has no branch history to walk and this mode
+# there would scan an empty or one-commit range and call it clean. Changing that is a checkout
+# change to the heaviest job in the workflow, not a one-liner, and the API path already covers the
+# same commits for a pull request.
+# ---------------------------------------------------------------------------------------------
+run_commits() {
+  local range="$1"
+  require_negclose_patterns "a commit-message scan of ${range}" || return 1
+
+  local dir manifest sha n=0
+  dir="$(mktemp -d)"; SCRATCH_DIRS+=("$dir")
+  manifest="${dir}/manifest.tsv"; : > "$manifest"
+
+  if ! git rev-list "$range" > "${dir}/revs.txt" 2>"${dir}/revs.err"; then
+    echo "::error::check-pr-text: 'git rev-list ${range}' FAILED — no commits were examined, so no"
+    echo "verdict can be given. This is a range failure, not a clean result."
+    sed 's/^/  /' "${dir}/revs.err" || true
+    return 1
+  fi
+
+  while read -r sha; do
+    [ -n "$sha" ] || continue
+    n=$((n+1))
+    git log -1 --format=%B "$sha" > "${dir}/commit-${sha}.txt"
+    printf 'commit\t%s\t%s\n' "$sha" "${dir}/commit-${sha}.txt" >> "$manifest"
+  done < "${dir}/revs.txt"
+
+  # An empty range is an ERROR, not a pass, for the same reason an empty corpus is one in live mode:
+  # "0 commits carried the pattern" and "0 commits were looked at" print the same word otherwise,
+  # and the range is the single easiest thing to get wrong (a stale `origin/main`, a two-dot range
+  # after main moved). If the range really is empty, that is worth knowing before it is called green.
+  if [ "$n" -eq 0 ]; then
+    echo "::error::check-pr-text: 0 commits in range '${range}' — nothing was examined."
+    echo "This is a reach failure, not a clean result. Check the range (and whether origin/main is"
+    echo "up to date in this checkout: a stale ref silently empties it)."
+    return 1
+  fi
+
+  echo "check-pr-text --commits ${range}: ${n} commit message(s), ${#NEGCLOSE_NEGATIONS[@]} negation cues."
+  classify_negclose "$manifest"
+  echo "check-pr-text: negclose corpus = ${NEGCLOSE_TOTAL} commits; classified ${NEGCLOSE_CLASSIFIED}/${NEGCLOSE_TOTAL}; flagged ${NEGCLOSE_FLAGGED}."
+  if [ "$NEGCLOSE_CLASSIFIED" -ne "$NEGCLOSE_TOTAL" ]; then
+    echo "::error::check-pr-text: classified ${NEGCLOSE_CLASSIFIED} of ${NEGCLOSE_TOTAL} commits — the rest were skipped."
+    return 1
+  fi
+  if [ "$NEGCLOSE_FLAGGED" -gt 0 ]; then
+    echo "::error::check-pr-text: ${NEGCLOSE_FLAGGED} of ${NEGCLOSE_TOTAL} commit messages put a closing keyword next to an issue number they appear to disclaim."
+    echo
+    print_negclose_convention
+    return 1
+  fi
+  echo "check-pr-text: OK — ${NEGCLOSE_TOTAL} commit messages, none with a negated closing keyword."
+  echo "NOT covered by this mode: the squash-merge message GitHub composes at merge time (it does"
+  echo "not exist yet), the pull request's body and comments (use the number mode for those), and"
+  echo "the local-detail pattern set (that is check-no-local-detail.sh, on tracked files)."
   return 0
 }
 
@@ -287,6 +699,7 @@ run_live() {
 # ---------------------------------------------------------------------------------------------
 run_self_test() {
   require_patterns "the self-test" || return 1
+  require_negclose_patterns "the self-test" || return 1
 
   local dir manifest checks=0 fails=0
   dir="$(mktemp -d)"; SCRATCH_DIRS+=("$dir")
@@ -379,9 +792,265 @@ run_self_test() {
   classify_corpus "${dir}/empty-manifest.tsv" > /dev/null
   want "empty corpus counts as 0 items" "$CORPUS_TOTAL" "0"
 
+  # -------------------------------------------------------------------------------------------
+  # eqoxide#1041 — NEGATED CLOSING KEYWORD.
+  #
+  # EVERY POSITIVE FIXTURE BELOW IS A MEASURED INSTANCE, QUOTED VERBATIM, not invented. An invented
+  # fixture for this class would be written by the same hand that missed it six times in a row. Each
+  # RED line is the exact text from the pull-request body or commit message that actually closed the
+  # issue named beside it; each was verified to go red on this regex and green on the pre-#1041
+  # script, which had no such regex at all.
+  # -------------------------------------------------------------------------------------------
+  local nc_dir="${dir}/negclose"; mkdir -p "$nc_dir"
+  local nc_red="${nc_dir}/red.tsv"; : > "$nc_red"
+  local nc_green="${nc_dir}/green.tsv"; : > "$nc_green"
+  local row label expect text
+
+  # label | issue the sentence disclaims and GitHub closed anyway | the text
+  local NC_RED_FIXTURES=(
+    'PR54 body (issue 35, closed 48 days)|35|Refs #35, #2, #49 — partial (routing half of the multi-tier fix); does not close #35.'
+    'PR864 body (issue 854)|854|    capability drops 2.5 → 2.0; a 2.40 curb becomes impassable — and it still does not close #854,'
+    'PR994 body (issue 982)|982|Does not close #982 (the `_cited` list is still a compile-only existence check with no reverse'
+    'PR1037 body, quoted note (issue 939)|939|> **#939** ... "Landing this issue does not close #939; it narrows the window #939 has to'
+    'PR1037 body, scope line (issue 939)|939|- **deliberately NOT Closes #939** — narrowed, not closed. Both zone-entry paths now publish, so'
+    'PR1037 body, scope line (issue 1010)|1010|- **deliberately NOT Closes #1010** — untouched. Separate PR.'
+    'commit 10619d99 message (issue 314, closed 37 days, COMMIT surface)|314|Scope note: this is the edge-SLIP class. It does NOT fix #314 (the North Qeynos'
+    'PR653 body (issue 302 — see the NEGATIVE note below)|302|- This does not close #302 or #254. It removes one documented contributor.'
+  )
+  local n_red=0
+  for row in "${NC_RED_FIXTURES[@]}"; do
+    n_red=$((n_red+1))
+    text="${row#*|*|}"
+    printf '%s\n' "$text" > "${nc_dir}/red-${n_red}.txt"
+    printf 'red\t%s\t%s\n' "$n_red" "${nc_dir}/red-${n_red}.txt" >> "$nc_red"
+  done
+
+  # MUST NOT FLAG. Four are real text from the same pull requests — including PR1037's real target,
+  # which it wrote inside backticks and GitHub did NOT link, and PR653's and PR994's legitimate
+  # closes. The rest are the boundary cases the regex has to survive: `Notes:`, `Another` and
+  # `annotation` all contain the letters "not", `unfixed` contains "fix", and a negation in the
+  # PREVIOUS sentence must not poison the next sentence's legitimate close.
+  local NC_GREEN_FIXTURES=(
+    '- `Closes #1022`'
+    'Fixes #641. Rebased on `8129376`. Second revision — all four blocking findings from the independent review addressed.'
+    'Closes #990'
+    'Refs #35, #2, #49 — partial (routing half of the multi-tier fix)'
+    'Refs #939 — narrowed, not closed. Both zone-entry paths now publish.'
+    'Notes: this closes #7'
+    'Another change here. Fixes #501.'
+    'This PR does not touch the renderer. Fixes #500.'
+    'annotation cleanup, fixes #9'
+    'The prefix handling is unfixed; resolves #12'
+  )
+  local n_green=0
+  for text in "${NC_GREEN_FIXTURES[@]}"; do
+    n_green=$((n_green+1))
+    printf '%s\n' "$text" > "${nc_dir}/green-${n_green}.txt"
+    printf 'green\t%s\t%s\n' "$n_green" "${nc_dir}/green-${n_green}.txt" >> "$nc_green"
+  done
+
+  echo "check-pr-text --self-test: eqoxide#1041 — ${n_red} measured-instance items + ${n_green} must-stay-green items"
+  classify_negclose "$nc_red" > "${nc_dir}/red-verdicts.txt"
+  want "every measured instance flagged"        "$NEGCLOSE_FLAGGED"    "$n_red"
+  want "every measured instance classified"     "$NEGCLOSE_CLASSIFIED" "$NEGCLOSE_TOTAL"
+  # The finding is only useful if it names the RIGHT number — a regex that flagged the line but
+  # reported the wrong issue would still pass a count-only assertion.
+  want "the disclaimed numbers are extracted" \
+    "$(printf '%s' "$NEGCLOSE_NUMBERS" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')" \
+    "35 302 314 854 939 982 1010 "
+
+  classify_negclose "$nc_green" > "${nc_dir}/green-verdicts.txt"
+  want "no must-stay-green item flagged"        "$NEGCLOSE_FLAGGED"    "0"
+  want "every must-stay-green item classified"  "$NEGCLOSE_CLASSIFIED" "$n_green"
+
+  # REACH CONTROL, twice, one per half of the pattern. The counts above prove the flags fired; they
+  # do NOT prove they fired BECAUSE the negation list and the keyword list were applied. Empty each
+  # in turn and re-run the identical red corpus: if anything still flags, the verdicts were not
+  # coming from the patterns. Every item must still be CLASSIFIED both times — "nothing flagged"
+  # and "nothing looked at" have to stay distinguishable.
+  local nc_saved_neg=("${NEGCLOSE_NEGATIONS[@]}") nc_saved_kw="$NEGCLOSE_KEYWORDS"
+  NEGCLOSE_NEGATIONS=()
+  classify_negclose "$nc_red" > /dev/null
+  want "no negation cue => nothing flags"       "$NEGCLOSE_FLAGGED"    "0"
+  want "no negation cue => still classified all" "$NEGCLOSE_CLASSIFIED" "$NEGCLOSE_TOTAL"
+  NEGCLOSE_NEGATIONS=("${nc_saved_neg[@]}")
+  NEGCLOSE_KEYWORDS=""
+  classify_negclose "$nc_red" > /dev/null
+  want "no closing keyword => nothing flags"    "$NEGCLOSE_FLAGGED"    "0"
+  NEGCLOSE_KEYWORDS="$nc_saved_kw"
+
+  # ...and that empty-list state must be REFUSED by the REAL script rather than reported as no
+  # findings. Same indirection as the LOCAL_DETAIL_PATTERNS_FILE checks above and for the same
+  # reason: this must run the script, not a copy of its condition.
+  local empty_neg="${nc_dir}/empty-negclose.sh"
+  printf 'NEGCLOSE_NEGATIONS=()\nNEGCLOSE_KEYWORDS=""\n' > "$empty_neg"
+  rc=0
+  out="$(NEGCLOSE_PATTERNS_FILE="$empty_neg" \
+         bash "${REPO_ROOT}/scripts/check-pr-text.sh" 1 --repo owner/name 2>&1)" || rc=$?
+  want "check-pr-text refuses an empty negation list" \
+       "$(printf '%s' "$out" | grep -c 'negation or keyword list is EMPTY' || true)" "1"
+  want "check-pr-text exits 1 on an empty negation list" "$rc" "1"
+  want "the negclose refusal fires BEFORE any fetch" \
+       "$(printf '%s' "$out" | grep -c 'scanning owner/name#1' || true)" "0"
+
+  # -------------------------------------------------------------------------------------------
+  # ATTRIBUTION — the second, separate question, and the home of the #302 NEGATIVE FIXTURE.
+  #
+  # Every row is measured: the close-event timestamps and commit ids come from each issue's
+  # timeline and each pull request's `merged_at`, read from the API during the eqoxide#1041 sweep.
+  # The six false closes land 1-2 seconds after their PR merged. Issue 302's close landed
+  # 2026-07-11, ELEVEN DAYS BEFORE PR #653 was opened — PR #306 closed it, legitimately — so the
+  # classifier must return NOT-ATTRIBUTED there even though PR #653's text matched the lint above
+  # and even though GitHub does list 302 in that PR's closingIssuesReferences. That is the whole
+  # point of keeping the two checks apart: matching the pattern is not a false close.
+  # -------------------------------------------------------------------------------------------
+  local a_label a_close a_commit a_merged a_range a_expect
+  local NC_ATTRIBUTION=(
+    'issue 35 <- PR 54|2026-07-01T00:43:38Z|null|2026-07-01T00:43:36Z||ATTRIBUTED-LINK'
+    'issue 854 <- PR 864|2026-08-06T04:25:57Z|null|2026-08-06T04:25:56Z||ATTRIBUTED-LINK'
+    'issue 982 <- PR 994|2026-08-12T21:51:34Z|null|2026-08-12T21:51:33Z||ATTRIBUTED-LINK'
+    'issue 939 <- PR 1037|2026-08-18T23:36:58Z|null|2026-08-18T23:36:57Z||ATTRIBUTED-LINK'
+    'issue 1010 <- PR 1037|2026-08-18T23:36:59Z|null|2026-08-18T23:36:57Z||ATTRIBUTED-LINK'
+    'issue 314 <- its closing commit|2026-07-12T18:18:53Z|10619d99dab87aa6fe57503fcec17d5c416254a8||10619d99dab87aa6fe57503fcec17d5c416254a8|ATTRIBUTED-COMMIT'
+    'issue 314 vs a range without that commit|2026-07-12T18:18:53Z|10619d99dab87aa6fe57503fcec17d5c416254a8||bb15748000000000000000000000000000000000|NOT-ATTRIBUTED'
+    'issue 302 <- PR 653 (NEGATIVE FIXTURE)|2026-07-11T20:18:54Z|null|2026-07-22T22:31:39Z||NOT-ATTRIBUTED'
+    'a disclaimed issue that is still open|||2026-07-22T22:31:39Z||STILL-OPEN'
+    'a disclaimed issue closed while the PR is unmerged|2026-08-01T00:00:00Z|null|||NOT-ATTRIBUTED'
+  )
+  for row in "${NC_ATTRIBUTION[@]}"; do
+    IFS='|' read -r a_label a_close a_commit a_merged a_range a_expect <<< "$row"
+    want "attribution: ${a_label}" \
+      "$(negclose_attribution "$a_close" "$a_commit" "$a_merged" "$a_range")" "$a_expect"
+  done
+
+  # -------------------------------------------------------------------------------------------
+  # run_live, END TO END, OFFLINE. Everything above drives classify_negclose directly, which does
+  # not prove run_live CALLS it — and that gap was measured on this branch, not assumed: deleting
+  # the `classify_negclose "$manifest"` line from run_live left --self-test at full green, exactly
+  # the failure mode this file's header already records for the empty-pattern checks ("the
+  # assertion tested a copy of the guard, not the guard").
+  #
+  # The fix is the same one that worked there: RUN THE SCRIPT. A stub `gh` is placed first on PATH
+  # and serves recorded payloads for PR #1037 — the pull request whose body, whose comment and whose
+  # commit message each carried the defect, and whose closingIssuesReferences GitHub really did
+  # report as exactly the two issues that body disclaimed. The stub emits already-filtered output
+  # because `gh` applies `--jq` itself. STUB_MODE=clean serves the corrected text through the same
+  # code path, so the run can be shown to go GREEN as well as RED — a check that only ever goes one
+  # way is not evidence.
+  # -------------------------------------------------------------------------------------------
+  local stubdir="${nc_dir}/stub"; mkdir -p "$stubdir"
+  cat > "${stubdir}/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+# Offline stand-in for `gh api`, driven by check-pr-text.sh --self-test. Recorded from
+# djhenry/eqoxide#1037. Not a general gh: it answers exactly the calls run_live makes.
+set -euo pipefail
+if [ "${STUB_MODE:-dirty}" = "clean" ]; then
+  BODY='- Closes #1022
+- #939 stays open — narrowed, not closed. Both zone-entry paths now publish.
+- #1010 is untouched. Separate PR.'
+  COMMENT='Landing this issue narrows the window #939 has to fire; #939 stays open.'
+  CMSG='fix(#1022): publish the door roster from the LOGIN handshake own drain too
+
+Scope: #939 stays open (narrowed, not closed) and #1010 is untouched.'
+else
+  BODY='- `Closes #1022`
+- **deliberately NOT Closes #939** — narrowed, not closed. Both zone-entry paths now publish, so
+- **deliberately NOT Closes #1010** — untouched. Separate PR.'
+  COMMENT='Landing this issue does not close #939; it narrows the window #939 has to fire.'
+  CMSG='fix(#1022): publish the door roster from the LOGIN handshake own drain too
+
+- **deliberately NOT Closes #1010** — untouched. Separate PR.'
+fi
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+args="$*"
+# `gh api "$@"` puts the subcommand first, so every call arrives as `api <endpoint-or-graphql> ...`.
+case "$args" in
+  "api graphql"*)
+    printf '%s\n' '{"data":{"repository":{"pullRequest":{"merged":true,"mergedAt":"2026-08-18T23:36:57Z","closingIssuesReferences":{"nodes":[{"number":939,"state":"CLOSED"},{"number":1010,"state":"CLOSED"}]}}}}}' ;;
+  *"/issues/939/timeline"*)  printf '2026-08-18T23:36:58Z\tnull\n' ;;
+  *"/issues/1010/timeline"*) printf '2026-08-18T23:36:59Z\tnull\n' ;;
+  *"/issues/1037/comments"*) printf 'comment\t5335451007\t%s\n' "$(b64 "$COMMENT")" ;;
+  *"/pulls/1037/reviews"*)   : ;;
+  *"/pulls/1037/comments"*)  : ;;
+  *"/pulls/1037/commits"*)   printf 'commit\t15b6630057fd99b75b813f254aa347f6c4d9f594\t%s\n' "$(b64 "$CMSG")" ;;
+  *"/issues/1037")           jq -n --arg b "$BODY" '{number:1037,title:"fix(#1022): publish the door roster",body:$b,pull_request:{}}' ;;
+  *) echo "stub gh: unhandled call: $args" >&2; exit 4 ;;
+esac
+GHSTUB
+  chmod +x "${stubdir}/gh"
+
+  rc=0
+  out="$(PATH="${stubdir}:${PATH}" STUB_MODE=dirty \
+         bash "${REPO_ROOT}/scripts/check-pr-text.sh" 1037 --repo owner/name 2>&1)" || rc=$?
+  want "run_live exits 1 on a negated closing keyword" "$rc" "1"
+  want "run_live flags it on ALL THREE surfaces (body, comment, commit message)" \
+       "$(printf '%s' "$out" | grep -c '^  \[NEGCLOSE\]' || true)" "3"
+  want "run_live names both disclaimed issues" \
+       "$(printf '%s' "$out" | grep -c 'will CLOSE issue 939\|will CLOSE issue 1010' || true)" "4"
+  want "run_live prints what GitHub actually parsed" \
+       "$(printf '%s' "$out" | grep -c 'closingIssuesReferences for this pull request: 939 1010' || true)" "1"
+  want "run_live reports the close attribution" \
+       "$(printf '%s' "$out" | grep -c 'close attribution: ATTRIBUTED-LINK' || true)" "2"
+  want "run_live scanned the commit surface at all" \
+       "$(printf '%s' "$out" | grep -c '^  \[NEGCLOSE\]    commit#15b6630057fd99b75b813f254aa347f6c4d9f594$' || true)" "1"
+  # The local-detail half must still be running in the same invocation — one pass must not be able
+  # to short-circuit the other.
+  want "run_live still ran the local-detail pass too" \
+       "$(printf '%s' "$out" | grep -c 'check-pr-text: corpus = 4 items; classified 4/4' || true)" "1"
+
+  rc=0
+  out="$(PATH="${stubdir}:${PATH}" STUB_MODE=clean \
+         bash "${REPO_ROOT}/scripts/check-pr-text.sh" 1037 --repo owner/name 2>&1)" || rc=$?
+  want "run_live exits 0 once the same text is rewritten" "$rc" "0"
+  want "run_live reports the rewritten corpus clean on both passes" \
+       "$(printf '%s' "$out" | grep -c 'clean AS CURRENTLY WRITTEN, on both passes' || true)" "1"
+  want "the rewritten text really went through the negclose pass" \
+       "$(printf '%s' "$out" | grep -c 'negclose corpus = 4 items; classified 4/4; flagged 0' || true)" "1"
+
+  # -------------------------------------------------------------------------------------------
+  # --commits mode, end to end, on a throwaway repository built here. This is the surface issue 314
+  # died on, and running the classifier alone would not prove the mode WIRES it up — the range
+  # walk, the per-commit message extraction and the exit code are all only exercised by running it.
+  # The dirty commit carries the measured text; the repo is created in a temp dir and removed by the
+  # EXIT trap, so nothing is ever pushed anywhere.
+  # -------------------------------------------------------------------------------------------
+  local trepo="${nc_dir}/gitrepo"
+  mkdir -p "$trepo"
+  git -c init.defaultBranch=main init -q "$trepo"
+  git -C "$trepo" -c user.email=selftest@invalid -c user.name=selftest \
+      commit -q --allow-empty -m 'fix(nav): a clean scope note — Refs #310, not addressed here'
+  git -C "$trepo" -c user.email=selftest@invalid -c user.name=selftest \
+      commit -q --allow-empty -m 'Scope note: this is the edge-SLIP class. It does NOT fix #314 (the North Qeynos'
+  git -C "$trepo" -c user.email=selftest@invalid -c user.name=selftest \
+      commit -q --allow-empty -m 'docs: restate the scope note without a linking keyword — #314 stays open'
+
+  rc=0
+  out="$(cd "$trepo" && LOCAL_DETAIL_PATTERNS_FILE="$PATTERNS_FILE" \
+         bash "${REPO_ROOT}/scripts/check-pr-text.sh" --commits HEAD~2..HEAD~1 2>&1)" || rc=$?
+  want "--commits flags the measured commit-message instance" \
+       "$(printf '%s' "$out" | grep -c 'will CLOSE issue 314' || true)" "1"
+  want "--commits exits 1 on a finding" "$rc" "1"
+
+  rc=0
+  out="$(cd "$trepo" && LOCAL_DETAIL_PATTERNS_FILE="$PATTERNS_FILE" \
+         bash "${REPO_ROOT}/scripts/check-pr-text.sh" --commits HEAD~1..HEAD 2>&1)" || rc=$?
+  want "--commits passes a clean commit range" "$rc" "0"
+  want "--commits classified the clean commit" \
+       "$(printf '%s' "$out" | grep -c 'classified 1/1' || true)" "1"
+
+  # An empty range must be an ERROR, not a pass: "0 commits carried the pattern" and "0 commits were
+  # looked at" print the same word otherwise, and a stale `origin/main` in a worktree is the easiest
+  # way in this fleet to hand it an empty range without noticing.
+  rc=0
+  out="$(cd "$trepo" && LOCAL_DETAIL_PATTERNS_FILE="$PATTERNS_FILE" \
+         bash "${REPO_ROOT}/scripts/check-pr-text.sh" --commits HEAD..HEAD 2>&1)" || rc=$?
+  want "--commits refuses an empty range" \
+       "$(printf '%s' "$out" | grep -c '0 commits in range' || true)" "1"
+  want "--commits exits 1 on an empty range" "$rc" "1"
+
   # Assert how many checks ran. A case that silently stops running must fail this step rather than
   # shrink the output. `checks + 1` counts this assertion itself, which has not been tallied yet.
-  want "self-test ran every check (incl. this one)" "$((checks + 1))" "15"
+  want "self-test ran every check (incl. this one)" "$((checks + 1))" "52"
 
   if [ "$fails" -ne 0 ]; then
     echo "check-pr-text --self-test: FAILED ${fails} of ${checks} checks."
@@ -397,13 +1066,17 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --self-test) run_self_test; exit $? ;;
+      --commits)   run_commits "$2"; exit $? ;;
       --repo)      repo="$2"; shift 2 ;;
-      -h|--help)   sed -n '1,45p' "$0"; exit 0 ;;
+      # Print the leading comment block, however long it grows. A fixed line range here rots into
+      # a truncated help text the first time the header is edited.
+      -h|--help)   awk 'NR>1 && !/^#/{exit} {print}' "$0"; exit 0 ;;
       *)           number="$1"; shift ;;
     esac
   done
   if [ -z "$number" ]; then
     echo "usage: scripts/check-pr-text.sh <pr-or-issue-number> [--repo <owner>/<name>]" >&2
+    echo "       scripts/check-pr-text.sh --commits <rev-range>" >&2
     echo "       scripts/check-pr-text.sh --self-test" >&2
     exit 2
   fi

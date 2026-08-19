@@ -93,6 +93,24 @@ jobs:
   # there, not a pass). `GH_TOKEN` gets the default read-only workflow token, which is enough for
   # every endpoint the script calls; a fork PR is fine because the script only reads.
   #
+  # SECOND PASS, SAME JOB (#1041): a NEGATED CLOSING KEYWORD. GitHub links
+  # `close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved` to the `#<n>` after it and does
+  # not read the negation in front of it, so "does not close" plus a number CLOSES that number. Six
+  # issues in this repo were false-closed exactly that way, one of them for 48 days, and the sentence
+  # that did it is the sentence written specifically to record that the issue was OUT of scope. The
+  # script now runs that pass over the same corpus and, for a pull request, prints GitHub's own
+  # `closingIssuesReferences` beside the findings — the only observable that reports what was
+  # actually parsed, as opposed to what the body appears to say.
+  #
+  # Its corpus grew for that pass: a pull request's COMMIT MESSAGES are now fetched too, because
+  # issue 314 was false-closed by a commit message and by nothing else. They come from the API and
+  # not from git on purpose — every `actions/checkout` in this file runs at the default fetch-depth
+  # of 1, so no job here has the branch history, and a git-based scan on this runner would read one
+  # merge commit and report a clean corpus. `scripts/check-pr-text.sh --commits <rev-range>` is the
+  # git-based mode, for a machine that actually has the commits; it is deliberately NOT wired into
+  # the `test` job below, since that would mean a full-history checkout on the heaviest job in the
+  # workflow to re-cover commits this job already reads.
+  #
   # WHAT THIS JOB STRUCTURALLY CANNOT SCAN: a comment posted after the last push. The trigger is
   # `pull_request`, so every run reads the text as it stood at a push, and the last green run keeps
   # asserting a corpus that has since grown. This PR demonstrated it on itself — the only run at the
@@ -103,6 +121,17 @@ jobs:
   # workflow's concurrency group is keyed on `github.ref`, which for an `issue_comment` event is the
   # default branch rather than the PR head, so comment-triggered runs would cancel each other and
   # cancel pushes. That is a workflow-structure change, not a one-line trigger addition.
+  #
+  # THAT BLIND SPOT BITES #1041 HARDER THAN IT BIT #980, and this job must not be read as sealing
+  # the surface. A scope note — "this PR deliberately does not close X" — is most often ADDED TO THE
+  # BODY DURING REVIEW, after the final push, which is exactly the edit no run here will ever see.
+  # Two of the six measured false closes were disclaimed in a body, one in a comment, and one in a
+  # commit message alone. Nothing automated covers a body edited after the last push, and nothing
+  # automated anywhere covers the squash-merge message typed into GitHub's merge dialog, which does
+  # not exist until the merge button is pressed. Before merging, run the script by hand against the
+  # number and check `gh pr view <n> --json closingIssuesReferences` against what the PR intends to
+  # close. That manual step is still the real control; this job narrows the window, it does not
+  # close it.
   pr-text:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -110,6 +139,10 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # #1041: the negated-close pass reads an ISSUE's close-event timeline (not a PR's) to decide
+      # whether a disclaimed issue's close is actually attributable to this pull request. That is
+      # the `/issues/<n>/timeline` endpoint, which `pull-requests: read` alone does not cover.
+      issues: read
     steps:
       - uses: actions/checkout@v4
       # `--self-test` first, same pattern as check-wrapped-literals above: a scanner that has
@@ -130,9 +163,19 @@ jobs:
       # `check-no-local-detail.sh` with `if false; then` turns `--self-test` RED (`want '1', got
       # '3'`), and neutering `require_patterns` in `check-pr-text.sh` turns it RED on two more
       # checks; hand-editing each back restores 15/15.
+      #
+      # The #1041 half adds to that: every positive fixture is a MEASURED instance quoted verbatim
+      # (the six real false closes, plus the one text match whose close was legitimate), a run_live
+      # end-to-end pass against a stub `gh` serving recorded payloads — added because deleting the
+      # new pass from run_live was MEASURED to leave the self-test at full green without it — and a
+      # `--commits` pass over a throwaway repository. Verified red in both directions at this
+      # commit: neutering the scanner, dropping the `\b` from the `not` cue, widening the match
+      # window past a sentence boundary, breaking the attribution comparison, deleting the pass from
+      # run_live, and deleting the commit fetch from the corpus each turn `--self-test` RED; hand-
+      # reverting each restores 52/52.
       - name: check-pr-text self-test
         run: bash scripts/check-pr-text.sh --self-test
-      - name: scan this PR's body and comments for local-system detail
+      - name: scan this PR's text for local-system detail and negated closing keywords
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
