@@ -477,9 +477,16 @@ pub type FriendsListShared = Arc<Mutex<Vec<String>>>;
 pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_state::WhoEntry>>>>>;
 
 /// Target position for the navigation system: the coordinate the nav walker is steering to, `None`
-/// when it has no goal. It is not written only by `/goto` — see [`GotoEntity`] for the FOLLOW case,
-/// where `NavWalker::drive_chase` republishes this slot from the chased entity's current position,
-/// and where the clearing rules that used to be stated here are set out against the code.
+/// when it has no goal. `/goto` sets it — `CommandState::request_goto`
+/// (`crates/eqoxide-command/src/nav.rs`) — and the walker clears it on ARRIVAL: the
+/// `ArrivalAction::Arrived` arm of `Walker::drive_walk` (`crates/eqoxide-nav/src/walker.rs`) clears
+/// this slot as it publishes the `arrived` nav state. That arm is reachable only for a COORDINATE
+/// goal: `arrival_action` (`crates/eqoxide-nav/src/steering.rs`) returns `Arrived` from its
+/// non-`following` branch alone, and `drive_walk` passes it `following = goto_entity.is_some()`.
+///
+/// Those two are not the whole writer set — see [`GotoEntity`] for the FOLLOW case, where
+/// `Walker::drive_chase` republishes this slot from the chased entity's current position, and where
+/// `CommandState::request_cancel_goto` clears THIS slot while deliberately leaving that one set.
 pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
 
 /// When the nav walker is FOLLOWing a named ENTITY, this holds its `entity_positions` key so the
@@ -492,11 +499,11 @@ pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
 /// reading back the use sites the build reports, and the test-only ones were separated out by
 /// comparing `cargo check --workspace` against `cargo check --workspace --all-targets`.
 ///
-/// * SET only by `NavCommands::request_follow` (`crates/eqoxide-command/src/nav.rs`), whose only
+/// * SET only by `CommandState::request_follow` (`crates/eqoxide-command/src/nav.rs`), whose only
 ///   production caller is POST /v1/move/follow. `/goto` does NOT set it — `request_goto` CLEARS
 ///   it, so a coordinate goto cancels an in-flight chase.
-/// * CLEARED by `request_goto`, `request_stop`, `NavWalker::reset_for_zone_change`,
-///   `NavWalker::nav_halt_if_dead`, and `NavWalker::drive_chase`'s own two clears (the goal was
+/// * CLEARED by `request_goto`, `request_stop`, `Walker::reset_for_zone_change`,
+///   `Walker::nav_halt_if_dead`, and `Walker::drive_chase`'s own two clears (the goal was
 ///   cancelled elsewhere; the entity despawned or left view).
 ///
 /// Two things this slot does NOT do, both of which earlier revisions of this doc asserted (#1044
@@ -514,7 +521,7 @@ pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
 ///   the follow distance and `Drive` outside it, never `Arrived`.
 ///
 /// The first of those is agent-visible, because that same auto-melee branch also calls
-/// `NavCommands::request_cancel_goto`, which clears [`GotoTarget`] and deliberately LEAVES this
+/// `CommandState::request_cancel_goto`, which clears [`GotoTarget`] and deliberately LEAVES this
 /// slot set (pinned by `request_cancel_goto_clears_only_target`). The melee path does not put the
 /// goal back. So the next `drive_chase` to run reads `goto_target` and finds it `None` — unless a
 /// fresh `/goto`, `/follow` or zone-cross resolution has issued a new goal meanwhile, each of
@@ -522,9 +529,13 @@ pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
 /// well: the follow is ABANDONED, not suspended and resumed. The cancel is at least announced
 /// (`request_cancel_goto` stamps a fresh idle goal with reason `goto_superseded`), but nothing
 /// restarts the chase, so an agent that wants to keep following through a melee engagement has to
-/// re-POST /v1/move/follow. Auto-melee is not the only route in: the render thread calls
-/// `request_cancel_goto` too, on the frame WASD or `/v1/move/manual` takes steering over, and a
-/// chase dies the same way there.
+/// re-POST /v1/move/follow. Auto-melee is not the only route in: the render thread (`src/app.rs`)
+/// reaches `request_cancel_goto` from FOUR sites, and a chase dies the same way at every one of
+/// them — the per-frame WASD branch, the per-frame `/v1/move/manual` branch, the key-DOWN handler
+/// for W/A/S/D/Q/E, and the key-DOWN handler for R/F9. That last one is the surprising member: it
+/// is the CAMERA reset-to-follow and moves the character nowhere, so recentring the camera ends a
+/// live follow. All four are named rather than summarised as the movement paths, because that
+/// summary is the same undercount shape [`ControllerShared`] records below.
 pub type GotoEntity = Arc<Mutex<Option<String>>>;
 
 /// Authoritative controller snapshot: once the camera has initialised, the render thread
@@ -562,8 +573,8 @@ pub type ControllerShared = Arc<Mutex<ControllerView>>;
 /// only writer nor a per-FRAME one. Those writes are the NAV thread's, on its own cadence, and
 /// `ActionLoop::drive_auto_engage_melee` drives this slot from that thread too, while closing on a
 /// melee target (see [`GotoEntity`]). The render thread does write it — but only ever to clear it
-/// to `None`, on the frame WASD or `/v1/move/manual` takes steering over: the same two sites that
-/// call `request_cancel_goto`.
+/// to `None`, on the frame WASD or `/v1/move/manual` takes steering over — both of which also
+/// call `request_cancel_goto`, which has further call sites of its own.
 pub type NavIntent = Arc<Mutex<Option<MoveIntent>>>;
 
 /// A large (>12u) server position correction the nav thread hands to the render controller to apply
@@ -1420,9 +1431,9 @@ pub struct EntityPoseView {
 }
 
 /// Live entity name → pose/gait map (same keys as `EntityPositions`), read by
-/// `GET /v1/observe/entities?labeled=1` (#643). NOT on a clock (#1044, same class as #1023):
-/// published from two call sites, both through the single `WorldSlots::publish_entities`
-/// projection —
+/// `GET /v1/observe/entities?labeled=1` (#643). NOT on a clock (#1044, same class as #1023). Every
+/// write goes through the single `WorldSlots::publish_entities` projection, which is where its
+/// callers are documented. Among them, with the cadence each publishes on:
 ///
 /// 1. `ActionLoop::sync_entities`, called once per packet `run_gameplay_phase`'s inbound drain
 ///    has drained AND applied via `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — a
@@ -1430,10 +1441,6 @@ pub struct EntityPoseView {
 ///    silent zone.
 /// 2. `login::run_login_flow`'s own one-time seed, republishing everything discovered during
 ///    login once, before the gameplay loop's own drain takes over.
-///
-/// `run_zone_entry_handshake`'s own drain during a re-zone does not touch this slot (it takes no
-/// `WorldSlots` parameter) — the roster keeps the departed zone's poses until the gameplay loop's
-/// drain resumes after the handshake returns.
 pub type EntityPoses = Arc<Mutex<Roster<EntityPoseView>>>;
 
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /v1/observe/zone_points.
