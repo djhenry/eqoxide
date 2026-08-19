@@ -4720,8 +4720,6 @@ mod tests {
             "arrival ends the route — its tier must not linger");
     }
 
-    /// Build a minimal ActionLoop for unit tests that only exercise a single `sync_*`/tick method —
-    /// every other shared slot gets an empty/default placeholder.
     /// #643: This pins the publisher half of the net→HTTP path (the HTTP half is pinned by the app
     /// crate's `tests/entity_pose_643.rs`). It also pins the SIGN of the gait field: `animation` is
     /// `signed animation:10` on the wire, so a mob backing up carries a negative gait — reporting
