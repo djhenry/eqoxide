@@ -523,9 +523,9 @@ pub fn running_jump_reach(run_speed: f32) -> f32 {
 /// vestigial, or one of the three constants is miscalibrated — in which case the unreachable branch
 /// is the surviving EVIDENCE of that and deleting it destroys the evidence. Nothing in this tree
 /// can tell the two apart, and changing a constant to force one reading is a decision nobody has
-/// taken. `todo.md`'s "exhaustive fall-damage testing (controlled-fall nav)" section settles it by
-/// measurement — specifically its "Validate the fall-damage curve vs the real client across drop
-/// heights" item. Until that runs, treat the ceiling as a property of THIS code, not of a fall.
+/// taken. Only measurement settles it: the fall-damage curve has to be validated against the real
+/// client across drop heights, and nobody has run that. Until someone does, treat the ceiling as a
+/// property of THIS code, not of a fall.
 ///
 /// The bound is not confined to this function: `eqoxide-nav`'s pre-emptive lethal-fall guard
 /// compares `max_damage` against current HP, so it cannot fire at all above the ceiling. See
@@ -533,8 +533,8 @@ pub fn running_jump_reach(run_speed: f32) -> f32 {
 ///
 /// UNCITED, as a statement about the tree as it stands: no document in this repository, and none in
 /// the private EQ knowledge-base tree, derives this curve or its constants. That is the operative
-/// fact — treat every number here as unverified until someone re-derives it. #1005's `todo.md`
-/// entry has the measurement plan.
+/// fact — treat every number here as unverified until someone re-derives it. #1005 tracks the
+/// measurement.
 ///
 /// The lineage, because it explains the gap rather than filling it: the curve and its constants
 /// came from a reverse-engineering note that this repository once carried and deliberately removed
@@ -716,52 +716,6 @@ mod fall_damage_ceiling_tests {
             assert_eq!(fall_damage(h).1, OBSERVED_CEILING,
                 "the curve must be flat at the ceiling above saturation, and is not at {h}");
         }
-    }
-
-    /// The doc comment above sends readers to three named referents. **A citation that no longer
-    /// resolves does not fail loudly — it keeps reading as evidence**, which is the same class of
-    /// defect #1058 itself is. These are the two this crate can reach; the third (`eqoxide-nav`'s
-    /// `classify_ledge_fall`) is pinned from the nav side, which is the direction the dependency
-    /// runs.
-    #[test]
-    fn the_doc_comments_citations_still_resolve() {
-        const SRC: &str = include_str!("physics.rs");
-        const TODO: &str = include_str!("../../../todo.md");
-        // Non-degeneracy. Without these an empty or truncated corpus, or a `contains` that matched
-        // anything, would pass every assertion below without looking at a thing.
-        assert!(SRC.len() > 10_000, "physics.rs corpus looks truncated ({} bytes)", SRC.len());
-        assert!(TODO.len() > 10_000, "todo.md corpus looks truncated ({} bytes)", TODO.len());
-        // The control strings are ASSEMBLED, not written out: a literal absent-name control is a
-        // contradiction in a test that searches its own file — the literal puts the name there.
-        let absent_mod = format!("fall_damage_{}_tests", "basement");
-        let absent_heading = format!("exhaustive fall-damage testing ({} free-fall)", "uncontrolled");
-        assert!(!SRC.contains(&absent_mod),
-            "control: a name that is NOT in physics.rs must not be found, or these searches prove nothing");
-        assert!(!TODO.contains(&absent_heading),
-            "control: a heading that is NOT in todo.md must not be found");
-
-        // 1. The test module the doc tells readers to read for the bound.
-        const TEST_MOD: &str = "fall_damage_ceiling_tests";
-        assert!(SRC.contains(&format!("mod {TEST_MOD}")),
-            "the doc cites `{TEST_MOD}`, and no module by that name exists in this file");
-        assert!(SRC.contains(&format!("`{TEST_MOD}`")),
-            "this module was renamed without updating the doc comment that sends readers to it");
-
-        // 2. The todo.md section that settles the two readings, and the item inside it that does.
-        const SECTION: &str = "## TODO: exhaustive fall-damage testing (controlled-fall nav)";
-        const ITEM: &str = "Validate the fall-damage curve vs the real client across drop";
-        assert!(SRC.contains("exhaustive fall-damage testing (controlled-fall nav)")
-            && SRC.contains(ITEM), "the doc no longer names the todo.md section and item it cites");
-        let sec = TODO.find(SECTION).unwrap_or_else(|| panic!("todo.md no longer has the section \
-            the doc comment cites, verbatim: {SECTION:?}"));
-        let item = TODO.find(ITEM).unwrap_or_else(|| panic!("todo.md no longer has the measurement \
-            item the doc comment cites: {ITEM:?}"));
-        // POSITION, not just presence: the item must live under that heading. A citation that
-        // resolves to the right words under the wrong heading is the silent failure this guards.
-        assert!(item > sec, "the cited item is above the section it is cited as belonging to");
-        assert!(!TODO[sec + SECTION.len()..item].contains("\n## "),
-            "another `## ` heading now sits between the cited section and the cited item, so the \
-             item is no longer in that section");
     }
 
     /// The bottom of the curve, asserted positively as well as negatively: a short fall reports
