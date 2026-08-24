@@ -41,8 +41,5 @@ tools/target/
 opencode.json
 --out
 
-# Python bytecode cache. `scripts/mutate.py --self-test` sets `sys.dont_write_bytecode` before it
-# imports `scripts/mutate_selftest.py`, so it does NOT create `scripts/__pycache__/` — a guard that
-# walks the repo root would otherwise descend into a directory the harness had created. This entry
-# stays for any other Python run under the tree.
+# Python bytecode cache.
 __pycache__/

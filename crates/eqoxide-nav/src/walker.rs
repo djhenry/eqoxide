@@ -224,9 +224,9 @@ pub enum LedgeFallVerdict {
 ///
 /// **This function does not change WHEN the guard fires**, and must not: `Stop` is exactly the old
 /// `gs.cur_hp > 0 && max_dmg >= gs.cur_hp as u32`. Whether the ceiling is a real property of falls
-/// or an artefact of an unre-derived constant is unresolved (see [`fall_damage`]'s doc and
-/// `todo.md`'s "exhaustive fall-damage testing (controlled-fall nav)" section); until that
-/// measurement is run, tightening the guard would be inventing a threat, and staying silent about
+/// or an artefact of an unre-derived constant is unresolved (see [`fall_damage`]'s doc, and #1005
+/// for the measurement that would settle it); until that measurement is run, tightening the guard
+/// would be inventing a threat, and staying silent about
 /// its reach is asserting a protection. Reporting is the only honest option left.
 pub fn classify_ledge_fall(drop_u: f32, cur_hp: i32) -> LedgeFallVerdict {
     let (_, max_dmg) = fall_damage(drop_u);
