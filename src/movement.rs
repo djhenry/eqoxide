@@ -948,9 +948,7 @@ impl CharacterController {
             let mut stepped = false;
             // Step-up is the native 2u for BOTH free WASD and nav (#239): nav must not be able to
             // climb anything a WASD player can't. Fence/cart lips taller than 2u are crossed the way
-            // a real player does — via `hop`, below — not climbed. (`intent.climb` no longer raises
-            // this; it used to carry the super-human NAV_CLIMB=20.)
-            let _ = intent.climb;
+            // a real player does — via `hop`, below — not climbed.
             let max_step = STEP_UP;
             // Allow step-up while SWIMMING too, not just when grounded: that's how a character hauls
             // OUT of water onto the shore (swimming clears on_ground, so without this it just presses
@@ -2041,7 +2039,7 @@ mod tests {
     }
     fn walk(speed: f32, dir: [f32; 2]) -> MoveIntent {
         MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: false, speed,
-                     climb: 0.0, hop: false }
+                     hop: false }
     }
     /// Partial vertical wall: east=`e`, north [n0,n1], height [h0,h1] — for bends/obstacles.
     fn wall_seg(e: f32, n0: f32, n1: f32, h0: f32, h1: f32) -> MeshData {
@@ -2096,7 +2094,7 @@ mod tests {
             let (dx, dy) = (carrot[0] - ctrl.pos[0], carrot[1] - ctrl.pos[1]);
             let d = (dx * dx + dy * dy).sqrt().max(1e-3);
             let intent = MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
-                want_swim: false, speed: 44.0, climb: 0.0, hop: false };
+                want_swim: false, speed: 44.0, hop: false };
             ctrl.step(intent, 0.016, &col);
             // Skip the tail approach to the goal (the carrot shortens there) — measure along the route.
             if ((ctrl.pos[0] - goal[0]).powi(2) + (ctrl.pos[1] - goal[1]).powi(2)).sqrt() > 6.0 {
@@ -2148,7 +2146,7 @@ mod tests {
         ctrl.on_ground = true;
         let swim = MoveIntent {
             wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: true,
-            speed: 35.0, climb: 0.0, hop: false,
+            speed: 35.0, hop: false,
         };
         for _ in 0..240 { ctrl.step(swim, 1.0 / 60.0, &c); }
         assert!(ctrl.pos[2] > 5.0, "swim floats off the bottom toward the surface (~8): {}", ctrl.pos[2]);
@@ -2222,7 +2220,7 @@ mod tests {
         // Drive a persistent upward swim wish (the nav swim-up toward a high waypoint), like the walker.
         let swim_up = MoveIntent {
             wish_dir: [0.0, 0.0], wish_vspeed: 20.0, jump: false, want_swim: true,
-            speed: 0.0, climb: 0.0, hop: false,
+            speed: 0.0, hop: false,
         };
         let mut worst_head = f32::MIN;
         for _ in 0..600 {
@@ -2253,7 +2251,7 @@ mod tests {
     }
     fn dive(vspeed: f32) -> MoveIntent {
         MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: vspeed, jump: false, want_swim: true,
-                     speed: 0.0, climb: 0.0, hop: false }
+                     speed: 0.0, hop: false }
     }
 
     /// **#855 — THE UNIVERSAL: a driven swim descent never puts the feet below the floor, at ANY
@@ -2935,34 +2933,20 @@ mod tests {
     }
 
     #[test]
-    fn nav_does_not_scale_a_lip_taller_than_the_native_step() {
-        // A 6u lip: floor z=0, a 6u riser at east=5, floor z=6 beyond. #239: nav must move like a
-        // WASD player — the native 2u step-up can't mount a 6u riser, and the old NAV_CLIMB=20
-        // super-step is gone — so nav is blocked at the lip exactly like WASD. (find_path now routes
-        // AROUND such lips: its feet-level path_clear rejects the >2.5u riser; a THIN fence with flat
-        // floor on both sides is crossed by `hop`, not climb — see the hop test below.)
+    fn the_controller_does_not_scale_a_lip_taller_than_the_native_step() {
+        // A 6u lip: floor z=0, a 6u riser at east=5, floor z=6 beyond. #239: nav moves like a WASD
+        // player — the native 2u step-up can't mount a 6u riser, so the walker is blocked at the
+        // lip. There is ONE step-up path: `step()` reads `STEP_UP` and nothing in a `MoveIntent`
+        // can raise it, so a nav intent and a WASD intent are the same input here. (find_path
+        // routes AROUND such lips: its feet-level path_clear rejects the >2.5u riser; a THIN fence
+        // with flat floor on both sides is crossed by `hop`, not climb — see the hop test below.)
         let geo = || col(vec![floor(0.0, -100.0, 5.0), wall(5.0, 0.0, 6.0), floor(6.0, 5.0, 100.0)]);
 
-        // Free WASD (climb=0 → native 2u step): blocked at the lip, stays at z=0.
-        let mut wasd = CharacterController::new([3.0, 0.0, 0.0]);
-        wasd.on_ground = true;
-        for _ in 0..5 { wasd.step(walk(35.0, [1.0, 0.0]), 0.1, &geo()); }
-        assert!(wasd.pos[0] < 5.1, "WASD must NOT scale a 6u lip: east={}", wasd.pos[0]);
-        assert!(wasd.pos[2] < 1.0, "WASD should stay at floor z=0: {}", wasd.pos[2]);
-
-        // Nav is now capped at the same native step-up (no NAV_CLIMB): also blocked, also at z=0.
-        // climb is set high (not 0) deliberately: intent.climb is now ignored entirely (see
-        // `let _ = intent.climb;` in step()), but the WASD and nav intents used to be byte-identical
-        // here (both climb: 0.0), so re-introducing the old NAV_CLIMB super-step (`if intent.climb >
-        // 0 { climb up to intent.climb }`) would NOT have been caught by this test. Setting climb
-        // to a value that WOULD scale the lip if honored makes the test an actual regression guard.
-        let nav_intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false,
-            want_swim: false, speed: 35.0, climb: 20.0, hop: false };
-        let mut nav = CharacterController::new([3.0, 0.0, 0.0]);
-        nav.on_ground = true;
-        for _ in 0..5 { nav.step(nav_intent, 0.1, &geo()); }
-        assert!(nav.pos[0] < 5.1, "nav must NOT scale a 6u lip either (#239): east={}", nav.pos[0]);
-        assert!(nav.pos[2] < 1.0, "nav should stay at floor z=0: {}", nav.pos[2]);
+        let mut ctrl = CharacterController::new([3.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        for _ in 0..5 { ctrl.step(walk(35.0, [1.0, 0.0]), 0.1, &geo()); }
+        assert!(ctrl.pos[0] < 5.1, "must NOT scale a 6u lip: east={}", ctrl.pos[0]);
+        assert!(ctrl.pos[2] < 1.0, "should stay at floor z=0: {}", ctrl.pos[2]);
     }
 
     #[test]
@@ -2979,7 +2963,7 @@ mod tests {
 
         // Nav with hop commanded: hops the fence and lands on the flat floor beyond (z≈0, east>5).
         let nav_intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false,
-            want_swim: false, speed: 35.0, climb: 0.0, hop: true };
+            want_swim: false, speed: 35.0, hop: true };
         let mut nav = CharacterController::new([2.0, 0.0, 0.0]);
         nav.on_ground = true;
         for _ in 0..40 { nav.step(nav_intent, 0.05, &geo()); }
@@ -3061,7 +3045,7 @@ mod tests {
     }
     fn swim_still() -> MoveIntent {
         MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: true,
-                     speed: 0.0, climb: 0.0, hop: false }
+                     speed: 0.0, hop: false }
     }
 
     #[test]
@@ -3313,7 +3297,7 @@ mod tests {
     /// Drive the controller east with a constant intent for `frames` frames.
     fn drive_east(ctrl: &mut CharacterController, col: &Collision, frames: usize, vspeed: f32) {
         let intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: vspeed, jump: false,
-                                  want_swim: true, speed: 44.0, climb: 0.0, hop: false };
+                                  want_swim: true, speed: 44.0, hop: false };
         for _ in 0..frames { ctrl.step(intent, 1.0 / 60.0, col); }
     }
 
@@ -3405,7 +3389,7 @@ mod tests {
             "fixture/capability: with the far floor below the duck depth the crossing must be \
              allowed; got {:?}", ctrl.pos);
         let west = MoveIntent { wish_dir: [-1.0, 0.0], wish_vspeed: 0.0, jump: false,
-                                want_swim: true, speed: 44.0, climb: 0.0, hop: false };
+                                want_swim: true, speed: 44.0, hop: false };
         for _ in 0..360 { ctrl.step(west, 1.0 / 60.0, &c); }
         assert!(ctrl.pos[0] < 0.0,
             "#661 review B1: the crossing must be a round trip — driving back west must re-duck \
@@ -4448,7 +4432,7 @@ mod tests {
                     if zone_emb <= 400 {
                         let mut ctrl = CharacterController::new(p);
                         let idle = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false,
-                                                want_swim: true, speed: 0.0, climb: 0.0, hop: false };
+                                                want_swim: true, speed: 0.0, hop: false };
                         for _ in 0..110 { ctrl.step(idle, 1.0 / 60.0, &col); }
                         let settle_from = ctrl.pos;
                         for _ in 0..10 { ctrl.step(idle, 1.0 / 60.0, &col); }
@@ -5228,7 +5212,7 @@ mod tests {
         let mut ctrl = CharacterController::new([0.0, 0.0, 5.0]);
         ctrl.on_ground = false;
         let swim_down = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: -15.0, jump: false,
-            want_swim: true, speed: 0.0, climb: 0.0, hop: false };
+            want_swim: true, speed: 0.0, hop: false };
 
         // Drive it down through the water bottom into the pit; stop as soon as we're clearly out of
         // the water and still above the pit floor, so we can inspect the mid-fall state.
@@ -5288,7 +5272,7 @@ mod tests {
         assert!(c.in_water([ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]]), "must start submerged in the pond");
         // Swim EAST (lateral) while holding a persistent DOWN wish — the look-slightly-down case.
         let swim_out = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: -15.0, jump: false,
-            want_swim: true, speed: 40.0, climb: 0.0, hop: false };
+            want_swim: true, speed: 40.0, hop: false };
 
         // Drive east until we've drifted out of the pond AND settled back onto the (flush, dry)
         // floor, then stop — running further would walk the character off the finite test floor's
@@ -5321,7 +5305,7 @@ mod tests {
         // the hop probe band so `can_hop` fires). The hop launches from z=0 and lands on z=-3.
         let geo = col(vec![floor(0.0, -100.0, 5.0), wall(5.0, 0.0, 5.0), floor(-3.0, 5.0, 100.0)]);
         let nav_intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false,
-            want_swim: false, speed: 35.0, climb: 0.0, hop: true };
+            want_swim: false, speed: 35.0, hop: true };
         let mut ctrl = CharacterController::new([2.0, 0.0, 0.0]);
         ctrl.on_ground = true;
         for _ in 0..80 { ctrl.step(nav_intent, 0.05, &geo); }
@@ -6117,7 +6101,7 @@ mod tests {
     }
     fn swim_toward(dir: [f32; 2], speed: f32) -> MoveIntent {
         MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: true, speed,
-                     climb: 0.0, hop: false }
+                     hop: false }
     }
     /// The swim plane of the scenes above: `surface (0) − float_depth`.
     fn plane() -> f32 { -crate::traversability::PLAYER_BODY.float_depth }
@@ -6232,7 +6216,7 @@ mod tests {
         let c = open_water();
         let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
         let up = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 20.0, jump: false, want_swim: true,
-                              speed: 0.0, climb: 0.0, hop: false };
+                              speed: 0.0, hop: false };
         for i in 0..(30 * 60) {
             ctrl.step(up, 1.0 / 60.0, &c);
             assert!(ctrl.afloat_stall().is_none(),
@@ -6293,7 +6277,7 @@ mod tests {
             let c = deep_sealed_east_face();
             let mut ctrl = CharacterController::new([0.0, 0.0, start_z]);
             let intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: vspeed, jump: false,
-                                      want_swim: true, speed: 44.0, climb: 0.0, hop: false };
+                                      want_swim: true, speed: 44.0, hop: false };
             for _ in 0..(6 * 60) { ctrl.step(intent, 1.0 / 60.0, &c); }
             let travelled = (ctrl.pos[2] - start_z).abs();
             assert!(ctrl.in_water && !ctrl.on_ground,

@@ -26,8 +26,7 @@ pub const PLAYER_RADIUS: f32 = 1.0;
 /// around) — there is no larger climb and no separate slope check. It is the single source of truth
 /// for how high nav may climb, so `find_path` derives its edge-climb cap (`STEP_H`) from it. Both
 /// free WASD and the nav walker are clamped to this — navigation must never climb what a WASD player
-/// can't (#239). (Was decoupled from a super-human `NAV_CLIMB = 20.0`, which teleported the walker up
-/// 20u ridges/invisible walls and stranded it on the high side of boundaries.)
+/// can't (#239).
 pub const STEP_UP: f32 = 2.0;
 
 /// Downward acceleration for the fall integration, in EQ units/s². This is the ACCELERATION only —

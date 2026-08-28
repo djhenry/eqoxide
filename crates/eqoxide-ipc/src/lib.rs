@@ -63,12 +63,6 @@ pub struct MoveIntent {
     pub jump:        bool,
     pub want_swim:   bool,
     pub speed:       f32,
-    /// Max step-up height the controller may climb this move, in EQ units. `0` (default) uses the
-    /// native `movement::STEP_UP` (2.0) — correct for free WASD, which must NOT be able to scale
-    /// walls. The `/goto` planner raises it so the controller can surmount the small lips
-    /// (fences/cart edges) that `find_path` already routed over (its edge-climb cap is the same).
-    /// Without this the path leads over a lip the 2u step can't clear and the player wedges (#41).
-    pub climb:       f32,
     /// One-shot request to hop a low barrier (fence/cart) this tick. The `/goto` planner sets it once
     /// its own net-progress stall detection fires (the controller can't see net progress — sliding
     /// ALONG a fence looks like good per-frame motion). The controller hops only if it's grounded,

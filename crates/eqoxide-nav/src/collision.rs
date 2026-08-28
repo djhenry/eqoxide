@@ -3540,8 +3540,8 @@ impl Collision {
         // rise cap (that would reject legitimate smooth ramps) — it's the FEET-level `path_clear`
         // below: a discrete riser taller than the walker's ~2.5u step blocks the low ray, so A* routes
         // around it, while a smooth ramp (surface stays under the ray) passes and is governed by
-        // MAX_WALK_GRADE. Paired with the controller's native STEP_UP cap (no more NAV_CLIMB=20), nav
-        // can no longer scale the boundary-wall lips it used to climb onto the high side of.
+        // MAX_WALK_GRADE. Paired with the controller's native STEP_UP cap, nav cannot scale the
+        // boundary-wall lips it would otherwise climb onto the high side of.
         const MAX_STEP_DOWN: f32 = 60.0; // max DROP between adjacent cells (fall/hop down a level)
         // Grade limit (eqoxide#212): STEP_H=20 over an 8u cell is a 250% grade. A discrete vertical
         // step that tall is USUALLY blocked here by the feet-ray path_clear (its riser is a wall) —

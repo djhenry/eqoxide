@@ -1908,7 +1908,6 @@ impl App {
                     jump:        space,
                     want_swim:   swimming,
                     speed:       MOVE_SPEED,
-                    climb:       0.0,   // free WASD uses the native 2u step (no wall-climbing)
                     hop:         false, // and does not auto-hop barriers (Space is the manual jump)
                 }
             } else if let Some(m) = manual {
@@ -1934,7 +1933,6 @@ impl App {
                     jump:        m.jump && !in_water, // land hop only; underwater a jump is swim-up
                     want_swim:   in_water,
                     speed:       MOVE_SPEED,
-                    climb:       0.0,
                     hop:         false,
                 }
             } else {

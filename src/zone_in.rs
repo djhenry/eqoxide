@@ -286,7 +286,7 @@ mod tests {
     }
     fn idle() -> MoveIntent {
         MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: false,
-                     speed: 0.0, climb: 0.0, hop: false }
+                     speed: 0.0, hop: false }
     }
     /// A single flat floor at `z`, spanning the whole test extent.
     fn flat_at(z: f32) -> Collision { col(vec![floor(z, -100.0, 100.0)]) }
