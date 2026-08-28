@@ -1874,7 +1874,6 @@ pub struct ZoneServerInfo_S {
     pub port: u16,
 }
 
-/// Zone point entry — zone exit info. [`SIZE_ZONE_POINT_ENTRY`] bytes on the wire.
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct ZonePointEntry_S {
