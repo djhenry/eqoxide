@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 /// Nav tick interval (ms). Steps are gated to fire no more often than this.
 const NAV_TICK_MS: u128 = 150;
 /// Native Titanium base run speed in EQ units/second (runspeed 0.7 → 44 u/s; 10 Hz updates of
-/// 4.4 u each). Per eq-client-expert, see ~/git/eq_kb/player-movement-speed.md.
+/// 4.4 u each).
 /// We must NOT move faster than this: even where THIS server tolerates it, others rubber-band or
 /// reject motion the real client can't produce. Defined in `eqoxide-core::physics` (#544 Step 2d)
 /// and re-exported here so `crate::action_loop::RUN_SPEED` keeps resolving.
