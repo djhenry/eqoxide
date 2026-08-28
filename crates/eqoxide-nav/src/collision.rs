@@ -9838,6 +9838,209 @@ mod tests {
         probe("B7 moat → city center",            [-502.3, -141.3, -16.0], [0.0, 0.0, 3.0]);
     }
 
+    /// #309: the Crushbone moat is NOT a one-way trap — a character on its bottom has a route back
+    /// onto dry land from everywhere along it.
+    ///
+    /// #309 reports that a character which falls into the moat is stranded, because the ladders
+    /// meant to let it climb out are non-functional. The ladder half is true and structural: there
+    /// is no climbable-surface concept anywhere in this client, and nowhere for one to come from —
+    /// a `.wtr` leaf's `special` distinguishes only dry / water / zone-line (`region_map.rs`), so
+    /// EQ's own region data never flags a surface as climbable. Ladders are ordinary geometry.
+    ///
+    /// The stranding it predicts is what this test pins, and it does not happen — but NOT for the
+    /// reason one would expect. Measured, not assumed: re-running this with
+    /// `PLAYER_BODY.haul_out_up` forced to `-1000.0` (which rejects every water→land haul-out edge
+    /// in `neighbors`) leaves all probes escaping, on longer routes. So the moat's exit is not the
+    /// haul-out at all; it is ordinary walkable ground. The scan below names it — the lowest dry
+    /// bank anywhere along the moat sits at `-0.71 u` relative to the waterline, i.e. a shallow
+    /// shelf at/below the surface that the character simply walks out onto. The banks everywhere
+    /// else are ~12 u above the water, far past `haul_out_up`, which is why the routes run to
+    /// 170-290 waypoints: A* crosses the moat to the shallow end rather than climbing out in place.
+    ///
+    /// HONEST LIMITS.
+    /// * This is the PLANNER's answer — a route exists. That the controller can follow it is a
+    ///   separate contract, pinned by `p1_haul_out_admission_matches_controller_execution`
+    ///   (`tests/walker_sim.rs`).
+    /// * "Escapes" means a route to a goal the planner accepts. Goals are taken from geometry
+    ///   first, and a column that fails those is retried against goals already PROVEN reachable
+    ///   from the water elsewhere in this same run: hand-picked dry points are frequently rejected
+    ///   `GoalNotWalkable` (the probe's floor model disagreeing with the planner's), and counting
+    ///   that as a trap is a measurement artefact, not a finding. An earlier revision of this test
+    ///   did exactly that and reported a false trap at (16,-40).
+    ///
+    /// `ZONE_GLB=~/.local/share/eqoxide/assets/models/crushbone.glb \
+    ///   cargo test -p eqoxide-nav --lib crushbone_water_is_not_a_one_way_trap -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires the cached crushbone glb at $ZONE_GLB"]
+    fn crushbone_water_is_not_a_one_way_trap() {
+        let p = std::env::var("ZONE_GLB").expect("set ZONE_GLB to the cached crushbone glb");
+        let za = ZoneAssets::from_glb(std::path::Path::new(&p)).unwrap();
+        let mut col = Collision::build(&za, 32.0);
+        let wtr_dir = std::path::Path::new(&p).parent().unwrap().join("maps/water");
+        crate::water_grid::ZoneWater::load(&wtr_dir, "crushbone").install(&mut col)
+            .expect("crushbone .wtr must load — without it the moat has no water volume at all (#762) \
+                     and every probe below would pass VACUOUSLY against a dry zone");
+
+        let e0 = col.origin[0];
+        let n0 = col.origin[1];
+        let e1 = e0 + col.cols as f32 * col.cell_size;
+        let n1 = n0 + col.rows as f32 * col.cell_size;
+        let w = col.region_map().cloned().expect("water map must be installed");
+        let aabbs = w.water_region_aabbs((e0, e1, n0, n1, -5000.0, 5000.0));
+
+        // Wet columns on an 8u lattice, each carrying its real surface plane.
+        let mut wet: std::collections::HashMap<(i32, i32), f32> = std::collections::HashMap::new();
+        for (ae, an, az) in aabbs.iter() {
+            let mut n = an[0].max(n0);
+            while n <= an[1].min(n1) {
+                let mut e = ae[0].max(e0);
+                while e <= ae[1].min(e1) {
+                    let key = ((e / 8.0).round() as i32, (n / 8.0).round() as i32);
+                    if wet.contains_key(&key) { e += 8.0; continue; }
+                    // A z known to be inside this leaf. Leaves can be unbounded below (z from
+                    // -5000), so clamp before taking the midpoint or the probe lands in the void.
+                    let probe_z = 0.5 * (az[0].max(-500.0) + az[1].min(500.0));
+                    if w.is_water(e, n, probe_z) {
+                        if let Some(s) = w.surface_z(e, n, probe_z) { wet.insert(key, s); }
+                    }
+                    e += 8.0;
+                }
+                n += 8.0;
+            }
+        }
+        assert!(wet.len() > 100,
+            "crushbone must have a substantial water volume, found only {} wet columns — a near-empty \
+             scan would make every escape assertion below vacuous", wet.len());
+
+        // Flood-fill into connected bodies (4-connected, sharing a surface plane). The largest is
+        // the moat; the rest are the river arms and the deep pools east of the keep.
+        let mut body_of: std::collections::HashMap<(i32, i32), usize> = std::collections::HashMap::new();
+        let mut bodies: Vec<Vec<(i32, i32)>> = Vec::new();
+        for (&k, &s) in wet.iter() {
+            if body_of.contains_key(&k) { continue; }
+            let id = bodies.len();
+            let (mut cells, mut stack) = (Vec::new(), vec![k]);
+            body_of.insert(k, id);
+            while let Some(c) = stack.pop() {
+                cells.push(c);
+                for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let nb = (c.0 + dx, c.1 + dy);
+                    if body_of.contains_key(&nb) { continue; }
+                    if let Some(&ns) = wet.get(&nb) {
+                        if (ns - s).abs() <= 1.0 { body_of.insert(nb, id); stack.push(nb); }
+                    }
+                }
+            }
+            bodies.push(cells);
+        }
+        // Sort every body's cells, then the bodies themselves: the flood-fill walks a HashMap, so
+        // without this the probe columns differ run to run. That is not cosmetic — the
+        // non-deterministic revision of this test alternated green and red on the same tree.
+        for c in bodies.iter_mut() { c.sort(); }
+        bodies.sort_by_key(|c| (std::cmp::Reverse(c.len()), c[0]));
+
+        // Nearest dry STANDABLE candidates: body fits, and open air above (so a ceiling or a roof
+        // underside cannot pose as a bank).
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
+        const HEADROOM: f32 = 6.0;
+        let dry_candidates = |e: f32, n: f32, surface: f32| -> Vec<(f32, [f32; 3])> {
+            let mut out: Vec<(f32, [f32; 3])> = Vec::new();
+            for ring in 1..=8i32 {
+                let d = ring as f32 * 8.0;
+                for (de, dn) in [(-d, 0.0f32), (d, 0.0), (0.0, -d), (0.0, d),
+                                 (-d, -d), (d, d), (-d, d), (d, -d)] {
+                    let (be, bn) = (e + de, n + dn);
+                    for nf in col.column_floors(be, bn, surface, 60.0, 60.0) {
+                        if w.is_water(be, bn, nf + 0.5) { continue; }   // submerged: not a bank
+                        if !col.footprint_clear(be, bn, nf, r, 8) { continue; }
+                        if col.nearest_hit_t([be, bn, nf + 0.5], [be, bn, nf + HEADROOM]).is_some() { continue; }
+                        out.push((nf - surface, [be, bn, nf]));
+                    }
+                }
+                if out.len() >= 4 { break; }
+            }
+            out.sort_by(|a, b| a.0.abs().partial_cmp(&b.0.abs()).unwrap_or(std::cmp::Ordering::Equal));
+            out.truncate(4);
+            out
+        };
+
+        let cells = &bodies[0];
+        let surface = wet[&cells[0]];
+        // Name the moat's actual exit: the lowest dry bank anywhere along it. A value at or below
+        // 0 means land meets the waterline — a walk-out, needing neither a ladder nor a haul-out.
+        let mut lowest: Option<(f32, [f32; 3], [f32; 2])> = None;
+        for c in cells.iter() {
+            let (e, n) = (c.0 as f32 * 8.0, c.1 as f32 * 8.0);
+            for (lip, g) in dry_candidates(e, n, surface) {
+                if lowest.is_none() || lip < lowest.unwrap().0 { lowest = Some((lip, g, [e, n])); }
+            }
+        }
+        let (low_lip, low_at, low_from) = lowest.expect("the moat must border some dry standable land");
+        eprintln!("moat: {} columns, surface {surface:.1}; LOWEST dry bank {low_lip:+.2} u at \
+            ({:.0},{:.0},{:.1}), reached from water ({:.0},{:.0})",
+            cells.len(), low_at[0], low_at[1], low_at[2], low_from[0], low_from[1]);
+        assert!(low_lip <= crate::traversability::PLAYER_BODY.haul_out_up,
+            "the moat's lowest bank is {low_lip:+.2} u above the waterline, past both the walk-out \
+             (<= 0) and the haul-out cap ({}) — with no climb mechanic in this client that WOULD \
+             strand a swimmer, which is exactly what #309 predicted",
+            crate::traversability::PLAYER_BODY.haul_out_up);
+
+        // The reported scenario: the character is at the BOTTOM of the moat, not bobbing at its
+        // surface. Probe 12 columns spread through the body; every one must have a way out.
+        // Pass 1 uses each column's own local geometry and banks the goals that worked.
+        let step = (cells.len() / 12).max(1);
+        let probes: Vec<[f32; 3]> = cells.iter().step_by(step).take(12).map(|c| {
+            let (e, n) = (c.0 as f32 * 8.0, c.1 as f32 * 8.0);
+            let bottom = w.bottom_z(e, n, surface - 1.0).unwrap_or(surface - 1.0);
+            [e, n, bottom + 0.5]
+        }).collect();
+        let mut proven: Vec<[f32; 3]> = Vec::new();
+        let mut retry: Vec<[f32; 3]> = Vec::new();
+        for start in &probes {
+            let cands = dry_candidates(start[0], start[1], surface);
+            match cands.iter().find_map(|(lip, g)| match plan(&col, *start, *g, r) {
+                PlanOutcome::Route(path) => Some((path.len(), *lip, *g)),
+                _ => None,
+            }) {
+                Some((wp, lip, g)) => {
+                    eprintln!("  bottom ({:>5.0},{:>5.0},{:>6.1}) depth {:>4.1}: ESCAPES via \
+                        ({:.0},{:.0},{:.1}) [{lip:+.2} u], {wp} waypoints",
+                        start[0], start[1], start[2], surface - (start[2] - 0.5), g[0], g[1], g[2]);
+                    if !proven.contains(&g) { proven.push(g); }
+                }
+                None => retry.push(*start),
+            }
+        }
+        // Pass 2: a column whose own neighbourhood offered no plannable goal is not stranded if it
+        // can reach dry land that the water has already been shown to reach.
+        let mut stranded = Vec::new();
+        for start in retry {
+            match proven.iter().find_map(|g| match plan(&col, start, *g, r) {
+                PlanOutcome::Route(path) => Some((path.len(), *g)),
+                _ => None,
+            }) {
+                Some((wp, g)) => eprintln!("  bottom ({:>5.0},{:>5.0},{:>6.1}): ESCAPES to a \
+                    PROVEN goal ({:.0},{:.0},{:.1}), {wp} waypoints (its own neighbours were all \
+                    GoalNotWalkable)", start[0], start[1], start[2], g[0], g[1], g[2]),
+                None => {
+                    eprintln!("  bottom ({:>5.0},{:>5.0},{:>6.1}): NO ROUTE OUT — not to its own \
+                        neighbours, nor to any of the {} goals proven reachable from this water",
+                        start[0], start[1], start[2], proven.len());
+                    stranded.push(start);
+                }
+            }
+        }
+        assert_eq!(probes.len(), 12, "the moat must be large enough to spread 12 probes through");
+        assert!(!proven.is_empty(), "no probe reached dry land at all — the run proved nothing");
+        assert!(stranded.is_empty(),
+            "#309: {} of {} probes from the bottom of the Crushbone moat (surface {surface:.1}) have \
+             NO route back onto dry land — it is a one-way trap. The exit this test measured is a \
+             walk-out at the moat's shallow end ({low_lip:+.2} u at ({:.0},{:.0})), NOT the haul-out \
+             edge; if this went red, check whether that shelf is still walkable, whether the .wtr \
+             still loads, and the floor model at the shallow end. Stranded at: {stranded:?}",
+            stranded.len(), probes.len(), low_at[0], low_at[1]);
+    }
+
     /// #259: a sunken, water-filled pit in the middle of an otherwise-open street. The pit floor
     /// is a legal one-way DROP from the rim (MAX_STEP_DOWN is generous) but climbing back out is
     /// capped at `WATER_EXIT_UP` (~2.5u above the water surface) — the water surface here sits
@@ -10514,8 +10717,8 @@ mod clearance_probe_is_not_lossy_885 {
             "these documented repro commands omit `-p eqoxide-nav`, so from the workspace root they \
              select the ROOT package's lib target, print `running 0 tests` and exit 0 — a vacuous \
              green, not a measurement: {missing:?}");
-        assert_eq!(recipes, 9,
-            "expected 9 documented `--lib` repro commands in this file, found {recipes}. If one was \
+        assert_eq!(recipes, 10,
+            "expected 10 documented `--lib` repro commands in this file, found {recipes}. If one was \
              added or deleted, weigh it — a scan that stopped reaching them would otherwise pass by \
              finding nothing.");
     }
