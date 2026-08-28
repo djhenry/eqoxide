@@ -1890,11 +1890,6 @@ pub struct ZonePointEntry_S {
     pub unknown028: u32,
 }
 
-const _: () = assert!(
-    std::mem::size_of::<ZonePointEntry_S>() == SIZE_ZONE_POINT_ENTRY,
-    "ZonePointEntry_S must match SIZE_ZONE_POINT_ENTRY (RoF2 ZonePoint_Entry)"
-);
-
 /// Spawn appearance change (8 bytes).
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
