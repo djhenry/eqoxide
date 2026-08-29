@@ -1832,6 +1832,12 @@ impl App {
         let lmb_drive = self.drag_active && manual_move;
         // Swim (vertical movement) only while driving forward/back AND standing in a water region.
         let in_water = self.collision.as_ref().is_some_and(|c| c.in_water(self.scene.player_pos));
+        // On a ladder (#309). Read once here beside `in_water` because the manual-drive hatch below
+        // needs it for the same reason it needs `in_water`: an agent whose route wedged part-way up
+        // a ladder has to be able to finish or abandon the climb by hand, and the climb mechanic is
+        // a reconstruction (see `eqoxide_nav::climb`), so leaving it with no manual recovery would
+        // be trusting an unverified mechanism with no way out.
+        let on_climbable = self.collision.as_ref().is_some_and(|c| c.on_climbable(self.scene.player_pos));
         let swimming = lmb_drive && in_water && (w_held || s_held);
 
         {
@@ -1907,6 +1913,10 @@ impl App {
                     wish_vspeed: if swimming { dz * MOVE_SPEED } else { 0.0 },
                     jump:        space,
                     want_swim:   swimming,
+                    // No climb key is bound, so free WASD never climbs (#309). Deliberate: a driver
+                    // that could set this anywhere is a fly cheat, and the ladder mechanic has no
+                    // measured native binding to copy yet — see `eqoxide_nav::climb`.
+                    want_climb:  false,
                     speed:       MOVE_SPEED,
                     climb:       0.0,   // free WASD uses the native 2u step (no wall-climbing)
                     hop:         false, // and does not auto-hop barriers (Space is the manual jump)
@@ -1922,7 +1932,14 @@ impl App {
                 // the pool floor. On land, jump is the normal hop and `up` is ignored (#207). Gate on
                 // `in_water` (the player is in water), NOT the keyboard-swim `swimming` flag — that's
                 // `lmb_drive && w_held`, which is never set for an API-driven agent.
-                let vspeed = if in_water {
+                //
+                // On a LADDER, `up` drives the climb instead (#309) — the same one field, resolved
+                // against whichever medium the body is actually in. A ladder wins over water where
+                // both apply (the Crushbone moat is exactly that case): holding the swimmer at its
+                // float plane is what a character trying to climb OUT of the moat needs least.
+                let vspeed = if on_climbable {
+                    m.up * crate::nav::climb::CLIMB_SPEED
+                } else if in_water {
                     let v = m.up * MOVE_SPEED;
                     if m.jump && v < MOVE_SPEED { MOVE_SPEED } else { v }
                 } else {
@@ -1933,6 +1950,7 @@ impl App {
                     wish_vspeed: vspeed,
                     jump:        m.jump && !in_water, // land hop only; underwater a jump is swim-up
                     want_swim:   in_water,
+                    want_climb:  on_climbable && m.up != 0.0,
                     speed:       MOVE_SPEED,
                     climb:       0.0,
                     hop:         false,

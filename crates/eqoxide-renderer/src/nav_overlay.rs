@@ -70,7 +70,10 @@ pub fn accept_color(kind: EdgeKind) -> [f32; 4] {
     match kind {
         EdgeKind::Walk => COL_ACCEPT_WALK,
         EdgeKind::Jump | EdgeKind::Fall => COL_ACCEPT_AIR,
-        EdgeKind::Pad => COL_ACCEPT_PAD,
+        // A climb edge (#309) draws in the PAD colour deliberately: both are non-geometric graph
+        // edges the planner asserts it may traverse, and a debug overlay that gave the climb its own
+        // hue would suggest a distinction the search does not make.
+        EdgeKind::Pad | EdgeKind::Climb => COL_ACCEPT_PAD,
         EdgeKind::SwimSurface | EdgeKind::SwimInterior | EdgeKind::SwimVertical
         | EdgeKind::WaterEntry | EdgeKind::WaterDescent | EdgeKind::HaulOut => COL_ACCEPT_SWIM,
     }

@@ -2188,6 +2188,7 @@ impl Walker {
                 wish_vspeed: 0.0,
                 jump:        false,
                 want_swim:   false,
+                want_climb:  false,
                 speed:       nav_speed(gs),
                 climb:       0.0,
                 hop:         false,
@@ -2264,6 +2265,16 @@ impl Walker {
             c.in_water([gs.player_x, gs.player_y, gs.player_z])
                 || c.in_water([gs.player_x, gs.player_y, gs.player_z + 3.0])
         });
+        // CLIMB (#309): ask to climb when the body is on a ladder AND the waypoint being steered to
+        // is meaningfully above it. `on_climbable` is the SAME volume test the controller re-applies
+        // before granting the climb, so the walker cannot ask for a rise the controller would refuse
+        // — it would simply not move and stall against the ladder, the failure mode the honesty
+        // contract exists to make impossible. Below `NAV_CLIMB_MIN_RISE` the ordinary step-up already
+        // handles the height, and asking to climb would suppress gravity for nothing.
+        const NAV_CLIMB_MIN_RISE: f32 = 2.0;
+        let climb = target.2 - gs.player_z > NAV_CLIMB_MIN_RISE
+            && self.collision.read().unwrap().as_ref()
+                .is_some_and(|c| c.on_climbable([gs.player_x, gs.player_y, gs.player_z]));
         let jump = match (self.path.get(self.path_i), self.path.get(self.path_i + 1)) {
             (Some(a), Some(b)) if self.path_i >= 1 => {
                 let seg = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
@@ -2287,12 +2298,18 @@ impl Walker {
         } else {
             None
         };
-        let wish_vspeed = if swim { swim_vspeed(target.2, gs.player_z, swim_plane) } else { 0.0 };
+        // A climb owns the vertical wish outright when it fires: a character on a ladder in a flooded
+        // moat is BOTH on a climbable surface and in water, and letting the swim controller keep the
+        // wish would hold it at the swim plane — 10 units below the rim it is trying to reach.
+        let wish_vspeed = if climb { crate::climb::CLIMB_SPEED }
+            else if swim { swim_vspeed(target.2, gs.player_z, swim_plane) }
+            else { 0.0 };
         *self.nav_intent.lock().unwrap() = Some(MoveIntent {
             wish_dir:    [dx / dist, dy / dist],
             wish_vspeed,
             jump,
             want_swim:   swim,
+            want_climb:  climb,
             speed:       nav_speed(gs),
             climb:       0.0, // nav uses the native step-up now (#239); fences handled by hop
             hop:         self.stuck_ticks >= NAV_HOP_TICKS,
