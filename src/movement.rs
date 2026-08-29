@@ -892,10 +892,20 @@ impl CharacterController {
         // frame's value forward only so `enter_hold` can accumulate `secs` and decide whether the
         // reason changed — an observable with no clear-path is its own honesty bug (#343/#679).
         let prev_hold = self.hold.take();
+        // A climb is granted the same way a swim is: the driver ASKS, the world decides.
+        // `want_climb` alone moves nobody — the body must be on a climbable surface (#309). That
+        // gate is what keeps this from being a fly hack: the set of places it can fire is fixed by
+        // the zone's `LADDER*` objects, not by the driver.
+        //
+        // Computed HERE, above the net, because the net's door needs the same answer the vertical
+        // branch below acts on (see `depenetrate`). Nothing between this line and its use can move
+        // the body: the net is the only thing that runs first, and on the frames it moves anything
+        // it returns early. So hoisting it is the same value, asked once.
+        let climbing = intent.want_climb && col.on_climbable(self.pos);
         // Depenetration / unstuck net runs first (§3.3). If it handled an embedded frame, freeze
         // the rest of the step so we neither slide deeper nor fall through void.
         self.afloat_log_cooldown = (self.afloat_log_cooldown - dt).max(0.0);
-        if self.depenetrate(dt, col, prev_hold) {
+        if self.depenetrate(dt, col, climbing, prev_hold) {
             // #776: reaching here means the net HANDLED the frame, and the net's door (see
             // `depenetrate`) hands every wet body straight back to physics — so a frame the net
             // handled is a frame with a DRY body, by construction, not by coincidence. `NotAfloat`
@@ -932,11 +942,6 @@ impl CharacterController {
         let water_at = water_probe(col, self.pos);
         self.in_water = col.in_water(water_at);
         let swimming = intent.want_swim && self.in_water;
-        // A climb is granted the same way a swim is: the driver ASKS, the world decides. `want_climb`
-        // alone moves nobody — the body must be on a climbable surface (#309). That gate is what
-        // keeps this from being a fly hack: the set of places it can fire is fixed by the zone's
-        // `LADDER*` objects, not by the driver.
-        let climbing = intent.want_climb && col.on_climbable(self.pos);
         if self.hop_cooldown > 0.0 { self.hop_cooldown = (self.hop_cooldown - dt).max(0.0); }
 
         // ── Horizontal: collide-and-slide, with step-up when blocked on the ground. ──
@@ -1826,7 +1831,7 @@ impl CharacterController {
     ///
     /// `prev_hold` is the hold `step` took at the top of this frame — see `enter_hold`. Nothing in
     /// here reads it for physics; it exists so a continuing hold can accumulate its duration.
-    fn depenetrate(&mut self, dt: f32, col: &Collision, prev_hold: Option<ControllerHold>) -> bool {
+    fn depenetrate(&mut self, dt: f32, col: &Collision, climbing: bool, prev_hold: Option<ControllerHold>) -> bool {
         // No geometry loaded → no constraints; never teleport the free player.
         if !col.has_geometry() {
             self.stuck_time = 0.0;
@@ -1863,7 +1868,30 @@ impl CharacterController {
         // body takes the ordinary clear path — stuck-clock reset, good-sample banking (waders,
         // standing in shallow water, still bank) — and physics keeps custody. The dry-body net
         // below is byte-identical to what it has always been.
-        if body_in_water(col, p) || !is_embedded(col, p) {
+        // #309: AND NEITHER IS A BODY ON A LADDER — for the same reason, one medium over. Every
+        // clause of the sentence above survives the substitution: a climbing body's vertical is
+        // owned by the climb rather than by gravity, its lateral motion by the collided slide, and
+        // "near geometry" is not an emergency for a body whose whole purpose is to be pressed
+        // against a panel. Hugging the rungs IS the activity, not evidence of a failure to place.
+        //
+        // The measured failure was a compound of the two media, which is why the water door alone
+        // did not already cover it. Climbing out of Crushbone's moat lifts the feet through the
+        // waterline, so `body_in_water` goes false the moment the climb succeeds; the body is
+        // inside the ladder's footprint, so `is_embedded` is true; and `DRY && embedded` is exactly
+        // this door's admission criterion. Traced live at 26 samples/sec, one mount produced 14
+        // push-outs, every one from the surface to the moat bottom —
+        // `pushed out from (335.1,-31.1,-11.6) to (333.2,-31.8,Grounded(-24.0))` — each undoing
+        // the 12 u the climb had just gained, in a single frame, at −380 u/s. The mount still
+        // completed, eventually, whenever the body happened to cross at a spot with a clear
+        // footprint: between 17.6 s and 46.9 s, at random. That is the "not very smooth" the climb
+        // looked like from outside.
+        //
+        // The exemption is the climb GRANT, not mere proximity — `want_climb && on_climbable`,
+        // decided by `step` and passed in. Exempting anything merely standing near a ladder would
+        // strip the net from a body genuinely wedged beside one, and that body still needs it: the
+        // instant either half goes false the net resumes on the next frame, so there is no state a
+        // body can be parked in where nothing will come for it.
+        if climbing || body_in_water(col, p) || !is_embedded(col, p) {
             self.stuck_time = 0.0;
             self.good_timer += dt;
             // The ring's invariant — every banked sample is GROUNDED and NON-EMBEDDED — used to
@@ -2176,6 +2204,69 @@ mod tests {
         // Asking, but nowhere near a ladder: the flag alone grants nothing.
         let midair = drive([40.0, 0.0, 0.0], up(true));
         assert!(midair[2].abs() < 1.0, "want_climb off a climbable must do nothing, got {midair:?}");
+    }
+
+    /// #309, the moat mount: a climb that CROSSES A WATER SURFACE must not be confiscated by the
+    /// depenetration net.
+    ///
+    /// Measured live in Crushbone before the fix, at 26 samples/sec: one mount produced **14**
+    /// push-outs, every one from the waterline to the moat floor —
+    /// `pushed out from (335.1,-31.1,-11.6) to (333.2,-31.8,Grounded(-24.0))`. The body rose the
+    /// 12 units from the moat floor to the surface at `CLIMB_SPEED`, cleanly, in ~0.85s; then fell
+    /// the same 12 units back in 0.03s at −380 u/s. Not gravity — a one-frame teleport. The mount
+    /// took between 17.6s and 46.9s of that bobbing to complete, depending on where the body
+    /// happened to be when it crossed.
+    ///
+    /// The mechanism is the net's door asking a walk question about a climb. Climbing lifts the
+    /// feet through the surface, so `body_in_water` goes false; the body hugs the panel, so
+    /// `is_embedded` is true; `DRY && embedded` is precisely the door's admission criterion, and
+    /// the ring push-out then relocates via `nearest_floor` — the moat bottom.
+    #[test]
+    fn climbing_out_of_water_is_not_confiscated_by_the_depenetration_net() {
+        use crate::nav::climb::CLIMB_SPEED;
+        // Crushbone's moat in miniature: floor at −24, water −24…−12, and a `LADDER14` panel
+        // standing on the bottom and rising into the air (east=10, north[−4,4], up[−24,0]).
+        let ladder = crate::assets::ObjectModel {
+            name: "LADDER14".into(),
+            meshes: vec![mesh(vec![[-4.0, -24.0, 10.0], [4.0, -24.0, 10.0], [4.0, 0.0, 10.0], [-4.0, 0.0, 10.0]])],
+            instances: vec![[[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]]],
+        };
+        let mut c = Collision::build(&ZoneAssets {
+            terrain: vec![floor(-24.0, -100.0, 100.0)], objects: vec![ladder], textures: vec![] }, 4.0);
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::water_slab(-24.0, -12.0))));
+
+        // The fixture must reproduce the live shape, or it pins nothing: hugging the panel the
+        // body's footprint really is pierced, and the moment its feet clear the waterline it
+        // really does read dry — the two halves of the net's door, both true at once.
+        let start = [9.5, 0.0, -13.0];
+        let surfaced = [9.5, 0.0, -11.5];
+        assert!(c.on_climbable(start), "fixture: the panel must be climbable where the body hugs it");
+        assert!(is_embedded(&c, surfaced), "fixture: hugging the panel must read as embedded");
+        assert!(!body_in_water(&c, surfaced), "fixture: above the surface the body must read dry");
+
+        let mut ctrl = CharacterController::new(start);
+        let climb = MoveIntent {
+            wish_dir: [0.0, 0.0], wish_vspeed: CLIMB_SPEED, jump: false, want_swim: false,
+            want_climb: true, speed: 0.0, climb: 0.0, hop: false,
+        };
+        // Measure the DRAWDOWN — the deepest the body ever falls back from the highest it has
+        // reached. Sampling only the frames above the waterline would miss the defect entirely:
+        // the teleport lands at −24, which that filter discards, and the bob then re-reaches the
+        // same waterline height on the next rise. What the bug does is give back ground already
+        // gained, so that is what the test has to measure.
+        let (mut peak, mut drawdown) = (ctrl.pos[2], 0.0f32);
+        for _ in 0..120 {
+            ctrl.step(climb, 1.0 / 60.0, &c);
+            peak = peak.max(ctrl.pos[2]);
+            drawdown = drawdown.max(peak - ctrl.pos[2]);
+        }
+        // The claim is not "it eventually gets out" — the bobbing mount did that too, given a
+        // random twenty seconds. The claim is that the rise is MONOTONE.
+        assert!(drawdown < 1.0,
+            "a climb must never give back height it has gained; fell back {drawdown:.1}u from a peak of {peak:.1}");
+        assert!(ctrl.pos[2] > -4.0,
+            "two seconds of climbing from -13 must clear the water by a wide margin, got {:?}", ctrl.pos);
     }
 
     #[test]
