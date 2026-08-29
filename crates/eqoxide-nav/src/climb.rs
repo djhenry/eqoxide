@@ -102,13 +102,25 @@ pub struct ClimbVolume {
 impl ClimbVolume {
     /// Is `p` (world `[a0, a1, up]`) inside the capture footprint and within the climbable span?
     ///
-    /// The z test is generous at the bottom: a character FLOATING in the moat sits at the water
-    /// surface (−11), far above the ladder's foot (−25.6), and must still be able to mount. Anything
-    /// from the foot to the top counts.
+    /// The z test is generous at BOTH ends, by the same [`DISMOUNT_Z_TOL`].
+    ///
+    /// At the bottom because a character FLOATING in the moat sits at the water surface (−11), far
+    /// above the ladder's foot (−25.6), and must still be able to mount.
+    ///
+    /// At the top because the ledge a ladder delivers you onto is ABOVE the panel's last rung, and a
+    /// climb that stops at the rung strands the body in mid-air beside it. Measured live in
+    /// crushbone: the ladder tops out at −0.66 and the rampart it serves is at 0.0, four units east —
+    /// a body held to `top_z` hangs over the moat, and the moment the climb releases it falls the
+    /// whole 12 units back into the water. `DISMOUNT_Z_TOL` is exactly the right amount and not a
+    /// tuned one: [`Collision::resolve_climb_edges`] only accepts a ledge whose floor is within
+    /// `DISMOUNT_Z_TOL` of `top_z`, so extending the span by that much is precisely what it takes to
+    /// reach any ledge an edge could have been built from, and no further.
+    ///
+    /// [`Collision::resolve_climb_edges`]: crate::collision::Collision
     pub fn contains(&self, p: [f32; 3]) -> bool {
         p[0] >= self.lo[0] && p[0] <= self.hi[0]
             && p[1] >= self.lo[1] && p[1] <= self.hi[1]
-            && p[2] >= self.foot_z - DISMOUNT_Z_TOL && p[2] <= self.top_z
+            && p[2] >= self.foot_z - DISMOUNT_Z_TOL && p[2] <= self.top_z + DISMOUNT_Z_TOL
     }
 
     /// Horizontal centre of the volume.
@@ -284,6 +296,24 @@ mod tests {
         assert!(v.contains([-73.28, -16.21, -25.0]), "standing at the foot must be inside");
         assert!(!v.contains([-73.28, -16.21, 40.0]), "far above the top is not on the ladder");
         assert!(!v.contains([0.0, 0.0, -11.0]), "far away horizontally is not on the ladder");
+    }
+
+    /// The ledge a ladder SERVES sits above its last rung: crushbone's tops out at −0.66 and the
+    /// rampart it reaches is at 0.0, four units east. A span that stopped at `top_z` left the body
+    /// hanging in mid-air beside the ledge, and the moment the climb released it fell the whole 12
+    /// units back into the moat — measured live, repeatedly, before this changed. The span must
+    /// reach as high as `Collision::resolve_climb_edges` is willing to PLACE a dismount, or the
+    /// planner offers edges the climb cannot deliver the body onto.
+    #[test]
+    fn the_climbable_span_reaches_as_high_as_a_dismount_can_sit() {
+        let mut m = panel("LADDER14", 10.0);
+        m.instances.push(place(0.0, 0.0, 0.0, 1.0));
+        let v = &volumes_from_objects(&[m])[0];
+        assert!(v.contains([0.0, 0.0, v.top_z + DISMOUNT_Z_TOL - 0.01]),
+            "a body level with the highest ledge an edge can be built from must still be ON the \
+             ladder — that is the height the climb has to carry it to");
+        assert!(!v.contains([0.0, 0.0, v.top_z + DISMOUNT_Z_TOL + 1.0]),
+            "above every ledge an edge could be built from is off the ladder");
     }
 
     #[test]
