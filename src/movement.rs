@@ -202,6 +202,11 @@ pub struct CharacterController {
     pub vel_z:     f32,
     pub on_ground: bool,
     pub in_water:  bool,
+    /// Whether the body is ACTIVELY climbing this frame — the granted climb, not the request
+    /// (`want_climb` alone is nobody's business but the driver's; the grant also requires
+    /// `on_climbable`). Published so the renderer can pick the climb clip (#309); no physics
+    /// reads it back.
+    pub climbing:  bool,
     /// Recent grounded, non-embedded positions for the last-good fallback (§3.3).
     good:          std::collections::VecDeque<[f32; 3]>,
     good_timer:    f32,
@@ -535,7 +540,7 @@ impl Recovery {
 
 impl CharacterController {
     pub fn new(pos: [f32; 3]) -> Self {
-        Self { pos, vel_z: 0.0, on_ground: false, in_water: false,
+        Self { pos, vel_z: 0.0, on_ground: false, in_water: false, climbing: false,
                good: std::collections::VecDeque::new(), good_timer: 0.0, hold_log_cooldown: 0.0,
                hold: None,
                stuck_time: 0.0, rescue_cooldown: 0.0,
@@ -902,6 +907,10 @@ impl CharacterController {
         // the body: the net is the only thing that runs first, and on the frames it moves anything
         // it returns early. So hoisting it is the same value, asked once.
         let climbing = intent.want_climb && col.on_climbable(self.pos);
+        // Published HERE, at the grant, not at the vertical branch below: the net can return early
+        // on a frame that is genuinely a climb, and a climb clip that dropped out for the one frame
+        // the net intervened would flicker.
+        self.climbing = climbing;
         // Depenetration / unstuck net runs first (§3.3). If it handled an embedded frame, freeze
         // the rest of the step so we neither slide deeper nor fall through void.
         self.afloat_log_cooldown = (self.afloat_log_cooldown - dt).max(0.0);

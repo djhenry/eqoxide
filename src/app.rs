@@ -1672,6 +1672,7 @@ impl App {
             self.scene.player_action = select_player_action(
                 player_dead,
                 combat_code,
+                self.controller.climbing,
                 self.controller.in_water,
                 moving,
                 self.player_nav_speed,
@@ -2975,6 +2976,7 @@ fn next_fade(current: f32, transitioning: bool, dt: f32) -> f32 {
 fn select_player_action(
     player_dead: bool,
     combat_code: Option<u8>,
+    climbing: bool,
     in_water: bool,
     moving: bool,
     nav_speed: f32,
@@ -2984,6 +2986,17 @@ fn select_player_action(
         "dead".to_string()
     } else if let Some(code) = combat_code {
         format!("C{:02}", code)
+    } else if climbing {
+        // ABOVE the water arm deliberately (#309). A ladder mount out of the Crushbone moat starts
+        // with the feet still under the waterline, so a climb tested after `in_water` would render
+        // as a swim for the first third of the ascent — the character would breaststroke up a
+        // ladder. Climbing is also the more specific claim: it is granted only when the body is
+        // actually on a `LADDER*` surface AND asked to climb, whereas `in_water` is merely where
+        // the body happens to be.
+        //
+        // Below the combat arm, though: a swing while climbing is still a swing, matching how
+        // combat already outranks swimming.
+        "climbing".to_string()
     } else if in_water {
         // In water we always swim, never stand: the forward stroke (P06 "swim") while moving, and
         // treading water in place (L09 "swim_idle") when holding position — so a still character
@@ -3532,13 +3545,13 @@ mod tests {
 
     #[test]
     fn self_player_walks_below_threshold() {
-        let action = select_player_action(false, None, false, true, 5.0, false);
+        let action = select_player_action(false, None, false, false, true, 5.0, false);
         assert_eq!(action, "walking");
     }
 
     #[test]
     fn self_player_runs_above_threshold() {
-        let action = select_player_action(false, None, false, true, 44.0, false);
+        let action = select_player_action(false, None, false, false, true, 44.0, false);
         assert_eq!(action, "running",
             "moving at RUN_SPEED (44 u/s, well above WALK_RUN_THRESHOLD) must select the run clip \
              — this is the exact #623 bug: this arm used to always return \"walking\"");
@@ -3548,43 +3561,77 @@ mod tests {
     fn self_player_dead_overrides_everything() {
         // Dead outranks even a fast-moving, in-combat, submerged, sitting state — all set to what
         // would otherwise select a different action, to prove "dead" really is checked first.
-        let action = select_player_action(true, Some(3), true, true, 44.0, true);
+        let action = select_player_action(true, Some(3), false, true, true, 44.0, true);
         assert_eq!(action, "dead");
     }
 
     #[test]
     fn self_player_combat_swing_outranks_movement() {
-        let action = select_player_action(false, Some(7), false, true, 44.0, false);
+        let action = select_player_action(false, Some(7), false, false, true, 44.0, false);
         assert_eq!(action, "C07");
     }
 
     #[test]
     fn self_player_submerged_swims_regardless_of_speed_moving() {
-        let action = select_player_action(false, None, true, true, 44.0, false);
+        let action = select_player_action(false, None, false, true, true, 44.0, false);
         assert_eq!(action, "swimming",
             "submerged + moving must swim, never fall through to the walk/run branch");
     }
 
     #[test]
     fn self_player_submerged_treads_when_still() {
-        let action = select_player_action(false, None, true, false, 0.0, false);
+        let action = select_player_action(false, None, false, true, false, 0.0, false);
         assert_eq!(action, "treading");
     }
 
     #[test]
     fn self_player_sitting_only_applies_when_not_moving() {
-        let sitting_still = select_player_action(false, None, false, false, 0.0, true);
+        let sitting_still = select_player_action(false, None, false, false, false, 0.0, true);
         assert_eq!(sitting_still, "sitting");
         // Movement stands the player up (classic EQ behavior, eqoxide#53) even while `sitting` is
         // still latched true server-side.
-        let sitting_but_moving = select_player_action(false, None, false, true, 44.0, true);
+        let sitting_but_moving = select_player_action(false, None, false, false, true, 44.0, true);
         assert_eq!(sitting_but_moving, "running");
     }
 
     #[test]
     fn self_player_idle_when_still_and_not_sitting() {
-        let action = select_player_action(false, None, false, false, 0.0, false);
+        let action = select_player_action(false, None, false, false, false, 0.0, false);
         assert_eq!(action, "idle");
+    }
+
+    // --- climbing (#309). The ordering assertion is the point: a Crushbone ladder mount begins
+    // with the feet still under the moat's waterline, so `climbing` and `in_water` are BOTH true
+    // for the first third of the ascent. Ranking the climb below the water arm is what would make
+    // the character breaststroke up a ladder.
+    #[test]
+    fn self_player_climbing_outranks_swimming_while_still_in_the_water() {
+        let action = select_player_action(false, None, true, true, true, 14.0, false);
+        assert_eq!(action, "climbing",
+            "a climb that starts below the waterline must render as a climb, not a swim");
+    }
+
+    #[test]
+    fn self_player_climbing_outranks_treading_when_holding_position_on_the_ladder() {
+        // Hanging on the ladder without ascending is still climbing, not treading water: the
+        // `moving`/`nav_speed` pair says nothing about whether the body is on a ladder.
+        let action = select_player_action(false, None, true, true, false, 0.0, false);
+        assert_eq!(action, "climbing");
+    }
+
+    #[test]
+    fn self_player_climbing_outranks_the_walk_run_branch_on_a_dry_ladder() {
+        let action = select_player_action(false, None, true, false, true, 44.0, false);
+        assert_eq!(action, "climbing",
+            "a dry ladder above the waterline must not fall through to run");
+    }
+
+    #[test]
+    fn self_player_death_and_combat_still_outrank_climbing() {
+        // Deliberately NOT symmetric with the arms above: dying on a ladder is dying, and a swing
+        // while climbing is still a swing — matching how combat already outranks swimming.
+        assert_eq!(select_player_action(true, None, true, false, false, 0.0, false), "dead");
+        assert_eq!(select_player_action(false, Some(7), true, false, false, 0.0, false), "C07");
     }
 
     #[test]
