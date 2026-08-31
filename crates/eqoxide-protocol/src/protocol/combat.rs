@@ -1,39 +1,13 @@
-//! Targeting/consider packet builders and auto-combat target selection. Moved out of
-//! `navigation.rs` (cleanup step 1) — pure `args -> Vec<u8>` builders with no navigation state.
+//! Targeting/consider packet builders. Moved out of `navigation.rs` (cleanup step 1) — pure
+//! `args -> Vec<u8>` builders with no navigation state.
+//!
+//! This module also held `pick_combat_target`, the auto-combat target-priority function, until
+//! #1109 removed the client-side auto-retarget it served. Choosing whom to fight is a strategy
+//! decision that belongs to the agent driving the client, not to the client.
 
 /// OP_TargetCommand payload: ClientTarget_Struct = just the target spawn id (u32).
 pub fn build_target_packet(spawn_id: u32) -> Vec<u8> {
     spawn_id.to_le_bytes().to_vec()
-}
-
-/// Auto-combat target priority. Prefers the mob currently attacking the player (an add that aggros
-/// mid-fight) so the player fights back instead of being beaten unanswered — but keeps the current
-/// target when it is itself one of the attackers, so two adds don't cause target thrash. Falls back
-/// to a still-valid current target, then the nearest reachable trash mob.
-///
-/// - `current_valid`: the current target is alive and reachable.
-/// - `current_is_attacker`: the current target has swung at the player recently.
-/// - `attacker`: a recent attacker that is alive + reachable (the add to engage), if any.
-pub fn pick_combat_target(
-    current: Option<u32>,
-    current_valid: bool,
-    current_is_attacker: bool,
-    attacker: Option<u32>,
-    nearest_trash: Option<u32>,
-) -> Option<u32> {
-    // Already fighting one of our attackers — stay on it (don't thrash to a second add).
-    if current_valid && current_is_attacker {
-        return current;
-    }
-    // An add is hitting us and isn't our current target — engage it.
-    if let Some(a) = attacker {
-        return Some(a);
-    }
-    // Nobody attacking us; finish the current target if it's still good, else pick fresh trash.
-    if current_valid {
-        return current;
-    }
-    nearest_trash
 }
 
 /// OP_Consider payload: RoF2 `Consider_Struct` (**20 bytes**). The client fills playerid+targetid;
@@ -57,43 +31,6 @@ pub fn build_consider_packet(player_id: u32, target_id: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn auto_combat_engages_add_attacking_player() {
-        // Fighting rat #10 (valid, but NOT hitting us); rat #20 aggros and hits us → switch to #20.
-        assert_eq!(
-            pick_combat_target(Some(10), true, false, Some(20), Some(99)),
-            Some(20),
-        );
-    }
-
-    #[test]
-    fn auto_combat_keeps_current_when_it_is_the_attacker() {
-        // Current target is one of the mobs hitting us → stay on it; don't thrash to a second add.
-        assert_eq!(
-            pick_combat_target(Some(10), true, true, Some(20), Some(99)),
-            Some(10),
-        );
-    }
-
-    #[test]
-    fn auto_combat_retargets_attacker_when_current_dead() {
-        // Current target died; an add is on us → engage the add, not the nearest trash.
-        assert_eq!(
-            pick_combat_target(Some(10), false, false, Some(20), Some(99)),
-            Some(20),
-        );
-    }
-
-    #[test]
-    fn auto_combat_falls_back_to_nearest_trash() {
-        // No attacker, current invalid → nearest trash (existing grind behavior).
-        assert_eq!(pick_combat_target(Some(10), false, false, None, Some(99)), Some(99));
-        // No attacker, current still valid, nobody hitting us → finish current.
-        assert_eq!(pick_combat_target(Some(10), true, false, None, Some(99)), Some(10));
-        // Nothing to do.
-        assert_eq!(pick_combat_target(None, false, false, None, None), None);
-    }
 
     #[test]
     fn build_target_packet_is_spawn_id_le() {

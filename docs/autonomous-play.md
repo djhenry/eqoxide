@@ -84,13 +84,21 @@ The doubled heading meant the server thought the player faced the wrong way → 
 `src/eq_net/navigation.rs: send_position_update` (`2048.0/360.0`). This is the single most important
 fix for any client-initiated melee.
 
-### Auto-combat (navigation.rs, runs in the 150ms nav tick when auto-attack is ON)
+### Auto-combat (action_loop.rs, runs in the 150ms nav tick when auto-attack is ON)
 - **Auto-engage**: while attacking, if the target is within ~60u, walk (collision-aware) to ~5u and
   **face it each tick** so swings register; hold + face once in melee.
-- **Auto-retarget**: when the target dies/goes unreachable, target the nearest reachable trash mob
-  (name starts `a_`/`an_`, excludes named guards/merchants) within 200u that has a clear path
-  (`path_clear`). If none reachable, idle and wait for respawns (do NOT roam toward out-of-pocket
-  mobs — it strands the bot; see §5 limitations).
+- **The client never picks your target.** `/v1/combat/target`(`/name`) sets the target and it stays
+  set until you change it, the mob despawns, or you click one in the HUD. Auto-attack swings at
+  whatever is targeted; it does not choose.
+
+  There *was* an auto-retarget here — while auto-attack was on it re-picked a target every tick
+  (a mob attacking you > the current target > nearest `a_`/`an_` trash within 200u). **#1109
+  removed it.** It silently overrode targets the agent had explicitly requested, with no event to
+  say so: in Field of Bone a level-1 necro targeted `a_decaying_skeleton005` (id 238), auto-attack
+  swung at `a_decaying_skeleton014` (id 275) because 275 had aggroed, and 238 was still at 100% HP
+  when the character died. Retargeting is a **strategy** decision and belongs in the agent's
+  scripting, above the client — same reason grinding policy does. If you want the old behaviour,
+  build it from `/v1/observe/entities` + the `combat`/`attacked` event + `/v1/combat/target`.
 - **Reachability matters**: the combat approach drives the shared collide-and-slide mover
   (`CharacterController::slide`) toward the target, so a mob behind a wall it cannot slide around, or
   across water / at a different z, is not reliably meleeable (see §5). For a mob around a corner, issue

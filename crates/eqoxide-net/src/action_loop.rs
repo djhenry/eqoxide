@@ -262,6 +262,17 @@ const CAST_PENDING_REAP: Duration = Duration::from_secs(14);
 /// `Unconfirmed`/202. Sourced from `transport.rs` (30s resend_timeout), NOT invented.
 const ECHO_QUARANTINE: Duration = Duration::from_secs(30);
 
+/// How long an NPC stays in `GameState::recent_attackers` after its last swing at the player.
+///
+/// This const used to live inside the auto-retarget driver that #1109 removed, and the prune ran
+/// only while auto-attack was ON and only on ticks that got past the dead-player guard and the
+/// 150 ms gate. Its consumers were never so conditional — `packet_handler`'s `combat`/`attacked`
+/// event fires only for an id NOT already in the map, and the renderer's #418 swing-facing
+/// override reads it every frame — so with auto-attack off a mob that stopped and later resumed
+/// swinging never re-fired `attacked`. The prune is now unconditional (see `tick`), which is what
+/// "recent" was always supposed to mean.
+const ATTACKER_TTL: Duration = Duration::from_secs(6);
+
 /// A merchant buy sent via the honest awaited path (A3 Migration 1, #448), parked here until its
 /// resolving packet lands. Holds the `oneshot::Sender` HTTP is awaiting plus the merchant/slot the
 /// buy was for, so a fulfil can CORRELATE the OP_ShopPlayerBuy echo (rejecting a stray shop echo
@@ -1413,6 +1424,12 @@ impl ActionLoop {
         // command can't 409-block the next same-type command indefinitely. See `reap_expired_pending`.
         self.reap_expired_pending();
 
+        // Expire stale entries so `recent_attackers` keeps meaning "is swinging at us right now".
+        // Unconditional and above every early return: both consumers (the `combat`/`attacked` event
+        // gate in `packet_handler`, the renderer's #418 swing-facing override) are live whether or
+        // not auto-attack is on. See `ATTACKER_TTL` for why this is no longer inside a driver.
+        gs.recent_attackers.retain(|_, t| t.elapsed() < ATTACKER_TTL);
+
         self.drain_loot(gs);
         self.drain_doors(stream, gs);
         self.drain_quests(stream, gs);
@@ -1460,8 +1477,9 @@ impl ActionLoop {
         // cadence so the per-tick ack timeout count matches the documented ~3s window.
         self.tick_give(stream, gs);
 
-        self.drive_auto_target(stream, gs);
-
+        // #1109: no `drive_auto_target` here. The client does not choose whom to fight — targeting
+        // is the agent's decision, made through `/v1/combat/target`(`/name`) and honoured until the
+        // agent changes it. See the note above `drive_auto_pet_combat`.
         self.drive_auto_pet_combat(stream, gs);
 
         if self.drive_auto_engage_melee(stream, gs) { return; }
@@ -2649,74 +2667,12 @@ impl ActionLoop {
 
     // `apply_fast_steering` moved to `eqoxide_nav::walker::Walker` (M1 extraction).
 
-    fn drive_auto_target(&mut self, stream: &mut EqStream, gs: &mut GameState) {
-        // Auto-target: while auto-attacking, pick who to fight each tick. Priority (see
-        // `pick_combat_target`): a mob that is actively attacking the player (engage adds instead of
-        // tanking them unanswered) > a still-valid current target > the nearest reachable trash mob
-        // (name starts "a_"/"an_", excluding named guards/merchants/citizens) within ~200u, so
-        // grinding continues hands-free between kills.
-        if self.auto_attack {
-            // Drop attackers that haven't swung at us in a while so a long-dead aggressor or one
-            // we've out-run doesn't keep pulling target priority.
-            const ATTACKER_TTL: std::time::Duration = std::time::Duration::from_secs(6);
-            gs.recent_attackers.retain(|_, t| t.elapsed() < ATTACKER_TTL);
-
-            let col = self.collision.read().unwrap();
-            // LINE of sight, not a walkable path: "is this NPC in the open in front of me", used only
-            // to drop targets behind a wall. `line_clear` (a centre ray) is the right primitive —
-            // `path_clear` now sweeps the player's whole collision volume (#358), which would also
-            // reject a perfectly attackable NPC standing in a doorway.
-            let clear_to = |e: &eqoxide_core::game_state::Entity| -> bool {
-                col.as_ref().is_none_or(|c| {
-                    c.line_clear([gs.player_x, gs.player_y, e.z + 3.0], [e.x, e.y, e.z + 3.0], 2.0)
-                })
-            };
-            let alive_reachable = |id: u32| -> bool {
-                gs.world.entities.get(&id).map(|e| !e.dead && e.is_npc && clear_to(e)).unwrap_or(false)
-            };
-
-            let current = gs.target_id;
-            // The current target is valid only if alive AND still reachable in a straight line —
-            // otherwise drop it so we retarget or roam (don't get stuck swinging "too far").
-            let current_valid = current.map(&alive_reachable).unwrap_or(false);
-            let current_is_attacker = current.map(|id| gs.recent_attackers.contains_key(&id)).unwrap_or(false);
-
-            // The add to engage: the most-recent attacker that is alive + reachable and isn't already
-            // our current target. (If the current target is the attacker, `pick_combat_target` keeps it.)
-            let attacker = gs.recent_attackers.iter()
-                .filter(|(id, _)| Some(**id) != current && alive_reachable(**id))
-                .max_by_key(|(_, t)| **t)
-                .map(|(id, _)| *id);
-
-            // Nearest reachable trash, only needed as the fallback (no attacker, no valid current).
-            let nearest_trash = if attacker.is_none() && !current_valid {
-                let mut best: Option<(f32, u32)> = None;
-                for (id, e) in &gs.world.entities {
-                    if e.dead || !e.is_npc { continue; }
-                    let nl = e.name.to_ascii_lowercase();
-                    if !(nl.starts_with("a_") || nl.starts_with("an_")) { continue; }
-                    let dx = e.x - gs.player_x;
-                    let dy = e.y - gs.player_y;
-                    let d2 = dx * dx + dy * dy;
-                    if d2 > 200.0 * 200.0 || !clear_to(e) { continue; }
-                    if best.map(|(bd, _)| d2 < bd).unwrap_or(true) { best = Some((d2, *id)); }
-                }
-                best.map(|(_, id)| id)
-            } else { None };
-            drop(col);
-
-            let desired = pick_combat_target(current, current_valid, current_is_attacker, attacker, nearest_trash);
-            // Only send a target packet when the choice actually changes (avoid per-tick spam). If
-            // `desired` is None we keep the current target and idle, matching the old behaviour of
-            // waiting for a respawn rather than roaming out of a sealed pocket.
-            if let Some(id) = desired {
-                if Some(id) != current {
-                    gs.set_target(id); // also clears stale con/attitude from the old target (#323)
-                    stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
-                }
-            }
-        }
-    }
+    // #1109: `drive_auto_target` lived here — while auto-attack was on it re-picked the target
+    // every tick (attacker > current > nearest "a_"/"an_" trash within 200u) and silently replaced
+    // whatever the agent had asked for, with no event or message to say so. That is a strategy
+    // decision, and strategy belongs in the agent's scripting, not in the game client: auto-grind
+    // is a policy built ON this client, not a behaviour OF it. The client now targets only what it
+    // is told to target (`drain_target`) and what the player clicks.
 
     fn drive_auto_pet_combat(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Auto-pet-combat: if the player has a pet (e.g. a summoned necro pet), send it to attack
@@ -8189,6 +8145,97 @@ mod tests {
         // `resolve_goal` further down. If this ever goes false the test above is vacuous.
         assert!(nav.drive_auto_engage_melee(&mut stream, &mut gs),
             "the melee override must be active, or this test proves nothing about tick ordering");
+    }
+
+    /// #1109 — THE CLIENT DOES NOT CHOOSE WHOM TO FIGHT.
+    ///
+    /// The removed `drive_auto_target` re-picked a target every tick while auto-attack was on,
+    /// ranking `a mob attacking us > the current target > nearest "a_"/"an_" trash`, and it
+    /// announced nothing when it swapped. The live failure: a level-1 Iksar necro in Field of Bone
+    /// targeted `a_decaying_skeleton005` (id 238) via `/v1/combat/target/name`, turned auto-attack
+    /// on, and the client immediately retargeted `a_decaying_skeleton014` (id 275) because 275 had
+    /// aggroed during the walk over. Every swing landed on 275, 238 sat at 100% HP throughout, and
+    /// the character died to the mob it had never asked to fight.
+    ///
+    /// This drives the REAL `tick`, in the exact configuration that used to flip the target — the
+    /// requested target alive/reachable and a DIFFERENT mob in `recent_attackers`, which was the
+    /// top-priority branch — and pins that the target is still the one that was asked for.
+    ///
+    /// MUTATION CHECK: restore any auto-retarget that outranks the current target (e.g. re-add the
+    /// attacker branch) → RED here, because 275 is the attacker and 238 is what was requested.
+    #[tokio::test]
+    async fn the_client_never_retargets_for_the_agent_1109() {
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let group: eqoxide_ipc::GroupShared =
+            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
+        let mut nav = test_action_loop(group);
+
+        let mut gs = GameState::new();
+        gs.player_id = 371;
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.cur_hp = 29;
+        gs.max_hp = 29;
+        for (id, name, x) in [(238u32, "a_decaying_skeleton005", 10.0f32),
+                              (275u32, "a_decaying_skeleton014", 30.0f32)] {
+            gs.upsert_entity(eqoxide_core::game_state::Entity {
+                spawn_id: id, name: name.into(), level: 4, is_npc: true,
+                x, y: 0.0, z: 0.0, hp_pct: 100.0, cur_hp: 60, max_hp: 60, race: "SKE".into(),
+                heading: 0.0, dead: false, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
+                gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0,
+                pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false,
+                flymode: 0, npc_tint_index: 0,
+            });
+        }
+
+        // What the agent asked for, exactly as `drain_target` applies it.
+        gs.set_target(238);
+        // …and the add that used to steal it: alive, reachable, and swinging at us right now.
+        gs.recent_attackers.insert(275, Instant::now());
+        nav.auto_attack = true;
+
+        for _ in 0..3 {
+            nav.last_tick = Instant::now() - Duration::from_millis(NAV_TICK_MS as u64 * 4);
+            nav.tick(&mut stream, &mut gs);
+            assert_eq!(gs.target_id, Some(238),
+                "the client must swing at the spawn the agent targeted, never re-pick one itself");
+        }
+        assert_eq!(gs.target_name.as_deref(), Some("a_decaying_skeleton005"),
+            "the target's derived fields must describe the requested spawn too");
+    }
+
+    /// #1109 — the `ATTACKER_TTL` prune must survive the driver that used to host it.
+    ///
+    /// The `retain` lived inside `drive_auto_target`, so it only ran while auto-attack was ON and
+    /// only on ticks that cleared the dead-player guard and the 150 ms gate. Its consumers are not
+    /// so conditional: `apply_combat_damage` fires the `combat`/`attacked` event only for an id NOT
+    /// already in the map, so an entry that never expires means a mob that stops and later resumes
+    /// attacking never re-announces itself to the agent. The prune now runs unconditionally.
+    ///
+    /// MUTATION CHECK: gate the `retain` behind `if self.auto_attack` → RED (auto-attack is off
+    /// here); move it back below the 150 ms gate → RED (the first tick is not gated open).
+    #[tokio::test]
+    async fn stale_attackers_expire_with_auto_attack_off_1109() {
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let group: eqoxide_ipc::GroupShared =
+            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
+        let mut nav = test_action_loop(group);
+
+        let mut gs = GameState::new();
+        gs.player_id = 371;
+        gs.cur_hp = 29;
+        gs.max_hp = 29;
+        gs.recent_attackers.insert(7, Instant::now() - (ATTACKER_TTL + Duration::from_secs(1)));
+        gs.recent_attackers.insert(8, Instant::now());
+        nav.auto_attack = false;
+
+        nav.tick(&mut stream, &mut gs);
+
+        assert!(!gs.recent_attackers.contains_key(&7),
+            "an attacker past ATTACKER_TTL must expire even with auto-attack off, or the \
+             `attacked` event can never fire again for that spawn");
+        assert!(gs.recent_attackers.contains_key(&8), "a fresh attacker must survive the prune");
     }
 
     #[test]

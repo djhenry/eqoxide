@@ -44,7 +44,7 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 |---|---|---|
 | Movement: walk `POST /v1/navigate/goto` (A* pathfinding) | ✅ | Routes around walls within connected areas; stalls across closed doors |
 | Movement: teleport `POST /v1/navigate/warp` | ✅ | Anti-cheat capped (~50–95u/hop); small hops from a synced state |
-| Combat: auto-attack / auto-face / auto-retarget | ✅ | Heading-scale fix made melee land; hands-free grinding works |
+| Combat: auto-attack / auto-face | ✅ | Heading-scale fix made melee land. Swings at the target you set and only that one — the client never re-picks it (#1109); retargeting and grind policy live in the driving agent |
 | Spell casting (`POST /v1/combat/cast`, gems, cast bar) | ✅ | `OP_CastSpell` + begin/mana/interrupt feedback |
 | Scribe / memorize spells (`POST /v1/combat/scribe`, `/v1/combat/memorize`) | ✅ | |
 | Pets: tracking, auto-pet-combat, recall | ✅ | `OP_PetCommands`; squishy classes stand off |
