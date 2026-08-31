@@ -2728,13 +2728,21 @@ impl ActionLoop {
             if let Some(tid) = gs.target_id {
                 // #1109: a DEAD target is not engageable. This filter used to be redundant —
                 // `drive_auto_target` ran immediately above this driver and dropped an invalid
-                // (dead) target before the engage ever saw it. With that driver gone the corpse
-                // stays in `world.entities` until it rots, so without this check auto-attack
-                // pins the player to the corpse and `request_cancel_goto()`s every 150 ms tick —
-                // silently cancelling the agent's own `/v1/move/goto` (the driver returns true,
-                // so `tick` never reaches the walker) until it thinks to turn auto-attack off or
-                // the corpse despawns. `drive_auto_pet_combat` above has always filtered
-                // `!e.dead` for exactly this reason.
+                // (dead) target before the engage ever saw it. With that driver gone the dead
+                // entity stays in `world.entities` until the SERVER removes the spawn, so without
+                // this check auto-attack pins the player to it and `request_cancel_goto()`s every
+                // 150 ms tick — silently cancelling the agent's own `/v1/move/goto` (the driver
+                // returns true, so `tick` never reaches the walker). `drive_auto_pet_combat`
+                // above has always filtered `!e.dead` for exactly this reason.
+                //
+                // How long that window is depends on the mob, and both ends of it matter.
+                // Measured live in `fieldofbone`: `a_decaying_skeleton000` leaves no corpse, and
+                // the server deleted its spawn ~2 s after death — 13 ticks, every one of them a
+                // cancelled goto, which is already enough to kill the goal outright. A mob that
+                // DOES leave a corpse is the long end: EQEmu hands the corpse the dead NPC's own
+                // entity id (`entity_list.AddCorpse(corpse, GetID())` — visible here in player
+                // corpses keeping their spawn id), so `target_id` stays resolvable and dead for
+                // the corpse's whole decay. Do not read the short case as the bound.
                 if let Some((ex, ey)) = gs.world.entities.get(&tid)
                     .filter(|e| !e.dead).map(|e| (e.x, e.y)) {
                     let dx = ex - gs.player_x;
@@ -8280,13 +8288,21 @@ mod tests {
     /// `drive_auto_engage_melee` filtered on distance but never on `dead`. That was survivable only
     /// because the deleted `drive_auto_target` ran immediately above it and dropped an invalid (dead)
     /// target first. Removing the retarget exposed the gap: `apply_death` marks the NPC dead and
-    /// LEAVES it in `world.entities` (only OP_DeleteSpawn, minutes later when the corpse rots, clears
-    /// the target), so with auto-attack still on the engage driver kept engaging the corpse, called
-    /// `request_cancel_goto()`, and returned true — and `tick` returns on that, before the walker
-    /// ever runs. An agent that killed a mob and then issued `/v1/move/goto` for the next camp would
-    /// see its goal cancelled every 150 ms, reported honestly as `idle`/`goto_superseded` and utterly
-    /// unrecoverable until it guessed to `DELETE /v1/combat/attack`. That is the exact workflow the
-    /// #1109 docs now tell agents to use, so the removal had to carry this fix with it.
+    /// LEAVES it in `world.entities` until the server removes the spawn (`remove_entity` is what
+    /// clears `target_id`), so with auto-attack still on the engage driver kept engaging the dead
+    /// target, called `request_cancel_goto()`, and returned true — and `tick` returns on that,
+    /// before the walker ever runs. An agent that killed a mob and then issued `/v1/move/goto` for
+    /// the next camp would see its goal cancelled every 150 ms, reported honestly as
+    /// `idle`/`goto_superseded` and unrecoverable until it guessed to `DELETE /v1/combat/attack`.
+    /// That is the exact workflow the #1109 docs now tell agents to use, so the removal had to
+    /// carry this fix with it.
+    ///
+    /// Measured live on this fix (level-12 Iksar necro, `fieldofbone`): a `/v1/move/goto` issued
+    /// the instant the target hit 0% HP, with auto-attack still ON, went `planning` →
+    /// `navigating` and kept moving — 2.6 s of it with the dead spawn still in `target_id`, i.e.
+    /// ~17 ticks that each would have cancelled the goal before this filter. See the engage
+    /// driver's own comment for why that window is short for a corpseless trash mob and long for
+    /// anything that leaves a corpse.
     ///
     /// MUTATION CHECK: drop the `.filter(|e| !e.dead)` from `drive_auto_engage_melee` → RED on the
     /// first assert. The live-target control below is what keeps this honest — it fails if the driver
