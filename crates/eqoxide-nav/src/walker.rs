@@ -2259,7 +2259,6 @@ impl Walker {
                 want_swim:   false,
                 want_climb:  false,
                 speed:       nav_speed(gs),
-                climb:       0.0,
                 hop:         false,
             });
             if self.backoff_ticks == 0 {
@@ -2418,7 +2417,6 @@ impl Walker {
             want_swim:   swim,
             want_climb:  climb,
             speed:       nav_speed(gs),
-            climb:       0.0, // nav uses the native step-up now (#239); fences handled by hop
             hop:         self.stuck_ticks >= NAV_HOP_TICKS,
         });
         // Publish this tick's snapshot: the committed routes the walker is ACTUALLY following and

@@ -161,7 +161,7 @@ use eqoxide_ipc::MoveIntent;
                     let intent = eqoxide_ipc::MoveIntent {
                         wish_dir: [1.0, 0.0],
                         wish_vspeed: if swim && bank_z > p[2] + 1.0 { 20.0 } else { 0.0 },
-                        jump: false, want_swim: swim, want_climb: false, speed: 35.0, climb: 0.0, hop: false,
+                        jump: false, want_swim: swim, want_climb: false, speed: 35.0, hop: false,
                     };
                     ctrl.step(intent, 1.0 / 60.0, &col);
                     if ctrl.on_ground && ctrl.pos[0] > 24.0 && (ctrl.pos[2] - bank_z).abs() < 0.6 {
@@ -250,7 +250,7 @@ use eqoxide_ipc::MoveIntent;
             let d = (dx * dx + dy * dy).sqrt();
             let wish_dir = if d > 1e-3 { [dx / d, dy / d] } else { [0.0, 0.0] };
             ctrl.step(MoveIntent { wish_dir, wish_vspeed, jump: false, want_swim, want_climb: false,
-                speed: RUN_SPEED, climb: 0.0, hop: false }, DT, &col);
+                speed: RUN_SPEED, hop: false }, DT, &col);
 
             let at_goal = (ctrl.pos[0] - goal[0]).hypot(ctrl.pos[1] - goal[1]) < 3.0
                 && (ctrl.pos[2] - (-24.0)).abs() < 2.0;
@@ -446,7 +446,7 @@ use eqoxide_ipc::MoveIntent;
                         // step): a false pass. Both quoted phrases are pinned by
                         // `walker_source_anchors_cited_in_this_file_still_resolve`.
                         ctrl.step(MoveIntent { wish_dir: backoff_dir, wish_vspeed: 0.0, jump: false,
-                            want_swim: false, want_climb: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
+                            want_swim: false, want_climb: false, speed: RUN_SPEED, hop: false }, DT, col);
                     }
                     if backoff_ticks == 0 {
                         if let PlanOutcome::Route(r) = col.find_path_ex(
@@ -546,7 +546,7 @@ use eqoxide_ipc::MoveIntent;
                     } else { None };
                     let wish_vspeed = if swim { swim_vspeed(tz, p[2], swim_plane) } else { 0.0 };
                     ctrl.step(MoveIntent { wish_dir: aim, wish_vspeed, jump: false, want_swim: swim, want_climb: false,
-                        speed: RUN_SPEED, climb: 0.0, hop: stuck_ticks >= NAV_HOP_TICKS }, DT, col);
+                        speed: RUN_SPEED, hop: stuck_ticks >= NAV_HOP_TICKS }, DT, col);
                     if (ctrl.pos[0] - goal[0]).hypot(ctrl.pos[1] - goal[1]) < 3.0 { return None; }
                 }
             }
@@ -2118,7 +2118,7 @@ fn goal_append_blast_radius() {
             let d = (dx * dx + dy * dy).sqrt().max(1e-3);
             for _ in 0..FRAMES_PER_TICK {
                 ctrl.step(MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
-                    want_swim: false, want_climb: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
+                    want_swim: false, want_climb: false, speed: RUN_SPEED, hop: false }, DT, col);
             }
         }
         // Phase 2: push STRAIGHT at the goal XY for ~4 s, hopping — the walker's honest best effort to
@@ -2129,7 +2129,7 @@ fn goal_append_blast_radius() {
             let d = (dx * dx + dy * dy).sqrt().max(1e-3);
             for _ in 0..FRAMES_PER_TICK {
                 ctrl.step(MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
-                    want_swim: false, want_climb: false, speed: RUN_SPEED, climb: 0.0, hop: true }, DT, col);
+                    want_swim: false, want_climb: false, speed: RUN_SPEED, hop: true }, DT, col);
             }
         }
         ctrl.pos
@@ -2307,7 +2307,7 @@ fn corner_buffer_blast_radius() {
             let d = (dx * dx + dy * dy).sqrt().max(1e-3);
             for _ in 0..FRAMES_PER_TICK {
                 ctrl.step(MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
-                    want_swim: false, want_climb: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
+                    want_swim: false, want_climb: false, speed: RUN_SPEED, hop: false }, DT, col);
             }
             // Smoothness: accumulate |Δheading| of ACTUAL movement (wiggle shows up as turning).
             let (mx, my) = (ctrl.pos[0] - prev[0], ctrl.pos[1] - prev[1]);
@@ -2494,7 +2494,7 @@ fn descent_guard_blast_radius() {
             let d = (dx * dx + dy * dy).sqrt().max(1e-3);
             for _ in 0..FRAMES_PER_TICK {
                 ctrl.step(MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
-                    want_swim: false, want_climb: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
+                    want_swim: false, want_climb: false, speed: RUN_SPEED, hop: false }, DT, col);
             }
         }
         (false, MAX_TICKS)
@@ -2649,7 +2649,7 @@ fn parallel_wall_clearance_blast_radius() {
             let d = (dx * dx + dy * dy).sqrt().max(1e-3);
             for _ in 0..FRAMES_PER_TICK {
                 ctrl.step(MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
-                    want_swim: false, want_climb: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
+                    want_swim: false, want_climb: false, speed: RUN_SPEED, hop: false }, DT, col);
             }
         }
         (false, MAX_TICKS)

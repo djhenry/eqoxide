@@ -1919,7 +1919,6 @@ impl App {
                     // measured native binding to copy yet — see `eqoxide_nav::climb`.
                     want_climb:  false,
                     speed:       MOVE_SPEED,
-                    climb:       0.0,   // free WASD uses the native 2u step (no wall-climbing)
                     hop:         false, // and does not auto-hop barriers (Space is the manual jump)
                 }
             } else if let Some(m) = manual {
@@ -1953,7 +1952,6 @@ impl App {
                     want_swim:   in_water,
                     want_climb:  on_climbable && m.up != 0.0,
                     speed:       MOVE_SPEED,
-                    climb:       0.0,
                     hop:         false,
                 }
             } else {

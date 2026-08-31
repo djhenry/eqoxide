@@ -60,7 +60,7 @@ fn swim_toward(col: &Collision, from: [f32; 3], to: [f32; 3], secs: f32) -> [f32
         let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
         let dir = if l > 0.2 { [d[0] / l, d[1] / l] } else { [0.0, 0.0] };
         c.step(MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: true, want_climb: false,
-                            speed: 44.0, climb: 0.0, hop: false }, dt, col);
+                            speed: 44.0, hop: false }, dt, col);
     }
     c.pos
 }
@@ -235,7 +235,7 @@ fn qcat_pocket_swimmer_escapes_to_the_shaft_under_a_driven_dive() {
             let dir = if l > 0.2 { [d[0] / l, d[1] / l] } else { [0.0, 0.0] };
             let vs = if c.pos[2] > -60.0 && l > 4.0 { -20.0 } else { 0.0 };
             c.step(MoveIntent { wish_dir: dir, wish_vspeed: vs, jump: false, want_swim: true, want_climb: false,
-                                speed: 44.0, climb: 0.0, hop: false }, dt, &col);
+                                speed: 44.0, hop: false }, dt, &col);
         }
         let end = c.pos;
         assert!((end[2] - shaft_plane).abs() < 0.05,
@@ -305,7 +305,7 @@ fn the_first_frame_never_lifts_a_qcat_pocket_swimmer_toward_the_dry_tile() {
     // The walker's intent at a water waypoint: horizontal only, no vertical wish (so any vertical
     // motion observed is the controller's, not a drive's).
     c.step(MoveIntent { wish_dir: [0.55, -0.83], wish_vspeed: 0.0, jump: false, want_swim: true, want_climb: false,
-                        speed: 44.0, climb: 0.0, hop: false }, 1.0 / 60.0, &col);
+                        speed: 44.0, hop: false }, 1.0 / 60.0, &col);
     let dz = c.pos[2] - start[2];
     assert!(dz < 1e-3,
         "#649: frame 1 must never LIFT the swimmer (the unfixed net mounts the tile floor at \

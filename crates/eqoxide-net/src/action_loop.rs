@@ -2789,7 +2789,6 @@ impl ActionLoop {
                                 want_swim:   swim,
                                 want_climb:  false, // melee approach is horizontal; no ladder pursuit
                                 speed:       RUN_SPEED,
-                                climb:       0.0, // nav uses the native step-up now (#239); fences handled by hop
                                 hop:         false,                      // melee approach: no auto-hop
                             });
                         } else {
