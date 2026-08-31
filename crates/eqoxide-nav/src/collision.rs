@@ -226,6 +226,30 @@ pub struct PadEdge {
     pub dest: [f32; 3],
 }
 
+/// A planner edge for a climbable surface — a ladder (#309). Entering the volume and climbing lifts
+/// the character from anywhere in its span to a dismount floor at the top: like [`PadEdge`], a
+/// DISCONTINUOUS link terrain-follow A* cannot express, because the connecting geometry is a
+/// VERTICAL face and [`MAX_WALK_GRADE`] correctly refuses it.
+///
+/// Crushbone's moat is the motivating case: ~10 units of vertical wall between the waterline and the
+/// rim against a ~2u haul-out, with five `LADDER14` objects placed around it, and no other way out.
+/// Without this edge A* floods the moat, closes its frontier and returns `Unreachable(SearchClosed)`
+/// for a goal the native client can plainly reach — the same class of honesty violation #403 fixed
+/// for pads.
+///
+/// The DISMOUNT end is resolved and honesty-gated once by [`Collision::resolve_climb_edges`]: a
+/// ladder whose top has no standable floor beside it yields NO edge, so the planner never routes a
+/// character up something it would then be stuck on top of. See [`crate::climb`] for what about this
+/// mechanic is client-derived (the `LADDER` name trigger) and what is an unverified guess (the
+/// motion constants) — every route that uses one of these edges is counted and disclosed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClimbEdge {
+    /// The climbable volume: where the character must be to mount, and how far up it goes.
+    pub volume: crate::climb::ClimbVolume,
+    /// Standable floor at the top, beside the ladder — the edge TARGET (`[east, north, z]`).
+    pub dismount: [f32; 3],
+}
+
 /// Per-plan context for `find_path_res`: the things that must be shared across the several A* calls
 /// one logical plan makes, rather than re-armed per call.
 #[derive(Clone, Default)]
@@ -632,6 +656,21 @@ pub struct Collision {
     /// the water map at `set_water` (zone load). Lets `find_zone_line_near` be an O(1) cache read on
     /// the network thread instead of an exhaustive scan that linkdead-ed the client (#204).
     zone_line_regions: Vec<(i32, [f32; 3])>,
+    /// Every climbable surface in this zone, derived from the placed objects at [`Collision::build`]
+    /// (#309). PHYSICAL capability: "is the character on something it could climb?" — the question
+    /// the movement controller asks. Present whether or not the ladder leads anywhere useful.
+    climb_volumes: Vec<crate::climb::ClimbVolume>,
+    /// The subset of `climb_volumes` A* may route THROUGH, each with a resolved dismount floor
+    /// (#309). ROUTABLE claim: "may the planner promise the character gets somewhere by climbing
+    /// this?" — which additionally requires that the top has standable ground beside it.
+    ///
+    /// Kept separate from `climb_volumes` for the same reason `teleport_pad_footprints` is kept
+    /// separate from [`Collision::resolve_teleport_pads`]: conflating "the agent could take this"
+    /// with "the planner may route through this" hides a real capability behind a verdict about the
+    /// far end. Built by [`Collision::resolve_climb_edges`] at the end of `build`.
+    climb_edges: Vec<ClimbEdge>,
+    /// Routes that used a climb edge, surfaced as `nav_climb` — see [`Collision::climb_plans`].
+    climb_plans: std::sync::atomic::AtomicU64,
     /// The zone-lifetime static clearance field (#378 / design §3d, the `MemoField`): graded
     /// wall/ground distances per (2 u cell, floor bucket), computed on demand and cached until the
     /// zone (and this struct) is dropped. See `traversability::ClearanceField`.
@@ -1057,7 +1096,8 @@ impl Collision {
                 z_max: 0.0, facing_blind_surfaces: Default::default(), tight_plans: Default::default(),
                 clearance: Default::default(), water_grid: None,
                 water: Err(eqoxide_core::region_map::RegionDataAbsent::NotAttached),
-                from_collision_mesh, zone_line_regions: Vec::new() };
+                from_collision_mesh, zone_line_regions: Vec::new(),
+                climb_volumes: Vec::new(), climb_edges: Vec::new(), climb_plans: Default::default() };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
         let rows = (((max[1] - min[1]) / cell_size).ceil() as usize + 1).max(1);
@@ -1078,14 +1118,90 @@ impl Collision {
                 }
             }
         }
-        Collision { water_grid_lazy: std::sync::OnceLock::new(), tris, tri_nz, cells, origin: min, cell_size, cols, rows,
+        let mut col = Collision { water_grid_lazy: std::sync::OnceLock::new(), tris, tri_nz, cells, origin: min, cell_size, cols, rows,
             #[cfg(test)]
             z_min,
             z_max,
             facing_blind_surfaces: Default::default(), tight_plans: Default::default(),
             water: Err(eqoxide_core::region_map::RegionDataAbsent::NotAttached),
             from_collision_mesh, zone_line_regions: Vec::new(),
-            clearance: Default::default(), water_grid: None }
+            climb_volumes: crate::climb::volumes_from_objects(&assets.objects),
+            climb_edges: Vec::new(), climb_plans: Default::default(),
+            clearance: Default::default(), water_grid: None };
+        // AFTER the grid exists, not during: resolving a dismount casts floor probes, which need
+        // `cells` populated. Zone geometry is static, so this is a one-off zone-load cost and every
+        // plan afterwards reads a finished list (the shape `set_region_data` uses for #204).
+        col.climb_edges = col.resolve_climb_edges();
+        col
+    }
+
+    /// Which of this zone's climbable surfaces may A* actually route through, and to where (#309).
+    ///
+    /// An edge exists only when the ladder's top has floor a character can STAND on within
+    /// [`climb::DISMOUNT_Z_TOL`] of it — probed on a ring just outside the volume, because you step
+    /// OFF a ladder sideways, not through it. A ladder into a sealed ceiling, one whose top is a
+    /// sheer face, or one that ends in mid-air therefore produces no edge at all.
+    ///
+    /// That gate is the whole point, and it is the same honesty rule
+    /// [`Collision::resolve_teleport_pads`] applies to a pad whose destination is over the void:
+    /// **a link the planner cannot show leads somewhere standable is never offered**. Reporting a
+    /// goal reachable and then stranding the character on top of a ladder is a worse failure than
+    /// reporting it unreachable, because the agent has no way to tell it happened.
+    fn resolve_climb_edges(&self) -> Vec<ClimbEdge> {
+        use crate::climb::DISMOUNT_Z_TOL;
+        use crate::traversability::{Point, Traversability, Tier};
+        if self.cols == 0 { return Vec::new(); }
+        // Minimum clearance, matching the fine tier: a dismount ledge beside a ladder is a
+        // "does the character fit" question, and demanding the generous margin would refuse the
+        // narrow walkways ladders characteristically serve.
+        let trav = Traversability::new(self, Tier::Minimum.units(), self.cell_size, 0.0, false);
+        let mut out = Vec::new();
+        for v in &self.climb_volumes {
+            let c = v.center();
+            // Step outward past the volume's own footprint, plus the body's width, so the probe
+            // lands on ground BESIDE the ladder rather than in the panel it just climbed.
+            let pr = eqoxide_core::physics::PLAYER_RADIUS;
+            let reach = [(v.hi[0] - v.lo[0]) * 0.5 + pr, (v.hi[1] - v.lo[1]) * 0.5 + pr];
+            let mut best: Option<[f32; 3]> = None;
+            for (da, db) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+                             (0.7, 0.7), (0.7, -0.7), (-0.7, 0.7), (-0.7, -0.7)] {
+                let (a, b) = (c[0] + da * reach[0], c[1] + db * reach[1]);
+                let Some(fz) = self.nearest_floor(a, b, v.top_z, DISMOUNT_Z_TOL, DISMOUNT_Z_TOL) else { continue };
+                if (fz - v.top_z).abs() > DISMOUNT_Z_TOL { continue }
+                if !trav.can_occupy_fast(Point::new([a, b], fz)) { continue }
+                // Prefer the highest qualifying ledge: with several in the window, the one nearest
+                // the ladder's top is the one a climb actually delivers you onto.
+                if best.is_none_or(|p| fz > p[2]) { best = Some([a, b, fz]); }
+            }
+            if let Some(dismount) = best {
+                out.push(ClimbEdge { volume: v.clone(), dismount });
+            }
+        }
+        out
+    }
+
+    /// Every climbable surface in this zone — the PHYSICAL question (#309). See `climb_volumes`.
+    pub fn climb_volumes(&self) -> &[crate::climb::ClimbVolume] { &self.climb_volumes }
+
+    /// The climbable surfaces A* may route through — the ROUTABLE question (#309). See `climb_edges`.
+    pub fn climb_edges(&self) -> &[ClimbEdge] { &self.climb_edges }
+
+    /// Is `p` (`[east, north, up]`) on a climbable surface? The movement controller's test: it asks
+    /// about `climb_volumes`, NOT `climb_edges`, because whether a ladder leads anywhere standable
+    /// is a routing verdict and has no business vetoing what the character's body can do.
+    pub fn on_climbable(&self, p: [f32; 3]) -> bool {
+        self.climb_volumes.iter().any(|v| v.contains(p))
+    }
+
+    /// Routes that used a climb edge, surfaced to agents as `nav_climb` (#309).
+    ///
+    /// Counted because the climb MECHANISM is unverified — the native client demonstrably climbs
+    /// these ladders, but how it decides to is not known from the decompile (see [`crate::climb`]).
+    /// An agent handed a route that depends on a reconstruction rather than on measured client
+    /// behaviour must be able to see that, exactly as `nav_tight` discloses a minimum-clearance
+    /// route. Never cleared; a non-zero count is informational, not a failure.
+    pub fn climb_plans(&self) -> u64 {
+        self.climb_plans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Routes that only existed at the MINIMUM clearance, surfaced as `nav_tight` — see the
@@ -3695,6 +3811,29 @@ impl Collision {
             let (pdc, pdr) = to_cell(p.dest[0], p.dest[1]);
             (psc, psr, p.source[2], pdc, pdr, p.dest[2])
         }).collect();
+        // CLIMB EDGES (#309): the same one-off materialisation as the pads above, resolving each
+        // ladder onto THIS grid's cells so the search loop stays an integer compare.
+        //
+        // Two things differ from a pad, both forced by what a ladder is. The source is a cell
+        // RECTANGLE rather than one cell — a ladder's capture footprint is ~10u wide once padded,
+        // which is several cells at 8u and more at 2u. And the source Z is a RANGE spanning the
+        // whole ladder, not one tier: in the Crushbone moat a character floating at the waterline
+        // (z ≈ −11) and one standing on the moat floor (z ≈ −24) are 14 units apart and BOTH have to
+        // find the same ladder, which a `GOAL_TIER_TOL` compare against a single height cannot do.
+        struct GridClimb { c0: i32, c1: i32, r0: i32, r1: i32, z_lo: f32, z_hi: f32,
+                           dc: i32, dr: i32, dz: f32, mount: [f32; 2] }
+        let climb_edges: Vec<GridClimb> = self.climb_edges.iter().map(|e| {
+            let (c0, r0) = to_cell(e.volume.lo[0], e.volume.lo[1]);
+            let (c1, r1) = to_cell(e.volume.hi[0], e.volume.hi[1]);
+            let (dc, dr) = to_cell(e.dismount[0], e.dismount[1]);
+            GridClimb { c0: c0.min(c1), c1: c0.max(c1), r0: r0.min(r1), r1: r0.max(r1),
+                z_lo: e.volume.foot_z - crate::climb::DISMOUNT_Z_TOL, z_hi: e.volume.top_z,
+                dc, dr, dz: e.dismount[2], mount: e.volume.center() }
+        }).collect();
+        // Did the search reach a node by CLIMBING? Collected here and checked against the returned
+        // route below, so `nav_climb` counts routes an agent is actually handed — not every ladder
+        // the frontier happened to touch, which would make the disclosure meaningless.
+        let mut climbed: std::collections::HashSet<Key> = std::collections::HashSet::new();
         let skey: Key = (sc, sr, qf(start_floor));
         let mut g_score: std::collections::HashMap<Key, f32> = std::collections::HashMap::new();
         let mut came:    std::collections::HashMap<Key, Key> = std::collections::HashMap::new();
@@ -3855,6 +3994,42 @@ impl Collision {
                         floor_of.insert(dkey, pdz);
                         heap.push(Node { f: tentative + h(pdc, pdr), c: pdc, r: pdr, fz: pdz });
                     }
+                }
+            }
+            // CLIMB EDGE (#309): if this node stands inside a ladder's footprint, anywhere along the
+            // ladder's height, add the edge to the dismount floor at its top. Like the pad edge above
+            // this expresses a link the terrain-follow families structurally cannot: the connecting
+            // surface is VERTICAL, and `MAX_WALK_GRADE` is right to refuse it. Refusing it is exactly
+            // what strands a character in the Crushbone moat, where ~10u of sheer wall stands between
+            // the waterline and the rim, the haul-out is 2u, and five ladders are the way out.
+            //
+            // ASCENT ONLY, deliberately. A descent edge would need a validated standable target at the
+            // ladder's FOOT, which `resolve_climb_edges` does not resolve — and offering a link whose
+            // far end has not been shown standable is the precise failure this edge exists to avoid.
+            // Downward travel keeps whatever the existing fall edge (lethality-checked) already allows.
+            for e in &climb_edges {
+                if c < e.c0 || c > e.c1 || r < e.r0 || r > e.r1 { continue; }
+                if fz < e.z_lo || fz > e.z_hi { continue; }
+                let dkey = (e.dc, e.dr, qf(e.dz));
+                if closed.contains(&dkey) { continue; }
+                // Time-equivalent cost: the rise at `CLIMB_SPEED`, re-expressed as the walking
+                // distance that takes the same time, so it is commensurable with the walk edges'
+                // metres. Plus a flat penalty in the `PAD_PENALTY` mould, which keeps a walkable
+                // route preferred where one exists. A cost, never a filter — it can no more cause a
+                // false `no_path` than the pad penalty can.
+                const CLIMB_PENALTY: f32 = 60.0;
+                let rise = (e.dz - fz).max(0.0);
+                let tentative = g_cur + CLIMB_PENALTY + rise / crate::climb::CLIMB_SPEED * NAV_RUN_SPEED;
+                if let Some(t) = tr.as_deref_mut() {
+                    t.edge([a[0], a[1], fz], [e.mount[0], e.mount[1], e.dz],
+                        EdgeVerdict::Accepted { kind: EdgeKind::Climb });
+                }
+                if tentative < *g_score.get(&dkey).unwrap_or(&f32::MAX) {
+                    g_score.insert(dkey, tentative);
+                    came.insert(dkey, ckey);
+                    floor_of.insert(dkey, e.dz);
+                    climbed.insert(dkey);
+                    heap.push(Node { f: tentative + h(e.dc, e.dr), c: e.dc, r: e.dr, fz: e.dz });
                 }
             }
             for (dc, dr) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
@@ -4504,6 +4679,7 @@ impl Collision {
         };
         let mut path = Vec::new();
         let mut cur = goal_key;
+        let mut used_climb = false;
         while cur != skey {
             let (c, r, fb) = cur;
             let ctr = center(c, r);
@@ -4515,12 +4691,22 @@ impl Collision {
             // key — cell AND floor bucket (#403 review B): a multi-level zone can route through the
             // pad's (col,row) at an UNRELATED z-tier, and snapping that waypoint to the pad endpoint's
             // z would inject a spurious vertical jump the walker clips/falls on.
+            if climbed.contains(&cur) { used_climb = true; }
             let wp = ctx.teleport_pads.iter().find_map(|p| {
                 let dc = to_cell(p.dest[0], p.dest[1]);
                 let sc = to_cell(p.source[0], p.source[1]);
                 if (c, r) == dc && fb == qf(p.dest[2])        { Some(p.dest) }
                 else if (c, r) == sc && fb == qf(p.source[2]) { Some(p.source) }
                 else { None }
+            }).or_else(|| {
+                // A CLIMB dismount waypoint is snapped to its EXACT resolved point for the same
+                // reason a pad endpoint is (#403 review B, full key — cell AND floor bucket): the
+                // dismount is a sub-cell ledge beside the ladder, and an 8u cell centre can easily
+                // land back in the moat the character just climbed out of.
+                self.climb_edges.iter().find_map(|e| {
+                    let dc = to_cell(e.dismount[0], e.dismount[1]);
+                    if (c, r) == dc && fb == qf(e.dismount[2]) { Some(e.dismount) } else { None }
+                })
             }).unwrap_or_else(|| {
                 // Carry each waypoint's actual floor height so the walker moves + collision-checks at
                 // the right z while climbing/descending (instead of the goal's z, which clips walls).
@@ -4528,6 +4714,15 @@ impl Collision {
             });
             path.push(wp);
             match came.get(&cur) { Some(&p) => cur = p, None => break }
+        }
+        // `nav_climb` (#309): count the ROUTE, once, and only when the route actually handed back
+        // traverses a climb edge. The climb mechanic is a reconstruction — the native client has one,
+        // but how it triggers is not known from the decompile (see `crate::climb`) — so an agent must
+        // be able to see that this particular route leans on it, the way `nav_tight` discloses a
+        // minimum-clearance route. Counting frontier touches instead would report ladders the route
+        // never uses and make the signal worthless.
+        if used_climb {
+            self.climb_plans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         path.reverse();
         // Edge margin (#312): A* routes through 8u cell CENTERS, so a cell that merely touches a
@@ -5289,6 +5484,110 @@ mod tests {
         let norths: Vec<f32> = edges.iter().map(|e| e.source[1]).collect();
         assert!(norths.iter().any(|&n| (10.0..=25.0).contains(&n)), "a source in band A: {norths:?}");
         assert!(norths.iter().any(|&n| (45.0..=60.0).contains(&n)), "a source in band B: {norths:?}");
+    }
+
+    // ───────────────────── #309: the ladder climb edge (crushbone's moat) ─────────────────────
+    // A ladder is the SECOND discontinuous link terrain-follow A* cannot express (the first was the
+    // teleport pad, #403). A vertical face is CORRECTLY refused by the walk test — a 24u rise is far
+    // over `STEP_H`, and its grade far over `MAX_WALK_GRADE` — so a pit whose only exit is a ladder
+    // floods the frontier, closes it, and reports `Unreachable`, while the native client climbs
+    // straight out (demonstrated by the repo owner against the retail binary; see `crate::climb` for
+    // what is derived from the client and what is a guess). The fix is a new EDGE KIND, never a
+    // loosened walk test: baking a ladder into walkable ground would be the #229/#329 class of lie.
+    // These fixtures reproduce Crushbone's moat topology synthetically and are mutation-checked —
+    // revert the astar climb-edge emission and `moat_with_a_ladder_routes_out` goes RED.
+
+    /// A walled pit (floor at up=0, east[0,80] × north[0,80]) whose east wall rises 24u to a rim
+    /// (up=24, east[80,200]). `ladder_east` optionally stands a `LADDER14` panel, floor-to-rim, at
+    /// that east coordinate. The pit is deliberately ≥64 nav cells so the ladderless baseline closes
+    /// a whole surveyed frontier and reports `SearchClosed` ("no way out of here"), not the weaker
+    /// `StartIsolated` ("boxed in where you stand").
+    /// MeshData pos = `[north, up, east]`; Collision maps to world `[east, north, up]`.
+    fn moat_scene(ladder_east: Option<f32>) -> (Collision, [f32; 3], [f32; 3]) {
+        let quad = |v: Vec<[f32; 3]>| MeshData {
+            positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let floor = quad(vec![[0.0, 0.0, 0.0], [80.0, 0.0, 0.0], [80.0, 0.0, 80.0], [0.0, 0.0, 80.0]]);
+        let rim   = quad(vec![[0.0, 24.0, 80.0], [80.0, 24.0, 80.0], [80.0, 24.0, 200.0], [0.0, 24.0, 200.0]]);
+        let wall  = quad(vec![[0.0, 0.0, 80.0], [80.0, 0.0, 80.0], [80.0, 24.0, 80.0], [0.0, 24.0, 80.0]]);
+        let objects = ladder_east.map(|e| eqoxide_assets::ObjectModel {
+            name: "LADDER14".into(),
+            // Floor-to-rim, 8u wide across north, centred on north 40 — the same shape as Crushbone's
+            // `LADDER14`, whose 24.93u scaled height likewise spans moat floor to rim.
+            meshes: vec![quad(vec![[36.0, 0.0, e], [44.0, 0.0, e], [44.0, 24.0, e], [36.0, 24.0, e]])],
+            instances: vec![[[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]]],
+        }).into_iter().collect();
+        let col = Collision::build(
+            &ZoneAssets { terrain: vec![floor, rim, wall], objects, textures: vec![] }, 8.0);
+        (col, [20.0, 40.0, 0.0], [160.0, 40.0, 24.0])
+    }
+
+    /// The baseline this whole feature exists to change: with no ladder the pit is a genuine trap,
+    /// and A* says so definitively (`SearchClosed`) rather than guessing.
+    #[test]
+    fn moat_without_a_ladder_is_a_sealed_trap() {
+        let (col, start, goal) = moat_scene(None);
+        assert!(col.climb_edges().is_empty(), "no ladder object — no climb edge");
+        let out = plan(&col, start, goal, 1.0);
+        assert!(matches!(out, PlanOutcome::Unreachable { reason: NoRoute::SearchClosed, .. }),
+            "a 24u wall with no ladder seals the pit — expected Unreachable(SearchClosed), got {out:?}");
+    }
+
+    /// THE #309 GATE (mutation-checked). The same pit, with a `LADDER14` against the wall: a complete
+    /// route out, ending on the rim, and counted as a climb so `nav_climb` can disclose that the
+    /// route leans on an UNVERIFIED motion model.
+    #[test]
+    fn moat_with_a_ladder_routes_out() {
+        let (col, start, goal) = moat_scene(Some(79.0));
+        let edges = col.climb_edges();
+        assert_eq!(edges.len(), 1, "one ladder standing on validated rim floor → one edge, got {edges:?}");
+        let d = edges[0].dismount;
+        assert!(d[0] > 80.0, "the dismount must land on the RIM side of the wall, got {d:?}");
+        assert!((d[2] - 24.0).abs() <= crate::climb::DISMOUNT_Z_TOL,
+            "the dismount must be at rim height, got {d:?}");
+
+        assert_eq!(col.climb_plans(), 0, "no route planned yet");
+        let out = plan(&col, start, goal, 1.0);
+        let route = match out {
+            PlanOutcome::Route(p) => p,
+            other => panic!("the ladder makes the rim reachable — expected a Route, got {other:?}"),
+        };
+        let last = *route.last().unwrap();
+        assert!((last[0] - goal[0]).abs() <= 8.0 && (last[1] - goal[1]).abs() <= 8.0,
+            "route must end at the rim goal, got {last:?}");
+        assert!(route.iter().any(|wp| (wp[2] - 24.0).abs() <= 2.0 && wp[0] > 80.0),
+            "route must actually top out on the rim: {route:?}");
+        assert_eq!(col.climb_plans(), 1, "a route that climbs must be counted for nav_climb");
+    }
+
+    /// HONESTY GUARD, the mirror of `pad_with_void_destination_creates_no_edge`: a climb edge must
+    /// never FABRICATE reachability. A ladder standing in open pit — nothing standable within
+    /// `DISMOUNT_Z_TOL` of its top — resolves to NO edge, so the pit stays honestly `Unreachable`.
+    /// Offering a link whose far end has not been shown standable is exactly the failure the
+    /// both-ends-resolve gate exists to prevent.
+    #[test]
+    fn a_ladder_with_no_landing_at_its_top_yields_no_edge() {
+        let (col, start, goal) = moat_scene(Some(40.0)); // mid-pit: its top is over open air
+        assert!(!col.climb_volumes().is_empty(),
+            "the object IS a climbable volume — the body may still mount it");
+        assert!(col.climb_edges().is_empty(),
+            "…but with no floor at its top it is NOT a routable edge, got {:?}", col.climb_edges());
+        let out = plan(&col, start, goal, 1.0);
+        assert!(matches!(out, PlanOutcome::Unreachable { .. }),
+            "a ladder to nowhere must not make the rim reachable, got {out:?}");
+    }
+
+    /// `nav_climb` must disclose the routes that actually lean on the unverified climb motion, and
+    /// only those: a plain walk across the pit floor of a laddered zone leaves the counter alone.
+    #[test]
+    fn climb_counter_ignores_routes_that_never_climb() {
+        let (col, start, _goal) = moat_scene(Some(79.0));
+        let out = plan(&col, start, [60.0, 60.0, 0.0], 1.0);
+        assert!(matches!(out, PlanOutcome::Route(_)),
+            "a walk across the pit floor must route, got {out:?}");
+        assert_eq!(col.climb_plans(), 0, "a route that never touches the ladder must not be counted");
     }
 
     /// #257: the net-thread wall-clock budget (PLAN_BUDGET_MS) must be generous enough that a
@@ -9838,6 +10137,209 @@ mod tests {
         probe("B7 moat → city center",            [-502.3, -141.3, -16.0], [0.0, 0.0, 3.0]);
     }
 
+    /// #309: the Crushbone moat is NOT a one-way trap — a character on its bottom has a route back
+    /// onto dry land from everywhere along it.
+    ///
+    /// #309 reports that a character which falls into the moat is stranded, because the ladders
+    /// meant to let it climb out are non-functional. The ladder half is true and structural: there
+    /// is no climbable-surface concept anywhere in this client, and nowhere for one to come from —
+    /// a `.wtr` leaf's `special` distinguishes only dry / water / zone-line (`region_map.rs`), so
+    /// EQ's own region data never flags a surface as climbable. Ladders are ordinary geometry.
+    ///
+    /// The stranding it predicts is what this test pins, and it does not happen — but NOT for the
+    /// reason one would expect. Measured, not assumed: re-running this with
+    /// `PLAYER_BODY.haul_out_up` forced to `-1000.0` (which rejects every water→land haul-out edge
+    /// in `neighbors`) leaves all probes escaping, on longer routes. So the moat's exit is not the
+    /// haul-out at all; it is ordinary walkable ground. The scan below names it — the lowest dry
+    /// bank anywhere along the moat sits at `-0.71 u` relative to the waterline, i.e. a shallow
+    /// shelf at/below the surface that the character simply walks out onto. The banks everywhere
+    /// else are ~12 u above the water, far past `haul_out_up`, which is why the routes run to
+    /// 170-290 waypoints: A* crosses the moat to the shallow end rather than climbing out in place.
+    ///
+    /// HONEST LIMITS.
+    /// * This is the PLANNER's answer — a route exists. That the controller can follow it is a
+    ///   separate contract, pinned by `p1_haul_out_admission_matches_controller_execution`
+    ///   (`tests/walker_sim.rs`).
+    /// * "Escapes" means a route to a goal the planner accepts. Goals are taken from geometry
+    ///   first, and a column that fails those is retried against goals already PROVEN reachable
+    ///   from the water elsewhere in this same run: hand-picked dry points are frequently rejected
+    ///   `GoalNotWalkable` (the probe's floor model disagreeing with the planner's), and counting
+    ///   that as a trap is a measurement artefact, not a finding. An earlier revision of this test
+    ///   did exactly that and reported a false trap at (16,-40).
+    ///
+    /// `ZONE_GLB=~/.local/share/eqoxide/assets/models/crushbone.glb \
+    ///   cargo test -p eqoxide-nav --lib crushbone_water_is_not_a_one_way_trap -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires the cached crushbone glb at $ZONE_GLB"]
+    fn crushbone_water_is_not_a_one_way_trap() {
+        let p = std::env::var("ZONE_GLB").expect("set ZONE_GLB to the cached crushbone glb");
+        let za = ZoneAssets::from_glb(std::path::Path::new(&p)).unwrap();
+        let mut col = Collision::build(&za, 32.0);
+        let wtr_dir = std::path::Path::new(&p).parent().unwrap().join("maps/water");
+        crate::water_grid::ZoneWater::load(&wtr_dir, "crushbone").install(&mut col)
+            .expect("crushbone .wtr must load — without it the moat has no water volume at all (#762) \
+                     and every probe below would pass VACUOUSLY against a dry zone");
+
+        let e0 = col.origin[0];
+        let n0 = col.origin[1];
+        let e1 = e0 + col.cols as f32 * col.cell_size;
+        let n1 = n0 + col.rows as f32 * col.cell_size;
+        let w = col.region_map().cloned().expect("water map must be installed");
+        let aabbs = w.water_region_aabbs((e0, e1, n0, n1, -5000.0, 5000.0));
+
+        // Wet columns on an 8u lattice, each carrying its real surface plane.
+        let mut wet: std::collections::HashMap<(i32, i32), f32> = std::collections::HashMap::new();
+        for (ae, an, az) in aabbs.iter() {
+            let mut n = an[0].max(n0);
+            while n <= an[1].min(n1) {
+                let mut e = ae[0].max(e0);
+                while e <= ae[1].min(e1) {
+                    let key = ((e / 8.0).round() as i32, (n / 8.0).round() as i32);
+                    if wet.contains_key(&key) { e += 8.0; continue; }
+                    // A z known to be inside this leaf. Leaves can be unbounded below (z from
+                    // -5000), so clamp before taking the midpoint or the probe lands in the void.
+                    let probe_z = 0.5 * (az[0].max(-500.0) + az[1].min(500.0));
+                    if w.is_water(e, n, probe_z) {
+                        if let Some(s) = w.surface_z(e, n, probe_z) { wet.insert(key, s); }
+                    }
+                    e += 8.0;
+                }
+                n += 8.0;
+            }
+        }
+        assert!(wet.len() > 100,
+            "crushbone must have a substantial water volume, found only {} wet columns — a near-empty \
+             scan would make every escape assertion below vacuous", wet.len());
+
+        // Flood-fill into connected bodies (4-connected, sharing a surface plane). The largest is
+        // the moat; the rest are the river arms and the deep pools east of the keep.
+        let mut body_of: std::collections::HashMap<(i32, i32), usize> = std::collections::HashMap::new();
+        let mut bodies: Vec<Vec<(i32, i32)>> = Vec::new();
+        for (&k, &s) in wet.iter() {
+            if body_of.contains_key(&k) { continue; }
+            let id = bodies.len();
+            let (mut cells, mut stack) = (Vec::new(), vec![k]);
+            body_of.insert(k, id);
+            while let Some(c) = stack.pop() {
+                cells.push(c);
+                for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let nb = (c.0 + dx, c.1 + dy);
+                    if body_of.contains_key(&nb) { continue; }
+                    if let Some(&ns) = wet.get(&nb) {
+                        if (ns - s).abs() <= 1.0 { body_of.insert(nb, id); stack.push(nb); }
+                    }
+                }
+            }
+            bodies.push(cells);
+        }
+        // Sort every body's cells, then the bodies themselves: the flood-fill walks a HashMap, so
+        // without this the probe columns differ run to run. That is not cosmetic — the
+        // non-deterministic revision of this test alternated green and red on the same tree.
+        for c in bodies.iter_mut() { c.sort(); }
+        bodies.sort_by_key(|c| (std::cmp::Reverse(c.len()), c[0]));
+
+        // Nearest dry STANDABLE candidates: body fits, and open air above (so a ceiling or a roof
+        // underside cannot pose as a bank).
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
+        const HEADROOM: f32 = 6.0;
+        let dry_candidates = |e: f32, n: f32, surface: f32| -> Vec<(f32, [f32; 3])> {
+            let mut out: Vec<(f32, [f32; 3])> = Vec::new();
+            for ring in 1..=8i32 {
+                let d = ring as f32 * 8.0;
+                for (de, dn) in [(-d, 0.0f32), (d, 0.0), (0.0, -d), (0.0, d),
+                                 (-d, -d), (d, d), (-d, d), (d, -d)] {
+                    let (be, bn) = (e + de, n + dn);
+                    for nf in col.column_floors(be, bn, surface, 60.0, 60.0) {
+                        if w.is_water(be, bn, nf + 0.5) { continue; }   // submerged: not a bank
+                        if !col.footprint_clear(be, bn, nf, r, 8) { continue; }
+                        if col.nearest_hit_t([be, bn, nf + 0.5], [be, bn, nf + HEADROOM]).is_some() { continue; }
+                        out.push((nf - surface, [be, bn, nf]));
+                    }
+                }
+                if out.len() >= 4 { break; }
+            }
+            out.sort_by(|a, b| a.0.abs().partial_cmp(&b.0.abs()).unwrap_or(std::cmp::Ordering::Equal));
+            out.truncate(4);
+            out
+        };
+
+        let cells = &bodies[0];
+        let surface = wet[&cells[0]];
+        // Name the moat's actual exit: the lowest dry bank anywhere along it. A value at or below
+        // 0 means land meets the waterline — a walk-out, needing neither a ladder nor a haul-out.
+        let mut lowest: Option<(f32, [f32; 3], [f32; 2])> = None;
+        for c in cells.iter() {
+            let (e, n) = (c.0 as f32 * 8.0, c.1 as f32 * 8.0);
+            for (lip, g) in dry_candidates(e, n, surface) {
+                if lowest.is_none() || lip < lowest.unwrap().0 { lowest = Some((lip, g, [e, n])); }
+            }
+        }
+        let (low_lip, low_at, low_from) = lowest.expect("the moat must border some dry standable land");
+        eprintln!("moat: {} columns, surface {surface:.1}; LOWEST dry bank {low_lip:+.2} u at \
+            ({:.0},{:.0},{:.1}), reached from water ({:.0},{:.0})",
+            cells.len(), low_at[0], low_at[1], low_at[2], low_from[0], low_from[1]);
+        assert!(low_lip <= crate::traversability::PLAYER_BODY.haul_out_up,
+            "the moat's lowest bank is {low_lip:+.2} u above the waterline, past both the walk-out \
+             (<= 0) and the haul-out cap ({}) — with no climb mechanic in this client that WOULD \
+             strand a swimmer, which is exactly what #309 predicted",
+            crate::traversability::PLAYER_BODY.haul_out_up);
+
+        // The reported scenario: the character is at the BOTTOM of the moat, not bobbing at its
+        // surface. Probe 12 columns spread through the body; every one must have a way out.
+        // Pass 1 uses each column's own local geometry and banks the goals that worked.
+        let step = (cells.len() / 12).max(1);
+        let probes: Vec<[f32; 3]> = cells.iter().step_by(step).take(12).map(|c| {
+            let (e, n) = (c.0 as f32 * 8.0, c.1 as f32 * 8.0);
+            let bottom = w.bottom_z(e, n, surface - 1.0).unwrap_or(surface - 1.0);
+            [e, n, bottom + 0.5]
+        }).collect();
+        let mut proven: Vec<[f32; 3]> = Vec::new();
+        let mut retry: Vec<[f32; 3]> = Vec::new();
+        for start in &probes {
+            let cands = dry_candidates(start[0], start[1], surface);
+            match cands.iter().find_map(|(lip, g)| match plan(&col, *start, *g, r) {
+                PlanOutcome::Route(path) => Some((path.len(), *lip, *g)),
+                _ => None,
+            }) {
+                Some((wp, lip, g)) => {
+                    eprintln!("  bottom ({:>5.0},{:>5.0},{:>6.1}) depth {:>4.1}: ESCAPES via \
+                        ({:.0},{:.0},{:.1}) [{lip:+.2} u], {wp} waypoints",
+                        start[0], start[1], start[2], surface - (start[2] - 0.5), g[0], g[1], g[2]);
+                    if !proven.contains(&g) { proven.push(g); }
+                }
+                None => retry.push(*start),
+            }
+        }
+        // Pass 2: a column whose own neighbourhood offered no plannable goal is not stranded if it
+        // can reach dry land that the water has already been shown to reach.
+        let mut stranded = Vec::new();
+        for start in retry {
+            match proven.iter().find_map(|g| match plan(&col, start, *g, r) {
+                PlanOutcome::Route(path) => Some((path.len(), *g)),
+                _ => None,
+            }) {
+                Some((wp, g)) => eprintln!("  bottom ({:>5.0},{:>5.0},{:>6.1}): ESCAPES to a \
+                    PROVEN goal ({:.0},{:.0},{:.1}), {wp} waypoints (its own neighbours were all \
+                    GoalNotWalkable)", start[0], start[1], start[2], g[0], g[1], g[2]),
+                None => {
+                    eprintln!("  bottom ({:>5.0},{:>5.0},{:>6.1}): NO ROUTE OUT — not to its own \
+                        neighbours, nor to any of the {} goals proven reachable from this water",
+                        start[0], start[1], start[2], proven.len());
+                    stranded.push(start);
+                }
+            }
+        }
+        assert_eq!(probes.len(), 12, "the moat must be large enough to spread 12 probes through");
+        assert!(!proven.is_empty(), "no probe reached dry land at all — the run proved nothing");
+        assert!(stranded.is_empty(),
+            "#309: {} of {} probes from the bottom of the Crushbone moat (surface {surface:.1}) have \
+             NO route back onto dry land — it is a one-way trap. The exit this test measured is a \
+             walk-out at the moat's shallow end ({low_lip:+.2} u at ({:.0},{:.0})), NOT the haul-out \
+             edge; if this went red, check whether that shelf is still walkable, whether the .wtr \
+             still loads, and the floor model at the shallow end. Stranded at: {stranded:?}",
+            stranded.len(), probes.len(), low_at[0], low_at[1]);
+    }
+
     /// #259: a sunken, water-filled pit in the middle of an otherwise-open street. The pit floor
     /// is a legal one-way DROP from the rim (MAX_STEP_DOWN is generous) but climbing back out is
     /// capped at `WATER_EXIT_UP` (~2.5u above the water surface) — the water surface here sits
@@ -10514,8 +11016,8 @@ mod clearance_probe_is_not_lossy_885 {
             "these documented repro commands omit `-p eqoxide-nav`, so from the workspace root they \
              select the ROOT package's lib target, print `running 0 tests` and exit 0 — a vacuous \
              green, not a measurement: {missing:?}");
-        assert_eq!(recipes, 9,
-            "expected 9 documented `--lib` repro commands in this file, found {recipes}. If one was \
+        assert_eq!(recipes, 10,
+            "expected 10 documented `--lib` repro commands in this file, found {recipes}. If one was \
              added or deleted, weigh it — a scan that stopped reaching them would otherwise pass by \
              finding nothing.");
     }

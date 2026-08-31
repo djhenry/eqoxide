@@ -202,6 +202,11 @@ pub struct CharacterController {
     pub vel_z:     f32,
     pub on_ground: bool,
     pub in_water:  bool,
+    /// Whether the body is ACTIVELY climbing this frame — the granted climb, not the request
+    /// (`want_climb` alone is nobody's business but the driver's; the grant also requires
+    /// `on_climbable`). Published so the renderer can pick the climb clip (#309); no physics
+    /// reads it back.
+    pub climbing:  bool,
     /// Recent grounded, non-embedded positions for the last-good fallback (§3.3).
     good:          std::collections::VecDeque<[f32; 3]>,
     good_timer:    f32,
@@ -535,7 +540,7 @@ impl Recovery {
 
 impl CharacterController {
     pub fn new(pos: [f32; 3]) -> Self {
-        Self { pos, vel_z: 0.0, on_ground: false, in_water: false,
+        Self { pos, vel_z: 0.0, on_ground: false, in_water: false, climbing: false,
                good: std::collections::VecDeque::new(), good_timer: 0.0, hold_log_cooldown: 0.0,
                hold: None,
                stuck_time: 0.0, rescue_cooldown: 0.0,
@@ -892,10 +897,24 @@ impl CharacterController {
         // frame's value forward only so `enter_hold` can accumulate `secs` and decide whether the
         // reason changed — an observable with no clear-path is its own honesty bug (#343/#679).
         let prev_hold = self.hold.take();
+        // A climb is granted the same way a swim is: the driver ASKS, the world decides.
+        // `want_climb` alone moves nobody — the body must be on a climbable surface (#309). That
+        // gate is what keeps this from being a fly hack: the set of places it can fire is fixed by
+        // the zone's `LADDER*` objects, not by the driver.
+        //
+        // Computed HERE, above the net, because the net's door needs the same answer the vertical
+        // branch below acts on (see `depenetrate`). Nothing between this line and its use can move
+        // the body: the net is the only thing that runs first, and on the frames it moves anything
+        // it returns early. So hoisting it is the same value, asked once.
+        let climbing = intent.want_climb && col.on_climbable(self.pos);
+        // Published HERE, at the grant, not at the vertical branch below: the net can return early
+        // on a frame that is genuinely a climb, and a climb clip that dropped out for the one frame
+        // the net intervened would flicker.
+        self.climbing = climbing;
         // Depenetration / unstuck net runs first (§3.3). If it handled an embedded frame, freeze
         // the rest of the step so we neither slide deeper nor fall through void.
         self.afloat_log_cooldown = (self.afloat_log_cooldown - dt).max(0.0);
-        if self.depenetrate(dt, col, prev_hold) {
+        if self.depenetrate(dt, col, climbing, prev_hold) {
             // #776: reaching here means the net HANDLED the frame, and the net's door (see
             // `depenetrate`) hands every wet body straight back to physics — so a frame the net
             // handled is a frame with a DRY body, by construction, not by coincidence. `NotAfloat`
@@ -1036,8 +1055,29 @@ impl CharacterController {
         let submerged_on_floor = self.in_water && !swimming
             && col.water_surface(water_at).is_some_and(|surf| self.pos[2] < surf - float_depth);
 
-        // ── Vertical: swim / buoyancy / jump / gravity + ground clamp. ──
-        if swimming {
+        // ── Vertical: climb / swim / buoyancy / jump / gravity + ground clamp. ──
+        if climbing {
+            // Gravity is suspended while climbing, for the same reason it is while swimming: the
+            // body is supported by something other than the ground under it. Without this the
+            // character falls off the ladder between ticks and never gains height.
+            self.on_ground = false;
+            self.vel_z = 0.0;
+            // Hanging on a ladder ends the airborne episode, so stepping off at the top is not
+            // charged as a fall from wherever the climb began (the §442 DEFECT-1 rule, applied to
+            // the other kind of non-falling descent — climbing DOWN a 25u ladder must not be
+            // lethal).
+            self.airborne_start_z = None;
+            let want = intent.wish_vspeed * dt;
+            if want > 0.0 {
+                // COLLIDED, via the same swept rise the swim path uses. Nothing in `swim_rise` is
+                // about water — it sweeps the body's top and stops `SKIN` short of the first hit —
+                // and reusing it is what keeps a climb from pushing a head through the overhang a
+                // ladder so often ends under.
+                self.pos[2] += self.swim_rise(want, col);
+            } else if want < 0.0 {
+                self.pos[2] += self.swim_sink(want, col);
+            }
+        } else if swimming {
             self.on_ground = false;
             self.vel_z = 0.0;
             // §442 (#442) DEFECT-1: water BREAKS a fall — the airborne episode is over the moment the
@@ -1798,7 +1838,7 @@ impl CharacterController {
     ///
     /// `prev_hold` is the hold `step` took at the top of this frame — see `enter_hold`. Nothing in
     /// here reads it for physics; it exists so a continuing hold can accumulate its duration.
-    fn depenetrate(&mut self, dt: f32, col: &Collision, prev_hold: Option<ControllerHold>) -> bool {
+    fn depenetrate(&mut self, dt: f32, col: &Collision, climbing: bool, prev_hold: Option<ControllerHold>) -> bool {
         // No geometry loaded → no constraints; never teleport the free player.
         if !col.has_geometry() {
             self.stuck_time = 0.0;
@@ -1835,7 +1875,30 @@ impl CharacterController {
         // body takes the ordinary clear path — stuck-clock reset, good-sample banking (waders,
         // standing in shallow water, still bank) — and physics keeps custody. The dry-body net
         // below is byte-identical to what it has always been.
-        if body_in_water(col, p) || !is_embedded(col, p) {
+        // #309: AND NEITHER IS A BODY ON A LADDER — for the same reason, one medium over. Every
+        // clause of the sentence above survives the substitution: a climbing body's vertical is
+        // owned by the climb rather than by gravity, its lateral motion by the collided slide, and
+        // "near geometry" is not an emergency for a body whose whole purpose is to be pressed
+        // against a panel. Hugging the rungs IS the activity, not evidence of a failure to place.
+        //
+        // The measured failure was a compound of the two media, which is why the water door alone
+        // did not already cover it. Climbing out of Crushbone's moat lifts the feet through the
+        // waterline, so `body_in_water` goes false the moment the climb succeeds; the body is
+        // inside the ladder's footprint, so `is_embedded` is true; and `DRY && embedded` is exactly
+        // this door's admission criterion. Traced live at 26 samples/sec, one mount produced 14
+        // push-outs, every one from the surface to the moat bottom —
+        // `pushed out from (335.1,-31.1,-11.6) to (333.2,-31.8,Grounded(-24.0))` — each undoing
+        // the 12 u the climb had just gained, in a single frame, at −380 u/s. The mount still
+        // completed, eventually, whenever the body happened to cross at a spot with a clear
+        // footprint: between 17.6 s and 46.9 s, at random. That is the "not very smooth" the climb
+        // looked like from outside.
+        //
+        // The exemption is the climb GRANT, not mere proximity — `want_climb && on_climbable`,
+        // decided by `step` and passed in. Exempting anything merely standing near a ladder would
+        // strip the net from a body genuinely wedged beside one, and that body still needs it: the
+        // instant either half goes false the net resumes on the next frame, so there is no state a
+        // body can be parked in where nothing will come for it.
+        if climbing || body_in_water(col, p) || !is_embedded(col, p) {
             self.stuck_time = 0.0;
             self.good_timer += dt;
             // The ring's invariant — every banked sample is GROUNDED and NON-EMBEDDED — used to
@@ -2038,7 +2101,7 @@ mod tests {
         Collision::build(&ZoneAssets { terrain: meshes, objects: vec![], textures: vec![] }, 4.0)
     }
     fn walk(speed: f32, dir: [f32; 2]) -> MoveIntent {
-        MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: false, speed,
+        MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: false, want_climb: false, speed,
                      hop: false }
     }
     /// Partial vertical wall: east=`e`, north [n0,n1], height [h0,h1] — for bends/obstacles.
@@ -2094,7 +2157,7 @@ mod tests {
             let (dx, dy) = (carrot[0] - ctrl.pos[0], carrot[1] - ctrl.pos[1]);
             let d = (dx * dx + dy * dy).sqrt().max(1e-3);
             let intent = MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
-                want_swim: false, speed: 44.0, hop: false };
+                want_swim: false, want_climb: false, speed: 44.0, hop: false };
             ctrl.step(intent, 0.016, &col);
             // Skip the tail approach to the goal (the carrot shortens there) — measure along the route.
             if ((ctrl.pos[0] - goal[0]).powi(2) + (ctrl.pos[1] - goal[1]).powi(2)).sqrt() > 6.0 {
@@ -2104,6 +2167,113 @@ mod tests {
         }
         assert!(arrived, "walker must reach the goal (ended at {:?})", ctrl.pos);
         assert!(max_xte < 3.0, "walker strayed {max_xte:.1}u off the line at the bend (corner-cutting into walls)");
+    }
+
+    /// #309: the climb branch — a `LADDER14` panel standing on the floor, and the controller driven
+    /// with the intent the walker sends at a ladder waypoint.
+    ///
+    /// Three cases, and the middle one is the point: the rise is gated on the INTENT, not on mere
+    /// proximity to the object. Standing beside a ladder must not levitate anybody, or every ladder
+    /// in the game becomes an invisible updraft.
+    #[test]
+    fn climb_rises_only_on_a_climbable_and_only_when_asked() {
+        use crate::nav::climb::CLIMB_SPEED;
+        // Vertical `LADDER14` panel: east=10, north[-4,4], floor (up=0) to up=24.
+        // MeshData pos = [north, up, east].
+        let ladder = crate::assets::ObjectModel {
+            name: "LADDER14".into(),
+            meshes: vec![mesh(vec![[-4.0, 0.0, 10.0], [4.0, 0.0, 10.0], [4.0, 24.0, 10.0], [-4.0, 24.0, 10.0]])],
+            instances: vec![[[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]]],
+        };
+        let c = Collision::build(&ZoneAssets {
+            terrain: vec![floor(0.0, -100.0, 100.0)], objects: vec![ladder], textures: vec![] }, 4.0);
+        assert!(c.on_climbable([8.0, 0.0, 0.0]), "fixture: the ladder foot must read as climbable");
+        assert!(!c.on_climbable([40.0, 0.0, 0.0]), "fixture: open floor must not");
+
+        let up = |want_climb: bool| MoveIntent {
+            wish_dir: [0.0, 0.0], wish_vspeed: CLIMB_SPEED, jump: false, want_swim: false,
+            want_climb, speed: 0.0, hop: false,
+        };
+        let drive = |start: [f32; 3], intent: MoveIntent| {
+            let mut ctrl = CharacterController::new(start);
+            ctrl.on_ground = true;
+            for _ in 0..60 { ctrl.step(intent, 1.0 / 60.0, &c); }
+            ctrl.pos
+        };
+
+        // On the ladder, asking to climb: one second of CLIMB_SPEED, unobstructed.
+        let climbed = drive([8.0, 0.0, 0.0], up(true));
+        assert!(climbed[2] > CLIMB_SPEED * 0.9,
+            "a second of climbing must lift ~{CLIMB_SPEED}u up the ladder, got {climbed:?}");
+        // On the ladder, NOT asking: gravity and the ground, exactly as anywhere else.
+        let idle = drive([8.0, 0.0, 0.0], up(false));
+        assert!(idle[2].abs() < 1.0, "standing beside a ladder must not levitate, got {idle:?}");
+        // Asking, but nowhere near a ladder: the flag alone grants nothing.
+        let midair = drive([40.0, 0.0, 0.0], up(true));
+        assert!(midair[2].abs() < 1.0, "want_climb off a climbable must do nothing, got {midair:?}");
+    }
+
+    /// #309, the moat mount: a climb that CROSSES A WATER SURFACE must not be confiscated by the
+    /// depenetration net.
+    ///
+    /// Measured live in Crushbone before the fix, at 26 samples/sec: one mount produced **14**
+    /// push-outs, every one from the waterline to the moat floor —
+    /// `pushed out from (335.1,-31.1,-11.6) to (333.2,-31.8,Grounded(-24.0))`. The body rose the
+    /// 12 units from the moat floor to the surface at `CLIMB_SPEED`, cleanly, in ~0.85s; then fell
+    /// the same 12 units back in 0.03s at −380 u/s. Not gravity — a one-frame teleport. The mount
+    /// took between 17.6s and 46.9s of that bobbing to complete, depending on where the body
+    /// happened to be when it crossed.
+    ///
+    /// The mechanism is the net's door asking a walk question about a climb. Climbing lifts the
+    /// feet through the surface, so `body_in_water` goes false; the body hugs the panel, so
+    /// `is_embedded` is true; `DRY && embedded` is precisely the door's admission criterion, and
+    /// the ring push-out then relocates via `nearest_floor` — the moat bottom.
+    #[test]
+    fn climbing_out_of_water_is_not_confiscated_by_the_depenetration_net() {
+        use crate::nav::climb::CLIMB_SPEED;
+        // Crushbone's moat in miniature: floor at −24, water −24…−12, and a `LADDER14` panel
+        // standing on the bottom and rising into the air (east=10, north[−4,4], up[−24,0]).
+        let ladder = crate::assets::ObjectModel {
+            name: "LADDER14".into(),
+            meshes: vec![mesh(vec![[-4.0, -24.0, 10.0], [4.0, -24.0, 10.0], [4.0, 0.0, 10.0], [-4.0, 0.0, 10.0]])],
+            instances: vec![[[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]]],
+        };
+        let mut c = Collision::build(&ZoneAssets {
+            terrain: vec![floor(-24.0, -100.0, 100.0)], objects: vec![ladder], textures: vec![] }, 4.0);
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::water_slab(-24.0, -12.0))));
+
+        // The fixture must reproduce the live shape, or it pins nothing: hugging the panel the
+        // body's footprint really is pierced, and the moment its feet clear the waterline it
+        // really does read dry — the two halves of the net's door, both true at once.
+        let start = [9.5, 0.0, -13.0];
+        let surfaced = [9.5, 0.0, -11.5];
+        assert!(c.on_climbable(start), "fixture: the panel must be climbable where the body hugs it");
+        assert!(is_embedded(&c, surfaced), "fixture: hugging the panel must read as embedded");
+        assert!(!body_in_water(&c, surfaced), "fixture: above the surface the body must read dry");
+
+        let mut ctrl = CharacterController::new(start);
+        let climb = MoveIntent {
+            wish_dir: [0.0, 0.0], wish_vspeed: CLIMB_SPEED, jump: false, want_swim: false,
+            want_climb: true, speed: 0.0, hop: false,
+        };
+        // Measure the DRAWDOWN — the deepest the body ever falls back from the highest it has
+        // reached. Sampling only the frames above the waterline would miss the defect entirely:
+        // the teleport lands at −24, which that filter discards, and the bob then re-reaches the
+        // same waterline height on the next rise. What the bug does is give back ground already
+        // gained, so that is what the test has to measure.
+        let (mut peak, mut drawdown) = (ctrl.pos[2], 0.0f32);
+        for _ in 0..120 {
+            ctrl.step(climb, 1.0 / 60.0, &c);
+            peak = peak.max(ctrl.pos[2]);
+            drawdown = drawdown.max(peak - ctrl.pos[2]);
+        }
+        // The claim is not "it eventually gets out" — the bobbing mount did that too, given a
+        // random twenty seconds. The claim is that the rise is MONOTONE.
+        assert!(drawdown < 1.0,
+            "a climb must never give back height it has gained; fell back {drawdown:.1}u from a peak of {peak:.1}");
+        assert!(ctrl.pos[2] > -4.0,
+            "two seconds of climbing from -13 must clear the water by a wide margin, got {:?}", ctrl.pos);
     }
 
     #[test]
@@ -2145,7 +2315,7 @@ mod tests {
         let mut ctrl = CharacterController::new([0.0, 0.0, -20.0]);
         ctrl.on_ground = true;
         let swim = MoveIntent {
-            wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: true,
+            wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: true, want_climb: false,
             speed: 35.0, hop: false,
         };
         for _ in 0..240 { ctrl.step(swim, 1.0 / 60.0, &c); }
@@ -2219,7 +2389,7 @@ mod tests {
         let mut ctrl = CharacterController::new([0.0, 0.0, start_z]);
         // Drive a persistent upward swim wish (the nav swim-up toward a high waypoint), like the walker.
         let swim_up = MoveIntent {
-            wish_dir: [0.0, 0.0], wish_vspeed: 20.0, jump: false, want_swim: true,
+            wish_dir: [0.0, 0.0], wish_vspeed: 20.0, jump: false, want_swim: true, want_climb: false,
             speed: 0.0, hop: false,
         };
         let mut worst_head = f32::MIN;
@@ -2250,7 +2420,7 @@ mod tests {
         c
     }
     fn dive(vspeed: f32) -> MoveIntent {
-        MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: vspeed, jump: false, want_swim: true,
+        MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: vspeed, jump: false, want_swim: true, want_climb: false,
                      speed: 0.0, hop: false }
     }
 
@@ -2963,7 +3133,7 @@ mod tests {
 
         // Nav with hop commanded: hops the fence and lands on the flat floor beyond (z≈0, east>5).
         let nav_intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false,
-            want_swim: false, speed: 35.0, hop: true };
+            want_swim: false, want_climb: false, speed: 35.0, hop: true };
         let mut nav = CharacterController::new([2.0, 0.0, 0.0]);
         nav.on_ground = true;
         for _ in 0..40 { nav.step(nav_intent, 0.05, &geo()); }
@@ -3044,7 +3214,7 @@ mod tests {
         c
     }
     fn swim_still() -> MoveIntent {
-        MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: true,
+        MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: true, want_climb: false,
                      speed: 0.0, hop: false }
     }
 
@@ -3297,7 +3467,7 @@ mod tests {
     /// Drive the controller east with a constant intent for `frames` frames.
     fn drive_east(ctrl: &mut CharacterController, col: &Collision, frames: usize, vspeed: f32) {
         let intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: vspeed, jump: false,
-                                  want_swim: true, speed: 44.0, hop: false };
+                                  want_swim: true, want_climb: false, speed: 44.0, hop: false };
         for _ in 0..frames { ctrl.step(intent, 1.0 / 60.0, col); }
     }
 
@@ -3389,7 +3559,7 @@ mod tests {
             "fixture/capability: with the far floor below the duck depth the crossing must be \
              allowed; got {:?}", ctrl.pos);
         let west = MoveIntent { wish_dir: [-1.0, 0.0], wish_vspeed: 0.0, jump: false,
-                                want_swim: true, speed: 44.0, hop: false };
+                                want_swim: true, want_climb: false, speed: 44.0, hop: false };
         for _ in 0..360 { ctrl.step(west, 1.0 / 60.0, &c); }
         assert!(ctrl.pos[0] < 0.0,
             "#661 review B1: the crossing must be a round trip — driving back west must re-duck \
@@ -4432,7 +4602,7 @@ mod tests {
                     if zone_emb <= 400 {
                         let mut ctrl = CharacterController::new(p);
                         let idle = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false,
-                                                want_swim: true, speed: 0.0, hop: false };
+                                                want_swim: true, want_climb: false, speed: 0.0, hop: false };
                         for _ in 0..110 { ctrl.step(idle, 1.0 / 60.0, &col); }
                         let settle_from = ctrl.pos;
                         for _ in 0..10 { ctrl.step(idle, 1.0 / 60.0, &col); }
@@ -5212,7 +5382,7 @@ mod tests {
         let mut ctrl = CharacterController::new([0.0, 0.0, 5.0]);
         ctrl.on_ground = false;
         let swim_down = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: -15.0, jump: false,
-            want_swim: true, speed: 0.0, hop: false };
+            want_swim: true, want_climb: false, speed: 0.0, hop: false };
 
         // Drive it down through the water bottom into the pit; stop as soon as we're clearly out of
         // the water and still above the pit floor, so we can inspect the mid-fall state.
@@ -5272,7 +5442,7 @@ mod tests {
         assert!(c.in_water([ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]]), "must start submerged in the pond");
         // Swim EAST (lateral) while holding a persistent DOWN wish — the look-slightly-down case.
         let swim_out = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: -15.0, jump: false,
-            want_swim: true, speed: 40.0, hop: false };
+            want_swim: true, want_climb: false, speed: 40.0, hop: false };
 
         // Drive east until we've drifted out of the pond AND settled back onto the (flush, dry)
         // floor, then stop — running further would walk the character off the finite test floor's
@@ -5305,7 +5475,7 @@ mod tests {
         // the hop probe band so `can_hop` fires). The hop launches from z=0 and lands on z=-3.
         let geo = col(vec![floor(0.0, -100.0, 5.0), wall(5.0, 0.0, 5.0), floor(-3.0, 5.0, 100.0)]);
         let nav_intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false,
-            want_swim: false, speed: 35.0, hop: true };
+            want_swim: false, want_climb: false, speed: 35.0, hop: true };
         let mut ctrl = CharacterController::new([2.0, 0.0, 0.0]);
         ctrl.on_ground = true;
         for _ in 0..80 { ctrl.step(nav_intent, 0.05, &geo); }
@@ -6100,7 +6270,7 @@ mod tests {
         flooded_corridor(vec![floor(-40.0, -100.0, 100.0)], -40.0, 0.0)
     }
     fn swim_toward(dir: [f32; 2], speed: f32) -> MoveIntent {
-        MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: true, speed,
+        MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: true, want_climb: false, speed,
                      hop: false }
     }
     /// The swim plane of the scenes above: `surface (0) − float_depth`.
@@ -6215,7 +6385,7 @@ mod tests {
         // it is why both halves of the stall predicate are HORIZONTAL.
         let c = open_water();
         let mut ctrl = CharacterController::new([0.0, 0.0, plane()]);
-        let up = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 20.0, jump: false, want_swim: true,
+        let up = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 20.0, jump: false, want_swim: true, want_climb: false,
                               speed: 0.0, hop: false };
         for i in 0..(30 * 60) {
             ctrl.step(up, 1.0 / 60.0, &c);
@@ -6277,7 +6447,7 @@ mod tests {
             let c = deep_sealed_east_face();
             let mut ctrl = CharacterController::new([0.0, 0.0, start_z]);
             let intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: vspeed, jump: false,
-                                      want_swim: true, speed: 44.0, hop: false };
+                                      want_swim: true, want_climb: false, speed: 44.0, hop: false };
             for _ in 0..(6 * 60) { ctrl.step(intent, 1.0 / 60.0, &c); }
             let travelled = (ctrl.pos[2] - start_z).abs();
             assert!(ctrl.in_water && !ctrl.on_ground,

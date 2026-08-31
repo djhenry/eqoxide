@@ -341,18 +341,30 @@ mod windowed_speed_sample_tests {
 /// server-authoritative position deltas, not WASD keys; remote entities always face their travel
 /// direction, so they can never appear to move "backward" in this client's model), and
 /// `eqoxide_renderer::anim::Skin::clip_for_action` has no `_ if action == "walking_backward"`-style
-/// arm that would ever request a back-walk clip — it is **not wired up**, not because the clip data
-/// is absent (baked GLBs DO carry clips whose name contains `walk_back`, e.g.
-/// `L07A_walk_back`/`L07B_walk_back` in `humanoid.glb`/`elf.glb`; `clip_for_action`'s `"running"` arm
-/// even explicitly excludes any clip name containing `"back"` so it can't be mis-picked as a run
-/// clip). Whether that `walk_back` label is itself correct is a separate, pre-existing question:
-/// `eqoxide_asset_server::convert::anim_label` (src/convert/mod.rs:1176) currently maps WLD code
-/// `L07` to `"walk_back"`, but `eq_kb/animation-codes.md` (private knowledge base; see that repo
-/// for sourcing) says `L07` is CLIMB, not a walk-backward loop, and lists no confirmed retail code
-/// for backward walking at all. Regardless of which side of that dispute is
-/// right, wiring a "backward" action through `clip_for_action` is out of scope for this fix (#623's
-/// confirmed bug and required Fix A/B/C is walk-vs-run only) — noted here rather than silently
-/// ignored, and left for whoever resolves the L07 labeling question.
+/// arm that would ever request a back-walk clip — it is **not wired up**. An earlier version of
+/// this note added "and not because the clip data is absent", pointing at the `walk_back`-named
+/// clips in the baked GLBs (`L07A_walk_back`/`L07B_walk_back` in `humanoid.glb`/`elf.glb`) and
+/// flagging the label itself as a live dispute: `eqoxide_asset_server::convert::anim_label`
+/// (src/convert/mod.rs:1176) maps WLD code `L07` to `"walk_back"`, while `eq_kb/animation-codes.md`
+/// (private knowledge base; see that repo for sourcing) has `L07` = CLIMB and lists no confirmed
+/// retail code for backward walking at all.
+///
+/// **That dispute is now settled, and the knowledge base was right: `L07` is a climb.** It was
+/// settled by measuring the clip rather than by preferring one label over the other. Forward
+/// kinematics across `L07A`'s cycle puts the hands **above the head** twice per cycle (peak +0.97u
+/// past the head, at t≈0.00 and t≈0.52 — alternating hand-over-hand reach) while the pelvis travels
+/// 0.31u in total and the hands travel further than the feet (1.47 vs 1.05). A backward walk rocks
+/// the pelvis and never lifts a hand past the shoulders. The clip was then watched directly in
+/// `render_model --clip L07A` and confirmed by eye as a ladder climb.
+///
+/// Two consequences, both the opposite of what the old note implied. First, **the back-walk clip
+/// data is in fact absent** — the clips that looked like back-walk data are climbs, so wiring a
+/// "backward" action would have posed a character climbing an invisible ladder while retreating.
+/// (`clip_for_action`'s `"running"` arm excludes any name containing `"back"`, which is why that
+/// mislabel never leaked into locomotion.) Second, the climb clip is no longer unused: it is wired
+/// as the `"climbing"` action for ladder ascent (#309), matched by animation CODE (`l07a`) rather
+/// than by the wrong English suffix, so it resolves correctly both now and after the asset bake is
+/// corrected to emit `"climb"`.
 pub fn walk_or_run(speed_u_per_s: f32) -> &'static str {
     if speed_u_per_s > WALK_RUN_THRESHOLD { "running" } else { "walking" }
 }

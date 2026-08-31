@@ -865,6 +865,28 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                        margin from the walls and drops they pass. Expect tight doorways/bridges.",
         }))
     });
+    // Climbable-surface routing (#309). The native RoF2 client demonstrably climbs the ladders this
+    // keys off — verified by running the retail binary — but HOW it decides to is not recoverable
+    // from the decompile, so eqoxide's version is a reconstruction from the one ladder-distinguishing
+    // datum the binary does contain (the `LADDER` name prefix its zone-object constructor classifies
+    // on). The reachability claim is sound: the edge only exists where a dismount floor resolved. The
+    // MOTION is the unverified part. Report it for the same reason `nav_tight` is reported — an agent
+    // being handed routes that lean on a reconstructed mechanic deserves to know which ones.
+    let nav_climb = s.shared_collision.read().unwrap().as_ref().and_then(|col| {
+        let n = col.climb_plans();
+        (n > 0).then(|| serde_json::json!({
+            "reason": "mechanism_unverified",
+            "routes": n,
+            "ladders": col.climb_edges().len(),
+            "detail": "these routes climb a ladder to get where they are going. The native client can \
+                       climb these same objects, and the edge is only offered where standable floor was \
+                       found at the top — so the goal really is reachable. What is NOT verified is the \
+                       climb mechanic itself: the trigger is reconstructed from the client's own \
+                       `LADDER` name classification, and the climb SPEED and mount tolerance are \
+                       plausible guesses, not measured client values. Expect the traversal to look \
+                       right and the timing to be approximate.",
+        }))
+    });
     // The fine 2u steering tier's last honest word (#382). `null` when it is threading cleanly — a
     // healthy tier says nothing, exactly like `nav_support` / `nav_tight`.
     let nav_local = nav.local.as_ref().filter(|l| l.state != "threaded").map(|l| serde_json::json!({
@@ -1281,6 +1303,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // `nav_degraded`/`inverted_floor_art`, whose mechanism (the column_bottom valve) D-2 deleted.
         "nav_support": nav_support,
         "nav_tight": nav_tight,
+        "nav_climb": nav_climb,
         // Is this client's model of the CURRENT ZONE actually loaded? Gate every world-shaped
         // conclusion on `zone_assets.state == "ready"` (#579). See the comment where it's built.
         "zone_assets": zone_assets,

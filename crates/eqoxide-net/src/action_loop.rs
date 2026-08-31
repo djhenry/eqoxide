@@ -2787,6 +2787,7 @@ impl ActionLoop {
                                 wish_vspeed: 0.0,
                                 jump:        false,
                                 want_swim:   swim,
+                                want_climb:  false, // melee approach is horizontal; no ladder pursuit
                                 speed:       RUN_SPEED,
                                 hop:         false,                      // melee approach: no auto-hop
                             });

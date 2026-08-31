@@ -62,6 +62,12 @@ pub struct MoveIntent {
     pub wish_vspeed: f32,
     pub jump:        bool,
     pub want_swim:   bool,
+    /// Drive the character UP a climbable surface this tick (#309), at `wish_vspeed`. Honoured only
+    /// while the body is actually on one (`Collision::on_climbable`) — exactly the shape of
+    /// `want_swim`, which is likewise a request the controller grants only in water. Free WASD
+    /// leaves it `false` for now: nothing binds a climb key, and a driver that could set it anywhere
+    /// would be a fly cheat, not a ladder.
+    pub want_climb:  bool,
     pub speed:       f32,
     /// One-shot request to hop a low barrier (fence/cart) this tick. The `/goto` planner sets it once
     /// its own net-progress stall detection fires (the controller can't see net progress — sliding
