@@ -345,6 +345,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         eprintln!("Usage: render_model <model.glb> [--arch <archetype>] [--port <port>] [--markers] [--parts]");
+        eprintln!("       [--clip <name|index|list>]  — play a named clip instead of the idle;");
+        eprintln!("       `--clip list` prints every clip in the model and exits.");
         eprintln!("       render_model --race <CODE> [--gender 0|1] [--port <port>]");
         eprintln!();
         eprintln!("Standalone glTF model viewer for debugging character model rendering.");
@@ -380,6 +382,12 @@ fn main() {
         .and_then(|i| args.get(i + 1)).cloned();
     let gender: u8 = args.iter().position(|a| a == "--gender")
         .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(0);
+    // `--clip <name|index|list>`: pose the model with an ARBITRARY clip instead of the idle.
+    // Exists so a disputed clip can be watched on its own, before anything is wired to it —
+    // the L07 "walk_back" vs CLIMB labeling question (#309) is exactly that situation, and it
+    // cannot be settled by reading either label.
+    let clip_arg: Option<String> = args.iter().position(|a| a == "--clip")
+        .and_then(|i| args.get(i + 1)).cloned();
 
     let (model_path, arch_name) = if let Some(ref r) = race {
         let base = eqoxide::models::race_model_basename(r, gender).unwrap_or("race_hum");
@@ -525,7 +533,7 @@ fn main() {
     }
 
     let event_loop = EventLoop::new().expect("event loop");
-    let mut app = ModelViewerApp::new(model_path, arch_name, race, gender, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode);
+    let mut app = ModelViewerApp::new(model_path, arch_name, race, gender, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode, clip_arg);
     event_loop.run_app(&mut app).expect("event loop run");
 }
 
@@ -600,6 +608,55 @@ fn gpu_skin_y_extent(
 }
 
 /// Skinned-mode render state — mirrors the client's `encode_skinned_entity_pass`.
+/// Resolve a `--clip` argument against a model's clip list: an exact index, or a
+/// case-insensitive substring of the clip name. `list` (or an argument that matches nothing)
+/// prints every clip and exits, because silently falling back to the idle would mean the viewer
+/// showed one animation while the operator believed they were reviewing another — the failure
+/// mode this flag exists to prevent.
+fn resolve_clip(skin: &eqoxide::anim::SkinData, arg: Option<&str>) -> Option<usize> {
+    let arg = arg?;
+    let dump = || {
+        eprintln!("render_model: {} clips:", skin.clips.len());
+        for (i, c) in skin.clips.iter().enumerate() {
+            eprintln!("  [{i:3}] {}  ({:.2}s)", c.name, c.duration);
+        }
+    };
+    if arg.eq_ignore_ascii_case("list") {
+        dump();
+        std::process::exit(0);
+    }
+    if let Ok(i) = arg.parse::<usize>() {
+        if i < skin.clips.len() {
+            eprintln!("render_model: --clip {i} -> {}", skin.clips[i].name);
+            return Some(i);
+        }
+        eprintln!("render_model: --clip {i} out of range (model has {} clips)", skin.clips.len());
+        dump();
+        std::process::exit(2);
+    }
+    let needle = arg.to_lowercase();
+    let hits: Vec<usize> = skin.clips.iter().enumerate()
+        .filter(|(_, c)| c.name.to_lowercase().contains(&needle))
+        .map(|(i, _)| i).collect();
+    match hits.as_slice() {
+        [i] => {
+            eprintln!("render_model: --clip {arg} -> [{i}] {}", skin.clips[*i].name);
+            Some(*i)
+        }
+        [] => {
+            eprintln!("render_model: --clip {arg} matched no clip.");
+            dump();
+            std::process::exit(2);
+        }
+        many => {
+            eprintln!("render_model: --clip {arg} is ambiguous — {} clips match:", many.len());
+            for &i in many { eprintln!("  [{i:3}] {}", skin.clips[i].name); }
+            eprintln!("Use a longer substring or the index.");
+            std::process::exit(2);
+        }
+    }
+}
+
 struct SkinnedView {
     model:      GpuSkinnedModel,
     joints_buf: wgpu::Buffer,
@@ -609,6 +666,8 @@ struct SkinnedView {
     /// exactly like the live client (`head::hair_tint_applies`, #519).
     gender:     u8,
     arch:       String,
+    /// Resolved `--clip` index. `None` = the ordinary idle-with-walk-fallback the client uses.
+    clip_override: Option<usize>,
     anim_time:  f32,
     last:       std::time::Instant,
     /// CPU copy of (position, joint_indices, joint_weights) for every skinned vertex,
@@ -632,6 +691,8 @@ struct ModelViewerApp {
     shared_window:  SharedWindow,
     show_markers:   bool,
     parts_mode:     bool,
+    /// `--clip` argument, resolved against the model's clip list once the skin is loaded.
+    clip_arg:       Option<String>,
     state:          Option<ViewerState>,
 }
 
@@ -683,8 +744,9 @@ impl ModelViewerApp {
         model_path: PathBuf, arch_name: String, race: Option<String>, gender: u8,
         shared_camera: SharedCamera, shared_wire: SharedWireframe, frame_req: FrameReq,
         shared_window: SharedWindow, show_markers: bool, parts_mode: bool,
+        clip_arg: Option<String>,
     ) -> Self {
-        Self { model_path, arch_name, race, gender, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode, state: None }
+        Self { model_path, arch_name, race, gender, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode, clip_arg, state: None }
     }
 }
 
@@ -984,8 +1046,9 @@ impl ApplicationHandler for ModelViewerApp {
                         eprintln!("render_model[skinned] GPU-PROBE: gpu_skinned_y_extent={:.3} (cpu={:.3}) -> GPU rendered≈{:.2} ft",
                             gpu_ext, smodel.true_height, gpu_ext * scale);
                     }
+                    let clip_override = resolve_clip(&smodel.skin, self.clip_arg.as_deref());
                     Some(SkinnedView { model: smodel, joints_buf, joints_bg, race: r,
-                        gender: self.gender,
+                        gender: self.gender, clip_override,
                         arch: self.arch_name.clone(), anim_time: 0.0, last: std::time::Instant::now(),
                         cpu_verts, dbg_done: false })
                 }
@@ -1179,6 +1242,21 @@ impl ApplicationHandler for ModelViewerApp {
             }
             WindowEvent::RedrawRequested => {
                 render_frame(s);
+                // winit's default `ControlFlow` is `Wait`: the window paints ONLY when
+                // something explicitly asks it to. Nothing here did — the only
+                // `request_redraw` calls were on an HTTP camera poke, a scroll, and a
+                // screenshot. So a posed model advanced its animation clock only when one
+                // of those happened to arrive. The animation was not playing badly; it was
+                // not playing at all, it was being nudged, at whatever irregular rate the
+                // pokes came in. That reads as "choppy" and it is easy to misread as bad
+                // clip data — the clip is clean LINEAR at 10fps with a seamless loop.
+                //
+                // Ask for the next frame whenever there is a clip to advance. A model with
+                // no clips still costs nothing: it falls through and the loop goes back to
+                // sleep, which is why this is gated rather than a blanket `Poll`.
+                if s.skinned.as_ref().is_some_and(|sk| !sk.model.skin.clips.is_empty()) {
+                    s.window.request_redraw();
+                }
             }
             _ => {}
         }
@@ -1235,9 +1313,12 @@ fn render_frame(s: &mut ViewerState) {
         let height = if sk.model.true_height > 0.001 { sk.model.true_height } else { 1.0 };
         let dominant = (target / height) * sk.model.node_scale;
         let vscale = -2.0 * sk.model.feet_offset * dominant;
-        // Idle animation pose → joint matrices (same fallback order as the client).
-        let idle = sk.model.skin.clip_for_action("idle")
-            .or_else(|| sk.model.skin.clip_for_action("walking")).unwrap_or(0);
+        // Idle animation pose → joint matrices (same fallback order as the client), unless
+        // `--clip` named one explicitly.
+        let idle = sk.clip_override.unwrap_or_else(|| {
+            sk.model.skin.clip_for_action("idle")
+                .or_else(|| sk.model.skin.clip_for_action("walking")).unwrap_or(0)
+        });
         let dur = sk.model.skin.clips.get(idle).map(|c| c.duration).unwrap_or(0.0).max(0.0001);
         sk.anim_time = (sk.anim_time + dt) % dur;
         let matrices = if sk.model.skin.clips.is_empty() {
