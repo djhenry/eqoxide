@@ -266,11 +266,16 @@ const ECHO_QUARANTINE: Duration = Duration::from_secs(30);
 ///
 /// This const used to live inside the auto-retarget driver that #1109 removed, and the prune ran
 /// only while auto-attack was ON and only on ticks that got past the dead-player guard and the
-/// 150 ms gate. Its consumers were never so conditional — `packet_handler`'s `combat`/`attacked`
-/// event fires only for an id NOT already in the map, and the renderer's #418 swing-facing
-/// override reads it every frame — so with auto-attack off a mob that stopped and later resumed
-/// swinging never re-fired `attacked`. The prune is now unconditional (see `tick`), which is what
+/// 150 ms gate. That was far too conditional for the consumer it actually feeds:
+/// `packet_handler`'s `combat`/`attacked` event fires only for an id NOT already in the map, so
+/// with auto-attack off an entry never expired and a mob that stopped and later resumed swinging
+/// never re-fired `attacked`. The prune is now unconditional (see `tick`), which is what
 /// "recent" was always supposed to mean.
+///
+/// The renderer's #418 swing-facing override reads the same map, but this TTL cannot move a
+/// frame either way: `scene.rs` gates that override on its own `COMBAT_SWING_WINDOW` of 600 ms,
+/// ten times tighter than the 6 s here, so anything this prune drops stopped being drawn
+/// mid-swing 5.4 s earlier. It is named here only so the next reader does not re-derive that.
 const ATTACKER_TTL: Duration = Duration::from_secs(6);
 
 /// A merchant buy sent via the honest awaited path (A3 Migration 1, #448), parked here until its
@@ -1425,9 +1430,10 @@ impl ActionLoop {
         self.reap_expired_pending();
 
         // Expire stale entries so `recent_attackers` keeps meaning "is swinging at us right now".
-        // Unconditional and above every early return: both consumers (the `combat`/`attacked` event
-        // gate in `packet_handler`, the renderer's #418 swing-facing override) are live whether or
-        // not auto-attack is on. See `ATTACKER_TTL` for why this is no longer inside a driver.
+        // Unconditional and above every early return, because the consumer this feeds — the
+        // `combat`/`attacked` event gate in `packet_handler` — is live whether or not auto-attack
+        // is on. (The renderer's #418 override reads the map too, but gates on its own 600 ms
+        // window, so this 6 s TTL never changes a frame.) See `ATTACKER_TTL`.
         gs.recent_attackers.retain(|_, t| t.elapsed() < ATTACKER_TTL);
 
         self.drain_loot(gs);
@@ -2720,7 +2726,17 @@ impl ActionLoop {
         // far-away face) is what makes melee actually land. Runs regardless of any pending goto.
         if self.auto_attack {
             if let Some(tid) = gs.target_id {
-                if let Some((ex, ey)) = gs.world.entities.get(&tid).map(|e| (e.x, e.y)) {
+                // #1109: a DEAD target is not engageable. This filter used to be redundant —
+                // `drive_auto_target` ran immediately above this driver and dropped an invalid
+                // (dead) target before the engage ever saw it. With that driver gone the corpse
+                // stays in `world.entities` until it rots, so without this check auto-attack
+                // pins the player to the corpse and `request_cancel_goto()`s every 150 ms tick —
+                // silently cancelling the agent's own `/v1/move/goto` (the driver returns true,
+                // so `tick` never reaches the walker) until it thinks to turn auto-attack off or
+                // the corpse despawns. `drive_auto_pet_combat` above has always filtered
+                // `!e.dead` for exactly this reason.
+                if let Some((ex, ey)) = gs.world.entities.get(&tid)
+                    .filter(|e| !e.dead).map(|e| (e.x, e.y)) {
                     let dx = ex - gs.player_x;
                     let dy = ey - gs.player_y;
                     let dist = (dx * dx + dy * dy).sqrt();
@@ -8214,7 +8230,10 @@ mod tests {
     /// attacking never re-announces itself to the agent. The prune now runs unconditionally.
     ///
     /// MUTATION CHECK: gate the `retain` behind `if self.auto_attack` → RED (auto-attack is off
-    /// here); move it back below the 150 ms gate → RED (the first tick is not gated open).
+    /// here); move it back below the 150 ms gate → RED (the first tick is not gated open); move it
+    /// below the dead-player guard → RED (the third case below is a corpse, and that guard
+    /// `return`s). All three placements the prune must clear are pinned, not just the two the
+    /// 150 ms gate covers.
     #[tokio::test]
     async fn stale_attackers_expire_with_auto_attack_off_1109() {
         let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
@@ -8236,6 +8255,76 @@ mod tests {
             "an attacker past ATTACKER_TTL must expire even with auto-attack off, or the \
              `attacked` event can never fire again for that spawn");
         assert!(gs.recent_attackers.contains_key(&8), "a fresh attacker must survive the prune");
+
+        // …and a DEAD player still prunes. `nav_halt_if_dead` `return`s out of `tick`, so this
+        // pins that the prune sits ABOVE that guard too — not merely above the 150 ms gate.
+        // Being slain is exactly when stale attackers pile up, and the map outlives the corpse.
+        let mut dead_gs = GameState::new();
+        dead_gs.player_id = 371;
+        dead_gs.cur_hp = 0;
+        dead_gs.max_hp = 29;
+        dead_gs.player_dead = true;
+        dead_gs.recent_attackers.insert(9, Instant::now() - (ATTACKER_TTL + Duration::from_secs(1)));
+        assert!(dead_gs.is_player_dead(), "premise: the dead-player guard must actually fire here");
+
+        nav.last_tick = Instant::now() - Duration::from_millis(NAV_TICK_MS as u64 * 4);
+        nav.tick(&mut stream, &mut dead_gs);
+
+        assert!(!dead_gs.recent_attackers.contains_key(&9),
+            "the prune must run above the dead-player guard — a corpse's stale attackers still \
+             expire, or they survive the death and poison the next `attacked` event");
+    }
+
+    /// #1109 fallout — AUTO-ATTACK ON A CORPSE MUST NOT EAT THE AGENT'S `/goto`.
+    ///
+    /// `drive_auto_engage_melee` filtered on distance but never on `dead`. That was survivable only
+    /// because the deleted `drive_auto_target` ran immediately above it and dropped an invalid (dead)
+    /// target first. Removing the retarget exposed the gap: `apply_death` marks the NPC dead and
+    /// LEAVES it in `world.entities` (only OP_DeleteSpawn, minutes later when the corpse rots, clears
+    /// the target), so with auto-attack still on the engage driver kept engaging the corpse, called
+    /// `request_cancel_goto()`, and returned true — and `tick` returns on that, before the walker
+    /// ever runs. An agent that killed a mob and then issued `/v1/move/goto` for the next camp would
+    /// see its goal cancelled every 150 ms, reported honestly as `idle`/`goto_superseded` and utterly
+    /// unrecoverable until it guessed to `DELETE /v1/combat/attack`. That is the exact workflow the
+    /// #1109 docs now tell agents to use, so the removal had to carry this fix with it.
+    ///
+    /// MUTATION CHECK: drop the `.filter(|e| !e.dead)` from `drive_auto_engage_melee` → RED on the
+    /// first assert. The live-target control below is what keeps this honest — it fails if the driver
+    /// stops engaging altogether, so a blanket "never engage" cannot pass this test.
+    #[tokio::test]
+    async fn a_dead_target_does_not_hold_auto_engage_1109() {
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let group: eqoxide_ipc::GroupShared =
+            std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
+        let mut nav = test_action_loop(group);
+
+        let mut gs = GameState::new();
+        gs.player_id = 371;
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.cur_hp = 29;
+        gs.max_hp = 29;
+        gs.upsert_entity(eqoxide_core::game_state::Entity {
+            spawn_id: 238, name: "a_decaying_skeleton005".into(), level: 4, is_npc: true,
+            x: 10.0, y: 0.0, z: 0.0, hp_pct: 0.0, cur_hp: 0, max_hp: 60, race: "SKE".into(),
+            heading: 0.0, dead: true, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
+            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0,
+            pose: eqoxide_core::game_state::Pose::Standing, gait: None, is_boat: false,
+            flymode: 0, npc_tint_index: 0,
+        });
+        gs.set_target(238);
+        nav.auto_attack = true;
+
+        assert!(!nav.drive_auto_engage_melee(&mut stream, &mut gs),
+            "a corpse must not hold the melee engage — it cancels the agent's goto every tick and \
+             short-circuits the walker for as long as auto-attack stays on");
+
+        // CONTROL: the same spawn, alive, at the same 10u. The driver must still engage, or the
+        // assertion above would pass for the useless reason that engage never fires at all.
+        gs.world.entities.get_mut(&238).unwrap().dead = false;
+        assert!(nav.drive_auto_engage_melee(&mut stream, &mut gs),
+            "premise: a LIVE target within 200u must still engage, or this test proves nothing");
     }
 
     #[test]

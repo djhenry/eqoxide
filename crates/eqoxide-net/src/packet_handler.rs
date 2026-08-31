@@ -2107,8 +2107,10 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     // to report it (see the OP_ENV_DAMAGE fall report in `action_loop.rs`, which the server has no
     // way to derive on its own), and NEVER apply our own damage number to published state.
 
-    // Remember who is swinging at us (hit OR miss) so auto-combat can engage an add that aggros
-    // mid-fight instead of tanking it unanswered. Only NPC attackers on the player count.
+    // Remember who is swinging at us (hit OR miss). This map is read ONLY BY OBSERVERS — the
+    // `attacked` event gate just below, and the renderer's #418 swing-facing override. It steers
+    // no combat: until #1109 it also fed the client's auto-retarget, and that is gone, because
+    // the client does not choose whom to fight. Only NPC attackers on the player count.
     if target_id == gs.player_id && source_id != gs.player_id && gs.world.entities.contains_key(&source_id) {
         // Emit an async "attacked" event only when a NEW mob starts hitting us (not already a recent
         // attacker), so an agent is notified once when something aggros — not on every swing.
@@ -2629,8 +2631,9 @@ pub fn attitude_name(faction: u32) -> &'static str {
 ///
 /// A consider reply is data ABOUT a spawn, never a target-select (eqoxide#330). It used to write
 /// `gs.target_id`, which made it a 5th (uncounted) writer alongside the 4 that PR #327 routed
-/// through `set_target`: if the target changed (auto-combat retarget, hail, a second manual
-/// target) before a stale reply for the PREVIOUS target landed, this handler snapped
+/// through `set_target`: if the target changed (hail, a second manual target — and, before
+/// #1109 removed it, the client's own auto-retarget) before a stale reply for the PREVIOUS
+/// target landed, this handler snapped
 /// `target_id`/`target_con*` back to that stale spawn while `target_name`/`target_hp_pct` kept
 /// the CURRENT target's values — a mismatched id+con vs name+hp split-brain. It no longer writes
 /// `target_id` at all.
@@ -4176,7 +4179,8 @@ mod tests {
     #[test]
     fn apply_consider_stale_reply_logs_but_does_not_overwrite_current_target_con() {
         // #330: a manual target on A sends OP_CONSIDER, but the reply can land after we've
-        // already retargeted to B (auto-combat retarget, hail, or a second manual target).
+        // already retargeted to B (hail, or a second manual target; before #1109, the
+        // client's own auto-retarget too — the race outlives that one cause).
         // The stale reply must NOT clobber target_id/con back to A while target_name/target_hp_pct
         // still hold B's values (the split-brain bug) — but it must STILL log its chat line: the
         // reply is a legitimate con result for A, and the same code path serves the standalone

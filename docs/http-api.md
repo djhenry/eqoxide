@@ -167,6 +167,13 @@ zone, incl. server-initiated changes / cross-zone respawns), **combat** (`slain`
 `attacked` — a new mob started hitting you). More `kind`s land here over time without changing the
 shape.
 
+`attacked` is edge-triggered off a 6s "recently swung at us" window, so it means *"this spawn was
+not hitting you a moment ago"* rather than *"you have never been hit by this spawn"*. A lull longer
+than that window — kiting, a root/mez, the mob switching to your pet — re-arms it, and the same
+spawn fires `attacked` again when it resumes. Before #1109 that window was only pruned while
+auto-attack was ON, so with it off a spawn fired `attacked` at most once per zone; the prune is
+unconditional now, which makes the event honest in both states rather than only one.
+
 ---
 
 ## `chat` — send on the inter-agent channels

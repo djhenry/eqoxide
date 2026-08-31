@@ -195,8 +195,13 @@ needs a small floor-height step (`STEP_H=20`) and a clear chest-height segment.
 - **Water** — *the pathing half of this bullet is now conditional; the combat half is unchanged and
   unverified.* It used to read, flatly: "fish/water mobs sit in water a walking character can't path
   to; `find_path` returns no route to them, and even if `path_clear` (LOS over water) passes, melee
-  won't connect across/below water. The auto-grind excludes nothing by name now, relying on
-  `path_clear`; if you target water mobs, exclude `fish` by name."
+  won't connect across/below water."
+
+  The advice that followed — *"the auto-grind excludes nothing by name now, relying on `path_clear`;
+  if you target water mobs, exclude `fish` by name"* — described the client-side target picker that
+  **#1109 deleted**. There is no client-side `path_clear` filter left to lean on, and no name filter
+  to adjust: the client targets what you tell it to. Excluding water mobs is now your scripting's
+  job, and the reason to do it is unchanged — melee still won't connect across or below water.
 
   **What changed (pathing only).** The first clause described the 2D-with-water-hacks planner. Today
   `astar` builds 4u water columns and emits water-entry, 3D interior, descent, surface-crossing and
@@ -262,5 +267,7 @@ at z≈-40** (where surface fish are reachable); the **pit bottom z≈-76** leav
 A non-GM Female Wood Elf Ranger was created, then **won fights**, **leveled** hands-free (L1→L4 via
 real kills, 0 deaths grinding the qcat fish-room edge), **traveled** qcat↔qeynos via zone lines, and
 **bought** a spell from a merchant — all via the HTTP API + the auto-combat nav, after the heading,
-zone-change, merchant, and pathfinding fixes above. The recurring friction was always *reaching* the
+zone-change, merchant, and pathfinding fixes above. **Read the "hands-free" in that run as historical:**
+it included the client-side auto-retarget #1109 removed, so reproducing it today means the driving
+script picks each next mob (`/v1/observe/entities` → `/v1/combat/target`). Everything else stands. The recurring friction was always *reaching* the
 target (walls/water/pockets + the position clobber), never the actions themselves once in range.
