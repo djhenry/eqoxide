@@ -594,7 +594,7 @@ fn gpu_skin_y_extent(
         let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         cpass.set_pipeline(&pipeline);
         cpass.set_bind_group(0, &bg, &[]);
-        cpass.dispatch_workgroups(((n + 63) / 64) as u32, 1, 1);
+        cpass.dispatch_workgroups(n.div_ceil(64) as u32, 1, 1);
     }
     enc.copy_buffer_to_buffer(&obuf, 0, &staging, 0, out_size);
     queue.submit(std::iter::once(enc.finish()));
@@ -1005,7 +1005,7 @@ impl ApplicationHandler for ModelViewerApp {
                         let idle = smodel.skin.clip_for_action("idle")
                             .or_else(|| smodel.skin.clip_for_action("walking")).unwrap_or(0);
                         let mats: Vec<Mat4> = smodel.skin.evaluate(idle, 0.0).iter()
-                            .map(|m| Mat4::from_cols_array_2d(m)).collect();
+                            .map(Mat4::from_cols_array_2d).collect();
                         let (mut lo, mut hi) = (f32::MAX, f32::MIN);
                         for (mesh, sd) in asset.meshes.iter().zip(asset.skin_meshes.iter()) {
                             let Some(sd) = sd else { continue };
@@ -1337,7 +1337,7 @@ fn render_frame(s: &mut ViewerState) {
         if !sk.dbg_done {
             sk.dbg_done = true;
             use glam::Mat4;
-            let mats: Vec<Mat4> = matrices.iter().map(|mm| Mat4::from_cols_array_2d(mm)).collect();
+            let mats: Vec<Mat4> = matrices.iter().map(Mat4::from_cols_array_2d).collect();
             // Outlier check on the skinned model-Y: if the full max-min extent is much larger
             // than the p0.5..p99.5 body, stray verts are inflating true_height (the root cause
             // of the male-model half-size bug, now fixed in models.rs by using the robust extent).
@@ -1515,16 +1515,14 @@ fn render_frame(s: &mut ViewerState) {
         let mut cur_tex: Option<usize> = None;
         for (i, mesh) in s.model.meshes.iter().enumerate() {
             pass.set_bind_group(2, &s.uniform_pool[i].1, &[]);
-            if !wireframe {
-                if mesh.texture_idx != cur_tex {
-                    cur_tex = mesh.texture_idx;
-                    let bg = match cur_tex {
-                        Some(idx) if idx < s.model.texture_bind_groups.len() =>
-                            &s.model.texture_bind_groups[idx],
-                        _ => &s.fallback_bg,
-                    };
-                    pass.set_bind_group(1, bg, &[]);
-                }
+            if !wireframe && mesh.texture_idx != cur_tex {
+                cur_tex = mesh.texture_idx;
+                let bg = match cur_tex {
+                    Some(idx) if idx < s.model.texture_bind_groups.len() =>
+                        &s.model.texture_bind_groups[idx],
+                    _ => &s.fallback_bg,
+                };
+                pass.set_bind_group(1, bg, &[]);
             }
             pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
             if wireframe {
