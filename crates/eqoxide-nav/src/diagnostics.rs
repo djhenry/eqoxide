@@ -60,6 +60,9 @@ pub enum EdgeKind {
     Fall,
     /// Teleport-pad graph edge (#403).
     Pad,
+    /// Ladder climb to a resolved dismount at the top (#309) — like `Pad`, a graph edge for a link
+    /// the terrain-follow families cannot express, here because the surface is vertical.
+    Climb,
     /// Swim across a water surface (#191).
     SwimSurface,
     /// 3-DOF swim between interior water nodes (water design §6).

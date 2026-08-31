@@ -62,6 +62,14 @@ pub struct MoveIntent {
     pub wish_vspeed: f32,
     pub jump:        bool,
     pub want_swim:   bool,
+    /// Drive the character UP a climbable surface this tick (#309), at `wish_vspeed`. Honoured only
+    /// while the body is actually on one (`Collision::on_climbable`) — exactly the shape of
+    /// `want_swim`, which is likewise a request the controller grants only in water. Free WASD
+    /// leaves it `false` for now: nothing binds a climb key, and a driver that could set it anywhere
+    /// would be a fly cheat, not a ladder.
+    ///
+    /// Distinct from `climb` below, which is a step-up HEIGHT and unrelated despite the name.
+    pub want_climb:  bool,
     pub speed:       f32,
     /// Max step-up height the controller may climb this move, in EQ units. `0` (default) uses the
     /// native `movement::STEP_UP` (2.0) — correct for free WASD, which must NOT be able to scale
