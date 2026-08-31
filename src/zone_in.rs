@@ -285,7 +285,7 @@ mod tests {
         Collision::build(&ZoneAssets { terrain: meshes, objects: vec![], textures: vec![] }, 4.0)
     }
     fn idle() -> MoveIntent {
-        MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: false,
+        MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: false, want_climb: false,
                      speed: 0.0, climb: 0.0, hop: false }
     }
     /// A single flat floor at `z`, spanning the whole test extent.

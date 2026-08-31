@@ -312,6 +312,26 @@ impl SkinData {
             "treading" => self.clips.iter()
                 .position(|c| { let n = c.name.to_lowercase(); n.contains("swim") && n.contains("idle") })
                 .or_else(|| self.clips.iter().position(|c| c.name.to_lowercase().contains("swim"))),
+            // Ladder climb (#309). Matched by ANIMATION CODE (L07), not by the English
+            // suffix, because the suffix is wrong: the asset bake labels L07 "walk_back"
+            // (`eqoxide_asset_server`'s `anim_label`), but `eq_kb/animation-codes.md` has
+            // L07 = CLIMB and lists no confirmed retail code for walking backward.
+            //
+            // The clip settles it on its own, without either label being trusted. Forward
+            // kinematics over its cycle: the hands rise ABOVE the head twice per cycle
+            // (peak +0.97u past the head, at t≈0.00 and t≈0.52 — alternating hand-over-hand
+            // reach) while the pelvis travels 0.31u total and the hands travel further than
+            // the feet (1.47 vs 1.05). A backward walk rocks the pelvis and never lifts a
+            // hand past the shoulders. This is a climb.
+            //
+            // `l07a`, not `l07`: the A/B suffix is A = full body, B = upper-body-only (the
+            // convention `idle_fidget_clips` tests). A climb drives the legs, so B would
+            // animate the arms over a dead lower half. "climb" is also accepted so that a
+            // re-bake carrying the corrected label still resolves here.
+            "climbing" => self.clips.iter().position(|c| {
+                let n = c.name.to_lowercase();
+                n.starts_with("l07a") || (n.contains("climb") && !n.contains("idle"))
+            }),
             "sitting" => self.clips.iter().position(|c| {
                 let n = c.name.to_lowercase();
                 n.contains("sit") && !n.contains("swim")
@@ -552,6 +572,64 @@ mod tests {
             rest_translations, rest_rotations, rest_scales,
             ground_probes: vec![], joint_names: vec![],
         }
+    }
+
+    /// Real baked clip names from `humanoid.glb` — including the MISLABELED L07 pair, which is
+    /// the whole point: the resolver must find the climb through a name that says "walk_back".
+    fn climb_skin(names: &[&str]) -> SkinData {
+        let (rest_translations, rest_rotations, rest_scales) = default_rest(3);
+        SkinData {
+            joint_count: 3,
+            parents: vec![None, Some(0), Some(1)],
+            inv_bind: vec![identity_mat(); 3],
+            clips: names.iter()
+                .map(|n| AnimClip { name: n.to_string(), duration: 1.0, channels: vec![make_channel(0)] })
+                .collect(),
+            rest_translations, rest_rotations, rest_scales,
+            ground_probes: vec![], joint_names: vec![],
+        }
+    }
+
+    #[test]
+    fn climbing_resolves_the_l07_clip_through_its_wrong_walk_back_label() {
+        // The bake calls L07 "walk_back" (`eqoxide_asset_server`'s `anim_label`). It is a climb:
+        // over the cycle the hands rise +0.97u above the head twice while the pelvis travels
+        // 0.31u. Matching the CODE rather than the English is what makes this resolve — and is
+        // the same tactic the "dead" arm already uses with `starts_with("d05")`.
+        let skin = climb_skin(&["L01A_walk", "L07A_walk_back", "L07B_walk_back", "P01A_run"]);
+        assert_eq!(skin.clip_for_action("climbing"), Some(1),
+            "must pick L07A (full body), not L07B (upper body only) and not the walk");
+    }
+
+    #[test]
+    fn climbing_prefers_the_full_body_a_variant_even_when_b_is_listed_first() {
+        // A/B convention: A = full body, B = upper-body-only. A climb drives the legs, so picking
+        // B would animate the arms over a dead lower half — and clip ORDER must not decide it.
+        let skin = climb_skin(&["L07B_walk_back", "L07A_walk_back"]);
+        assert_eq!(skin.clip_for_action("climbing"), Some(1));
+    }
+
+    #[test]
+    fn climbing_still_resolves_once_the_asset_bake_is_corrected_to_say_climb() {
+        // Forward compatibility: when `anim_label` is fixed to emit "climb", the arm must keep
+        // working without a second change here.
+        let skin = climb_skin(&["L01A_walk", "L07A_climb"]);
+        assert_eq!(skin.clip_for_action("climbing"), Some(1));
+    }
+
+    #[test]
+    fn climbing_is_none_when_the_model_has_no_climb_clip() {
+        // Honest absence: the caller falls back to the idle rather than posing something wrong.
+        let skin = climb_skin(&["L01A_walk", "P01A_run", "Spider_Idle"]);
+        assert_eq!(skin.clip_for_action("climbing"), None);
+    }
+
+    #[test]
+    fn the_mislabeled_l07_clip_is_never_picked_as_a_walk_or_a_run() {
+        // Pre-existing guarantee that must survive this change: the "running" arm excludes any
+        // name containing "back", so the climb clip cannot be mis-picked as locomotion.
+        let skin = climb_skin(&["L07A_walk_back", "L01A_walk", "P01A_run"]);
+        assert_eq!(skin.clip_for_action("running"), Some(2));
     }
 
     #[test]

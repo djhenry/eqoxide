@@ -45,7 +45,7 @@ fn swim_toward(col: &Collision, from: [f32; 3], to: [f32; 3], secs: f32) -> [f32
         let d = [to[0] - c.pos[0], to[1] - c.pos[1]];
         let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
         let dir = if l > 0.2 { [d[0] / l, d[1] / l] } else { [0.0, 0.0] };
-        c.step(MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: true,
+        c.step(MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: true, want_climb: false,
                             speed: 44.0, climb: 0.0, hop: false }, dt, col);
     }
     c.pos
@@ -56,7 +56,7 @@ fn try_to_sink(col: &Collision, from: [f32; 3], secs: f32) -> [f32; 3] {
     let mut c = CharacterController::new(from);
     let dt = 1.0 / 60.0;
     for _ in 0..((secs / dt) as usize) {
-        c.step(MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: -44.0, jump: false, want_swim: true,
+        c.step(MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: -44.0, jump: false, want_swim: true, want_climb: false,
                             speed: 0.0, climb: 0.0, hop: false }, dt, col);
     }
     c.pos
@@ -299,7 +299,7 @@ fn an_afloat_body_with_no_floor_in_reach_never_drifts() {
          NOT be embedded — otherwise scene 4 isn't testing the no-floor-in-reach case specifically");
 
     let mut ctrl = CharacterController::new(start);
-    let idle = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: true,
+    let idle = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: true, want_climb: false,
                             speed: 0.0, climb: 0.0, hop: false };
     let dt = 1.0 / 60.0;
     for _ in 0..110 { ctrl.step(idle, dt, &col); }

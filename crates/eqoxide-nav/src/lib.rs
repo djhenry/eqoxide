@@ -20,6 +20,7 @@
 //! `CharacterController` are nav+movement integration tests and live in the app crate's
 //! `tests/walker_sim.rs`, not here (that controller is the one dependency this crate must not have).
 
+pub mod climb;
 pub mod collision;
 pub mod diagnostics;
 pub mod planner;

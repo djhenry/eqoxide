@@ -177,6 +177,14 @@ pub type ObjectModelsByName = (std::collections::HashMap<String, Vec<MeshData>>,
 /// `instances` is a column-major 4×4 placing one copy of the model into world space.
 #[derive(Clone)]
 pub struct ObjectModel {
+    /// The glTF mesh name, verbatim — for Crushbone's ladders, `LADDER14`.
+    ///
+    /// Kept because the NATIVE CLIENT dispatches object behavior off this same name: RoF2's zone
+    /// object constructor classifies actors by name prefix (`__strnicmp(name, "LADDER", 6)` →
+    /// category 6, `GRASS_` → 7, default 5) before binding them. Consumers here therefore match
+    /// prefixes rather than invent their own object taxonomy — see
+    /// `eqoxide_nav::climb::is_climbable_name`. Empty when the glTF mesh is unnamed.
+    pub name: String,
     pub meshes: Vec<MeshData>,
     /// Column-major 4×4 transforms, one per placement (`Mat4::from_cols_array_2d` form).
     pub instances: Vec<[[f32; 4]; 4]>,
@@ -473,7 +481,11 @@ impl ZoneAssets {
             } else {
                 let mi = mesh.index();
                 let slot = *obj_index.entry(mi).or_insert_with(|| {
-                    objects.push(ObjectModel { meshes: read_mesh(&mesh), instances: Vec::new() });
+                    objects.push(ObjectModel {
+                        name: mesh.name().unwrap_or("").to_string(),
+                        meshes: read_mesh(&mesh),
+                        instances: Vec::new(),
+                    });
                     objects.len() - 1
                 });
                 objects[slot].instances.push(matrix);
@@ -706,6 +718,7 @@ mod instanced_tests {
     #[test]
     fn expand_objects_applies_instance_matrices() {
         let model = ObjectModel {
+            name: "TESTOBJ".into(),
             meshes: vec![MeshData {
                 positions: vec![[1.0,0.0,0.0]], normals: vec![[1.0,0.0,0.0]],
                 uvs: vec![[0.0,0.0]], indices: vec![0],

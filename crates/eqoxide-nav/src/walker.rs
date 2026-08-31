@@ -372,6 +372,11 @@ pub struct Walker {
     pub stuck_best:       f32,
     pub stuck_ticks:      u32,
     pub stuck_i:          usize,
+    /// The height the stall detector last credited a CLIMB with reaching (#309), or `None` when the
+    /// body is not climbing. `stuck_i` cannot see a ladder: the whole ascent is ONE coarse segment,
+    /// so `path_i` is pinned for its entire duration while the body is plainly moving. This is the
+    /// mark the vertical channel measures against — see the stall block in `drive_walk`.
+    pub climb_mark:       Option<f32>,
     /// Stall-recovery re-paths WITHOUT forward progress; capped (#229 resets it on real progress).
     pub nav_repaths:      u32,
     /// Closest straight-line distance to the current goal reached so far.
@@ -513,6 +518,7 @@ impl Walker {
             stuck_best: f32::MAX,
             stuck_ticks: 0,
             stuck_i: 0,
+            climb_mark: None,
             nav_repaths: 0,
             nav_best_gdist: f32::MAX,
             nav_best_g3d: f32::MAX,
@@ -1946,6 +1952,69 @@ impl Walker {
         // (The committed coarse/fine routes are published in the snapshot at the end of this tick —
         // the old separate `nav_path_view` pair is gone: ONE published source, #608.)
 
+        // Below `NAV_CLIMB_MIN_RISE` the ordinary step-up already handles the height, and asking to
+        // climb would suppress gravity for nothing.
+        const NAV_CLIMB_MIN_RISE: f32 = 2.0;
+        // CLIMB CARROT (#309). A climb dismount is the one carrot that LEGITIMATELY crosses a solid
+        // face — the ladder's own wall — so the #685 LOS clamp above shortens it back to the body's
+        // tier, exactly as it should for every other carrot. Measured live in crushbone: both routes
+        // were correct (the fine one read `[body, [340.45,-32.09,0.0], [343.2,-31.7,0.0], …]`) and
+        // the aim still collapsed to the waterline, so `climb` below never fired and the walker
+        // pressed the body into the moat wall until it declared `walker_stalled`. This is the same
+        // class as #639's final-hop check: a pre-existing WALK-geometry test re-asking a climb as if
+        // it were a walk.
+        //
+        // Aim at the climb itself instead — but ONLY when this route actually planned that climb.
+        // The dismount is matched against the committed path (reconstruction snaps it to the exact
+        // resolved point, so this compares equal), which is what keeps a body that merely wanders
+        // through a ladder's volume on some unrelated errand from being hijacked up it. Asking about
+        // `climb_edges` rather than `climb_volumes` is the documented routable-vs-physical split: a
+        // ladder with no standable top has no edge, so nav never aims at one.
+        //
+        // ASCEND, *THEN* STEP OFF — the aim is two-phase, because the dismount is by construction
+        // OUTSIDE the volume (`resolve_climb_edges` reaches half a footprint plus a body radius past
+        // the edge, so it lands on the ledge, not on the ladder). Aiming straight at it from the
+        // bottom drags the body diagonally out through the volume wall long before it has the height:
+        // measured live in crushbone, the body left the footprint at east 339.5 (the padded volume
+        // ends at 339.45), lost `on_climbable` mid-shaft and fell back — over and over, topping out
+        // at u=-0.66 and dropping to -7 for 40 s. So while the dismount is still meaningfully above
+        // us, aim at the ladder's own centre-line at the dismount's height: the body rises hugging
+        // the rungs, which is also what KEEPS `on_climbable` true the whole way up. Only once it has
+        // the height does the aim swing out to the ledge, which is how a body climbs a real ladder.
+        // Resolved ONCE, because the aim, the gravity suspension and the vertical wish are three
+        // faces of a single decision — "this body is on this ladder, executing this route's climb".
+        // Deriving them separately from carrot geometry is exactly what produced the measured live
+        // oscillation: any tick where the carrot briefly looked wrong dropped the body off the
+        // ladder mid-shaft, and it fell 12 units back into the moat.
+        let climb_edge = self.collision.read().unwrap().as_ref().and_then(|c| {
+            let body = [gs.player_x, gs.player_y, gs.player_z];
+            c.climb_edges().iter().find(|e| {
+                e.volume.contains(body)
+                    && self.path.get(self.path_i..).is_some_and(|rest| rest.iter().any(|w| {
+                        (w[0] - e.dismount[0]).abs() < 0.01
+                            && (w[1] - e.dismount[1]).abs() < 0.01
+                            && (w[2] - e.dismount[2]).abs() < 0.01
+                    }))
+            }).cloned()
+        });
+        let target = match &climb_edge {
+            // ASCENDING — aim at the ladder's own centre-line at the ledge's height. Aiming straight
+            // at the ledge from the bottom drags the body diagonally out through the volume wall long
+            // before it has the height (measured: it left the footprint at east 339.5, the padded
+            // volume ending at 339.45, and fell). Hugging the rungs is also what KEEPS the body
+            // inside the volume, which is the whole basis of the climb.
+            Some(e) if e.dismount[2] - gs.player_z > NAV_CLIMB_MIN_RISE => {
+                let ctr = e.volume.center();
+                (ctr[0], ctr[1], e.dismount[2])
+            }
+            // STEPPING OFF — near the ledge's height, swing the aim out onto it. The rise below
+            // carries the body to the ledge and then HOLDS, so this crossing happens at the ledge's
+            // own height with gravity still suspended: the body walks off the top of the ladder onto
+            // the rampart rather than being dropped beside it.
+            Some(e) => (e.dismount[0], e.dismount[1], e.dismount[2]),
+            None => target,
+        };
+
         let dx   = target.0 - gs.player_x; // east  delta (server_x)
         let dy   = target.1 - gs.player_y; // north delta (server_y)
         let dist = (dx * dx + dy * dy).sqrt();
@@ -2188,6 +2257,7 @@ impl Walker {
                 wish_vspeed: 0.0,
                 jump:        false,
                 want_swim:   false,
+                want_climb:  false,
                 speed:       nav_speed(gs),
                 climb:       0.0,
                 hop:         false,
@@ -2218,10 +2288,46 @@ impl Walker {
             return;
         }
 
+        // CLIMB (#309): the body is on a ladder this route planned to use, so it is supported by
+        // something other than the ground and gravity must stay suspended for the WHOLE maneuver —
+        // ascent and step-off alike. `climb_edge`'s own `volume.contains` test is one disjunct of
+        // the `on_climbable` the controller re-applies before granting the climb, so the walker can
+        // never ask for a climb the controller would refuse — it would simply hang against the
+        // ladder and stall, the failure mode the honesty contract exists to make impossible.
+        //
+        // Named HERE, above the stall detector, because that detector needs it: see the vertical
+        // progress channel below. The `MoveIntent` further down consumes the same value.
+        let climb = climb_edge.is_some();
+
         // Progress-based stall detection.
         if have_path {
+            // VERTICAL PROGRESS (#309). This detector reads progress as "`path_i` advanced", and a
+            // ladder is invisible to that: the ascent is ONE coarse segment, so the cursor is pinned
+            // for the whole climb while the body is moving 14 u/s. The route-level detector above
+            // already carries the equivalent channel in its own terms ("a spiral/vertical climb
+            // toward a goal above counts as approach", 3-D distance); this one had none, so it read
+            // a WORKING climb as a wedge — and its recovery is a downhill BACK-OFF, which drives the
+            // body off the ladder and undoes the ascent. Measured live in crushbone on the fixed
+            // carrot: the body oscillated between u=-23.6 and u=-4.5 for 34 s, re-planning ~1/s,
+            // then declared `walker_stalled` while sitting inside a ladder it could climb.
+            //
+            // MEASURED, not assumed — the mark only moves on an actual RISE of `NAV_CLIMB_PROGRESS`.
+            // A body pressed against a ladder it cannot get up gains no height and still stalls out
+            // on schedule, which is the whole point of the detector. `stuck_i` is deliberately NOT
+            // touched: `path_i > stuck_i` stays reachable only by walking, which is the premise the
+            // route-level detector's channel (a) justifies itself on (#727).
+            const NAV_CLIMB_PROGRESS: f32 = 2.0;
+            let climbed = climb
+                && self.climb_mark.is_some_and(|z0| gs.player_z - z0 > NAV_CLIMB_PROGRESS);
+            if !climb {
+                self.climb_mark = None;
+            } else if climbed || self.climb_mark.is_none() {
+                self.climb_mark = Some(gs.player_z);
+            }
             if self.path_i > self.stuck_i {
                 self.stuck_i = self.path_i;
+                self.stuck_ticks = 0;
+            } else if climbed {
                 self.stuck_ticks = 0;
             } else {
                 self.stuck_ticks += 1;
@@ -2287,12 +2393,30 @@ impl Walker {
         } else {
             None
         };
-        let wish_vspeed = if swim { swim_vspeed(target.2, gs.player_z, swim_plane) } else { 0.0 };
+        // A climb owns the vertical wish outright when it fires: a character on a ladder in a flooded
+        // moat is BOTH on a climbable surface and in water, and letting the swim controller keep the
+        // wish would hold it at the swim plane — 10 units below the rim it is trying to reach.
+        // Rise until the body has the LEDGE's height, then hold it there: a climb that keeps driving
+        // upward past the ledge would ride out of the volume's top and drop the body beside the
+        // ladder, and one that stops rising the instant it arrives would hand the body back to
+        // gravity while it is still out over the water. Holding is what turns the dismount from a
+        // timing race into a walk.
+        let wish_vspeed = match &climb_edge {
+            Some(e) if gs.player_z < e.dismount[2] => crate::climb::CLIMB_SPEED,
+            Some(_) => 0.0,
+            None if swim => swim_vspeed(target.2, gs.player_z, swim_plane),
+            None => 0.0,
+        };
         *self.nav_intent.lock().unwrap() = Some(MoveIntent {
-            wish_dir:    [dx / dist, dy / dist],
+            // A carrot directly over the body's own column has no direction — that is not a
+            // degenerate case any more now that a climb aims up the ladder's centre-line (#309).
+            // `dist` is a `sqrt`, so `dx / dist` there is NaN, and a NaN wish_dir poisons the
+            // controller's velocity for the rest of the session.
+            wish_dir:    if dist > 1e-3 { [dx / dist, dy / dist] } else { [0.0, 0.0] },
             wish_vspeed,
             jump,
             want_swim:   swim,
+            want_climb:  climb,
             speed:       nav_speed(gs),
             climb:       0.0, // nav uses the native step-up now (#239); fences handled by hop
             hop:         self.stuck_ticks >= NAV_HOP_TICKS,
