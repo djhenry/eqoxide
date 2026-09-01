@@ -2690,6 +2690,14 @@ impl ActionLoop {
             // zone after a distant mob and lose itself. When there's no such target (idle, or the
             // mob died), recall the pet with PET_BACKOFF so it returns to the owner instead of
             // wandering off — the previous version left it chasing and it dropped out of view.
+            //
+            // #1109 made that recall FIRE AFTER EVERY KILL. `drive_auto_target` used to re-point
+            // `target_id` at the next live spawn on the same tick the old one died, so the pet
+            // chained straight onto it; with no retargeter the dead mob stays targeted, `engage`
+            // resolves to None, and the pet backs off until the AGENT targets something. That is
+            // the intended split (strategy is the agent's), but it is a real behaviour change and
+            // it is documented for agents in `docs/autonomous-play.md` §2 — the pet stops fighting
+            // in the gap, including when a second mob is already on the player.
             let engage = if self.auto_attack {
                 gs.target_id
                     .and_then(|tid| gs.world.entities.get(&tid).map(|e| (tid, e)))
@@ -2736,8 +2744,9 @@ impl ActionLoop {
                 // above has always filtered `!e.dead` for exactly this reason.
                 //
                 // How long that window is depends on the mob, and both ends of it matter.
-                // Measured live in `fieldofbone`: `a_decaying_skeleton000` leaves no corpse, and
-                // the server deleted its spawn ~2 s after death — 13 ticks, every one of them a
+                // Measured live in `fieldofbone`: after `a_decaying_skeleton000` died no corpse
+                // entity appeared in the roster and the server deleted its spawn ~2 s later —
+                // 13 ticks, every one of them a
                 // cancelled goto, which is already enough to kill the goal outright. A mob that
                 // DOES leave a corpse is the long end: EQEmu hands the corpse the dead NPC's own
                 // entity id (`entity_list.AddCorpse(corpse, GetID())` — visible here in player

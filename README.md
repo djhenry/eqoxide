@@ -47,7 +47,7 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 | Combat: auto-attack / auto-face | ✅ | Heading-scale fix made melee land. Swings at the target you set and only that one — the client never re-picks it (#1109); retargeting and grind policy live in the driving agent |
 | Spell casting (`POST /v1/combat/cast`, gems, cast bar) | ✅ | `OP_CastSpell` + begin/mana/interrupt feedback |
 | Scribe / memorize spells (`POST /v1/combat/scribe`, `/v1/combat/memorize`) | ✅ | |
-| Pets: tracking, auto-pet-combat, recall | ✅ | `OP_PetCommands`; squishy classes stand off |
+| Pets: tracking, auto-pet-combat, recall | ✅ | `OP_PetCommands`; squishy classes stand off. Attacks only a *live* target — and since #1109 nothing re-picks one, so the pet backs off after each kill until the agent retargets |
 | Target / consider / hail / say | ✅ | `/v1/combat/target`, `/v1/combat/target/name`, `/v1/combat/consider`, `/v1/interact/hail`, `/v1/interact/say` |
 | Merchant buy / sell / trade window | ✅ | `/v1/merchant/buy`, `/v1/merchant/sell`, `/trade/*`; live-verified buy (item + coin) |
 | Loot corpses (`POST /v1/interact/loot`) | ✅ | Auto-loot queues own kills; takes listed items |
