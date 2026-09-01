@@ -84,13 +84,31 @@ The doubled heading meant the server thought the player faced the wrong way → 
 `src/eq_net/navigation.rs: send_position_update` (`2048.0/360.0`). This is the single most important
 fix for any client-initiated melee.
 
-### Auto-combat (navigation.rs, runs in the 150ms nav tick when auto-attack is ON)
-- **Auto-engage**: while attacking, if the target is within ~60u, walk (collision-aware) to ~5u and
-  **face it each tick** so swings register; hold + face once in melee.
-- **Auto-retarget**: when the target dies/goes unreachable, target the nearest reachable trash mob
-  (name starts `a_`/`an_`, excludes named guards/merchants) within 200u that has a clear path
-  (`path_clear`). If none reachable, idle and wait for respawns (do NOT roam toward out-of-pocket
-  mobs — it strands the bot; see §5 limitations).
+### Auto-combat (action_loop.rs, runs in the 150ms nav tick when auto-attack is ON)
+- **Auto-engage**: while attacking, if the target is within **200u**, walk (collision-aware)
+  toward it and **face it each tick** so swings register; hold + face once in range. The stop
+  distance is **5u** normally but **25u** for a character with a pet (the pet tanks; a squishy
+  caster that closes to melee dies). A **dead** target is not engaged at all (#1109) — before
+  that filter, auto-attack on a corpse cancelled your own `/v1/move/goto` every 150 ms tick.
+- **The client never picks your target.** `/v1/combat/target`(`/name`) sets the target and it stays
+  set until you change it, the mob despawns, or you click one in the HUD. Auto-attack swings at
+  whatever is targeted; it does not choose.
+
+  There *was* an auto-retarget here — while auto-attack was on it re-picked a target every tick
+  (a mob attacking you > the current target > nearest `a_`/`an_` trash within 200u). **#1109
+  removed it.** It silently overrode targets the agent had explicitly requested, with no event to
+  say so: in Field of Bone a level-1 necro targeted `a_decaying_skeleton005` (id 238), auto-attack
+  swung at `a_decaying_skeleton014` (id 275) because 275 had aggroed, and 238 was still at 100% HP
+  when the character died. Retargeting is a **strategy** decision and belongs in the agent's
+  scripting, above the client — same reason grinding policy does. If you want the old behaviour,
+  build it from `/v1/observe/entities` + the `combat`/`attacked` event + `/v1/combat/target/name`.
+- **Your pet is recalled when the target dies — retarget promptly.** `drive_auto_pet_combat`
+  only attacks a *live* target within 200u. Nothing re-picks the target any more, so the tick
+  after a kill still has the dead mob in `target_id`, the pet driver finds nothing engageable,
+  and it sends `PET_BACKOFF`: the pet disengages and returns to you until your script targets
+  something new. If a second mob is already on you, nothing is fighting it in that gap. This is
+  the direct cost of moving strategy out of the client, and it is **only** visible in the client
+  log (`EQ: pet <id> → back off (no target)`) — there is no event for it.
 - **Reachability matters**: the combat approach drives the shared collide-and-slide mover
   (`CharacterController::slide`) toward the target, so a mob behind a wall it cannot slide around, or
   across water / at a different z, is not reliably meleeable (see §5). For a mob around a corner, issue
@@ -98,9 +116,22 @@ fix for any client-initiated melee.
 
 ### Verifying combat
 Client logs outgoing hits as `EQ: combat: Claude hits <mob> for N damage` and kills as
-`<mob> has been slain` in `/tmp/eqoxide.log`. The client does NOT expose HP via `/v1/observe/debug`; use the
-combat log + `/v1/observe/entities` (mob despawns on death) + a level/exp DB read. EQEmu combat logging is OFF
-by default, so the zone log won't show swings.
+`<mob> has been slain` in `/tmp/eqoxide.log`.
+
+`/v1/observe/debug` **does** expose HP — `hp`, `hp_max`, `hp_pct` for the player and
+`target_hp_pct` for the target — and `target_hp_pct` → 0 is the signal that the mob you asked
+for died. This section used to claim the opposite; it was wrong, and #1109 made it
+load-bearing, because `target_hp_pct` is the cheapest way for the agent that now owns
+retargeting to know when to retarget.
+
+Do **not** infer death from the mob leaving `/v1/observe/entities` — it does not leave. A dead
+NPC stays in the roster at its death position until the server deletes the spawn. Measured in
+`fieldofbone`: for a corpseless trash mob no corpse entity appeared in the roster and the spawn
+was gone ~2 s later; for anything that leaves a corpse it is the corpse's whole decay, since
+EQEmu gives the corpse the dead NPC's own entity id. There is also **no push event for an NPC
+death**, so the agent must poll `target_hp_pct` or watch the combat log for the slain line.
+
+EQEmu combat logging is OFF by default, so the zone log won't show swings.
 
 ---
 
@@ -187,8 +218,15 @@ needs a small floor-height step (`STEP_H=20`) and a clear chest-height segment.
 - **Water** — *the pathing half of this bullet is now conditional; the combat half is unchanged and
   unverified.* It used to read, flatly: "fish/water mobs sit in water a walking character can't path
   to; `find_path` returns no route to them, and even if `path_clear` (LOS over water) passes, melee
-  won't connect across/below water. The auto-grind excludes nothing by name now, relying on
-  `path_clear`; if you target water mobs, exclude `fish` by name."
+  won't connect across/below water."
+
+  The advice that followed — *"the auto-grind excludes nothing by name now, relying on `path_clear`;
+  if you target water mobs, exclude `fish` by name"* — described the client-side target picker that
+  **#1109 deleted** — and misnamed its primitive on the way past: the picker used `line_clear`, a
+  centre ray, not `path_clear`, which is the #358 sweep of the player's whole collision volume.
+  There is no client-side clearance filter left to lean on either way, and no name filter to
+  adjust: the client targets what you tell it to. Excluding water mobs is now your scripting's
+  job, and the reason to do it is unchanged — melee still won't connect across or below water.
 
   **What changed (pathing only).** The first clause described the 2D-with-water-hacks planner. Today
   `astar` builds 4u water columns and emits water-entry, 3D interior, descent, surface-crossing and
@@ -254,5 +292,9 @@ at z≈-40** (where surface fish are reachable); the **pit bottom z≈-76** leav
 A non-GM Female Wood Elf Ranger was created, then **won fights**, **leveled** hands-free (L1→L4 via
 real kills, 0 deaths grinding the qcat fish-room edge), **traveled** qcat↔qeynos via zone lines, and
 **bought** a spell from a merchant — all via the HTTP API + the auto-combat nav, after the heading,
-zone-change, merchant, and pathfinding fixes above. The recurring friction was always *reaching* the
+zone-change, merchant, and pathfinding fixes above. **Read the "hands-free" in that run as historical:**
+it included the client-side auto-retarget #1109 removed, so reproducing it today means the driving
+script picks each next mob (`/v1/observe/entities` → `/v1/combat/target/name`; the entities
+roster is name→position with **no spawn ids**, so `/name` — which returns the `matched` id it
+resolved — is the call that chains, not `/v1/combat/target`). Everything else stands. The recurring friction was always *reaching* the
 target (walls/water/pockets + the position clobber), never the actions themselves once in range.
