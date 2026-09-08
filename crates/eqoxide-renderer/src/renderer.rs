@@ -1149,7 +1149,7 @@ impl EqRenderer {
         }
 
         // Sort merged meshes so same-texture groups are contiguous (they already are, but be safe).
-        self.gpu_meshes.sort_by_key(|m| m.texture_idx.map_or(usize::MAX, |i| i));
+        self.gpu_meshes.sort_by_key(|m| m.texture_idx.unwrap_or(usize::MAX));
 
         // Build GPU-instanced object models: each ObjectModel mesh is uploaded ONCE (in raw
         // EQ model-local space — the instanced shader applies the instance matrix and the

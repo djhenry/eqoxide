@@ -1076,7 +1076,7 @@ impl ApplicationHandler for ModelViewerApp {
         let wireframe_indices: Vec<(wgpu::Buffer, u32)> = asset.meshes.iter().filter_map(|mesh| {
             if mesh.indices.is_empty() { return None; }
             let mut edge_set = std::collections::HashSet::new();
-            for tri in mesh.indices.chunks_exact(3) {
+            for tri in mesh.indices.as_chunks::<3>().0 {
                 for edge in &[ (tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0]) ] {
                     let key = (edge.0.min(edge.1), edge.0.max(edge.1));
                     edge_set.insert(key);

@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn texture_idx_sort_key_none_sorts_last() {
         let mut idxs: Vec<Option<usize>> = vec![None, Some(2), Some(0), Some(1), None];
-        idxs.sort_by_key(|t| t.map_or(usize::MAX, |i| i));
+        idxs.sort_by_key(|t| t.unwrap_or(usize::MAX));
         assert_eq!(idxs, vec![Some(0), Some(1), Some(2), None, None]);
     }
 

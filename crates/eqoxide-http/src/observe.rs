@@ -5401,7 +5401,15 @@ mod tests {
     /// the intervening reliable packets of other opcodes (which legitimately consumed sequence
     /// numbers) go missing and it reports phantom "lost packets". This is the exact
     /// `scripts/packet-analysis.py --dir in --op 0x5089` (#463) workflow, which defaults to summary=1.
+    // clippy::await_holding_lock: `_guard` is deliberately held across the `.await`s below — that's
+    // the whole point of `test_capture_lock` (#541, see its doc comment): this test drives the real
+    // global capture pipeline end-to-end through the HTTP endpoint and needs the lock held for the
+    // full request, not just setup. `#[tokio::test]` here uses the default single-threaded
+    // (`current_thread`) runtime with no nested `tokio::spawn`, so the guard never crosses an OS
+    // thread; concurrently-run test binaries on other threads block synchronously on the std Mutex,
+    // which is the intended serialization, not a deadlock risk.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn packets_summary_with_op_filter_does_not_fabricate_seq_gaps() {
         use eqoxide_telemetry as pkt;
         let _guard = pkt::test_capture_lock();

@@ -20,9 +20,12 @@ Zone_*.png
 # Agent-harness workspaces (agents, skills, settings, local state) — not published.
 # .claude/ is Claude Code's; .agents/ and .codex/ are the same content mirrored for
 # other harnesses. Any future harness workspace belongs under this same rule.
+# Git patterns are case-sensitive; some harnesses have mirrored into a capitalized
+# `.Codex/` instead of `.codex/`, so both spellings are listed explicitly (#1096 residue).
 .claude/
 .agents/
 .codex/
+.Codex/
 
 # Superpowers plans/specs — developer-local, not published
 docs/superpowers/
