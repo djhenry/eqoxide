@@ -8857,10 +8857,13 @@ mod tests {
         // REACH CONTROL. The four points above are only meaningful if the pinned constant actually
         // sits INSIDE the window they bound. A window that had drifted wholesale would still pass
         // every assert above while describing an interval bracketing no real measurement.
-        assert!(MEASURED_WORST_BUTCHER_PRODUCTION > FIRST_ACCEPTED
-                && MEASURED_WORST_BUTCHER_PRODUCTION < LAST_ACCEPTED,
+        // Keep this a runtime reach control so Clippy does not reduce the intentionally pinned
+        // measurement to a constant assertion. The contract is STRICT interior membership: either
+        // accepted endpoint would satisfy the prose-rounding check but would no longer be bracketed.
+        let pinned_measurement = std::hint::black_box(MEASURED_WORST_BUTCHER_PRODUCTION);
+        assert!(pinned_measurement > FIRST_ACCEPTED && pinned_measurement < LAST_ACCEPTED,
             "#909: the pinned MEASURED_WORST_BUTCHER_PRODUCTION \
-             ({MEASURED_WORST_BUTCHER_PRODUCTION}) is not strictly inside the window this test pins \
+             ({pinned_measurement}) is not strictly inside the window this test pins \
              ([{FIRST_ACCEPTED}, {LAST_ACCEPTED}]), so the four boundary asserts above are about an \
              interval that no longer brackets the measurement they exist to bracket");
     }

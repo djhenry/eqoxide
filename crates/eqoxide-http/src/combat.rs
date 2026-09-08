@@ -920,5 +920,9 @@ mod tests {
 /// a clean scan of a corpus it never read, which is a confident falsehood. The guard asserts it can
 /// SEE this constant; because it is the last item in the file, seeing it proves the scan arrived at
 /// the end. **Keep it last.**
+///
+/// Clippy's `items_after_test_module` wants this above `mod tests` — that is precisely the
+/// reorder that would defeat it, so the lint is silenced here rather than obeyed (#1110).
+#[cfg_attr(test, allow(clippy::items_after_test_module))]
 #[cfg(test)]
 pub(crate) const GUARD_REACH_SENTINEL_COMBAT: u8 = 0;

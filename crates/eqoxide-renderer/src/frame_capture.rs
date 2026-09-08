@@ -24,7 +24,7 @@ pub fn encode_frame_png(
         let start    = (row * row_pitch) as usize;
         let row_bytes = &mapped[start..start + (width * 4) as usize];
         if is_bgra {
-            for px in row_bytes.chunks_exact(4) {
+            for px in row_bytes.as_chunks::<4>().0 {
                 rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
             }
         } else {

@@ -85,7 +85,7 @@ pub(crate) fn recover_masked_color_key(rgba: &mut [u8], width: u32, height: u32)
     }
 
     // Already keyed? Any texel below the mask cutoff means the bake did its job — leave it alone.
-    if rgba.chunks_exact(4).any(|t| t[3] < MASK_ALPHA_CUTOFF_U8) {
+    if rgba.as_chunks::<4>().0.iter().any(|t| t[3] < MASK_ALPHA_CUTOFF_U8) {
         return 0;
     }
 
@@ -95,7 +95,7 @@ pub(crate) fn recover_masked_color_key(rgba: &mut [u8], width: u32, height: u32)
     // Only key if the corner color is the single most common RGB (a genuine background fill), so a
     // MASK texture whose corner is an incidental detail color is never punched through.
     let mut counts: std::collections::HashMap<[u8; 3], usize> = std::collections::HashMap::new();
-    for t in rgba.chunks_exact(4) {
+    for t in rgba.as_chunks::<4>().0 {
         *counts.entry([t[0], t[1], t[2]]).or_insert(0) += 1;
     }
     let (dominant, dom_count) = counts
@@ -113,7 +113,7 @@ pub(crate) fn recover_masked_color_key(rgba: &mut [u8], width: u32, height: u32)
 
     // Zero the alpha of every texel matching the background key color.
     let mut keyed = 0;
-    for t in rgba.chunks_exact_mut(4) {
+    for t in rgba.as_chunks_mut::<4>().0 {
         if [t[0], t[1], t[2]] == corner {
             t[3] = 0;
             keyed += 1;
@@ -669,7 +669,7 @@ mod tests {
 
         let keyed = recover_masked_color_key(&mut rgba, 4, 4);
         assert_eq!(keyed, 12, "all 12 background texels keyed transparent");
-        for (i, t) in rgba.chunks_exact(4).enumerate() {
+        for (i, t) in rgba.as_chunks::<4>().0.iter().enumerate() {
             if [5, 6, 9, 10].contains(&i) {
                 assert_eq!(t, &leaf, "leaf texel unchanged (rgb + alpha)");
             } else {

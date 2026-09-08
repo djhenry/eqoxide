@@ -51,8 +51,11 @@ fn a_route_whose_final_appended_hop_is_unwalkable_is_refused() {
     // Fixture validity 3: and the final approach really is beyond the walk envelope — i.e. this IS
     // an un-walkable hop, so a fix that refuses it is refusing something real. (The penultimate
     // waypoint is a low-ground cell centre ≤ ~11 u from the goal; the rise is the whole 12.8 u.)
-    assert!(scenes::FACE_RISE / CELL > MAX_WALK_GRADE,
-        "fixture: 12.8 u over one 8 u cell is grade {:.2} > {MAX_WALK_GRADE}", scenes::FACE_RISE / CELL);
+    let approach_floor = col.nearest_floor(0.0, goal[1], scenes::LOW_Z, 4.0, 8.0)
+        .expect("fixture: the flat approach must have a floor one plan cell before the goal");
+    let final_hop_grade = (gf.unwrap() - approach_floor).abs() / CELL;
+    assert!(final_hop_grade > MAX_WALK_GRADE,
+        "fixture: the measured final hop must exceed MAX_WALK_GRADE, got {final_hop_grade:.2} > {MAX_WALK_GRADE}");
 
     let path = col.find_path(start, goal, PLAYER_BODY.radius, &[], /*allow_partial=*/ false);
     assert!(path.is_none(),

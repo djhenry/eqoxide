@@ -284,7 +284,7 @@ fn convert_s3d_to_glb(input: &Path, output: &Path) -> Result<()> {
                 // (stray attachment-point geometry), then offset the surviving
                 // indices into the merged vertex buffer.
                 let mut prim_indices: Vec<u32> = Vec::with_capacity(raw_indices.len());
-                for tri in raw_indices.chunks_exact(3) {
+                for tri in raw_indices.as_chunks::<3>().0 {
                     let drop = tri
                         .iter()
                         .any(|&i| outliers.get(i as usize).copied().unwrap_or(false));
@@ -321,7 +321,7 @@ fn convert_s3d_to_glb(input: &Path, output: &Path) -> Result<()> {
             // Collect SOLID faces (incl. invisible-but-solid) for the collision mesh, offset
             // into the merged buffer. Drop the same placeholder/outlier vertices the render
             // path drops so the two stay consistent (for zone meshes `outliers` is all-false).
-            for tri in mesh.collision_indices().chunks_exact(3) {
+            for tri in mesh.collision_indices().as_chunks::<3>().0 {
                 let drop = tri
                     .iter()
                     .any(|&i| outliers.get(i as usize).copied().unwrap_or(false));
@@ -1019,7 +1019,7 @@ fn convert_s3d_to_glb_skinned(input: &Path, output: &Path, model_code: Option<&s
             for primitive in mesh.primitives() {
                 let raw: Vec<u32> = primitive.indices();
                 let mut idxs: Vec<u32> = Vec::with_capacity(raw.len());
-                for tri in raw.chunks_exact(3) {
+                for tri in raw.as_chunks::<3>().0 {
                     if tri
                         .iter()
                         .any(|&i| geo.outliers.get(i as usize).copied().unwrap_or(false))

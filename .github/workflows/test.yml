@@ -62,3 +62,17 @@ jobs:
       # command back down to make it green — that is the failure #605 documents.
       - name: cargo test --workspace
         run: cargo test --workspace --locked
+
+      # Visibility only, NOT a gate (`continue-on-error: true`): as of #1110/#1020, the workspace is
+      # down to 10 warnings, all `clippy::too_many_arguments` on long-lived call signatures (see e.g.
+      # `eqoxide-net::gameplay`, `eqoxide-net::packet_handler`, `src/app.rs`) — fixing those means
+      # redesigning those signatures, a call for whoever owns each of them, not a mechanical cleanup.
+      # `-D warnings` is already wired in so flipping this to blocking later is a one-line change
+      # (drop `continue-on-error`) once those sites are dealt with — don't let this step silently
+      # regress to 0 warnings without someone noticing and flipping it.
+      #
+      # `--keep-going` per the build step above; `-D warnings` makes new warnings visible as a
+      # (non-blocking) red X rather than scrolling past in a wall of green.
+      - name: cargo clippy --workspace (report only, not yet a gate — #1110)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings

@@ -433,7 +433,7 @@ use eqoxide_ipc::MoveIntent;
                     // exactly as the walker does, so a jump can never reset `stuck_ticks`.
                     if path_i > walked_to { stuck_i = stuck_i.max(path_i); }
                 }
-                if replan_cd > 0 { replan_cd -= 1; }
+                replan_cd = replan_cd.saturating_sub(1);
 
                 // downhill backoff in progress → drive reverse aim, then re-plan when it ends
                 if backoff_ticks > 0 {
@@ -2252,11 +2252,11 @@ fn goal_append_blast_radius() {
 /// by driving the production `CharacterController` over routable start/goal pairs TWICE per pair —
 /// once on the PLAIN coarse route, once on the INFLATED route — with the carrot LOS clamp
 /// (`carrot_los_clear`) ON in BOTH (the shipped config), so the ONLY variable is the inflation. Reports:
-///   * BROKEN   — completed on the plain route but NOT the inflated one (inflation broke a route). Must be 0.
-///   * GAINED   — completed on the inflated route but not the plain one (a corner wedge inflation cleared).
-///   * SMOOTHED — of pairs that complete BOTH ways, how many turn LESS on the inflated route (smoother),
-///                and the mean reduction in total turning (radians) — the anti-wiggle signal.
-///   * SLOWDOWN — ticks-inflated / ticks-plain on both-complete pairs. Must be ~1.0 (no crawl on open ground).
+/// * BROKEN   — completed on the plain route but NOT the inflated one (inflation broke a route). Must be 0.
+/// * GAINED   — completed on the inflated route but not the plain one (a corner wedge inflation cleared).
+/// * SMOOTHED — of pairs that complete BOTH ways, how many turn LESS on the inflated route (smoother),
+///   and the mean reduction in total turning (radians) — the anti-wiggle signal.
+/// * SLOWDOWN — ticks-inflated / ticks-plain on both-complete pairs. Must be ~1.0 (no crawl on open ground).
 ///
 /// This models COARSE-tier pursuit (the tier the inflation reshapes); the live client also has the fine
 /// tier + re-plan, so GAINED here is a coarse-only proxy — but BROKEN, SLOWDOWN and the narrow-corridor
@@ -2446,10 +2446,11 @@ fn corner_buffer_blast_radius() {
 /// This harness measures ONE build. Run it (identical seeds ⇒ identical sampled pairs, since the
 /// floor model is untouched by the fix) on unmodified `main` and on the fix branch, then diff the
 /// `PAIR` lines:
-///   * `route+complete` → `refused`      = a LEGIT route lost — a regression, must be 0;
-///   * `route+INCOMPLETE` → `refused`    = a phantom route turned into an honest refusal — the win;
-///   * `route+INCOMPLETE` → `route+complete` = re-routed via a real entrance — also the win;
-///   * `refused` → `route` = gained.
+/// * `route+complete` → `refused`      = a LEGIT route lost — a regression, must be 0;
+/// * `route+INCOMPLETE` → `refused`    = a phantom route turned into an honest refusal — the win;
+/// * `route+INCOMPLETE` → `route+complete` = re-routed via a real entrance — also the win;
+/// * `refused` → `route` = gained.
+///
 /// Every planned route is DRIVEN by the production controller (coarse-pursuit proxy, as in the
 /// #685 harness), so "complete" is the controller's verdict, not the planner's.
 ///
