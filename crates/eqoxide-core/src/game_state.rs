@@ -1353,10 +1353,14 @@ pub struct GameState {
     pub target_id: Option<u32>,
     pub target_name: Option<String>,
     /// NPCs that have recently swung at the player (hit or miss), keyed by spawn id → time of the
-    /// last swing. Auto-combat uses this to engage an add that aggros mid-fight instead of letting
-    /// it beat the player unanswered, while keeping the current target if it is also attacking us
-    /// (so two adds don't cause target thrash). Set in `apply_combat_damage`; read + pruned by the
-    /// nav auto-retarget.
+    /// last swing. Set in `apply_combat_damage`; pruned every tick against `ATTACKER_TTL` in
+    /// `ActionLoop::tick`.
+    ///
+    /// Two readers, both OBSERVERS — nothing here steers combat. `apply_combat_damage` uses an
+    /// id's ABSENCE to fire the `combat`/`attacked` event exactly once per aggro, so an agent
+    /// learns something started hitting it; the renderer (#418) faces a mid-swing NPC at the
+    /// player instead of trusting a stale wire heading. It fed the auto-retarget too until #1109
+    /// removed it — the client no longer decides whom to fight.
     pub recent_attackers: std::collections::HashMap<u32, std::time::Instant>,
     pub target_hp_pct: Option<f32>,
     /// Consider color (RGB) of the current target, set from the OP_Consider reply.
@@ -1753,11 +1757,13 @@ impl GameState {
         // Both are HashMaps keyed by spawn id. Neither is HTTP-exposed; both feed behaviour.
         // `combat_anims` also keys the PLAYER's own id, which is the one id that does NOT change
         // across a zone line — so an un-cleared entry replays the departed zone's swing on the
-        // first frames of the new one. `recent_attackers` feeds the auto-combat add-retarget; it is
-        // separately TTL-pruned (`ATTACKER_TTL`, 6s, in `action_loop`) and its consumer additionally
-        // requires the id to resolve to a live reachable NPC, so the surviving harm is narrow — an
-        // id the new zone reuses inside that window being treated as something that attacked us.
+        // first frames of the new one. `recent_attackers` gates the `combat`/`attacked` event and
+        // the renderer's #418 swing facing; it is separately TTL-pruned (`ATTACKER_TTL`, 6s, in
+        // `action_loop`), so the surviving harm is narrow — an id the new zone reuses inside that
+        // window drawing a spurious `attacked`, or one frame of an NPC turned the wrong way.
         // Cleared anyway: "narrow" is a bound on a wrong answer, not an argument for keeping it.
+        // (Before #1109 it also fed the auto-retarget, whose live-and-reachable check bounded this
+        // further. That consumer is gone; this clear and the TTL are the only bounds left.)
         self.combat_anims.clear();
         self.recent_attackers.clear();
     }
@@ -4031,11 +4037,12 @@ pub(crate) mod tests {
     ///   and the player's id is the one id that does NOT change across a zone line — so a surviving
     ///   entry replays the departed zone's swing on the first frames of the new zone with no packet
     ///   behind it.
-    /// * `recent_attackers` feeds the auto-combat add-retarget. Its window is bounded (a 6s
-    ///   `ATTACKER_TTL` prune in `action_loop`) and its consumer additionally requires the id to
-    ///   resolve to a live, reachable NPC — so the surviving harm is narrow: an id the new zone
-    ///   reuses inside that window being treated as something that just attacked us. Narrow is a
-    ///   bound on a wrong answer, not a reason to keep it.
+    /// * `recent_attackers` gates the `combat`/`attacked` event and the renderer's #418 swing
+    ///   facing. Its window is bounded (a 6s `ATTACKER_TTL` prune in `action_loop`), so the
+    ///   surviving harm is narrow: an id the new zone reuses inside that window being treated as
+    ///   something that just attacked us — a spurious `attacked` event, or one frame of an NPC
+    ///   turned the wrong way. Narrow is a bound on a wrong answer, not a reason to keep it.
+    ///   (Before #1109 it also fed the auto-retarget, which could act on that reused id.)
     ///
     /// Mutation check (both directions): drop the two clears → RED; WRAP as
     /// `if false { …clears… } else { self.combat_anims.clear(); }` → RED at the
@@ -4055,7 +4062,7 @@ pub(crate) mod tests {
              so a surviving entry replays that swing in the new zone with no packet behind it");
         assert!(gs.recent_attackers.is_empty(),
             "an attacker id is a per-zone spawn id; inside the 6s TTL, an id the new zone reuses \
-             would be treated by the auto-combat retarget as something that just attacked us");
+             would be reported to the agent as something that just attacked us");
     }
 
     /// #941 — the CLASS guard. Not an assertion test: a COMPILE-TIME forcing function.
