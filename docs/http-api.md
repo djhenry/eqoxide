@@ -83,7 +83,7 @@ so an accepted goal never hides the fact that the body is hanging out of the wor
 |-------|------|-------------|
 | `POST /v1/combat/target` | `{"id":<spawn_id>}` | Target a spawn + auto-consider it. |
 | `POST /v1/combat/target/name` | `{"name":"a rat"}` | Target a mob by fuzzy name. **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to) — always check it before acting on the target. |
-| `POST /v1/combat/attack` | — | Enable auto-attack. |
+| `POST /v1/combat/attack` | — | Enable auto-attack. Swings at the **current target and only** that target — the client never re-picks it for you (#1109), so a target you set stays set until you change it or the spawn goes away. |
 | `DELETE /v1/combat/attack` | — | Disable auto-attack. |
 | `POST /v1/combat/consider` | `{"id":N}` (default current target) | Consider a spawn (difficulty tier + faction attitude). Result: `target_con`/`target_attitude`/`target_level` on `/observe/debug` if the spawn IS the current target, always `last_consider` regardless — see [Consider results](#consider-results). |
 | `POST /v1/combat/cast` | `{"gem":0-8}` \| `{"spell_id":N,"target_id":M?}` \| `{"item_slot":N}` | Cast a memorized gem, a memorized spell by id, or an item clicky (on target, else current, else self). `gem`/`spell_id`/`item_slot` are **mutually exclusive** — two or more in one body is a `400`, never a silent pick (#952/#956, see [Mutually exclusive request forms](#mutually-exclusive-request-forms-952956)). `target_id` composes with all three. |
@@ -166,6 +166,13 @@ Currently emitted: **chat** (incoming tells/ooc/shout/group/gmsay), **navigate**
 zone, incl. server-initiated changes / cross-zone respawns), **combat** (`slain` — you died;
 `attacked` — a new mob started hitting you). More `kind`s land here over time without changing the
 shape.
+
+`attacked` is edge-triggered off a 6s "recently swung at us" window, so it means *"this spawn was
+not hitting you a moment ago"* rather than *"you have never been hit by this spawn"*. A lull longer
+than that window — kiting, a root/mez, the mob switching to your pet — re-arms it, and the same
+spawn fires `attacked` again when it resumes. Before #1109 that window was only pruned while
+auto-attack was ON, so with it off a spawn fired `attacked` at most once per zone; the prune is
+unconditional now, which makes the event honest in both states rather than only one.
 
 ---
 

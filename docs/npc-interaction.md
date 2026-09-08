@@ -4,8 +4,9 @@ All NPC interaction goes through shared-arc slots that the nav thread drains eac
 tick (150 ms). The render HUD writes the same slots via its buttons and the HTTP
 API writes them from external agents.
 
-> **Combat, auto-grind, and buying** (auto-attack, auto-engage/retarget, the facing requirement,
-> and merchant purchases) are covered in `autonomous-play.md`. This doc covers the
+> **Combat, auto-grind, and buying** (auto-attack, auto-engage, the facing requirement, and
+> merchant purchases) are covered in `autonomous-play.md`. Note there is no client-side
+> *retarget* — #1109 removed it; choosing the next mob is the agent's job. This doc covers the
 > hail/say/target/consider conversation flow.
 
 ---
