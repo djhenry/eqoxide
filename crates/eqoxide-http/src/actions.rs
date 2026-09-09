@@ -55,7 +55,12 @@ pub(crate) async fn track(State(state): State<HttpState>, request: Request, next
     // keep its result receiver alive independently of the HTTP connection.
     let (parts, body) = request.into_parts();
     use axum::extract::FromRequest;
-    let bytes = match axum::body::Bytes::from_request(Request::new(body), &state).await {
+    // Buffer under the caller's own body limit. axum reads `DefaultBodyLimit` from the request
+    // extensions, so a bare `Request::new(body)` would force the built-in 2 MiB default on these
+    // ten groups alone. Extensions are all a `Bytes` extraction consults.
+    let mut probe = Request::new(body);
+    *probe.extensions_mut() = parts.extensions.clone();
+    let bytes = match axum::body::Bytes::from_request(probe, &state).await {
         Ok(bytes) => bytes,
         Err(error) => return error.into_response(),
     };
@@ -90,22 +95,31 @@ async fn execute(state: HttpState, request: Request, next: Next, path: String) -
     let awaited = matches!(path.as_str(), "/v1/combat/cast" | "/v1/merchant/open"
         | "/v1/merchant/buy" | "/v1/interact/give");
     if awaited {
-        if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            if let Some(object) = value.as_object_mut() {
-                let outcome = object.get("status").and_then(|v| v.as_str()).unwrap_or("unconfirmed");
-                let result = match outcome {
-                    "completed" | "open" | "bought" | "given" if status == StatusCode::OK => "confirmed",
-                    "refused" | "fizzled" | "interrupted" => "refused",
-                    _ => "unconfirmed",
-                };
-                let reason = object.get("reason").or_else(|| object.get("message"))
-                    .and_then(|v| v.as_str()).unwrap_or(outcome).to_owned();
-                tracker.finish(id, result, &reason);
-                object.insert("request_id".into(), id.into());
-                publish(&state);
-                return (status, Json(value)).into_response();
-            }
+        if let Ok(serde_json::Value::Object(mut object)) = serde_json::from_slice(&bytes) {
+            let outcome = object.get("status").and_then(|v| v.as_str()).unwrap_or("unconfirmed");
+            let result = match outcome {
+                "completed" | "open" | "bought" | "given" if status == StatusCode::OK => "confirmed",
+                "refused" | "fizzled" | "interrupted" => "refused",
+                _ => "unconfirmed",
+            };
+            let reason = object.get("reason").or_else(|| object.get("message"))
+                .and_then(|v| v.as_str()).unwrap_or(outcome).to_owned();
+            tracker.finish(id, result, &reason);
+            object.insert("request_id".into(), id.into());
+            publish(&state);
+            return (status, Json(object)).into_response();
         }
+        // Answer an unreadable receipt now. It is the only outcome signal on this path, so falling
+        // through would discard it and skip `finish`, leaving the watchdog to report
+        // `outcome_timeout` for an already-decided request. Unreachable today; pins the degradation.
+        let (result, reason) = if status.is_success() {
+            ("unconfirmed", "unreadable_receipt".to_owned())
+        } else {
+            ("refused", String::from_utf8_lossy(&bytes).into_owned())
+        };
+        tracker.finish(id, result, &reason);
+        publish(&state);
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
     }
     if status.is_success() {
         // Queued text often describes the intended end state ("auto-attack ON"). Do not present
@@ -316,4 +330,57 @@ mod tests {
         }
     }
 
+    /// `track` buffers the body itself, so it must pass the original extensions to the extractor —
+    /// otherwise these ten groups are the only routes that ignore a configured `DefaultBodyLimit`.
+    #[tokio::test]
+    async fn tracked_route_honors_a_body_limit_override() {
+        let state = empty_state();
+        let app = axum::Router::new()
+            .route("/v1/combat/attack", axum::routing::post(
+                |body: axum::body::Bytes| async move { body.len().to_string() }))
+            .layer(axum::middleware::from_fn_with_state(state.clone(), super::track))
+            // Outermost, so the marker is in extensions before `track` buffers.
+            .layer(axum::extract::DefaultBodyLimit::disable())
+            .with_state(state.clone());
+        let oversize = 3 * 1024 * 1024;
+        let response = app.oneshot(Request::post("/v1/combat/attack")
+            .header("content-type", "application/json")
+            .body(Body::from("x".repeat(oversize))).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK,
+            "a disabled body limit must reach the buffering read, not just the handler");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, oversize.to_string().as_bytes(), "the whole body must survive buffering");
+    }
+
+    /// A non-object receipt must still reach the caller and finish the action immediately. The old
+    /// code returned a generic 202 and let the watchdog invent `outcome_timeout` 30 s later.
+    #[tokio::test]
+    async fn awaited_non_object_receipt_is_preserved_and_finished_immediately() {
+        for (status, body, result, reason) in [
+            (StatusCode::OK, r#""just a string""#, "unconfirmed", "unreadable_receipt"),
+            (StatusCode::CONFLICT, "not json at all", "refused", "not json at all"),
+        ] {
+            let state = empty_state();
+            let app = axum::Router::new()
+                .route("/v1/combat/cast", axum::routing::post(
+                    move |axum::extract::State(state): axum::extract::State<crate::HttpState>| async move {
+                        // Admission puts the action in the tracker; the awaited branch keys on PATH,
+                        // so only the receipt shape is under test.
+                        let (tx, _rx) = tokio::sync::oneshot::channel();
+                        assert!(state.command.request_cast_await(
+                            eqoxide_ipc::CastRequest { gem: 0, target_id: None, item_slot: None }, tx));
+                        (status, body)
+                    }))
+                .layer(axum::middleware::from_fn_with_state(state.clone(), super::track))
+                .with_state(state.clone());
+            let response = app.oneshot(post("/v1/combat/cast", r#"{"gem":0}"#)).await.unwrap();
+            assert_eq!(response.status(), status, "the handler's own status must survive");
+            let returned = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(returned, body.as_bytes(), "the handler's own receipt must not be discarded");
+            let feed = events(&state).await;
+            assert_eq!(feed["count"], 1, "the action must be finished now, not left to the watchdog");
+            assert_eq!(feed["events"][0]["result"], result);
+            assert_eq!(feed["events"][0]["reason"], reason);
+        }
+    }
 }

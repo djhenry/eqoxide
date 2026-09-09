@@ -10,7 +10,7 @@
 //! `self.merchant.merchant` (the live `MerchantSnapshot` for GET /v1/merchant/list) is a
 //! read-path/published field, not a command — deliberately NOT exposed here (see `mod.rs`).
 
-use super::CommandState;
+use super::{Action, CommandState};
 use eqoxide_ipc::{BuyOk, CommandResult, OpenOk, TradeCmd};
 use tokio::sync::oneshot;
 
@@ -21,7 +21,7 @@ impl CommandState {
     /// click — FIRE-AND-FORGET). The drain opens the merchant then sends OP_ShopPlayerBuy. HTTP's
     /// POST /v1/merchant/buy uses the awaited [`request_buy_await`](Self::request_buy_await) instead.
     pub fn request_merchant_buy(&self, merchant_id: u32, slot: u32) -> bool {
-        self.enqueue(&self.merchant.buy, (merchant_id, slot), false, "merchant.buy")
+        self.enqueue(&self.merchant.buy, (merchant_id, slot), false, Action::MerchantBuy)
     }
 
     /// Command-with-result buy (A3 Migration 1, #448): queue the SAME buy as `request_merchant_buy`
@@ -35,19 +35,19 @@ impl CommandState {
         slot: u32,
         tx: oneshot::Sender<CommandResult<BuyOk>>,
     ) -> bool {
-        self.enqueue(&self.merchant.buy_await, (merchant_id, slot, tx), true, "merchant.buy_await")
+        self.enqueue(&self.merchant.buy_await, (merchant_id, slot, tx), true, Action::MerchantBuyAwait)
     }
 
     /// Sell `quantity` of player inventory slot `slot` to merchant `merchant_id` (POST
     /// /v1/merchant/sell, the merchant window's sell click).
     pub fn request_merchant_sell(&self, merchant_id: u32, slot: u32, quantity: u32) -> bool {
-        self.enqueue(&self.merchant.sell, (merchant_id, slot, quantity), false, "merchant.sell")
+        self.enqueue(&self.merchant.sell, (merchant_id, slot, quantity), false, Action::MerchantSell)
     }
 
     /// Open or close the merchant window (POST /v1/merchant/{open,close}, the merchant window's
     /// close button, and the transient-window-close handler for `registry::MERCHANT`).
     pub fn request_merchant_trade(&self, cmd: TradeCmd) -> bool {
-        self.enqueue(&self.merchant.trade, cmd, false, "merchant.trade")
+        self.enqueue(&self.merchant.trade, cmd, false, Action::MerchantTrade)
     }
 
     /// Command-with-result open (eqoxide#479): queue the SAME open as
@@ -61,7 +61,7 @@ impl CommandState {
         merchant_id: u32,
         tx: oneshot::Sender<CommandResult<OpenOk>>,
     ) -> bool {
-        self.enqueue(&self.merchant.open_await, (merchant_id, tx), true, "merchant.open_await")
+        self.enqueue(&self.merchant.open_await, (merchant_id, tx), true, Action::MerchantOpenAwait)
     }
 
     // ── take_* : the MODEL (`ActionLoop::drain_merchant`) drains these once per tick ─────────────

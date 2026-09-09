@@ -5,7 +5,7 @@
 //! validation and packet-building stay where they were (the HTTP handlers, the trainer window, and
 //! `ActionLoop::drain_trainer`). No behavior change — just one typed surface.
 
-use super::CommandState;
+use super::{Action, CommandState};
 
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
@@ -14,13 +14,13 @@ impl CommandState {
     /// current session using the `npc_id == 0` sentinel (POST /v1/trainer/close — 0 is never a real
     /// spawn id).
     pub fn request_open_trainer(&self, npc_id: u32) -> bool {
-        self.enqueue(&self.trainer.trainer_open_req, npc_id, false, "trainer.trainer_open_req")
+        self.enqueue(&self.trainer.trainer_open_req, npc_id, false, Action::TrainerOpenReq)
     }
 
     /// Train one point of `skill_id` at the open trainer (POST /v1/trainer/train, the trainer
     /// window's Train button).
     pub fn request_train_skill(&self, skill_id: u32) -> bool {
-        self.enqueue(&self.trainer.trainer_train_req, skill_id, false, "trainer.trainer_train_req")
+        self.enqueue(&self.trainer.trainer_train_req, skill_id, false, Action::TrainerTrainReq)
     }
 
     // ── take_* : the MODEL (`ActionLoop::drain_trainer`) drains these once per tick ───────────────

@@ -15,6 +15,7 @@ const NAV_TICK_MS: u128 = 150;
 pub(crate) use eqoxide_core::physics::RUN_SPEED;
 use crate::protocol::*;
 use crate::transport::EqStream;
+use eqoxide_command::Action;
 use eqoxide_core::game_state::{GameState, ZonePoint};
 use eqoxide_ipc::{TradeCmd, CampCmd};
 use eqoxide_ipc::MoveIntent;
@@ -1569,7 +1570,7 @@ impl ActionLoop {
                 tracing::info!("EQ: quests: cancelled task_id={task_id} sequence_number={seq}");
                 gs.log_msg("quest", "Cancelled task");
             } else {
-                self.command.refuse_drained("quest.cancel_task", "task_missing");
+                self.command.refuse_drained(Action::QuestCancelTask, "task_missing");
                 tracing::warn!("EQ: quests: cancel requested for unknown task_id={task_id} — ignoring");
             }
         }
@@ -1595,7 +1596,7 @@ impl ActionLoop {
                 tracing::info!("EQ: group: accepted invite from {inviter}");
                 gs.log_msg("group", &format!("Accepted group invite from {inviter}"));
             } else {
-                self.command.refuse_drained("group.group_accept", "no_pending_invite");
+                self.command.refuse_drained(Action::GroupAccept, "no_pending_invite");
             }
         }
 
@@ -1607,7 +1608,7 @@ impl ActionLoop {
                 tracing::info!("EQ: group: declined invite from {inviter}");
                 gs.log_msg("group", &format!("Declined group invite from {inviter}"));
             } else {
-                self.command.refuse_drained("group.group_decline", "no_pending_invite");
+                self.command.refuse_drained(Action::GroupDecline, "no_pending_invite");
             }
         }
 
@@ -1662,7 +1663,7 @@ impl ActionLoop {
                 tracing::info!("EQ: trainer: training skill {skill_id} at npc {npc_id}");
                 gs.log_msg("trainer", &format!("Training {}", eqoxide_core::skills::skill_name(skill_id).unwrap_or("?")));
             } else {
-                self.command.refuse_drained("trainer.trainer_train_req", "no_trainer_window");
+                self.command.refuse_drained(Action::TrainerTrainReq, "no_trainer_window");
                 gs.log_msg("trainer", "Cannot train — no trainer window open");
             }
         }
@@ -2243,7 +2244,7 @@ impl ActionLoop {
             // anyway would leave the client believing in a target the server never set. Say so
             // instead of lying. The player's own spawn is legal and is absent from `entities`. (#348)
             if id != gs.player_id && !gs.world.entities.contains_key(&id) {
-                self.command.refuse_drained("combat.target", "target_missing");
+                self.command.refuse_drained(Action::CombatTarget, "target_missing");
                 let text = format!("Cannot target spawn {id}: it is not in this zone.");
                 gs.log_msg("combat", &text);
                 gs.push_event("combat", "target_failed", "", true, &text);
@@ -2307,7 +2308,7 @@ impl ActionLoop {
         if let Some(cmd) = pet_cmd {
             let cmd = cmd as u32;
             if gs.pet_id.is_none() {
-                self.command.refuse_drained("combat.pet_cmd", "no_pet");
+                self.command.refuse_drained(Action::CombatPetCmd, "no_pet");
                 gs.log_msg("pet", "You have no pet");
             } else if cmd == PET_ATTACK {
                 match gs.target_id.filter(|&t| t != 0) {
@@ -2320,7 +2321,7 @@ impl ActionLoop {
                         gs.log_msg("pet", "Pet attack ordered");
                     }
                     None => {
-                        self.command.refuse_drained("combat.pet_cmd", "no_target");
+                        self.command.refuse_drained(Action::CombatPetCmd, "no_target");
                         gs.log_msg("pet", "Pet attack: no target");
                     },
                 }
@@ -2349,11 +2350,11 @@ impl ActionLoop {
                     tracing::info!("EQ: read book slot={} file='{}'", slot, item.filename);
                 }
                 Some(_) => {
-                    self.command.refuse_drained("interact.read_book", "item_not_readable");
+                    self.command.refuse_drained(Action::InteractReadBook, "item_not_readable");
                     gs.log_msg("book", &format!("Item in slot {slot} is not readable"));
                 },
                 None => {
-                    self.command.refuse_drained("interact.read_book", "item_missing");
+                    self.command.refuse_drained(Action::InteractReadBook, "item_missing");
                     gs.log_msg("book", &format!("No item in slot {slot} to read"));
                 },
             }
@@ -2398,7 +2399,7 @@ impl ActionLoop {
                         tracing::info!("EQ: guild accept from {inviter} (guild_id={guild_id})");
                     }
                     None => {
-                        self.command.refuse_drained("guild.guild_action", "no_pending_invite");
+                        self.command.refuse_drained(Action::GuildAction, "no_pending_invite");
                         gs.log_msg("guild", "No pending guild invite to accept");
                     },
                 },
@@ -2681,7 +2682,7 @@ impl ActionLoop {
         let move_req = self.command.take_inventory_move();
         if let Some((from_slot, to_slot)) = move_req {
             if !gs.inventory.iter().any(|item| item.slot == from_slot as i32) {
-                self.command.refuse_drained("inventory.move_req", "item_missing");
+                self.command.refuse_drained(Action::InventoryMoveReq, "item_missing");
                 return;
             }
             // build_move_item emits the structured 28-byte RoF2 MoveItem_Struct; a flat 12-byte

@@ -11,7 +11,7 @@
 //! /v1/observe/dialogue) are read-path/published snapshots, not commands — deliberately NOT
 //! exposed here (see `mod.rs`).
 
-use super::CommandState;
+use super::{Action, CommandState};
 use crate::slot::Mailbox;
 use eqoxide_core::game_state::DialogueChoice;
 use eqoxide_ipc::{CommandResult, GiveOk};
@@ -24,26 +24,26 @@ impl CommandState {
     /// the NPC-dialogue window's re-hail). `spawn_id`, when known, is targeted first so the
     /// server's EVENT_SAY fires (#130).
     pub fn request_hail(&self, name: String, spawn_id: Option<u32>) -> bool {
-        self.enqueue(&self.interact.hail, (name, spawn_id), false, "interact.hail")
+        self.enqueue(&self.interact.hail, (name, spawn_id), false, Action::InteractHail)
     }
 
     /// Say arbitrary Say-channel text (POST /v1/interact/say, the chat window's say box, a
     /// dialogue keyword follow-up click).
     pub fn request_say(&self, text: String) -> bool {
-        self.enqueue(&self.interact.say, text, false, "interact.say")
+        self.enqueue(&self.interact.say, text, false, Action::InteractSay)
     }
 
     /// Loot a corpse by spawn id (POST /v1/interact/loot, the Loot window). The drain pushes it
     /// onto the existing auto-loot queue.
     pub fn request_loot(&self, corpse_id: u32) -> bool {
-        self.enqueue(&self.interact.loot, corpse_id, false, "interact.loot")
+        self.enqueue(&self.interact.loot, corpse_id, false, Action::InteractLoot)
     }
 
     /// Give (quest turn-in) inventory slot `from_slot` to NPC `npc_id` — FIRE-AND-FORGET (the UI
     /// turn-in path). The drain runs the multi-tick trade-window state machine. HTTP's POST
     /// /v1/interact/give uses the awaited [`request_give_await`](Self::request_give_await) instead.
     pub fn request_give(&self, npc_id: u32, from_slot: u32) -> bool {
-        self.enqueue(&self.interact.give, (npc_id, from_slot), false, "interact.give")
+        self.enqueue(&self.interact.give, (npc_id, from_slot), false, Action::InteractGive)
     }
 
     /// Command-with-result give (A3 Migration 2, #448): queue the SAME turn-in as `request_give` but
@@ -58,7 +58,7 @@ impl CommandState {
         from_slot: u32,
         tx: oneshot::Sender<CommandResult<GiveOk>>,
     ) -> bool {
-        self.enqueue(&self.interact.give_await, (npc_id, from_slot, tx), true, "interact.give_await")
+        self.enqueue(&self.interact.give_await, (npc_id, from_slot, tx), true, Action::InteractGiveAwait)
     }
 
     /// `true` while an awaited give is parked and undrained — a PEEK, not a drain (#347). Lets a
@@ -71,32 +71,32 @@ impl CommandState {
     /// Click a door by id (POST /v1/interact/click_door, or a human click in the 3D view). The
     /// drain sends OP_ClickDoor.
     pub fn request_door_click(&self, door_id: u8) -> bool {
-        self.enqueue(&self.interact.door_click, door_id, false, "interact.door_click")
+        self.enqueue(&self.interact.door_click, door_id, false, Action::InteractDoorClick)
     }
 
     /// Posture: `Some(true)` = sit, `Some(false)` = stand (POST /v1/interact/{sit,stand}, the
     /// Actions window's sit/stand toggle).
     pub fn request_sit(&self, sit: bool) -> bool {
-        self.enqueue(&self.interact.sit, sit, false, "interact.sit")
+        self.enqueue(&self.interact.sit, sit, false, Action::InteractSit)
     }
 
     /// Run/walk toggle (#625): `Some(true)` = run, `Some(false)` = walk (POST /v1/interact/{run,walk},
     /// the Actions window's Run/Walk button). The drain sends `OP_SetRunMode` (0x009f) and switches
     /// the local movement speed to match.
     pub fn request_run_mode(&self, run: bool) -> bool {
-        self.enqueue(&self.interact.run_mode, run, false, "interact.run_mode")
+        self.enqueue(&self.interact.run_mode, run, false, Action::InteractRunMode)
     }
 
     /// Click one of the current NPC-dialogue saylink choices (POST /v1/interact/dialogue, the
     /// NPC-dialogue window). The drain sends OP_ItemLinkClick.
     pub fn request_dialogue_click(&self, choice: DialogueChoice) -> bool {
-        self.enqueue(&self.interact.dialogue_click, choice, false, "interact.dialogue_click")
+        self.enqueue(&self.interact.dialogue_click, choice, false, Action::InteractDialogueClick)
     }
 
     /// Read a book/note at inventory wire slot `slot` (POST /v1/interact/read). The drain sends
     /// OP_ReadBook. (#288)
     pub fn request_read_book(&self, slot: i32) -> bool {
-        self.enqueue(&self.interact.read_book, slot, false, "interact.read_book")
+        self.enqueue(&self.interact.read_book, slot, false, Action::InteractReadBook)
     }
 
     // ── take_* : the MODEL (`ActionLoop`'s drains) drains these once per tick ─────────────────────

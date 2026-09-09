@@ -2,6 +2,66 @@ use std::{collections::HashMap, future::Future, sync::{Arc, Mutex, atomic::{Atom
 
 use tokio::time::Instant;
 
+/// Names one tracked command slot as a typed variant instead of a string.
+///
+/// [`CommandState::refuse_drained`] is called from `eqoxide-net` and must name the same slot the
+/// `enqueue` here filled. With bare strings, a rename on one side silently matched nothing: the
+/// action fell through to [`DrainScope`] and reported `unconfirmed` /
+/// `processed_without_server_confirmation` instead of `refused`, with no error anywhere. A variant
+/// makes that divergence a compile failure. The label text is derived from the `group.slot` idents,
+/// so it cannot drift from the field path `enqueue` locks.
+macro_rules! action_labels {
+    ($($variant:ident => $group:ident . $slot:ident),* $(,)?) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+        pub enum Action { $($variant,)* }
+        impl Action {
+            /// The `domain.slot` text. Operator-facing only — correlation uses the variant.
+            pub const fn label(self) -> &'static str {
+                match self { $(Action::$variant => concat!(stringify!($group), ".", stringify!($slot)),)* }
+            }
+            #[cfg(test)]
+            const ALL: &'static [Action] = &[$(Action::$variant,)*];
+        }
+    };
+}
+action_labels! {
+    CombatTarget          => combat.target,
+    CombatAttack          => combat.attack,
+    CombatConsider        => combat.consider,
+    CombatCast            => combat.cast,
+    CombatCastAwait       => combat.cast_await,
+    CombatMemSpell        => combat.mem_spell,
+    CombatPetCmd          => combat.pet_cmd,
+    MerchantBuy           => merchant.buy,
+    MerchantBuyAwait      => merchant.buy_await,
+    MerchantSell          => merchant.sell,
+    MerchantTrade         => merchant.trade,
+    MerchantOpenAwait     => merchant.open_await,
+    InventoryMoveReq      => inventory.move_req,
+    InteractHail          => interact.hail,
+    InteractSay           => interact.say,
+    InteractLoot          => interact.loot,
+    InteractGive          => interact.give,
+    InteractGiveAwait     => interact.give_await,
+    InteractDoorClick     => interact.door_click,
+    InteractSit           => interact.sit,
+    InteractRunMode       => interact.run_mode,
+    InteractDialogueClick => interact.dialogue_click,
+    InteractReadBook      => interact.read_book,
+    QuestAcceptTask       => quest.accept_task,
+    QuestCancelTask       => quest.cancel_task,
+    GroupInvite           => group.group_invite,
+    GroupAccept           => group.group_accept,
+    GroupDecline          => group.group_decline,
+    GroupLeave            => group.group_leave,
+    GroupKick             => group.group_kick,
+    GroupMakeLeader       => group.group_make_leader,
+    GuildAction           => guild.guild_action,
+    TrainerOpenReq        => trainer.trainer_open_req,
+    TrainerTrainReq       => trainer.trainer_train_req,
+    ChatSend              => chat.chat_send,
+}
+
 #[derive(Clone, Default)]
 pub struct ActionTracker(Arc<Mutex<State>>);
 #[derive(Default)]
@@ -9,7 +69,7 @@ struct State {
     next: u64,
     pending: HashMap<u64, Pending>,
     queued: HashMap<usize, Vec<u64>>,
-    names: HashMap<usize, String>,
+    names: HashMap<usize, Action>,
     drained: HashMap<usize, Vec<u64>>,
     events: Vec<ActionRecord>,
 }
@@ -45,11 +105,11 @@ impl ActionTracker {
         let ids: Vec<_> = self.0.lock().unwrap().pending.iter().filter(|(_, p)| p.accepted && p.deadline <= Instant::now()).map(|(&id, _)| id).collect();
         for id in ids { self.finish(id, "unconfirmed", "outcome_timeout"); }
     }
-    pub(crate) fn accept(&self, key: usize, awaited: bool, name: &str) {
+    pub(crate) fn accept(&self, key: usize, awaited: bool, name: Action) {
         let _ = CONTEXT.try_with(|context| {
             if !Arc::ptr_eq(&self.0, &context.tracker.0) { return; }
             let mut state = self.0.lock().unwrap();
-            state.names.insert(key, name.into());
+            state.names.insert(key, name);
             if let Some(p) = state.pending.get_mut(&context.id) {
                 p.accepted = true;
                 p.deadline = Instant::now() + Duration::from_secs(30);
@@ -75,16 +135,16 @@ impl Drop for DrainScope {
 impl crate::CommandState {
     pub fn actions(&self) -> ActionTracker { self.actions.clone() }
     /// Report a local rejection for a command already drained this tick.
-    /// `command` is the canonical IPC domain.slot label, e.g. `combat.target`.
-    pub fn refuse_drained(&self, command: &str, reason: &str) {
+    /// `command` names the slot as an [`Action`], so it cannot drift from the `enqueue` that filled it.
+    pub fn refuse_drained(&self, command: Action, reason: &str) {
         let ids = {
             let mut state = self.actions.0.lock().unwrap();
-            let keys: Vec<_> = state.names.iter().filter(|(_, name)| name.as_str() == command).map(|(&key, _)| key).collect();
+            let keys: Vec<_> = state.names.iter().filter(|&(_, &name)| name == command).map(|(&key, _)| key).collect();
             keys.into_iter().flat_map(|key| state.drained.remove(&key).unwrap_or_default()).collect::<Vec<_>>()
         };
         for id in ids { self.actions.finish(id, "refused", reason); }
     }
-    pub(crate) fn enqueue<T>(&self, slot: &Mutex<Option<T>>, msg: T, awaited: bool, name: &str) -> bool {
+    pub(crate) fn enqueue<T>(&self, slot: &Mutex<Option<T>>, msg: T, awaited: bool, name: Action) -> bool {
         let mut value = slot.lock().unwrap();
         if value.is_some() { return false; }
         *value = Some(msg);
@@ -101,7 +161,20 @@ impl crate::CommandState {
 
 #[cfg(test)]
 mod tests {
+    use super::Action;
     use crate::CommandState;
+
+    /// Duplicate labels would make `refuse_drained` refuse both slots, inventing a refusal for a
+    /// command whose precondition was fine.
+    #[test]
+    fn every_action_label_is_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for action in Action::ALL {
+            assert!(seen.insert(action.label()), "duplicate action label: {}", action.label());
+        }
+        assert_eq!(seen.len(), Action::ALL.len());
+    }
+
     #[tokio::test]
     async fn accepted_command_survives_refusal_and_new_enqueue_after_drain() {
         let command = CommandState::default();
@@ -190,7 +263,7 @@ mod tests {
         {
             let _scope = tracker.drain_scope();
             command.take_target();
-            command.refuse_drained("combat.target", "target_missing");
+            command.refuse_drained(Action::CombatTarget, "target_missing");
         }
         let events = tracker.take_events();
         assert_eq!(events.len(), 1);

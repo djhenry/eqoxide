@@ -6,7 +6,7 @@
 //! behavior change — just one typed surface. `self.guild.guild` (the roster/identity snapshot) is
 //! deliberately NOT exposed here — that's read-path, not a command (see `mod.rs`).
 
-use super::CommandState;
+use super::{Action, CommandState};
 use eqoxide_ipc::GuildAction;
 
 impl CommandState {
@@ -17,7 +17,7 @@ impl CommandState {
     /// undrained — preserves the original `queue()` helper's atomic check-then-set, which the HTTP
     /// handler surfaces as 409 CONFLICT rather than silently clobbering a pending action.
     pub fn request_guild_action(&self, action: GuildAction) -> bool {
-        self.enqueue(&self.guild.guild_action, action, false, "guild.guild_action")
+        self.enqueue(&self.guild.guild_action, action, false, Action::GuildAction)
     }
 
     // ── take_* : the MODEL (`ActionLoop::tick`'s `drain_guild`) drains this once per tick ─────────

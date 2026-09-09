@@ -5,7 +5,7 @@
 //! thin typed read/write of a slot in `self.combat`; validation and packet-building stay where they
 //! were (the HTTP handler and `ActionLoop::tick`). No behavior change — just one typed surface.
 
-use super::CommandState;
+use super::{Action, CommandState};
 use eqoxide_ipc::{CastEnd, CastRequest, CommandResult};
 use tokio::sync::oneshot;
 
@@ -15,23 +15,23 @@ impl CommandState {
     /// Target a spawn (POST /v1/combat/target{,/name}, the Target/Actions windows). The drain
     /// (`take_target`) auto-considers it. Caller validates the id is in-zone first.
     pub fn request_target(&self, spawn_id: u32) -> bool {
-        self.enqueue(&self.combat.target, spawn_id, false, "combat.target")
+        self.enqueue(&self.combat.target, spawn_id, false, Action::CombatTarget)
     }
 
     /// Toggle auto-attack (POST/DELETE /v1/combat/attack, the Attack button). `on` = engage.
     pub fn request_attack(&self, on: bool) -> bool {
-        self.enqueue(&self.combat.attack, on, false, "combat.attack")
+        self.enqueue(&self.combat.attack, on, false, Action::CombatAttack)
     }
 
     /// Consider a spawn (POST /v1/combat/consider, the Consider button) — con color/faction reply.
     pub fn request_consider(&self, spawn_id: u32) -> bool {
-        self.enqueue(&self.combat.consider, spawn_id, false, "combat.consider")
+        self.enqueue(&self.combat.consider, spawn_id, false, Action::CombatConsider)
     }
 
     /// Cast a memorized gem, a spell id, or an item clicky (POST /v1/combat/cast, the spell-gem /
     /// spellbook windows). The handler builds the [`CastRequest`]; the drain resolves the target.
     pub fn request_cast(&self, req: CastRequest) -> bool {
-        self.enqueue(&self.combat.cast, req, false, "combat.cast")
+        self.enqueue(&self.combat.cast, req, false, Action::CombatCast)
     }
 
     /// Command-with-result cast (A3 Migration 3, #448): queue the SAME cast as `request_cast` but hand
@@ -41,7 +41,7 @@ impl CommandState {
     /// Writes the sibling `cast_await` slot — the fire-and-forget `cast` slot (UI path) is left
     /// untouched. See `crate::command_state::result`.
     pub fn request_cast_await(&self, req: CastRequest, tx: oneshot::Sender<CommandResult<CastEnd>>) -> bool {
-        self.enqueue(&self.combat.cast_await, (req, tx), true, "combat.cast_await")
+        self.enqueue(&self.combat.cast_await, (req, tx), true, Action::CombatCastAwait)
     }
 
     /// Memorize a known spell (`scribing = 1`) or scribe a scroll (`scribing = 0`) into a book/gem
@@ -49,12 +49,12 @@ impl CommandState {
     /// scribe (moved to cursor first by the drain), `None` for a memorize. Tuple shape preserved
     /// verbatim from `ipc::MemSpellReq`.
     pub fn request_mem_spell(&self, slot: u32, spell_id: u32, scribing: u32, from: Option<u32>) -> bool {
-        self.enqueue(&self.combat.mem_spell, (slot, spell_id, scribing, from), false, "combat.mem_spell")
+        self.enqueue(&self.combat.mem_spell, (slot, spell_id, scribing, from), false, Action::CombatMemSpell)
     }
 
     /// Queue one OP_PetCommands byte (POST /v1/pet/command, the Pet window). See `PET_*` constants.
     pub fn request_pet_command(&self, cmd: u8) -> bool {
-        self.enqueue(&self.combat.pet_cmd, cmd, false, "combat.pet_cmd")
+        self.enqueue(&self.combat.pet_cmd, cmd, false, Action::CombatPetCmd)
     }
 
     // ── take_* : the MODEL (`ActionLoop::tick`) drains these once per tick ────────────────────────

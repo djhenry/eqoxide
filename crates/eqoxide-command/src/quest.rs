@@ -7,7 +7,7 @@
 //! snapshots (published by `ActionLoop`, read by `http/quests.rs` GETs) and are deliberately NOT
 //! wrapped here — see `mod.rs`'s scope note.
 
-use super::CommandState;
+use super::{Action, CommandState};
 
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
@@ -16,12 +16,12 @@ impl CommandState {
     /// button), or decline all pending offers using the `task_id == 0` sentinel (POST
     /// /v1/quests/decline, the journal's Decline button).
     pub fn request_accept_task(&self, task_id: u32) -> bool {
-        self.enqueue(&self.quest.accept_task, task_id, false, "quest.accept_task")
+        self.enqueue(&self.quest.accept_task, task_id, false, Action::QuestAcceptTask)
     }
 
     /// Abandon an active task (POST /v1/quests/cancel {"task_id":N}, the journal's Abandon button).
     pub fn request_cancel_task(&self, task_id: u32) -> bool {
-        self.enqueue(&self.quest.cancel_task, task_id, false, "quest.cancel_task")
+        self.enqueue(&self.quest.cancel_task, task_id, false, Action::QuestCancelTask)
     }
 
     // ── take_* : the MODEL (`ActionLoop::drain_quests`) drains these once per tick ────────────────

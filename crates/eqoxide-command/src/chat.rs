@@ -8,7 +8,7 @@
 //! read-path feeds the model publishes and the view/HTTP reads (`GET /v1/events/*` and
 //! `/v1/observe/messages`), not writes the view makes — see `mod.rs`.
 
-use super::CommandState;
+use super::{Action, CommandState};
 use eqoxide_ipc::ChatSend;
 
 impl CommandState {
@@ -19,7 +19,7 @@ impl CommandState {
     pub fn request_chat_send(&self, msg: ChatSend) {
         let mut queue = self.chat.chat_send.lock().unwrap();
         queue.push(msg);
-        self.actions.accept(std::sync::Arc::as_ptr(&self.chat.chat_send) as usize, false, "chat.chat_send");
+        self.actions.accept(std::sync::Arc::as_ptr(&self.chat.chat_send) as usize, false, Action::ChatSend);
     }
 
     // ── take_* : the MODEL (`ActionLoop::tick`'s `drain_chat`) drains this once per tick ───────────
