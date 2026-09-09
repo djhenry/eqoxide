@@ -6,77 +6,76 @@
 //! `drain_group`). No behavior change — just one typed surface. `self.group.group` (the roster
 //! snapshot) is deliberately NOT exposed here — that's read-path, not a command (see `mod.rs`).
 
-use super::CommandState;
-use crate::slot::Mailbox;
+use super::{Action, CommandState};
 
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
 
     /// Send an invite (POST /v1/group/invite {"name"}).
     pub fn request_group_invite(&self, name: String) -> bool {
-        self.group.group_invite.try_put(name)
+        self.enqueue(&self.group.group_invite, name, false, Action::GroupInvite)
     }
 
     /// Accept the current pending invite (POST /v1/group/accept, the invite banner's Accept
     /// button). Caller checks a pending invite exists first.
     pub fn request_group_accept(&self) -> bool {
-        self.group.group_accept.try_put(())
+        self.enqueue(&self.group.group_accept, (), false, Action::GroupAccept)
     }
 
     /// Decline the current pending invite (POST /v1/group/decline, the invite banner's Decline
     /// button). Caller checks a pending invite exists first.
     pub fn request_group_decline(&self) -> bool {
-        self.group.group_decline.try_put(())
+        self.enqueue(&self.group.group_decline, (), false, Action::GroupDecline)
     }
 
     /// Leave the current group (POST /v1/group/leave, the Group window's Leave button). Caller
     /// checks the player is currently grouped first.
     pub fn request_group_leave(&self) -> bool {
-        self.group.group_leave.try_put(())
+        self.enqueue(&self.group.group_leave, (), false, Action::GroupLeave)
     }
 
     /// Kick a member (POST /v1/group/kick {"name"}, or the Group window's per-row ✕ / context
     /// menu). Caller checks leadership + membership first.
     pub fn request_group_kick(&self, name: String) -> bool {
-        self.group.group_kick.try_put(name)
+        self.enqueue(&self.group.group_kick, name, false, Action::GroupKick)
     }
 
     /// Transfer leadership (POST /v1/group/makeleader {"name"}, or the Group window's context
     /// menu). Caller checks leadership + membership first.
     pub fn request_group_make_leader(&self, name: String) -> bool {
-        self.group.group_make_leader.try_put(name)
+        self.enqueue(&self.group.group_make_leader, name, false, Action::GroupMakeLeader)
     }
 
     // ── take_* : the MODEL (`ActionLoop::tick`'s `drain_group`) drains these once per tick ────────
 
     /// Drain a pending invite request.
     pub fn take_group_invite(&self) -> Option<String> {
-        self.group.group_invite.take_msg()
+        self.dequeue(&self.group.group_invite)
     }
 
     /// Drain a pending accept request.
     pub fn take_group_accept(&self) -> Option<()> {
-        self.group.group_accept.take_msg()
+        self.dequeue(&self.group.group_accept)
     }
 
     /// Drain a pending decline request.
     pub fn take_group_decline(&self) -> Option<()> {
-        self.group.group_decline.take_msg()
+        self.dequeue(&self.group.group_decline)
     }
 
     /// Drain a pending leave request.
     pub fn take_group_leave(&self) -> Option<()> {
-        self.group.group_leave.take_msg()
+        self.dequeue(&self.group.group_leave)
     }
 
     /// Drain a pending kick request.
     pub fn take_group_kick(&self) -> Option<String> {
-        self.group.group_kick.take_msg()
+        self.dequeue(&self.group.group_kick)
     }
 
     /// Drain a pending make-leader request.
     pub fn take_group_make_leader(&self) -> Option<String> {
-        self.group.group_make_leader.take_msg()
+        self.dequeue(&self.group.group_make_leader)
     }
 }
 

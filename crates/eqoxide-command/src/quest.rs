@@ -7,8 +7,7 @@
 //! snapshots (published by `ActionLoop`, read by `http/quests.rs` GETs) and are deliberately NOT
 //! wrapped here — see `mod.rs`'s scope note.
 
-use super::CommandState;
-use crate::slot::Mailbox;
+use super::{Action, CommandState};
 
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
@@ -17,24 +16,24 @@ impl CommandState {
     /// button), or decline all pending offers using the `task_id == 0` sentinel (POST
     /// /v1/quests/decline, the journal's Decline button).
     pub fn request_accept_task(&self, task_id: u32) -> bool {
-        self.quest.accept_task.try_put(task_id)
+        self.enqueue(&self.quest.accept_task, task_id, false, Action::QuestAcceptTask)
     }
 
     /// Abandon an active task (POST /v1/quests/cancel {"task_id":N}, the journal's Abandon button).
     pub fn request_cancel_task(&self, task_id: u32) -> bool {
-        self.quest.cancel_task.try_put(task_id)
+        self.enqueue(&self.quest.cancel_task, task_id, false, Action::QuestCancelTask)
     }
 
     // ── take_* : the MODEL (`ActionLoop::drain_quests`) drains these once per tick ────────────────
 
     /// Drain a pending accept/decline-all request.
     pub fn take_accept_task(&self) -> Option<u32> {
-        self.quest.accept_task.take_msg()
+        self.dequeue(&self.quest.accept_task)
     }
 
     /// Drain a pending cancel-task request.
     pub fn take_cancel_task(&self) -> Option<u32> {
-        self.quest.cancel_task.take_msg()
+        self.dequeue(&self.quest.cancel_task)
     }
 }
 

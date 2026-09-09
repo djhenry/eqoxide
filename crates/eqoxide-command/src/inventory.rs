@@ -8,8 +8,7 @@
 //! `self.inventory.inventory` (the live `Vec<InvItem>` snapshot for GET /v1/observe/inventory) is a
 //! read-path/published field, not a command — deliberately NOT exposed here (see `mod.rs`).
 
-use super::CommandState;
-use crate::slot::Mailbox;
+use super::{Action, CommandState};
 
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
@@ -17,14 +16,14 @@ impl CommandState {
     /// Move/equip/unequip an item between inventory slots (POST /v1/inventory/move, the inventory
     /// window's drag-drop). `(from, to)` are Titanium wire slot ids. The drain sends OP_MoveItem.
     pub fn request_inventory_move(&self, from: u32, to: u32) -> bool {
-        self.inventory.move_req.try_put((from, to))
+        self.enqueue(&self.inventory.move_req, (from, to), false, Action::InventoryMoveReq)
     }
 
     // ── take_* : the MODEL (`ActionLoop::drain_move_item`) drains this once per tick ─────────────
 
     /// Drain a pending move request as `(from_slot, to_slot)`.
     pub fn take_inventory_move(&self) -> Option<(u32, u32)> {
-        self.inventory.move_req.take_msg()
+        self.dequeue(&self.inventory.move_req)
     }
 }
 

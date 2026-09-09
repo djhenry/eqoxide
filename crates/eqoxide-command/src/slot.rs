@@ -1,136 +1,43 @@
-//! [`Mailbox`] — the ONE way a `request_*` writes a single-slot command mailbox (#347 step 2).
+//! Occupancy inspection and regression checks for command mailboxes.
 //!
-//! Every view→model command in this crate lives in an `Arc<Mutex<Option<T>>>` that `ActionLoop`
-//! drains once per tick. Before #347 every `request_*` wrote it with a blind
-//! `*slot.lock().unwrap() = Some(x)`, so a second request arriving inside the drain window
-//! **replaced** the first — and the HTTP handler that made the first request had already answered
-//! `200`. One of the two actions simply never happened and nothing said so. That is the structural
-//! form of the agent-honesty defect: the client reported a confident falsehood.
-//!
-//! [`Mailbox::try_put`] is the fix: it is a check-then-set under ONE lock acquisition, and it
-//! **never overwrites**. An occupied mailbox is left exactly as it was and the caller gets `false`,
-//! which the HTTP handlers turn into `409 CONFLICT`. `guild.rs`'s `request_guild_action` did this
-//! by hand before #347 and was the only slot in the codebase that did; this trait generalizes it.
-//!
-//! ## Why a trait rather than a guard call
-//! `try_put`/[`Mailbox::take_msg`] are the only slot operations this crate's `request_*`/`take_*`
-//! methods use, so "overwrite a pending command" is not something a domain module can express by
-//! accident — it has to be written out longhand as a raw `*slot.lock().unwrap() = ..`. The
-//! [`tests::no_domain_module_blind_writes_a_command_slot`] source guard below then fails on any
-//! such longhand write that is not explicitly annotated `LAST-WINS`, so the rule cannot be
-//! reintroduced silently by a later domain migration. (Making it *statically* unrepresentable would
-//! mean changing the slot's declared type in `eqoxide-ipc`, which every drain site and several
-//! other crates name; that is a bigger blast radius than #347's scope allows.)
-//!
-//! ## What is deliberately NOT a `Mailbox`
-//! Three domains keep last-writer-wins semantics, each annotated `LAST-WINS` at the write site:
-//!   * **nav** (`nav.rs`) — `/move/goto`, `/move/follow`, `/move/stop`, `/move/zone_cross` are a
-//!     RETARGET, not a queue: a second goto is meant to supersede the first. Crucially, nav is also
-//!     the one domain that is already honest about it — every write stamps a fresh `goal_id` and
-//!     publishes `nav_state`/`nav_reason` (#349/#725), so a superseded goal is observable to the
-//!     agent. It is not in the silent-drop class this module addresses.
-//!   * **lifecycle** (`lifecycle.rs`) — `camp` is a toggle whose LAST value is the intended one, and
-//!     `POST /v1/lifecycle/exit` must be able to override an in-progress camp (it is the only way to
-//!     tear down a wedged session). `respawn` is a plain `bool` flag, not an `Option`: setting it
-//!     twice loses nothing.
-//!   * **social** (`social.rs`) — `who_req`/`friends_req` hold a `oneshot::Sender`, not a command.
-//!     Dropping one does not produce a false `200`: the losing caller's receiver closes and its
-//!     handler answers `503`. Out of #347's "both callers got 200" class, so left unchanged.
-//!
-//! `chat.rs`'s `chat_send` is a `Vec`, i.e. already an unbounded FIFO, and was the only loss-free
-//! slot before this change.
+//! Production writes and drains use `CommandState::enqueue` and `CommandState::dequeue` so
+//! request identity moves under the same lock as the payload. An occupied mailbox refuses a new
+//! write. Navigation and lifecycle retain their explicit last-writer-wins contracts; social
+//! lookups use reply channels whose closure is observable by the awaiting caller.
+//! The source guard permits a raw slot write only when its line or immediately preceding
+//! comment block carries `LAST-WINS` with a reason. Navigation retargets, lifecycle toggles,
+//! and social reply-channel replacement use this explicit exception.
 
 use std::sync::Mutex;
 
-/// A single-slot command mailbox that refuses to lose a message.
-///
-/// Implemented for `Mutex<Option<T>>`, which is what every command slot in `eqoxide_ipc` is behind
-/// an `Arc`. See the module docs for why this exists.
 pub(crate) trait Mailbox<T> {
-    /// Put `msg` in the mailbox if it is empty. Returns `true` if it was accepted.
-    ///
-    /// Returns `false` — leaving the pending message **untouched** — if a message is already
-    /// waiting to be drained. Check-then-set happens under a single lock acquisition, so two
-    /// concurrent `try_put`s can never both succeed.
-    fn try_put(&self, msg: T) -> bool;
-
-    /// Drain the mailbox, leaving it empty. The MODEL side (`ActionLoop::tick`) calls this.
-    fn take_msg(&self) -> Option<T>;
-
-    /// `true` if a message is waiting to be drained — a PEEK that leaves the mailbox alone.
-    ///
-    /// Exists so a test can observe "the first request is still parked" without `take_msg`ing it,
-    /// which would destroy the very occupancy the next assertion depends on.
     fn is_occupied(&self) -> bool;
 }
 
 impl<T> Mailbox<T> for Mutex<Option<T>> {
-    fn try_put(&self, msg: T) -> bool {
-        let mut slot = self.lock().unwrap();
-        if slot.is_some() {
-            return false;
-        }
-        *slot = Some(msg);
-        true
-    }
-
-    fn take_msg(&self) -> Option<T> {
-        self.lock().unwrap().take()
-    }
-
-    fn is_occupied(&self) -> bool {
-        self.lock().unwrap().is_some()
-    }
+    fn is_occupied(&self) -> bool { self.lock().unwrap().is_some() }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Mailbox;
-    use std::sync::Mutex;
-
     #[test]
-    fn try_put_fills_an_empty_mailbox() {
-        let m: Mutex<Option<u32>> = Mutex::new(None);
-        assert!(m.try_put(7));
-        assert_eq!(m.take_msg(), Some(7));
-        assert_eq!(m.take_msg(), None, "a drained mailbox must not re-fire");
-    }
-
-    #[test]
-    fn try_put_on_an_occupied_mailbox_is_refused_and_preserves_the_first_message() {
-        let m: Mutex<Option<u32>> = Mutex::new(None);
-        assert!(m.try_put(1));
-        assert!(!m.try_put(2), "the second message must be refused");
-        assert_eq!(m.take_msg(), Some(1), "the FIRST message must survive untouched");
-    }
-
-    /// Under real concurrency, exactly one of N racing `try_put`s wins and the winner's message is
-    /// the one that drains — no interleaving can produce two accepted puts or a lost winner.
-    #[test]
-    fn concurrent_try_puts_accept_exactly_one() {
-        use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Barrier};
-
-        for _round in 0..200 {
-            let m: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
-            let accepted = Arc::new(AtomicUsize::new(0));
+    fn concurrent_requests_accept_exactly_one_and_preserve_its_payload() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..200 {
+            let command = crate::CommandState::default();
             let barrier = Arc::new(Barrier::new(4));
-            let handles: Vec<_> = (0..4)
-                .map(|i| {
-                    let (m, accepted, barrier) = (m.clone(), accepted.clone(), barrier.clone());
-                    std::thread::spawn(move || {
-                        barrier.wait();
-                        if m.try_put(i) {
-                            accepted.fetch_add(1, Ordering::SeqCst);
-                            Some(i)
-                        } else {
-                            None
-                        }
-                    })
+            let handles: Vec<_> = (1..=4).map(|id| {
+                let command = command.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    command.request_target(id).then_some(id)
                 })
-                .collect();
-            let winners: Vec<usize> = handles.into_iter().filter_map(|h| h.join().unwrap()).collect();
-            assert_eq!(accepted.load(Ordering::SeqCst), 1, "exactly one put may be accepted");
-            assert_eq!(m.take_msg(), Some(winners[0]), "the accepted put's message must be the one that drains");
+            }).collect();
+            let winners: Vec<_> = handles.into_iter().filter_map(|h| h.join().unwrap()).collect();
+            assert_eq!(winners.len(), 1);
+            assert_eq!(command.take_target(), Some(winners[0]));
+            assert_eq!(command.take_target(), None);
         }
     }
 
@@ -207,7 +114,7 @@ mod tests {
         assert!(scanned >= 10, "expected to scan the crate's domain modules, scanned only {scanned}");
         assert!(
             offenders.is_empty(),
-            "blind command-slot write(s) found — use `Mailbox::try_put` (which refuses rather than \
+            "blind command-slot write(s) found — use `CommandState::enqueue` (which refuses rather than \
              overwrites), or annotate the line `LAST-WINS` with the reason if the domain genuinely \
              wants last-writer-wins (see slot.rs module docs, #347):\n{}",
             offenders.join("\n"),

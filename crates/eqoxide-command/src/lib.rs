@@ -83,6 +83,9 @@
 //!    `#[allow(dead_code)]`. (`combat.rs` is the reference for the METHOD shape; note combat also
 //!    already removed its field — that is the eventual end state, NOT what a Wave-2 domain does.)
 
+mod actions;
+// `Action` is public because `refuse_drained`'s callers live in eqoxide-net — see `actions.rs`.
+pub use actions::{Action, ActionTracker, ActionContext, ActionRecord};
 mod combat;
 mod slot;
 /// A3 Migration 1 (#448): the reusable Command-with-result infra. `CommandResult<T>` is the honest
@@ -133,6 +136,7 @@ mod lifecycle;
 /// doc. Every field below is now a genuine view→model command bundle.
 #[derive(Clone, Default)]
 pub struct CommandState {
+    actions: ActionTracker,
     combat:    eqoxide_ipc::CombatSlots,
     merchant:  eqoxide_ipc::MerchantSlots,
     inventory: eqoxide_ipc::InventorySlots,
@@ -179,6 +183,7 @@ impl CommandState {
         lifecycle: eqoxide_ipc::LifecycleSlots,
     ) -> Self {
         CommandState {
+            actions: ActionTracker::default(),
             combat, merchant, inventory, interact, quest, group, guild, trainer, social, chat,
             nav, lifecycle,
             zone_cross_outstanding: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),

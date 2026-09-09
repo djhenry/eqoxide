@@ -732,7 +732,7 @@ mod tests {
             door_id: 7, name: "HHCELL".into(),
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, opentype: 58, is_open: false,
         });
-        let app = crate::v1_router().with_state(state);
+        let app = crate::v1_router(&state).with_state(state);
         let req = match case.post_body {
             Some(json) => Request::post(case.route)
                 .header("content-type", "application/json")
@@ -914,7 +914,7 @@ mod tests {
         state.net_health.lock().unwrap().last_tick = std::time::Instant::now();
         crate::testkit::set_gs(&state, |gs| gs.world.zone_name = "testfixture".to_string());
         let frame_req = state.camera.frame_req.clone();
-        let app = crate::v1_router().with_state(state);
+        let app = crate::v1_router(&state).with_state(state);
         let req = Request::get("/v1/observe/frame?allow_pending=1&prset=top_down&pitch=10")
             .body(Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();

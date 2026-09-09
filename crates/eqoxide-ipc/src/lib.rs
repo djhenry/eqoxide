@@ -1900,7 +1900,8 @@ pub struct MessageEntry {
 /// `apply_packet` (`crates/eqoxide-net/src/gameplay.rs`) — a cadence driven by server traffic,
 /// not the 150 ms nav clock; the interval is unbounded in a silent zone. `sync_messages` also
 /// publishes [`DialogueShared`] and [`ChatEventsShared`] in the SAME call, on this same cadence.
-/// It is the sole production writer of [`ChatEventsShared`] and of this slot — but NOT of
+/// It is the sole production writer of this slot. Action outcomes independently append to
+/// [`ChatEventsShared`]. It is NOT the sole writer of
 /// [`DialogueShared`], which `run_zone_entry_handshake` clears directly on a re-zone. See that
 /// type's own doc, which names the second writer (#1044 review round 1, finding B: the earlier
 /// wording said "sole publisher" of all three and contradicted [`DialogueShared`]'s own doc just
@@ -2429,31 +2430,18 @@ pub struct Event {
     pub from:     String,
     pub directed: bool,
     pub text:     String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
-/// Live snapshot of async events, read by the `GET /v1/events/*` endpoints. Ordered by ascending
-/// `id`.
-///
-/// NOT on a clock (#1044, same class as #1023): published by `ActionLoop::sync_messages`
-/// alongside [`MessagesShared`] and [`DialogueShared`] — same cadence, see [`MessagesShared`]'s
-/// doc. Sourced from `GameState::push_event`'s own 200-entry ring
-/// (`crates/eqoxide-core/src/game_state.rs`), which many packet handlers and a couple of
-/// `gameplay.rs` timeout paths append to directly — `sync_messages` republishes that ring
-/// wholesale (clear + extend) into this slot, so it is the only writer of the PUBLISHED copy even
-/// though `push_event` itself has many callers upstream of it.
-///
-/// Checked for a second writer in `eqoxide-http` (flagged as a possibility in #1044): none found
-/// in production code. `eqoxide-http/src/events.rs` only ever READS this slot (`fetch`'s
-/// `s.chat.chat_events.lock().unwrap()`); the direct `.push()`s onto it in that file seed fixtures
-/// for the endpoint's own tests and are not compiled into the non-test configuration at all.
-///
-/// That last clause is the COMPILER's answer, not a brace-counting scan of the source (#1044
-/// review round 3, BLOCKING 3; the scan method is measured-defeated in this repo by #825 — a `}`
-/// inside a comment or string literal silently truncates the region it thinks it is reading). To
-/// re-run it: bind a marker at each candidate site and compare `cargo check --workspace` against
-/// `cargo check --workspace --all-targets`. A site the first configuration never reaches is
-/// test-only. Include at least one site you already know is production, or an all-negative result
-/// cannot be told apart from an instrument that never fired.
+/// Combined 200-entry event feed, ordered by a client-process cursor. Game snapshot publication
+/// uses [`ChatSlots::publish_game_events`]; HTTP action outcomes use [`ChatSlots::push_action_event`].
+/// Both append under this same mutex. Repeated game snapshots preserve action outcomes and source
+/// gaps consume cursor positions, allowing HTTP readers to count missing events before filtering.
 pub type ChatEventsShared = Arc<Mutex<Vec<Event>>>;
 
 /// One queued outgoing chat message, set by POST /v1/chat/{tell,ooc,shout,group} and drained by the
@@ -2673,6 +2661,8 @@ pub struct ChatSlots {
     pub chat_events: ChatEventsShared,
     pub chat_send:   ChatSendShared,
     pub messages:    MessagesShared,
+    /// Last game-source event copied into the combined event feed.
+    pub game_event_cursor: Arc<Mutex<u64>>,
 }
 
 /// `/v1/move/*`: the `/goto` target (+ chase-entity), zone-crossing, aggro-avoidance knobs, and live
@@ -3515,3 +3505,5 @@ mod world_roster_tests_643 {
     }
 
 }
+
+mod event_feed;

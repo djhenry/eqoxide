@@ -15,6 +15,7 @@ const NAV_TICK_MS: u128 = 150;
 pub(crate) use eqoxide_core::physics::RUN_SPEED;
 use crate::protocol::*;
 use crate::transport::EqStream;
+use eqoxide_command::Action;
 use eqoxide_core::game_state::{GameState, ZonePoint};
 use eqoxide_ipc::{TradeCmd, CampCmd};
 use eqoxide_ipc::MoveIntent;
@@ -1146,9 +1147,8 @@ impl ActionLoop {
         // Publish the current clickable NPC-dialogue choices (GET /v1/observe/dialogue, #120).
         *self.interact.dialogue.lock().unwrap() = gs.dialogue_choices.clone();
         // Publish async events (GET /v1/events/*), preserving their stable monotonic ids.
-        let mut ev = self.chat.chat_events.lock().unwrap();
-        ev.clear();
-        ev.extend(gs.chat_events.iter().map(|e| eqoxide_ipc::Event {
+        self.chat.publish_game_events(gs.chat_events.iter().map(|e| eqoxide_ipc::Event {
+            request_id: None, result: None, reason: None,
             id: e.id, category: e.category.clone(), kind: e.kind.clone(),
             from: e.from.clone(), directed: e.directed, text: e.text.clone(),
         }));
@@ -1424,6 +1424,7 @@ impl ActionLoop {
         stream:  &mut EqStream,
         gs:      &mut GameState,
     ) {
+        let _action_scope = self.command.actions().drain_scope();
         // #492: drop any A3 pending slot the server never resolved (buy/open/cast) BEFORE the drains
         // re-check the in-flight singleton guard, so a stranded slot from a silent Unconfirmed/202
         // command can't 409-block the next same-type command indefinitely. See `reap_expired_pending`.
@@ -1569,6 +1570,7 @@ impl ActionLoop {
                 tracing::info!("EQ: quests: cancelled task_id={task_id} sequence_number={seq}");
                 gs.log_msg("quest", "Cancelled task");
             } else {
+                self.command.refuse_drained(Action::QuestCancelTask, "task_missing");
                 tracing::warn!("EQ: quests: cancel requested for unknown task_id={task_id} — ignoring");
             }
         }
@@ -1593,6 +1595,8 @@ impl ActionLoop {
                 stream.send_app_packet(OP_GROUP_FOLLOW, &build_group_follow(&inviter, &gs.player_name));
                 tracing::info!("EQ: group: accepted invite from {inviter}");
                 gs.log_msg("group", &format!("Accepted group invite from {inviter}"));
+            } else {
+                self.command.refuse_drained(Action::GroupAccept, "no_pending_invite");
             }
         }
 
@@ -1603,6 +1607,8 @@ impl ActionLoop {
                 stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &gs.player_name));
                 tracing::info!("EQ: group: declined invite from {inviter}");
                 gs.log_msg("group", &format!("Declined group invite from {inviter}"));
+            } else {
+                self.command.refuse_drained(Action::GroupDecline, "no_pending_invite");
             }
         }
 
@@ -1657,6 +1663,7 @@ impl ActionLoop {
                 tracing::info!("EQ: trainer: training skill {skill_id} at npc {npc_id}");
                 gs.log_msg("trainer", &format!("Training {}", eqoxide_core::skills::skill_name(skill_id).unwrap_or("?")));
             } else {
+                self.command.refuse_drained(Action::TrainerTrainReq, "no_trainer_window");
                 gs.log_msg("trainer", "Cannot train — no trainer window open");
             }
         }
@@ -2237,6 +2244,7 @@ impl ActionLoop {
             // anyway would leave the client believing in a target the server never set. Say so
             // instead of lying. The player's own spawn is legal and is absent from `entities`. (#348)
             if id != gs.player_id && !gs.world.entities.contains_key(&id) {
+                self.command.refuse_drained(Action::CombatTarget, "target_missing");
                 let text = format!("Cannot target spawn {id}: it is not in this zone.");
                 gs.log_msg("combat", &text);
                 gs.push_event("combat", "target_failed", "", true, &text);
@@ -2300,6 +2308,7 @@ impl ActionLoop {
         if let Some(cmd) = pet_cmd {
             let cmd = cmd as u32;
             if gs.pet_id.is_none() {
+                self.command.refuse_drained(Action::CombatPetCmd, "no_pet");
                 gs.log_msg("pet", "You have no pet");
             } else if cmd == PET_ATTACK {
                 match gs.target_id.filter(|&t| t != 0) {
@@ -2311,7 +2320,10 @@ impl ActionLoop {
                         tracing::info!("EQ: pet command attack → target {tid}");
                         gs.log_msg("pet", "Pet attack ordered");
                     }
-                    None => gs.log_msg("pet", "Pet attack: no target"),
+                    None => {
+                        self.command.refuse_drained(Action::CombatPetCmd, "no_target");
+                        gs.log_msg("pet", "Pet attack: no target");
+                    },
                 }
             } else {
                 stream.send_app_packet(OP_PET_COMMANDS, &build_pet_command(cmd, 0));
@@ -2337,8 +2349,14 @@ impl ActionLoop {
                     stream.send_app_packet(OP_READ_BOOK, &pkt);
                     tracing::info!("EQ: read book slot={} file='{}'", slot, item.filename);
                 }
-                Some(_) => gs.log_msg("book", &format!("Item in slot {slot} is not readable")),
-                None    => gs.log_msg("book", &format!("No item in slot {slot} to read")),
+                Some(_) => {
+                    self.command.refuse_drained(Action::InteractReadBook, "item_not_readable");
+                    gs.log_msg("book", &format!("Item in slot {slot} is not readable"));
+                },
+                None => {
+                    self.command.refuse_drained(Action::InteractReadBook, "item_missing");
+                    gs.log_msg("book", &format!("No item in slot {slot} to read"));
+                },
             }
         }
     }
@@ -2380,7 +2398,10 @@ impl ActionLoop {
                         gs.log_msg("guild", &format!("Accepting guild invite from {inviter}"));
                         tracing::info!("EQ: guild accept from {inviter} (guild_id={guild_id})");
                     }
-                    None => gs.log_msg("guild", "No pending guild invite to accept"),
+                    None => {
+                        self.command.refuse_drained(Action::GuildAction, "no_pending_invite");
+                        gs.log_msg("guild", "No pending guild invite to accept");
+                    },
                 },
             }
         }
@@ -2660,6 +2681,10 @@ impl ActionLoop {
         // takes the direct-swap/equip path. (A count would only be for splitting a stack.)
         let move_req = self.command.take_inventory_move();
         if let Some((from_slot, to_slot)) = move_req {
+            if !gs.inventory.iter().any(|item| item.slot == from_slot as i32) {
+                self.command.refuse_drained(Action::InventoryMoveReq, "item_missing");
+                return;
+            }
             // build_move_item emits the structured 28-byte RoF2 MoveItem_Struct; a flat 12-byte
             // packet is silently dropped by the server (see build_move_item / eqoxide#11).
             stream.send_app_packet(OP_MOVE_ITEM, &build_move_item(from_slot, to_slot));
@@ -6510,6 +6535,52 @@ mod tests {
     fn new_loop() -> ActionLoop {
         let g: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
         test_action_loop(g)
+    }
+
+    /// A command can become invalid after HTTP validation. Its own request must receive
+    /// the local refusal, and no wire action may be emitted for that refused command.
+    #[tokio::test]
+    async fn tracked_drains_refuse_stale_preconditions_347() {
+        for case in 0..9 {
+            let mut nav = new_loop();
+            let mut gs = GameState::new();
+            gs.player_id = 42;
+            let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+            let tracker = nav.command.actions();
+            let context = tracker.begin("stale_precondition");
+            assert!(context.scope(async {
+                match case {
+                    0 => nav.command.request_target(99),
+                    1 => nav.command.request_train_skill(1),
+                    2 => nav.command.request_group_accept(),
+                    3 => nav.command.request_group_decline(),
+                    4 => nav.command.request_read_book(22),
+                    5 => nav.command.request_cancel_task(99),
+                    6 => nav.command.request_pet_command(PET_ATTACK as u8),
+                    7 => nav.command.request_guild_action(eqoxide_ipc::GuildAction::Accept),
+                    _ => nav.command.request_inventory_move(22, 23),
+                }
+            }).await);
+            {
+                let _scope = tracker.drain_scope();
+                match case {
+                    0 => nav.drain_target(&mut stream, &mut gs),
+                    1 => nav.drain_trainer(&mut stream, &mut gs),
+                    2 | 3 => nav.drain_group(&mut stream, &mut gs),
+                    4 => nav.drain_read_book(&mut stream, &mut gs),
+                    5 => nav.drain_quests(&mut stream, &mut gs),
+                    6 => nav.drain_pet(&mut stream, &mut gs),
+                    7 => nav.drain_guild(&mut stream, &mut gs),
+                    _ => nav.drain_move_item(&mut stream, &mut gs),
+                }
+            }
+            let events = tracker.take_events();
+            assert_eq!(events.len(), 1, "case {case}");
+            assert_eq!(events[0].id, context.id(), "case {case}");
+            assert_eq!(events[0].result, "refused", "case {case}");
+            assert!(!events[0].reason.is_empty(), "case {case}");
+            assert!(stream.sent_app_packets().is_empty(), "case {case}");
+        }
     }
 
     /// A 32-byte RoF2 Merchant_Sell_Struct echo: npcid@0, itemslot@8, quantity@16, price@24.
