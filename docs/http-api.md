@@ -144,11 +144,11 @@ so an accepted goal never hides the fact that the body is hanging out of the wor
 
 ## `events` — the async event feed
 
-The bus an agent polls for "what just happened, as soon as it happened". Every event is
-`{id, category, kind, directed, from, text}`:
+The bus an agent polls for "what just happened, as soon as it happened". Every event includes
+`{id, category, kind, directed, from, text}`; action events also carry `request_id`, `result`, and `reason`:
 
 - `id` — **1-based** monotonic cursor. Pass the response's `last_id` as your next `?since=`.
-- `category` — top-level bucket: `chat` | `combat` | `navigate` | `system`.
+- `category` — top-level bucket: `chat` | `combat` | `navigate` | `system` | `action`.
 - `kind` — sub-type within the category (e.g. chat→tell/ooc/shout/group/gmsay, navigate→zone,
   combat→slain/attacked).
 - `directed` — concerns *you* specifically (a /v1/chat/tell to your name, a GM message, your own zone change
@@ -234,28 +234,65 @@ across two reads means nothing was drawn in between.
 
 ## Notes
 
-- **Most actions are fire-and-forget**: a handler writes a shared request slot that the navigation
-  thread drains each tick. The HTTP 200 means *queued and not overwritten*, not *done* — observe the
-  result via `GET /v1/observe/*` or the `chat/events` feed. See
-  [What a 200 means, and the two ways an action is refused](#what-a-200-means-and-the-two-ways-an-action-is-refused-347).
+- **Queued mailbox actions return `202` with a `request_id`**. Read `/v1/events/action` for the
+  correlated result. An `unconfirmed` result is unknown and must not be treated as success or a
+  reason to retry blindly. See [Admission and action outcomes](#admission-and-action-outcomes-347).
 - **Async travel**: `move/goto` / `move/zone_cross` return immediately; poll `GET /v1/observe/debug` (or watch
   for a `zone` event) to know when movement / a zone-in completed.
 - **Coordinates**: server convention is `x=east, y=north, z=up`. Brewall map coords negate x/y.
 - See `docs/autonomous-play.md` for end-to-end play recipes.
 
-### What a 200 means, and the two ways an action is refused (#347)
+### Admission and action outcomes (#347)
 
-A `200` from an action endpoint asserts exactly two things, and no more:
+Mutation routes in `combat`, `interact`, `merchant`, `inventory`, `quests`, `group`, `guild`,
+`trainer`, `pet`, and `chat` return the following JSON when a mailbox command is accepted:
 
-1. the request passed the checks the client could make against its own published state, and
-2. it reached the command slot **without displacing an earlier request that had not been sent yet**.
+```json
+{"request_id":42,"status":"accepted","message":"queued; outcome not yet confirmed"}
+```
 
-It does **not** assert the packet went out, and it never asserted the server accepted it. Anything
-stronger has its own status code (`/merchant/{buy,open}`, `/interact/give` and `/combat/cast` await
-the real outcome and answer `200` / `409` / `202 unconfirmed`).
+The status is **202 Accepted**. This replaces the previous queued `200` and optimistic text.
+Validation errors and occupied-mailbox `409` responses still queue nothing and have no request ID.
+Read-only routes and no-op responses do not create actions. Navigation continues to use its goal
+IDs; camera and lifecycle retain their existing contracts.
+
+`/merchant/buy`, `/merchant/open`, `/interact/give`, and `/combat/cast` already await a real outcome.
+They keep their existing status and receipt fields, add `request_id`, and also emit an action event.
+A cast's existing HTTP `200` can mean fizzled or interrupted; check `landed` and `status`, not the
+HTTP status alone. Closing the HTTP connection does not discard the result receiver: a later
+confirmation or refusal is still published to the event feed.
+
+Poll `/v1/events/action?since=<last_id>&wait=30` for correlated events:
+
+```json
+{"id":123,"category":"action","kind":"interact.loot","directed":true,"from":"",
+ "text":"processed_without_server_confirmation","request_id":42,
+ "result":"unconfirmed","reason":"processed_without_server_confirmation"}
+```
+
+`kind` is the route below `/v1/`, with slashes replaced by dots. Results are:
+
+| Result | Meaning |
+|--------|---------|
+| `confirmed` | An existing awaited result path observed a positive server outcome. |
+| `refused` | A known execution-time precondition failed or the awaited action reported failure. |
+| `unconfirmed` | The client cannot establish the outcome: the command lacks a correlated reply path, the server was silent, or tracking expired. |
+
+Each accepted request produces at most one terminal **tracking** result. Commands without a
+correlated server-result path currently report `unconfirmed` after drainage, even when the game
+action may later succeed. Admission and packet submission never manufacture confirmation. An
+independent watchdog expires accepted tracking records after 30 seconds even if the network loop
+stops. **Timeout does not remove a queued command**, so it can still execute later. Re-check game
+state before deciding whether to retry. Partial HTTP request bodies are read with the usual size
+limit before work is detached; abandoning a partial body does not submit an action.
+
+The event feed retains 200 events across all categories. `dropped` counts lost cursor positions,
+including gaps before game events reached the shared feed; filtered-out events are not counted as
+lost. Re-check state if loss is reported. Request IDs and event cursors belong to one client process:
+a restart requires resetting the cursor, and a process exit can prevent an outcome from being delivered.
 
 **`404` — rejected at the door.** The client refuses a request its own published snapshot already
-contradicts, instead of queueing it and answering `200`. Nothing is queued and nothing is sent:
+contradicts, instead of accepting it into a mailbox. Nothing is queued and nothing is sent:
 
 | Route | Checked against | Refused when |
 |-------|-----------------|--------------|

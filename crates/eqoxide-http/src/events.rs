@@ -51,20 +51,17 @@ async fn get_by_category(
 /// Shared cursor read: filter by `id > since`, optional `directed`, and optional `category`;
 /// long-poll up to `wait` seconds for a match. Each event: `{id, category, kind, directed, from, text}`.
 ///
-/// The response also carries `first_id` — the oldest event id still retained in the (200-entry)
-/// ring buffer `GameState::push_event` maintains — plus a `dropped` count. `push_event` silently
-/// evicts the oldest entry once the ring is full, so a caller that only sees `last_id` can advance
-/// its `since` cursor past ids it never actually received (eqoxide#350). `first_id > since + 1`
-/// means at least one event between them was evicted before this poll ever saw it; `dropped` is
-/// exactly how many. When nothing has been evicted (or the ring is empty), `first_id <= since + 1`
-/// and `dropped == 0`.
+/// `first_id` names the oldest retained event. `dropped` counts missing cursor positions in
+/// `(since, last_id]` before category/directed filtering, including upstream game-source gaps.
+/// Both producers share a 200-entry ring. A client must re-check state when events were lost.
 async fn fetch(s: HttpState, q: EventsQuery, category: Option<String>) -> Json<serde_json::Value> {
     let since         = q.since.unwrap_or(0);
     let directed_only = q.directed.unwrap_or(0) != 0;
     let wait          = q.wait.unwrap_or(0).min(30);
     let deadline      = Instant::now() + Duration::from_secs(wait);
     loop {
-        let (events, last_id, first_id) = {
+        crate::actions::publish(&s);
+        let (events, last_id, first_id, dropped) = {
             let all = s.chat.chat_events.lock().unwrap();
             let last_id = all.last().map(|e| e.id).unwrap_or(since).max(since);
             // The oldest id still in the ring — independent of `since`/`category`, since eviction
@@ -76,10 +73,11 @@ async fn fetch(s: HttpState, q: EventsQuery, category: Option<String>) -> Json<s
                     && (!directed_only || e.directed)
                     && category.as_deref().is_none_or(|c| e.category == c))
                 .cloned().collect();
-            (evs, last_id, first_id)
+            let retained = all.iter().filter(|e| e.id > since).count() as u64;
+            let dropped = last_id.saturating_sub(since).saturating_sub(retained);
+            (evs, last_id, first_id, dropped)
         };
         if !events.is_empty() || Instant::now() >= deadline {
-            let dropped = first_id.saturating_sub(since + 1);
             return Json(serde_json::json!({
                 "count": events.len(),
                 "last_id": last_id,
@@ -111,6 +109,7 @@ mod tests {
         Event {
             id, category: "chat".to_string(), kind: "ooc".to_string(),
             from: "someone".to_string(), directed: false, text: format!("event {id}"),
+            request_id: None, result: None, reason: None,
         }
     }
 
@@ -239,4 +238,28 @@ mod tests {
         assert_eq!(j["count"], 3);
         assert_eq!(j["last_id"], 8);
     }
+
+    #[tokio::test]
+    async fn interleaved_source_gaps_are_counted_before_filtering() {
+        let state = empty_state();
+        state.chat.push_action_event(42, "loot", "unconfirmed", "no receipt");
+        state.chat.publish_game_events([ev(51), ev(52)]);
+        let app = router().with_state(state);
+        let response = app.oneshot(Request::get("/action?since=0&directed=1")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        let value = body_json(response).await;
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["first_id"], 1);
+        assert_eq!(value["last_id"], 53);
+        assert_eq!(value["dropped"], 50);
+    }
+
+    #[tokio::test]
+    async fn maximum_cursor_does_not_overflow() {
+        let app = router().with_state(empty_state());
+        let response = app.oneshot(Request::get("/all?since=18446744073709551615")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(body_json(response).await["dropped"], 0);
+    }
+
 }

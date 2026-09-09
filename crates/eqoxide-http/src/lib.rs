@@ -56,6 +56,7 @@ where
     }
 }
 
+mod actions;
 mod name_match;
 mod observe;
 mod quests;
@@ -1453,7 +1454,7 @@ impl MoveGate {
 /// production serves, under the SAME `/v1/...` paths an agent calls — see
 /// `req_form::tests::every_declared_mutually_exclusive_form_group_is_refused_not_silently_dropped`.
 /// A per-module `router()` would have let that test assert against a path shape no agent ever uses.
-pub(crate) fn v1_router() -> Router<HttpState> {
+pub(crate) fn v1_router(state: &HttpState) -> Router<HttpState> {
     Router::new()
         .nest("/v1/observe",   observe::router())
         .nest("/v1/quests",    quests::router())
@@ -1471,6 +1472,7 @@ pub(crate) fn v1_router() -> Router<HttpState> {
         .nest("/v1/social",    social::router())
         .nest("/v1/camera",    camera::router())
         .nest("/v1/lifecycle", lifecycle::router())
+        .layer(axum::middleware::from_fn_with_state(state.clone(), actions::track))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1522,7 +1524,7 @@ pub fn spawn_camera_server(
                 inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
                 quest, group_slots, lifecycle, guild_slots, nav_debug_view, skin_cap_downgrades,
             };
-            let app = v1_router().with_state(state);
+            let app = v1_router(&state).with_state(state.clone());
             let (listener, bound_port) = if let Some(std_l) = exact_listener {
                 // --api-port: use the listener main already bound to the exact requested port.
                 std_l.set_nonblocking(true).expect("set api-port listener non-blocking");
@@ -1569,9 +1571,11 @@ pub fn spawn_camera_server(
             // the more specific `api_port=` line on top of it once the listener is actually up.
             eqoxide_crash::log_instance(&format!("api_port={bound_port}"));
             tracing::info!("camera HTTP: http://127.0.0.1:{bound_port}");
+            let action_watchdog = actions::watchdog(state);
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("camera HTTP: server error: {e}");
             }
+            action_watchdog.abort();
         });
     })
     .expect("spawn http-server thread");

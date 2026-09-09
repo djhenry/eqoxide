@@ -17,14 +17,19 @@ impl CommandState {
     /// Queue one outgoing chat message (POST /v1/chat/{tell,ooc,shout,group,guild}, or a `/tell`
     /// `/ooc` `/shout` `/g` slash command in the Chat window).
     pub fn request_chat_send(&self, msg: ChatSend) {
-        self.chat.chat_send.lock().unwrap().push(msg);
+        let mut queue = self.chat.chat_send.lock().unwrap();
+        queue.push(msg);
+        self.actions.accept(std::sync::Arc::as_ptr(&self.chat.chat_send) as usize, false, "chat.chat_send");
     }
 
     // ── take_* : the MODEL (`ActionLoop::tick`'s `drain_chat`) drains this once per tick ───────────
 
     /// Drain the whole outgoing-chat queue at once (FIFO order preserved).
     pub fn take_chat_send(&self) -> Vec<ChatSend> {
-        std::mem::take(&mut *self.chat.chat_send.lock().unwrap())
+        let mut queue = self.chat.chat_send.lock().unwrap();
+        let result = std::mem::take(&mut *queue);
+        self.actions.drain(std::sync::Arc::as_ptr(&self.chat.chat_send) as usize);
+        result
     }
 }
 

@@ -30,9 +30,9 @@ eqoxide-ipc = { path = "../eqoxide-ipc" }
 tracing = "0.1"
 # tokio::sync::oneshot — the awaited-command reply channel (`request_open_await`/`request_buy_await`/
 # `request_who`/`request_friends`), mirroring the same `Sender<T>` shape `ipc`'s await slots hold.
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "time"] }
 
 [dev-dependencies]
 # `#[tokio::test]` (merchant/interact await round-trip tests) needs the macro + a runtime; the
 # awaited channel itself only needs `sync` (already a normal dependency above).
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "test-util"] }

@@ -355,6 +355,7 @@ fn main() {
         chat_events: Arc::new(Mutex::new(Vec::new())),
         chat_send:   Arc::new(Mutex::new(Vec::new())),
         messages:    Arc::new(Mutex::new(Vec::new())),
+        game_event_cursor: Default::default(),
     };
     // Single-authority movement (Component A): the render thread owns the CharacterController and
     // publishes `controller_view`; the nav thread streams it and writes `nav_intent` for /goto;

@@ -6,7 +6,6 @@
 //! `ActionLoop::drain_trainer`). No behavior change — just one typed surface.
 
 use super::CommandState;
-use crate::slot::Mailbox;
 
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
@@ -15,25 +14,25 @@ impl CommandState {
     /// current session using the `npc_id == 0` sentinel (POST /v1/trainer/close — 0 is never a real
     /// spawn id).
     pub fn request_open_trainer(&self, npc_id: u32) -> bool {
-        self.trainer.trainer_open_req.try_put(npc_id)
+        self.enqueue(&self.trainer.trainer_open_req, npc_id, false, "trainer.trainer_open_req")
     }
 
     /// Train one point of `skill_id` at the open trainer (POST /v1/trainer/train, the trainer
     /// window's Train button).
     pub fn request_train_skill(&self, skill_id: u32) -> bool {
-        self.trainer.trainer_train_req.try_put(skill_id)
+        self.enqueue(&self.trainer.trainer_train_req, skill_id, false, "trainer.trainer_train_req")
     }
 
     // ── take_* : the MODEL (`ActionLoop::drain_trainer`) drains these once per tick ───────────────
 
     /// Drain a pending open/close request. `Some(0)` means close.
     pub fn take_trainer_open(&self) -> Option<u32> {
-        self.trainer.trainer_open_req.take_msg()
+        self.dequeue(&self.trainer.trainer_open_req)
     }
 
     /// Drain a pending train-skill request.
     pub fn take_train_skill(&self) -> Option<u32> {
-        self.trainer.trainer_train_req.take_msg()
+        self.dequeue(&self.trainer.trainer_train_req)
     }
 }
 
