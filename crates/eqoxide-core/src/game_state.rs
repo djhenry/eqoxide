@@ -1043,6 +1043,30 @@ pub struct ControllerHold {
     pub secs: f32,
 }
 
+/// One client-side body relocation — the destination and how far the body was moved to get there.
+///
+/// Emitted by the `#845` last-resort placement (`CharacterController::last_resort_placement`), the
+/// only path that moves the local player without the driver asking and without a server correction
+/// behind it. It exists so an agent driving the HTTP API can both *detect* an unrequested `pos`
+/// jump (via the monotonic `GameState::client_relocations` counter) and *attribute* it (via
+/// `GameState::last_relocation`), instead of seeing a bare coordinate change with nothing to pin it
+/// on. That gap was #925.
+///
+/// `distance` is the full 3-D move from the pre-placement position to `to` — deliberately NOT the
+/// horizontal-only figure the `#845` `warn!` line logs, because the placement can change height and
+/// an agent comparing `pos` deltas needs the number that matches what it will observe.
+///
+/// `PartialEq` matters for the same reason it does on [`ControllerHold`]: this rides inside
+/// [`GameState`], whose snapshot dedup (`eq_net::gameplay::publish_snapshot`) only republishes when
+/// the state actually changed. `[f32; 3]` + `f32` compares fine.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct Relocation {
+    /// Where the body was put, in `[east, north, up]` (`pos`) order.
+    pub to: [f32; 3],
+    /// Full 3-D distance from the pre-placement position to `to`.
+    pub distance: f32,
+}
+
 /// All state the renderer needs for one frame.
 ///
 /// `PartialEq` is load-bearing: `eq_net::gameplay::publish_snapshot` compares the freshly-mutated
@@ -1411,6 +1435,18 @@ pub struct GameState {
     /// Count of server rubber-band corrections (position deltas > 5 units).
     pub server_corrections: u32,
 
+    /// Monotonic count of client-side body relocations by the `#845` last-resort placement — the
+    /// one path that moves the local player with neither a driver request nor a server correction
+    /// behind it. Like `server_corrections` this is NOT zone-scoped: it counts for the life of the
+    /// session so an agent can detect an unrequested `pos` jump by watching it tick. Paired with
+    /// `last_relocation`, which carries the where/how-far of the most recent one. See [`Relocation`]
+    /// and #925.
+    pub client_relocations: u32,
+    /// The most recent client-side relocation (destination + 3-D distance), or `None` if none has
+    /// happened this zone. ZONE-SCOPED: `begin_zone_in` clears it, because `to` names a point in the
+    /// zone being left. The `client_relocations` counter above is what survives a zone change.
+    pub last_relocation: Option<Relocation>,
+
     // Loot state
     /// Corpse spawn_ids queued for auto-looting (populated by OP_BecomeCorpse).
     pub pending_loot: VecDeque<u32>,
@@ -1645,6 +1681,14 @@ impl GameState {
         // keeps rendering through the load; this covers the one that publishes nothing at all.)
         self.player_hold = None;
         self.player_afloat_stall = None;
+        // #925: `last_relocation.to` is a coordinate in the zone we are leaving, so it is stale the
+        // moment we cross. Unlike the hold/stall above this needs NO view-clear pairing: a
+        // relocation is a ONE-SHOT edge event (like `landed_fall_height`), latched into
+        // `ControllerView` and `take()`n exactly once by `stream_position` — never re-published
+        // every tick — so clearing it here is sufficient and it cannot come back on the next tick.
+        // The `client_relocations` counter is deliberately NOT cleared: it is session-monotonic,
+        // like `server_corrections`.
+        self.last_relocation = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
         // target_name/target_hp_pct fall back to the stale cached snapshot — /observe/debug then
@@ -2431,7 +2475,7 @@ mod pose_tests_643 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{CastState, ControllerHold, ControllerHoldReason, DialogueChoice, Door, GameState,
-                HeldMotion, LastConsider, MerchantItem, TaskOffer, ZonePoint, make_entity};
+                HeldMotion, LastConsider, MerchantItem, Relocation, TaskOffer, ZonePoint, make_entity};
 
     /// #586/#598: exhaustive property over every ordering of the levitate channels' events —
     /// including the FULL-SNAPSHOT (`resync_from_snapshot`) path that carries the real mid-zone
@@ -3430,6 +3474,27 @@ pub(crate) mod tests {
              \"no hold\" instead of a confident wedge alarm about the zone we left");
     }
 
+    /// #925 — `last_relocation` names a point in the zone we are LEAVING, so a zone-in must drop it;
+    /// the `client_relocations` counter beside it must NOT be dropped (it is session-monotonic, like
+    /// `server_corrections`, and an agent watching it tick must not see it reset on every crossing).
+    ///
+    /// Mutation-check: drop `self.last_relocation = None` from `begin_zone_in` → the first assert
+    /// goes RED. Add `self.client_relocations = 0` to `begin_zone_in` → the second assert goes RED.
+    #[test]
+    fn begin_zone_in_clears_the_relocation_but_not_the_counter_925() {
+        let mut gs = GameState::new();
+        gs.client_relocations = 3;
+        gs.last_relocation = Some(Relocation { to: [111.0, 222.0, -7.5], distance: 84.0 });
+
+        gs.begin_zone_in();
+
+        assert!(gs.last_relocation.is_none(),
+            "`last_relocation.to` is a coordinate in the departed zone — a zone-in must clear it");
+        assert_eq!(gs.client_relocations, 3,
+            "the relocation COUNTER is session-monotonic (like server_corrections) — a zone-in \
+             must not reset it, or an agent watching it tick sees a phantom drop every crossing");
+    }
+
     /// #884 — `ALL` is DERIVED, so it cannot go stale, and every variant answers `motion()`.
     ///
     /// The derivation is what is under test here, not the two rows: `controller_hold_reason!` emits
@@ -3671,6 +3736,7 @@ pub(crate) mod tests {
             clock.observe(AfloatFrame::Wished, anchor, 0.05);
         }
         gs.player_afloat_stall = Some(clock.stall().expect("fixture must reach the stall threshold"));
+        gs.last_relocation = Some(Relocation { to: [-812.5, 43.0, -119.75], distance: 96.0 });
         gs.target_id = Some(18);
         gs.target_name = Some("Guard_Drath000".into());
         gs.target_hp_pct = Some(100.0);
@@ -3723,6 +3789,7 @@ pub(crate) mod tests {
         assert!(gs.zone_cross_plan.is_none(), "zone_cross_plan");
         assert!(gs.player_hold.is_none(), "player_hold");
         assert!(gs.player_afloat_stall.is_none(), "player_afloat_stall");
+        assert!(gs.last_relocation.is_none(), "last_relocation");
         assert!(gs.target_id.is_none(), "target_id");
         assert!(gs.target_name.is_none(), "target_name");
         assert!(gs.target_hp_pct.is_none(), "target_hp_pct");
@@ -4099,6 +4166,10 @@ pub(crate) mod tests {
             player_pos_known: _, position_provisional_since: _,
             zone_cross_attempts: _, zone_cross_plan: _,
             player_hold: _, player_afloat_stall: _,
+            // #925: `last_relocation.to` is a coordinate in the departed zone. The
+            // `client_relocations` COUNTER beside it is NOT here — it is session-monotonic; see the
+            // NOT-ZONE-SCOPED group below.
+            last_relocation: _,
             target_id: _, target_name: _, target_hp_pct: _,
             target_con: _, target_con_name: _, target_attitude: _,
             last_consider: _,
@@ -4147,7 +4218,10 @@ pub(crate) mod tests {
             tasks: _, completed_task_history: _,
             // Logs, feeds and session plumbing.
             messages: _, chat_events: _, next_chat_id: _, last_book_text: _, ucs: _,
-            strategy: _, server_corrections: _,
+            // #925: `client_relocations` counts client-side body relocations for the life of the
+            // session, exactly like `server_corrections` beside it. (The `last_relocation` detail it
+            // pairs with IS zone-scoped — see the ZONE-SCOPED group above.)
+            strategy: _, server_corrections: _, client_relocations: _,
         } = GameState::new();
     }
 

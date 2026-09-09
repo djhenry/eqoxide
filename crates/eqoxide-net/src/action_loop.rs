@@ -3195,6 +3195,19 @@ impl ActionLoop {
                 }
             }
         }
+        // #925: the #845 last-resort relocation marker, take-and-cleared exactly once here, on the
+        // same one-shot terms as `landed_fall_height` above. A relocation is the one path that moves
+        // the local player with neither a driver request nor a server correction behind it, so
+        // without this an agent driving the HTTP API sees a bare `pos` jump with nothing to pin it
+        // on (that gap was #925). This runs BEFORE the correction-branch early return below so a
+        // relocation is never skipped on a tick that also carries a server correction — the counter
+        // is monotonic (`wrapping_add`, like `server_corrections`) and `last_relocation` carries the
+        // where/how-far. `GameState::begin_zone_in` clears `last_relocation` (its `to` names a
+        // departed-zone point) but deliberately not the counter.
+        if let Some(r) = self.controller.controller_view.lock().unwrap().relocated.take() {
+            gs.client_relocations = gs.client_relocations.wrapping_add(1);
+            gs.last_relocation = Some(r);
+        }
         let gp = [gs.player_x, gs.player_y, gs.player_z];
         if !self.streamed_init {
             self.last_streamed = gp;
@@ -3912,6 +3925,64 @@ mod tests {
         assert!(gs.player_afloat_stall.is_none(),
             "the mirror is level-triggered and must also be the clear — a stall that is written \
              once and never withdrawn keeps reporting a trapped swimmer who is already swimming");
+    }
+
+    /// #925 — `stream_position` drains the render thread's one-shot `#845` relocation marker into
+    /// `GameState`, incrementing `client_relocations` and setting `last_relocation`, exactly ONCE
+    /// per relocation.
+    ///
+    /// This is the live writer for both fields the HTTP API serialises; without it
+    /// `player.client_relocations` is frozen at 0 and `player.last_relocation` is permanently `null`,
+    /// so an agent can never see the one `pos` jump that has neither a driver request nor a server
+    /// correction behind it — the #343 `connected: true` shape in the silent direction.
+    ///
+    /// **The CONTRAST with the afloat-stall mirror above is the point.** That signal is level-
+    /// triggered — republished every frame, so its mirror is an unconditional destructure and a
+    /// `None` view withdraws it next tick. A relocation is an EDGE: the marker is `take()`n from the
+    /// view, so a tick that finds the slot empty must NOT increment the counter and must NOT clear
+    /// `last_relocation`. This test drives an empty tick between two populated ones to pin both.
+    ///
+    /// MUTATION CHECKS: drop the `relocated.take()` block from `stream_position` → RED at the first
+    /// counter assertion. Change `wrapping_add(1)` to a plain assignment `= 1` → RED at the
+    /// two-relocations assertion. Move the block AFTER the correction-branch early return → RED
+    /// whenever a correction and a relocation land on the same tick (not exercised here directly,
+    /// but the placement above the `gp` binding is what this ordering pins).
+    #[tokio::test]
+    async fn stream_position_drains_the_relocation_marker_exactly_once_925() {
+        use eqoxide_core::game_state::Relocation;
+
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+
+        let first = Relocation { to: [111.0, 222.0, -7.5], distance: 84.0 };
+        {
+            let mut view = nav.controller.controller_view.lock().unwrap();
+            view.initialized = true;
+            view.pos = first.to;
+            view.relocated = Some(first);
+        }
+        nav.stream_position(&mut stream, &mut gs);
+        assert_eq!(gs.client_relocations, 1,
+            "a relocation in the view must reach the GameState counter the HTTP API serialises");
+        assert_eq!(gs.last_relocation, Some(first),
+            "and `last_relocation` must carry the destination + distance intact — an agent \
+             attributes the `pos` jump with those");
+
+        // An ordinary tick with nothing new in the slot: the marker is an EDGE, not a level — the
+        // counter must hold and `last_relocation` must NOT be withdrawn (this is where it differs
+        // from the afloat-stall mirror, which clears itself every tick).
+        nav.stream_position(&mut stream, &mut gs);
+        assert_eq!(gs.client_relocations, 1, "an empty tick must not re-count the same relocation");
+        assert_eq!(gs.last_relocation, Some(first),
+            "an empty tick must not withdraw `last_relocation` — it is not level-triggered");
+
+        // A second, distinct relocation: the counter advances, the detail is replaced.
+        let second = Relocation { to: [-40.0, 5.0, 12.0], distance: 300.0 };
+        nav.controller.controller_view.lock().unwrap().relocated = Some(second);
+        nav.stream_position(&mut stream, &mut gs);
+        assert_eq!(gs.client_relocations, 2, "a second relocation must advance the monotonic counter");
+        assert_eq!(gs.last_relocation, Some(second), "and replace the detail with the newer one");
     }
 
     /// A `ControllerHold` fixture. Public fields, so this is just a named literal — but naming it

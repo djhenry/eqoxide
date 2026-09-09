@@ -105,6 +105,14 @@ pub struct ControllerView {
     /// #442). `None` except right after a landing; the nav streamer take-and-clears it exactly once.
     /// Respects the init gate — default `None`, only ever set after `initialized`.
     pub landed_fall_height: Option<f32>,
+    /// One-shot `#845` relocation marker (destination + 3-D distance) latched by the render thread
+    /// the frame the controller performs a last-resort body placement, for the nav thread to turn
+    /// into `player.client_relocations` / `player.last_relocation` on `GET /v1/observe/debug` (#925).
+    /// A one-shot latch exactly like `landed_fall_height` — NOT a level signal like `hold` — so it
+    /// stays `pub`: there is no "stale `Some`" failure mode to guard against, because the nav
+    /// streamer take-and-clears it exactly once. `None` except right after a placement; respects the
+    /// init gate (only ever set after `initialized`).
+    pub relocated: Option<eqoxide_core::game_state::Relocation>,
     /// The controller is holding the body still and has no way to resume — see
     /// [`eqoxide_core::game_state::ControllerHold`]. A LEVEL signal, not a one-shot latch like
     /// `landed_fall_height`: a stale `Some` after the condition ends is the failure mode to avoid,

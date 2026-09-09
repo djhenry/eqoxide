@@ -1187,6 +1187,15 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // published thresholds and the `detail` string are defined in ONE place (that type), not
     // re-spelled here where they could drift from it.
     let player_afloat_stall = player.afloat_stall.clone();
+    // #925 — the `#845` client-side relocation disclosure. `client_relocations` is a plain `u32`
+    // (Copy), `last_relocation` is a `PlayerRelocationView` carrying `&'static str` prose and so is
+    // cloned like `player_hold`. Both bound here and attached with `player.insert` below for the
+    // same reason as everything since `player_levitating`: the `json!` literal is at serde_json's
+    // recursion limit. `last_relocation` is serialised through its own view type so the field
+    // names and the `detail` string live in ONE place (`PlayerRelocationView`), not re-spelled
+    // here where they could drift.
+    let player_client_relocations = player.client_relocations;
+    let player_last_relocation = player.last_relocation.clone();
     let mut out = serde_json::json!({
         "player": {
             "name":       player.name,
@@ -1605,6 +1614,31 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // serialises `PlayerState` directly cannot see it. `afloat_stall_reaches_the_debug_json_801`
         // goes through this handler for that reason.
         player.insert("afloat_stall".into(),           serde_json::json!(player_afloat_stall));
+        // #925 — CLIENT-SIDE RELOCATION. The `#845` last-resort placement is the one path that
+        // moves the local player with neither a driver request nor a server correction behind it:
+        // when the body cannot stay where it is (embedded, or over a void), the controller finds
+        // somewhere it can legally stand within 512 u and `recover()`s it there. Before these two
+        // inserts the only record was a `tracing::warn!` — `server_corrections` does not advance,
+        // `hold` stays `null` (a succeeding search never raises it), and `pos` just read somewhere
+        // new next tick. An agent differencing its own `pos` saw the jump and could not attribute
+        // it, and "the client relocated me" needs a different response than "the server corrected
+        // me".
+        //
+        //   client_relocations — SESSION-monotonic count of these events, the sibling of
+        //                        `server_corrections` in the literal above. Poll it to DETECT a
+        //                        relocation (watch for it to change). NOT zone-scoped.
+        //   last_relocation    — detail of the MOST RECENT one (`{to_east,to_north,to_up,distance,
+        //                        detail}`), or `null`. ZONE-SCOPED: cleared on zone-in, because
+        //                        `to_*` name a point in the zone just left. Read it to ATTRIBUTE a
+        //                        relocation (which `pos` you should now be at, and the jump size).
+        //
+        // Both ALWAYS PRESENT — `client_relocations` is `0` and `last_relocation` is `null` until
+        // one happens — same grepping-agent contract as `hold`/`afloat_stall` above: an omitted key
+        // would read as "this client is too old to report relocations", which it must never do when
+        // the honest answer is "none yet". `..._reaches_the_debug_json_925` asserts `contains_key`
+        // on bytes from the real router for that reason.
+        player.insert("client_relocations".into(),      serde_json::json!(player_client_relocations));
+        player.insert("last_relocation".into(),         serde_json::json!(player_last_relocation));
         // #612 — OUTBOUND honesty. Everything else in this payload is about what the server told us;
         // these four are about what WE failed to say. Every send error used to be discarded
         // (`let _ = self.socket.try_send(..)`), so a datagram that never left the machine was
@@ -3823,6 +3857,70 @@ mod tests {
         assert_eq!(h["reason"], serde_json::json!("underworld_no_recovery"));
         assert!(h["detail"].as_str().expect("detail is a string").to_ascii_lowercase().contains("underworld"),
             "the detail must name what is actually true about this reason, got {}", h["detail"]);
+    }
+
+    /// #925 — the `#845` client-side relocation disclosure must reach a RESPONSE BODY, not just a
+    /// struct. Same failure shape as `hold_reaches_the_debug_json_817` / `afloat_stall_reaches_the_
+    /// debug_json_801` above: the value is mirrored into `GameState` by `ActionLoop::stream_position`
+    /// and projected into `PlayerState`, and still reaches no served body unless `get_debug`'s
+    /// hand-built `player` object gets an explicit `player.insert` — `get_debug` never serialises
+    /// `PlayerState` whole. This drives the REAL router with a REAL request and parses the REAL
+    /// bytes, for the same reason those two do.
+    ///
+    /// Both keys are checked: `client_relocations` (session counter, `0` when none) and
+    /// `last_relocation` (zone-scoped detail, `null` when none). The always-present half is the
+    /// point — an omitted key would read to a grepping agent as "this client is too old to report
+    /// relocations", which must never happen when the honest answer is "none yet".
+    ///
+    /// MUTATION CHECK (reasoned, matches the two sibling tests): delete either
+    /// `player.insert("client_relocations".into(), …)` / `player.insert("last_relocation".into(), …)`
+    /// line from `get_debug` and the matching `contains_key` assertion below goes RED.
+    #[tokio::test]
+    async fn client_relocations_and_last_relocation_reach_the_debug_json_925() {
+        use eqoxide_core::game_state::Relocation;
+
+        // ── Absent: `0` and an explicit `null`, both PRESENT as keys, never omitted. ──────────────
+        let v = debug_json(empty_state()).await;
+        let player = v["player"].as_object().expect("player object");
+        assert!(player.contains_key("client_relocations"),
+            "the client_relocations key must be PRESENT in the served body — an agent that greps \
+             for it and finds nothing cannot tell \"never relocated\" from \"this client cannot \
+             report one\". Keys served: {:?}", player.keys().collect::<Vec<_>>());
+        assert_eq!(player["client_relocations"], serde_json::json!(0),
+            "with no relocation the counter must serve as 0, got {}", player["client_relocations"]);
+        assert!(player.contains_key("last_relocation"),
+            "the last_relocation key must be PRESENT in the served body for the same reason. Keys \
+             served: {:?}", player.keys().collect::<Vec<_>>());
+        assert!(player["last_relocation"].is_null(),
+            "no relocation must serialise last_relocation as an explicit null, got {}",
+            player["last_relocation"]);
+
+        // ── Present: a counter that has advanced and a detail for the most recent event. The
+        // components are exactly representable in binary floating point (integers and halves), so
+        // the JSON round-trip through the real router cannot introduce a spurious ULP mismatch —
+        // see the note in `hold_reaches_the_debug_json_817`. ────────────────────────────────────
+        let reloc = Relocation { to: [111.5_f32, 222.25, -7.5], distance: 84.0 };
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.client_relocations = 2;
+            gs.last_relocation = Some(reloc);
+        });
+        let v = debug_json(state).await;
+        assert_eq!(v["player"]["client_relocations"], serde_json::json!(2),
+            "the counter must round-trip the session total verbatim — polling it for change is how \
+             a caller detects a relocation. Got {}", v["player"]["client_relocations"]);
+        let r = &v["player"]["last_relocation"];
+        assert!(r.is_object(), "a relocation in the GameState must reach the body, got {r}");
+        assert_eq!(r["to_east"],  serde_json::json!(111.5_f32));
+        assert_eq!(r["to_north"], serde_json::json!(222.25_f32));
+        assert_eq!(r["to_up"],    serde_json::json!(-7.5_f32),
+            "the destination must survive the round-trip on all three axes including a negative up \
+             — an agent differences it against `player.pos` directly");
+        assert_eq!(r["distance"], serde_json::json!(84.0_f32),
+            "distance is the size of the `pos` jump to expect, got {}", r["distance"]);
+        assert!(r["detail"].as_str().expect("detail is a string").to_ascii_lowercase().contains("client"),
+            "the detail must say plainly that the CLIENT moved the body — an agent differencing \
+             `pos` needs to tell this from a server correction: {}", r["detail"]);
     }
 
     /// #598 finding 1, at the API BOUNDARY — the honesty contract must hold in the SERIALIZED body,

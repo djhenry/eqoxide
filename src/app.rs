@@ -2087,6 +2087,17 @@ impl App {
                             v.landed_fall_height = Some(h);
                         }
                     }
+                    // #925: the #845 last-resort relocation marker is latched on the SAME terms —
+                    // a one-shot pulse, taken from the controller only into an empty view slot so a
+                    // relocation the nav thread has not yet consumed is never clobbered by a later
+                    // one. (In practice a second relocation cannot fire until the body is grounded
+                    // again, so the slot is effectively always free; the guard matches
+                    // `landed_fall_height` rather than relying on that.)
+                    if v.relocated.is_none() {
+                        if let Some(r) = self.controller.take_relocation() {
+                            v.relocated = Some(r);
+                        }
+                    }
                     v.initialized = true;
                 }
             }
