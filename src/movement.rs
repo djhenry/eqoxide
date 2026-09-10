@@ -20,7 +20,7 @@ pub use eqoxide_ipc::{ControllerView, MoveIntent};
 // in `eqoxide-core` because it has to be nameable by BOTH `eqoxide-ipc` (`ControllerView::hold`)
 // and `GameState::player_hold`, and core is the only crate below both. Re-exported here so the rest
 // of the app crate can keep saying `crate::movement::ControllerHold`.
-pub use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason};
+pub use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason, Relocation};
 
 // Pure physics constants + kinematics moved DOWN into `eqoxide-core::physics` (#544 Step 2d) so nav
 // stops up-referencing this app-layer module for them. Re-exported here so every existing
@@ -246,6 +246,15 @@ pub struct CharacterController {
     /// fall damage. Height ALWAYS comes from this tracked airborne start, never a nav waypoint z.
     airborne_start_z:   Option<f32>,
     landed_fall_height: Option<f32>,
+    /// #925: one-shot marker for a `#845` last-resort body relocation — the destination and the
+    /// full 3-D distance moved. Latched by [`Self::last_resort_placement`] the frame it calls
+    /// `recover()` to put an otherwise-unrecoverable body somewhere standable, and take-and-cleared
+    /// exactly once by the nav thread (`ActionLoop::stream_position`), which turns it into the
+    /// HTTP-observable `player.client_relocations` counter + `player.last_relocation` detail. Plumbed
+    /// identically to `landed_fall_height` above: same one-shot `Option`, same `take_*` accessor,
+    /// same `teleport` clear. Before this, a `#845` relocation moved the body up to 512u with
+    /// nothing on the HTTP side to detect or attribute it — that gap was #925.
+    relocated:          Option<Relocation>,
     /// #529: the self-player currently has a Levitate effect — gravity is OFF and the character
     /// HOVERS at altitude, free-floating over land/gaps/water instead of falling. Set each frame
     /// from the server-authoritative buff/appearance state via [`Self::set_levitating`] (like
@@ -545,7 +554,7 @@ impl CharacterController {
                hold: None,
                stuck_time: 0.0, rescue_cooldown: 0.0,
                hop_cooldown: 0.0, underworld: f32::NEG_INFINITY,
-               airborne_start_z: None, landed_fall_height: None, levitating: false,
+               airborne_start_z: None, landed_fall_height: None, relocated: None, levitating: false,
                swim_sinking: false,
                afloat: AfloatStallClock::default(), afloat_log_cooldown: 0.0 }
     }
@@ -556,6 +565,15 @@ impl CharacterController {
     /// except the one right after a genuine landing (never after a teleport / depenetration recovery).
     pub fn take_landed_fall_height(&mut self) -> Option<f32> {
         self.landed_fall_height.take()
+    }
+
+    /// Take-and-clear the one-shot `#845` relocation marker (destination + 3-D distance the body was
+    /// moved by the last-resort placement). The nav thread reads this each tick and turns it into
+    /// the HTTP-observable `player.client_relocations` / `player.last_relocation` (#925). Edge-
+    /// triggered and consumed exactly once; `None` on every frame except the one right after a
+    /// last-resort placement fired (and never after a `teleport`, which clears it).
+    pub fn take_relocation(&mut self) -> Option<Relocation> {
+        self.relocated.take()
     }
 
     /// Set the zone underworld floor (from `GameState::zone_underworld`); `None` disables the clamp.
@@ -875,6 +893,12 @@ impl CharacterController {
         // fall landing (§442 hazard 2b — `app.rs` calls this from the `pos_correction` handler).
         self.airborne_start_z = None;
         self.landed_fall_height = None;
+        // #925: a not-yet-drained `#845` relocation marker describes a move to a position this
+        // discontinuity has now superseded — its `to` is a coordinate the body is no longer at.
+        // Drop it so a server correction landing in the same net tick can't publish a stale
+        // `last_relocation`. (`last_resort_placement` itself calls `recover()`, not `teleport()`, so
+        // this clear never eats a relocation it just set.)
+        self.relocated = None;
         self.swim_sinking = false; // #444: a teleport isn't a swim-down exit either
         // #776: a position discontinuity supersedes the afloat window as well. The anchor describes
         // a point THIS body failed to get away from; after a relocation it is a point the body is no
@@ -2016,14 +2040,19 @@ impl CharacterController {
     /// rather than a condition. (The `moved` figure on that line is HORIZONTAL only, so read the
     /// destination, not the distance, if the placement changed height.)
     ///
-    /// ⚠️ **A third thing does NOT keep it honest, and an earlier version of this comment claimed
-    /// it did.** A success here is invisible to `player.hold`: this arm returns before
-    /// [`Self::enter_hold`] is reached, and `step` takes the hold at the top of every frame, so the
-    /// body is relocated with the field `None` throughout — measured at 0 held frames of 300 in a
-    /// zone this search solves. The transition an agent can see is the inverse one: a *published*
-    /// hold means this search answered `nowhere`, and it does not clear on its own (measured at
-    /// 1800 frames / 60 s in a static zone it cannot solve, raised and never cleared). Nothing on
-    /// the HTTP side marks the relocation; the `warn` below is its only record. That gap is #925.
+    /// A success here is invisible to `player.hold`: this arm returns before [`Self::enter_hold`] is
+    /// reached, and `step` takes the hold at the top of every frame, so the body is relocated with
+    /// that field `None` throughout — measured at 0 held frames of 300 in a zone this search solves.
+    /// The hold transition an agent can see is the inverse one: a *published* hold means this search
+    /// answered `nowhere`, and it does not clear on its own (measured at 1800 frames / 60 s in a
+    /// static zone it cannot solve, raised and never cleared).
+    ///
+    /// **The relocation itself is HTTP-observable (#925).** The success arm latches [`self.relocated`]
+    /// (a one-shot, plumbed exactly like `landed_fall_height`); the nav thread take-and-clears it and
+    /// surfaces it on `GET /v1/observe/debug` as `player.client_relocations` — a session-monotonic
+    /// counter an agent watches to *detect* an unrequested `pos` jump — and `player.last_relocation`
+    /// — `{to, distance}` with the full 3-D move, to *attribute* it. Both are always present (`0` /
+    /// `null` when none). The `warn` below is still emitted; it is no longer the only record.
     ///
     /// Not throttled on success — a success moves the body, so it cannot repeat from the same
     /// place. [`RESCUE_RETRY_SECS`] throttles only the failing search.
@@ -2039,6 +2068,14 @@ impl CharacterController {
                      a body, {:?}. This is a client-side relocation, not a server correction.",
                     from, moved, q);
                 self.recover(q[0], q[1], Recovery::Grounded(q[2]));
+                // #925: latch the one-shot the nav thread turns into `player.client_relocations` /
+                // `player.last_relocation`. `distance` is the FULL 3-D move (not the horizontal-only
+                // `moved` logged above), because an agent comparing `pos` deltas needs the figure
+                // that matches what it will observe when the placement changed height.
+                let distance = ((q[0] - from[0]).powi(2)
+                    + (q[1] - from[1]).powi(2)
+                    + (q[2] - from[2]).powi(2)).sqrt();
+                self.relocated = Some(Relocation { to: q, distance });
                 true
             }
             None => {
@@ -4827,6 +4864,82 @@ mod tests {
         assert!((ctrl.pos[0] - before[0]).abs() > 1.0,
             "after the placement the body must respond to a driver, moved {:?} → {:?}",
             before, ctrl.pos);
+    }
+
+    /// #925 — a last-resort placement latches an HTTP-observable marker: destination + FULL 3-D
+    /// distance, take-and-cleared exactly once. This is what lets an agent driving the HTTP API
+    /// detect and attribute an unrequested `pos` jump instead of seeing a bare coordinate change.
+    ///
+    /// The fixture is the same void column as `_845` above, whose only ground is 133 u away
+    /// horizontally and ~81 u UP — so the 3-D distance is materially larger than the horizontal
+    /// figure the `#845` `warn!` logs, and the test pins that it is the 3-D one that reaches the
+    /// marker.
+    ///
+    /// MUTATION-CHECK: delete `self.relocated = Some(..)` from `last_resort_placement` → the first
+    /// assert (`Some`) fails. Change `distance` there to the horizontal `moved` → the 3-D assert
+    /// fails. The `teleport` clear of `self.relocated` is pinned separately, by
+    /// `teleport_clears_an_undrained_relocation_marker_925` below; the one-shot half here is pinned
+    /// by the second `take_relocation()` returning `None`.
+    #[test]
+    fn a_last_resort_placement_latches_a_one_shot_relocation_marker_925() {
+        let c = void_column_with_distant_ground();
+        let mut ctrl = CharacterController::new(VOID_START);
+        ctrl.set_underworld(Some(-222.0));
+
+        assert!(ctrl.take_relocation().is_none(), "fixture: no relocation before the search fires");
+
+        for _ in 0..60 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 30.0, &c); } // past STUCK_FALLBACK_SECS
+        assert_ne!(ctrl.pos, VOID_START, "fixture: the placement must have moved the body");
+
+        let r = ctrl.take_relocation().expect(
+            "#925: a last-resort placement must latch a relocation marker an agent can observe");
+        // `to` is the placement target the client `recover()`d to; the body may settle a fraction
+        // of a unit onto the floor over the frames that follow (measured: ~6e-5 u on z), so this is
+        // a near-equality, not bit-equality. It still pins "the marker points where the body was
+        // put" — a wrong `to` is off by the search radius, tens of units, not a floor-snap epsilon.
+        for a in 0..3 {
+            assert!((r.to[a] - ctrl.pos[a]).abs() < 0.05,
+                "the marker's destination must be where the body was actually put (axis {a}): \
+                 {:?} vs {:?}", r.to, ctrl.pos);
+        }
+
+        let dx = ctrl.pos[0] - VOID_START[0];
+        let dy = ctrl.pos[1] - VOID_START[1];
+        let dz = ctrl.pos[2] - VOID_START[2];
+        let three_d = (dx * dx + dy * dy + dz * dz).sqrt();
+        let horizontal = (dx * dx + dy * dy).sqrt();
+        assert!((r.distance - three_d).abs() < 0.5,
+            "distance must be the full 3-D move ({three_d:.1}), got {:.1}", r.distance);
+        assert!(r.distance > horizontal + 1.0,
+            "fixture sanity: the placement changed height, so 3-D ({:.1}) must exceed horizontal \
+             ({horizontal:.1}) — otherwise this test is not pinning the distinction it claims",
+            r.distance);
+
+        assert!(ctrl.take_relocation().is_none(),
+            "the marker is a one-shot — a second take must yield None");
+    }
+
+    /// #925 — `teleport` drops a not-yet-drained relocation marker. A large server correction (which
+    /// `app.rs` routes through `teleport`) is a position discontinuity that SUPERSEDES the pending
+    /// relocation: its `to` is a coordinate the body is no longer at. If the render thread has not
+    /// latched the marker into `ControllerView` yet when the correction lands, leaving it on the
+    /// controller would let the next frame publish a `last_relocation` about a superseded position,
+    /// beside a `pos` the server has since overwritten.
+    ///
+    /// This mirrors `teleport_mid_fall_emits_no_fall_damage` for `landed_fall_height` — the same
+    /// one-shot, the same `teleport` clear, pinned the same way.
+    ///
+    /// MUTATION-CHECK: drop `self.relocated = None` from `teleport` → this test goes RED.
+    #[test]
+    fn teleport_clears_an_undrained_relocation_marker_925() {
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        ctrl.relocated = Some(Relocation { to: [111.0, 222.0, -7.5], distance: 84.0 });
+
+        ctrl.teleport([500.0, -30.0, 12.0]); // a >12u server correction, via app.rs's pos_correction handler
+
+        assert!(ctrl.take_relocation().is_none(),
+            "a teleport / server correction supersedes a pending relocation — its destination is a \
+             position the body is no longer at, and must not reach `last_relocation`");
     }
 
     /// #845 — the disclosure is NOT removed. A zone that genuinely offers nowhere to stand must

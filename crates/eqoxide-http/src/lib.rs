@@ -152,6 +152,13 @@ pub struct PlayerState {
     pub heading_ccw:  f32, // 0=north CCW
     pub heading_cw:   f32, // 0=north CW (wire format)
     pub server_corrections: u32,
+    /// #925: monotonic count of client-side body relocations by the `#845` last-resort placement —
+    /// the one `pos` jump with neither a driver request nor a server correction behind it. The
+    /// SESSION total, like `server_corrections`: it is not reset by a zone change, so an agent
+    /// detects an unrequested relocation by watching this tick. `last_relocation` below carries the
+    /// where/how-far of the most recent one. Always present in `GET /v1/observe/debug` (`0` when
+    /// none has happened); see `client_relocations_and_last_relocation_reach_the_debug_json_925`.
+    pub client_relocations: u32,
     pub mem_spells:   [u32; 9],
     /// Player skill values by skill id (0..77), for GET /v1/observe/skills (eqoxide#99).
     pub skills:       Vec<u32>,
@@ -316,6 +323,20 @@ pub struct PlayerState {
     /// `afloat_stall_reaches_the_debug_json_801`, which asserts `contains_key` on bytes returned by
     /// the real router — not by this attribute and not by any test that serialises `PlayerState`.
     pub afloat_stall: Option<PlayerAfloatStallView>,
+    /// #925 (agent-honesty): **the client relocated the body itself** — the destination and how far,
+    /// see [`PlayerRelocationView`]. Set by the `#845` last-resort placement, the one path that
+    /// moves the local player with neither a driver request nor a server correction behind it. `null`
+    /// until one happens this zone; ZONE-SCOPED (`GameState::begin_zone_in` clears it, because `to`
+    /// names a point in the departed zone), whereas the [`Self::client_relocations`] counter beside
+    /// it is session-monotonic. Pair them: the counter to *detect* (poll it, watch for a change),
+    /// this to *attribute* (which `pos` you should now be at, and the jump size to expect).
+    ///
+    /// No `skip_serializing_if`, and reachable in `GET /v1/observe/debug` for the same reason as
+    /// [`Self::hold`]/[`Self::afloat_stall`]: nothing serialises `PlayerState` whole, so the key is
+    /// put in the response by the `player.insert("last_relocation", …)` in `observe::get_debug`, and
+    /// `client_relocations_and_last_relocation_reach_the_debug_json_925` asserts `contains_key` on
+    /// bytes from the real router.
+    pub last_relocation: Option<PlayerRelocationView>,
 }
 
 impl PlayerState {
@@ -347,6 +368,9 @@ impl PlayerState {
             heading_ccw: gs.player_heading,
             heading_cw:  eqoxide_protocol::protocol::ccw_to_cw(gs.player_heading),
             server_corrections: gs.server_corrections,
+            // #925: session-monotonic, mirrored into `gs` by the same `ActionLoop::stream_position`
+            // tick as the position and the hold. Not zone-scoped — see the field doc.
+            client_relocations: gs.client_relocations,
             mem_spells: gs.mem_spells,
             skills:     gs.player_skills.clone(),
             trainer_open:   gs.trainer_open.is_some(),
@@ -428,6 +452,11 @@ impl PlayerState {
                              is reported as null.",
                 }
             }),
+            // #925: the `#845` last-resort relocation, mirrored into `gs` by the same
+            // `stream_position` tick as the hold and position above. `detail` is attached here, like
+            // every other agent-facing explanation in this crate. `client_relocations` above is the
+            // session counter; this is the most-recent detail.
+            last_relocation: gs.last_relocation.map(PlayerRelocationView::of),
             // #336: spawn-scoped, unlike target_con*/target_level above — populated for the LAST
             // consider of any spawn, not gated on that spawn being the current target.
             run_mode:      gs.run_mode,
@@ -877,6 +906,105 @@ pub struct PlayerAfloatStallView {
     pub progress_threshold: f32,
     /// Plain-language statement of what is true and what an agent can do about it.
     pub detail: &'static str,
+}
+
+/// **#925 (agent-honesty): the client moved the local player itself.** Served as
+/// `player.last_relocation` by `GET /v1/observe/debug`, and by no other route. Same dependency
+/// direction as [`PlayerHoldView`]/[`PlayerAfloatStallView`]: this type existing and being
+/// populated by [`PlayerState::from_game_state`] does NOT put it in a response body — nothing
+/// serialises `PlayerState` whole, `observe::get_debug` hand-builds its `player` object, so the
+/// key reaches an agent only via the explicit `player.insert("last_relocation", …)` there, pinned
+/// by `client_relocations_and_last_relocation_reach_the_debug_json_925`.
+///
+/// # The gap this closes (#925)
+///
+/// The `#845` last-resort placement is the one code path that changes the local player's position
+/// with **neither a driver request nor a server correction behind it**: when the body cannot be
+/// placed where it is (embedded in geometry, or over a void with no floor within 200 u), the
+/// controller searches the zone out to `RESCUE_RADII` (max 512 u horizontally) for anywhere it
+/// could legally stand and `recover()`s it there. Before #925 the only record of that jump was a
+/// `tracing::warn!` line — an operator reading logs saw it, an agent polling this API did not:
+/// [`PlayerState::server_corrections`] does not advance (the server did not move the body),
+/// [`PlayerState::hold`] stays `null` (a succeeding search returns before the hold is raised), and
+/// `pos` simply reads somewhere new next tick with nothing to say why. An agent differencing its
+/// own `pos` could see the discontinuity but not attribute it, and "the client relocated me" and
+/// "the server corrected me" call for different responses.
+///
+/// # This is NOT a [`PlayerHoldView`]
+///
+/// A `hold` says *the body cannot move at all*. This says the opposite happened — the body was
+/// stuck and the client **got it unstuck on its own**. The two are mutually exclusive at the point
+/// of origin: `last_resort_placement` publishes `hold: embedded_no_recovery` only when the search
+/// finds **nowhere**, and latches this only when it finds **somewhere**. If you are reading a
+/// non-`null` `last_relocation`, that search succeeded; if you are reading a non-`null` `hold`, it
+/// failed. You will not read both from the same search.
+///
+/// # Pair it with the counter
+///
+/// [`PlayerState::client_relocations`] is a **session-monotonic** count of these events;
+/// `last_relocation` is the **detail of the most recent one** and is **zone-scoped**
+/// (`GameState::begin_zone_in` clears it, because `to_east/north/up` name a point in the zone that
+/// was just left). Poll the counter to *detect* a relocation (watch for it to change); read this
+/// to *attribute* one (which `pos` you should now be at, and how large a jump to expect). A `null`
+/// here means *no relocation has happened in this zone* — it does **not** mean none happened this
+/// session; the counter is the field for that.
+///
+/// # Freshness
+///
+/// A one-shot EDGE event, plumbed like `landed_fall_height`, not a level signal like `hold`: the
+/// controller latches it once when the placement fires, `app.rs` moves it into the view on the
+/// next rendered frame (into an empty slot only), and `ActionLoop::stream_position` drains it into
+/// `GameState` exactly once, on the same tick it mirrors the position. It does **not** get
+/// re-asserted or withdrawn on later ticks — once set it stands, unchanged, until the next
+/// `begin_zone_in`. So unlike `hold`/`afloat_stall` there is no idle-render-loop staleness
+/// question here: the value is a report of a thing that already happened, not a live predicate.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PlayerRelocationView {
+    /// Where the client put the body, in the SAME frame and FOOT datum as the served `player.pos`
+    /// array (`[east, north, up]`), so it can be differenced against `pos` directly. Named for the
+    /// struct fields it is built from, NOT for response keys — there are no
+    /// `pos_east`/`pos_north`/`pos_up` keys in any body this API serves (#810 round-2 review, B1).
+    pub to_east:  f32,
+    pub to_north: f32,
+    pub to_up:    f32,
+    /// Full 3-D straight-line distance from the body's pre-placement position to
+    /// `[to_east, to_north, to_up]`, in world units — the size of the `pos` jump an agent
+    /// differencing its own position will observe. Deliberately the WHOLE move, not the
+    /// horizontal-only figure the `#845` `warn!` logs: it equals that figure when the placement did
+    /// not change height and exceeds it whenever it did (the void-recovery case, which drops or
+    /// lifts the body, always does).
+    pub distance: f32,
+    /// Plain-language statement of what is true and what an agent can do about it.
+    pub detail: &'static str,
+}
+
+impl PlayerRelocationView {
+    /// The ONE place a [`Relocation`](eqoxide_core::game_state::Relocation) becomes an agent-facing
+    /// view — same rule as [`PlayerHoldView::of`]: the `detail` prose is attached here, not stored
+    /// on the POD and not written inline at the call site, so there is one copy of the text.
+    pub fn of(r: eqoxide_core::game_state::Relocation) -> Self {
+        PlayerRelocationView {
+            to_east:  r.to[0],
+            to_north: r.to[1],
+            to_up:    r.to[2],
+            distance: r.distance,
+            detail: "the CLIENT moved the body itself. The #845 last-resort placement found the \
+                     body could not stay where it was — embedded in world geometry, or over a void \
+                     with no floor within 200 u below its feet — searched the zone out to 512 u \
+                     for anywhere it could legally stand, and put it there. This was NOT a driver \
+                     request (no /v1/move/* call caused it) and NOT a server correction \
+                     (`server_corrections` did not advance) — the client relocated on its own \
+                     initiative to keep the body in the world. You are now at \
+                     [to_east, to_north, to_up], the same frame and datum as `player.pos`; expect \
+                     `pos` to have jumped by `distance` units (the full 3-D move — at least the \
+                     horizontal figure in the client log, more when the placement changed height). \
+                     To detect future relocations, poll `client_relocations`: it is a \
+                     session-monotonic counter, while this detail is cleared on the next zone-in. \
+                     A succeeding search never sets `hold`; if a later search finds nowhere, \
+                     `hold` becomes `embedded_no_recovery` and this stays as the last one that \
+                     worked.",
+        }
+    }
 }
 
 /// A cast in flight, for `/v1/observe/debug` → `casting` (#348).
