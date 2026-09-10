@@ -3,9 +3,12 @@
 **Status:** DRAFT FOR REVIEW. No crate code written — the brainstorming HARD-GATE is in
 effect until the user approves this document. Design approved verbally in chat
 ("I'm happy with the rest of the design"); one change was requested and is folded in
-(§3.6, auto-disengage on a fresh `/goto`). The user has said to expect further
-iterations after user feedback, so this document is structured section-by-section for
-cheap revision.
+(§3.6, auto-disengage on a fresh `/goto`). Review round 1 (2026-09-10) settled all four
+§8 questions: use the `enter_engaging` helper (not the unconditional-cancel
+alternative); §3.9 (`auto_attack` on `/v1/observe/debug`) is **in scope for this PR**;
+the `/zone_cross` disengage disclosure stays an appended text sentence; `melee_disengaged`
+stays a distinct `nav_reason`. The user has said to expect further iterations after
+end-user feedback, so this document is structured section-by-section for cheap revision.
 
 **Scope:** `crates/eqoxide-ipc/src/lib.rs` (new `nav_state`/`nav_reason` vocabulary +
 one predicate), `crates/eqoxide-nav/src/walker.rs` (re-export + one small publish
@@ -13,9 +16,10 @@ helper), `crates/eqoxide-command/src/nav.rs` (`has_active_goto`, widen one
 preservation predicate, stale-doc fixes), `crates/eqoxide-net/src/action_loop.rs`
 (a new reconciler in `tick`; delete one line from `drive_auto_engage_melee`),
 `crates/eqoxide-http/src/move_api.rs` (auto-disengage in three handlers),
-`docs/http-api.md` (state/reason tables). Optionally
-`crates/eqoxide-http/src/lib.rs` + `crates/eqoxide-http/src/observe.rs` (§3.9).
-It does **NOT** touch the pathfinding tiers, the controller, or the combat wire code.
+`crates/eqoxide-http/src/lib.rs` + `crates/eqoxide-http/src/observe.rs` (`auto_attack`
+on `/v1/observe/debug`, §3.9), `docs/http-api.md` (state/reason tables + the new
+player field). It does **NOT** touch the pathfinding tiers, the controller, or the
+combat wire code.
 
 **Closes / unblocks:** #1007, re-scoped. #1007 stays **OPEN** until this lands. The
 original #1007 (life-halt goal-word freeze) already shipped — `nav.rs:176-209` +
@@ -638,10 +642,10 @@ and `engaging` would then stick after the mob dies until the next `/move/*` — 
 | WASD / `/manual` per-frame cancel while `engaging` | `request_cancel_goto` | idle branch, `nav_state_is_suspended` preserves word | `engaging` | `melee_engaged` | `null` | +1 per frame (pre-existing, Non-Goal) |
 | fresh `/goto` while `engaging` + live target | handler + reconciler | `request_attack(false)` → next tick predicate false → retire; `request_goto` stamped `pending` at accept | `pending`→… | — | `[x,y,z]` | +1 (the goto) |
 
-### 3.9 Optional honesty add-on — `auto_attack` on `/v1/observe/debug`
+### 3.9 `auto_attack` on `/v1/observe/debug` — in scope for this PR
 
-Not required by the fix. An agent debugging "why did my `/goto` come back
-`disengaged: true`?" or "why is `nav_state` `engaging`?" currently cannot read
+**Decided 2026-09-10:** in scope, not deferred. An agent debugging "why did my `/goto`
+come back `disengaged: true`?" or "why is `nav_state` `engaging`?" currently cannot read
 auto-attack posture from any endpoint. Small, isolated, and in the honesty spirit:
 
 * `PlayerState` (`crates/eqoxide-http/src/lib.rs:129`): add `pub auto_attack: bool;`.
@@ -653,10 +657,12 @@ auto-attack posture from any endpoint. Small, isolated, and in the honesty spiri
   (@36) and a one-line note that, like `run_mode`/`sitting`, it is last-sent intent,
   not a server confirmation.
 
-**Recommendation:** include it — it is ~4 lines + a doc line, it closes the obvious
-follow-up question the new `disengaged`/`engaging` observables raise, and it matches
-the existing `run_mode` precedent exactly. If the user would rather keep this PR
-minimal, it splits cleanly into its own change.
+It is ~4 lines + a doc line, it closes the obvious follow-up question the new
+`disengaged`/`engaging` observables raise, and it matches the existing `run_mode`
+precedent exactly. `PlayerState` gaining a field is a compile-forced decision at every
+construction site of the struct — grep for `PlayerState {` before implementing; on
+`main` @ `09ec76dc` `from_game_state` @349 is the only one, but a test fixture may add
+another.
 
 ---
 
@@ -669,8 +675,8 @@ minimal, it splits cleanly into its own change.
 | `crates/eqoxide-command/src/nav.rs` | `has_active_goto`; `nav_state_is_life_halt`→`nav_state_is_suspended` @202; comment rewrite @176-201; 3 stale doc fixes | 3.4, 3.5, 3.3 |
 | `crates/eqoxide-net/src/action_loop.rs` | `engage_active` field; `reconcile_engage_nav_state` + call @~1473; **delete** line 2821; #1109 comment rewrite @2762-2779 | 3.2, 3.3 |
 | `crates/eqoxide-http/src/move_api.rs` | `disengage_for_new_move` helper; wire into `post_goto`/`post_follow`/`post_zone_cross`; `disengaged` in responses | 3.6 |
-| `docs/http-api.md` | `nav_state` table +`engaging` row @363-378; `nav_reason` +`melee_engaged`/`melee_disengaged` @459+; idle-reason lists @366/@1449/@1722; `#725` "can never stick" note @380-396 (name `engaging` as transient-not-terminal); `disengaged` key on `/goto`/`/follow` bodies | 3.1, 3.6, 3.7 |
-| `crates/eqoxide-http/src/lib.rs` + `observe.rs` + `docs/http-api.md` | **optional** — `auto_attack` on `PlayerState`/`from_game_state`/`get_debug` | 3.9 |
+| `docs/http-api.md` | `nav_state` table +`engaging` row @363-378; `nav_reason` +`melee_engaged`/`melee_disengaged` @459+; idle-reason lists @366/@1449/@1722; `#725` "can never stick" note @380-396 (name `engaging` as transient-not-terminal); `disengaged` key on `/goto`/`/follow` bodies; `auto_attack` in the `/v1/observe/debug` player-field list | 3.1, 3.6, 3.7, 3.9 |
+| `crates/eqoxide-http/src/lib.rs` + `observe.rs` | `auto_attack` on `PlayerState` @129 / `from_game_state` @349 / `get_debug`'s hand-built `player` (~@1569) | 3.9 |
 
 ---
 
@@ -753,12 +759,12 @@ pursuit continues. To actually stop: `DELETE /v1/combat/attack` (→ scenario 4)
 
 ## 6. Testing
 
-~5 forcing tests. Each names the mutation(s) that must turn it **red** — both a
+~7 forcing tests. Each names the mutation(s) that must turn it **red** — both a
 *delete* (remove the line/guard) and a *wrap/flip* (invert the predicate) where the
 code is a condition — modelled on `retire_life_halt`'s mutation-check tests
 (`action_loop.rs:8217`, `:8288`). Placement: `action_loop.rs` `#[cfg(test)]` for the
 reconciler; `nav.rs` tests for the preservation predicate; `move_api.rs` tests for the
-handlers.
+handlers; `observe.rs` (or the http-crate router test module) for the debug field.
 
 | # | test | asserts | must go RED when… |
 |---|------|---------|-------------------|
@@ -768,6 +774,7 @@ handlers.
 | 4 | `stop_and_wasd_cancel_do_not_flip_engaging_to_idle` (`nav.rs`) | with `nav_state.state = "engaging"`, calling `request_stop()` and `request_cancel_goto()` each leaves `state == "engaging"`, `reason == "melee_engaged"`, bumps `goal_id`, clears `goto_target` | change `nav_state_is_suspended` back to `nav_state_is_life_halt` at `nav.rs:202`; make `nav_state_is_suspended` return `nav_state_is_life_halt(s) && false` |
 | 5 | `engaging_is_not_terminal` | `TERMINAL_NAV_STATES` does not contain `"engaging"`; and a functional check: `engaging` + no goto + `resolve_goal` None-branch still lets the reconciler retire it next pass (it is not frozen) | add `"engaging"` to `TERMINAL_NAV_STATES` (both the `[&str; N]` len and the functional assertion fail) |
 | 6 | `fresh_goto_while_engaging_disengages_and_echoes_it` (`move_api.rs`) | router-level: `auto_attack=true` + live target, `POST /v1/move/goto` → body has `"disengaged": true` and `"status":"navigating"`; a queued `take_attack()` == `Some(false)`; with `auto_attack=false` the same POST → `"disengaged": false` | delete the `disengage_for_new_move` call in `post_goto`; **flip** its `gs.auto_attack && live_target` to `||`; delete the `"disengaged"` json line |
+| 7 | `observe_debug_player_always_carries_auto_attack` (`observe.rs` / http router test) | `GET /v1/observe/debug` on the real router → `body["player"]` **`contains_key("auto_attack")`** and its value tracks `gs.auto_attack` (false at boot; true after a `request_attack(true)` + `drain_combat`) | delete the `player.insert("auto_attack", …)` line in `get_debug`; **flip** the inserted value to a literal `false` (the "tracks `gs.auto_attack`" assertion fails) |
 
 Baseline to preserve: `rbuild . test --workspace --locked` → **1145 passed / 0 failed /
 29 ignored** on `main` [cited, build-run skill]. Run with `timeout: 420000`.
@@ -792,27 +799,31 @@ Baseline to preserve: `rbuild . test --workspace --locked` → **1145 passed / 0
 
 ---
 
-## 8. Open questions / deviations from the approved chat sketch
+## 8. Resolved questions / deviations from the approved chat sketch
 
-1. **`enter_engaging` nulls `goal`/`local` (§3.4).** The chat sketch said only
-   "`set_nav_state_because(NAV_STATE_ENGAGING, …)`." Source review found that path keeps
-   a stale `goal` when entering `engaging` from a terminal `arrived` (goto slot already
-   cleared, `NavStatus.goal` not) — the #732 defect class. The helper is the minimal
-   fix that keeps `nav_goal` honest (`null`) under `engaging`. **Alternative** if the
-   reviewer prefers no new `walker.rs` method: make the reconciler's episode-entry
-   `request_cancel_goto()` **unconditional** (not gated on `has_active_goto()`), which
-   also clears `goal` via `retire_to_idle` — at the cost of one `goal_id` bump per
-   engage episode even when no goto was in flight. That bump is arguably correct #349
-   semantics ("a nav-relevant transition an agent watching an old goal_id should see"),
-   but it is a new `goal_id` writer not tied to a `/move/*` POST. Recommendation: keep
-   the helper.
-2. **§3.9 (`auto_attack` on `/observe/debug`)** — include now, or split? Recommendation:
-   include (4 lines + a doc line, closes the obvious follow-up question).
-3. **`post_zone_cross` disengage disclosure** is an appended sentence on the existing
-   `text(…)` body, not a JSON key (that handler returns plain text). Confirm that is
-   acceptable vs. converting it to JSON (a larger, riskier change to a well-worn
-   handler).
-4. **`melee_disengaged` vs. reusing `goal_dropped`.** A distinct reason costs one
-   constant and one doc row but lets an agent tell "my melee pursuit ended" from "my
-   goto's chase target despawned." Kept distinct. Push back if the vocabulary is
-   getting too wide.
+All four settled in review round 1 (2026-09-10). Recorded here because each is a
+deviation from, or a sharpening of, the verbal sketch — a later iteration reopening any
+of them should know what was weighed.
+
+1. **`enter_engaging` nulls `goal`/`local` (§3.4).** — **RESOLVED: keep the helper.**
+   The chat sketch said only "`set_nav_state_because(NAV_STATE_ENGAGING, …)`." Source
+   review found that path keeps a stale `goal` when entering `engaging` from a terminal
+   `arrived` (goto slot already cleared on arrival, `NavStatus.goal` not) — the #732
+   defect class. The helper is the minimal fix that keeps `nav_goal` honest (`null`)
+   under `engaging`. The rejected alternative — an **unconditional** episode-entry
+   `request_cancel_goto()` (not gated on `has_active_goto()`), which also clears `goal`
+   via `retire_to_idle` — was declined because it adds a `goal_id` writer not tied to a
+   `/move/*` POST and bumps the id once per engage episode even with no goto in flight.
+2. **§3.9 (`auto_attack` on `/observe/debug`).** — **RESOLVED: in scope for this PR.**
+   ~4 lines + a doc line; closes the follow-up question the new `disengaged`/`engaging`
+   observables raise; mirrors the `run_mode` precedent. Wired through §3.9, §4, and
+   test 7 (§6).
+3. **`post_zone_cross` disengage disclosure.** — **RESOLVED: appended text sentence, no
+   JSON conversion.** That handler returns `text(…)` and converting it to `json(…)` is
+   a larger, riskier change to a well-worn handler for no honesty gain — the sentence
+   carries the same fact. `/goto` and `/follow` already return `json(…)`, so they get
+   the `"disengaged"` key.
+4. **`melee_disengaged` vs. reusing `goal_dropped`.** — **RESOLVED: distinct reason.**
+   Costs one constant and one doc row; buys an agent the ability to tell "my melee
+   pursuit ended" from "my goto's chase target despawned." Revisit only if the
+   `nav_reason` vocabulary is judged too wide in a later pass.
