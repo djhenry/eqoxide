@@ -4877,8 +4877,9 @@ mod tests {
     ///
     /// MUTATION-CHECK: delete `self.relocated = Some(..)` from `last_resort_placement` → the first
     /// assert (`Some`) fails. Change `distance` there to the horizontal `moved` → the 3-D assert
-    /// fails. Drop `self.relocated = None` from `teleport` and a separate teleport test would catch
-    /// it; here the one-shot half is pinned by the second `take_relocation()` returning `None`.
+    /// fails. The `teleport` clear of `self.relocated` is pinned separately, by
+    /// `teleport_clears_an_undrained_relocation_marker_925` below; the one-shot half here is pinned
+    /// by the second `take_relocation()` returning `None`.
     #[test]
     fn a_last_resort_placement_latches_a_one_shot_relocation_marker_925() {
         let c = void_column_with_distant_ground();
@@ -4916,6 +4917,29 @@ mod tests {
 
         assert!(ctrl.take_relocation().is_none(),
             "the marker is a one-shot — a second take must yield None");
+    }
+
+    /// #925 — `teleport` drops a not-yet-drained relocation marker. A large server correction (which
+    /// `app.rs` routes through `teleport`) is a position discontinuity that SUPERSEDES the pending
+    /// relocation: its `to` is a coordinate the body is no longer at. If the render thread has not
+    /// latched the marker into `ControllerView` yet when the correction lands, leaving it on the
+    /// controller would let the next frame publish a `last_relocation` about a superseded position,
+    /// beside a `pos` the server has since overwritten.
+    ///
+    /// This mirrors `teleport_mid_fall_emits_no_fall_damage` for `landed_fall_height` — the same
+    /// one-shot, the same `teleport` clear, pinned the same way.
+    ///
+    /// MUTATION-CHECK: drop `self.relocated = None` from `teleport` → this test goes RED.
+    #[test]
+    fn teleport_clears_an_undrained_relocation_marker_925() {
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        ctrl.relocated = Some(Relocation { to: [111.0, 222.0, -7.5], distance: 84.0 });
+
+        ctrl.teleport([500.0, -30.0, 12.0]); // a >12u server correction, via app.rs's pos_correction handler
+
+        assert!(ctrl.take_relocation().is_none(),
+            "a teleport / server correction supersedes a pending relocation — its destination is a \
+             position the body is no longer at, and must not reach `last_relocation`");
     }
 
     /// #845 — the disclosure is NOT removed. A zone that genuinely offers nowhere to stand must

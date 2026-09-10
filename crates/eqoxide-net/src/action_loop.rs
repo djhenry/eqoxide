@@ -3944,9 +3944,8 @@ mod tests {
     ///
     /// MUTATION CHECKS: drop the `relocated.take()` block from `stream_position` → RED at the first
     /// counter assertion. Change `wrapping_add(1)` to a plain assignment `= 1` → RED at the
-    /// two-relocations assertion. Move the block AFTER the correction-branch early return → RED
-    /// whenever a correction and a relocation land on the same tick (not exercised here directly,
-    /// but the placement above the `gp` binding is what this ordering pins).
+    /// two-relocations assertion. Move the block AFTER the correction-branch early return → RED at
+    /// the final phase, which lands a relocation and a >12u server correction on the same tick.
     #[tokio::test]
     async fn stream_position_drains_the_relocation_marker_exactly_once_925() {
         use eqoxide_core::game_state::Relocation;
@@ -3983,6 +3982,23 @@ mod tests {
         nav.stream_position(&mut stream, &mut gs);
         assert_eq!(gs.client_relocations, 2, "a second relocation must advance the monotonic counter");
         assert_eq!(gs.last_relocation, Some(second), "and replace the detail with the newer one");
+
+        // A relocation and a >12u server correction on the SAME net tick. The drain sits ABOVE the
+        // correction branch's early return, so the marker must still land here — a relocation really
+        // happened, and an agent differencing its own `pos` needs it precisely on the tick the
+        // server ALSO yanked the body, the messiest tick to leave unexplained.
+        gs.player_x = 5_000.0; // thousands of units from last_streamed on either axis — clears CORRECTION_SQ (12u)
+        let third = Relocation { to: [7.5, -3.0, 60.0], distance: 12.5 };
+        nav.controller.controller_view.lock().unwrap().relocated = Some(third);
+        nav.stream_position(&mut stream, &mut gs);
+        assert!(nav.controller.pos_correction.lock().unwrap().is_some(),
+            "premise: player_x jumped 5000u from last_streamed, so this tick MUST take the \
+             correction branch and return early");
+        assert_eq!(gs.client_relocations, 3,
+            "the relocation drain runs before the correction-branch early return — move it below and \
+             a server correction landing on the same tick silently swallows the relocation");
+        assert_eq!(gs.last_relocation, Some(third),
+            "and `last_relocation` carries the newest detail even on a correction tick");
     }
 
     /// A `ControllerHold` fixture. Public fields, so this is just a named literal — but naming it

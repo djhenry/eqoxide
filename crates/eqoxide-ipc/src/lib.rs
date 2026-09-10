@@ -2899,9 +2899,24 @@ impl ControllerSlots {
     /// residual is `player_pos_known`'s, and is filed as #871 rather than fixed here — a different
     /// field, whose only writer is the same unconditional mirror, but whose blast radius is position
     /// streaming).
+    ///
+    /// #925: it ALSO drains any undrained `#845` relocation marker from the view. That marker is a
+    /// one-shot (`stream_position` `take()`s it, never re-mirrors it), so this is not the every-tick
+    /// re-clear the disclosures need — it is a single `take()`: if a relocation was latched into the
+    /// view but not yet drained when the crossing lands, its `to` is a coordinate in the departed
+    /// zone, and draining it here (bumping `client_relocations`, which is session-monotonic, but not
+    /// setting the just-cleared `GameState::last_relocation`) keeps that stale coordinate from
+    /// reaching the new zone's `last_relocation` on the first net tick.
     pub fn begin_zone_in(&self, gs: &mut eqoxide_core::game_state::GameState) {
         gs.begin_zone_in();
-        self.controller_view.lock().unwrap().invalidate_disclosures();
+        let mut view = self.controller_view.lock().unwrap();
+        view.invalidate_disclosures();
+        // #925: the relocation really happened, so it still counts — but its destination named a
+        // point in the zone we just left, and `gs.begin_zone_in()` above already cleared
+        // `last_relocation`, so take the marker unread and only advance the monotonic counter.
+        if view.relocated.take().is_some() {
+            gs.client_relocations = gs.client_relocations.wrapping_add(1);
+        }
     }
 }
 
@@ -2948,7 +2963,7 @@ impl CameraSlots {
 #[cfg(test)]
 mod zone_in_disclosure_tests {
     use super::*;
-    use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason, GameState};
+    use eqoxide_core::game_state::{ControllerHold, ControllerHoldReason, GameState, Relocation};
 
     /// **#846 review B1 — the two halves of a zone-in clear, pinned together.**
     ///
@@ -3000,6 +3015,47 @@ mod zone_in_disclosure_tests {
              back; measured to happen on the very next net tick (#846 review B1). The stall this \
              fixture publishes is a real matured one, so the second element of this tuple is a \
              live assertion rather than a `None == None` tautology (review F1).");
+    }
+
+    /// **#925 — a relocation marker sitting undrained in the view when the crossing lands must not
+    /// leak the departed zone's coordinate into the new zone.**
+    ///
+    /// The `#845` last-resort placement latches a one-shot `ControllerView::relocated`;
+    /// `ActionLoop::stream_position` normally `take()`s it within a net tick. If a crossing happens
+    /// first, the marker is still there, and its `to` is a point in the zone being left. The
+    /// `GameState` half of the clear (`GameState::begin_zone_in`) only nulls `last_relocation` — it
+    /// cannot reach the view — so without the drain in `ControllerSlots::begin_zone_in` the first
+    /// post-crossing `stream_position` mirrors that stale `to` straight into the fresh zone's
+    /// `last_relocation`. The relocation still HAPPENED, so the monotonic counter must advance; only
+    /// the coordinate is dropped.
+    ///
+    /// MUTATION CHECK: drop the `if view.relocated.take().is_some()` block from
+    /// `ControllerSlots::begin_zone_in` → the "marker drained" assertion goes RED (the marker
+    /// survives into the new zone), and so does the counter assertion.
+    #[test]
+    fn controller_slots_begin_zone_in_drains_an_undrained_relocation_marker_925() {
+        let slots = ControllerSlots::default();
+        let mut gs = GameState::new();
+
+        // A relocation happened last zone and was mirrored through once already…
+        gs.client_relocations = 4;
+        // …and a SECOND one was just latched into the view, not yet drained, when the crossing hit.
+        const IN_THE_OLD_ZONE: [f32; 3] = [-812.5, 43.0, -119.75];
+        slots.controller_view.lock().unwrap().relocated =
+            Some(Relocation { to: IN_THE_OLD_ZONE, distance: 96.0 });
+
+        slots.begin_zone_in(&mut gs);
+
+        assert!(slots.controller_view.lock().unwrap().relocated.is_none(),
+            "the undrained marker must be TAKEN by the zone-in pairing — left in the view, the \
+             first `stream_position` in the new zone mirrors its departed-zone `to` into \
+             `last_relocation`");
+        assert!(gs.last_relocation.is_none(),
+            "and it must not have been written into `last_relocation`: `GameState::begin_zone_in` \
+             cleared that field, and the drain must not re-populate it with an old-zone point");
+        assert_eq!(gs.client_relocations, 5,
+            "the relocation really happened, so the session-monotonic counter must still advance — \
+             an agent watching it must not miss an event just because a crossing raced the drain");
     }
 
     /// The invalidation must not latch the disclosures OFF: the render thread's first publication

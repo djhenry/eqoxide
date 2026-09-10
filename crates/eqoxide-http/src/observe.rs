@@ -1635,8 +1635,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // Both ALWAYS PRESENT — `client_relocations` is `0` and `last_relocation` is `null` until
         // one happens — same grepping-agent contract as `hold`/`afloat_stall` above: an omitted key
         // would read as "this client is too old to report relocations", which it must never do when
-        // the honest answer is "none yet". `..._reaches_the_debug_json_925` asserts `contains_key`
-        // on bytes from the real router for that reason.
+        // the honest answer is "none yet". `client_relocations_and_last_relocation_reach_the_debug_json_925`
+        // asserts `contains_key` on bytes from the real router for that reason.
         player.insert("client_relocations".into(),      serde_json::json!(player_client_relocations));
         player.insert("last_relocation".into(),         serde_json::json!(player_last_relocation));
         // #612 — OUTBOUND honesty. Everything else in this payload is about what the server told us;

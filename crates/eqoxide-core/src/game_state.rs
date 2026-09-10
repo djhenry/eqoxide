@@ -1058,8 +1058,14 @@ pub struct ControllerHold {
 ///
 /// `PartialEq` matters for the same reason it does on [`ControllerHold`]: this rides inside
 /// [`GameState`], whose snapshot dedup (`eq_net::gameplay::publish_snapshot`) only republishes when
-/// the state actually changed. `[f32; 3]` + `f32` compares fine.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+/// the state actually changed. `[f32; 3]` + `f32` compares fine — and because neither member ever
+/// advances on its own (unlike `ControllerHold::secs`), a settled `Some(r)` compares equal frame to
+/// frame and costs exactly one extra republish per relocation.
+///
+/// Deliberately NOT `serde::Serialize` (sibling [`ControllerHold`] is not either): nothing
+/// serialises this type. The HTTP path builds `PlayerRelocationView` from it in `eqoxide-http`,
+/// which is where the wire field names and the `detail` prose live.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Relocation {
     /// Where the body was put, in `[east, north, up]` (`pos`) order.
     pub to: [f32; 3],
@@ -1432,7 +1438,8 @@ pub struct GameState {
     /// The nav walker checks this to stop driving a corpse toward a stale /goto (eqoxide#61).
     pub player_dead: bool,
 
-    /// Count of server rubber-band corrections (position deltas > 5 units).
+    /// Count of server rubber-band corrections (horizontal position deltas > 12 units, i.e. past
+    /// `CORRECTION_SQ` — see `packet_handler`'s `OP_ClientUpdate` handler and `stream_position`).
     pub server_corrections: u32,
 
     /// Monotonic count of client-side body relocations by the `#845` last-resort placement — the
@@ -1682,12 +1689,19 @@ impl GameState {
         self.player_hold = None;
         self.player_afloat_stall = None;
         // #925: `last_relocation.to` is a coordinate in the zone we are leaving, so it is stale the
-        // moment we cross. Unlike the hold/stall above this needs NO view-clear pairing: a
-        // relocation is a ONE-SHOT edge event (like `landed_fall_height`), latched into
-        // `ControllerView` and `take()`n exactly once by `stream_position` — never re-published
-        // every tick — so clearing it here is sufficient and it cannot come back on the next tick.
-        // The `client_relocations` counter is deliberately NOT cleared: it is session-monotonic,
-        // like `server_corrections`.
+        // moment we cross. The `client_relocations` counter is deliberately NOT cleared: it is
+        // session-monotonic, like `server_corrections`.
+        //
+        // ⚠️ THIS CLEAR IS NOT SUFFICIENT ON ITS OWN, for the same reason the hold/stall clears
+        // above are not: the value races in `ControllerView`, above this crate. Unlike those two it
+        // is a ONE-SHOT — `stream_position` does not re-mirror it every tick, it `take()`s it once —
+        // so the failure is narrower: a single relocation marker latched into the view but not yet
+        // drained when the crossing happens would be drained into the NEW zone's `last_relocation`
+        // on the first net tick, carrying the departed zone's `to`. So the pairing in
+        // `eqoxide_ipc::ControllerSlots::begin_zone_in` TAKES that marker rather than re-clearing:
+        // it still bumps `client_relocations` (the relocation really did happen) but drops the stale
+        // coordinate unread. Same residual window `landed_fall_height` carries and #871 tracks for
+        // `player_pos_known` — closed here rather than ridden.
         self.last_relocation = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while

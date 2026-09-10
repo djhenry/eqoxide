@@ -157,7 +157,7 @@ pub struct PlayerState {
     /// SESSION total, like `server_corrections`: it is not reset by a zone change, so an agent
     /// detects an unrequested relocation by watching this tick. `last_relocation` below carries the
     /// where/how-far of the most recent one. Always present in `GET /v1/observe/debug` (`0` when
-    /// none has happened); see `client_relocations_reaches_the_debug_json_925`.
+    /// none has happened); see `client_relocations_and_last_relocation_reach_the_debug_json_925`.
     pub client_relocations: u32,
     pub mem_spells:   [u32; 9],
     /// Player skill values by skill id (0..77), for GET /v1/observe/skills (eqoxide#99).
@@ -334,8 +334,8 @@ pub struct PlayerState {
     /// No `skip_serializing_if`, and reachable in `GET /v1/observe/debug` for the same reason as
     /// [`Self::hold`]/[`Self::afloat_stall`]: nothing serialises `PlayerState` whole, so the key is
     /// put in the response by the `player.insert("last_relocation", …)` in `observe::get_debug`, and
-    /// `last_relocation_reaches_the_debug_json_925` asserts `contains_key` on bytes from the real
-    /// router.
+    /// `client_relocations_and_last_relocation_reach_the_debug_json_925` asserts `contains_key` on
+    /// bytes from the real router.
     pub last_relocation: Option<PlayerRelocationView>,
 }
 
@@ -914,7 +914,7 @@ pub struct PlayerAfloatStallView {
 /// populated by [`PlayerState::from_game_state`] does NOT put it in a response body — nothing
 /// serialises `PlayerState` whole, `observe::get_debug` hand-builds its `player` object, so the
 /// key reaches an agent only via the explicit `player.insert("last_relocation", …)` there, pinned
-/// by `last_relocation_reaches_the_debug_json_925`.
+/// by `client_relocations_and_last_relocation_reach_the_debug_json_925`.
 ///
 /// # The gap this closes (#925)
 ///
