@@ -2767,6 +2767,13 @@ impl ActionLoop {
     ///
     /// Runs above the 150 ms gate and every early return in `tick`, so the word tracks the
     /// pursuit within one tick in both directions.
+    ///
+    /// The one exception is `nav_halt_if_dead`'s own early return, immediately above this call:
+    /// if it fires, `engage_active` freezes at its current value for the halt's duration. That is
+    /// safe only because `require_alive` (`eqoxide-http/src/lib.rs`) 409-refuses every
+    /// `/v1/move/*` under a life halt, so no goto can be accepted to be silently stomped or
+    /// silently missed during the freeze; the latch resumes normal operation the first tick the
+    /// halt clears (#1007 final review, M3).
     fn reconcile_engage_nav_state(&mut self, gs: &GameState) {
         // Same predicate as `drive_auto_engage_melee`'s own gates: auto_attack on, a live
         // (non-dead) target, 2D distance < 200u. Kept in lock-step with that fn on purpose
@@ -2791,13 +2798,30 @@ impl ActionLoop {
                     self.command.request_cancel_goto();
                 }
                 self.engage_active = true;
+                self.walker.enter_engaging();
+            } else if self.command.has_active_goto() {
+                // #1007 final-review finding C1: a goto/follow/zone_cross was stamped AFTER
+                // this episode began — either racing the HTTP handler's async disengage toggle
+                // (`self.auto_attack` clears at most one tick later, in `drain_combat`), or a
+                // `/move/zone_cross` that predates the episode and only now resolved via
+                // `drain_zone_cross`. That goal is LIVE and honestly published right now
+                // (`nav_state`/`nav_goal` reflect it). Calling `enter_engaging()` here would
+                // relabel over it and null `NavStatus.goal` with nothing left to ever restore
+                // it — a durable `nav_goal` lie of exactly the #732 shape this feature exists
+                // to police. Leave the word alone this tick: either the disengage lands next
+                // tick and `want_engage` goes false (the `else` branch below then retires
+                // nothing, because the state was never relabelled to `engaging`), or the goto
+                // keeps its own honest word for as long as it stays live.
+                // `drive_auto_engage_melee` still runs unchanged later in `tick` and is
+                // unaffected by this branch — it reads neither `engage_active` nor this word.
+            } else {
+                // Steady state: no live goto to protect. `enter_engaging`'s own early-return
+                // guard makes a re-publish of the same `engaging`/`melee_engaged` a no-op — no
+                // lock write, no `goal_id` touch. It also nulls `goal`/`local` on the
+                // transition in, so `nav_goal` is null under `engaging` even when the episode
+                // began from a stale `arrived`.
+                self.walker.enter_engaging();
             }
-            // Idempotent on every later tick: `enter_engaging`'s own early-return guard
-            // makes a re-publish of the same `engaging`/`melee_engaged` a no-op — no lock
-            // write, no `goal_id` touch. It also nulls `goal`/`local` on the transition in,
-            // so `nav_goal` is null under `engaging` even when the episode began from a
-            // stale `arrived`.
-            self.walker.enter_engaging();
         } else {
             // Retire ONLY our own word — guarded so we never stomp navigating / arrived /
             // blocked / dead written by anyone else.
@@ -6091,6 +6115,12 @@ mod tests {
             eqoxide_nav::walker::NAV_REASON_GOAL_DROPPED,
             eqoxide_nav::walker::NAV_REASON_RESPAWNED,
             eqoxide_nav::walker::NAV_REASON_HP_RESTORED,
+            // #1007 final review, I3 — and the second half of that finding, which the docs-only
+            // half would have hidden: `reconcile_engage_nav_state`'s retire branch publishes this
+            // on `idle`, but the constant was never added here, so DIRECTION 1 (code → docs) was
+            // vacuous for it and never noticed the `idle` row had no `melee_disengaged`. Listing
+            // it in the docs alone turns DIRECTION 2 red; both halves belong together.
+            eqoxide_nav::walker::NAV_REASON_MELEE_DISENGAGED,
             eqoxide_command::NAV_REASON_STOPPED,
             eqoxide_command::NAV_REASON_GOTO_CANCELLED,
             eqoxide_command::NAV_REASON_ZONE_CROSS_UNHANDLED,
@@ -8981,6 +9011,45 @@ mod tests {
             "reconcile_engage_nav_state must run before the 150 ms gate's early return");
     }
 
+    /// **#1007 final review, I6 — the load-bearing predicate lock-step.** `engaging` survives
+    /// `resolve_goal`'s generic "retire any non-terminal word" rule for exactly ONE reason:
+    /// `drive_auto_engage_melee`'s early-return predicate (`auto_attack && live target && !dead
+    /// && dist < 200.0`) is the same predicate as the reconciler's `want_engage`, so whenever
+    /// `engaging` is published the driver also claims that same tick and returns before
+    /// `resolve_goal` ever runs. Add a condition to ONE of the two (a zoning guard, a
+    /// pet-standoff check, a line-of-sight check) and `engaging` gets published, the driver
+    /// declines, the tick falls through, and `resolve_goal` retires the word to
+    /// `idle`/`goal_dropped` at the 150 ms cadence — #1007's ORIGINAL defect reproduced inside
+    /// its own fix. This test is what goes red.
+    #[tokio::test]
+    async fn engaging_survives_a_full_tick_because_the_driver_shares_the_reconcilers_predicate() {
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let (mut al, nav, _command, _collision, _za) = shared_nav_action_loop();
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
+        gs.target_id = Some(42);
+        al.auto_attack = true;
+
+        // Gate OPEN, so the WHOLE tick runs — including `resolve_goal`'s generic retirement.
+        al.last_tick = Instant::now() - Duration::from_millis(NAV_TICK_MS as u64 * 4);
+        al.tick(&mut stream, &mut gs);
+
+        assert_eq!(nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_ENGAGING,
+            "the reconciler published `engaging`, and a full tick must not retire it");
+
+        // THE INVARIANT: the driver's predicate, evaluated independently against the SAME tick's
+        // state, must also claim the tick. That — and only that — is why the fall-through to
+        // `resolve_goal` above never happens while `engaging` is published.
+        assert!(al.drive_auto_engage_melee(&mut stream, &mut gs),
+            "`drive_auto_engage_melee` must claim every tick the reconciler calls `engaging` — if \
+             the two predicates ever drift apart, `resolve_goal` retires `engaging` to \
+             `idle`/`goal_dropped` and #1007 is back");
+    }
+
     #[test]
     fn engaging_retires_to_idle_melee_disengaged_when_the_target_dies() {
         let (mut al, nav, _command, _collision, _za) = shared_nav_action_loop();
@@ -9051,6 +9120,71 @@ mod tests {
         let after_5 = nav.nav_state.lock().unwrap().clone();
         assert_eq!(after_5.goal_id, n + 1, "no further goal_id churn while the pursuit continues (#349)");
         assert_eq!(after_5.state, eqoxide_ipc::NAV_STATE_ENGAGING);
+    }
+
+    /// **#1007 final review, C1.** A `/move/{goto,follow,zone_cross}` can stamp a fresh goal
+    /// *after* an engage episode has already begun — either racing the HTTP handler's async
+    /// auto-attack-off toggle (`self.auto_attack` only clears a tick later, in `drain_combat`),
+    /// or a `/move/zone_cross` queued BEFORE the episode that only resolves mid-episode via
+    /// `drain_zone_cross`. That goal is live and honestly published. An unconditional
+    /// `enter_engaging()` on the next reconciler tick would relabel over it and null
+    /// `NavStatus.goal` with nothing left to ever restore it — `goto_target` keeps driving the
+    /// real walk while `nav_goal` reads `null` forever: the exact #732 lie this feature exists
+    /// to police.
+    ///
+    /// **Mutation check:** collapse the `else if self.command.has_active_goto()` arm back into an
+    /// unconditional `self.walker.enter_engaging()` → step 2's `goal` assertion goes RED with
+    /// `left: None, right: Some([10.0, 0.0, 0.0])`.
+    #[test]
+    fn a_goal_stamped_mid_episode_keeps_its_own_word_and_goal() {
+        let (mut al, nav, command, _collision, _za) = shared_nav_action_loop();
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
+        gs.target_id = Some(42);
+        al.auto_attack = true;
+
+        // 1. The episode genuinely begins.
+        al.reconcile_engage_nav_state(&gs);
+        {
+            let ns = nav.nav_state.lock().unwrap();
+            assert_eq!(ns.state, eqoxide_ipc::NAV_STATE_ENGAGING);
+            assert_eq!(ns.goal, None, "a melee pursuit has no fixed-point goal");
+        }
+
+        // 2. A fresh goal lands MID-episode (stand-in for the racy HTTP disengage path, or for
+        //    `drain_zone_cross` resolving a cross queued before the episode). Nothing about
+        //    `auto_attack` or the target changed, so the very next tick still has
+        //    `want_engage == true` with `engage_active == true` — the buggy shape.
+        let new_gid = command.request_goto((10.0, 0.0, 0.0));
+        al.reconcile_engage_nav_state(&gs);
+
+        {
+            let ns = nav.nav_state.lock().unwrap();
+            assert_eq!(ns.goal, Some([10.0, 0.0, 0.0]),
+                "the reconciler must not null a goal it did not stamp — `goto_target` still \
+                 drives the walk, so a null `nav_goal` here is a durable #732 lie");
+            assert_eq!(ns.goal_id, new_gid,
+                "the reconciler must not bump `goal_id` again mid-episode (#349)");
+            assert_ne!(ns.state, eqoxide_ipc::NAV_STATE_ENGAGING,
+                "the live goto keeps its own honest word");
+            assert_eq!(ns.state, "pending", "…which is what `request_goto` stamped");
+        }
+
+        // 3. The handler's async disengage finally lands (via `drain_combat`) on a later tick.
+        //    The `else` arm must not retire a word it never wrote: `nav_state_is(ENGAGING)` is
+        //    false, so it correctly does nothing but drop the latch.
+        al.auto_attack = false;
+        al.reconcile_engage_nav_state(&gs);
+
+        let ns = nav.nav_state.lock().unwrap();
+        assert_eq!(ns.state, "pending", "retiring must not stomp the goto's own word");
+        assert_eq!(ns.goal, Some([10.0, 0.0, 0.0]));
+        assert_eq!(ns.goal_id, new_gid);
+        assert!(!al.engage_active, "the episode latch drops with the predicate");
     }
 
     #[test]

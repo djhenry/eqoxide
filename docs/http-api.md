@@ -363,7 +363,7 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `nav_state` | Meaning | `nav_reason` |
 |-------------|---------|--------------|
 | `pending` | A `/move/{goto,follow,zone_cross}` was **just accepted** and the walker has not ticked yet. Normally it lasts one walker tick (~150 ms) and becomes `planning`/`navigating`/`following`; a `/zone_cross` issued during a zone load holds it until the request is drained (see `zone_loading`). Its purpose is honesty: the instant a new request is accepted the state resets to `pending` (under a fresh `nav_goal_id`), so a read can **never** return the *previous* goal's terminal `arrived`/`no_path`/`blocked` as if it were the new request's outcome (#349). **`pending` always retires.** It is not on the terminal list, and every walker tick that finds no goal in flight and no queued `/zone_cross` retires any non-terminal state to `idle` with a reason — so `pending` cannot outlive the request that stamped it (#725; before that fix a dropped `/zone_cross` left `pending` standing indefinitely — measured at 75 s — with `nav_reason` and `nav_goal` both `null`). | — |
-| `idle` | Nothing to do. **Every `idle` the client publishes after start-up carries a `nav_reason` saying how it got there**, so `nav_state: "idle"` with `nav_reason: null` means exactly one thing: no nav request has been made since this client started (#725). It is otherwise a real outcome, not an absence of one. | `zoned`, `stopped`, `goto_superseded`, `goal_dropped`, `respawned`, `hp_restored`, `zone_cross_dropped_unhandled` — all below; `null` **only** at start-up |
+| `idle` | Nothing to do. **Every `idle` the client publishes after start-up carries a `nav_reason` saying how it got there**, so `nav_state: "idle"` with `nav_reason: null` means exactly one thing: no nav request has been made since this client started (#725). It is otherwise a real outcome, not an absence of one. | `zoned`, `stopped`, `goto_superseded`, `melee_disengaged`, `goal_dropped`, `respawned`, `hp_restored`, `zone_cross_dropped_unhandled` — all below; `null` **only** at start-up |
 | `planning` | A route is being computed on the pathfinding worker thread. The character stands still. Normally < 1 s. | — |
 | `navigating` | Walking a **complete route to your goal**. | `goal_z_snapped` (see below) or — |
 | `navigating_partial` | Walking a **partial** route: the search was cut short, so this is *not* a route to your goal — it's progress toward a frontier, and it will re-plan from the far end. Usually resolves to `navigating` or `arrived`. | `search_node_cap` |
@@ -392,15 +392,19 @@ That rule replaced an opt-in list of states-to-retire, under which any state mis
 survived forever once its goal vanished. Two were missing, and both were observed live: `pending`
 after a dropped `/zone_cross` (#725), and `following` after the followed entity despawned.
 
-**The two life-halt words sit outside this scheme on purpose (#1007).** `dead` and `halted_hp_zero`
-are not on the terminal list, yet they do not retire the way the rule above describes and they must
-not: they are not a goal's outcome, they are a statement about the character. They are re-published
-by every walker tick whose predicate still holds, and they are cleared by that same tick — to `idle`
-with `respawned` or `hp_restored` — the moment it does not. Two consequences worth knowing as a
-reader: a goal-level retirement (`/stop`, a supersede, a dropped goal) does **not** relabel them, and
-they cannot get stuck, because clearing them is not conditional on any goal existing. Adding either
-word to `TERMINAL_NAV_STATES` would break exactly that — the clearing path is guarded on
-non-membership, so the halt would become permanent. The code says so at the array.
+**The two life-halt words, and `engaging`, sit outside this scheme on purpose (#1007).** `dead` and
+`halted_hp_zero` are not on the terminal list, yet they do not retire the way the rule above
+describes and they must not: they are not a goal's outcome, they are a statement about the
+character; `engaging` isn't a goal's outcome either — it names a live entity pursuit, not a fixed
+point — and is retired by the same kind of per-tick predicate check (the auto-attack reconciler's
+own), not by the generic rule. All three are re-published by their own tick logic whenever its
+predicate still holds, and are cleared by that same logic — to `idle` with `respawned`,
+`hp_restored`, or `melee_disengaged` respectively — the moment it does not. Two consequences worth
+knowing as a reader: a goal-level retirement (`/stop`, a supersede, a dropped goal) does **not**
+relabel any of the three, and none of them can get stuck, because clearing each is not conditional
+on any goal existing. Adding any of them to `TERMINAL_NAV_STATES` would break exactly that — the
+clearing path is guarded on non-membership, so the word would become permanent. The code says so
+at the array.
 
 ### `nav_stall` — a committed route the walker is not executing (#851)
 
@@ -460,7 +464,7 @@ those call sites now names itself. The complete set of ways to reach `idle`:
 | `nav_reason` | Meaning |
 |--------------|---------|
 | `zoned` | **The character changed zone**, and navigation was reset because a route computed in the old zone means nothing in the new one. This is the `nav_state` a *successful* `/v1/move/zone_cross` ends at — read it together with `player.zone`, which is the authoritative statement of where you are. It is deliberately about the zone change and not about the request, so it is equally true of a GM `#zone`, a gate/evac, or a portal door. Not an error. |
-| `stopped` | **You asked** — `POST /v1/move/stop` was accepted and any goto/follow/queued zone-cross was cancelled. **One exception, and it is deliberate (#1007):** if `nav_state` is a life halt (`dead` or `halted_hp_zero`) when the `/stop` lands, the goal really is cancelled but the published word stays the halt word — because a `/stop` says something about your goal and nothing at all about whether you are alive, and relabelling the halt `idle` would tell you the halt cleared. The fresh `nav_goal_id` is your confirmation the `/stop` landed. **Do not wait for a `409` here:** `/stop` is a cancel and is deliberately outside the life-halt gate, so it never answers `409` under a halt — a live session always answers `200`, and its only other answer is a `503` from the session-liveness guard (`require_live_session` — net thread not running, not connected, or not ticking). The same preservation covers `goto_superseded`, the other `idle` retirement stamped through the same writer. It does **not** cover `zone_cross_dropped_unhandled`: `ZoneCrossTicket::drop` publishes that one straight through `NavStatus::retire_to_idle`, bypassing the guard, so a zone-cross ticket dropped unhandled while halted can publish `idle` for a single tick before the walker republishes the halt word on the next one. |
+| `stopped` | **You asked** — `POST /v1/move/stop` was accepted and any goto/follow/queued zone-cross was cancelled. **One exception, and it is deliberate (#1007):** if `nav_state` is `engaging` or a life halt (`dead` or `halted_hp_zero`) when the `/stop` lands, the goal really is cancelled but the published word stays put — because a `/stop` says something about your goal and nothing at all about whether you are alive or mid-pursuit, and relabelling `engaging` or a life halt to `idle` would tell you the pursuit or the halt cleared when it did not. The fresh `nav_goal_id` is your confirmation the `/stop` landed. **Do not wait for a `409` here:** `/stop` is a cancel and is deliberately outside the life-halt gate, so it never answers `409` under a halt — a live session always answers `200`, and its only other answer is a `503` from the session-liveness guard (`require_live_session` — net thread not running, not connected, or not ticking). The same preservation covers `goto_superseded`, the other `idle` retirement stamped through the same writer. It does **not** cover `zone_cross_dropped_unhandled`: `ZoneCrossTicket::drop` publishes that one straight through `NavStatus::retire_to_idle`, bypassing the guard, so a zone-cross ticket dropped unhandled while halted can publish `idle` for a single tick before the walker republishes the halt word on the next one. |
 | `goto_superseded` | You did **not** ask: something else took over steering — manual movement (keyboard or `POST /v1/move/manual`), or the auto-melee-engage override. Your goto is gone; reissue it if you still want it. |
 | `goal_dropped` | Your goal stopped existing without being reached — e.g. a `/follow` target despawned, or a request was cancelled from elsewhere in the client. Not an error about the route; there is simply nothing left to walk to. Reissue if you still want it. |
 | `respawned` | The `dead` state cleared because the character came back up (#644) — a real death ended. Since #1000 it is published **only** for `dead`; the HP-only halt retires under `hp_restored` instead, so this word never claims a respawn that did not happen. |

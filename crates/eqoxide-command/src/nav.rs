@@ -33,10 +33,14 @@ pub const NAV_REASON_STOPPED: &str = "stopped";
 /// `nav_reason` on the `idle` that [`CommandState::request_cancel_goto`] publishes (#725 review,
 /// B1) — the narrower cancel taken when manual movement (keyboard WASD, camera reset) or the HTTP
 /// manual-move escape hatch takes over steering. A melee-engage episode also supersedes an
-/// in-flight goto once, but the reconciler immediately relabels the word to `engaging`/
-/// `melee_engaged` — an agent never observes `goto_superseded` from auto-attack. Distinct from
-/// [`NAV_REASON_STOPPED`] because the caller did NOT ask to stop: something else took the wheel,
-/// and an agent polling its own `/goto` needs to be able to tell those apart.
+/// in-flight goto once, and the reconciler relabels the word to `engaging`/`melee_engaged` in the
+/// same tick — but that is two separate lock acquisitions (this word is published first, then
+/// overwritten moments later), so a concurrent reader CAN observe `goto_superseded` from
+/// auto-attack in that gap; it is at most a sub-tick transient, not a state no reader ever sees
+/// (#1007 final review, C1/I4 — see `docs/http-api.md`'s `goto_superseded` row for the honest
+/// statement of this). Distinct from [`NAV_REASON_STOPPED`] because the caller did NOT ask to
+/// stop: something else took the wheel, and an agent polling its own `/goto` needs to be able to
+/// tell those apart.
 pub const NAV_REASON_GOTO_CANCELLED: &str = "goto_superseded";
 
 /// A `/v1/move/zone_cross` request that has been DRAINED out of its one-shot slot.
@@ -285,8 +289,10 @@ impl CommandState {
         // SAY WHY (#725 review, B1), and say something DIFFERENT from `/stop`: from the agent's side
         // these are not the same event. `stopped` = you asked. `goto_superseded` = you did not, and
         // steering was taken over by manual movement or the manual-move escape hatch. (A melee
-        // engage supersedes a goto once on entry too, but its observable `nav_reason` is
-        // `melee_engaged`, not this.)
+        // engage also supersedes a goto once on entry, publishing this word first — the
+        // reconciler relabels it to `engaging`/`melee_engaged` moments later, in the same tick,
+        // but through a separate lock acquisition, so a concurrent reader CAN observe
+        // `goto_superseded` from auto-attack in that gap; #1007 final review, C1/I4.)
         self.stamp_new_goal("idle", Some(NAV_REASON_GOTO_CANCELLED), None)
     }
 

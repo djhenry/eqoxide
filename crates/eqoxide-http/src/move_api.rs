@@ -419,7 +419,7 @@ async fn post_goto(
     if disengaged {
         if let Some(busy) = s.command.request_attack(false).refused_json(serde_json::json!({
             "status": "busy_attack",
-            "message": "an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued)",
+            "message": "an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued, and this move was NOT accepted either)",
         })) { return busy; }
     }
     // Set the position, then clear any chase — goto walks to a fixed point and stops. `request_goto`
@@ -541,7 +541,7 @@ async fn post_follow(
     if disengaged {
         if let Some(busy) = s.command.request_attack(false).refused_json(serde_json::json!({
             "status": "busy_attack",
-            "message": "an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued)",
+            "message": "an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued, and this move was NOT accepted either)",
         })) { return busy; }
     }
     // Position first, then the chase key: the nav thread re-resolves the key's live position each
@@ -657,7 +657,7 @@ async fn post_zone_cross(
     if disengaged {
         if let Some(busy) = s.command.request_attack(false).refused_json(serde_json::json!({
             "status": "busy_attack",
-            "message": "an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued)",
+            "message": "an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued, and this move was NOT accepted either)",
         })) { return busy; }
     }
     // Reset nav_state to `pending` under a fresh goal id SYNCHRONOUSLY (#349), so a read right after
@@ -2164,5 +2164,60 @@ mod tests {
         let j2: serde_json::Value = serde_json::from_str(&body_text(resp2).await).unwrap();
         assert_eq!(j2["disengaged"], serde_json::json!(false));
         assert_eq!(state2.command.take_attack(), None, "no disengage queued when auto_attack was already off");
+
+        // auto_attack off but a LIVE TARGET present → still no disengage (kills the &&→|| mutant:
+        // under ||, a live target alone would incorrectly trigger a disengage here).
+        let state3 = empty_state();
+        set_gs(&state3, |gs| {
+            gs.target_id = Some(42);
+            gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 10.0, 0.0, 0.0, true));
+        });
+        let app3 = router().with_state(state3.clone());
+        let req3 = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp3 = app3.oneshot(req3).await.unwrap();
+        let j3: serde_json::Value = serde_json::from_str(&body_text(resp3).await).unwrap();
+        assert_eq!(j3["disengaged"], serde_json::json!(false),
+            "auto_attack is off — a live target alone must not trigger a disengage");
+        assert_eq!(state3.command.take_attack(), None,
+            "no disengage toggle queued when auto_attack was already off, even with a live target");
+    }
+
+    /// #1007 final review, M2 — the `busy_attack` 409 must say the MOVE was refused too.
+    ///
+    /// The disengage toggle and the `/goto` are one atomic request: if the toggle can't be queued
+    /// the handler returns before `request_goto`, so nothing at all happened. A message that only
+    /// mentions the toggle lets an agent read "nothing changed" as "only the disengage failed, my
+    /// move landed" — and then wait forever on a goal that was never stamped.
+    #[tokio::test]
+    async fn a_busy_attack_toggle_refuses_the_whole_goto_and_says_so() {
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.auto_attack = true;
+            gs.target_id = Some(42);
+            gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 10.0, 0.0, 0.0, true));
+        });
+        // A toggle is already in flight and undrained, so the handler's own `request_attack(false)`
+        // is refused (`enqueue` returns false on an occupied slot).
+        assert!(state.command.request_attack(true), "the pre-seeded toggle must itself be queued");
+        assert!(!state.command.has_active_goto(), "no goto in flight before the request");
+
+        let app = router().with_state(state.clone());
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let j: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(j["status"], serde_json::json!("busy_attack"));
+        assert_eq!(j["message"], serde_json::json!("an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued, and this move was NOT accepted either)"),
+            "the refusal must disclose that the MOVE was refused too, not just the toggle: {j}");
+        // …and the move really was refused: no goto was stamped.
+        assert!(!state.command.has_active_goto(),
+            "the handler returned before `request_goto`, so no goal may have been accepted");
+        assert_eq!(state.command.take_attack(), Some(true),
+            "the pre-seeded toggle is still the one in the slot — the handler wrote nothing");
     }
 }
