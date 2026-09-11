@@ -13,9 +13,10 @@
 //!
 //! `request_goto`/`request_follow`/`request_stop` mirror `POST /v1/move/{goto,follow,stop}`
 //! (`http/move_api.rs`) exactly. `request_cancel_goto` is a DIFFERENT, narrower write used by
-//! keyboard/manual-move cancellation (`app.rs`) and the melee-engage auto-cancel
-//! (`eq_net/action_loop.rs`): it clears only `goto_target`, leaving `goto_entity` alone — preserving
-//! the pre-migration behavior at each of those call sites (they never touched `goto_entity`).
+//! keyboard/manual-move cancellation and camera reset (`app.rs`), and — exactly once, on episode
+//! entry — the #1007 melee-engage reconciler's goto supersede (`eq_net/action_loop.rs`): it clears
+//! only `goto_target`, leaving `goto_entity` alone — preserving the pre-migration behavior at each
+//! of those call sites (they never touched `goto_entity`).
 
 use super::CommandState;
 
@@ -30,10 +31,12 @@ pub const NAV_REASON_ZONE_CROSS_UNHANDLED: &str = "zone_cross_dropped_unhandled"
 pub const NAV_REASON_STOPPED: &str = "stopped";
 
 /// `nav_reason` on the `idle` that [`CommandState::request_cancel_goto`] publishes (#725 review,
-/// B1) — the narrower cancel taken when manual movement, the HTTP manual-move escape hatch, or the
-/// auto-melee-engage override takes over steering. Distinct from [`NAV_REASON_STOPPED`] because the
-/// caller did NOT ask to stop: something else took the wheel, and an agent polling its own `/goto`
-/// needs to be able to tell those apart.
+/// B1) — the narrower cancel taken when manual movement (keyboard WASD, camera reset) or the HTTP
+/// manual-move escape hatch takes over steering. A melee-engage episode also supersedes an
+/// in-flight goto once, but the reconciler immediately relabels the word to `engaging`/
+/// `melee_engaged` — an agent never observes `goto_superseded` from auto-attack. Distinct from
+/// [`NAV_REASON_STOPPED`] because the caller did NOT ask to stop: something else took the wheel,
+/// and an agent polling its own `/goto` needs to be able to tell those apart.
 pub const NAV_REASON_GOTO_CANCELLED: &str = "goto_superseded";
 
 /// A `/v1/move/zone_cross` request that has been DRAINED out of its one-shot slot.
@@ -262,9 +265,10 @@ impl CommandState {
     }
 
     /// Cancel an in-progress goto WITHOUT touching `goto_entity` — used where manual movement
-    /// (keyboard WASD, the HTTP manual-move escape hatch, or an auto-melee-engage override) needs to
-    /// take over steering this frame/tick but isn't itself a `/stop`. Narrower than
-    /// [`Self::request_stop`] on purpose; preserves the exact pre-migration call sites' behavior
+    /// (keyboard WASD, camera reset, the HTTP manual-move escape hatch) — or, exactly once on
+    /// entry, the #1007 melee-engage reconciler — needs to take over steering this frame/tick but
+    /// isn't itself a `/stop`. Narrower than [`Self::request_stop`] on purpose; preserves the exact
+    /// pre-migration call sites' behavior
     /// for `goto_entity` (left alone here — the walker's own `drive_chase` clears it on its next
     /// tick once it observes `goto_target` is `None`, treating the goto as "cancelled elsewhere").
     ///
@@ -280,7 +284,9 @@ impl CommandState {
         *self.nav.goto_target.lock().unwrap() = None;
         // SAY WHY (#725 review, B1), and say something DIFFERENT from `/stop`: from the agent's side
         // these are not the same event. `stopped` = you asked. `goto_superseded` = you did not, and
-        // steering was taken over by manual movement or the melee-engage override.
+        // steering was taken over by manual movement or the manual-move escape hatch. (A melee
+        // engage supersedes a goto once on entry too, but its observable `nav_reason` is
+        // `melee_engaged`, not this.)
         self.stamp_new_goal("idle", Some(NAV_REASON_GOTO_CANCELLED), None)
     }
 

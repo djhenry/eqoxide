@@ -544,6 +544,11 @@ pub struct ActionLoop {
     /// Whether auto-attack is currently engaged (set by the /attack toggle). While true and a
     /// target is set, the nav thread keeps the player facing the target so melee swings land.
     auto_attack:      bool,
+    /// #1007: latched true for the duration of one melee-engage episode — set when
+    /// `reconcile_engage_nav_state` first publishes `engaging`, cleared when it retires.
+    /// Makes the one-shot goto-supersede edge-triggered (one `goal_id` bump per episode,
+    /// not one per gated tick — #349).
+    engage_active: bool,
     /// The path-walker (M1 extraction, #eq-dev-process) — the `/goto` route, stall/backoff/
     /// oscillation recovery, and arrival. Holds its OWN clones of `nav`/`world`/`collision` (the
     /// same shared state as this struct's own fields, not a copy of it) plus the pathfinding
@@ -715,6 +720,7 @@ impl ActionLoop {
             position_seq: 0,
             last_tick: Instant::now(),
             auto_attack: false,
+            engage_active: false,
             walker,
             zone_assets,
             last_pet_target: None,
@@ -1470,6 +1476,8 @@ impl ActionLoop {
         if self.walker.nav_halt_if_dead(gs) {
             return;
         }
+
+        self.reconcile_engage_nav_state(gs);   // #1007 — peer with nav_halt_if_dead: above the gate
 
         self.walker.apply_fast_steering(gs);
 
@@ -2752,6 +2760,55 @@ impl ActionLoop {
         }
     }
 
+    /// Reconcile the `engaging` `nav_state` word against the live auto-attack pursuit
+    /// predicate (#1007). Pure: reads `self.auto_attack` + `gs`, writes only the nav_state
+    /// word (and, once per episode, supersedes an in-flight goto). `drive_auto_engage_melee`
+    /// owns steering/facing and no longer touches nav command state.
+    ///
+    /// Runs above the 150 ms gate and every early return in `tick`, so the word tracks the
+    /// pursuit within one tick in both directions.
+    fn reconcile_engage_nav_state(&mut self, gs: &GameState) {
+        // Same predicate as `drive_auto_engage_melee`'s own gates: auto_attack on, a live
+        // (non-dead) target, 2D distance < 200u. Kept in lock-step with that fn on purpose
+        // — the word must mean exactly "that driver is about to steer."
+        let want_engage = self.auto_attack
+            && gs.target_id
+                .and_then(|tid| gs.world.entities.get(&tid))
+                .filter(|e| !e.dead)
+                .map(|e| {
+                    let dx = e.x - gs.player_x;
+                    let dy = e.y - gs.player_y;
+                    (dx * dx + dy * dy).sqrt() < 200.0
+                })
+                .unwrap_or(false);
+
+        if want_engage {
+            if !self.engage_active {
+                // First tick of the episode. Take the wheel from any in-flight goto ONCE,
+                // so `goal_id` bumps once (#349) and `goal` is cleared before `engaging` is
+                // published (so `nav_goal` is null under `engaging`, #732 discipline).
+                if self.command.has_active_goto() {
+                    self.command.request_cancel_goto();
+                }
+                self.engage_active = true;
+            }
+            // Idempotent on every later tick: `enter_engaging`'s own early-return guard
+            // makes a re-publish of the same `engaging`/`melee_engaged` a no-op — no lock
+            // write, no `goal_id` touch. It also nulls `goal`/`local` on the transition in,
+            // so `nav_goal` is null under `engaging` even when the episode began from a
+            // stale `arrived`.
+            self.walker.enter_engaging();
+        } else {
+            // Retire ONLY our own word — guarded so we never stomp navigating / arrived /
+            // blocked / dead written by anyone else.
+            if self.walker.nav_state_is(eqoxide_nav::walker::NAV_STATE_ENGAGING) {
+                self.walker.set_nav_state_because(
+                    "idle", Some(eqoxide_nav::walker::NAV_REASON_MELEE_DISENGAGED));
+            }
+            self.engage_active = false;
+        }
+    }
+
     /// Returns true if this handled the tick and the caller must stop (melee engage/hold fired).
     fn drive_auto_engage_melee(&mut self, stream: &mut EqStream, gs: &mut GameState) -> bool {
         // Auto-engage: while auto-attacking, walk into melee range of the target and face it so
@@ -2759,24 +2816,19 @@ impl ActionLoop {
         // far-away face) is what makes melee actually land. Runs regardless of any pending goto.
         if self.auto_attack {
             if let Some(tid) = gs.target_id {
-                // #1109: a DEAD target is not engageable. This filter used to be redundant —
-                // `drive_auto_target` ran immediately above this driver and dropped an invalid
-                // (dead) target before the engage ever saw it. With that driver gone the dead
-                // entity stays in `world.entities` until the SERVER removes the spawn, so without
-                // this check auto-attack pins the player to it and `request_cancel_goto()`s every
-                // 150 ms tick — silently cancelling the agent's own `/v1/move/goto` (the driver
-                // returns true, so `tick` never reaches the walker). `drive_auto_pet_combat`
-                // above has always filtered `!e.dead` for exactly this reason.
-                //
-                // How long that window is depends on the mob, and both ends of it matter.
-                // Measured live in `fieldofbone`: after `a_decaying_skeleton000` died no corpse
-                // entity appeared in the roster and the server deleted its spawn ~2 s later —
-                // 13 ticks, every one of them a
-                // cancelled goto, which is already enough to kill the goal outright. A mob that
-                // DOES leave a corpse is the long end: EQEmu hands the corpse the dead NPC's own
-                // entity id (`entity_list.AddCorpse(corpse, GetID())` — visible here in player
-                // corpses keeping their spawn id), so `target_id` stays resolvable and dead for
-                // the corpse's whole decay. Do not read the short case as the bound.
+                // #1109 / #1007: a DEAD target is not engageable. The dead entity stays in
+                // `world.entities` until the SERVER removes the spawn — measured live in
+                // `fieldofbone`: ~2 s / 13 ticks for a no-corpse mob, and far longer for one
+                // that leaves a corpse (EQEmu hands the corpse the dead NPC's own entity id,
+                // so `target_id` stays resolvable-and-dead for the corpse's whole decay; do
+                // not read the short case as the bound). Two consumers must filter it, for the
+                // same reason:
+                //   - this driver, so auto-attack does not pin the player walking at a corpse;
+                //   - `reconcile_engage_nav_state`, whose `want_engage` predicate is the same
+                //     `auto_attack && live target && < 200u` shape — an unfiltered dead target
+                //     would pin `nav_state` at `engaging` indefinitely (the #1007 lie in a new
+                //     place).
+                // `drive_auto_pet_combat` above has always filtered `!e.dead` for exactly this.
                 if let Some((ex, ey)) = gs.world.entities.get(&tid)
                     .filter(|e| !e.dead).map(|e| (e.x, e.y)) {
                     let dx = ex - gs.player_x;
@@ -2818,7 +2870,6 @@ impl ActionLoop {
                             let here = [gs.player_x, gs.player_y, gs.player_z];
                             self.send_position_update(stream, gs, here, gs.player_x, gs.player_y, gs.player_z, hdg);
                         }
-                        self.command.request_cancel_goto(); // cancel any stale walk
                         return true;
                     }
                 }
@@ -8277,19 +8328,32 @@ mod tests {
     /// halted and then recovered while auto-attacking could therefore never reach the code that
     /// clears the word — the candidate mechanism for the original "every sample of the run" sighting
     /// (unverified at filing; this test settles the code half of it). The retirement now runs inside
-    /// `nav_halt_if_dead`, which the tick calls **unconditionally, above every early return** — this
-    /// drives the real `tick` with the melee early return LIVE and asserts the word still clears.
+    /// `nav_halt_if_dead`, which the tick calls **unconditionally, above every early return**.
     ///
-    /// The reach control is the third assert: `drive_auto_engage_melee` is called directly and must
-    /// return `true`, so the tick provably takes the early return and the retirement provably did
-    /// NOT come from `resolve_goal`. Without it this test could pass on a tick that simply fell
-    /// through to the bottom, and would then prove nothing about the ordering it is named for.
+    /// **Task 5 update:** this used to drive the recovery through the real `tick` and read the
+    /// halt's own transient `idle`/`hp_restored` back off `nav_state` at the end of it. That is no
+    /// longer observable: `reconcile_engage_nav_state` (#1007 Task 5) sits in `tick` right after
+    /// `nav_halt_if_dead`, ALSO above every early return, and — because auto-attack has a live
+    /// target 10u away here — unconditionally republishes `engaging`/`melee_engaged` over whatever
+    /// `nav_halt_if_dead` just wrote, halt or no halt. A `tick`-level read can therefore no longer
+    /// tell "the halt correctly cleared" from "it never cleared, and the reconciler papered over a
+    /// still-halted word regardless" — both end the tick at `engaging`. So (2) below calls
+    /// `nav_halt_if_dead` directly, the same way `dead_player_halts_navigation` and its neighbors
+    /// above already do, to keep pinning the halt's OWN retirement independent of the reconciler.
+    /// (3) then drives the real `tick` to pin the reconciler's side of the new contract: the
+    /// instant the halt clears, if auto-attack is still live, `nav_state` must say `engaging`, not
+    /// linger on the halt's own transient `idle` — the #1007 fix this whole plan exists for.
+    ///
+    /// The reach control is the last assert: `drive_auto_engage_melee` is called directly and must
+    /// return `true`, so (3)'s tick provably took the melee early return, not `resolve_goal`.
+    /// Without it this test could pass on a tick that simply fell through to the bottom, and would
+    /// then prove nothing about the ordering it is named for.
     ///
     /// MUTATION CHECK: move the `retire_life_halt()` call out of `nav_halt_if_dead` and into
-    /// `resolve_goal`'s no-goal branch (i.e. restore the pre-fix arrangement) → RED here while
+    /// `resolve_goal`'s no-goal branch (i.e. restore the pre-fix arrangement) → RED at (2) while
     /// `a_life_halt_clears_itself_under_an_honest_reason_1000` above stays GREEN, which is exactly
     /// the pair of verdicts that distinguishes "the retirement exists" from "the retirement is
-    /// reachable".
+    /// reachable". (3) alone would NOT catch this mutation post-Task-5 — see the note above.
     #[tokio::test]
     async fn a_life_halt_retires_above_the_auto_engage_early_return_1007() {
         let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
@@ -8323,16 +8387,31 @@ mod tests {
         assert_eq!(nav.nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_HALTED_HP_ZERO,
             "the tick must publish the HP-only halt word");
 
-        // (2) An authoritative OP_HPUpdate restores HP. The melee driver still owns this tick.
+        // (2) An authoritative OP_HPUpdate restores HP. Call `nav_halt_if_dead` directly (not
+        // through `tick`) so this assertion pins the halt's OWN retirement, not masked by
+        // `reconcile_engage_nav_state` — see the doc comment above.
         gs.cur_hp = 214;
-        nav.last_tick = Instant::now() - Duration::from_millis(NAV_TICK_MS as u64 * 4);
-        nav.tick(&mut stream, &mut gs);
+        assert!(!nav.walker.nav_halt_if_dead(&gs), "a live player must not halt");
         let ns = nav.nav.nav_state.lock().unwrap().clone();
         assert_eq!(ns.state, "idle",
-            "the halt must clear even though the melee early return owns the rest of the tick");
+            "the halt must clear the instant `nav_halt_if_dead` sees a live player");
         assert_eq!(ns.reason.as_deref(), Some("hp_restored"));
 
-        // (3) REACH CONTROL — the early return really is taken, so (2) cannot have been retired by
+        // (3) Now drive the REAL tick on this same recovered HP. The melee driver still owns the
+        // rest of the tick, but `reconcile_engage_nav_state` — which, like `nav_halt_if_dead`, runs
+        // unconditionally above every early return — immediately republishes the honest word:
+        // auto-attack has a live target 10u away, so `nav_state` must say `engaging`, not linger on
+        // (2)'s transient `idle`. This is the #1007 fix itself: an agent must never read `idle`
+        // while auto-attack is visibly steering the body at a mob.
+        nav.last_tick = Instant::now() - Duration::from_millis(NAV_TICK_MS as u64 * 4);
+        nav.tick(&mut stream, &mut gs);
+        let ns2 = nav.nav.nav_state.lock().unwrap().clone();
+        assert_eq!(ns2.state, eqoxide_ipc::NAV_STATE_ENGAGING,
+            "the melee early return owns the rest of the tick, but the reconciler still runs above \
+             it and must overwrite the halt's transient idle with the honest engaging word");
+        assert_eq!(ns2.reason.as_deref(), Some(eqoxide_ipc::NAV_REASON_MELEE_ENGAGED));
+
+        // (4) REACH CONTROL — the early return really is taken, so (3) cannot have been produced by
         // `resolve_goal` further down. If this ever goes false the test above is vacuous.
         assert!(nav.drive_auto_engage_melee(&mut stream, &mut gs),
             "the melee override must be active, or this test proves nothing about tick ordering");
@@ -8858,5 +8937,137 @@ mod tests {
         // rename made this zero, `offenders.is_empty()` would pass for the wrong reason.
         assert_eq!(allowed_hits, 2,
             "expected exactly the two republishing helpers' own mirror edits, found {allowed_hits}");
+    }
+
+    #[test]
+    fn engaging_is_published_while_auto_attack_pursues_a_live_nearby_target() {
+        let (mut al, nav, _command, _collision, _za) = shared_nav_action_loop();
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
+        gs.target_id = Some(42);
+        al.auto_attack = true;
+
+        al.reconcile_engage_nav_state(&gs);
+
+        let ns = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(ns.state, eqoxide_ipc::NAV_STATE_ENGAGING);
+        assert_eq!(ns.reason.as_deref(), Some(eqoxide_ipc::NAV_REASON_MELEE_ENGAGED));
+        assert_eq!(ns.goal, None, "a melee pursuit has no fixed-point goal");
+    }
+
+    #[tokio::test]
+    async fn the_reconciler_runs_above_the_150ms_gate() {
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        let (mut al, nav, _command, _collision, _za) = shared_nav_action_loop();
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
+        gs.target_id = Some(42);
+        al.auto_attack = true;
+
+        // Gate CLOSED: last_tick fresh, so `tick` early-returns at the 150 ms gate…
+        al.last_tick = Instant::now();
+        al.tick(&mut stream, &mut gs);
+
+        // …yet the reconciler, which sits ABOVE the gate, still published the word.
+        assert_eq!(nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_ENGAGING,
+            "reconcile_engage_nav_state must run before the 150 ms gate's early return");
+    }
+
+    #[test]
+    fn engaging_retires_to_idle_melee_disengaged_when_the_target_dies() {
+        let (mut al, nav, _command, _collision, _za) = shared_nav_action_loop();
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
+        gs.target_id = Some(42);
+        al.auto_attack = true;
+
+        al.reconcile_engage_nav_state(&gs);
+        let gid = nav.nav_state.lock().unwrap().goal_id;
+        assert_eq!(nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_ENGAGING);
+
+        // The target dies but lingers in world.entities until the server deletes the spawn.
+        let mut dead = eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true);
+        dead.dead = true;
+        gs.upsert_entity(dead);
+
+        al.reconcile_engage_nav_state(&gs);
+
+        let ns = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(ns.state, "idle");
+        assert_eq!(ns.reason.as_deref(), Some(eqoxide_ipc::NAV_REASON_MELEE_DISENGAGED));
+        assert_eq!(ns.goal_id, gid, "retiring the melee word is not a goal accept — goal_id unchanged");
+    }
+
+    #[test]
+    fn the_retire_guard_leaves_a_word_written_by_someone_else_alone() {
+        let (mut al, nav, _command, _collision, _za) = shared_nav_action_loop();
+        *nav.nav_state.lock().unwrap() = eqoxide_ipc::NavStatus {
+            state: "navigating".into(),
+            reason: Some("seeded".into()),
+            ..Default::default()
+        };
+        let gs = GameState::new(); // predicate false: no target
+        al.auto_attack = false;
+
+        al.reconcile_engage_nav_state(&gs);
+
+        assert_eq!(nav.nav_state.lock().unwrap().state, "navigating",
+            "the reconciler must only ever retire its OWN `engaging` word");
+    }
+
+    #[test]
+    fn entering_melee_supersedes_an_active_goto_exactly_once() {
+        let (mut al, nav, command, _collision, _za) = shared_nav_action_loop();
+        let n = command.request_goto((10.0, 0.0, 0.0));
+        assert_eq!(nav.nav_state.lock().unwrap().goal_id, n);
+
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
+        gs.target_id = Some(42);
+        al.auto_attack = true;
+
+        al.reconcile_engage_nav_state(&gs);
+        let after_entry = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(after_entry.goal_id, n + 1, "the in-flight goto is superseded exactly once");
+        assert_eq!(after_entry.state, eqoxide_ipc::NAV_STATE_ENGAGING);
+
+        for _ in 0..5 {
+            al.reconcile_engage_nav_state(&gs);
+        }
+        let after_5 = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(after_5.goal_id, n + 1, "no further goal_id churn while the pursuit continues (#349)");
+        assert_eq!(after_5.state, eqoxide_ipc::NAV_STATE_ENGAGING);
+    }
+
+    #[test]
+    fn entering_melee_with_no_active_goto_does_not_touch_goal_id() {
+        let (mut al, nav, _command, _collision, _za) = shared_nav_action_loop();
+        let before = nav.nav_state.lock().unwrap().goal_id;
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
+        gs.target_id = Some(42);
+        al.auto_attack = true;
+
+        al.reconcile_engage_nav_state(&gs);
+
+        assert_eq!(nav.nav_state.lock().unwrap().goal_id, before,
+            "with no goto in flight, entering melee is not a goal accept");
+        assert_eq!(nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_ENGAGING);
     }
 }
