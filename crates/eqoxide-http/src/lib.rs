@@ -289,6 +289,12 @@ pub struct PlayerState {
     /// `sitting`/`auto_attack`: what we told the server, not what it granted. Defaults `true`
     /// (matching every driver's pre-#625 behavior of always moving at run speed).
     pub run_mode:  bool,
+    /// #1007: our own last-SENT auto-attack toggle intent (`true` = pursuing/swinging at
+    /// `target_id`). Like `run_mode` above and `sitting`, this is what we told the server via
+    /// `/v1/combat/attack/{on,off}` (`OP_Attack` has no ack) — NOT a server confirmation. An agent
+    /// that just POSTed a disengaging `/v1/move/{goto,follow,zone_cross}` reads this to confirm the
+    /// pursuit was actually called off.
+    pub auto_attack: bool,
     /// #724 review B1: **the controller has stopped the body and cannot resume** — see
     /// [`PlayerHoldView`]. `null` when it has not, which is the overwhelmingly normal case.
     ///
@@ -460,6 +466,7 @@ impl PlayerState {
             // #336: spawn-scoped, unlike target_con*/target_level above — populated for the LAST
             // consider of any spawn, not gated on that spawn being the current target.
             run_mode:      gs.run_mode,
+            auto_attack:   gs.auto_attack,
             last_consider: gs.last_consider.as_ref().map(|c| LastConsiderView {
                 spawn_id: c.spawn_id,
                 name:     c.name.clone(),

@@ -1175,6 +1175,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // served JSON object at the insert site below.
     let player_hp_verified = player.hp_verified;
     let player_run_mode = player.run_mode;
+    let player_auto_attack = player.auto_attack;
     // #724/#817 — the stuck-and-cannot-free disclosure. `PlayerHoldView` is not `Copy` (it carries
     // a `&'static str` reason plus a `f32`/`&'static str` detail, both trivially `Clone`), so this
     // is a clone rather than the `Copy` bind `player_levitating`/`player_run_mode` use above; bound
@@ -1567,6 +1568,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // granted — exactly the same epistemic level as `sitting`/`auto_attack` elsewhere in this
         // payload. Attached here (not in the literal above, which is at the recursion limit).
         player.insert("run_mode".into(),               serde_json::json!(player_run_mode));
+        // #1007 — our own last-SENT auto-attack toggle intent. `OP_Attack` has no server ack, so
+        // this is NOT a confirmation — same epistemic level as `run_mode`/`sitting` above. Always
+        // present so an agent can poll "did my /move/* disengage the pursuit?" without inferring it
+        // from target/hp deltas.
+        player.insert("auto_attack".into(),            serde_json::json!(player_auto_attack));
         // #724/#817 — HOLD: the movement controller has stopped the body and cannot resume (embedded
         // in geometry with push-out exhausted, or hanging at the underworld floor with no recovery
         // position). `null` for a healthy character, INCLUDING one simply standing still — `pos` and
@@ -6132,6 +6138,21 @@ mod tests {
         assert!(second > first,
             "X-Snapshot-Age-Ms froze at {first} across two reads of a stale source — it must be \
              derived at READ time (#343/#646), not cached or driven by the dead publisher");
+    }
+
+    #[tokio::test]
+    async fn observe_debug_player_always_carries_auto_attack() {
+        // Always present, false at boot.
+        let state = empty_state();
+        let j = debug_json(state).await;
+        assert_eq!(j["player"]["auto_attack"], serde_json::json!(false),
+            "auto_attack is always present on /observe/debug, false by default");
+
+        // Tracks gs.auto_attack.
+        let state2 = empty_state();
+        set_gs(&state2, |gs| gs.auto_attack = true);
+        let j2 = debug_json(state2).await;
+        assert_eq!(j2["player"]["auto_attack"], serde_json::json!(true));
     }
 }
 
