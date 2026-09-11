@@ -1992,6 +1992,39 @@ pub fn nav_state_is_life_halt(state: &str) -> bool {
     state == NAV_STATE_DEAD || state == NAV_STATE_HALTED_HP_ZERO
 }
 
+/// `nav_state` while auto-attack is pursuing a live target into melee range (#1007).
+/// The character IS navigating — `drive_auto_engage_melee` is steering the controller
+/// toward `target_id` — so publishing `idle` (which `request_cancel_goto` used to do
+/// every gated tick) is the #343 lie: a confident "ready for work" over a body walking
+/// across the zone at a skeleton. TRANSIENT: retired to `idle`/`melee_disengaged` the
+/// first tick the pursuit predicate is false. **Deliberately NOT in
+/// `TERMINAL_NAV_STATES`** — see the trap doc at `walker.rs:101`.
+pub const NAV_STATE_ENGAGING: &str = "engaging";
+
+/// `nav_reason` accompanying `NAV_STATE_ENGAGING`: auto-attack has a live target within
+/// the ~200u engage radius and is steering toward it. If a `/move/goto` was in flight
+/// when the pursuit began, it was superseded ONCE (a single `goal_id` bump) — read the
+/// `nav_goal_id` you got back from `POST /goto`: a higher current id means the melee
+/// engage took the wheel.
+pub const NAV_REASON_MELEE_ENGAGED: &str = "melee_engaged";
+
+/// `nav_reason` on the `idle` that `NAV_STATE_ENGAGING` retires to when the pursuit
+/// predicate goes false — the target died or despawned, moved beyond ~200u, `auto_attack`
+/// was turned off, or a fresh `/move/{goto,follow,zone_cross}` disengaged it (§3.6).
+/// Distinct from `stopped` (you asked via `/move/stop`) and `goto_superseded` (manual
+/// movement took over): "your melee pursuit ended and nothing replaced it."
+pub const NAV_REASON_MELEE_DISENGAGED: &str = "melee_disengaged";
+
+/// Is `state` one where navigation is SUSPENDED by something outside the goal's own
+/// lifecycle — a life halt (#1000/#1007) or an active melee pursuit (#1007 re-scope)?
+/// Used by `CommandState::stamp_new_goal`'s idle branch to decide whether a goal-level
+/// event (a `/stop`, a per-frame `request_cancel_goto` from WASD/`/manual`) may relabel
+/// the published word. It may not: neither event is evidence about whether the character
+/// is halted or in melee, and only the owning driver can know.
+pub fn nav_state_is_suspended(s: &str) -> bool {
+    nav_state_is_life_halt(s) || s == NAV_STATE_ENGAGING
+}
+
 /// Live navigation state for the active `/move/goto`, set by the nav thread and read by
 /// GET /v1/observe/debug. `state` is the agent-facing contract documented in `docs/http-api.md`:
 ///
@@ -3568,6 +3601,33 @@ mod world_roster_tests_643 {
              state that no longer exists");
     }
 
+}
+
+#[cfg(test)]
+mod nav_suspended_tests_1007 {
+    use super::*;
+
+    #[test]
+    fn engaging_is_a_suspended_state_alongside_the_life_halts() {
+        assert!(nav_state_is_suspended(NAV_STATE_DEAD));
+        assert!(nav_state_is_suspended(NAV_STATE_HALTED_HP_ZERO));
+        assert!(nav_state_is_suspended(NAV_STATE_ENGAGING));
+    }
+
+    #[test]
+    fn ordinary_goal_states_are_not_suspended() {
+        assert!(!nav_state_is_suspended("idle"));
+        assert!(!nav_state_is_suspended("navigating"));
+        assert!(!nav_state_is_suspended("arrived"));
+        assert!(!nav_state_is_suspended("blocked"));
+    }
+
+    #[test]
+    fn the_melee_vocab_is_spelled_as_the_agent_contract_documents() {
+        assert_eq!(NAV_STATE_ENGAGING, "engaging");
+        assert_eq!(NAV_REASON_MELEE_ENGAGED, "melee_engaged");
+        assert_eq!(NAV_REASON_MELEE_DISENGAGED, "melee_disengaged");
+    }
 }
 
 mod event_feed;

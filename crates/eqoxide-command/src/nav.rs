@@ -13,9 +13,10 @@
 //!
 //! `request_goto`/`request_follow`/`request_stop` mirror `POST /v1/move/{goto,follow,stop}`
 //! (`http/move_api.rs`) exactly. `request_cancel_goto` is a DIFFERENT, narrower write used by
-//! keyboard/manual-move cancellation (`app.rs`) and the melee-engage auto-cancel
-//! (`eq_net/action_loop.rs`): it clears only `goto_target`, leaving `goto_entity` alone — preserving
-//! the pre-migration behavior at each of those call sites (they never touched `goto_entity`).
+//! keyboard/manual-move cancellation and camera reset (`app.rs`), and — exactly once, on episode
+//! entry — the #1007 melee-engage reconciler's goto supersede (`eq_net/action_loop.rs`): it clears
+//! only `goto_target`, leaving `goto_entity` alone — preserving the pre-migration behavior at each
+//! of those call sites (they never touched `goto_entity`).
 
 use super::CommandState;
 
@@ -30,10 +31,16 @@ pub const NAV_REASON_ZONE_CROSS_UNHANDLED: &str = "zone_cross_dropped_unhandled"
 pub const NAV_REASON_STOPPED: &str = "stopped";
 
 /// `nav_reason` on the `idle` that [`CommandState::request_cancel_goto`] publishes (#725 review,
-/// B1) — the narrower cancel taken when manual movement, the HTTP manual-move escape hatch, or the
-/// auto-melee-engage override takes over steering. Distinct from [`NAV_REASON_STOPPED`] because the
-/// caller did NOT ask to stop: something else took the wheel, and an agent polling its own `/goto`
-/// needs to be able to tell those apart.
+/// B1) — the narrower cancel taken when manual movement (keyboard WASD, camera reset) or the HTTP
+/// manual-move escape hatch takes over steering. A melee-engage episode also supersedes an
+/// in-flight goto once, and the reconciler relabels the word to `engaging`/`melee_engaged` in the
+/// same tick — but that is two separate lock acquisitions (this word is published first, then
+/// overwritten moments later), so a concurrent reader CAN observe `goto_superseded` from
+/// auto-attack in that gap; it is at most a sub-tick transient, not a state no reader ever sees
+/// (#1007 final review, C1/I4 — see `docs/http-api.md`'s `goto_superseded` row for the honest
+/// statement of this). Distinct from [`NAV_REASON_STOPPED`] because the caller did NOT ask to
+/// stop: something else took the wheel, and an agent polling its own `/goto` needs to be able to
+/// tell those apart.
 pub const NAV_REASON_GOTO_CANCELLED: &str = "goto_superseded";
 
 /// A `/v1/move/zone_cross` request that has been DRAINED out of its one-shot slot.
@@ -181,6 +188,12 @@ impl CommandState {
             // (`/move/stop`, a supersede by manual movement or the melee-engage override, a zone
             // change) is evidence about whether the character can walk.
             //
+            // The same argument covers `engaging` (#1007 re-scope): a `/stop` or a per-frame
+            // `request_cancel_goto` from WASD/`/manual` says nothing about whether auto-attack is
+            // still pursuing a live target — only the tick reconciler can know — so a goal-level
+            // event may not relabel that word either. Hence `nav_state_is_suspended`, not
+            // `nav_state_is_life_halt`, gates the preservation below.
+            //
             // Without this guard the field has two unordered writers on two threads: the net
             // thread's `nav_halt_if_dead` republishes the halt every tick, and the render thread's
             // per-frame `request_cancel_goto` (WASD, and the non-draining `/v1/move/manual` slot,
@@ -199,7 +212,7 @@ impl CommandState {
             // untouched. `retire_to_idle` stays the single exhaustive (E0027-netted) writer; this
             // restores two fields after it, and deliberately not by destructuring, so a field added
             // to `NavStatus` tomorrow is still force-decided there and cannot leak through here.
-            let halted = eqoxide_ipc::nav_state_is_life_halt(&s.state)
+            let halted = eqoxide_ipc::nav_state_is_suspended(&s.state)   // was: nav_state_is_life_halt
                 .then(|| (s.state.clone(), s.reason.clone()));
             s.retire_to_idle(reason);
             if let Some((halt_state, halt_reason)) = halted {
@@ -256,9 +269,10 @@ impl CommandState {
     }
 
     /// Cancel an in-progress goto WITHOUT touching `goto_entity` — used where manual movement
-    /// (keyboard WASD, the HTTP manual-move escape hatch, or an auto-melee-engage override) needs to
-    /// take over steering this frame/tick but isn't itself a `/stop`. Narrower than
-    /// [`Self::request_stop`] on purpose; preserves the exact pre-migration call sites' behavior
+    /// (keyboard WASD, camera reset, the HTTP manual-move escape hatch) — or, exactly once on
+    /// entry, the #1007 melee-engage reconciler — needs to take over steering this frame/tick but
+    /// isn't itself a `/stop`. Narrower than [`Self::request_stop`] on purpose; preserves the exact
+    /// pre-migration call sites' behavior
     /// for `goto_entity` (left alone here — the walker's own `drive_chase` clears it on its next
     /// tick once it observes `goto_target` is `None`, treating the goto as "cancelled elsewhere").
     ///
@@ -274,7 +288,11 @@ impl CommandState {
         *self.nav.goto_target.lock().unwrap() = None;
         // SAY WHY (#725 review, B1), and say something DIFFERENT from `/stop`: from the agent's side
         // these are not the same event. `stopped` = you asked. `goto_superseded` = you did not, and
-        // steering was taken over by manual movement or the melee-engage override.
+        // steering was taken over by manual movement or the manual-move escape hatch. (A melee
+        // engage also supersedes a goto once on entry, publishing this word first — the
+        // reconciler relabels it to `engaging`/`melee_engaged` moments later, in the same tick,
+        // but through a separate lock acquisition, so a concurrent reader CAN observe
+        // `goto_superseded` from auto-attack in that gap; #1007 final review, C1/I4.)
         self.stamp_new_goal("idle", Some(NAV_REASON_GOTO_CANCELLED), None)
     }
 
@@ -350,6 +368,26 @@ impl CommandState {
     pub fn goto_target(&self) -> Option<(f32, f32, f32)> {
         *self.nav.goto_target.lock().unwrap()
     }
+
+    /// Is a `/move/goto` (or the goto half of a `/follow`) target currently set? Un-gated
+    /// (unlike `goto_target()` above, which is `#[cfg(test)]`-only) — the #1007 reconciler
+    /// needs it in a release build to decide whether entering melee must supersede a walk.
+    pub fn has_active_goto(&self) -> bool {
+        self.nav.goto_target.lock().unwrap().is_some()
+    }
+
+    /// Is a `/move/zone_cross` request queued (not yet drained by `take_zone_cross`), or was it
+    /// just re-queued by `resolve_zone_cross`'s `Err(why)` arm because zone assets aren't usable
+    /// yet? Un-gated for the same reason as `has_active_goto` above — the #1007 reconciler needs
+    /// this in a release build.
+    ///
+    /// #1007 follow-up (independent review): `has_active_goto` alone is blind to this slot — a
+    /// pending zone-cross lives in `self.nav.zone_cross`, not `goto_target`. Without this method
+    /// the reconciler could relabel a same-tick `zone_loading` publish straight to `engaging`,
+    /// because from its point of view no goal was active at all.
+    pub fn has_pending_zone_cross(&self) -> bool {
+        self.nav.zone_cross.lock().unwrap().is_some()
+    }
 }
 
 #[cfg(test)]
@@ -357,6 +395,41 @@ mod tests {
     use super::{
         CommandState, NAV_REASON_GOTO_CANCELLED, NAV_REASON_STOPPED, NAV_REASON_ZONE_CROSS_UNHANDLED,
     };
+
+    #[test]
+    fn has_active_goto_tracks_the_goto_slot() {
+        let cs = CommandState::default();
+        assert!(!cs.has_active_goto(), "no goto set at construction");
+        cs.request_goto((1.0, 2.0, 3.0));
+        assert!(cs.has_active_goto(), "a /goto target is now set");
+        cs.request_stop();
+        assert!(!cs.has_active_goto(), "stop clears the goto slot");
+    }
+
+    #[test]
+    fn stop_and_wasd_cancel_do_not_flip_engaging_to_idle() {
+        for cancel in ["stop", "cancel_goto"] {
+            let cs = CommandState::default();
+            // Route through the real accept path first so `state` is a normal in-flight goal…
+            let g0 = cs.request_goto((10.0, 0.0, 0.0));
+            // …then seed `engaging` directly on the locked NavStatus, exactly as the reconciler would.
+            {
+                let mut s = cs.nav.nav_state.lock().unwrap();
+                s.state = "engaging".into();
+                s.reason = Some(eqoxide_ipc::NAV_REASON_MELEE_ENGAGED.into());
+            }
+            let g1 = match cancel {
+                "stop" => cs.request_stop(),
+                _ => cs.request_cancel_goto(),
+            };
+            let s = cs.nav.nav_state.lock().unwrap();
+            assert_eq!(s.state, "engaging",
+                "{cancel}: a goal-level cancel must not relabel the suspended word");
+            assert_eq!(s.reason.as_deref(), Some("melee_engaged"), "{cancel}: reason preserved too");
+            assert!(g1 > g0, "{cancel}: goal_id still bumps (the caller's landed-request signal)");
+            assert!(cs.nav.goto_target.lock().unwrap().is_none(), "{cancel}: goto slot cleared");
+        }
+    }
 
     #[test]
     fn request_goto_sets_target_and_clears_entity() {

@@ -18,6 +18,7 @@ use axum::{
 use std::collections::HashMap;
 use super::*;
 use crate::name_match::{distance_between, resolve_in_world, MatchQuality, NameMatch};
+use crate::refusal::Refusal;
 
 /// A `text/plain` response (for require_live_session errors and malformed-body 4xx). Mirrors
 /// `http::combat`'s local helper — `/goto` and `/follow` now answer with JSON on success (#513).
@@ -280,6 +281,22 @@ fn resolve_current_target(
     Ok((key, pos))
 }
 
+/// #1007: should a fresh `/move/{goto,follow,zone_cross}` disengage an active auto-attack melee
+/// pursuit? True iff auto-attack is on AND the current target still resolves to a live entity.
+///
+/// Deliberately a PURE predicate with no `request_*` call inside — the caller does the refusable
+/// toggle in the canonical `if let Some(busy) = … { return busy; }` shape, so the `guild.rs`
+/// refusal-lint sees a checked site. Deliberately NO `< 200u` distance gate: "I issued a new
+/// movement command" is reason enough to end the pursuit; the geometry is the melee driver's
+/// concern, not this one's.
+fn should_disengage_for_new_move(s: &HttpState) -> bool {
+    let gs = s.game_state.load();
+    gs.auto_attack
+        && gs.target_id
+            .and_then(|tid| gs.world.entities.get(&tid))
+            .is_some_and(|e| !e.dead)
+}
+
 /// Resolve the player's CURRENT TARGET to a [`NameMatch`], so the "no name/coords" default of
 /// `/goto` and `/follow` discloses which spawn it actually resolved to, exactly like a by-name call.
 ///
@@ -392,7 +409,22 @@ async fn post_goto(
             }
         };
 
-    // Apply aggro-avoidance knobs for this route (#242).
+    // #1007: newest explicit command wins. A fresh /goto supersedes an in-flight melee pursuit —
+    // disengage auto-attack so the body walks to the point instead of being dragged back to the
+    // target every tick by drive_auto_engage_melee. A raced toggle returns 409 here rather than a
+    // false `"disengaged": true`.
+    //
+    // #952 (agent-honesty): this runs BEFORE apply_avoid_opts below — a refused request must leave
+    // the shared nav_avoid setting untouched, not silently apply this call's aggro-avoidance knobs
+    // for a move that was never queued.
+    let disengaged = should_disengage_for_new_move(&s);
+    if disengaged {
+        if let Some(busy) = s.command.request_attack(false).refused_json(serde_json::json!({
+            "status": "busy_attack",
+            "message": "an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued, and this move was NOT accepted either)",
+        })) { return busy; }
+    }
+    // Apply aggro-avoidance knobs for this route (#242) — after the busy-attack check above (#952).
     apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     // Set the position, then clear any chase — goto walks to a fixed point and stops. `request_goto`
     // stamps a fresh goal identity (state → `pending`, bumped `goal_id`) SYNCHRONOUSLY, so a read
@@ -416,6 +448,7 @@ async fn post_goto(
     };
     json(StatusCode::OK, serde_json::json!({
         "status": "navigating",
+        "disengaged": disengaged,
         "goal": [target.0, target.1, target.2],
         "goal_id": goal_id,
         "matched": matched.map(|m| m.to_json()),
@@ -500,9 +533,22 @@ async fn post_follow(
     };
 
     let pos = matched.pos.expect("checked above");
-    // #952: apply the aggro-avoidance knobs HERE, past every 4xx return above and immediately before
-    // the follow is queued — the same position in the handler `/goto` applies them, and for the same
-    // reason: a request that is refused must leave the shared nav setting exactly as it found it.
+    // #1007: newest explicit command wins. A fresh /follow supersedes an in-flight melee pursuit —
+    // disengage auto-attack so the body follows the named entity instead of being dragged back to
+    // the target every tick by drive_auto_engage_melee. A raced toggle returns 409 here rather than
+    // a false `"disengaged": true`.
+    //
+    // #952: this runs BEFORE apply_avoid_opts below — past every 4xx return above, but a request
+    // refused HERE must still leave the shared nav_avoid setting exactly as it found it, not apply
+    // this call's aggro-avoidance knobs for a follow that was never queued.
+    let disengaged = should_disengage_for_new_move(&s);
+    if disengaged {
+        if let Some(busy) = s.command.request_attack(false).refused_json(serde_json::json!({
+            "status": "busy_attack",
+            "message": "an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued, and this move was NOT accepted either)",
+        })) { return busy; }
+    }
+    // Apply the aggro-avoidance knobs — after the busy-attack check above (#952).
     apply_avoid_opts(&s.nav.nav_avoid, avoid_aggro, aggro_buffer);
     // Position first, then the chase key: the nav thread re-resolves the key's live position each
     // tick (eqoxide#88) and homes in as the entity moves.
@@ -511,6 +557,7 @@ async fn post_follow(
         matched.key, pos.0, pos.1, pos.2);
     json(StatusCode::OK, serde_json::json!({
         "status": "following",
+        "disengaged": disengaged,
         "goal_id": goal_id,
         "matched": matched.to_json(),
         "hold": gate.disclosure(), // #884 — see /goto
@@ -588,7 +635,6 @@ async fn post_zone_cross(
     // so nothing is queued and no goal_id is stamped.
     if let Some(r) = crate::MoveGate::read(&s).refusal() { return r; }
     let b = body.unwrap_or_default();
-    apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     let zone_id = b.zone_id.unwrap_or(0);
     if zone_id != 0 {
         // A zone_id that doesn't fit the wire u16 (e.g. 99999) can never match a zone line, so
@@ -608,6 +654,24 @@ async fn post_zone_cross(
         }
     }
     let zone_id = zone_id as u16; // safe: either 0, or validated above to fit u16 and be reachable
+    // #1007: newest explicit command wins. A fresh /zone_cross supersedes an in-flight melee
+    // pursuit — disengage auto-attack so the body walks to the zone line instead of being dragged
+    // back to the target every tick by drive_auto_engage_melee. A raced toggle returns 409 here
+    // rather than a false disengage disclosure.
+    //
+    // #952 (agent-honesty): this runs BEFORE apply_avoid_opts below — past every 4xx return above
+    // (unreachable zone_id included), but a request refused HERE must still leave the shared
+    // nav_avoid setting exactly as it found it, not apply this call's aggro-avoidance knobs for a
+    // crossing that was never queued.
+    let disengaged = should_disengage_for_new_move(&s);
+    if disengaged {
+        if let Some(busy) = s.command.request_attack(false).refused_json(serde_json::json!({
+            "status": "busy_attack",
+            "message": "an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued, and this move was NOT accepted either)",
+        })) { return busy; }
+    }
+    // Apply the aggro-avoidance knobs — after the busy-attack check above (#952).
+    apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     // Reset nav_state to `pending` under a fresh goal id SYNCHRONOUSLY (#349), so a read right after
     // this 200 can't see the previous nav's terminal state before the walker drains the request.
     let goal_id = s.command.request_zone_cross(zone_id);
@@ -615,12 +679,16 @@ async fn post_zone_cross(
     // Honest, async-aware response (#267): the client WALKS to the zone line, it does not teleport, so
     // this 200 means "accepted", not "arrived". Tell the caller how to observe the real outcome — a bare
     // "queued" read as success while a wedged character went nowhere.
-    text(StatusCode::OK, format!(
+    let mut body = format!(
         "zone_cross to zone_id={zone_id} accepted [goal_id={goal_id}] — walking to the zone line (async, not a teleport). \
          Poll GET /v1/observe/debug: the `zone` field changes on success. Every failure is now reported \
          honestly in `nav_state` (+`nav_reason`): `no_path` = no route to the line EXISTS (definitive), \
          `search_exhausted` = the planner gave up ('I don't know', not 'no'), `blocked` = a route exists \
-         but the walker physically wedged. See docs/http-api.md 'Navigation state'."))
+         but the walker physically wedged. See docs/http-api.md 'Navigation state'.");
+    if disengaged {
+        body.push_str(" Auto-attack was disengaged (a fresh zone_cross supersedes a melee pursuit).");
+    }
+    text(StatusCode::OK, body)
 }
 
 #[cfg(test)]
@@ -903,7 +971,7 @@ mod tests {
     /// A future fix that moves the call past the 400 will turn this RED with the message saying so,
     /// which is the point — the divergence cannot quietly change in either direction.
     #[tokio::test]
-    async fn a_refused_zone_cross_does_write_the_avoid_knobs_pre_existing_divergence() {
+    async fn a_refused_zone_cross_leaves_the_avoid_knobs_untouched() {
         let state = empty_state();
         {
             let mut o = state.nav.nav_avoid.lock().unwrap();
@@ -920,12 +988,12 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {}", body_text(resp).await);
         let o = nav_avoid.lock().unwrap();
-        assert!(!o.enabled && o.buffer == 25.0,
-            "this test pins a KNOWN divergence: /zone_cross applies the avoid knobs before its own \
-             400, so a refused crossing is expected to have written them. The slot reads \
-             enabled={} buffer={}. If you just moved `apply_avoid_opts` past the 400 — good, that \
-             is the fix; invert this assertion, and update `docs/http-api.md`'s note that /zone_cross \
-             is the exception.",
+        // #952 follow-up (independent review): apply_avoid_opts now runs AFTER both the zone_id
+        // 400 and the busy_attack 409 in this handler, matching /goto and /follow — a refused
+        // /zone_cross must leave the shared nav_avoid setting exactly as it found it.
+        assert!(o.enabled && o.buffer == 0.0,
+            "a refused /zone_cross must not write the avoid knobs for a crossing that was never \
+             queued. The slot reads enabled={} buffer={}",
             o.enabled, o.buffer);
     }
 
@@ -2075,5 +2143,93 @@ mod tests {
         let j = body_json(resp).await;
         assert_eq!(j["hold"], from_debug,
             "the 409's hold and player.hold must be byte-identical: {j} vs {from_debug}");
+    }
+
+    /// #1007: a fresh /goto while auto-attack is active should disengage the pursuit and echo it.
+    #[tokio::test]
+    async fn fresh_goto_while_engaging_disengages_and_echoes_it() {
+        // auto_attack on + a live target → the fresh goto disengages it.
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.auto_attack = true;
+            gs.target_id = Some(42);
+            gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 10.0, 0.0, 0.0, true));
+        });
+        let app = router().with_state(state.clone());
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(j["disengaged"], serde_json::json!(true), "a fresh goto disengages an active auto-attack");
+        assert_eq!(j["status"], serde_json::json!("navigating"));
+        assert_eq!(state.command.take_attack(), Some(false), "the disengage toggle was queued");
+
+        // auto_attack off → nothing to disengage, disengaged:false, no toggle queued.
+        let state2 = empty_state();
+        let app2 = router().with_state(state2.clone());
+        let req2 = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp2 = app2.oneshot(req2).await.unwrap();
+        let j2: serde_json::Value = serde_json::from_str(&body_text(resp2).await).unwrap();
+        assert_eq!(j2["disengaged"], serde_json::json!(false));
+        assert_eq!(state2.command.take_attack(), None, "no disengage queued when auto_attack was already off");
+
+        // auto_attack off but a LIVE TARGET present → still no disengage (kills the &&→|| mutant:
+        // under ||, a live target alone would incorrectly trigger a disengage here).
+        let state3 = empty_state();
+        set_gs(&state3, |gs| {
+            gs.target_id = Some(42);
+            gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 10.0, 0.0, 0.0, true));
+        });
+        let app3 = router().with_state(state3.clone());
+        let req3 = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp3 = app3.oneshot(req3).await.unwrap();
+        let j3: serde_json::Value = serde_json::from_str(&body_text(resp3).await).unwrap();
+        assert_eq!(j3["disengaged"], serde_json::json!(false),
+            "auto_attack is off — a live target alone must not trigger a disengage");
+        assert_eq!(state3.command.take_attack(), None,
+            "no disengage toggle queued when auto_attack was already off, even with a live target");
+    }
+
+    /// #1007 final review, M2 — the `busy_attack` 409 must say the MOVE was refused too.
+    ///
+    /// The disengage toggle and the `/goto` are one atomic request: if the toggle can't be queued
+    /// the handler returns before `request_goto`, so nothing at all happened. A message that only
+    /// mentions the toggle lets an agent read "nothing changed" as "only the disengage failed, my
+    /// move landed" — and then wait forever on a goal that was never stamped.
+    #[tokio::test]
+    async fn a_busy_attack_toggle_refuses_the_whole_goto_and_says_so() {
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.auto_attack = true;
+            gs.target_id = Some(42);
+            gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 10.0, 0.0, 0.0, true));
+        });
+        // A toggle is already in flight and undrained, so the handler's own `request_attack(false)`
+        // is refused (`enqueue` returns false on an occupied slot).
+        assert!(state.command.request_attack(true), "the pre-seeded toggle must itself be queued");
+        assert!(!state.command.has_active_goto(), "no goto in flight before the request");
+
+        let app = router().with_state(state.clone());
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let j: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(j["status"], serde_json::json!("busy_attack"));
+        assert_eq!(j["message"], serde_json::json!("an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued, and this move was NOT accepted either)"),
+            "the refusal must disclose that the MOVE was refused too, not just the toggle: {j}");
+        // …and the move really was refused: no goto was stamped.
+        assert!(!state.command.has_active_goto(),
+            "the handler returned before `request_goto`, so no goal may have been accepted");
+        assert_eq!(state.command.take_attack(), Some(true),
+            "the pre-seeded toggle is still the one in the slot — the handler wrote nothing");
     }
 }

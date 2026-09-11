@@ -2716,7 +2716,7 @@ pub(crate) fn apply_target_command(gs: &mut GameState, payload: &[u8]) {
     }
     let new_target = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     if new_target == 0 {
-        gs.clear_target();
+        gs.clear_target("server_cleared");
         tracing::info!("EQ: OP_TargetCommand — server cleared our target");
     } else {
         gs.set_target(new_target);
