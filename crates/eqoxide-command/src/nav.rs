@@ -181,6 +181,12 @@ impl CommandState {
             // (`/move/stop`, a supersede by manual movement or the melee-engage override, a zone
             // change) is evidence about whether the character can walk.
             //
+            // The same argument covers `engaging` (#1007 re-scope): a `/stop` or a per-frame
+            // `request_cancel_goto` from WASD/`/manual` says nothing about whether auto-attack is
+            // still pursuing a live target — only the tick reconciler can know — so a goal-level
+            // event may not relabel that word either. Hence `nav_state_is_suspended`, not
+            // `nav_state_is_life_halt`, gates the preservation below.
+            //
             // Without this guard the field has two unordered writers on two threads: the net
             // thread's `nav_halt_if_dead` republishes the halt every tick, and the render thread's
             // per-frame `request_cancel_goto` (WASD, and the non-draining `/v1/move/manual` slot,
@@ -199,7 +205,7 @@ impl CommandState {
             // untouched. `retire_to_idle` stays the single exhaustive (E0027-netted) writer; this
             // restores two fields after it, and deliberately not by destructuring, so a field added
             // to `NavStatus` tomorrow is still force-decided there and cannot leak through here.
-            let halted = eqoxide_ipc::nav_state_is_life_halt(&s.state)
+            let halted = eqoxide_ipc::nav_state_is_suspended(&s.state)   // was: nav_state_is_life_halt
                 .then(|| (s.state.clone(), s.reason.clone()));
             s.retire_to_idle(reason);
             if let Some((halt_state, halt_reason)) = halted {
@@ -373,6 +379,31 @@ mod tests {
         assert!(cs.has_active_goto(), "a /goto target is now set");
         cs.request_stop();
         assert!(!cs.has_active_goto(), "stop clears the goto slot");
+    }
+
+    #[test]
+    fn stop_and_wasd_cancel_do_not_flip_engaging_to_idle() {
+        for cancel in ["stop", "cancel_goto"] {
+            let cs = CommandState::default();
+            // Route through the real accept path first so `state` is a normal in-flight goal…
+            let g0 = cs.request_goto((10.0, 0.0, 0.0));
+            // …then seed `engaging` directly on the locked NavStatus, exactly as the reconciler would.
+            {
+                let mut s = cs.nav.nav_state.lock().unwrap();
+                s.state = "engaging".into();
+                s.reason = Some(eqoxide_ipc::NAV_REASON_MELEE_ENGAGED.into());
+            }
+            let g1 = match cancel {
+                "stop" => cs.request_stop(),
+                _ => cs.request_cancel_goto(),
+            };
+            let s = cs.nav.nav_state.lock().unwrap();
+            assert_eq!(s.state, "engaging",
+                "{cancel}: a goal-level cancel must not relabel the suspended word");
+            assert_eq!(s.reason.as_deref(), Some("melee_engaged"), "{cancel}: reason preserved too");
+            assert!(g1 > g0, "{cancel}: goal_id still bumps (the caller's landed-request signal)");
+            assert!(cs.nav.goto_target.lock().unwrap().is_none(), "{cancel}: goto slot cleared");
+        }
     }
 
     #[test]
