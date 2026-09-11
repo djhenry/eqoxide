@@ -350,6 +350,13 @@ impl CommandState {
     pub fn goto_target(&self) -> Option<(f32, f32, f32)> {
         *self.nav.goto_target.lock().unwrap()
     }
+
+    /// Is a `/move/goto` (or the goto half of a `/follow`) target currently set? Un-gated
+    /// (unlike `goto_target()` above, which is `#[cfg(test)]`-only) — the #1007 reconciler
+    /// needs it in a release build to decide whether entering melee must supersede a walk.
+    pub fn has_active_goto(&self) -> bool {
+        self.nav.goto_target.lock().unwrap().is_some()
+    }
 }
 
 #[cfg(test)]
@@ -357,6 +364,16 @@ mod tests {
     use super::{
         CommandState, NAV_REASON_GOTO_CANCELLED, NAV_REASON_STOPPED, NAV_REASON_ZONE_CROSS_UNHANDLED,
     };
+
+    #[test]
+    fn has_active_goto_tracks_the_goto_slot() {
+        let cs = CommandState::default();
+        assert!(!cs.has_active_goto(), "no goto set at construction");
+        cs.request_goto((1.0, 2.0, 3.0));
+        assert!(cs.has_active_goto(), "a /goto target is now set");
+        cs.request_stop();
+        assert!(!cs.has_active_goto(), "stop clears the goto slot");
+    }
 
     #[test]
     fn request_goto_sets_target_and_clears_entity() {
