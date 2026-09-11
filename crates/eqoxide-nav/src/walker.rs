@@ -73,7 +73,11 @@ pub const NAV_STATE_ZONE_LOADING: &str = "zone_loading";
 /// fact about the published HP reading and NOT a death (#1000).
 ///
 /// Both retire in [`Walker::nav_halt_if_dead`] the first tick the halt condition is false.
-pub use eqoxide_ipc::{NAV_STATE_DEAD, NAV_STATE_HALTED_HP_ZERO, nav_state_is_life_halt};
+pub use eqoxide_ipc::{
+    NAV_STATE_DEAD, NAV_STATE_HALTED_HP_ZERO, NAV_STATE_ENGAGING,
+    NAV_REASON_MELEE_ENGAGED, NAV_REASON_MELEE_DISENGAGED,
+    nav_state_is_life_halt, nav_state_is_suspended,
+};
 
 /// The CLOSED set of `nav_state` words that are a finished OUTCOME — an answer an agent may read
 /// after the goal that produced it is gone (#725).
@@ -685,6 +689,24 @@ impl Walker {
             "#725 B1: `idle` must name how it got there; `nav_reason: null` is reserved for boot");
         let mut s = self.nav.nav_state.lock().unwrap();
         Self::write_nav_state_locked(&mut s, state, reason);
+    }
+
+    /// Publish `engaging`/`melee_engaged` (#1007). Idempotent — the reconciler calls this
+    /// every tick a pursuit is active. Unlike a bare `set_nav_state_because("engaging", …)`
+    /// this also nulls `goal` and `local`: a melee pursuit has no fixed-point goal (the
+    /// target is a live entity) and does not use the fine planner, so leaving either set
+    /// would be a stale `nav_goal`/`nav_local` beside `engaging` — the #732 defect class.
+    /// `goal_id` is NOT bumped here: entering melee is not a `/move/*` accept, and the
+    /// one-shot supersede in the reconciler already bumped it once if there was a goto.
+    pub fn enter_engaging(&self) {
+        let mut s = self.nav.nav_state.lock().unwrap();
+        if s.state == NAV_STATE_ENGAGING
+            && s.reason.as_deref() == Some(eqoxide_ipc::NAV_REASON_MELEE_ENGAGED) {
+            return; // already there — no write, no churn
+        }
+        s.transition_within_goal(NAV_STATE_ENGAGING, Some(eqoxide_ipc::NAV_REASON_MELEE_ENGAGED));
+        s.goal  = None;   // explicit narrowing of transition_within_goal's `_keep_goal`  (#732)
+        s.local = None;   // explicit narrowing of transition_within_goal's `_keep_local` (#382/#766)
     }
 
     /// The body of [`Walker::set_nav_state_because`], with the lock passed in rather than taken.
@@ -5955,5 +5977,50 @@ an honour-system opt-out; `grep -rn '{NOT_PRODUCTION}'` enumerates every use.")
             w.drive_walk(&mut gs, goal);
             assert_eq!(inert_notices(&gs), 2, "clearing the drive state must re-arm the disclosure");
         }
+
+    #[test]
+    fn engaging_is_not_terminal() {
+        assert!(!TERMINAL_NAV_STATES.contains(&"engaging"),
+            "engaging is TRANSIENT — listing it makes its retirement dead code (#1007 trap)");
+        assert_eq!(TERMINAL_NAV_STATES.len(), 5);
+        assert!(!nav_state_is_terminal("engaging"));
+    }
+
+    #[test]
+    fn enter_engaging_nulls_goal_and_local() {
+        let (walker, nav, _intent, _dbg) = walker_with(Default::default());
+        *nav.nav_state.lock().unwrap() = eqoxide_ipc::NavStatus {
+            state: "arrived".into(),
+            reason: Some("seeded".into()),
+            goal: Some([9.0, 9.0, 9.0]),
+            local: Some(eqoxide_ipc::NavLocal {
+                state: "threading".into(),
+                reason: "carrot".into(),
+                stuck_ticks: 3,
+                plan_us: 120,
+            }),
+            ..Default::default()
+        };
+
+        walker.enter_engaging();
+
+        let ns = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(ns.state, "engaging");
+        assert_eq!(ns.reason.as_deref(), Some("melee_engaged"));
+        assert_eq!(ns.goal, None, "a melee pursuit has no fixed-point goal (#732)");
+        assert_eq!(ns.local, None, "a melee pursuit does not use the fine planner (#382/#766)");
+    }
+
+    #[test]
+    fn enter_engaging_is_idempotent() {
+        let (walker, nav, _intent, _dbg) = walker_with(Default::default());
+        walker.enter_engaging();
+        let gid = nav.nav_state.lock().unwrap().goal_id;
+        walker.enter_engaging();
+        let ns = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(ns.goal_id, gid, "a re-publish of the same engaging word must not churn goal_id");
+        assert_eq!(ns.state, "engaging");
+        assert_eq!(ns.reason.as_deref(), Some("melee_engaged"));
+    }
     }
 }
