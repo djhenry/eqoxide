@@ -2103,6 +2103,22 @@ impl ActionLoop {
                         ZoneCrossResolution::ServerResolved =>
                             gs.log_msg("zone", "Walking to a zone line (destination resolved by server — best effort, see zone_cross_best_effort on GET /v1/observe/debug)"),
                     }
+                    // #1007 follow-up (independent review): this walk needs the SAME "newest
+                    // explicit command wins" disengage the HTTP /goto, /follow and /zone_cross
+                    // handlers apply immediately before their own `request_goto` — this call is
+                    // just as much a fresh explicit move as those. Without it, `auto_attack`
+                    // stays on and `drive_auto_engage_melee` (which runs every tick, after the
+                    // reconciler) keeps steering the player at the OLD combat target and
+                    // returning early, preempting the tick before `resolve_goal`/`drive_walk`
+                    // ever get to progress THIS goal past the `pending` `request_goto` just
+                    // stamped — an internally-triggered freeze the HTTP callers' disengage never
+                    // covers because they only run on their OWN request, not this one. Same
+                    // live-target predicate `reconcile_engage_nav_state`'s `want_engage` uses.
+                    if self.auto_attack
+                        && gs.target_id.and_then(|tid| gs.world.entities.get(&tid)).is_some_and(|e| !e.dead)
+                    {
+                        self.command.request_attack(false);
+                    }
                     self.command.request_goto((tx, ty, tz));
                 }
                 // #815: WHY there is no located region decides what we may say. The gate above
@@ -2798,13 +2814,25 @@ impl ActionLoop {
                     self.command.request_cancel_goto();
                 }
                 self.engage_active = true;
-                self.walker.enter_engaging();
-            } else if self.command.has_active_goto() {
-                // #1007 final-review finding C1: a goto/follow/zone_cross was stamped AFTER
-                // this episode began — either racing the HTTP handler's async disengage toggle
-                // (`self.auto_attack` clears at most one tick later, in `drain_combat`), or a
-                // `/move/zone_cross` that predates the episode and only now resolved via
-                // `drain_zone_cross`. That goal is LIVE and honestly published right now
+                if self.command.has_pending_zone_cross() {
+                    // #1007 follow-up (independent review): `drain_zone_cross` runs earlier in
+                    // `tick()` than this reconciler, so `resolve_zone_cross`'s `Err(why)`
+                    // re-queue arm may have published `zone_loading` THIS SAME tick — before
+                    // `want_engage` ever went true. `has_active_goto()` can't see this: a
+                    // pending/re-queued zone-cross lives in the separate `zone_cross` slot, not
+                    // `goto_target`. Calling `enter_engaging()` here would immediately clobber
+                    // that honest word. Leave it alone for the same reason as the C1 branch
+                    // below — it will retire on its own once the cross resolves.
+                } else {
+                    self.walker.enter_engaging();
+                }
+            } else if self.command.has_active_goto() || self.command.has_pending_zone_cross() {
+                // #1007 final-review finding C1 (+ follow-up: pending zone_cross): a
+                // goto/follow/zone_cross was stamped AFTER this episode began — either racing
+                // the HTTP handler's async disengage toggle (`self.auto_attack` clears at most
+                // one tick later, in `drain_combat`), or a `/move/zone_cross` that predates the
+                // episode and only now resolved (or re-queued) via `drain_zone_cross`. That goal
+                // is LIVE and honestly published right now
                 // (`nav_state`/`nav_goal` reflect it). Calling `enter_engaging()` here would
                 // relabel over it and null `NavStatus.goal` with nothing left to ever restore
                 // it — a durable `nav_goal` lie of exactly the #732 shape this feature exists
@@ -2859,13 +2887,18 @@ impl ActionLoop {
                     let dy = ey - gs.player_y;
                     let dist = (dx * dx + dy * dy).sqrt();
                     if dist < 200.0 { // engage targets within ~200u (sparse spawns; walk to them)
-                        const MELEE: f32 = 5.0;
-                        const PET_STANDOFF: f32 = 25.0; // pet classes hang back and let the pet tank
                         // With a pet, DON'T walk into melee — the pet holds aggro (PET_ATTACK) and a
                         // squishy caster who closes to melee just gets killed (a level-1 necro died
                         // to a level-4 skeleton this way). Stand off ~25u: out of the mob's melee but
                         // close enough to loot the corpse after the pet kills it.
-                        let engage = if gs.pet_id.is_some() { PET_STANDOFF } else { MELEE };
+                        //
+                        // #1007 follow-up: these thresholds moved to `eqoxide_core::game_state` (as
+                        // `MELEE_ENGAGE_RANGE`/`PET_STANDOFF_RANGE`) so `GameState::target_in_melee_
+                        // range` — the `/observe/debug` disclosure of "still closing" vs "in range,
+                        // not landing swings" — can describe this driver's own behavior instead of
+                        // carrying a second copy of these numbers that could silently drift from it.
+                        use eqoxide_core::game_state::{MELEE_ENGAGE_RANGE, PET_STANDOFF_RANGE};
+                        let engage = if gs.pet_id.is_some() { PET_STANDOFF_RANGE } else { MELEE_ENGAGE_RANGE };
                         let hdg = if dist > 0.01 { eq_heading(dx, dy) } else { gs.player_heading };
                         gs.player_heading = hdg;
                         if dist > engage {
@@ -9185,6 +9218,57 @@ mod tests {
         assert_eq!(ns.goal, Some([10.0, 0.0, 0.0]));
         assert_eq!(ns.goal_id, new_gid);
         assert!(!al.engage_active, "the episode latch drops with the predicate");
+    }
+
+    /// **#1007 follow-up (independent review): a re-queued `/zone_cross` mid-load must survive
+    /// the SAME-tick reconciler when auto-attack is also live.** `drain_zone_cross` runs earlier
+    /// in `tick()` than `reconcile_engage_nav_state` (see the call order in `tick()`); if a
+    /// zone-cross is queued while assets are loading, `resolve_zone_cross`'s `Err(why)` arm
+    /// re-queues it and publishes the honest transient `zone_loading` — but `has_active_goto()`
+    /// cannot see that pending request (it lives in the separate `zone_cross` slot, not
+    /// `goto_target`), so an unconditional `enter_engaging()` on the very next call would clobber
+    /// it with `engaging` even though the player has not actually reached melee — the same #732
+    /// shape as C1's goto case, through the blind spot `has_active_goto()` alone cannot see.
+    ///
+    /// **Mutation check:** drop the `|| self.command.has_pending_zone_cross()` disjunct (either
+    /// occurrence) → this test's final assertion goes RED (`engaging` clobbers `zone_loading`).
+    #[tokio::test]
+    async fn a_pending_zone_cross_keeps_its_own_word_through_the_reconciler() {
+        use eqoxide_nav::zone_assets;
+        const WANT: u16 = 30;
+
+        let (mut al, nav, command, collision, za) = shared_nav_action_loop();
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
+        *al.world.zone_points.lock().unwrap() = vec![zp_at(7, WANT, [10.0, 10.0, 0.0])];
+        zone_assets::begin_zone_load(&collision, &za, "freporte", "loading…"); // assets loading
+
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.world.zone_name = "freporte".into();
+        gs.player_id = 7;
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a skeleton", 150.0, 0.0, 0.0, true));
+        gs.target_id = Some(42);
+        al.auto_attack = true;
+
+        // The episode has already begun (mirrors the steady-state branch this bug lives in).
+        al.reconcile_engage_nav_state(&gs);
+        assert_eq!(nav.nav_state.lock().unwrap().state, eqoxide_ipc::NAV_STATE_ENGAGING);
+
+        // A `/move/zone_cross` lands mid-episode and re-queues because assets aren't ready — the
+        // REAL path, same as `zone_cross_queued_during_load_is_cancellable_by_stop_and_never_leaks`.
+        command.request_zone_cross(WANT);
+        al.drain_zone_cross(&mut stream, &mut gs);
+        assert_eq!(nav.nav_state.lock().unwrap().state, "zone_loading",
+            "drain_zone_cross published the honest transient state");
+
+        // The reconciler runs immediately after, in the SAME tick (see tick()'s call order) —
+        // `want_engage` is still true (auto_attack unchanged, target still in range).
+        al.reconcile_engage_nav_state(&gs);
+
+        assert_eq!(nav.nav_state.lock().unwrap().state, "zone_loading",
+            "the reconciler must not clobber a live zone_cross with `engaging` — \
+             has_pending_zone_cross() closes the blind spot has_active_goto() cannot see");
     }
 
     #[test]

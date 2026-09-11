@@ -1073,6 +1073,17 @@ pub struct Relocation {
     pub distance: f32,
 }
 
+/// The distance `ActionLoop::drive_auto_engage_melee` stops closing at and starts holding
+/// position/facing, for a character with no pet. Mirrored here (not just in `eqoxide-net`) so
+/// [`GameState::target_in_melee_range`] can describe that driver's behavior for `/observe/debug`
+/// without eqoxide-core depending on eqoxide-net. Keep this in lock-step with the `MELEE` literal
+/// in `drive_auto_engage_melee` — see that method's doc.
+pub const MELEE_ENGAGE_RANGE: f32 = 5.0;
+/// Same as [`MELEE_ENGAGE_RANGE`], for a character WITH a pet — the pet tanks, so the player
+/// stands off outside the mob's own melee range instead of closing to melee itself. Mirrors
+/// `drive_auto_engage_melee`'s `PET_STANDOFF` literal.
+pub const PET_STANDOFF_RANGE: f32 = 25.0;
+
 /// All state the renderer needs for one frame.
 ///
 /// `PartialEq` is load-bearing: `eq_net::gameplay::publish_snapshot` compares the freshly-mutated
@@ -1400,6 +1411,19 @@ pub struct GameState {
     /// exposed on /observe/debug so agents can read "how tough" without scraping chat.
     pub target_con_name: Option<String>,
     pub target_attitude: Option<String>,
+    /// #1007 follow-up (live-test-drive finding): WHY `target_id` is currently null. `None` while
+    /// a target IS set, and also `None` if no target has ever been cleared this session (fresh
+    /// `GameState`) — both read the same as "nothing to report" on purpose, the same convention
+    /// `nav_reason` uses beside `nav_state`. Set to `Some(reason)` by every `clear_target` call,
+    /// and reset to `None` by `set_target` the moment a new target lands.
+    ///
+    /// Exists because `auto_attack:true` + `target_id:null` was otherwise a silent, honest-looking
+    /// dead end: the target despawning mid-fight (a kill, or an out-of-range/zone-purge removal)
+    /// leaves `auto_attack` untouched — it is a wholly separate flag, never read or written by
+    /// `clear_target`/`remove_entity` — so an agent polling `/observe/debug` saw the exact same
+    /// `target_id: null` a character that never targeted anything would show, with nothing to tell
+    /// the two apart. See `clear_target`'s call sites for the three reasons this can fire.
+    pub target_cleared_reason: Option<&'static str>,
     /// #336: the result of the MOST RECENT consider of ANY spawn — target or not. Unlike
     /// `target_con*` above (gated on the reply being about the CURRENT target, #330), this is set
     /// unconditionally by every `apply_consider` and is never touched by `set_target`/`clear_target`
@@ -1708,7 +1732,7 @@ impl GameState {
         // target_name/target_hp_pct fall back to the stale cached snapshot — /observe/debug then
         // reports a full-HP target from the OLD zone (a confident falsehood an agent may attack /
         // consider). Clear the whole target (id + name + hp + con) here, not just the entity map (#408).
-        self.clear_target();
+        self.clear_target("zone_changed");
         // #883: `last_consider` is the SAME hazard as the target fields above — spawn ids are a
         // per-zone namespace, so the same id in the new zone is a different mob at a different
         // difficulty, while `ago_secs` keeps counting normally and discloses nothing. It needs its
@@ -2154,7 +2178,7 @@ impl GameState {
     pub fn remove_entity(&mut self, spawn_id: u32) {
         self.world.entities.remove(&spawn_id);
         if self.target_id == Some(spawn_id) {
-            self.clear_target(); // #331: also drops the now-stale name/hp/con, not just the id
+            self.clear_target("target_despawned"); // #331: also drops the now-stale name/hp/con, not just the id
         }
         if self.pet_id == Some(spawn_id) {
             self.pet_id = None; // pet died / despawned
@@ -2185,6 +2209,10 @@ impl GameState {
         self.target_con = None;
         self.target_con_name = None;
         self.target_attitude = None;
+        // #1007 follow-up: a target is live again — whatever explained the PREVIOUS null no
+        // longer applies. Leaving the old reason in place would tell an agent that just retargeted
+        // "despawned" about a target it can currently see and attack.
+        self.target_cleared_reason = None;
         if id == self.player_id {
             self.target_name = Some(self.player_name.clone());
             self.target_hp_pct = Some(self.hp_pct);
@@ -2204,13 +2232,48 @@ impl GameState {
     /// now-dead mob. The HUD hid the leak (it requires both id and name to be `Some`), but the
     /// `/v1/observe/debug` HTTP snapshot doesn't, so it reported a dead target's name/HP forever
     /// after every kill.
-    pub fn clear_target(&mut self) {
+    ///
+    /// `reason` (#1007 follow-up) is a machine-readable, `/observe/debug`-facing WHY, stamped into
+    /// `target_cleared_reason` — see that field's doc for what reads it and why it exists. Every
+    /// call site names the reason from the caller's own vantage point:
+    ///   "target_despawned" — `remove_entity`: the target's spawn left `world.entities` (a kill,
+    ///                        corpse decay/removal, or an out-of-range purge).
+    ///   "zone_changed"     — the zone-transition cleanup: the old target's spawn id is meaningless
+    ///                        in the new zone.
+    ///   "server_cleared"   — `apply_target_command`: the server explicitly forced our target to
+    ///                        none (OP_TargetCommand, new_target == 0 — e.g. a merc-hire clear).
+    pub fn clear_target(&mut self, reason: &'static str) {
         self.target_id = None;
         self.target_name = None;
         self.target_hp_pct = None;
         self.target_con = None;
         self.target_con_name = None;
         self.target_attitude = None;
+        self.target_cleared_reason = Some(reason);
+    }
+
+    /// #1007 follow-up (live-test-drive finding): is the current target within the SAME
+    /// engage ring `ActionLoop::drive_auto_engage_melee` stops closing at? `None` when there is
+    /// nothing to judge (no target, target dead, or its spawn id no longer resolves in
+    /// `world.entities`); `Some(true)`/`Some(false)` otherwise.
+    ///
+    /// Exists to disambiguate a flat `target_hp_pct` under `nav_state: "engaging"`: without this,
+    /// "still walking into range" and "standing there, swings not landing" render identically on
+    /// `/observe/debug` — both are just `engaging` beside an HP number that hasn't moved. This
+    /// answers which one it is.
+    ///
+    /// `MELEE_ENGAGE_RANGE`/`PET_STANDOFF_RANGE` MUST stay in lock-step with the literals
+    /// `drive_auto_engage_melee` checks its own `dist > engage` against — this predicate only
+    /// describes that driver's behavior, it does not govern it (that driver has its own copy, on
+    /// the other side of the eqoxide-net/eqoxide-core boundary).
+    pub fn target_in_melee_range(&self) -> Option<bool> {
+        let tid = self.target_id?;
+        let e = self.world.entities.get(&tid).filter(|e| !e.dead)?;
+        let dx = e.x - self.player_x;
+        let dy = e.y - self.player_y;
+        let dist = (dx * dx + dy * dy).sqrt();
+        let engage = if self.pet_id.is_some() { PET_STANDOFF_RANGE } else { MELEE_ENGAGE_RANGE };
+        Some(dist <= engage)
     }
 
     pub fn upsert_door(&mut self, d: Door) {
@@ -4186,6 +4249,7 @@ pub(crate) mod tests {
             last_relocation: _,
             target_id: _, target_name: _, target_hp_pct: _,
             target_con: _, target_con_name: _, target_attitude: _,
+            target_cleared_reason: _,
             last_consider: _,
             casting: _, pending_cast_end: _, ended_cast_spell: _, suppress_cast_end: _,
             dialogue_choices: _,

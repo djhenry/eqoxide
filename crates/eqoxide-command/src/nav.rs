@@ -375,6 +375,19 @@ impl CommandState {
     pub fn has_active_goto(&self) -> bool {
         self.nav.goto_target.lock().unwrap().is_some()
     }
+
+    /// Is a `/move/zone_cross` request queued (not yet drained by `take_zone_cross`), or was it
+    /// just re-queued by `resolve_zone_cross`'s `Err(why)` arm because zone assets aren't usable
+    /// yet? Un-gated for the same reason as `has_active_goto` above — the #1007 reconciler needs
+    /// this in a release build.
+    ///
+    /// #1007 follow-up (independent review): `has_active_goto` alone is blind to this slot — a
+    /// pending zone-cross lives in `self.nav.zone_cross`, not `goto_target`. Without this method
+    /// the reconciler could relabel a same-tick `zone_loading` publish straight to `engaging`,
+    /// because from its point of view no goal was active at all.
+    pub fn has_pending_zone_cross(&self) -> bool {
+        self.nav.zone_cross.lock().unwrap().is_some()
+    }
 }
 
 #[cfg(test)]

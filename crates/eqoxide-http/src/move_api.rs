@@ -409,12 +409,14 @@ async fn post_goto(
             }
         };
 
-    // Apply aggro-avoidance knobs for this route (#242).
-    apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     // #1007: newest explicit command wins. A fresh /goto supersedes an in-flight melee pursuit —
     // disengage auto-attack so the body walks to the point instead of being dragged back to the
     // target every tick by drive_auto_engage_melee. A raced toggle returns 409 here rather than a
     // false `"disengaged": true`.
+    //
+    // #952 (agent-honesty): this runs BEFORE apply_avoid_opts below — a refused request must leave
+    // the shared nav_avoid setting untouched, not silently apply this call's aggro-avoidance knobs
+    // for a move that was never queued.
     let disengaged = should_disengage_for_new_move(&s);
     if disengaged {
         if let Some(busy) = s.command.request_attack(false).refused_json(serde_json::json!({
@@ -422,6 +424,8 @@ async fn post_goto(
             "message": "an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued, and this move was NOT accepted either)",
         })) { return busy; }
     }
+    // Apply aggro-avoidance knobs for this route (#242) — after the busy-attack check above (#952).
+    apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     // Set the position, then clear any chase — goto walks to a fixed point and stops. `request_goto`
     // stamps a fresh goal identity (state → `pending`, bumped `goal_id`) SYNCHRONOUSLY, so a read
     // right after this can never return the PREVIOUS goto's terminal state (#349).
@@ -529,14 +533,14 @@ async fn post_follow(
     };
 
     let pos = matched.pos.expect("checked above");
-    // #952: apply the aggro-avoidance knobs HERE, past every 4xx return above and immediately before
-    // the follow is queued — the same position in the handler `/goto` applies them, and for the same
-    // reason: a request that is refused must leave the shared nav setting exactly as it found it.
-    apply_avoid_opts(&s.nav.nav_avoid, avoid_aggro, aggro_buffer);
     // #1007: newest explicit command wins. A fresh /follow supersedes an in-flight melee pursuit —
     // disengage auto-attack so the body follows the named entity instead of being dragged back to
     // the target every tick by drive_auto_engage_melee. A raced toggle returns 409 here rather than
     // a false `"disengaged": true`.
+    //
+    // #952: this runs BEFORE apply_avoid_opts below — past every 4xx return above, but a request
+    // refused HERE must still leave the shared nav_avoid setting exactly as it found it, not apply
+    // this call's aggro-avoidance knobs for a follow that was never queued.
     let disengaged = should_disengage_for_new_move(&s);
     if disengaged {
         if let Some(busy) = s.command.request_attack(false).refused_json(serde_json::json!({
@@ -544,6 +548,8 @@ async fn post_follow(
             "message": "an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued, and this move was NOT accepted either)",
         })) { return busy; }
     }
+    // Apply the aggro-avoidance knobs — after the busy-attack check above (#952).
+    apply_avoid_opts(&s.nav.nav_avoid, avoid_aggro, aggro_buffer);
     // Position first, then the chase key: the nav thread re-resolves the key's live position each
     // tick (eqoxide#88) and homes in as the entity moves.
     let goal_id = s.command.request_follow(matched.key.clone(), pos);
@@ -629,7 +635,6 @@ async fn post_zone_cross(
     // so nothing is queued and no goal_id is stamped.
     if let Some(r) = crate::MoveGate::read(&s).refusal() { return r; }
     let b = body.unwrap_or_default();
-    apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     let zone_id = b.zone_id.unwrap_or(0);
     if zone_id != 0 {
         // A zone_id that doesn't fit the wire u16 (e.g. 99999) can never match a zone line, so
@@ -653,6 +658,11 @@ async fn post_zone_cross(
     // pursuit — disengage auto-attack so the body walks to the zone line instead of being dragged
     // back to the target every tick by drive_auto_engage_melee. A raced toggle returns 409 here
     // rather than a false disengage disclosure.
+    //
+    // #952 (agent-honesty): this runs BEFORE apply_avoid_opts below — past every 4xx return above
+    // (unreachable zone_id included), but a request refused HERE must still leave the shared
+    // nav_avoid setting exactly as it found it, not apply this call's aggro-avoidance knobs for a
+    // crossing that was never queued.
     let disengaged = should_disengage_for_new_move(&s);
     if disengaged {
         if let Some(busy) = s.command.request_attack(false).refused_json(serde_json::json!({
@@ -660,6 +670,8 @@ async fn post_zone_cross(
             "message": "an auto-attack toggle is already queued — nothing changed, retry (it was NOT queued, and this move was NOT accepted either)",
         })) { return busy; }
     }
+    // Apply the aggro-avoidance knobs — after the busy-attack check above (#952).
+    apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     // Reset nav_state to `pending` under a fresh goal id SYNCHRONOUSLY (#349), so a read right after
     // this 200 can't see the previous nav's terminal state before the walker drains the request.
     let goal_id = s.command.request_zone_cross(zone_id);
@@ -959,7 +971,7 @@ mod tests {
     /// A future fix that moves the call past the 400 will turn this RED with the message saying so,
     /// which is the point — the divergence cannot quietly change in either direction.
     #[tokio::test]
-    async fn a_refused_zone_cross_does_write_the_avoid_knobs_pre_existing_divergence() {
+    async fn a_refused_zone_cross_leaves_the_avoid_knobs_untouched() {
         let state = empty_state();
         {
             let mut o = state.nav.nav_avoid.lock().unwrap();
@@ -976,12 +988,12 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {}", body_text(resp).await);
         let o = nav_avoid.lock().unwrap();
-        assert!(!o.enabled && o.buffer == 25.0,
-            "this test pins a KNOWN divergence: /zone_cross applies the avoid knobs before its own \
-             400, so a refused crossing is expected to have written them. The slot reads \
-             enabled={} buffer={}. If you just moved `apply_avoid_opts` past the 400 — good, that \
-             is the fix; invert this assertion, and update `docs/http-api.md`'s note that /zone_cross \
-             is the exception.",
+        // #952 follow-up (independent review): apply_avoid_opts now runs AFTER both the zone_id
+        // 400 and the busy_attack 409 in this handler, matching /goto and /follow — a refused
+        // /zone_cross must leave the shared nav_avoid setting exactly as it found it.
+        assert!(o.enabled && o.buffer == 0.0,
+            "a refused /zone_cross must not write the avoid knobs for a crossing that was never \
+             queued. The slot reads enabled={} buffer={}",
             o.enabled, o.buffer);
     }
 
