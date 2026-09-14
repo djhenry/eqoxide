@@ -264,6 +264,27 @@ pub struct PlayerState {
     pub target_attitude: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_level:    Option<u32>,
+    /// #1007 follow-up (live-test-drive finding): mirrors
+    /// [`eqoxide_core::game_state::GameState::target_cleared_reason`] — WHY `target_id` above is
+    /// currently null. `None` while a target is set, and also `None` when nothing has ever been
+    /// cleared this session; see that field's doc for the full contract and the three reasons it
+    /// can carry ("target_despawned" / "zone_changed" / "server_cleared").
+    ///
+    /// Exists because `auto_attack: true` beside `target_id: null` used to be indistinguishable
+    /// from a character that never targeted anything — a despawn mid-fight left `auto_attack`
+    /// untouched (a wholly separate flag) with nothing else in this payload explaining the null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_cleared_reason: Option<&'static str>,
+    /// #1007 follow-up: mirrors
+    /// [`eqoxide_core::game_state::GameState::target_in_melee_range`] — is the CURRENT target
+    /// within the same engage ring `ActionLoop::drive_auto_engage_melee` stops closing at? `None`
+    /// when there is no live target to judge; `Some(false)` = target live, still closing;
+    /// `Some(true)` = in range.
+    ///
+    /// Disambiguates a flat `target_hp_pct` under `nav_state: "engaging"`, which otherwise reads
+    /// identically for "still walking into range" and "standing there, swings not landing."
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_in_melee_range: Option<bool>,
     /// #336: the result of the most recent consider of ANY spawn — target or not. `target_con`/
     /// `target_attitude`/`target_level` above are target-scoped (only populated while that spawn IS
     /// the current target); `last_consider` is spawn-scoped, so a standalone
@@ -289,6 +310,12 @@ pub struct PlayerState {
     /// `sitting`/`auto_attack`: what we told the server, not what it granted. Defaults `true`
     /// (matching every driver's pre-#625 behavior of always moving at run speed).
     pub run_mode:  bool,
+    /// #1007: our own last-SENT auto-attack toggle intent (`true` = pursuing/swinging at
+    /// `target_id`). Like `run_mode` above and `sitting`, this is what we told the server via
+    /// `/v1/combat/attack/{on,off}` (`OP_Attack` has no ack) — NOT a server confirmation. An agent
+    /// that just POSTed a disengaging `/v1/move/{goto,follow,zone_cross}` reads this to confirm the
+    /// pursuit was actually called off.
+    pub auto_attack: bool,
     /// #724 review B1: **the controller has stopped the body and cannot resume** — see
     /// [`PlayerHoldView`]. `null` when it has not, which is the overwhelmingly normal case.
     ///
@@ -420,6 +447,11 @@ impl PlayerState {
             target_con:      gs.target_id.and(gs.target_con_name.clone()),
             target_attitude: gs.target_id.and(gs.target_attitude.clone()),
             target_level:    gs.target_id.and_then(|id| gs.world.entities.get(&id)).map(|e| e.level),
+            // #1007 follow-up: both computed straight off `gs`, not stored — same discipline as
+            // `hp_verified`/`coin_verified` above, and `target_in_melee_range` is a live-distance
+            // read that can only ever be correct at read time (#343).
+            target_cleared_reason: gs.target_cleared_reason,
+            target_in_melee_range: gs.target_in_melee_range(),
             // #724 review B1: the controller's hold, mirrored into `gs` by the same
             // `ActionLoop::stream_position` tick that mirrors the position, so this is as fresh as
             // `pos_east/north/up`. `detail` is attached here rather than stored, like every other
@@ -460,6 +492,7 @@ impl PlayerState {
             // #336: spawn-scoped, unlike target_con*/target_level above — populated for the LAST
             // consider of any spawn, not gated on that spawn being the current target.
             run_mode:      gs.run_mode,
+            auto_attack:   gs.auto_attack,
             last_consider: gs.last_consider.as_ref().map(|c| LastConsiderView {
                 spawn_id: c.spawn_id,
                 name:     c.name.clone(),

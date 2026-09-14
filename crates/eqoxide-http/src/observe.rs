@@ -1175,6 +1175,9 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // served JSON object at the insert site below.
     let player_hp_verified = player.hp_verified;
     let player_run_mode = player.run_mode;
+    let player_auto_attack = player.auto_attack;
+    let player_target_cleared_reason = player.target_cleared_reason;
+    let player_target_in_melee_range = player.target_in_melee_range;
     // #724/#817 — the stuck-and-cannot-free disclosure. `PlayerHoldView` is not `Copy` (it carries
     // a `&'static str` reason plus a `f32`/`&'static str` detail, both trivially `Clone`), so this
     // is a clone rather than the `Copy` bind `player_levitating`/`player_run_mode` use above; bound
@@ -1567,6 +1570,22 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // granted — exactly the same epistemic level as `sitting`/`auto_attack` elsewhere in this
         // payload. Attached here (not in the literal above, which is at the recursion limit).
         player.insert("run_mode".into(),               serde_json::json!(player_run_mode));
+        // #1007 — our own last-SENT auto-attack toggle intent. `OP_Attack` has no server ack, so
+        // this is NOT a confirmation — same epistemic level as `run_mode`/`sitting` above. Always
+        // present so an agent can poll "did my /move/* disengage the pursuit?" without inferring it
+        // from target/hp deltas.
+        player.insert("auto_attack".into(),            serde_json::json!(player_auto_attack));
+        // #1007 follow-up (live-test-drive finding) — see `PlayerState::target_cleared_reason`'s
+        // doc for the full contract. `null` while a target is set, or if nothing has ever been
+        // cleared this session; otherwise "target_despawned" / "zone_changed" / "server_cleared".
+        // ALWAYS PRESENT for the same reason as `auto_attack` above: an absent key here would be
+        // indistinguishable from a client too old to report it at all.
+        player.insert("target_cleared_reason".into(), serde_json::json!(player_target_cleared_reason));
+        // #1007 follow-up — see `PlayerState::target_in_melee_range`'s doc. `null` when there is no
+        // live target to judge; otherwise `true` (in range of the current engage ring) / `false`
+        // (target live, still closing). Disambiguates a flat `target_hp_pct` under `nav_state:
+        // "engaging"` — "still walking into range" vs "standing there, swings not landing."
+        player.insert("target_in_melee_range".into(), serde_json::json!(player_target_in_melee_range));
         // #724/#817 — HOLD: the movement controller has stopped the body and cannot resume (embedded
         // in geometry with push-out exhausted, or hanging at the underworld floor with no recovery
         // position). `null` for a healthy character, INCLUDING one simply standing still — `pos` and
@@ -5000,6 +5019,99 @@ mod tests {
             "stale target_hp_pct must not leak into the new zone (#408)");
     }
 
+    /// **#1007 follow-up (live-test-drive finding): a despawned target must say WHY `target_id`
+    /// went null, distinguishing it from a character that never targeted anything.**
+    ///
+    /// Before this field existed, `auto_attack: true` beside `target_id: null` after a kill read
+    /// identically to a fresh character that had never targeted at all — `auto_attack` is a wholly
+    /// separate flag `remove_entity`/`clear_target` never touch. `target_cleared_reason` closes
+    /// that gap.
+    ///
+    /// Mutation check: drop the `reason` argument from `remove_entity`'s `clear_target` call (or
+    /// hardcode a different string) → the second assertion goes RED.
+    #[tokio::test]
+    async fn debug_explains_a_despawned_target_while_auto_attack_stays_on_1007() {
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.upsert_entity(eqoxide_core::game_state::make_entity(9, "a rat", 10.0, 0.0, 0.0, true));
+            gs.set_target(9);
+            gs.auto_attack = true;
+        });
+        let p = debug_json(state.clone()).await["player"].clone();
+        assert_eq!(p["target_id"], serde_json::json!(9), "precondition: targeted before despawn");
+        assert_eq!(p["target_cleared_reason"], serde_json::json!(null),
+            "no reason to report while a target is actually set");
+
+        set_gs(&state, |gs| gs.remove_entity(9)); // the kill/despawn
+        let p = debug_json(state).await["player"].clone();
+        assert_eq!(p["target_id"], serde_json::json!(null));
+        assert_eq!(p["auto_attack"], serde_json::json!(true),
+            "auto_attack is a separate flag — a despawn must not silently clear it");
+        assert_eq!(p["target_cleared_reason"], serde_json::json!("target_despawned"),
+            "target_id going null while auto_attack stays true must say WHY, or it is \
+             indistinguishable from a character that never targeted anything");
+    }
+
+    /// #1007 follow-up: the zone-change and server-forced-clear reasons, and re-targeting clearing
+    /// the reason again (it no longer describes the CURRENT target's absence once one is set).
+    #[tokio::test]
+    async fn debug_reports_the_other_two_target_cleared_reasons_and_clears_on_retarget_1007() {
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.world.zone_name = "kaladimb".into();
+            gs.upsert_entity(eqoxide_core::game_state::make_entity(66, "Guard_Dalammer000", 0.0, 0.0, 0.0, true));
+            gs.set_target(66);
+            gs.begin_zone_in(); // #408's own path — clears via "zone_changed"
+        });
+        assert_eq!(debug_json(state.clone()).await["player"]["target_cleared_reason"],
+            serde_json::json!("zone_changed"));
+
+        set_gs(&state, |gs| gs.clear_target("server_cleared")); // mirrors apply_target_command(0)
+        assert_eq!(debug_json(state.clone()).await["player"]["target_cleared_reason"],
+            serde_json::json!("server_cleared"));
+
+        set_gs(&state, |gs| {
+            gs.upsert_entity(eqoxide_core::game_state::make_entity(70, "a bat", 0.0, 0.0, 0.0, true));
+            gs.set_target(70);
+        });
+        assert_eq!(debug_json(state).await["player"]["target_cleared_reason"], serde_json::json!(null),
+            "a freshly-set target must not still carry the PREVIOUS clear's reason");
+    }
+
+    /// **#1007 follow-up (live-test-drive finding): disambiguate "still closing" from "in range,
+    /// not landing swings" under a flat `target_hp_pct`.**
+    ///
+    /// Mutation check: change `target_in_melee_range`'s `<=` to `<` → the exact-boundary case
+    /// nothing here pins would drift silently; the closing/in-range cases below still catch a
+    /// wrong-direction flip.
+    #[tokio::test]
+    async fn debug_discloses_whether_the_target_is_actually_in_melee_range_1007() {
+        let state = empty_state();
+        let p = debug_json(state.clone()).await["player"].clone();
+        assert_eq!(p["target_in_melee_range"], serde_json::json!(null),
+            "no live target to judge yet");
+
+        set_gs(&state, |gs| {
+            gs.player_x = 0.0;
+            gs.player_y = 0.0;
+            // 50u away: within the 200u engage radius (so `nav_state` can read `engaging`) but well
+            // outside the 5u melee ring — still closing.
+            gs.upsert_entity(eqoxide_core::game_state::make_entity(11, "a wolf", 50.0, 0.0, 0.0, true));
+            gs.set_target(11);
+        });
+        let p = debug_json(state.clone()).await["player"].clone();
+        assert_eq!(p["target_in_melee_range"], serde_json::json!(false),
+            "target is live but still 50u out — closing, not yet swinging");
+
+        set_gs(&state, |gs| {
+            if let Some(e) = gs.world.entities.get_mut(&11) { e.x = 2.0; }
+        });
+        let p = debug_json(state).await["player"].clone();
+        assert_eq!(p["target_in_melee_range"], serde_json::json!(true),
+            "target is now 2u out — inside the melee ring, so a flat target_hp_pct here means \
+             swings aren't landing, not that the walk is still in progress");
+    }
+
     /// **#732 (agent-honesty) — the OBSERVER half: a retired goal must not be published.**
     ///
     /// `nav_goal` is read straight off the shared `NavStatus` (`"nav_goal": nav.goal`, from a plain
@@ -6132,6 +6244,21 @@ mod tests {
         assert!(second > first,
             "X-Snapshot-Age-Ms froze at {first} across two reads of a stale source — it must be \
              derived at READ time (#343/#646), not cached or driven by the dead publisher");
+    }
+
+    #[tokio::test]
+    async fn observe_debug_player_always_carries_auto_attack() {
+        // Always present, false at boot.
+        let state = empty_state();
+        let j = debug_json(state).await;
+        assert_eq!(j["player"]["auto_attack"], serde_json::json!(false),
+            "auto_attack is always present on /observe/debug, false by default");
+
+        // Tracks gs.auto_attack.
+        let state2 = empty_state();
+        set_gs(&state2, |gs| gs.auto_attack = true);
+        let j2 = debug_json(state2).await;
+        assert_eq!(j2["player"]["auto_attack"], serde_json::json!(true));
     }
 }
 

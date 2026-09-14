@@ -92,13 +92,17 @@ async fn execute(state: HttpState, request: Request, next: Next, path: String) -
             }))).into_response();
         }
     };
+    // #952 follow-up (independent review): `/v1/combat/target/name` computes a rich `matched{}`
+    // disclosure (#513) on success, but wasn't in this allowlist — its real 200 body fell through
+    // to the generic "queued; outcome not yet confirmed" 202 below, discarding `matched` entirely.
+    // A caller could never confirm which spawn a fuzzy name actually resolved to.
     let awaited = matches!(path.as_str(), "/v1/combat/cast" | "/v1/merchant/open"
-        | "/v1/merchant/buy" | "/v1/interact/give");
+        | "/v1/merchant/buy" | "/v1/interact/give" | "/v1/combat/target/name");
     if awaited {
         if let Ok(serde_json::Value::Object(mut object)) = serde_json::from_slice(&bytes) {
             let outcome = object.get("status").and_then(|v| v.as_str()).unwrap_or("unconfirmed");
             let result = match outcome {
-                "completed" | "open" | "bought" | "given" if status == StatusCode::OK => "confirmed",
+                "completed" | "open" | "bought" | "given" | "targeting" if status == StatusCode::OK => "confirmed",
                 "refused" | "fizzled" | "interrupted" => "refused",
                 _ => "unconfirmed",
             };
@@ -328,6 +332,31 @@ mod tests {
             assert_eq!(feed["events"][0]["request_id"], receipt["request_id"]);
             assert_eq!(feed["events"][0]["result"], "confirmed");
         }
+    }
+
+    /// #952 follow-up (independent review): `/v1/combat/target/name`'s `matched{}` disclosure
+    /// (#513) must survive the full tracked router, not just the bare `combat::router()` its own
+    /// unit tests exercise. Before this fix the generic 202 fallback replaced the whole 200 body,
+    /// silently discarding `matched` and misreporting a synchronous success as still-pending.
+    ///
+    /// **Mutation check:** drop `"/v1/combat/target/name"` from the `awaited` allowlist → the
+    /// `matched` assertions below go RED (`j["matched"]` is absent from the 202 fallback body).
+    #[tokio::test]
+    async fn target_name_matched_disclosure_survives_the_tracked_router() {
+        let state = empty_state();
+        state.world.entity_ids_mut().insert_for_test("a_rat003".into(), 55);
+        let app = v1_router(&state).with_state(state.clone());
+        let response = app.oneshot(post("/v1/combat/target/name", r#"{"name":"a rat"}"#)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let j = json(response).await;
+        assert_eq!(j["status"], "targeting");
+        assert_eq!(j["matched"]["id"], 55);
+        assert_eq!(j["matched"]["quality"], "exact");
+        assert!(j["request_id"].as_u64().is_some());
+        let feed = events(&state).await;
+        assert_eq!(feed["events"][0]["kind"], "combat.target.name");
+        assert_eq!(feed["events"][0]["result"], "confirmed",
+            "a synchronous 200 targeting receipt is a confirmed outcome, not a still-pending one");
     }
 
     /// `track` buffers the body itself, so it must pass the original extensions to the extractor —
