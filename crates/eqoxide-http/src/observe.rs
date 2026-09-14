@@ -2132,6 +2132,16 @@ struct EntitiesView {
     /// could not classify into "idle". Nothing agent-visible reported the pose at all, so the
     /// confusion was completely invisible to a driving agent; this field is that missing channel.
     poses: HashMap<String, eqoxide_ipc::EntityPoseView>,
+    /// #1117 — name → dead flag. Same key-set guarantee as `poses`: projected in the same critical
+    /// section over the shared world tables, so `body["dead"][name]` is safe for any `name` in
+    /// `entities`.
+    ///
+    /// This is a **flag, not a refusal**: a corpse still appears in `entities` and still resolves
+    /// via `/v1/combat/target/name` — it now just reports `dead: true` instead of looking like a
+    /// live mob. Same agent-honesty precedent as `player.dead` on `GET /v1/observe/debug`
+    /// (#284/#406). Before this field existed, a caller driving target selection off `entities`
+    /// alone had no way to distinguish a fresh corpse from a live mob standing at the same spot.
+    dead: HashMap<String, bool>,
     /// #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc. Only on the `?labeled=1` shape;
     /// the default bare map keeps its exact historical shape and carries the same value in the
     /// `SNAPSHOT_AGE_HEADER` response header instead.
@@ -2207,8 +2217,10 @@ struct EntitiesQuery {
 ///   byte-identical-position duplicates collapsed. Backward-compatible (e.g. `group_driver.py`'s
 ///   `ents.get(name)` / `ents.items()` keep working) and its world model is corrected for free.
 /// - **`?labeled=1`** → the rich `EntitiesView` (`count`/`entities`/`deduped`/`duplicate_groups`/
-///   `note`) that LABELS the collapse for agents that want to SEE which duplicates were removed —
-///   nothing is dropped silently (the honesty invariant), just moved off the default shape.
+///   `note`/`poses`/`dead`) that LABELS the collapse for agents that want to SEE which duplicates
+///   were removed — nothing is dropped silently (the honesty invariant), just moved off the
+///   default shape. `dead` (#1117) is what lets a caller tell a corpse apart from a live mob
+///   standing at the same spot, without a separate target+debug round-trip.
 ///
 /// The underlying `gs.world.entities`/`entity_ids` model is untouched in either case, so every instance
 /// stays targetable by its full (suffixed) name.
@@ -2233,22 +2245,28 @@ async fn get_entities(State(s): State<HttpState>, Query(q): Query<EntitiesQuery>
     // the gap would have produced a `poses` map missing keys that `entities` still had, so an agent
     // doing `body["poses"][name]` could KeyError on a race it had been told could not happen.
     //
-    // ⚠️ LOCK ORDER is `entity_positions` → `entity_poses`, matching `sync_entities`'
-    // `entity_positions` → `entity_ids` → `entity_poses` (poses last in both, positions first in
-    // both). See the canonical-order note in `name_match.rs`. Do not reverse these.
-    let (entities, deduped, duplicate_groups, poses) = {
+    // ⚠️ LOCK ORDER is `entity_positions` → `entity_poses` → `entity_dead`, matching
+    // `publish_entities`' `entity_positions` → `entity_ids` → `entity_poses` → `entity_dead`
+    // (positions first, dead last, in both). See the canonical-order note in `name_match.rs`. Do
+    // not reverse these.
+    let (entities, deduped, duplicate_groups, poses, dead) = {
         let positions = s.world.entity_positions();
         let (entities, deduped, duplicate_groups) = dedup_entities(&positions);
-        // Only pay for the pose projection on the labeled shape; the bare map does not carry it.
-        let poses = if labeled {
-            let all = s.world.entity_poses();
-            entities.keys()
-                .filter_map(|n| all.get(n).map(|p| (n.clone(), p.clone())))
-                .collect::<HashMap<_, _>>()
+        // Only pay for the pose/dead projections on the labeled shape; the bare map carries neither.
+        let (poses, dead) = if labeled {
+            let all_poses = s.world.entity_poses();
+            let poses = entities.keys()
+                .filter_map(|n| all_poses.get(n).map(|p| (n.clone(), p.clone())))
+                .collect::<HashMap<_, _>>();
+            let all_dead = s.world.entity_dead();
+            let dead = entities.keys()
+                .filter_map(|n| all_dead.get(n).map(|&d| (n.clone(), d)))
+                .collect::<HashMap<_, _>>();
+            (poses, dead)
         } else {
-            HashMap::new()
+            (HashMap::new(), HashMap::new())
         };
-        (entities, deduped, duplicate_groups, poses)
+        (entities, deduped, duplicate_groups, poses, dead)
     };
     // #646: read-time freshness — see `SNAPSHOT_AGE_HEADER`'s doc.
     let snapshot_age_ms = s.health().snapshot_age_ms;
@@ -2261,7 +2279,8 @@ async fn get_entities(State(s): State<HttpState>, Query(q): Query<EntitiesQuery>
              spawn_ids on the wire) rather than a client artifact."
         ));
         let resp = Json(EntitiesView {
-            count: entities.len(), entities, deduped, duplicate_groups, note, poses, snapshot_age_ms,
+            count: entities.len(), entities, deduped, duplicate_groups, note, poses, dead,
+            snapshot_age_ms,
         }).into_response();
         with_snapshot_age(resp, snapshot_age_ms)
     } else {
@@ -5423,6 +5442,29 @@ mod tests {
             "the collapse must be labeled with an explanation, got: {}", v["note"]);
         assert_eq!(v["duplicate_groups"][0]["kept"], "Geeda");
         assert!(v["entities"]["Geeda"].is_array());
+    }
+
+    /// #1117 — `?labeled=1` must report a corpse's `dead: true` truthfully, so a caller driving
+    /// target selection off `entities` alone can tell it apart from a live mob at the same spot,
+    /// without a separate target+debug round-trip.
+    #[tokio::test]
+    async fn entities_labeled_reports_dead_flag_1117() {
+        let state = empty_state();
+        {
+            let mut pos = state.world.entity_positions_mut();
+            pos.insert_for_test("a_rat".to_string(),         (10.0, 20.0, 0.0));
+            pos.insert_for_test("a_rat_corpse".to_string(),  (30.0, 40.0, 0.0));
+            let mut dead = state.world.entity_dead_mut();
+            dead.insert_for_test("a_rat".to_string(), false);
+            dead.insert_for_test("a_rat_corpse".to_string(), true);
+        }
+        let resp = get(state, "/entities?labeled=1").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["dead"]["a_rat"], false, "a live mob must report dead: false");
+        assert_eq!(v["dead"]["a_rat_corpse"], true,
+            "a corpse must report dead: true, not be indistinguishable from a live mob");
     }
 
     /// A typo'd query param must fail loudly (#363 honesty), not silently fall back to the default.
