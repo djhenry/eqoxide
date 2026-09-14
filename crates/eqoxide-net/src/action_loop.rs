@@ -737,10 +737,11 @@ impl ActionLoop {
     /// Copy all entity positions from `gs` into the shared entity map
     /// (used by the HTTP /entities endpoint and /goto by-name lookup).
     pub fn sync_entities(&self, gs: &GameState) {
-        // #643: positions, ids AND pose/gait are published together by `WorldSlots::publish_entities`
-        // — the single roster writer, which owns the "all three maps always agree" invariant and the
-        // canonical lock order. Do NOT hand-roll the three inserts here again: that is exactly how
-        // the login-path seed silently stopped publishing poses. See that method's doc comment.
+        // #643/#1117: positions, ids, pose/gait AND dead-flag are published together by
+        // `WorldSlots::publish_entities` — the single roster writer, which owns the "all four maps
+        // always agree" invariant and the canonical lock order. Do NOT hand-roll the inserts here
+        // again: that is exactly how the login-path seed silently stopped publishing poses. See that
+        // method's doc comment.
         self.world.publish_entities(&gs.world.entities);
     }
 
@@ -1184,12 +1185,12 @@ impl ActionLoop {
     /// [`Self::controller_slots`] — a read-only borrow of the slots, not the loop.
     ///
     /// Some of its groups describe the zone we are LEAVING and have no publisher the handshake can
-    /// otherwise reach: the entity roster triple (`entity_positions`/`entity_ids`/`entity_poses`)
-    /// and `zone_points`. `GameState::begin_zone_in` emptying `gs.world.entities` /
+    /// otherwise reach: the entity roster quartet (`entity_positions`/`entity_ids`/`entity_poses`/
+    /// `entity_dead`) and `zone_points`. `GameState::begin_zone_in` emptying `gs.world.entities` /
     /// `gs.world.zone_points` does not reach the copies an agent reads. See
     /// `gameplay::run_zone_entry_handshake`'s own comment.
     ///
-    /// The roster half is why this hands out the whole bundle rather than the three maps: they are
+    /// The roster half is why this hands out the whole bundle rather than the four maps: they are
     /// private behind the single-publisher seal (#665/#652) and can only be written through
     /// `WorldSlots::publish_entities`, which needs the bundle.
     pub fn world_slots(&self) -> &eqoxide_ipc::WorldSlots { &self.world }

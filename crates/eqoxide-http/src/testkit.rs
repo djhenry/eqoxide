@@ -110,9 +110,9 @@ pub fn empty_state_with_net_thread_dead(
     HttpState { net_thread_dead, ..empty_state() }
 }
 
-/// The shared world tables (`entity_positions` / `entity_ids` / `entity_poses`) behind an
-/// [`HttpState`]. `HttpState.world` is private, so downstream integration tests that need to seed
-/// the roster the way the net thread's `sync_entities` does go through this (#643).
+/// The shared world tables (`entity_positions` / `entity_ids` / `entity_poses` / `entity_dead`)
+/// behind an [`HttpState`]. `HttpState.world` is private, so downstream integration tests that need
+/// to seed the roster the way the net thread's `sync_entities` does go through this (#643/#1117).
 pub fn world_slots(state: &HttpState) -> eqoxide_ipc::WorldSlots {
     state.world.clone()
 }

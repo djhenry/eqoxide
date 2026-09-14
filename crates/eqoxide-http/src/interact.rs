@@ -274,10 +274,22 @@ struct LootBody {
     name: Option<String>,
 }
 
-/// A spawn's entity-list key names a corpse (the only class this endpoint is allowed to queue —
-/// eqoxide#346: a live mob or a nonexistent spawn must never be silently "looted").
-fn is_corpse_key(key: &str) -> bool {
-    key.to_lowercase().contains("corpse")
+/// A spawn is a corpse (the only class this endpoint is allowed to queue — eqoxide#346: a live mob
+/// or a nonexistent spawn must never be silently "looted") if EITHER its entity-list key names one,
+/// or the `entity_dead` roster already says so.
+///
+/// #1117 follow-up: the server does not rename a corpse (e.g. `a_rat00` → `a_rat00's corpse`) in
+/// the same instant it dies — `apply_death` sets `entity_dead[key] = true` when the death packet
+/// lands, but the rename is a separate, later spawn update. In that window the name-substring check
+/// alone answered false for an entity that unambiguously IS already a corpse, so `{"id":N}` and
+/// `{"name":"..."}` 404'd with "not a corpse" / "no corpse matching" for a kill the caller had just
+/// landed. `entity_dead` closes that window: it is published atomically alongside `entity_ids` and
+/// `entity_positions` (`WorldSlots::publish_entities`, #1117), so by the time a spawn is resolvable
+/// through either of those maps its `dead` entry is already correct — no separate race to model here,
+/// same reasoning as `NameMatch.dead`'s doc in `name_match.rs`. This only WIDENS what counts as a
+/// corpse; it can never turn a live mob into one, so #346's invariant still holds.
+fn is_corpse_key(key: &str, dead: &RosterReadGuard<'_, bool>) -> bool {
+    key.to_lowercase().contains("corpse") || dead.get(key).copied().unwrap_or(false)
 }
 
 fn queue_loot(s: &HttpState, name: String, id: u32) -> (StatusCode, String) {
@@ -291,11 +303,13 @@ fn queue_loot(s: &HttpState, name: String, id: u32) -> (StatusCode, String) {
 /// items land in inventory (see GET /v1/observe/inventory). Body: {"id":N} for a specific corpse
 /// spawn id, {"name":"..."} to fuzzy-match a corpse name, or {} for the nearest corpse.
 ///
-/// Every path (id / name / nearest) is restricted to entities whose key names a corpse — eqoxide#346
-/// found that the explicit `id`/`name` paths had NO such check, so an unknown id defaulted to
+/// Every path (id / name / nearest) is restricted to entities that ARE a corpse — eqoxide#346 found
+/// that the explicit `id`/`name` paths had NO such check, so an unknown id defaulted to
 /// `format!("spawn {}", id)` and a 200, and a name like "rat" could match a live `a_rat01` standing
 /// next to `a_rat00's corpse`. A nonexistent id or a name matching no corpse is 404; a name matching
-/// more than one corpse is 409 (ambiguous) rather than silently picking one.
+/// more than one corpse is 409 (ambiguous) rather than silently picking one. "Is a corpse" is
+/// `is_corpse_key`'s OR of the name-substring check and the `entity_dead` roster (#1117 follow-up) —
+/// see its doc for why the roster check is needed alongside the name.
 async fn post_loot(
     State(s): State<HttpState>,
     OptionalJson(body): OptionalJson<LootBody>,
@@ -317,8 +331,9 @@ async fn post_loot(
         let ids = s.world.entity_ids();
         let found = ids.iter().find(|(_, &v)| v == id).map(|(k, _)| k.clone());
         drop(ids);
+        let dead = s.world.entity_dead();
         return match found {
-            Some(key) if is_corpse_key(&key) => queue_loot(&s, key, id),
+            Some(key) if is_corpse_key(&key, &dead) => queue_loot(&s, key, id),
             Some(key) => (StatusCode::NOT_FOUND,
                 format!("spawn_id {} is not a corpse ({})", id, clean_entity_name(&key))),
             None => (StatusCode::NOT_FOUND, format!("no spawn with id {}", id)),
@@ -326,13 +341,15 @@ async fn post_loot(
     }
     if let Some(name) = &b.name {
         let ids = s.world.entity_ids();
+        let dead = s.world.entity_dead();
         let nl = name.to_lowercase();
         let matches: Vec<(String, u32)> = ids.iter()
-            .filter(|(k, _)| is_corpse_key(k)
+            .filter(|(k, _)| is_corpse_key(k, &dead)
                 && (k.to_lowercase().contains(&nl) || clean_entity_name(k).to_lowercase().contains(&nl)))
             .map(|(k, &v)| (k.clone(), v))
             .collect();
         drop(ids);
+        drop(dead);
         return match matches.len() {
             0 => (StatusCode::NOT_FOUND, format!("no corpse matching {:?}", name)),
             1 => { let (key, id) = matches[0].clone(); queue_loot(&s, key, id) }
@@ -342,10 +359,12 @@ async fn post_loot(
     }
     // Nearest corpse to the player (camera focus = player pos).
     let focus = s.camera.snapshot.lock().unwrap().focus;
+    // Canonical lock order (#1117): entity_positions → entity_ids → entity_dead. Do not reverse.
     let positions = s.world.entity_positions();
     let ids = s.world.entity_ids();
+    let dead = s.world.entity_dead();
     let resolved = positions.iter()
-        .filter(|(k, _)| is_corpse_key(k))
+        .filter(|(k, _)| is_corpse_key(k, &dead))
         .map(|(k, &(x, y, _))| {
             let (dx, dy) = (x - focus[0], y - focus[1]);
             (k.clone(), dx * dx + dy * dy)
@@ -354,6 +373,7 @@ async fn post_loot(
         .and_then(|(k, _)| ids.get(&k).map(|&id| (k, id)));
     drop(positions);
     drop(ids);
+    drop(dead);
     match resolved {
         Some((name, id)) => queue_loot(&s, name, id),
         None => (StatusCode::NOT_FOUND, "no corpse found to loot".into()),
@@ -862,6 +882,82 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(command.take_loot(), Some(9));
+    }
+
+    // ── #1117 follow-up: `entity_dead` closes the corpse-rename race — a freshly-dead spawn whose
+    // key the server has not yet renamed to "...'s corpse" must still be lootable, by id, by name,
+    // and as the nearest corpse. Mutation check: revert `is_corpse_key` to the bare
+    // `key.to_lowercase().contains("corpse")` (drop the `|| dead.get(...)` half) and each of the
+    // three tests below goes RED (404/"no corpse found" instead of 200).
+
+    /// `seed_npc` alone leaves the key un-renamed (no "corpse" substring); this also marks it dead
+    /// in the roster the way `apply_death` does, ahead of the server's rename.
+    fn seed_freshly_dead_npc(state: &crate::HttpState, key: &str, id: u32, pos: (f32, f32, f32)) {
+        seed_npc(state, key, id, pos);
+        state.world.entity_dead_mut().insert_for_test(key.to_string(), true);
+    }
+
+    #[tokio::test]
+    async fn loot_id_matching_a_freshly_dead_unrenamed_spawn_still_works_1117() {
+        let state = empty_state();
+        seed_freshly_dead_npc(&state, "a_rat00", 9, (2.0, 2.0, 0.0));
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/loot")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":9}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK,
+            "a spawn the entity_dead roster already says is dead must be lootable even before its \
+             key is renamed to \"...'s corpse\"");
+        assert_eq!(command.take_loot(), Some(9));
+    }
+
+    #[tokio::test]
+    async fn loot_name_matching_a_freshly_dead_unrenamed_spawn_still_works_1117() {
+        let state = empty_state();
+        seed_freshly_dead_npc(&state, "a_rat00", 9, (2.0, 2.0, 0.0));
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/loot")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a_rat00"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK,
+            "a spawn the entity_dead roster already says is dead must resolve by name even before \
+             its key is renamed to \"...'s corpse\"");
+        assert_eq!(command.take_loot(), Some(9));
+    }
+
+    #[tokio::test]
+    async fn loot_no_body_loots_a_freshly_dead_unrenamed_nearest_spawn_1117() {
+        let state = empty_state();
+        seed_freshly_dead_npc(&state, "a_rat00", 9, (2.0, 2.0, 0.0));
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/loot").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK,
+            "the nearest-corpse fallback must also see a freshly-dead, not-yet-renamed spawn");
+        assert_eq!(command.take_loot(), Some(9));
+    }
+
+    /// The other half of the mutation check: a LIVE mob (not renamed, `entity_dead` absent or
+    /// false) must still 404 — `entity_dead` widens what counts as a corpse, it must never narrow
+    /// #346's "never loot something that isn't a corpse" guarantee.
+    #[tokio::test]
+    async fn loot_id_matching_a_live_mob_with_no_dead_entry_is_still_404_1117() {
+        let state = empty_state();
+        seed_npc(&state, "a_rat01", 11, (2.0, 2.0, 0.0)); // no entity_dead entry at all
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/loot")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":11}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND,
+            "an id with neither a corpse-named key nor a true entity_dead entry must never be \
+             queued for looting");
+        assert!(command.take_loot().is_none());
     }
 
     // ── A3 Migration 2 (#448): POST /v1/interact/give reports the TRUE outcome, not a queued 200 ──
