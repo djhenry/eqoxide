@@ -1259,7 +1259,7 @@ pub type NavAvoidShared = Arc<Mutex<AggroAvoidOpts>>;
 /// It derefs to `HashMap<String, V>`, so every existing read — `get`, `len`, `iter`, `keys`,
 /// `contains_key`, `&*guard` into a `&HashMap` — works exactly as before, with no call-site
 /// changes. What it deliberately does NOT implement is `DerefMut`, and it exposes no public
-/// mutators. The only way to write one is [`WorldSlots::publish_entities`], which writes all three
+/// mutators. The only way to write one is [`WorldSlots::publish_entities`], which writes all four
 /// roster maps together.
 ///
 /// # Why a newtype instead of a plain `HashMap`
@@ -1356,9 +1356,9 @@ impl<V> std::ops::Deref for Roster<V> {
 // from alone. Closing the producer set was necessary but not sufficient: the remaining leak was that
 // the CONTAINER handed out mutable access to what it protects.
 //
-// #665 closed that at the container: `WorldSlots`' three roster fields are now PRIVATE and its only
-// read path is [`WorldSlots::entity_positions`] / `entity_ids` / `entity_poses`, which return a
-// [`RosterReadGuard`] — a guard with NO `DerefMut`. With no `&mut Roster` reachable from outside the
+// #665 closed that at the container: `WorldSlots`' four roster fields are now PRIVATE and its only
+// read path is [`WorldSlots::entity_positions`] / `entity_ids` / `entity_poses` / `entity_dead`,
+// which return a [`RosterReadGuard`] — a guard with NO `DerefMut`. With no `&mut Roster` reachable from outside the
 // crate, there are no two `&mut Roster`s to `mem::swap`, so the move above is now a COMPILE error
 // (proved by the `compile_fail` doctests on those accessors). Writes still go only through
 // `publish_entities`, still the single publisher.
@@ -1380,7 +1380,7 @@ impl<V> Roster<V> {
     /// Insert one entry. `pub(crate)` — only the single publisher may write a roster.
     pub(crate) fn insert(&mut self, k: String, v: V) -> Option<V> { self.0.insert(k, v) }
 
-    /// **Test fixtures only.** Seed one entry directly, bypassing the all-three-maps guarantee —
+    /// **Test fixtures only.** Seed one entry directly, bypassing the all-four-maps guarantee —
     /// which is exactly what a test wants when it needs a partial or intentionally-mismatched
     /// roster. Never available in a release build; see the type's doc comment.
     #[cfg(any(test, feature = "test-fixtures"))]
@@ -1388,7 +1388,7 @@ impl<V> Roster<V> {
 }
 
 /// A **read-only** lock guard over a [`Roster`], returned by [`WorldSlots`]'s roster accessors
-/// (`entity_positions` / `entity_ids` / `entity_poses`).
+/// (`entity_positions` / `entity_ids` / `entity_poses` / `entity_dead`).
 ///
 /// It `Deref`s to `Roster<V>` (which in turn `Deref`s to `HashMap`), so every read the old public
 /// `Arc<Mutex<Roster<..>>>` fields supported — `get`, `len`, `iter`, `keys`, `values`,
@@ -2741,7 +2741,7 @@ pub struct NavSlots {
 /// shared world index, not particular to navigation, even though nav is its biggest reader.
 #[derive(Clone)]
 pub struct WorldSlots {
-    // The three roster maps are PRIVATE (#665): a `pub Arc<Mutex<Roster<..>>>` field hands out a
+    // The four roster maps are PRIVATE (#665): a `pub Arc<Mutex<Roster<..>>>` field hands out a
     // `MutexGuard`, whose `DerefMut` yields a `&mut Roster` that `mem::swap` can move past the
     // single-publisher rule (`publish_entities`). Reads go through the [`RosterReadGuard`] accessors
     // below (no `DerefMut`); the only writer is `publish_entities`. #652 sealed the VALUE producers;

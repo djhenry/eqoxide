@@ -1079,7 +1079,7 @@ async fn run_zone_entry_handshake(
     // fresh publish, for the whole zone load (up to `ZONE_ENTRY_HANDSHAKE_DEADLINE`, 30 s) while
     // `publish_snapshot` runs every 10 ms and keeps the HTTP session live and answering:
     //
-    //   * the roster triple backs NAME → SPAWN-ID resolution — GET /v1/observe/entities,
+    //   * the roster quartet backs NAME → SPAWN-ID resolution — GET /v1/observe/entities,
     //     POST /v1/interact/hail, /v1/merchant/open|buy|sell, /v1/trainer/open, /v1/move/goto by
     //     name, and the "is this spawn known?" gate on /v1/combat/target and /v1/combat/consider —
     //     so a call issued during the window resolves a name against the zone we just left and
@@ -2644,7 +2644,8 @@ mod zone_entry_handshake_publish_tests {
     /// **#1010 — the PUBLISHED half of the ENTITY ROSTER purge, pinned DURING the handshake window.**
     ///
     /// `GameState::begin_zone_in` empties `gs.world.entities`, but what an agent reads is the
-    /// roster triple in `WorldSlots` (`entity_positions`/`entity_ids`/`entity_poses`). Before this
+    /// roster quartet in `WorldSlots` (`entity_positions`/`entity_ids`/`entity_poses`/
+    /// `entity_dead`). Before this
     /// fix the roster held the DEPARTED zone's entities for the whole handshake — up to
     /// `ZONE_ENTRY_HANDSHAKE_DEADLINE` (30 s) — while `publish_snapshot`
     /// ran every 10 ms and kept the HTTP session live. That roster is what name → spawn-id
@@ -2660,7 +2661,7 @@ mod zone_entry_handshake_publish_tests {
     /// (`_tx` is bound but never `.send()`s, so the inner `try_recv` never once succeeds), and the
     /// roster is polled with a 1 s budget — three orders of magnitude short of the deadline. Unlike
     /// the doors case there is no failure-path clear for the roster to mask a late result either:
-    /// with the fix removed, NOTHING in this function ever touches the three maps.
+    /// with the fix removed, NOTHING in this function ever touches the four maps.
     ///
     /// The seeded entities are the departed zone's, in BOTH copies, as production would have them:
     /// published (via the real single publisher, not a hand-rolled write — the maps are private,
@@ -2696,7 +2697,7 @@ mod zone_entry_handshake_publish_tests {
             );
         }
         let world = eqoxide_ipc::WorldSlots::default();
-        // Publish them the way production does — through the ONE publisher (#665/#652: the three
+        // Publish them the way production does — through the ONE publisher (#665/#652: the four
         // maps are private and this is the only writer), so the fixture is a real prior publish.
         assert_eq!(world.publish_entities(&gs.world.entities), 2,
             "fixture premise: the departed zone's roster really is published before the zone-in");
@@ -2717,18 +2718,20 @@ mod zone_entry_handshake_publish_tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         loop {
-            let (p, i, o) = (
+            let (p, i, o, d) = (
                 world.entity_positions().len(),
                 world.entity_ids().len(),
                 world.entity_poses().len(),
+                world.entity_dead().len(),
             );
-            if (p, i, o) == (0, 0, 0) { break; }
+            if (p, i, o, d) == (0, 0, 0, 0) { break; }
             assert!(std::time::Instant::now() < deadline,
                 "the published entity roster still held the departed zone's entities 1s into a \
-                 handshake whose deadline is 30s (positions={p} ids={i} poses={o}) — an agent \
-                 polling GET /v1/observe/entities reads a complete, well-formed roster of a zone it \
-                 is no longer in, and every name → spawn-id resolution built on it (hail, merchant, \
-                 trainer, goto-by-name, combat target) addresses a departed spawn id (#1010)");
+                 handshake whose deadline is 30s (positions={p} ids={i} poses={o} dead={d}) — an \
+                 agent polling GET /v1/observe/entities reads a complete, well-formed roster of a \
+                 zone it is no longer in, and every name → spawn-id resolution built on it (hail, \
+                 merchant, trainer, goto-by-name, combat target) addresses a departed spawn id \
+                 (#1010)");
             sleep(Duration::from_millis(10)).await;
         }
 

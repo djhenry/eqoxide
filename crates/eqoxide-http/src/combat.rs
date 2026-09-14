@@ -111,11 +111,14 @@ struct TargetNameBody {
 /// resolves the name to a spawn_id via gs.world.entities and sends OP_TargetCommand.
 ///
 /// #513 (agent-honesty): the response now DISCLOSES the matched entity — `matched:{id, name,
-/// quality, distance?}` — so the caller can confirm the resolution picked the intended spawn.
-/// `quality` is `"exact"` (a case-insensitive name match) or `"fuzzy"` (only a partial/substring
-/// match existed); an exact match is ALWAYS preferred over a nearer fuzzy one, and the disclosed
-/// id/name always describe the SAME spawn that was targeted (both derive from one `NameMatch`).
-/// A name that doesn't even fuzzy-match is an honest 404, not a distant wrong target.
+/// quality, distance?, candidates, dead}` — so the caller can confirm the resolution picked the
+/// intended spawn. `quality` is `"exact"` (a case-insensitive name match) or `"fuzzy"` (only a
+/// partial/substring match existed); an exact match is ALWAYS preferred over a nearer fuzzy one, and
+/// the disclosed id/name always describe the SAME spawn that was targeted (both derive from one
+/// `NameMatch`). `candidates` is how many spawns matched at that same quality (ambiguity, #513
+/// review F2); `dead` is `true` if the matched spawn is a corpse — still targeted, just disclosed
+/// honestly rather than looking like a live mob (#1117, flag don't refuse). A name that doesn't even
+/// fuzzy-match is an honest 404, not a distant wrong target.
 async fn post_target_name(
     State(s): State<HttpState>,
     body: Result<Json<TargetNameBody>, axum::extract::rejection::JsonRejection>,

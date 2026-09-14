@@ -80,11 +80,13 @@ pub(crate) struct NameMatch {
     /// `"exact"`, and the agent reasonably concluded the resolution was unambiguous when it was a
     /// coin flip. The count lets the caller gate on ambiguity instead of being quietly guessed at.
     pub candidates: usize,
-    /// Whether the matched entity is a corpse (#1117). `false` both for a genuinely-alive entity and
-    /// for the rare race where the entity is absent from the `entity_dead` roster (a name that
-    /// resolved via `positions`/`ids` but hasn't been projected into `entity_dead` yet) — the
-    /// conservative default leans toward NOT hiding a target the caller could otherwise act on
-    /// (flag, don't refuse).
+    /// Whether the matched entity is a corpse (#1117). `unwrap_or(false)` against the `entity_dead`
+    /// roster is a **defensive default, not a modeled race**: `WorldSlots::publish_entities` writes
+    /// `entity_positions`/`entity_ids`/`entity_poses`/`entity_dead` together under one critical
+    /// section (see its doc comment for the canonical lock order), so a name resolved via
+    /// `positions`/`ids` is guaranteed to also be present in `entity_dead` in production — the same
+    /// structural guarantee `poses` already has (#643). The only way to observe a missing key is
+    /// `Roster::insert_for_test` seeding a partial fixture directly in a unit test.
     ///
     /// This is a **flag, not a refusal**: resolution still succeeds and returns this match — a
     /// corpse may be inspectable/lootable later — the caller now just learns the truth instead of a
