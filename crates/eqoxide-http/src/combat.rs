@@ -111,11 +111,14 @@ struct TargetNameBody {
 /// resolves the name to a spawn_id via gs.world.entities and sends OP_TargetCommand.
 ///
 /// #513 (agent-honesty): the response now DISCLOSES the matched entity — `matched:{id, name,
-/// quality, distance?}` — so the caller can confirm the resolution picked the intended spawn.
-/// `quality` is `"exact"` (a case-insensitive name match) or `"fuzzy"` (only a partial/substring
-/// match existed); an exact match is ALWAYS preferred over a nearer fuzzy one, and the disclosed
-/// id/name always describe the SAME spawn that was targeted (both derive from one `NameMatch`).
-/// A name that doesn't even fuzzy-match is an honest 404, not a distant wrong target.
+/// quality, distance?, candidates, dead}` — so the caller can confirm the resolution picked the
+/// intended spawn. `quality` is `"exact"` (a case-insensitive name match) or `"fuzzy"` (only a
+/// partial/substring match existed); an exact match is ALWAYS preferred over a nearer fuzzy one, and
+/// the disclosed id/name always describe the SAME spawn that was targeted (both derive from one
+/// `NameMatch`). `candidates` is how many spawns matched at that same quality (ambiguity, #513
+/// review F2); `dead` is `true` if the matched spawn is a corpse — still targeted, just disclosed
+/// honestly rather than looking like a live mob (#1117, flag don't refuse). A name that doesn't even
+/// fuzzy-match is an honest 404, not a distant wrong target.
 async fn post_target_name(
     State(s): State<HttpState>,
     body: Result<Json<TargetNameBody>, axum::extract::rejection::JsonRejection>,
@@ -841,6 +844,29 @@ mod tests {
         assert_eq!(j["matched"]["quality"], "exact");
         assert_eq!(command.take_target(), Some(55),
             "the disclosed id must be the one actually targeted — they can't disagree");
+    }
+
+    /// #1117: targeting a corpse by name must still succeed (flag, don't refuse) AND honestly
+    /// disclose `matched.dead: true` — a corpse must not look indistinguishable from a live mob of
+    /// the same name through this endpoint.
+    #[tokio::test]
+    async fn target_name_discloses_dead_true_for_a_corpse() {
+        let state = empty_state();
+        state.world.entity_ids_mut().insert_for_test("a_rat003".into(), 55);
+        state.world.entity_positions_mut().insert_for_test("a_rat003".into(), (3.0, 4.0, 0.0));
+        state.world.entity_dead_mut().insert_for_test("a_rat003".into(), true);
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/target/name")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a rat"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a corpse must still resolve as a target");
+        let j = body_json(resp).await;
+        assert_eq!(j["matched"]["id"], 55);
+        assert_eq!(j["matched"]["dead"], true, "a corpse must be honestly disclosed as dead");
+        assert_eq!(command.take_target(), Some(55),
+            "a corpse is still targetable — flag, don't refuse");
     }
 
     /// THE #513 INVARIANT: given an EXACT match and a nearer FUZZY decoy, resolution must pick the

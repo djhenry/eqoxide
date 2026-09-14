@@ -264,6 +264,17 @@ pub struct PlayerState {
     pub target_attitude: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_level:    Option<u32>,
+    /// #1117 follow-up: is the CURRENT target a corpse? `None` while nothing is targeted (same
+    /// gating as `target_con`/`target_level` above); `Some(bool)` once it is, read straight off the
+    /// live entity's `dead` field — the same per-entity flag `entity_dead` (GET
+    /// /v1/observe/entities?labeled=1) and `matched.dead` (POST /v1/combat/target/name,
+    /// /v1/move/goto, /v1/move/follow) disclose. Exists so an agent can tell its OWN current target
+    /// is a corpse from this one read, without cross-referencing `entities?labeled=1` by name or
+    /// issuing a mutating `/goto {}` just to read `matched.dead` back. "Flag, don't refuse": a
+    /// corpse target is still a valid target, this field just tells the truth about it — same
+    /// agent-honesty precedent as `dead` on this same payload (#284/#406).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_dead:     Option<bool>,
     /// #1007 follow-up (live-test-drive finding): mirrors
     /// [`eqoxide_core::game_state::GameState::target_cleared_reason`] — WHY `target_id` above is
     /// currently null. `None` while a target is set, and also `None` when nothing has ever been
@@ -447,6 +458,8 @@ impl PlayerState {
             target_con:      gs.target_id.and(gs.target_con_name.clone()),
             target_attitude: gs.target_id.and(gs.target_attitude.clone()),
             target_level:    gs.target_id.and_then(|id| gs.world.entities.get(&id)).map(|e| e.level),
+            // #1117 follow-up: same gating + same live-entity source as target_level above.
+            target_dead:     gs.target_id.and_then(|id| gs.world.entities.get(&id)).map(|e| e.dead),
             // #1007 follow-up: both computed straight off `gs`, not stored — same discipline as
             // `hp_verified`/`coin_verified` above, and `target_in_melee_range` is a live-distance
             // read that can only ever be correct at read time (#343).
