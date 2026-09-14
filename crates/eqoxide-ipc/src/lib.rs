@@ -1450,6 +1450,18 @@ pub struct EntityPoseView {
 ///    login once, before the gameplay loop's own drain takes over.
 pub type EntityPoses = Arc<Mutex<Roster<EntityPoseView>>>;
 
+/// Live entity name → dead flag (same keys as `EntityPositions`), read by
+/// `GET /v1/observe/entities?labeled=1` and `POST /v1/combat/target/name` (#1117). Same publish
+/// cadence as [`EntityPoses`] — see its doc comment for the two callers and why this is
+/// traffic-driven, not clock-driven, rather than on a fixed clock.
+///
+/// `true` once `Entity::dead` (set by `packet_handler::apply_death`, or already `true` at
+/// corpse-spawn time via `register_spawn`'s `is_corpse` check) is observed. This is a **flag,
+/// not a refusal**: a corpse still resolves as a target — it may be inspectable/lootable later —
+/// it just no longer reports itself as alive to a caller that checks this field. Same
+/// agent-honesty precedent as `player.dead` on `GET /v1/observe/debug` (#284/#406).
+pub type EntityDead = Arc<Mutex<Roster<bool>>>;
+
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /v1/observe/zone_points.
 ///
 /// EMPTIED by `gameplay::run_zone_entry_handshake` on a re-zone (#1010) — without the clear this
@@ -2739,6 +2751,9 @@ pub struct WorldSlots {
     /// name → pose/gait (#643). Same keys as `entity_positions`; published in the same
     /// full-replace so it can never go stale independently of the roster.
     entity_poses:     EntityPoses,
+    /// name → dead flag (#1117). Same keys as `entity_positions`; published in the same
+    /// full-replace so it can never go stale independently of the roster.
+    entity_dead:      EntityDead,
     pub zone_points:      ZonePoints,
     /// #816 — see [`ZoneMapLoadShared`].
     pub zone_map_load:    ZoneMapLoadShared,
@@ -2754,6 +2769,7 @@ impl Default for WorldSlots {
             entity_positions: Arc::new(Mutex::new(Roster::new())),
             entity_ids:       Arc::new(Mutex::new(Roster::new())),
             entity_poses:     Arc::new(Mutex::new(Roster::new())),
+            entity_dead:      Arc::new(Mutex::new(Roster::new())),
             zone_points:      Arc::new(Mutex::new(Vec::new())),
             zone_map_load:    Arc::new(Mutex::new(None)),
         }
@@ -2762,20 +2778,20 @@ impl Default for WorldSlots {
 
 impl WorldSlots {
     /// **The one and only way to publish the entity roster.** Full-replaces `entity_positions`,
-    /// `entity_ids` and `entity_poses` from `entities`, holding all three locks for the whole
-    /// swap. Returns the number of entities published.
+    /// `entity_ids`, `entity_poses` and `entity_dead` from `entities`, holding all four locks for
+    /// the whole swap. Returns the number of entities published.
     ///
     /// It cannot write one map without the others, which is what makes
-    /// `/v1/observe/entities?labeled=1`'s "`poses` is keyed exactly like `entities`" promise hold by
-    /// construction. See [`Roster`] for the defect that motivated it and for why a second publisher
-    /// is a COMPILE ERROR rather than a lint or a review catch.
+    /// `/v1/observe/entities?labeled=1`'s "`poses`/`dead` are keyed exactly like `entities`" promise
+    /// hold by construction. See [`Roster`] for the defect that motivated it and for why a second
+    /// publisher is a COMPILE ERROR rather than a lint or a review catch.
     ///
     /// # ⚠️ Lock order
     ///
-    /// `entity_positions` → `entity_ids` → `entity_poses`. This is the canonical order every other
-    /// site must follow (see `eqoxide_http::name_match`'s `resolve_in_world` and its ABBA regression
-    /// guard). Centralising the write path here means the *writer* half of that discipline now
-    /// exists in exactly one place and cannot drift.
+    /// `entity_positions` → `entity_ids` → `entity_poses` → `entity_dead`. This is the canonical
+    /// order every other site must follow (see `eqoxide_http::name_match`'s `resolve_in_world` and
+    /// its ABBA regression guard). Centralising the write path here means the *writer* half of that
+    /// discipline now exists in exactly one place and cannot drift.
     ///
     /// # Full replace, deliberately
     ///
@@ -2803,9 +2819,11 @@ impl WorldSlots {
         let mut positions = self.entity_positions.lock().unwrap(); // 1st — canonical order
         let mut ids       = self.entity_ids.lock().unwrap();       // 2nd
         let mut poses     = self.entity_poses.lock().unwrap();     // 3rd
+        let mut dead      = self.entity_dead.lock().unwrap();      // 4th
         positions.clear();
         ids.clear();
         poses.clear();
+        dead.clear();
         for (&id, e) in entities {
             positions.insert(e.name.clone(), (e.x, e.y, e.z));
             ids.insert(e.name.clone(), id);
@@ -2813,6 +2831,7 @@ impl WorldSlots {
                 pose: e.pose.label(),
                 gait: e.gait.map(|g| g.raw()),
             });
+            dead.insert(e.name.clone(), e.dead);
         }
         positions.len()
     }
@@ -2824,8 +2843,9 @@ impl WorldSlots {
     /// # ⚠️ Lock order
     ///
     /// A site holding more than one of these must acquire them in the canonical order
-    /// `entity_positions()` → `entity_ids()` → `entity_poses()` — the same order `publish_entities`
-    /// and `eqoxide_http::name_match`'s ABBA guard use. Taking them any other way is a deadlock.
+    /// `entity_positions()` → `entity_ids()` → `entity_poses()` → `entity_dead()` — the same order
+    /// `publish_entities` and `eqoxide_http::name_match`'s ABBA guard use. Taking them any other way
+    /// is a deadlock.
     ///
     /// # The #665 leak is now a compile error
     ///
@@ -2864,6 +2884,12 @@ impl WorldSlots {
         RosterReadGuard(self.entity_poses.lock().unwrap())
     }
 
+    /// Read-lock the live **dead** roster (name → `bool`, #1117). Reads only; see
+    /// [`entity_positions`](Self::entity_positions) for the lock order and the #665 rationale.
+    pub fn entity_dead(&self) -> RosterReadGuard<'_, bool> {
+        RosterReadGuard(self.entity_dead.lock().unwrap())
+    }
+
     /// **Test fixtures only.** Mutable lock on the **positions** roster, so a test can seed a partial
     /// or deliberately-mismatched roster via [`Roster::insert_for_test`]. Gated to `test` /
     /// `test-fixtures`, so it is **absent from `cargo build --release`** — the release build keeps no
@@ -2886,6 +2912,13 @@ impl WorldSlots {
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn entity_poses_mut(&self) -> std::sync::MutexGuard<'_, Roster<EntityPoseView>> {
         self.entity_poses.lock().unwrap()
+    }
+
+    /// **Test fixtures only.** Mutable lock on the **dead** roster; see
+    /// [`entity_positions_mut`](Self::entity_positions_mut).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn entity_dead_mut(&self) -> std::sync::MutexGuard<'_, Roster<bool>> {
+        self.entity_dead.lock().unwrap()
     }
 }
 
@@ -3542,11 +3575,11 @@ mod world_roster_tests_643 {
     use super::WorldSlots;
     use eqoxide_core::game_state::{make_entity, Gait, Pose};
 
-    /// `publish_entities` writes all three maps or none — the guarantee
+    /// `publish_entities` writes all four maps or none — the guarantee
     /// `/v1/observe/entities?labeled=1` makes to agents. MUTATION CHECK: delete any one of the
-    /// three `insert`s (or any one `clear`) in `publish_entities` and this goes RED.
+    /// four `insert`s (or any one `clear`) in `publish_entities` and this goes RED.
     #[test]
-    fn publish_entities_writes_all_three_maps_with_identical_keys() {
+    fn publish_entities_writes_all_four_maps_with_identical_keys() {
         let world = WorldSlots::default();
 
         let mut sitter = make_entity(1, "a_sitter", 1.0, 2.0, 3.0, true);
@@ -3554,14 +3587,17 @@ mod world_roster_tests_643 {
         sitter.gait = Some(Gait::from_wire_10bit(12));
         let mut walker = make_entity(2, "a_walker", 4.0, 5.0, 6.0, true);
         walker.gait = Some(Gait::from_wire_10bit(1012)); // backing up: -12
+        let mut corpse = make_entity(3, "a_corpse", 7.0, 8.0, 9.0, true);
+        corpse.dead = true;
         let entities: std::collections::HashMap<u32, _> =
-            [(1u32, sitter), (2u32, walker)].into_iter().collect();
+            [(1u32, sitter), (2u32, walker), (3u32, corpse)].into_iter().collect();
 
-        assert_eq!(world.publish_entities(&entities), 2);
+        assert_eq!(world.publish_entities(&entities), 3);
 
         let positions = world.entity_positions();
         let ids       = world.entity_ids();
         let poses     = world.entity_poses();
+        let dead      = world.entity_dead();
 
         fn sorted<V>(m: &std::collections::HashMap<String, V>) -> Vec<String> {
             let mut v: Vec<String> = m.keys().cloned().collect();
@@ -3573,6 +3609,9 @@ mod world_roster_tests_643 {
         assert_eq!(sorted(&positions), sorted(&poses),
             "positions and poses must have identical key sets — an agent indexes `poses` by a name \
              it read from `entities`");
+        assert_eq!(sorted(&positions), sorted(&dead),
+            "positions and dead must have identical key sets — an agent indexes `dead` by a name \
+             it read from `entities`");
 
         assert_eq!(positions["a_sitter"], (1.0, 2.0, 3.0));
         assert_eq!(ids["a_sitter"], 1);
@@ -3580,10 +3619,13 @@ mod world_roster_tests_643 {
         assert_eq!(poses["a_sitter"].gait, Some(12));
         assert_eq!(poses["a_walker"].pose, "standing");
         assert_eq!(poses["a_walker"].gait, Some(-12), "a backing-up mob's gait stays negative");
+        assert_eq!(dead["a_sitter"], false);
+        assert_eq!(dead["a_walker"], false);
+        assert_eq!(dead["a_corpse"], true, "a corpse's dead flag must survive the publish");
     }
 
     /// A second publish must FULL-REPLACE, not merge: an entity from the previous zone (or the
-    /// previous login attempt) must not survive in any of the three maps.
+    /// previous login attempt) must not survive in any of the four maps.
     #[test]
     fn publish_entities_full_replaces_so_no_stale_entity_survives() {
         let world = WorldSlots::default();
@@ -3599,6 +3641,9 @@ mod world_roster_tests_643 {
         assert!(!world.entity_poses().contains_key("old_zone_mob"),
             "a stale pose is worse than a stale position — it is a confident claim about a body \
              state that no longer exists");
+        assert!(!world.entity_dead().contains_key("old_zone_mob"),
+            "a stale dead flag is worse than a stale position — it is a confident claim about a \
+             body state that no longer exists");
     }
 
 }
